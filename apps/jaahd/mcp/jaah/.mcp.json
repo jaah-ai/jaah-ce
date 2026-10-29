@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "control": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/trampoline.py"]
+    }
+  }
+}

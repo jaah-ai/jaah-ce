@@ -1,0 +1,93 @@
+# compose.yml — Jaah Community Edition: the control plane (api, web, Postgres) and, under the `node` profile, the node.
+#
+#   docker compose up -d                          # the control plane; the console at http://localhost:3050
+#   docker compose --profile node up -d           # also the node as a container (macOS, Windows, Linux fallback)
+#   docker compose build                          # build every image from this checkout instead of pulling
+#
+# The images are the published ones at JAAH_VERSION (install.sh writes it to `.env` beside this file); each also
+# has a `build:` block, so a checkout builds its own. A release ships this file rendered with each image pinned to
+# its signed digest (.github/render_compose.py); `dev` is never published, so an unset JAAH_VERSION never pulls.
+# Image names follow the repository the release ran in (`ghcr.io/<owner>/<repo>-<image>`); JAAH_CE_IMAGES points a
+# staging install at its own and is otherwise unset.
+# Every port is published on 127.0.0.1 only. The node runs on its own network with the api and web, never
+# Postgres's: the agents it runs cannot reach the database.
+name: jaah-ce
+
+services:
+  postgres:
+    image: postgres:18@sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: jaah
+      POSTGRES_DB: jaah
+      # Reachable only on the `db` network (internal: no host port, no route out), whose one other member is the api.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - jaah-db:/var/lib/postgresql
+    networks: [db]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "jaah", "-d", "jaah"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    image: ${JAAH_CE_IMAGES:-ghcr.io/jaah-ai/jaah-ce}-api:${JAAH_VERSION:-dev}
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://jaah@postgres:5432/jaah
+      FRONTEND_URL: http://localhost:3050
+    volumes:
+      - jaah-secrets:/var/lib/jaah-ce/secrets
+      - jaah-node-identity:/var/lib/jaah-ce/node-identity
+      - jaah-attachments:/var/lib/jaah-ce/attachments
+      - jaah-sessions:/var/lib/jaah-ce/sessions
+    # The native node's control plane (`app/ce_node.py::NATIVE_API_PORT`).
+    ports: ["127.0.0.1:8000:8000"]
+    networks: [db, default]
+
+  web:
+    image: ${JAAH_CE_IMAGES:-ghcr.io/jaah-ai/jaah-ce}-web:${JAAH_VERSION:-dev}
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+    depends_on: [api]
+    ports: ["127.0.0.1:3050:3050"]
+
+  node:
+    profiles: [node]
+    image: ${JAAH_CE_IMAGES:-ghcr.io/jaah-ai/jaah-ce}-node:${JAAH_VERSION:-dev}
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    platform: linux/amd64
+    # The daemon is not an init: the tmux server and the entrypoint's session-server loop are reparented to PID 1.
+    init: true
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      JAAH_NODE_ENV_FILE: /var/lib/jaah-ce/node-identity/node.env
+    volumes:
+      - jaah-node-identity:/var/lib/jaah-ce/node-identity:ro
+      - jaah-node-home:/home/jaah/.jaah
+
+networks:
+  db:
+    internal: true
+
+volumes:
+  jaah-db:
+  jaah-secrets:
+  jaah-node-identity:
+  jaah-node-home:
+  jaah-attachments:
+  jaah-sessions:

@@ -1,0 +1,112 @@
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -648,8 +648,35 @@
+   const size = stats?.contextUsage?.contextWindow;
+   if (typeof used !== "number" || !Number.isSafeInteger(used) || used < 0) return null;
+   if (typeof size !== "number" || !Number.isSafeInteger(size) || size <= 0) return null;
++  // jaah fork (packages/acp-forks/pi-acp): the session's running cost, which ACP's `usage_update.cost` carries.
++  const cost = stats?.cost;
++  if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0) {
++    return { sessionUpdate: "usage_update", used, size, cost: { amount: cost, currency: "USD" } };
++  }
+   return { sessionUpdate: "usage_update", used, size };
+ }
++// jaah fork: one assistant message's tokens added to its turn's per-model counts.
++function addTurnUsage(turnUsage, msg) {
++  const u = msg?.usage;
++  if (!turnUsage || !u || typeof u !== "object") return;
++  const model = typeof msg.model === "string" ? msg.model : "";
++  const counts = turnUsage.get(model) ?? { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 };
++  const add = (key, value) => {
++    if (typeof value === "number" && Number.isFinite(value) && value > 0) counts[key] += value;
++  };
++  add("inputTokens", u.input);
++  add("outputTokens", u.output);
++  add("cachedReadTokens", u.cacheRead);
++  add("cachedWriteTokens", u.cacheWrite);
++  turnUsage.set(model, counts);
++}
++// jaah fork: a turn's tokens as the prompt result's `_meta.quota` (the shape claude-agent-acp and codex-acp report),
++// one row per model; null when the turn reported none.
++function toQuotaMeta(turnUsage) {
++  if (!turnUsage || turnUsage.size === 0) return null;
++  const model_usage = [...turnUsage].map(([model, token_count]) => ({ model: model || null, token_count }));
++  return { quota: { model_usage } };
++}
+ function findUniqueLineNumber(text, needle) {
+   if (!needle) return void 0;
+   const first = text.indexOf(needle);
+@@ -834,6 +861,8 @@
+   // jaah fork (packages/acp-forks/pi-acp): the turn's last assistant message when it ended in error, so a
+   // usage limit answers the prompt with that error instead of `end_turn`.
+   lastAssistantError = null;
++  // jaah fork: the running turn's per-model token counts (`addTurnUsage`), reported with its prompt result.
++  turnUsage = null;
+   // For ACP diff support: capture file contents before edit/write mutations,
+   // then emit ToolCallContent {type:"diff"}. Compatible structured edit/write
+   // events may need to be implemented in pi in the future.
+@@ -872,8 +901,9 @@
+   }
+   async prompt(message, images = []) {
+     const expandedMessage = expandSlashCommand(message, this.fileCommands);
++    const usage = /* @__PURE__ */ new Map();
+     const turnPromise = new Promise((resolve4, reject) => {
+-      const queued = { message: expandedMessage, images, resolve: resolve4, reject };
++      const queued = { message: expandedMessage, images, resolve: resolve4, reject, usage };
+       if (this.pendingTurn) {
+         this.turnQueue.push(queued);
+         this.emit({
+@@ -891,7 +921,7 @@
+       }
+       this.startTurn(queued);
+     });
+-    return turnPromise;
++    return turnPromise.then((reason) => ({ reason, usage }));
+   }
+   async cancel() {
+     this.cancelRequested = true;
+@@ -947,6 +977,7 @@
+     if (limit) this.pendingTurn?.reject(limit);
+     else this.pendingTurn?.resolve(reason);
+     this.pendingTurn = null;
++    this.turnUsage = null;
+     this.inAgentLoop = false;
+     const next = this.turnQueue.shift();
+     if (next) {
+@@ -1001,6 +1032,7 @@
+     this.cancelRequested = false;
+     this.inAgentLoop = false;
+     this.lastAssistantError = null;
++    this.turnUsage = t.usage ?? null;
+     this.pendingTurn = { resolve: t.resolve, reject: t.reject };
+     this.emit({
+       sessionUpdate: "session_info_update",
+@@ -1016,6 +1048,7 @@
+           this.pendingTurn?.resolve(reason);
+         }
+         this.pendingTurn = null;
++        this.turnUsage = null;
+         this.inAgentLoop = false;
+         this.emit({
+           sessionUpdate: "session_info_update",
+@@ -1249,6 +1282,7 @@
+       case "message_end": {
+         const msg = ev.message;
+         if (msg?.role === "assistant") this.lastAssistantError = msg.stopReason === "error" ? msg : null;
++        if (msg?.role === "assistant") addTurnUsage(this.turnUsage, msg);
+         break;
+       }
+       case "auto_retry_start": {
+@@ -2528,9 +2562,10 @@
+         return { stopReason: "end_turn" };
+       }
+     }
+-    const result = await session.prompt(message, images);
++    const { reason: result, usage } = await session.prompt(message, images);
+     const stopReason = result === "error" ? session.wasCancelRequested() ? "cancelled" : "end_turn" : result;
+-    return { stopReason };
++    const meta = toQuotaMeta(usage);
++    return meta ? { stopReason, _meta: meta } : { stopReason };
+   }
+   async cancel(params) {
+     const session = this.sessions.maybeGet(params.sessionId);

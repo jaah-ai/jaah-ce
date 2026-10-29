@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+# Dockerfile.web — the community edition's console: the Vite build of apps/web, served by unprivileged nginx.
+#
+#   docker build -f Dockerfile.web -t jaah-ce-web .     # from the jaah-ce repository; the monorepo names its path
+#
+# The build context is the repository root. The cloud image's build and serve stages
+# without its docs site and website widget: nginx serves the console on 3050 and proxies /api to the `api` service.
+FROM node:26-alpine@sha256:c6ad9e9c1d80f6eb607c26b4b0a132ff7a2344fad1c78ea3baa2a7d4c8de6d94 AS build
+WORKDIR /app
+COPY apps/web/package.json apps/web/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
+COPY apps/web/ ./
+COPY VERSION ./VERSION
+ARG APP_VERSION
+ENV APP_VERSION=${APP_VERSION}
+RUN npm run build && chmod -R a+rX /app/dist
+
+FROM nginxinc/nginx-unprivileged:alpine@sha256:b5047b9b76845eac124358373c6852377c52e4b05834a47647e955dd91cb8f1e
+USER root
+RUN apk upgrade --no-cache \
+ && apk del --no-cache nginx-module-image-filter nginx-module-xslt nginx-module-geoip nginx-module-njs
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY apps/web/nginx.conf.template /etc/nginx/templates/default.conf.template
+COPY apps/web/nginx-security-headers.conf /etc/nginx/snippets/security-headers.conf
+COPY apps/web/nginx-console-csp.conf /etc/nginx/snippets/console-csp.conf
+# No docs host (a reserved name no request carries), and the api as the compose service names it.
+ENV DOCS_HOSTNAME=docs.invalid \
+    API_UPSTREAM=api:8000
+# No Live Cast: the template's live listener (3053), its last block, is cut from its heading to the end; a cut that
+# missed it fails the build (its snippet is not copied, so nginx would not start).
+RUN sed -i '/^# ── THE LIVE LISTENER (3053)/,$d' /etc/nginx/templates/default.conf.template \
+ && ! grep -q 'live-csp' /etc/nginx/templates/default.conf.template
+RUN rm -f /etc/nginx/conf.d/default.conf && chmod -R a+rX /etc/nginx/templates /etc/nginx/snippets \
+ && chown 101:0 /tmp && chmod 1777 /tmp
+USER 101
+EXPOSE 3050

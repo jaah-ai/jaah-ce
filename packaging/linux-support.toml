@@ -1,0 +1,42 @@
+# The Linux releases and architectures a Jaah node SUPPORTS — the one home of that list.
+#
+# Keys are `/etc/os-release` `ID` and `VERSION_ID`, compared as exact strings. A release not listed here is
+# warned about and tried (the bootstrap), never refused. Readers: the API's node label
+# (`apps/api/app/node_platform.py::distro_label`), the bootstrap renderer and the docs, which point here and
+# never restate the list.
+schema = 1
+
+# Machine names as `uname -m` prints them; the daemon normalises to the wire's x64/arm64
+# (host_platform._types.normalise_arch) and the console shows "x86" / "Arm".
+arches = ["x86_64", "aarch64"]
+
+[[release]]
+id = "ubuntu"
+version_id = "22.04"
+label = "Ubuntu 22.04"
+pkg = "apt"
+
+[[release]]
+id = "ubuntu"
+version_id = "24.04"
+label = "Ubuntu 24.04"
+pkg = "apt"
+
+[[release]]
+id = "ubuntu"
+version_id = "26.04"
+label = "Ubuntu 26.04"
+pkg = "apt"
+
+[[release]]
+id = "amzn"
+version_id = "2023"
+label = "Amazon Linux 2023"
+pkg = "dnf"
+
+[[release]]
+id = "amzn"
+version_id = "2027"
+label = "Amazon Linux 2027"
+pkg = "dnf"
+preview = true

@@ -1,0 +1,949 @@
+# nginx.conf.template — processed by nginx:alpine's built-in docker-entrypoint (20-envsubst-on-templates.sh)
+# before nginx starts: any /etc/nginx/templates/*.template gets its ${VAR} references substituted from
+# the container's actual environment, written to /etc/nginx/conf.d/ with the .template suffix stripped.
+# ${API_UPSTREAM} is compose's "api:8000" (a compose service hostname) by default (see Dockerfile.frontend's
+# ENV) — ECS's task definition overrides it to "localhost:8000" since sidecar containers in one Fargate
+# task share the task's network namespace, not compose-style per-service DNS names.
+# ── THE PUBLIC LISTENER'S SECOND GUARD: THE RAW REQUEST URI ───────────────────────────────────────────
+#
+# The `$server_port` guards inside the machine-surface locations below are chosen by nginx's NORMALIZED
+# $uri. That is the right hop to enforce on, and it is not sufficient on its own, because `proxy_pass`
+# without a URI part forwards the RAW request line — so the two can disagree about what a request is.
+#
+# MEASURED: `GET /api/agent%2f%2e%2e/x` on 3051 normalizes to $uri=/api/x, which matches NO machine
+# location and so met no guard, while the upstream received `/api/agent%2f%2e%2e/x` verbatim. uvicorn
+# percent-decodes that to `/api/agent/../x`, which satisfies `app/auth.py::PUBLIC_PREFIXES`'
+# `startswith("/api/agent/")` — i.e. it skips SessionAuthMiddleware entirely. It is a 404 today only
+# because no route matches a literal `..` segment, which is luck, not a boundary.
+#
+# So the raw form is refused too, case-insensitively, wherever a normalized path could land outside a
+# guarded location. Nothing a browser legitimately requests begins with these prefixes.
+#
+# WHAT THIS DOES *NOT* COVER, and why that is correct. `/api/;/agent/x` and `/api/..;/agent/x` still
+# reach the app on 3051. They name no machine surface in ANY form — the app decides what is machine
+# surface by `startswith("/api/agent/")` on the decoded path, which those fail — so the app treats them
+# as ordinary session-gated paths and 401s them. Refusing them here would mean guessing at strings that
+# merely CONTAIN "agent", which is a broader rule than the one being enforced.
+#
+# That makes the boundary a MIRROR of `app/auth.py`'s PUBLIC_PATHS/PUBLIC_PREFIXES rather than a superset
+# of it: what is refused here is what the app would otherwise let past cookie-less, and no more.
+#
+# "And no more" is safe because only a path that still satisfies `startswith("/api/agent/")` after
+# decoding is agent surface, and both its raw and its normalized forms are refused above.
+#
+# If those app-side sets change — a new token-only prefix, a new dual-principal path, a new exact public
+# path — this file has to change with them, and the public-UI split test fails until it does.
+map "$server_port$request_uri" $refuse_machine_surface_raw {
+  default                                0;
+  "~*^3051/api/agent(/|%2f|\?)"          1;
+  "~*^3051/api/node-bus(/|%2f|\?)"       1;
+  "~*^3051/api/console-stream(/|%2f|\?)" 1;
+}
+
+# ── AND THE ONE THING A PREFIX LIST CANNOT COVER: raw and normalized disagreeing ─────────────────────
+#
+# The map above anchors on the LITERAL prefix, so encoding a single character of it slips past:
+# MEASURED, `GET /%61pi/agent/%2e%2e/ingest` on 3051 was proxied, the upstream received it verbatim, and
+# the app saw `/api/agent/../ingest` — which satisfies `startswith("/api/agent/")` and so skipped
+# SessionAuthMiddleware. A 404 only because no route today matches a literal `..` segment: that is
+# route-shape luck, not a boundary. One `/api/agent/{param}` route, or one `:path` converter under that
+# prefix, turns it into an unauthenticated reach with nothing failing.
+#
+# The closed rule is not a longer prefix list. Every such trick needs the RAW path to differ from the
+# normalized one, and the raw path betrays it: a dot-segment, or a percent-encoded separator or dot.
+# NOTE it must be the RAW uri — `$uri` is useless here, because nginx has already RESOLVED the `..` out
+# of it (measured: `/%61pi/agent/../x` arrives with $uri=/api/x, no dot-segment left to match).
+# `[^?]*` keeps this to the PATH: a query string may legitimately carry %2F, and `?filter=a%2Fb` must
+# still work. Nothing this SPA requests has an encoded separator or a dot-segment in its path.
+map "$server_port$request_uri" $refuse_public_raw_normalized_split {
+  default                           0;
+  "~*^3051[^?]*(\.\.|%2e|%2f|%5c)"  1;
+}
+
+# THE SETUPINTENT CLIENT SECRET NEVER REACHES NGINX'S LOG. A redirect-based payment method (a bank debit) sends the
+# browser back to `/org/billing?setup_intent=…&setup_intent_client_secret=…&redirect_status=…` — Stripe's
+# own query, not ours — so the document request carries the secret, and every request the page makes before
+# it scrubs the URL (`apps/web/src/lib/scrubRedirectSecret.ts`) carries it as the Referer. The console's
+# access log records both with the secret's VALUE replaced; everything else as `combined` does. Residual: the
+# load balancers' own access logs keep the request line as sent.
+# THE EMAILED `?token=` LINKS ARE REDACTED THE SAME WAY: the password-reset link `/reset-password?token=…`
+# (single-use, 1 h — anyone reading the log inside that hour could take the account) and the sign-up link
+# `/signup/verify?token=…` (24 h) are page loads served here, and each page's first requests carry the
+# token as the Referer until it scrubs the URL. `[?&]` anchors to the `token` parameter itself, so a
+# parameter merely ending in `token` is untouched; the lazy prefix redacts the FIRST `token`, the one the
+# page reads. A map applies only its first matching regex, so a request carrying both values would log the
+# token — no link we send does. Residual, as for the secret: nginx's error log prints the raw request/Referer.
+map $request $console_log_request {
+  default $request;
+  "~^(?<before>.*[?&]setup_intent_client_secret=)[^&\s]*(?<after>.*)$" "${before}redacted${after}";
+  "~^(?<before>.*?[?&]token=)[^&\s]*(?<after>.*)$" "${before}redacted${after}";
+}
+map $http_referer $console_log_referer {
+  default $http_referer;
+  "~^(?<before>.*[?&]setup_intent_client_secret=)[^&]*(?<after>.*)$" "${before}redacted${after}";
+  "~^(?<before>.*?[?&]token=)[^&]*(?<after>.*)$" "${before}redacted${after}";
+}
+
+# The docs site's hostname, or "" while the image runs with its placeholder (docs.invalid, Dockerfile.frontend):
+# the console's /docs/ redirect (below) exists only when there is a docs host.
+map "${DOCS_HOSTNAME}" $docs_host {
+  "docs.invalid" "";
+  default "${DOCS_HOSTNAME}";
+}
+log_format console_redacted '$remote_addr - $remote_user [$time_local] '
+                            '"$console_log_request" $status $body_bytes_sent '
+                            '"$console_log_referer" "$http_user_agent"';
+
+# The access-log format for `/api/git-connect/`, `/api/slack-connect/`, `/api/email-connect/` AND `/api/auth/oauth/` (OAuth callback prefixes whose
+# query string carries a live authorization code), declared HERE because `log_format` is an http-context
+# directive and this file is included into that context — inside a `location` it is a config-parse
+# error, which would fail nginx's startup outright rather than degrade one log line. Identical to the
+# `combined` default except that it logs `$uri` (the normalized path, no args) in place of `$request`
+# (the whole request line). See the location below for why that one field must not be logged.
+log_format git_connect_no_args '$remote_addr - $remote_user [$time_local] '
+                               '"$request_method $uri $server_protocol" '
+                               '$status $body_bytes_sent "$http_referer" "$http_user_agent"';
+
+# ── COMPRESSION ──────────────────────────────────────────────────────────────────────────────────
+#
+# Nothing was gzipped here at all: `gzip` defaults to `off`, so every JSON response, every JS bundle
+# and every stylesheet crossed the wire uncompressed. On the SPA's own payloads that is the single
+# largest cheap win available — this console's responses are JSON and JS, which are the compressible
+# extreme (repeated keys, repeated identifiers), not media that is already compressed.
+#
+# DECLARED ONCE, AT HTTP LEVEL — this template is rendered into conf.d/, inside nginx's `http` — so it
+# covers BOTH server blocks below (the console and the docs site) and BOTH listeners of each. A setting
+# that applies to only one port, or one block, is a setting nobody tests on the other.
+#
+# `gzip_proxied any` IS LOAD-BEARING, not boilerplate. It defaults to `off`, which means nginx
+# compresses nothing it received from an upstream — i.e. every single /api/ response, which is the
+# traffic this change exists for. Without this line the block would compress the static bundle and
+# silently do nothing for the API.
+#
+# `gzip_vary on` emits `Vary: Accept-Encoding`, which the immutable one-year cache on /assets/ below
+# makes non-optional: a shared cache must not hand a gzipped body to a client that did not ask for one.
+#
+# `gzip_comp_level 5` rather than the 1 default or the 9 maximum: 9 spends materially more CPU for a
+# few percent, and CPU is the constrained resource on this task (one Fargate task shared by nginx and
+# uvicorn). 5 is the usual knee of that curve.
+#
+# `gzip_min_length 1024` because below roughly a kilobyte the gzip header plus the CPU is a loss, and
+# a great many of this API's responses are small status objects.
+#
+# text/markdown is the docs site's `.md` page twins (the docs block below types them).
+#
+# text/html is compressed unconditionally by nginx and is NOT listed here — `gzip_types` is always
+# implicitly `text/html`, and restating it is an error nginx warns about.
+#
+# NOT LISTED, deliberately: `text/event-stream`. See the /api/stream location below, which turns gzip
+# off outright — a compressed SSE stream is a broken SSE stream, and relying on a MIME type staying
+# absent from a list is a weaker guarantee than saying so at the location that must not have it.
+gzip              on;
+gzip_vary         on;
+gzip_proxied      any;
+gzip_comp_level   5;
+gzip_min_length   1024;
+gzip_types        application/json
+                  application/javascript
+                  text/javascript
+                  application/manifest+json
+                  text/css
+                  text/plain
+                  image/svg+xml
+                  text/markdown;
+
+server {
+  # `default_server` on both: an unknown Host (and the ALB health check, which sends the task IP) reaches
+  # the console, never the docs block below, whose server_name is the only thing that selects it.
+  listen 3050 default_server;
+
+  # 3051 IS THE PUBLIC LISTENER'S PORT, and the ONLY difference between the two is that the machine
+  # surface is refused on it (`$server_port = 3051` guards below). The prod control plane is fronted by
+  # TWO load balancers — an internal one on 3050 and an internet-facing one on 3051 — and this is where
+  # the split is actually ENFORCED.
+  #
+  # WHY HERE AND NOT ONLY AT THE ALB. AWS says a listener rule "evaluation is performed only after URI
+  # normalization occurs" and never defines what that normalization does — not `//`, not `/./`, not
+  # `/../`, not percent-decoding. nginx's normalization, by contrast, is defined AND measured: against
+  # nginx:alpine with this template, `/api//agent/x`, `/api/./agent/x`, `/api/x/../agent/x`,
+  # `/api%2Fagent/x` and `/api/agent%2Fx` all land in `location /api/agent/` and are all 403 here on
+  # 3051. So the ALB rules are the cheap outer edge and this guard is the guarantee — the property sits
+  # on the layer whose behaviour can actually be established.
+  #
+  # ONE server block with two `listen` lines rather than two blocks, deliberately: a second block would
+  # have to restate every location below, and the SSE/WebSocket ones exist because their absence was a
+  # real outage (see each). A copy that drifts silently loses those properties on the public port only —
+  # the port nobody develops against.
+  listen 3051 default_server;
+
+  server_name _;
+  root /usr/share/nginx/html;
+  index index.html;
+  # Every console request logs through `console_redacted` (the SetupIntent secret and `?token=`, above); a location
+  # that names its own format (`git_connect_no_args`) keeps it.
+  access_log /dev/stdout console_redacted;
+
+  # SSE relay (T7b, spec R3/Component 4) — a dedicated location so the long-lived stream gets
+  # buffering disabled and a long read timeout without changing behavior for the rest of /api/,
+  # which stays proxied with nginx's normal (buffered) defaults.
+  location /api/stream {
+    # The raw-URI guard (see the map at the top of this file). This location is reachable by a request
+    # whose NORMALIZED path landed here while its raw path named the machine surface.
+    default_type application/json;
+    if ($refuse_public_raw_normalized_split) {
+      return 400 '{"detail":"malformed path"}';
+    }
+    if ($refuse_machine_surface_raw) {
+      return 403 '{"detail":"This is the public browser entrypoint. The agent/node API is not served here - dial the control plane\'s internal hostname over the tailnet."}';
+    }
+
+    proxy_pass http://${API_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 3600s;
+    # STATED, not inherited-by-luck. The http-level `gzip on` above would apply here too, and gzip is
+    # incompatible with this location's whole purpose: nginx's gzip filter accumulates output before it
+    # can emit a compressed chunk, which reintroduces exactly the buffering `proxy_buffering off` two
+    # lines up exists to remove — an SSE event would sit in the compressor instead of reaching the
+    # browser. It happens to be inert today only because `text/event-stream` is not in `gzip_types`;
+    # that is one edit away from being false, and this location is where the requirement belongs.
+    gzip off;
+  }
+
+  # Console setup (T13b, spec R5/Component 6) — `POST /api/console/{project}/{number}/open` and the direct
+  # grant routes. The console's bytes no longer pass here: they ride the relay (see /api/console-stream
+  # below). The WS-upgrade shape is the former socket's — a dedicated location so the WS handshake's
+  # Upgrade/Connection headers and HTTP/1.1 are applied ONLY here, not to the whole buffered /api/
+  # block (a plain proxied REST call must not carry a bogus Upgrade header). Mirrors the /api/stream
+  # block's "one dedicated location for the long-lived connection" shape, with WS-upgrade headers
+  # instead of SSE-buffering ones. proxy_read_timeout is long because the terminal is idle-but-open
+  # between keystrokes. There is no longer a meaningful idle bound while a foreground tab is open at all:
+  # the browser sends a periodic keepalive frame (interval single-homed in ConsoleTerminal.tsx's
+  # KEEPALIVE_INTERVAL_MS) which refreshes the node's session activity, so CONSOLE_IDLE_TIMEOUT_SECONDS
+  # never elapses — that valve now only reaps a session whose viewer is really gone.
+  location /api/console/ {
+    # The raw-URI guard (see the map at the top of this file). This location is reachable by a request
+    # whose NORMALIZED path landed here while its raw path named the machine surface.
+    default_type application/json;
+    if ($refuse_public_raw_normalized_split) {
+      return 400 '{"detail":"malformed path"}';
+    }
+    if ($refuse_machine_surface_raw) {
+      return 403 '{"detail":"This is the public browser entrypoint. The agent/node API is not served here - dial the control plane\'s internal hostname over the tailnet."}';
+    }
+
+    proxy_pass http://${API_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+  }
+
+  # Console PTY stream — a NODE's dedicated per-session dial, now served by the console RELAY
+  # (apps/api/app/console_relay/server.py), not the API. On ECS the ALB routes /api/console-stream and the
+  # browser's /api/console-relay straight to the relay's target group, so nginx never sees either; this
+  # block is kept for any path that still reaches nginx (and for its public-listener refusal). NOT the
+  # browser-facing /api/console/ above (different endpoint, no trailing slash, so it does not match that prefix
+  # and would otherwise fall through to the buffered /api/ catch-all below). Same failure mode as
+  # /api/node-bus's comment describes verbatim: without these headers the handshake degrades to a plain
+  # HTTP GET, which SessionAuthMiddleware then 401s. 2026-08-06: this is exactly what happened — main1's
+  # console dial logged `server rejected WebSocket connection: HTTP 401` on every project, every node,
+  # invisible in dev the same way node-bus was (dev nodes dial the desktop CP's API port directly,
+  # bypassing nginx entirely; only a node behind this proxy — the whole ECS control plane — ever hit it).
+  # EXACT path (`location =`), no trailing slash — see /api/node-bus's comment for why the prefix form
+  # was wrong.
+  location = /api/console-stream {
+    # PUBLIC LISTENER: REFUSED. See the `listen 3051` comment at the top of this server block.
+    # On the `return` below only — a proxied response carries its own Content-Type, and this cannot go
+    # inside the `if` (nginx: "default_type directive is not allowed here"). Without it the refusal is
+    # served as text/plain and the web client cannot read `detail` out of it.
+    default_type application/json;
+    if ($server_port = 3051) {
+      return 403 '{"detail":"This is the public browser entrypoint. The agent/node API is not served here - dial the control plane\'s internal hostname over the tailnet."}';
+    }
+
+    proxy_pass http://${API_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+  }
+
+  # Node-bus WebSocket — the fleet's whole transport since NATS was retired: every node
+  # holds one socket here for presence, command dispatch and alerts. It needs its own location for the
+  # same reason /api/console/ does, and its absence was NOT a missing optimisation but a hard failure:
+  # without the Upgrade/Connection headers the handshake degrades to a plain HTTP GET, which
+  # SessionAuthMiddleware then 401s (/api/node-bus is not in PUBLIC_PATHS/PUBLIC_PREFIXES — it
+  # authenticates itself, from the token in its own `hello` frame). Nodes logged
+  # `server rejected WebSocket connection: HTTP 401` and never registered.
+  # This stayed invisible because the desktop CP is reached on the API port DIRECTLY, bypassing nginx;
+  # only a node behind this proxy (i.e. the whole ECS control plane) ever hit it.
+  # EXACT path (`location =`), no trailing slash: the endpoint is `/api/node-bus`, not a prefix. It was
+  # written as a PREFIX location while this comment claimed otherwise, which mattered once the public
+  # guard below existed: `/api/node-buses` inherited it and 403'd on the public listener only. It also
+  # gave any such path the WebSocket upgrade headers on both listeners, which was never intended.
+  location = /api/node-bus {
+    # PUBLIC LISTENER: REFUSED. See the `listen 3051` comment at the top of this server block.
+    # On the `return` below only — a proxied response carries its own Content-Type, and this cannot go
+    # inside the `if` (nginx: "default_type directive is not allowed here"). Without it the refusal is
+    # served as text/plain and the web client cannot read `detail` out of it.
+    default_type application/json;
+    if ($server_port = 3051) {
+      return 403 '{"detail":"This is the public browser entrypoint. The agent/node API is not served here - dial the control plane\'s internal hostname over the tailnet."}';
+    }
+
+    proxy_pass http://${API_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+  }
+
+  # The peer surface (app/routes/cp_peer.py: node-bus forwarding between control-plane tasks) is
+  # TASK-TO-TASK ONLY: a peer dials the owner task's own port directly, `ip:8000` over the tasks'
+  # self-referencing security-group ingress, never through this proxy. Nothing legitimate
+  # reaches it here on EITHER listener, so it is refused on both — unconditionally, no `$server_port`
+  # guard. Defence in depth: the routes authenticate the caller themselves (`_peer_only`); this closes the
+  # nginx path before the app is ever asked. Longest prefix wins regardless of order, but it sits above
+  # `/api/agent/` so a reader sees the carve-out first. The console owner leg is no longer here: it moved
+  # to the relay at /api/agent/console-relay/owner-leg (apps/api/app/console_relay/server.py), still
+  # task-to-task only, relay task to relay task.
+  location /api/agent/cp-peer/ {
+    default_type application/json;
+    return 403 '{"detail":"peer surface is task-to-task only"}';
+  }
+
+  # The agent/node API. It had no location of its own — it fell through to the buffered `/api/`
+  # catch-all below — and this one exists ONLY to hang the public-listener guard on it; the proxy
+  # settings are that block's, verbatim, so nothing changes for the internal listener. Both the prefix
+  # and the bare path, because a prefix `location` does not match the path with nothing after it.
+  location /api/agent/ {
+    # PUBLIC LISTENER: REFUSED. See the `listen 3051` comment at the top of this server block.
+    # On the `return` below only — a proxied response carries its own Content-Type, and this cannot go
+    # inside the `if` (nginx: "default_type directive is not allowed here"). Without it the refusal is
+    # served as text/plain and the web client cannot read `detail` out of it.
+    default_type application/json;
+    if ($server_port = 3051) {
+      return 403 '{"detail":"This is the public browser entrypoint. The agent/node API is not served here - dial the control plane\'s internal hostname over the tailnet."}';
+    }
+
+    proxy_pass http://${API_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  location = /api/agent {
+    # PUBLIC LISTENER: REFUSED. See the `listen 3051` comment at the top of this server block.
+    # On the `return` below only — a proxied response carries its own Content-Type, and this cannot go
+    # inside the `if` (nginx: "default_type directive is not allowed here"). Without it the refusal is
+    # served as text/plain and the web client cannot read `detail` out of it.
+    default_type application/json;
+    if ($server_port = 3051) {
+      return 403 '{"detail":"This is the public browser entrypoint. The agent/node API is not served here - dial the control plane\'s internal hostname over the tailnet."}';
+    }
+
+    proxy_pass http://${API_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  # THE ONE LOCATION WHOSE QUERY STRING IS A CREDENTIAL. `/api/git-connect/callback` is
+  # reached by GitHub redirecting the browser with `?code=<live authorization code>&state=...`, and the
+  # default `combined` format logs `$request` — the whole request LINE, query string included — which
+  # would put that code in this container's stdout and so in CloudWatch, at whatever retention that
+  # group has. `$uri` is the path alone, after normalization and without args, so this keeps the access
+  # log's usefulness and drops the one field that must not be in it.
+  #
+  # NOT MERELY BELT-AND-BRACES, and not redundant with the `activity_events` fences either: those keep
+  # the code out of the DATABASE, and this keeps it out of the LOGS. Different sinks, different
+  # audiences, and the application code that is careful about both cannot reach nginx's own logging.
+  # The code being single-use, short-lived and PKCE-bound is what makes the residual acceptable rather
+  # than what makes this unnecessary.
+  location /api/git-connect/ {
+    # THE TWO RAW-URI GUARDS, COPIED FROM `location /api/` AND NOT INHERITED — nginx locations do not
+    # inherit each other's `if` blocks, and the first cut of this location omitted them. That was a
+    # real hole rather than an untidiness: a request whose NORMALIZED path lands here can carry a RAW
+    # path naming the machine surface, `proxy_pass` forwards the raw line verbatim, and
+    # `auth.py::PUBLIC_PREFIXES` matches `/api/agent/` on the decoded form — so
+    # `GET /api/agent/../git-connect/x` reached the app with SessionAuthMiddleware skipped entirely.
+    # Measured on the public listener against a capturing upstream: 400 through `/api/`, 200 here.
+    # Any new `/api/...` location owes these the same way; the map at the top of this file is the
+    # single home for what they mean.
+    default_type application/json;
+    if ($refuse_public_raw_normalized_split) {
+      return 400 '{"detail":"malformed path"}';
+    }
+    if ($refuse_machine_surface_raw) {
+      return 403 '{"detail":"This is the public browser entrypoint. The agent/node API is not served here - dial the control plane\'s internal hostname over the tailnet."}';
+    }
+
+    access_log /dev/stdout git_connect_no_args;
+    # `access_log` DOES NOT GOVERN `error_log`, and the error log carries the request line UNREDACTED.
+    # Measured: one 502 from this prefix wrote the live `?code=` TWICE — once in `request:` and once in
+    # `upstream:`. That path is reachable whenever the API sidecar is restarting, deploying or slow,
+    # which is precisely when someone is reading these logs.
+    #
+    # `crit` SUPPRESSES THE `[error]`-LEVEL UPSTREAM LINES, and the cost is stated rather than hidden:
+    # for this ONE prefix we lose nginx's own upstream-failure detail. What survives is the thing that
+    # actually tells you it happened — the access log still records the 502, with the path and without
+    # the args — and the API's own logs are unaffected. Losing one diagnostic line for one route beats
+    # writing a live authorization code to CloudWatch at whatever retention that group has.
+    error_log /dev/stderr crit;
+
+    proxy_pass http://${API_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  # ADD TO SLACK, `/api/slack-connect/{start,callback}`: the callback's `?code=&state=` is a live
+  # credential for exactly the reason `location /api/git-connect/` states, so the same treatment — both raw-URI
+  # guards, the no-args access log, and `error_log crit`.
+  location /api/slack-connect/ {
+    default_type application/json;
+    if ($refuse_public_raw_normalized_split) {
+      return 400 '{"detail":"malformed path"}';
+    }
+    if ($refuse_machine_surface_raw) {
+      return 403 '{"detail":"This is the public browser entrypoint. The agent/node API is not served here - dial the control plane\'s internal hostname over the tailnet."}';
+    }
+
+    access_log /dev/stdout git_connect_no_args;
+    # Why `crit`: see `location /api/git-connect/` — the error log carries the request line unredacted.
+    error_log /dev/stderr crit;
+
+    proxy_pass http://${API_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  # CONNECT GMAIL, `/api/email-connect/gmail/{start,callback}`: the callback's `?code=&state=` is a live
+  # credential for exactly the reason `location /api/git-connect/` states, so the same treatment — both raw-URI
+  # guards, the no-args access log, and `error_log crit`.
+  location /api/email-connect/ {
+    default_type application/json;
+    if ($refuse_public_raw_normalized_split) {
+      return 400 '{"detail":"malformed path"}';
+    }
+    if ($refuse_machine_surface_raw) {
+      return 403 '{"detail":"This is the public browser entrypoint. The agent/node API is not served here - dial the control plane\'s internal hostname over the tailnet."}';
+    }
+
+    access_log /dev/stdout git_connect_no_args;
+    # Why `crit`: see `location /api/git-connect/` — the error log carries the request line unredacted.
+    error_log /dev/stderr crit;
+
+    proxy_pass http://${API_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  # THE GITHUB/MICROSOFT SIGN-IN CALLBACKS, `/api/auth/oauth/<provider>/{start,callback}`: the callback's
+  # `?code=&state=` is a live credential for exactly the reason the location above states, so this is
+  # the same treatment — both raw-URI guards, the no-args access log, and `error_log crit`. NO public-port
+  # refusal: like `/api/auth/google`, this is a public way in.
+  location /api/auth/oauth/ {
+    default_type application/json;
+    if ($refuse_public_raw_normalized_split) {
+      return 400 '{"detail":"malformed path"}';
+    }
+    if ($refuse_machine_surface_raw) {
+      return 403 '{"detail":"This is the public browser entrypoint. The agent/node API is not served here - dial the control plane\'s internal hostname over the tailnet."}';
+    }
+
+    access_log /dev/stdout git_connect_no_args;
+    # Why `crit`: see `location /api/git-connect/` — the error log carries the request line unredacted.
+    error_log /dev/stderr crit;
+
+    proxy_pass http://${API_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  location /api/ {
+    # The raw-URI guard (see the map at the top of this file). This location is reachable by a request
+    # whose NORMALIZED path landed here while its raw path named the machine surface.
+    default_type application/json;
+    if ($refuse_public_raw_normalized_split) {
+      return 400 '{"detail":"malformed path"}';
+    }
+    if ($refuse_machine_surface_raw) {
+      return 403 '{"detail":"This is the public browser entrypoint. The agent/node API is not served here - dial the control plane\'s internal hostname over the tailnet."}';
+    }
+
+    proxy_pass http://${API_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  # THE DOCS SITE LIVES ON ITS OWN HOST: the console's /docs/... is a permanent redirect to the same path
+  # at the root of `${DOCS_HOSTNAME}`, so a bookmark, an old link and the
+  # support agent's console-relative `/docs/<page>` links all land on the one canonical URL. With no docs
+  # host configured (the image's docs.invalid: compose, a local run) there is nowhere to send it — a 404.
+  # `^~` so no regex location can claim a docs path; the SPA's own `/projects/:id/docs` is not under this
+  # prefix. Always https: the docs host is only ever reached through the TLS-terminating ALB.
+  location = /docs {
+    include /etc/nginx/snippets/security-headers.conf;
+    if ($docs_host = "") { return 404; }
+    return 301 https://$docs_host/$is_args$args;
+  }
+
+  location ^~ /docs/ {
+    include /etc/nginx/snippets/security-headers.conf;
+    if ($docs_host = "") { return 404; }
+    rewrite ^/docs/(.*)$ https://$docs_host/$1 permanent;
+  }
+
+  # The console's own robots.txt — without it the SPA fallback below answers /robots.txt with index.html.
+  # Only /docs/ (the redirect above) is for crawlers: everything else here is the signed-in console. No
+  # Sitemap line: the docs host's own robots.txt names its sitemap, when its build has one (dev's has none).
+  location = /robots.txt {
+    default_type text/plain;
+    add_header Cache-Control "no-cache";
+    include /etc/nginx/snippets/security-headers.conf;
+    return 200 "User-agent: *\nAllow: /docs/\nDisallow: /\n";
+  }
+
+  # Vite's build gives every JS/CSS/asset file a content hash in its filename — a
+  # rebuild always produces new asset URLs, so these are safe to cache indefinitely.
+  location /assets/ {
+    add_header Cache-Control "public, max-age=31536000, immutable";
+    # REPEATED, not inherited: nginx's `add_header` is not inherited into a location that declares its
+    # own, so without the snippet the asset responses on a public origin carry none of the headers.
+    include /etc/nginx/snippets/security-headers.conf;
+    try_files $uri =404;
+  }
+
+  location / {
+    # index.html is unhashed and is what the SPA fallback below serves for every client-routed path
+    # (e.g. /nodes) — no-cache forces revalidation on every load so a rebuild's new hashed asset
+    # references are picked up immediately instead of an old index.html pinning stale asset URLs.
+    add_header Cache-Control "no-cache";
+
+    # THE DOCUMENTS GET NO HEADERS FROM THE APP. `SecurityHeadersMiddleware` (apps/api/app/auth.py) is
+    # FastAPI middleware, so its CSP lands on /api/* responses only — index.html and the assets above
+    # are served by nginx and had nothing. That was survivable while the only route here was the
+    # tailnet; it is not once this origin is on the internet, because a session on this page grants a
+    # PTY on fleet nodes, which makes framing it a shell-access primitive rather than a defacement.
+    #
+    # Unconditional rather than guarded on $server_port: none of the four is a behaviour the internal
+    # listener wants either, and a header that appears on only one port is a header nobody tests. The
+    # four live in ONE snippet (apps/web/nginx-security-headers.conf, which also says why HSTS carries no
+    # includeSubDomains), included by every location here and in the docs block that sets its own
+    # headers — so the two sites cannot drift apart.
+    include /etc/nginx/snippets/security-headers.conf;
+
+    # THE CONSOLE'S CONTENT-SECURITY-POLICY, on the documents only (a policy on a script or image response
+    # governs nothing). Its own snippet, never the shared one above: the docs site includes that one and
+    # loads none of what this policy allows. Every source in it, and why: apps/web/nginx-console-csp.conf.
+    include /etc/nginx/snippets/console-csp.conf;
+    # No `$uri/`: a client route that is also a build directory (`/templates`, beside `public/templates/`'s
+    # images) would get nginx's directory 301, absolute and naming the container port (`:3051/templates/`).
+    try_files $uri /index.html;
+  }
+}
+
+# ── THE DOCS SITE BY HOST ("host mode") ────────────────────────────────────────────────────────────────
+#
+# The Jaah reader docs site, built into this same image at base `/`, served on its own hostname — whichever
+# `${DOCS_HOSTNAME}` names (set per environment by the ECS task definition). The
+# image's default, docs.invalid, matches no real Host, so with no hostname configured this block is
+# unreachable and every request stays on the console's `default_server` above. Both listeners, because
+# the docs alias can sit on either load balancer (the `docs_on_public_alb` deploy setting).
+#
+# ONE `/api` LOCATION, deliberately: `/api/public/jarvis/`, the website Jarvis widget's public API. Every
+# other `/api/...` here is a plain 404 from the tree, never a proxy to the app. The public-UI split test pins
+# that it stays the only one.
+server {
+  listen 3050;
+  listen 3051;
+
+  server_name ${DOCS_HOSTNAME};
+  root /usr/share/nginx/docs-root;
+  index index.html;
+  absolute_redirect off;
+
+  error_page 404 /404.html;
+
+  # The site was once built under /docs/ here too: an old docs-host link keeps working, one hop to its page.
+  location = /docs {
+    include /etc/nginx/snippets/security-headers.conf;
+    return 301 /$is_args$args;
+  }
+
+  location ^~ /docs/ {
+    include /etc/nginx/snippets/security-headers.conf;
+    rewrite ^/docs/(.*)$ /$1 permanent;
+  }
+
+  # Docusaurus content-hashes everything under /assets/, so a rebuild always produces new URLs.
+  location /assets/ {
+    add_header Cache-Control "public, max-age=31536000, immutable";
+    include /etc/nginx/snippets/security-headers.conf;
+    try_files $uri =404;
+  }
+
+  # THE JARVIS WIDGET (the site widget's build, copied in by the frontend image). `Access-Control-Allow-Origin: *`
+  # because jaah.ai embeds it cross-origin as a module script, which the browser fetches in CORS mode. Its
+  # chunks are content-hashed, so immutable; the loader's name is the embed contract and never changes, so it
+  # revalidates on every load — a deploy reaches every embedding page at once.
+  location ^~ /jarvis/ {
+    add_header Access-Control-Allow-Origin "*" always;
+    add_header Cache-Control "public, max-age=31536000, immutable";
+    include /etc/nginx/snippets/security-headers.conf;
+    try_files $uri =404;
+  }
+
+  location = /jarvis/jarvis.js {
+    add_header Access-Control-Allow-Origin "*" always;
+    add_header Cache-Control "no-cache";
+    include /etc/nginx/snippets/security-headers.conf;
+    try_files $uri =404;
+  }
+
+  # The widget's public API, proxied to the app exactly as the console block's `/api/` is: the same raw-URI
+  # guards (a new `/api/...` location owes them — see the maps at the top of this file) and the same
+  # forwarding headers. Those set no X-Forwarded-For on purpose: the ALB's own XFF passes through, so
+  # uvicorn's trusted-loopback hop resolves `request.client.host` to the real client (apps/api/entrypoint.sh)
+  # and the per-IP limit stays per visitor. `$proxy_add_x_forwarded_for` would append the ALB's address and
+  # put every visitor in one bucket. A turn is an SSE stream, so unbuffered and uncompressed like
+  # `/api/stream` above.
+  location /api/public/jarvis/ {
+    default_type application/json;
+    if ($refuse_public_raw_normalized_split) {
+      return 400 '{"detail":"malformed path"}';
+    }
+    if ($refuse_machine_surface_raw) {
+      return 403 '{"detail":"This is the public browser entrypoint. The agent/node API is not served here - dial the control plane\'s internal hostname over the tailnet."}';
+    }
+
+    proxy_pass http://${API_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 120s;
+    gzip off;
+  }
+
+  location / {
+    add_header Cache-Control "no-cache";
+    include /etc/nginx/snippets/security-headers.conf;
+    # `$uri.html` before `$uri/index.html`: pages are emitted as `<page>.html` (trailingSlash: false).
+    try_files $uri $uri.html $uri/index.html =404;
+
+    # The `.md` twin of every page (for agents) — not in nginx's mime map, so typed here.
+    # Typed by `types`, not `default_type`: gzip_types matches the bare type, never one carrying a charset.
+    location ~ \.md$ {
+      types { text/markdown md; }
+      charset utf-8;
+      charset_types text/markdown;
+    }
+  }
+}
+
+# ── THE HOOKS LISTENER (3052): THE PUBLIC HOOKS EDGE'S ONLY TARGET ─────────────────────────────────────
+#
+# The internet-facing hooks ALB targets this port and nothing else, and this block is where its ALLOW-LIST
+# is enforced: the fenced `hooks-paths` set is proxied and every other path is nginx's own 404 — no console,
+# no SPA, no other /api location. The ALB's forward rule repeats the set as the cheap outer edge; a deploy
+# test asserts the two are EQUAL.
+#
+# Every `proxy_pass` NAMES THE PATH IT MATCHED, so nginx forwards the NORMALIZED uri it matched on rather
+# than the raw request line — a raw `/api/public/triggers/x/..%2f..%2fagent/y` cannot reach the app as
+# anything but the normalized path. Same forwarding headers as the console's `/api/` (no X-Forwarded-For
+# of our own: the ALB's passes through, so the app's per-IP limits see the sender).
+#
+# The query string is not logged (`git_connect_no_args`): a sender may put a token in the URL.
+server {
+  listen 3052 default_server;
+  server_name _;
+  access_log /dev/stdout git_connect_no_args;
+  # Above the api's own 1 MiB cap, so the api answers an oversized body itself (413 + a `skipped` row on the
+  # trigger) and nginx is only the backstop.
+  client_max_body_size 2m;
+
+  # hooks-paths:
+  location /api/public/triggers/ {
+    proxy_pass http://${API_UPSTREAM}/api/public/triggers/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  location /api/public/email/unsubscribe/ {
+    proxy_pass http://${API_UPSTREAM}/api/public/email/unsubscribe/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  location = /api/public/telegram/updates {
+    proxy_pass http://${API_UPSTREAM}/api/public/telegram/updates;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+  # end hooks-paths
+
+  # The bare prefixes, which nginx would otherwise 301 to the slashed form: 404 like everything off the fence.
+  location = /api/public/triggers {
+    return 404;
+  }
+
+  location = /api/public/email/unsubscribe {
+    return 404;
+  }
+
+  location / {
+    return 404;
+  }
+}
+
+# ── THE LIVE LISTENER (3053): THE LIVE CAST EDGE'S ONLY TARGET ─────────────────────────────────────────
+#
+# The internet-facing Live Cast ALB targets this port and nothing else. Its forward rule is deliberately
+# broad (`/`, `/*`): THIS block is the fence. It serves the viewer page (`live.html`, for every client
+# route, with the api's snapshot of that route spliced in), the content-hashed build under `/assets/`, the
+# share card `/live-og.png`, its own robots.txt, sitemap and health probe, and proxies `/api/public/live/`
+# and nothing else under `/api` — no console document, no other /api location, no machine surface. A deploy
+# test pins all of it.
+#
+# LAST IN THIS FILE, and it must stay last: the community edition has no Live Cast, so its console image cuts this file
+# from this heading to the end (the community edition's console Dockerfile).
+#
+# READ-ONLY BUT ONE: every `/api/public/live/` route answers GET (and HEAD) only, except the exact
+# `/api/public/live/beacon`, which takes POST only and changes no task data: the viewer's own analytics
+# (`app/live_analytics.py`) — without its location every beacon was this 403 and the dashboard's Live tab read
+# zero. Any other method is nginx's 403 before the app sees it.
+#
+# INDEXABLE DOCUMENTS, deliberately: the viewer page, robots.txt, the sitemap and the share card carry
+# no `X-Robots-Tag`, so search engines index a published project and link previews unfurl it. `/api/` and
+# `/assets/` stay `noindex, nofollow` — each location there states it, since nginx does not inherit
+# `add_header` into a location that declares its own.
+#
+# THE SNAPSHOT (SSI): `location /` records the route (`$live_path`, set before try_files rewrites `$uri` to
+# `/live.html`) and lets `live.html`'s two `include virtual` directives fetch `/_live_snapshot/{head,body}<route>`
+# (with the board page, `$live_page`) — an internal GET subrequest to the api's `/api/public/live/_snapshot/`, carrying the visitor's own address, so
+# the api's per-IP budget sees the visitor. A slow or failed api renders each include's stub block instead
+# (`ssi_silent_errors`, short timeouts, every error status turned into an empty 204): the page always loads, as the
+# client-only viewer it was.
+#
+# THE EDGE CACHE (`live_snapshot` zone): a fragment is the same for every visitor, so one render per route (and board page) serves
+# all of them for `proxy_cache_valid` — the snapshot's fan-out of viewer reads (and the sitemap's walk) is paid
+# once per route per window, not once per page view. The price: an unpublish or a hidden task leaves the snapshot
+# up to 10 s late (the sitemap up to 5 min); the viewer's own reads stay `no-store`. Only a 200 is kept: the api's
+# empty 204 (a visitor's refused budget, a fault) is never served to anyone else.
+proxy_cache_path /tmp/nginx-live-cache levels=1:2 keys_zone=live_snapshot:10m max_size=64m inactive=10m use_temp_path=off;
+
+#
+# The proxy NAMES THE PATH IT MATCHED, so nginx forwards the normalized uri it fenced on, never the raw
+# request line; the raw-URI guard below refuses a raw path that disagrees with its normalized form anyway
+# (the reasoning is the console's — see the maps at the top of this file). Here it also refuses `//` and `/./`,
+# which nginx collapses but the WAF's per-route budget would otherwise read as a different path. It guards the
+# viewer page too, so the route the snapshot is rendered for is the route the visitor typed. A viewer route has
+# none of these in its path; a query is outside the match.
+#
+# The query string is not logged (`git_connect_no_args`, and `error_log crit` where nginx would print the raw
+# request line on an upstream failure): no viewer route reads one but the snapshot's board page, and a visitor's
+# query (an ad click's `fbclid`, `utm_*`) is tracking data the log has no use for.
+map $request_uri $refuse_live_raw_normalized_split {
+  default                   0;
+  "~*^[^?]*(\.\.|%2e|%2f|%5c|//|/\./)" 1;
+}
+
+# The board page a project's snapshot renders (`?page=N`, app/routes/live_snapshot.py), which `live.html`'s includes
+# forward: digits alone, so no other query reaches the api or splits the edge cache.
+map $arg_page $live_page {
+  default             "";
+  "~^[1-9][0-9]{0,2}$" $arg_page;
+}
+
+server {
+  listen 3053 default_server;
+  server_name _;
+  root /usr/share/nginx/html;
+  access_log /dev/stdout git_connect_no_args;
+
+  # live-paths:
+  location /api/public/live/ {
+    default_type application/json;
+    if ($refuse_live_raw_normalized_split) {
+      return 400 '{"detail":"malformed path"}';
+    }
+    limit_except GET {
+      deny all;
+    }
+    error_log /dev/stderr crit;
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    include /etc/nginx/snippets/security-headers.conf;
+
+    proxy_pass http://${API_UPSTREAM}/api/public/live/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    # The project stream is SSE: unbuffered, uncompressed, long-lived — `/api/stream`'s settings and reasons.
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 3600s;
+    gzip off;
+  }
+
+  location = /api/public/live/beacon {
+    default_type application/json;
+    if ($refuse_live_raw_normalized_split) {
+      return 400 '{"detail":"malformed path"}';
+    }
+    limit_except POST {
+      deny all;
+    }
+    error_log /dev/stderr crit;
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    include /etc/nginx/snippets/security-headers.conf;
+
+    proxy_pass http://${API_UPSTREAM}/api/public/live/beacon;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  # The viewer page's snapshot fragments: reachable only as `live.html`'s SSI subrequest (`internal`), which nginx
+  # always issues as GET. Uncompressed (`Accept-Encoding` cleared — the subrequest inherits the visitor's, and a
+  # gzipped fragment would be spliced in as bytes) and short timeouts, so a slow api costs the page its stub,
+  # never its load.
+  location /_live_snapshot/ {
+    internal;
+    if ($refuse_live_raw_normalized_split) {
+      return 400;
+    }
+    error_log /dev/stderr crit;
+
+    proxy_pass http://${API_UPSTREAM}/api/public/live/_snapshot/;
+    proxy_method GET;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header Accept-Encoding "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_connect_timeout 2s;
+    proxy_send_timeout 5s;
+    proxy_read_timeout 5s;
+
+    proxy_cache live_snapshot;
+    proxy_cache_key "$uri?$args";
+    proxy_ignore_headers Cache-Control Expires Set-Cookie;
+    proxy_cache_valid 200 10s;
+    proxy_cache_lock on;
+    proxy_cache_use_stale updating error timeout;
+    proxy_intercept_errors on;
+    error_page 400 404 429 500 502 503 504 = @live_snapshot_empty;
+  }
+
+  # Every published project's routes, rendered by the api. Its caching is this edge's, not the api's.
+  location = /sitemap.xml {
+    if ($refuse_live_raw_normalized_split) {
+      return 400;
+    }
+    limit_except GET {
+      deny all;
+    }
+    error_log /dev/stderr crit;
+    proxy_hide_header Cache-Control;
+    add_header Cache-Control "public, max-age=300";
+    include /etc/nginx/snippets/security-headers.conf;
+
+    proxy_cache live_snapshot;
+    proxy_cache_key "sitemap.xml";
+    proxy_ignore_headers Cache-Control Expires Set-Cookie;
+    proxy_cache_valid 200 300s;
+    proxy_cache_lock on;
+    proxy_cache_use_stale updating error timeout http_500 http_502 http_503 http_504;
+
+    proxy_pass http://${API_UPSTREAM}/api/public/live/sitemap.xml;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+  # end live-paths
+  # An error's body would be spliced into the page: an empty 204 makes the include render its stub.
+  location @live_snapshot_empty {
+    return 204;
+  }
+
+
+  # The bare prefix, which nginx would otherwise 301 to the slashed form — with `:3053` in the Location.
+  location = /api/public/live {
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    include /etc/nginx/snippets/security-headers.conf;
+    return 404;
+  }
+
+  # Every other /api path — the console API, /api/agent*, the node bus, the console stream — is a plain 404.
+  location /api/ {
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    include /etc/nginx/snippets/security-headers.conf;
+    return 404;
+  }
+
+  location = /api {
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    include /etc/nginx/snippets/security-headers.conf;
+    return 404;
+  }
+
+  # The ALB target group's probe: nginx alone, so an api deploy never holds this group's health hostage.
+  location = /healthz-live {
+    access_log off;
+    default_type text/plain;
+    return 200 "ok\n";
+  }
+
+  location = /robots.txt {
+    default_type text/plain;
+    add_header Cache-Control "no-cache";
+    include /etc/nginx/snippets/security-headers.conf;
+    return 200 "User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: https://$host/sitemap.xml\n";
+  }
+
+  # The one share card every page's `og:image` names (1200x630, the console's public live-og.png).
+  location = /live-og.png {
+    add_header Cache-Control "public, max-age=86400";
+    include /etc/nginx/snippets/security-headers.conf;
+    try_files /live-og.png =404;
+  }
+
+  # The viewer's chunk recovery: the one build file NOT content-hashed, so `live.html` from either of two builds finds
+  # it (the viewer's chunk recovery module). Its name never changes, so it is revalidated, never immutable.
+  location = /assets/live-recovery.js {
+    add_header Cache-Control "no-cache";
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    include /etc/nginx/snippets/security-headers.conf;
+    try_files $uri =404;
+  }
+
+  # The same content-hashed build the console serves (Vite), so immutable.
+  location /assets/ {
+    add_header Cache-Control "public, max-age=31536000, immutable";
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    include /etc/nginx/snippets/security-headers.conf;
+    try_files $uri =404;
+  }
+
+  # THE VIEWER PAGE FOR EVERY CLIENT ROUTE (`/`, `/<org>/<slug>`, …) — `live.html` and never another file from
+  # the build root, so the console's own `index.html` is not reachable here, with the route's snapshot spliced in
+  # (THE SNAPSHOT, above). No-cache for the reason the console's `/` states. Its Content-Security-Policy is the
+  # viewer's own (nginx-live-csp.conf).
+  location / {
+    set $live_path $uri;
+    if ($refuse_live_raw_normalized_split) {
+      return 400;
+    }
+    ssi on;
+    ssi_silent_errors on;
+    add_header Cache-Control "no-cache";
+    include /etc/nginx/snippets/security-headers.conf;
+    include /etc/nginx/snippets/live-csp.conf;
+    try_files /live.html =404;
+  }
+}

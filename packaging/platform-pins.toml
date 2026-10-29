@@ -1,0 +1,841 @@
+# platform-pins.toml — EVERY third-party artifact the macOS (darwin-arm64) and Windows (windows-x64) node
+# bundles carry, and the interpreter the Linux `jaah-python` package ships (linux-x64, linux-arm64;
+# read by its package builder), pinned by URL + sha256. The single home of those pins: the platform-bundle builder reads
+# this file, downloads each artifact on the BUILDER (never on a node — a node fetches only the finished
+# bundle, from the control plane's `/api/agent/dist/...` route), and refuses the build on any digest
+# mismatch. Bump an artifact by changing its `url` AND `sha256` together in one commit.
+#
+# Each `[[artifact]]`:
+#   id        unique name (what a failure names)
+#   platform  darwin-arm64 | windows-x64 | linux-x64 | linux-arm64 (the `jaah-python` package; `python` only) |
+#             build-linux-x64 (a BUILD TOOL: used on the Linux builder — the
+#             import-smoke's python, the build toolchains — never shipped)
+#   url       https only
+#   sha256    of the downloaded bytes
+#   format    tar.gz | tar.zst | conda | zip | whl | file
+#   extract   [{ from, to }] — `from` is an archive member (a prefix when it ends in "/", "" = everything),
+#             `to` the path under `versions/<ver>/` in the bundle. For `file`, `to` is the one destination.
+#   exclude   optional fnmatch globs over member paths, dropped from every extract
+#   exec      optional; true marks every extracted file executable
+#   build     optional { tool, root, … }: the archive is SOURCE, compiled on the builder by the `tool`
+#             (go | zig) build-linux-x64 pin (the builder's BUILD table holds the fields per tool).
+#             `root` is the source dir in the archive; each extract rule's `to` is a binary it builds.
+#   licence, licence_source   SPDX expression + the https page it was read from (re-read on every bump);
+#             REQUIRED on every darwin-arm64 and linux-* pin. GPL-family binaries (git, stunnel) and LGPL dylibs MAY
+#             ship in the macOS bundle — unmodified, dynamically linked, their source at licence_source/url
+#             — and NEVER in the .deb (the package-licence check gates microvm-pins.toml).
+
+schema = 1
+
+# The interpreter the node runs. Every `python` artifact must carry this version in its URL, and the
+# daemon must import under it (the build's import-smoke runs the build-linux-x64 twin of this exact
+# version). 3.14 is the latest stable CPython. The Linux `jaah` .deb depends on `jaah-python (>= <this>)`.
+[python]
+version = "3.14.7"
+
+# ── python-build-standalone (astral-sh), release 20260929, install_only ────────────────────────────
+
+[[artifact]]
+id = "python"
+platform = "darwin-arm64"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.14.7%2B20260929-aarch64-apple-darwin-install_only.tar.gz"
+sha256 = "0211ccf04c5e0a0feb0b9bf1148030e1f6a31b8eae624f13919a7752a4e3dc79"
+licence = "PSF-2.0"
+licence_source = "https://github.com/python/cpython/blob/v3.14.7/LICENSE"
+format = "tar.gz"
+extract = [{ from = "python/", to = "runtime/python/" }]
+
+[[artifact]]
+id = "python"
+platform = "windows-x64"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.14.7%2B20260929-x86_64-pc-windows-msvc-install_only.tar.gz"
+sha256 = "4990c28f72e15f11331dcb0cf4fb7e187b0bb134321ade04c265372bf9096571"
+format = "tar.gz"
+# The VC runtime the conda-forge openssl.exe below imports; Windows itself ships the UCRT, not this.
+# `python3.exe` beside `python.exe` (the same launcher, so the same DLLs and stdlib): every hook, gate and
+# the control MCP server is spelled `python3`, and Claude Code spawns MCP servers natively, where only a
+# real `.exe` resolves on PATH.
+extract = [
+  { from = "python/", to = "runtime/python/" },
+  { from = "python/python.exe", to = "runtime/python/python3.exe" },
+  { from = "python/vcruntime140.dll", to = "bin/vcruntime140.dll" },
+]
+# Debug symbols: ~half the archive, never read on a node.
+exclude = ["*.pdb"]
+
+# The Linux `jaah-python` package (/usr/lib/jaah-python), one per arch. The build tool below is the same bytes
+# as linux-x64, pinned separately: one is shipped, the other only runs on the builder.
+[[artifact]]
+id = "python"
+platform = "linux-x64"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.14.7%2B20260929-x86_64-unknown-linux-gnu-install_only.tar.gz"
+sha256 = "0056208b5fdfcec939bc5b3908f5e7c89d11c6e2f1fdf02c9cc6aa98d10c5d05"
+licence = "PSF-2.0"
+licence_source = "https://github.com/python/cpython/blob/v3.14.7/LICENSE"
+format = "tar.gz"
+extract = [{ from = "python/", to = "python/" }]
+
+[[artifact]]
+id = "python"
+platform = "linux-arm64"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.14.7%2B20260929-aarch64-unknown-linux-gnu-install_only.tar.gz"
+sha256 = "08a224bc0bcadfee3eab55db618343e6ba221f3595000e0894aae163648abc9d"
+licence = "PSF-2.0"
+licence_source = "https://github.com/python/cpython/blob/v3.14.7/LICENSE"
+format = "tar.gz"
+extract = [{ from = "python/", to = "python/" }]
+
+[[artifact]]
+id = "python"
+platform = "build-linux-x64"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.14.7%2B20260929-x86_64-unknown-linux-gnu-install_only.tar.gz"
+sha256 = "0056208b5fdfcec939bc5b3908f5e7c89d11c6e2f1fdf02c9cc6aa98d10c5d05"
+format = "tar.gz"
+extract = [{ from = "python/", to = "python/" }]
+
+# ── Python wheels, unpacked WHOLE into vendor/<platform>/ ───────────────────────────────────────────
+# `vendor/<platform>/` is the one site dir the bundle's `jaah-vendor.pth` adds (`site.addsitedir`, so a
+# wheel's own `.pth` — pywin32's — is processed too). Two kinds of wheel land there:
+#   * the daemon's five dependencies (websockets, pyyaml, cryptography, cffi, pycparser), one pin per
+#     package per platform. Their VERSIONS have one home, infra/jaah/requirements.txt, and their sha256s
+#     are the hash lock's (apps/jaahd/requirements.txt): the builder refuses a wheel pin whose version is
+#     not the pin's or whose sha256 the lock does not carry (load_pins), refuses a staged vendor dir holding
+#     a byte no wheel's RECORD vouches for or missing one of the five at the lock's version (check_vendor),
+#     and resolves each one — `_rust` and `_cffi_backend` to binaries built for the target — as the target's
+#     interpreter would (the import-smoke). A bump ends here, with these URLs + sha256s; the sequence is in
+#     docs/policies/jaah-package-distribution.md § The daemon's Python dependencies.
+#     Pure wheels (`py3-none-any`) serve both platforms; compiled ones are cp314 (`[python] version`),
+#     cryptography's abi3.
+#   * Windows-only platform wheels (pywin32, pywinpty), cp314 win_amd64 — the daemon's Windows seam.
+
+[[artifact]]
+id = "websockets"
+platform = "darwin-arm64"
+url = "https://files.pythonhosted.org/packages/d7/b0/3f01fcb3406662f6deb1e3e72b34dd0979e993991c0b7435a9e12bc14f02/websockets-17.3-py3-none-any.whl"
+sha256 = "dc2b495a92b3971966bf102e73589f950db3ec1ca6713265355ce7771d97b199"
+licence = "BSD-3-Clause"
+licence_source = "https://github.com/python-websockets/websockets/blob/17.3/LICENSE"
+format = "whl"
+extract = [{ from = "", to = "vendor/darwin-arm64/" }]
+
+[[artifact]]
+id = "websockets"
+platform = "windows-x64"
+url = "https://files.pythonhosted.org/packages/d7/b0/3f01fcb3406662f6deb1e3e72b34dd0979e993991c0b7435a9e12bc14f02/websockets-17.3-py3-none-any.whl"
+sha256 = "dc2b495a92b3971966bf102e73589f950db3ec1ca6713265355ce7771d97b199"
+format = "whl"
+extract = [{ from = "", to = "vendor/windows-x64/" }]
+
+[[artifact]]
+id = "pyyaml"
+platform = "darwin-arm64"
+url = "https://files.pythonhosted.org/packages/bd/9c/4d95bb87eb2063d20db7b60faa3840c1b18025517ae857371c4dd55a6b3a/pyyaml-6.0.3-cp314-cp314-macosx_11_0_arm64.whl"
+sha256 = "34d5fcd24b8445fadc33f9cf348c1047101756fd760b4dacb5c3e99755703310"
+licence = "MIT"
+licence_source = "https://github.com/yaml/pyyaml/blob/6.0.3/LICENSE"
+format = "whl"
+extract = [{ from = "", to = "vendor/darwin-arm64/" }]
+
+[[artifact]]
+id = "pyyaml"
+platform = "windows-x64"
+url = "https://files.pythonhosted.org/packages/23/20/bb6982b26a40bb43951265ba29d4c246ef0ff59c9fdcdf0ed04e0687de4d/pyyaml-6.0.3-cp314-cp314-win_amd64.whl"
+sha256 = "4a2e8cebe2ff6ab7d1050ecd59c25d4c8bd7e6f400f5f82b96557ac0abafd0ac"
+format = "whl"
+extract = [{ from = "", to = "vendor/windows-x64/" }]
+
+[[artifact]]
+id = "cryptography"
+platform = "darwin-arm64"
+url = "https://files.pythonhosted.org/packages/e5/56/d194340cc4a57535e82e1bee9e89667ac4b7c13b5d3f59686deae3094dd5/cryptography-50.0.2-cp311-abi3-macosx_11_0_arm64.whl"
+sha256 = "fa8f5efb344d6908a1ce62f4a24e2e5780f825d6f53f5f50ec5ffacac72936cb"
+licence = "Apache-2.0 OR BSD-3-Clause"
+licence_source = "https://github.com/pyca/cryptography/blob/50.0.2/LICENSE"
+format = "whl"
+extract = [{ from = "", to = "vendor/darwin-arm64/" }]
+
+[[artifact]]
+id = "cryptography"
+platform = "windows-x64"
+url = "https://files.pythonhosted.org/packages/9a/4f/adfc442765721292fff86d314ce385d3249d22db42295c0dd057727b60f3/cryptography-50.0.2-cp311-abi3-win_amd64.whl"
+sha256 = "7afa5a6602a9f29af1f3a2965f831bae7c9d5d597b7cbb716d41ab3b7d89879c"
+licence = "Apache-2.0 OR BSD-3-Clause"
+licence_source = "https://github.com/pyca/cryptography/blob/50.0.2/LICENSE"
+format = "whl"
+extract = [{ from = "", to = "vendor/windows-x64/" }]
+
+[[artifact]]
+id = "cffi"
+platform = "darwin-arm64"
+url = "https://files.pythonhosted.org/packages/b3/a9/9db617d05d7367c1ad0ab00b3aa6e6f9281edd689b4ee9ea0e5a84e89c97/cffi-2.1.1-cp314-cp314-macosx_11_0_arm64.whl"
+sha256 = "661c298b4821edebead0c91edd2b00374d67ad7c5a1f7a91d4442633b79d6a72"
+licence = "MIT-0"
+licence_source = "https://github.com/python-cffi/cffi/blob/v2.1.1/LICENSE"
+format = "whl"
+extract = [{ from = "", to = "vendor/darwin-arm64/" }]
+
+[[artifact]]
+id = "cffi"
+platform = "windows-x64"
+url = "https://files.pythonhosted.org/packages/a7/06/1c3e01e3ba14c39f6d10bfbac52753b7e22259e38088e5cfe1d704918690/cffi-2.1.1-cp314-cp314-win_amd64.whl"
+sha256 = "3222ba5d678f80a030e6afbcc33dc1ae5cb45facabb61cee2c7016b8432fde48"
+licence = "MIT-0"
+licence_source = "https://github.com/python-cffi/cffi/blob/v2.1.1/LICENSE"
+format = "whl"
+extract = [{ from = "", to = "vendor/windows-x64/" }]
+
+[[artifact]]
+id = "pycparser"
+platform = "darwin-arm64"
+url = "https://files.pythonhosted.org/packages/b6/ae/315bbeee126a769cbde43cf4908acb4b40408d8bf8bbf334dd7368d8dadf/pycparser-3.12-py3-none-any.whl"
+sha256 = "a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e"
+licence = "BSD-3-Clause"
+licence_source = "https://github.com/eliben/pycparser/blob/release_v3.12/LICENSE"
+format = "whl"
+extract = [{ from = "", to = "vendor/darwin-arm64/" }]
+
+[[artifact]]
+id = "pycparser"
+platform = "windows-x64"
+url = "https://files.pythonhosted.org/packages/b6/ae/315bbeee126a769cbde43cf4908acb4b40408d8bf8bbf334dd7368d8dadf/pycparser-3.12-py3-none-any.whl"
+sha256 = "a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e"
+format = "whl"
+extract = [{ from = "", to = "vendor/windows-x64/" }]
+
+[[artifact]]
+id = "pywin32"
+platform = "windows-x64"
+url = "https://files.pythonhosted.org/packages/21/82/3bf86d2e2808902013132e1ce905a7da0da53790f3836c64bf44d55e24f3/pywin32-312-cp314-cp314-win_amd64.whl"
+sha256 = "a4dd3a848290ef724347b19f301045831d8e802fa4464f491b98b1e0a081432e"
+format = "whl"
+extract = [{ from = "", to = "vendor/windows-x64/" }]
+
+[[artifact]]
+id = "pywinpty"
+platform = "windows-x64"
+url = "https://files.pythonhosted.org/packages/e9/23/f3cd1b1e5fc56517f54452c49f92049e7dd9ffc8a63de22a495581f50d04/pywinpty-3.0.5-cp314-cp314-win_amd64.whl"
+sha256 = "03bb3c16d691d9242267201830bcd0e64a9b663170e9042bc84b210da9de15ac"
+format = "whl"
+extract = [{ from = "", to = "vendor/windows-x64/" }]
+
+# ── tmux ────────────────────────────────────────────────────────────────────────────────────────────
+# macOS: tmux's own upstream build (tmux/tmux-builds) — links only libSystem + libresolv, ad-hoc signed,
+# so it is shipped byte-for-byte with no relocation.
+
+[[artifact]]
+id = "tmux"
+platform = "darwin-arm64"
+url = "https://github.com/tmux/tmux-builds/releases/download/v3.7c/tmux-3.7c-macos-arm64.tar.gz"
+sha256 = "0a763dd0380aa980d239509654da1bc7455843706a3c050f6709c8cd2e13d12d"
+licence = "ISC"
+licence_source = "https://github.com/tmux/tmux/blob/3.7c/COPYING"
+format = "tar.gz"
+extract = [{ from = "tmux", to = "bin/tmux" }]
+exec = true
+
+# Windows: MSYS2's tmux and the two DLLs it imports beyond the runtime (libevent core,
+# ncursesw). NOT msys-2.0.dll: tmux must bind to Git for Windows' OWN runtime — the one its panes' shells
+# run on, so server, clients and panes share one process table and mount table — and the loader finds it on
+# PATH (`host_platform.windows.git_path_dirs`). Shipping a second runtime beside tmux.exe would split them.
+# The terminfo entries are kept for a client pointed at them with TERMINFO.
+
+[[artifact]]
+id = "tmux"
+platform = "windows-x64"
+url = "https://repo.msys2.org/msys/x86_64/tmux-3.7.c-1-x86_64.pkg.tar.zst"
+sha256 = "d8294c959d340ded4c5edcfd597a1ab30e345633031f8ed07a6cfe3600113158"
+format = "tar.zst"
+extract = [{ from = "usr/bin/tmux.exe", to = "bin/tmux.exe" }]
+
+[[artifact]]
+id = "libevent"
+platform = "windows-x64"
+url = "https://repo.msys2.org/msys/x86_64/libevent-2.1.13-1-x86_64.pkg.tar.zst"
+sha256 = "ce967e0bbeb4cf396a42e6cd7516b6bbcef23237bf0a55099adbdfe1e9b3fce3"
+format = "tar.zst"
+extract = [{ from = "usr/bin/msys-event_core-2-1-7.dll", to = "bin/msys-event_core-2-1-7.dll" }]
+
+[[artifact]]
+id = "ncurses"
+platform = "windows-x64"
+url = "https://repo.msys2.org/msys/x86_64/ncurses-6.6-2-x86_64.pkg.tar.zst"
+sha256 = "828c92f09b17f00d3b49362fcfa4affa58e5e50e238f290ea36eb7a690da3acb"
+format = "tar.zst"
+extract = [
+  { from = "usr/bin/msys-ncursesw6.dll", to = "bin/msys-ncursesw6.dll" },
+  { from = "usr/share/terminfo/74/tmux", to = "usr/share/terminfo/74/tmux" },
+  { from = "usr/share/terminfo/74/tmux-256color", to = "usr/share/terminfo/74/tmux-256color" },
+  { from = "usr/share/terminfo/73/screen", to = "usr/share/terminfo/73/screen" },
+  { from = "usr/share/terminfo/73/screen-256color", to = "usr/share/terminfo/73/screen-256color" },
+  { from = "usr/share/terminfo/78/xterm", to = "usr/share/terminfo/78/xterm" },
+  { from = "usr/share/terminfo/78/xterm-256color", to = "usr/share/terminfo/78/xterm-256color" },
+  { from = "usr/share/terminfo/63/cygwin", to = "usr/share/terminfo/63/cygwin" },
+  { from = "usr/share/terminfo/6d/ms-terminal", to = "usr/share/terminfo/6d/ms-terminal" },
+]
+
+# ── docker CLI (static, download.docker.com) + the compose plugin (docker/compose releases) ─────────
+
+[[artifact]]
+id = "docker"
+platform = "darwin-arm64"
+url = "https://download.docker.com/mac/static/stable/aarch64/docker-29.8.2.tgz"
+sha256 = "5ffa2bafbabe073470f0333f4a129599230b73d1170bb61146b3d9b08e1d1325"
+licence = "Apache-2.0"
+licence_source = "https://github.com/docker/cli/blob/v29.8.2/LICENSE"
+format = "tar.gz"
+extract = [{ from = "docker/docker", to = "bin/docker" }]
+exec = true
+
+[[artifact]]
+id = "docker"
+platform = "windows-x64"
+url = "https://download.docker.com/win/static/stable/x86_64/docker-29.8.2.zip"
+sha256 = "e8a956a1f117764dd79f6b1964eca0bb451088fe2db5ecce93ed0e01e5d814b3"
+format = "zip"
+# The CLI only: the engine is node-managed (the `jaah-engine` WSL2 distro), never dockerd.exe.
+extract = [{ from = "docker/docker.exe", to = "bin/docker.exe" }]
+
+[[artifact]]
+id = "docker-compose"
+platform = "darwin-arm64"
+url = "https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-darwin-aarch64"
+sha256 = "998735c9b6fe68a4f05895e6ea73d71ad06f9fc7046383ad89e47346781b6af5"
+licence = "Apache-2.0"
+licence_source = "https://github.com/docker/compose/blob/v5.5.1/LICENSE"
+format = "file"
+extract = [{ from = "", to = "bin/docker-compose" }]
+exec = true
+
+# Compose hands every build to buildx; without the plugin it falls back to the classic builder, which
+# refuses a Dockerfile's `RUN --mount`. Linked into the runner's cli-plugins by jaah-engine-launch.
+[[artifact]]
+id = "docker-buildx"
+platform = "darwin-arm64"
+url = "https://github.com/docker/buildx/releases/download/v0.37.2/buildx-v0.37.2.darwin-arm64"
+sha256 = "149e6a006edaa430f297b2bdcf65baaa6d7ee5ccfc7aa67dd50ce1c2b1db47e2"
+licence = "Apache-2.0"
+licence_source = "https://github.com/docker/buildx/blob/v0.37.2/LICENSE"
+format = "file"
+extract = [{ from = "", to = "bin/docker-buildx" }]
+exec = true
+
+[[artifact]]
+id = "docker-compose"
+platform = "windows-x64"
+url = "https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-windows-x86_64.exe"
+sha256 = "a3c0c73033eaede90210345d0cc2233edf4fab8fe0282a91dad8fd8436809d2f"
+format = "file"
+extract = [{ from = "", to = "bin/docker-compose.exe" }]
+
+# The same buildx gap as on macOS (above), found on a real PC (the macOS pin had no Windows row): without
+# it `./dc up` failed on its first `RUN --mount`. Copied into the runner's cli-plugins by JaahService.
+[[artifact]]
+id = "docker-buildx"
+platform = "windows-x64"
+url = "https://github.com/docker/buildx/releases/download/v0.37.2/buildx-v0.37.2.windows-amd64.exe"
+sha256 = "39928ae02c2f4ba8b03ac84a51f3c966a8ffc7588f1f07a956c8620069408638"
+format = "file"
+extract = [{ from = "", to = "bin/docker-buildx.exe" }]
+
+# ── Windows container engine: the `jaah-engine` WSL2 distro's root filesystem ──────────────────────
+# Imported by the jaah-engine service (libexec/JaahService.cs), which then installs dockerd into it from
+# the same Alpine release's signed repository (libexec/jaah-engine.sh). Alpine 3.24 ships docker 29.8.2,
+# the CLI version pinned above.
+
+[[artifact]]
+id = "alpine-rootfs"
+platform = "windows-x64"
+url = "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.2-x86_64.tar.gz"
+sha256 = "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677"
+format = "file"
+extract = [{ from = "", to = "share/engine/alpine-minirootfs.tar.gz" }]
+
+# ── Windows MicroVM backend: the `jaah-microvm` WSL2 distro's root filesystem ──────────────────────
+# Imported by JaahService's jaah-engine role on a MicroVM-marked node, then provisioned by
+# libexec/jaah-microvm.sh, which receives the bundle's `microvm/` payload. Ubuntu
+# noble, the series the x86_64 MicroVM pins (virtiofsd's glibc) are built for. A dated release, never `current/`.
+
+[[artifact]]
+id = "ubuntu-noble-wsl-rootfs"
+platform = "windows-x64"
+url = "https://cloud-images.ubuntu.com/wsl/releases/24.04/20240423/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz"
+sha256 = "8251e27ffff381a4af5f41dcb94d867de3e0d9774a9241908ab34555d99315ea"
+format = "file"
+extract = [{ from = "", to = "share/microvm-wsl/ubuntu-noble-wsl.rootfs.tar.gz" }]
+
+# ── macOS container engine: lima (limactl + the guest agent colima's VM needs) and colima ───────────
+# limactl finds its guest agent and templates at `../share/lima/` relative to itself. `bin/lima` is the
+# release's wrapper script: colima's dependency check looks up `lima`, never `limactl`, on PATH, and without
+# it the engine never starts ("lima not found").
+
+[[artifact]]
+id = "lima"
+platform = "darwin-arm64"
+url = "https://github.com/lima-vm/lima/releases/download/v2.2.0/lima-2.2.0-Darwin-arm64.tar.gz"
+sha256 = "bbdef91774885a0d05f7b048c4eb89ae2bcf3a0c252ae7ca7934e63df76d93c3"
+licence = "Apache-2.0"
+licence_source = "https://github.com/lima-vm/lima/blob/v2.2.0/LICENSE"
+format = "tar.gz"
+extract = [
+  { from = "bin/limactl", to = "bin/limactl" },
+  { from = "bin/lima", to = "bin/lima" },
+  { from = "share/lima/lima-guestagent.Linux-aarch64.gz", to = "share/lima/lima-guestagent.Linux-aarch64.gz" },
+  { from = "share/lima/templates/", to = "share/lima/templates/" },
+]
+exec = true
+
+[[artifact]]
+id = "colima"
+platform = "darwin-arm64"
+url = "https://github.com/abiosoft/colima/releases/download/v0.10.3/colima-Darwin-arm64"
+sha256 = "980ad8bf61a4ca370243f4cb41401a61276dcd2c2502bee7b9b86f9250169f34"
+licence = "MIT"
+licence_source = "https://github.com/abiosoft/colima/blob/v0.10.3/LICENSE"
+format = "file"
+extract = [{ from = "", to = "bin/colima" }]
+exec = true
+
+# ── openssl CLI (apps/jaahd/login_seal.py shells out to it) — conda-forge builds ────────────────────
+# macOS ships LibreSSL and Windows no openssl at all. conda-forge's are relocatable as built: the macOS
+# binary resolves its dylibs through `@rpath` = `@loader_path/../lib/`, hence `lib/`, not `bin/`.
+
+[[artifact]]
+id = "openssl"
+platform = "darwin-arm64"
+url = "https://conda.anaconda.org/conda-forge/osx-arm64/openssl-3.6.4-h55eecbc_0.conda"
+sha256 = "f23239eacd75c4c50705e68fae1aa3292da473e6a3a4abe2330f1e6afa680704"
+licence = "Apache-2.0"
+licence_source = "https://github.com/openssl/openssl/blob/openssl-3.6.4/LICENSE.txt"
+format = "conda"
+extract = [
+  { from = "bin/openssl", to = "bin/openssl" },
+  { from = "lib/libssl.3.dylib", to = "lib/libssl.3.dylib" },
+  { from = "lib/libcrypto.3.dylib", to = "lib/libcrypto.3.dylib" },
+  { from = "lib/libssl.3.dylib", to = "runtime/git/lib/libssl.3.dylib" },
+  { from = "lib/libcrypto.3.dylib", to = "runtime/git/lib/libcrypto.3.dylib" },
+]
+exec = true
+
+[[artifact]]
+id = "openssl"
+platform = "windows-x64"
+url = "https://conda.anaconda.org/conda-forge/win-64/openssl-3.6.4-hf411b9b_0.conda"
+sha256 = "9dddb559ba49744d5d94092d8d13cb0567f5c3b3f439f3acf28433d1f4256acc"
+format = "conda"
+extract = [
+  { from = "Library/bin/openssl.exe", to = "bin/openssl.exe" },
+  { from = "Library/bin/libssl-3-x64.dll", to = "bin/libssl-3-x64.dll" },
+  { from = "Library/bin/libcrypto-3-x64.dll", to = "bin/libcrypto-3-x64.dll" },
+]
+
+# ── ast-grep CLI (the Architectural Guard's rule engine) — ast-grep/ast-grep releases ───────────────
+# Version + sha256 single-homed in the governance package (guard/ast_grep.toml); a pin test
+# asserts these rows equal it. `ast-grep` only — the release's `sg` alias is the same binary.
+
+[[artifact]]
+id = "ast-grep"
+platform = "darwin-arm64"
+url = "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-aarch64-apple-darwin.zip"
+sha256 = "6d2279dea5bea2ad79c66ea93f5fe54ba926e398a8a26de76c56db68fe59eac6"
+licence = "MIT"
+licence_source = "https://github.com/ast-grep/ast-grep/blob/0.45.3/LICENSE"
+format = "zip"
+extract = [{ from = "ast-grep", to = "bin/ast-grep" }]
+exec = true
+
+[[artifact]]
+id = "ast-grep"
+platform = "windows-x64"
+url = "https://github.com/ast-grep/ast-grep/releases/download/0.45.3/app-x86_64-pc-windows-msvc.zip"
+sha256 = "3751b7d6be7fd39a80df1180ffe7e053903dcf92d3190e5a8336ff1746af9059"
+format = "zip"
+extract = [{ from = "ast-grep.exe", to = "bin/ast-grep.exe" }]
+
+# ── Codex CLI on Windows (a Windows node's runner CLI) — openai/codex releases ──────────────────────
+# The release's package archive, which is the official installer's own layout (`bin/codex.exe` beside its
+# code-mode host, `codex-path/rg.exe`, `codex-resources/`, and a `codex-package.json` whose entrypoint is
+# `bin/codex.exe`); sha256 as upstream's `codex-package_SHA256SUMS` lists it. NOT the bare
+# `codex-…-windows-msvc.exe.zip`: its manifest names the exe by its long name at the root, so a rename to
+# `codex.exe` would contradict it. launch.sh puts `codex/bin` on PATH (`agents.codex.CodexAdapter.windows_cli_dir`).
+# Voice is the interactive dictation host, never run by a runner. Moves TOGETHER with the `[[npm]]
+# @openai/codex` pin below (a bundle test asserts the two versions agree).
+
+[[artifact]]
+id = "codex"
+platform = "windows-x64"
+url = "https://github.com/openai/codex/releases/download/rust-v0.163.0/codex-package-x86_64-pc-windows-msvc.tar.gz"
+sha256 = "901028b285614a9974f431f9d9f6534b3e5ed8d62eba4ba64f4762c00f040522"
+format = "tar.gz"
+extract = [{ from = "", to = "codex/" }]
+exclude = ["codex-resources/voice/*"]
+
+# ── Node.js (macOS) — the runtime the runner CLIs (codex, claude-agent-acp, codex-acp) install onto ───
+# nodejs.org's official build (sha256 from its SHASUMS256.txt). `bin/npm`, `bin/npx` and `bin/corepack` are
+# the release's own relative symlinks into `lib/node_modules/`; npm's `#!/usr/bin/env node` needs
+# `runtime/node/bin` on PATH. Headers (`include/`) are for native addons, never built on a node.
+
+[[artifact]]
+id = "node"
+platform = "darwin-arm64"
+url = "https://nodejs.org/dist/v24.22.1/node-v24.22.1-darwin-arm64.tar.gz"
+sha256 = "89c682593d76cd44233fa53b1563264e7de9cbb189cad169135c5b4fadfbc0a7"
+licence = "MIT"
+licence_source = "https://github.com/nodejs/node/blob/v24.22.1/LICENSE"
+format = "tar.gz"
+extract = [
+  { from = "node-v24.22.1-darwin-arm64/bin/", to = "runtime/node/bin/" },
+  { from = "node-v24.22.1-darwin-arm64/lib/", to = "runtime/node/lib/" },
+  { from = "node-v24.22.1-darwin-arm64/LICENSE", to = "runtime/node/LICENSE" },
+]
+
+# ── Tailscale (macOS) — built HERE from the release tag's source (no official macOS binary tarball) ──
+# The Go toolchain is the version the tag's go.mod / go.toolchain.version names; GOTOOLCHAIN=local makes
+# an older one fail the build. Bump tailscale's url + sha256 + root + both stamps together, and `go`
+# to what the new tag's go.mod requires. The stamps are what `tailscale version` reports (upstream's
+# build_dist.sh sets the same two variables from git, which a source archive does not carry).
+
+[[artifact]]
+id = "go"
+platform = "build-linux-x64"
+url = "https://go.dev/dl/go1.27.3.linux-amd64.tar.gz"
+sha256 = "65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
+format = "tar.gz"
+extract = [{ from = "go/", to = "go/" }]
+
+[[artifact]]
+id = "tailscale"
+platform = "darwin-arm64"
+url = "https://github.com/tailscale/tailscale/archive/refs/tags/v1.104.2.tar.gz"
+sha256 = "4c1c806e16507414a1459afcdc399f6a1323c21a1ac90f07bea0465fd8fd7e1d"
+licence = "BSD-3-Clause"
+licence_source = "https://github.com/tailscale/tailscale/blob/v1.104.2/LICENSE"
+format = "tar.gz"
+build = { tool = "go", root = "tailscale-1.104.2/", ldflags = "-X tailscale.com/version.longStamp=1.104.2 -X tailscale.com/version.shortStamp=1.104.2" }
+extract = [
+  { from = "./cmd/tailscale", to = "bin/tailscale" },
+  { from = "./cmd/tailscaled", to = "bin/tailscaled" },
+]
+
+# ── git (macOS; no Xcode CLT, so no /usr/bin/git) — conda-forge, conda prefix layout under runtime/git/ ──
+# Its binaries find their dylibs via `@rpath` = `@loader_path/../lib/` (bin/) and `@loader_path/../../lib/`
+# (libexec/git-core/), so the closure lives in `runtime/git/lib/` — the openssl pin above adds its two
+# dylibs there too. Each dep below ships exactly the dylib its install name loads (+ the file a symlink
+# names); the closure was walked from every shipped Mach-O. Paths conda would rewrite at install time
+# (the `/Users/runner/.../_h_env_placehold…` prefix: exec path, templates, system gitconfig, CA file) are
+# NOT rewritten (decision G3) — the launcher sets GIT_EXEC_PATH, GIT_TEMPLATE_DIR, GIT_CONFIG_NOSYSTEM,
+# GIT_ATTR_NOSYSTEM and GIT_SSL_CAINFO. Perl/Tcl/Python commands are dropped (no perl/tk/python shipped
+# for them), and so are the hook samples (they carry the build prefix).
+
+[[artifact]]
+id = "git"
+platform = "darwin-arm64"
+url = "https://conda.anaconda.org/conda-forge/osx-arm64/git-2.56.0-pl5440h66f49b9_0.conda"
+sha256 = "2faaa571f7da2dd0b17f54ddb8a0437c9bde290af2202257c75ba73889819975"
+licence = "GPL-2.0-only"
+licence_source = "https://github.com/git/git/blob/v2.56.0/COPYING"
+format = "conda"
+extract = [
+  { from = "bin/", to = "runtime/git/bin/" },
+  { from = "libexec/git-core/", to = "runtime/git/libexec/git-core/" },
+  { from = "share/git-core/templates/", to = "runtime/git/share/git-core/templates/" },
+]
+exclude = ["gitk", "git-gui*", "git-citool", "git-cvs*", "git-archimport", "git-svn", "git-send-email",
+           "git-instaweb", "git-p4", "*.sample"]
+
+[[artifact]]
+id = "ca-certificates"
+platform = "darwin-arm64"
+url = "https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.10.19-hbd8a1cb_0.conda"
+sha256 = "9404ee878c6bd5b260655ab651366db43fac6be8d465fcc0acd0f7a50be91acb"
+licence = "MPL-2.0"
+licence_source = "https://curl.se/docs/caextract.html"
+format = "conda"
+extract = [{ from = "ssl/cacert.pem", to = "runtime/git/ssl/cacert.pem" }]
+
+[[artifact]]
+id = "libcurl"
+platform = "darwin-arm64"
+url = "https://conda.anaconda.org/conda-forge/osx-arm64/libcurl-8.23.0-h6651222_0.conda"
+sha256 = "d9f60525b665e50da15c84fcb4e74e6b1f0a56ea4c89a02d4258f23c3fe1f02c"
+licence = "curl"
+licence_source = "https://github.com/curl/curl/blob/curl-8_23_0/COPYING"
+format = "conda"
+extract = [{ from = "lib/libcurl.4.dylib", to = "runtime/git/lib/libcurl.4.dylib" }]
+
+[[artifact]]
+id = "krb5"
+platform = "darwin-arm64"
+url = "https://conda.anaconda.org/conda-forge/osx-arm64/krb5-1.22.2-h34f8a20_2.conda"
+sha256 = "aaea1d42b07769920db2af7471ece9399d2613448863da64ad8272998db5db34"
+licence = "MIT"
+licence_source = "https://github.com/krb5/krb5/blob/krb5-1.22.2-final/NOTICE"
+format = "conda"
+extract = [
+  { from = "lib/libgssapi_krb5.2.2.dylib", to = "runtime/git/lib/libgssapi_krb5.2.2.dylib" },
+  { from = "lib/libkrb5.3.3.dylib", to = "runtime/git/lib/libkrb5.3.3.dylib" },
+  { from = "lib/libk5crypto.3.1.dylib", to = "runtime/git/lib/libk5crypto.3.1.dylib" },
+  { from = "lib/libcom_err.3.0.dylib", to = "runtime/git/lib/libcom_err.3.0.dylib" },
+  { from = "lib/libkrb5support.1.1.dylib", to = "runtime/git/lib/libkrb5support.1.1.dylib" },
+]
+
+[[artifact]]
+id = "libnghttp2"
+platform = "darwin-arm64"
+url = "https://conda.anaconda.org/conda-forge/osx-arm64/libnghttp2-1.68.1-h435687b_1.conda"
+sha256 = "445440d8cccccb6585f71d1eb7c949d64a2af2ced5481d924621424ff3b6a398"
+licence = "MIT"
+licence_source = "https://github.com/nghttp2/nghttp2/blob/v1.68.1/COPYING"
+format = "conda"
+extract = [{ from = "lib/libnghttp2.14.dylib", to = "runtime/git/lib/libnghttp2.14.dylib" }]
+
+[[artifact]]
+id = "libpsl"
+platform = "darwin-arm64"
+url = "https://conda.anaconda.org/conda-forge/osx-arm64/libpsl-0.23.1-hdb0c161_1.conda"
+sha256 = "c8c3153df39abedf3413483f672151ad70f1adb0c06c192bdf7ec432c3616b07"
+licence = "MIT"
+licence_source = "https://github.com/rockdaboot/libpsl/blob/0.23.1/COPYING"
+format = "conda"
+extract = [{ from = "lib/libpsl.5.dylib", to = "runtime/git/lib/libpsl.5.dylib" }]
+
+# libpsl's; the single largest piece of the git closure (libicudata is ~33 MB).
+[[artifact]]
+id = "icu"
+platform = "darwin-arm64"
+url = "https://conda.anaconda.org/conda-forge/osx-arm64/icu-78.3-py310h579977c_2.conda"
+sha256 = "6cdb5dee54c72e56ab189fb3ad33cb28533553d42590e7e831160248f4416a43"
+licence = "Unicode-3.0"
+licence_source = "https://github.com/unicode-org/icu/blob/release-78.3/LICENSE"
+format = "conda"
+extract = [
+  { from = "lib/libicuuc.78.dylib", to = "runtime/git/lib/libicuuc.78.dylib" },
+  { from = "lib/libicuuc.78.3.dylib", to = "runtime/git/lib/libicuuc.78.3.dylib" },
+  { from = "lib/libicudata.78.dylib", to = "runtime/git/lib/libicudata.78.dylib" },
+  { from = "lib/libicudata.78.3.dylib", to = "runtime/git/lib/libicudata.78.3.dylib" },
+]
+
+[[artifact]]
+id = "libssh2"
+platform = "darwin-arm64"
+url = "https://conda.anaconda.org/conda-forge/osx-arm64/libssh2-1.11.1-hbf2880b_1.conda"
+sha256 = "a056e518c3d2d09fbb1778cea80c0c95338fb24adf1a817bbf90fb484850a304"
+licence = "BSD-3-Clause"
+licence_source = "https://github.com/libssh2/libssh2/blob/libssh2-1.11.1/COPYING"
+format = "conda"
+extract = [
+  { from = "lib/libssh2.1.dylib", to = "runtime/git/lib/libssh2.1.dylib" },
+  { from = "lib/libssh2.1.0.1.dylib", to = "runtime/git/lib/libssh2.1.0.1.dylib" },
+]
+
+[[artifact]]
+id = "zstd"
+platform = "darwin-arm64"
+url = "https://conda.anaconda.org/conda-forge/osx-arm64/zstd-1.5.7-hf451053_7.conda"
+sha256 = "da867f5092eb0cb746d353694f0098031fd9817a4ce7d5743121209ae0f406ca"
+licence = "BSD-3-Clause OR GPL-2.0-only"
+licence_source = "https://github.com/facebook/zstd/blob/v1.5.7/LICENSE"
+format = "conda"
+extract = [
+  { from = "lib/libzstd.1.dylib", to = "runtime/git/lib/libzstd.1.dylib" },
+  { from = "lib/libzstd.1.5.7.dylib", to = "runtime/git/lib/libzstd.1.5.7.dylib" },
+]
+
+[[artifact]]
+id = "libzlib"
+platform = "darwin-arm64"
+url = "https://conda.anaconda.org/conda-forge/osx-arm64/libzlib-1.3.2-h8088a28_3.conda"
+sha256 = "a18fa5d5bac452401459f966cf0d872224e8080c4ff93c77e168d43ab42ef9d7"
+licence = "Zlib"
+licence_source = "https://github.com/madler/zlib/blob/v1.3.2/LICENSE"
+format = "conda"
+extract = [
+  { from = "lib/libz.1.dylib", to = "runtime/git/lib/libz.1.dylib" },
+  { from = "lib/libz.1.3.2.dylib", to = "runtime/git/lib/libz.1.3.2.dylib" },
+]
+
+[[artifact]]
+id = "libexpat"
+platform = "darwin-arm64"
+url = "https://conda.anaconda.org/conda-forge/osx-arm64/libexpat-2.8.5-h6111c0a_0.conda"
+sha256 = "50aa761b83fc7a116ca88fe0cb4cefce5abababb10a926bf8afbafd5c298d102"
+licence = "MIT"
+licence_source = "https://github.com/libexpat/libexpat/blob/R_2_8_5/expat/COPYING"
+format = "conda"
+extract = [
+  { from = "lib/libexpat.1.dylib", to = "runtime/git/lib/libexpat.1.dylib" },
+  { from = "lib/libexpat.1.12.5.dylib", to = "runtime/git/lib/libexpat.1.12.5.dylib" },
+]
+
+[[artifact]]
+id = "libiconv"
+platform = "darwin-arm64"
+url = "https://conda.anaconda.org/conda-forge/osx-arm64/libiconv-1.18-he4c29f2_3.conda"
+sha256 = "689a14968267f2f97c07112fca5636e7d756036b9aee969911267c20bd3eea1f"
+licence = "LGPL-2.1-only"
+licence_source = "https://git.savannah.gnu.org/cgit/libiconv.git/tree/COPYING.LIB?h=v1.18"
+format = "conda"
+extract = [{ from = "lib/libiconv.2.dylib", to = "runtime/git/lib/libiconv.2.dylib" }]
+
+[[artifact]]
+id = "libintl"
+platform = "darwin-arm64"
+url = "https://conda.anaconda.org/conda-forge/osx-arm64/libintl-0.25.1-hae62183_2.conda"
+sha256 = "b43c6645e668f86d04d5c06d6dc17efe921bbd9244be4b77946d56fb950a3fcc"
+licence = "LGPL-2.1-or-later"
+licence_source = "https://git.savannah.gnu.org/cgit/gettext.git/tree/gettext-runtime/intl/COPYING.LIB?h=v0.25.1"
+format = "conda"
+extract = [{ from = "lib/libintl.8.dylib", to = "runtime/git/lib/libintl.8.dylib" }]
+
+[[artifact]]
+id = "pcre2"
+platform = "darwin-arm64"
+url = "https://conda.anaconda.org/conda-forge/osx-arm64/pcre2-10.47-he63d830_1.conda"
+sha256 = "f8c415329b542e1fca1ff2917b80e687c18302dfa0353530668b90cb225b494f"
+licence = "BSD-3-Clause WITH PCRE2-exception"
+licence_source = "https://github.com/PCRE2Project/pcre2/blob/pcre2-10.47/LICENCE.md"
+format = "conda"
+extract = [
+  { from = "lib/libpcre2-8.0.dylib", to = "runtime/git/lib/libpcre2-8.0.dylib" },
+  { from = "lib/libpcre2-8.0.15.0.dylib", to = "runtime/git/lib/libpcre2-8.0.15.0.dylib" },
+]
+
+# ── amazon-efs-utils (macOS NodeLink mounts) — upstream's source, its Python run by runtime/python ───
+# The SAME release as the Linux package: the version is single-homed in efs-utils-build.yml's
+# EFS_UTILS_VERSION (a bundle test holds this url to it). On macOS the helper
+# always tunnels TLS through stunnel (never efs-proxy, which is Linux-only). `efs-utils.crt` is the
+# stunnel CAfile its config names.
+
+[[artifact]]
+id = "efs-utils"
+platform = "darwin-arm64"
+url = "https://github.com/aws/efs-utils/archive/refs/tags/v3.3.1.tar.gz"
+sha256 = "d6ca34f6d85aa57c4aba59e13c834d9345fc8b95a670ac7df332ee708a9c3e7e"
+licence = "MIT"
+licence_source = "https://github.com/aws/efs-utils/blob/v3.3.1/LICENSE"
+format = "tar.gz"
+extract = [
+  { from = "efs-utils-3.3.1/src/mount_efs/", to = "runtime/efs-utils/mount_efs/" },
+  { from = "efs-utils-3.3.1/src/efs_utils_common/", to = "runtime/efs-utils/efs_utils_common/" },
+  { from = "efs-utils-3.3.1/src/watchdog/", to = "runtime/efs-utils/watchdog/" },
+  { from = "efs-utils-3.3.1/dist/efs-utils.conf", to = "runtime/efs-utils/efs-utils.conf" },
+  { from = "efs-utils-3.3.1/dist/efs-utils.crt", to = "runtime/efs-utils/efs-utils.crt" },
+]
+
+# ── stunnel (macOS) — efs-utils' TLS tunnel; built HERE from upstream's release (no conda-forge osx-arm64
+# build, and a Homebrew bottle would need its install names rewritten) ─────────────────────────────────
+# zig cross-compiles it for arm64 macOS with no Apple SDK, against the openssl pin above: it links that
+# pin's `@rpath/libssl.3.dylib` + `libcrypto.3.dylib`, found at run time through `@loader_path/../lib`
+# (the bundle's `lib/`). zig's macOS headers lack <util.h>, so `openpty`'s prototype is force-included
+# from the macOS build's `stunnel-openpty.h`. sha256 = stunnel.org's own `.sha256`; the archive/ url outlives the next release. Bump url + sha256 + root together.
+
+[[artifact]]
+id = "zig"
+platform = "build-linux-x64"
+url = "https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz"
+sha256 = "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
+format = "tar.xz"
+extract = [{ from = "zig-x86_64-linux-0.17.0/", to = "zig/" }]
+
+[[artifact]]
+id = "stunnel"
+platform = "darwin-arm64"
+url = "https://www.stunnel.org/archive/5.x/stunnel-5.82.tar.gz"
+sha256 = "8e7438ccd6b3a2ab05182d0846e112a56a7f557ecdee40de07bf67820008bef7"
+licence = "GPL-2.0-or-later WITH stunnel-exception"
+licence_source = "https://www.stunnel.org/COPYING.html"
+format = "tar.gz"
+build = { tool = "zig", root = "stunnel-5.82/", target = "aarch64-macos.11.0", deps = ["openssl"], configure = [
+  "--host=aarch64-apple-darwin", "--build=x86_64-pc-linux-gnu", "--prefix=/Library/Jaah", "--with-ssl={deps}",
+  "--disable-libwrap", "--disable-systemd", "--disable-fips", "LDFLAGS=-Wl,-rpath,@loader_path/../lib -Wl,-S",
+  "CFLAGS=-O2 -include {repo}/packaging/macos/build/stunnel-openpty.h",
+] }
+extract = [{ from = "src/stunnel", to = "bin/stunnel" }]
+
+# ── Runner vendor CLIs (Linux nodes and vnodes) ──────────────────────────────────────────────────────
+# NOT bundle artifacts: the platform-bundle builder reads only `[python]` and `[[artifact]]`. These are the
+# single home of every runner CLI version a node installs; `apps/jaahd/runner_cli_pins.py` is the one
+# reader (the package's post-install, the vnode CLI installer and the OMX refresh in `omx_layer.py` all
+# resolve `name@version` through it, never an unpinned latest), and a node whose installed version differs from the
+# pin reinstalls it on the next converge. The file ships to nodes in the bundle tree
+# (the bundle builder's MANIFEST). ENFORCED: `runner_cli_pins.py install` refuses a tarball whose
+# sha512 is not `integrity`, and installs its dependencies from the committed lock in
+# `packaging/runner-cli-locks/`. Bump a CLI by changing `version` AND `integrity` together (`integrity` is
+# `npm view <name>@<version> dist.integrity`), then regenerate its lock in the same commit:
+# `python3 apps/jaahd/runner_cli_pins.py lock <name>`.
+#
+# Each `[[npm]]`:
+#   name       the npm package
+#   bin        the binary it links into `~/.local/bin` (what the presence check looks for)
+#   version    exact, never a range or a tag
+#   integrity  sha512 SRI of the tarball
+#   replaces   optional: the package this one renamed. Installers uninstall it first, since npm refuses to
+#              link a bin another package still owns (EEXIST)
+#   patches    optional: repo paths of unified diffs applied, in order and exactly, to the verified tarball's
+#              tree before its dependencies install; one that does not apply refuses the install. A patch
+#              lives under `packages/acp-forks/<name>/` with the README saying why and how to drop it
+
+# Moves TOGETHER with the Windows bundle's `codex` artifact above (one CLI version on every node).
+[[npm]]
+name = "@openai/codex"
+bin = "codex"
+version = "0.163.0"
+integrity = "sha512-HNd7vR9oTK6M2ikxFnvNDCdYUgAsyo9VVnd5KnEd2ON0GYI++7MiX9XNPUkhtdgGKFPsWS+CEppQ1UU63uVhUw=="
+
+[[npm]]
+name = "oh-my-codex"
+bin = "omx"
+version = "0.21.18"
+integrity = "sha512-PV0MyWrzM4BiDpDiYmKas8Tc+RNmTBOHjRbOjcTwGCVnWhYaUSAyykqHi8n7w4+rdhNYi9EUuuj8mi0aOVLIyw=="
+
+# Pi moved to this name; pi-acp 0.0.34 needs pi 0.81 or later, which only it publishes.
+[[npm]]
+name = "@earendil-works/pi-coding-agent"
+bin = "pi"
+version = "1.0.2"
+integrity = "sha512-3ZdIghMSELMGV3sKi5iASOb1Jwb696fLjmNu0aezaqDxTLLWWoRpqBYkGxJ1CgAMCbtfqXWEF0lcRrlVXmiEGQ=="
+replaces = "@mariozechner/pi-coding-agent"
+patches = ["packages/acp-forks/pi-coding-agent/0001-undici-8.12.patch"]
+
+[[npm]]
+name = "pi-acp"
+bin = "pi-acp"
+version = "0.0.34"
+integrity = "sha512-MrCp37UbpUzkTkzTIMJQf1RYrT+kr4fgGDGFoLmBN26UupuCZp0XxVIY+7XYsMo3yDnzDeZUJ0jPyM3Si6Bkkg=="
+patches = ["packages/acp-forks/pi-acp/0001-surface-final-error.patch", "packages/acp-forks/pi-acp/0002-zod-4.patch",
+           "packages/acp-forks/pi-acp/0003-usage-cost.patch"]
+
+[[npm]]
+name = "@agentclientprotocol/codex-acp"
+bin = "codex-acp"
+version = "2.2.2"
+integrity = "sha512-vNdeNV3jxbqaH7MYvVWzyB6cMOz+YGIV9W1xyBDsQfoii92DulZLM+ahCL2T2G6uohlaB1Yma347p2kLfAab2w=="
+patches = ["packages/acp-forks/codex-acp/0001-config-projects-win.patch"]
+
+[[npm]]
+name = "@agentclientprotocol/claude-agent-acp"
+bin = "claude-agent-acp"
+version = "0.93.0"
+integrity = "sha512-Uec78bLVFgzXrJMxzg8b5r3WkgIEeo+yv2MrQBTAEXFK5E4Jzzd1XPbN3Khsd9EFIewWkbVOZ5PeStdPykaCHQ=="
+
+# Google Antigravity's CLI (`agy`): a closed native binary with no npm package, so a release tarball at a
+# pinned URL. `sha256` is the tarball's, `bin_sha256` the extracted `antigravity` binary's (what a node
+# hashes to decide it already has the pinned build). Bump all values together, from
+# https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_<arch>.json (its `url`).
+[agy]
+version = "1.2.11"
+release = "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.2.11-6016716732497920"
+sha256 = { amd64 = "c91c62c5e6fa954f5a7e1d7b9ad417d749db4aa60a4ba0b3d604dec1b645d190", arm64 = "01513bc61f9592353045ba801ebb407fbccb8984fcbfde591bc6b681b24e92bc" }
+bin_sha256 = { amd64 = "ec7cf797ecb0e1d91ddf3b6d9d6c1d616bb89f78a5b0e43536b72a7fce695f56", arm64 = "1ab3a89cbf1b6ef03ef33030c76ad13fbb9dead2566d5c83488e87ddbf619a8a" }
+
+# Google's ACP server for Antigravity (`agy_acp_server`, ACP registry id `antigravity-acp`): a closed native
+# binary, so a release zip at a pinned URL per arch. `sha256` is the zip's, `bin_sha256` the extracted
+# `agy_acp_server.par`'s (what a node hashes to decide it already has the pinned build). The zip also holds
+# `localharness_external`, which the server finds beside its real path. About 1.06 GB unpacked; the installer
+# refuses without headroom (`runner_cli_pins.py agy-acp-install`). Bump all values together, from
+# https://raw.githubusercontent.com/agentclientprotocol/registry/main/antigravity-acp/agent.json, and re-measure
+# the unpacked size.
+[agy-acp-server]
+version = "1.4.1"
+release = { amd64 = "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.4.1-linux-x86_64.zip", arm64 = "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.4.1-linux-arm64.zip" }
+sha256 = { amd64 = "2e37012ceb2a5c7fc7309b6e6596234fb637ee3c62a5199f65d4cbe777871384", arm64 = "609336a1c97545487e3ddd55dbd153dc0f40f4e6534486cc1c5f4c0ebb85c2da" }
+bin_sha256 = { amd64 = "57e7c4c505fdc8787993d4ff868274f44fd7aa4e4c82cf424fece3bf6c487643", arm64 = "7d3eb1fab7b5b60a545004f91850609ae6c345abceffbd82b4959385069f9ffe" }

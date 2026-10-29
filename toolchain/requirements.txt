@@ -1,0 +1,44 @@
+# Pinned Python deps of the Jaah node daemon — the SINGLE HOME of these version pins. Every other consumer follows
+# this file rather than restating a version:
+#   * apps/jaahd/requirements.txt — the hash LOCK a node installs from (`pip install --require-hashes
+#     --only-binary=:all:` into /usr/lib/jaahd/venv, built by the package's post-install script —
+#     docs/policies/jaah-package-distribution.md § The daemon's Python dependencies). GENERATED from this
+#     file by `python3 tools/lock_jaahd_requirements.py --write`; the quick gate's `--check` fails when the two
+#     disagree. A bump starts HERE; the sequence that follows (the lock, the platform pins) is in that doc section.
+#   * apps/api/requirements.txt `-r`s this file, so the api image resolves the same versions (unhashed: the api's
+#     own install is not in hash mode).
+#   * packaging/platform-pins.toml — the macOS/Windows bundles' wheels of these packages: the builder refuses a
+#     wheel whose version is not this file's, or whose sha256 the lock does not carry.
+# No third-party file is committed to the repo: nothing here is vendored (the owner's decision; the packaging doc says why).
+#
+# No NATS client and no PyNaCl: the WebSocket transport (bus and console PTY) and the apt-repo GPG signing
+# (jaah-package-distribution) leave nothing importing either.
+# WebSocket CLIENT for the node bus: apps/jaahd dials the CP's /api/node-bus. apps/api also
+# picks this up (its requirements.txt `-r`s this file): it serves websockets via uvicorn AND dials them itself
+# — Slack Socket Mode (`app/slack_socket.py`) and the console proxy to the peer task holding a ticket
+# (`apps/api/app/console_relay/server.py`).
+# THREE constraints fix the range:
+#   * The `jaah` package declares `python3 (>= 3.12)` and installs this library into the node's venv under that
+#     interpreter ⇒ requires-python must admit 3.12. 17.x declares `>=3.11`.
+#   * `websockets.asyncio.client` — what node_bus.py imports — landed in 13.0 ⇒ that is the floor.
+#   * The apps/api image installs the full wheel, `websockets.legacy` included, which uvicorn's
+#     `websockets` protocol impl imports (`websockets.legacy.server`) ⇒ a bump must still ship `legacy/`.
+websockets==17.3  # https://pypi.org/project/websockets/17.3/
+# YAML parser for the compliance scan's CI-definition primitive (the governance package's `primitives/ci.py`),
+# which imports it LAZILY and answers `error` without it, never a pass. The api image already resolved this
+# exact version transitively (dbos).
+pyyaml==6.0.3  # https://pypi.org/project/PyYAML/6.0.3/
+# PyCA cryptography: NodeVault's RSA-OAEP + AES-GCM on the node (`apps/jaahd/nodevault_crypto.py`, fail-closed
+# through `probe()` when it does not import) and the api's credential store at rest (`app/credential_crypto.py`;
+# PyJWT's RS256 rides it too). THE STANDARD LIBRARY CANNOT DO THIS ONE: `hashlib`/`hmac` give no cipher, and a
+# hand-rolled AES-GCM protecting a credential store is the thing you are never supposed to write. Pinned exactly,
+# and the pin is load-bearing: it decides which statically linked OpenSSL seals the store. 46.x carried
+# GHSA-537c-gmf6-5ccf (a vulnerable OpenSSL inside the wheel); 50.0.1+ audits clean (`pip-audit`, weekly in the CI
+# maintenance workflow). abi3 manylinux_2_28 wheels: no Rust toolchain on a node, glibc >= 2.28 (Ubuntu 24.04 is 2.39).
+cryptography==50.0.2  # https://pypi.org/project/cryptography/50.0.2/
+# cryptography's one runtime dependency (`cffi>=2.0.0; platform_python_implementation != "PyPy"`), and cffi's
+# (`pycparser`). Pinned here because the lock must name EVERY package the venv installs with a hash, and a
+# transitive pin left to the resolver is a version nobody chose. cffi is not abi3: one wheel per CPython minor,
+# which is why the lock carries every wheel's hash (the node's interpreter picks its own).
+cffi==2.1.1  # https://pypi.org/project/cffi/2.1.1/
+pycparser==3.12  # https://pypi.org/project/pycparser/3.12/

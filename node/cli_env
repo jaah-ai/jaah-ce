@@ -1,0 +1,33 @@
+# cli_env — every documented telemetry, error-reporting and update-check off-switch of the provider CLIs a
+# community-edition node runs (PRD: no phone home). The single home of those switches: the node image
+# (Dockerfile.node) and the native unit (jaah-ce-node) both load this file, and the node passes each pair
+# into every agent window (apps/jaahd/ce_caps.py, `cli_env`). One KEY=VALUE per line, each with the page that
+# documents it on the line above. A CLI with no documented environment switch is listed at the end.
+
+# Claude Code (and DeepSeek, which runs on it): auto-updates, telemetry, error reporting, /feedback, release notes — https://code.claude.com/docs/en/env-vars.md
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+# Claude Code: telemetry and feature-flag fetching — https://code.claude.com/docs/en/env-vars.md
+DISABLE_TELEMETRY=1
+# Claude Code: the same switch, read as a boolean — https://code.claude.com/docs/en/env-vars.md
+DO_NOT_TRACK=1
+# Claude Code: error reporting — https://code.claude.com/docs/en/env-vars.md
+DISABLE_ERROR_REPORTING=1
+# Claude Code: background auto-updates — https://code.claude.com/docs/en/env-vars.md
+DISABLE_AUTOUPDATER=1
+# Claude Code: /feedback, /bug and /share — https://code.claude.com/docs/en/env-vars.md
+DISABLE_FEEDBACK_COMMAND=1
+# Claude Code: the in-session feedback survey — https://code.claude.com/docs/en/env-vars.md
+CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1
+# Pi (and pi-acp, which spawns it): every startup network call — version check, package updates, telemetry — https://pi.dev/docs/latest/environment-variables
+PI_OFFLINE=1
+# Pi: the latest-version request — https://pi.dev/docs/latest/environment-variables
+PI_SKIP_VERSION_CHECK=1
+# Pi: install/update telemetry and provider attribution headers — https://pi.dev/docs/latest/environment-variables
+PI_TELEMETRY=0
+
+# No documented environment switch (recorded for the release checklist):
+#   Codex CLI — its analytics, OTel export, update check and feedback are `config.toml` keys only
+#     (`analytics.enabled`, `otel.*`, `check_for_update_on_startup`, `feedback.enabled`),
+#     https://learn.chatgpt.com/docs/config-file/config-reference
+#   Antigravity CLI (agy) — telemetry is an interactive `/config` toggle only; the node already switches its
+#     self-updater off per process (apps/jaahd/agents/antigravity_keyring.py)

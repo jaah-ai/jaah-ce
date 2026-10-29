@@ -1,0 +1,168 @@
+fastapi==0.142.4
+# Declared, not left to arrive transitively: the ASGI layer under every route is security-relevant, and an
+# unpinned transitive resolve is how starlette sat on 0.40.0 through seven advisories (white-box M3/L8,
+# PYSEC-2026-161 the Host-header bypass among them). 1.7.0 is what fastapi 0.142.2 resolves to and the
+# first line `pip-audit` reports clean; bump it with fastapi, never apart from it.
+starlette==1.10.0
+uvicorn[standard]==0.54.0
+sqlalchemy==2.0.55
+psycopg[binary]==3.3.6
+alembic==1.20.1
+bcrypt==5.0.0
+itsdangerous==2.2.0
+# Declared because `app/console_direct.py::revoke_for_admin_session_sync` imports `anyio.from_thread`
+# DIRECTLY — the bridge that lets a synchronous route reach the event loop the node sockets live on,
+# so session-retirement handlers can push a direct-console revoke without moving bcrypt onto that loop.
+# It arrives transitively via fastapi -> starlette, but a direct importer declares its own dependency:
+# `from_thread.run`'s failure type differs across majors (4.x raises anyio.NoEventLoopError, 3.x a bare
+# RuntimeError), so the version this code is written against is a real contract, not an accident.
+# Pinned to the version the transitive resolve already lands on and the bridge was verified against, so
+# declaring it changes no installed byte — the point is to stop a future resolve moving it silently.
+anyio==4.15.1
+# multipart/form-data parsing for FastAPI's UploadFile (task attachment uploads, app/routes/attachments.py).
+# Pinned >=0.0.18 — CVE-2024-53981 (GHSA-59g5-xgcq-4qw3, a malformed-boundary DoS) affects earlier releases.
+#
+# AND >=0.0.31 — PYSEC-2026-3040. `parse_form()` did not validate `Content-Length`, so a NEGATIVE value
+# turned its bounded read into a read-until-EOF. Verified at the source rather than taken from the
+# advisory: 0.0.31 adds `if content_length < 0: raise ValueError(...)`, which 0.0.20 does not have.
+#
+# THIS IS DEFENCE IN DEPTH, NOT A LIVE HOLE HERE, AND THE FIRST DRAFT OF THIS COMMENT SAID OTHERWISE.
+# It claimed the vulnerable parser sat above `routes/attachments.py::_read_bounded` and had therefore
+# made that helper's memory bound void. That is FALSE, and a blind review caught it: the pinned
+# starlette (0.40.0) never calls `parse_form()` at all — `formparsers.py` drives `MultipartParser`
+# directly and spools each part into a `SpooledTemporaryFile`. So the CVE's entry point is unreachable
+# from this app today, `_read_bounded` was doing its job the whole time, and what the bump buys is
+# closing the path before some future starlette takes it. Recorded because the wrong version of this
+# sentence would have become the cited precedent for the next person reasoning about upload limits.
+#
+# ONE REAL BEHAVIOUR CHANGE, MEASURED, because "no behaviour change" was also wrong. From 0.0.30 a part
+# carrying ONLY the RFC 5987 extended form (`filename*=UTF-8''...`) with no plain `filename` no longer
+# yields a `filename` option:
+#     0.0.20  filename*-only -> {name, filename}
+#     0.0.31  filename*-only -> {name}
+# starlette builds an `UploadFile` only `if b"filename" in options`, so such a part arrives as a plain
+# form field and `file: UploadFile = File(...)` answers 422 — landing exactly on the non-ASCII filename
+# case `attachments.py` exists to serve. Browsers and requests/httpx send the plain spelling, and a part
+# carrying BOTH still resolves, so the blast radius is a client that sends `filename*` alone. Named
+# rather than discovered. (Security-neutral-to-positive: where both are present the ASCII one now wins,
+# so the BIDI-override stripping downstream sees the tamer value.)
+python-multipart==0.0.32
+# verifies Google Sign-In ID tokens against Google's public keys
+google-auth==2.62.0
+# HTTP transport google-auth uses to fetch Google's public JWKS (google.auth.transport.requests)
+requests==2.34.2
+# `cryptography` (AES-256-GCM for `credentials.config` at rest — app/credential_crypto.py; PyJWT's RS256 rides it):
+# pinned, with its rationale, in infra/jaah/requirements.txt, which the `-r` line below pulls in.
+# Two importers. Verifies the Microsoft sign-in ID token (`app/microsoft_oauth.py`): RS256 signature
+# against Entra's published JWKS (`PyJWKClient`), `aud`/`exp`/`nbf`/`iat`. google-auth cannot do this —
+# its verifier is Google's certs only. Signs a GCP service account's RS256 token grant (`app/gcp/auth.py`),
+# so Your Cloud on GCP needs no cloud SDK. RSA rides the `cryptography` pin (infra/jaah/requirements.txt); no transitive arrivals.
+# Pinned exactly: it decides which tokens sign someone in.
+PyJWT==2.15.1
+# Live session-summary LLM (DeepSeek via its Anthropic-compatible API). Moved here from the agent so the
+# agent stays pure-stdlib; imported lazily in app/session_summary.py (absent key/SDK → deterministic label).
+anthropic>=2.3.0,<3
+# Renders the HUMAN-READABLE schedule sentence the console's cron list and detail pages show beside the
+# raw expression ("Every 5 minutes", "At 06:30 AM, only on Monday") — `app/cron_schedule.describe_schedule`
+# is its only call site. Pure Python, MIT, and `pip show` reports ZERO runtime dependencies, so it adds
+# nothing to the image but itself.
+#
+# IT IS A RENDERER AND NEVER A SECOND PARSER. `dbos._croniter` remains the only thing that decides when
+# anything fires (one parser, and it is the engine's own); this library never reaches a
+# next-fire computation, and `describe_schedule` falls back to printing the raw expression if it raises —
+# so a sentence it cannot render costs a nice label, never a firing and never a 500 on a list page.
+#
+# Pinned exactly because the pinned VERSION is the contract: the acceptance suite asserts eight
+# expression→sentence pairs verbatim, verified against the pin below. A bump that rewords "Every hour" is a UI
+# change and a red suite, which is the point of noticing it here rather than in a screenshot.
+cron-descriptor==2.2.1
+# NO LONGER A TEST-ONLY DEPENDENCY, and it must not drift back under the block below.
+# `app/routes/agent_sessions.py` imports it at module scope and `put_object` is on the request path
+# of `POST /api/agent/sessions/{sid}/transcript` — the CP's own presigned `manifest.json` PUT. Split
+# test deps out of the production image with this still below the line and that route 500s.
+httpx==0.27.2
+# Stripe billing (`app/billing/`). `app/billing/gateway.py` is the ONE importer: every other module reaches
+# Stripe through its `Gateway`, so this pin and that module's `STRIPE_API_VERSION` move together.
+# Pinned exactly because the SDK release IS the API version: 16.0.0's `stripe/_api_version.py` pins
+# `2026-09-30.endive`, and `tests/billing/test_gateway_contract.py` fails the day the two disagree.
+stripe==16.0.0
+# The CPU profiler `app/cpu_profile.py` runs as a subprocess (`py-spy record` against the api's own pid) while
+# the `cpu_profiling` operator setting is on. A self-contained Rust binary in a manylinux wheel: no Python
+# imports it and it pulls in no dependency. Pinned exactly; 0.4.2 verified to sample CPython 3.14.
+py-spy==0.4.2
+# SAML 2.0 and OIDC sign-in (`app/org_sso.py`). pysaml2 is the SAML SP: it parses IdP metadata and
+# checks an assertion's XML signature by shelling out to the `xmlsec1` binary, which the api image installs.
+# Authlib is the OIDC relying party: discovery, the code exchange and the ID token's JWKS signature check.
+# dnspython reads the `_jaah.<domain>` TXT record that verifies an SSO domain.
+pysaml2==7.5.5
+Authlib==1.9.1
+# joserfc: the JOSE library Authlib builds on, imported directly by `app/sso_signin.py` for the ID token check.
+joserfc==1.7.7
+dnspython==2.9.0
+# pysaml2's own dependencies, declared so a resolve never moves the SAML parser stack silently: defusedxml
+# (the hardened XML parser pysaml2 reads every Response with), xmlschema + elementpath (schema validation;
+# xmlschema 2.x caps elementpath below 5), pyOpenSSL (certificate loading), python-dateutil + six (timestamps).
+# Pinned to what the full resolve already lands on, so declaring them changes no installed byte. Bump with pysaml2.
+defusedxml==0.7.1
+xmlschema==2.5.1
+elementpath==4.8.0
+pyOpenSSL==26.4.0
+python-dateutil==3.0.0
+six==1.17.0
+# test deps (unit suite runs inside the container via ./dc test)
+pytest==9.1.1
+pytest-xdist==3.8.0
+pytest-timeout==2.4.0
+# What starlette 1.x's `TestClient` drives (it falls back to `httpx` only with a deprecation warning). Already
+# installed through `anthropic`; declared because every TestClient test depends on it directly, and it is
+# stricter than `httpx` in ways tests notice: it refuses a non-finite float or a lone surrogate in `json=`,
+# and logs each request URL on the `httpx2` logger.
+httpx2==2.16.0
+# Validates the Jaah API reference's exported spec as OpenAPI 3.1 (in the API test suite).
+openapi-spec-validator==0.9.0
+# The `websockets` pin the node bus and console stream are served over — AND, since the control plane scaled
+# out, a library this app imports DIRECTLY: `app/console_stream.py::_proxy_to_owner` is a
+# `websockets.asyncio.client` CLIENT (one control-plane task dialling the peer that owns a console ticket),
+# as `app/slack_socket.py` already was. A direct importer declares its own dependency; this one is declared
+# by the `-r` below rather than a second `websockets==` line, because the shared requirements file it
+# includes is the single home for the version (its floor note — `websockets.asyncio.client` landed in
+# 13.0 — is exactly this import's floor) and one pin cannot drift from itself. Bump there, not here.
+-r ../../toolchain/requirements.txt
+# Durable-workflow engine for the control plane's human-in-the-middle flows — the account login wizard
+# today (`app/durable/`). MIT-licensed, and it checkpoints into OUR Postgres rather than a
+# hosted service: it owns one schema (`durable_dbos_sys`) whose DDL it creates and migrates itself, so
+# nothing here is a new operational dependency and no alembic revision of ours describes it.
+#
+# Pinned exactly because this library OWNS A DATABASE SCHEMA: `run_migrations` is on, so the version
+# installed here decides what DDL runs against `durable_dbos_sys` at launch. An unplanned bump is a
+# schema change, not just a code change, and it happens during startup of whatever deploy carries it.
+#
+# It also feeds DBOS's DEFAULT `application_version`, a hash that includes the library version — which
+# would make a bump orphan every login in flight. That particular hazard does not apply to us only
+# because `app/durable/runtime.py` overrides that field with a pin of its own; read its docstring
+# before changing either number.
+#
+# A release that changes this schema's storage deploys stop-then-start, never overlapped. 3.2.0 is one: it
+# adds migration 123 (`workflow_status.creator_xid`), so the schema reads 123 at this pin. 3.3.0 drops
+# `dbos._croniter`, which `app/cron_schedule.py` imports: hold here until that import moves.
+#
+# Transitive additions are pyyaml, python-dateutil and click only — psycopg, sqlalchemy and websockets
+# are already pinned above and satisfy 3.x's floors (>=3.1, >=2.0.43, >=14.0 respectively; unchanged
+# from 2.x). The opentelemetry extras are deliberately NOT installed; `enable_otlp` is off.
+dbos==3.2.0
+# The SQLAlchemy side of Postgres's `vector` extension, for the support knowledge base
+# (`app/support_kb`): the `VECTOR(768)` column type `app/models/support.py::SupportKbChunk` maps and
+# the `cosine_distance` operator `support_kb/search.py` orders by (`<=>`), so the ORM can spell a
+# nearest-neighbour query instead of hand-built SQL against a column it otherwise could not type.
+# Pure Python, MIT, and its wheel declares NO runtime dependency (numpy is consulted only if the
+# caller already imported it; we hand it plain lists) — nothing else lands in the image.
+#
+# WHAT IT IS NOT: the extension itself. `vector` is a Postgres server extension; RDS Postgres 18 ships
+# it (0.8.2) and local + CI run the `pgvector/pgvector:0.8.2-pg18-trixie` image, and revision 0309 runs
+# `CREATE EXTENSION IF NOT EXISTS vector`. This package only teaches SQLAlchemy the type; without the
+# server extension the migration fails, not this import. Nor is it an embedder: the vectors come from
+# Gemini over REST (`support_kb/embeddings.py`).
+#
+# Pinned exactly like every other line: the pin decides how a Python list is rendered into a `vector`
+# literal on the wire, which is the one place a silent bump could corrupt every stored embedding.
+pgvector==0.5.1

@@ -1,0 +1,7 @@
+# Dockerfile.web's build context is the repository root; it reads apps/web and VERSION. Kept out: the secrets file
+# and local build products, so `COPY apps/web/ ./` cannot overwrite the image's own `npm ci` and build.
+.env
+.git
+**/node_modules
+**/__pycache__
+apps/web/dist

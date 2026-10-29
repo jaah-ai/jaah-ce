@@ -1,0 +1,83 @@
+#!/bin/sh
+# jaahd-venv — build (or rebuild) the node daemon's Python environment, /usr/lib/jaahd/venv, from the hash lock
+# the package ships (apps/jaahd/requirements.txt — generated from infra/jaah/requirements.txt, the one home of the
+# pins). The ONE place the venv is made: the .deb's postinst runs it on every configure, the community edition's
+# node image at build time. Doctrine: docs/policies/jaah-package-distribution.md § The daemon's Python
+# dependencies.
+#
+#   jaahd-venv [LIB_ROOT]        LIB_ROOT defaults to /usr/lib/jaahd; the venv is LIB_ROOT/venv, the lock
+#                                LIB_ROOT/apps/jaahd/requirements.txt, the interpreter the `jaah-python` package's
+#                                /usr/lib/jaah-python/bin/python3 — the absolute path every root script of this
+#                                package pins (jaahd-update, jaah-reclaim, jaah-root-grow), never the distro's
+#                                python3 (3.10 on Ubuntu 22.04) and never a PATH lookup under dpkg's inherited environment. Run with
+#                                -I and without PYTHONPATH/PYTHONHOME, so no ambient module can stand in for venv or
+#                                pip; pip's own PIP_* environment and config files are honoured on purpose (an
+#                                operator's mirror or proxy), and the hash lock bounds what they can change to a
+#                                refusal.
+#
+# No third-party file ships in the package or the repo: `pip install --require-hashes --only-binary=:all:` fetches
+# the pinned wheels from PyPI (or the index pip's own configuration names), refuses any byte the lock does not
+# hash and never builds an sdist. So a node needs PyPI reach at INSTALL and at every UPGRADE THAT CHANGES THE
+# PINS — and at no other time: an upgrade whose lock and interpreter are unchanged keeps the venv as it is.
+#
+# Rebuilt, never patched: the stamp (venv/.jaah-pins) records the lock's sha256, the interpreter's path and its `X.Y`;
+# any differing (new pins, a venv still on another interpreter, or a minor bump — a venv's site-packages is per
+# minor) rebuilds the whole
+# venv in `venv.new`, swapped into place only once pip succeeded, so a failed build never leaves a half venv.
+#
+# FAILURE SENTENCES (the two cases, each printed once, each naming the fix):
+#   * no venv yet (first install, or a venv deleted by hand) → exit 1, the package stays unconfigured: the daemon
+#     cannot import its dependencies, so starting it would only fail later and quieter.
+#   * a previous venv exists → it is KEPT and this exits 0: the daemon keeps running on the previous pins, and the
+#     next configure (`dpkg-reconfigure jaah`, or the next upgrade) retries the build.
+set -eu
+
+lib="${1:-/usr/lib/jaahd}"
+venv="$lib/venv"
+lock="$lib/apps/jaahd/requirements.txt"
+stamp_file="$venv/.jaah-pins"
+
+[ -f "$lock" ] || { echo "jaahd-venv: no lock at $lock" >&2; exit 1; }
+python=/usr/lib/jaah-python/bin/python3
+[ -x "$python" ] || { echo "jaahd-venv: no $python (the jaah package depends on jaah-python)" >&2; exit 1; }
+minor="$("$python" -I -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+stamp="$(sha256sum < "$lock" | cut -d' ' -f1) $python python$minor"
+
+if [ -x "$venv/bin/python3" ] && [ -f "$stamp_file" ] && [ "$(cat "$stamp_file")" = "$stamp" ]; then
+    exit 0
+fi
+
+# ensurepip's bundled pip (shipped with jaah-python) is what installs: it may be old, but it reads a hash lock and
+# manylinux_2_28 tags (pip >= 20.3). Probed first, so a host without it gets its own sentence, never the network one.
+if ! "$python" -I -m ensurepip --version >/dev/null 2>&1; then
+    echo "jaahd-venv: $python has no ensurepip — reinstall the jaah-python package" >&2
+    exit 1
+fi
+rm -rf -- "$venv.new"
+# No cache (root's ~/.cache is not a package surface), no version nag, no prompt. `umask 022` so the runner uid
+# (user jaah) and a MicroVM guest can read it.
+if (umask 022 && env -u PYTHONPATH -u PYTHONHOME "$python" -I -m venv "$venv.new" \
+        && env -u PYTHONPATH -u PYTHONHOME "$venv.new/bin/python3" -I -m pip install --quiet --no-cache-dir \
+            --no-input --disable-pip-version-check --require-hashes --only-binary=:all: -r "$lock"); then
+    printf '%s\n' "$stamp" > "$venv.new/.jaah-pins"
+    rm -rf -- "$venv.old"
+    if [ -d "$venv" ]; then mv "$venv" "$venv.old"; fi
+    mv "$venv.new" "$venv"
+    rm -rf -- "$venv.old"
+    echo "jaahd-venv: built $venv (python$minor, lock sha256 ${stamp%% *})"
+    exit 0
+fi
+
+rm -rf -- "$venv.new"
+if [ -x "$venv/bin/python3" ]; then
+    echo "jaahd-venv: could not rebuild $venv from $lock — pip must reach https://pypi.org (or the index its" \
+         "configuration names) at install and at an upgrade that changes the pins; KEEPING the previous venv" \
+         "($(cat "$stamp_file" 2>/dev/null || echo 'unstamped')): the daemon runs on the previous dependency set" \
+         "until the package's configure step succeeds (re-run it: \`apt install --reinstall jaah\` or" \
+         "\`dnf reinstall jaah\`)" >&2
+    exit 0
+fi
+echo "jaahd-venv: could not build $venv from $lock — pip must reach https://pypi.org (or the index its" \
+     "configuration names) at install and at an upgrade that changes the pins; fix the network or proxy, then" \
+     "re-run the package's configure step: \`apt install --reinstall jaah\` or \`dnf reinstall jaah\`" >&2
+exit 1

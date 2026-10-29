@@ -1,0 +1,3 @@
+pytest>=9.1.1,<10
+# The gate shards this suite (its "Jaahd unit (pytest)" step); same pin as apps/api.
+pytest-xdist==3.8.0

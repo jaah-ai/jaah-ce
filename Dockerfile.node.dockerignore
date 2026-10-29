@@ -1,0 +1,12 @@
+# Dockerfile.node's build context is the repository root; its bundle stage reads only the node closure, the local
+# edition's manifest (node/stage_bundle.py) and the node/ directory. Kept out: the secrets file and everything heavy
+# no stage reads.
+.env
+.git
+**/node_modules
+**/__pycache__
+dist
+apps/web
+apps/api
+apps/docs
+apps/site-widget

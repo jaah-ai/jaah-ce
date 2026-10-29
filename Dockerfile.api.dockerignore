@@ -1,0 +1,10 @@
+# Dockerfile.api's build context is the public tree's root; it reads apps/api, toolchain/, the files it copies into
+# ./shared and ./doctrine, and VERSION. Kept out: the secrets file and everything
+# heavy.
+.env
+.git
+**/node_modules
+**/__pycache__
+apps/web
+apps/docs
+apps/site-widget

@@ -1,0 +1,6 @@
+{
+  "name": "jaah",
+  "version": "1.0.0",
+  "description": "The control MCP server: a model's typed channel to the control plane, over the node daemon's vocabulary socket.",
+  "mcpServers": "./.mcp.json"
+}

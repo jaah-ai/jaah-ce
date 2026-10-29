@@ -1,0 +1,19 @@
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -35449,9 +35449,13 @@
+     });
+     const mergedConfig = {
+       ...forceGitRootTurnDiffPaths(mergeGatewayConfig(this.config, this.gatewayConfig)),
+-      projects: Object.fromEntries(sessionRoots.map((root) => [root, {
+-        trust_level: "trusted"
+-      }]))
++      projects: {
++        ...Object.fromEntries(sessionRoots.map((root) => [root, {
++          trust_level: "trusted"
++        }])),
++        // jaah.ai fork (packages/acp-forks/codex-acp): a CODEX_CONFIG `projects` entry wins over the trust above.
++        ...this.config["projects"]
++      }
+     };
+     const configWithWorkspaceRoots = mergeSandboxWorkspaceWriteRoots(mergedConfig, additionalDirectories);
+     if (mcpServers.length === 0) {

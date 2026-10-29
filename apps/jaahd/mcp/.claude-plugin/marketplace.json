@@ -1,0 +1,16 @@
+{
+  "name": "jaah",
+  "owner": {
+    "name": "jaah"
+  },
+  "metadata": {
+    "description": "The node's own plugins, served from the jaahd package rather than a network source. Registered as a local DIRECTORY marketplace at the path the .deb installs it to, so an account needs no git, no credential and no network to install from it."
+  },
+  "plugins": [
+    {
+      "name": "jaah",
+      "source": "./jaah",
+      "description": "The control MCP server: a model's typed channel to the control plane, over the node daemon's vocabulary socket."
+    }
+  ]
+}

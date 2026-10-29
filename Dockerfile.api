@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1
+# Dockerfile.api — the community edition's control plane: the FastAPI app, its migrations and its boot, as one user.
+#
+#   docker build -f Dockerfile.api -t jaah-ce-api .     # from the jaah-ce repository (or a tree build_tree.py built)
+#
+# The build context is the public tree's root: every path below is one tools/community_edition/manifest.toml ships. Unlike
+# the cloud image it carries no RDS CA bundle, support knowledge base, legal pages or compliance packages: the
+# community edition serves none of them. It runs as uid 1000, the uid of the node image's user, so the node identity file
+# the control plane writes 0600 on the `jaah-node-identity` volume is readable by the container node. Each boot
+# migrates plain Postgres to head and runs the seed, which runs the CE bootstrap (`app/ce_bootstrap.py`:
+# secrets, the org, the node, its pool).
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:dbcc3a4a3b1b9e68420a4742940aa6267c97e61811736a5fef0918a06ade1827 AS deps
+RUN apk upgrade --no-cache && apk add --no-cache python-3.14 py3.14-pip tzdata bash
+
+WORKDIR /app
+COPY apps/api/requirements.txt ./requirements.txt
+# The node toolchain's pins, which requirements.txt `-r`s (`../../toolchain/requirements.txt` from /app).
+COPY toolchain/requirements.txt /toolchain/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+
+FROM deps
+COPY apps/api/ ./
+# The runner doctrine the dispatch composer reads for every role (app/dispatch_compose/system_prompt.py).
+COPY doctrine/fleet/ ./doctrine/fleet/
+COPY doctrine/context-architecture.md ./doctrine/
+# The files the api loads by path from ./shared (app/shared_module.py); each is single-homed beside its other reader.
+COPY apps/jaahd/transcript_redact.py apps/jaahd/agent_providers.py apps/jaahd/jaah_env.py apps/jaahd/bedrock_call_key.py apps/jaahd/account_auth.py ./shared/
+COPY tools/manifest_check.py tools/github_settings.py ./shared/
+COPY packaging/linux-support.toml ./shared/
+COPY VERSION ./VERSION
+ARG APP_VERSION
+ENV APP_VERSION=${APP_VERSION}
+
+# World-readable whatever the build context's modes (a CI checkout under a restrictive umask), then the one user.
+# The data root's directories are created here, owned by that user, so a fresh named volume mounted on each
+# inherits the owner (`app/ce_bootstrap.py::CE_DATA_DIR`).
+RUN chmod -R a+rX /app \
+ && adduser -D -u 1000 -h /home/jaah -s /sbin/nologin jaah \
+ && install -d -o jaah -g jaah -m 0700 /var/lib/jaah-ce /var/lib/jaah-ce/secrets \
+      /var/lib/jaah-ce/node-identity /var/lib/jaah-ce/attachments /var/lib/jaah-ce/sessions
+USER jaah
+EXPOSE 8000
+HEALTHCHECK --interval=5s --timeout=3s --start-period=120s --retries=12 \
+  CMD python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=2)'
+# Migrate, seed (the CE bootstrap rides it), then the single-worker launcher (entrypoint.sh says why).
+CMD ["sh", "-c", "python migrate.py && python -m app.seed && exec ./entrypoint.sh app.main:app --host 0.0.0.0 --port 8000"]

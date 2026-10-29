@@ -1,0 +1,135 @@
+/* apps/web — what is LEFT of the in-house stylesheet after the MUI migration.
+ *
+ * The console's design system is `@mui/material` now. `src/theme.ts` is the single home for the design
+ * tokens, the component defaults and every `styleOverrides`; an individual element is styled with `sx`.
+ * Nothing in this file styles a primitive MUI provides — no button, badge, table, card, modal, form
+ * control, layout shell, spacing scale or colour token. The two document-level design-token blocks that
+ * used to open this file — the light one and its `[data-theme="dark"]` counterpart — are gone with them:
+ * `theme.ts`'s `cssVariables` palette (keyed on that same `[data-theme]` attribute) is their successor
+ * single home, and the duplication was deliberately time-boxed to the length of the migration.
+ *
+ * WHAT SURVIVES, AND WHY THERE IS NO OTHER WAY TO WRITE IT
+ * Two things only:
+ *   1. the two elements that exist ABOVE the React root, which no React component can reach; and
+ *   2. DOM created by a third-party library — xterm.js and TipTap/ProseMirror — which mounts its own
+ *      nodes and accepts a `className`, never an `sx`. Emotion cannot style a node it did not render.
+ *
+ * Every selector below is enumerated, with its one-line reason and its LIVE CONSUMER FILE, in the
+ * styles allowlist the style gate reads. A selector added here without a row there is a gate failure.
+ */
+
+/* ── 1. Above the React root ─────────────────────────────────────────────────
+   `<html>`, `<body>` and `#root` are written by `index.html`, outside React, so MUI's `CssBaseline`
+   (which resets `body` but knows nothing about `#root`) cannot give them a height. Without the chain
+   the app shell's `height: 100dvh` has nothing to resolve against on the pre-auth routes.
+   CONSUMER: apps/web/index.html (the `#root` div) + apps/web/src/App.tsx (APP_LAYOUT_SX). */
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/* The universal border-box reset — the ONE rule here that is NOT a document-shell or third-party rule,
+   and the one whose removal this task actually had to measure rather than reason about.
+   `CssBaseline` NOMINALLY owns this: it emits `html { box-sizing: border-box }` plus
+   `*, *::before, *::after { box-sizing: inherit }`. The second half does not reach the document in this
+   app's configuration — MEASURED on `/tasks/new`: `[...document.styleSheets]` contains no `*::before`
+   rule at all, `html`/`body` compute `border-box`, and a bordered child sized against its parent
+   computes `content-box` and overflows by exactly its two border pixels. 31 Playwright assertions
+   failed on that 2px and its siblings when this rule was first deleted.
+   So it stays, unlayered and global, until `CssBaseline`'s own `*` rule is shown to land. The probe
+   that proves it — the witness element, the width to run it at, and the three lines to paste — is
+   single-homed in the styles allowlist ("The one survivor that was NOT obvious"); re-run it
+   there before this block is ever deleted again, rather than keeping a second copy here to drift.
+   CONSUMER: every element in the document. */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+/* ── 2. xterm.js viewport (third-party DOM) ──────────────────────────────────
+   xterm renders `.xterm-viewport` itself, inside the console body; there is no React element to hang an
+   `sx` on. Retained verbatim from the pre-migration stylesheet, re-scoped from the retired
+   `.console-body` class to the `data-testid` its migrated owner now emits.
+
+   What these three declarations are FOR — and, just as importantly, what they are not. The touch-drag
+   that scrolls the terminal's scrollback is routed entirely by the JS handler in `ConsoleTerminal.tsx`,
+   which reads the drag off the container and replays it as a wheel event; this rule cannot reach a
+   terminal-area touch at all (in @xterm/xterm@5.5.0 `.xterm-screen` is appended after `.xterm-viewport`
+   and paints above it, and xterm binds its own wheel/touch listeners on `this.element`). What is left is
+   `overscroll-behavior: contain` keeping a drag that reaches either end of the viewport's own exposed
+   scrollbar strip from turning into a page scroll. That strip measured 0px wide in every context tried, so no reachable-strip claim is made:
+   the declarations stay as a defensive guard for engines that do reserve scrollbar width, and removing
+   them would be an unverified behaviour change. `-webkit-overflow-scrolling` is iOS-only and inert on
+   current iOS; it is kept with the other two rather than for a job of its own.
+   CONSUMER: apps/web/src/components/ConsoleTerminal.tsx (`data-testid="console-body"`, :1383). */
+[data-testid='console-body'] .xterm-viewport {
+  touch-action: pan-y;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ── 3. TipTap / ProseMirror editor DOM (third-party) ────────────────────────
+   `<EditorContent>` takes a `className`, not an `sx`, and the `.rte-prosemirror` node below it is
+   created by ProseMirror from `editorProps.attributes.class`. Neither is a React element in this tree. */
+
+/* The scrolling content pane of the editor, and the whole body of the read-only renderer.
+   CONSUMER: apps/web/src/components/richtext/RichTextEditor.tsx:313,
+             apps/web/src/components/richtext/RichTextRenderer.tsx:43. */
+.rte-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem;
+  /* Fixes a phone editor that was unusable and unscrollable. `pan-y` states that a vertical
+     finger drag on this pane is a SCROLL and not a gesture for the browser to claim.
+     `pan-y pinch-zoom`, never the bare `pan-y` the console rule uses: this pane holds PROSE, and a bare
+     `pan-y` would also take pinch-zoom away from it — an accessibility floor, not a gesture worth
+     claiming.
+     The `overscroll-behavior-y: contain` that shipped beside it is GONE, and it is what made the edit
+     page unscrollable on a phone: this pane is the editor's scroller only where the page around it is
+     clamped (desktop, or a keyboard-up phone) — at phone width it grows to its prose instead, and a
+     `contain` scroll container with nothing to scroll still refuses to chain the gesture out to the
+     shell, which is the only thing that CAN scroll there. Measurements and the other three sites: `pages/taskDetail/taskDetailConstants.ts`,
+     PAGE_SX, "WHY NO SCROLLPORT ON THIS PAGE CONTAINS ITS OVERSCROLL". */
+  touch-action: pan-y pinch-zoom;
+}
+
+/* The contenteditable itself. `min-height: 100%` is what makes the whole pane a click target rather
+   than just the first line; `outline: none` suppresses the UA focus ring on a box whose focus is already
+   signalled by the caret.
+   CONSUMER: apps/web/src/components/richtext/RichTextEditor.tsx:110 (editorProps.attributes.class). */
+.rte-prosemirror {
+  outline: none;
+  min-height: 100%;
+}
+
+/* TipTap's Placeholder extension marks the empty first paragraph and puts the text in a data attribute;
+   only a `::before` can render it. Colour comes from the MUI palette variable, not a retired token.
+   CONSUMER: apps/web/src/components/richtext/RichTextEditor.tsx:110. */
+.rte-prosemirror p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
+  color: var(--mui-palette-text-disabled);
+  pointer-events: none;
+}
+
+/* A quote reads as a quote, not an indent: a left rule and gray text; LegalPage.tsx's `quoteSx` uses the same tokens.
+   Stronger than its divider/secondary tokens, which measured near-invisible (rule) and barely gray (text) on
+   the light ground; the mix lands mid-gray in both schemes without a hard-coded colour.
+   ProseMirror renders the `<blockquote>`, so no `sx` reaches it.
+   CONSUMER: apps/web/src/components/richtext/RichTextEditor.tsx, RichTextRenderer.tsx (StarterKit blockquote). */
+.rte-prosemirror blockquote {
+  margin-left: 0;
+  margin-right: 0;
+  padding-left: 12px;
+  border-left: 3px solid var(--mui-palette-text-disabled);
+  color: color-mix(in srgb, var(--mui-palette-text-primary) 62%, var(--mui-palette-background-default));
+}
+
+/* The read-only renderer is not editable, so it must not claim a text cursor.
+   CONSUMER: apps/web/src/components/richtext/RichTextRenderer.tsx:28. */
+.rte-prosemirror-readonly {
+  cursor: default;
+}

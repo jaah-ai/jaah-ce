@@ -1,0 +1,208 @@
+{
+  "model": "opus",
+  "agentPushNotifEnabled": true,
+  "skipDangerousModePermissionPrompt": true,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/.claude/context-routes.json\" ] || [ -n \"$JAAH_PROJECT_MEMORY\" ]; then mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/context_router.py\" --path 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/context-router.log\" || true; fi"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/.claude/context-routes.json\" ] || [ -n \"$JAAH_PROJECT_MEMORY\" ]; then mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/context_router.py\" --tool 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/context-router.log\" || true; fi"
+          },
+          {
+            "type": "command",
+            "command": "mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/check_gh_pr_guard.py\" 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/gh-pr-guard.log\" || true"
+          },
+          {
+            "type": "command",
+            "command": "mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/check_tmux_guard.py\" 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/tmux-guard.log\" || true"
+          },
+          {
+            "type": "command",
+            "command": "mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/check_git_stash_guard.py\" 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/git-stash-guard.log\" || true"
+          },
+          {
+            "type": "command",
+            "command": "mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/check_dangerous_rm_guard.py\" 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/dangerous-rm-guard.log\" || true"
+          }
+        ]
+      },
+      {
+        "matcher": "ScheduleWakeup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/check_schedule_wakeup_guard.py\" 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/schedule-wakeup-guard.log\" || true"
+          }
+        ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/capture_askuserquestion.py\" 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/capture-askuserquestion.log\" || true",
+            "timeout": 150
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/read_once_guard.py\" 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/read-once-guard.log\" || true",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$JAAH_PROJECT_MEMORY\" ] || exit 0; mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/context_router.py\" --memory-path 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/context-router.log\" || true",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__plugin_jaah_control__task_complete",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/check_settle_clean_guard.py\" 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/settle-clean-guard.log\" || true"
+          },
+          {
+            "type": "command",
+            "command": "[ -n \"$JAAH_PROJECT_MEMORY\" ] || exit 0; python3 \"/usr/lib/jaahd/tools/project_memory_node.py\" --settle >/dev/null 2>&1 || true",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__plugin_jaah_control__task_settle",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/check_settle_clean_guard.py\" 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/settle-clean-guard.log\" || true"
+          },
+          {
+            "type": "command",
+            "command": "[ -n \"$JAAH_PROJECT_MEMORY\" ] || exit 0; python3 \"/usr/lib/jaahd/tools/project_memory_node.py\" --settle >/dev/null 2>&1 || true",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/tools/check_context.py\" ]; then python3 \"$CLAUDE_PROJECT_DIR/tools/check_context.py\" --quiet; fi",
+            "statusMessage": "Checking context architecture…"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$JAAH_PROJECT_MEMORY\" ] || exit 0; mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/context_router.py\" --tool-result 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/context-router.log\" || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$JAAH_PROJECT_MEMORY\" ] || exit 0; mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/context_router.py\" --tool-result 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/context-router.log\" || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/.claude/context-routes.json\" ] || [ -n \"$JAAH_PROJECT_MEMORY\" ]; then mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/context_router.py\" --prompt 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/context-router.log\" || true; fi",
+            "statusMessage": "Routing context…"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"/usr/lib/jaahd/tools/install_hooks.py\" >/dev/null 2>&1 || true"
+          },
+          {
+            "type": "command",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/.claude/context-routes.json\" ] || [ -n \"$JAAH_PROJECT_MEMORY\" ] || [ -d \"$CLAUDE_PROJECT_DIR/../_repos\" ] || [ -f /jaah/repos/manifest.json ]; then mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/context_router.py\" --session 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/context-router.log\" || true; fi",
+            "statusMessage": "Loading context routing manifest…"
+          },
+          {
+            "type": "command",
+            "command": "[ -n \"$JAAH_PROJECT_MEMORY\" ] || exit 0; python3 \"/usr/lib/jaahd/tools/project_memory_node.py\" --session-start >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" || exit 0; runner=; lib=; [ \"$(uname -s)\" = Linux ] || lib=\"${JAAH_LIB_ROOT:-}\"; [ -n \"$lib\" ] || lib=/usr/lib/jaahd; for c in \"$lib/tools/run_gate.py\" tools/run_gate.py; do if [ -f \"$c\" ]; then runner=\"$c\"; break; fi; done; if [ -z \"$runner\" ]; then echo \"Stop-gate: no run_gate.py at $lib/tools or ./tools — quick gate NOT run here; the pre-commit gate still enforces it\"; exit 0; fi; out=$(python3 \"$runner\" --tier quick 2>&1); rc=$?; [ $rc -eq 78 ] && { echo \"Stop-gate: the quick gate could NOT BE RESOLVED here (run_gate exit 78) — it did not run, so this is NOT a gate failure; the pre-commit gate still enforces it:\"; echo \"$out\" | tail -3; exit 0; }; [ $rc -ne 0 ] && { sel=$(echo \"$out\" | grep -E '✗|FAILED|Error' | tail -5); [ -n \"$sel\" ] || sel=$(echo \"$out\" | tail -5); echo \"$sel\"; exit 2; }; exit 0",
+            "asyncRewake": true,
+            "rewakeSummary": "Test gate failed",
+            "timeout": 60
+          },
+          {
+            "type": "command",
+            "command": "mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/check_unattended_ask_nudge.py\" 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/unattended-ask-nudge.log\" || true",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "[ -n \"$JAAH_PROJECT_MEMORY\" ] || exit 0; python3 \"/usr/lib/jaahd/tools/project_memory_node.py\" --stop >/dev/null 2>&1 || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p \"$CLAUDE_PROJECT_DIR/.omc/logs\" 2>/dev/null; python3 \"/usr/lib/jaahd/tools/read_once_guard.py\" --reset 2>>\"$CLAUDE_PROJECT_DIR/.omc/logs/read-once-guard.log\" || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

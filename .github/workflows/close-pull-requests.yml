@@ -1,0 +1,32 @@
+# This repository is a read-only mirror of the Jaah source: every pull request from a fork is closed with a pointer to
+# Issues.
+# `pull_request_target` runs this repository's own copy of the workflow, never the fork's, and nothing here checks
+# out or runs the pull request's code. Plain REST calls with this run's GITHUB_TOKEN; no third-party action.
+name: Close pull requests
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  close:
+    # Pull requests from forks; a branch of this repository is the maintainers' own.
+    if: github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Comment with a pointer to Issues, then close
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          body="Thanks! This repository is a read-only mirror published from the Jaah source, so it does not take pull requests. Please open an issue describing the change instead: https://github.com/$GITHUB_REPOSITORY/issues"
+          call() { curl -fsS -o /dev/null -X "$1" -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" "$api/$2" -d "$3"; }
+          call POST "issues/$NUMBER/comments" "$(jq -n --arg b "$body" '{body: $b}')"
+          call PATCH "pulls/$NUMBER" '{"state":"closed"}'

@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1
+# Dockerfile.node — the community edition's node: jaahd, git, tmux, Node and every provider CLI, under two uids.
+#
+#   docker build -f Dockerfile.node -t jaah-ce-node .     # from the jaah-ce repository (or a tree build_tree.py built)
+#
+# The node macOS and Windows run inside the compose stack, and the Linux fallback when the native node cannot start
+# (node/jaah-ce-node). amd64 only: Antigravity ships no linux arm64 build. No vendor is blackholed and nothing
+# is stubbed — this is the product node, not the dev sandbox's. Pool worktrees and account
+# dirs live in the `jaah-node-home` volume at `$JAAH_HOME`. It builds from the public tree only (node/stage_bundle.py).
+# The daemon's Python dependencies come from its hash lock (`apps/jaahd/requirements.txt`) into a venv the image
+# builds the way a fleet node does, so the image carries no third-party file of its own and pulls from PyPI at build.
+#
+# Two uids, as on a fleet node (`apps/jaahd/session_user.py`): agent sessions run as `jaah`, the daemon as `jaahd`
+# (primary group `jaah`, the sharing group). The node's identity (`NODE_TOKEN`) is readable by `jaahd` alone, so a
+# session reaches the control plane only through the credential socket. The container starts as root; the entrypoint
+# lays out the runtime tree, then drops each process to its uid.
+
+# ── the node bundle, staged as a packaged node holds it (node/stage_bundle.py) ─────────────────────────────────
+FROM --platform=linux/amd64 python:3.14-slim-trixie@sha256:cd89c30eda26ee911a4611b18680086e0ea42e6f5f8cbe653d07fa7958c9cec8 AS bundle
+WORKDIR /src
+COPY . .
+# The launchers are rendered for the venv's interpreter, built in the final stage below: the path is a string in each
+# launcher and need not exist here.
+RUN python3 node/stage_bundle.py /src /stage /usr/lib/jaahd/venv/bin/python3
+
+# ── Node.js, for the npm-installed CLIs ────────────────────────────────────────────────────────────────────────
+FROM --platform=linux/amd64 node:24-trixie-slim@sha256:54f84b4cf8432b21aaffd5d3ce8d41e12cea0d10d33c09d2f3c9879d49d6b446 AS node
+
+# ── the node ───────────────────────────────────────────────────────────────────────────────────────────────────
+FROM --platform=linux/amd64 python:3.14-slim-trixie@sha256:cd89c30eda26ee911a4611b18680086e0ea42e6f5f8cbe653d07fa7958c9cec8
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git tmux procps ca-certificates curl unzip xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+ && ln -s /usr/local/bin/python3 /usr/bin/python3 \
+ && mkdir -p /usr/lib/jaah-python/bin && ln -s /usr/local/bin/python3 /usr/lib/jaah-python/bin/python3
+
+# At the packaged path, as on a fleet node; the bundle is relocatable, so nothing depends on it. Its `bin/` holds the
+# runner-facing clients stage_bundle.py rendered for the venv's interpreter.
+COPY --from=bundle /stage /usr/lib/jaahd
+# The daemon's venv, built exactly as a fleet node builds it: the same script the fleet package's postinst runs, over
+# the same lock, with the image's python3 (standing in, at its path, for the fleet's `jaah-python`). It needs PyPI at build time and never afterwards.
+RUN sh /usr/lib/jaahd/packaging/jaahd-venv /usr/lib/jaahd
+RUN chmod -R a+rX /usr/lib/jaahd
+
+# `jaah` keeps uid 1000, so a volume from a one-uid release keeps its owner. `/var/lib/jaah-ce` is root's alone:
+# the compose file mounts the control plane's identity volume beneath it, and only the entrypoint (root) reads it.
+# `/home/jaah` 0750 so the daemon (group `jaah`) reaches `JAAH_HOME`, and `/var/lib/jaahd` jaahd:jaah 0750 so a
+# session's clone reaches the daemon's pool mirror beneath it (the fleet package's post-install script sets the same); git trusts the
+# session's repos for the daemon alone, as the fleet package's post-install script sets for the fleet daemon.
+RUN useradd --create-home --uid 1000 --shell /bin/bash jaah \
+ && chmod 0750 /home/jaah \
+ && groupadd --system jaahd \
+ && useradd --system --gid jaah --groups jaahd --home-dir /var/lib/jaahd --shell /usr/sbin/nologin jaahd \
+ && install -d -o jaahd -g jaah -m 0750 /var/lib/jaahd \
+ && git config --file /var/lib/jaahd/.gitconfig safe.directory '*' \
+ && chown jaahd:jaahd /var/lib/jaahd/.gitconfig \
+ && install -d -o root -g root -m 0700 /var/lib/jaah-ce
+WORKDIR /home/jaah
+ENV LANG=C.UTF-8 \
+    JAAH_HOME=/home/jaah/.jaah \
+    JAAH_SESSION_USER=jaah \
+    JAAH_DAEMON_USER=jaahd \
+    JAAH_NODE_ENV_FILE=/var/lib/jaah-ce/node-identity/node.env \
+    JAAH_RUN_ROOT=/run/jaah \
+    JAAH_CRED_SOCKET=/run/jaah/creds/sock \
+    TMUX_TMPDIR=/run/jaah/tmux \
+    JAAH_CLI_ENV_FILE=/usr/lib/jaahd/node/cli_env
+USER jaah
+RUN HOME=/home/jaah PATH=/home/jaah/.local/bin:$PATH /usr/lib/jaahd/node/install_clis.sh /usr/lib/jaahd \
+ # Created as `jaah`, setgid and group-writable, so a fresh volume mounted here inherits the owner and the sharing.
+ && install -d -m 2770 /home/jaah/.jaah
+USER root
+VOLUME ["/home/jaah/.jaah"]
+ENTRYPOINT ["/usr/lib/jaahd/node/entrypoint.sh"]

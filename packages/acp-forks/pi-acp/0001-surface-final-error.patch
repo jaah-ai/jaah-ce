@@ -1,0 +1,73 @@
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -831,6 +831,9 @@
+   // when retry, compaction, or queued continuations run. The session-level prompt
+   // completes only when `agent_settled` is emitted.
+   inAgentLoop = false;
++  // jaah fork (packages/acp-forks/pi-acp): the turn's last assistant message when it ended in error, so a
++  // usage limit answers the prompt with that error instead of `end_turn`.
++  lastAssistantError = null;
+   // For ACP diff support: capture file contents before edit/write mutations,
+   // then emit ToolCallContent {type:"diff"}. Compatible structured edit/write
+   // events may need to be implemented in pi in the future.
+@@ -939,7 +942,10 @@
+   async settleTurn() {
+     await this.publishContextUsage();
+     const reason = this.cancelRequested ? "cancelled" : "end_turn";
+-    this.pendingTurn?.resolve(reason);
++    const limit = this.cancelRequested ? null : usageLimitError(this.lastAssistantError, Date.now());
++    this.lastAssistantError = null;
++    if (limit) this.pendingTurn?.reject(limit);
++    else this.pendingTurn?.resolve(reason);
+     this.pendingTurn = null;
+     this.inAgentLoop = false;
+     const next = this.turnQueue.shift();
+@@ -994,6 +1000,7 @@
+   startTurn(t) {
+     this.cancelRequested = false;
+     this.inAgentLoop = false;
++    this.lastAssistantError = null;
+     this.pendingTurn = { resolve: t.resolve, reject: t.reject };
+     this.emit({
+       sessionUpdate: "session_info_update",
+@@ -1239,6 +1246,11 @@
+         });
+         break;
+       }
++      case "message_end": {
++        const msg = ev.message;
++        if (msg?.role === "assistant") this.lastAssistantError = msg.stopReason === "error" ? msg : null;
++        break;
++      }
+       case "auto_retry_start": {
+         this.emit({
+           sessionUpdate: "agent_message_chunk",
+@@ -1403,6 +1415,28 @@
+   const index = Number(rawIndex);
+   return Number.isSafeInteger(index) && index >= 0 && String(index) === rawIndex ? index : null;
+ }
++var USAGE_LIMIT_RE = /\b429\b|rate[ _-]?limit|usage[ _-]?limit|too many requests|quota/i;
++var RESET_SECONDS_RE = /(?:retry|reset)[^0-9]{0,30}?(\d+(?:\.\d+)?)\s*(?:s|sec|secs|seconds)\b/i;
++var RESET_ISO_RE = /(?:retry|reset|until)[^0-9]{0,30}?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2}))/i;
++var RESET_EPOCH_RE = /(?:retry|reset|until)[^0-9]{0,30}?\b(1\d{9}|1\d{12})\b/i;
++function resetsAtFrom(text, now) {
++  let at = now + 36e5;
++  const seconds = RESET_SECONDS_RE.exec(text);
++  const iso = RESET_ISO_RE.exec(text);
++  const epoch = RESET_EPOCH_RE.exec(text);
++  if (seconds) at = now + Number(seconds[1]) * 1e3;
++  else if (iso && !Number.isNaN(Date.parse(iso[1]))) at = Date.parse(iso[1]);
++  else if (epoch) at = epoch[1].length > 10 ? Number(epoch[1]) : Number(epoch[1]) * 1e3;
++  return new Date(Math.max(at, now)).toISOString();
++}
++// A turn whose model call pi gave up on with a 429 or usage limit -> the prompt's JSON-RPC error, with the class and
++// reset jaah's host reads from `_meta["jaah.ai"]` (one hour on when pi names no time). Any other error -> null.
++function usageLimitError(msg, now) {
++  const message = String(msg?.errorMessage ?? "");
++  if (!USAGE_LIMIT_RE.test(message)) return null;
++  const meta = { error_class: "usage_limit", resets_at: resetsAtFrom(message, now) };
++  return new RequestError2(429, message, { _meta: { "jaah.ai": meta } });
++}
+ function formatAutoRetryMessage(ev) {
+   const attempt = Number(ev.attempt);
+   const maxAttempts = Number(ev.maxAttempts);

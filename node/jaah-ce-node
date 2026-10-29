@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# jaah-ce-node — install the community edition's node natively on Linux, as you: no sudo, no apt, a systemd user unit.
+#
+#   jaah-ce-node install                  # provision and start the node
+#   jaah-ce-node install --upgrade <tag>  # re-provision jaahd and the CLIs at <tag> (the control plane's tag)
+#
+# Probes first: `systemctl --user` must answer, `tmux` and `git` must be installed, and the runtime download must
+# succeed. Any miss runs the node as a container in the compose stack instead (its `node` profile) and says so in
+# one line. Otherwise everything lands under ~/.local/share/jaah-ce: a managed Python (via uv), a Node LTS, the
+# node bundle with its runner-facing clients in lib/bin (stage_bundle.py, run under that Python) and every provider
+# CLI (install_clis.sh); the unit reads ~/.config/jaah-ce/node.env,
+# which the control plane writes (`python -m app.ce_node env --native`), and cli_env (the CLIs' telemetry off).
+set -euo pipefail
+
+say() { printf 'jaah-ce-node: %s\n' "$*"; }
+die() { say "$*" >&2; exit 1; }
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The source tree: this directory sits at the public repo's root (`node/`), or under the edition's directory in the monorepo.
+if [ -d "$here/../apps/jaahd" ]; then root="$(cd "$here/.." && pwd)"; else root="$(cd "$here/../../.." && pwd)"; fi
+data="${XDG_DATA_HOME:-$HOME/.local/share}/jaah-ce"
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/jaah-ce"
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+unit="jaah-ce-node.service"
+python_series="3.14"
+node_series="latest-v24.x"
+
+compose() { docker compose -f "$root/compose.yml" "$@"; }
+
+fallback() {
+  say "$1 — running the node as a container instead (docker compose --profile node up -d node)"
+  [ -f "$root/compose.yml" ] || die "no compose.yml beside this checkout ($root) — start the stack from the jaah-ce repository"
+  compose exec -T api python -m app.ce_node home --container </dev/null \
+    || die "could not point the control plane at the container node — is the stack up? (docker compose up -d)"
+  compose --profile node up -d node
+  exit 0
+}
+
+usage() { sed -n '3,5p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+[ "${1:-}" = install ] || usage
+shift
+if [ "${1:-}" = --upgrade ]; then
+  tag="${2:?--upgrade needs the tag to install}"
+  git -C "$root" fetch --quiet --tags origin
+  git -C "$root" -c advice.detachedHead=false checkout --quiet --detach "refs/tags/$tag"
+  say "source at $tag — re-provisioning"
+  exec "${BASH_SOURCE[0]}" install
+fi
+[ $# -eq 0 ] || usage
+
+# ── probes: any miss is the container fallback ────────────────────────────────────────────────────────────────
+systemctl --user show-environment >/dev/null 2>&1 || fallback "systemctl --user does not answer on this host"
+command -v tmux >/dev/null 2>&1 || fallback "tmux is not installed"
+command -v git >/dev/null 2>&1 || fallback "git is not installed"
+stage="$(mktemp -d)"
+trap 'rm -rf -- "$stage"' EXIT
+curl -fsSL -o "$stage/uv-install.sh" https://astral.sh/uv/install.sh \
+  && curl -fsSL -o "$stage/SHASUMS256.txt" "https://nodejs.org/dist/$node_series/SHASUMS256.txt" \
+  || fallback "the runtime download failed"
+
+mkdir -p "$data" "$conf" "$unit_dir"
+chmod 0700 "$data" "$conf"
+
+# ── runtimes: a managed Python and a Node LTS, both user-level ────────────────────────────────────────────────
+UV_INSTALL_DIR="$data/uv" UV_NO_MODIFY_PATH=1 sh "$stage/uv-install.sh" --quiet
+export UV_PYTHON_INSTALL_DIR="$data/python"
+"$data/uv/uv" python install --quiet "$python_series"
+py="$("$data/uv/uv" python find --managed-python "$python_series")"
+
+case "$(uname -m)" in x86_64|amd64) node_arch=x64 ;; aarch64|arm64) node_arch=arm64 ;; *) die "unsupported CPU $(uname -m)" ;; esac
+tarball="$(awk -v a="linux-$node_arch.tar.xz" '$2 ~ a"$" {print $2}' "$stage/SHASUMS256.txt")"
+curl -fsSL -o "$stage/$tarball" "https://nodejs.org/dist/$node_series/$tarball"
+(cd "$stage" && grep " $tarball\$" SHASUMS256.txt | sha256sum -c --quiet -)
+rm -rf -- "$data/node"
+mkdir -p "$data/node"
+tar -xJf "$stage/$tarball" -C "$data/node" --strip-components=1
+
+# ── the node bundle and the provider CLIs ─────────────────────────────────────────────────────────────────────
+rm -rf -- "$data/lib.new"
+"$py" "$here/stage_bundle.py" "$root" "$data/lib.new"
+rm -rf -- "$data/lib"
+mv "$data/lib.new" "$data/lib"
+PATH="$HOME/.local/bin:$data/node/bin:$(dirname "$py"):$PATH" "$data/lib/node/install_clis.sh" "$data/lib"
+
+# ── the node's identity: written once, by the control plane ───────────────────────────────────────────────────
+if [ ! -s "$conf/node.env" ]; then
+  [ -f "$root/compose.yml" ] || die "no $conf/node.env and no compose.yml to ask the control plane for one"
+  (umask 077 && compose exec -T api python -m app.ce_node env --native > "$conf/node.env.new")
+  mv "$conf/node.env.new" "$conf/node.env"
+fi
+chmod 0600 "$conf/node.env"
+# Every slot and clone path the control plane hands the node derives from its home: this one, not the container's.
+[ -f "$root/compose.yml" ] || die "no compose.yml beside this checkout ($root) to tell the control plane this node's home"
+compose exec -T api python -m app.ce_node home "$data/home" </dev/null \
+  || die "could not tell the control plane this node's home — is the stack up? (docker compose up -d), then run this again"
+
+# ── the unit ──────────────────────────────────────────────────────────────────────────────────────────────────
+# One uid (no sudo): every agent session can read node.env — an accepted limit, tools/community_edition/README.md
+# § The node, "The node token and agent sessions".
+cat > "$unit_dir/$unit" <<UNIT
+[Unit]
+Description=Jaah Community Edition node
+After=network-online.target
+
+[Service]
+Environment=JAAH_HOME=$data/home
+Environment=JAAH_SESSION_USER=%u
+Environment=JAAH_NODE_ENV_FILE=$conf/node.env
+Environment=JAAH_RUN_ROOT=%t/jaah-ce
+Environment=JAAH_CRED_SOCKET=%t/jaah-ce/creds.sock
+Environment=TMUX_TMPDIR=%t/jaah-ce/tmux
+Environment=JAAH_CLI_ENV_FILE=$data/lib/node/cli_env
+Environment=PATH=%h/.local/bin:$data/lib/bin:$data/node/bin:$(dirname "$py"):/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=$data/lib/node/cli_env
+EnvironmentFile=$conf/node.env
+ExecStartPre=/bin/mkdir -p -m 0700 %t/jaah-ce/tmux/tmux-$(id -u) $data/home
+ExecStart=$py $data/lib/apps/jaahd/main.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
+systemctl --user daemon-reload
+systemctl --user enable --quiet "$unit"
+systemctl --user restart "$unit"
+loginctl enable-linger "$(id -un)" 2>/dev/null \
+  || say "could not keep the node running after you log out (loginctl enable-linger refused) — it runs while you are logged in"
+say "node installed and started — systemctl --user status $unit"
