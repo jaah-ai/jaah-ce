@@ -6,19 +6,21 @@ logout, health, /api/public/*).
 """
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import os
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta, timezone
 from types import MappingProxyType
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, overload
 from uuid import UUID
 
 import bcrypt
 from fastapi import Depends, HTTPException, Request
 from itsdangerous import BadSignature, SignatureExpired, TimestampSigner, URLSafeTimedSerializer
-from sqlalchemy import select
+from sqlalchemy import inspect as sa_inspect, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import instance_dict
 from starlette.concurrency import run_in_threadpool
@@ -29,10 +31,11 @@ from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app import act_as, api_keys, edition, edition_features, hipaa, node_credentials, request_caller
-from app.actors import set_request_actor
+from app.actors import REQUEST_ACTOR_ATTR, set_request_actor
 # The session clock, in epoch seconds, under this module's own name so a test moves minting and verifying alike.
-from app.clock import epoch as _now
-from app.db import IdentitySessionLocal, SessionLocal, get_session
+from app.clock import epoch as _now, utcnow
+from app import db_async
+from app.db_async import DbDep
 from app.dev_bypass import is_local_env
 from app.entity_shape import optional_uuid
 from app.models.identity import AdminUser
@@ -149,7 +152,7 @@ NODE_TOKEN_API_PATHS: Mapping[str, frozenset[str]] = MappingProxyType(
 def _touch_last_seen(session: Session, user: AdminUser) -> None:
     """Presence, throttled — and the account's first use stamps `activated_at`, which is what moves it off
     "invited" on People (`routes/users.py::_invitation_status`)."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     last = user.last_seen_at
     if last is not None and last.tzinfo is None:
         last = last.replace(tzinfo=timezone.utc)
@@ -199,7 +202,10 @@ def google_client_id() -> str | None:
 
     Unset is fail-closed: no button, and POST /api/auth/google 503s. Anything not ending in
     `.apps.googleusercontent.com` (a bad paste, a placeholder, the client secret) reads as unset, rather
-    than rendering a button wired to a bogus audience."""
+    than rendering a button wired to a bogus audience. An edition without `oauth_signin` (whose
+    `/api/auth/google` is not served) has none."""
+    if not edition_features.enabled("oauth_signin"):
+        return None
     value = (os.environ.get("GOOGLE_CLIENT_ID") or "").strip()
     return value if value.endswith(".apps.googleusercontent.com") else None
 
@@ -211,8 +217,14 @@ class _ClockedSigner(TimestampSigner):
         return int(_now())
 
 
+def signer(salt: str, *, signer_class: type[TimestampSigner] = TimestampSigner) -> URLSafeTimedSerializer:
+    """THE signer over the session secret, one per `salt` (the session cookie, the MFA pending cookie, an OAuth
+    flow cookie, an SSO test handoff). Built per call, never cached, so a patched `SESSION_SECRET` applies."""
+    return URLSafeTimedSerializer(resolve_session_secret(), salt=salt, signer=signer_class)
+
+
 def _serializer() -> URLSafeTimedSerializer:
-    return URLSafeTimedSerializer(resolve_session_secret(), salt="cockpit-session", signer=_ClockedSigner)
+    return signer("cockpit-session", signer_class=_ClockedSigner)
 
 
 class SessionClaims(NamedTuple):
@@ -259,6 +271,14 @@ def create_session_token(
     if terms is not None:
         payload["terms"] = terms
     return _serializer().dumps(payload)
+
+
+def session_ref(connection: HTTPConnection) -> tuple[UUID, int, int] | None:
+    """`(admin_id, epoch, iepoch)` of the connection's session cookie: what a console ticket is minted with
+    (`routes/console.py`), re-asked on by the sweep (`app/console_relay/tickets.py::sweep`), and what the browser
+    leg's dial must carry (`tickets.claim`)."""
+    claims = read_session(connection.cookies.get(COOKIE_NAME))
+    return (claims.admin_id, claims.epoch, claims.iepoch) if claims is not None else None
 
 
 def read_session(token: str | None) -> SessionClaims | None:
@@ -519,23 +539,39 @@ class NodeAuthUnavailable(RuntimeError):
 NODE_AUTH_UNAVAILABLE_DETAIL = "node authentication unavailable"
 
 
+#: A foreign thread's bound on an identity read run on the serving loop (`app/authz/principal.py`'s figure).
+_IDENTITY_READ_TIMEOUT_SECONDS = 30.0
+
+
 def _valid_node_token(request: Request) -> bool:
+    """`_valid_node_token_async` for a caller on a foreign thread (the guard's decision): run on the serving loop. A
+    bridge that cannot deliver (a timeout, no loop) is the database being unavailable: 503, never a 401."""
+    try:
+        return db_async.run_on_loop(_valid_node_token_async(request), timeout=_IDENTITY_READ_TIMEOUT_SECONDS)
+    except (TimeoutError, RuntimeError) as exc:
+        raise NodeAuthUnavailable(str(exc)) from exc
+
+
+async def _valid_node_token_async(request: Request) -> bool:
     """Fail-closed check of the request's X-Agent-Token, for the `NODE_TOKEN_API_PATHS` carve-out.
 
     The rule is `app/node_credentials.py::resolve`'s; this wrapper exists because the middleware needs a
     boolean and runs outside the dependency graph.
 
-    Opens its own short-lived session (middleware has nothing to inherit), on the identity lane
-    (`app/db.py`) so a starved request pool cannot refuse a node. Synchronous: the caller runs it via
-    `run_in_threadpool` so the DB round trip does not block the event loop.
+    Opens its own short-lived session (middleware has nothing to inherit): an identity read on the async pool
+    (`app/db_async.py`), awaited on the loop.
 
     A database fault refuses the caller (fails closed) by raising `NodeAuthUnavailable` — a 503, not the
     401 a bad token earns: an unproven caller must not get through, unlike
-    `app/routes/node_bus.py::_identity`, where the fact at stake is cosmetic."""
+    `app/routes/node_bus.py::_identity`, where the fact at stake is cosmetic.
+
+    The resolved caller is kept on `request.state.agent_caller` (`agent_caller`), so a carve-out route can
+    scope its rows to the calling node's org without resolving the token a second time."""
     presented = request.headers.get("X-Agent-Token", "")
     try:
-        with IdentitySessionLocal() as session:
-            return node_credentials.resolve(session, presented) is not None
+        caller = await db_async.run_in_session(node_credentials.resolve, presented, identity=True)
+        request.state.agent_caller = caller
+        return caller is not None
     except Exception as exc:  # noqa: BLE001 — see the docstring: an unprovable caller is refused
         logging.getLogger(__name__).warning(
             "node-auth: could not resolve an X-Agent-Token on %s (%s) — refusing with 503",
@@ -604,7 +640,7 @@ class SessionAuthMiddleware:
                 host = request.client.host if request.client else None
                 if not api_keys.parse(presented_key):
                     return JSONResponse({"detail": api_keys.INVALID_DETAIL}, status_code=401)
-                verdict = await run_in_threadpool(api_keys.verify, presented_key, host)
+                verdict = await api_keys.verify_async(presented_key, host)
                 if isinstance(verdict, api_keys.Refusal):
                     await run_in_threadpool(api_keys.record_refusal, verdict, client_ip=host)
                     return api_keys.refusal_response(verdict, host)
@@ -614,8 +650,8 @@ class SessionAuthMiddleware:
                 # No valid session. A daemon call with its own X-Agent-Token passes only for the carve-out
                 # paths and methods, so the route's `require_user_or_agent` can run. Everything else stays 401.
                 try:
-                    agent_ok = request.method in NODE_TOKEN_API_PATHS.get(path, ()) and await run_in_threadpool(
-                        _valid_node_token, request
+                    agent_ok = request.method in NODE_TOKEN_API_PATHS.get(path, ()) and await _valid_node_token_async(
+                        request
                     )
                 except NodeAuthUnavailable:
                     return JSONResponse({"detail": NODE_AUTH_UNAVAILABLE_DETAIL}, status_code=503)
@@ -632,7 +668,7 @@ class SessionAuthMiddleware:
                 from app import ip_allowlist
 
                 host = request.client.host if request.client else None
-                refused = await run_in_threadpool(ip_allowlist.session_refusal, admin_id, host)
+                refused = await ip_allowlist.session_refusal(claims.admin_id, host)
                 if refused is not None:
                     return ip_allowlist.refused_response(host)
                 request.state.admin_id = admin_id
@@ -693,38 +729,93 @@ def session_idled_out(conn: HTTPConnection | None, session: Session, user: Admin
     return hipaa_on and hipaa.idled_out(age)
 
 
-def _session_user(request: Request, session: Session) -> AdminUser | None:
-    """Resolve the AdminUser for the request's session cookie, or None (absent/bad cookie, unknown user, or
-    stale session_epoch). The one home both `require_user` and `require_user_or_agent` use. A session its
-    org's HIPAA idle rule ended raises 401 `SESSION_IDLE_TIMEOUT_DETAIL` instead (`session_idled_out`)."""
-    claims = read_session(request.cookies.get(COOKIE_NAME))
-    if claims is None:
-        key = api_keys.of(request) if COOKIE_NAME not in request.cookies else None
-        return _api_key_owner(session, key) if key is not None else None
-    # On the identity lane (`app/db.py`), never the route session: a dependency runs in its own threadpool
-    # call, so a connection the route session checked out here would be HELD while the request queues for
-    # its next thread — and a burst of such requests holds every connection while each waits for a thread
-    # whose occupant waits for a connection. The row then joins the route session without a
-    # query (`merge(load=False)`), so a route that writes the caller's own row still writes it.
-    with IdentitySessionLocal() as identity:
-        # Inside the identity escape: this read resolves who is asking, and `admin_users` is tenant-owned. On
-        # `@always(Tenancy.BOOTSTRAP)` routes no scope is bound, so a filtered lookup would 401 every valid
-        # cookie (`app/tenancy/seam.py::identity_scope`). The escape closes on the row: the writes below stamp
-        # nothing under `IDENTITY` or unbound alike, and `AdminUser` has no lazy relationship a route reads.
-        with seam.identity_scope():
-            user = identity.get(AdminUser, claims.admin_id)
-        if not session_row_is_live(user, claims.epoch, claims.iepoch):
-            return None
-        if session_idled_out(request, identity, user, claims.issued_at):
-            raise HTTPException(status_code=401, detail=SESSION_IDLE_TIMEOUT_DETAIL)
+#: Where a request notes the cookie row it has already verified (`note_verified_row`), so the second reader of
+#: the same cookie in that request reuses it instead of a second identity-lane checkout and re-read.
+_VERIFIED_ROW_ATTR = "session_verified_row"
+
+
+def note_verified_row(conn: HTTPConnection, claims: SessionClaims, user: AdminUser) -> None:
+    """Record `user` as this request's cookie row, read for `claims` and found live and not idled out. Only a row
+    that passed both checks is noted; the note lives as long as the request's scope."""
+    setattr(conn.state, _VERIFIED_ROW_ATTR, (claims.admin_id, claims.epoch, claims.iepoch, claims.issued_at, user))
+
+
+def _verified_row(conn: HTTPConnection, claims: SessionClaims) -> AdminUser | None:
+    """The row `note_verified_row` recorded for exactly these claims in this request, or None."""
+    noted = getattr(conn.state, _VERIFIED_ROW_ATTR, None)
+    if noted is None or noted[:4] != (claims.admin_id, claims.epoch, claims.iepoch, claims.issued_at):
+        return None
+    return noted[4]
+
+
+def _session_row_in(identity: Session, request: Request, claims: SessionClaims) -> AdminUser | None:
+    """`_read_session_row`'s read over `identity` (sync ORM code, run over the async connection)."""
+    # Inside the identity escape: this read resolves who is asking, and `admin_users` is tenant-owned. On
+    # `@always(Tenancy.BOOTSTRAP)` routes no scope is bound, so a filtered lookup would 401 every valid
+    # cookie (`app/tenancy/seam.py::identity_scope`). The escape closes on the row: the writes below stamp
+    # nothing under `IDENTITY` or unbound alike, and `AdminUser` has no lazy relationship a route reads.
+    with seam.identity_scope():
+        user = identity.get(AdminUser, claims.admin_id)
+    if not session_row_is_live(user, claims.epoch, claims.iepoch):
+        return None
+    if session_idled_out(request, identity, user, claims.issued_at):
+        raise HTTPException(status_code=401, detail=SESSION_IDLE_TIMEOUT_DETAIL)
+    return user
+
+
+def _join_route_session(session: Session, request: Request | None, user: AdminUser, present: bool) -> AdminUser:
+    """`user` (read on the async pool) joined to the route session without a query, its writes attributed to
+    them, and — for a cookie (`present`) not sent by Jarvis — their presence stamped."""
     user = session.merge(user, load=False)
     # Whose writes this session's flushes are, for `actors.stamp_dirty_task_actors`. Recorded here, the one
     # place a console session resolves to a user; agent-token requests attribute to the system actor.
     set_request_actor(session, user.id)
+    # And on the request, for an async route's own session (`app/actors.py::REQUEST_STATE_KEY`).
+    if request is not None:
+        setattr(request.state, REQUEST_ACTOR_ATTR, user.id)
     # A read Jarvis made for the user is not the user being present.
-    if not assisted(request):
+    if present and request is not None and not assisted(request):
         _touch_last_seen(session, user)
+        # A presence write that failed rolled back and expired the row: reload it here, inside the session's own
+        # call, since an async route reads it on the loop, where a lazy refresh cannot run (`MissingGreenlet`).
+        if sa_inspect(user).expired_attributes:
+            session.refresh(user)
     return user
+
+
+async def _session_user(request: Request, session: AsyncSession) -> AdminUser | None:
+    """Resolve the AdminUser for the request's session cookie (or API key), or None (absent/bad cookie, unknown user,
+    or stale session_epoch). A session its org's HIPAA idle rule ended raises 401 `SESSION_IDLE_TIMEOUT_DETAIL`
+    instead (`session_idled_out`). The identity reads are awaited on the async pool (each completes and releases
+    before the route session's first statement, `app/db_async.py`), and the row joins the route's `AsyncSession`.
+    The authz guard resolves the principal first and notes the row it verified for these same claims
+    (`authz/principal.py::_resolve_principal`): reusing it saves every guarded request two reads."""
+    claims = read_session(request.cookies.get(COOKIE_NAME))
+    if claims is None:
+        key = api_keys.of(request) if COOKIE_NAME not in request.cookies else None
+        if key is None:
+            return None
+        owner = await _identity_read(session, _key_owner_in, key.owner_id)
+        if owner is None or owner.disabled_at is not None:
+            return None
+        return await session.run_sync(_join_route_session, request, owner, False)
+    user = _verified_row(request, claims)
+    if user is None:
+        user = await _identity_read(session, _session_row_in, request, claims)
+        if user is None:
+            return None
+        note_verified_row(request, claims, user)
+    return await session.run_sync(_join_route_session, request, user, True)
+
+
+async def _identity_read(route: AsyncSession, fn, *args):  # type: ignore[no-untyped-def]
+    """`fn(identity_session, *args)` on the async pool as an identity read, under `_IDENTITY_READ_TIMEOUT_SECONDS`. A
+    dependency resolved ahead of this one (a router's plan-switch check) may have left a read open on the route
+    session: it is returned first, since a coroutine never holds two connections (`app/db_async.py`)."""
+    await db_async.release(route)
+    return await asyncio.wait_for(
+        db_async.run_in_session(fn, *args, identity=True), timeout=_IDENTITY_READ_TIMEOUT_SECONDS
+    )
 
 
 def assisted(request: Request) -> bool:
@@ -737,76 +828,118 @@ def assisted(request: Request) -> bool:
     return assist.of(request) is not None
 
 
-def _api_key_owner(session: Session, key: "api_keys.ApiKeyContext") -> AdminUser | None:
-    """The owner a verified API key (`SessionAuthMiddleware`) acts as, re-read on the identity lane as a cookie's row
-    is; None once disabled. No presence write: a script is not the person being present."""
-    with IdentitySessionLocal() as identity:
-        with seam.identity_scope():
-            user = identity.scalar(select(AdminUser).where(AdminUser.id == key.owner_id))
-        if user is None or user.disabled_at is not None:
-            return None
-    user = session.merge(user, load=False)
+def _key_owner_in(identity: Session, owner_id: UUID) -> AdminUser | None:
+    with seam.identity_scope():
+        return identity.scalar(select(AdminUser).where(AdminUser.id == owner_id))
+
+
+#: `session.info` key holding the person `adopt_user` joined behind an act-as seat.
+_ADOPTED_PERSON_KEY = "adopted_person"
+
+
+@overload
+def adopt_user(session: Session, user: AdminUser) -> AdminUser: ...
+@overload
+def adopt_user(session: Session, user: None) -> None: ...
+def adopt_user(session: Session, user: Optional[AdminUser]) -> Optional[AdminUser]:
+    """The request's user, joined to `session` — an async route's own session, inside `run_sync` — without a query,
+    as `_session_user` joins it to its dependency's session: so a write to the caller's row lands with the route's
+    commit, and a lazy read goes over the route's connection. A detached copy (an act-as seat, a key's narrowed row:
+    `app/act_as.py`) is never written and stays as it is; the person behind a seat joins instead, as `_session_user`
+    joins them before `_acting_seat` swaps the seat in, so the route's own reads find their row. The route session's
+    writes are theirs (`set_request_actor`; a seat carries its person's id), as on the sync route session."""
+    if user is None:
+        return user
     set_request_actor(session, user.id)
-    return user
+    if sa_inspect(user).session is None:
+        person = act_as.person(user)
+        if person is not user and sa_inspect(person).session is not None:
+            # Held by the session: its identity map keeps an unmodified instance only weakly.
+            session.info[_ADOPTED_PERSON_KEY] = session.merge(person, load=False)
+        return user
+    return session.merge(user, load=False)
 
 
-def require_user(
-    request: Request, session: Session = Depends(get_session)
-) -> AdminUser:
-    user = _session_user(request, session)
+def agent_caller(request: Request) -> Optional[node_credentials.AgentCaller]:
+    """The X-Agent-Token caller the middleware authenticated for a carve-out path (`_valid_node_token`), or None
+    when the request carried a cookie or no valid token. A route reads it only after `require_user_or_agent`
+    answered None (the agent case)."""
+    return getattr(request.state, "agent_caller", None)
+
+
+# ── The dependency family: `require_user` & co. ─────────────────────────────────────────────────────────────
+# The caller's row joins the route's own `AsyncSession` (FastAPI caches `get_db` per request, so the handler's
+# `DbDep` is that session), so the route's writes carry the caller as their actor.
+
+
+async def _acting_seat(request: Request, session: AsyncSession, user: AdminUser) -> AdminUser:
+    """`user`, or — when an operator's tab acts as an org (`app/act_as.py`) — that org's Owner seat, read as an
+    identity read. An API key never acts as an org: the key itself says whose seat it is (`api_keys.narrow`)."""
+    key = api_keys.of(request)
+    if key is not None:
+        return api_keys.key_user(user, key)
+    requested = act_as.requested(request.headers)
+    if requested is None:
+        return user
+    target = await _identity_read(session, act_as.target_org, user, requested)
+    return act_as.seat_user(user, target) if target is not None else user
+
+
+async def require_user(request: Request, session: DbDep) -> AdminUser:
+    """The signed-in caller (or an API key's owner), or 401."""
+    user = await _session_user(request, session)
     if user is None:
         raise HTTPException(status_code=401, detail="unauthorized")
-    return _acting_seat(request, session, user)
+    return await _acting_seat(request, session, user)
 
 
-def require_user_or_signed_out(
-    request: Request, session: Session = Depends(get_session)
-) -> AdminUser:
+async def require_user_or_signed_out(request: Request, session: DbDep) -> AdminUser:
     """`require_user` for `GET /api/auth/me`, except that the console's signed-out probe whose cookie decodes but
     holds no session (ended by a sign-out elsewhere, a disabled seat) answers 204 and clears it, as the middleware
     does for a cookie that does not decode (`SIGNED_OUT_PROBE_HEADER`)."""
-    user = _session_user(request, session)
+    user = await _session_user(request, session)
     if user is None:
         if is_session_probe(request):
             raise HTTPException(status_code=204, headers=signed_out_headers(clear_session=True))
         raise HTTPException(status_code=401, detail="unauthorized")
-    return _acting_seat(request, session, user)
+    return await _acting_seat(request, session, user)
 
 
-def require_person(user: AdminUser = Depends(require_user)) -> AdminUser:
+async def require_user_or_agent(request: Request, session: DbDep) -> AdminUser | None:
+    """Auth for the daemon's cookie-less read surface (NODE_TOKEN_API_PATHS). A valid console session returns the
+    AdminUser as require_user does. Otherwise, if the middleware validated an X-Agent-Token
+    (`request.state.agent_authenticated`), return None; the route must tolerate a None actor. Anything else is 401.
+    Only routes in NODE_TOKEN_API_PATHS may depend on this."""
+    user = await _session_user(request, session)
+    if user is not None:
+        return await _acting_seat(request, session, user)
+    if getattr(request.state, "agent_authenticated", False):
+        return None
+    raise HTTPException(status_code=401, detail="unauthorized")
+
+
+async def require_person(user: AdminUser = Depends(require_user)) -> AdminUser:
     """The signed-in person's own row even while their tab acts as an org (`act_as.person`) — for routes about
     the person, not the org: their second factor, their trusted devices."""
     return act_as.person(user)
 
 
-def _acting_seat(request: Request, session: Session, user: AdminUser) -> AdminUser:
-    """`user`, or — when an operator's tab acts as an org (`app/act_as.py`) — that org's Owner seat. The org
-    is read on the identity lane, for `_session_user`'s reason."""
-    key = api_keys.of(request)
-    if key is not None:
-        # The header is ignored for a key (R3): the key itself says whose seat it is (`api_keys.narrow`).
-        return api_keys.key_user(user, key)
-    requested = act_as.requested(request.headers)
-    if requested is None:
-        return user
-    with IdentitySessionLocal() as identity:
-        target = act_as.target_org(identity, user, requested)
-    return act_as.seat_user(user, target) if target is not None else user
+async def require_superadmin(user: AdminUser = Depends(require_user)) -> AdminUser:
+    """Gate a route to is_superadmin users only; anyone else reads `hidden_route`."""
+    return check_superadmin(user)
 
 
-def require_user_or_agent(
-    request: Request, session: Session = Depends(get_session)
-) -> AdminUser | None:
-    """Auth for the daemon's cookie-less read surface (NODE_TOKEN_API_PATHS). A valid console session
-    returns the AdminUser as require_user does. Otherwise, if the middleware validated an X-Agent-Token
-    (`request.state.agent_authenticated`), return None; the route must tolerate a None actor. Anything
-    else is 401. Only routes in NODE_TOKEN_API_PATHS may depend on this."""
-    user = _session_user(request, session)
-    if user is not None:
-        return _acting_seat(request, session, user)
-    if getattr(request.state, "agent_authenticated", False):
-        return None
-    raise HTTPException(status_code=401, detail="unauthorized")
+async def require_operator(user: AdminUser = Depends(require_user)) -> AdminUser:
+    """Gate a handler to the deployment's operator (`check_operator`)."""
+    return check_operator(user)
+
+
+async def require_operator_acting(user: AdminUser = Depends(require_user)) -> AdminUser:
+    """`require_operator`, read on the person behind an act-as seat (`act_as.person`): an operator acting as an org
+    passes and the handler runs as that org's seat; a tenant admin is refused as `require_operator` refuses them.
+    For operator doors the console reaches with a one-request act-as on another org's row (`pool_slots.py`)."""
+    check_operator(act_as.person(user))
+    return user
 
 
 def hidden_route() -> HTTPException:
@@ -816,8 +949,8 @@ def hidden_route() -> HTTPException:
     return HTTPException(status_code=404)
 
 
-def require_superadmin(user: AdminUser = Depends(require_user)) -> AdminUser:
-    """Gate a route to is_superadmin users only; anyone else reads `hidden_route`."""
+def check_superadmin(user: AdminUser) -> AdminUser:
+    """`user` if is_superadmin, else `hidden_route`."""
     if not user.is_superadmin:
         raise hidden_route()
     return user
@@ -835,17 +968,17 @@ OPERATOR_GATE_FLEET_DETAIL = (
 )
 
 
-def require_operator(user: AdminUser = Depends(require_user)) -> AdminUser:
-    """Gate a handler to the deployment's operator: `is_superadmin` and an operator-plane org
+def check_operator(user: AdminUser) -> AdminUser:
+    """`user` if they are the deployment's operator, else `hidden_route`: `is_superadmin` and an operator-plane org
     (`app/tenancy/ids.py::is_operator_plane`).
 
     For routes whose subject is the fleet but whose declaration is `ORG_SCOPED` (`routes/model_prices.py`,
     `routes/port_grid.py`, `routes/cloud_nodes.py`), which `authz_guard`'s `Tenancy.OPERATOR` check never
     sees. A tenant-org superadmin must not rewrite the fleet's rate card or launch defaults. Anyone else,
     operator staff included, reads `hidden_route`: the door is not advertised."""
-    from app.tenancy.ids import is_operator_plane
+    from app.tenancy.ids import is_operator_user
 
-    if not is_operator_plane(user.org_id, user.is_superadmin):
+    if not is_operator_user(user):
         raise hidden_route()
     return user
 
@@ -857,23 +990,15 @@ def require_operator_field(user: AdminUser) -> AdminUser:
     Two refusal sentences keyed on `is_tenant_org` (which reader, not who is admitted): the tenant arm
     names who can act and nothing of the operator's deployment (`app/tenancy/copy.py`'s rule); operator
     staff get the fleet-wide sentence."""
-    from app.tenancy.ids import is_operator_plane, is_tenant_org
+    from app.tenancy.ids import is_operator_user, is_tenant_org
 
-    if not is_operator_plane(user.org_id, user.is_superadmin):
+    if not is_operator_user(user):
         detail = (
             OPERATOR_GATE_TENANT_DETAIL
             if is_tenant_org(user.org_id)
             else OPERATOR_GATE_FLEET_DETAIL
         )
         raise HTTPException(status_code=403, detail=detail)
-    return user
-
-
-def require_operator_acting(user: AdminUser = Depends(require_user)) -> AdminUser:
-    """`require_operator`, read on the person behind an act-as seat (`act_as.person`): an operator acting as an org
-    passes and the handler runs as that org's seat; a tenant admin is refused as `require_operator` refuses them.
-    For operator doors the console reaches with a one-request act-as on another org's row (`pool_slots.py`)."""
-    require_operator(act_as.person(user))
     return user
 
 
@@ -893,7 +1018,4 @@ def assert_superadmin_floor(session: Session, target: AdminUser | None = None) -
         .with_for_update()
     ).all()
     if len(locked) <= 1:
-        raise HTTPException(
-            status_code=409,
-            detail="cannot remove the last superadmin",
-        )
+        raise HTTPException(status_code=409, detail="cannot remove the last superadmin")

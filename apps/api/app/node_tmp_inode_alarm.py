@@ -101,9 +101,9 @@ def after_commit(crossing: Optional[Crossing]) -> None:
     if crossing is None:
         return
     from app import alert_record
-    from app.db import SessionLocal
+    from app.db import BridgedSession
 
-    session = SessionLocal()
+    session = BridgedSession()
     try:
         colocated = False
         if edition_features.enabled("multi_node_hosts"):  # The community edition has no Multi-Node Hosts.

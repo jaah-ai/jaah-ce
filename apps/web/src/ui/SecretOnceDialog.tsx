@@ -1,7 +1,8 @@
 import type { JSX, ReactNode } from 'react'
 import Banner from './Banner'
-import CopyableValue from './CopyableValue'
+import { CopyableValue } from './CopyableValue'
 import FormDialog from './FormDialog'
+import { grid } from '../theme'
 
 /* THE ONE TIME A SECRET IS SHOWN (a trigger's on create/reveal/rotate, an API key's on create/rotate). The
  * secret lives only in the caller's transient state, passed in here; closing hands control back so the
@@ -15,6 +16,8 @@ export default function SecretOnceDialog({
   submitLabel,
   testIdPrefix,
   valueTestId = `${testIdPrefix}-value`,
+  copyLabel = 'Copy secret',
+  children,
   onClose,
 }: {
   /** `null` = closed. */
@@ -28,6 +31,10 @@ export default function SecretOnceDialog({
   testIdPrefix: string
   /** Overrides the value box's id where an e2e already reads another. */
   valueTestId?: string
+  /** The copy button's name: what the value is ("Copy secret", "Copy code"). */
+  copyLabel?: string
+  /** What the secret goes with, drawn between the notice and the secret (a tracker's ingress URL). */
+  children?: ReactNode
   onClose: () => void
 }): JSX.Element {
   return (
@@ -43,12 +50,13 @@ export default function SecretOnceDialog({
       onClose={onClose}
     >
       <Banner severity="warning" testId={`${testIdPrefix}-warning`}>{notice}</Banner>
+      {children}
       <CopyableValue
         value={secret ?? ''}
-        copyLabel="Copy secret"
+        copyLabel={copyLabel}
         testId={valueTestId}
         copyTestId={`${testIdPrefix}-copy`}
-        sx={{ flex: '1 1 16rem', overflowWrap: 'anywhere' }}
+        sx={{ flexGrow: 1, flexShrink: 1, flexBasis: grid(42.5), overflowWrap: 'anywhere' }}
       />
     </FormDialog>
   )

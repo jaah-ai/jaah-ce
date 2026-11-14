@@ -1,47 +1,53 @@
 import { Fragment, useEffect, useMemo, useState, type ComponentType, type KeyboardEvent, type ReactNode } from 'react'
+import { useListBackground } from '../components/ListDetail'
 import { Navigate, useParams, useSearchParams } from 'react-router-dom'
 import UnknownRoute from '../components/UnknownRoute'
 import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
 import Button from '@mui/material/Button'
-import TextField from '@mui/material/TextField'
-import InputAdornment from '@mui/material/InputAdornment'
 import List from '@mui/material/List'
 import ListItemButton from '@mui/material/ListItemButton'
 import ListItemText from '@mui/material/ListItemText'
 import ListSubheader from '@mui/material/ListSubheader'
-import MenuItem from '@mui/material/MenuItem'
 import useMediaQuery from '@mui/material/useMediaQuery'
-import { useTheme } from '@mui/material/styles'
+import { type Theme, useTheme } from '@mui/material/styles'
 import { useAuth } from '../auth'
 import { exitActAs, useActingAs } from '../lib/actAs'
 import { Banner } from '../ui/Banner'
 import { isOrgAdminSeat, ORG_ACCESS_URL, ORG_SETTINGS_TAB_PARAM, orgSectionOfTab } from '../lib/orgAdmin'
 import { keepInPane } from '../lib/scrollWithinPane'
+import { FONT_SIZE, FONT_WEIGHT, grid, RADIUS, SIZE } from '../theme'
 import { slugFrom } from '../lib/slug'
-import PortGridSection from '../components/PortGridSection'
 import EmptyState from '../ui/EmptyState'
-import { Icon } from '../ui/icons'
+import { ChevronRightIcon } from '../ui/icons'
+import SearchBox from '../ui/SearchBox'
+import SelectField from '../ui/SelectField'
 import SectionCard, { SECTION_CARD_TEXT_INSET } from '../ui/SectionCard'
-import { ABOVE_PHONE, PHONE, PHONE_QUERY, SHELL_FILL_ATTR } from '../ui/listStyles'
+import { usePhone } from '../hooks/usePhone'
+import { ABOVE_PHONE, PHONE, SHELL_FILL_ATTR, SHELL_INSET } from '../ui/listStyles'
 import { LAUNCHER_CLEARANCE_PX } from '../ui/launcherSeat'
-import { NODELINK_STORE_URL } from './nodes/nodeLinkStore/api'
 import { BILLING_PAGE } from '../lib/companySetup'
-import { ownOrgPanelsShown, type OwnOrgPanel } from './settings/ownOrg/OwnOrgPanels'
+import { OwnOrgGate, ownOrgPanelsShown, type OwnOrgPanel } from './settings/ownOrg/OwnOrgPanels'
 import ApiKeysSection from './settings/apiKeys/ApiKeysSection'
-import { OwnCronMinPeriodSection } from './orgs/CronMinPeriodBlock'
+import CronMinPeriodBlock from './orgs/CronMinPeriodBlock'
+import OutcomeScanIntervalBlock from './orgs/OutcomeScanIntervalBlock'
 import ProvidersSection from './settings/providers/ProvidersSection'
 import { planSurfaceShown, planSwitchOn } from '../lib/planSwitches'
 import NodeVaultSection from './settings/nodeVault/NodeVaultSection'
 import TagsSection from './settings/tags/TagsSection'
 import UnroutedNotificationsNotice from './settings/notifications/UnroutedNotificationsNotice'
 import RetentionSection from './settings/retention/RetentionSection'
+import PipelineRulesSection from './settings/pipelineRules/PipelineRulesSection'
+import { PipelineTemplateFeed } from './pipelineTemplates/PipelineTemplateList'
+import OAuthAppsSection from './settings/oauthApps/OAuthAppsSection'
+import { TrackerFeed } from './trackers/TrackerList'
+import { WebhookFeed } from './webhooks/WebhookList'
 import { controlSx, KnobAlerts, KnobSaveBar, KnobSection, TELEGRAM_BOT_KEY, touchTargetSx, useKnobEditor, useLitJump } from './settings/KnobSection'
 import type { OperatorSetting } from '../types'
-import { NO_AUTOFILL_INPUT } from '../ui/noAutofill'
 import LoadingState from '../ui/LoadingState'
 import { IS_CE } from '../lib/edition'
 import { isEnabled, type FeatureName } from '../lib/editionFeatures'
+import { editionModule } from '../lib/editionModule'
 import ThisMachineSection from './ce/ThisMachineSection'
 
 
@@ -69,7 +75,7 @@ import ThisMachineSection from './ce/ThisMachineSection'
  * section. When no served knob anchors a panel — the tenant superadmin served no Cloud knob, or a failed
  * knob fetch — the panel is SYNTHESIZED into the area and section it belongs to, so a gated surface
  * never vanishes with the knobs and never lands in the wrong place. */
-export type PanelKind = OwnOrgPanel | 'thisMachine' | 'apiKeys' | 'ports' | 'tags' | 'pricing' | 'headscale' | 'billingStatus' | 'bedrockStatus' | 'cronMinPeriod' | 'emailTemplates' | 'emailDeliveryLog' | 'emailSuppressions' | 'dmarcReports' | 'sesAccount' | 'providers' | 'nodeVault' | 'complianceSigning' | 'legalStatus' | 'nodelinkLocations' | 'telegramWebhook' | 'retention' | 'residency' | 'dataRegions'
+export type PanelKind = OwnOrgPanel | 'thisMachine' | 'apiKeys' | 'tags' | 'pricing' | 'headscale' | 'billingStatus' | 'billingReconcile' | 'stripeLog' | 'bedrockStatus' | 'cronMinPeriod' | 'outcomeScanInterval' | 'emailTemplates' | 'emailDeliveryLog' | 'emailSuppressions' | 'dmarcReports' | 'sesAccount' | 'providers' | 'nodeVault' | 'complianceSigning' | 'oauthApps' | 'issueTrackers' | 'webhooks' | 'legalStatus' | 'nodelinkLocations' | 'telegramWebhook' | 'retention' | 'residency' | 'dataRegions' | 'pipelineRules' | 'pipelineTemplates'
 export type PanelDef = {
   kind: PanelKind
   /** The name search shows and (`own`) the card title. */
@@ -90,32 +96,47 @@ export type PanelDef = {
   /** The panel's main controls and what it shows: search finds a panel by what it does, not its title alone. */
   terms: string
 }
-/* The operator's model rate card (`settings/modelPrices/`): Model pricing's (`model_prices`), loaded only with it — the
- * community edition's tree leaves it out, and `import.meta.glob` yields `{}` for an absent file. */
-const ModelPricesSection: ComponentType | undefined = Object.values(isEnabled('model_prices')
-  ? import.meta.glob<ComponentType>('./settings/modelPrices/ModelPricesSection.tsx', { eager: true, import: 'default' })
-  : {})[0]
+/* The operator's model rate card (`settings/modelPrices/`): Model pricing's (`model_prices`), loaded only with it
+ * (`lib/editionModule.ts`). */
+const ModelPricesSection = editionModule(isEnabled('model_prices'),
+  () => import.meta.glob<ComponentType>('./settings/modelPrices/ModelPricesSection.tsx', { eager: true, import: 'default' }))
 
 const CORE_PANELS: readonly PanelDef[] = [
   { kind: 'tags', label: 'Tags', anchorKey: 'task_default_persona', area: 'Tasks', section: 'Tags', own: true, titled: true, terms: 'Add tag, edit tag, delete tag, tag group' },
-  // `port_block_size` is pinned by the wire, the writer's bounds and `test_operator_settings.py`.
-  { kind: 'ports', label: 'Range starts', anchorKey: 'port_block_size', area: 'Infrastructure', section: 'Ports', own: false, framed: true, terms: 'Add range start, delete range start, env var' },
   ...(ModelPricesSection
     ? [{ kind: 'pricing', label: 'Model pricing', anchorKey: 'quota_high_pct', area: 'Accounts', section: 'Pricing', own: true, terms: 'Add a model, add rates, save rates, delete rates, model id' } as const]
     : []),
   // No knob anchor (its own route): synthesized into Providers, the one home of per-provider policy:
   // each provider's runtime card.
   { kind: 'providers', label: 'Providers', anchorKey: 'acp_runtime', area: 'Providers', section: 'Providers', own: true, fixed: true, terms: 'Runtime switch, ACP, legacy, terminal only, capabilities, gaps, shared gaps, gap count, runtime modes, not enforced natively' },
-  // The org's API keys (`settings/apiKeys`): a category of its own, every Org Owner and Admin. `/settings/api-keys`.
+  // API keys (`settings/apiKeys`): a category of its own, every member (their own; an Org Owner/Admin sees all). `/settings/api-keys`.
   { kind: 'apiKeys', label: 'API keys', anchorKey: 'own_org_api_keys', area: 'API keys', section: 'API keys', own: true, fixed: true, terms: 'Create key, revoke key, rotate secret, expiry, permissions, bearer, token, IP allowlist' },
   // The viewer's own org's raise-only floor for its schedules (beside the task knobs, not the org's cards).
   { kind: 'cronMinPeriod', label: 'Cron minimum period', anchorKey: 'own_org_cron_min_period', area: 'Tasks', section: 'Schedules', own: true, fixed: true, terms: 'Cron, schedule, minimum period, edit your minimum, clear your minimum' },
+  // The viewer's own org's outcome scan cadence, the projects' default (a project's own beats it): a schedule too.
+  { kind: 'outcomeScanInterval', label: 'Outcome scan interval', anchorKey: 'own_org_outcome_scan_interval', area: 'Tasks', section: 'Schedules', own: true, fixed: true, terms: 'Outcome scan, interval, minutes, reverts, fixes, edit your interval, clear your interval' },
   // No knob anchors it: always synthesized into a category of its own.
   { kind: 'nodeVault', label: 'NodeVault', anchorKey: 'nodevault', area: 'NodeVault', section: 'NodeVault', own: true, fixed: true, terms: 'Set up, rotate key, current key, previous keys' },
   // No knob anchors it: synthesized into Retention (the old Data category merged in), after the operator's own
   // retention knobs. The viewer's own org's windows (`settings/retention`).
   { kind: 'retention', label: 'Your data', anchorKey: 'org_retention', area: 'Retention', section: 'Your data', own: true, titled: true, fixed: true, terms: 'Session transcripts, activity events, task artifacts, days, delete older data' },
+  // No knob anchors it: the catalog's `oauth_app.<slug>` knobs are its rows (`isOAuthAppKnob`), never knob cards.
+  // Operator only: every OAuth vendor, most voted first.
+  { kind: 'oauthApps', label: 'OAuth apps', anchorKey: 'oauth_apps', area: 'Integrations', section: 'OAuth apps', own: true, titled: true, fixed: true, terms: 'Jaah app, OAuth app credential, Beta, votes, most voted, connections, vendor' },
+  // No knob anchors it: the org's tracker connections (`pages/trackers/`), each row opening its page.
+  { kind: 'issueTrackers', label: 'Issue trackers', anchorKey: 'issue_trackers', area: 'Integrations', section: 'Issue trackers', own: true, titled: true, fixed: true, terms: 'Linear, Jira, Backlog, tracker, mapping, start label, done state, events' },
+  // No knob anchors it: the org's rules every project's pipeline save is checked against (`settings/pipelineRules`).
+  { kind: 'pipelineRules', label: 'Pipeline rules', anchorKey: 'pipeline_rules', area: 'Projects', section: 'Pipeline rules', own: true, titled: true, fixed: true, terms: 'Guardrail, production, approvals, automatic, maintainers, off, warn, block, org rule' },
+  // No knob anchors it: the org's shared pipelines, each row opening its page (`pages/pipelineTemplates/`).
+  { kind: 'pipelineTemplates', label: 'Pipeline templates', anchorKey: 'pipeline_templates', area: 'Projects', section: 'Pipeline templates', own: true, titled: true, fixed: true, terms: 'Template, shared pipeline, lock, locked, publish, draft, version, linked projects, stages' },
+  // No knob anchors it: the org's outgoing webhook endpoints (`pages/webhooks/`), each row opening its page.
+  { kind: 'webhooks', label: 'Webhooks', anchorKey: 'webhooks', area: 'Integrations', section: 'Webhooks', own: true, titled: true, fixed: true, terms: 'Webhook, endpoint, URL, events, signing secret, rotate secret, deliveries, redeliver, send test, HMAC' },
 ]
+
+/** The catalog's derived `oauth_app.<slug>` knobs (`operator_settings/catalog_integrations.py::catalog_app_knobs`):
+ *  the OAuth apps panel's rows, so no knob card draws them a second time. */
+const OAUTH_APPS_PANEL = isEnabled('multi_org_tenancy')
+const isOAuthAppKnob = (s: OperatorSetting): boolean => OAUTH_APPS_PANEL && s.key.startsWith('oauth_app.')
 
 /** A knob's SAVED value by key (pending edits excluded): what a panel that follows a knob reads. */
 type SavedKnob = (key: string) => unknown
@@ -128,9 +149,10 @@ export type CloudPanel = PanelDef & { body: PanelBody }
 /* The cloud console's own panels (billing, organizations, system mail, Telegram, headscale, NodeLink, data regions
  * and residency, legal pages, compliance manifest signing), read the way `lib/cloudSurfaces.ts` reads `routesCloud.tsx`: absent from the local
  * edition's public tree, dropped by `IS_CE` here. Appended, so each area keeps its panels in their old order. */
-const cloudFound = import.meta.glob<{ cloudSettingsPanels: readonly CloudPanel[]; cloudProducts: CloudProducts }>(
-  './settingsCloud.tsx', { eager: true })
-const CLOUD_PANELS: readonly CloudPanel[] = IS_CE ? [] : (cloudFound['./settingsCloud.tsx']?.cloudSettingsPanels ?? [])
+const settingsCloud = editionModule(!IS_CE,
+  () => import.meta.glob<{ cloudSettingsPanels: readonly CloudPanel[]; cloudProducts: CloudProducts }>(
+    './settingsCloud.tsx', { eager: true }))
+const CLOUD_PANELS: readonly CloudPanel[] = settingsCloud?.cloudSettingsPanels ?? []
 
 /** One search result for what moved from Settings to Products: its words, raw (`searchIndex` normalizes them). */
 export type ProductsHit = { label: string; sectionLabel: string; id: string; terms: readonly string[]; to: string }
@@ -144,7 +166,7 @@ export type CloudProducts = {
   /** The search entries for the moved knobs and, with `panels`, Products' own panels and `(default)`. */
   productsHits: (moved: readonly OperatorSetting[], panels: boolean) => ProductsHit[]
 }
-const PRODUCTS: CloudProducts | null = !isEnabled('billing') ? null : (cloudFound['./settingsCloud.tsx']?.cloudProducts ?? null)
+const PRODUCTS: CloudProducts | null = !isEnabled('billing') ? null : (settingsCloud?.cloudProducts ?? null)
 const isProductsKnob = (s: OperatorSetting): boolean => PRODUCTS?.isProductsKnob(s) ?? false
 
 /* The community edition's one machine (`local/ThisMachineSection.tsx`): its only node UI, in a category of its own. */
@@ -158,13 +180,18 @@ const PANEL_BODY: Partial<Record<PanelKind, PanelBody>> = {
   ...Object.fromEntries(CLOUD_PANELS.map(p => [p.kind, p.body])),
   thisMachine: () => <ThisMachineSection />,
   tags: () => <TagsSection />,
-  ports: () => <PortGridSection />,
   ...(ModelPricesSection && { pricing: () => <ModelPricesSection /> }),
   apiKeys: () => <ApiKeysSection />,
-  cronMinPeriod: () => <OwnCronMinPeriodSection />,
+  cronMinPeriod: () => <OwnOrgGate>{id => <CronMinPeriodBlock orgId={id} />}</OwnOrgGate>,
+  outcomeScanInterval: () => <OwnOrgGate>{id => <OutcomeScanIntervalBlock orgId={id} />}</OwnOrgGate>,
   providers: () => <ProvidersSection />,
   nodeVault: () => <NodeVaultSection />,
-  retention: () => <OwnRetentionSection />,
+  retention: () => <OwnOrgGate>{id => <RetentionSection orgId={id} />}</OwnOrgGate>,
+  oauthApps: saved => <OAuthAppsSection saved={saved} />,
+  issueTrackers: () => <TrackerFeed />,
+  webhooks: () => <WebhookFeed />,
+  pipelineRules: () => <PipelineRulesSection />,
+  pipelineTemplates: () => <PipelineTemplateFeed />,
 }
 
 // One SECTION (a card) inside one AREA (a category). `label` is server display text, `id` the element-id
@@ -235,8 +262,6 @@ function opensGroup(areas: Area[], i: number): boolean {
 const UNSECTIONED = '__all'
 
 
-const slug = (text: string) => slugFrom(text)
-
 const loose = (text: string) => text.toLowerCase().replace(/[^a-z0-9]/g, '')
 
 /** The section a `?section=` deep link names, and its area: by the section's slug or label, a knob key in it, or
@@ -263,7 +288,7 @@ function sectionHome(areas: Area[], areaParam: string, sectionParam: string): { 
 // Element ids must be unique, so slug collisions get a counter — and it LOOPS, since a suffixed candidate
 // can itself be taken (`A!`, `A 2`, `A?` → `a`, `a-2`, then `a-2` again).
 function uniqueId(base: string, taken: { id: string }[]): string {
-  const root = slug(base) || UNSECTIONED
+  const root = slugFrom(base) || UNSECTIONED
   let id = root
   let n = 2
   while (taken.some(t => t.id === id)) id = `${root}-${n++}`
@@ -377,9 +402,9 @@ const OTHER_MATCHES_SX = {
   mt: 1,
   borderTop: 1,
   borderColor: 'divider',
-  lineHeight: '32px',
-  fontSize: '0.75rem',
-  fontWeight: 600,
+  lineHeight: grid(5),
+  fontSize: FONT_SIZE.sm,
+  fontWeight: FONT_WEIGHT.semibold,
   color: 'text.secondary',
   bgcolor: 'transparent',
   position: 'static',
@@ -388,11 +413,11 @@ const OTHER_MATCHES_SX = {
 /* A category group's heading (`CATEGORY_GROUPS`): small and muted, in the flow of the list, so it never reads as an
  * item and never covers one while the rail scrolls. */
 const CATEGORY_HEADING_SX = {
-  lineHeight: '28px',
+  lineHeight: grid(4.5),
   mt: 1,
   px: 2,
-  fontSize: '0.75rem',
-  fontWeight: 600,
+  fontSize: FONT_SIZE.sm,
+  fontWeight: FONT_WEIGHT.semibold,
   color: 'text.secondary',
   bgcolor: 'transparent',
   position: 'static',
@@ -419,65 +444,33 @@ function searchMatches(index: SearchEntry[], query: string): SearchHit[] {
     .map(r => ({ entry: r.entry, loose: r.rank === RANK.HELP }))
 }
 
-/** Material's `search` path, inlined: `@mui/icons-material` is not a dependency (`ui/InfoTip`). */
-function SearchGlyph() {
-  return (
-    <Icon viewBox="0 0 24 24" size={20} sx={{ fill: 'currentColor', color: 'text.secondary' }}>
-      <path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z" />
-    </Icon>
-  )
-}
-
-/** Material's `chevron_right` path, the phone list's "opens a page" affordance. */
-function ChevronGlyph() {
-  return (
-    <Icon viewBox="0 0 24 24" size={20} sx={{ fill: 'currentColor', color: 'text.secondary' }}>
-      <path d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
-    </Icon>
-  )
-}
-
 /* THE PAGE CAP: the rail plus one settings column, so the Save bar sits over the settings rather than a
  * screen away from the row it saves. 64rem for the column (the research band is 40–48rem for a single
  * form; this column carries a fixed label + control pair with room for a wrapping default beside them),
  * `12rem` matching the rail's own width below, plus the 12px between them (`gap: 2` at the theme's 6px
  * unit). */
-const PAGE_MAX_WIDTH = { sm: 'calc(64rem + 12rem + 12px)' }
+const PAGE_MAX_WIDTH = { sm: `calc(${grid(170.5)} + ${grid(32)} + ${grid(2)})` }
 
 /* THE PINNED CHROME. Above a phone the page is exactly the shell's scrollport tall (`100dvh`
- * less `.app-main`'s 1.75rem top and bottom padding — App.tsx's shell layout contract), so the Save
+ * less `.app-main`'s top inset and its 1.75rem bottom under a fill page — App.tsx's shell layout contract), so the Save
  * bar, the search box and the category rail stay put and only the chosen category's cards scroll.
  * A shell banner above the page (`PendingOrgBanner`, `PlanEndedBanner`) adds its own height to the
  * scrollport, which then scrolls by exactly that much: the banner scrolls away and the page sits whole.
  * On a phone the list is the page and scrolls as one; only the Save bar sticks to the top. */
-const PINNED_PAGE_SX = { [ABOVE_PHONE]: { height: 'calc(100dvh - 3.5rem)' } }
+const PINNED_PAGE_SX = { [ABOVE_PHONE]: { height: `calc(100dvh - ${SHELL_INSET} - 1.75rem)` } }
 /* The Help launcher's room under a pinned scroller's last row (`.app-main`'s own clearance, less the 1.75rem it
  * keeps under this fill page): a column's last card scrolls clear of the launcher. */
 const LAUNCHER_TAIL = `calc(${LAUNCHER_CLEARANCE_PX}px - 1.75rem)`
 /** What scrolls when the chrome is pinned: fills the page's leftover height and owns its own scrollbar. */
 const PINNED_SCROLL_SX = { [ABOVE_PHONE]: { flex: '1 1 0', minHeight: 0, overflowY: 'auto', pb: LAUNCHER_TAIL } }
 
-/* Below this the 12rem rail left the cards ~180px at 700px: a category picker beside the search takes its place. */
-const COMPACT_QUERY = '(max-width:899.95px)'
 /* The compact search's floor: the icon plus its whole "Search" placeholder. With the expanded sidebar beside it
  * (760–900px) a 6rem floor read "Searc", and "Search settings" whole left no room for the Category picker and Save. */
-const COMPACT_SEARCH_FLOOR = '8rem'
+const COMPACT_SEARCH_FLOOR = grid(20)
 /* The cards column's right padding, inside its scrollbar gutter; the search row above reserves the same. */
-const AREA_COLUMN_PR = '4px'
+const AREA_COLUMN_PR = grid(0.5)
 /* On a phone the Save bar sticks over the page while anything is unsaved: a card scrolled to stops under it. */
-const SAVE_BAR_CLEARANCE = '4.75rem'
-
-/* The viewer's own org's retention windows (`panelShown.retention` guarantees the id). */
-function OwnRetentionSection() {
-  const { admin } = useAuth()
-  return admin?.org?.id ? <RetentionSection orgId={admin.org.id} /> : null
-}
-
-/* Old addresses of what moved to Machines (`pages/Nodes.tsx`): a deep link lands where the thing now lives.
- * `area` and `section` are the slugs the Settings page gave them. */
-const MOVED: readonly { area: string; section: string; to: string }[] = [
-  { area: 'accounts', section: 'nodelink-storage', to: NODELINK_STORE_URL },
-]
+const SAVE_BAR_CLEARANCE = grid(12.5)
 
 /* Renamed areas (Nodes is the node list, so its Settings area is Infrastructure; Data merged into
  * Retention): an old link keeps its section and every other param. Read per render, not on arrival — it lands on this same route. */
@@ -498,14 +491,13 @@ export default function Settings() {
   const [moved] = useState(() => {
     const area = searchParams.get('area')
     const section = searchParams.get('section')
-    return MOVED.find(m => area === m.area && section === m.section)?.to
-      ?? (admin?.is_operator === true ? PRODUCTS?.productsMoved(area, section)
-        // A tenant has no Billing category (no knob it may edit): an Org Owner/Admin's billing is the Billing page.
-        : area === 'billing' && isOrgAdminSeat(admin) && isEnabled('billing') ? BILLING_PAGE : undefined)
+    return admin?.is_operator === true ? PRODUCTS?.productsMoved(area, section)
+      // A tenant has no Billing category (no knob it may edit): an Org Owner/Admin's billing is the Billing page.
+      : area === 'billing' && isOrgAdminSeat(admin) && isEnabled('billing') ? BILLING_PAGE : undefined
   })
   if (moved) return <Navigate to={moved} replace />
   /* The retired org panel's `?orgtab=` (its tabs are Organizations' cards now, Access is Directory's): the
-     tab's card, or Access in Directory. Old links, the `/orgs/:id` redirect and bookmarks still land. */
+     tab's card, or Access in Directory. Old links, `MembersTable`'s tenant link and bookmarks still land. */
   const orgTab = searchParams.get(ORG_SETTINGS_TAB_PARAM)
   if (orgTab !== null) {
     if (orgTab === 'access') return <Navigate to={ORG_ACCESS_URL} replace />
@@ -532,11 +524,11 @@ export default function Settings() {
 export function SettingsAreaPath() {
   const { area = '' } = useParams()
   const [searchParams] = useSearchParams()
-  if (!CATEGORY_ORDER.some(label => slug(label) === area) && !RENAMED_AREAS.has(area)) return <UnknownRoute />
+  if (!CATEGORY_ORDER.some(label => slugFrom(label) === area) && !RENAMED_AREAS.has(area)) return <UnknownRoute />
   const next = new URLSearchParams(searchParams)
   next.set('area', area)
   // An area with a section of its own name (Providers › Providers) opens on that section.
-  if (!next.has('section') && PANELS.some(p => slug(p.area) === area && slug(p.section) === area)) next.set('section', area)
+  if (!next.has('section') && PANELS.some(p => slugFrom(p.area) === area && slugFrom(p.section) === area)) next.set('section', area)
   return <Navigate to={`/settings?${next}`} replace />
 }
 
@@ -573,12 +565,14 @@ function SettingsPage() {
   const [lit, setLit] = useState<string | null>(null)
 
   const theme = useTheme()
-  const phone = useMediaQuery(PHONE_QUERY)
-  const compact = useMediaQuery(COMPACT_QUERY) && !phone
+  const phone = usePhone()
+  // Below 900px the 12rem rail left the cards ~180px at 700px: a category picker beside the search takes its place.
+  // So beside an open editor (a Settings record's page, components/ListDetail.tsx): the list's floor is narrower still.
+  const behindEditor = useListBackground() !== null
+  const compact = (useMediaQuery((t: Theme) => t.breakpoints.down('md')) || behindEditor) && !phone
 
   /* ── The gated panels ────────────────────────────────────────────────────────────────────────
-   * The port grid's range table: an org admin (`isOrgAdminSeat`; `routes/port_grid.py`'s `org_admin_writer`,
-   * scoped to the caller's org). So is NodeVault (`routes/nodevault.py`'s `@org_admin`, AC-2.1). So is the cron minimum period (`routes/orgs.py::get_org_cron_min_period`, own org). The rate card, the headscale switch and the email templates: the operator alone
+   * NodeVault: an org admin (`isOrgAdminSeat`; `routes/nodevault.py`'s `@org_admin`, AC-2.1). So is the cron minimum period (`routes/orgs.py::get_org_cron_min_period`, own org). The rate card, the headscale switch and the email templates: the operator alone
    * (`routes/model_prices.py` and `routes/headscale_allowlist.py` take `Depends(require_operator)`) — never a tenant
    * superadmin, who holds `system:view` too.
    * Operational data (support telemetry) is not a setting and lives on the Support page instead. Tags:
@@ -587,7 +581,6 @@ function SettingsPage() {
   const { admin } = useAuth()
   const isOperator = admin?.is_operator === true
   const isOrgAdmin = isOrgAdminSeat(admin)
-  const actingAs = useActingAs()
   const savedKnob: SavedKnob = key => settings?.find(s => s.key === key)?.value
   const telegramBotSaved = Boolean(savedKnob(TELEGRAM_BOT_KEY))
   const nodeVaultOn = planSwitchOn(admin, 'nodevault_enabled')
@@ -599,16 +592,20 @@ function SettingsPage() {
   const panelShown: Record<PanelKind, boolean> = {
     thisMachine: IS_CE,
     tags: true,
-    ports: isOrgAdmin,
     pricing: isOperator,
     headscale: isOperator,
     billingStatus: isOperator,
+    // `/api/billing/reconcile*` and `/api/billing/write-log` are the operator's alone.
+    billingReconcile: isOperator,
+    stripeLog: isOperator,
     bedrockStatus: isOperator,
     // Their subject is the viewer's own org: with none bound each would be an empty card.
     ...ownOrg,
-    // An Org Owner or Admin of a tenant, or the operator acting as one (list and revoke); never the operator's own plane.
-    apiKeys: isOrgAdmin && Boolean(admin?.org?.id) && (!isOperator || actingAs !== null),
+    // Every member of an org: a tenant's, or the operator in their own org or acting as one (`routes/api_keys.py`).
+    apiKeys: Boolean(admin?.org?.id),
     cronMinPeriod: isOrgAdmin && Boolean(admin?.org?.id),
+    // The outcome ledger's cadence: off the plan's agent performance a tenant's read is refused (403).
+    outcomeScanInterval: isOrgAdmin && Boolean(admin?.org?.id) && planSurfaceShown(admin, 'agent_performance'),
     emailTemplates: isOperator,
     emailDeliveryLog: isOperator,
     emailSuppressions: isOperator,
@@ -620,6 +617,14 @@ function SettingsPage() {
     nodeVault: isOrgAdmin && nodeVaultOn,
     // The API's `require_operator` refuses everyone else.
     complianceSigning: isOperator,
+    // `/api/integrations/apps` takes `require_operator`. Votes come from many orgs: without them the knobs stay rows
+    // (`isOAuthAppKnob`).
+    oauthApps: isOperator && OAUTH_APPS_PANEL,
+    // `/api/tracker-connections` is `@org_admin` (`routes/trackers.py`); a tracker reaches Jaah through an event
+    // trigger, which an edition without them never receives.
+    issueTrackers: isOrgAdmin && isEnabled('event_triggers'),
+    // `/api/webhooks` is `@org_admin` (`routes/webhooks.py`) and refuses a tenant off the `webhooks_enabled` switch.
+    webhooks: isOrgAdmin && planSurfaceShown(admin, 'webhooks_enabled'),
     legalStatus: isOperator,
     // `/api/operator/nodelink-locations` is the operator's alone.
     nodelinkLocations: isOperator,
@@ -630,6 +635,10 @@ function SettingsPage() {
     residency: isOrgAdmin && Boolean(admin?.org?.id) && residencyShown,
     // `/api/operator/data-regions` is the operator's alone.
     dataRegions: isOperator,
+    // `PUT /api/org/pipeline-guardrails` is `org_admin_writer`'s; the rules are the viewer's own org's.
+    pipelineRules: isOrgAdmin && Boolean(admin?.org?.id),
+    // Every template write is `org_admin_writer`'s; the templates are the viewer's own org's.
+    pipelineTemplates: isOrgAdmin && Boolean(admin?.org?.id),
   }
 
   /* ── AND WHICH KNOBS IT OFFERS ────────────────────────────────────────────────────────────────────
@@ -645,7 +654,7 @@ function SettingsPage() {
   )
   const visibleKnobs = useMemo(
     () => (isOperator
-      ? knobs.visibleKnobs.filter(s => !isProductsKnob(s))
+      ? knobs.visibleKnobs.filter(s => !isProductsKnob(s) && !isOAuthAppKnob(s))
       // `rowEditable`'s verdict, from the flags it reads (the function itself is new every render).
       : knobs.visibleKnobs.filter(s => knobs.editable || (knobs.orgEditable && s.tenant_editable === true))
     ).filter(knobShown),
@@ -700,7 +709,7 @@ function SettingsPage() {
     }
     return inCategoryOrder(out)
     // `panelShown` is derived from the booleans and the org id the memo lists.
-  }, [visibleKnobs, knobsSettled, isOperator, isOrgAdmin, admin?.org?.id, telegramBotSaved, nodeVaultOn, retentionShown, residencyShown, ownOrgKey, actingAs])
+  }, [visibleKnobs, knobsSettled, isOperator, isOrgAdmin, admin?.org?.id, telegramBotSaved, nodeVaultOn, retentionShown, residencyShown, ownOrgKey])
 
   // The active category is DERIVED from `?area=<id>` with a fallback to the first area: a save can change
   // the areas, and a vanished one would leave the page pointing at nothing. In the URL, not local state,
@@ -717,7 +726,7 @@ function SettingsPage() {
      unknown slug is not a place this console has. */
   // On a loaded catalogue only: a failed load drops the knob areas, and would call the viewer's own area denied.
   const deniedArea = settings !== null && areaParam !== '' && !chosenArea
-    ? CATEGORY_ORDER.find(label => slug(label) === areaParam) ?? null
+    ? CATEGORY_ORDER.find(label => slugFrom(label) === areaParam) ?? null
     : null
   // On a phone the list is a page of its own: no category chosen means the list. On a desktop the first
   // category stands in, except for a denied one: its notice and the list stand there instead.
@@ -823,7 +832,7 @@ function SettingsPage() {
   const results = useMemo(() => searchMatches(index, query), [index, query])
   const searching = query.trim() !== ''
 
-  function onSearchKey(e: KeyboardEvent<HTMLInputElement>) {
+  function onSearchKey(e: KeyboardEvent<HTMLDivElement>) {
     if (e.key === 'Enter' && results[0]) {
       e.preventDefault()
       jumpTo(results[0].entry)
@@ -833,7 +842,7 @@ function SettingsPage() {
   }
 
   // The reader's note for one category, or null when this viewer may edit every knob row in it. A category that
-  // also holds panels (Infrastructure: the Ports knobs beside Range starts, whose vars an org admin adds) names
+  // also holds panels (Infrastructure: the Cloud knobs beside the headscale switch) names
   // the knob cards the note covers, so a panel's own Add button never reads as contradicting it.
   function readOnlyNote(area: Area): string | null {
     const covered = area.sections.filter(sec => sec.entries.some(e => !rowEditable(e)))
@@ -870,7 +879,7 @@ function SettingsPage() {
           id={panelId}
           data-testid="settings-section"
           data-highlight={lit === panelId ? 'true' : undefined}
-          sx={lit === panelId ? { outline: `2px solid ${theme.palette.warning.main}`, borderRadius: '4px' } : undefined}
+          sx={lit === panelId ? { outline: `2px solid ${theme.palette.warning.main}`, borderRadius: RADIUS.sm } : undefined}
         >
           <Box id={section.entries.length === 0 && i === 0 ? anchorId : undefined}>
             {/* A section with knobs already carries its label (Billing > Stripe: the Stripe credential knob), so
@@ -902,7 +911,7 @@ function SettingsPage() {
         flexShrink: 0,
         // Pinned: the rail runs the page's height and scrolls on its own if the categories outgrow it.
         [ABOVE_PHONE]: {
-          width: '12rem',
+          width: grid(32),
           alignSelf: 'stretch',
           overflowY: 'auto',
           borderRight: '1px solid',
@@ -930,21 +939,22 @@ function SettingsPage() {
             }}
             data-testid="settings-category"
             sx={{
-              borderRadius: '4px',
-              minHeight: { xs: '48px', sm: '36px' },
+              borderRadius: RADIUS.sm,
+              minHeight: { xs: grid(8), sm: grid(6) },
               gap: 1,
-              '&.Mui-selected': { fontWeight: 600 },
+              '&.Mui-selected': { fontWeight: FONT_WEIGHT.semibold },
             }}
           >
             <ListItemText
               primary={area.label}
               secondary={n ? `${n} unsaved` : undefined}
               slotProps={{
-                primary: { sx: { fontWeight: current ? 600 : 500 } },
-                secondary: { sx: { color: 'primary.main', fontWeight: 600 } },
+                primary: { sx: { fontWeight: current ? FONT_WEIGHT.semibold : FONT_WEIGHT.medium } },
+                secondary: { sx: { color: 'primary.main', fontWeight: FONT_WEIGHT.semibold } },
               }}
             />
-            {phone && <ChevronGlyph />}
+            {/* The phone list's "opens a page" affordance. */}
+            {phone && <ChevronRightIcon size={SIZE.iconMd} sx={{ color: 'text.secondary' }} />}
           </ListItemButton>
           </Fragment>
         )
@@ -961,7 +971,7 @@ function SettingsPage() {
       sx={{
         display: 'flex',
         flexDirection: 'column',
-        gap: '0.75rem',
+        gap: 2,
         maxWidth: PAGE_MAX_WIDTH,
         ...PINNED_PAGE_SX,
         ...(unsaved && {
@@ -999,48 +1009,40 @@ function SettingsPage() {
             flexWrap: 'wrap',
             gap: 1.5,
             alignItems: 'center',
-            [ABOVE_PHONE]: { flexShrink: 0, overflow: 'hidden', scrollbarGutter: 'stable', pr: AREA_COLUMN_PR, pt: '10px', mt: '-10px', pb: '4px', mb: '-4px' },
+            [ABOVE_PHONE]: { flexShrink: 0, overflow: 'hidden', scrollbarGutter: 'stable', pr: AREA_COLUMN_PR, pt: 1.5, mt: -1.5, pb: 0.5, mb: -0.5 },
           }}
         >
-          <TextField
-            size="small"
-            type="search"
+          <SearchBox
             value={query}
-            onChange={e => setQuery(e.target.value)}
+            onChange={setQuery}
+            delayMs={0}
             onKeyDown={onSearchKey}
             placeholder={compact ? 'Search' : 'Search settings'}
-            slotProps={{
-              htmlInput: { ...NO_AUTOFILL_INPUT, 'aria-label': 'Search settings', 'data-testid': 'settings-search' },
-              input: { startAdornment: <InputAdornment position="start"><SearchGlyph /></InputAdornment> },
-            }}
-            sx={compact ? { ...controlSx, flex: `1 1 ${COMPACT_SEARCH_FLOOR}`, minWidth: COMPACT_SEARCH_FLOOR } : phone ? { ...controlSx, width: '100%' } : { ...controlSx, flex: '1 1 16rem', maxWidth: '28rem' }}
+            ariaLabel="Search settings"
+            inputTestId="settings-search"
+            sx={compact ? { ...controlSx, flex: `1 1 ${COMPACT_SEARCH_FLOOR}`, minWidth: COMPACT_SEARCH_FLOOR } : phone ? { ...controlSx, width: '100%' } : { ...controlSx, flex: `1 1 ${grid(42.5)}`, maxWidth: grid(74.5) }}
           />
           {(categoryArea || showCluster) && (
             <Box data-testid="settings-band-actions" sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flex: '1 1 0', ml: 'auto' }}>
               {/* Not while searching: the results replace the page, so a category picked then would show nothing. */}
               {categoryArea && (
-                <TextField
-                  select
-                  size="small"
+                <SelectField
                   label="Category"
                   value={categoryArea.id}
-                  onChange={e => openArea(e.target.value)}
-                  // The field names the area alone: the Save button already counts what is unsaved; the menu says where.
-                  slotProps={{
-                    htmlInput: { 'data-testid': 'settings-category-select' },
-                    select: { renderValue: id => areas.find(a => a.id === id)?.label ?? '' },
-                  }}
-                  sx={{ ...controlSx, flex: '0 1 12rem', minWidth: '8rem' }}
+                  onChange={openArea}
+                  testId="settings-category-select"
+                  sx={{ ...controlSx, flex: `0 1 ${grid(32)}`, minWidth: SIZE.fieldSm }}
                 >
-                  {/* Flat children, not a Fragment per area: the Select reads its options off its direct children. */}
-                  {areas.flatMap((area, i) => {
-                    const n = unsavedIn(area.sections.flatMap(sec => sec.entries))
-                    const item = <MenuItem key={area.id} value={area.id}>{n ? `${area.label} (${n} unsaved)` : area.label}</MenuItem>
-                    return opensGroup(areas, i)
-                      ? [<ListSubheader key={`heading-${area.id}`} sx={CATEGORY_HEADING_SX}>{categoryHeading(area)}</ListSubheader>, item]
-                      : [item]
-                  })}
-                </TextField>
+                  {/* One `<optgroup>` per heading; an option counts what its area has unsaved. */}
+                  {areas.flatMap((_area, i) => (opensGroup(areas, i) ? [i] : [])).map((start, g, starts) => (
+                    <optgroup key={areas[start].id} label={categoryHeading(areas[start])}>
+                      {areas.slice(start, starts[g + 1]).map(area => {
+                        const n = unsavedIn(area.sections.flatMap(sec => sec.entries))
+                        return <option key={area.id} value={area.id}>{n ? `${area.label} (${n} unsaved)` : area.label}</option>
+                      })}
+                    </optgroup>
+                  ))}
+                </SelectField>
               )}
               {/* `nowrap`: a line breaks on min-content, and a wrappable "Save (1)" let the unit shrink past Save's right end. */}
               {showCluster && <Box sx={{ ml: 'auto', flexShrink: 0, whiteSpace: 'nowrap' }}><KnobSaveBar knobs={knobs} bar={false} /></Box>}
@@ -1069,7 +1071,7 @@ function SettingsPage() {
                 <ListItemButton
                   onClick={() => jumpTo(entry)}
                   data-testid="settings-search-result"
-                  sx={{ borderRadius: '4px', minHeight: { xs: '48px', sm: '40px' } }}
+                  sx={{ borderRadius: RADIUS.sm, minHeight: { xs: grid(8), sm: grid(6.5) } }}
                 >
                   <ListItemText
                     primary={entry.label}
@@ -1121,7 +1123,7 @@ function SettingsPage() {
                 minWidth: 0,
                 display: current ? 'flex' : 'none',
                 flexDirection: 'column',
-                gap: '0.75rem',
+                gap: 2,
                 // The one scrolling column. A card (it clips) would otherwise shrink to fit it; the
                 // right padding keeps the scrollbar off the cards' border. The gutter is reserved whether or not
                 // the category overflows, so the cards' right edge (and the search row's, above) never moves.
@@ -1133,7 +1135,7 @@ function SettingsPage() {
                   pr: AREA_COLUMN_PR,
                   '& > *': { flexShrink: 0 },
                   // A spacer, not padding: the deep-link fit writes this column's padding. Less the column's gap.
-                  '&::after': { content: '""', flexShrink: 0, height: `calc(${LAUNCHER_TAIL} - 0.75rem)` },
+                  '&::after': { content: '""', flexShrink: 0, height: `calc(${LAUNCHER_TAIL} - ${grid(2)})` },
                 },
               }}
             >
@@ -1144,13 +1146,13 @@ function SettingsPage() {
                   <Button type="button" variant="text" size="small" onClick={closeArea} sx={{ ...touchTargetSx, px: 1 }}>
                     ‹ Back
                   </Button>
-                  <Typography component="h3" variant="subtitle1" sx={{ fontWeight: 600, fontSize: '1rem' }}>
+                  <Typography component="h3" variant="subtitle1" sx={{ fontWeight: FONT_WEIGHT.semibold, fontSize: FONT_SIZE.lg }}>
                     {area.label}
                   </Typography>
                 </Box>
               )}
               {/* A reader who cannot save is told whose values these are, once per category and only where the
-              category has knob rows: a panel (range starts, cloud connections, tags) has its own writer and its own
+              category has knob rows: a panel (cloud connections, tags) has its own writer and its own
               affordances, so the note never sits over one (ui-copy-standards: no page subtitle for the editor). It
               promises no org-marked values — an org's overrides are the operator's, set on Orgs > <org> > Settings
               (`routes/orgs.py::put_org_settings`). No "read-only", "permission" or "superadmin". */}

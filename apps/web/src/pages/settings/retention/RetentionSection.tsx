@@ -1,28 +1,28 @@
-import { useEffect, useRef, useState, type JSX } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
+import { useState, type JSX } from 'react'
 import Box from '@mui/material/Box'
-import Button from '@mui/material/Button'
-import Stack from '@mui/material/Stack'
-import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
-import { useAuth } from '../../../auth'
-import { usePolicyQuery } from '../../../hooks/usePolicyQuery'
-import { useSubmit } from '../../../hooks/useSubmit'
-import { planSurfaceShown } from '../../../lib/planSwitches'
-import Banner from '../../../ui/Banner'
-import { tapTargetSx } from '../../../ui/listStyles'
-import SavedNote from '../../../ui/SavedNote'
-import SubmitButton from '../../../ui/SubmitButton'
+import { usePolicyEditor } from '../../../hooks/usePolicyEditor'
+import { planSurface } from '../../../lib/planSwitches'
+import type { Explain } from '../../../ui/explain'
+import FormTextField from '../../../ui/FormTextField'
+import PolicyForm from '../../../ui/PolicyForm'
 import { getRetention, putRetention, retentionKey, type Retention, type RetentionClass, type RetentionInput } from './api'
+import { SIZE } from '../../../theme'
 
 /* Settings › Retention › Your organization (and a customer's Security › Retention): how long the viewer's own org keeps its transcripts, activity and task artifacts
  * (`./api.ts`). Shorten only — each field's range is the server's. A tenant whose plan leaves Retention out gets
  * nothing drawn and no fetch; the operator is never refused. */
 
-const CLASSES: readonly { id: RetentionClass; label: string; note?: string }[] = [
-  { id: 'transcripts', label: 'Session transcripts' },
-  { id: 'events', label: 'Activity events', note: 'Security events stay at least 365 days.' },
-  { id: 'artifacts', label: 'Task artifacts' },
+const RETENTION_DOCS = 'administration/security-and-audit/settings'
+
+const CLASSES: readonly { id: RetentionClass; label: string; help: Explain }[] = [
+  { id: 'transcripts', label: 'Session transcripts', help: { tip: 'Days before agent session transcripts are deleted.', docs: RETENTION_DOCS } },
+  {
+    id: 'events',
+    label: 'Activity events',
+    help: { tip: 'Days before activity events are deleted.', more: 'Security events stay at least 365 days.', docs: RETENTION_DOCS },
+  },
+  { id: 'artifacts', label: 'Task artifacts', help: { tip: 'Days before files tasks produced are deleted.', docs: RETENTION_DOCS } },
 ]
 
 type Draft = Record<RetentionClass, string>
@@ -42,20 +42,13 @@ function fieldError(raw: string, w: Retention[RetentionClass]): string {
   return ''
 }
 
-export function RetentionSection({ orgId }: { orgId: string }): JSX.Element {
-  const { admin } = useAuth()
-  if (!planSurfaceShown(admin, 'org_retention_enabled')) return <></>
-  return <Editor orgId={orgId} operator={admin?.is_operator === true} />
-}
+export const RetentionSection = planSurface('org_retention_enabled', (admin, { orgId }: { orgId: string }) => <Editor orgId={orgId} operator={admin?.is_operator === true} />)
 
 function Editor({ orgId, operator }: { orgId: string; operator: boolean }): JSX.Element {
-  const client = useQueryClient()
-  const { gate, data } = usePolicyQuery({ queryKey: retentionKey(orgId), queryFn: () => getRetention(orgId), operator, rows: 3, failure: 'Could not load retention.' })
-  const [draft, setDraft] = useState<Draft>({ transcripts: '', events: '', artifacts: '' })
-  // A refetch (window focus) refreshes the fields only while nothing is being edited.
-  const editing = useRef(false)
-  useEffect(() => { if (data && !editing.current) setDraft(toDraft(data)) }, [data])
-  const { busy, formError, run, saved: justSaved, clearSaved } = useSubmit()
+  const { gate, data, draft, edit, busy, formError, save, saveBar } = usePolicyEditor({
+    queryKey: retentionKey(orgId), queryFn: () => getRetention(orgId), operator, rows: 3, failure: 'Could not load retention.',
+    toDraft, initial: { transcripts: '', events: '', artifacts: '' },
+  })
   // The clamped values the last save wrote, named beside "Saved." — the user typed none of them.
   const [adjusted, setAdjusted] = useState('')
 
@@ -65,14 +58,8 @@ function Editor({ orgId, operator }: { orgId: string; operator: boolean }): JSX.
   const changed = CLASSES.some(c => draft[c.id].trim() !== (data[c.id].days?.toString() ?? ''))
   const valid = CLASSES.every(c => !errors[c.id])
 
-  function edit(id: RetentionClass, value: string) {
-    editing.current = true
-    setDraft(d => ({ ...d, [id]: value }))
-    clearSaved()
-  }
-
-  const save = () =>
-    run('Could not save retention.', async () => {
+  const store = () =>
+    save('Could not save retention.', async () => {
       const body = Object.fromEntries(
         CLASSES.map(c => [c.id, draft[c.id].trim() ? Number(draft[c.id].trim()) : null]),
       ) as RetentionInput
@@ -81,22 +68,12 @@ function Editor({ orgId, operator }: { orgId: string; operator: boolean }): JSX.
         .filter(c => data[c.id].clamped_from !== null && body[c.id] === data[c.id].days)
         .map(c => `${c.label} set to ${body[c.id]} days.`)
         .join(' '))
-      editing.current = false
-      client.setQueryData(retentionKey(orgId), next)
+      return next
     })
 
   return (
-    <Stack
-      component="form"
-      noValidate
-      spacing={2}
-      data-testid="org-retention"
-      onSubmit={e => {
-        e.preventDefault()
-        if (changed && valid) void save()
-      }}
-      sx={{ maxWidth: 560, minWidth: 0 }}
-    >
+    <PolicyForm testId="org-retention" canSave={changed && valid} onSave={() => void store()} error={formError}
+      bar={{ ...saveBar, dirty: changed, disabled: !valid, savedDetail: adjusted }}>
       <Typography variant="body2" sx={{ color: 'text.secondary' }}>
         Older data is deleted for good each night.
       </Typography>
@@ -116,45 +93,27 @@ function Editor({ orgId, operator }: { orgId: string; operator: boolean }): JSX.
         // A value the range has since moved past reads as its clamp, so Save is never blocked by a field not edited.
         const clamped = w.clamped_from !== null && draft[c.id].trim() === String(w.days)
           ? ` Was ${w.clamped_from}; the allowed range changed.` : ''
-        const help = `${range}${clamped}${c.note ? ` ${c.note}` : ''}`
         return (
-          <TextField
+          <FormTextField
             key={c.id}
-            size="small"
             label={c.label}
+            help={c.help}
             value={draft[c.id]}
-            onChange={e => edit(c.id, e.target.value)}
+            onChange={v => edit(d => ({ ...d, [c.id]: v }))}
             disabled={busy}
             placeholder={inRange ? `Default (${w.default_days} days)` : `Platform (${w.default_days} days)`}
-            error={Boolean(errors[c.id])}
-            helperText={errors[c.id] || help}
+            error={errors[c.id]}
+            hint={`${range}${clamped}`}
             slotProps={{
               htmlInput: { inputMode: 'numeric', 'data-testid': `org-retention-${c.id}` },
-              // The label stays raised so the empty state's "Default (N days)" is visible.
-              inputLabel: { shrink: true },
               input: { endAdornment: empty ? undefined : <Box component="span" sx={{ color: 'text.secondary', ml: 1 }}>days</Box> },
               formHelperText: { sx: { mx: 0, whiteSpace: 'normal', overflowWrap: 'anywhere' } },
             }}
-            sx={{ maxWidth: 360, width: '100%' }}
+            sx={{ maxWidth: SIZE.measureNarrow, width: '100%' }}
           />
         )
       })}
-
-      {formError && <Banner severity="error" testId="org-retention-error">{formError}</Banner>}
-
-      <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 1.5 }}>
-        <SubmitButton busy={busy} disabled={!changed || !valid} testId="org-retention-save">Save</SubmitButton>
-        <Button
-          disabled={busy || !changed}
-          onClick={() => { editing.current = false; setDraft(toDraft(data)); clearSaved() }}
-          data-testid="org-retention-cancel"
-          sx={tapTargetSx}
-        >
-          Cancel
-        </Button>
-        <SavedNote show={justSaved} detail={adjusted} />
-      </Box>
-    </Stack>
+    </PolicyForm>
   )
 }
 

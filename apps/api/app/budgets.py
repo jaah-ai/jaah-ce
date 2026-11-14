@@ -21,7 +21,6 @@ so crossing it again notifies again.
 from __future__ import annotations
 
 import logging
-from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Final, Iterable, Literal, Optional, Sequence
@@ -32,15 +31,13 @@ from sqlalchemy.orm import Session
 
 from app import edition_features, email_notify, merge_lane_state, plan_terms, task_ancestry
 from app.clock import utcnow
+from app.db import every_org_session
+from app.entity_shape import names_of
 from app.models.access import Budget, Group, UserGroupMembership
 from app.models.metering import TokenUsageCall
 from app.models.projects import Project
 from app.money import usd_text
 from app.user_activity import record_write
-
-# The community edition has no Telegram: `_notify` reads this name behind the same check.
-if edition_features.enabled("telegram"):
-    from app import telegram_notify
 
 log = logging.getLogger("budgets")
 
@@ -180,11 +177,7 @@ def statuses_of(session: Session, budgets: Sequence[Budget], now: Optional[datet
     group_ids = [b.group_id for b in budgets if b.group_id is not None]
     by_project = project_spend(session, org_id, project_ids, month)
     by_group = group_spend(session, org_id, group_ids, month)
-    names: dict[object, str] = {}
-    if project_ids:
-        names.update(session.execute(select(Project.id, Project.name).where(Project.id.in_(project_ids))).tuples().all())
-    if group_ids:
-        names.update(session.execute(select(Group.id, Group.name).where(Group.id.in_(group_ids))).tuples().all())
+    names: dict[object, str] = {**names_of(session, Project, project_ids), **names_of(session, Group, group_ids)}
     out = [
         Status(b, names.get(b.project_id if b.project_id is not None else b.group_id, ""),
                by_project.get(b.project_id, 0) if b.project_id is not None else by_group.get(b.group_id, 0))  # type: ignore[arg-type]
@@ -226,6 +219,14 @@ class Ledger:
             self._held[org_id] = [s for s in statuses_of(self.session, found, self.now) if s.state == "held"] if on else []
         return self._held[org_id]
 
+    def prime(self, org_ids: Iterable[Optional[UUID]]) -> None:
+        """`held` answered for every org of `org_ids` holding no budget at all (most orgs) in one read."""
+        wanted = {org_id for org_id in org_ids if org_id is not None and org_id not in self._held}
+        if not wanted:
+            return
+        budgeted = set(self.session.scalars(select(Budget.org_id).where(Budget.org_id.in_(wanted)).distinct()))
+        self._held.update({org_id: [] for org_id in wanted - budgeted})
+
     def _launcher_groups(self, task) -> set[UUID]:
         user_id = task_ancestry.launcher_user_id(self.session, task.id)
         if user_id is None:
@@ -258,7 +259,10 @@ class Ledger:
 
 def hold_reasons(session: Session, tasks: Iterable, now: Optional[datetime] = None) -> dict[int, str]:
     """`{task id: reason}` for those of `tasks` a budget holds back (`Ledger.hold_reason`)."""
+    tasks = list(tasks)
     ledger = Ledger(session, now)
+    if len(tasks) > 1:
+        ledger.prime(task.org_id for task in tasks)
     out: dict[int, str] = {}
     for task in tasks:
         reason = ledger.hold_reason(task)
@@ -332,11 +336,7 @@ def _notify(session: Session, status: Status, reached: bool) -> None:
             session, org_id, headline=headline, text=text, button_label="Open budget", href=href,
             event=email_notify.BUDGET_EVENT,
         )
-        # And over Telegram, to whoever chose it; the record counts emails only (as `plan_rollover` does).
-        if edition_features.enabled("telegram"):
-            telegram_notify.deliver_billing_message(
-                session, org_id, headline=headline, text=text, href=href, event=email_notify.BUDGET_EVENT,
-            )
+        # The record counts emails only (as `plan_rollover` does); the send carried Telegram too.
         # Why nobody was emailed; `plan_rollover` is billing's, so an edition without it records the count alone.
         unsent: Optional[str] = None
         why = ""
@@ -395,16 +395,7 @@ def _alert_org(session: Session, org_id: UUID, now: Optional[datetime], report: 
 
 def alert(now: Optional[datetime] = None) -> Report:
     """One pass over every org that has budgets (module docstring), on the operator plane."""
-    fleet: AbstractContextManager[Session]
-    if edition_features.enabled("multi_node_hosts"):
-        from app import vnodes
-
-        fleet = vnodes.fleet_session()
-    else:
-        # Run only by its system cron, which already holds the operator plane (`cron_runtime`).
-        from app.db import SessionLocal
-
-        fleet = SessionLocal()
+    fleet = every_org_session()
     report = Report()
     with fleet as session:
         org_ids = list(session.scalars(select(Budget.org_id).distinct()).all())

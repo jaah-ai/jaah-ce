@@ -126,6 +126,10 @@ def effective_settings(session: Session, *, org: Optional[UUID] = None) -> list[
             "key": knob.key,
             "label": knob.label,
             "help": knob.help,
+            # The "More" pop-up (`Knob.more`/`choice_help`/`docs`); `choice_help` pairs with the authored `choices`.
+            "more": knob.more,
+            "choice_help": list(knob.choice_help) if knob.choice_help else None,
+            "docs": knob.docs,
             "kind": knob.kind,
             "env": knob.env,
             "default": knob.default,
@@ -179,12 +183,12 @@ def project_choices() -> dict[str, str]:
     operator alone (`routes/settings.py`)."""
     from sqlalchemy import select as _select
 
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.models.orgs import Org
     from app.models.projects import Project
 
     detached, operator = reads._org_plane()
-    with detached, operator, SessionLocal() as session:
+    with detached, operator, BridgedSession() as session:
         rows = session.execute(
             _select(Project.id, Org.name, Project.name).join(Org, Org.id == Project.org_id)
             .order_by(Org.name, Project.name)

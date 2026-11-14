@@ -19,10 +19,15 @@ Enforced by the monorepo's environment-surfaces check.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import select
 import socket
 import stat
+import subprocess
+import sys
+import time
 import urllib.error
 from pathlib import Path
 
@@ -498,6 +503,92 @@ def marketplace_roots(provisioned_defaults: dict[str, str]) -> dict[str, str]:
     return out
 
 
+# ── Hook helpers: the stdlib-only leaf every runner hook may import ─────────────────────────────────
+
+def hook_log(name: str, *parts: str) -> None:
+    """Append one stamped line (`parts`, space-joined) to `hook_log_dir()/name` — the runner hooks' durable
+    decision log. Instrumentation only: it never gates a decision and never raises (a hook exception kills the
+    session). Homed here for `hook_log_dir`'s reason."""
+    log_dir = hook_log_dir()
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        with open(log_dir / name, "a") as fh:
+            fh.write(f"{stamp} {' '.join(parts)}\n")
+    except OSError:
+        pass
+
+
+# The chunk of a bounded hook-payload read.
+_STDIN_CHUNK_CHARS = 4096
+
+
+def hook_payload(wait_seconds: float | None, max_chars: int = 1 << 20) -> dict:
+    """The hook event JSON the agent wrote to our stdin, or `{}` — never an exception, never a hang. A tty
+    (manual run), silence past `wait_seconds`, bad JSON or a non-object all answer `{}`.
+
+    Bounded in time AND size: `select` only says ONE byte is ready, so a writer that sends `{` and holds the
+    pipe open would wedge the turn; `os.read` on the raw fd, not `stream.read(n)` — TextIOWrapper loops until n
+    chars or EOF, making the deadline decoration. A truncated payload just fails to parse. A stream with no real
+    fd cannot block, so it takes the plain read. `wait_seconds=None`: no deadline — read to EOF (a hook whose
+    agent writes and closes before it runs). Hook chains share one stdin, so only a chain's first reader may
+    call this. Homed here for `hook_log_dir`'s reason."""
+    stream = getattr(sys, "stdin", None)
+    if stream is None:
+        return {}
+    try:
+        if stream.isatty():
+            return {}       # a manual invocation, not a hook event — nothing is coming
+    except (OSError, ValueError):
+        return {}
+    try:
+        if wait_seconds is not None and not select.select([stream], [], [], wait_seconds)[0]:
+            return {}       # nothing piped in within the budget
+    except (OSError, ValueError, TypeError):
+        # Not selectable: still usually readable, and isatty already excluded the blocking case.
+        pass
+    deadline = None if wait_seconds is None else time.monotonic() + wait_seconds
+    try:
+        fd = stream.fileno()
+    except (OSError, ValueError, AttributeError):
+        fd = -1
+    if fd < 0:
+        try:
+            return _as_payload(stream.read(max_chars))
+        except (OSError, ValueError, UnicodeDecodeError):
+            return {}
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        while total < max_chars:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                    break
+            chunk = os.read(fd, _STDIN_CHUNK_CHARS)
+            if not chunk:
+                break   # EOF — the normal end, since the agent closes as it spawns us
+            chunks.append(chunk)
+            total += len(chunk)
+    except (OSError, ValueError):
+        return {}
+    try:
+        raw = b"".join(chunks).decode("utf-8", "replace")
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    return _as_payload(raw)
+
+
+def _as_payload(raw) -> dict:
+    """The JSON object `raw` holds, or `{}` — the one place that decides what counts as a hook payload; a
+    non-object has no field to read."""
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 # ── The virtual-node seam: the helpers and flags a relocated instance reads ──────────────────────────
 # Helpers joining onto `run_root`; none is a surface of its own.
 
@@ -538,6 +629,28 @@ def tailscale_command(*args: str) -> list[str]:
 
 _VNODE_TRUE = ("1", "true", "yes")
 _VNODE_FALSE = ("", "0", "false", "no")
+
+
+def tailscale_json(*args: str, timeout: float, who: str) -> dict | None:
+    """`tailscale <args>` (`tailscale_command`) parsed as a JSON object, or None: not askable here, the binary
+    absent, a nonzero exit, or output that is not an object — each logged under `who`. The one runner of the
+    tailscale CLI's `--json` verbs."""
+    if not tailscale_askable():
+        return None
+    try:
+        proc = subprocess.run(tailscale_command(*args), capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.info("%s: tailscale %s unavailable (%s)", who, args[0], exc)
+        return None
+    if proc.returncode != 0:
+        log.info("%s: tailscale %s failed (rc=%s)", who, args[0], proc.returncode)
+        return None
+    try:
+        parsed = json.loads(proc.stdout or "{}")
+    except ValueError as exc:
+        log.warning("%s: tailscale %s returned unparseable JSON (%s)", who, args[0], exc)
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def is_vnode() -> bool:

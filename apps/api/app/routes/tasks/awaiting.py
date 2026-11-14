@@ -2,19 +2,23 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
+from collections.abc import Iterable
 from typing import Any, Optional
 
 from sqlalchemy import and_, case, literal, or_, select, update
 from sqlalchemy.orm import Session
 
-from app import actors, fleet_verdicts, merge_lane_state, runner_terminations, slot_destroy, task_sections
+from app import (
+    actors, fleet_verdicts, merge_lane_state, runner_terminations, slot_destroy, slot_state, task_sections,
+)
+from app.clock import utcnow
 from app.events import emit_console_event
 from app.models.tasks import Task, TaskQuestion
-from app.models.worktrees import SlotIntent
+from app.models.worktrees import SlotIntent, Worktree
 from app.task_artifacts import visible_artifact_clause, visible_artifact_clause_joined
 from app.task_awaiting_response_parser import parse_response_options
-from app.task_lifecycle import ACTIVE, AWAITING_RESPONSE, READY
+from app.task_lifecycle import ACTIVE, AWAITING_RESPONSE, READY, TRANSITION_BY_NAME
 from app.user_activity import record_task_note
 from app.routes.tasks.policy import (
     OPERATOR_CRITERION_PERSONAS,
@@ -39,7 +43,7 @@ def _park(
     is refused: an unguarded park is never a gate."""
     if not from_states:
         raise ValueError("_park needs the gate's own source states")
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     row = session.execute(
         update(Task)
         .where(Task.id == task_id, Task.state.in_(from_states))
@@ -60,8 +64,7 @@ def _park(
         question[:120],
         extra={"question": question, "options": parse_response_options(question)},
     )
-    emit_console_event(session, entity="task", id=task_id, action=AWAITING_RESPONSE)
-    session.commit()
+    emit_console_event(session, entity="task", id=task_id, action=AWAITING_RESPONSE, commit=True)
     log.info("task %s ->awaiting_response (%s; github_synced_at=%s)", task_id, why, now)
     return AWAITING_RESPONSE
 
@@ -91,7 +94,7 @@ def resume_dispatched_task_on_answer(task_id: int, session: Session) -> Optional
     A system follow-up, not an operator verb. Only called after the node acks the delivery. No attempt
     reset, no re-stamped binding: the same session runs the same attempt. A moved row, or one with a visible
     open round, returns None."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     # Lock first, in its own statement: a capture holding the lock commits its round before the guard below
     # takes its snapshot (an UPDATE's own re-check would reuse a snapshot that cannot see it).
     session.execute(select(Task.id).where(Task.id == task_id).with_for_update())
@@ -124,11 +127,25 @@ def _pending_delivery_clause(task_id: int):
     return and_(
         is_deliver,
         case((is_deliver, SlotIntent.payload["task_id"].astext)) == str(task_id),
-        or_(
-            SlotIntent.outcome.is_(None),
-            SlotIntent.outcome.notin_(fleet_verdicts.SLOT_INTENT_RETIRING_OUTCOMES),
-        ),
+        # The drain's own pending test: its index guard reads the few live rows (`fleet_verdicts.still_pending`).
+        fleet_verdicts.still_pending(),
     )
+
+
+def answer_delivery_in_flight(task: Task, session: Session, runner_session_id: str) -> bool:
+    """True iff a `deliver_answer` for THIS park, addressed to the live runner RUNNER_SESSION_ID, is not retired
+    yet (still re-served) — the legacy gate stays `awaiting_response` until the node's `done` ack, so a second
+    answer would mint a second delivery the runner acts on again. Only a delivery minted since the park
+    (`github_synced_at`) to that session counts: one left behind by a runner that has since gone must not shut
+    the door the cold resume reopens."""
+    is_deliver = SlotIntent.verb == fleet_verdicts.VERB_DELIVER_ANSWER
+    clauses = [
+        _pending_delivery_clause(task.id),
+        case((is_deliver, SlotIntent.payload["session_id"].astext)) == runner_session_id,
+    ]
+    if task.github_synced_at is not None:
+        clauses.append(SlotIntent.created_at >= task.github_synced_at)
+    return session.scalar(select(SlotIntent.id).where(*clauses).limit(1)) is not None
 
 
 def supersede_pending_answer_delivery(task_id: int, session: Session) -> list[int]:
@@ -155,6 +172,18 @@ def supersede_pending_answer_delivery(task_id: int, session: Session) -> list[in
         .returning(SlotIntent.payload)
         .execution_options(synchronize_session=False)
     ).scalars().all()
+    round_ids = _rearm_rounds(session, task_id, payloads)
+    if payloads:
+        log.warning(
+            "task %s: runner asked a new question while %s answer delivery(ies) were unacknowledged — retired "
+            "them; round(s) %s re-quoted with the next delivery", task_id, len(payloads), round_ids,
+        )
+    return round_ids
+
+
+def _rearm_rounds(session: Session, task_id: int, payloads: Iterable[Any]) -> list[int]:
+    """Put the answered rounds the `deliver_answer` PAYLOADS carried back in the hand-off batch (`delivered_at`
+    cleared), so the next delivery re-quotes them. Returns the round ids. Does not commit."""
     round_ids = sorted({
         int(qid) for payload in payloads if isinstance(payload, dict)
         for qid in payload.get("question_ids") or [] if isinstance(qid, int)
@@ -167,12 +196,30 @@ def supersede_pending_answer_delivery(task_id: int, session: Session) -> list[in
             .values(delivered_at=None)
             .execution_options(synchronize_session=False)
         )
-    if payloads:
-        log.warning(
-            "task %s: runner asked a new question while %s answer delivery(ies) were unacknowledged — retired "
-            "them; round(s) %s re-quoted with the next delivery", task_id, len(payloads), round_ids,
-        )
     return round_ids
+
+
+def rearm_undelivered_answer(session: Session, payload: Any) -> None:
+    """A `deliver_answer` the node refused until `fleet_verdicts.purge_unexecutable_intents` dropped it: its
+    rounds were stamped delivered at the mint, so without this the answer is lost and the task waits forever on a
+    runner that never got it. The rounds go back in the hand-off batch and the parked-task sweep
+    (`task_pipeline_cp.expire_awaiting_response`) mints a fresh delivery, until one lands or the runner goes.
+
+    Only a round hand-off (`question_ids`) on a task still `awaiting_response`; a task edit's dismissal is
+    `live_task_edits.reopen_undelivered_dismissal`'s. Does not commit."""
+    if not isinstance(payload, dict) or payload.get("dismiss") is True:
+        return
+    task_id = payload.get("task_id")
+    if not isinstance(task_id, int) or not payload.get("question_ids"):
+        return
+    # Unlocked on purpose: the caller holds the intent row, and the answer path locks the task before intents, so a
+    # lock here could deadlock. A re-arm racing a fresh answer only re-quotes an answer, never loses one.
+    if session.scalar(select(Task.state).where(Task.id == task_id)) != AWAITING_RESPONSE:
+        return
+    round_ids = _rearm_rounds(session, task_id, [payload])
+    if round_ids:
+        log.warning("task %s: an answer delivery was dropped undelivered — round(s) %s re-armed for the next "
+                    "delivery", task_id, round_ids)
 
 
 def resume_past_pending_answer_delivery(task_id: int, session: Session, *, session_id: str = "") -> bool:
@@ -233,6 +280,7 @@ def resume_past_pending_answer_delivery(task_id: int, session: Session, *, sessi
 def system_fail_dispatched_task(
     task_id: int, reason: str, session: Session, *, final: bool = False, session_id: str = "",
     cause: Optional[str] = None, node: Optional[str] = None, note_detail: Optional[str] = None,
+    outcome_end: str = "abandoned", review_tier: Any = None,
 ) -> Optional[str]:
     """UNIVERSAL runner-reported FAILURE driven DB-DIRECT when a runner cannot proceed. Not
     unconditionally terminal: `end_attempt` returns the Task to `ready` while attempts remain.
@@ -256,6 +304,8 @@ def system_fail_dispatched_task(
         cause=cause,
         node=node,
         note_detail=note_detail,
+        outcome_end=outcome_end,
+        review_tier=review_tier,
     )
 
 
@@ -273,14 +323,38 @@ def _not_a_cp_round() -> Any:
 # `await_response_on_wedged_dispatch` gate, which has no runner and must not be reclaimed in a loop. An
 # open round is positive evidence (its one writer requires a running state, and `AskUserQuestion` is the
 # only human channel) — except one the CP raised itself on its gate (`CP_GATE_KEY`). Visible rounds only: a
-# Reset soft-hides rounds.
-def _has_open_runner_question(task_id_column: Any) -> Any:
+# Reset soft-hides rounds. `before` narrows it to rounds created before that instant.
+def _has_open_runner_question(task_id_column: Any, *, before: Optional[datetime] = None) -> Any:
     return select(literal(1)).where(
         TaskQuestion.task_id == task_id_column,
         TaskQuestion.status == "open",
         _not_a_cp_round(),
         visible_artifact_clause_joined(TaskQuestion.created_at),
+        *(() if before is None else (TaskQuestion.created_at < before,)),
     ).exists()
+
+
+def _answered_runner_park(task_id_column: Any) -> Any:
+    """The row is parked on a RUNNER's question that a human has since resolved, with nothing still open: the
+    answer found no live session to deliver into (`_settle_gate_if_nothing_outstanding` keeps it pending), so
+    only a fresh runner reading the Q&A trail moves the task on.
+
+    Positive evidence, as `_has_open_runner_question` is: the park's own text (`awaiting_response_body`, written
+    verbatim by the park `record_question_round` makes) is a resolved runner round. The CP's wedged-dispatch gate
+    parks on a text no runner round carries, and its checkout round is a CP round, so neither matches."""
+    any_open = select(literal(1)).where(
+        TaskQuestion.task_id == task_id_column,
+        TaskQuestion.status == "open",
+        visible_artifact_clause_joined(TaskQuestion.created_at),
+    ).exists()
+    answered = select(literal(1)).where(
+        TaskQuestion.task_id == task_id_column,
+        TaskQuestion.status != "open",
+        TaskQuestion.question == Task.awaiting_response_body,
+        _not_a_cp_round(),
+        visible_artifact_clause_joined(TaskQuestion.created_at),
+    ).exists()
+    return and_(~any_open, answered)
 
 
 def reclaim_awaiting_response_task(task_id: int, session: Session, *, node_fault: bool = False) -> bool:
@@ -290,7 +364,8 @@ def reclaim_awaiting_response_task(task_id: int, session: Session, *, node_fault
     With its session dead the row is unanswerable: answers are delivered into that session. `node_fault`
     means what it does in `reclaim_active_task`; the refund uses this door's source state.
 
-    Guarded by `_has_open_runner_question`, not the state. A chat is reclaimed too (owner: a fresh session
+    Guarded by `_has_open_runner_question` or `_answered_runner_park`, not the state. An answered (or
+    dismissed: declining is a decision) park lands `ready` with its attempts reset, as `answer` would. A chat is reclaimed too (owner: a fresh session
     beats a row parked for ever), but a chat parks with no round, so its signature is
     `awaiting_response_body IS NULL` (the CP gate always writes one) AND `runner_session_id IS NOT NULL`
     (the gate's archetype never had a session), keyed on `DONE_CRITERION_OPERATOR`. `resume_from_console`
@@ -306,6 +381,36 @@ def reclaim_awaiting_response_task(task_id: int, session: Session, *, node_fault
     # Before `end_attempt`, for `reclaim_active_task`'s reason.
     refunded = node_fault and _refund_node_fault_attempt(
         task_id, session, sources=(AWAITING_RESPONSE,))
+    # Not a row whose runner the unanswered-question sweep stopped on purpose: its rounds are kept for the
+    # operator and the answer relaunches it (`stop_runner_on_unanswered_question`).
+    not_stopped = Task.question_runner_stopped_at.is_(None)
+    # Answered after its runner died: the answer is the restart (`TRANSITIONS`' `answer` row resets attempts),
+    # so the vanished runner must not spend the budget and land `system_failed` at the ceiling. Same transaction
+    # as `end_attempt`, whose identical guard then lands it `ready`.
+    answered = session.execute(
+        update(Task)
+        .where(
+            Task.id == task_id, Task.state == AWAITING_RESPONSE, not_stopped,
+            Task.persona.notin_(OPERATOR_CRITERION_PERSONAS), _answered_runner_park(Task.id),
+        )
+        .values(
+            **({"dispatch_attempts": 0} if TRANSITION_BY_NAME["answer"].resets_attempts else {}),
+            **actors.task_actor_values(session),
+        )
+        .returning(Task.id)
+    ).first() is not None
+    if answered:
+        # The fresh runner reads these answers from its Q&A trail; stamped, as `_resume_after_stopped_question_runner`
+        # stamps them, so they do not ride that runner's own warm batches. Before `end_attempt`, which commits.
+        session.execute(
+            update(TaskQuestion)
+            .where(
+                TaskQuestion.task_id == task_id, TaskQuestion.status != "open", TaskQuestion.delivered_at.is_(None),
+                visible_artifact_clause(TaskQuestion.created_at, session.scalar(
+                    select(Task.artifacts_hidden_before).where(Task.id == task_id))),
+            )
+            .values(delivered_at=utcnow())
+        )
     # As `reclaim_active_task`: the note names the node and VM the parked runner was on.
     trace = _vanished_trace(session, task_id)
     landed = end_attempt(
@@ -314,14 +419,13 @@ def reclaim_awaiting_response_task(task_id: int, session: Session, *, node_fault
         sources=(AWAITING_RESPONSE,),
         node=trace.node, note_detail=trace.detail, note_vm=trace.vm,
         guards=(
-            # Not a row whose runner the unanswered-question sweep stopped on purpose: its rounds are kept for the
-            # operator and the answer relaunches it (`stop_runner_on_unanswered_question`).
-            Task.question_runner_stopped_at.is_(None),
+            not_stopped,
             or_(
-                # A runner frozen inside its own `AskUserQuestion`, for every non-interactive persona.
+                # A runner frozen inside its own `AskUserQuestion`, or one whose question was answered after it
+                # died, for every non-interactive persona.
                 and_(
                     Task.persona.notin_(OPERATOR_CRITERION_PERSONAS),
-                    _has_open_runner_question(Task.id),
+                    or_(_has_open_runner_question(Task.id), _answered_runner_park(Task.id)),
                 ),
                 # A chat parked at a turn boundary (no round); see the docstring for why both columns.
                 and_(
@@ -335,34 +439,53 @@ def reclaim_awaiting_response_task(task_id: int, session: Session, *, node_fault
         cause=runner_terminations.CAUSE_VANISHED,
     )
     if landed is None:
-        _discard_unused_refund(task_id, session, refunded=refunded)
+        # The attempts reset and stamp above are as orphaned as a refund when the reclaim declines: discard them.
+        _discard_unused_refund(task_id, session, refunded=refunded or answered)
         return False
     log.info(
-        "task %s parked on an unanswerable question (its runner vanished) reclaimed by the reaper -> %s",
-        task_id, landed,
+        "task %s parked on %s (its runner vanished) reclaimed by the reaper -> %s",
+        task_id, "an answered question" if answered else "an unanswerable question", landed,
     )
     return True
 
 
-def _aged_open_round(task_id: int, cutoff: datetime) -> Any:
-    """An OPEN, VISIBLE round on this task created before `cutoff` — the age guard both unanswered-question
-    doors ride, spelled as an EXISTS so it sits inside their one guarded write.
+def _stage_one_clause(cutoff: datetime) -> Any:
+    """Stage one's guard (`stop_runner_on_unanswered_question`) on a correlated `Task`: not a chat, not already
+    stopped, and an OPEN, VISIBLE runner round created before `cutoff`. Built here once for the write and for
+    `unanswered_question_may_be_due`.
 
-    Joined to `tasks` because `visible_artifact_clause_joined` requires it (else a silent cartesian
-    product). Implies `_has_open_runner_question`, so it keeps both doors off the CP's gate. The clock is
-    the round's `created_at`, not `tasks.updated_at`, which moves for unrelated reasons."""
+    The clock is the round's `created_at`, not `tasks.updated_at`, which moves for unrelated reasons. A runner
+    round only (`_has_open_runner_question`), so the CP's own wedged-dispatch gate never matches."""
+    return and_(
+        Task.persona.notin_(OPERATOR_CRITERION_PERSONAS),
+        Task.question_runner_stopped_at.is_(None),
+        _has_open_runner_question(Task.id, before=cutoff),
+    )
+
+
+def _stage_two_clause(cutoff: datetime) -> Any:
+    """Stage two's guard (`expire_timed_out_awaiting_response_task`) on a correlated `Task`: not a chat, and
+    either an open runner round older than `cutoff` or a row stage one stopped before `cutoff` (with nothing
+    open it must not hold its tree for ever). Built here once for the write and for
+    `unanswered_question_may_be_due`."""
+    return and_(
+        Task.persona.notin_(OPERATOR_CRITERION_PERSONAS),
+        or_(
+            _has_open_runner_question(Task.id, before=cutoff),
+            Task.question_runner_stopped_at < cutoff,
+        ),
+    )
+
+
+def addressable_hold_filter(task_id_column: Any) -> tuple[Any, ...]:
+    """The `Worktree` conditions for the hold `task_pipeline_cp.expire_awaiting_response` retries the answer
+    hand-off against: the task's own `TASK` slot, launched and dispatched. Shared with
+    `unanswered_question_may_be_due`."""
     return (
-        select(literal(1))
-        .select_from(TaskQuestion)
-        .join(Task, Task.id == TaskQuestion.task_id)
-        .where(
-            TaskQuestion.task_id == task_id,
-            TaskQuestion.status == "open",
-            TaskQuestion.created_at < cutoff,
-            _not_a_cp_round(),
-            visible_artifact_clause_joined(TaskQuestion.created_at),
-        )
-        .exists()
+        Worktree.task_id == task_id_column,
+        Worktree.state == slot_state.TASK,
+        Worktree.launch_session_id.isnot(None),
+        Worktree.dispatch_id.isnot(None),
     )
 
 
@@ -379,16 +502,14 @@ def stop_runner_on_unanswered_question(task_id: int, session: Session) -> bool:
     (`lease_drain._release_stopped_question_holds`) after the kill — releasing now would cancel the kill
     (see `end_attempt`). Work in progress keeps its slot until the answer or stage two. No attempt is
     charged. An `advisor` and the CP's gate are excluded, as in stage two."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     hours = int(unanswered_question_timeout().total_seconds() // 3600)
     row = session.execute(
         update(Task)
         .where(
             Task.id == task_id,
             Task.state == AWAITING_RESPONSE,
-            Task.persona.notin_(OPERATOR_CRITERION_PERSONAS),
-            Task.question_runner_stopped_at.is_(None),
-            _aged_open_round(task_id, now - unanswered_question_timeout()),
+            _stage_one_clause(now - unanswered_question_timeout()),
         )
         .values(
             question_runner_stopped_at=now,
@@ -419,14 +540,36 @@ def stop_runner_on_unanswered_question(task_id: int, session: Session) -> bool:
     # No transition row: the state did not change, and a same-state `task:` row skews epic time metrics.
     # The event still refreshes the board.
     emit_console_event(session, entity="task", id=task_id, action=AWAITING_RESPONSE,
-                       record_transition=False)
-    session.commit()
+                       record_transition=False, commit=True)
     send_minted_intents(issued)  # AFTER the commit — see `send_minted_intents`.
     log.warning(
         "task %s: its question went unanswered for over %sh — runner stopped, the row stays "
         "awaiting_response and answerable", task_id, hours,
     )
     return True
+
+
+def unanswered_question_may_be_due(now: Optional[datetime] = None) -> Any:
+    """True for an `awaiting_response` row (correlated to `Task`) that the parked-task sweep
+    (`task_pipeline_cp.expire_awaiting_response`) could act on. A read-time hint that only skips rows; each
+    stage's own guarded write stays the decision.
+
+    Composed from the same clause builders as the writes (`_stage_two_clause`, `_stage_one_clause`,
+    `addressable_hold_filter`), so it is never narrower than them. Left out, because they need the row at write
+    time: the state (the caller's CASE applies it), `end_attempt`'s own guards (destroy pending), stage one's
+    post-check, and the hand-off's lock and `_open_question_count`; `undelivered` stands in for the hand-off's
+    own pending-answer read. A row that comes due after this read is acted on by the next pass."""
+    now = now or utcnow()
+    undelivered = select(literal(1)).where(
+        TaskQuestion.task_id == Task.id,
+        TaskQuestion.status != "open",
+        TaskQuestion.delivered_at.is_(None),
+    ).exists()
+    return or_(
+        _stage_two_clause(now - unanswered_question_release_after()),
+        _stage_one_clause(now - unanswered_question_timeout()),
+        and_(select(literal(1)).where(*addressable_hold_filter(Task.id)).exists(), undelivered),
+    )
 
 
 def expire_timed_out_awaiting_response_task(task_id: int, session: Session) -> bool:
@@ -440,11 +583,11 @@ def expire_timed_out_awaiting_response_task(task_id: int, session: Session) -> b
     stage-one-stopped row and a still-live park.
 
     `final=True` lands `system_failed`: a re-dispatch would re-ask the same absent human. The question is
-    quoted into `awaiting_response_body`. Excluded: the CP's own wedged-dispatch gate (no open round;
-    `_aged_open_round`), and an `advisor` at any age. The age test is a guard on the write, so an answer
+    quoted into `awaiting_response_body`. Excluded: the CP's own wedged-dispatch gate (no runner round;
+    `_stage_two_clause`), and an `advisor` at any age. The age test is a guard on the write, so an answer
     in between cannot be overtaken."""
     days = unanswered_question_release_after().days
-    cutoff = datetime.now(timezone.utc) - unanswered_question_release_after()
+    cutoff = utcnow() - unanswered_question_release_after()
     # Read before the write only to quote it into the reason, never to branch on.
     question = session.scalar(
         select(TaskQuestion.question)
@@ -463,15 +606,7 @@ def expire_timed_out_awaiting_response_task(task_id: int, session: Session) -> b
             f"this task again."
         ),
         sources=(AWAITING_RESPONSE,),
-        guards=(
-            # NOT a chat — the docstring is the single home for that exclusion.
-            Task.persona.notin_(OPERATOR_CRITERION_PERSONAS),
-            or_(
-                _aged_open_round(task_id, cutoff),
-                # Or a row stage one stopped that long ago: with nothing open it must not hold its tree for ever.
-                Task.question_runner_stopped_at < cutoff,
-            ),
-        ),
+        guards=(_stage_two_clause(cutoff),),
         # TERMINAL BY CONSTRUCTION — see the docstring.
         final=True,
         cause=runner_terminations.CAUSE_QUESTION_UNANSWERED,

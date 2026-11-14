@@ -57,7 +57,7 @@ except ImportError as exc:
         f"packaged path {_PACKAGED_DAEMON_DIR}): {exc}",
         file=sys.stderr,
     )
-    raise SystemExit(1)
+    raise SystemExit(1) from exc
 
 
 # ── protocol constants ──────────────────────────────────────────────────────────────────────────────────

@@ -2,10 +2,10 @@ import type { ReactNode } from 'react'
 import { Navigate, Outlet } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import { useAuth, useCan } from '../../auth'
-import { useConfirm } from '../../components/ConfirmDialog'
+import { danger, useConfirm } from '../../components/ConfirmDialog'
 import { DenyListBackground, useListBackground } from '../../components/ListDetail'
 import { countOf } from '../../lib/humanize'
-import { planSwitchOn } from '../../lib/planSwitches'
+import { NotOnPlan, planSwitchOn } from '../../lib/planSwitches'
 import { MANAGE_KEY, deleteTemplate, templateKey, templateUsage } from './api'
 
 /* WHO MANAGES TEMPLATES — the console's twin of `routes/task_templates.py::_Viewer`: the operator edits the global
@@ -20,14 +20,16 @@ export function useTemplateEditing(): { global: boolean; org: boolean; any: bool
   return { global, org, any: global || org }
 }
 
-/** The manage list's and the editor's route guard (`RequireFeature`'s holding and refusal rules). */
+/** The manage list's and the editor's route guard (`RequireFeature`'s holding and refusal rules). An org whose plan
+ *  leaves Templates (org) out is told so ("Not on your plan"), not refused as if the person lacked access. */
 export function RequireTemplateEditor() {
-  const { loading, resolving } = useAuth()
+  const { admin, loading, resolving } = useAuth()
   const { any } = useTemplateEditing()
   const background = useListBackground()
   if (loading) return null
   if (!any) {
     if (resolving) return null
+    if (admin && !planSwitchOn(admin, 'org_templates_enabled')) return <NotOnPlan name="org_templates_enabled" />
     return background ? <DenyListBackground deny={background} /> : <Navigate to="/no-access" replace />
   }
   return <Outlet />
@@ -46,14 +48,12 @@ export function useTemplateDelete(): [(row: { id: string; name: string }) => Pro
       : automations === 0
         ? 'No automation uses it. This cannot be undone.'
         : `${countOf(automations, 'automation')} will stop. This cannot be undone.`
-    const ok = await confirm({
+    const ok = await confirm(danger('Delete', {
       title: 'Delete template?',
       message,
       identity: row.name,
-      confirmLabel: 'Delete',
-      destructive: true,
       run: { action: () => deleteTemplate(row.id), failed: 'Could not delete the template.' },
-    })
+    }))
     if (ok) {
       queryClient.removeQueries({ queryKey: templateKey(row.id) })
       void queryClient.invalidateQueries({ queryKey: MANAGE_KEY })

@@ -133,11 +133,3 @@ export async function runOverSelection<Row, T>(
     degraded: said.some(note => note.degraded),
   }
 }
-
-/** One key out of a by-verb map, without mutating the map React is rendering. */
-export function omitKey<T>(map: Record<string, T>, key: string): Record<string, T> {
-  if (!(key in map)) return map
-  const next = { ...map }
-  delete next[key]
-  return next
-}

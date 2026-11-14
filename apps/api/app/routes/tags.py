@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
-from typing import Iterable, Optional
+from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -24,17 +24,19 @@ from app.actors import actor_names_for, stamp_actor
 from app.auth import require_user
 from app.authz.catalog import permission_key
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
-from app.db import get_session
+from app.authz.principal import AsyncCaller, current_caller
+from app.db_async import DbDep, on_session
 from app.entity_shape import (
     EntityOut,
     StrictModel,
     bounded_text,
+    commit_row,
     entity_fields,
-    flush_or_409,
     optional_uuid,
+    reject_cleared,
     row_by_uuid_or_404,
     validated_description,
+    partial_of,
     validated_name,
 )
 from app.models.identity import AdminUser
@@ -146,14 +148,11 @@ class TagGroupCreateIn(StrictModel):
     multi_select: bool = False
 
 
-class TagGroupUpdateIn(StrictModel):
+class TagGroupUpdateIn(partial_of(TagGroupCreateIn)):  # type: ignore[misc,valid-type]  # generated base
     """A partial update; only the fields present are touched. Renaming is legitimate: the name is the
     Group-by handle."""
 
-    name: Optional[str] = None
-    description: Optional[str] = None
     state: Optional[str] = None
-    multi_select: Optional[bool] = None
 
 
 class TagCreateIn(StrictModel):
@@ -164,10 +163,8 @@ class TagCreateIn(StrictModel):
     description: Optional[str] = None
 
 
-class TagUpdateIn(StrictModel):
-    tag: Optional[str] = None
-    name: Optional[str] = None
-    description: Optional[str] = None
+class TagUpdateIn(partial_of(TagCreateIn)):  # type: ignore[misc,valid-type]  # generated base
+    pass
 
 
 class TagOrderIn(StrictModel):
@@ -269,16 +266,9 @@ def _group_out(row: TagGroup, tags: list[Tag], actor_names: dict[UUID, str]) -> 
     )
 
 
-def _actor_names(
-    session: Session, groups: Iterable[TagGroup], tags: Iterable[Tag]
-) -> dict[UUID, str]:
-    return actor_names_for(session, [*groups, *tags])
-
-
 def _groups_out(session: Session, groups: list[TagGroup]) -> list[TagGroupOut]:
     tags = _tags_by_group(session, [group.id for group in groups])
-    flat = [tag for rows in tags.values() for tag in rows]
-    names = _actor_names(session, groups, flat)
+    names = actor_names_for(session, [*groups, *(tag for rows in tags.values() for tag in rows)])
     return [_group_out(group, tags.get(group.id, []), names) for group in groups]
 
 
@@ -287,15 +277,19 @@ def _one_group_out(session: Session, group: TagGroup) -> TagGroupOut:
 
 
 def _one_tag_out(session: Session, row: Tag) -> TagOut:
-    return _tag_out(row, _actor_names(session, [], [row]))
+    return _tag_out(row, actor_names_for(session, [row]))
 
 
 def _ordered_groups(
-    session: Session, *, include_draft: bool, lock: bool = False
+    session: Session, *, include_draft: bool, lock: bool = False, org_id: Optional[UUID] = None,
 ) -> list[TagGroup]:
+    """The catalogue in its order. `org_id` pins the org where the seam binds none (`routes/live_public.py`); a
+    console route leaves it out, since the tenancy seam already bounds its session to the actor's org."""
     stmt = select(TagGroup).order_by(TagGroup.position, TagGroup.name)
     if not include_draft:
         stmt = stmt.where(TagGroup.state == "active")
+    if org_id is not None:
+        stmt = stmt.where(TagGroup.org_id == org_id)
     if lock:
         # `routes/groups.py`'s idiom: without the lock a concurrent DELETE makes the renumber a
         # `StaleDataError` 500.
@@ -353,14 +347,10 @@ def _validated_order(requested: list[str], present: list[UUID], *, noun: str) ->
         parsed = optional_uuid(value)
         if parsed is None:
             # 422, not 404: the id is body data, so the request is malformed.
-            raise HTTPException(
-                status_code=422, detail=f"{value[:80]!r} is not a {noun} id"
-            )
+            raise HTTPException(status_code=422, detail=f"{value[:80]!r} is not a {noun} id")
         order.append(parsed)
     if len(set(order)) != len(order):
-        raise HTTPException(
-            status_code=422, detail=f"the {noun} order lists the same {noun} more than once"
-        )
+        raise HTTPException(status_code=422, detail=f"the {noun} order lists the same {noun} more than once")
     expected = set(present)
     if set(order) != expected:
         missing = sorted(str(row_id) for row_id in expected - set(order))
@@ -380,12 +370,11 @@ def _validated_order(requested: list[str], present: list[UUID], *, noun: str) ->
 
 @router.get("/groups", response_model=list[TagGroupOut])
 @feature("tasks", "view")
-def list_tag_groups(
+async def list_tag_groups(
+    db: DbDep,
     include_draft: bool = False,
     # `require_user` authenticates; the `include_draft` arm reads the principal instead.
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> list[TagGroupOut]:
     """The catalogue. Active only by default, ordered by `position` then `name`, each group's tags likewise.
 
@@ -398,23 +387,24 @@ def list_tag_groups(
     refuses no role-holder today; it stays so the draft read never outlives the key it rides on."""
     # `principal.has` already answers True for a superadmin. `None` is unreachable (`require_user`
     # refused it) but spelled fail-closed so adding `agent_allowed` later cannot disclose drafts.
-    if include_draft and not (principal is not None and principal.has(TAGS_VIEW_KEY)):
+    if include_draft and not (caller.principal is not None and caller.principal.has(TAGS_VIEW_KEY)):
         raise HTTPException(
             status_code=403,
             detail=(
                 "include_draft needs `tags:view` or superadmin; draft tag groups are not a task surface"
             ),
         )
-    return _groups_out(session, _ordered_groups(session, include_draft=include_draft))
+    return await db.run_sync(_list_tag_groups, include_draft)
+
+
+def _list_tag_groups(session: Session, include_draft: bool, org_id: Optional[UUID] = None) -> list[TagGroupOut]:
+    return _groups_out(session, _ordered_groups(session, include_draft=include_draft, org_id=org_id))
 
 
 @router.post("/groups", response_model=TagGroupOut, status_code=201)
 @feature("tags", "create")
-def create_tag_group(
-    body: TagGroupCreateIn,
-    user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-) -> TagGroupOut:
+@on_session
+def create_tag_group(session: Session, body: TagGroupCreateIn, user: AdminUser = Depends(require_user)) -> TagGroupOut:
     """A group is born draft with no tags (`state` is refused), so going live requires the activation
     check on PUT, which needs a tag."""
     name = validated_name(body.name, field="name")
@@ -429,19 +419,17 @@ def create_tag_group(
     )
     stamp_actor(row, user, created=True)
     session.add(row)
-    flush_or_409(session, f"a tag group named {name!r} already exists")
-    session.commit()
-    session.refresh(row)
-    return _one_group_out(session, row)
+    return _one_group_out(session, commit_row(session, row, taken=f"a tag group named {name!r} already exists"))
 
 
 @router.put("/groups/{group_id}", response_model=TagGroupOut)
 @feature("tags", "edit")
+@on_session
 def update_tag_group(
+    session: Session,
     group_id: str,
     body: TagGroupUpdateIn,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> TagGroupOut:
     """Partial update. Every refusal is decided before the first `setattr`, so a rejected edit changes
     nothing.
@@ -455,10 +443,7 @@ def update_tag_group(
     # persist and return on reactivation, so DELETE is not the only way to retire a vocabulary.
     row = _group(session, group_id)
     fields = body.model_dump(exclude_unset=True)
-    for field in ("name", "state", "multi_select"):
-        if field in fields and fields[field] is None:
-            # None of these three has a meaningful empty value; only `description` clears (to `''`).
-            raise HTTPException(status_code=422, detail=f"{field} cannot be cleared")
+    reject_cleared(fields, ("name", "state", "multi_select"))  # only `description` clears (to `''`)
     name = validated_name(fields["name"], field="name") if "name" in fields else None
     state = _validated_state(fields["state"]) if "state" in fields else None
     description = validated_description(fields["description"]) if "description" in fields else None
@@ -502,19 +487,14 @@ def update_tag_group(
         row.multi_select = bool(fields["multi_select"])
     if fields:
         stamp_actor(row, user)
-    flush_or_409(session, f"a tag group named {(name if name is not None else row.name)!r} already exists")
-    session.commit()
-    session.refresh(row)
+    commit_row(session, row, taken=f"a tag group named {(name if name is not None else row.name)!r} already exists")
     return _one_group_out(session, row)
 
 
 @router.delete("/groups/{group_id}", status_code=204)
 @feature("tags", "delete")
-def delete_tag_group(
-    group_id: str,
-    user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-) -> Response:
+@on_session
+def delete_tag_group(session: Session, group_id: str, user: AdminUser = Depends(require_user)) -> Response:
     """Unconditional; the FKs cascade (migration 0123) the group, its tags and every assignment. No
     occupancy guard: the confirmation dialog reads `/usage` first, and an unoverridable refusal makes a
     vocabulary undeletable."""
@@ -538,11 +518,8 @@ def delete_tag_group(
 
 @router.get("/groups/{group_id}/usage", response_model=UsageOut)
 @feature("tags", "view")
-def tag_group_usage(
-    group_id: str,
-    _: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-) -> UsageOut:
+@on_session
+def tag_group_usage(session: Session, group_id: str, _: AdminUser = Depends(require_user)) -> UsageOut:
     """Distinct tasks holding any tag in this group (a task with two of them counts once).
 
     `tags:view`, not `tasks:view`: it is a task count, and its only caller is the delete confirmation."""
@@ -558,12 +535,8 @@ def tag_group_usage(
 
 @router.post("/groups/{group_id}/tags", response_model=TagOut, status_code=201)
 @feature("tags", "create")
-def create_tag(
-    group_id: str,
-    body: TagCreateIn,
-    user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-) -> TagOut:
+@on_session
+def create_tag(session: Session, group_id: str, body: TagCreateIn, user: AdminUser = Depends(require_user)) -> TagOut:
     group = _group(session, group_id)
     name = validated_name(body.name, field="name")
     code = (
@@ -580,19 +553,18 @@ def create_tag(
     )
     stamp_actor(row, user, created=True)
     session.add(row)
-    flush_or_409(session, f"tag {code!r} already exists in tag group {group.name!r}")
-    session.commit()
-    session.refresh(row)
+    commit_row(session, row, taken=f"tag {code!r} already exists in tag group {group.name!r}")
     return _one_tag_out(session, row)
 
 
 @router.put("/groups/{group_id}/tag-order", response_model=TagGroupOut)
 @feature("tags", "edit")
+@on_session
 def reorder_tags(
+    session: Session,
     group_id: str,
     body: TagOrderIn,
     _: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> TagGroupOut:
     """One transaction, `position` 1..n over the group's complete tag list. Idempotent."""
     group = _group(session, group_id)
@@ -618,11 +590,8 @@ def reorder_tags(
 # parameter and this endpoint would be unreachable.
 @router.put("/group-order", response_model=list[TagGroupOut])
 @feature("tags", "edit")
-def reorder_tag_groups(
-    body: GroupOrderIn,
-    _: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-) -> list[TagGroupOut]:
+@on_session
+def reorder_tag_groups(session: Session, body: GroupOrderIn, _: AdminUser = Depends(require_user)) -> list[TagGroupOut]:
     """Every group in the intended order, drafts included, and the response carries drafts too (its only
     consumer, the Settings page, lists them)."""
     rows = _ordered_groups(session, include_draft=True, lock=True)
@@ -635,11 +604,8 @@ def reorder_tag_groups(
 
 @router.get("/{tag_id}/usage", response_model=UsageOut)
 @feature("tags", "view")
-def tag_usage(
-    tag_id: str,
-    _: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-) -> UsageOut:
+@on_session
+def tag_usage(session: Session, tag_id: str, _: AdminUser = Depends(require_user)) -> UsageOut:
     """`tags:view` for `tag_group_usage`'s reason — a task count, not a vocabulary."""
     row = _tag(session, tag_id)
     count = session.scalar(
@@ -650,24 +616,18 @@ def tag_usage(
 
 @router.put("/{tag_id}", response_model=TagOut)
 @feature("tags", "edit")
-def update_tag(
-    tag_id: str,
-    body: TagUpdateIn,
-    user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-) -> TagOut:
+@on_session
+def update_tag(session: Session, tag_id: str, body: TagUpdateIn, user: AdminUser = Depends(require_user)) -> TagOut:
     """Partial update of the three authorable fields. The group is not one: moving a tag would carry its
     assignments into another vocabulary, and `position` is group-scoped."""
     row = _tag(session, tag_id)
     fields = body.model_dump(exclude_unset=True)
-    for field in ("tag", "name"):
-        if field in fields and fields[field] is None:
-            raise HTTPException(status_code=422, detail=f"{field} cannot be cleared")
+    reject_cleared(fields, ("tag", "name"))
     code = _normalized_tag(fields["tag"]) if "tag" in fields else None
     name = validated_name(fields["name"], field="name") if "name" in fields else None
     description = validated_description(fields["description"]) if "description" in fields else None
     # Read the group name before the first `setattr`: a query on a dirty row autoflushes, and a
-    # duplicate would raise outside `flush_or_409` as a 500 instead of the 409.
+    # duplicate would raise outside `commit_row` as a 500 instead of the 409.
     group_name = session.scalar(select(TagGroup.name).where(TagGroup.id == row.tag_group_id))
     if code is not None:
         row.tag = code
@@ -677,19 +637,14 @@ def update_tag(
         row.description = description
     if fields:
         stamp_actor(row, user)
-    flush_or_409(session, f"tag {(code or row.tag)!r} already exists in tag group {group_name!r}")
-    session.commit()
-    session.refresh(row)
+    commit_row(session, row, taken=f"tag {(code or row.tag)!r} already exists in tag group {group_name!r}")
     return _one_tag_out(session, row)
 
 
 @router.delete("/{tag_id}", status_code=204)
 @feature("tags", "delete")
-def delete_tag(
-    tag_id: str,
-    user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-) -> Response:
+@on_session
+def delete_tag(session: Session, tag_id: str, user: AdminUser = Depends(require_user)) -> Response:
     """Cascades to this tag's assignments (`task_tags.tag_id ON DELETE CASCADE`).
 
     Deleting an active group's last tag is allowed (operator decision): the zero-tag rule is an

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import Box from '@mui/material/Box'
-import { useMinuteTick } from '../../hooks/useMinuteTick'
+import { MINUTE_MS, useNow } from '../../hooks/useNow'
 import { toggled } from '../../lib/sets'
 import { taskRowElementId } from '../../lib/taskDeepLink'
 import type { PipelineTask } from '../../types'
@@ -23,7 +23,7 @@ export default function SubtaskList({ task }: { task: PipelineTask }) {
   const navigate = useNavigate()
   const orgVisible = useOrgVisible()
   // The rows' ages are computed from `Date.now()` in `toViewRow`.
-  useMinuteTick()
+  useNow(MINUTE_MS)
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set())
 
   const sections: FeedSection[] = epicChildGroups(task.children ?? []).map(group => ({

@@ -8,20 +8,14 @@
 //   - `userSettingsToPreferences` — draft → the wire keys, identical for both surfaces.
 // The controls live once in `components/UserSettingsFields.tsx`. Pure of React: the pages own WHEN to
 // read/write and the endpoint (`PUT /api/auth/me` for self, `PATCH /api/users/{id}` for a superadmin).
-import { FOCUSED_PROJECT_PREF, readFocusedProjectId } from './focusedProject'
 
 /**
  * Every preference either settings surface offers, and nothing else.
- * Absent: `nav_collapsed_groups` (the retired sidebar fold set, no control) and `notifications` — offered on
- * both surfaces but saved by its own tab's button, so folding it in would make Settings' save re-assert a
- * block the operator never opened. Its home: `lib/notificationPrefs.ts` + `components/NotificationsPanel.tsx`.
+ * Absent: alerts — notification channels, which `components/NotificationsPanel.tsx` saves on its own.
  */
 export type UserSettingsDraft = {
   /** `'default'` = never picked: the operator's default applies (`lib/colorScheme.ts`); stored absent. */
   theme: 'default' | 'light' | 'dark'
-  wideMode: boolean
-  /** `null` = no focused project (All projects); `lib/focusedProject.ts` says what it does. */
-  focusedProjectId: number | null
 }
 
 /**
@@ -33,8 +27,6 @@ export function readUserSettings(
 ): UserSettingsDraft {
   return {
     theme: preferences?.theme === 'dark' || preferences?.theme === 'light' ? preferences.theme : 'default',
-    wideMode: preferences?.wide_mode === true,
-    focusedProjectId: readFocusedProjectId(preferences),
   }
 }
 
@@ -47,15 +39,13 @@ const STORED_KEYS: {
   /* `undefined`, not `null`: JSON drops the key, which the server reads as unset, and an outgoing API release
      during a rollout accepts an absent key but 422s a `null` (`preferences.py::preferences_document`). */
   theme: ['theme', value => (value === 'default' ? undefined : value)],
-  wideMode: ['wide_mode', value => value],
-  focusedProjectId: [FOCUSED_PROJECT_PREF, value => value],
 }
 
 /**
  * The draft as the server's preference keys — the ONE write shape.
  * PARTIAL by design: both write paths REPLACE `admin_users.preferences` wholesale (`routes/auth.py`,
  * `routes/users.py`), so callers merge it over the stored document (`mergedUserPreferences`) or they
- * wipe `notifications` and `nav_collapsed_groups`.
+ * wipe the task rail's keys.
  */
 export function userSettingsToPreferences(draft: UserSettingsDraft): Record<string, unknown> {
   const stored: Record<string, unknown> = {}
@@ -70,8 +60,7 @@ export function userSettingsToPreferences(draft: UserSettingsDraft): Record<stri
 
 /**
  * The COMPLETE preferences document to send: these keys merged over everything they do not own (both
- * write paths replace wholesale). Serves the two draft-shaped callers; `/users/:id`'s Notifications tab
- * merges a `notifications` block and spreads the stored object itself. Takes the stored document rather
+ * write paths replace wholesale). Serves the two draft-shaped callers (`lib/preferencesPatch.ts`). Takes the stored document rather
  * than reading one: the surfaces hold it in different places.
  */
 export function mergedUserPreferences(

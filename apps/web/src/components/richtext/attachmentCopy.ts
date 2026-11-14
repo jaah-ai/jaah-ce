@@ -3,7 +3,7 @@ import { Mapping } from '@tiptap/pm/transform'
 import type { Transaction } from '@tiptap/pm/state'
 import type { Editor } from '@tiptap/core'
 import { nanoid } from 'nanoid'
-import { apiFetch } from '../../api'
+import { getBlob } from '../../api'
 import {
   type AttachmentResolver,
   attachmentToken,
@@ -124,9 +124,7 @@ export function mintImageFilename(file: File): string {
 async function fetchCopiedImage(source: string, token: string): Promise<File> {
   let blob: Blob
   if (source.startsWith('/api/')) {
-    const resp = await apiFetch(source, { credentials: 'same-origin' })
-    if (!resp.ok) throw new Error(`could not read ${token}`)
-    blob = await resp.blob()
+    blob = await getBlob(source)
   } else {
     // A painted URL of THIS tab; one minted elsewhere (another tab, since released) is gone.
     const painted = paintedBytes(source)

@@ -1,7 +1,7 @@
-import type { Forge, OrgRef, Project, ProjectCreateDefaults, ProjectRepo, TechStackEntry } from '../../types'
+import type { Forge, OrgRef, Project, ProjectCreateDefaults, ProjectRepo, RoutingMode, TechStackEntry } from '../../types'
 import { ApiError, apiDetail, post } from '../../api'
 import { writeAsOnce } from '../../lib/actAs'
-import { strOrNull } from '../../lib/strings'
+import { splitList, strOrNull } from '../../lib/strings'
 import { loadRepoState } from '../../ui/RepoUrlLookup'
 import { connectInPopup, openConnectPopup } from './githubOAuthPopup'
 
@@ -27,25 +27,37 @@ export type ProjectFormState = {
   default_provider: string
   /* The persona new tasks start as (`''` = the org's "Persona" default). Edit only, as the default agent. */
   default_persona: string
-  port_vars: string
-  port_block: string
+  /* Project memory (`projects.project_memory`): `''` = the org's default, `'on'`/`'off'` = this project's. Edit only. */
+  project_memory: ProjectMemoryChoice
   branch_prefix: string
   gate_quick_cmd: string
   gate_full_cmd: string
   /* PRs per merge-lane batch (`merge_lane_batch_max`); `''` = the lane's default. Edit only, not governance. */
   merge_lane_batch_max: string
+  /* The project's own merge lane switch (`merge_lane_enabled`), off by default; null = a cached row from before the
+  column: not sent. Edit only. */
+  merge_lane_enabled: boolean | null
+  /* Minutes between outcome scans (`outcome_scan_interval_minutes`); `''` = inherit. Edit only, not governance. */
+  outcome_scan_interval_minutes: string
+  /* The project's own CI security-check name patterns, comma-separated (`security_check_patterns`). Edit only. */
+  security_check_patterns: string
+  /* Intelligent routing (`routes/projects.py::_validated_routing`). Edit only. `routing_mode` `''` = unknown (a cached
+  row from before the column): `buildBody` omits it. `routing_latency_cap_hours` `''` = no cap. */
+  routing_mode: RoutingMode | ''
+  routing_latency_cap_hours: string
+  blind_review: boolean
+  blind_review_other_vendor: boolean
+  /* `experiment_budget_share` as a percent (0–100); `''` = not known (a cached row) or cleared: not sent. */
+  experiment_budget_pct: string
   stack_up_cmd: string
   stack_down_cmd: string
   /* Tri-state: a checkbox has no empty state, so without `null` an unknown flag would render and submit
   as `false`. `formFromProject` says when unknown happens; `buildBody` makes the null unsendable. */
   push_enabled: boolean | null
-  /* A `users.id` UUID string, or `''` for nobody: a select's value is always a string, and `null` would
-  make it uncontrolled. `buildBody` is the one place `''` becomes the column's null. */
-  business_analyst_id: string
-  architect_id: string
-  /* The whole Jira config: the `credentials` row, or `null`. Null rather than `''` because
-  `ui/AsyncLookup` already models nothing-chosen as null; the uuid key is the column value. */
-  jira_credential_id: string | null
+  /* Who background jobs run as: a `users.id` UUID string, `''` = the org's default (a select's value is always a
+  string; `buildBody` is the one place `''` becomes the column's null). Edit only, and sent only by an Org Owner/Admin or the
+  operator, only when changed (the edit page drops it otherwise: the server refuses anyone else naming it). */
+  run_jobs_as_id: string
   tech_stack: TechStackEntry[]
   notes: string
   /* A plain string like `notes`, not a governance string, though it renders on Governance: any
@@ -73,15 +85,18 @@ export function createCommands(raw: Partial<ProjectCreateDefaults> | null | unde
   }
 }
 
+/** The Project memory select's values: `''` follows the org's default (System Settings). */
+export type ProjectMemoryChoice = '' | 'on' | 'off'
+
 export function emptyForm(mode: ProjectFormMode, commands: ProjectCreateDefaults): ProjectFormState {
   return {
     mode, name: '', repos: [newRepoDraft(true)],
-    default_model: '', default_agent_id: null, default_provider: '', default_persona: '', merge_lane_batch_max: '',
-    port_vars: '',
-    port_block: '', ...NEW_PROJECT_GOVERNANCE, ...commands,
-    // Not seeded: there is no default person, and the create path does not accept them (see `namesHumans`).
-    business_analyst_id: '', architect_id: '',
-    jira_credential_id: null,
+    default_model: '', default_agent_id: null, default_provider: '', default_persona: '', project_memory: '', merge_lane_batch_max: '', merge_lane_enabled: false, outcome_scan_interval_minutes: '', security_check_patterns: '',
+    routing_mode: 'inherit', routing_latency_cap_hours: '', blind_review: false, blind_review_other_vendor: true,
+    experiment_budget_pct: '10',
+    ...NEW_PROJECT_GOVERNANCE, ...commands,
+    // Not seeded: there is no default person, and the create path does not accept it.
+    run_jobs_as_id: '',
     /* Not seeded: a default would be prose nobody wrote in every runner's system prompt. */
     tech_stack: [], notes: '', agent_instructions: '',
   }
@@ -90,14 +105,21 @@ export function emptyForm(mode: ProjectFormMode, commands: ProjectCreateDefaults
 export function formFromProject(p: Project): ProjectFormState {
   return {
     mode: 'edit', id: p.id, name: p.name,
-    repos: p.repos ? p.repos.map(repoDraftFromRow) : null,
+    repos: p.repos ? p.repos.map(r => repoDraftFromRow(r, p)) : null,
     default_model: p.default_model ?? '',
     default_agent_id: p.default_agent_id ?? null,
     default_provider: p.default_provider ?? '',
     default_persona: p.default_persona ?? '',
+    project_memory: p.project_memory == null ? '' : p.project_memory ? 'on' : 'off',
     merge_lane_batch_max: p.merge_lane_batch_max != null ? String(p.merge_lane_batch_max) : '',
-    port_vars: (p.port_vars ?? []).join(', '),
-    port_block: p.port_block != null ? String(p.port_block) : '',
+    merge_lane_enabled: p.merge_lane_enabled ?? null,
+    outcome_scan_interval_minutes: p.outcome_scan_interval_minutes != null ? String(p.outcome_scan_interval_minutes) : '',
+    security_check_patterns: (p.security_check_patterns ?? []).join(', '),
+    routing_mode: p.routing_mode ?? '',
+    routing_latency_cap_hours: p.routing_latency_cap_hours != null ? String(p.routing_latency_cap_hours) : '',
+    blind_review: p.blind_review ?? false,
+    blind_review_other_vendor: p.blind_review_other_vendor ?? true,
+    experiment_budget_pct: p.experiment_budget_share != null ? String(Math.round(p.experiment_budget_share * 1000) / 10) : '',
     /* `?? ''` on six NOT NULL columns, never a house default: the persisted roster can predate the columns
     right after a deploy. It is a controlled-input guard, and an empty required field honestly blocks submit;
     seeding a default would write a value nobody chose. */
@@ -109,11 +131,7 @@ export function formFromProject(p: Project): ProjectFormState {
     /* `?? null`, never `?? false`: a pre-deploy cached row lacks the key, and `false` would make an unrelated
     Save revoke push and dispatch `sync_access_guard`. `null` renders indeterminate and `buildBody` omits it. */
     push_enabled: p.push_enabled ?? null,
-    /* A real conversion: the column is nullable and null means "— None —"; a pre-column row reads the same. */
-    business_analyst_id: p.business_analyst_id ?? '',
-    architect_id: p.architect_id ?? '',
-    /* The warm-reload guard: absent key → null ("no Jira"), keeping the picker controlled. */
-    jira_credential_id: p.jira_credential_id ?? null,
+    run_jobs_as_id: p.run_jobs_as_id ?? '',
     /* Coerced per field, not just per array: `list[dict[str, str]]` once accepted `[{"layer": "frontend"}]`,
     and `buildBody`'s `.trim()` on `undefined` threw inside `handleSubmit`'s try, showing "Failed to save
     project" with no request. The API now refuses it (`routes/projects.py::TechStackEntry`); existing rows
@@ -166,6 +184,11 @@ export type RepoDraft = {
   forge_base_url: string
   integration_branch: string
   is_primary: boolean
+  /* The repository's own Branch policy (Governance), tier-authored as the project's were: `repoBody` sends them only
+  with governance. `push_enabled` is tri-state as the project's (`null`: a cached row that predates it, not sent). */
+  branch_prefix: string
+  push_enabled: boolean | null
+  allow_force_push: boolean
   saved?: { repo_url: string; integration_branch: string; name: string; web_url: string | null; forge: Forge | null }
   /* The URL its forge reported with no branch at all (`RepoRowFields`); never sent. */
   empty?: string
@@ -211,12 +234,23 @@ export function newRepoNameError(name: string): string | null {
 export const NEW_REPO_BRANCH = 'develop'
 
 let draftSeq = 0
-export function newRepoDraft(isPrimary: boolean): RepoDraft {
+/* `like`: the primary's (or, with no repository yet, the project's) prefix and push, which a new row inherits as the
+ * server does for a row that names neither; none, a new project's seed. Force push never carries over: each
+ * repository opts in on its own. */
+export type RepoPolicySeed = Pick<RepoDraft, 'branch_prefix' | 'push_enabled'>
+export function newRepoDraft(isPrimary: boolean, like?: RepoPolicySeed): RepoDraft {
   draftSeq += 1
-  return { key: `new-${draftSeq}`, repo_url: '', forge: '', forge_base_url: '', integration_branch: NEW_REPO_BRANCH, is_primary: isPrimary }
+  return {
+    key: `new-${draftSeq}`, repo_url: '', forge: '', forge_base_url: '', integration_branch: NEW_REPO_BRANCH, is_primary: isPrimary,
+    branch_prefix: like?.branch_prefix ?? NEW_PROJECT_GOVERNANCE.branch_prefix,
+    push_enabled: like ? like.push_enabled : NEW_PROJECT_GOVERNANCE.push_enabled,
+    allow_force_push: false,
+  }
 }
 
-function repoDraftFromRow(r: ProjectRepo): RepoDraft {
+/* The three policy fields `?? the project's`: a cached row can predate them, and the server backfilled each from its
+ * project (the primary's are the project's anyway). */
+function repoDraftFromRow(r: ProjectRepo, p: Project): RepoDraft {
   return {
     key: `id-${r.id}`, id: r.id, repo_url: r.repo_url,
     /* Seeded from any `gitlab`, gitlab.com's included: on a known host the picker is hidden and `repoBody`
@@ -225,6 +259,9 @@ function repoDraftFromRow(r: ProjectRepo): RepoDraft {
     forge_base_url: r.forge_base_url ?? '',
     integration_branch: r.integration_branch,
     is_primary: r.is_primary,
+    branch_prefix: r.branch_prefix ?? p.branch_prefix ?? '',
+    push_enabled: r.push_enabled ?? p.push_enabled ?? null,
+    allow_force_push: r.allow_force_push ?? false,
     saved: { repo_url: r.repo_url, integration_branch: r.integration_branch, name: r.name, web_url: r.web_url, forge: r.forge },
   }
 }
@@ -251,14 +288,6 @@ export function repoName(repo: RepoDraft): string {
   return path.replace(/[?#].*$/, '').replace(/\/+$/, '').replace(/\.git$/i, '') || t
 }
 
-/** The row's forge page: the server's for a stored, unedited URL; an https URL as typed otherwise; else none. */
-export function repoWebUrl(repo: RepoDraft): string | null {
-  if (repo.create) return null
-  if (repo.saved && repo.saved.repo_url === repo.repo_url) return repo.saved.web_url
-  const t = repo.repo_url.trim()
-  return /^https:\/\/[^/]+\/.+/i.test(t) ? t.replace(/\.git$/i, '') : null
-}
-
 /** Removing the primary while others remain, as the server words it (AS4: `_PICK_ANOTHER_PRIMARY`). */
 export const PICK_ANOTHER_PRIMARY = 'Pick another primary first.'
 /** The banner over a refusal that lives on the rows. */
@@ -270,8 +299,37 @@ export function withPrimary(repos: RepoDraft[]): RepoDraft[] {
   return repos.map((r, i) => ({ ...r, is_primary: i === 0 }))
 }
 
+/* A push is allowed only to a ref under `branch_prefix` (docs: the repo-access-levels policy, §The five fields), so
+ * an integration branch outside the prefix (`jaah-master` with `jaah-master/`) is one runners cannot push to; under
+ * it (`jaah/master` with `jaah/`) they can. The prefix is judged as the server stores it: trimmed, with exactly one
+ * trailing `/`. An empty prefix is unrestricted. */
+/** The first integration branch outside the prefix, which runners cannot push to, or null. */
+export function branchOutsidePrefix(prefix: string, repos: readonly RepoDraft[] | null): string | null {
+  const stored = storedPrefix(prefix)
+  if (!stored) return null
+  for (const repo of repos ?? []) {
+    const branch = repo.integration_branch.trim()
+    if (branch && !branch.startsWith(stored)) return branch
+  }
+  return null
+}
+
+/** The warning on Branch prefix while `branchOutsidePrefix` names a branch. */
+export function branchOutsidePrefixWarning(prefix: string, branch: string): string {
+  return `Runners can't push to ${branch}: it isn't under ${storedPrefix(prefix)}. Use a prefix it starts with, e.g. jaah/ for jaah/master.`
+}
+
+function storedPrefix(prefix: string): string {
+  const bare = prefix.trim().replace(/\/+$/, '')
+  return bare ? `${bare}/` : ''
+}
+
 /** The per-row messages a table draws: on a field (shown on that control) or on the row itself. */
-export type RepoRowError = { repo_url?: string; integration_branch?: string; owner?: string; name?: string; row?: string }
+export type RepoRowError = {
+  repo_url?: string; integration_branch?: string; owner?: string; name?: string; row?: string
+  /** Drawn on Branch policy's prefix (`ProjectEditPage`), not the table: it keeps no row open. */
+  branch_prefix?: string
+}
 export type RepoRowErrors = Record<string, RepoRowError>
 /** A row's field errors (all but `row`), which keep it open. */
 export const REPO_FIELD_ERRORS = ['repo_url', 'integration_branch', 'owner', 'name'] as const
@@ -309,8 +367,8 @@ type MadeRepo = { url: string; forge: string; root: string; base_url?: string | 
  * URL was entered, or now when `probe` (the wizard), in case that answer had not come — main and develop
  * (`POST /api/git-repos/initialize`; a cut-short initialization is finished: `forge_repo_init.initialize`). Each
  * made row at once becomes an existing one on its URL (`onRows`; marked empty when its initialization failed), so a retried
- * Create or Save never makes it twice. Returns the rows to send; throws a `NewRepoError` naming a row it could not
- * make, else the forge's own refusal. `org`: another org's project (an operator's) — every read and write
+ * run (the wizard's Repository Next, its Create, or the edit page's Save) never makes it twice. Returns the rows to send;
+ * throws a `NewRepoError` naming the row it could not make or initialize, else the forge's own refusal. `org`: another org's project (an operator's) — every read and write
  * here goes as that org, through its forge connections (`lib/actAs.ts::writeAsOnce`). */
 export async function prepareRepos(
   rows: RepoDraft[], projectName: string, probe: boolean, onRows: (rows: RepoDraft[]) => void, org: OrgRef | null = null,
@@ -367,7 +425,12 @@ export async function prepareRepos(
       // Marked before writing: a cut-short initialization reads as non-empty, and the retry must still finish it.
       replace(r.key, { ...r, empty: r.repo_url })
     }
-    await post('/api/git-repos/initialize', { url, name: projectName.trim() }, ...asOrg)
+    try {
+      await post('/api/git-repos/initialize', { url, name: projectName.trim() }, ...asOrg)
+    } catch (err) {
+      // On the row it was for, as a create's refusal is.
+      throw new NewRepoError(apiDetail(err, 'Failed to initialize the repository'), r.key)
+    }
   }
   return out
 }
@@ -410,7 +473,7 @@ export function repoRowErrors(err: unknown, sent: readonly RepoDraft[]): RepoRow
     if (loc[3] === 'repo_url' && item.type === 'invalid_repo_url' && forgePickerShown(repo.repo_url) && repo.forge === '') {
       message = 'Unrecognised host — set Forge, or fix the URL.'
     }
-    const field = loc[3] === 'repo_url' || loc[3] === 'integration_branch' ? loc[3] : 'row'
+    const field = loc[3] === 'repo_url' || loc[3] === 'integration_branch' || loc[3] === 'branch_prefix' ? loc[3] : 'row'
     errors[repo.key] = { ...errors[repo.key], [field]: errors[repo.key]?.[field] ?? message }
   }
   return Object.keys(errors).length ? errors : null
@@ -424,31 +487,32 @@ export function repoRowErrors(err: unknown, sent: readonly RepoDraft[]): RepoRow
  * Six here: the seventh, `integration_branch`, is the primary row's branch in `repos`, which the server counts
  * as authored only when it changes (`_repos_author_the_branch`); the table locks it instead. */
 function governanceBody(form: ProjectFormState): Record<string, unknown> {
+  /* With repositories, prefix and push are each row's (`repoBody`); the project's pair is the primary's projection,
+  sent as the primary's so the two never disagree. No repos list (a cached row): the project's own fields. */
+  const primary = form.repos === null ? undefined : withPrimary(filledRepos(form.repos)).find(r => r.is_primary)
+  const { branch_prefix, push_enabled } = primary ?? form
   return {
     /* The five text fields go out `.trim()`, never `strOrNull`: they are NOT NULL (a null is a 422).
     `branch_prefix`'s `''` is a real value (no prefix), as is a blank gate or stack command (none). The
-    trailing-slash normalisation (`sn` → `sn/`) is the API's; send the typed value. */
-    branch_prefix: form.branch_prefix.trim(),
+    trailing-slash normalisation (`agent` → `agent/`) is the API's; send the typed value. */
+    branch_prefix: branch_prefix.trim(),
     gate_quick_cmd: form.gate_quick_cmd.trim(),
-    gate_full_cmd: form.gate_full_cmd.trim(),
+    /* Create only. An edit adds it in `ProjectEditPage` only for a basic pipeline, decided from the live project at save
+    time (`basicPipeline`), and only when typed: a custom pipeline's full gate is its Merge step's gate list, which
+    this one command would overwrite. */
+    ...(form.mode === 'edit' ? {} : { gate_full_cmd: form.gate_full_cmd.trim() }),
     stack_up_cmd: form.stack_up_cmd.trim(),
     stack_down_cmd: form.stack_down_cmd.trim(),
     /* Spread-if-known: `null` is "the row has not told us", and an omitted key leaves the column alone under
     `exclude_unset`. `false` would be a guess with a side effect; `null` is a 422. */
-    ...(form.push_enabled !== null ? { push_enabled: form.push_enabled } : {}),
+    ...(push_enabled !== null ? { push_enabled } : {}),
   }
 }
 
-/* May this form name the two humans? One predicate for what `buildBody` sends and what renders.
- * Edit only: the create path does not accept the keys (a 422), and the candidates come from
- * `GET /api/projects/{id}/members`, which needs an id. */
-export function namesHumans(form: ProjectFormState): boolean {
-  return form.mode === 'edit'
-}
-
 /* One `ProjectRepoIn`. The forge pair is always sent, null off the picker: a known host derives its forge, and a
-declaration left behind by a URL edit must not outlive the host it was made for. */
-function repoBody(repo: RepoDraft): Record<string, unknown> {
+declaration left behind by a URL edit must not outlive the host it was made for. The row's Branch policy goes only
+with `includeGovernance`, as `governanceBody`: omitted, the server keeps what is stored (a new row: the project's). */
+function repoBody(repo: RepoDraft, includeGovernance: boolean): Record<string, unknown> {
   const declared = forgePickerShown(repo.repo_url) && repo.forge === 'gitlab'
   return {
     ...(repo.id !== undefined ? { id: repo.id } : {}),
@@ -457,7 +521,21 @@ function repoBody(repo: RepoDraft): Record<string, unknown> {
     forge_base_url: declared ? strOrNull(repo.forge_base_url) : null,
     integration_branch: repo.integration_branch.trim(),
     is_primary: repo.is_primary,
+    ...(includeGovernance
+      ? {
+        branch_prefix: repo.branch_prefix.trim(),
+        ...(repo.push_enabled !== null ? { push_enabled: repo.push_enabled } : {}),
+        allow_force_push: repo.allow_force_push,
+      }
+      : {}),
   }
+}
+
+/** A row's Branch policy at a glance (the General tab's shield): read only, a prefix, or no rules. */
+export type BranchRules = 'read_only' | 'prefix' | 'none'
+export function branchRules(repo: RepoDraft): BranchRules {
+  if (repo.push_enabled === false) return 'read_only'
+  return repo.branch_prefix.trim() !== '' ? 'prefix' : 'none'
 }
 
 /** The rows that are repositories: a blank URL is none, and is neither checked nor sent; a new one is one. */
@@ -479,7 +557,7 @@ export function formHasRepo(form: ProjectFormState): boolean {
 const REPO_ONLY_KEYS: ReadonlySet<string> = new Set([
   'repo_url', 'forge', 'forge_base_url', 'integration_branch', 'branch_prefix', 'push_enabled',
   'gate_quick_cmd', 'gate_full_cmd', 'stack_up_cmd', 'stack_down_cmd',
-  'port_vars', 'port_block', 'merge_lane_batch_max',
+  'merge_lane_batch_max', 'outcome_scan_interval_minutes', 'security_check_patterns',
 ])
 
 /** Whether this form hides `key` — one predicate for what renders, what is checked and what is sent. */
@@ -502,7 +580,6 @@ function defaultAgentBody(form: ProjectFormState): Record<string, unknown> {
 // (ProjectCreate / ProjectUpdate mirror each other). `includeGovernance` has no default: a new submit path
 // must state which it is.
 export function buildBody(form: ProjectFormState, includeGovernance: boolean): Record<string, unknown> {
-  const portVars = form.port_vars.split(',').map(s => s.trim()).filter(Boolean)
   const techStack = form.tech_stack
     .map(t => ({ layer: t.layer.trim(), technology: t.technology.trim() }))
     .filter(t => t.layer || t.technology)
@@ -510,31 +587,34 @@ export function buildBody(form: ProjectFormState, includeGovernance: boolean): R
     name: form.name.trim(),
     /* The whole set, never the legacy `repo_url`/`integration_branch` beside it (`_split_repos` refuses the pair).
     Blank rows dropped, the primary kept on what remains; `[]` removes every repository. */
-    ...(form.repos !== null ? { repos: withPrimary(filledRepos(form.repos)).map(repoBody) } : {}),
+    ...(form.repos !== null ? { repos: withPrimary(filledRepos(form.repos)).map(r => repoBody(r, includeGovernance)) } : {}),
     default_model: strOrNull(form.default_model),
     /* Edit only: `ProjectCreate` has no such field; any `projects:edit` holder sets it. Empty is an explicit null:
     the default. */
     ...(form.mode === 'edit' ? { merge_lane_batch_max: form.merge_lane_batch_max.trim() ? Number(form.merge_lane_batch_max) : null } : {}),
+    // Edit only; a resend is no change on the server, so only an unknown (cached-row) value is left out.
+    ...(form.mode === 'edit' && form.merge_lane_enabled !== null ? { merge_lane_enabled: form.merge_lane_enabled } : {}),
+    // Edit only, as `merge_lane_batch_max`; empty is an explicit null: inherit.
+    ...(form.mode === 'edit'
+      ? { outcome_scan_interval_minutes: form.outcome_scan_interval_minutes.trim() ? Number(form.outcome_scan_interval_minutes) : null }
+      : {}),
+    // Edit only, as the interval; the whole list replaces the stored one.
+    ...(form.mode === 'edit'
+      ? { security_check_patterns: splitList(form.security_check_patterns) }
+      : {}),
     /* Edit only, as `merge_lane_batch_max`. One half per write (`_DEFAULT_AGENT_OR_PROVIDER`): an agent sends
     `default_agent_id` (the server clears the provider); otherwise `default_provider`, whose explicit null clears
     both a stored provider and — when an agent was the default — that agent. */
     ...(form.mode === 'edit' ? defaultAgentBody(form) : {}),
+    ...(form.mode === 'edit' ? routingBody(form) : {}),
     /* Edit only, as the default agent; empty is an explicit null: the org default. */
     ...(form.mode === 'edit' ? { default_persona: strOrNull(form.default_persona) } : {}),
-    port_vars: portVars.length ? portVars : null,
-    port_block: form.port_block.trim() ? Number(form.port_block) : null,
+    // Edit only, as the persona; `''` is an explicit null: the org's default.
+    ...(form.mode === 'edit' ? { project_memory: form.project_memory === '' ? null : form.project_memory === 'on' } : {}),
     ...(includeGovernance ? governanceBody(form) : {}),
-    /* Only where accepted, via `strOrNull`: `''` ("— None —") must go as an explicit null to clear the column
-    (an omitted key changes nothing). Spread, since the API tests `field in payload`. */
-    ...(namesHumans(form)
-      ? {
-        business_analyst_id: strOrNull(form.business_analyst_id),
-        architect_id: strOrNull(form.architect_id),
-      }
-      : {}),
-    /* On all three paths, never omitted: the explicit `null` is what clears it on a PUT. Not governance: any
-    `projects:edit` holder sets it, bounded by the credential's read visibility (`_validated_jira_credential`). */
-    jira_credential_id: form.jira_credential_id,
+    /* Edit only (the create path refuses the key), via `strOrNull`: `''` (Org default) must go as an explicit null
+    to clear the column (an omitted key changes nothing). Spread, since the API tests `field in payload`. */
+    ...(form.mode === 'edit' ? { run_jobs_as_id: strOrNull(form.run_jobs_as_id) } : {}),
     tech_stack: techStack.length ? techStack : null,
     notes: strOrNull(form.notes),
     /* On all three paths, deliberately outside `governanceBody`: that fragment is dropped for a
@@ -553,7 +633,7 @@ export type GovernanceAuthority = { may_author_governance: boolean }
 
 /* May this form author the seven? One predicate for what `buildBody` sends and what renders.
  * It reads the server's verdict rather than mirroring the rule: the API also requires a write object
- * grant on a node in the org (`_has_authority_to_author_governance`, app/routes/projects.py), a DB fact
+ * grant on a node in the org (`has_authority_to_author_governance`, app/routes/projects.py), a DB fact
  * the browser cannot see, so a mirror gave some org-admins a live tab and a 403 on Save.
  * `undefined` (pending or failed; a `projects:view`-only viewer is refused) reads as locked, never yes:
  * locked fields are unchanged, so omitting them saves exactly as an ordinary holder would. The notice is
@@ -568,4 +648,18 @@ export function governanceIsReadOnly(
 ): boolean {
   void form
   return mayAuthorGovernance !== true
+}
+
+/* Intelligent routing's fields, edit only. An unknown mode (`''`, a cached row) is not sent; an empty cap is an
+ * explicit null: no cap. An empty experiment budget is not sent (the column has no empty state). */
+function routingBody(form: ProjectFormState): Record<string, unknown> {
+  const hours = form.routing_latency_cap_hours.trim()
+  const pct = form.experiment_budget_pct.trim()
+  return {
+    ...(form.routing_mode !== '' ? { routing_mode: form.routing_mode } : {}),
+    ...(pct ? { experiment_budget_share: Number(pct) / 100 } : {}),
+    routing_latency_cap_hours: hours ? Number(hours) : null,
+    blind_review: form.blind_review,
+    blind_review_other_vendor: form.blind_review_other_vendor,
+  }
 }

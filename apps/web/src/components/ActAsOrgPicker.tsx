@@ -1,15 +1,17 @@
 import { useState, type ReactNode } from 'react'
 import Button from '@mui/material/Button'
-import TextField from '@mui/material/TextField'
 import { apiDetail } from '../api'
 import { enterActAs } from '../lib/actAs'
 import { ORG_IDS_MAX, useOrgSearch } from '../lib/orgs'
 import { useOrgScope } from '../lib/orgScope'
 import type { Org } from '../types'
 import Banner from '../ui/Banner'
+import SearchBox from '../ui/SearchBox'
 import InterstitialPanel from '../ui/InterstitialPanel'
+import FormTextField from '../ui/FormTextField'
 import LoadingState from '../ui/LoadingState'
 import { tapTargetSx } from '../ui/listStyles'
+import Tip from '../ui/Tip'
 
 /** The operator's way into a feature that runs inside one org (Compliance, a plan-gated page): the operator plane
  *  has none, and the org filter only narrows reads, so the way in is acting as an org (`lib/actAs.ts`). Lists the
@@ -49,12 +51,14 @@ export default function ActAsOrgPicker({ testId, actAsTestId, title, body, eligi
   return (
     <InterstitialPanel testId={testId} title={title} body={body(view)}>
       {searchable && (
-        <TextField
-          type="search"
+        <SearchBox
           label="Search orgs"
           value={search.typed}
-          onChange={e => search.type(e.target.value)}
-          slotProps={{ inputLabel: { shrink: true }, htmlInput: { 'aria-label': 'Search orgs' } }}
+          onChange={search.type}
+          onClear={search.clear}
+          // `useOrgSearch` debounces the server read itself.
+          delayMs={0}
+          ariaLabel="Search orgs"
           sx={theme => ({ m: 0, mt: 1, '& .MuiInputBase-root': tapTargetSx(theme) })}
         />
       )}
@@ -66,30 +70,25 @@ export default function ActAsOrgPicker({ testId, actAsTestId, title, body, eligi
         <Banner severity="info">{noneText}{noneHint && <> {noneHint}</>}</Banner>
       ) : (
         <>
-          <TextField
-            select
+          <FormTextField
             label="Org"
+            help="Org whose Owner you act as, in this tab only."
             value={chosen.id}
-            onChange={e => setPicked(e.target.value)}
-            slotProps={{ select: { native: true }, inputLabel: { shrink: true } }}
+            onChange={setPicked}
+            // The picked org's state rides its own option, once: no second chip beside the field.
+            options={orgs.map(org => ({ value: org.id, label: org.lifecycle === 'pending' ? `${org.name} · Pending` : org.name }))}
             // The outlined label rides ~9px above the field: clear of the sentence above.
-            sx={theme => ({ m: 0, mt: 1, '& .MuiInputBase-root': tapTargetSx(theme) })}
-          >
-            {/* The picked org's state rides its own option, once: no second chip beside the field. */}
-            {orgs.map(org => (
-              <option key={org.id} value={org.id}>{org.lifecycle === 'pending' ? `${org.name} · Pending` : org.name}</option>
-            ))}
-          </TextField>
-          <Button
+            sx={{ m: 0, mt: 1 }}
+          />
+          <Tip title={`Acts as ${chosen.name}'s Owner in this tab`}><Button
             variant="contained"
             color="warning"
             data-testid={actAsTestId}
-            title={`Acts as ${chosen.name}'s Owner in this tab`}
             onClick={() => enterActAs({ id: chosen.id, slug: chosen.slug, name: chosen.name })}
             sx={[tapTargetSx, { alignSelf: 'flex-start', textTransform: 'none' }]}
           >
             Act as {chosen.name}
-          </Button>
+          </Button></Tip>
         </>
       )}
     </InterstitialPanel>

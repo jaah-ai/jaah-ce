@@ -1,6 +1,7 @@
 import type { OperatorSetting } from '../../types'
+import { numberFormat } from '../../lib/humanize'
 
-const GROUPED = new Intl.NumberFormat('en-US', { maximumFractionDigits: 20 })
+const GROUPED = numberFormat({ maximumFractionDigits: 20 })
 const DECIMAL = /^-?\d+(\.\d+)?$/
 
 /** A number knob's stored value as words: a QUANTITY (a knob with a unit — "86,400 s", "8,192 MiB") has its

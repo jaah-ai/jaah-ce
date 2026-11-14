@@ -60,10 +60,15 @@ FRAME_CONSOLE_OPEN = "console_open"
 FRAME_CONSOLE_DIRECT_GRANT = "console_direct_grant"
 FRAME_CONSOLE_DIRECT_REVOKE = "console_direct_revoke"
 FRAME_CONSOLE_DIRECT_USED = "console_direct_used"
+# The CP's keepalive (`app/ws_keepalive.py`): `ping` (CP -> node) after 20s of inbound silence, `pong` (node -> CP,
+# no reply) its answer. Unknown types are dropped by old daemons, whose 5s heartbeats keep the socket alive anyway.
+FRAME_PING = "ping"
+FRAME_PONG = "pong"
 
-# In-flight reply cap per connection, well above the node's default `node_max_concurrent_commands` (64), whose
-# ceiling it is (`operator_settings`).
-MAX_PENDING_PER_NODE = 256
+# AS1 MEMORY bound, not a concurrency cap: each pending request holds a future and its
+# envelope until the node replies, so a node that stops answering must not grow this process without limit.
+# 4096 is over 10x the peak in-flight a node's runners and console reach; no legitimate workload meets it.
+MAX_PENDING_PER_NODE = 4096
 
 
 class NodeNotConnected(Exception):
@@ -126,8 +131,9 @@ def serving_loop() -> Optional[asyncio.AbstractEventLoop]:
     return _serving_loop
 
 
-def resolve_caller(provided: object) -> node_credentials.AgentCaller | None:
-    """Authenticate one node's presented bearer and say which node it is, or `None`.
+async def resolve_caller_async(provided: object) -> node_credentials.AgentCaller | None:
+    """Authenticate one node's presented bearer and say which node it is, or `None` — the form the WebSocket
+    doors await. An identity read on the async pool (`app/db_async.py`).
 
     The rule is `app/node_credentials.py::resolve`'s; this adds a session for the WebSocket handlers,
     which sit outside FastAPI's dependency graph.
@@ -138,34 +144,12 @@ def resolve_caller(provided: object) -> node_credentials.AgentCaller | None:
     try:
         # Imported lazily: `app.db` builds the engine at import, and
         # the node daemon's console-direct test imports this module stdlib-only.
-        from app import node_credentials
-        from app.db import IdentitySessionLocal
+        from app import db_async, node_credentials
 
-        with IdentitySessionLocal() as session:
-            return node_credentials.resolve(session, provided)
+        return await db_async.run_in_session(node_credentials.resolve, provided, identity=True)
     except Exception as exc:  # noqa: BLE001 — see the docstring: an unprovable caller is refused
         log.warning("node-auth: could not resolve a presented bearer (%s) — refusing the dial", exc)
         return None
-
-
-async def resolve_caller_async(provided: object) -> node_credentials.AgentCaller | None:
-    """`resolve_caller`, off the event loop — the form the WebSocket doors must use (`SessionLocal` is
-    synchronous).
-
-    `run_in_threadpool`, not `asyncio.to_thread`: the latter uses a different pool, so neither capacity
-    limiter would see the real concurrency. Imported lazily to keep the jaahd contract test's import
-    graph stdlib-only.
-    """
-    from starlette.concurrency import run_in_threadpool
-
-    return await run_in_threadpool(resolve_caller, provided)
-
-
-def token_ok(provided: object) -> bool:
-    """`resolve_caller` reduced to yes/no, for doors that do not care which node dialled (the
-    console-stream leg is paired by a single-use ticket).
-    """
-    return resolve_caller(provided) is not None
 
 
 class NodeConnection:
@@ -208,7 +192,7 @@ class NodeConnection:
         if len(self._pending) >= MAX_PENDING_PER_NODE:
             # Refuse rather than grow unbounded; a node this far behind is not serving commands.
             log.warning(
-                "node-bus: %s has %d requests in flight (cap %d) — refusing another",
+                "node-bus: %s has %d requests in flight (memory bound %d) — refusing another",
                 self.node_id, len(self._pending), MAX_PENDING_PER_NODE,
             )
             raise NodeNotConnected(self.node_id)
@@ -351,16 +335,16 @@ class SharedSocketStore:
     """The default placement store: `app/node_presence.py` read through this process's own sessions.
 
     The surface `NodeBusRegistry.attach_store` takes (a test may attach a fake with the same four
-    methods). Sync methods open a `SessionLocal` here and so must be called off the event loop; the
+    methods). Sync methods open a `BridgedSession` here and so must be called off the event loop; the
     `_async` twins are `node_presence`'s own thread-hopping ones. All imports are lazy — see the module
     docstring.
     """
 
     def holder_of(self, node_id: str):
         from app import node_presence
-        from app.db import SessionLocal
+        from app.db import BridgedSession
 
-        with SessionLocal() as session:
+        with BridgedSession() as session:
             return node_presence.holder_of(session, node_id)
 
     async def holder_of_async(self, node_id: str):
@@ -370,9 +354,9 @@ class SharedSocketStore:
 
     def connected_node_ids(self) -> list[str]:
         from app import node_presence
-        from app.db import SessionLocal
+        from app.db import BridgedSession
 
-        with SessionLocal() as session:
+        with BridgedSession() as session:
             return node_presence.connected_node_ids(session)
 
     async def connected_node_ids_async(self) -> list[str]:
@@ -441,7 +425,7 @@ class NodeBusRegistry:
         redial immediately instead of backing off (`apps/jaahd/node_bus.py`).
 
         Snapshot first (unregistering mutates `_conns`), and unregister before closing so a concurrent
-        command gets an immediate 503. Per-socket failures are swallowed: under uvicorn many sockets are
+        command gets an immediate 503. Per-socket failures are swallowed: on shutdown many sockets are
         already closed by now (`app/main.py::_lifespan`). Idempotent.
         """
         conns = list(self._conns.items())
@@ -501,7 +485,7 @@ class NodeBusRegistry:
 
     def local_sockets(self) -> list[tuple[str, uuid.UUID]]:
         """`(node_id, socket_id)` for every socket this process holds — what the peer heartbeat re-asserts
-        in the shared placement table (`app/cp_peers.py::heartbeat_tick`). Sync and DB-free.
+        in the shared placement table (`app/cp_peers.py::housekeeping`). Sync and DB-free.
 
         `list(dict.items())` first — one C-level copy under the GIL — so the comprehension never walks the
         loop-owned dict while a register/unregister on the loop resizes it (the heartbeat calls this off

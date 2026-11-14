@@ -7,11 +7,12 @@ The adapter owns the WHOLE exec line (not a base to append to), and every launch
 Stdlib only, no daemon imports at module scope, so `fleet_launch` can import the package without a cycle.
 Shapes only: no registry (`agents/__init__.py`) and no vendor name.
 
-A `Protocol`, not an ABC: structural typing, nothing to inherit. Conformance is checked by
-`tests/test_agent_adapters.py` against `ADAPTER_MEMBERS`, not at runtime.
+An ABC: the per-vendor members are abstract, so an adapter missing one fails when the registry
+instantiates it; `ADAPTER_MEMBERS` names the whole surface for `tests/test_agent_adapters.py`.
 """
 from __future__ import annotations
 
+import abc
 import base64
 import json
 import os
@@ -19,7 +20,7 @@ import re
 import stat
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from typing import Any, ClassVar, Protocol, runtime_checkable
+from typing import Any, ClassVar
 
 
 @dataclass(frozen=True)
@@ -365,6 +366,7 @@ class SessionTreeWalk:
                     self.shortfall.append(f"{entry.path!r} is nested deeper than a member name can carry")
 
 
+import file_io  # noqa: E402 — `read_tail_lines` reads through `file_io.tail_bytes`
 from file_io import (  # noqa: E402,F401 — the one home moved to `file_io`; re-exported for its readers.
     # A test patches `file_io._regular_fd`, never `base`'s name: these call `file_io`'s binding.
     _REGULAR_READ_FLAGS, _regular_fd, final_path_under, json_object, open_regular, read_bounded)
@@ -373,16 +375,19 @@ from file_io import (  # noqa: E402,F401 — the one home moved to `file_io`; re
 
 # A credential's size bound when its adapter states none: the largest any adapter's `MAX_CREDENTIAL_BYTES`.
 _RUNNER_READ_MAX_BYTES = 1024 * 1024
+# The read bound on a small credential file (a few hundred bytes when real): Claude's and Antigravity's.
+SMALL_CREDENTIAL_MAX_BYTES = 256 * 1024
 
 
 def credential_state(path: str, present: Callable[[], bool], *, runner_shape: str = "file",
-                     max_bytes: int = _RUNNER_READ_MAX_BYTES) -> str:
+                     max_bytes: int = _RUNNER_READ_MAX_BYTES, stat_only: bool = False) -> str:
     """Which of `agent_config_dirs`' three states a provider's credential file at `path` is in.
 
     `CREDS_UNREADABLE` is `PermissionError` alone — it is THERE and this process may not read it — and is
     never collapsed into `CREDS_NONE`, which the autoclose idle ladder reaps on (the false reap). Any other
     failure (absent, a symlink, a FIFO, a directory) is `CREDS_NONE`; a readable regular file is
     `CREDS_TOKEN` iff `present()` (the adapter's own shape check, `credential_file_present`) says so.
+    `stat_only` probes with an `lstat` instead of an open, so `unreadable` is an untraversable parent alone.
     `agent_config_dirs.creds_state` (Claude's file) answers through it too.
 
     A path this daemon cannot see (a Windows NodeLink store) is asked of the runner account instead, by
@@ -393,7 +398,7 @@ def credential_state(path: str, present: Callable[[], bool], *, runner_shape: st
     if runner_credentials.read_through_runner(path):
         return runner_credentials.credential_state(path, shape=runner_shape, max_bytes=max_bytes)
     try:
-        os.close(_regular_fd(path))
+        os.lstat(path) if stat_only else os.close(_regular_fd(path))
     except PermissionError:
         return agent_config_dirs.CREDS_UNREADABLE
     except OSError:
@@ -467,15 +472,13 @@ def read_tail_lines(path: str, limit: int) -> list[bytes]:
         return []
     try:
         with os.fdopen(fd, "rb", closefd=False) as handle:
-            size = os.fstat(fd).st_size
-            if size > limit:
-                handle.seek(size - limit)
-                tail = handle.read(limit)
+            tail = file_io.tail_bytes(handle, limit)
+            # Decided from where the read started, not a second size read: a transcript a runner is still
+            # writing can grow past the bound between the two, and that would drop a complete line.
+            if handle.tell() - len(tail) > 0:
                 # Everything up to the first newline is the remainder of a line the seek cut.
                 cut = tail.find(b"\n")
                 tail = tail[cut + 1:] if cut != -1 else b""
-            else:
-                tail = handle.read(limit)
     except OSError:
         return []
     finally:
@@ -752,12 +755,13 @@ HOST_CHAIN_EVENTS: tuple[tuple[str, str, str], ...] = (
 def host_lifecycle_dispatch(chains: "LifecycleChains", *, vendor: str, host_lifecycle: tuple[str, ...]) -> dict:
     """The ACP host's own hook file, the counterpart of `harness_dispatch(..., host_lifecycle=…)`: the `chains` and
     harness rows of the `host_lifecycle` events only, keyed by their Claude names, in the file shape `dispatch`
-    reads. Nothing in it is per vendor: the host runs Claude's events, so no event or matcher map is needed."""
+    reads. Nothing in it is per vendor: the host runs Claude's events, so no event map is needed, and the only
+    matchers on those events are `CLAUDE_ONLY_MATCHERS` (`SessionStart`'s `compact`), which the host drops."""
     hooks: dict = chain_hook_groups(chains, tuple(row for row in HOST_CHAIN_EVENTS if row[2] in host_lifecycle),
                                     group=_dispatch_entry)
     harness = read_harness(harness_settings_path(), vendor)
     events = {name: name if name in host_lifecycle else None for name in harness.get("hooks") or {}}
-    for slot, entries in harness_entries(harness, vendor=vendor, events=events, matchers={}).items():
+    for slot, entries in harness_entries(harness, vendor=vendor, events=events, matchers=CLAUDE_ONLY_MATCHERS).items():
         hooks.setdefault(slot, []).extend(entries)
     return {"session_start": [], "events": hooks}
 
@@ -791,6 +795,9 @@ ACP_CHAIN_EVENTS: tuple[tuple[str, str, str], ...] = (
 #: Claude Code's harness events -> the slot an in-band engine dispatches them under (`harness_groups`): Claude's
 #: own names, but for `SessionStart`, the launch's `session_start` slot. `PostToolUseFailure` is None — the
 #: failed-command memory nudge — until an engine reports a failed call apart from a succeeded one.
+#: `PermissionRequest` and `Notification` are None: the fleet harness permission guard
+#: answers Claude Code's own terminal prompt, and an ACP engine's approvals go to the host
+#: (`session/request_permission`), never to a pane.
 ACP_HARNESS_EVENTS: dict[str, str | None] = {
     "SessionStart": "session_start",
     "UserPromptSubmit": "UserPromptSubmit",
@@ -800,21 +807,23 @@ ACP_HARNESS_EVENTS: dict[str, str | None] = {
     "Stop": "Stop",
     "SessionEnd": "SessionEnd",
     "PreCompact": "PreCompact",
+    "PermissionRequest": None,
+    "Notification": None,
 }
 
-#: The harness matchers no engine but Claude Code has a tool for (None = the row is dropped): the wakeup
-#: scheduler.
-CLAUDE_ONLY_MATCHERS: dict[str, None] = {
+#: The harness matchers no engine but Claude Code has (None = the row is dropped): the wakeup scheduler, the
+#: `permission_prompt` notification, and `SessionStart`'s `compact` source (the post-compaction re-brief).
+CLAUDE_ONLY_MATCHERS: dict[str, str | None] = {
     "ScheduleWakeup": None,
+    "permission_prompt": None,
+    "compact": None,
 }
 
-#: The control server's settle tools as an ACP engine's payload spells them, `mcp__<server>__<tool>` over
-#: `control_mcp_server`'s name — the matcher the settle guard fires on. `task_settle` is the pre-rename name,
-#: still served unlisted (`agent_vocabulary.ALIASES`). An engine that respells the server name (one underscore,
-#: a bridge that unwraps the call) keeps its own two rows instead.
+#: The control server's settle tool as an ACP engine's payload spells it, `mcp__<server>__<tool>` over
+#: `control_mcp_server`'s name — the matcher the settle guard fires on. An engine that respells the server
+#: name (one underscore, a bridge that unwraps the call) keeps its own row instead.
 CONTROL_TOOL_MATCHERS: dict[str, str] = {
     "mcp__plugin_jaah_control__task_complete": "mcp__control__task_complete",
-    "mcp__plugin_jaah_control__task_settle": "mcp__control__task_settle",
 }
 #: Their inverse, the file's `tool_names` (`harness_dispatch`): the engine's spelling -> Claude's, so the settle
 #: guard reads the name it compares.
@@ -916,25 +925,54 @@ def control_mcp_server(command: str, args, env, *, name: str = "control") -> dic
             "env": [{"name": str(k), "value": str(v)} for k, v in dict(env).items()]}
 
 
-@runtime_checkable
-class AgentAdapter(Protocol):
+class AgentAdapter(abc.ABC):
     """One agent CLI, as the fleet's launch/ingest paths need to know it.
 
     Every method is a place two vendors legitimately differ. Nothing here may branch on a vendor name —
     an adapter IS the branch, resolved once by `agents.get_adapter`.
+
+    One class, not a Protocol beside a defaults base: the per-vendor members are `abstractmethod`s, so an
+    adapter missing one fails loudly when the registry instantiates it, and the trivially-constant ones
+    carry the most common answer for an adapter to override where it differs. The attributes below are
+    annotations only, no default: each adapter sets them, and a missing one stays missing.
     """
 
     #: The `accounts.provider` value this adapter serves — the registry key, and the only name by which
     #: any call site may ask for it (`agent_providers.PROVIDER_VALUES` is the vocabulary).
     provider: str
 
+    #: The vendor's invocation before the model flag (element 0 the attested binary) — what `base_argv`
+    #: extends. An adapter that keeps the default `base_argv` and forgets this fails loudly, never with an
+    #: argv that attests nothing.
+    base_command: tuple[str, ...]
+
+    #: What the four constant accessors answer — `task_delivery`, `tui`, `quit_signature`, `api_key_env`.
+    #: Each adapter sets the four beside the comment saying why.
+    task_delivery_kind: str
+    tui_vocabulary: "ComposerTui | None"
+    quit_sig: QuitSignature
+    api_key_variable: str
+
+    #: `register_mcp`'s `mcp add` invocation: the vendor's binary ("" registers nothing), and the scope arguments
+    #: passed only when there are any (`()` leaves `agent_layer.register_control_mcp`'s own default).
+    mcp_binary: str
+    mcp_scope_args: tuple[str, ...] = ()
+
+    #: The `login.LoginAdapter` class whose `credential_path` + `credential_present` the default
+    #: `credential_state` reads. An adapter with its own probe (`agent_config_dirs.creds_state`) overrides the
+    #: method instead. `stat_only` probes the file with an `lstat` that never opens it (`base.credential_state`).
+    login_adapter: type
+    stat_only: bool = False
+
     def base_argv(self, *, model: str) -> tuple[str, ...]:
-        """The CLI invocation, with the model choice already spelled this vendor's way.
+        """The CLI invocation, with the model choice already spelled this vendor's way: `base_command` plus
+        `--model <model>` when there is one.
 
         `model` empty ⇒ NO model flag at all. Element 0 is the executable as PATH finds it (`clauded_wt`
         preflights it with `shutil.which`), so a launcher prefix (`npx -y …`) would attest nothing."""
-        ...
+        return self.base_command + (("--model", model) if model else ())
 
+    @abc.abstractmethod
     def exec_line(
         self, *, sys_file: str, task_file: str, settings_flag: str,
         model_args: tuple[str, ...], session_args: tuple[str, ...], rc_flag: str = "",
@@ -945,34 +983,24 @@ class AgentAdapter(Protocol):
         Values arrive shell-unsafe and every interpolated one is quoted (`fleet_launch.shq`), except
         `settings_flag`, already composed by `write_hooks`. `rc_flag` is ONE argv element, unused today
         but pinned by `tests/golden/claude_launch.sh`, and must be quoted like the rest."""
-        ...
-
-    def resume_exec_line(
-        self, *, sys_file: str, settings_flag: str, model_args: tuple[str, ...], native_ref: str,
-    ) -> "list[str] | None":
-        """The `exec` lines of a `launch.sh` that reopens the engine's own session `native_ref` in this CLI's TUI,
-        with no task prompt — the console handing a chat over to the terminal (`fleet_dispatch.launch_runner`'s
-        `resume_ref`). Quoted like `exec_line`. None = this CLI's terminal cannot resume a session, so the
-        catalogue offers no hand-off for it (`agent_providers.Console.toggle`)."""
-        ...
 
     def task_delivery(self) -> str:
         """One of `TASK_ARGV_POSITIONAL` / `TASK_ARGV_FLAG` / `TASK_TMUX_PASTE` — how the task prompt
-        reaches this CLI, so a paste-arranging caller need not parse argv."""
-        ...
+        reaches this CLI, so a paste-arranging caller need not parse argv. `task_delivery_kind`."""
+        return self.task_delivery_kind
 
     def tui(self) -> "ComposerTui | None":
-        """This CLI's on-screen vocabulary, or None for Claude Code, whose answer-delivery screen lives in
-        `answer_delivery` itself (and whose task prompt rides the argv).
+        """This CLI's on-screen vocabulary (`tui_vocabulary`), or None for Claude Code, whose answer-delivery
+        screen lives in `answer_delivery` itself (and whose task prompt rides the argv).
 
         Required for `TASK_TMUX_PASTE` (`answer_delivery.deliver_task_prompt` refuses a paste without
         one); asserted registry-wide by `test_every_paste_delivered_adapter_publishes_a_screen_to_paste_into`."""
-        ...
+        return self.tui_vocabulary
 
     def consent_dialogs(self) -> "tuple[ConsentDialog, ...]":
         """The startup consent dialogs this CLI can open in a runner's pane, for `consent_watch` to accept
         when the pre-seeded consents missed. `()` for a CLI with none known."""
-        ...
+        return ()
 
     def inherits_harness_hooks(self) -> bool:
         """Does this CLI already get the fleet's ACCOUNT-LEVEL hook layer, outside `LifecycleChains`?
@@ -980,35 +1008,59 @@ class AgentAdapter(Protocol):
         The layer is the fleet harness's static hook file (quick gate, context router, guards). True
         ⇒ do not compose them into the chains too (they would run twice); False ⇒ the chains are the only
         channel. A capability question, so `_lifecycle_chains` never branches on a vendor."""
-        ...
+        return True
+
+    def legacy_mcp_config(self, connections: "tuple[McpConnection, ...]", *,
+                          config_path: str, guest: bool = False) -> "tuple[str, tuple[str, ...]] | None":
+        """A LEGACY launch's linked remote MCP servers: `(file content, argv)` — the per-session config file the
+        launch writes at CONFIG_PATH and the CLI options naming it — or None when CONNECTIONS is empty or this CLI
+        takes no per-session config file. Never holds a token: each entry starts `mcp_bridge`. `guest`: a MicroVM
+        guest's launch (`remote_mcp_servers`)."""
+        return None
 
     def additional_dirs_settings(self, dirs: "tuple[str, ...]") -> dict:
         """The settings that let a session of this CLI work in DIRS beside its cwd (a multi-repo slot's
         non-primary worktrees, `slot_repos.extra_dirs`), merged into the launch's settings file — or `{}` when
         this CLI's settings carry no such key."""
-        ...
+        return {}
 
-    def api_key_settings(self, helper: str) -> dict:
+    def runner_settings(self) -> dict:
+        """Settings every unattended task run of this CLI carries (never a console tab, where a person answers the
+        CLI's own prompts), merged into the launch's settings file — or `{}` when this CLI needs none."""
+        return {}
+
+    def api_key_settings(self, helper: str, workspace_id: str = "") -> dict:
         """The settings an API-KEY launch of this CLI needs, given `helper` (a shell command printing the
-        key) — or `{}` when this CLI takes the key from its environment. Read only when `api_key_env()` is
+        key) and the account's `workspace_id` (`""` when none; a CLI without the notion ignores it) — or `{}`
+        when this CLI takes the key from its environment. Read only when `api_key_env()` is
         empty (`fleet_dispatch.api_key_helper_command`)."""
-        ...
+        return {}
 
     def api_key_env(self) -> str:
         """The variable an API-KEY launch exports the fetched key under (`fleet_dispatch.build_auth_lines`),
         or `""` when this CLI takes its key from `api_key_settings`' helper instead — the one decision
-        between the two routes, so no launch site branches on a vendor."""
-        ...
+        between the two routes, so no launch site branches on a vendor. `api_key_variable`."""
+        return self.api_key_variable
 
     def api_key_argv(self) -> tuple[str, ...]:
         """Extra argv an API-KEY launch of this CLI needs so it reads `api_key_env()` instead of opening
         its sign-in screen, or `()`. Shell-unsafe elements; the exec line quotes them."""
-        ...
+        return ()
 
     def api_key_prepare(self, *, config_dir: str) -> None:
         """What an API-KEY launch needs on disk in its token-less account home before the CLI starts
         (a setting selecting key auth), or nothing. Never writes the key; never raises."""
-        ...
+        return None
+
+    def model_switch(self) -> "Callable[..., tuple[str, str]] | None":
+        """This CLI's in-place model switch for a live pane, or None when it has none (`model_switch.py` drives it).
+        The driver is called `(pane, model, *, config_dir, sleep_fn, saved)` on a PROVEN pane (`answer_delivery`'s
+        target primitives) and answers `(status, reason)`, status one of `MODEL_SWITCH_STATUSES`. `saved` is the
+        account's `model_switch.SavedDefault` (None outside an intent): a driver that must put back an account default
+        its CLI overwrites records the TRUE original there once, so a re-served attempt or another switch on the same
+        account restores that, never the value an earlier attempt's late write left behind. Every adapter answers
+        it; None is the common answer."""
+        return None
 
     def account_layer(self) -> str:
         """Which account layer this CLI's home carries — its catalogue row's `capabilities.account_layer`.
@@ -1017,7 +1069,9 @@ class AgentAdapter(Protocol):
         `plugins/` tree of marketplace checkouts, which another CLI may import and break on) is converged
         into it. Anything else = leave the home to `prepare` + `register_mcp` and this vendor's own
         `account_layer_converge`."""
-        ...
+        import agent_providers  # noqa: PLC0415 — deferred: this module imports nothing of the daemon at load
+
+        return agent_providers.account_layer(self.provider)
 
     def account_layer_refresh(self, run, *, prefix: str) -> dict:
         """This vendor's own NODE-LEVEL package refresh, once per online sweep, before any account's
@@ -1025,20 +1079,21 @@ class AgentAdapter(Protocol):
         `prefix` (the session user's `~/.local`). `{"applied": bool, "skipped": str, "error": str}`; a
         vendor with no such layer answers `skipped`. `run(argv, *, env=None, timeout=None, cwd=None)` returns
         `{"exit_code", "stdout", "stderr"}`; a missing binary is exit -1, never a raise."""
-        ...
+        return {"applied": False, "skipped": "no vendor account layer", "error": ""}
 
     def account_layer_converge(self, *, config_dir: str, run, offline: bool) -> dict:
         """This vendor's own PER-ACCOUNT layer, run by the sweep for an account whose
         `account_layer()` is not "omc" — what the Claude Code layer is to a Claude home. At least
         `{"present": bool, "error": str}` (`present` re-asked of `account_layer_missing` after the
         writes); the rest is the vendor's own detail. `offline` = touch no network. Never raises."""
-        ...
+        return {"present": True, "error": "", "skipped": "no vendor account layer"}
 
     def account_layer_missing(self, *, config_dir: str) -> str:
         """"" when this vendor's account layer is present in `config_dir`, else the FIRST absent marker
         — the sweep's scheduling predicate and its verdict after a converge. Read-only, no fork."""
-        ...
+        return ""
 
+    @abc.abstractmethod
     def env(self, *, config_dir: str, worktree: str) -> dict[str, str]:
         """The environment variables this CLI needs for THIS DISPATCH — the account pin among them.
 
@@ -1047,202 +1102,43 @@ class AgentAdapter(Protocol):
         but-empty one resolves to `$HOME` or another account). A RUN property is not dropped with the pin:
         an API-key dispatch has no `config_dir`, and losing e.g. an auto-approve variable stalls the
         runner silently at its first tool call."""
-        ...
 
+    @abc.abstractmethod
     def prepare(self, *, worktree: str, config_dir: str, project: str) -> None:
         """Anything that must exist on disk before this CLI is exec'd into `worktree`. On the dispatch
         path: fast and idempotent."""
-        ...
 
     def write_hooks(self, *, settings_path: str, chains: LifecycleChains,
                     mode: int | None = None, config_dir: str = "") -> str:
         """Render `chains` this vendor's way, WRITE it, and return the flag that installs it (empty when
         there is nothing to install), via `session_user` (the runner uid reads it back). `mode` is the
         caller's, passed through untouched (`None` = seam default). `config_dir` is for a vendor that
-        loads hooks from one path under its own home and ignores `settings_path`; empty = no account."""
-        ...
+        loads hooks from one path under its own home and ignores `settings_path`; empty = no account.
+        By default `render_hooks` plus the write, `base.write_rendered_hooks`."""
+        return write_rendered_hooks(
+            self, settings_path=settings_path, chains=chains, mode=mode, config_dir=config_dir)
 
+    @abc.abstractmethod
     def render_hooks(self, *, settings_path: str, chains: LifecycleChains,
                      config_dir: str = "") -> tuple[str | None, str]:
         """`write_hooks` without the write: `(file content or None, flag)`.
 
         Pure, for `fleet_launch.build_settings`, whose output is asserted against
         `tests/golden/claude_settings.json`."""
-        ...
 
     def quit_signature(self) -> QuitSignature:
         """What this CLI's `SessionEnd` looks like when the operator quit at the prompt — see
-        `QuitSignature`. An interactive chat is completed on exactly that and nothing else."""
-        ...
+        `QuitSignature` (`quit_sig`). An interactive chat is completed on exactly that and nothing else."""
+        return self.quit_sig
 
     def register_mcp(self, *, config_dir: str) -> None:
         """Make the control-plane MCP server reachable from this account's CLI (architecture A9).
 
         Tool-name derivation differs per vendor (`agent_providers`' `mcp_tool_prefix`). A no-op when the
-        registration already ships with the account's configuration."""
-        ...
-
-    def session_binding(self) -> str:
-        """`SESSION_ASSIGN` or `SESSION_DISCOVER` — see those constants."""
-        ...
-
-    def discover_session_id(self, *, config_dir: str, worktree: str, since: float) -> str | None:
-        """For a `SESSION_DISCOVER` vendor: the id of the session this CLI started after `since`
-        (epoch seconds), or None when it cannot be told apart yet. Never called for `SESSION_ASSIGN`.
-
-        `None` means "looked, nothing there" and is reported terminally; a partial enumeration must RAISE
-        (retryable in `session_sweep`). A cap shedding provably-older candidates of a sorted list may
-        still answer; one shedding unreached entries may not. The caller pins the first id resolved, so a
-        wrong answer is permanent."""
-        ...
-
-    def credential_state(self, *, config_dir: str) -> str:
-        """One of `agent_config_dirs.CREDS_TOKEN` / `CREDS_NONE` / `CREDS_UNREADABLE` for this account.
-
-        No adapter may collapse UNREADABLE into NONE: a kill-safety gate doing so reaps a live runner."""
-        ...
-
-    def transcript(self, *, config_dir: str, worktree: str, session_id: str) -> str | None:
-        """Path to this session's transcript, or None when the vendor records none / it is not there yet.
-        None is terminal, as in `discover_session_id`: an incomplete enumeration RAISES. A match found
-        despite truncation is still returned (truncation can cost a match, never invent one)."""
-        ...
-
-    def transcript_root(self, *, config_dir: str) -> str:
-        """The ONE directory under `config_dir` holding this vendor's transcripts — the containment root
-        for `transcript()`'s answer.
-
-        A security seam: containing against the account home would put the stored OAuth credential one
-        runner-planted hardlink away from the forever-kept transcript bucket (whose redaction cannot match
-        an opaque token). A `SESSION_DISCOVER` adapter MUST narrow it; an ASSIGN one never reaches the
-        vendor containment leg (`session_sweep._vendor_transcript`)."""
-        ...
-
-    def session_members(self, *, config_dir: str, transcript: str) -> list[tuple[str, str]]:
-        """Every OTHER file the vendor itself wrote for the session whose main record is `transcript` —
-        `[(member name, path)]`, so the capture is the vendor's whole record and not one file of it.
-
-        Two name shapes, nothing else: `subagent-<id>.jsonl.gz` for a sub-agent's own thread (its spend is
-        folded like the main file's) and `vendor/<path relative to transcript_root>.gz` for any other
-        session file (uploaded verbatim, never folded). Every path lies under `transcript_root`; the sweep
-        re-checks that. An ASSIGN adapter answers `[]` (the sweep reads Claude's sub-agents itself). An
-        enumeration that could not complete RAISES — the sweep records the omission on the manifest rather
-        than let a partial set pass as the whole."""
-        ...
-
-    def turn_error(self, *, transcript: str) -> TurnError | None:
-        """The error the session's LAST turn ended on, when that turn ended on a vendor API error after the
-        CLI's own retries — else None (still working, ended cleanly, or unreadable: never a guess).
-
-        The node-side stand-in for Claude Code's `StopFailure` on a CLI that fires no hook on an API-error
-        turn (`vendor_turn_errors`). Read off the vendor's OWN structured error record only, never prose,
-        so a runner merely working on the subject of errors is never condemned. An adapter whose CLI has a
-        `StopFailure` hook answers None: the hook already reports it."""
-        ...
-
-    def read_usage(self, line: bytes) -> TokenCounts | None:
-        """One transcript line's token spend, or None when that line reports none (which is most lines,
-        and every line for a vendor with no usage accounting).
-
-        A line naming a model but spending nothing MAY answer an all-zero `TokenCounts` with that model,
-        for transcripts that put model and counts on different lines (the fold carries the model forward;
-        `usage_by_model()` drops empty buckets). Distinct from the no-accounting rule, which answers None."""
-        ...
-
-
-class AdapterDefaults:
-    """The most common answer to each of `AgentAdapter`'s trivially-constant members, for adapters to
-    subclass and override where they differ. Not a `Protocol` subclass, so a missing method stays missing."""
-
-    #: The catalogue `value` and the account-pin environment (`AgentAdapter.provider`, `.env`), which the defaults
-    #: below read. Annotations only, as `base_command`: each adapter sets them, and a missing one stays missing.
-    provider: str
-    env: Callable[..., dict[str, str]]
-
-    #: The vendor's invocation before the model flag (element 0 the attested binary) — what `base_argv`
-    #: extends. Annotation only, no default: an adapter that keeps the default `base_argv` and forgets
-    #: this fails loudly, never with an argv that attests nothing.
-    base_command: tuple[str, ...]
-
-    #: What the four constant accessors answer — `task_delivery`, `tui`, `quit_signature`, `api_key_env`.
-    #: Annotations only, like `base_command`: each adapter sets the four beside the comment saying why.
-    task_delivery_kind: str
-    tui_vocabulary: "ComposerTui | None"
-    quit_sig: QuitSignature
-    api_key_variable: str
-
-    #: `register_mcp`'s `mcp add` invocation: the vendor's binary, and the scope arguments passed only
-    #: when there are any (`()` leaves `agent_layer.register_control_mcp`'s own default).
-    mcp_binary: str
-    mcp_scope_args: tuple[str, ...] = ()
-
-    #: The `login.LoginAdapter` class whose `credential_path` + `credential_present` the default
-    #: `credential_state` reads. An adapter with its own probe (`agent_config_dirs.creds_state`, or an
-    #: `lstat` that never reads the file) overrides the method instead.
-    login_adapter: type
-
-    def base_argv(self, *, model: str) -> tuple[str, ...]:
-        """`base_command` plus `--model <model>` when there is one."""
-        return self.base_command + (("--model", model) if model else ())
-
-    def task_delivery(self) -> str:
-        return self.task_delivery_kind
-
-    def resume_exec_line(self, *, sys_file: str, settings_flag: str, model_args: tuple[str, ...],
-                         native_ref: str) -> "list[str] | None":
-        return None
-
-    def tui(self) -> "ComposerTui | None":
-        return self.tui_vocabulary
-
-    def quit_signature(self) -> QuitSignature:
-        return self.quit_sig
-
-    def api_key_env(self) -> str:
-        return self.api_key_variable
-
-    def write_hooks(self, *, settings_path: str, chains: LifecycleChains,
-                    mode: int | None = None, config_dir: str = "") -> str:
-        """`render_hooks` plus the write, `base.write_rendered_hooks`."""
-        return write_rendered_hooks(
-            self, settings_path=settings_path, chains=chains, mode=mode, config_dir=config_dir)
-
-    def inherits_harness_hooks(self) -> bool:
-        return True
-
-    def consent_dialogs(self) -> "tuple[ConsentDialog, ...]":
-        return ()
-
-    def api_key_settings(self, helper: str) -> dict:
-        return {}
-
-    def additional_dirs_settings(self, dirs: "tuple[str, ...]") -> dict:
-        return {}
-
-    def api_key_argv(self) -> tuple[str, ...]:
-        return ()
-
-    def api_key_prepare(self, *, config_dir: str) -> None:
-        return None
-
-    def account_layer(self) -> str:
-        import agent_providers  # noqa: PLC0415 — deferred: this module imports nothing of the daemon at load
-
-        return agent_providers.account_layer(self.provider)
-
-    def account_layer_refresh(self, run, *, prefix: str) -> dict:
-        return {"applied": False, "skipped": "no vendor account layer", "error": ""}
-
-    def account_layer_converge(self, *, config_dir: str, run, offline: bool) -> dict:
-        return {"present": True, "error": "", "skipped": "no vendor account layer"}
-
-    def account_layer_missing(self, *, config_dir: str) -> str:
-        return ""
-
-    def register_mcp(self, *, config_dir: str) -> None:
-        """Re-assert the control-plane MCP server on this account with `mcp_binary`'s own `mcp add`
-        (`_register_control_mcp`). Non-raising: a degraded agent layer, never a stranded dispatch."""
-        if not config_dir:
+        registration already ships with the account's configuration. By default re-asserts the server with
+        `mcp_binary`'s own `mcp add` (`_register_control_mcp`). Non-raising: a degraded agent layer, never a
+        stranded dispatch."""
+        if not (config_dir and self.mcp_binary):
             return None
         try:
             self._register_control_mcp(config_dir=config_dir)
@@ -1256,31 +1152,85 @@ class AdapterDefaults:
         from . import agent_layer  # a daemon-facing sibling: local, so this module stays importable alone
 
         return agent_layer.register_control_mcp(
-            binary=self.mcp_binary, config_dir=config_dir, env=self.env(config_dir=config_dir),
+            binary=self.mcp_binary, config_dir=config_dir, env=self.env(config_dir=config_dir, worktree=""),
             **({"scope_args": self.mcp_scope_args} if self.mcp_scope_args else {}))
 
     def session_binding(self) -> str:
+        """`SESSION_ASSIGN` or `SESSION_DISCOVER` — see those constants."""
         return SESSION_DISCOVER
 
     def discover_session_id(self, *, config_dir: str, worktree: str, since: float) -> str | None:
-        """None: an ASSIGN vendor is never asked, and an ACP engine's `sessionId` is stored by the host."""
-        return None
+        """For a `SESSION_DISCOVER` vendor: the id of the session this CLI started after `since`
+        (epoch seconds), or None when it cannot be told apart yet. Never called for `SESSION_ASSIGN`.
 
-    def session_members(self, *, config_dir: str, transcript: str) -> list[tuple[str, str]]:
-        """`[]`: no sub-agent threads of the vendor's own to upload beside the main record."""
-        return []
+        `None` means "looked, nothing there" and is reported terminally; a partial enumeration must RAISE
+        (retryable in `session_sweep`). A cap shedding provably-older candidates of a sorted list may
+        still answer; one shedding unreached entries may not. The caller pins the first id resolved, so a
+        wrong answer is permanent. Default None: an ASSIGN vendor is never asked, and an ACP engine's
+        `sessionId` is stored by the host."""
+        return None
 
     def credential_state(self, *, config_dir: str) -> str:
-        """Which of `agent_config_dirs`' three states `login_adapter`'s credential file is in —
-        `base.credential_state` over its path and shape check. Not `agent_config_dirs.creds_state`
-        (Claude's file). `unreadable` is never collapsed into `none`: the autoclose idle ladder acts on
-        `none`, so that would be a false reap."""
+        """One of `agent_config_dirs.CREDS_TOKEN` / `CREDS_NONE` / `CREDS_UNREADABLE` for this account.
+
+        No adapter may collapse UNREADABLE into NONE: a kill-safety gate doing so reaps a live runner (the
+        autoclose idle ladder acts on `none`, so that would be a false reap). By default `base.credential_state`
+        over `login_adapter`'s credential path and shape check — not `agent_config_dirs.creds_state` (Claude's
+        file). No `config_dir` is `none`: there is no account to probe."""
+        import agent_config_dirs  # noqa: PLC0415 — a daemon module, as in `base.credential_state`
+
+        if not config_dir:
+            return agent_config_dirs.CREDS_NONE
         login = self.login_adapter()
         return credential_state(login.credential_path(config_dir=config_dir),
-                                lambda: login.credential_present(config_dir=config_dir))
+                                lambda: login.credential_present(config_dir=config_dir), stat_only=self.stat_only)
+
+    @abc.abstractmethod
+    def transcript(self, *, config_dir: str, worktree: str, session_id: str) -> str | None:
+        """Path to this session's transcript, or None when the vendor records none / it is not there yet.
+        None is terminal, as in `discover_session_id`: an incomplete enumeration RAISES. A match found
+        despite truncation is still returned (truncation can cost a match, never invent one)."""
+
+    @abc.abstractmethod
+    def transcript_root(self, *, config_dir: str) -> str:
+        """The ONE directory under `config_dir` holding this vendor's transcripts — the containment root
+        for `transcript()`'s answer.
+
+        A security seam: containing against the account home would put the stored OAuth credential one
+        runner-planted hardlink away from the forever-kept transcript bucket (whose redaction cannot match
+        an opaque token). A `SESSION_DISCOVER` adapter MUST narrow it; an ASSIGN one never reaches the
+        vendor containment leg (`session_sweep._vendor_transcript`)."""
+
+    def session_members(self, *, config_dir: str, transcript: str) -> list[tuple[str, str]]:
+        """Every OTHER file the vendor itself wrote for the session whose main record is `transcript` —
+        `[(member name, path)]`, so the capture is the vendor's whole record and not one file of it.
+
+        Two name shapes, nothing else: `subagent-<id>.jsonl.gz` for a sub-agent's own thread (its spend is
+        folded like the main file's) and `vendor/<path relative to transcript_root>.gz` for any other
+        session file (uploaded verbatim, never folded). Every path lies under `transcript_root`; the sweep
+        re-checks that. An ASSIGN adapter answers `[]` (the sweep reads Claude's sub-agents itself). An
+        enumeration that could not complete RAISES — the sweep records the omission on the manifest rather
+        than let a partial set pass as the whole. Default `[]`: no session files of the vendor's own."""
+        return []
 
     def turn_error(self, *, transcript: str) -> TurnError | None:
+        """The error the session's LAST turn ended on, when that turn ended on a vendor API error after the
+        CLI's own retries — else None (still working, ended cleanly, or unreadable: never a guess).
+
+        The node-side stand-in for Claude Code's `StopFailure` on a CLI that fires no hook on an API-error
+        turn (`vendor_turn_errors`). Read off the vendor's OWN structured error record only, never prose,
+        so a runner merely working on the subject of errors is never condemned. An adapter whose CLI has a
+        `StopFailure` hook answers None (the default): the hook already reports it."""
         return None
+
+    @abc.abstractmethod
+    def read_usage(self, line: bytes) -> TokenCounts | None:
+        """One transcript line's token spend, or None when that line reports none (which is most lines,
+        and every line for a vendor with no usage accounting).
+
+        A line naming a model but spending nothing MAY answer an all-zero `TokenCounts` with that model,
+        for transcripts that put model and counts on different lines (the fold carries the model forward;
+        `usage_by_model()` drops empty buckets). Distinct from the no-accounting rule, which answers None."""
 
 
 class LoginAdapterBase:
@@ -1367,6 +1317,69 @@ class IncompleteSessionMembers(Exception):
 # `ADAPTER_MEMBERS`: a provider without it runs the legacy path whatever the switch says.
 
 
+#: An MCP connection's name: the engine sees the server as `mcp_<name>`.
+_MCP_CONNECTION_NAME = re.compile(r"^[a-z0-9_]{1,40}$")
+
+
+@dataclass(frozen=True)
+class McpConnection:
+    """One remote MCP server the task's project linked (the dispatch decision's `mcp_connections` entry). No
+    secret: `credential_path` is the roster path the bridge fetches the token by (`mcp_bridge`)."""
+
+    name: str
+    credential_path: str
+    url: str
+    transport: str
+
+    def __post_init__(self) -> None:
+        """A malformed entry is refused (ValueError naming the field), never launched as something else."""
+        if not _MCP_CONNECTION_NAME.match(self.name or ""):
+            raise ValueError(f"mcp connection name {self.name!r} must match ^[a-z0-9_]{{1,40}}$")
+        if not self.credential_path:
+            raise ValueError(f"mcp connection {self.name!r} names no credential")
+        import mcp_bridge  # noqa: PLC0415 — the daemon module, outside this stdlib-only package
+
+        try:
+            mcp_bridge.check_url(self.url)
+        except ValueError as exc:
+            raise ValueError(f"mcp connection {self.name!r}: {exc}") from None
+        if self.transport not in mcp_bridge.TRANSPORTS:
+            raise ValueError(f"mcp connection {self.name!r} transport must be one of {mcp_bridge.TRANSPORTS}")
+
+
+def mcp_connections_from_wire(raw: object) -> tuple[McpConnection, ...]:
+    """The decision's `mcp_connections` as `McpConnection`s: absent (an older control plane) is `()`. A malformed
+    entry, or a second one under a name already taken, raises ValueError — a launch with a server nobody linked,
+    or without one that was, is worse than a refused one."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError("mcp_connections must be a list")
+    out: list[McpConnection] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise ValueError("an mcp_connections entry must be an object")
+        out.append(McpConnection(name=str(item.get("name") or ""),
+                                 credential_path=str(item.get("credential_path") or ""),
+                                 url=str(item.get("url") or ""), transport=str(item.get("transport") or "")))
+    names = [c.name for c in out]
+    if len(set(names)) != len(names):
+        raise ValueError("mcp_connections names must be unique")
+    return tuple(out)
+
+
+def remote_mcp_servers(connections: tuple[McpConnection, ...], *, guest: bool = False) -> tuple[dict, ...]:
+    """One ACP stdio entry per connection, `mcp_<name>`, each starting `mcp_bridge` — the only way a linked server
+    reaches an engine: no URL with a token, no env, nothing an engine writes to its own config. `guest`: a MicroVM
+    guest's launch (`AcpLaunchContext.guest`), whose bridge runs on the guest's interpreter."""
+    if not connections:
+        return ()
+    import mcp_bridge  # noqa: PLC0415 — the daemon module, outside this stdlib-only package
+
+    return tuple(mcp_bridge.server_entry(c.name, c.credential_path, c.url, c.transport, guest=guest)
+                 for c in connections)
+
+
 @dataclass(frozen=True)
 class AcpLaunchContext:
     """What a provider's `acp_launch` is told about one run. Paths are as the engine will see them (guest paths
@@ -1385,6 +1398,9 @@ class AcpLaunchContext:
     #: The credential-helper COMMAND an API-key run takes its key from (`fleet_dispatch.api_key_helper_command`):
     #: it names the credential, never holds it. `""` for OAuth and for an adapter whose key rides another way.
     key_helper: str = ""
+    #: The API-key account's Anthropic workspace (`cred_broker.account_workspace_id`), sent with every request when
+    #: set; `""` for none, for OAuth, and when the fetch failed (`fleet_dispatch.api_key_workspace_id`).
+    workspace_id: str = ""
     #: The Architectural Guard is on for this run (its `JAAH_GUARD_*` env rides `launch.sh`).
     guard: bool = False
     #: A Jaah-account run's plan (`bedrock_launch.BedrockPlan`), None otherwise: an adapter that can run on the
@@ -1393,6 +1409,9 @@ class AcpLaunchContext:
     #: A MicroVM guest's launch (`microvm_session.model_launch_files`): `worktree` and `config_dir` are the guest's,
     #: so nothing of them is on this host, and an API-key run signs in through `AcpLaunch.authenticate`.
     guest: bool = False
+    #: The remote MCP servers the task's project linked (`McpConnection`), `()` for none. An adapter whose
+    #: provider row says `supports_remote_mcp` adds `remote_mcp_servers(...)` beside its control server.
+    mcp_connections: tuple[McpConnection, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1430,9 +1449,23 @@ class AcpLaunch:
         launch.validate_secrets(dict(self.env), self.mcp_servers, dict(self.session_meta))
 
 
+# What a `model_switch` driver answers: `switched` (verified on screen), `busy` (the runner is mid-turn or its composer
+# is covered or holds text, so nothing was typed — a normal wait the CP re-serves WITHOUT charging its park budget),
+# `retry` (transient — no confirmation seen; the switch is idempotent, so the CP re-serves it, charged), or
+# `unsupported` (this CLI cannot run that model — a retry would answer the same). Its bounded polls: the CP's
+# re-serve is the real retry loop.
+MODEL_SWITCHED = "switched"
+MODEL_SWITCH_BUSY = "busy"
+MODEL_SWITCH_RETRY = "retry"
+MODEL_SWITCH_UNSUPPORTED = "unsupported"
+MODEL_SWITCH_STATUSES = (MODEL_SWITCHED, MODEL_SWITCH_BUSY, MODEL_SWITCH_RETRY, MODEL_SWITCH_UNSUPPORTED)
+MODEL_SWITCH_POLLS = 10
+MODEL_SWITCH_POLL_SECS = 0.5
+
+
 # The protocol's member list, for the conformance test.
 ADAPTER_MEMBERS: tuple[str, ...] = (
-    "provider", "base_argv", "exec_line", "resume_exec_line", "task_delivery", "tui", "consent_dialogs", "inherits_harness_hooks",
+    "provider", "base_argv", "exec_line", "task_delivery", "tui", "consent_dialogs", "inherits_harness_hooks",
     "api_key_settings", "api_key_env", "api_key_argv", "api_key_prepare",
     "account_layer", "account_layer_refresh", "account_layer_converge",
     "account_layer_missing", "env", "prepare", "write_hooks",
@@ -1442,10 +1475,12 @@ ADAPTER_MEMBERS: tuple[str, ...] = (
 )
 
 __all__ = [
-    "AcpLaunch", "AcpLaunchContext",
-    "AdapterDefaults", "AgentAdapter", "ComposerTui", "ConsentDialog", "LifecycleChains", "LoginAdapterBase",
+    "AcpLaunch", "AcpLaunchContext", "McpConnection", "mcp_connections_from_wire",
+    "remote_mcp_servers",
+    "AgentAdapter", "ComposerTui", "ConsentDialog", "LifecycleChains", "LoginAdapterBase",
     "QuitSignature", "TokenCounts", "TurnError",
-    "ADAPTER_MEMBERS",
+    "ADAPTER_MEMBERS", "MODEL_SWITCHED", "MODEL_SWITCH_BUSY", "MODEL_SWITCH_POLLS", "MODEL_SWITCH_POLL_SECS", "MODEL_SWITCH_RETRY",
+    "MODEL_SWITCH_STATUSES", "MODEL_SWITCH_UNSUPPORTED",
     "IncompleteSessionMembers", "SessionTreeWalk",
     "control_mcp_server", "CLAUDE_CONTROL_SERVER_NAME", "CONTROL_SERVER_NAMES", "count_int", "json_object", "read_bounded", "read_head_lines", "read_tail_lines", "write_rendered_hooks",
     "chain_hook_groups", "harness_dispatch", "harness_entries", "host_lifecycle_dispatch", "acp_hook_files",

@@ -1,4 +1,4 @@
-import { useRef, type ComponentType } from 'react'
+import { useEffect, useRef, type ComponentType } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import { get } from '../../api'
@@ -31,6 +31,7 @@ import {
   type WizardStepState,
 } from '../../lib/welcomeWizard'
 import { isEnabled } from '../../lib/editionFeatures'
+import { editionModule } from '../../lib/editionModule'
 import type { SetupChecklistStatus, SetupChecklistStep } from '../setupChecklist/SetupChecklist'
 import type { GuideAnswer } from './guide'
 
@@ -66,7 +67,6 @@ export type CompanySetupStepStatusOut = {
 export type CompanySetupStatus = {
   visible: boolean
   steps: CompanySetupStepStatusOut[] | null
-  github?: { app: boolean; user_connected: boolean } | null
   project_id?: number | null
   /** The project `add_slots` links to: the org's first one, assigned or not. */
   assign_project_id?: number | null
@@ -75,6 +75,8 @@ export type CompanySetupStatus = {
   /** The org's onboarding latch is still open: setup is neither finished nor closed (`setupRefetchInterval`
    *  polls node-reported steps only while it is). */
   onboarding_open?: boolean
+  /** This read started setup over (`routes/org_setup.py::SetupStatus.reopened`). */
+  reopened?: boolean
   /** The org's qualifying first task — the most recent `done` one, else the most recent (the `first_task`
    *  signal's criteria); null for none. */
   first_task?: CompanySetupFirstTask | null
@@ -104,11 +106,10 @@ const STATUS_OF: Record<WizardStepState, SetupChecklistStatus> = {
 
 /** The in-place plan picker's widest, in px. */
 const PLAN_PICKER_MAX_WIDTH = 360
-/* The plan step's picker (`components/PlanPicker.tsx`): billing's (`billing`), loaded where present — the community
-   edition's tree leaves it out, and `import.meta.glob` yields `{}` for an absent file. */
-const PlanPicker: ComponentType<{ canChoose: boolean }> | undefined = Object.values(isEnabled('billing')
-  ? import.meta.glob<ComponentType<{ canChoose: boolean }>>('../PlanPicker.tsx', { eager: true, import: 'default' })
-  : {})[0]
+/* The plan step's picker (`components/PlanPicker.tsx`): billing's (`billing`), loaded where present
+   (`lib/editionModule.ts`). */
+const PlanPicker = editionModule(isEnabled('billing'),
+  () => import.meta.glob<ComponentType<{ canChoose: boolean }>>('../PlanPicker.tsx', { eager: true, import: 'default' }))
 
 /** How often the status is re-asked while a step is under way (a plan's node coming up, approval landing) or
  *  waits on a node or a sign-in: the widget sits on screen, so such a step must tick over without a navigation. */
@@ -120,6 +121,7 @@ const NODE_REPORTED_STEPS: readonly CompanySetupStepId[] = ['compute', 'add_comp
 
 /** The console events that can move a step: a node added, deleted or changing state; an account changed. */
 const SETUP_EVENT_ENTITIES = ['node', 'account'] as const
+const SETUP_LIVE_REFETCH_MIN_MS = 5_000
 
 /** `refetchInterval` for the status: poll while any step is `in_progress`, or — while onboarding is open — a
  *  node-reported step is open (not `blocked`: that one waits on approval, polled through its own `in_progress`
@@ -136,7 +138,7 @@ export function setupRefetchInterval(status: CompanySetupStatus | undefined): nu
 /** `passive`: a second reader beside the widget (the Tasks board's setup diagram) — it shares the widget's cached
  *  answer and never re-asks itself (no poll, no focus or live refetch), so the status is asked once, not per mount. */
 export function useCompanySetupGuide({ passive = false }: { passive?: boolean } = {}): CompanySetupAnswer {
-  const { admin, updatePreferences } = useAuth()
+  const { admin, updatePreferences, refresh } = useAuth()
   const can = useCan()
 
   /* ✕ HIDES, it does not end the guide: the stored flag keeps the widget away until the
@@ -156,14 +158,33 @@ export function useCompanySetupGuide({ passive = false }: { passive?: boolean } 
        change: `OnboardingWidget` re-asks on every navigation, this re-asks on return to the tab, and a step
        under way is polled. `staleTime: 0` so each of those really asks. */
     staleTime: 0,
+    /* A passive reader never asks on its own mount either: under `staleTime: 0` every mount would (the board's
+       diagram on each visit to /tasks). With no answer cached yet it still asks — React Query always does. */
+    refetchOnMount: !passive,
     refetchOnWindowFocus: !passive,
     refetchInterval: query => passive ? false : setupRefetchInterval(query.state.data),
   })
-  /* A node added, deleted or turning live, an account changed: re-ask at once, not on the next page. */
+  /* SETUP STARTED OVER (`routes/org_setup.py::reopen_onboarding` cleared every member's ✕): this tab's copy of the
+     preferences still holds the hide, and its next save PUTs the whole document back — so read the identity again
+     when this read did the reopening (`reopened`), or the latch is seen reopening (another tab or the operator did).
+     The widget's reader only: a passive one would read it twice. */
+  const onboardingOpen = statusQuery.data?.onboarding_open
+  const reopened = statusQuery.data?.reopened === true
+  const wasOpen = useRef(onboardingOpen)
+  useEffect(() => {
+    if (!passive && (reopened || (wasOpen.current === false && onboardingOpen === true))) void refresh()
+    wasOpen.current = onboardingOpen
+  }, [onboardingOpen, reopened, passive, refresh])
+  /* A node added, deleted or turning live, an account changed: re-ask at once, not on the next page.
+     JOINING a read in flight (`cancelRefetch: false`): the widget and the sidebar's Setup buttons each hear the same
+     event, and the default would have each one cancel the read the one before it started — one event, three reads,
+     two of them thrown away. */
   useLiveRefetch(
     useEventStream(admin && !passive ? '/api/stream' : null, SETUP_EVENT_ENTITIES),
-    () => { void statusQuery.refetch() },
+    () => { void statusQuery.refetch({ cancelRefetch: false }) },
     null,
+    /* A burst of node or account events (a node's slots turning live) asks once now and once after, not per event. */
+    { minIntervalMs: SETUP_LIVE_REFETCH_MIN_MS },
   )
 
   if (!admin) return { pending: false, forViewer: false, guide: null }
@@ -198,8 +219,15 @@ export function useCompanySetupGuide({ passive = false }: { passive?: boolean } 
       done,
       status: STATUS_OF[step.state],
     }
-    /* A finished row links nowhere: its destination begins ANOTHER add. */
-    if (done) return { ...row, to: '' }
+    /* A finished row stays a link (operator decision): to change the plan in place, or to add another. A viewer
+       who could not act there gets no link — and no note, since the row is done. */
+    if (done) {
+      if (!holds(id === 'task' ? 'tasks:create' : 'org_admin')) return { ...row, to: '' }
+      if (id === 'plan' && PlanPicker) {
+        return { ...row, cta: 'Change', expand: <Box sx={{ maxWidth: PLAN_PICKER_MAX_WIDTH }}><PlanPicker canChoose /></Box> }
+      }
+      return id === 'task' && projectId !== null ? { ...row, to: newTaskHref(projectId) } : row
+    }
     /* Waiting: never a link. On the node, no words either (operator decision): the dashed glyph and
        muted title say "not yet", and the open rows above are plainly the ones to do first. A wait the page shows
        no other way (approval, a plan to choose, a refused add) keeps its note. */
@@ -212,10 +240,6 @@ export function useCompanySetupGuide({ passive = false }: { passive?: boolean } 
        link: the steps after it wait on a node, so adding one is the way on. */
     if (step.state === 'in_progress') return { ...row, to: '' }
     switch (id) {
-      case 'forge':
-        /* Any org admin's connection on any forge finishes it, and a token can be pasted for any
-           forge without the operator's GitHub app, so an org admin always goes. */
-        return isOrgAdminSeat(admin) ? row : { ...row, note: 'Ask an admin to connect Git' }
       case 'plan':
         if (!holds('org_admin')) return { ...row, note: ASK_AN_ADMIN }
         /* The plan brings the node: chosen in place. */

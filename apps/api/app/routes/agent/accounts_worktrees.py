@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -11,19 +11,16 @@ from sqlalchemy.orm import Session
 from app import (
     account_auth,
     agent_providers,
-    node_credentials,
     slot_stack,
     slot_state,
     slot_title,
-    tenant_defaults,
 )
 from app.account_runners import fleet_assigned_runner_counts
 # routes need one for a user who is NOT the caller (they carry no session cookie, only the node token).
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
-from app.db import get_session
+from app.db_async import on_session
 from app.node_clone import account_slug_expr, resolve_auth_dir
-from app.shared_storage import resolve_shared_auth_dir
 from app.node_identity import (
     is_registered_node,
     jaah_home_expr,
@@ -38,8 +35,8 @@ from app.models.nodes import Node
 from app.models.projects import Project
 from app.models.tasks import Task
 from app.models.worktrees import Worktree
-from app.entity_shape import iso_or_none
-from app.routes.agent.auth import _CALLER_TASK_ID_RE, _check_token, _wire_project, caller_node_ref
+from app.entity_shape import from_row, or_404
+from app.routes.agent.auth import _CALLER_TASK_ID_RE, AgentDoor, _check_token, _wire_project, caller_node_ref
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
@@ -56,15 +53,9 @@ class AgentAccountOut(BaseModel):
     """
 
     slug: str
+    # Where the account's token is, is the node's to resolve (its config dir, else `.shared/<slug>`,
+    # `apps/jaahd/shared_storage.py`): no store path rides this wire.
     config_dir: str
-    # For OLDER jaahd packages only (a newer one resolves the token itself, config dir then `.shared/<slug>`,
-    # and ignores both fields): where a shared account's credential file lives, set only when the asking
-    # node reports a mounted token share (`nodes.shared_accounts_root`); exported as
-    # `CLAUDE_SECURESTORAGE_CONFIG_DIR`. `None`, never `""`: an empty value means `~/.claude`.
-    securestorage_dir: Optional[str] = None
-    # The `accounts.shared` column, independent of the asking node (older packages refuse a shared account
-    # with no `securestorage_dir` rather than fall back to a local token).
-    shared: bool = False
     enabled: bool
     # `oauth`/`api_key` (`app/account_auth.py`). An API-key account serves `config_dir=""`, identical to an
     # OAuth account on a home-less node, so the node cannot infer it. Defaults to OAuth for older nodes.
@@ -83,12 +74,13 @@ class AgentAccountOut(BaseModel):
 # Fleet-wide arms are widened by `_read_scope_for`.
 @router.get("/accounts", response_model=list[AgentAccountOut])
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def agent_accounts(
+    session: Session,
     node_id: str = Query(..., min_length=1,
                          description="the asking node — config_dir is a PER-NODE answer"),
     include_disabled: bool = Query(default=False),
     _: None = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> list[AgentAccountOut]:
     """The enabled account roster as the asking node sees it; `include_disabled=1` returns the whole
     roster. gh-free.
@@ -96,9 +88,6 @@ def agent_accounts(
     No `quota`: dispatchability is CP-side (`jaah_scheduler.gate_and_tier`). `node_id` is required
     because `config_dir` is per node (`node_clone.resolve_auth_dir`); no declared home resolves to `""`.
     `min_length=1` refuses an identity-less daemon; an unregistered id only warns.
-
-    `securestorage_dir` is served only when the account is `shared`, the node reports a mounted token share
-    (a non-empty `shared_accounts_root`) and its org may use NodeLink; `shared` rides unconditioned beside it.
     """
     if not is_registered_node(node_id, session):
         warn_unregistered_node(node_id, "the account roster read")
@@ -111,45 +100,23 @@ def agent_accounts(
     # defect: `Worktree` is tenant-owned and this route is `ORG_SCOPED`, so counts are org-local and
     # under-count a saturated account. Fix owed: wrap this call in `seam.operator_scope()`.
     runner_counts = fleet_assigned_runner_counts(session)
-    # The asking node's row, read once: home and the token share it reports (`nodelinks.ingest_snapshot` keeps
-    # only a permitted root). No row → `""` for every `config_dir` and `None` for every `securestorage_dir`.
-    # An org whose NodeLink plan term is off is served no `securestorage_dir`, as before the switch was retired.
-    node_row = session.execute(
-        select(Node.jaah_home, Node.shared_accounts_root, Node.org_id).where(node_matches(node_id))
-    ).first()
-    jaah_home = node_row.jaah_home if node_row else None
-    share_root = (
-        str(node_row.shared_accounts_root)
-        if node_row and node_row.shared_accounts_root
-        and tenant_defaults.shared_store_allowed(session, node_row.org_id)
-        else ""
-    )
+    # The asking node's home, read once. No row → `""` for every `config_dir`.
+    jaah_home = session.scalar(select(Node.jaah_home).where(node_matches(node_id)))
 
     # `accounts.node_id` is a uuid and the LABEL is the name: one batched read, not a subquery per row.
     # A NULL reference ("fleet-wide") misses the dict and stays None.
     account_node_names = names_by_id(session, [row.node_id for row in rows])
+    # `auth_kind` and `provider` ride straight off the row: no secret with the first (the key itself lives in a
+    # `credentials` row served slug-in-path, `GET /api/agent/accounts/{slug}/api-key` → `get_account_api_key`),
+    # and the second is a property of the account, so no node-scoped conjunct belongs on it.
     return [
-        AgentAccountOut(
-            slug=row.slug,
+        from_row(
+            AgentAccountOut, row,
             # `""` is true for an API-key account (no directory anywhere); `auth_kind` disambiguates.
             config_dir=(
                 "" if account_auth.is_api_key(row.auth_kind)
                 else resolve_auth_dir(jaah_home, row.slug)
             ),
-            # `or None` keeps the contract (an empty value means `~/.claude`). The API-key conjunct is explicit
-            # because `accounts.shared` is writable on any row.
-            securestorage_dir=(
-                (resolve_shared_auth_dir(row.slug, share_root) or None)
-                if (row.shared and share_root and not account_auth.is_api_key(row.auth_kind))
-                else None
-            ),
-            shared=row.shared,
-            enabled=row.enabled,
-            # Straight off the row; no secret rides with it. The key itself lives in a `credentials` row
-            # served slug-in-path (`GET /api/agent/accounts/{slug}/api-key` → `get_account_api_key`).
-            auth_kind=row.auth_kind,
-            # Straight off the row: a property of the account, so no node-scoped conjunct belongs on it.
-            provider=row.provider,
             node_id=account_node_names.get(row.node_id),
             # Keyed on the account itself: `fleet_assigned_runner_counts` groups `worktrees.account_id`,
             # the FK the ingest resolves from whatever dir the node reported.
@@ -162,8 +129,7 @@ def agent_accounts(
 # ── Dispatcher worktree-pool roster read (DB SSOT) ──
 
 class AgentWorktreeOut(BaseModel):
-    """One pool-worktree slot in a project's roster, as the jaahd dispatcher reads it
-    (`worktree_mechanics.lifecycle.roster_from_db` → `select_slot`). gh-free. `branch` feeds branch reuse;
+    """One pool-worktree slot in a project's roster. gh-free. `branch` feeds branch reuse;
     `last_active` the .env-seed MRU pick.
     """
 
@@ -225,18 +191,18 @@ class AgentWorktreeOut(BaseModel):
 
 @router.get("/worktrees", response_model=list[AgentWorktreeOut])
 @infra(Tenancy.OPERATOR)
+@on_session
 def agent_worktrees(
+    session: Session,
+    door: AgentDoor,
     project: str = Query(default=""),
     project_id: Optional[int] = Query(default=None),
     node_id: str = Query(default=""),
-    caller: node_credentials.AgentCaller = Depends(_check_token),
-    x_agent_task_id: str = Header(default=""),
-    session: Session = Depends(get_session),
 ) -> list[AgentWorktreeOut]:
     """The pool roster the dispatcher and node readers pick from, narrowed to what the caller is.
 
-    `project_id` (or, from an older daemon, `project` — a name inside the caller's org, `_wire_project`) is
-    optional; unresolvable → 404, not `[]` (Console reads `[]` as "no live session"). `node_id` is the node
+    `project_id` is optional (`project`, the display name, never selects — `_wire_project`); a request
+    naming a project it cannot resolve → 404, not `[]` (Console reads `[]` as "no live session"). `node_id` is the node
     uuid (`app/node_identity.py`).
 
     The node is derived, not filtered: a node credential confines the roster to that node, and naming
@@ -244,6 +210,7 @@ def agent_worktrees(
     `OPERATOR` (`test_authz_policy._INFRA_OPERATOR_PLANE_ALLOWLIST`). A numeric `X-Agent-Task-Id` (stamped
     by the daemon, `cred_broker._perform_call`) confines it further to that task's slots; defence in depth.
     """
+    caller, x_agent_task_id = door
     idle_expr = slot_state.idle_hours_expr()
     # The node's NAME for the served field AND the tie-break — a correlated probe, not a join, so the
     # existing outer joins keep their multiplicity.
@@ -273,12 +240,10 @@ def agent_worktrees(
         .order_by(Project.name, Worktree.number, node_name)
     )
     if project_id is not None or project:
-        project_row = _wire_project(session, caller, project_id, project)
-        if project_row is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"unknown project {project_id if project_id is not None else repr(project)}",
-            )
+        project_row = or_404(
+            _wire_project(session, project_id),
+            detail=f"unknown project {project_id if project_id is not None else repr(project)}",
+        )
         query = query.where(Worktree.project_id == project_row.id)
     # 403 on a `node_id` naming a node other than the credential's; the PROVEN value is `caller.node_id`.
     caller_node_ref(session, caller, node_id)
@@ -290,35 +255,22 @@ def agent_worktrees(
         query = query.where(Worktree.node_id == node_ref(node_id))
     declared_task = x_agent_task_id.strip()
     if _CALLER_TASK_ID_RE.fullmatch(declared_task):
-        # `task_id` is NULL on `free` and `user` rows (`ck_worktrees_state_ownership`), so those never match.
+        # `task_id` is NULL on `free` rows (`ck_worktrees_state_ownership`), so those never match.
         query = query.where(Worktree.task_id == int(declared_task))
     out: list[AgentWorktreeOut] = []
     for row in session.execute(query).all():
         wt = row[0]
         out.append(
-            AgentWorktreeOut(
+            from_row(
+                AgentWorktreeOut, wt,
                 node_id=row.node_name,
-                project_id=wt.project_id,
                 project=row.project_name,
-                number=wt.number,
-                path=wt.path,
-                branch=wt.branch,
-                state=wt.state,
-                last_active=iso_or_none(wt.last_active),
-                has_repo=wt.has_repo,
                 # String compatibility pair — see the model. Still the NAME.
                 project_compat=str(row.project_name),
                 number_compat=str(wt.number),
-                dirty=wt.dirty,
-                merged=wt.merged,
-                session=wt.session,
-                session_id=wt.session_id,
-                session_status=wt.session_status,
-                console=wt.console,
                 # The answer the CP would give that node for that account, not the node's last spelling.
                 # `""` (unresolved account, or no declared home) maps to None.
                 account=resolve_auth_dir(row.slot_home, row.account_slug) or None,
-                window_name=wt.window_name,
                 # `resolved_title`'s OUTPUT. The INPUT is the OPINION, not the raw `name`, whose derived
                 # value would out-rank the task branch; `routes/portfolio.py::_wt_out` must match.
                 title=slot_title.resolved_title(
@@ -331,7 +283,6 @@ def agent_worktrees(
                     task_id=wt.task_id,
                     task_title=row.task_title,
                 ),
-                task_id=wt.task_id,
                 # DERIVED from this row's SENSED columns; the stored `stack_state` column has no writer
                 # (`app/slot_stack.py`). `observed_at` bounds freshness: without it a dead daemon keeps
                 # reporting `"up"`.
@@ -341,17 +292,7 @@ def agent_worktrees(
                     probes=wt.probes,
                     observed_at=wt.observed_at,
                 ),
-                observed_at=iso_or_none(wt.observed_at),
-                last_used=iso_or_none(wt.last_used),
                 idle_hours=row.idle_joined,
-                probes=wt.probes,
-                ports=wt.ports,
-                host_env=wt.host_env,
-                ahead=wt.ahead,
-                behind=wt.behind,
-                session_started_at=iso_or_none(wt.session_started_at),
-                tmux_target=wt.tmux_target,
-                generation=wt.generation,
             )
         )
     return out

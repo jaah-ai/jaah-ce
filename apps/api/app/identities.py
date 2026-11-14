@@ -10,19 +10,19 @@ email column of `admin_users`, which is no longer unique (`tests/test_identity_e
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 from uuid import UUID
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import notification_channels
 from app.models.identity import (
     IDENTITY_FIELDS,
     AdminUser,
     UserIdentity,
     assert_member_row_not_superadmin,
-    set_identity_fields,
 )
 from app.tenancy import seam
 
@@ -81,7 +81,7 @@ def label_expr():
 def person_label_sql(alias: str, *, fallback: str) -> str:
     """`person_label` for a RAW-SQL statement, over the `admin_users` row aliased `alias`: the name pair off
     the person's IDENTITY (never the membership's own copy, which a rename through another membership leaves
-    stale), else `fallback` — a SQL expression the caller spells for its surface (`{alias}.email` where the
+    stale), else `fallback` — a SQL expression the caller spells for its surface (`person_email_sql` where the
     address may be shown; an org's name where it may not, `org_invitations.pending_for`). The ONE raw-SQL
     spelling; the operator's entitlements-export tool carries a copy it cannot import, pointed back here."""
     pair = (
@@ -89,6 +89,12 @@ def person_label_sql(alias: str, *, fallback: str) -> str:
         f"FROM identities i WHERE i.id = {alias}.identity_id)"
     )
     return f"COALESCE({pair}, {fallback})"
+
+
+def person_email_sql(alias: str) -> str:
+    """The person's email for a RAW-SQL statement over the `admin_users` row aliased `alias` — off the identity,
+    the one home of the address; the `fallback` `person_label_sql` takes where the address may be shown."""
+    return f"(SELECT i.email FROM identities i WHERE i.id = {alias}.identity_id)"
 
 
 def by_email(session: Session, email: str) -> Optional[UserIdentity]:
@@ -166,17 +172,14 @@ def has_membership(session: Session, email: str) -> bool:
         ) is not None
 
 
-def set_fields(session: Session, identity: UserIdentity, **fields) -> None:
+def set_fields(identity: UserIdentity, **fields) -> None:
     """Write person-level fields when the caller holds the identity rather than one membership (a stale
-    provider link released at sign-in): the identity, and the legacy copy on each of its memberships
-    (`models.set_identity_fields`'s dual write, until revision 2)."""
-    rows = memberships(session, identity.id)
-    if not rows:
-        for field, value in fields.items():
-            setattr(identity, field, value)
-        return
-    for row in rows:
-        set_identity_fields(row, **fields)
+    provider link released at sign-in). Refuses a name outside `IDENTITY_FIELDS`."""
+    unknown = set(fields) - set(IDENTITY_FIELDS)
+    if unknown:
+        raise ValueError(f"not identity fields: {sorted(unknown)}")
+    for field, value in fields.items():
+        setattr(identity, field, value)
 
 
 def first_membership(session: Session, email: str) -> Optional[AdminUser]:
@@ -192,24 +195,21 @@ def first_membership(session: Session, email: str) -> Optional[AdminUser]:
 
 def add_membership(session: Session, identity: UserIdentity, *, org_id: UUID, actor) -> AdminUser:
     """A new membership of an EXISTING person in `org_id`, attributed to `actor` — the way a second row is
-    made (a self-created org's owner, `app/signup.py::create_signup`). It NAMES the identity, so the 0360
-    insert trigger attaches it rather than refusing the person's email; the legacy columns take the
-    person's current values (revision-1 dual write). Never `is_superadmin`. Refused 409 past the org's Users
+    made (a self-created org's owner, `app/signup.py::create_signup`). It NAMES the identity, so its insert
+    attaches it rather than refusing the person's email. Never `is_superadmin`. Refused 409 past the org's Users
     cap, like every create. Joins the org's Everyone group; flushes, the caller commits."""
     from app import access
     from app.actors import stamp_actor
     from app.org_limits import require_headroom
 
     require_headroom(session, org_id, "users")
-    user = AdminUser(
-        identity=identity, org_id=org_id,
-        **{field: getattr(identity, field) for field in IDENTITY_FIELDS},
-    )
+    user = AdminUser(identity=identity, org_id=org_id)
     assert_member_row_not_superadmin(user)
     stamp_actor(user, actor, created=True)
     session.add(user)
     session.flush()
     access.join_everyone(session, user)
+    notification_channels.ensure_account_email(session, user)
     return user
 
 
@@ -240,6 +240,25 @@ def end_every_session(session: Session, user: AdminUser) -> list[tuple[UUID, int
         if row_id == user.id:
             set_committed_value(user, "session_epoch", epoch + 1)
     return retired
+
+
+def retire_session(user: AdminUser) -> tuple[UUID, int]:
+    """End ONE membership's sessions: bump its row epoch (`auth.session_row_is_live` refuses a retired one) and
+    return `(id, retired epoch)` — the PRE-bump epoch — for the caller's post-commit direct-console revoke."""
+    retired = user.session_epoch or 0
+    user.session_epoch = retired + 1
+    return user.id, retired
+
+
+def retire_org_sessions(
+    session: Session, org_id: UUID, *, only: Optional[Callable[[AdminUser], bool]] = None
+) -> list[tuple[UUID, int]]:
+    """`retire_session` over every member of `org_id` — or those `only` admits — and their retired pairs."""
+    return [
+        retire_session(member)
+        for member in session.scalars(select(AdminUser).where(AdminUser.org_id == org_id))
+        if only is None or only(member)
+    ]
 
 
 def identity_provider(identity: UserIdentity) -> str:

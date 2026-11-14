@@ -1,5 +1,5 @@
-"""The GitHub OAuth adapter — GitHub's departures from plain OAuth2 on top of the generic wire in
-`oauth2_wire.py`. Connect GitHub and GitHub sign-in authorize against ONE of two designated apps
+"""The GitHub OAuth adapter — GitHub's Connect and sign-in on the shared engine (`oauth_providers.py`,
+`PROVIDERS["github"]`). Connect GitHub and GitHub sign-in authorize against ONE of two designated apps
 (`git_access.app_config`): the GitHub App by default, whose user token (`ghu_`) reaches the
 accounts it is installed on, or a classic OAuth App, whose token (`gho_`) reaches what its user reaches.
 
@@ -12,10 +12,11 @@ accounts it is installed on, or a classic OAuth App, whose token (`gho_`) reache
 * A classic OAuth App token does not expire and carries no refresh token; a GitHub App's expires (8h) with a
   rotating single-use refresh token when the App opts in. So `TokenGrant` fields are Optional, and
   `git_access.py` refreshes under a row lock.
-* No `response_type` on authorize and no `grant_type` on exchange (see `oauth2_wire.authorize_url`).
+* No `response_type` on authorize and no `grant_type` on exchange (the provider's `response_type=None` and
+  `send_grant_type=False`); the refresh sends `grant_type`. Token calls carry GitHub's own `Accept`.
 
 PKCE (`S256`) is sent on every authorize even though optional. The public names are re-exported here
-so callers (`git_connect.py`, `git_access.py`, `durable/git_token.py`) need not know the wire module.
+so callers (`git_connect.py`, `git_access.py`, `durable/git_token.py`) need not know the engine or wire.
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ from typing import Optional
 
 import httpx
 
-from app import github_api, http_bounded, oauth2_wire
+from app import github_api, http_bounded, oauth_providers
 from app.oauth2_wire import (  # re-exported: see this module's header
     OAuth2Error,
     PkcePair,
@@ -54,11 +55,13 @@ __all__ = [
 
 log = logging.getLogger("app.github_oauth")
 
-AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
-TOKEN_URL = "https://github.com/login/oauth/access_token"
+_PROVIDER = oauth_providers.PROVIDERS["github"]
+
+AUTHORIZE_URL: str = _PROVIDER.authorize_url or ""
+TOKEN_URL: str = _PROVIDER.token_url or ""
 
 # What every authorize asks for (module header). Space-separated, GitHub's spelling.
-SCOPE = "repo workflow read:org read:user user:email"
+SCOPE: str = _PROVIDER.scope or ""
 
 # The prefix of a GitHub App's user-to-server token (`is_app_issued`).
 _APP_TOKEN_PREFIX = "ghu_"
@@ -121,14 +124,12 @@ def authorize_url(
     whichever account happens to be signed in.
     """
     extra = {key: value for key, value in (("login", login), ("prompt", prompt)) if value}
-    return oauth2_wire.authorize_url(
-        endpoint=AUTHORIZE_URL,
+    return oauth_providers.authorize_url(
+        _PROVIDER,
         client_id=client_id,
         redirect_uri=redirect_uri,
         state=state,
         challenge=challenge,
-        scope=SCOPE,
-        response_type=None,
         extra=extra or None,
     )
 
@@ -141,19 +142,17 @@ def exchange_code(
     `redirect_uri` must be byte-identical to the one sent to `authorize_url`, or GitHub answers
     `redirect_uri_mismatch` — it is a binding, not a destination, on this call.
     """
-    return oauth2_wire.exchange_code(
-        endpoint=TOKEN_URL,
+    return oauth_providers.exchange_code(
+        _PROVIDER,
         client_id=client_id,
         client_secret=client_secret,
         code=code,
         redirect_uri=redirect_uri,
         verifier=verifier,
-        vendor="GitHub",
         # GitHub's vendor type: without a recognised `Accept` the endpoint answers form-encoded.
         accept=github_api.GITHUB_ACCEPT,
         status_hint=_STATUS_PAGE,
         error_cls=GitHubOAuthError,
-        send_grant_type=False,
     )
 
 
@@ -163,12 +162,11 @@ def refresh(*, client_id: str, client_secret: str, refresh_token: str) -> TokenG
     The returned `refresh_token` must be persisted: GitHub retires the one just spent, and dropping it
     surfaces hours later as `bad_refresh_token`.
     """
-    return oauth2_wire.refresh(
-        endpoint=TOKEN_URL,
+    return oauth_providers.refresh(
+        _PROVIDER,
         client_id=client_id,
         client_secret=client_secret,
         refresh_token=refresh_token,
-        vendor="GitHub",
         accept=github_api.GITHUB_ACCEPT,
         status_hint=_STATUS_PAGE,
         error_cls=GitHubOAuthError,
@@ -176,8 +174,6 @@ def refresh(*, client_id: str, client_secret: str, refresh_token: str) -> TokenG
 
 
 # ── Console sign-in (`app/login_oauth.py`): read who the token is, then keep or give the token back ─────
-
-API_URL = "https://api.github.com"
 
 # One budget per call; the user is waiting on a redirect.
 _LOGIN_TIMEOUT_SECONDS = 15.0
@@ -190,7 +186,7 @@ _client = http_bounded.client
 
 
 def _get_json(client: httpx.Client, path: str) -> tuple[int, object]:
-    with client.stream("GET", f"{API_URL}{path}") as response:
+    with client.stream("GET", f"{github_api.GITHUB_API_BASE}{path}") as response:
         raw, truncated = http_bounded.read_capped(response, _LOGIN_MAX_BYTES)
         status = response.status_code
     return status, (None if truncated else http_bounded.json_or_none(raw))
@@ -245,7 +241,7 @@ def revoke_user_token(*, client_id: str, client_secret: str, access_token: str) 
     called: it would also revoke every other token of the same App the user holds, their connection's
     included.
     """
-    url = f"{API_URL}/applications/{client_id}/token"
+    url = f"{github_api.GITHUB_API_BASE}/applications/{client_id}/token"
     for attempt in (1, 2):
         try:
             with _client(

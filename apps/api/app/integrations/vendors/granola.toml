@@ -1,0 +1,55 @@
+# Granola. Facts confirmed at the vendor's own docs: the public API, its keys and plans
+# https://docs.granola.ai/introduction ; list notes (401 on a bad key) https://docs.granola.ai/api-reference/list-notes
+# The MCP server (https://docs.granola.ai/help-center/sharing/integrations/mcp; its own OAuth metadata at
+# mcp.granola.ai/.well-known/oauth-protected-resource, Dynamic Client Registration at mcp-auth.granola.ai): a row
+# holds the API key, or the MCP sign-in's grant (the W1-MCP wave's `[mcp]` block on this same file).
+slug = "granola"
+label = "Granola"
+category = "productivity"
+vendor_docs_url = "https://docs.granola.ai/introduction"
+summary = "Read your Granola meeting notes, summaries and transcripts."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, placeholder = "grn_...", help = "Granola desktop app > Settings > Connectors > API keys > Create new key: choose the scopes, then Generate API Key and copy it - Granola shows it once (a Business or Enterprise workspace is required)" },
+]
+
+[test]
+method = "GET"
+path = "https://public-api.granola.ai/v1/notes?page_size=1"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+list_field = "notes"
+
+[mcp]
+url = "https://mcp.granola.ai/mcp"
+url_editable = false
+transport = "streamable_http"
+auth = "oauth_dcr"
+
+[docs]
+agent_uses = [
+  "Find the notes from a meeting a task names and read its summary",
+  "Read a meeting's transcript to pull out decisions and action items",
+  "Through Granola's MCP server (sign in with Granola, then link the secret to a project), search notes and ask questions across meetings",
+  "List recent meetings, or those in a folder, to prepare a weekly report",
+]
+prerequisites = [
+  "A Granola Business or Enterprise workspace. On Enterprise, an admin must turn on API access for members (Settings > Workspace > General)",
+]
+limitations = [
+  "Granola's API is read-only: agents cannot create or edit notes",
+  "Only notes that have a generated summary and transcript are returned",
+  "A personal key reaches your own notes and those shared with you; a workspace key, created by an admin, reaches the workspace's shared notes",
+]
+troubleshooting = [
+  { symptom = "Test says Granola rejected the API key (401)", fix = "The key was revoked, expired or mistyped. Create a new key under Settings > Connectors > API keys and select Replace on the secret" },
+  { symptom = "There is no API keys option in Granola's settings", fix = "Your workspace is not on Business or Enterprise, or an Enterprise admin has not enabled API access for members. Ask your Granola admin" },
+  { symptom = "The secret shows Needs reconnect", fix = "The Granola sign-in for the MCP server ended. Select Reconnect and sign in to Granola again" },
+  { symptom = "New tasks on the project have no Granola tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with" },
+  { symptom = "Test passes but a meeting is missing", fix = "Its notes have not finished generating, or the key's user cannot see them. Wait for the summary, or share the note with that user" },
+]
+faq = [
+  { q = "Does Jaah record my meetings", a = "No. Jaah reads the notes Granola already made" },
+  { q = "API key or sign-in", a = "Either. An API key serves the REST API on Business and Enterprise. Signing in serves Granola's MCP server, also on Basic (notes from the last 30 days only); on Enterprise an admin must allow it. One secret holds one of them" },
+]

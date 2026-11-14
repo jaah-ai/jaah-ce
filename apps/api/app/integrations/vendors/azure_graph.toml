@@ -1,0 +1,48 @@
+# Azure Graph & Entra: a Microsoft Entra service principal for Microsoft Graph application permissions. Facts
+# confirmed at the vendor's own docs: client-credentials grant
+# https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow ; GET /organization and
+# its least-privileged permission Organization.Read.All https://learn.microsoft.com/en-us/graph/api/organization-list ;
+# a wrong secret is AADSTS7000215, HTTP 401.
+slug = "azure_graph"
+label = "Azure Graph & Entra"
+category = "cloud"
+vendor_docs_url = "https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow"
+summary = "Read and manage your Microsoft Entra directory - users, groups, apps - through Microsoft Graph as an app."
+default_base_url = "https://login.microsoftonline.com"
+
+[[auth]]
+kind = "service_account"
+fields = [
+  { key = "tenant_id", label = "Tenant ID", kind = "text", required = true, placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", help = "Microsoft Entra admin center > Entra ID > Overview > Tenant ID, or a domain such as acme.onmicrosoft.com" },
+  { key = "client_id", label = "Client ID", kind = "text", required = true, placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", help = "Entra ID > App registrations > New registration (name it Jaah, single tenant), then the app's Overview > Application (client) ID" },
+  { key = "client_secret", label = "Client secret", kind = "secret", required = true, help = "The app's Certificates & secrets > Client secrets > New client secret: copy the Value column (not the Secret ID) - Entra shows it once" },
+]
+
+[test]
+kind = "hook"
+tester = "app.credentials.testers:test_azure_graph"
+
+[docs]
+agent_uses = [
+  "Look up users, groups and group members in your directory",
+  "List app registrations and service principals, for example to audit secrets that are about to expire",
+  "Read sign-in and audit logs to investigate an incident, if you granted AuditLog.Read.All",
+  "Create users or change group membership, if you granted the matching write permissions",
+]
+prerequisites = [
+  "A Microsoft Entra tenant, and a Privileged Role Administrator or Global Administrator to grant admin consent",
+  "An app registration for Jaah with the Microsoft Graph application permissions agents need. The Test needs Organization.Read.All; add others, such as User.Read.All or Group.Read.All, for what tasks do. Then select Grant admin consent on the app's API permissions page",
+]
+limitations = [
+  "This is app-only access: agents act as the Jaah app, not as a person, and see everything the granted application permissions allow across the tenant. Grant the least you need",
+  "Client secrets expire (at most 24 months). Add a new secret before the old one expires and select Replace",
+  "Mail, calendar and files of individual users are better connected per person with Microsoft 365",
+]
+troubleshooting = [
+  { symptom = "Test says Azure Graph & Entra rejected the client secret (401)", fix = "You copied the Secret ID, or the secret expired (AADSTS7000215). Create a new client secret, copy its Value, and select Replace" },
+  { symptom = "Test says Azure Graph & Entra rejected the tenant ID or client ID (400)", fix = "The tenant or the app does not exist, or they do not belong together (AADSTS90002 or AADSTS700016). Copy both from the same app registration's Overview" },
+  { symptom = "Test says Microsoft Graph refused the organization read (403)", fix = "The app lacks Organization.Read.All, or admin consent was not granted. Add it under API permissions > Microsoft Graph > Application permissions and select Grant admin consent" },
+]
+faq = [
+  { q = "How is this different from Azure", a = "Azure manages cloud resources in a subscription. Azure Graph & Entra reaches your directory and Microsoft 365 data through Microsoft Graph" },
+]

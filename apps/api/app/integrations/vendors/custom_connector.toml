@@ -1,0 +1,44 @@
+slug = "custom_connector"
+label = "Custom connector"
+category = "custom"
+credential_type = "generic_api_key"
+vendor_docs_url = "https://datatracker.ietf.org/doc/html/rfc6750"
+summary = "Connect any REST API that is not in the catalog: define its base URL and how it authenticates once, then everyone in your organization can connect to it."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "base_url", label = "URL", kind = "url", required = false, outright = true, placeholder = "https://api.example.com", help = "The API's root address, for example https://api.example.com/v1. It must be https:// and reachable from the internet; Jaah refuses private, loopback and cloud-metadata addresses" },
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "The key or token the API gave you, usually under its account, developer or API settings page. Paste the key alone, without a scheme word such as Bearer" },
+  { key = "header_name", label = "Header name", kind = "text", required = false, placeholder = "Authorization", help = "The HTTP header the API reads the key from, as its documentation names it (for example X-API-Key). Leave it blank to send the key in Authorization" },
+  { key = "value_prefix", label = "Value prefix", kind = "text", required = false, placeholder = "Bearer", help = "The word sent before the key, such as Bearer or Token. Leave it blank to send the key alone" },
+]
+
+[docs]
+agent_uses = [
+  "Call any endpoint of the API with the key you connected, from the base URL you defined",
+  "Read records, create or update them and trigger jobs, exactly as the API's own documentation describes",
+  "Use the same connection across every task that is allowed to use the secret, without anyone pasting the key into a prompt",
+]
+prerequisites = [
+  "The API's documentation, to find its base URL and how it expects the key (Bearer token, a named header such as X-API-Key, HTTP Basic, or OAuth2)",
+  "A key, token, login or OAuth app for the API",
+  "To define a connector the whole organization can reuse: an Org Owner or Admin. Open Secrets, select Add secret, pick the Custom category, then Add custom on the Custom connector card. Give it a name, the base URL and the auth scheme (bearer token, header key, user name and password, or OAuth2 client), and optionally a test path such as /v1/me. Once saved every member sees it as its own card in the Custom category, and connects to it like any built-in service",
+]
+limitations = [
+  "Jaah does not know the API's endpoints: agents work from the API's own documentation, so link it in the task or the connector's description",
+  "The Test calls one GET request on the test path (or the base URL when there is none) and passes on any 2xx answer, so it proves the API accepted the secret, not that every endpoint will",
+  "Only https:// addresses on the public internet can be defined; an API inside a private network is not reachable from Jaah's control plane",
+  "An OAuth2 connector needs an OAuth app you register at the API's provider, with the redirect URI shown on the connection's page",
+]
+troubleshooting = [
+  { symptom = "Saving the connector says the Base URL is refused", fix = "The host resolves to a private, loopback or cloud-metadata address, or it is not https. Use the API's public https address" },
+  { symptom = "The Test says the host rejected the request (401 or 403)", fix = "Check the key, then the connector's header name and value prefix against the API's documentation. Many APIs expect X-API-Key with no prefix, others Authorization with Bearer" },
+  { symptom = "The Test says the host answered 404", fix = "The test path does not exist on the API. Ask an Org Owner or Admin to set a test path the API answers, such as /v1/me or /health" },
+  { symptom = "The Test cannot reach the address", fix = "Check the base URL is spelled correctly and the API is online; Jaah dials only public addresses" },
+]
+faq = [
+  { q = "What is the difference between this card and a built-in service", a = "A built-in service knows its own address, auth and test. A custom connector is the same thing defined by your organization: you supply the address, auth scheme and test path once, and every member then connects to it on its own card under Secrets > Add secret > Custom" },
+  { q = "Can another organization see our custom connectors", a = "No. A custom connector belongs to the organization that defined it; other organizations never see it" },
+  { q = "Who can change or delete a custom connector", a = "Org Owners and Admins. A connector that still has connections cannot be deleted, so nobody loses a working secret by accident" },
+]

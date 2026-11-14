@@ -2,7 +2,7 @@
 // Rows are the server's projection: identity is curated in `app/workflow_registry.py`, counts are folded
 // by `app/workflow_engine.py`. No browser-side copy of either.
 
-import { get } from '../../api'
+import { get, withQuery } from '../../api'
 import { RUNS_PAGE_SIZE } from '../../hooks/usePagedList'
 
 /* Every string vocabulary is typed `string` (as in `pages/cron/api.ts`): a row from an older/newer API
@@ -106,12 +106,8 @@ export const getWorkflow = (name: string) =>
 
 /** `offset` is the server's `next_offset` echoed verbatim, never computed from `limit`. */
 export function listWorkflowRuns(filters: RunFilters = {}) {
-  const params = new URLSearchParams({ limit: String(RUNS_PAGE_SIZE) })
-  if (filters.name) params.set('name', filters.name)
-  if (filters.status) params.set('status', filters.status)
-  if (filters.search) params.set('search', filters.search)
-  if (filters.offset) params.set('offset', String(filters.offset))
-  return get<WorkflowRunsPage>(`/api/workflows/runs?${params}`)
+  const { name, status, search, offset } = filters
+  return get<WorkflowRunsPage>(withQuery('/api/workflows/runs', { limit: RUNS_PAGE_SIZE, name, status, search, offset: offset || undefined }))
 }
 
 /** PENDING `cron_tick` runs (`sched-cron:*` ids), which the runs page excludes — `routes/workflows.py::

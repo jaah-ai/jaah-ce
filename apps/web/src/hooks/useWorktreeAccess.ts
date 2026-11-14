@@ -1,4 +1,7 @@
 import { useCan } from '../auth'
+import type { ConsoleRequest } from '../components/ConsoleDock'
+import { hasLiveSession, resolveTitle } from '../lib/worktree'
+import type { Worktree } from '../types'
 
 /* ── The worktree tiers, as the SERVER declares them ──────────────────────────────────────────────
  *
@@ -9,10 +12,8 @@ import { useCan } from '../auth'
  * TWO PREDICATES, BECAUSE THERE ARE TWO SERVER FACTS:
  *   · `POST /api/commands` (worktree commands) accepts `worktrees:edit` OR `system:create` (the bus's
  *     original key, kept) — `useCanEditWorktrees`.
- *   · The console relay and `PUT …/{project}/{number}/title` accept `worktrees:edit` ONLY —
- *     `useCanDriveWorktreeSession`.
- * Fusing them offered `worktrees:view` + `system:create` a live cursor whose frames the CP discards, plus
- * renames that 403.
+ *   · The console relay accepts `worktrees:edit` ONLY — `useCanDriveWorktreeSession`.
+ * Fusing them offered `worktrees:view` + `system:create` a live cursor whose frames the CP discards.
  *
  * Each mirrors ONE route declaration literally (no implication logic — settled); hence no
  * `canViewWorktrees` either: `worktrees:view` is spelled by `App.tsx`'s `RequireFeature`, `Sidebar.tsx`,
@@ -24,8 +25,8 @@ import { useCan } from '../auth'
  */
 
 /** May this principal drive the node COMMAND BUS — `worktrees:edit` OR `system:create`? The ⋯ sheet's
- *  `stack_*` / `sync_develop` / `logs` / `open_finder` / `open_cursor` items and the Sync fan-outs; NOT the
- *  console keyboard or Title rename (see `useCanDriveWorktreeSession`).
+ *  `stack_*` / `logs` / `open_finder` / `open_cursor` items; NOT the console keyboard (see
+ *  `useCanDriveWorktreeSession`).
  */
 export function useCanEditWorktrees(): boolean {
   const can = useCan()
@@ -33,13 +34,33 @@ export function useCanEditWorktrees(): boolean {
 }
 
 /** May this principal drive a worktree SESSION — the flat `worktrees:edit` key?
- * The two-way console and the Title rename. `system:create` does NOT pass: the relay
- * (`routes/console.py`) and title route (`routes/pool_slots.py`) declare `worktrees:edit` alone, so such a
- * principal gets a read-only console. FLAT (`useCan`), exactly as both routes check it (`Principal.has`):
- * neither asks for the key ON a project. The per-slot half is `worktree_editable_clause` (`tasks:edit` on
- * the running task's project, or the caller's own hold), reported on each row as `may_edit`
+ * The two-way console. `system:create` does NOT pass: the relay (`routes/console.py`) declares
+ * `worktrees:edit` alone, so such a principal gets a read-only console. FLAT (`useCan`), exactly as the
+ * route checks it (`Principal.has`): it does not ask for the key ON a project. The per-slot half is
+ * `worktree_editable_clause` (`tasks:edit` on the running task's project), reported on each row as `may_edit`
  * (`types.ts`), which consumers AND in.
  */
 export function useCanDriveWorktreeSession(): boolean {
   return useCan()('worktrees:edit')
+}
+
+/** The console request for a pool SLOT — the one place a slot row becomes a `ConsoleRequest`.
+ *
+ * `mayEdit` is the server's per-row verdict (`types.ts::Worktree.may_edit`) forwarded VERBATIM: the console
+ * ANDs it with `useCanDriveWorktreeSession` and fails closed on anything but `true` (`ConsoleTerminal.tsx`).
+ * `nodeId`: (project, number) names one slot PER NODE; without it the relay may attach another node's
+ * same-numbered slot. `title`: the resolved Title at open time
+ * (`lib/worktree.ts::resolveTitle`). `hadLiveSession`: the row's session answer at click time, for the
+ * pane's wording only (`ConsolePane.tsx`'s SLOT_EMPTY_REASON). Not for a MicroVM view (no slot).
+ */
+export function slotConsoleRequest(wt: Worktree): ConsoleRequest {
+  return {
+    project: wt.project,
+    projectId: wt.project_id,
+    number: wt.number,
+    nodeId: wt.node_uuid,
+    mayEdit: wt.may_edit,
+    title: resolveTitle(wt),
+    hadLiveSession: hasLiveSession(wt),
+  }
 }

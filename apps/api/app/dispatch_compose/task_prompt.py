@@ -19,12 +19,15 @@ from app.dispatch_compose.fencing import (
 )
 from app.dispatch_compose.placeholders import _PROJECT_INSTRUCTIONS_MAX_CHARS
 from app.dispatch_compose.recon_map import _render_recon_map
+from app.dispatch_compose.role_tables import _EPIC_SUMMARY_CONTENT
 from app.dispatch_compose.system_prompt import (
     _TRUSTED_LINES_SECRETS_FLOOR,
     apply_provider_values,
     resolve_provider,
 )
 from app.models.projects import Project
+from app.task_branch import task_branch as task_branch_of, task_branch_prefix
+from app.task_language import language_directive
 from app.task_manifest import ARTIFACT_KIND_LABELS
 
 # The hub repo, in full `org/repo`. Gates only the Start-here groups naming a tool the hub alone has at
@@ -62,6 +65,8 @@ def _start_here_block(
     recon_map_present: bool = False,
     repo: bool = True,
     merge_lane: bool = False,
+    review_lanes: str = "",
+    repo_withheld: bool = False,
 ) -> str:
     """The prefilled "Start here" block: dispatch-time invariants a runner would otherwise re-derive.
 
@@ -73,7 +78,10 @@ def _start_here_block(
     CONTROL-PLANE STATE`, `THIS SLOT`); repo-local tools hub-only; `LIVE CONTROL-PLANE STATE` outside the
     `ships_pr` fork. Slot facts are variable names the node fills. The path is trusted, its bytes not.
     `repo` False (a folder slot) withholds the base line too: a folder is checked out at nothing.
-    `merge_lane` True (the caller has checked a full gate exists) says the merge lane runs the full tier."""
+    `merge_lane` True (the caller has checked a full gate exists) says the merge lane runs the full tier.
+    `review_lanes` is a coder's CP-composed "Review lanes:" line (`agent_router.review_lanes.prompt_line`), rendered
+    under the gate for a `ships_pr` role; "" renders nothing. `repo_withheld` (a folder slot on a project WITH a
+    repository: its starter chose to run without it) says why there is no repository."""
     lines = [
         # Renders the RECON MAP pointer only when the section did (the caller passes whether it rendered).
         (
@@ -90,14 +98,19 @@ def _start_here_block(
     ]
     # Branch/gate invariants for PR-shipping roles only: an analysis role must not branch or open a PR.
     if ships_pr:
+        task_branch = f"{task_branch_prefix(branch_prefix)}fleet/task-<id>"
+        # A task dispatched before the `fleet/`-once spelling pushed the doubled one; its open PR stays on it.
+        earlier = (f" (if it does not exist but `{branch_prefix}fleet/task-<id>` does, this task started before "
+                   "that spelling changed: switch to that one and keep pushing it)"
+                   if f"{branch_prefix}fleet/task-<id>" != task_branch else "")
         lines += [
             f"  Worktree base: {integration_base}. On a fresh dispatch the worktree is DETACHED at its HEAD: "
-            f"`git fetch origin {branch_prefix}fleet/task-<id>`; if it exists, switch to it and continue "
-            f"from its commits, else create and switch to `{branch_prefix}fleet/task-<id>` before "
-            f"committing. On a resume you are already on it (`git branch --show-current`). Rebase onto "
+            f"`git fetch origin {task_branch}`; if it exists, switch to it and continue "
+            f"from its commits, else create and switch to `{task_branch}` before "
+            f"committing{earlier}. On a resume you are already on it (`git branch --show-current`). Rebase onto "
             f"and open your PR against this base.",
             f"  Branch prefix: {branch_prefix or '(none)'} (every ref you create or push is "
-            f"`{branch_prefix}fleet/task-<id>`)",
+            f"`{task_branch}`)",
         ]
         # A blank command is a project with no gate for that tier.
         lines += [
@@ -127,6 +140,8 @@ def _start_here_block(
                 "`GATE_RESULT tier=<quick|full> status=<pass|fail|timeout> elapsed=<seconds> "
                 "failed=<slugs|->`. Read that instead of the log."
             )
+        if review_lanes:
+            lines.append(review_lanes)
         # Hub-only: the hub context checker's refusals an edit most often trips.
         if hub_repo:
             lines += [
@@ -138,6 +153,11 @@ def _start_here_block(
             ]
     elif repo:
         lines.append(f"  Worktree base: {integration_base} (what your worktree is checked out at)")
+    if repo_withheld and not repo:
+        lines.append(
+            "  Repository: none — this task runs without the project's repository (its starter can't see it). "
+            "Don't ask for repository access; work from the task text, tools and credentials."
+        )
     # Hub-only, outside the `ships_pr` fork.
     if hub_repo:
         lines += [
@@ -229,9 +249,9 @@ _FINISH_FOLLOW_UP_TERMS = (
     "  The Finish stage found a gap in this epic and filed you to close it. If you are the last follow-up "
     "to settle `done`, your most recent report becomes the epic's final report.\n"
     "  So upload TWO reports, in this order, both before your terminal `task_complete`: (1) your run report, "
-    "then (2) an EPIC-LEVEL FINAL SUMMARY — what the epic asked for, what shipped across its children, what "
-    "this follow-up closed, and what is still outstanding, for a reader who never opens a child task. Write "
-    "it even if a sibling may settle after you."
+    "then (2) an EPIC-LEVEL FINAL SUMMARY of the whole epic — across all its children, this follow-up "
+    "included — for a reader who never opens a child task. Write it even if a sibling may settle after you.\n"
+    + _EPIC_SUMMARY_CONTENT
 )
 
 
@@ -297,17 +317,33 @@ def _restart_terms(
 class PromptRepo:
     """One repository a multi-repository slot holds, as the runner prompt names it: `owner/name`,
     its absolute path on the dispatching node (`""` when the node has no Jaah home on record), its
-    integration branch, and whether it is the primary."""
+    integration branch, whether it is the primary, and its Branch policy (`models.ProjectRepo`; a None prefix
+    is the project's)."""
 
     name: str
     path: str
     base: str
     primary: bool
+    branch_prefix: str | None = None
+    push_enabled: bool = True
+    allow_force_push: bool = False
+
+
+def _policy(row) -> dict:
+    """A `ProjectRepo` row's Branch policy, as `PromptRepo` carries it."""
+    return dict(branch_prefix=row.branch_prefix, push_enabled=row.push_enabled,
+                allow_force_push=row.allow_force_push)
+
+
+def _prompt_worthy(rows: list) -> bool:
+    """Two or more repositories render the REPOSITORIES block; one renders only its force-push ask, if it allows
+    force push (`_force_push_line`). Otherwise `()`, and the prompt is unchanged byte for byte (AC2.1)."""
+    return len(rows) >= 2 or any(row.allow_force_push and row.push_enabled for row in rows)
 
 
 def slot_repos_for_prompt(session: Session, project_id: int, node_id: str, slot: object) -> tuple[PromptRepo, ...]:
     """Every repository slot `slot` of `project_id` on `node_id` holds, primary first, or `()` when the project
-    connects fewer than two (a single-repository prompt is unchanged byte for byte, AC2.1).
+    connects fewer than two and its one does not allow force push (`_prompt_worthy`).
 
     The paths mirror the node's layout (`app/node_clone.py`): the primary is the slot's own declared path
     (`worktrees.path`), every other repository `<home>/repos/<pid>/_repos/<rid>/<N>`. The prompt is composed
@@ -315,11 +351,11 @@ def slot_repos_for_prompt(session: Session, project_id: int, node_id: str, slot:
     to say."""
     from app.models.nodes import Node  # noqa: PLC0415 — the composer's other reads stay lazy too
     from app.models.worktrees import Worktree  # noqa: PLC0415 — the composer's other reads stay lazy too
-    from app.node_clone import repo_worktree  # noqa: PLC0415
+    from app.node_clone import repo_slot_path  # noqa: PLC0415
     from app.node_identity import node_ref  # noqa: PLC0415
 
     rows = _prompt_repo_rows(session, project_id)
-    if len(rows) < 2:
+    if not _prompt_worthy(rows):
         return ()
     home = session.scalar(select(Node.jaah_home).where(Node.id == node_ref(node_id))) if node_id else None
     number = int(slot) if slot is not None else None
@@ -329,7 +365,8 @@ def slot_repos_for_prompt(session: Session, project_id: int, node_id: str, slot:
     return tuple(
         PromptRepo(
             name=row.name, base=row.integration_branch, primary=row.is_primary,
-            path=(slot_path or "") if row.is_primary else repo_worktree(home, int(project_id), row.id, number),
+            path=(slot_path or "") if row.is_primary else repo_slot_path(home, int(project_id), row.id, number),
+            **_policy(row),
         )
         for row in rows
     )
@@ -347,17 +384,17 @@ def _prompt_repo_rows(session: Session, project_id: int) -> list:
 
 def vm_repos_for_prompt(session: Session, project_id: int) -> tuple[PromptRepo, ...]:
     """`slot_repos_for_prompt` for a MicroVM session: the same repositories at their GUEST paths — the primary at
-    `/jaah/worktree`, every other at `/jaah/repos/<rid>` (`microvm_rail.guest_repo_path`). `()` under two."""
+    `/jaah/worktree`, every other at `/jaah/repos/<rid>` (`microvm_rail.guest_repo_path`); `()` as there."""
     if not edition_features.enabled("microvm"):
         return ()  # The community edition has no MicroVMs.
     from app.microvm_rail import GUEST_WORKTREE, guest_repo_path  # noqa: PLC0415
 
     rows = _prompt_repo_rows(session, project_id)
-    if len(rows) < 2:
+    if not _prompt_worthy(rows):
         return ()
     return tuple(
         PromptRepo(name=row.name, base=row.integration_branch, primary=row.is_primary,
-                   path=GUEST_WORKTREE if row.is_primary else guest_repo_path(row.id))
+                   path=GUEST_WORKTREE if row.is_primary else guest_repo_path(row.id), **_policy(row))
         for row in rows
     )
 
@@ -371,20 +408,33 @@ def _repos_block(repos: tuple[PromptRepo, ...], branch_prefix: str, task_id: obj
     caller)."""
     if len(repos) < 2:
         return ""
-    branch = f"{branch_prefix}fleet/task-{task_id if task_id is not None else '<id>'}"
+    task_ref = task_id if task_id is not None else '<id>'
+    branch = task_branch_of(branch_prefix, task_ref)
+    branches = {repo: task_branch_of(branch_prefix if repo.branch_prefix is None else repo.branch_prefix, task_ref)
+                for repo in repos}
+    shared = len(set(branches.values())) == 1
+    if shared:
+        branch = next(iter(branches.values()))
     lines = [
-        f"REPOSITORIES — this project connects {len(repos)}, and your slot holds every one, each on `{branch}` "
-        "cut from its own integration branch. You start in the PRIMARY:"
+        f"REPOSITORIES — this project connects {len(repos)}, and your slot holds every one, each on "
+        f"{f'`{branch}`' if shared else 'its own branch below'} cut from its own integration branch. You start in "
+        "the PRIMARY:"
     ]
     for repo in repos:
         where = repo.path or "its path is in the SessionStart `[repos]` block"
+        own = "" if shared else f" — branch `{branches[repo]}`"
+        read_only = "" if repo.push_enabled else " — read only: read it, don't change it, never push"
         lines.append(f"  - {repo.name}{' (PRIMARY)' if repo.primary else ''} — {where} — integration branch "
-                     f"`{repo.base}`")
+                     f"`{repo.base}`{own}{read_only}")
+    if not shared:
+        branch = "<its branch>"
     if ships_pr:
         lines += [
             "  Change whichever repositories the task needs; one you did not change gets no PR. One PR per "
             "changed repository:",
             "  - PRIMARY: exactly as the rest of this prompt says.",
+            *(["  - A read-only repository: read it, don't change it — no commit, push or PR."]
+              if any(not repo.push_enabled for repo in repos) else []),
             f"  - Every other repository, from that repository's own directory: commit on `{branch}`, `git push "
             f"origin HEAD`, `jaah-forge pr create --base <its integration branch> --head {branch} --title <title> "
             "--body-file <file>`, then `jaah-forge pr auto-merge <number>` yourself, whatever the primary's "
@@ -401,6 +451,22 @@ def _repos_block(repos: tuple[PromptRepo, ...], branch_prefix: str, task_id: obj
             "the settle is refused (`unmerged_prs`) while any PR you opened is left out or unmerged.",
         ]
     return "\n".join(lines) + "\n\n"
+
+
+#: The one force-push ask: the node's guard then lets ANY push to that integration branch through, forced or not,
+#: so the yes is the only gate for both.
+_FORCE_PUSH_ASK = (
+    "Force push allowed on {targets}: before pushing straight to that integration branch, forced or not, "
+    "<!--if:ask-->ask the user "
+    "through AskUserQuestion and get an explicit yes (one yes lasts the rest of the task)<!--else:ask-->don't — "
+    "you have no question tool to ask the user first<!--end:ask-->."
+)
+
+
+def _force_push_line(repos: tuple[PromptRepo, ...]) -> str:
+    """`_FORCE_PUSH_ASK` naming every pushable repository that allows force push, or `""`."""
+    targets = [f"`{repo.base}` of {repo.name}" for repo in repos if repo.allow_force_push and repo.push_enabled]
+    return _FORCE_PUSH_ASK.format(targets=", ".join(targets)) + "\n\n" if targets else ""
 
 
 #: The last sentence every runner reads, forked so a CLI with no question tool gets no ASK arm.
@@ -430,10 +496,15 @@ def build_task_prompt(
     # `_COND_FLAGS`. False withholds every branch, base, gate, port and PR line, whatever the role.
     repo: bool,
     prior_stage_output: str | None = None,
+    # A folder slot on a project that HAS a repository (`tasks.has_repo` False by a Start without it): one
+    # Start-here line says why. Ignored when `repo`.
+    repo_withheld: bool = False,
     # The merge lane's verdict on a reopened lane runner's last PR (`routes/tasks/qa_render.py::_task_merge_lane_verdict`).
     merge_lane_verdict: str | None = None,
     console_task_id: int | None = None,
     autonomous: bool = True,
+    # The task's language (`app/task_language.py::language_directive`); None or English adds no line.
+    language: str | None = None,
     issue_state: str | None = None,
     # A list of `{"persona", "recon_map"}` wrappers (`routes/tasks/task_wire.py::_task_prerequisite_recon_map`), or a
     # bare dict (one stage's own `Task.recon_map`).
@@ -483,6 +554,9 @@ def build_task_prompt(
     # Every repository the slot holds (`slot_repos_for_prompt`), for a project connecting two or more
     # repositories: the REPOSITORIES block under Start-here. Fewer than two renders exactly what it always did.
     repos: tuple[PromptRepo, ...] = (),
+    # A coder's "Review lanes:" line (`compose._review_lanes_line`), CP-composed from the routing decision. "" renders
+    # nothing.
+    review_lanes: str = "",
 ) -> str:
     """The runner task prompt: the DB `body`, plus optional prior-stage output, Q&A and recon map.
 
@@ -592,15 +666,20 @@ def build_task_prompt(
             # Whether the section actually rendered, never whether `recon_map` was truthy.
             recon_map_present=bool(recon_section),
             repo=repo,
+            repo_withheld=repo_withheld,
             merge_lane=lane,
+            review_lanes=_trusted(review_lanes),
         ) + "\n\n"
     )
     # Under Start-here: which repositories the slot holds and how each is delivered. A folder holds none.
-    repos_line = _repos_block(
-        tuple(PromptRepo(name=_trusted(r.name), path=_trusted(r.path), base=_trusted(r.base), primary=r.primary)
-              for r in repos),
-        branch_prefix, console_task_id, ships_pr,
-    ) if repo else ""
+    trusted_repos = tuple(
+        PromptRepo(name=_trusted(r.name), path=_trusted(r.path), base=_trusted(r.base), primary=r.primary,
+                   branch_prefix=None if r.branch_prefix is None else _trusted(r.branch_prefix),
+                   push_enabled=r.push_enabled, allow_force_push=r.allow_force_push)
+        for r in repos
+    )
+    repos_line = (_repos_block(trusted_repos, branch_prefix, console_task_id, ships_pr)
+                  + _force_push_line(trusted_repos)) if repo else ""
     # Above the Start-here invariants: a runner must learn its premise differs before reading the base.
     resume_line = _restart_terms(
         resume_worktree, prior_session_ended, bool((qa_trail or "").strip()), ships_pr
@@ -611,7 +690,7 @@ def build_task_prompt(
     # BLOCKED/FAILED half (omitted, never softened).
     integration_sentence = (
         f"Integration branch: {integration_base}. When done AND {lane_green} green, open a PR to "
-        f"{integration_base} from `{branch_prefix}fleet/task-<id>` and report it with `pull_request_enqueue` "
+        f"{integration_base} from `{task_branch_of(branch_prefix, '<id>')}` and report it with `pull_request_enqueue` "
         f"at open and after every push; the merge lane "
         + (f"runs `{gate_full_cmd}` and merges it" if gate_full_cmd.strip() else "merges it on the PR's own checks")
         + ". Never merge it "
@@ -621,7 +700,7 @@ def build_task_prompt(
         + (f"When done AND `{gate_full_cmd}` is green, integrate " if gate_full_cmd.strip()
            else "When done (this project declares no full gate), integrate ")
         + f"per the charter: a PR to "
-        f"{integration_base} from `{branch_prefix}fleet/task-<id>` with "
+        f"{integration_base} from `{task_branch_of(branch_prefix, '<id>')}` with "
         f"auto-merge, never a direct push, never master/main. "
     ) if ships_pr else ""
     # The provider pass runs over the trusted halves only; the untrusted block is spliced in untouched,
@@ -633,6 +712,7 @@ def build_task_prompt(
         f"{nodelinks_line}"
         f"{guard_line}"
         f"{_autonomous_directive(autonomous, asks_at_gate, console_present, provider=provider_record)}"
+        f"{language_directive(language)}"
         f"{secrets_floor_line}"
         f"{finish_follow_up_line}"
         f"{resume_line}"

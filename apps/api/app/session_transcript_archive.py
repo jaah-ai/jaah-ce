@@ -4,9 +4,9 @@ Every public entry point is synchronous, a correctness constraint: the CP is one
 gzip/tarfile hold the GIL, so assembly on the loop would stall the node bus, PTY and heartbeats. The
 route is `def` and `stream_archive` a sync generator, which starlette runs via `iterate_in_threadpool`.
 
-Concurrency is capped by a non-blocking `BoundedSemaphore`. `Permit` is single-shot because a stream
-has two release paths (generator `finally`, `BackgroundTask`) and `release()` increments
-unconditionally. The control plane only presigns: no S3 API, plain httpx. The community edition (no `aws`) keeps
+No concurrency cap: each assembly holds one member chunk at a time (`_Sink` drains as it goes), so memory
+does not bound how many run, and the CPU work is off the loop on the threadpool (the async runtime's CPU
+offload replaces that thread once it lands). The control plane only presigns: no S3 API, plain httpx. The community edition (no `aws`) keeps
 every session object on its own volume instead (`on_volume`, `attachment_storage.local_volume`): the same keys, read
 as files.
 """
@@ -17,25 +17,18 @@ import hashlib
 import io
 import json
 import tarfile
-import threading
 import time
 import zlib
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Generator, Iterator, Mapping, Optional
 
 import httpx
 
-from app import edition_features
+from app import edition_features, http_bounded
 from app import session_transcripts as transcripts
-from app.clock import as_utc
-
-# Each assembly holds the GIL through gzip for its whole life; the cap is about CPU, not S3.
-MAX_CONCURRENT_ASSEMBLIES = 2
-
-# What a refused request is told to wait. Rendered into `Retry-After` verbatim.
-RETRY_AFTER_SECONDS = 30
+from app.clock import as_utc, utcnow
 
 # Stamped once per plan; an upper bound only, since `resolve_credentials` refuses a credential inside
 # its 16-minute refresh margin. A slower download aborts mid-stream.
@@ -44,7 +37,7 @@ PRESIGN_EXPIRES_SECONDS = 3600
 # Read timeout per chunk, not per member: a large transcript legitimately takes minutes.
 FETCH_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
 
-# `FETCH_TIMEOUT` is per chunk, so a trickling read or slow client could pin a permit forever.
+# `FETCH_TIMEOUT` is per chunk, so a trickling read or slow client could pin an assembly forever.
 ASSEMBLY_DEADLINE_SECONDS = 30 * 60
 
 # The manifest is read whole: 256 members at ~200 bytes, with headroom. One oversized object would
@@ -79,7 +72,7 @@ class _Deadline:
     def check(self) -> None:
         if time.monotonic() > self._expires:
             raise ArchiveAborted(
-                f"assembly exceeded its {self._seconds:g}s bound — the permit is not held longer"
+                f"assembly exceeded its {self._seconds:g}s bound"
             )
 
 
@@ -93,45 +86,6 @@ class ArchiveAborted(Exception):
 
 class ManifestUnreadable(Exception):
     """The session's `manifest.json` could not be fetched or parsed — raised before any byte is sent."""
-
-
-class Permit:
-    """One assembly slot, releasable exactly once however many paths try.
-
-    `BoundedSemaphore` is then the backstop: a residual double-release is a loud `ValueError`
-    rather than a cap that silently grew.
-    """
-
-    __slots__ = ("_semaphore", "_lock", "_released")
-
-    def __init__(self, semaphore: threading.BoundedSemaphore) -> None:
-        self._semaphore = semaphore
-        self._lock = threading.Lock()
-        self._released = False
-
-    @property
-    def released(self) -> bool:
-        with self._lock:
-            return self._released
-
-    def release(self) -> bool:
-        """Free the slot. Returns True iff THIS call did it; every later call is a no-op."""
-        with self._lock:
-            if self._released:
-                return False
-            self._released = True
-        self._semaphore.release()
-        return True
-
-
-_PERMITS = threading.BoundedSemaphore(MAX_CONCURRENT_ASSEMBLIES)
-
-
-def acquire_permit() -> Optional[Permit]:
-    """A permit, or None when every slot is taken. NEVER blocks — a queued request is a stalled one."""
-    if not _PERMITS.acquire(blocking=False):
-        return None
-    return Permit(_PERMITS)
 
 
 @dataclass(frozen=True)
@@ -172,7 +126,7 @@ def _presign_get(*, bucket: str, region: str, key: str, credentials: Any, expire
         region=region,
         service="s3",
         credentials=credentials,
-        amz_date=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+        amz_date=utcnow().strftime("%Y%m%dT%H%M%SZ"),
         expires_seconds=expires,
     )
 
@@ -187,7 +141,7 @@ def _get(client: httpx.Client, url: str, *, what: str, stream: bool) -> httpx.Re
         raise RuntimeError("no S3 in this edition: it reads its volume")
     from app.aws import presign
 
-    request = client.build_request("GET", url, headers={"Accept-Encoding": "identity"})
+    request = client.build_request("GET", url)
     presign.reject_forbidden_headers(request.headers.keys())
     response = client.send(request, stream=stream)
     if response.status_code != 200:
@@ -214,7 +168,7 @@ def fetch_manifest(
         expires=PRESIGN_EXPIRES_SECONDS,
     )
     try:
-        with httpx.Client(timeout=FETCH_TIMEOUT) as client:
+        with http_bounded.client(FETCH_TIMEOUT) as client:
             response = _get(client, url, what="the manifest", stream=True)
             try:
                 body = bytearray()
@@ -391,7 +345,7 @@ def write_volume(key: str, body: bytes) -> None:
 
 
 def located(bucket: Optional[str]) -> Optional[tuple[str, str, Any]]:
-    """`storage()` for an object in `bucket` — a row's stored bucket, or the one `data_residency.bucket_for_org`
+    """`storage()` for an object in `bucket` — a row's stored bucket, or the one `org_bucket`
     picked for a write: `(region, bucket, credentials)`, the region being that bucket's own data region
     (`data_residency.region_of_bucket`). Blank or the configured bucket = `storage()` unchanged (a legacy NULL
     row, an org that never picked). None when storage is not configured here."""
@@ -632,7 +586,7 @@ def _member_chunks(client: httpx.Client, member: Member) -> Iterator[bytes]:
 def iter_member(member: Member) -> Iterator[bytes]:
     """One member's decompressed bytes, integrity-checked as they pass, outside any archive — for a CP reader
     of a transcript (`app/project_memory/distill.py`). Raises `ArchiveAborted` as `_member_chunks` does."""
-    with httpx.Client(timeout=FETCH_TIMEOUT) as client:
+    with http_bounded.client(FETCH_TIMEOUT) as client:
         yield from _member_chunks(client, member)
 
 
@@ -646,42 +600,38 @@ def _discard(tar: tarfile.TarFile, gz: gzip.GzipFile) -> None:
     gz.close()
 
 
-def stream_archive(plan: ArchivePlan, permit: Permit) -> Iterator[bytes]:
+def stream_archive(plan: ArchivePlan) -> Iterator[bytes]:
     """The `.tar.gz`, assembled member by member. A sync generator (see the module docstring).
 
     On any member failure this raises without closing the tar, so no trailer is written and the client
     sees a transport error, not a clean EOF. Hence no `Content-Length`.
     """
+    deadline = _Deadline(ASSEMBLY_DEADLINE_SECONDS)
+    sink = _Sink()
+    gz = gzip.GzipFile(fileobj=sink, mode="wb", compresslevel=GZIP_LEVEL, mtime=plan.mtime)
+    sink.attach(gz)
+    tar = tarfile.open(fileobj=gz, mode="w|", format=tarfile.PAX_FORMAT)
     try:
-        deadline = _Deadline(ASSEMBLY_DEADLINE_SECONDS)
-        sink = _Sink()
-        gz = gzip.GzipFile(fileobj=sink, mode="wb", compresslevel=GZIP_LEVEL, mtime=plan.mtime)
-        sink.attach(gz)
-        tar = tarfile.open(fileobj=gz, mode="w|", format=tarfile.PAX_FORMAT)
-        try:
-            info = _tarinfo(
-                arcname=plan.manifest_arcname, size=len(plan.manifest_bytes), mtime=plan.mtime
-            )
-            tar.addfile(info, io.BytesIO(plan.manifest_bytes))
-            yield from sink.drain()
-            with httpx.Client(timeout=FETCH_TIMEOUT) as client:
-                for member in plan.members:
-                    deadline.check()
-                    yield from _emit(
-                        tar,
-                        sink,
-                        _tarinfo(arcname=member.arcname, size=member.bytes_raw, mtime=plan.mtime),
-                        _member_chunks(client, member),
-                        deadline,
-                    )
-            # ONLY here, and only on the clean path: these two calls ARE the trailer.
-            tar.close()
-            gz.close()
-            yield from sink.drain()
-        except BaseException:
-            _discard(tar, gz)
-            raise
-    finally:
-        # Frees a mid-stream abort; the route's `BackgroundTask` frees an early disconnect.
-        permit.release()
+        info = _tarinfo(
+            arcname=plan.manifest_arcname, size=len(plan.manifest_bytes), mtime=plan.mtime
+        )
+        tar.addfile(info, io.BytesIO(plan.manifest_bytes))
+        yield from sink.drain()
+        with http_bounded.client(FETCH_TIMEOUT) as client:
+            for member in plan.members:
+                deadline.check()
+                yield from _emit(
+                    tar,
+                    sink,
+                    _tarinfo(arcname=member.arcname, size=member.bytes_raw, mtime=plan.mtime),
+                    _member_chunks(client, member),
+                    deadline,
+                )
+        # ONLY here, and only on the clean path: these two calls ARE the trailer.
+        tar.close()
+        gz.close()
+        yield from sink.drain()
+    except BaseException:
+        _discard(tar, gz)
+        raise
 

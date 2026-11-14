@@ -21,12 +21,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any, Optional
 
 from sqlalchemy import select, update
 
 from app import cron_activities, cron_alarms
+from app.clock import utcnow
 from app.cron_runtime import (
     SCHEDULE_NAME_PREFIX,
     resolved_timezone_name,
@@ -38,7 +38,7 @@ from app.cron_schedule import (
     validate_cron_expression,
 )
 from app.crons import SCHEDULE_KIND_CRON
-from app.db import SessionLocal
+from app.db import BridgedSession
 from app.models.automations import Cron
 
 log = logging.getLogger("cockpit-cron")
@@ -154,7 +154,7 @@ def _entries(desired: list[_Desired]) -> list[dict]:
     ]
 
 
-def reconcile_cron_schedules(*, session_factory=SessionLocal) -> ReconcileResult:
+def reconcile_cron_schedules(*, session_factory=BridgedSession) -> ReconcileResult:
     """Bring DBOS's schedules into line with `crons`. Never raises — see the module docstring.
 
     Run only as the `cron-projection` queue's step (`app/durable/cron_projection.py`), which is what asks
@@ -247,7 +247,7 @@ def _re_anchor(session_factory, cron_id) -> None:
         cron = session.get(Cron, cron_id)
         if cron is None:
             return
-        cron.schedule_anchor_at = datetime.now(timezone.utc)
+        cron.schedule_anchor_at = utcnow()
         session.commit()
 
 
@@ -306,7 +306,7 @@ def rephase_anchors(session) -> int:
     updated = session.execute(
         update(Cron)
         .where(Cron.schedule_kind == SCHEDULE_KIND_CRON)
-        .values(schedule_anchor_at=datetime.now(timezone.utc))
+        .values(schedule_anchor_at=utcnow())
     ).rowcount
     session.commit()
     return updated
@@ -342,6 +342,6 @@ if __name__ == "__main__":
     # `./dc` after a direct `crons` write: ask the serving api for a pass. This process has no engine.
     from app.durable.cron_projection import request_projection_in_transaction
 
-    with SessionLocal() as _session:
+    with BridgedSession() as _session:
         request_projection_in_transaction(_session)
         _session.commit()

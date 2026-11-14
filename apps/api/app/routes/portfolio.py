@@ -8,21 +8,25 @@ from datetime import datetime
 from typing import Any, Literal, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, Path, Query, Request
 from pydantic import BaseModel
-from sqlalchemy import Select, Text, func, or_, select
+from sqlalchemy import Select, Text, false, func, or_, select, true
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
-from app import account_fold, account_sharing, activity_rank, fleet_verdicts, merge_lane_state, project_repos, slot_allocation, slot_stack, slot_state, slot_title
+from app import account_fold, account_sharing, activity_rank, fleet_verdicts, jaah_repos, merge_lane_state, project_repos, slot_allocation, slot_stack, slot_state, slot_title
 # Aliased: `_wt_out` and its callers hold a LOCAL `actor_names` map.
 from app.actors import actor_names as resolve_actor_names
-from app.auth import require_user, require_user_or_agent
+from app import db_async
+from app.project_env import port_specs_by_project
+from app.auth import agent_caller, require_user_or_agent
 from app.command_read import command_read, withhold_host_paths
 from app.authz.catalog import PROJECTS_VIEW_KEY, permission_key
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller, current_principal_async
 from app.authz.visibility import (
     AllowedObjects,
+    account_roster_select,
     granted_account_slugs,
     node_reach_clause,
     readable_account_select,
@@ -34,8 +38,10 @@ from app.authz.visibility import (
     visible_worktree_clause,
     worktree_editable_clause,
 )
-from app.db import get_session
-from app.entity_shape import get_or_404
+from app.db_async import DbDep, on_session
+from app.production_qa import gate as production_qa_gate
+from app.entity_shape import from_row, get_or_404, or_404
+from app.list_page import PageQuery, sql_page
 from app.models.audit import CommandAudit
 from app.models.credentials import Account
 from app.models.identity import AdminUser
@@ -44,14 +50,16 @@ from app.models.orgs import in_live_org
 from app.models.projects import Project, Runner
 from app.models.tasks import Task
 from app.models.worktrees import Worktree
+from app.pipeline_gates import full_gate
+from app.releases import stages as release_stages
 from app.routes.projects import ProjectOut as ProjectsRouteProjectOut
-from app.routes.projects import _project_out, live_cast_holders, microvm_page
+from app.routes.projects import _project_out, job_people_of, jobs_run_as_out, live_cast_holders, microvm_page, offered_benchmark_budgets, one_project_out
 from app.node_clone import account_slug_expr, account_slug_from_dir, resolve_auth_dir
 from app.node_identity import names_by_id, node_ref
 # The aware-or-422 date-range contract is single-homed in `routes/audit.py` (a zoneless wall clock read
 # as UTC misplaces the boundary). Nothing under `app/routes/` imports this module, so no cycle.
 # TODO: lift `_require_aware` to a neutral module as a public helper; two routes now depend on it.
-from app.routes.audit import _require_aware
+from app.routes.audit import CREATED_AT_END, CREATED_AT_START, _require_aware
 from app.tenancy import seam
 from app.tenancy.copy import WITHHELD_ACTOR
 from app.tenancy.ids import is_tenant_org
@@ -81,14 +89,9 @@ class WorktreeOut(BaseModel):
     number: int
     path: str
     branch: Optional[str]
-    # The only occupancy fact: `free` | `task` | `user`, paired with exactly one owner column by the
-    # ownership CHECK.
+    # The only occupancy fact: `free` | `task`, paired with `task_id` by the ownership CHECK.
     state: str
     task_id: Optional[int]
-    # Non-NULL exactly when `state == "user"`. `owner_user_email` is the one display form (`/api/users` is
-    # superadmin-only). Never render the uuid.
-    owner_user_id: Optional[UUID]
-    owner_user_email: Optional[str]
     stack_state: Optional[str]
     ports: Optional[dict[str, Any]]
     urls: Optional[dict[str, Any]]
@@ -122,8 +125,6 @@ class WorktreeOut(BaseModel):
     # Resolved through the id (`app/actors.py::actor_names`). `str`: both columns are NOT NULL.
     created_by: str
     updated_by: str
-    # `number == 0` is the main clone; keyed on `number`, not occupancy.
-    protected: bool
     # When this CP last sensed the slot present; `None` for declared-but-unbuilt. The one
     # not-built vs not-probed signal.
     observed_at: Optional[datetime]
@@ -177,8 +178,6 @@ def _wt_out(
     account_slug: str | None,
     account_name: str | None,
     account_org_id: UUID | None,
-    # Threaded for `actor_names`' reason; `null` already means "no owner".
-    owner_user_email: str | None,
     # `slot_allocation.destroy_node_errors`' entry for this slot, read once per page; None when the node said nothing.
     destroy_node_error: str | None,
     # The reader's org, so a tenant is not served the operator's host layout: `path` lives under the node's
@@ -188,21 +187,15 @@ def _wt_out(
     org: Optional[OrgRef],
 ) -> WorktreeOut:
     task_active = slot_title.task_active_from_state(task_state)
-    return WorktreeOut(
-        id=wt.id,
+    return from_row(
+        WorktreeOut, wt,
         # The node name for display and the host `urls_for` builds slot URLs on; the uuid is the identity.
         node_id=node_name,
         node_uuid=str(wt.node_id),
         project=project_name,
-        project_id=wt.project_id,
         org=org,
-        number=wt.number,
         path="" if is_tenant_org(reader_org) else wt.path,
         branch=wt.branch if wt.has_repo else None,
-        state=wt.state,
-        task_id=wt.task_id,
-        owner_user_id=wt.owner_user_id,
-        owner_user_email=owner_user_email,
         # Derived from the sensed columns (`app/slot_stack.py`); the stored columns have no writer.
         # `observed_at` bounds freshness. URLs use the node name since the browser is remote.
         stack_state=slot_stack.stack_state_for(
@@ -211,9 +204,7 @@ def _wt_out(
             probes=wt.probes,
             observed_at=wt.observed_at,
         ),
-        ports=wt.ports,
         urls=slot_stack.urls_for(wt.ports, node_name, node_tailnet_name),
-        last_active=wt.last_active,
         idle_hours=(
             None
             if idle_hours is None or idle_hours == slot_state.UNKNOWN_AGE_SENTINEL
@@ -222,14 +213,10 @@ def _wt_out(
         ahead=wt.ahead if wt.has_repo else None,
         behind=wt.behind if wt.has_repo else None,
         dirty=wt.dirty if wt.has_repo else None,
-        session_status=wt.session_status,
-        session_started_at=wt.session_started_at,
-        model=wt.model,
         # `resolve_auth_dir` fails closed to `""` -> None. Also `None` for a tenant: the dir embeds the
         # operator's `jaah_home`, and with the row's `project`/`number` would reconstruct the blanked `path`.
         account=None if is_tenant_org(reader_org) else (resolve_auth_dir(jaah_home, account_slug) or None),
         account_name=account_name if not is_tenant_org(reader_org) or account_org_id == reader_org else None,
-        window_name=wt.window_name,
         title=slot_title.resolved_title(
             # Not the raw `name`: a derived label would out-rank the active task's (`slot_title.stored_opinion`).
             slot_title.stored_opinion(
@@ -239,20 +226,12 @@ def _wt_out(
             ),
             task_active=task_active, task_id=wt.task_id, task_title=task_title,
         ),
-        name=wt.name,
-        description=wt.description,
         task_active=task_active,
         task_awaiting_answer=slot_title.task_awaiting_answer_from_state(task_state),
-        created_at=wt.created_at,
-        updated_at=wt.updated_at,
         created_by=actor_names.get(wt.created_by_id, _UNKNOWN_ACTOR),
         updated_by=actor_names.get(wt.updated_by_id, _UNKNOWN_ACTOR),
-        protected=wt.number == 0,
-        observed_at=wt.observed_at,
         holder_since=wt.state_since,
-        last_seen_live=wt.last_seen_live,
         may_edit=may_edit,
-        kind=wt.kind,
         retiring=wt.retiring_at is not None,
         retiring_since=wt.retiring_at,
         # The node's raw refusal for the operator plane; a tenant reads it redacted (paths, URL credentials, tokens).
@@ -260,7 +239,6 @@ def _wt_out(
             (fleet_verdicts.redact_node_detail(wt.destroy_error) or None) if is_tenant_org(reader_org) else wt.destroy_error
         ),
         destroy_node_error=destroy_node_error,
-        has_repo=wt.has_repo,
         repos=_tenant_blanked_repos(wt.repos) if is_tenant_org(reader_org) else wt.repos,
     )
 
@@ -283,9 +261,6 @@ _WT_NODE_TAILNET_NAME = Node.config_snapshot[slot_stack.TAILNET_DNS_NAME_SNAPSHO
     "node_tailnet_name"
 )
 
-# OUTER: `owner_user_id` is NULL on every non-`user` slot.
-_WT_OWNER_JOIN = AdminUser.id == Worktree.owner_user_id
-
 # OUTER: `task_id` has no FK on purpose, so a slot dangling at a deleted task must still read `free`.
 _WT_TASK_JOIN = Task.id == Worktree.task_id
 # Labelled so unpacking cannot confuse the task's `title` with the slot's.
@@ -305,7 +280,7 @@ _WT_ACCOUNT_COLUMNS = (
 
 
 def _slot_rows_select(principal: Principal | None) -> Select[Any]:
-    """The one SELECT both slot readers unpack (`_wt_out`'s positional order), up to its `where`: the caller adds
+    """The one SELECT both slot readers unpack (`_wt_out`'s positional order), up to the caller's `where`, which adds
     `visible_worktree_clause(principal)` beside its own identity predicates."""
     return (
         select(
@@ -317,28 +292,26 @@ def _slot_rows_select(principal: Principal | None) -> Select[Any]:
             _WT_NODE_TAILNET_NAME,
             worktree_editable_clause(principal).label(_WT_MAY_EDIT_LABEL),
             *_WT_ACCOUNT_COLUMNS,
-            AdminUser.email.label("owner_user_email"),
         )
         .join(Project, _WT_PROJECT_JOIN)
         .join(Node, _WT_NODE_JOIN)
         .outerjoin(Task, _WT_TASK_JOIN)
-        .outerjoin(AdminUser, _WT_OWNER_JOIN)
     )
 
 
 @router.get("/api/worktrees", response_model=list[WorktreeOut])
 @feature("worktrees", "view")
+@on_session
 def list_worktrees(
+    session: Session,
     node_id: Optional[str] = Query(default=None),
     limit: int = Query(default=_LIST_BOUND_DEFAULT, ge=1, le=_LIST_BOUND_MAX),
-    _user: AdminUser = Depends(require_user),
     # The authorization subject; the decision reads THIS, never the ORM row.
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ):
     stmt = (
-        _slot_rows_select(principal)
-        .where(visible_worktree_clause(principal))
+        _slot_rows_select(caller.principal)
+        .where(visible_worktree_clause(caller.principal))
         # (project, number) is not unique across nodes; `Node.name` makes the order stable.
         .order_by(Project.name, Worktree.number, Node.name)
         .limit(limit)
@@ -358,26 +331,25 @@ def list_worktrees(
             wt, project_name, idle, task_state, task_title, actor_names,
             node_name=node_name, node_tailnet_name=node_tailnet_name, may_edit=may_edit, jaah_home=jaah_home, account_slug=account_slug,
             account_name=account_name, account_org_id=account_org_id,
-            owner_user_email=owner_user_email, destroy_node_error=destroy_errors.get(wt.id),
-            reader_org=_user.org_id, org=org_ref_of(orgs, wt.org_id),
+            destroy_node_error=destroy_errors.get(wt.id),
+            reader_org=caller.actor.org_id, org=org_ref_of(orgs, wt.org_id),
         )
         for (
             wt, project_name, idle, task_state, task_title,
             node_name, node_tailnet_name, may_edit, jaah_home, account_slug, account_name, account_org_id,
-            owner_user_email,
         ) in rows
     ]
 
 
 @router.get("/api/worktrees/{project_id}/{number}", response_model=WorktreeOut)
 @feature("worktrees", "view")
+@on_session
 def get_worktree(
+    session: Session,
     project_id: int,
     number: int,
     node_id: Optional[str] = Query(default=None),
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ):
     """One slot. `node_id` (the node uuid) names which, since (project_id, number) is not unique across nodes;
     omitted, the lowest node name wins.
@@ -385,51 +357,75 @@ def get_worktree(
     A slot this caller may not see is a 404, not a 403, so slots are not enumerable:
     `visible_worktree_clause` sits in the same `where` as the identity predicates."""
     stmt = (
-        _slot_rows_select(principal)
+        _slot_rows_select(caller.principal)
         .where(
             Worktree.project_id == project_id,
             Worktree.number == number,
-            visible_worktree_clause(principal),
+            visible_worktree_clause(caller.principal),
         )
         .order_by(Node.name, Node.id)
     )
     if node_id is not None:
         stmt = stmt.where(Worktree.node_id == node_ref(node_id))
-    row = session.execute(stmt).first()
-    if row is None:
-        # Both "no such slot" and "not yours" — one answer, see the docstring.
-        raise HTTPException(status_code=404, detail="worktree not found")
+    # Both "no such slot" and "not yours" — one answer, see the docstring.
+    row = or_404(session.execute(stmt).first(), detail="worktree not found")
     (
         wt, project_name, idle, task_state, task_title,
         node_name, node_tailnet_name, may_edit, jaah_home, account_slug, account_name, account_org_id,
-        owner_user_email,
     ) = row
     actor_names = resolve_actor_names(session, (wt.created_by_id, wt.updated_by_id))
     return _wt_out(
         wt, project_name, idle, task_state, task_title, actor_names,
         node_name=node_name, node_tailnet_name=node_tailnet_name, may_edit=may_edit, jaah_home=jaah_home, account_slug=account_slug,
         account_name=account_name, account_org_id=account_org_id,
-        owner_user_email=owner_user_email, destroy_node_error=slot_allocation.destroy_node_error(session, wt),
-        reader_org=_user.org_id, org=org_ref_of(org_refs(session, (wt.org_id,)), wt.org_id),
+        destroy_node_error=slot_allocation.destroy_node_error(session, wt),
+        reader_org=caller.actor.org_id, org=org_ref_of(org_refs(session, (wt.org_id,)), wt.org_id),
     )
 
 
 # ── Projects ─────────────────────────────────────────────────────────────────
 
+def _agent_project_scope(request: Request) -> Any:
+    """The rows an X-Agent-Token caller of `list_projects` may read: a node sees its own org's projects only.
+
+    Placement floors a task's nodes to its project's org (`placement_grants.org_floor`), so a node never hosts
+    another org's project and its resolvers (`projects.list`: `ctl.py`, `project_lookup.py`, the hook clients)
+    need nothing beyond its org; serving every org handed a tenant's node other tenants' project rows. One
+    accepted gap: a project moved to another org while a carried-over run (`app/carryover.py`) still finishes on
+    the old org's node drops out of that node's list for the rest of that run. The
+    scope is the agent plane's own (`routes/agent/auth.py::_read_scope_for`): the node's org, everything for a
+    fleet-wide arm (this CP itself, local dev), nothing for an unbound caller."""
+    from app.routes.agent.auth import _read_scope_for
+
+    caller = agent_caller(request)
+    scope = _read_scope_for(caller) if caller is not None else None
+    if scope is seam.OPERATOR:
+        return true()
+    if scope is None:
+        return false()
+    return Project.org_id == scope
+
+
 @router.get("/api/projects", response_model=list[ProjectsRouteProjectOut])
 @feature("projects", "view", collection=True, agent_allowed=True)
+@db_async.on_thread(actor="_user")
 def list_projects(
+    session: Session,
+    request: Request,
     limit: int = Query(default=_LIST_BOUND_DEFAULT, ge=1, le=_LIST_BOUND_MAX),
     # `activity`: most tasks in the last 30 days first, then by name (`app/activity_rank.py`).
     order: Literal["name", "activity"] = "name",
+    # An exact name: how a `/projects/<name>` address finds its id (`ProjectEditPage`'s redirect). One row per org.
+    name: str | None = Query(default=None, min_length=1),
     # jaahd's project resolvers read this via X-Agent-Token with no cookie. The decision reads
     # `principal`, never this ORM row.
     _user: AdminUser | None = Depends(require_user_or_agent),
-    # `None` is the agent principal, allow-all by decision (`scoped_project_select(None)` is unfiltered):
-    # scoping the resolvers would be a dispatch outage. It never means unauthenticated.
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    # `None` is the agent principal (`scoped_project_select(None)` is unfiltered); it is scoped to the calling
+    # node's org below (`_agent_project_scope`). It never means unauthenticated.
+    principal: Principal | None = Depends(current_principal_async),
 ):
+    # A worker thread, not `run_sync`: the page's cost is ORM row work over every visible project (~200 ms on dev),
+    # which on the loop serialises a burst of page loads behind one another; on threads they run in parallel.
     # Cookie callers are scoped: `tools/control_plane_client.py::fetch_projects` logs in as `ADMIN_EMAIL`
     # and expects the full inventory, so that user must stay a superadmin.
     # `scoped_project_select`, never a hand filter: the clause only holds inside a `Project` FROM
@@ -438,6 +434,8 @@ def list_projects(
     rows = session.scalars(
         scoped_project_select(principal, key=PROJECTS_VIEW_KEY)
         .where(in_live_org(Project.org_id))
+        .where(_agent_project_scope(request) if _user is None else true())
+        .where(Project.name == name if name is not None else true())
         .order_by(*ordering)
         .limit(limit)
     ).all()
@@ -449,8 +447,24 @@ def list_projects(
     repos = project_repos.repos_by_project(session, [r.id for r in rows])
     # And Live Cast: each org's allowance read once (`live_cast_holders`).
     live_cast = live_cast_holders(session, [r.org_id for r in rows])
+    # And Production QA: each org's switch read once (`production_qa_gate.orgs_on`).
+    production_qa = production_qa_gate.orgs_on(session, [r.org_id for r in rows])
+    # And benchmark mode: each org's switch read once, a budget only for an offered project.
+    benchmark = offered_benchmark_budgets(session, rows)
+    # And each "Run jobs as" person's name, in one query (`job_people_of`).
+    job_people = job_people_of(session, rows)
+    # And which are Jaah-managed, in one query (`jaah_repos.managed_ids`).
+    managed = jaah_repos.managed_ids(session, [r.id for r in rows])
+    # And each merge step's command, the one control for the full gate (`full_gate.full_gate_commands`).
+    full_gates = full_gate.full_gate_commands(session, rows)
+    # And each project's Port variables, in one query (`project_env.port_specs_by_project`).
+    port_vars = port_specs_by_project(session, [r.id for r in rows])
+    # And each project's stage addresses, in one query (`release_stages.live_urls`).
+    live_urls = release_stages.live_urls(session, [r.id for r in rows])
     return [
-        _project_out(r, org=org_ref_of(refs, r.org_id), lane=lanes[r.id], vm=vm, repos=repos[r.id], live_cast=live_cast)
+        _project_out(r, org=org_ref_of(refs, r.org_id), lane=lanes[r.id], vm=vm, repos=repos[r.id], live_cast=live_cast,
+                     production_qa=production_qa, benchmark=benchmark, job_people=job_people, jaah_managed=managed,
+                     full_gates=full_gates, port_vars=port_vars, live_urls=live_urls)
         for r in rows
     ]
 
@@ -458,24 +472,22 @@ def list_projects(
 # `:int`, so `/api/projects/governance-authority` and its siblings are never shadowed.
 @router.get("/api/projects/{project_id:int}", response_model=ProjectsRouteProjectOut)
 @feature("projects", "view", object_type="project", object_params=("project_id",))
+@db_async.on_thread(actor=lambda caller, **_: caller.actor)
 def get_project(
+    session: Session,
     project_id: int,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
-):
-    """One project, as a `list_projects` row: the edit page's read when the row is past the list's bound
-    (an operator's All-orgs view). Same scope, so another org's project is a 404 to a tenant."""
-    row = session.scalars(scoped_project_select(principal, key=PROJECTS_VIEW_KEY).where(
-        Project.id == project_id, in_live_org(Project.org_id),
-    )).first()
-    if row is None:
-        raise HTTPException(status_code=404, detail="unknown project")
-    return _project_out(
-        row, org=org_ref_of(org_refs(session, [row.org_id]), row.org_id), lane=merge_lane_state.lane_state(session, row),
-        vm=microvm_page(session, [row]), repos=project_repos.repos_of(session, row.id),
-        live_cast=live_cast_holders(session, [row.org_id]),
+    caller: AsyncCaller = Depends(current_caller),
+) -> ProjectsRouteProjectOut:
+    """One project, as a `list_projects` row: the edit page's record read (`ProjectEditPage`'s `useEditRecord`).
+    Same scope, so another org's project is a 404 to a tenant."""
+    # A worker thread, for `list_projects`' reason (the same row work, for one project).
+    row = or_404(
+        session.scalars(scoped_project_select(caller.principal, key=PROJECTS_VIEW_KEY).where(
+            Project.id == project_id, in_live_org(Project.org_id),
+        )).first(),
+        detail="unknown project",
     )
+    return one_project_out(session, row).model_copy(update=jobs_run_as_out(session, row))
 
 
 # ── Command log ──────────────────────────────────────────────────────────────
@@ -583,7 +595,9 @@ def _command_log_filtered(
 
 @router.get("/api/command-log", response_model=CommandPageOut)
 @feature("system", "view")
+@on_session
 def command_log(
+    session: Session,
     # Bounded: pydantic parses arbitrary-precision ints, so a huge page overflows `bigint` in the offset and
     # Postgres raises an uncaught 500; it also caps the scan one request can buy. The client derives its
     # last page from `total`.
@@ -612,21 +626,9 @@ def command_log(
             "CLEARED MEANS OMITTED."
         ),
     ),
-    start: Optional[datetime] = Query(
-        default=None,
-        description=(
-            "Inclusive lower bound on created_at. ISO-8601 WITH AN EXPLICIT OFFSET (…+02:00 or …Z); a "
-            "zoneless value is refused with 422 rather than read in a guessed zone. CLEARED MEANS "
-            "OMITTED: drop the key, do not send it empty."
-        ),
-    ),
-    end: Optional[datetime] = Query(
-        default=None,
-        description="Inclusive upper bound on created_at. Same requirements as start.",
-    ),
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    start: Optional[datetime] = CREATED_AT_START,
+    end: Optional[datetime] = CREATED_AT_END,
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CommandPageOut:
     """Node-grant scoped: the log shows only the nodes this caller was granted; `system:view` still
     required. A row bound to no node still shows (`authz.visible_node_ref_clause`) and is selectable via
@@ -640,7 +642,6 @@ def command_log(
 
     Cost: an exact `COUNT(*)`, and a `q` search is three unanchored `ILIKE`s plus two JSONB→text casts,
     bounded by the other filters and table size. A `pg_trgm` GIN index is the fix if needed (DDL)."""
-    offset = (page - 1) * per
     start = _require_aware(start, "start")
     end = _require_aware(end, "end")
     # Empty strings are cleared controls (normalised in `_command_log_filtered`); the two `datetime`
@@ -649,26 +650,20 @@ def command_log(
     # test-harness rows.
     scoping = (
         CommandAudit.args["_test"].as_string().is_(None),
-        visible_node_ref_clause(principal, CommandAudit.node_id),
+        visible_node_ref_clause(caller.principal, CommandAudit.node_id),
     )
     # The reader's org decides the read model and the search surface together (`app/command_read.py`,
     # `search_payload`).
-    tenant = is_tenant_org(_user.org_id)
+    tenant = is_tenant_org(caller.actor.org_id)
     filters = dict(
         node_id=node_id, q=q, status=status, start=start, end=end, search_payload=not tenant,
     )
 
-    total = session.scalar(
-        _command_log_filtered(
-            select(func.count()).select_from(CommandAudit).where(*scoping), **filters
-        )
-    ) or 0
-
-    stmt = _command_log_filtered(
-        select(CommandAudit).where(*scoping).order_by(CommandAudit.created_at.desc(), CommandAudit.id.desc()),
-        **filters,
+    rows, total = sql_page(
+        session, _command_log_filtered(select(CommandAudit).where(*scoping), **filters),
+        PageQuery(page=page, per=per, sort=None, dir="asc"),
+        sorts={}, default=[CommandAudit.created_at.desc()], tie=CommandAudit.id.desc(),
     )
-    rows = session.scalars(stmt.offset(offset).limit(per)).all()
     # One query for the page's node names. `""` spells a NULL node reference (unregistered or deleted
     # node); not `"local"`, which would name a node.
     names = names_by_id(session, [r.node_id for r in rows])
@@ -678,22 +673,19 @@ def command_log(
 def _command_out(r: CommandAudit, names: dict[UUID, str], *, tenant: bool) -> CommandOut:
     """One row as `command_log` and `command_log_entry` serve it, through the one tenant read model."""
     args, result = command_read(r.args, r.result, tenant=tenant)
-    return CommandOut(
-        id=r.id, node_id=names.get(r.node_id) or "",
-        node_uuid=str(r.node_id) if r.node_id is not None else None, command_type=r.command_type, args=args,
-        status=r.status,
-        created_at=r.created_at,
-        completed_at=r.completed_at, result=result,
+    return from_row(
+        CommandOut, r, node_id=names.get(r.node_id) or "",
+        node_uuid=str(r.node_id) if r.node_id is not None else None, args=args, result=result,
     )
 
 
 @router.get("/api/command-log/{command_id}", response_model=CommandDetailOut)
 @feature("system", "view")
+@on_session
 def command_log_entry(
-    command_id: int = Path(ge=1, le=2**31 - 1),  # `command_audit_log.id` is `integer`: past it the bind 500s.
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    session: Session,
+    command_id: int = Path(ge=1, le=2**31 - 1),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CommandDetailOut:
     """One row of the log, under exactly the list's scoping (`command_log`): a row this caller could not
     page to (another org's, an ungranted node's, a test-harness row) is a 404, indistinguishable from an
@@ -705,14 +697,14 @@ def command_log_entry(
     row = get_or_404(
         session, CommandAudit, command_id, detail="Command not found", where=(
             CommandAudit.args["_test"].as_string().is_(None),
-            visible_node_ref_clause(principal, CommandAudit.node_id),
+            visible_node_ref_clause(caller.principal, CommandAudit.node_id),
         ),
     )
-    tenant = is_tenant_org(_user.org_id)
+    tenant = is_tenant_org(caller.actor.org_id)
     actor = row.actor
     if tenant and actor and not actor.startswith("system:"):
         known = session.scalar(
-            select(AdminUser.id).where(AdminUser.email == actor, AdminUser.org_id == _user.org_id).limit(1)
+            select(AdminUser.id).where(AdminUser.email == actor, AdminUser.org_id == caller.actor.org_id).limit(1)
         )
         actor = actor if known is not None else WITHHELD_ACTOR
     out = _command_out(row, names_by_id(session, [row.node_id]), tenant=tenant)
@@ -748,8 +740,8 @@ def _account_rows_by_join_key(
 ) -> tuple[dict[str, Account], list[Account]]:
     """The `accounts` DB SSOT indexed for the resources join: (slug → row, every row by slug).
 
-    Scoped to what `principal` may read (`app/authz/visibility.py::readable_account_select`), as `GET /api/accounts`
-    is: this page serves a superset of the roster's fields. Deny by default.
+    Scoped to the Accounts roster (`app/authz/visibility.py::account_roster_select`), as `GET /api/accounts` is; the
+    sensed fields stay on `readable_account_slugs`. Deny by default.
 
     One index: a dir is derived from the slug (`node_clone.resolve_auth_dir`), so its basename is the slug
     (`account_slug_from_dir`). `slug` is unique, so `setdefault` decides nothing.
@@ -757,7 +749,7 @@ def _account_rows_by_join_key(
     The second return value is the complete roster: a row with an empty slug would be missing from the
     index, so the no-match pass must iterate rows."""
     rows_by_slug: dict[str, Account] = {}
-    rows = list(session.scalars(readable_account_select(principal).order_by(Account.slug)).all())
+    rows = list(session.scalars(account_roster_select(principal).order_by(Account.slug)).all())
     for row in rows:
         if row.slug:
             rows_by_slug.setdefault(row.slug, row)
@@ -780,14 +772,14 @@ def _shared_account_rows(session: Session, principal: Principal | None, slugs: s
 
 @router.get("/api/resources")
 @feature("system", "view")
+@on_session
 def get_resources(
+    session: Session,
     node_id: Optional[str] = Query(default=None),
-    _user: AdminUser = Depends(require_user),
     # The authorization subject for both dimensions this page serves: the node roster and the accounts
     # (credential dir, login email, quota, uuid). Also the key-tier subject: the narrowing at the bottom
     # reads `accounts:view` off it.
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ):
     """Node-grant scoped: this route answers the same "which hosts exist" question as `GET /api/nodes` (the
     account matrix is keyed by node names, and two aggregates read `runners`/`worktrees` fleet-wide), so
@@ -798,7 +790,7 @@ def get_resources(
     # Account records come from `account_fold.account_records`; a stale source leaves the page stale, never
     # a 500. `sessions` is seeded and then recomputed from `worktrees` below.
     data: dict[str, Any] = {
-        "accounts": _readable_fold_records(session, principal),
+        "accounts": _readable_fold_records(session, caller.principal),
         "sessions": {"total": 0, "busy": 0, "idle": 0},
     }
     # Per-node state beside the folded record, because the fold cannot say where: a login is per (account,
@@ -812,13 +804,13 @@ def get_resources(
     # The roster is the leak, so the grant narrows it. Node uuids as text, the matrix's key (names repeat
     # across orgs); `None` for an unrestricted principal (no query). Under the org filter the select is
     # narrowed at the seam to the selected orgs' nodes.
-    allowed_node_ids = None if sees_all_nodes(principal) and org_filter is None else {
-        str(row.id) for row in session.scalars(scoped_node_select(principal)).all()
+    allowed_node_ids = None if sees_all_nodes(caller.principal) and org_filter is None else {
+        str(row.id) for row in session.scalars(scoped_node_select(caller.principal)).all()
     }
     # Hoisted: an account no node has observed has no fold row and reaches the payload only via the
     # no-credentials pass, so the matrix must also be asked for roster slugs. Otherwise that account gets
     # no `nodes` key and no way to start a first login.
-    rows_by_slug, all_rows = _account_rows_by_join_key(session, principal)
+    rows_by_slug, all_rows = _account_rows_by_join_key(session, caller.principal)
     # What `hidden_account_count` compares with the seam-bound count; the shared rows below are no part of it.
     owned_count = len(all_rows)
     # Fold slugs first (existing order), then roster rows without a fold record. Both are already
@@ -829,7 +821,7 @@ def get_resources(
     ))
     account_nodes = account_fold.account_node_matrix(
         session, matrix_slugs, allowed_node_ids=allowed_node_ids,
-        tenant_reader=is_tenant_org(_user.org_id),
+        tenant_reader=is_tenant_org(caller.actor.org_id),
     )
     if org_filter is not None:
         # Under the filter an account stays when a selected org owns it or a node of a selected org holds a login for it
@@ -842,7 +834,7 @@ def get_resources(
         on_selected_nodes = {
             slug for slug, cells in account_nodes.items() if any(cell.get("present") for cell in cells)
         }
-        for shared_row in _shared_account_rows(session, principal, on_selected_nodes - owned):
+        for shared_row in _shared_account_rows(session, caller.principal, on_selected_nodes - owned):
             rows_by_slug.setdefault(shared_row.slug, shared_row)
             all_rows.append(shared_row)
         data["accounts"] = [
@@ -861,7 +853,7 @@ def get_resources(
         select(func.count()).select_from(Runner)
         # `?node_id=` narrows; node reach confines. Without it the fleet-wide count is a runner census of
         # hosts this caller cannot name.
-        .where(node_reach_clause(principal, Runner.node_id))
+        .where(node_reach_clause(caller.principal, Runner.node_id))
     )
     if node_id is not None:
         runner_count_stmt = runner_count_stmt.where(Runner.node_id == node_ref(node_id))
@@ -877,7 +869,7 @@ def get_resources(
             Worktree.session_status.isnot(None), Worktree.session_status != "",
             # The whole visibility rule, not just its node conjunct: these are per-slot rows, owing the same answer
             # as `GET /api/worktrees`.
-            visible_worktree_clause(principal),
+            visible_worktree_clause(caller.principal),
         )
     )
     if node_id is not None:
@@ -914,7 +906,7 @@ def get_resources(
         pinned_node_id: jaah_home
         for pinned_node_id, jaah_home in session.execute(
             # Scoped: `config_dir` is composed from `jaah_home`, so an unscoped read would republish the roster.
-            scoped_node_select(principal)
+            scoped_node_select(caller.principal)
             .with_only_columns(Node.id, Node.jaah_home)
             .where(Node.id.in_(pinned_ids))
         ).all()
@@ -1014,7 +1006,7 @@ def get_resources(
     # record and in every per-node cell is blanked (as `routes/nodes/node_wire.py::_narrow_for_tenant` blanks the
     # node), to each field's own empty value (`""` / `None`) so withheld reads as unreported. One pass over
     # the finished payload, after the join loop and before the count below.
-    if is_tenant_org(_user.org_id):
+    if is_tenant_org(caller.actor.org_id):
         for acct in data["accounts"]:
             acct["config_dir"] = ""
             for cell in acct.get("nodes") or []:
@@ -1026,7 +1018,7 @@ def get_resources(
     # account subject is narrowed per subject, in one pass, on top of the grants (key decides whether, grants
     # which). `hidden_account_count` is always present (whole roster without the key; grant-withheld rows with it,
     # from a plain seam-bound count less the owned rows, so it cannot go negative). Absence denies.
-    if not (principal is not None and principal.has(_ACCOUNTS_VIEW_KEY)):
+    if not (caller.principal is not None and caller.principal.has(_ACCOUNTS_VIEW_KEY)):
         data["hidden_account_count"] = len(data["accounts"])
         data["accounts"] = []
     else:
@@ -1064,11 +1056,12 @@ class ProvisioningOut(BaseModel):
 
 
 @router.get("/api/accounts/provisioning", response_model=list[ProvisioningOut])
-@feature("system", "view")
-def account_provisioning(
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+# `accounts:view`, not `system:view`: every member may bring their own account (`access_catalog.MEMBER_KEYS`), and
+# the wizard polls this. The object filters below decide which records.
+@feature("accounts", "view")
+async def account_provisioning(
+    db: DbDep,
+    caller: AsyncCaller = Depends(current_caller),
 ):
     """In-flight/last Add-Account and Re-login wizard records, derived from durable-workflow state
     (`app/durable/accounts.py::provisioning_records`) — the sole source of truth for the whole
@@ -1084,10 +1077,34 @@ def account_provisioning(
     # ride `system:view`. The key decides whether; the object filters below decide which. At the top, since every
     # field is an account fact. No `hidden_*_count`: the wire shape is a list polled every 2s, and `[]` is ordinary.
     # Absence denies (see `get_resources`).
-    if principal is None or not principal.has(_ACCOUNTS_VIEW_KEY):
+    if caller.principal is None or not caller.principal.has(_ACCOUNTS_VIEW_KEY):
         return []
-    # Filtered in Python: records come from workflow state, not a query.
-    allowed = granted_account_slugs(session, principal)
+    # Filtered in Python: records come from workflow state, not a query. A reader without `system:view` (the
+    # roster's own key) polls only their OWN accounts' logins — the wizard's need — never an org account's.
+    allowed = await db.run_sync(_provisioning_slugs, caller.principal)
+    # The records, derived from durable-workflow state: DBOS's own (blocking) store, read off the loop with the
+    # route's read transaction handed back first.
+    from app.durable import accounts as durable_accounts
+
+    await db_async.release(db)
+    provisioning = await run_in_threadpool(durable_accounts.provisioning_records)
+    return await db.run_sync(_account_provisioning, caller.actor, caller.principal, allowed, provisioning)
+
+
+def _provisioning_slugs(session: Session, principal: Principal) -> AllowedObjects:
+    """The slugs `account_provisioning` may serve: the granted accounts, narrowed to the caller's own for a
+    reader without `system:view`."""
+    granted = granted_account_slugs(session, principal)
+    if principal.has_org("system:view"):
+        return granted
+    owned = select(Account.slug).where(Account.owner_id == principal.user_id)
+    return AllowedObjects(unrestricted=False, ids=frozenset(slug for slug in session.scalars(owned) if granted.contains(slug)))
+
+
+def _account_provisioning(
+    session: Session, _user: AdminUser, principal: Principal, allowed: AllowedObjects,
+    provisioning: list[dict[str, Any]],
+) -> list[ProvisioningOut]:
     # Who is served the live one-time code (narrower than the record): with link and code a reader can
     # approve the pending device flow with their own account. So the floor is whoever could start the
     # login: `system:create` (`routes/commands.py::COMMAND_TYPE_KEYS`, `_SYSTEM_ONLY`; not `system:edit`,
@@ -1097,6 +1114,8 @@ def account_provisioning(
     # `is_operator`, not the bare flag: a tenant-org superadmin sees only codes they could have started.
     sees_all_codes = principal is None or principal.is_operator
     startable: AllowedObjects | None = None
+    # Anyone else started only their OWN login (`routes/commands.py::_personal_account_path`): its code is served
+    # to whoever started it (`durable_accounts.login_creator`, the personal path's own rule), never on ownership.
 
     def _sees_code(record: dict[str, Any]) -> bool:
         """Whether this record's live code may be served to this reader, per record.
@@ -1107,7 +1126,12 @@ def account_provisioning(
         if sees_all_codes:
             return True
         if not sees_any_code:
-            return False
+            node_id, slug = record.get("node_id"), record.get("slug")
+            if not (node_id and slug):
+                return False
+            from app.durable import accounts as durable_accounts
+
+            return durable_accounts.login_creator(node_id, slug) == str(principal.user_id)
         if startable is None:
             startable = readable_account_slugs(session, principal)
         return startable.contains(record.get("slug"))
@@ -1131,12 +1155,9 @@ def account_provisioning(
             return record
         return {**record, "user_code": ""}
 
-    # The records, derived from durable-workflow state.
-    from app.durable import accounts as durable_accounts
-
     records = [
         ProvisioningOut(**_projected(record))
-        for record in durable_accounts.provisioning_records()
+        for record in provisioning
         if allowed.contains(record.get("slug"))
     ]
     # ── `config_dir` is the operator's host layout, withheld here as everywhere else ───────

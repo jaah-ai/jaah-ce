@@ -13,29 +13,16 @@ from app.operator_settings import reads as settings_reads
 from app.models.projects import Project
 from app.models.tasks import Task
 from app.persona_registry import (
+    ALWAYS_INTERVIEWING_PERSONAS,
     DB_DIRECT_SETTLE_STATES,
     DONE_CRITERION_OPERATOR,
     OPERATOR_PERSONAS,
     PERSONA_CREATE_AUTONOMOUS,
     PERSONA_DONE_CRITERION,
     PERSONA_RECORDS,
-    PROJECT_SETTINGS_LICENCES,
-    SCHEDULABLE_PERSONAS,
-    SHAPE_CRON,
-    SHAPE_TRIGGER,
-    SHAPE_DELETE_FILED,
-    SHAPE_EDIT_FILED,
-    SHAPE_FOLLOW_UP,
-    SHAPE_TASKS,
-    SHAPE_SYSTEM_TASK,
-    SHAPE_TOP_LEVEL,
-    SHAPE_DRAFT_TOP_LEVEL,
-    INERT_SHAPES,
-    SYSTEM_PERSONAS,
-    TRIGGER_PERSONAS,
-    TASK_CREATION_LICENCES,
 )
 from app.task_lifecycle import STATES, _RUNNER_END_STATES
+from app.entity_shape import or_404
 
 
 def fleet_dispatch_cap(*, org: UUID) -> int:
@@ -77,6 +64,8 @@ PERSONA_EPIC = "epic"
 PERSONA_BUSINESS_ANALYSIS = "business_analysis"
 PERSONA_ARCHITECTURE = "architecture"
 PERSONA_PLAN = "plan"
+# A new web app's first epic stage: a business-only interview that always asks (`persona_registry.py`).
+PERSONA_APP_WIZARD = "app_wizard"
 # The build persona (writes code, ships a PR), top-level or epic child — `parent_task_id` alone carries
 # which. Disjoint from `SYSTEM_PERSONAS`.
 PERSONA_CODER = "coder"
@@ -91,7 +80,7 @@ PERSONA_TEST_OPTIMIZER = "test_optimizer"
 PERSONA_ADVISOR = "advisor"
 # Speed persona: no review lane of any kind; its product is one self-contained HTML mockup uploaded as a
 # `report` artifact. ARTIFACT ONLY, NEVER A PR (owner's decision) — `outcome` criterion, absent from
-# `MERGED_PR_CRITERION_PERSONAS`, no `TASK_CREATION_LICENCES` row, charter defaults it to haiku.
+# `MERGED_PR_CRITERION_PERSONAS`, charter defaults it to haiku.
 PERSONA_PROTOTYPER = "prototyper"
 # Localization persona: a build persona like `coder` (merged PR), whose work is translating new and changed
 # source text. Operator-pickable, and a `plan` breakdown may file it as an epic build child.
@@ -99,6 +88,9 @@ PERSONA_TRANSLATE = "translate"
 # Marketing persona: a build persona like `translate` (merged PR), whose work is marketing copy in the
 # repo's brand voice. Operator-pickable, and a `plan` breakdown may file it as an epic build child.
 PERSONA_MARKETER = "marketer"
+# A business project's first task (`persona_registry.py`): interviews the owner, then records the business activity in
+# the repo and ships a PR. Always asks, so never filed where nobody answers.
+PERSONA_BUSINESS_WIZARD = "business_wizard"
 # The personas a `plan` breakdown may file as an epic's BUILD children (`coder` the default). Every site
 # that counts, archives, rolls up or judges an epic's build children reads this, never `PERSONA_CODER`
 # alone, so a `translate` or `marketer` child is a full sibling of a `coder` one.
@@ -125,75 +117,49 @@ PERSONA_TRIAGE = "triage"
 PERSONA_ADHOC = "adhoc"
 
 # ── Task-creation authority ──────────────────────────────────────────────────────────────────────────
-# Licences (`TASK_CREATION_LICENCES`, `app/persona_registry.py`) say which persona may create in which
-# shape; the per-endpoint path check stays here (`append_tasks`: parent is an epic;
-# `append_finish_follow_up`: caller is a live `finish` child). Neither half may be dropped. `POST
-# /runner-breaks` is exempt: born `system_failed` + `hidden`, never dispatchable.
+# Every persona holds every shape (`persona_registry.TASK_CREATION_LICENCE`); the per-endpoint path check stays here (`append_tasks`: parent is an epic;
+# `append_finish_follow_up`: caller is a live `finish` child). Neither half may be dropped.
 
 # ── SHAPE_TOP_LEVEL's Depth vocabulary — the console's own sketch · task · epic axis ─────────────────
 # `sketch` files a `prototyper`, `epic` files an epic plus its analysis children, and `task` files one
 # single-row persona: `coder` unless the filer names another. The nameable set is the operator's pickable
-# personas minus `prototyper` (that is `sketch`) and minus every licence holder, of either table, save one
-# holding only `INERT_SHAPES`: a task-creation licence holder would be a creation-graph edge back into the
-# filers (`advisor` itself would be a self-loop), but an inert holder (`coder`) files only drafts an operator
-# must start, so it adds no edge; and a project-settings holder (`onboard`) would let a chat that reads
-# untrusted material file a runner that rewrites its project's gate and stack commands under the chat
-# owner's authority. Derived rather than listed, so a newly licensed persona leaves this set on its own.
+# personas minus `prototyper` (that is `sketch`), `advisor` (a chat ends only on a person's Complete, so a
+# filed one would hold a slot with nobody in it) and `onboard` (rewriting the project's own settings is the
+# operator's call to start, as `persona_registry.PROJECT_DEFAULT_PERSONAS` argues), and `business_wizard` (it always
+# asks, and an agent's filing has nobody to answer).
 TOP_LEVEL_DEPTH_SKETCH = "sketch"
 TOP_LEVEL_DEPTH_TASK = "task"
 TOP_LEVEL_DEPTH_EPIC = "epic"
 TOP_LEVEL_DEPTHS: tuple[str, ...] = (TOP_LEVEL_DEPTH_SKETCH, TOP_LEVEL_DEPTH_TASK, TOP_LEVEL_DEPTH_EPIC)
 TOP_LEVEL_TASK_PERSONAS: tuple[str, ...] = tuple(
-    p for p in OPERATOR_PERSONAS
-    if p != PERSONA_PROTOTYPER
-    and (p not in TASK_CREATION_LICENCES or TASK_CREATION_LICENCES[p].shapes <= INERT_SHAPES)
-    and p not in PROJECT_SETTINGS_LICENCES
+    p for p in OPERATOR_PERSONAS if p not in (PERSONA_PROTOTYPER, PERSONA_ADVISOR, "onboard", PERSONA_BUSINESS_WIZARD)
 )
 # Every persona a `SHAPE_TOP_LEVEL` row itself can carry — what the amend/delete doors reach.
 TOP_LEVEL_FILED_PERSONAS: frozenset[str] = frozenset(
     TOP_LEVEL_TASK_PERSONAS + (PERSONA_PROTOTYPER, PERSONA_EPIC)
 )
 
-# ── The acyclicity invariant ─────────────────────────────────────────────────────────────────────────
-# The work graph is a finite fan because the persona graph (edge `A -> B`: licence-holder A can file a
-# persona-B row) is acyclic, so no licence needs a depth or quota. `plan -> finish -> coder` terminates.
-# Declared as data so a test can search it for a cycle.
-SHAPE_PRODUCES_PERSONAS: dict[str, frozenset[str]] = {
-    # The append ALWAYS creates the `finish` child alongside the coders.
-    SHAPE_TASKS: frozenset(EPIC_BUILD_PERSONAS + (PERSONA_FINISH,)),
-    SHAPE_FOLLOW_UP: frozenset((PERSONA_CODER,)),
-    # An epic filing also writes its analysis children, `plan` among them — a licence holder, so the chain
-    # `advisor -> plan -> finish -> coder` is real and terminates.
-    SHAPE_TOP_LEVEL: TOP_LEVEL_FILED_PERSONAS | frozenset(
-        (PERSONA_BUSINESS_ANALYSIS, PERSONA_ARCHITECTURE, PERSONA_PLAN)
-    ),
-    # The same rows, but born `draft` and never started by the filer: nothing runs until an operator's Start,
-    # so a human sits on the edge and it is no runaway (`INERT_SHAPES`). Empty, as the lifecycle shapes are.
-    SHAPE_DRAFT_TOP_LEVEL: frozenset(),
-    # The route 422s outside `SYSTEM_PERSONAS`; disjoint from every licence, so a leaf.
-    SHAPE_SYSTEM_TASK: frozenset(SYSTEM_PERSONAS),
-    # A cron files no row itself, but each firing files one of these; none holds `SHAPE_CRON`, so no cycle.
-    SHAPE_CRON: frozenset(SCHEDULABLE_PERSONAS),
-    # Modeled exactly as a cron: each delivery files one of these — an epic with its analysis children, as
-    # `trigger_intake` does. None holds `SHAPE_TRIGGER`, so no cycle (`plan` files again, and that chain ends).
-    SHAPE_TRIGGER: frozenset(TRIGGER_PERSONAS) | frozenset(
-        (PERSONA_BUSINESS_ANALYSIS, PERSONA_ARCHITECTURE, PERSONA_PLAN)
-    ),
-    # Lifecycle shapes create nothing; present as EMPTY because the acyclicity test enumerates
-    # `CREATION_SHAPES` and treats a missing shape as a failure. Neither can change a row's persona.
-    SHAPE_EDIT_FILED: frozenset(),
-    SHAPE_DELETE_FILED: frozenset(),
-}
+# The work graph is not bounded by who may file whom — every persona may file every shape — but by the loop
+# guard on each door that makes work run unattended (`routes/agent/auth.py::require_human_started`; the
+# argument: `app/task_ancestry.py::machine_origin`).
 
 # The analysis personas an epic child can carry: done-on-artifact, unlike `coder`
 # (merged PR) and `epic` (container). Differs from `INTERVIEWING_CHILD_PERSONAS` by `plan` alone and
 # answers a different question; an exact-set test pins the difference.
-_ANALYSIS_PERSONAS = (PERSONA_BUSINESS_ANALYSIS, PERSONA_ARCHITECTURE, PERSONA_PLAN)
+_ANALYSIS_PERSONAS = (PERSONA_BUSINESS_ANALYSIS, PERSONA_ARCHITECTURE, PERSONA_PLAN, PERSONA_APP_WIZARD)
 
 # The epic children that inherit the epic's Full Auto switch: `autonomous = false` means "interview me on
 # requirements and design", so `plan`/`coder`/`finish` children run Full Auto unconditionally. No
 # per-child toggle exists on any surface.
 INTERVIEWING_CHILD_PERSONAS = frozenset((PERSONA_BUSINESS_ANALYSIS, PERSONA_ARCHITECTURE))
+
+
+def epic_child_autonomous(persona: str, epic_autonomous: bool) -> bool:
+    """The Full Auto an epic child dispatches with, stored on its row: an always-interviewing persona
+    (`persona_registry.ALWAYS_INTERVIEWING_PERSONAS`) never, an interviewing child its epic's, any other always."""
+    if persona in ALWAYS_INTERVIEWING_PERSONAS:
+        return False
+    return epic_autonomous if persona in INTERVIEWING_CHILD_PERSONAS else True
 
 # Personas whose runner settles DB-direct via `/api/agent/tasks/{id}/complete`. Derived from the
 # registry; `app/task_pipeline.py` derives its copy off the same records.
@@ -227,8 +193,7 @@ def create_autonomous_for_persona(persona: Optional[str], submitted: Optional[bo
 # Keys mirrored as literals in `app/operator_settings/catalog.py::CATALOG` (defaults there);
 # `_advisor_chat_cap_or_409` re-reads them on every create and re-start.
 
-# Per-project default is STRICTLY BELOW the smallest port grid's index ceiling (`app/port_grid.py::index_ceiling`),
-# so chats never take a project's last leasable slot; the knob's floor of 1 keeps an edit from meaning "no cap".
+# The knob's floor of 1 keeps an edit from meaning "no cap".
 SETTING_ADVISOR_MAX_CHATS_PER_PROJECT = "advisor_max_chats_per_project"
 
 
@@ -290,6 +255,12 @@ _PERSONA_TASK_TEMPLATES: dict[str, tuple[str, str]] = {
         "--- Work item ---\n{work_item}",
         _WORK_ITEM_PARENT_EPIC,
     ),
+    PERSONA_APP_WIZARD: (
+        "Interview the app's owner about the web app below, in business words only, then hand the Architect "
+        "a PRD of its first version. The owner's own description is below: do not ask again what it already "
+        "says. Do NOT design or implement.\n\n--- Work item ---\n{work_item}",
+        _WORK_ITEM_PARENT_EPIC,
+    ),
     PERSONA_ARCHITECTURE: (
         "Architecture for the following work item, building on the business analysis. Propose the "
         "technical approach, key components/interfaces, and trade-offs; call out risks. Do NOT "
@@ -317,6 +288,12 @@ _PERSONA_TASK_TEMPLATES: dict[str, tuple[str, str]] = {
         "Write the marketing copy the following work item asks for, exactly as specified — in the repo's "
         "brand voice, honoring its acceptance criteria and scope. Nothing more, nothing less.\n\n"
         "--- Work item ---\n{work_item}",
+        _WORK_ITEM_OWN_BODY,
+    ),
+    PERSONA_BUSINESS_WIZARD: (
+        "Interview the owner about the business activity below, in business words only, then record it in "
+        "the repo so later tasks start knowing the business, and ship that as one PR. The owner's own words are "
+        "below: do not ask again what they already say.\n\n--- Work item ---\n{work_item}",
         _WORK_ITEM_OWN_BODY,
     ),
     PERSONA_FINISH: (
@@ -399,9 +376,10 @@ def _advisor_chat_cap_or_409(
     in_project = session.scalar(live_chats.where(Task.project_id == project_id)) or 0
     # Both caps are read for the org of the project the chat lands in: the per-creator count spans the
     # caller's org (the seam scopes it), and the destination project is the work this chat is for.
-    org = session.scalar(select(Project.org_id).where(Project.id == project_id))
-    if org is None:
-        raise HTTPException(status_code=404, detail=f"project {project_id} not found")
+    org = or_404(
+        session.scalar(select(Project.org_id).where(Project.id == project_id)),
+        detail=f"project {project_id} not found",
+    )
     # Resolved once so the 409 names the number actually compared.
     project_cap = max_advisor_chats_per_project(org=org)
     if in_project >= project_cap:

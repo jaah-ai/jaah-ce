@@ -1,14 +1,17 @@
 import type { JSX, MouseEvent, ReactNode, SyntheticEvent } from 'react'
 import { useEffect, useRef, useState } from 'react'
 import Box from '@mui/material/Box'
-import Tooltip from '@mui/material/Tooltip'
+import { Tip } from './Tip'
 
 /* A disabled control's reason, on hover AND tap. A disabled MUI button takes no pointer events, so its own `title`
    never shows; the reason rides a wrapping span instead. With no `reason` it lays out as the bare child. Pair it with
-   `disabled` (and the same words in the control's own `title`, for assistive tech) at the call site.
+   `disabled` (and the same words in the control's own `ui/Tip`, which stays the disabled control's `title` for
+   assistive tech) at the call site.
    The wrapper stays mounted when the reason clears (`display: contents`, so it lays out as nothing): a control
-   that becomes enabled is the same element, not a remount that would drop its focus.
-   The tooltip owns the span's `title` (`describeChild` keeps it there while closed), so hover and tap show one
+   that becomes enabled is the same element, not a remount that would drop its focus. With a reason the span is its
+   row's flex item: a row that stretches the control stretches the span (`data-disabled-reason`,
+   `ui/FormActionBar.tsx::stretchSelectorFor`, which stretches the control inside it too).
+   The tooltip (`ui/Tip`) owns the span's `title` (`describeChild` keeps it there while closed), so hover and tap show one
    sentence. CONTROLLED, OPENED BY THE CLICK A TAP DELIVERS — the same mechanics as `FeedList`'s disc tip: a touch
    has no hover, and MUI's own touch path does not open on this (enabled) span. */
 export function DisabledReason({ reason, children }: { reason: string | undefined; children: ReactNode }): JSX.Element {
@@ -31,12 +34,11 @@ export function DisabledReason({ reason, children }: { reason: string | undefine
     setOpen(false)
   }
   return (
-    <Tooltip
-      title={reason ?? ''}
+    <Tip
+      title={reason}
       open={Boolean(reason) && open}
       onOpen={() => { if (reason) setOpen(true) }}
       onClose={close}
-      describeChild
       leaveTouchDelay={6000}
     >
       <Box
@@ -47,6 +49,6 @@ export function DisabledReason({ reason, children }: { reason: string | undefine
       >
         {children}
       </Box>
-    </Tooltip>
+    </Tip>
   )
 }

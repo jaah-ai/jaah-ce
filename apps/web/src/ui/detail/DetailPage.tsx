@@ -7,8 +7,11 @@ import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
 import type { SxProps, Theme } from '@mui/material/styles'
 import { PHONE, SECTION_FILL_ATTR, SHELL_FILL_ATTR } from '../listStyles'
+import { FORM_BAR_GROUND } from '../FormActionBar'
 import PageHeader from '../PageHeader'
-import HelpLabel from '../HelpLabel'
+import HelpLabel, { ExplainMoreButton } from '../HelpLabel'
+import type { HelpProp } from '../explain'
+import { FONT_WEIGHT, LINE_HEIGHT, grid } from '../../theme'
 
 /* THE PAGE'S MEASURE. `read` caps the column at 64rem; `fill` makes the page a flex column owning the
  * viewport height, handed to the ONE section marked `fill` (a console, transcript or editor).
@@ -18,7 +21,7 @@ import HelpLabel from '../HelpLabel'
 export type DetailMeasure = 'read' | 'fill'
 
 const MEASURE_SX: Record<DetailMeasure, SxProps<Theme>> = {
-  read: { maxWidth: '64rem' },
+  read: { maxWidth: grid(170.5) },
   fill: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, gap: 2 },
 }
 
@@ -70,7 +73,9 @@ export const DetailPage = forwardRef(function DetailPage({
         actions={actions}
       />
       {children}
-      {/* THE SAVE BAR IS PAGE-LEVEL, always: inside a tab panel it is unreachable from the other tabs. */}
+      {/* THE SAVE BAR IS PAGE-LEVEL, always: inside a tab panel it is unreachable from the other tabs. A gap above
+          it, so at the scroll's end the last row (a checkbox, a field) is not pressed against the bar as if under it. */}
+      {actionBar && <Box aria-hidden sx={{ height: grid(2), flexShrink: 0 }} />}
       {actionBar}
     </Box>
   )
@@ -82,7 +87,14 @@ export const DETAIL_ACTIONS_SX = { display: 'flex', flexWrap: 'wrap', alignItems
 
 /** A section title's look (`variant="subtitle2"` with this `sx`), for a panel heading a sub-section of its own
  *  that sits beside `DetailSection`s as their peer (`pages/orgs/SsoTab.tsx`). */
-export const SECTION_TITLE_SX = { fontWeight: 600, lineHeight: 1.6, minWidth: 0 } as const
+export const SECTION_TITLE_SX = { fontWeight: FONT_WEIGHT.semibold, lineHeight: LINE_HEIGHT.normal, minWidth: 0 } as const
+
+/** The action bar on the PAGE's ground, spread into a page's `& > [data-testid="…-actions"]` rule when no panel
+ *  sits behind its fields: `ui/FormActionBar`'s `background.paper` read as a stray box on `background.default`;
+ *  `FORM_BAR_GROUND` moves its fill and the strip under it together (`/profile`, `/users/:id`, `/groups/:id`). */
+export const BAR_ON_PAGE_GROUND_SX = {
+  [FORM_BAR_GROUND]: (theme: Theme) => (theme.vars ?? theme).palette.background.default,
+} as const
 
 /* A GROUP OF FIELDS, BORDERLESS: the tab panel already draws the boundary (a card inside cost ~20px of
  * phone width). `ui/SectionCard` keeps its other callers.
@@ -110,8 +122,8 @@ export function DetailSection({
   /** Point a single field's `aria-labelledby` at the group when the group's name IS the field's name.
    *  Never for two or more fields — it renames every one. */
   titleId?: string
-  /** A few words shown on hovering the title (`ui/HelpLabel`), for a section whose title names its field. */
-  help?: string
+  /** The title's explanation, a hover on it (`ui/HelpLabel`), for a section whose title names its field. */
+  help?: HelpProp
   divided?: boolean
   fill?: boolean
   headingLevel?: 'h2' | 'h3'
@@ -125,6 +137,8 @@ export function DetailSection({
       <HelpLabel label={title} help={help} />
     </Typography>
   )
+  // The keyboard way to the title's pop-up; nothing when it has no more to say.
+  const more = title ? <ExplainMoreButton label={title} help={help} /> : null
   return (
     <Box
       component="section"
@@ -136,7 +150,7 @@ export function DetailSection({
           : { flexShrink: 0 }),
         display: 'flex',
         flexDirection: 'column',
-        gap: 1.75,
+        gap: 1.5,
         minWidth: 0,
         ...(divided ? { mt: 2, pt: 1.5, borderTop: '1px solid', borderColor: 'divider' } : {}),
       }}
@@ -147,8 +161,9 @@ export function DetailSection({
           {actions}
         </Box>
       ) : heading}
+      {more}
       {fields ? (
-        <Box component="dl" sx={{ m: 0, display: 'flex', flexDirection: 'column', gap: 1.75, minWidth: 0 }}>
+        <Box component="dl" sx={{ m: 0, display: 'flex', flexDirection: 'column', gap: 1.5, minWidth: 0 }}>
           {children}
         </Box>
       ) : children}
@@ -168,9 +183,13 @@ export function DetailField({
   labelTestId,
   dense,
   inline,
+  help,
   children,
 }: {
   label: string
+  /** The label's explanation (`ui/HelpLabel`): a hover on it; outside a `<label>`, the label itself takes focus and
+   *  carries the tip as its `aria-description`. */
+  help?: HelpProp
   /** Spans two grid columns, for a cluster rather than a word. Unconditional (≥1100px-only left a 1024px
    *  iPad wrapping); on the phone the row's own columns, since `span 2` in a one-column grid adds a column. */
   wide?: boolean
@@ -185,7 +204,7 @@ export function DetailField({
   /** The value at `body2`, for a card whose other text is `body2` (a queue card), so values do not outsize it. */
   dense?: boolean
   /** On the phone, keeps the value beside its label, wrapping inside its column: for a short value with a note
-   *  riding it ("8 · No task slot"), which at its content width would drop below the label. */
+   *  riding it ("8 · 2 retiring"), which at its content width would drop below the label. */
   inline?: boolean
   children: ReactNode
 }): JSX.Element {
@@ -199,7 +218,7 @@ export function DetailField({
       sx={{
         display: 'flex',
         flexDirection: 'column',
-        gap: 0.35,
+        gap: 0,
         minWidth: 0,
         ...(wide ? { gridColumn: 'span 2' } : null),
         ...(fullRow ? { gridColumn: '1 / -1' } : null),
@@ -209,7 +228,7 @@ export function DetailField({
           flexDirection: 'row',
           flexWrap: 'wrap',
           alignItems: 'baseline',
-          gap: 0.6,
+          gap: 0.5,
         },
       }}
     >
@@ -217,9 +236,10 @@ export function DetailField({
         component="dt"
         variant="caption"
         data-testid={labelTestId}
-        sx={{ color: 'text.secondary', [PHONE]: { flex: '0 0 auto', minWidth: '4.5rem' } }}
+        sx={{ color: 'text.secondary', [PHONE]: { flex: '0 0 auto', minWidth: grid(12) } }}
       >
-        {label}
+        <HelpLabel label={label} help={help} />
+        <ExplainMoreButton label={label} help={help} />
       </Typography>
       <Box
         component="dd"

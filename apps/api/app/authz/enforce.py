@@ -7,7 +7,6 @@ from uuid import UUID
 
 from fastapi import HTTPException
 from sqlalchemy import select
-from sqlalchemy.orm import Session
 from starlette.exceptions import WebSocketException
 from starlette.requests import HTTPConnection
 from starlette.websockets import WebSocket
@@ -20,7 +19,7 @@ from app.auth import (
     _valid_node_token,
     hidden_route,
 )
-from app.db import SessionLocal
+from app.db import BridgedSession
 from app.models.orgs import Org
 from app.tenancy import seam
 from app.authz.catalog import AUTHOR_DRAFT_KEY, AUTHOR_DRAFT_PARAM, Access, Tenancy, permission_key
@@ -55,22 +54,10 @@ _WS_NOT_FOUND = 4404
 _WS_CODE_FOR_STATUS = {401: _WS_UNAUTHORIZED, 403: _WS_UNAUTHORIZED, 404: _WS_NOT_FOUND}
 
 
-class HintedDenial(HTTPException):
-    """A denial carrying the access-request hint (`app/access_requests.py::request_hint`): rendered as
-    `{detail, request: {scope, role}}` by `app/main.py`'s handler. Only ever raised with a hint — a denial
-    without one stays a plain `HTTPException`, so its body is byte-identical to before."""
-
-    def __init__(self, status_code: int, detail: str, request: dict) -> None:
-        super().__init__(status_code=status_code, detail=detail)
-        self.request = request
-
-
-def _deny(conn: HTTPConnection, status: int, detail: str, *, request: dict | None = None) -> HTTPException:
-    """The denial `_enforce` raises — always an `HTTPException`. `_enforce` runs in a worker thread and a
-    socket close takes two awaits, so `authz_guard` converts it (`_deny_websocket`). `request` is the
-    access-request hint, when the refusal earned one (`_request_hint`)."""
-    if request is not None:
-        return HintedDenial(status, detail, request)
+def _deny(conn: HTTPConnection, status: int, detail: str) -> HTTPException:
+    """The denial `_enforce` raises — always a plain `HTTPException`, so a refusal of a row the caller may not
+    see is byte-identical to a row that does not exist. `_enforce` runs in a worker thread and a socket close
+    takes two awaits, so `authz_guard` converts it (`_deny_websocket`)."""
     return HTTPException(status_code=status, detail=detail)
 
 
@@ -113,8 +100,8 @@ def _forbidden(conn: HTTPConnection) -> Exception:
     return _deny(conn, 403, "forbidden")
 
 
-def _not_found(conn: HTTPConnection, *, request: dict | None = None) -> Exception:
-    return _deny(conn, 404, "not found", request=request)
+def _not_found(conn: HTTPConnection) -> Exception:
+    return _deny(conn, 404, "not found")
 
 
 def _decides_without_io(declaration: Declaration) -> bool:
@@ -177,7 +164,7 @@ def _refuse_other_org_mutation(
             continue
     if not probes:
         return
-    with seam.operator_scope(), SessionLocal() as session:
+    with seam.operator_scope(), BridgedSession() as session:
         for spec, object_id in probes:
             org_id = session.scalar(select(spec.entity.org_id).where(spec.entity.id == object_id))
             if org_id is None or org_id == principal.org_id:
@@ -262,8 +249,8 @@ def _enforce(conn: HTTPConnection, declaration: Declaration | None = None) -> se
                 # The agent principal reads on the fleet plane: the clauses already read `None` as
                 # allow-all, so the seam must agree. The one route reaching here is `routes/portfolio.py`'s
                 # projects collection (jaahd's clone-path resolver; unbound it answered `200 []` —
-                # `tests/test_authz_project_scoping.py`). It is not narrowed per arm (`_read_scope_for`):
-                # `_valid_node_token` returns only a bool, not the resolved caller.
+                # `tests/test_authz_project_scoping.py`). The seam stays fleet-wide; the handler narrows a node to
+                # its own org (`routes/portfolio.py::_agent_project_scope`) — change the two together.
                 return seam.OPERATOR
             log.warning(
                 "authz: denying cookie-less caller on agent-allowed route %s — no valid agent token",
@@ -398,7 +385,7 @@ def _authored_draft_subject(
     task_id = _author_draft_id(conn, spec)
     if task_id is None:
         return False
-    with seam.bound_to(principal.org_id), SessionLocal() as session:
+    with seam.bound_to(principal.org_id), BridgedSession() as session:
         return authored_draft(session, principal, task_id)
 
 
@@ -412,30 +399,6 @@ def _author_draft_id(conn: HTTPConnection, spec: ObjectSpec) -> Any | None:
     try:
         return spec.id_type(conn.path_params.get(AUTHOR_DRAFT_PARAM))  # type: ignore[arg-type]
     except (TypeError, ValueError, AttributeError):
-        return None
-
-
-def _request_hint(
-    session: Session,
-    principal: Principal,
-    declaration: Declaration,
-    object_type: str,
-    object_id: int | UUID,
-    key: str | None,
-) -> dict | None:
-    """The access-request hint a refusal of this object carries — `{scope, role}` for a project or
-    account of the caller's own org, else None (`app/access_requests.py::request_hint`, the
-    one home of the rule). `key` is the key refused: the admitted one, else the declared one. Never
-    raises: a hint that cannot be computed must not turn a refusal into a 500."""
-    from app import access_requests
-
-    refused = key or permission_key(declaration.feature or "", declaration.action or "")
-    try:
-        return access_requests.request_hint(
-            session, principal, OBJECT_SPEC_BY_NAME.get(object_type), object_id, refused
-        )
-    except Exception:  # noqa: BLE001 - the refusal is what matters; the hint is a courtesy
-        log.exception("authz: could not compute the access-request hint for %s %s", object_type, object_id)
         return None
 
 
@@ -472,7 +435,7 @@ def _enforce_object_params(
         plane = seam.operator_scope()
     else:
         plane = seam.bound_to(principal.org_id if principal is not None else None)
-    with plane, SessionLocal() as session:
+    with plane, BridgedSession() as session:
         for param in declaration.object_params:
             raw = conn.path_params.get(param)
             try:
@@ -480,7 +443,7 @@ def _enforce_object_params(
                 object_id = spec.id_type(raw)  # type: ignore[arg-type]
             except (TypeError, ValueError, AttributeError):
                 # Not an id → cannot name a reachable object. `UUID` raises `AttributeError` for non-str.
-                raise _not_found(conn)
+                raise _not_found(conn) from None
             # The guard parses the raw segment (dependencies run before coercion); every divergence from
             # pydantic fails closed. 404, unless a write on a readable row, which is a 403 with
             # `readable_write_denial` (as `require_object_access`).
@@ -492,12 +455,11 @@ def _enforce_object_params(
                     session, principal, spec, object_id, mode=mode
                 ):
                     continue
-                hint = _request_hint(session, principal, declaration, object_type, object_id, key)
                 if _refused_write_is_readable(
                     session, principal, object_type, object_id, mode, read_key=read_key
                 ):
-                    raise _deny(conn, 403, readable_write_denial(object_type), request=hint)
-                raise _not_found(conn, request=hint)
+                    raise _deny(conn, 403, readable_write_denial(object_type))
+                raise _not_found(conn)
             # For a key-scoped type, the admitting key must be held on this row's own scope
             # (`key_scope_column`/`key_scope_type`), not merely somewhere. Denial as its neighbour.
             if key is not None and key_scope_satisfied(
@@ -518,7 +480,6 @@ def _enforce_object_params(
                 continue
             # The key half's denial: 403 naming the key if the row is readable (the admitted key, else the
             # declared one), else 404.
-            hint = _request_hint(session, principal, declaration, object_type, object_id, key)
             if _refused_write_is_readable(
                 session, principal, object_type, object_id, mode, read_key=read_key
             ):
@@ -530,9 +491,8 @@ def _enforce_object_params(
                         key=key
                         or permission_key(declaration.feature or "", declaration.action or ""),
                     ),
-                    request=hint,
                 )
-            raise _not_found(conn, request=hint)
+            raise _not_found(conn)
 
 
 def _resolved_label(resolved: seam.Scope) -> str:

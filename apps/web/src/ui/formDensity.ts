@@ -6,9 +6,12 @@
  * needs its own verification pass, not a drive-by.
  */
 
+import { PHONE } from './listStyles'
+import { SIZE } from '../theme'
+
 // Consumers: `components/tasks/TaskEditForm.tsx`, `pages/ProjectEditPage.tsx`.
 export const BUTTON_SX = {
-  '@media (max-width:480px)': { minHeight: 44 },
+  [PHONE]: { minHeight: SIZE.tapTarget },
   /* MUI marks a disabled button `pointer-events: none`; a native disabled button stays hit-testable.
   Reachability oracles hit-test with `elementFromPoint` to prove the mobile nav does not cover an action,
   and `none` makes the probe fall through to the container. `auto` restores native semantics; the button
@@ -20,12 +23,12 @@ export const BUTTON_SX = {
 // Consumers: `components/tasks/TaskEditForm.tsx`, `components/tasks/GateForm.tsx`, `pages/ProjectEditPage.tsx`.
 export const TEXTAREA_RESIZE_SX = {
   '& textarea': { resize: 'vertical' },
-  '@media (max-width:480px)': { '& textarea': { resize: 'none' } },
+  [PHONE]: { '& textarea': { resize: 'none' } },
 } as const
 
 // A record form's column: a gap under the tab strip, 640px at most (a 1440px-wide form reads as unfinished).
 // Consumers: `pages/nodes/nodeLinkStore/NodeLinkEditPage.tsx`, `pages/settings/apiKeys/ApiKeyDetailPage.tsx`.
-export const FORM_SX = { display: 'flex', flexDirection: 'column', gap: 2, pt: 2, maxWidth: 640 } as const
+export const FORM_SX = { display: 'flex', flexDirection: 'column', gap: 2, pt: 2, maxWidth: SIZE.measure } as const
 
 // A token field's `slotProps` (an id, a path, a CIDR): no spell-check squiggle, no autofill.
 // Consumers: `pages/nodes/nodeLinkStore/{NodeLinkEditPage,StorageSourceFields}.tsx`,
@@ -36,8 +39,8 @@ export const TEXT_INPUT = { htmlInput: { spellCheck: false, autoComplete: 'off' 
 // input as well as the root: the geometry specs measure the `<input>`/`<textarea>`.
 // Consumers: `components/tasks/{TaskEditForm,GateForm}.tsx`; others use `ui/listStyles`'s `fieldTapTargetSx`.
 export const FIELD_SX = {
-  '@media (max-width:480px)': {
-    '& .MuiInputBase-root': { minHeight: 44 },
-    '& .MuiInputBase-input': { minHeight: 44, boxSizing: 'border-box' },
+  [PHONE]: {
+    '& .MuiInputBase-root': { minHeight: SIZE.tapTarget },
+    '& .MuiInputBase-input': { minHeight: SIZE.tapTarget, boxSizing: 'border-box' },
   },
 } as const

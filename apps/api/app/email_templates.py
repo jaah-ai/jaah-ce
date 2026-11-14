@@ -88,26 +88,34 @@ class TemplateType:
         return {p.key: p.sample for p in self.placeholders}
 
 
+def _standard_fields(
+    *, subject: str, preheader: str, heading: str, body: str, button: str, footer: str,
+    before_footer: tuple[Field, ...] = (),
+) -> tuple[Field, ...]:
+    """The field set most types share, in the layout's order; `before_footer` are a type's own extra fields."""
+    return (
+        Field("subject", "Subject", subject, required=True),
+        Field("preheader", "Preview text", preheader),
+        Field("heading", "Heading", heading, required=True),
+        Field("body", "Message", body, multiline=True, required=True),
+        Field("button_label", "Button", button, required=True),
+        *before_footer,
+        Field("footer", "Footer", footer, multiline=True),
+    )
+
+
 USER_INVITATION = TemplateType(
     key="user_invitation",
     label="User invitation",
     description="Sent when an admin creates a user, and on Resend invitation.",
-    fields=(
-        Field("subject", "Subject", "{{inviter_name}} invited you to {{org_name}} on Jaah", required=True),
-        Field("preheader", "Preview text", "Accept to join {{org_name}} as {{email}}."),
-        Field("heading", "Heading", "Join {{org_name}} on Jaah", required=True),
-        Field(
-            "body", "Message",
-            "Hi {{first_name}},\n\n{{inviter_name}} invited you to {{org_name}} on Jaah. Accept to sign in as "
-            "{{email}}.",
-            multiline=True, required=True,
-        ),
-        Field("button_label", "Button", "Accept invitation", required=True),
-        Field(
-            "footer", "Footer",
-            "Not expecting this? Ignore this email — nothing happens until you sign in.",
-            multiline=True,
-        ),
+    fields=_standard_fields(
+        subject="{{inviter_name}} invited you to {{org_name}} on Jaah",
+        preheader="Accept to join {{org_name}} as {{email}}.",
+        heading="Join {{org_name}} on Jaah",
+        body="Hi {{first_name}},\n\n{{inviter_name}} invited you to {{org_name}} on Jaah. Accept to sign in as "
+             "{{email}}.",
+        button="Accept invitation",
+        footer="Not expecting this? Ignore this email — nothing happens until you sign in.",
     ),
     placeholders=(
         Placeholder("first_name", "The invitee's first name, else \"there\"", "Alex"),
@@ -142,6 +150,31 @@ NOTIFICATION = TemplateType(
     essential=False,
 )
 
+ALERT_EMAIL_CONFIRM = TemplateType(
+    key="alert_email_confirm",
+    label="Confirm alert email",
+    description="Sent when someone adds an email for Jaah alerts, or verifies their login email: a link and a code "
+                "that confirm the address.",
+    fields=_standard_fields(
+        subject="Confirm this address for Jaah alerts",
+        preheader="Open the link, or enter the code in Jaah. The code expires in {{expires_minutes}} minutes.",
+        heading="Confirm this address for Jaah alerts",
+        body="Confirm {{email}} to get Jaah alerts here. Open the link, or enter this code in Profile > Alerts. "
+             "The code expires in {{expires_minutes}} minutes; the link in 24 hours.",
+        button="Confirm address",
+        footer="Didn't ask for this? Ignore this email — nothing is sent here until the address is confirmed.",
+    ),
+    placeholders=(
+        Placeholder("email", "The address being confirmed", "alex@example.com"),
+        Placeholder("code", "The 6-digit code, shown in its own box", "482913"),
+        Placeholder("verify_url", "The confirm link (the button's target)", "https://example.com/api/public/email/verify/sample"),
+        Placeholder("expires_minutes", "Minutes until the code expires", "30"),
+    ),
+    button="verify_url",
+    code="code",
+    essential=True,
+)
+
 # ── The onboarding emails ──────────────────────────────────────────────────────────────────
 # Senders go through `app/onboarding_mail.py::send`, which injects `tutorials_url` from the Sign-up settings.
 
@@ -163,22 +196,14 @@ SIGNUP_VERIFY = TemplateType(
     key="signup_verify",
     label="Verify email",
     description="Sent when someone signs up with email: a code and a link that confirm the address.",
-    fields=(
-        Field("subject", "Subject", "{{code}} is your Jaah verification code", required=True),
-        Field("preheader", "Preview text", "Enter it on the sign-up page. Expires in {{expires_minutes}} minutes."),
-        Field("heading", "Heading", "Verify your email", required=True),
-        Field(
-            "body", "Message",
-            "Hi {{first_name}},\n\nEnter this code on the sign-up page to confirm {{email}}. It expires in "
-            "{{expires_minutes}} minutes.",
-            multiline=True, required=True,
-        ),
-        Field("button_label", "Button", "Verify email", required=True),
-        Field(
-            "footer", "Footer",
-            "Didn't sign up? Ignore this email — no account is created without the code.",
-            multiline=True,
-        ),
+    fields=_standard_fields(
+        subject="{{code}} is your Jaah verification code",
+        preheader="Enter it on the sign-up page. Expires in {{expires_minutes}} minutes.",
+        heading="Verify your email",
+        body="Hi {{first_name}},\n\nEnter this code on the sign-up page to confirm {{email}}. It expires in "
+             "{{expires_minutes}} minutes.",
+        button="Verify email",
+        footer="Didn't sign up? Ignore this email — no account is created without the code.",
     ),
     placeholders=_common("applicant") + (
         Placeholder("code", "The 6-digit code, shown in its own box", "482913"),
@@ -194,24 +219,18 @@ SIGNUP_ACCOUNT_EXISTS = TemplateType(
     key="signup_account_exists",
     label="Account already exists",
     description="Sent instead of a code when someone signs up with an email that already has an account.",
-    fields=(
-        Field("subject", "Subject", "You already have a Jaah account", required=True),
-        Field("preheader", "Preview text", "Nothing changed. Sign in with {{email}}."),
-        Field("heading", "Heading", "You already have a Jaah account", required=True),
-        Field(
-            "body", "Message",
-            "Hi {{first_name}},\n\nSomeone tried to sign up with {{email}}, which already has a Jaah account. "
-            "No new account was created — sign in instead.",
-            multiline=True, required=True,
+    fields=_standard_fields(
+        subject="You already have a Jaah account",
+        preheader="Nothing changed. Sign in with {{email}}.",
+        heading="You already have a Jaah account",
+        body="Hi {{first_name}},\n\nSomeone tried to sign up with {{email}}, which already has a Jaah account. "
+             "No new account was created — sign in instead.",
+        button="Sign in",
+        before_footer=(
+            Field("reset_text", "Reset sentence", "Forgot your password?"),
+            Field("reset_label", "Reset link", "Reset your password", required=True),
         ),
-        Field("button_label", "Button", "Sign in", required=True),
-        Field("reset_text", "Reset sentence", "Forgot your password?"),
-        Field("reset_label", "Reset link", "Reset your password", required=True),
-        Field(
-            "footer", "Footer",
-            "Didn't try to sign up? Ignore this email — your account is unchanged.",
-            multiline=True,
-        ),
+        footer="Didn't try to sign up? Ignore this email — your account is unchanged.",
     ),
     placeholders=_common("account holder") + (
         Placeholder("login_url", "The sign-in link (the button's target)", "https://example.com/login?email=alex%40example.com"),
@@ -229,21 +248,14 @@ APPLICATION_RECEIVED = TemplateType(
     key="application_received",
     label="Application received",
     description="Sent to an applicant when they submit their application.",
-    fields=(
-        Field("subject", "Subject", "We got your Jaah application", required=True),
-        Field(
-            "preheader", "Preview text",
-            "We review every application and email you once yours is approved.",
-        ),
-        Field("heading", "Heading", "Thanks, {{first_name}}", required=True),
-        Field(
-            "body", "Message",
-            "We review every new account by hand. Once yours is approved, a welcome email tells you how to sign "
-            "in.\n\nUntil then, the tutorials show what Jaah does.",
-            multiline=True, required=True,
-        ),
-        Field("button_label", "Button", "Watch tutorials", required=True),
-        Field("footer", "Footer", _SIGNED_UP_FOOTER, multiline=True),
+    fields=_standard_fields(
+        subject="We got your Jaah application",
+        preheader="We review every application and email you once yours is approved.",
+        heading="Thanks, {{first_name}}",
+        body="We review every new account by hand. Once yours is approved, a welcome email tells you how to sign "
+             "in.\n\nUntil then, the tutorials show what Jaah does.",
+        button="Watch tutorials",
+        footer=_SIGNED_UP_FOOTER,
     ),
     placeholders=_common("applicant"),
     button="tutorials_url",
@@ -254,19 +266,17 @@ WELCOME = TemplateType(
     key="welcome",
     label="Welcome",
     description="Sent when an admin approves an organization, and on Send welcome email.",
-    fields=(
-        Field("subject", "Subject", "Your Jaah account is ready", required=True),
-        Field("preheader", "Preview text", "{{org_name}} is approved. Sign in to start."),
-        Field("heading", "Heading", "Welcome to Jaah, {{first_name}}", required=True),
-        Field(
-            "body", "Message",
-            "{{org_name}} is approved. Sign in with {{sign_in_method}} to start.",
-            multiline=True, required=True,
+    fields=_standard_fields(
+        subject="Your Jaah account is ready",
+        preheader="{{org_name}} is approved. Sign in to start.",
+        heading="Welcome to Jaah, {{first_name}}",
+        body="{{org_name}} is approved. Sign in with {{sign_in_method}} to start.",
+        button="Sign in",
+        before_footer=(
+            Field("tutorials_text", "Tutorials sentence", "New to Jaah?"),
+            Field("tutorials_label", "Tutorials link", "Watch the tutorials", required=True),
         ),
-        Field("button_label", "Button", "Sign in", required=True),
-        Field("tutorials_text", "Tutorials sentence", "New to Jaah?"),
-        Field("tutorials_label", "Tutorials link", "Watch the tutorials", required=True),
-        Field("footer", "Footer", _SIGNED_UP_FOOTER, multiline=True),
+        footer=_SIGNED_UP_FOOTER,
     ),
     placeholders=_common("account owner") + (
         Placeholder("org_name", "The organization", "Acme"),
@@ -282,22 +292,14 @@ PASSWORD_RESET = TemplateType(
     key="password_reset",
     label="Reset password",
     description="Sent when someone asks to reset their password, or to set a first one.",
-    fields=(
-        Field("subject", "Subject", "Set a new Jaah password", required=True),
-        Field("preheader", "Preview text", "The link works once and expires in {{expires_minutes}} minutes."),
-        Field("heading", "Heading", "Set a new password", required=True),
-        Field(
-            "body", "Message",
-            "Hi {{first_name}},\n\nSet a new password for {{email}}. The link works once and expires in "
-            "{{expires_minutes}} minutes.",
-            multiline=True, required=True,
-        ),
-        Field("button_label", "Button", "Set password", required=True),
-        Field(
-            "footer", "Footer",
-            "Didn't ask for this? Ignore this email — your password stays the same.",
-            multiline=True,
-        ),
+    fields=_standard_fields(
+        subject="Set a new Jaah password",
+        preheader="The link works once and expires in {{expires_minutes}} minutes.",
+        heading="Set a new password",
+        body="Hi {{first_name}},\n\nSet a new password for {{email}}. The link works once and expires in "
+             "{{expires_minutes}} minutes.",
+        button="Set password",
+        footer="Didn't ask for this? Ignore this email — your password stays the same.",
     ),
     placeholders=_common("account holder") + (
         Placeholder("reset_url", "The single-use reset link (the button's target)", "https://example.com/reset-password?token=sample"),
@@ -335,7 +337,7 @@ SIGNUP_ALERT = TemplateType(
         Placeholder("role", "The applicant's occupation or job title", "Head of Engineering"),
         Placeholder("intended_use", "What they plan to use Jaah for", "Automating our release pipeline"),
         Placeholder("method", "How they signed up: Email, Google, GitHub or Microsoft", "Google"),
-        Placeholder("review_url", "The organization's approval page (the button's target)", "https://example.com/orgs/sample"),
+        Placeholder("review_url", "The organization's approval page (the button's target)", "https://example.com/customers/sample"),
         Placeholder("status", "Waiting for review, or Approved automatically", "Waiting for review"),
     ),
     button="review_url",
@@ -352,25 +354,21 @@ TRIGGER_FAILED = TemplateType(
     key="trigger_failed",
     label="Trigger stopped",
     description="Sent to a trigger's owner the moment the system stops it (auto-pause, or its owner lost access).",
-    fields=(
-        Field("subject", "Subject", "Trigger stopped: {{trigger_name}}", required=True),
-        Field("preheader", "Preview text", "{{reason}}"),
-        Field("heading", "Heading", "{{trigger_name}} stopped", required=True),
-        Field(
-            "body", "Message",
-            "Hi {{first_name}},\n\n{{trigger_name}} in {{project_name}} stopped filing Tasks: {{reason}}.\n\n"
-            "New deliveries are skipped until you fix the cause and resume it.",
-            multiline=True, required=True,
-        ),
-        Field("button_label", "Button", "Open trigger", required=True),
-        Field("footer", "Footer", _TRIGGER_FOOTER, multiline=True),
+    fields=_standard_fields(
+        subject="Trigger stopped: {{trigger_name}}",
+        preheader="{{reason}}",
+        heading="{{trigger_name}} stopped",
+        body="Hi {{first_name}},\n\n{{trigger_name}} in {{project_name}} stopped filing Tasks: {{reason}}.\n\n"
+             "New deliveries are skipped until you fix the cause and resume it.",
+        button="Open trigger",
+        footer=_TRIGGER_FOOTER,
     ),
     placeholders=(
         Placeholder("first_name", "The owner's first name, else \"there\"", "Alex"),
-        Placeholder("trigger_name", "The trigger", "Deploy failures"),
+        Placeholder("trigger_name", "The trigger", "Release failures"),
         Placeholder("project_name", "The trigger's project", "Acme web"),
         Placeholder("reason", "Why it stopped", "5 consecutive failures (last: preflight timed out)"),
-        Placeholder("trigger_url", "The trigger's page (the button's target)", "https://example.com/triggers/sample"),
+        Placeholder("trigger_url", "The trigger's automation (the button's target)", "https://example.com/automations/sample"),
     ),
     button="trigger_url",
     essential=False,
@@ -380,16 +378,13 @@ TRIGGER_DIGEST = TemplateType(
     key="trigger_digest",
     label="Trigger digest",
     description="Sent once a day to each trigger owner who had deliveries, or a trigger not Active, in the last 24 hours.",
-    fields=(
-        Field("subject", "Subject", "Your triggers: {{headline}}", required=True),
-        Field("preheader", "Preview text", "{{headline}} in the last 24 hours."),
-        Field("heading", "Heading", "Your triggers, last 24 hours", required=True),
-        Field(
-            "body", "Message", "Hi {{first_name}},\n\n{{headline}} in the last 24 hours.\n\n{{trigger_lines}}",
-            multiline=True, required=True,
-        ),
-        Field("button_label", "Button", "Open triggers", required=True),
-        Field("footer", "Footer", _TRIGGER_FOOTER, multiline=True),
+    fields=_standard_fields(
+        subject="Your triggers: {{headline}}",
+        preheader="{{headline}} in the last 24 hours.",
+        heading="Your triggers, last 24 hours",
+        body="Hi {{first_name}},\n\n{{headline}} in the last 24 hours.\n\n{{trigger_lines}}",
+        button="Open triggers",
+        footer=_TRIGGER_FOOTER,
     ),
     placeholders=(
         Placeholder("first_name", "The owner's first name, else \"there\"", "Alex"),
@@ -399,10 +394,10 @@ TRIGGER_DIGEST = TemplateType(
         ),
         Placeholder(
             "trigger_lines", "One paragraph per trigger: its health, its counts by outcome, any budget breach, its link",
-            "Deploy failures — Degraded: 1 failure — last: preflight timed out\n12 dispatched, 1 failed\n"
-            "https://example.com/triggers/sample",
+            "Release failures — Degraded: 1 failure — last: preflight timed out\n12 dispatched, 1 failed\n"
+            "https://example.com/automations/sample",
         ),
-        Placeholder("triggers_url", "The Triggers page (the button's target)", "https://example.com/triggers"),
+        Placeholder("triggers_url", "The Automations page (the button's target)", "https://example.com/automations"),
     ),
     button="triggers_url",
     essential=False,
@@ -427,18 +422,14 @@ TRUST_REQUEST_APPROVED = TemplateType(
     key="trust_request_approved",
     label="Trust documents approved",
     description="Sent to a Trust Center visitor when an admin approves their document request.",
-    fields=(
-        Field("subject", "Subject", "Jaah document request approved", required=True),
-        Field("preheader", "Preview text", "We'll send the documents separately."),
-        Field("heading", "Heading", "Request approved", required=True),
-        Field(
-            "body", "Message",
-            "Hi {{first_name}},\n\nYour request for {{documents}} is approved. We'll send the documents "
-            "separately.",
-            multiline=True, required=True,
-        ),
-        Field("button_label", "Button", "Open Trust Center", required=True),
-        Field("footer", "Footer", _TRUST_FOOTER, multiline=True),
+    fields=_standard_fields(
+        subject="Jaah document request approved",
+        preheader="We'll send the documents separately.",
+        heading="Request approved",
+        body="Hi {{first_name}},\n\nYour request for {{documents}} is approved. We'll send the documents "
+             "separately.",
+        button="Open Trust Center",
+        footer=_TRUST_FOOTER,
     ),
     placeholders=_trust_placeholders(),
     button="trust_url",
@@ -449,17 +440,13 @@ TRUST_REQUEST_DECLINED = TemplateType(
     key="trust_request_declined",
     label="Trust documents declined",
     description="Sent to a Trust Center visitor when an admin declines their document request.",
-    fields=(
-        Field("subject", "Subject", "Your Jaah document request", required=True),
-        Field("preheader", "Preview text", "We can't share these documents right now."),
-        Field("heading", "Heading", "Request declined", required=True),
-        Field(
-            "body", "Message",
-            "Hi {{first_name}},\n\nWe can't share {{documents}} right now.\n\n{{reason}}",
-            multiline=True, required=True,
-        ),
-        Field("button_label", "Button", "Open Trust Center", required=True),
-        Field("footer", "Footer", _TRUST_FOOTER, multiline=True),
+    fields=_standard_fields(
+        subject="Your Jaah document request",
+        preheader="We can't share these documents right now.",
+        heading="Request declined",
+        body="Hi {{first_name}},\n\nWe can't share {{documents}} right now.\n\n{{reason}}",
+        button="Open Trust Center",
+        footer=_TRUST_FOOTER,
     ),
     placeholders=_trust_placeholders() + (
         Placeholder("reason", "The admin's reason, when they gave one", "We share these with customers under contract."),
@@ -488,12 +475,90 @@ ORG_REJECTED = TemplateType(
     essential=True,
 )
 
+# ── The support ticket emails ─────────────────────────────────────────────────────────────
+# To the ticket's requester, at their login email (`app/support_mail.py`). Essential: a person who opened a ticket
+# always hears back, so there is no unsubscribe link; an operator may resend each from the ticket page.
+
+_TICKET_FOOTER = "Sent to {{email}} because you opened this ticket with Jaah support."
+
+
+def _ticket_placeholders(*extra: Placeholder) -> tuple[Placeholder, ...]:
+    return (
+        Placeholder("first_name", "The requester's first name, else \"there\"", "Alex"),
+        Placeholder("email", "The requester's email", "alex@example.com"),
+        Placeholder("ticket_id", "The ticket's number", "11"),
+        Placeholder("title", "The ticket's title", "Task frozen in running state"),
+        Placeholder("ticket_url", "The ticket's page (the button's target)", "https://example.com/support/tickets/11"),
+    ) + extra
+
+
+TICKET_RECEIVED = TemplateType(
+    key="ticket_received",
+    label="Ticket received",
+    description="Sent to the requester when they open a support ticket.",
+    fields=_standard_fields(
+        subject="We got your ticket #{{ticket_id}}: {{title}}",
+        preheader="We'll reply on the ticket and email you.",
+        heading="We got your ticket",
+        body="Hi {{first_name}},\n\nThanks for reaching out. Ticket #{{ticket_id}}, {{title}}, is with our support "
+             "team. We'll reply on the ticket and email you.",
+        button="Open ticket",
+        footer=_TICKET_FOOTER,
+    ),
+    placeholders=_ticket_placeholders(),
+    button="ticket_url",
+    essential=True,
+)
+
+TICKET_REPLY = TemplateType(
+    key="ticket_reply",
+    label="Ticket reply",
+    description="Sent to the requester when support posts a public reply on their ticket.",
+    fields=_standard_fields(
+        subject="Re: {{title}} (ticket #{{ticket_id}})",
+        preheader="{{author_name}} replied to your ticket.",
+        heading="Support replied",
+        body="Hi {{first_name}},\n\n{{author_name}} replied to ticket #{{ticket_id}}, {{title}}:\n\n{{reply}}",
+        button="Open ticket",
+        footer=_TICKET_FOOTER,
+    ),
+    placeholders=_ticket_placeholders(
+        Placeholder("author_name", "Who replied", "Sam Lee"),
+        Placeholder("reply", "The reply's text", "We restarted the stuck runner; the subtasks are moving again."),
+    ),
+    button="ticket_url",
+    essential=True,
+)
+
+TICKET_STATUS = TemplateType(
+    key="ticket_status",
+    label="Ticket solved or closed",
+    description="Sent to the requester when their ticket is marked Solved or Closed.",
+    fields=_standard_fields(
+        subject="Ticket #{{ticket_id}} is {{status}}: {{title}}",
+        preheader="{{status_note}}",
+        heading="Your ticket is {{status}}",
+        body="Hi {{first_name}},\n\nTicket #{{ticket_id}}, {{title}}, is {{status}}.\n\n{{status_note}}",
+        button="Open ticket",
+        footer=_TICKET_FOOTER,
+    ),
+    placeholders=_ticket_placeholders(
+        Placeholder("status", "The new status, in words: solved or closed", "solved"),
+        Placeholder(
+            "status_note", "What the requester can do next: reply to reopen, or open a new ticket",
+            "Not fixed? Reply on the ticket and it reopens.",
+        ),
+    ),
+    button="ticket_url",
+    essential=True,
+)
+
 TYPES: dict[str, TemplateType] = {
     t.key: t
     for t in (
         USER_INVITATION, NOTIFICATION, SIGNUP_VERIFY, SIGNUP_ACCOUNT_EXISTS, APPLICATION_RECEIVED, WELCOME,
         PASSWORD_RESET, SIGNUP_ALERT, TRIGGER_FAILED, TRIGGER_DIGEST, TRUST_REQUEST_APPROVED,
-        TRUST_REQUEST_DECLINED, ORG_REJECTED,
+        TRUST_REQUEST_DECLINED, ORG_REJECTED, TICKET_RECEIVED, TICKET_REPLY, TICKET_STATUS, ALERT_EMAIL_CONFIRM,
     )
 }
 TYPE_KEYS: tuple[str, ...] = tuple(TYPES)
@@ -645,20 +710,66 @@ def _link(url: str, label: str, *, style: str = "") -> str:
 
 def _rich(text: str) -> str:
     """Raw text as escaped HTML, each bare http(s) URL a link to itself (no rewriting, no tracking) and each
-    newline a `<br>`."""
-    out, pos = [], 0
-    for m in _URL_RE.finditer(text):
-        out.append(html.escape(text[pos:m.start()]))
-        out.append(_link(html.escape(m.group(0), quote=True), html.escape(m.group(0)), style=_WRAP))
-        pos = m.end()
-    out.append(html.escape(text[pos:]))
+    newline a `<br>`. A run between `_INERT_OPEN` and `_INERT_CLOSE` is escaped but never linked."""
+    out = []
+    for i, part in enumerate(_INERT_SPLIT_RE.split(text)):
+        if i % 2:
+            # A zero-width space after the scheme: the mail client's own auto-linking does not link it either.
+            out.append(html.escape(part).replace("://", ":&#8203;//"))
+            continue
+        pos = 0
+        for m in _URL_RE.finditer(part):
+            out.append(html.escape(part[pos:m.start()]))
+            out.append(_link(html.escape(m.group(0), quote=True), html.escape(m.group(0)), style=_WRAP))
+            pos = m.end()
+        out.append(html.escape(part[pos:]))
     return "".join(out).replace("\n", "<br>")
+
+
+# Placeholder values a tenant or applicant writes (an org name, a person's name, a reason) render in the body
+# as text, never as a link: an org named "https://evil.example/login" would otherwise put a live link to it
+# inside an email Jaah sends. Only the system-built values in `_LINKED_VALUES` link; a new placeholder is text
+# until it is listed there.
+_INERT_OPEN, _INERT_CLOSE = "\ue000", "\ue001"
+_INERT_SPLIT_RE = re.compile(f"{_INERT_OPEN}(.*?){_INERT_CLOSE}", re.S)
+_LINKED_VALUES = frozenset({
+    "login_url", "reset_url", "review_url", "tutorials_url", "trigger_url", "triggers_url", "trust_url",
+    "verify_url", "trigger_lines",
+})
+# A placeholder written inside a URL in the template text ("https://x/{{org_name}}") stays part of that link.
+_IN_URL_RE = re.compile(r"https?://\S*\Z")
+
+
+def _fill_inert(text: str, values: Mapping[str, str]) -> str:
+    """`_fill` with every tenant-written, non-blank value marked inert for `_rich`. Marker characters are dropped
+    from every value first, so no value can open or close a run. A value inside a template URL stays part of
+    that link only while it has no whitespace (a value with a space could append a URL of its own)."""
+    def one(m: re.Match[str]) -> str:
+        key = m.group(1)
+        if key not in values:
+            return m.group(0)
+        value = values[key].replace(_INERT_OPEN, "").replace(_INERT_CLOSE, "")
+        if key in _LINKED_VALUES or not value.strip():
+            return value
+        if _IN_URL_RE.search(text, 0, m.start()) and not re.search(r"\s", value):
+            return value
+        return _INERT_OPEN + value.strip() + _INERT_CLOSE
+    return _PLACEHOLDER_RE.sub(one, text)
 
 
 def _paragraphs(text: str) -> str:
     """Text as `<p>`s: a blank line splits paragraphs, a single newline is a `<br>`, a URL is a link."""
     blocks = [b.strip() for b in re.split(r"\n\s*\n", text.strip()) if b.strip()]
-    return "".join(f'<p class="em-body" style="margin:0 0 16px 0;color:{_BODY};">{_rich(b)}</p>' for b in blocks)
+    out, inert = [], False
+    for block in blocks:
+        # An inert value with a blank line spans blocks: reopen its run here, close it at the block's end.
+        if inert:
+            block = _INERT_OPEN + block
+        inert = block.rfind(_INERT_OPEN) > block.rfind(_INERT_CLOSE)
+        if inert:
+            block += _INERT_CLOSE
+        out.append(f'<p class="em-body" style="margin:0 0 16px 0;color:{_BODY};">{_rich(block)}</p>')
+    return "".join(out)
 
 
 def _extras_html(extras: _Extras) -> tuple[str, str]:
@@ -860,7 +971,8 @@ def render(
             footer=f["footer"], extras=extras, unsubscribe_url=unsubscribe_url,
         ),
         html=_layout(
-            title=f["subject"], preheader=f["preheader"], heading=f["heading"], body_html=_paragraphs(f["body"]),
+            title=f["subject"], preheader=f["preheader"], heading=f["heading"],
+            body_html=_paragraphs(_fill_inert(fields["body"], filled)),
             button_label=f.get("button_label", ""), button_url=url, footer=f["footer"], extras=extras,
             unsubscribe_url=unsubscribe_url,
         ),

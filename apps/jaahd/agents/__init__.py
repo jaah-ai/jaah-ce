@@ -7,7 +7,6 @@ another vendor's adapter (`tests/test_agent_adapters.py` proves it). Keys are `a
 """
 from __future__ import annotations
 
-from . import login as _login
 from .antigravity import AntigravityLoginAdapter
 from .antigravity_runner import AntigravityAdapter
 from .base import (
@@ -18,6 +17,7 @@ from .base import (
     ComposerTui,
     ConsentDialog,
     LifecycleChains,
+    McpConnection,
     QuitSignature,
     SESSION_ASSIGN,
     SESSION_DISCOVER,
@@ -26,6 +26,8 @@ from .base import (
     TASK_TMUX_PASTE,
     TokenCounts,
     TurnError,
+    mcp_connections_from_wire,
+    remote_mcp_servers,
 )
 from .claude import ClaudeAdapter
 from .claude_login import ClaudeLoginAdapter
@@ -84,7 +86,7 @@ def registered_providers() -> tuple[str, ...]:
 
 
 __all__ = [
-    "AcpLaunch", "AcpLaunchContext",
+    "AcpLaunch", "AcpLaunchContext", "McpConnection", "mcp_connections_from_wire", "remote_mcp_servers",
     "AgentAdapter", "ComposerTui", "ConsentDialog", "LifecycleChains", "QuitSignature", "TokenCounts", "TurnError",
     "UnknownProvider",
     "ADAPTER_MEMBERS",

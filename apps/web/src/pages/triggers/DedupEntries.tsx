@@ -5,8 +5,10 @@ import Button from '@mui/material/Button'
 import MuiLink from '@mui/material/Link'
 import Typography from '@mui/material/Typography'
 import { apiDetail } from '../../api'
-import { useConfirm } from '../../components/ConfirmDialog'
+import { danger, useConfirm } from '../../components/ConfirmDialog'
 import { useRowActions } from '../../hooks/useBusyIds'
+import { countOf } from '../../lib/humanize'
+import { grid } from '../../theme'
 import Banner from '../../ui/Banner'
 import EmptyState from '../../ui/EmptyState'
 import RelativeTime from '../../ui/RelativeTime'
@@ -22,7 +24,7 @@ export default function DedupEntries({ automationId }: { automationId: string })
     queryFn: () => listAutomationDedup(automationId),
   })
   const page = query.data ?? null
-  const { busy: clearing, error: clearError, setError: setClearError, run } = useRowActions()
+  const { busy: clearing, error: clearError, setError: setClearError, confirmRun } = useRowActions()
   const error = clearError || (query.isError && !query.isFetching ? apiDetail(query.error, 'Could not load dedup entries') : null)
   const [confirm, confirmDialog] = useConfirm()
 
@@ -31,20 +33,12 @@ export default function DedupEntries({ automationId }: { automationId: string })
     void query.refetch()
   }
 
-  async function clear(key: string) {
-    const ok = await confirm({
-      title: 'Clear entry',
-      message: 'Clear this entry? The same item may file a Task again.',
-      identity: key,
-      confirmLabel: 'Clear',
-      destructive: true,
-    })
-    if (!ok) return
-    await run(key, 'Could not clear the entry', async () => {
+  const clear = (key: string) => confirmRun(
+    confirm(danger('Clear', { title: 'Clear entry', message: 'Clear this entry? The same item may file a Task again.', identity: key })),
+    key, 'Could not clear the entry', async () => {
       await clearAutomationDedup(automationId, key)
       reload()
     })
-  }
 
   return (
     <Box data-testid="trigger-dedup" sx={{ display: 'flex', flexDirection: 'column', gap: 1, minWidth: 0 }}>
@@ -62,7 +56,7 @@ export default function DedupEntries({ automationId }: { automationId: string })
       {page && page.items.length > 0 && (
         <>
           <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-            {page.total === 1 ? '1 entry' : `${page.total} entries`}
+            {countOf(page.total, 'entry', 'entries')}
           </Typography>
           <Box component="ul" sx={{ listStyle: 'none', m: 0, p: 0, minWidth: 0 }}>
             {page.items.map(entry => (
@@ -85,7 +79,7 @@ export default function DedupEntries({ automationId }: { automationId: string })
                   variant="body2"
                   component="code"
                   sx={{
-                    flex: '1 1 12rem',
+                    flex: `1 1 ${grid(32)}`,
                     minWidth: 0,
                     overflowWrap: 'anywhere',
                     fontFamily: theme => theme.typography.mono.fontFamily,

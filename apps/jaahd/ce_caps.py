@@ -17,7 +17,6 @@ import contextlib
 import functools
 import logging
 import os
-import subprocess
 from pathlib import Path
 from typing import Callable, ParamSpec, TypeVar
 
@@ -50,16 +49,16 @@ _NON_AGENT_SUFFIXES = ("|term", "|web")
 
 def live_agent_windows() -> int | None:
     """How many agent windows are live in this node's tmux session; None when tmux could not be asked."""
-    env = fleet_launch.tmux_safe_env()
+    env = env_helpers._tmux_safe_env()
     try:
         session = fleet_launch.tmux_session()
-        listing = subprocess.run(
-            session_user.tmux_cmd(session_user.fleet_socket(env), "list-windows", "-t", f"={session}",
-                                  "-F", "#{window_name}"),
-            env=env, capture_output=True, text=True, timeout=15,
-        )
+        socket = session_user.fleet_socket(env)
     except Exception as exc:  # noqa: BLE001 — an unanswered query is unknown, never "none live"
         log.warning("ce_caps: the tmux window query failed (%s)", exc)
+        return None
+    listing = session_user.tmux_run(socket, "list-windows", "-t", f"={session}", "-F", "#{window_name}",
+                                    env=env, timeout=15)
+    if listing is None:
         return None
     if listing.returncode != 0:
         stderr = (listing.stderr or "").lower()
@@ -198,20 +197,12 @@ def cli_env() -> dict[str, str]:
     path = os.environ.get(CLI_ENV_FILE_ENV, "")
     if not path:
         return {}
-    pairs: dict[str, str] = {}
+    # `source` rules (`env_helpers._dotenv_lines`): the image's entrypoint `.`-sources the same file.
     try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        return {key: value for key, value in env_helpers._dotenv_lines(Path(path)) if key.isidentifier()}
     except OSError as exc:
         log.warning("ce_caps: cannot read the CLI env file %s: %s", path, exc)
         return {}
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        if key.isidentifier():
-            pairs[key] = value
-    return pairs
 
 
 def window_env() -> dict[str, str]:

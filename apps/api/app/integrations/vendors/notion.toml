@@ -1,0 +1,83 @@
+# Notion. Facts confirmed at the vendor's own docs: public-integration OAuth (authorize with owner=user, no scopes,
+# client pair as HTTP Basic at the token endpoint, refresh_token grant) https://developers.notion.com/docs/authorization ;
+# tokens and internal integration secrets https://developers.notion.com/docs/create-a-notion-integration ;
+# retrieve your token's bot user https://developers.notion.com/reference/get-self .
+# Probed 2026-11-03: a bad token answers 401 code "unauthorized"; the token endpoint parses a form body.
+# Its hosted MCP server takes its own sign-in or token, which this adopted type cannot hold: reached today as a
+# Custom MCP server (a limitation below); a card-level MCP block needs a second credential on one card.
+slug = "notion"
+label = "Notion"
+category = "productivity"
+vendor_docs_url = "https://developers.notion.com/docs/authorization"
+summary = "Search, read and update the Notion pages and databases you share with Jaah."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://api.notion.com/v1/oauth/authorize"
+token_url = "https://api.notion.com/v1/oauth/token"
+pkce = false
+basic_auth = true
+authorize_extra = { owner = "user" }
+jaah_app = true
+[auth.oauth.registration]
+console_url = "https://www.notion.so/profile/integrations"
+steps = [
+  "Select New integration, choose the workspace that should own it, and set Type to Public",
+  "Fill in Integration name Jaah, upload the Jaah logo, and add the company name, website, privacy policy and terms of use URLs Notion asks for",
+  "Under OAuth Domain & URIs add the redirect URIs below",
+  "Select Save, then open the Capabilities tab: tick Read content, Update content, Insert content and Read comments, and Read user information including email addresses, then Save changes",
+  "Open the Configuration tab to find the OAuth client ID and client secret",
+]
+review = "Not required to let any workspace connect. Listing Jaah in Notion's Integrations gallery is optional and is a separate submission"
+app_scopes = [
+  { name = "Read content", label = "Search and read the pages and databases the member shares with Jaah" },
+  { name = "Update content", label = "Edit those pages and database entries when a task asks" },
+  { name = "Insert content", label = "Add pages, blocks and database entries" },
+  { name = "Read comments", label = "Read discussion on a page for context" },
+  { name = "Read user information including email addresses", label = "Show whose workspace the connection reaches" },
+]
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "Integration secret or token", kind = "secret", required = true, placeholder = "ntn_...", help = "Notion > Settings > Connections > Develop or manage integrations (notion.so/profile/integrations) > New integration: choose the workspace, Type Internal, Save, then copy the Internal Integration Secret from the Configuration tab. Then share each page agents need with it: the page's ... menu > Connections > add the integration" },
+]
+
+[test]
+method = "GET"
+path = "https://api.notion.com/v1/users/me"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+headers = { "Notion-Version" = "2022-06-28" }
+identity = [["bot", "workspace_name"], ["name"]]
+identity_phrase = "in workspace"
+
+[docs]
+agent_uses = [
+  "Search the pages and databases you shared with Jaah and read a spec, runbook or meeting note a task links to",
+  "Query a Notion database, such as a roadmap or bug tracker, for the entries a task needs",
+  "Write results back: update a page, add a section, or create a new database entry",
+  "Read the comments on a page for context",
+]
+prerequisites = [
+  "A Notion account in the workspace agents should reach, with permission to add connections to its pages",
+  "For an internal integration secret: Workspace owner rights in Notion, which creating an integration requires",
+]
+limitations = [
+  "Notion's hosted MCP server needs its own sign-in or token, which this secret does not hold: to give agents its tools, add a Custom MCP server secret with the URL https://mcp.notion.com/mcp, connect it, and link it to the project",
+  "Agents see only the pages and databases shared with the connection: on sign-in, the pages you pick on Notion's consent screen; with a secret, the pages you add the integration to under the page's Connections menu. Sharing a page shares its sub-pages",
+  "One connection reaches one Notion workspace",
+  "Notion's API averages about three requests per second per connection; large exports are slow",
+  "Some block types (for example synced blocks from other pages, and some embeds) cannot be read or written through Notion's API",
+]
+troubleshooting = [
+  { symptom = "Test says Notion rejected the integration secret or token (401)", fix = "The secret was regenerated, the integration deleted, or the value mistyped. Copy the current secret from the integration's Configuration tab and select Replace" },
+  { symptom = "Test passes but agents say a page cannot be found (object_not_found)", fix = "The page is not shared with the connection. In Notion open the page's ... menu > Connections and add Jaah or your integration" },
+  { symptom = "Test says Notion rejected the access token", fix = "The connection was removed in Notion (Settings > Connections). Select Reconnect and pick the pages again" },
+  { symptom = "Notion shows Invalid redirect_uri on the sign-in screen", fix = "You are using your own public integration and its Redirect URIs do not include the one on this page. Add it under OAuth Domain & URIs" },
+]
+faq = [
+  { q = "Why can agents not see my whole workspace", a = "Notion shares nothing with an integration by default: you choose the pages, which keeps agents to what they need. Add more pages any time from the page's Connections menu" },
+  { q = "Sign-in or integration secret", a = "Sign in for a personal connection to the pages you pick. Use an internal integration secret for a team-wide connection owned by a workspace owner" },
+  { q = "Which Notion API version does Jaah use", a = "The Test sends Notion-Version 2022-06-28. Agents may send a newer version on their own calls" },
+]

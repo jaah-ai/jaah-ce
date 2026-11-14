@@ -2,12 +2,24 @@
 // addresses a slot. Here rather than on a page so no page imports another's route chunk.
 import type { Worktree } from '../types'
 
-// The Title, SHOWN AS IS: an in-flight operator edit wins, else `wt.title` VERBATIM. The CP resolves an
+// The Title, SHOWN AS IS: `wt.title` VERBATIM. The CP resolves an
 // absent Title (`apps/api/app/slot_title.py::resolved_title`), so `wt.title` is never null or `""`.
 // NEVER read the node-sensed tmux name (`types.ts` keeps it for older-node compat) and never compose a
 // default: no node-sensed value becomes a Title, and the CP must be the only opinion.
-export function resolveTitle(wt: Worktree, pending?: string): string {
-  return pending ?? wt.title
+export function resolveTitle(wt: Worktree): string {
+  return wt.title
+}
+
+// `slot_title.FREE_TITLE`, the one place that word is decided; rendered as-is.
+export const FREE_TITLE = 'free'
+
+// The Title as the Slots row and drawer SHOW it: `free` is the occupancy word, which the row disc and the
+// drawer chip already say, so it reads as the panel's absence mark `—` instead of a second `free`. The CP's
+// composed `{TaskId}|{Task Description}` reads as the console names a task, `#5 Title`.
+export function titleShown(title: string): string {
+  if (title === FREE_TITLE) return '—'
+  const composed = /^(\d+)\|(.*)$/s.exec(title)
+  return composed ? `#${composed[1]} ${composed[2]}` : title
 }
 
 // A folder slot: a project with no repository, so branch/ahead/behind/dirty arrive null and NO git cell,
@@ -23,16 +35,6 @@ export function isFolderSlot(wt: Worktree): boolean {
 // An {idle, busy} allowlist once dropped `waiting` slots from the chevrons and quota badge.
 export function hasLiveSession(wt: Worktree): boolean {
   return !!wt.session_status
-}
-
-/** May a console be OPENED on this slot — NOT `hasLiveSession` alone.
- *
- * `session_status` is empty for a runner wedged during startup (e.g. on a CLI prompt), which is exactly
- * when an operator needs a console. So: something live to ATTACH to, or `mayCreate` (the caller's
- * conjunction of the session key and `wt.may_edit`) — the console resolves-or-creates and takes no hold.
- * A `worktrees:view` principal is offered a console only where one is live. */
-export function canOpenConsoleOn(wt: Worktree, { mayCreate }: { mayCreate: boolean }): boolean {
-  return hasLiveSession(wt) || mayCreate
 }
 
 /** How long a held slot may sit with NOTHING ever sensed before a surface warns. Five minutes: well past
@@ -68,7 +70,7 @@ export function unsightedRunnerAgeMs(wt: Worktree, nowMs: number): number | null
 // Strict otherwise, because a WRONG id points a console at another run: anchored at the END on a whole
 // `/`-delimited segment, digits only. Any prefix is accepted ahead of `fleet/` (the browser does not
 // hold `branch_prefix`). The `fleet/` segment is REQUIRED: `wip/task-12` or `task-7` are branches a HUMAN
-// can name on a `user`-held slot, and must not resolve as a dispatch claim.
+// can name, and must not resolve as a dispatch claim.
 const BRANCH_TASK_ID = /(?:^|\/)fleet\/task-(\d+)(?:-\d+)?$/
 
 export function taskIdFromBranch(branch: string | null | undefined): number | null {
@@ -117,23 +119,22 @@ export function worktreeForTask(
   return worktrees.find(w => candidate(w) && w.task_id == null && namesTaskByBranch(w, taskId))
 }
 
-/* The branch key's gate: only `state === 'task'` speaks for a `fleet/task-N` branch. A `user`-held slot
-   is a person's, who may check out any branch, so a stale checkout there is never that task's runner. */
+/* The branch key's gate: only `state === 'task'` speaks for a `fleet/task-N` branch; a free slot's stale
+   checkout is never that task's runner. */
 function namesTaskByBranch(w: Worktree, taskId: number): boolean {
   if (w.state !== 'task') return false
   return taskIdFromBranch(w.branch) === taskId
 }
 
 // "This task has a runner whose console can be opened" — the one caller that asks for the branch
-// fallback (the unstamped-yet Running badge). ONLY A TASK-HELD SLOT: `hasLiveSession` is true for a
-// human's own console session too, so `state === 'task'` keeps a `user` slot out.
+// fallback (the unstamped-yet Running badge). ONLY A TASK-HELD SLOT.
 export function runnerWorktreeFor(
   taskId: number,
   projectName: string | undefined,
   worktrees: readonly Worktree[],
 ): Worktree | undefined {
   // TASK-HELD, NOT SENSED-LIVE: the CP's answer to "which slot is this task's runner in" is occupancy, so
-  // a wedged startup with no sensed session still resolves. `free`/`user` slots are refused.
+  // a wedged startup with no sensed session still resolves. `free` slots are refused.
   return worktreeForTask(
     taskId, projectName, worktrees, w => w.state === 'task', { branchFallback: true },
   )

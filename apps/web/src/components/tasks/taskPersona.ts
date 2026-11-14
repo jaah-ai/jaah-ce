@@ -12,7 +12,7 @@ export const ADVISOR_PERSONA = 'advisor'
 /* Is this row a chat. A chat parks `awaiting_response` at every turn boundary; on it the `?` must open
    the console — it has no question to answer, and answering would dispatch a second runner into the
    live chat's slot. Used by `shared.tsx`'s `answerTargetId`, `rowActions.tsx`'s `consoleSlotFor` and the
-   detail page's Answer tab. Structural parameter, not `PipelineTask`, to keep the leaf. */
+   detail page's Q&A tab. Structural parameter, not `PipelineTask`, to keep the leaf. */
 export function isChatTask(task: { persona?: string | null }): boolean {
   return task.persona === ADVISOR_PERSONA
 }
@@ -20,8 +20,7 @@ export function isChatTask(task: { persona?: string | null }): boolean {
 // The persona the `sketch` Depth position resolves (`personaForDepth`, `depthForPersona`, draft restore).
 export const PROTOTYPER_PERSONA = 'prototyper'
 
-// Not here: the chat mark (`./ChatGlyph`) and the picker caption (`PERSONA_PICKER_HINT`, read via
-// `personaPickerHint()` in `./personaRegistry`).
+// Not here: the chat mark (`./ChatGlyph`) and the picker caption (`PERSONA_HINT` in `./TaskSpecFields`).
 
 // Is this `persona` an epic — the one spelling of the `epic` Depth position. `persona` is NOT NULL.
 export function isEpicPersona(persona: string): boolean {

@@ -3,7 +3,8 @@
 Every Linux node ships its journal (`apps/jaahd/node_logs.py` → `POST /api/agent/node-logs` → CloudWatch,
 group `config.node_log_group()`, stream = node name); this is the one place the console reads it back, so a
 dead daemon is diagnosed in the UI, not with AWS tools. Operator only: a node journal is infrastructure.
-Vnode daemons ship nothing today (`node_logs.py` header), so a virtual node's stream is empty.
+A virtual node ships its own daemon's log file instead of a journal (`node_logs.py` header), so its stream holds
+the daemon's lines only, as unit `jaahd.service`.
 
 The stream is the node's ID (`ship_node_logs` writes it): a name is renameable and unique per org only, so a
 name-keyed stream let a tenant forge another host's lines. History shipped before that change sits in a stream
@@ -18,7 +19,7 @@ Message text is scrubbed (`fleet_verdicts.redact_credentials`) before the clip, 
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -29,9 +30,11 @@ from app import config, edition_features, fleet_verdicts
 from app.auth import require_operator
 from app.authz.catalog import Tenancy
 from app.authz.declarations import superadmin_only
-from app.db import get_session
+from app.clock import epoch_ms_or_none, to_epoch_ms
+from app.db_async import on_session
 from app.models.identity import AdminUser
 from app.routes.nodes.reads import _node_row
+from app.entity_shape import or_404
 
 router = APIRouter(tags=["nodes"])
 
@@ -56,13 +59,6 @@ class NodeJournalOut(BaseModel):
     before: datetime | None = None
 
 
-def _utc_ms(moment: datetime | None) -> int | None:
-    """Epoch ms of an ISO-8601 moment; a naive one is UTC."""
-    if moment is None:
-        return None
-    return int(moment.replace(tzinfo=moment.tzinfo or timezone.utc).timestamp() * 1000)
-
-
 def _entry(event: dict[str, object]) -> NodeJournalEntryOut | None:
     """One CloudWatch event as an entry: the shipper's `{unit, priority, message}` JSON, or the raw text whole."""
     raw = event.get("message")
@@ -80,9 +76,8 @@ def _entry(event: dict[str, object]) -> NodeJournalEntryOut | None:
         if isinstance(shipped_priority, int) and not isinstance(shipped_priority, bool):
             priority = shipped_priority
         text = str(parsed.get("message", ""))
-    try:
-        ts = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
-    except (OverflowError, OSError, ValueError):
+    ts = epoch_ms_or_none(timestamp)
+    if ts is None:
         return None
     return NodeJournalEntryOut(
         ts=ts,
@@ -111,22 +106,21 @@ def _read(
 
 @router.get("/api/nodes/{node_id}/journal", response_model=NodeJournalOut)
 @superadmin_only(Tenancy.OPERATOR)
+@on_session
 def get_node_journal(
+    session: Session,
     node_id: str,
     limit: int = Query(300, ge=1, le=1000),
     before: datetime | None = None,
     after: datetime | None = None,
     _: AdminUser = Depends(require_operator),
-    session: Session = Depends(get_session),
 ) -> NodeJournalOut:
     """The node's newest `limit` shipped journal lines up to `before` (default now) and not older than `after`,
     oldest first. 404 for an unknown node; 422 when `after` is not earlier than `before`."""
-    start_ms, end_ms = _utc_ms(after), _utc_ms(before)
+    start_ms, end_ms = to_epoch_ms(after), to_epoch_ms(before)
     if start_ms is not None and end_ms is not None and start_ms >= end_ms:
         raise HTTPException(status_code=422, detail="'after' must be earlier than 'before'")
-    row = _node_row(session, node_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"unknown node '{node_id}'")
+    row = or_404(_node_row(session, node_id), detail=f"unknown node '{node_id}'")
     if not edition_features.enabled("node_log_archive"):
         return NodeJournalOut(entries=[], error=_NOT_CONFIGURED, group_configured=False, before=before)
     from app.aws import json11

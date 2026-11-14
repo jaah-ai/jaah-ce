@@ -115,9 +115,6 @@ _TEMPLATE_DB_RE = re.compile(
     r"^cockpit_fixture_[0-9a-zA-Z]{1,%d}(?:_[0-9a-f]{%d})?(?:__building)?$" % (_MAX_HEAD_LEN, _DIGEST_LEN)
 )
 
-#: Pre-template long-lived databases; nothing creates them any more.
-_LEGACY_DB_RE = re.compile(r"^cockpit_test(?:_gw\d+)?$")
-
 #: An identifier safe to interpolate into DDL (`CREATE DATABASE` takes no parameters; fork names are typed).
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
@@ -248,7 +245,7 @@ def refuse_unless_stack_local() -> None:
     Two independent checks, fail-closed: `DB_SECRET_ARN` set (RDS; checked first, since there the URL
     host is not what gets dialled), and a URL host outside `db_credentials.LOCAL_DB_HOSTS` (catches
     forwards and the `awsdb` profile). CREATE/DROP FORCE/seeding a wrong DB is not undoable. A function
-    because `_build_here` writes via `app.db.SessionLocal`, bypassing `maintenance_connection`. Not a
+    because `_build_here` writes via `app.db.BridgedSession`, bypassing `maintenance_connection`. Not a
     security boundary.
     """
     if db_credentials.configured():
@@ -427,7 +424,7 @@ def _build_here() -> None:
     Refuses any target that is not a template under construction, so a mis-set `DATABASE_URL` cannot
     seed a fixture into a human's `cockpit`.
     """
-    # Host before name: this path writes via `SessionLocal`, not `maintenance_connection`.
+    # Host before name: this path writes via `BridgedSession`, not `maintenance_connection`.
     refuse_unless_stack_local()
     target = current_database()
     if not target.startswith(TEMPLATE_PREFIX):
@@ -446,11 +443,11 @@ def _build_here() -> None:
     # The dev seed's Live Cast publish enqueues into the engine's schema, which only a launch creates otherwise.
     migrate_system_schema()
 
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.seed import bootstrap
 
     # One call, `./dc seed --dev`'s spelling: the ordinary seed, then the dev profile.
-    with SessionLocal() as session:
+    with BridgedSession() as session:
         bootstrap(session, ensure=True, profile="dev")
         session.commit()
 
@@ -485,6 +482,16 @@ def clone(
     raise AssertionError("unreachable")  # pragma: no cover
 
 
+def _run_clones(conn) -> list[tuple[str, str]]:
+    """Every run clone on the server as `(name, owning run id)`."""
+    clones = []
+    for (name,) in conn.execute(_DATNAME_LIKE, (_like_prefix(RUN_DB_PREFIX),)).fetchall():
+        match = _RUN_DB_RE.match(name)
+        if match:
+            clones.append((name, match.group("run")))
+    return clones
+
+
 def drop_run_databases(
     run_id: str,
     *,
@@ -494,12 +501,8 @@ def drop_run_databases(
     run's own."""
     dropped: list[str] = []
     with maintenance_connection() as conn:
-        rows = conn.execute(
-            _DATNAME_LIKE, (_like_prefix(RUN_DB_PREFIX),)
-        ).fetchall()
-        for (name,) in rows:
-            match = _RUN_DB_RE.match(name)
-            if match and match.group("run") == run_id and _drop(conn, name, force=True):
+        for name, owner in _run_clones(conn):
+            if owner == run_id and _drop(conn, name, force=True):
                 dropped.append(name)
     if dropped:
         announce(f"fixture: dropped {', '.join(sorted(dropped))}")
@@ -511,7 +514,7 @@ def reclaim(
     run_id: str,
     announce: Callable[[str], None] = _noop,
 ) -> list[str]:
-    """Drop every clone whose owning run is gone, plus any pre-template long-lived database.
+    """Drop every clone whose owning run is gone.
 
     The only reclaim path for killed runs (no teardown ran). Liveness is asked, not assumed: each run
     holds an advisory lock on its id, so a takeable lock means a dead owner, and concurrent sessions
@@ -519,19 +522,7 @@ def reclaim(
     """
     reclaimed: list[str] = []
     with maintenance_connection() as conn:
-        rows = conn.execute(
-            _DATNAME_LIKE, (_like_prefix(RUN_DB_PREFIX),)
-        ).fetchall()
-        for (name,) in rows:
-            if _LEGACY_DB_RE.match(name):
-                # Pre-template residue; never forced, in case an old session still uses it.
-                if _drop(conn, name, force=False):
-                    reclaimed.append(name)
-                continue
-            match = _RUN_DB_RE.match(name)
-            if not match:
-                continue
-            owner = match.group("run")
+        for name, owner in _run_clones(conn):
             if owner == run_id:
                 continue
             key1, key2 = run_lock_key(owner)
@@ -585,7 +576,7 @@ def _fork(name: str) -> None:
     if name in _RESERVED or name == current_database() or name == E2E_DB_NAME:
         raise SystemExit(f"./dc db fork: {name!r} is not a name you may fork onto.")
     # Nor a name the harness reclaims: a run-id-shaped name would be force-dropped by the next `./dc test`.
-    if _RUN_DB_RE.match(name) or _LEGACY_DB_RE.match(name) or name.startswith(TEMPLATE_PREFIX):
+    if _RUN_DB_RE.match(name) or name.startswith(TEMPLATE_PREFIX):
         raise SystemExit(
             f"./dc db fork: {name!r} has the shape of a database the test harness owns and reclaims by "
             f"itself — the next `./dc test` would drop it while you were using it. Pick a name that is "

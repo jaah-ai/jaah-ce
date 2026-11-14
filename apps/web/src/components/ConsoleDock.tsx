@@ -17,7 +17,6 @@
 import {
   Suspense,
   createContext,
-  lazy,
   useCallback,
   useContext,
   useEffect,
@@ -25,6 +24,7 @@ import {
   useState,
   useSyncExternalStore,
 } from 'react'
+import { lazyRetry } from '../lib/lazyRetry'
 import { useQueryClient } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import { useTheme } from '@mui/material/styles'
@@ -54,7 +54,7 @@ import { useViewportWidth } from '../hooks/useViewportWidth'
 import type { Worktree } from '../types'
 import { useConsoleRuntime } from './console/consoleRuntime'
 
-const ConsoleTerminal = lazy(() => import('./ConsoleTerminal'))
+const ConsoleTerminal = lazyRetry(() => import('./ConsoleTerminal'))
 
 /** What a page hands over when it opens a console.
  *  `mayEdit` is REQUIRED — the server's per-row `may_edit` verdict; fail-closed (see ConsoleTerminal.tsx): a
@@ -383,7 +383,7 @@ function OpenConsole({
               aria-label="Loading console…"
               sx={
                 presentation === 'modal'
-                  ? { position: 'fixed', inset: 0, zIndex: 60, bgcolor: 'rgba(0, 0, 0, 0.55)' }
+                  ? { position: 'fixed', inset: 0, zIndex: (t) => t.zIndex.mobileStepper, bgcolor: 'rgba(0, 0, 0, 0.55)' }
                   : docked
                     /* Fills the dock-sized wrapper, so the app reflows once, on open. */
                     ? { flex: 1, bgcolor: 'background.default' }
@@ -396,7 +396,7 @@ function OpenConsole({
         >
           <ConsoleTerminal
             /* KEYED ON THE SLOT (clean terminal per slot), never on `presentation` — see header. */
-            key={`${request.projectId}/${request.number}/${request.nodeId ?? 'cp'}/${request.kind ?? 'clauded'}/${request.provider ?? ''}/${request.view ?? ''}`}
+            key={`${request.projectId}/${request.number}/${request.nodeId ?? 'cp'}/${request.kind ?? 'clauded'}/${request.view ?? ''}`}
             project={request.project}
             projectId={request.projectId}
             number={request.number}
@@ -407,7 +407,6 @@ function OpenConsole({
             /* THE OPENER'S ANSWER, NOT REFINED from `liveRow`: it describes the slot at the click, only to
                explain an empty dial; re-reading a moved row could flip a justified `false` to `true`. */
             hadLiveSession={request.hadLiveSession}
-            provider={request.provider}
             view={request.view}
             onClose={onClose}
             presentation={presentation}

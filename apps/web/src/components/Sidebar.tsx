@@ -1,4 +1,4 @@
-import { useState, type MouseEvent, type ReactNode } from 'react'
+import { useRef, useState, type MouseEvent, type ReactNode } from 'react'
 import useMediaQuery from '@mui/material/useMediaQuery'
 import Popover from '@mui/material/Popover'
 import { Link, useLocation } from 'react-router-dom'
@@ -14,26 +14,28 @@ import MenuItem from '@mui/material/MenuItem'
 import Paper from '@mui/material/Paper'
 import Toolbar from '@mui/material/Toolbar'
 import Typography from '@mui/material/Typography'
-import type { Theme } from '@mui/material/styles'
+import { useTheme, type Theme } from '@mui/material/styles'
 import { useAuth, useCan } from '../auth'
 import { CLOUD } from '../lib/cloudSurfaces'
 import { CLOUD_SIGNUP_URL, SITE_URL } from '../lib/edition'
-import { isEnabled } from '../lib/editionFeatures'
+import { isEnabled, type FeatureName } from '../lib/editionFeatures'
+import { countOf } from '../lib/humanize'
 import { useCeLimits } from '../lib/communityEdition'
 import { isOrgAdminSeat } from '../lib/orgAdmin'
-import { planSwitchOn } from '../lib/planSwitches'
-import { managesAccess } from '../lib/accessRequests'
+import { planSurfaceShown, planSwitchOn, type RosterSwitch } from '../lib/planSwitches'
 import { ADD_NAME, isNameless, memberName } from '../lib/memberLabel'
 import { SCOPE_PARAM } from '../lib/taskScope'
-import { useAutomationTabs } from '../lib/automationTabs'
+import { isInCustomize, useCustomizeTabs } from '../lib/customizeTabs'
 import { isInDirectory, useDirectoryTabs } from '../lib/directoryTabs'
 import { useNotFoundShown } from '../lib/notFound'
 import { useTaskTree } from '../hooks/useTaskTree'
-import { usePendingOrgCount, usePendingRequestCount, usePendingTrustRequestCount } from '../hooks/usePendingCount'
+import { useOpenTicketCount, usePendingOrgCount, usePendingTrustRequestCount } from '../hooks/usePendingCount'
 import { useHealth } from '../hooks/useHealth'
-import { useVersionCheck } from '../hooks/useVersionCheck'
 import type { PermissionKey } from '../types'
-import { ABOVE_PHONE, BOTTOM_NAV_HEIGHT, PHONE, PHONE_QUERY, schemed } from '../ui/listStyles'
+import CountPill from '../ui/CountPill'
+import { usePhone } from '../hooks/usePhone'
+import { ABOVE_PHONE, BOTTOM_NAV_HEIGHT, PHONE, schemed, SIDEBAR_NARROW_QUERY as NARROW_QUERY } from '../ui/listStyles'
+import { FONT_SIZE, FONT_WEIGHT, grid, LETTER_SPACING, LINE_HEIGHT, RADIUS, SIZE } from '../theme'
 import { APP_VERSION } from '../version'
 import BrandMark from './BrandMark'
 import BrandWordmark from './BrandWordmark'
@@ -48,25 +50,30 @@ import TaskTree from './tasks/rail/TaskTree'
 import SetupNavButton, { SetupNavBadge, useFoldedGuideProgress } from './onboarding/SetupNavButton'
 import { stoppedPhrase } from './tasks/rail/railModel'
 import {
-  BoltIcon, CogIcon, ContrastIcon, FolderIcon, LogIcon, MoreHorizIcon,
-  PersonIcon, RefreshIcon, TasksIcon, TemplatesIcon,
+  AlertIcon, CogIcon, ContrastIcon, FolderIcon, LogIcon, MoreHorizIcon,
+  PersonIcon, SlidersIcon, SupportIcon, TasksIcon,
 } from '../ui/icons'
 import { ThemeField } from './UserSettingsFields'
 import type { UserSettingsDraft } from '../lib/userSettings'
-import { readString, writeString } from '../lib/safeStorage'
+import { readString, removeKey, writeString } from '../lib/safeStorage'
+import { DIVIDER_PX } from '../lib/splitPane'
+import { parseSidebarWidth, resolveSidebarDrag, SIDEBAR_MAX_PX, SIDEBAR_MIN_PX, SIDEBAR_WIDTH_KEY } from '../lib/sidebarWidth'
+import SplitDivider from './SplitDivider'
+import Tip from '../ui/Tip'
+import { memoryOffered, mergeLanesOffered } from '../pages/audit/projectAuditTabs'
 
 /* THE RAIL — two lists split by one divider:
  *   · the task tree (`tasks/rail/TaskTree.tsx`): Pinned, All projects › Project › Feature, each
  *     node with its Stopped count. Collapsed, it hides behind the Tasks entry (a flyout); on a phone the Tasks
  *     slot opens it in a sheet once the board is showing;
- *   · the destinations: Directory, Automation, Audit, Customers and Products (the operator's), Settings — pinned to the rail's bottom,
- *     above the footer; the operator's Dashboard alone heads the rail, above the tree. Support (and its Requests tab) is no rail row: it lives in the user badge's menu, which
- *     carries the pending-requests count.
+ *   · the destinations: Directory, Reports (an Owner's/Admin's and the operator's), Customize, Deployments, Incidents, Support (the operator's, with
+ *     its open-ticket count), Compliance, Audit, Customers, Products and Agent index (the operator's), Settings — pinned to the rail's bottom,
+ *     above the footer. Everyone else reaches Support from the user badge's menu.
  * Above both, while onboarding is unfinished: the Setup button with its percentage (`onboarding/SetupNavButton.tsx`;
  * the phone's More sheet heads with it).
- * Header: brand, connection dot, bell, collapse toggle. Above the footer, during a per-agent plan's free trial: the
- * trial meter (`TrialAgentsMeter.tsx`; the phone's sits in the More sheet). Footer: ONE line — the user badge (a menu: the org
- * switcher, then Support, My Profile, Sign out), the first name, the version, Help (the support chat).
+ * Header: brand, connection dot, bell, collapse toggle. Above the footer, on a per-agent plan (trial or paid): the
+ * agents throttle (`TrialAgentsMeter.tsx`; the phone's sits in the More sheet). Footer: ONE line — the user badge (a menu: the org
+ * switcher, then Support (not the operator's: theirs is the rail row), My Profile, Sign out), the first name, the version, Help (the support chat).
  * Three shapes: the expanded rail, the collapsed rail (abbreviations), and the ≤480px bottom bar (four
  * slots + "More", a sheet carrying everything else and the account actions).
  *
@@ -91,7 +98,7 @@ export type Destination = {
   /* The phone bar's word when `label` would not fit its ~50px slot at 360px. */
   barLabel?: string
   /* The addresses this row is active on: `path` owns itself and everything under it; `exact` only itself;
-     `under` only what is under it; `except` lists addresses under it that belong to no row. Kept beside the
+     `under` only what is under it; `except` lists addresses (and what is under them) that belong to another row or none. Kept beside the
      row so a rename sees it. */
   owns: readonly { path: string; exact?: boolean; under?: boolean; except?: readonly string[] }[]
   /* A member of a TENANT org; never the operator plane, which has no plan. */
@@ -105,29 +112,29 @@ export type Destination = {
   requiresAny?: readonly PermissionKey[]
   /* Offered only while the viewer's org has Portfolio Compliance (`Admin.compliance_enabled`). */
   requiresCompliance?: boolean
+  /* A plan feature's surface: hidden from a tenant while this switch is off (`lib/planSwitches.tsx::planSurfaceShown`). */
+  planSurface?: RosterSwitch
+  /* An edition feature's surface: offered only while it is enabled (`lib/editionFeatures.ts::isEnabled`). */
+  feature?: FeatureName
 }
 
-/* Hand-ordered (`NAV_ORDER`); one word each, naming the area — its pages carry no title repeating it. Directory's and Automation's `to` and gate are resolved
-   per viewer from `lib/directoryTabs.ts` / `lib/automationTabs.ts` (the first offered tab; offered when any
+/* Hand-ordered (`NAV_ORDER`); one word each, naming the area — its pages carry no title repeating it. Directory's and Customize's `to` and gate are resolved
+   per viewer from `lib/directoryTabs.ts` / `lib/customizeTabs.ts` (the first offered tab; offered when any
    tab is), so their entries here carry neither. */
 const CORE_DESTINATIONS: readonly Destination[] = [
   { key: 'directory', to: '', label: 'Directory', abbr: 'Di', icon: <FolderIcon />, owns: [] },
-  /* The template gallery, for every member (`pages/templates/TemplatesPage.tsx`); its manage and editor pages sit under it. */
-  { key: 'templates', to: '/templates', label: 'Templates', abbr: 'Tp', icon: <TemplatesIcon />, barLabel: 'Templ.', owns: [{ path: '/templates' }] },
-  /* Automations, Playbooks and Slots, plus the retired Schedule/Triggers addresses that redirect into them. EXACT on
-     `/workflows`: the operator-only `/workflows/:name` and `/workflows/personas/:persona` detail pages belong to Audit. */
-  {
-    key: 'automation',
-    to: '',
-    label: 'Automation',
-    abbr: 'At',
-    icon: <BoltIcon />,
-    barLabel: 'Auto',
-    owns: [{ path: '/automations' }, { path: '/workflows', exact: true }, { path: '/crons' }, { path: '/triggers' }, { path: '/playbooks' }, { path: '/worktrees' }],
-  },
+  /* Playbooks, Templates, Agents and Compliance Packs, and every editor under them (`lib/customizeTabs.ts::isInCustomize`). */
+  { key: 'customize', to: '', label: 'Customize', abbr: 'Cz', icon: <SlidersIcon />, barLabel: 'Custom', owns: [] },
+  /* Production QA's incidents (`production_qa`). Twin of `App.tsx`'s guard on them. */
+  { key: 'incidents', to: '/incidents', label: 'Incidents', abbr: 'In', icon: <AlertIcon />, barLabel: 'Incid.', owns: [{ path: '/incidents' }], requires: 'projects:view', planSurface: 'production_qa' },
+  /* The operator's ticket queue (`routesCloud.tsx`'s `/support`), badged with every org's open tickets; offered while
+     `support_assistant` is enabled. Not a phone-bar slot: it sits in the More sheet, whose button carries its dot. */
+  { key: 'support', to: '/support', label: 'Support', abbr: 'Sup', icon: <SupportIcon />, barLabel: 'Support', owns: [{ path: '/support' }], operatorOnly: true, feature: 'support_assistant' },
   /* Twin of `App.tsx`'s guards (`audit:view`/`sessions:view`/`tasks:create` over `/audit*`, `sessions:view`
      over `/sessions*`); the shell (`pages/audit/AuditPage.tsx`) gates each tab on its own key. A tenant is offered
-     Activity and Sessions alone, each while its plan switch is on (`auditTenant` below). */
+     Activity and Sessions alone, each while its plan switch is on (`auditTenant` below), Merge lanes and Memory to a
+     `projects:view` holder (`pages/audit/projectAuditTabs.ts`), and an org admin Automations
+     (`/automations`), the org-wide list; the operator also Slots (`/worktrees`). */
   {
     key: 'audit',
     to: '/audit',
@@ -135,16 +142,17 @@ const CORE_DESTINATIONS: readonly Destination[] = [
     abbr: 'Au',
     icon: <LogIcon />,
     // `/workflows/:name` and `/workflows/personas/:persona`: the catalogue's and Personas' detail pages.
-    owns: [{ path: '/audit' }, { path: '/sessions' }, { path: '/workflows', under: true }],
-    requiresAny: ['audit:view', 'sessions:view', 'tasks:create'],
+    owns: [{ path: '/audit' }, { path: '/sessions' }, { path: '/workflows', under: true }, { path: '/automations' }, { path: '/worktrees' }],
+    requiresAny: ['audit:view', 'sessions:view', 'tasks:create', 'projects:view'],
   },
-  /* Read by `system:view`, saved by the operator only (`routes/settings.py::is_operator`). */
-  { key: 'settings', to: '/settings', label: 'Settings', abbr: 'St', icon: <CogIcon />, owns: [{ path: '/settings' }], requires: 'system:view' },
+  /* Read by `system:view`, saved by the operator only (`tenancy/ids.py::is_operator_user`). `/integrations/trackers`
+     is reached from Settings › Integrations, so it lights this row. */
+  { key: 'settings', to: '/settings', label: 'Settings', abbr: 'St', icon: <CogIcon />, owns: [{ path: '/settings' }, { path: '/integrations' }], requires: 'system:view' },
 ]
 
 /* The rail's order, over both homes: these rows and the cloud console's own (`routesCloud.tsx`'s `cloudNavItems` —
-   Dashboard, Customers, Products, Billing and Compliance — absent from the community edition, `lib/cloudSurfaces.ts`). */
-const NAV_ORDER = ['dashboard', 'directory', 'templates', 'automation', 'compliance', 'audit', 'customers', 'products', 'settings', 'plan'] as const
+   Reports, Customers, Products, Billing and Compliance — absent from the community edition, `lib/cloudSurfaces.ts`). */
+const NAV_ORDER = ['directory', 'reports', 'customize', 'incidents', 'support', 'compliance', 'audit', 'customers', 'products', 'agent-index', 'settings', 'plan'] as const
 const DESTINATIONS: readonly Destination[] = NAV_ORDER.flatMap(key => {
   const d = [...CORE_DESTINATIONS, ...(CLOUD?.cloudNavItems ?? [])].find(row => row.key === key)
   return d ? [d] : []
@@ -157,8 +165,8 @@ const TrialAgentsMeter = CLOUD?.TrialAgentsMeter
    the "More" sheet. The length is also the budget the active-route swap-in spends against. */
 const BAR_KEYS = ['tasks', 'directory', 'audit', 'settings'] as const
 
-/* Above the phone bar and below 900px (Settings' compact breakpoint): the rail starts collapsed whatever was saved. */
-const NARROW_QUERY = '(min-width:480.05px) and (max-width:899.95px)'
+/* `NARROW_QUERY` — above the phone bar and below 900px (Settings' compact breakpoint): the rail starts collapsed
+   whatever was saved. */
 
 /** The phone's bottom sheets (the tree and More): docked above the bar, scrolling within the viewport above it. */
 const BOTTOM_SHEET_SX = (t: Theme) => ({
@@ -171,10 +179,10 @@ const BOTTOM_SHEET_SX = (t: Theme) => ({
   zIndex: 41,
   maxHeight: `calc(100dvh - ${2 * BOTTOM_NAV_HEIGHT}px)`,
   overflowY: 'auto',
-  borderRadius: 0,
+  borderRadius: RADIUS.none,
   borderTop: '1px solid',
-  boxShadow: '0 -4px 16px rgba(0, 0, 0, 0.25)',
-  padding: '0.5rem 0.5rem calc(0.5rem + env(safe-area-inset-bottom, 0px))',
+  boxShadow: 8,
+  padding: `${grid(1)} ${grid(1)} calc(${grid(1)} + env(safe-area-inset-bottom, ${grid(0)}))`,
   ...schemed(t, c => ({ backgroundColor: c.bg, borderColor: c.border, color: c.text })),
 } as const)
 
@@ -203,7 +211,7 @@ type RailRow = {
 function owned(pathname: string, owns: Destination['owns']): boolean {
   return owns.some(
     ({ path, exact, under, except }) =>
-      !except?.includes(pathname) && ((!under && pathname === path) || (!exact && pathname.startsWith(`${path}/`))),
+      !except?.some(gone => pathname === gone || pathname.startsWith(`${gone}/`)) && ((!under && pathname === path) || (!exact && pathname.startsWith(`${path}/`))),
   )
 }
 
@@ -223,19 +231,19 @@ function railRow(t: Theme) {
   return {
     display: 'flex',
     alignItems: 'center',
-    gap: '0.375rem',
-    padding: '0.25rem 0.75rem',
-    margin: '0 0.375rem',
-    borderRadius: '4px',
-    fontSize: '0.8125rem',
-    fontWeight: 400,
+    gap: 1,
+    padding: `${grid(0.5)} ${grid(2)}`,
+    margin: `0 ${grid(1)}`,
+    borderRadius: RADIUS.sm,
+    fontSize: FONT_SIZE.md,
+    fontWeight: FONT_WEIGHT.regular,
     textDecoration: 'none',
     ...schemed(t, c => ({ color: c.text })),
     ...focusRing(t),
     '&:hover': schemed(t, c => ({ backgroundColor: c.hoverBg, color: c.textStrong })),
     '&.Mui-selected': {
       ...schemed(t, c => ({ backgroundColor: c.activeBg, color: c.textActive })),
-      fontWeight: 500,
+      fontWeight: FONT_WEIGHT.medium,
       position: 'relative',
       // The 3px left accent.
       '&::before': {
@@ -244,9 +252,10 @@ function railRow(t: Theme) {
         left: 0,
         top: 0,
         bottom: 0,
-        width: '3px',
+        width: grid(0.5),
         ...schemed(t, c => ({ backgroundColor: c.accent })),
-        borderRadius: '0 2px 2px 0',
+        borderTopRightRadius: RADIUS.sm,
+        borderBottomRightRadius: RADIUS.sm,
       },
       '&:hover': schemed(t, c => ({ backgroundColor: c.activeBg })),
     },
@@ -256,34 +265,12 @@ function railRow(t: Theme) {
   }
 }
 
-/** The collapsed rail's and the bar's Stopped total on the Tasks entry: a small filled count, aria-hidden (the
- *  row's label names it). */
+/** The collapsed rail's and the bar's Stopped total on the Tasks entry: the amber count coin (`ui/CountPill`) on the
+ *  icon's corner, aria-hidden (the row's label names it). */
 function StoppedBadge({ count }: { count: number }) {
-  if (count <= 0) return null
   return (
-    <Box
-      component="span"
-      data-testid="nav-tasks-stopped"
-      aria-hidden="true"
-      sx={{
-        position: 'absolute',
-        top: 1,
-        right: 2,
-        minWidth: 14,
-        height: 14,
-        padding: '0 3px',
-        borderRadius: '7px',
-        fontSize: '0.5625rem',
-        fontWeight: 700,
-        lineHeight: '14px',
-        textAlign: 'center',
-        boxSizing: 'border-box',
-        color: 'warning.contrastText',
-        backgroundColor: 'warning.main',
-      }}
-    >
-      {count > 99 ? '99+' : count}
-    </Box>
+    <CountPill count={count} tone="warning" max={99} testId="nav-tasks-stopped"
+      sx={{ position: 'absolute', top: 1, right: 0, minWidth: SIZE.iconXs, height: SIZE.iconXs }} />
   )
 }
 
@@ -291,36 +278,13 @@ function StoppedBadge({ count }: { count: number }) {
  *  aria-hidden — the row's `srSuffix` names the count. */
 function countBadge(count: number, testId: string): Pick<RailRow, 'trailing' | 'dot'> {
   return {
-    trailing: (
-      <Box
-        component="span"
-        data-testid={testId}
-        aria-hidden="true"
-        sx={{
-          flex: '0 0 auto',
-          marginLeft: 'auto',
-          minWidth: 16,
-          height: 16,
-          padding: '0 4px',
-          borderRadius: '8px',
-          fontSize: '0.625rem',
-          fontWeight: 700,
-          lineHeight: '16px',
-          textAlign: 'center',
-          boxSizing: 'border-box',
-          color: 'error.contrastText',
-          backgroundColor: 'error.main',
-        }}
-      >
-        {count > 50 ? '50+' : count}
-      </Box>
-    ),
+    trailing: <CountPill count={count} testId={testId} sx={{ marginLeft: 'auto' }} />,
     dot: (
       <StatusDot
         data-testid={`${testId}-dot`}
         tone="error"
-        size={7}
-        sx={{ position: 'absolute', top: 3, right: 5 }}
+        size={grid(1)}
+        sx={{ position: 'absolute', top: grid(0.5), right: grid(0.5) }}
       />
     ),
   }
@@ -361,29 +325,38 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
   const [narrowExpanded, setNarrowExpanded] = useState(false)
   if (!narrow && narrowExpanded) setNarrowExpanded(false)
   const collapsed = narrow ? !narrowExpanded : savedCollapsed
+  // The dragged width (`lib/sidebarWidth.ts`); `null` keeps the theme's default.
+  const [savedWidth, setSavedWidth] = useState(() => parseSidebarWidth(readString('local', SIDEBAR_WIDTH_KEY)))
+  const asideRef = useRef<HTMLElement>(null)
+  const theme = useTheme()
+  // A drag's move handler is bound once at pointer-down, so it reads the shape through a ref.
+  const collapsedRef = useRef(collapsed)
+  collapsedRef.current = collapsed
   const [moreOpen, setMoreOpen] = useState(false)
   const foldedGuide = useFoldedGuideProgress()
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null)
-  // The one useVersionCheck() for the authenticated app: Sidebar mounts once per session (AuthLayout,
-  // sibling of the Outlet); /login renders no Sidebar. Same single-detector rule for connection health.
-  const updateAvailable = useVersionCheck()
+  // The one connection-health detector for the authenticated app: Sidebar mounts once per session (AuthLayout,
+  // sibling of the Outlet); /login renders no Sidebar. The update check's one call is `UpdateBanner`'s.
   const health = useHealth()
-  const pendingRequests = usePendingRequestCount(isEnabled('users_invites') && managesAccess(admin))
   /* Operator-only reads wait for the live identity: a load seeded from another seat's snapshot (an org switch, a
      second sign-in) would ask as the operator and draw a 403. */
   const decidesOrgs = isEnabled('multi_org_tenancy') && admin?.is_operator === true && !resolving
   const pendingOrgs = usePendingOrgCount(decidesOrgs)
   const pendingTrust = usePendingTrustRequestCount(decidesOrgs)
+  const operatorSupport = isEnabled('support_assistant') && admin?.is_operator === true && !resolving
+  const openTickets = useOpenTicketCount(operatorSupport)
   const canTasks = can('tasks:view')
+  // The account menu's Support: everyone's but the operator's, whose way in is the rail row.
+  const accountSupport = isEnabled('support_assistant') && admin != null && admin.is_operator !== true
   /* Without Users and invitations there is no team: in the user menu one line points to Jaah Cloud (`CloudUpsell.tsx`, upsell 4). */
   const ceLimits = useCeLimits()
   const inviteUpsell = !isEnabled('users_invites') && (
-    <CloudUpsell cta="Invite your team on Jaah Cloud" href={ceLimits.data?.upgrade_url ?? CLOUD_SIGNUP_URL} testId="upsell-invite" sx={{ px: 2, py: 0.75 }} />
+    <CloudUpsell cta="Invite your team on Jaah Cloud" href={ceLimits.data?.upgrade_url ?? CLOUD_SIGNUP_URL} testId="upsell-invite" sx={{ px: 2, py: 0.5 }} />
   )
   const { tree } = useTaskTree(canTasks)
   const directoryTabs = useDirectoryTabs()
-  const automationTabs = useAutomationTabs()
-  const phone = useMediaQuery(PHONE_QUERY)
+  const customizeTabs = useCustomizeTabs()
+  const phone = usePhone()
   // The collapsed rail's flyout anchor, and the phone's tree sheet.
   const [flyoutAnchor, setFlyoutAnchor] = useState<HTMLElement | null>(null)
   const [treeSheetOpen, setTreeSheetOpen] = useState(false)
@@ -393,7 +366,7 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
   const onBoard = pathname === '/tasks'
   const inTasks = litPath === '/tasks' || litPath.startsWith('/tasks/') || (live !== undefined && litPath === '/')
   /* The Tasks entry: the board's own URL while on it (so a click keeps its scope and filters), a bare `/tasks` from
-     elsewhere — the user's focused project, else All projects (`lib/focusedProject.ts`). Expanded, the tree stands in for it; collapsed and on the bar it is the tree's handle. */
+     elsewhere, which opens on All projects. Expanded, the tree stands in for it; collapsed and on the bar it is the tree's handle. */
   const stopped = tree?.counts.stopped ?? 0
   const scopeRows: RailRow[] = live
     /* Never lit itself (the project row is); the phone bar lights its slot on the board (`barLit`). */
@@ -418,22 +391,27 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
 
   const auditTenant = (can('audit:view') && planSwitchOn(admin, 'audit_enabled'))
     || (can('sessions:view') && planSwitchOn(admin, 'session_transcripts_enabled'))
+    // Merge lanes and Memory, by the shell's own rule.
+    || mergeLanesOffered(can) || memoryOffered(admin, can)
   // A visitor opens none of the console's areas.
   const destinationRows: RailRow[] = live ? [] : DESTINATIONS.flatMap(d => {
     if (d.key === 'directory') {
       if (directoryTabs.length === 0) return []
       return [{ key: d.key, to: directoryTabs[0].path, label: d.label, abbr: d.abbr, icon: d.icon, active: isInDirectory(litPath) }]
     }
-    if (d.key === 'automation') {
-      if (automationTabs.length === 0) return []
-      return [{ key: d.key, to: automationTabs[0].path, label: d.label, barLabel: d.barLabel, abbr: d.abbr, icon: d.icon, active: owned(litPath, d.owns) }]
+    if (d.key === 'customize') {
+      if (customizeTabs.length === 0) return []
+      return [{ key: d.key, to: customizeTabs[0].path, label: d.label, barLabel: d.barLabel, abbr: d.abbr, icon: d.icon, active: isInCustomize(litPath) }]
     }
     const visible =
-      (d.key !== 'audit' || admin?.is_operator === true || auditTenant) &&
+      // An org admin always has Audit's Automations tab, whatever the plan's audit switches say.
+      (d.key !== 'audit' || admin?.is_operator === true || auditTenant || isOrgAdminSeat(admin)) &&
       (!d.tenantOnly || (admin?.tenant !== false && admin?.is_operator !== true)) &&
       (!d.operatorOnly || admin?.is_operator === true) &&
       (!d.orgAdminOnly || isOrgAdminSeat(admin)) &&
       (!d.requiresCompliance || admin?.compliance_enabled === true) &&
+      (!d.planSurface || planSurfaceShown(admin, d.planSurface)) &&
+      (!d.feature || isEnabled(d.feature)) &&
       (!d.requires || can(d.requires)) &&
       (!d.requiresAny || d.requiresAny.some(key => can(key)))
     if (!visible) return []
@@ -442,9 +420,13 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
     if (d.key === 'customers' && pendingOrgs + pendingTrust > 0) {
       Object.assign(row, countBadge(pendingOrgs + pendingTrust, 'nav-orgs-pending-count'))
       row.srSuffix = ', ' + [
-        pendingOrgs > 0 ? `${pendingOrgs} org${pendingOrgs === 1 ? '' : 's'} awaiting approval` : '',
-        pendingTrust > 0 ? `${pendingTrust} document request${pendingTrust === 1 ? '' : 's'} awaiting a decision` : '',
+        pendingOrgs > 0 ? `${countOf(pendingOrgs, 'org')} awaiting approval` : '',
+        pendingTrust > 0 ? `${countOf(pendingTrust, 'document request')} awaiting a decision` : '',
       ].filter(Boolean).join(', ')
+    }
+    if (d.key === 'support' && openTickets > 0) {
+      Object.assign(row, countBadge(openTickets, 'nav-support-open-count'))
+      row.srSuffix = `, ${countOf(openTickets, 'open ticket')}`
     }
     return [row]
   })
@@ -460,10 +442,6 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
     testId: 'nav-live-project',
   }))
 
-  /* The Dashboard heads the rail; every other destination stays pinned to its foot. */
-  const topRows = destinationRows.filter(r => r.key === 'dashboard')
-  const footRows = destinationRows.filter(r => r.key !== 'dashboard')
-
   /* THE BAR: its slots, narrowed to what this viewer may open. If the active row is not a slot it replaces the
      last one, so the current page always has a lit tab — only when the bar is full, so nothing overflows at
      320px. Project rows never take a slot: on the board, the Tasks slot is the lit one. */
@@ -475,32 +453,31 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
     if (barKeys.size >= BAR_KEYS.length) barKeys.delete(barRows[barRows.length - 1].key)
     barKeys.add(activeDestination.key)
   }
-
-  /* Access requests live under Support (its Requests tab), so the count of those waiting on this viewer rides
-     the Support links. */
-  const supportCount = pendingRequests > 0 && (
-    <Box component="span" sx={{ display: 'inline-flex', ml: 1 }}>{countBadge(pendingRequests, 'sidebar-support-requests-count').trailing}</Box>
-  )
-  const supportName = pendingRequests > 0 ? `Support, ${pendingRequests} pending request${pendingRequests === 1 ? '' : 's'}` : undefined
+  /* The More sheet's rows. A counted one (`countBadge`'s pill) dots the More button and names its count there. */
+  const sheetRows = allRows.filter(row => row.key !== 'tasks' && !barKeys.has(row.key))
+  const sheetCounts = sheetRows.filter(row => row.trailing !== undefined).map(row => row.srSuffix ?? '').join('')
 
   /* A nameless account shows its email whole rather than passing its prefix off as a name (`lib/memberLabel.ts::isNameless`). */
   const nameless = admin ? isNameless(admin) : false
+  /* The name ask's quiet mark (a dot), where others see the email: not in the community edition, whose one user is
+     the only one who sees anything. No page carries standing prose for it. */
+  const askName = nameless && isEnabled('users_invites')
   const firstName = admin?.first_name?.trim() || admin?.last_name?.trim() || ''
   const fullName = admin ? memberName(admin) : ''
   /* The footer badge's circle — shared by the initials and the nameless glyph, so both draw the same ring. */
   const userBadgeSx = {
     flexShrink: 0,
-    width: 24,
-    height: 24,
-    borderRadius: '50%',
-    border: '1.5px solid currentColor',
+    width: SIZE.iconLg,
+    height: SIZE.iconLg,
+    borderRadius: RADIUS.round,
+    border: '1px solid currentColor',
     boxSizing: 'border-box',
     display: 'inline-flex',
     alignItems: 'center',
     justifyContent: 'center',
-    fontSize: '0.625rem',
-    fontWeight: 700,
-    letterSpacing: '0.02em',
+    fontSize: FONT_SIZE.xxs,
+    fontWeight: FONT_WEIGHT.bold,
+    letterSpacing: LETTER_SPACING.none,
   } as const
   const themeField = live && <ThemeField value={live.theme} onChange={live.onThemeChange} defaultTheme={live.defaultTheme} />
   /* The viewer's two doors into the console, built once; none when the API named no console (then nothing links). */
@@ -510,16 +487,34 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
      Theme button stands alone there too. */
   const accountMenu = live !== undefined && collapsed && auth !== null
 
-  function toggle() {
+  function setCollapsed(next: boolean) {
     if (narrow) {
-      setNarrowExpanded(e => !e)
+      setNarrowExpanded(!next)
       return
     }
-    setSavedCollapsed(c => {
-      const next = !c
-      writeString('local', 'sidebar-collapsed', String(next))
-      return next
-    })
+    setSavedCollapsed(next)
+    writeString('local', 'sidebar-collapsed', String(next))
+  }
+
+  const toggle = () => setCollapsed(!collapsed)
+
+  /* The edge strip straddles the rail's right edge, so the edge sits half a strip right of the strip's left. */
+  function onEdgeMove(position: number, grabOffset: number) {
+    const left = asideRef.current?.getBoundingClientRect().left ?? 0
+    const drag = resolveSidebarDrag(position - grabOffset + DIVIDER_PX / 2 - left)
+    if (drag.collapsed) {
+      if (!collapsedRef.current) setCollapsed(true)
+      return
+    }
+    if (collapsedRef.current) setCollapsed(false)
+    setSavedWidth(drag.width)
+    writeString('local', SIDEBAR_WIDTH_KEY, String(drag.width))
+  }
+
+  function resetWidth() {
+    setSavedWidth(null)
+    removeKey('local', SIDEBAR_WIDTH_KEY)
+    if (collapsed) setCollapsed(false)
   }
 
   function openMenu(e: MouseEvent<HTMLElement>) {
@@ -548,8 +543,7 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
     const barLit = row.key === 'tasks' && !sheet && inTasks && !active
     const overflow = !barKeys.has(row.key)
     return (
-      <ListItemButton
-        key={row.key}
+      <Tip key={row.key} title={row.label}><ListItemButton
         {...(row.onSelect
           ? {
               component: 'a',
@@ -566,7 +560,6 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
               onClick: row.key === 'tasks' && !sheet && !live ? (e: MouseEvent<HTMLElement>) => openTree(e) : undefined,
             })}
         aria-haspopup={row.key === 'tasks' && !sheet && !live && (collapsed || phone) ? 'tree' : undefined}
-        title={row.label}
         // The accessible name in every shape: the collapsed rail and the bar show only an abbreviation, and
         // the counts only as an aria-hidden dot.
         aria-label={`${row.label}${row.srSuffix ?? ''}`}
@@ -579,16 +572,16 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
         sx={(t: Theme) => ({
           ...railRow(t),
           position: 'relative',
-          ...(collapsed && !sheet && { justifyContent: 'center', padding: '0.3125rem 0' }),
+          ...(collapsed && !sheet && { justifyContent: 'center', padding: `${grid(0.5)} 0` }),
           // Expanded, the tree IS the Tasks entry.
           ...(row.key === 'tasks' && !collapsed && !sheet && { [ABOVE_PHONE]: { display: 'none' } }),
           [PHONE]: sheet
             ? {
                 flex: '0 0 auto',
                 justifyContent: 'flex-start',
-                gap: '0.625rem',
-                padding: '0 1rem',
-                margin: '1px 0',
+                gap: 1.5,
+                padding: `0 ${grid(2.5)}`,
+                margin: 0,
               }
             : {
                 display: overflow ? 'none' : 'flex',
@@ -596,11 +589,11 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
                 flexDirection: 'column',
                 justifyContent: 'center',
                 alignItems: 'center',
-                gap: '2px',
+                gap: 0,
                 minWidth: 0,
-                // 1px gutter: five slots at 320px are 54px each; the label keeps its size.
-                margin: '2px 1px',
-                padding: '4px 1px',
+                // No gutter: five slots at 320px are 64px each; the label keeps its size.
+                margin: 0,
+                padding: `${grid(0.5)} 0`,
                 ...(barLit && schemed(t, c => ({ backgroundColor: c.activeBg, color: c.textActive }))),
               },
         })}
@@ -613,12 +606,12 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
           data-testid="nav-abbr"
           sx={(t: Theme) => ({
             fontFamily: t.typography.mono.fontFamily,
-            fontSize: '0.6875rem',
-            fontWeight: 700,
-            letterSpacing: 0,
+            fontSize: FONT_SIZE.xs,
+            fontWeight: FONT_WEIGHT.bold,
+            letterSpacing: LETTER_SPACING.none,
             display: 'none',
             ...(collapsed && !sheet && !row.icon && { display: 'inline' }),
-            [PHONE]: { display: sheet || row.icon ? 'none' : 'inline', fontSize: '0.8125rem' },
+            [PHONE]: { display: sheet || row.icon ? 'none' : 'inline', fontSize: FONT_SIZE.md },
           })}
         >
           {row.abbr}
@@ -629,7 +622,7 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
             data-testid="nav-icon"
             sx={{
               display: collapsed && !sheet ? 'inline-flex' : 'none',
-              fontSize: '1.25rem',
+              fontSize: SIZE.iconMd,
               [PHONE]: { display: sheet ? 'none' : 'inline-flex' },
             }}
           >
@@ -646,8 +639,8 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
             fontWeight: 'inherit',
             ...(collapsed && !sheet && { display: 'none' }),
             [PHONE]: sheet
-              ? { display: 'inline', fontSize: '0.875rem' }
-              : { display: 'block', fontSize: '0.5625rem', maxWidth: '100%' },
+              ? { display: 'inline', fontSize: FONT_SIZE.base }
+              : { display: 'block', fontSize: FONT_SIZE.xxs, maxWidth: '100%' },
           }}
         >
           {row.barLabel ? (
@@ -681,7 +674,7 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
             {row.dot}
           </Box>
         )}
-      </ListItemButton>
+      </ListItemButton></Tip>
     )
   }
 
@@ -689,18 +682,17 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
     <Box
       data-testid="sidebar-connection"
       sx={(t: Theme) => ({
-        /* On the rail's light ground `palette.success/warning.main` fall below 3:1, and this dot is the only
-           connection signal, so the two variables are re-pointed for this slot only. */
+        /* On the rail's light ground `palette.warning.main` falls below 3:1, and this dot is the only connection
+           signal, so the variable is re-pointed for this slot only. */
         ...schemed(t, c => ({
-          '--mui-palette-success-main': c.statusOk,
           '--mui-palette-warning-main': c.statusWarn,
         })),
         display: 'flex',
         alignItems: 'center',
-        gap: '0.125rem',
+        gap: 0,
         // Expanded: the auto margin pushes the cluster right, beside the toggle.
         ...(collapsed ? { flexDirection: 'column' } : { marginLeft: 'auto' }),
-        [PHONE]: { flex: '0 0 auto', flexDirection: 'row', padding: '0 0.5rem', marginLeft: 0 },
+        [PHONE]: { flex: '0 0 auto', flexDirection: 'row', padding: `0 ${grid(1)}`, marginLeft: 0 },
       })}
     >
       {/* `showDaemon` off `is_operator` (`ConnectionIndicator.tsx`'s `Breakdown` says why). */}
@@ -719,11 +711,11 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
   const accountButtonSx = (t: Theme) => ({
     flexShrink: 0,
     width: 'auto',
-    minHeight: 44,
-    padding: '0 12px',
+    minHeight: SIZE.tapTarget,
+    padding: `0 ${grid(2)}`,
     border: '1px solid',
-    borderRadius: '4px',
-    fontSize: '0.8125rem',
+    borderRadius: RADIUS.sm,
+    fontSize: FONT_SIZE.md,
     ...schemed(t, c => ({ color: c.text, borderColor: c.buttonBorder })),
     ...focusRing(t),
     '&:hover': schemed(t, c => ({
@@ -738,26 +730,26 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
      pill's lesson). */
   const filledSx = (t: Theme) => ({
     minWidth: 0,
-    minHeight: 32,
-    padding: '0.25rem 0.75rem',
-    borderRadius: '6px',
-    fontSize: '0.8125rem',
-    fontWeight: 600,
-    lineHeight: 1.2,
+    minHeight: SIZE.thumb,
+    padding: `${grid(0.5)} ${grid(2)}`,
+    borderRadius: RADIUS.sm,
+    fontSize: FONT_SIZE.md,
+    fontWeight: FONT_WEIGHT.semibold,
+    lineHeight: LINE_HEIGHT.snug,
     ...schemed(t, c => ({ backgroundColor: c.activeBg, color: c.textActive })),
     ...focusRing(t),
     '&:hover': schemed(t, c => ({ backgroundColor: c.bannerHoverBg, color: c.textActive })),
   })
-  const signupSx = (t: Theme) => ({ ...filledSx(t), flexShrink: 0, minHeight: 28, padding: '0.125rem 0.625rem' })
+  const signupSx = (t: Theme) => ({ ...filledSx(t), flexShrink: 0, minHeight: SIZE.avatar, padding: `0 ${grid(1.5)}` })
   const loginSx = (t: Theme) => ({
     flexShrink: 0,
     minWidth: 0,
-    minHeight: 28,
-    padding: '0.125rem 0.375rem',
-    borderRadius: '6px',
-    fontSize: '0.8125rem',
-    fontWeight: 500,
-    lineHeight: 1.2,
+    minHeight: SIZE.avatar,
+    padding: `0 ${grid(1)}`,
+    borderRadius: RADIUS.sm,
+    fontSize: FONT_SIZE.md,
+    fontWeight: FONT_WEIGHT.medium,
+    lineHeight: LINE_HEIGHT.snug,
     ...schemed(t, c => ({ color: c.textStrong })),
     ...focusRing(t),
     '&:hover': schemed(t, c => ({ backgroundColor: c.overlayHover, color: c.textStrong })),
@@ -766,9 +758,9 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
   const glyphButtonSx = (t: Theme) => ({
     flexShrink: 0,
     color: 'inherit',
-    fontSize: '1.125rem',
-    padding: '3px',
-    borderRadius: '6px',
+    fontSize: SIZE.iconSm,
+    padding: 0.5,
+    borderRadius: RADIUS.sm,
     ...schemed(t, c => ({ color: c.textStrong })),
     ...focusRing(t),
     '&:hover': schemed(t, c => ({ backgroundColor: c.overlayHover, color: c.textStrong })),
@@ -776,7 +768,7 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
   })
   const sheetLinkSx = (t: Theme) => ({
     ...railRow(t),
-    [PHONE]: { flex: '0 0 auto', justifyContent: 'flex-start', padding: '0 1rem', margin: '1px 0', fontSize: '0.875rem' },
+    [PHONE]: { flex: '0 0 auto', justifyContent: 'flex-start', padding: `0 ${grid(2.5)}`, margin: 0, fontSize: FONT_SIZE.base },
   })
 
   /* THE "TRY IT YOURSELF" CARD: the one lit surface a visitor's rail holds — the Setup card's frame, with the rail's
@@ -789,17 +781,17 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
       sx={(t: Theme) => ({
         display: 'flex',
         flexDirection: 'column',
-        gap: '0.5rem',
+        gap: 1,
         flex: '0 0 auto',
-        margin: shape === 'sheet' ? '0 0 0.375rem' : '0.25rem 0.5rem 0.375rem',
-        padding: '0.625rem 0.625rem 0.5625rem',
-        borderRadius: '8px',
+        margin: shape === 'sheet' ? `0 0 ${grid(1)}` : `${grid(0.5)} ${grid(1)} ${grid(1)}`,
+        padding: 1.5,
+        borderRadius: RADIUS.md,
         border: '1px solid',
         ...schemed(t, c => ({ borderColor: c.accent, backgroundColor: c.bannerBg, color: c.textStrong })),
         [PHONE]: shape === 'sheet' ? {} : { display: 'none' },
       })}
     >
-      <Typography component="p" sx={{ m: 0, fontSize: '0.8125rem', lineHeight: 1.35, fontWeight: 500 }}>
+      <Typography component="p" sx={{ m: 0, fontSize: FONT_SIZE.md, lineHeight: LINE_HEIGHT.snug, fontWeight: FONT_WEIGHT.medium }}>
         Jaah builds this project on its own.
       </Typography>
       <Button component="a" href={auth.signup} data-testid="sidebar-try-btn" sx={(t: Theme) => ({ ...filledSx(t), width: '100%' })}>
@@ -811,21 +803,28 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
   return (
     <Box
       component="aside"
+      ref={asideRef}
       data-testid="sidebar"
       // State as an attribute: under Emotion the class name is a hash.
       data-collapsed={collapsed ? 'true' : 'false'}
       sx={(t: Theme) => ({
-        width: collapsed ? t.custom.sidebar.widthCollapsed : t.custom.sidebar.width,
+        width: collapsed ? t.custom.sidebar.widthCollapsed : (savedWidth ?? t.custom.sidebar.width),
+        /* A laptop keeps the compact rail unless the dragged one is narrower: the page layouts' breakpoints
+           (`ui/listStyles.ts`) were measured against the default rail. */
         ...(!collapsed && {
-          [`@media (max-width:${t.custom.sidebar.compactBelowPx - 0.05}px)`]: { width: t.custom.sidebar.widthCompact },
+          [`@media (max-width:${t.custom.sidebar.compactBelowPx - 0.05}px)`]: {
+            width: Math.min(savedWidth ?? Infinity, t.custom.sidebar.widthCompact),
+          },
         }),
         flexShrink: 0,
         display: 'flex',
         flexDirection: 'column',
+        // The edge strip's anchor.
+        position: 'relative',
         // The rail must not be the scroll container: `min-height: 0` plus the nav's `overflow-y: auto` keeps
         // the footer pinned on a short window.
         minHeight: 0,
-        boxShadow: '2px 0 8px rgba(0, 0, 0, 0.12)',
+        boxShadow: 2,
         /* The `--sk-mark-*` properties feed `BrandMark` and `BrandWordmark` their stops: neither has scheme
            logic, so the rail (and the login card) supply them. */
         ...schemed(t, c => ({
@@ -847,7 +846,7 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
           flexDirection: 'row',
           alignItems: 'stretch',
           zIndex: 40,
-          boxShadow: '0 -2px 8px rgba(0, 0, 0, 0.12)',
+          boxShadow: 3,
         },
       })}
     >
@@ -859,14 +858,14 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
           minHeight: 0,
           display: 'flex',
           alignItems: 'center',
-          gap: '0.25rem',
-          padding: '0.625rem 0.5rem 0.5rem 0.875rem',
+          gap: 0.5,
+          padding: `${grid(1.5)} ${grid(1)} ${grid(1)} ${grid(2)}`,
           borderBottom: '1px solid',
           ...schemed(t, c => ({ borderColor: c.border })),
           ...(collapsed && {
             flexDirection: 'column',
-            padding: '0.625rem 0 0.5rem',
-            gap: '0.25rem',
+            padding: `${grid(1.5)} 0 ${grid(1)}`,
+            gap: 0.5,
           }),
           // On phones the header dissolves: brand and toggle hide, and the status cluster becomes a slot of
           // the bottom bar (the one mount serves all three shapes).
@@ -886,25 +885,24 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
           {/* Collapsed: the J mark alone; expanded: the wordmark. The viewer's opens the main website. */}
           <Box
             {...(live ? { component: 'a', href: SITE_URL, 'aria-label': 'jaah.ai', 'data-testid': 'sidebar-brand-link' } : {})}
-            sx={(t: Theme) => ({ display: 'inline-flex', lineHeight: 0, borderRadius: '4px', '&:focus-visible': focusRing(t)['&.Mui-focusVisible'] })}
+            sx={(t: Theme) => ({ display: 'inline-flex', lineHeight: LINE_HEIGHT.tight, borderRadius: RADIUS.sm, '&:focus-visible': focusRing(t)['&.Mui-focusVisible'] })}
           >
             {collapsed
-              ? <BrandMark size={24} />
-              : <Box data-testid="sidebar-brand-text"><BrandWordmark height={32} /></Box>}
+              ? <BrandMark size={SIZE.iconLg} />
+              : <Box data-testid="sidebar-brand-text"><BrandWordmark height={SIZE.thumb} /></Box>}
           </Box>
         </Box>
         {!live && statusCluster}
         <IconButton
           data-testid="sidebar-toggle"
           onClick={toggle}
-          title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
           aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
           sx={(t: Theme) => ({
             color: 'inherit',
-            fontSize: collapsed ? '1.125rem' : '1rem',
-            lineHeight: 1,
-            padding: '2px 5px',
-            borderRadius: '3px',
+            fontSize: FONT_SIZE.lg,
+            lineHeight: LINE_HEIGHT.tight,
+            padding: `0 ${grid(0.5)}`,
+            borderRadius: RADIUS.sm,
             ...focusRing(t),
             '&:hover': schemed(t, c => ({ backgroundColor: c.overlayHover, color: c.textStrong })),
             [ABOVE_PHONE]: { minWidth: 0, minHeight: 0 },
@@ -923,97 +921,12 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
           sx={(t: Theme) => ({
             display: 'flex',
             justifyContent: collapsed ? 'center' : 'stretch',
-            padding: collapsed ? '0.375rem 0' : '0.5rem 0.5rem 0.5rem 0.75rem',
+            padding: collapsed ? `${grid(1)} 0` : `${grid(1)} ${grid(1)} ${grid(1)} ${grid(2)}`,
             borderBottom: '1px solid',
             ...schemed(t, c => ({ borderColor: c.border })),
           })}
         >
           <OrgScopeControl variant={collapsed ? 'collapsed' : 'rail'} />
-        </Box>
-      )}
-      {updateAvailable && !live && (
-        // Non-destructive (D4/AC5): reload only on this explicit click, never automatically.
-        <Box
-          data-testid="sidebar-update-banner"
-          sx={(t: Theme) => ({
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: '0.5rem',
-            padding: '0.375rem 0.875rem',
-            borderBottom: '1px solid',
-            ...schemed(t, c => ({ backgroundColor: c.bannerBg, borderColor: c.border })),
-            ...(collapsed && { justifyContent: 'center', padding: '0.375rem 0' }),
-            [PHONE]: {
-              flex: '0 0 auto',
-              padding: 0,
-              backgroundColor: 'transparent',
-              borderBottom: 'none',
-            },
-          })}
-        >
-          {!collapsed && (
-            <Typography
-              component="span"
-              noWrap
-              data-testid="sidebar-update-text"
-              sx={(t: Theme) => ({
-                fontSize: '0.75rem',
-                minWidth: 0,
-                ...schemed(t, c => ({ color: c.textStrong })),
-                [PHONE]: { display: 'none' },
-              })}
-            >
-              Update available
-            </Typography>
-          )}
-          <Button
-            data-testid="sidebar-update-btn"
-            onClick={() => window.location.reload()}
-            title="Reload to load the new version"
-            aria-label="Reload to load the new version"
-            sx={(t: Theme) => ({
-              flexShrink: 0,
-              minWidth: 0,
-              padding: '0.125rem 0.5rem',
-              border: '1px solid',
-              borderRadius: '4px',
-              fontSize: '0.75rem',
-              fontWeight: 500,
-              ...schemed(t, c => ({
-                borderColor: c.accent,
-                color: c.textActive,
-                backgroundColor: c.activeBg,
-              })),
-              ...focusRing(t),
-              '&:hover': schemed(t, c => ({ backgroundColor: c.bannerHoverBg })),
-              [PHONE]: { minWidth: 44, minHeight: 44, margin: '2px' },
-            })}
-          >
-            {/* Both spans render; width picks one, as with the nav items. */}
-            <Box
-              component="span"
-              data-testid="sidebar-update-icon"
-              aria-hidden="true"
-              sx={{
-                display: 'none',
-                ...(collapsed && { display: 'inline' }),
-                [PHONE]: { display: 'inline', fontSize: '1rem' },
-              }}
-            >
-              <RefreshIcon />
-            </Box>
-            <Box
-              component="span"
-              data-testid="sidebar-update-label"
-              sx={{
-                ...(collapsed && { display: 'none' }),
-                [PHONE]: { display: 'none' },
-              }}
-            >
-              Reload
-            </Box>
-          </Button>
         </Box>
       )}
       {/* The divider is a sibling of the rows: the ≤480px bar lays out this nav's direct children as flex
@@ -1026,12 +939,12 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
           flex: '1 1 auto',
           minHeight: 0,
           overflowY: 'auto',
-          padding: '0.375rem 0',
+          padding: `${grid(1)} 0`,
           display: 'flex',
           flexDirection: 'column',
           // A row scrolled into view by focus must land above the pinned destinations, not under them
           // (six rows and the divider, rounded up).
-          [ABOVE_PHONE]: { scrollPaddingBottom: '12rem' },
+          [ABOVE_PHONE]: { scrollPaddingBottom: grid(32) },
           [PHONE]: {
             flex: '1 1 0%',
             minHeight: 'auto',
@@ -1046,7 +959,6 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
         {/* Onboarding's door, above everything while setup is unfinished (`onboarding/SetupNavButton.tsx`);
             the phone carries it in the More sheet. */}
         <SetupNavButton shape={collapsed ? 'collapsed' : 'rail'} />
-        {topRows.map(row => railItem(row))}
         {scopeRows.map(row => railItem(row))}
         {projectRows.map(row => railItem(row))}
         {canTasks && !collapsed && (
@@ -1062,8 +974,8 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
           sx={(t: Theme) => ({
             marginTop: 'auto',
             position: 'sticky',
-            bottom: '-0.375rem',
-            paddingBottom: '0.375rem',
+            bottom: `-${grid(1)}`,
+            paddingBottom: 1,
             display: 'flex',
             flexDirection: 'column',
             ...schemed(t, c => ({ backgroundColor: c.bg })),
@@ -1071,26 +983,24 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
           })}
         >
           {live && !collapsed && tryBanner('rail')}
-          {scopeRows.length > 0 && footRows.length > 0 && (
+          {scopeRows.length > 0 && destinationRows.length > 0 && (
             <Divider
               data-testid="sidebar-nav-sep"
               sx={(t: Theme) => ({
-                height: '1px',
-                border: 0,
-                margin: '0.375rem 0.75rem',
-                ...schemed(t, c => ({ backgroundColor: c.border })),
+                margin: `${grid(1)} ${grid(2)}`,
+                ...schemed(t, c => ({ borderColor: c.border })),
                 [PHONE]: { display: 'none' },
               })}
             />
           )}
-          {footRows.map(row => railItem(row))}
+          {destinationRows.map(row => railItem(row))}
         </Box>
         <ListItemButton
           component="button"
           data-testid="nav-more-btn"
           onClick={() => { setTreeSheetOpen(false); setMoreOpen(o => !o) }}
           aria-expanded={moreOpen}
-          aria-label={`More navigation${foldedGuide ? `, setup ${foldedGuide}` : ''}`}
+          aria-label={`More navigation${sheetCounts}${foldedGuide ? `, setup ${foldedGuide}` : ''}`}
           sx={(t: Theme) => ({
             display: 'none',
             [PHONE]: {
@@ -1099,12 +1009,12 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
               flexDirection: 'column',
               justifyContent: 'center',
               alignItems: 'center',
-              gap: '2px',
+              gap: 0,
               minWidth: 0,
               // Same slot metrics as a nav item, so the toggle is not an odd width.
-              margin: '2px 1px',
-              padding: '4px 1px',
-              borderRadius: '4px',
+              margin: 0,
+              padding: `${grid(0.5)} 0`,
+              borderRadius: RADIUS.sm,
               background: 'none',
               border: 'none',
               fontFamily: 'inherit',
@@ -1119,12 +1029,14 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
             },
           })}
         >
-          <Typography component="span" data-testid="nav-abbr" sx={{ fontSize: '1.25rem', display: 'inline-flex' }}>
+          <Typography component="span" data-testid="nav-abbr" sx={{ fontSize: SIZE.iconMd, display: 'inline-flex', position: 'relative' }}>
             <MoreHorizIcon />
+            {/* Left of the mark: the folded Setup badge holds the slot's top-right corner. */}
+            {sheetCounts && <StatusDot data-testid="nav-more-count-dot" tone="error" size={grid(1)} sx={{ position: 'absolute', top: 0, left: `-${grid(1)}` }} />}
           </Typography>
           {/* The onboarding bar folded into the navigation shows its count here; the sheet's Setup row restores it. */}
           <SetupNavBadge />
-          <Typography component="span" data-testid="nav-label" sx={{ fontSize: '0.5625rem' }}>
+          <Typography component="span" data-testid="nav-label" sx={{ fontSize: FONT_SIZE.xxs }}>
             More
           </Typography>
         </ListItemButton>
@@ -1148,7 +1060,7 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
           elevation={0}
           sx={(t: Theme) => ({
             ...BOTTOM_SHEET_SX(t),
-            padding: '0.5rem 0.25rem calc(0.5rem + env(safe-area-inset-bottom, 0px))',
+            padding: `${grid(1)} ${grid(0.5)} calc(${grid(1)} + env(safe-area-inset-bottom, ${grid(0)}))`,
           })}
         >
           <TaskTree tree={tree} touch onNavigate={() => setTreeSheetOpen(false)} />
@@ -1165,9 +1077,9 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
             'data-testid': 'nav-tree-flyout',
             sx: (t: Theme) => ({
               width: t.custom.sidebar.width,
-              maxHeight: 'calc(100vh - 32px)',
+              maxHeight: `calc(100vh - ${grid(5)})`,
               overflowY: 'auto',
-              py: 0.75,
+              py: 0.5,
               ...schemed(t, c => ({ backgroundColor: c.bg, color: c.text })),
             }),
           } as object,
@@ -1185,7 +1097,7 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
         >
           <SetupNavButton shape="sheet" />
           {live && tryBanner('sheet')}
-          {allRows.filter(row => row.key !== 'tasks' && !barKeys.has(row.key)).map(row => railItem(row, { sheet: true }))}
+          {sheetRows.map(row => railItem(row, { sheet: true }))}
           {/* The visitor's doors into the console, as rows above its Theme. */}
           {auth && [
             <ListItemButton key="login" component="a" href={auth.login} data-testid="sidebar-login-link" sx={sheetLinkSx}>
@@ -1199,7 +1111,7 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
             <Box
               onClick={e => e.stopPropagation()}
               data-testid="nav-more-sheet-theme"
-              sx={(t: Theme) => ({ marginTop: '0.375rem', padding: '0.5rem', borderTop: '1px solid', ...schemed(t, c => ({ borderColor: c.border })) })}
+              sx={(t: Theme) => ({ marginTop: 1, padding: 1, borderTop: '1px solid', ...schemed(t, c => ({ borderColor: c.border })) })}
             >
               {themeField}
             </Box>
@@ -1208,12 +1120,12 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
               typing a code must not close the sheet (a switch reloads the page anyway). */}
           {!live && <Box
             onClick={e => e.stopPropagation()}
-            sx={(t: Theme) => ({ marginTop: '0.375rem', borderTop: '1px solid', ...schemed(t, c => ({ borderColor: c.border })) })}
+            sx={(t: Theme) => ({ marginTop: 1, borderTop: '1px solid', ...schemed(t, c => ({ borderColor: c.border })) })}
           >
             {inviteUpsell}
-            {OrgSwitcherList && isEnabled('multi_org_tenancy') && <OrgSwitcherList />}
+            {OrgSwitcherList && isEnabled('multi_org_tenancy') && <OrgSwitcherList onNavigate={() => setMoreOpen(false)} />}
           </Box>}
-          {/* A per-agent plan's free trial, above the account line (`TrialAgentsMeter.tsx`). */}
+          {/* A per-agent plan's agents throttle, above the account line (`TrialAgentsMeter.tsx`). */}
           {!live && TrialAgentsMeter && <TrialAgentsMeter shape="sheet" />}
           <Box
             data-testid="nav-more-sheet-footer"
@@ -1223,9 +1135,9 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
               justifyContent: 'space-between',
               /* Wraps: a long account line (a nameless account's email) takes its own line above the buttons. */
               flexWrap: 'wrap',
-              gap: '0.5rem',
-              marginTop: '0.375rem',
-              padding: '0.5rem 0.5rem 0',
+              gap: 1,
+              marginTop: 1,
+              padding: `${grid(1)} ${grid(1)} 0`,
               borderTop: '1px solid',
               ...schemed(t, c => ({ borderColor: c.border })),
             })}
@@ -1240,7 +1152,7 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
                 data-testid="sidebar-user-name-mobile"
                 data-nameless={nameless || undefined}
                 sx={(t: Theme) => ({
-                  fontSize: '0.8125rem',
+                  fontSize: FONT_SIZE.md,
                   minWidth: 0,
                   ...(nameless && { overflowWrap: 'anywhere' }),
                   ...schemed(t, c => ({ color: nameless ? c.text : c.textStrong })),
@@ -1252,20 +1164,27 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
                 component="span"
                 noWrap
                 data-testid="sidebar-version-mobile"
-                sx={(t: Theme) => ({ fontSize: '0.75rem', minWidth: 0, ...schemed(t, c => ({ color: c.textStrong })) })}
+                sx={(t: Theme) => ({ fontSize: FONT_SIZE.sm, minWidth: 0, ...schemed(t, c => ({ color: c.textStrong })) })}
               >
                 {APP_VERSION}
               </Typography>
             </Box>
             {/* Profile is never a nav row: it is a zero-grant account's only entry point, and no grant filter
                 may drop it. A visitor has no account: its Theme sits above. */}
-            {!live && <Box sx={{ display: 'flex', gap: '0.375rem', flexShrink: 0 }}>
-              {isEnabled('support_assistant') && <Button component={Link} to="/support" data-testid="sidebar-support-link" aria-label={supportName} sx={accountButtonSx}>
+            {!live && <Box sx={{ display: 'flex', gap: 1, flexShrink: 0 }}>
+              {accountSupport && <Button component={Link} to="/support" data-testid="sidebar-support-link" sx={accountButtonSx}>
                 Support
-                {supportCount}
               </Button>}
-              <Button component={Link} to="/profile" data-testid="sidebar-profile-btn" sx={accountButtonSx}>
+              {/* `askName`'s dot rides My Profile here, as on the rail's badge; the label carries the ask. */}
+              <Button
+                component={Link}
+                to="/profile"
+                data-testid="sidebar-profile-btn"
+                aria-label={askName ? `My Profile. ${ADD_NAME}` : undefined}
+                sx={[accountButtonSx, { position: 'relative' }]}
+              >
                 My Profile
+                {askName && <StatusDot data-testid="sidebar-add-name-dot-mobile" tone="info" size={grid(1)} sx={{ position: 'absolute', top: grid(0.5), right: grid(0.5) }} />}
               </Button>
               <Button onClick={() => void logout()} data-testid="sidebar-signout-btn" sx={accountButtonSx}>
                 Sign out
@@ -1274,7 +1193,7 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
           </Box>
         </Paper>
       )}
-      {/* A per-agent plan's free trial, directly above the footer (`TrialAgentsMeter.tsx`); the phone's is in the More sheet. */}
+      {/* A per-agent plan's agents throttle, directly above the footer (`TrialAgentsMeter.tsx`); the phone's is in the More sheet. */}
       {!live && TrialAgentsMeter && <TrialAgentsMeter shape={collapsed ? 'collapsed' : 'rail'} />}
       {/* THE FOOTER — one line: the user badge (opens the org switcher, then Support / My Profile / Sign out), the first name, the
           version right-aligned, and Help to its right. Collapsed: the badge over Help, the version on the
@@ -1285,29 +1204,28 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
         sx={(t: Theme) => ({
           display: 'flex',
           alignItems: 'center',
-          gap: live ? '0.375rem' : '0.5rem',
+          gap: 1,
           ...(live && { flexWrap: 'wrap' }),
           /* Right padding is small: Help's own button padding already insets the glyph. */
-          padding: '0.375rem 0.25rem 0.375rem 0.625rem',
+          padding: `${grid(1)} ${grid(0.5)} ${grid(1)} ${grid(1.5)}`,
           borderTop: '1px solid',
           ...schemed(t, c => ({ borderColor: c.border })),
-          ...(collapsed && { flexDirection: 'column', gap: '0.25rem', padding: '0.375rem 0' }),
+          ...(collapsed && { flexDirection: 'column', gap: 0.5, padding: `${grid(1)} 0` }),
           [PHONE]: { display: 'none' },
         })}
       >
         {live && (
-          <IconButton
+          <Tip title={collapsed ? `${accountMenu ? 'Account' : 'Theme'} · ${APP_VERSION}` : 'Theme'}><IconButton
             data-testid={accountMenu ? 'sidebar-account-btn' : 'sidebar-theme-btn'}
             onClick={openMenu}
             aria-haspopup="menu"
             aria-expanded={menuAnchor !== null}
             aria-controls={menuAnchor ? 'sidebar-user-menu' : undefined}
             aria-label={accountMenu ? 'Account' : 'Theme'}
-            title={collapsed ? `${accountMenu ? 'Account' : 'Theme'} · ${APP_VERSION}` : 'Theme'}
             sx={glyphButtonSx}
           >
             {accountMenu ? <PersonIcon /> : <ContrastIcon />}
-          </IconButton>
+          </IconButton></Tip>
         )}
         {live && !collapsed && auth && [
           <Button key="login" component="a" href={auth.login} data-testid="sidebar-login-link" sx={loginSx}>
@@ -1317,7 +1235,7 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
             Sign up
           </Button>,
         ]}
-        {!live && <ButtonBase
+        {!live && <Tip title={collapsed ? `${fullName} · ${APP_VERSION}` : fullName}><ButtonBase
           data-testid="sidebar-user-badge"
           // Who is signed in, for a spec that must wait for identity to hydrate (the label shows a first name).
           data-user-email={admin?.email}
@@ -1325,29 +1243,33 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
           aria-haspopup="menu"
           aria-expanded={menuAnchor !== null}
           aria-controls={menuAnchor ? 'sidebar-user-menu' : undefined}
-          aria-label={`Account menu for ${fullName}${pendingRequests > 0 ? `, ${pendingRequests} pending request${pendingRequests === 1 ? '' : 's'}` : ''}`}
-          title={collapsed ? `${fullName} · ${APP_VERSION}` : fullName}
+          aria-label={askName ? `Account menu for ${fullName}. ${ADD_NAME}` : `Account menu for ${fullName}`}
           sx={(t: Theme) => ({
             position: 'relative',
             display: 'flex',
             alignItems: 'center',
-            gap: '0.5rem',
+            gap: 1,
             minWidth: 0,
-            padding: '2px 6px 2px 2px',
-            borderRadius: '14px',
+            padding: `0 ${grid(1)} 0 0`,
+            borderRadius: RADIUS.round,
             ...schemed(t, c => ({ color: c.textStrong })),
             ...focusRing(t),
             '&:hover': schemed(t, c => ({ backgroundColor: c.overlayHover })),
-            ...(collapsed && { padding: '2px' }),
+            ...(collapsed && { padding: 0 }),
           })}
         >
           {/* A nameless account draws a neutral head-and-shoulders glyph, not its email's initials ("DE" for
               dev-owner@…) in a per-author hue: those would pass the email prefix off as a name. The
               button's label and title still carry the email. */}
           {nameless ? (
-            <Box component="span" data-testid="sidebar-user-initials" data-nameless="true" aria-hidden="true" sx={userBadgeSx}>
-              <PersonIcon size={14} />
-            </Box>
+            <>
+              <Box component="span" data-testid="sidebar-user-initials" data-nameless="true" aria-hidden="true" sx={userBadgeSx}>
+                <PersonIcon size={SIZE.iconXs} />
+              </Box>
+              {/* `askName`'s dot on the badge, whose menu's My Profile reads "Add your name"; the button's label
+                  carries the ask for a screen reader. */}
+              {askName && <StatusDot data-testid="sidebar-add-name-dot" tone="info" size={grid(1)} sx={{ position: 'absolute', top: 0, left: 0 }} />}
+            </>
           ) : (
             <AuthorBadge name={fullName || '?'} testId="sidebar-user-initials" sx={userBadgeSx} />
           )}
@@ -1359,17 +1281,15 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
               data-nameless={nameless || undefined}
               sx={(t: Theme) => ({
                 minWidth: 0,
-                fontSize: '0.8125rem',
-                fontWeight: 500,
-                ...(nameless && { fontWeight: 400, ...schemed(t, c => ({ color: c.text })) }),
+                fontSize: FONT_SIZE.md,
+                fontWeight: FONT_WEIGHT.medium,
+                ...(nameless && { fontWeight: FONT_WEIGHT.regular, ...schemed(t, c => ({ color: c.text })) }),
               })}
             >
               {nameless ? admin?.email : firstName}
             </Typography>
           )}
-          {/* Requests waiting on this viewer: the menu's Support item names the count; the badge carries a dot. */}
-          {pendingRequests > 0 && countBadge(pendingRequests, 'sidebar-user-requests').dot}
-        </ButtonBase>}
+        </ButtonBase></Tip>}
         {!collapsed && (
           /* From version.ts (build-time APP_VERSION), never a literal; `textStrong` at full opacity
              (`text` falls short of contrast at this size). */
@@ -1377,15 +1297,14 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
             component="span"
             noWrap
             data-testid="sidebar-version"
-            title={APP_VERSION}
             /* Never shrinks: a clipped version ("1.1…") is a wrong answer, and on the 192px rail the
                first name is what gives way — the badge beside it still identifies the user. */
             sx={(t: Theme) => ({
               marginLeft: 'auto',
-              // Sits beside Help: pulls the footer's 0.5rem gap in to 0.125rem. The viewer has no Help.
-              marginRight: live ? '0.375rem' : '-0.375rem',
+              // Sits beside Help: pulls the footer's gap in to nothing. The viewer has no Help.
+              marginRight: live ? 1 : -1,
               flexShrink: 0,
-              fontSize: '0.75rem',
+              fontSize: FONT_SIZE.sm,
               ...schemed(t, c => ({ color: c.textStrong })),
             })}
           >
@@ -1407,7 +1326,7 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
           /* As wide as its widest row, so a short org name sits next to its "Current" / switch control instead
              of across a gap; never wider than 340px or the viewport minus a gutter, where a long org name gives
              way to an ellipsis (`account/OrgSwitcherList.tsx`). */
-          paper: { sx: { width: 'max-content', maxWidth: 'min(340px, calc(100vw - 32px))', maxHeight: 'calc(100dvh - 32px)' } },
+          paper: { sx: { width: 'max-content', maxWidth: `min(${grid(56.5)}, calc(100vw - ${grid(5)}))`, maxHeight: `calc(100dvh - ${grid(5)})` } },
         }}
       >
         {/* The visitor's: its Theme (`live/viewerTheme.ts`) — and, collapsed, Log in and Sign up above it (the
@@ -1432,24 +1351,23 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
             component="li"
             role="none"
             data-testid="sidebar-user-email"
-            sx={{ px: 2, pt: 0.75, pb: 0.5, fontSize: '0.8125rem', color: 'text.secondary', overflowWrap: 'anywhere' }}
+            sx={{ px: 2, pt: 0.5, pb: 0.5, fontSize: FONT_SIZE.md, color: 'text.secondary', overflowWrap: 'anywhere' }}
           >
             {admin?.email}
           </Box>,
           <Divider key="who-divider" />,
           ...(inviteUpsell ? [<Box key="invite" component="li" role="none">{inviteUpsell}</Box>] : []),
-          ...(OrgSwitcherList && isEnabled('multi_org_tenancy') ? [<OrgSwitcherList key="orgs" muiSkipListHighlight />] : []),
+          ...(OrgSwitcherList && isEnabled('multi_org_tenancy') ? [<OrgSwitcherList key="orgs" muiSkipListHighlight onNavigate={() => setMenuAnchor(null)} />] : []),
           <Divider key="divider" />,
-          ...(isEnabled('support_assistant') ? [
-            <MenuItem key="support" component={Link} to="/support" data-testid="sidebar-support-link" aria-label={supportName} onClick={() => setMenuAnchor(null)}>
+          ...(accountSupport ? [
+            <MenuItem key="support" component={Link} to="/support" data-testid="sidebar-support-link" onClick={() => setMenuAnchor(null)}>
               Support
-              {supportCount}
             </MenuItem>,
           ] : []),
           <MenuItem key="profile" component={Link} to="/profile" data-testid="sidebar-profile-btn" onClick={() => setMenuAnchor(null)}>
             My Profile
             {nameless && (
-              <Typography component="span" data-testid="sidebar-profile-add-name" sx={{ ml: 1, fontSize: '0.75rem', color: 'text.secondary' }}>
+              <Typography component="span" data-testid="sidebar-profile-add-name" sx={{ ml: 1, fontSize: FONT_SIZE.sm, color: 'text.secondary' }}>
                 {ADD_NAME}
               </Typography>
             )}
@@ -1466,6 +1384,23 @@ export default function Sidebar({ live }: { live?: LiveRail } = {}) {
           </MenuItem>,
         ]}
       </Menu>
+      {/* The draggable right edge (`lib/sidebarWidth.ts`): resize, or drag in to collapse as '‹' does. Not on the
+          phone bar, which has no edge, nor the Live Cast viewer's rail. */}
+      {!live && (
+        <Box
+          data-testid="sidebar-edge"
+          sx={{ position: 'absolute', top: 0, bottom: 0, right: -DIVIDER_PX / 2, width: DIVIDER_PX, display: 'flex', zIndex: 1, [PHONE]: { display: 'none' } }}
+        >
+          <SplitDivider
+            testId="sidebar-divider"
+            ariaLabel="Resize sidebar"
+            valueNow={collapsed ? 0 : (((savedWidth ?? theme.custom.sidebar.width) - SIDEBAR_MIN_PX) / (SIDEBAR_MAX_PX - SIDEBAR_MIN_PX)) * 100}
+            edge={() => (asideRef.current?.getBoundingClientRect().right ?? 0) - DIVIDER_PX / 2}
+            onMove={onEdgeMove}
+            onReset={resetWidth}
+          />
+        </Box>
+      )}
     </Box>
   )
 }

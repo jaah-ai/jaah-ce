@@ -33,10 +33,10 @@ ALERT_RECIPIENTS_KNOB = "signup_alert_recipients"
 
 def _active_fields(type_key: str) -> dict[str, str]:
     """On a short session of its own: a background send holds none. A read fault sends the defaults."""
-    from app.db import SessionLocal
+    from app.db import BridgedSession
 
     try:
-        with SessionLocal() as session:
+        with BridgedSession() as session:
             return email_template_store.active_fields(session, type_key)
     except Exception:
         log.exception("onboarding mail: the %s template could not be read — using the built-in one", type_key)
@@ -82,7 +82,7 @@ def send_after_answer(type_key: Optional[str], to: str, values: Mapping[str, str
 def recipients_for_alert(session: Session) -> list[str]:
     """Who the new-application alert goes to: the Sign-up setting's addresses, else every enabled
     superadmin whose login email a sign-in has proven (`email_verified_at`, the rule
-    `notify_targets.email_destination` holds), never the system actor."""
+    `notify_targets.email_routes` holds), never the system actor."""
     configured = settings_reads.get_str(ALERT_RECIPIENTS_KNOB)
     addresses = [part.strip() for part in configured.split(",") if part.strip()]
     if not addresses:

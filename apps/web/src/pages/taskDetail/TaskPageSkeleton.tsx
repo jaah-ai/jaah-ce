@@ -14,7 +14,9 @@ import Breadcrumb from '../../components/Breadcrumb'
 import LoadingState from '../../ui/LoadingState'
 import { DetailPage } from '../../ui/detail/DetailPage'
 import { VISUALLY_HIDDEN } from '../../ui/visuallyHidden'
-import { LOADING_ACTIONS_SX, LOADING_TAB_WIDTHS, LOADING_TABS_SX, PAGE_SX, TITLE_SKELETON_SX } from './taskDetailConstants'
+import {
+  LOADING_ACTIONS_SX, LOADING_TAB_WIDTHS, LOADING_TABS_SX, PAGE_OVERFLOW_SX, PAGE_SX, TITLE_SKELETON_SX,
+} from './taskDetailConstants'
 
 /* The trail when nothing about the row is known yet: "Tasks › ▭", the id the `<h1>`'s accessible name, so
    the heading never changes under a screen reader when the title lands. */
@@ -36,15 +38,30 @@ export function TaskTrailSkeleton({ id }: { id: string | undefined }) {
 
 /* The header (the trail, the cluster's place), a tab-strip skeleton and a skeleton body, in the boxes and `PAGE_SX` the
    loaded page uses (`LOADING_TABS_SX`), under their own `-loading` ids, so the page lands without a shift. The body
-   keeps the console's one `loading-state`. */
-export default function TaskPageSkeleton({ trail }: { trail: ReactNode }) {
+   keeps the console's one `loading-state`.
+   `org` and `state`: the HEADER a cold open from the board already knows from the board's row (the page's
+   loading branch builds them; this shell stays free of the page's imports). `org` is the record's org chip and `state`
+   the pill, drawn where the loaded cluster draws them, before a ⋯-sized skeleton for the actions that wait on the
+   page's own read. */
+export default function TaskPageSkeleton(
+  { trail, org, state }: { trail: ReactNode; org?: ReactNode; state?: ReactNode },
+) {
+  const actionsSkeleton = state === undefined
+    ? <Skeleton variant="rounded" aria-hidden data-testid="task-page-actions-skeleton" sx={LOADING_ACTIONS_SX} />
+    : (
+        <Box sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.5 }}>
+          {org}
+          {state}
+          <Skeleton variant="rounded" aria-hidden data-testid="task-page-actions-skeleton" sx={PAGE_OVERFLOW_SX} />
+        </Box>
+      )
   return (
     <DetailPage
       measure="fill"
       testId="task-page-loading"
       headerTestId="task-page-header-loading"
       breadcrumb={trail}
-      actions={<Skeleton variant="rounded" aria-hidden data-testid="task-page-actions-skeleton" sx={LOADING_ACTIONS_SX} />}
+      actions={actionsSkeleton}
       sx={PAGE_SX}
     >
       <Box data-testid="task-page-tabs-loading" aria-hidden sx={LOADING_TABS_SX}>

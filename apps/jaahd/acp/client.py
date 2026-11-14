@@ -17,12 +17,11 @@ key rides that request's `_meta`, never the environment.
 What the agent says about itself is kept for the session-start record: `initialize`'s `agentInfo` (its name and
 version — the engine's label, never the wrapper the launch runs it through) and the models a session opened with,
 sensed from `configOptions` (the option whose category or id is `model`) where the agent advertises them, else the
-unstable `models` field (`model_choice`).
+unstable `models` field (`model_choice`). An operator's model switch (`set_model`) goes back through whichever
+of the two the session advertised: `session/set_config_option` on that selector, else unstable `session/set_model`.
 
-Opening a session with a prior native ref follows D-ACP-1: `session/resume` (if the agent advertises it) ->
-`session/load` (if `loadSession`) -> `session/new`. A refused resume/load is not fatal — the run continues
-cold, and `resume_supported` records that it did. The native ref is always what the agent returned (or the
-ref it accepted), never derived from a transcript filename.
+A session opens with `session/new`; the native ref is always what the agent returned, never derived from a
+transcript filename.
 """
 from __future__ import annotations
 
@@ -66,8 +65,9 @@ def _option_values(options: object) -> list[str]:
 
 def model_choice(result: object) -> dict:
     """The models a `session/new` (or resume/load) result offers, as `{current, available, source}`: its
-    `configOptions` model selector where advertised (`source: "config_options"`), else the unstable
-    `models.availableModels` (`source: "models"`); {} when it names neither."""
+    `configOptions` model selector where advertised (`source: "config_options"`, plus the option's `config_id`,
+    what `AcpClient.set_model` addresses), else the unstable `models.availableModels` (`source: "models"`); {}
+    when it names neither."""
     if not isinstance(result, dict):
         return {}
     for opt in result.get("configOptions") or ():
@@ -76,7 +76,10 @@ def model_choice(result: object) -> dict:
         available = _option_values(opt.get("options"))
         current = opt.get("currentValue") if isinstance(opt.get("currentValue"), str) else ""
         if available or current:
-            return {"current": current, "available": available, "source": "config_options"}
+            choice = {"current": current, "available": available, "source": "config_options"}
+            if isinstance(opt.get("id"), str) and opt["id"]:
+                choice["config_id"] = opt["id"]
+            return choice
     models = result.get("models")
     if isinstance(models, dict):
         available = [m["modelId"] for m in models.get("availableModels") or ()
@@ -104,7 +107,6 @@ class AcpClient:
         self.agent_capabilities: dict = {}
         #: `initialize`'s `authMethods`: what the agent accepts in `authenticate`.
         self.auth_methods: list = []
-        self.resume_supported = True
         #: `initialize`'s `agentInfo` (`agent_info`), and the opened session's models (`model_choice`).
         self.agent_info: dict = {}
         self.models: dict = {}
@@ -145,34 +147,35 @@ class AcpClient:
         return self.supports("sessionCapabilities.systemPrompt")
 
     async def open_session(self, *, cwd: str, mcp_servers: list[dict], additional_dirs: list[str], meta: dict,
-                           resume_ref: str = "", agent_meta: dict | None = None,
-                           system_prompt: str = "") -> tuple[str, str]:
+                           agent_meta: dict | None = None, system_prompt: str = "") -> str:
         base: dict = {"cwd": cwd, "mcpServers": mcp_servers}
         if additional_dirs:
             base["additionalDirectories"] = additional_dirs
         if system_prompt:
             base["systemPrompt"] = {"mode": "append", "content": [{"type": "text", "text": system_prompt}]}
         base["_meta"] = {**(agent_meta or {}), META_KEY: meta}
-        if resume_ref:
-            for method, how, cap in (("session/resume", "resume", "sessionCapabilities.resume"),
-                                     ("session/load", "load", "loadSession")):
-                if not self.supports(cap):
-                    continue
-                try:
-                    result = await self.conn.request(method, {**base, "sessionId": resume_ref})
-                except JsonRpcError as exc:
-                    log.info("acp %s refused (%s); falling back", method, exc.message)
-                    continue
-                ref = result.get("sessionId") if isinstance(result, dict) else None
-                self.models = model_choice(result)
-                return (ref if isinstance(ref, str) and ref else resume_ref), how
-            self.resume_supported = False
         result = await self.conn.request("session/new", base)
         ref = result.get("sessionId") if isinstance(result, dict) else None
         self.models = model_choice(result)
         if not isinstance(ref, str) or not ref:
             raise JsonRpcError(-32603, "session/new returned no sessionId")
-        return ref, "new"
+        return ref
+
+    async def set_model(self, native_ref: str, model: str) -> bool:
+        """Switch the session's model through the selector it advertised (`model_choice`): the config option
+        (`session/set_config_option`), else the unstable `models` field (`session/set_model`). False, sending
+        nothing, when the session advertised neither. `models.current` follows a switch the agent accepted;
+        a `JsonRpcError` (an unknown model) propagates to the caller."""
+        source = self.models.get("source")
+        if source == "config_options" and self.models.get("config_id"):
+            await self.conn.request("session/set_config_option", {
+                "sessionId": native_ref, "configId": self.models["config_id"], "value": model})
+        elif source == "models":
+            await self.conn.request("session/set_model", {"sessionId": native_ref, "modelId": model})
+        else:
+            return False
+        self.models = {**self.models, "current": model}
+        return True
 
     async def prompt(self, native_ref: str, text: str, *, guidance: str = "") -> dict:
         """`session/prompt` with `text`, headed by a separate `guidance` text block when there is any (the host's

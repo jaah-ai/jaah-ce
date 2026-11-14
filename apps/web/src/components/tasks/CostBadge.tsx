@@ -16,13 +16,14 @@ import Box from '@mui/material/Box'
 import type { SxProps, Theme } from '@mui/material/styles'
 import { costLabel, costTitle } from '../../lib/taskCost'
 import type { PipelineTask } from '../../types'
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT } from '../../theme'
 import { monoSx } from '../../ui/listStyles'
 import { VISUALLY_HIDDEN } from '../../ui/visuallyHidden'
+import Tip from '../../ui/Tip'
 
 export default function CostBadge({
   task,
   sx,
-  title,
   testId = 'task-cost-badge',
 }: {
   /**
@@ -32,12 +33,6 @@ export default function CostBadge({
   task: Pick<PipelineTask, 'cost_usd' | 'cost_status' | 'cost_agent_reported'>
   /** Host geometry (width, margins, type scale, alignment); cannot repaint the identity. */
   sx?: SxProps<Theme>
-  /**
-   * OVERRIDE the `title` sentence, or `null` for none. `undefined` derives `costTitle`. `null` is for a
-   * host wrapping this in a MUI `Tooltip`, which would otherwise show a second native tooltip on the
-   * descendant (same trap as `RatingBadge`'s prop).
-   */
-  title?: string | null
   /** Spec handle, per badge. */
   testId?: string
 }): JSX.Element | null {
@@ -46,18 +41,17 @@ export default function CostBadge({
   if (shown === '') return null
 
   return (
-    <Box
+    <Tip title={costTitle(task) ?? undefined}><Box
       component="span"
       data-testid={testId}
       /* The exact figure (`costTitle`). `?? undefined`, not `''`: some readers announce an empty `title` as a label. */
-      title={(title === undefined ? costTitle(task) : title) ?? undefined}
       sx={[
         {
           /* LAYOUT DEFAULTS (overridable). `inline-block` so `textAlign` works when stretched;
              `lineHeight: 1` keeps height equal to font size. */
           display: 'inline-block',
-          fontSize: '0.8125rem',
-          lineHeight: 1,
+          fontSize: FONT_SIZE.md,
+          lineHeight: LINE_HEIGHT.tight,
           textAlign: 'right',
           // Separators would otherwise let a narrow cell break `$1,` from the rest.
           whiteSpace: 'nowrap',
@@ -68,7 +62,7 @@ export default function CostBadge({
           /* MONO: a measurement is mono (`TaskRunMetrics.tsx`), and tabular digits align decimals.
              `monoSx` — `ui/listStyles.ts` is the stack's single home. */
           ...monoSx(theme),
-          fontWeight: 600,
+          fontWeight: FONT_WEIGHT.semibold,
           /* NEUTRAL: cost is data, not status; fifty coloured rows emphasise nothing. */
           color: 'text.primary',
         }),
@@ -84,6 +78,6 @@ export default function CostBadge({
           <Box component="span" sx={VISUALLY_HIDDEN}> agent-reported</Box>
         </>
       )}
-    </Box>
+    </Box></Tip>
   )
 }

@@ -22,13 +22,14 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from app.auth import require_superadmin
 from app.authz.catalog import Tenancy
 from app.authz.declarations import superadmin_only
 from app.entity_shape import from_row
 from app.models.identity import AdminUser
-from app.routes.crons import _reject
+from app.routes.crons import RUNS_DEFAULT_LIMIT, RUNS_MAX_LIMIT, _reject
 from app.workflow_engine import (
     AGGREGATE_SCAN_LIMIT,
     EMPTY_AGGREGATE,
@@ -42,10 +43,6 @@ from app.workflow_engine import (
 from app.workflow_registry import CRON_TICK_WORKFLOW, WorkflowDescriptor, get, listed, listed_names
 
 router = APIRouter(prefix="/api/workflows", tags=["workflows"])
-
-# The runs page's default and ceiling, as in `app/routes/crons.py`: the engine table grows unbounded.
-RUNS_DEFAULT_LIMIT = 50
-RUNS_MAX_LIMIT = 200
 
 # How many PENDING cron ticks one read answers: a healthy plane holds a handful at most, so a longer list is
 # already the finding.
@@ -110,27 +107,12 @@ class WorkflowDetailOut(WorkflowTypeOut):
     engine_available: bool
 
 
-class WorkflowRunOut(BaseModel):
-    """One run as the page renders it. `app/workflow_engine.py` is the single home for where each field
-    comes from and why the payloads are bounded."""
+class WorkflowRunOut(WorkflowRun):
+    """One run as the page renders it: `app/workflow_engine.py`'s `WorkflowRun` (the single home for where each
+    field comes from and why the payloads are bounded) plus the registry label."""
 
-    workflow_id: str
     #: Both travel: the label is what an operator reads, the name what the `name` filter accepts.
-    name: str
     label: str
-    #: DBOS's own closed set as a string, so a newer DBOS state reaches the page as itself.
-    status: str
-    queue_name: Optional[str]
-    executor_id: Optional[str]
-    app_version: Optional[str]
-    #: 1 for a run that ran once; above 1 means it was recovered by another executor.
-    recovery_attempts: Optional[int]
-    created_at: Optional[datetime]
-    dequeued_at: Optional[datetime]
-    completed_at: Optional[datetime]
-    error: Optional[str]
-    input: Optional[str]
-    output: Optional[str]
 
 
 class WorkflowRunsPage(BaseModel):
@@ -180,7 +162,7 @@ def _run_out(run: WorkflowRun) -> WorkflowRunOut:
 
 @router.get("", response_model=WorkflowTypesOut)
 @superadmin_only(Tenancy.OPERATOR)
-def list_workflow_types(
+async def list_workflow_types(
     _actor: AdminUser = Depends(require_superadmin),
 ) -> WorkflowTypesOut:
     """Every registered non-cron workflow, with its recent-run rollup.
@@ -188,6 +170,10 @@ def list_workflow_types(
     Every registry entry appears, with zero counts if it never ran ("shipped but never fired" is
     actionable). One engine call for all types (`workflow_engine.aggregate`).
     """
+    return await run_in_threadpool(_list_workflow_types)
+
+
+def _list_workflow_types() -> WorkflowTypesOut:
     rollups = aggregate(names=listed_names())
     return WorkflowTypesOut(
         workflows=[
@@ -206,7 +192,7 @@ def list_workflow_types(
 
 @router.get("/runs", response_model=WorkflowRunsPage)
 @superadmin_only(Tenancy.OPERATOR)
-def list_workflow_runs(
+async def list_workflow_runs(
     name: Optional[str] = Query(
         default=None,
         description=(
@@ -254,6 +240,13 @@ def list_workflow_runs(
 
     `limit` and `offset` are capped by the signature and refused past it, not clamped silently.
     """
+    return await run_in_threadpool(_list_workflow_runs, name, status, search, start_time, end_time, limit, offset)
+
+
+def _list_workflow_runs(
+    name: Optional[str], status: Optional[str], search: Optional[str], start_time: Optional[str],
+    end_time: Optional[str], limit: int, offset: int,
+) -> WorkflowRunsPage:
     if name is not None and get(name) is None:
         _reject("name", f"{name!r} is not a registered workflow; expected one of {list(listed_names())}")
     if status is not None and status not in STATUSES:
@@ -295,7 +288,7 @@ def list_workflow_runs(
 
 @router.get("/runs/{workflow_id:path}", response_model=WorkflowRunOut)
 @superadmin_only(Tenancy.OPERATOR)
-def get_workflow_run(
+async def get_workflow_run(
     workflow_id: str,
     _actor: AdminUser = Depends(require_superadmin),
 ) -> WorkflowRunOut:
@@ -303,6 +296,10 @@ def get_workflow_run(
 
     Bounded to the registered workflows as the page is, so a cron tick's id is a 404 here too. A 404 also when
     the engine cannot answer: `list_runs` does not tell "no such run" from "no engine"."""
+    return await run_in_threadpool(_get_workflow_run, workflow_id)
+
+
+def _get_workflow_run(workflow_id: str) -> WorkflowRunOut:
     runs = list_runs(names=listed_names(), workflow_ids=[workflow_id], limit=1)
     if not runs:
         raise HTTPException(status_code=404, detail=f"no workflow run with id {workflow_id!r}")
@@ -311,7 +308,7 @@ def get_workflow_run(
 
 @router.get("/cron-ticks/pending", response_model=WorkflowRunsPage)
 @superadmin_only(Tenancy.OPERATOR)
-def list_pending_cron_ticks(
+async def list_pending_cron_ticks(
     _actor: AdminUser = Depends(require_superadmin),
 ) -> WorkflowRunsPage:
     """The PENDING `cron_tick` runs (`sched-cron:*` ids), newest first, with the executor holding each.
@@ -319,6 +316,10 @@ def list_pending_cron_ticks(
     The one window onto cron ticks: the runs page excludes them (the module docstring says why), which also
     hid a tick whose executor died mid-run. Not paged: `PENDING_TICKS_LIMIT` bounds it.
     """
+    return await run_in_threadpool(_list_pending_cron_ticks)
+
+
+def _list_pending_cron_ticks() -> WorkflowRunsPage:
     runs = list_runs(names=(CRON_TICK_WORKFLOW,), status="PENDING", limit=PENDING_TICKS_LIMIT)
     return WorkflowRunsPage(
         runs=[_run_out(run) for run in runs],
@@ -334,7 +335,7 @@ def list_pending_cron_ticks(
 
 @router.get("/{name}", response_model=WorkflowDetailOut)
 @superadmin_only(Tenancy.OPERATOR)
-def get_workflow_type(
+async def get_workflow_type(
     name: str,
     _actor: AdminUser = Depends(require_superadmin),
 ) -> WorkflowDetailOut:
@@ -343,12 +344,14 @@ def get_workflow_type(
     A 404, not an empty descriptor: an unregistered name is not a workflow with no runs. Its rollup uses
     its own window, not the list's (see `WorkflowDetailOut`).
     """
+    return await run_in_threadpool(_get_workflow_type, name)
+
+
+def _get_workflow_type(name: str) -> WorkflowDetailOut:
     descriptor = get(name)
     if descriptor is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"no workflow named {name!r}; this catalogue carries {list(listed_names())}",
-        )
+        # The catalogue is listed only on a miss: it is a scan, not a lookup.
+        raise HTTPException(status_code=404, detail=f"no workflow named {name!r}; this catalogue carries {list(listed_names())}")
     # This workflow's own window, not its share of the shared one (see `WorkflowDetailOut`).
     rollups = aggregate(names=(descriptor.name,))
     return WorkflowDetailOut(

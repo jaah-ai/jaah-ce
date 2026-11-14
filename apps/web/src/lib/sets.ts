@@ -22,6 +22,14 @@ export function withRemoved<K>(prev: ReadonlySet<K>, key: K): Set<K> {
   return next
 }
 
+/** A Record state without `key` — the same object when it had none, so a state setter is a no-op. */
+export function withoutKey<T>(prev: Record<string, T>, key: string): Record<string, T> {
+  if (!(key in prev)) return prev
+  const next = { ...prev }
+  delete next[key]
+  return next
+}
+
 /** `prev` with `key` present when `on`, absent otherwise: a checkbox's `onChange(checked)`. */
 export function withMember<K>(prev: ReadonlySet<K>, key: K, on: boolean): Set<K> {
   return on ? withAdded(prev, key) : withRemoved(prev, key)

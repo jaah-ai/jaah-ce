@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link as RouterLink } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Link from '@mui/material/Link'
@@ -6,21 +6,23 @@ import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
 import { FilterRow, FilterSelect, vocabularyOptions, withUnmatched } from '../../ui/FilterRow'
 import { humanDuration } from '../../lib/relativeTime'
+import { countOf } from '../../lib/humanize'
 import { useEventStream } from '../../hooks/useEventStream'
+import { usePhone } from '../../hooks/usePhone'
 import { useLiveRefetch } from '../../hooks/useLiveRefetch'
 import { useApiRead } from '../../hooks/useApiRead'
-import { usePagedLogFilters } from '../../hooks/usePagedLogFilters'
+import { useListPage } from '../../hooks/useListPage'
 import { useUrlFilters } from '../../hooks/useUrlFilters'
 import Banner from '../../ui/Banner'
 import NoMatchesState from '../../ui/NoMatchesState'
+import { SelectFilters } from '../../ui/SelectFilters'
 import type { FeedRowSpec } from '../../ui/feed/types'
 import FilterBar from '../../ui/FilterBar'
 import StatusChip, { type Tone } from '../../ui/StatusChip'
 import { PHONE } from '../../ui/listStyles'
-import { PageNav } from '../../ui/Pager'
+import ListPager from '../../ui/ListPager'
 import ListStates from '../../ui/feed/ListStates'
-import { usePageClamp } from '../../hooks/usePageClamp'
-import { Stat, StatGrid } from '../../ui/StatGrid'
+import { Stat, FactsGrid } from '../../ui/FactsGrid'
 import {
   listFleetIntents,
   type FleetIntentPage,
@@ -28,6 +30,7 @@ import {
   type IntentQueueCounts,
   type IntentSet,
 } from './intentsApi'
+import { FONT_WEIGHT, grid, SIZE } from '../../theme'
 
 /* AUDIT > NODES > SLOT INTENTS — the fleet's slot-intent queue, and the wedge detector.
  * An intent is an order the CP places against one pool SLOT (lease, release, stop its stack), minted by a
@@ -45,45 +48,32 @@ import {
  * record that a row refused until its budget ran out and was put before a human. `superseded` is
  * neutral bookkeeping. Unlisted outcomes fall to neutral (`ui/statusTone.ts`'s contract). This file is the
  * map's home. */
-const OUTCOME_TONE: Record<string, Tone> = {
-  done: 'success',
-  accepted: 'success',
-  refused_stale: 'warning',
-  refused_precondition: 'warning',
-  failed: 'error',
-  unsupported_verb: 'error',
-  superseded: 'neutral',
-  parked: 'error',
+type Mark = { tone: Tone; glyph: string }
+
+/* The disc's glyphs (no `badge-*` tokens exist, so `toneFor` cannot answer): tick succeeded, slashed ring refused at
+ * a gate, cross a genuine failure, question mark an unknown verb, return arrow withdrawn by the CP, double bang
+ * `parked`. Unlisted → `·`. */
+const OUTCOME: Record<string, Mark> = {
+  done: { tone: 'success', glyph: '✓' },
+  accepted: { tone: 'success', glyph: '✓' },
+  refused_stale: { tone: 'warning', glyph: '⊘' },
+  refused_precondition: { tone: 'warning', glyph: '⊘' },
+  failed: { tone: 'error', glyph: '✕' },
+  unsupported_verb: { tone: 'error', glyph: '?' },
+  clone_refused: { tone: 'error', glyph: '✕' },
+  superseded: { tone: 'neutral', glyph: '↺' },
+  parked: { tone: 'error', glyph: '‼' },
 }
 
-/** The server's one-word answer for why a row is not moving. */
-const STATE_TONE: Record<FleetIntentRow['state'], Tone> = {
-  due: 'info',
-  withheld: 'warning',
-  retired: 'neutral',
+/** The server's one-word answer for why a row is not moving: chevron on its way, ellipsis held back, filled square
+ *  over. */
+const STATE: Record<FleetIntentRow['state'], Mark> = {
+  due: { tone: 'info', glyph: '»' },
+  withheld: { tone: 'warning', glyph: '⋯' },
+  retired: { tone: 'neutral', glyph: '■' },
 }
 
-/* The disc's glyphs (no `badge-*` tokens exist, so `toneFor` cannot answer). Chevron on its way, ellipsis held
- * back, filled square over; retired — tick succeeded, slashed ring refused at a gate, cross a genuine failure,
- * question mark an unknown verb, return arrow withdrawn by the CP, double bang `parked`. Unlisted → `·`. */
-const STATE_GLYPH: Record<FleetIntentRow['state'], string> = {
-  due: '»',
-  withheld: '⋯',
-  retired: '■',
-}
-
-const OUTCOME_GLYPH: Record<string, string> = {
-  done: '✓',
-  accepted: '✓',
-  refused_stale: '⊘',
-  refused_precondition: '⊘',
-  failed: '✕',
-  unsupported_verb: '?',
-  superseded: '↺',
-  parked: '‼',
-}
-
-/** A one-option `FilterSelect`, not a toggle, so at 390px `FilterRow` packs it two per line with its peers. */
+/** A one-option select, not a toggle: one narrowing like its peers (`ui/SelectFilters`). */
 const REFUSING_OPTIONS = [{ value: 'yes', label: 'Refused at least once' }]
 
 /** `retired` is absent: the server 422s it (`_INTENT_STATES` in routes/nodes/intents.py is the single home). */
@@ -145,7 +135,7 @@ const INTENT_SET_DIVIDED_SX = {
  * selects rendered 150/130/206px, a ragged staircase; equal widths fix it. Wider, `flex: 1 1 150px` shares
  * spare width while keeping each control's floor. */
 const FILTER_STRIP_SX = {
-  '& .MuiFormControl-root': { flex: '1 1 150px', maxWidth: 240 },
+  '& .MuiFormControl-root': { flex: `1 1 ${grid(25)}`, maxWidth: grid(40) },
   [PHONE]: { '& .MuiFormControl-root': { flex: '1 1 100%', maxWidth: 'none' } },
 } as const
 
@@ -172,34 +162,32 @@ function IntentTable({
   onPage: (page: FleetIntentPage) => void
 }) {
   const copy = INTENT_SET_COPY[set]
-  /* EVERY FILTER CHANGE RESETS TO PAGE 1, through one helper: staying on a page past the end reads as "no
-     such rows". */
-  const { page, setPage, narrow: applyFilter } = usePagedLogFilters(1)
   const [verb, setVerb] = useState('')
   const [outcome, setOutcome] = useState('')
   const [state, setState] = useState('')
   const [refusing, setRefusing] = useState('')
+  const setters = { verb: setVerb, state: setState, outcome: setOutcome, refusing: setRefusing }
+  const phone = usePhone()
 
-  /* THE NODE LENS RESETS THE PAGE TOO (it bypasses `applyFilter`). ADJUSTED DURING RENDER, NOT IN AN EFFECT:
-     an effect runs after `filters` is rebuilt, so a request for the stale page would fire before the reset's.
-     React re-runs the render immediately, so the first request under the new lens is the right one. */
-  const lensRef = useRef(node)
-  if (lensRef.current !== node) {
-    lensRef.current = node
-    setPage(1)
-  }
+  /* EVERY FILTER CHANGE — the node lens included — LANDS ON PAGE 1 (`resetKey`, read as 1 in the same render,
+     so the first request under the new filters is the right one): staying on a page past the end reads as "no
+     such rows". Two tables on one URL: each set prefixes its own `page`/`per`. */
+  const { page, per, setPage, setPer } = useListPage({
+    prefix: `${set}_`, resetKey: JSON.stringify([verb, outcome, state, refusing, node]),
+  })
 
-  /* The request, built in one place: untouched it is `set=<set>&page=1` and NOTHING else. Unset filters are
-     OMITTED (`./intentsApi.ts`). */
+  /* The request, built in one place: untouched it is `set=<set>&page=1&per=50` and NOTHING else. Unset
+     filters are OMITTED (`./intentsApi.ts`). */
   const filters = useMemo(() => ({
     set,
     page,
+    per,
     verb,
     outcome,
     state,
     refusing: refusing !== '',
     node,
-  }), [set, page, verb, outcome, state, refusing, node])
+  }), [set, page, per, verb, outcome, state, refusing, node])
 
   /* The hook's generation fence: a stale winner would show a past queue as current. On failure the payload is
      NOT cleared: the last good reading under a stale banner beats a skeleton. */
@@ -222,10 +210,9 @@ function IntentTable({
   }, [refreshKey])
 
   const total = data?.total ?? 0
-  const per = data?.per ?? 0
-  /* Next is disabled on the known last page (`total`). The set can shrink under the operator (filter, lens,
-     failures ageing out of the purge) — the hook clamps back. */
-  const totalPages = usePageClamp(page, setPage, total, per)
+  /* The set can shrink under the operator (filter, lens, failures ageing out of the purge): `ListPager` clamps
+     back; until it lands the page is past the end. */
+  const pastEnd = page > Math.max(1, Math.ceil(total / per))
 
   /* Options from the server's scan of the set, never a client copy of `fleet_verdicts`. The ACTIVE value is
      unioned in so an applied filter never vanishes from its own control. */
@@ -264,16 +251,13 @@ function IntentTable({
        `_intent_queue` counts an absent outcome under. */
     const retiredOutcome = row.outcome ?? 'unknown'
     const stateWord = set === 'pending' ? row.state : retiredOutcome
+    const mark: Mark | undefined = set === 'pending' ? STATE[row.state] : OUTCOME[retiredOutcome]
 
     return {
       key: String(row.id),
       indicator: {
-        tone: set === 'pending'
-          ? (STATE_TONE[row.state] ?? 'neutral')
-          : (OUTCOME_TONE[retiredOutcome] ?? 'neutral'),
-        glyph: set === 'pending'
-          ? (STATE_GLYPH[row.state] ?? '·')
-          : (OUTCOME_GLYPH[retiredOutcome] ?? '·'),
+        tone: mark?.tone ?? 'neutral',
+        glyph: mark?.glyph ?? '·',
         label: stateWord,
         title: waiting ? `${stateWord} — ${waiting}` : stateWord,
         data: { status: set === 'pending' ? row.state : `outcome-${retiredOutcome}` },
@@ -282,13 +266,14 @@ function IntentTable({
       title: waiting ? `${row.verb} — ${waiting}` : row.verb,
       /* NAMES THE HOST: the node slot is gated at `id`, so a phone row would otherwise lack it. */
       titleText: `${row.node} ${row.slot} ${row.verb}${waiting ? ` — ${waiting}` : ''}`,
+      href: null,
       ariaLabel: `${row.verb} ${row.slot} on ${row.node} — ${stateWord}${waiting ? `, ${waiting}` : ''}`
         + (reasonText ? `. ${reasonText}` : ''),
       data: { 'intent-id': row.id, set },
       slots: [
         {
           key: 'refusals',
-          width: 52,
+          width: grid(8.5),
           gate: 'meta',
           align: 'right',
           mono: true,
@@ -296,13 +281,13 @@ function IntentTable({
           /* THE COUNT ONLY (the cause is the row's note). The ack rewrites `outcome` to `parked` once the
              budget is spent, erasing what the row refused with. */
           title: row.refusals > 0
-            ? `Refused ${row.refusals} time${row.refusals === 1 ? '' : 's'}`
+            ? `Refused ${countOf(row.refusals, 'time')}`
             : 'Never refused',
           node: row.refusals > 0 ? `${row.refusals}×` : null,
         },
         {
           key: 'node',
-          width: 96,
+          width: grid(16),
           gate: 'id',
           mono: true,
           testId: 'intent-node',
@@ -321,7 +306,7 @@ function IntentTable({
         },
         {
           key: 'age',
-          width: 52,
+          width: grid(8.5),
           mono: true,
           dim: true,
           testId: 'intent-age',
@@ -360,54 +345,29 @@ function IntentTable({
       <Box sx={[FILTER_STRIP_SX, { mt: 1 }]}>
         <FilterBar>
           <FilterRow>
-            <FilterSelect
-              label="Verb"
-              ariaLabel={`Filter ${set} intents by verb`}
-              value={verb}
-              onChange={next => applyFilter(() => setVerb(next))}
-              allLabel="All verbs"
-              options={verbOptions}
-              minWidth={150}
-            />
-            {set === 'pending' ? (
-              <FilterSelect
-                label="State"
-                ariaLabel="Filter pending intents by state"
-                value={state}
-                onChange={next => applyFilter(() => setState(next))}
-                allLabel="Any state"
-                options={STATE_OPTIONS}
-                minWidth={150}
-              />
-            ) : (
-              <FilterSelect
-                label="Outcome"
-                ariaLabel="Filter retired intents by outcome"
-                value={outcome}
-                onChange={next => applyFilter(() => setOutcome(next))}
-                allLabel="Any outcome"
-                options={outcomeOptions}
-                minWidth={150}
-              />
-            )}
-            <FilterSelect
-              label="Refusals"
-              ariaLabel={`Filter ${set} intents by refusals`}
-              value={refusing}
-              onChange={next => applyFilter(() => setRefusing(next))}
-              allLabel="Any"
-              options={REFUSING_OPTIONS}
-              minWidth={180}
+            <SelectFilters<keyof typeof setters>
+              narrowings={[
+                { key: 'verb', label: 'Verb', ariaLabel: `Filter ${set} intents by verb`, allLabel: 'All verbs', options: verbOptions, testId: `${set}-intents-filter-verb` },
+                set === 'pending'
+                  ? { key: 'state', label: 'State', ariaLabel: 'Filter pending intents by state', allLabel: 'Any state', options: STATE_OPTIONS, testId: 'pending-intents-filter-state' }
+                  : { key: 'outcome', label: 'Outcome', ariaLabel: 'Filter retired intents by outcome', allLabel: 'Any outcome', options: outcomeOptions, testId: 'retired-intents-filter-outcome' },
+                { key: 'refusing', label: 'Refusals', ariaLabel: `Filter ${set} intents by refusals`, allLabel: 'Any', options: REFUSING_OPTIONS, testId: `${set}-intents-filter-refusing`, minWidth: SIZE.fieldMd },
+              ]}
+              values={{ verb, state, outcome, refusing }}
+              onChange={(key, value) => setters[key](value)}
+              onClear={keys => keys.forEach(key => setters[key](''))}
+              phone={phone}
+              menuName={`Filter ${set} intents`}
             />
           </FilterRow>
         </FilterBar>
       </Box>
 
-      {/* `page > totalPages`: the clamp has queued a correction — hold the skeleton, not a false "no match".
+      {/* `pastEnd`: the clamp has queued a correction — hold the skeleton, not a false "no match".
           TWO DIFFERENT ANSWERS (via `total_unfiltered`): "nothing is queued" vs "nothing matches your filter".
           `copy.ariaLabel` / `copy.testId` keep "Pending intents" / "Recently retired intents" for suites and AT. */}
       <ListStates
-        loading={loading || page > totalPages}
+        loading={loading || pastEnd}
         skeleton={{ rows: 3 }}
         empty={rows.length === 0}
         noMatch={filtered && (data?.total_unfiltered ?? 0) > 0 && <NoMatchesState />}
@@ -415,12 +375,13 @@ function IntentTable({
         feed={{ ariaLabel: copy.ariaLabel, testId: copy.testId, sections: [{ key: set, rows: intentRows }] }}
       />
 
-      <PageNav
-        testId={`${copy.rowTestId}s-pagination`}
+      <ListPager
         page={page}
-        setPage={setPage}
-        totalPages={totalPages}
-        label={`Page ${page} of ${totalPages} — ${total} row${total === 1 ? '' : 's'}`}
+        per={per}
+        total={data ? total : null}
+        onPage={setPage}
+        onPer={setPer}
+        testId={`${copy.rowTestId}s-pagination`}
       />
     </Box>
   )
@@ -428,7 +389,7 @@ function IntentTable({
 
 /** A labelled strip of `key count` chips (`data-status="<prefix>-<key>"`), or "none"; unlisted in `tones` is neutral. */
 function CountChips({ testId, label, prefix, counts, tones }: {
-  testId: string; label: string; prefix: string; counts: [string, number][]; tones?: Record<string, Tone>
+  testId: string; label: string; prefix: string; counts: [string, number][]; tones?: Record<string, Mark>
 }) {
   return (
     <Box data-testid={testId} sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 0.5 }}>
@@ -437,7 +398,7 @@ function CountChips({ testId, label, prefix, counts, tones }: {
         <Typography variant="caption" component="span" sx={{ color: 'text.secondary' }}>none</Typography>
       ) : (
         counts.map(([key, count]) => (
-          <StatusChip key={key} label={`${key} ${count}`} tone={tones?.[key] ?? 'neutral'} data-status={`${prefix}-${key}`} />
+          <StatusChip key={key} label={`${key} ${count}`} tone={tones?.[key]?.tone ?? 'neutral'} data-status={`${prefix}-${key}`} />
         ))
       )}
     </Box>
@@ -502,7 +463,7 @@ export default function SlotIntentsTab({ enabled = true }: {
       )}
       {refusing > 0 && (
         <Banner severity="warning" testId="intents-refusing-banner">
-          {`${refusing} pending intent${refusing === 1 ? '' : 's'} ${refusing === 1 ? 'has' : 'have'} refused at least once. Each refusal spends the park budget; when it runs out a human gate opens.`}
+          {`${countOf(refusing, 'pending intent')} ${refusing === 1 ? 'has' : 'have'} refused at least once. Each refusal spends the park budget; when it runs out a human gate opens.`}
         </Banner>
       )}
 
@@ -517,7 +478,7 @@ export default function SlotIntentsTab({ enabled = true }: {
               onChange={next => setFilters({ node: next })}
               allLabel="All nodes"
               options={nodeOptions}
-              minWidth={180}
+              minWidth={SIZE.fieldMd}
             />
           </FilterRow>
         </FilterBar>
@@ -535,7 +496,7 @@ export default function SlotIntentsTab({ enabled = true }: {
       )}
 
       {/* `maxWidth` so the five numbers do not scatter across a wide page. */}
-      <StatGrid sx={{ maxWidth: 720 }}>
+      <FactsGrid fit sx={{ maxWidth: grid(120) }}>
         <Stat label="Pending" value={String(summary?.pending ?? 0)} testId="intents-stat-pending" />
         <Stat label="Due now" value={String(summary?.due ?? 0)} testId="intents-stat-due" />
         <Stat label="Withheld" value={String(summary?.withheld ?? 0)} testId="intents-stat-withheld" />
@@ -547,12 +508,12 @@ export default function SlotIntentsTab({ enabled = true }: {
             : humanDuration(summary.oldest_pending_age_seconds)}
           testId="intents-stat-oldest"
         />
-      </StatGrid>
+      </FactsGrid>
 
       {/* ── Pending ────────────────────────────────────────────────────────────────────────────────
           Two headings at the same level: the two sets are halves of one object, not main + appendix. */}
       <Box sx={INTENT_SET_SX}>
-        <Typography variant="subtitle2" component="h3" sx={{ fontWeight: 600 }}>
+        <Typography variant="subtitle2" component="h3" sx={{ fontWeight: FONT_WEIGHT.semibold }}>
           Pending
         </Typography>
 
@@ -567,7 +528,7 @@ export default function SlotIntentsTab({ enabled = true }: {
           The note is REQUIRED: `purge_unexecutable_intents` deletes retired rows past `retention_seconds`, so
           an empty history must never read as "nothing ever failed". */}
       <Box sx={INTENT_SET_DIVIDED_SX}>
-        <Typography variant="subtitle2" component="h3" sx={{ fontWeight: 600 }}>
+        <Typography variant="subtitle2" component="h3" sx={{ fontWeight: FONT_WEIGHT.semibold }}>
           Recently retired
         </Typography>
         {/* WHAT THE WINDOW BOUNDS: only FAILURES age out — `purge_unexecutable_intents` never matches `done`,
@@ -584,7 +545,7 @@ export default function SlotIntentsTab({ enabled = true }: {
           </Typography>
         )}
 
-        <CountChips testId="intents-outcomes" label="Outcomes:" prefix="outcome" counts={outcomes} tones={OUTCOME_TONE} />
+        <CountChips testId="intents-outcomes" label="Outcomes:" prefix="outcome" counts={outcomes} tones={OUTCOME} />
 
         <IntentTable set="retired" node={node} refreshKey={refreshKey} onPage={onPage} />
       </Box>

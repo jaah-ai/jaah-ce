@@ -1,27 +1,32 @@
 """Generic public (no-session) endpoints + shared helpers."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+from typing import Final, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy.orm import Session
+from pydantic import BaseModel
 
-from app import edition_features
-from app.durable import notify_outbox
+from app import db_async, edition_features
 from app.auth import google_client_id
 from app.authz.catalog import Tenancy
 from app.authz.declarations import always
-from app.db import get_session
+from app.db_async import DbDep
 from app.login_oauth import frontend_origin, github_configured, microsoft_configured
 from app.ratelimit import SharedRateLimiter
+from app.entity_shape import or_404
+from app.request_body import read_capped
 
 router = APIRouter(prefix="/api/public", tags=["public"])
 # The Telegram bot's webhook (cloud-only, included by `app/routers_cloud.py`).
 telegram_router = APIRouter(prefix="/api/public", tags=["public"])
+# Paths outside `/api` a spec fixes (`/.well-known/...`): the edge routes each one here by name (edge.tf, public-ui.tf).
+well_known_router = APIRouter(tags=["public"])
 log = logging.getLogger("app.routes.public")
 
 
@@ -34,7 +39,7 @@ def check_rate_limit(request: Request) -> None:
 
 @router.get("/settings", dependencies=[Depends(check_rate_limit)])
 @always(Tenancy.BOOTSTRAP)
-def public_settings(session: Session = Depends(get_session)):
+async def public_settings(*, session: DbDep):
     """Unauthenticated: what the login and sign-up pages need before sign-in — the app title, the Google
     OAuth client id the "Sign in with Google" button initializes with, and the sign-up flow's links.
 
@@ -50,16 +55,22 @@ def public_settings(session: Session = Depends(get_session)):
     enforcing seam would otherwise return nothing; the statement is pinned to `org_id = ORG_ZERO_ID`.
     `identity_scope()` would not work: `AppSettings` is not in `IDENTITY_CLASSES`.
     """
-    from app import legal_pages
-    from app.operator_settings import reads as settings_reads
     from app.routes.settings import app_title_for
     from app.tenancy import seam
     from app.tenancy.ids import ORG_ZERO_ID
 
     with seam.operator_scope():
-        app_title = app_title_for(session, ORG_ZERO_ID)
+        app_title = await session.run_sync(app_title_for, ORG_ZERO_ID)
+    await db_async.release(session)
+    # The rest reads operator settings and credentials on sessions of their own: off the event loop.
+    return {"app_title": app_title, **await run_in_threadpool(_public_settings_rest)}
+
+
+def _public_settings_rest() -> dict:
+    from app import legal_pages
+    from app.operator_settings import reads as settings_reads
+
     return {
-        "app_title": app_title,
         "google_client_id": google_client_id(),
         # Whether "Sign in with GitHub" renders: a platform GitHub OAuth App is designated (`login_oauth`).
         "github_sign_in": github_configured(),
@@ -76,19 +87,86 @@ def public_settings(session: Session = Depends(get_session)):
         "terms_url": legal_pages.signup_link("terms"),
         "privacy_url": legal_pages.signup_link("privacy"),
         "legal_version": settings_reads.get_str("legal_version"),
+        # The console's Sentry DSN (`apps/web/src/lib/errorTracking.ts`); blank = error tracking off, nothing loads.
+        # A browser DSN is public by design: the browser must hold it to send.
+        "error_tracking_dsn_web": settings_reads.get_text("error_tracking_dsn_web"),
     }
 
 
 @router.get("/signup-status", dependencies=[Depends(check_rate_limit)])
 @always(Tenancy.BOOTSTRAP)
-def signup_status():
+async def signup_status():
     """Unauthenticated: whether the self-service sign-up is open (`app/signup.py`), so the login and
     sign-up pages say "Sign-up is closed" before a visitor picks a provider. An edition without sign-up is closed."""
     if not edition_features.enabled("signup"):
         return {"open": False}
     from app import signup
 
-    return {"open": signup.is_open()}
+    return {"open": await run_in_threadpool(signup.is_open)}
+
+
+# ── The plans and prices list (`app/public_plans.py`; the docs portal's Plans and prices page) ───────────
+
+
+class PublicPriceOut(BaseModel):
+    amount_cents: int
+    currency: str
+    interval: str
+
+
+class PublicPlanOut(BaseModel):
+    key: str
+    name: str
+    description: str
+    #: The monthly price (0 = Free; per agent when `per_agent`); None = sold by contact only.
+    price: Optional[PublicPriceOut]
+    #: The yearly price; None = sold monthly only.
+    yearly_price: Optional[PublicPriceOut]
+    per_agent: bool
+    #: The fewest agents a purchase buys (`per_agent` plans).
+    min_agents: int
+    #: The free trial a purchase opens with, in days; None = none.
+    trial_days: Optional[int]
+    #: The plan ends after this many days; None = never.
+    duration_days: Optional[int]
+    #: What the plan bundles (an included hosted node, say), in words.
+    products: list[str]
+    #: Each cap by its label (Agents, Nodes, Projects, Users, GitHub Runners); None = unlimited.
+    caps: dict[str, Optional[int]]
+    #: The features the plan includes, by name.
+    features: list[str]
+    self_serve: bool
+
+
+class PublicHostingOut(BaseModel):
+    kind: str
+    key: str
+    label: str
+    monthly_cents: int
+    currency: str
+
+
+class PublicPlansOut(BaseModel):
+    plans: list[PublicPlanOut]
+    hosting: list[PublicHostingOut]
+
+
+#: Any site may read the list (the docs portal is on its own host); a reader's browser keeps it 5 minutes.
+PUBLIC_PLANS_HEADERS: Final = {"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=300"}
+
+
+@router.get("/plans", response_model=PublicPlansOut, dependencies=[Depends(check_rate_limit)])
+@always(Tenancy.BOOTSTRAP)
+async def public_plans(response: Response, *, db: DbDep) -> dict:
+    """Unauthenticated: every plan the sign-up offers with its price, caps and features, and what hosted machines
+    cost (`app/public_plans.py`). Plan and price rows are org-less, so nothing about any tenant is read."""
+    if not edition_features.enabled("signup"):
+        raise HTTPException(status_code=404, detail="Not found.")
+    from app import public_plans as listing
+
+    body = await db.run_sync(listing.listing)
+    response.headers.update(PUBLIC_PLANS_HEADERS)
+    return body
 
 
 # ── The public legal pages (`app/legal_pages.py` owns the text's source, the values and when it is live) ─
@@ -96,17 +174,26 @@ def signup_status():
 
 @router.get("/legal/{slug}", dependencies=[Depends(check_rate_limit)])
 @always(Tenancy.BOOTSTRAP)
-def legal_page(slug: str):
+async def legal_page(slug: str):
     """Unauthenticated: one legal page (any `legal_pages.PAGES` slug) as a block tree the
     console's /legal route renders. 404 until an operator publishes the pages with every value set — the
     same answer as an unknown page, so a draft's existence is not served either. Operator settings are
     org-less, so nothing about any tenant is read."""
     from app import legal_pages
 
-    page = legal_pages.render(slug, preview=False)
-    if page is None:
-        raise HTTPException(status_code=404, detail="Not found.")
+    page = or_404(await run_in_threadpool(legal_pages.render, slug, preview=False), detail="Not found.")
     return page
+
+
+@well_known_router.api_route("/.well-known/security.txt", methods=["GET", "HEAD"], dependencies=[Depends(check_rate_limit)])
+@always(Tenancy.BOOTSTRAP)
+async def security_txt():
+    """Unauthenticated: RFC 9116's security.txt, its Contact the Settings > Legal Security contact
+    (`legal_pages.security_txt`). 404 while that is unset."""
+    from app import legal_pages
+
+    body = or_404(await run_in_threadpool(legal_pages.security_txt), detail="Not found.")
+    return Response(body, media_type="text/plain; charset=utf-8", headers={"Cache-Control": "max-age=3600"})
 
 
 # ── The compliance manifest's public keys (`app/compliance_signing.py` owns the keys; R5) ───────────────
@@ -115,9 +202,9 @@ def legal_page(slug: str):
 def _published_keys_or_503():
     # An edition without compliance signs nothing, so it publishes no key: both key routes are its 404.
     if not edition_features.enabled("compliance"):
-        from app.ce_caps import NOT_IN_CE
+        from app import ce_caps
 
-        raise HTTPException(status_code=404, detail=NOT_IN_CE)
+        raise ce_caps.not_in_edition()
     from app import compliance_signing
     from app.aws.kms import KmsError
 
@@ -131,7 +218,7 @@ def _published_keys_or_503():
 
 @router.get("/compliance/keys", dependencies=[Depends(check_rate_limit)])
 @always(Tenancy.BOOTSTRAP)
-def compliance_keys():
+async def compliance_keys():
     """Unauthenticated: every public key a compliance manifest from this environment may be signed under —
     the active key and each retired one — so a third party verifies a manifest offline (the reader doc
     "Verifying a Jaah compliance manifest"). Public halves only; an empty list when signing is unconfigured."""
@@ -144,19 +231,18 @@ def compliance_keys():
                 "status": k.status,
                 "public_key_pem": k.public_key_pem,
             }
-            for k in _published_keys_or_503()
+            for k in await run_in_threadpool(_published_keys_or_503)
         ]
     }
 
 
 @router.get("/compliance/keys/{kid}.pem", dependencies=[Depends(check_rate_limit)])
 @always(Tenancy.BOOTSTRAP)
-def compliance_key_pem(kid: str):
+async def compliance_key_pem(kid: str):
     """Unauthenticated: one published key as PEM text — what the documented `curl … > key.pem` step fetches.
     404 for a kid this environment does not publish."""
-    key = next((k for k in _published_keys_or_503() if k.kid == kid), None)
-    if key is None:
-        raise HTTPException(status_code=404, detail="Not found.")
+    keys = await run_in_threadpool(_published_keys_or_503)
+    key = or_404(next((k for k in keys if k.kid == kid), None), detail="Not found.")
     return Response(content=key.public_key_pem, media_type="text/plain")
 
 
@@ -195,7 +281,7 @@ async def _unsubscribe_answer(request: Request, token: str, *, act: bool) -> Res
         return HTMLResponse(email_unsubscribe.page("confirm", nonce), headers=headers)
     # The body (RFC 8058's `List-Unsubscribe=One-Click`, or the confirm form's same field) is read and not
     # required: the signed token is the whole authority, and a client that posts another shape still means it.
-    await _read_capped(request, _UNSUBSCRIBE_MAX_BODY)
+    await read_capped(request, _UNSUBSCRIBE_MAX_BODY)
     await run_in_threadpool(email_unsubscribe.unsubscribe, target)
     return HTMLResponse(email_unsubscribe.page("done", nonce), headers=headers)
 
@@ -216,25 +302,54 @@ async def email_unsubscribe_one_click(token: str, request: Request):
     return await _unsubscribe_answer(request, token, act=True)
 
 
+# ── The confirm-address link of a typed-in alert email (`app/notification_emails.py` owns the flow) ──────────────
+
+EMAIL_VERIFY_PATH = "/email/verify/{token}"
+_email_verify_limiter = SharedRateLimiter(
+    limit=int(os.environ.get("EMAIL_VERIFY_RATE_LIMIT", "60")), window=60.0, bucket="alert-email-verify"
+)
+
+
+async def _email_verify_answer(request: Request, token: str, *, redeem: bool) -> Response:
+    import secrets as _secrets
+
+    from fastapi.responses import HTMLResponse
+
+    from app import email_unsubscribe, notification_emails
+
+    nonce = _secrets.token_urlsafe(16)
+    visitor_ip = request.client.host if request.client else "unknown"
+    if not await run_in_threadpool(_email_verify_limiter.allow, visitor_ip):
+        return Response("Too many requests. Try again in a minute.", status_code=429, media_type="text/plain")
+    kind = await run_in_threadpool(notification_emails.use_link, token, redeem=redeem)
+    status = 200 if kind in (notification_emails.LINK_CONFIRM, notification_emails.LINK_DONE) else 404
+    return HTMLResponse(
+        notification_emails.page(kind, nonce), status_code=status, headers=email_unsubscribe.page_headers(nonce),
+    )
+
+
+@router.get(EMAIL_VERIFY_PATH)
+@always(Tenancy.BOOTSTRAP)
+async def email_verify_confirm(token: str, request: Request):
+    """Unauthenticated: the page a confirm-address link opens — one button that POSTs. A GET changes nothing, so a
+    mail scanner's prefetch never confirms an address. An expired or used link answers a plain 404 page."""
+    return await _email_verify_answer(request, token, redeem=False)
+
+
+@router.post(EMAIL_VERIFY_PATH)
+@always(Tenancy.BOOTSTRAP)
+async def email_verify_redeem(token: str, request: Request):
+    """Unauthenticated: the confirm page's button. A live link proves its address (and the person's login email, while
+    it still is that address); a used or expired one answers a plain 404 page."""
+    return await _email_verify_answer(request, token, redeem=True)
+
+
 # ── Event-driven Task triggers (`app/trigger_intake.py` owns the flow) ─────────────────────────────
 
 TRIGGER_INGRESS_PATH = "/triggers/{ingress_token}"
-
-
-async def _read_capped(request: Request, limit: int) -> bytes | None:
-    """The raw body, or None once it passes `limit` bytes — refused by the declared length first, then by
-    what actually arrives, so a lying `Content-Length` cannot make us buffer more."""
-    declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > limit:
-        return None
-    chunks: list[bytes] = []
-    size = 0
-    async for chunk in request.stream():
-        size += len(chunk)
-        if size > limit:
-            return None
-        chunks.append(chunk)
-    return b"".join(chunks)
+# Reads granted more than 1 MiB (a record-only GitHub trigger's signed delivery) run a few at a time per process,
+# so a sender holding a token and a signature-shaped header cannot stack many 25 MiB buffers before the 401.
+_LARGE_READS = asyncio.Semaphore(4)
 
 
 @router.post(TRIGGER_INGRESS_PATH)
@@ -251,11 +366,19 @@ async def trigger_ingress(ingress_token: str, request: Request):
     from app import trigger_intake
     from app.triggers import MAX_BODY_BYTES
 
-    raw = await _read_capped(request, MAX_BODY_BYTES)
+    headers = dict(request.headers)
+    # The cap is chosen before a byte of the body is read: 1 MiB, or more only for a record-only GitHub trigger's
+    # signed delivery (`trigger_intake.body_limit`).
+    limit = await run_in_threadpool(trigger_intake.body_limit, ingress_token, headers)
+    if limit > MAX_BODY_BYTES:
+        async with _LARGE_READS:
+            raw = await read_capped(request, limit)
+    else:
+        raw = await read_capped(request, limit)
     visitor_ip = request.client.host if request.client else "unknown"
     answer = await run_in_threadpool(
         trigger_intake.ingest_http,
-        ingress_token, raw, dict(request.headers), dict(request.query_params), visitor_ip,
+        ingress_token, raw, headers, dict(request.query_params), visitor_ip, limit,
     )
     return JSONResponse(answer.body or {}, status_code=answer.status)
 
@@ -264,10 +387,19 @@ async def trigger_ingress(ingress_token: str, request: Request):
 
 _TELEGRAM_MAX_BODY = 64 * 1024
 _TELEGRAM_LINKED = "Connected. Jaah notifications will arrive here; turn events on or off in Profile > Notifications."
+_TELEGRAM_GROUP_LINKED = (
+    "Connected. Jaah notifications will arrive in this group, and everyone here will see them. Turn events on or off "
+    "in Profile > Notifications."
+)
+_TELEGRAM_ALREADY = "This chat is already connected. Turn events on or off in Profile > Notifications in Jaah."
 _TELEGRAM_BAD_CODE = "That link expired or was already used. Open Profile > Notifications in Jaah and connect again."
 _TELEGRAM_HELLO = "To get Jaah notifications here, open Profile > Notifications in Jaah and choose Connect."
-_TELEGRAM_REPLACED = "This chat no longer gets Jaah notifications: another Telegram account was connected instead."
 _TELEGRAM_LABEL_MAX = 64
+_TELEGRAM_GROUPS = ("group", "supergroup")
+
+
+def _telegram_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _telegram_sender_label(message: dict) -> str | None:
@@ -284,44 +416,62 @@ def _telegram_sender_label(message: dict) -> str | None:
     return name[:_TELEGRAM_LABEL_MAX] or None
 
 
-def _telegram_update(raw: bytes) -> dict | None:
+def _telegram_chat_label(chat: dict, message: dict) -> str | None:
+    """A group's title in full (Telegram caps it at 128), else the private chat's sender (`_telegram_sender_label`)."""
+    title = chat.get("title")
+    if chat.get("type") in _TELEGRAM_GROUPS and isinstance(title, str) and title.strip():
+        return title.strip()
+    return _telegram_sender_label(message)
+
+
+async def _telegram_update(raw: bytes, token: str) -> dict | None:
     """The reply for one update, as a Bot API method in the webhook's own response, or None for no reply.
 
-    Only a private chat's `/start` is acted on: the deep link's code redeems; anything else gets one line that
-    names where to start. A group the bot is added to is ignored."""
+    A `/start <code>` (or `/start@<bot> <code>`, as Telegram sends it from the `startgroup` link) in a private chat
+    or a group redeems the code for that chat. Any other private text gets one line that names where to start; a
+    group's other messages are ignored, except the notice that it became a supergroup, which moves its links to the
+    new chat id."""
     if not edition_features.enabled("telegram"):
         return None
-    from app import telegram_link
-    from app.db import SessionLocal
+    from app import telegram_bot, telegram_link
 
     try:
         update = json.loads(raw)
     except ValueError:
         return None
     message = update.get("message") if isinstance(update, dict) else None
-    chat = message.get("chat") if isinstance(message, dict) else None
-    text = message.get("text") if isinstance(message, dict) else None
-    if not isinstance(chat, dict) or chat.get("type") != "private" or not isinstance(text, str):
+    if not isinstance(message, dict):
         return None
-    chat_id = chat.get("id")
-    if not isinstance(chat_id, int) or isinstance(chat_id, bool):
+    chat = message.get("chat")
+    if not isinstance(chat, dict):
         return None
-    code = telegram_link.start_code(text)
+    chat_id = _telegram_int(chat.get("id"))
+    chat_type = chat.get("type")
+    if chat_id is None or chat_type not in ("private", *_TELEGRAM_GROUPS):
+        return None
+    moved_to = _telegram_int(message.get("migrate_to_chat_id"))
+    if chat_type in _TELEGRAM_GROUPS and moved_to is not None:
+        await db_async.run_in_session(telegram_link.migrate_chat, chat_id, moved_to)
+        return None
+    text = message.get("text")
+    if not isinstance(text, str):
+        return None
+    group = chat_type != "private"
+    bot_username = await run_in_threadpool(telegram_bot.bot_username, token) if group else None
+    code = telegram_link.start_code(text, bot_username)
     if code is None:
-        reply = _TELEGRAM_HELLO
+        return None if group else {"method": "sendMessage", "chat_id": chat_id, "text": _TELEGRAM_HELLO}
+    # `redeem` commits.
+    answer = await db_async.run_in_session(
+        telegram_link.redeem, code, chat_id, chat_type=chat_type, label=_telegram_chat_label(chat, message)
+    )
+    if answer is None:
+        reply = _TELEGRAM_BAD_CODE
+    elif answer == telegram_link.ALREADY:
+        reply = _TELEGRAM_ALREADY
     else:
-        with SessionLocal() as session:
-            linked = telegram_link.redeem(session, code, chat_id, label=_telegram_sender_label(message))
-        reply = _TELEGRAM_LINKED if linked is not None else _TELEGRAM_BAD_CODE
-        if linked is not None and linked[1] is not None:
-            _tell_replaced_chat(linked[1])
+        reply = _TELEGRAM_GROUP_LINKED if group else _TELEGRAM_LINKED
     return {"method": "sendMessage", "chat_id": chat_id, "text": reply}
-
-
-def _tell_replaced_chat(chat_id: int) -> None:
-    """Tell a chat a new link replaced that it gets nothing more: handed to the durable outbox
-    (`durable/notify_outbox.py`), so the webhook answers Telegram at once. Never raises."""
-    notify_outbox.telegram(chat_id, _TELEGRAM_REPLACED, "replaced-chat notice")
 
 
 @telegram_router.post("/telegram/updates")
@@ -342,8 +492,8 @@ async def telegram_webhook(request: Request):
     presented = request.headers.get(telegram_bot.SECRET_HEADER, "")
     if token is None or not hmac.compare_digest(presented.encode(), telegram_bot.webhook_secret(token).encode()):
         raise HTTPException(status_code=404, detail="Not found.")
-    raw = await _read_capped(request, _TELEGRAM_MAX_BODY)
+    raw = await read_capped(request, _TELEGRAM_MAX_BODY)
     if raw is None:
         return Response(status_code=200)
-    reply = await run_in_threadpool(_telegram_update, raw)
+    reply = await _telegram_update(raw, token)
     return JSONResponse(reply) if reply is not None else Response(status_code=200)

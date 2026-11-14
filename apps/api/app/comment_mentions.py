@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Callable, Iterable, Optional
 from uuid import UUID
 
@@ -21,6 +20,7 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app import notify_targets, support_access
+from app.clock import utcnow
 from app.identities import display_name, label_expr
 from app.models.identity import AdminUser
 from app.models.support import Ticket
@@ -233,7 +233,7 @@ def stamp_read(
             statement = statement.where(model.id.in_(ids[:MAX_READ_IDS]))
         return statement
 
-    now = datetime.now(timezone.utc) if read else None
+    now = utcnow() if read else None
     rows = list(session.scalars(unread(select(model))).all())
     for row in rows:
         row.read_at = now

@@ -1,0 +1,40 @@
+slug = "replicate"
+label = "Replicate"
+category = "ai_media"
+vendor_docs_url = "https://replicate.com/docs/reference/http"
+summary = "Run thousands of image, video, audio and language models hosted on Replicate."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_token", label = "API token", kind = "secret", required = true, placeholder = "r8_...", help = "Sign in at replicate.com, open your account menu > API tokens (replicate.com/account/api-tokens), name a new token and select Create token. It starts with r8_" },
+]
+
+[test]
+method = "GET"
+path = "https://api.replicate.com/v1/account"
+auth = { field = "api_token", header = "Authorization", prefix = "Bearer" }
+identity = [["username"]]
+
+[docs]
+agent_uses = [
+  "Run any public model on Replicate (image, video, speech, music, language) and fetch its output",
+  "Run your own private models and deployments",
+  "Check the status of a prediction and cancel one that is no longer needed",
+  "Search the model catalog for a model that fits the task",
+]
+prerequisites = [
+  "A Replicate account with billing set up; without a payment method the API is limited to a few requests per minute",
+]
+limitations = [
+  "Predictions are billed by Replicate per second of compute or per output; the Test only reads your account",
+  "Model outputs are stored by Replicate for a limited time, so agents should save anything they need",
+]
+troubleshooting = [
+  { symptom = "The Test says Replicate rejected the API token (401)", fix = "The token was deleted or mistyped. Create a new one under API tokens and select Replace" },
+  { symptom = "Agents get 429 Too Many Requests", fix = "The account has no payment method, so it is limited to about 6 requests per minute. Add billing in your Replicate account settings" },
+  { symptom = "Agents get 402 Payment Required", fix = "The account's credit is spent. Add credit or a payment method in Replicate's billing settings" },
+]
+faq = [
+  { q = "Whose account pays for the predictions", a = "The account the token belongs to, or the organization if you created the token while working in an organization" },
+]

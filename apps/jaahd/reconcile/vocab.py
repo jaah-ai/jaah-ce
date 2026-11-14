@@ -9,7 +9,7 @@ import stat
 from datetime import datetime, timezone
 
 import control_plane_api
-from jaah_env import env_get
+from env_helpers import now_iso
 
 log = logging.getLogger(__name__)
 
@@ -18,8 +18,6 @@ log = logging.getLogger(__name__)
 AGENTS_PROBE_TIMEOUT = 15
 
 GIT_FAST_TIMEOUT = 10
-
-GIT_FETCH_TIMEOUT = 20
 
 
 # The observation wire version; bump only for a breaking record change. A pid alone is not an identity
@@ -61,6 +59,20 @@ VERB_DELIVER_ANSWER = "deliver_answer"
 VERB_DELIVER_MESSAGE = "deliver_message"
 
 
+# Switch a live runner's model in place (an operator's edit of a running task): an ACP session's `set_model`
+# control, else the pane CLI's own switch (`model_switch`). Payload `{task_id, session_id, model}`.
+VERB_SWITCH_MODEL = "switch_model"
+
+
+# Opens a `failed` ack's detail when the runner was simply busy (mid-turn, a dialog up, text on its composer): a
+# normal wait, which the CP re-serves without charging the park budget (`routes/agent/slot_intents.py::_is_uncharged`
+# matches this exact prefix).
+RUNNER_BUSY_PREFIX = "runner-busy: "
+# A `switch_model` retired `done` WITHOUT switching (no in-place switch, an unknown model, a MicroVM session) leads its
+# detail with this, so the CP never records the model as the runner's (`apps/api/app/fleet_verdicts.py` twin).
+NOT_SWITCHED_PREFIX = "not switched: "
+
+
 # Kill a runner that finished without exiting and free its slot. Decided off the DB.
 VERB_KILL_RUNNER = "kill_runner"
 
@@ -74,7 +86,7 @@ VERB_DESTROY_SLOT = "destroy_slot"
 VERB_ERASE_TREE = "erase_tree"
 
 
-# Queue an operator's steer/interrupt/answer/close for an ACP session's host (`acp/runtime.py`'s control lane),
+# Queue an operator's steer/interrupt/answer/close/set_model for an ACP session's host (`acp/runtime.py`'s control lane),
 # addressed by the payload's session id: `{session_id, intent: {id, type, payload}}`.
 VERB_RUNTIME_CONTROL = "runtime_control"
 
@@ -86,7 +98,7 @@ VERB_RUNTIME_CONTROL = "runtime_control"
 # `destroy_slot` is the CP's order whatever the tree's state (`slot_allocation.retire`).
 _UNSTAMPED_VERBS = frozenset(
     {VERB_LEASE_SLOT, VERB_RELEASE_SLOT, VERB_DELIVER_ANSWER, VERB_DELIVER_MESSAGE, VERB_KILL_RUNNER,
-     VERB_RESET_TO_BASE, VERB_DESTROY_SLOT, VERB_ERASE_TREE, VERB_RUNTIME_CONTROL})
+     VERB_RESET_TO_BASE, VERB_DESTROY_SLOT, VERB_ERASE_TREE, VERB_RUNTIME_CONTROL, VERB_SWITCH_MODEL})
 
 
 # Only `done` retires an enacted intent; refusals stay pending for re-decision. `unsupported_verb` also
@@ -101,15 +113,9 @@ OUTCOME_REFUSED_PRECONDITION = "refused_precondition"
 
 OUTCOME_FAILED = "failed"
 
-
-def _env_int(name: str, default: int) -> int:
-    raw = env_get(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
+# A slot's clone the forge refused (auth, not found, `slot_clone.CloneFailed.refused`): retires the intent and ends
+# the task's attempt CP-side, where a retry would only be refused again.
+OUTCOME_CLONE_REFUSED = "clone_refused"
 
 
 def _epoch(t: str) -> int:
@@ -127,11 +133,7 @@ def _to_utc_iso(t: str) -> str:
     if not t:
         return ""
     try:
-        return (
-            datetime.fromisoformat(t.replace("Z", "+00:00"))
-            .astimezone(timezone.utc)
-            .strftime("%Y-%m-%dT%H:%M:%SZ")
-        )
+        return now_iso(datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp())
     except (ValueError, TypeError):
         return ""
 

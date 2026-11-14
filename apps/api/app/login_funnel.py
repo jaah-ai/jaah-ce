@@ -26,11 +26,10 @@ from uuid import UUID
 
 from fastapi import Request
 from sqlalchemy.orm import Session
-from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app import act_as, auth, edition_features, hipaa, identities, login_lockout, mfa, org_gate
-from app.db import IdentitySessionLocal, SessionLocal
+from app import db_async
 from app.request_caller import client_headers
 from app.models.identity import AdminUser, UserIdentity
 from app.models.orgs import Org
@@ -597,6 +596,17 @@ def reissue_session(request: Request, response, user: AdminUser) -> None:
     """Re-mint the caller's own live session for `user` at the row's AND the identity's current epochs,
     keeping the session's `iat`, `amr` and Terms claim. A no-op when the request carries no live session for this user
     (fails closed: nothing is minted that a sign-in did not start)."""
+    _remint(request, response, user, keep_terms=True)
+
+
+def release_terms_gate(request: Request, response, user: AdminUser) -> None:
+    """Re-mint the caller's own live session WITHOUT the Terms claim, once the person accepted
+    (`routes/legal_acceptance.py`) — the one writer that drops it. Otherwise `reissue_session`: the epochs
+    current, `iat` and `amr` kept, and a no-op without a live session of this user's."""
+    _remint(request, response, user, keep_terms=False)
+
+
+def _remint(request: Request, response, user: AdminUser, *, keep_terms: bool) -> None:
     # The person's own row, never an acting operator's seat copy (`act_as.person`): its epochs are the live ones.
     user = act_as.person(user)
     claims = auth.read_session(request.cookies.get(auth.COOKIE_NAME))
@@ -604,38 +614,27 @@ def reissue_session(request: Request, response, user: AdminUser) -> None:
         return
     auth.set_session_cookie(
         response, user.id, user.session_epoch or 0, iepoch=auth.identity_epoch(user),
-        iat=claims.iat, amr=claims.amr, terms=claims.terms,
+        iat=claims.iat, amr=claims.amr, terms=claims.terms if keep_terms else None,
     )
 
 
-def release_terms_gate(request: Request, response, user: AdminUser) -> None:
-    """Re-mint the caller's own live session WITHOUT the Terms claim, once the person accepted
-    (`routes/legal_acceptance.py`) — the one writer that drops it. Otherwise `reissue_session`: the epochs
-    current, `iat` and `amr` kept, and a no-op without a live session of this user's."""
-    user = act_as.person(user)
-    claims = auth.read_session(request.cookies.get(auth.COOKIE_NAME))
-    if claims is None or claims.admin_id != user.id:
-        return
-    auth.set_session_cookie(
-        response, user.id, user.session_epoch or 0, iepoch=auth.identity_epoch(user),
-        iat=claims.iat, amr=claims.amr,
-    )
-
-
-def _row_is_live(claims: auth.SessionClaims) -> bool:
+async def _row_is_live(claims: auth.SessionClaims) -> bool:
     """Whether the cookie's row still holds this session — read only when a re-mint is due (at most once
     per client per refresh interval), so a dead cookie is never refreshed and a slow request cannot
     re-mint a retired epoch over the cookie a password change or a new sign-in just set. A session its
     org's HIPAA idle rule ended is dead too: a public route's 200 must not revive it."""
-    # Identity escape: this read resolves who the cookie names (`auth._session_user`'s reason). The identity
-    # lane (`app/db.py`): a middleware read beside the route's own session.
-    with IdentitySessionLocal() as session:
-        with seam.identity_scope():
-            row = session.get(AdminUser, claims.admin_id)
-            if not auth.session_row_is_live(row, claims.epoch, claims.iepoch):
-                return False
-        # Outside the escape, which declares exactly what it reads (`orgs` is not tenant-owned).
-        return not auth.session_idled_out(None, session, row, claims.issued_at)
+    # An identity read on the async pool (`app/db_async.py`): a middleware read beside the route's own session.
+    return await db_async.run_in_session(_row_is_live_in, claims, identity=True)
+
+
+def _row_is_live_in(session: Session, claims: auth.SessionClaims) -> bool:
+    # Identity escape: this read resolves who the cookie names (`auth._session_user`'s reason).
+    with seam.identity_scope():
+        row = session.get(AdminUser, claims.admin_id)
+        if not auth.session_row_is_live(row, claims.epoch, claims.iepoch):
+            return False
+    # Outside the escape, which declares exactly what it reads (`orgs` is not tenant-owned).
+    return not auth.session_idled_out(None, session, row, claims.issued_at)
 
 
 # A request no person caused: the console marks a request sent after a quiet spell with no input
@@ -684,7 +683,7 @@ class SessionRefreshMiddleware(BaseHTTPMiddleware):
             or _sets_session_cookie(response)
             # Jarvis reading for the user is not the user being active: no slide.
             or auth.assisted(request)
-            or not await run_in_threadpool(_row_is_live, claims)
+            or not await _row_is_live(claims)
         ):
             return response
         auth.set_session_cookie(

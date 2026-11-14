@@ -91,6 +91,9 @@ TERMINAL_TYPES: tuple[str, ...] = (
     "no_pr",
     "finish",
     "outcome",
+    "review",
+    # A benchmark shadow's ending (`app/outcome_ledger/benchmark.py`): its draft PR is open and never merged.
+    "shadow_pr",
 )
 
 # ── The input manifest ──────────────────────────────────────────────────────────────────────────────
@@ -101,6 +104,10 @@ TERMINAL_TYPES: tuple[str, ...] = (
 INPUT_MANIFEST: dict[str, tuple[str, ...]] = {
     "architecture": ("prd",),
     "plan": ("prd", "architecture"),
+    # The blind review children read their coder's epic's documents (`app/blind_review.py::epic_inputs`).
+    "reviewer": ("prd", "architecture"),
+    "security_reviewer": ("prd", "architecture"),
+    "tester": ("prd", "architecture"),
 }
 
 # ── The manifest levels ─────────────────────────────────────────────────────────────────────────────

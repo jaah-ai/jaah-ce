@@ -1,6 +1,8 @@
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
+import { SIZE } from '../../../theme'
 import { GLYPH_BOX_SX, GLYPH_BUTTON_ON_SX, GLYPH_BUTTON_SX } from '../../../ui/ToolbarMenu'
+import Tip from '../../../ui/Tip'
 
 /* FLAT / TREE — a roster's STRUCTURE, the ONE control that decides it (one-decision-one-control): ONE
  * wordless on/off button at every width, pressed = Tree. The glyph shows the CURRENT structure; tooltip and
@@ -21,7 +23,7 @@ function ViewGlyph({ view }: { view: PaneView }) {
       focusable="false"
       data-testid="pane-mode-glyph"
       data-view={view}
-      sx={{ width: 16, height: 16, display: 'block' }}
+      sx={{ width: SIZE.iconSm, height: SIZE.iconSm, display: 'block' }}
     >
       <Box
         component="path"
@@ -39,19 +41,18 @@ function ViewGlyph({ view }: { view: PaneView }) {
 export default function PaneModeToggle({ value, onChange }: { value: PaneView; onChange: (next: PaneView) => void }) {
   const tree = value === 'hierarchy'
   return (
-    <Button
+    <Tip title="Tree view"><Button
       variant="outlined"
       color="inherit"
       onClick={() => onChange(tree ? 'flat' : 'hierarchy')}
       aria-pressed={tree}
       aria-label="Tree view"
-      title="Tree view"
       data-testid="pane-mode-toggle"
       sx={tree ? GLYPH_BUTTON_ON_SX : GLYPH_BUTTON_SX}
     >
       <Box component="span" sx={GLYPH_BOX_SX}>
         <ViewGlyph view={value} />
       </Box>
-    </Button>
+    </Button></Tip>
   )
 }

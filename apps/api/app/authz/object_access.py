@@ -1,4 +1,5 @@
-"""Single-object access: `can_access`, `require_object_access`, and create-time ownership."""
+"""Single-object access: `can_access`, `require_object_access`, the org-wide 403s `require_org_key` /
+`require_org_admin`, and create-time ownership."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -9,6 +10,7 @@ from fastapi import HTTPException
 from sqlalchemy import literal, select
 from sqlalchemy.orm import Session
 
+from app.entity_shape import SYSTEM_ACTOR_ID
 from app.models.credentials import Account, Credential
 from app.models.identity import AdminUser
 from app.models.tasks import Task
@@ -45,6 +47,27 @@ def named_user_reaches_project(
     if is_tenant_org(actor.org_id) and user.id != actor.id:
         probe = replace(probe, is_superadmin=False)
     return can_access(session, probe, "project", project_id, mode=ObjectAccess.READ)
+
+
+def named_user_or_422(
+    session: Session, value: UUID, *, project_id: int, actor: AdminUser, field: str, system_refusal: str,
+    reach_refusal: str,
+) -> UUID:
+    """`field`'s user id (a project role, a task assignee), refused unless it names a real, non-system user who
+    can ALREADY reach `project_id` (`named_user_reaches_project`): the one door the two routes share, each
+    owing only the two sentences that are its own. 422 naming the field, never the account: echoing the
+    email would be a uuid→address oracle. By id first: the system row sits in org zero (revision 0406),
+    which a tenant caller's scope does not read, so a tenant naming it is refused as the system actor."""
+    user = session.get(AdminUser, value)
+    if user is None and value != SYSTEM_ACTOR_ID:
+        raise HTTPException(status_code=422, detail=f"{field} does not name a known user (id={value})")
+    if value == SYSTEM_ACTOR_ID or user.is_system:
+        raise HTTPException(status_code=422, detail=f"{field} may not be the system actor: {system_refusal}")
+    if not named_user_reaches_project(session, user, project_id, actor=actor):
+        raise HTTPException(
+            status_code=422, detail=f"{field} names a user with no access to this project — {reach_refusal}",
+        )
+    return value
 
 
 #: What Start's own route guard asks of the presser (`start_task`'s `@feature`), so of a stand-in too.
@@ -221,6 +244,28 @@ def require_object_access(
         raise HTTPException(status_code=404, detail="not found")
 
 
+def require_org_key(principal: Principal | None, key: str, *, detail: Any) -> None:
+    """`Principal.has_org(key)` or 403 with `detail` verbatim (a str or a `{code, message}` dict — each
+    route keeps its own body). The handler-side gate of a widening write: the key held on one project never
+    reaches the org's rows or settings. `None` (the agent principal) is refused: no agent route widens."""
+    if principal is None or not principal.has_org(key):
+        raise HTTPException(status_code=403, detail=detail)
+
+
+def require_org_admin(principal: Principal | None, *, detail: Any) -> None:
+    """`Principal.is_org_admin` or 403 with `detail` verbatim — the `@org_admin` rule for a handler that
+    declares a lower tier and asks it itself (G4)."""
+    if principal is None or not principal.is_org_admin:
+        raise HTTPException(status_code=403, detail=detail)
+
+
+def require_project_key(principal: Principal | None, key: str, project_id: int | None, *, detail: Any) -> None:
+    """`has_project_key` or 403 with `detail` verbatim — the handler-side gate of a write that needs `key` on
+    that one project."""
+    if not has_project_key(principal, key, project_id):
+        raise HTTPException(status_code=403, detail=detail)
+
+
 #: The two answers of a create door's `ownership` field (G2/G3): the caller's own row, or the org's.
 OWNERSHIP_PERSONAL = "personal"
 OWNERSHIP_ORG = "org"
@@ -241,9 +286,7 @@ def validated_ownership(
     if value is None:
         return None
     if value not in choices:
-        raise HTTPException(
-            status_code=422, detail=f"ownership must be one of {list(choices)}"
-        )
+        raise HTTPException(status_code=422, detail=f"ownership must be one of {list(choices)}")
     if value in (OWNERSHIP_ORG, OWNERSHIP_SYSTEM) and not may_create_org:
         raise HTTPException(
             status_code=403,
@@ -331,6 +374,50 @@ def stamp_owner_on_create(
     if ownership != OWNERSHIP_PERSONAL and creates_org_rows(principal):
         return
     obj.owner_id = principal.user_id
+
+
+def validated_reassignment(
+    session: Session,
+    principal: Principal | None,
+    obj: Credential | Account,
+    *,
+    ownership: Any,
+    owner_user_id: UUID | None,
+) -> tuple[UUID | None, bool]:
+    """The `(owner_id, system)` a LIVE credential or account is moved to: its type (`personal` / `org`, and
+    `system` for a credential) and, for a personal one, its owner — an Org Owner/Admin's or an operator's act
+    (403 otherwise; an echo of the stored values passes for anyone). Assigns nothing: the caller compares, assigns with the rest of its write, clears what the
+    new type cannot carry (a credential's project home) and commits. `ownership` absent keeps the type;
+    `owner_user_id` absent on a personal target keeps the current owner, else the caller. The owner passes
+    `validated_owner_user` (an enabled member of the row's org). An account is never `system`."""
+    is_credential = isinstance(obj, Credential)
+    current = (
+        OWNERSHIP_PERSONAL if obj.owner_id is not None
+        else OWNERSHIP_SYSTEM if is_credential and obj.system else OWNERSHIP_ORG
+    )
+    choices = CREDENTIAL_OWNERSHIP_CHOICES if is_credential else OWNERSHIP_CHOICES
+    target = validated_ownership(ownership, may_create_org=True, choices=choices) or current
+    unchanged = (obj.owner_id, is_credential and bool(obj.system))
+    if target == current and owner_user_id in (None, obj.owner_id):
+        # An echo of what is stored: nothing to decide, whoever sends it.
+        return unchanged
+    if principal is not None and not principal.is_org_admin:
+        raise HTTPException(status_code=403, detail="only an Org Owner or Admin changes an owner")
+    if principal is not None and owner_user_id == principal.user_id and principal.org_id != obj.org_id:
+        # `validated_owner_user` waves a caller naming itself through; an operator is no member of a tenant's org.
+        raise HTTPException(status_code=422, detail="owner_user_id must be a member of this org")
+    if target != OWNERSHIP_PERSONAL:
+        if owner_user_id is not None:
+            raise HTTPException(status_code=422, detail="owner_user_id needs ownership 'personal'")
+        return None, target == OWNERSHIP_SYSTEM
+    owner_id = (
+        validated_owner_user(session, principal, owner_user_id, ownership=target, org_id=obj.org_id)
+        or obj.owner_id
+        or (principal.user_id if principal is not None else None)
+    )
+    if owner_id is None:
+        raise HTTPException(status_code=422, detail="owner_user_id is required for a personal row")
+    return owner_id, False
 
 
 # Which task clause each action means, derived from the declaration's verb. `view` -> READ holds for

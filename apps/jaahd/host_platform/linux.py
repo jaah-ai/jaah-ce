@@ -19,7 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from host_platform import _posix
+from host_platform import _posix, _types
 from host_platform._types import Paths, Peer, Service, metrics_sample
 
 OS = "linux"
@@ -81,10 +81,7 @@ pane_os_pid = _posix.pane_os_pid
 
 path_key = _posix.path_key
 is_under = _posix.is_under
-
-
-def machine() -> str:
-    return _platform.machine()
+machine = _types.machine
 
 
 def os_version() -> str:
@@ -276,6 +273,39 @@ def child_pids(pid: "int | str") -> set | None:
             return set(fh.read().split())
     except OSError:
         return None
+
+
+def ptrace_scope() -> int:
+    """Yama's ptrace scope (`/proc/sys/kernel/yama/ptrace_scope`); 0 — any same-uid ptrace — when there is no
+    Yama or it cannot be read."""
+    try:
+        with open("/proc/sys/kernel/yama/ptrace_scope", encoding="ascii") as handle:
+            return int(handle.read().strip() or "0")
+    except (OSError, ValueError):
+        return 0
+
+
+def socket_holders(inode: int) -> set[int]:
+    """Pids, other than this one, holding socket INODE open (their `/proc/<pid>/fd` links). Only processes this
+    one may read are seen."""
+    link = f"socket:[{inode}]"
+    me = os.getpid()
+    holders: set[int] = set()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == me:
+            continue
+        try:
+            names = os.listdir(f"/proc/{entry}/fd")
+        except OSError:
+            continue
+        for name in names:
+            try:
+                if os.readlink(f"/proc/{entry}/fd/{name}") == link:
+                    holders.add(int(entry))
+                    break
+            except OSError:
+                continue
+    return holders
 
 
 def owner_uid(pid: int) -> int | None:

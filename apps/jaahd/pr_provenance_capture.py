@@ -1,7 +1,7 @@
 """A `merged_pr` settle's PR provenance — merge sha, commits, changed paths — stamped as `pr_provenance`.
 
 Read by `pr_stats_capture.capture_all` beside `pr_stats`, with the same login, PR number and ONE shared budget
-(`pr_stats_capture.BUDGET_S`), through the forge-agnostic `Adapter.provenance`. GitHub and GitLab implement it;
+(`pr_stats_capture.BUDGET_S`), through the forge-agnostic `Adapter.provenance`. All four forges implement it;
 a forge that does not answers `not_captured`/`unsupported_forge` rather than a guess. The caller may not send
 `pr_provenance` itself (`agent_vocabulary`'s `task.complete` `daemon_body_keys`): commits a model typed would be
 self-attested. The wire is `forge_cli.model.Provenance`; the CP half that stores it: `apps/api/app/pr_changes.py`.

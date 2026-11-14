@@ -1,8 +1,8 @@
-"""Authorization: groups, permissions, roles, role bindings, access requests and budgets."""
+"""Authorization: groups, permissions, roles, role bindings and budgets."""
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import Optional
 from uuid import UUID
 from sqlalchemy import (
     BigInteger,
@@ -17,10 +17,9 @@ from sqlalchemy import (
     text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
-from app.access_catalog import LEVELS, ONE_SCOPE_SQL, REQUEST_STATES, SCOPE_ORG_IS_OWN_SQL, in_sql
+from app.access_catalog import LEVELS, ONE_SCOPE_SQL, SCOPE_ORG_IS_OWN_SQL, in_sql
 from app.models.base import Base, EntityMixin, org_unique, OrgScoped, StampedMixin, timestamp_column, UuidPkMixin
 
 
@@ -163,9 +162,9 @@ class RolePermission(Base):
 
 
 class RoleAtScopeMixin:
-    """A role at a scope: the four columns a binding holds and a request names (one row's worth of either).
-    `role_id` is RESTRICT — a role still bound or asked for is not deletable (built-ins are never deleted
-    anyway); exactly one of `_SCOPE_COLUMNS` is set (`ONE_SCOPE_SQL`, each table's own CHECK)."""
+    """A role at a scope: the four columns a binding holds.
+    `role_id` is RESTRICT — a role still bound is not deletable (built-ins are never deleted
+    anyway); exactly one of `_SCOPE_COLUMNS` is set (`ONE_SCOPE_SQL`, the table's CHECK)."""
 
     role_id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("roles.id", ondelete="RESTRICT"), nullable=False
@@ -229,44 +228,3 @@ class RoleBinding(UuidPkMixin, StampedMixin, OrgScoped, RoleAtScopeMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("groups.id", ondelete="CASCADE"), nullable=True
     )
     expires_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
-
-
-class AccessRequest(UuidPkMixin, StampedMixin, OrgScoped, RoleAtScopeMixin, Base):
-    """One principal asking for a role at a scope, and what came of it.
-
-    The role and scope columns (`RoleAtScopeMixin`) and their CHECKs are `RoleBinding`'s: a request names
-    exactly the binding approving it would write. One PENDING request per (requester, role, scope)
-    (`uq_access_requests_pending`).
-    `binding_id` is SET NULL so the record outlives a later unbind. `state`'s vocabulary is
-    `app/access_catalog.py::REQUEST_STATES`."""
-
-    __tablename__ = "access_requests"
-    __table_args__ = (
-        CheckConstraint(ONE_SCOPE_SQL, name="ck_access_requests_one_scope"),
-        CheckConstraint(SCOPE_ORG_IS_OWN_SQL, name="ck_access_requests_scope_org_is_own_org"),
-        CheckConstraint(
-            in_sql("state", REQUEST_STATES), name="ck_access_requests_state"
-        ),
-        Index(
-            "uq_access_requests_pending", "requester_id", "role_id", *_SCOPE_COLUMNS,
-            unique=True, postgresql_nulls_not_distinct=True,
-            postgresql_where=text("state = 'pending'"),
-        ),
-    )
-
-    requester_id: Mapped[UUID] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("admin_users.id", ondelete="CASCADE"), nullable=False
-    )
-    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    state: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
-    decided_by_id: Mapped[Optional[UUID]] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("admin_users.id", ondelete="SET NULL"), nullable=True
-    )
-    decided_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
-    binding_id: Mapped[Optional[UUID]] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("role_bindings.id", ondelete="SET NULL"), nullable=True
-    )
-    requester_seen_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
-    slack_messages: Mapped[list[Any]] = mapped_column(
-        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
-    )

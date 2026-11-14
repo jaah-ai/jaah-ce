@@ -1,0 +1,36 @@
+slug = "apify"
+label = "Apify"
+category = "search"
+credential_type = "apify"
+vendor_docs_url = "https://docs.apify.com/platform/integrations/api"
+summary = "Run Apify Actors and read their datasets to scrape and crawl the web from agent sessions."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_token", label = "API token", kind = "secret", required = true, placeholder = "apify_api_...", help = "In Apify Console open Settings > API & Integrations (console.apify.com/settings/integrations) and copy the Default API token, or select Create a new token. Leave Limit token permissions off unless you grant it the Actors your agents should run" },
+]
+
+[docs]
+agent_uses = [
+  "Run any public or private Actor from Apify Store (web scrapers, crawlers, browser automations) with the input the task needs",
+  "Read the results an Actor run stored in its dataset or key-value store",
+  "Check the status and log of a run, and abort a run that went wrong",
+  "Schedule or re-run your saved Actor tasks",
+]
+prerequisites = [
+  "An Apify account (the free plan includes monthly platform credit)",
+  "The Actors your agents should run, either your own or ones from Apify Store",
+]
+limitations = [
+  "Actor runs consume your Apify platform credit and compute units; Jaah sets no spending cap, so set one in Apify Console under Settings > Usage & billing",
+  "A token with Limit token permissions on can only run the Actors and read the storages it was granted",
+]
+troubleshooting = [
+  { symptom = "The Test says Apify rejected the API token (401)", fix = "The token was revoked or mistyped. Create a new one in Console > Settings > API & Integrations and select Replace on the secret" },
+  { symptom = "The Test passes but an agent gets 403 when it starts an Actor", fix = "The token has Limit token permissions on. Edit the token in Settings > API & Integrations and grant it the Actor and its storages, or use the Default API token" },
+  { symptom = "Runs fail with a usage or credit error", fix = "The account's monthly credit is spent. Check Console > Settings > Usage & billing and raise the limit or upgrade the plan" },
+]
+faq = [
+  { q = "Does Jaah run Actors on its own", a = "No. Only an agent working a task you started calls Apify, and only with the secret you let that task use" },
+]

@@ -17,12 +17,14 @@ import base64
 import binascii
 import logging
 import re
-from datetime import datetime, timezone
 from typing import NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
+from starlette.concurrency import run_in_threadpool
 from app import edition_features, node_credentials
+from app.clock import utcnow
+from app.entity_shape import or_404
 from app.operator_settings import reads as settings_reads
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
@@ -149,7 +151,7 @@ def _object_key(object_path: str, raw_path: str) -> str | None:
 
 @router.get(f"{APT_PATH}/{{object_path:path}}", status_code=307)
 @infra(Tenancy.OPERATOR)
-def serve_apt_object(
+async def serve_apt_object(
     object_path: str,
     request: Request,
     # Order is the contract: the translation runs first so `_check_token` sees the header.
@@ -161,12 +163,17 @@ def serve_apt_object(
     A redirect, not a proxy, so the CP never streams package bytes; apt does not forward its Basic
     credentials to the redirect target.
     """
-    key = _object_key(object_path, _raw_path(request))
-    if key is None:
-        # Before any config read, so a hostile path gets the same 404 whether or not a channel exists.
-        raise HTTPException(status_code=404, detail="no such object")
+    # Off the loop: the presign resolves the bucket setting (a DB read on a cache miss) and the AWS credentials
+    # (an HTTP fetch from the container endpoint).
+    return await run_in_threadpool(
+        serve_object, _object_key(object_path, _raw_path(request)), channel="apt", caller=caller
+    )
 
-    return presigned_redirect(key, channel="apt", caller=caller)
+
+def serve_object(key: str | None, *, channel: str, caller: node_credentials.AgentCaller) -> RedirectResponse:
+    """The one 404-then-redirect tail every bucket channel shares: `key` is the channel's allowlisted key."""
+    # Before any config read, so a hostile path gets the same 404 whether or not a channel exists.
+    return presigned_redirect(or_404(key, detail="no such object"), channel=channel, caller=caller)
 
 
 def presigned_redirect(
@@ -175,9 +182,9 @@ def presigned_redirect(
     """A 307 to a 90-second presigned GET for `key` in the apt bucket, or a 503 naming what is missing.
 
     The single home for the bucket/region/credential resolution and the signing, shared by every
-    channel re-serving this bucket (`apt`, `dist` in `routes/agent_dist.py`). `key` must already be
-    allowlisted by the caller; `channel` is only the word the 503s and the log line name. Neither the
-    token nor the `Location` (a bearer credential) is ever logged — only the caller and key.
+    channel re-serving this bucket (`apt`, `dist` in `routes/agent_dist.py`, `rpm` in `routes/agent_rpm.py`).
+    `key` must already be allowlisted by the caller; `channel` is only the word the 503s and the log line name.
+    Neither the token nor the `Location` (a bearer credential) is ever logged — only the caller and key.
     """
     bucket = settings_reads.get_str(APT_BUCKET_SETTING)
     if not bucket:
@@ -219,7 +226,7 @@ def presigned_redirect(
             region=region,
             service="s3",
             credentials=credentials,
-            amz_date=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+            amz_date=utcnow().strftime("%Y%m%dT%H%M%SZ"),
             expires_seconds=APT_URL_EXPIRES_SECONDS,
         )
     except ValueError as exc:

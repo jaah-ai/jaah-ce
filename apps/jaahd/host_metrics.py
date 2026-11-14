@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import math
 import os
 import shutil
 import time
@@ -32,7 +33,7 @@ import time
 import environment
 import host_platform
 import process_metrics
-from jaah_env import env_get
+from jaah_env import env_get, env_number
 
 # The procfs readers, Linux only (`linux` imports `fcntl`, which Windows lacks).
 linux_platform = host_platform.current() if host_platform.is_linux() else None
@@ -66,15 +67,13 @@ _MIN_WINDOW_SECS = 30.0
 
 
 def _env_float(name: str, default: float) -> float:
-    """An operator float override, falling back to `default` on absent/blank/unparseable/non-positive.
-    A knob with a working default must never take the daemon down."""
+    """An operator float override (`jaah_env.env_number`), falling back to `default` on absent/blank/unparseable/
+    non-positive and clamped to the window floor."""
     raw = env_get(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        log.warning("host_metrics: %s=%r is not a number — using the %.1fs default", name, raw, default)
+    value = env_number(name, math.nan, parse=float)
+    if not math.isfinite(value):
+        if raw:
+            log.warning("host_metrics: %s=%r is not a finite number — using the %.1fs default", name, raw, default)
         return default
     if value <= 0:
         log.warning("host_metrics: %s=%r is not positive — using the %.1fs default", name, raw, default)

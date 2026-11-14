@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 # Stdlib-only leaves: the ticket and email-template CHECKs render from their vocabularies.
@@ -136,24 +136,6 @@ class EmailTemplate(EntityMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
 
 
-class EmailMailbox(UuidPkMixin, OrgScoped, Base):
-    """RETIRED: the Gmail push cursor of the deployment mailbox system mail was once received into. Nothing reads or
-    writes it since inbound moved to SES (`app/ses_inbound.py`); the table stays while the release before that cutover
-    can still run, and is dropped with `inbound_emails.gmail_message_id` (F4). Machine state, not a user entity
-    (`tests/test_entity_shape.py`)."""
-
-    __tablename__ = "email_mailboxes"
-    __table_args__ = (
-        org_unique(__tablename__),
-        UniqueConstraint("address", name="uq_email_mailboxes_address"),
-    )
-
-    address: Mapped[str] = mapped_column(Text, nullable=False)
-    history_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    watch_expires_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
-    updated_at: Mapped[datetime] = timestamp_column()
-
-
 #: Where an `inbound_emails` row came from (`provider`): the retired deployment Gmail mailbox (history only), SES
 #: system inbound (`app/ses_inbound.py`), or a tenant's Gmail connection.
 INBOUND_EMAIL_PROVIDERS: tuple[str, ...] = ("gmail", "ses", "tenant_gmail")
@@ -255,6 +237,18 @@ class EmailDelivery(UuidPkMixin, OrgScoped, Base):
         _in_check("status", EMAIL_DELIVERY_STATUSES, "ck_email_deliveries_status"),
         UniqueConstraint("provider_message_id", name="uq_email_deliveries_provider_message_id"),
         Index("ix_email_deliveries_created_at", "created_at"),
+        Index(
+            "ix_email_deliveries_ref", "ref", postgresql_ops={"ref": "text_pattern_ops"},
+            postgresql_where=text("ref IS NOT NULL"),
+        ),
+        Index(
+            "ix_email_deliveries_hosted_app", "hosted_app_id", "created_at",
+            postgresql_where=text("hosted_app_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_email_deliveries_relay", "hosted_app_id", "relay_id", unique=True,
+            postgresql_where=text("relay_id IS NOT NULL"),
+        ),
     )
 
     created_at: Mapped[datetime] = timestamp_column()
@@ -274,6 +268,16 @@ class EmailDelivery(UuidPkMixin, OrgScoped, Base):
     last_event_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
     #: SES's events for this message, newest last and capped (`email_deliveries.EVENTS_CAP`).
     events: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    #: What the email was about, for a sender that shows its own sends back: `support:<ticket>:<kind>:<source>`
+    #: (`app/support_mail.py::ref`). NULL for every other email.
+    ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    #: The hosted app whose mail this is (`app/hosted_apps/mail.py`), copied, not a foreign key: the record outlives
+    #: the app. NULL for the control plane's own mail.
+    hosted_app_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    #: The app's own id for the message (seam S2's `id`): unique per app, so a redelivered message is one row.
+    relay_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    #: What queued it (`app/write_origin.py`), revision 202611130200. NULL on a row queued before the column.
+    origin: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 #: Why an address is on the system-mail suppression list (`app/email_deliveries.py` owns each value's meaning).
@@ -358,10 +362,9 @@ class SlackInstallation(UuidPkMixin, StampedMixin, OrgScoped, Base):
     """An org's Slack workspace, installed through the console's Add to Slack button.
 
     One row per org (v1: one workspace each). `team_id` routes every inbound Socket Mode envelope to its org
-    and is unique among connected rows, so a workspace can never answer for two orgs. `token_sealed` is the
-    installation's bot token, a tier-1 envelope bound to the row id (`app/slack_workspaces.py`, which owns every
-    rule); cleared on disconnect, so a disconnected row holds no secret. `bot_user_id` is that workspace's
-    self-echo filter. An org's setting, not an entity (`tests/test_entity_shape.py`)."""
+    and is unique among connected rows, so a workspace can never answer for two orgs. The bot token lives in the
+    linked system credential (`credential_id`; `app/slack_workspaces.py` owns every rule), deleted on disconnect, so a
+    disconnected row holds no secret. `bot_user_id` is that workspace's self-echo filter. An org's setting, not an entity (`tests/test_entity_shape.py`)."""
 
     __tablename__ = "slack_installations"
     __table_args__ = (
@@ -371,16 +374,92 @@ class SlackInstallation(UuidPkMixin, StampedMixin, OrgScoped, Base):
             "uq_slack_installations_connected_team_id", "team_id", unique=True,
             postgresql_where=text("disconnected_at IS NULL"),
         ),
-        CheckConstraint(
-            "(disconnected_at IS NULL) = (token_sealed IS NOT NULL)", name="ck_slack_installations_token_iff_connected"
-        ),
     )
 
     team_id: Mapped[str] = mapped_column(String(32), nullable=False)
     team_name: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     app_id: Mapped[str] = mapped_column(String(32), nullable=False)
     bot_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
-    token_sealed: Mapped[Optional[dict]] = mapped_column(JSONB(none_as_null=True), nullable=True)
     disconnected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     #: Why it is disconnected, a short sentence for the console (`slack_workspaces.DISCONNECT_REASONS`).
     disconnect_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    #: The system `slack_workspace` credential holding this installation's bot token (`slack_workspaces.store_credential`);
+    #: NULL on a disconnected row, and SET NULL on that row's delete.
+    credential_id: Mapped[Optional[UUID]] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("credentials.id", ondelete="SET NULL"), nullable=True
+    )
+    #: The bot scopes the install granted (`oauth.v2.access`'s `scope`); NULL is unknown — a workspace connected before
+    #: the column existed, probed once on first use (`app/slack_conversations.py`).
+    scopes: Mapped[Optional[list[str]]] = mapped_column(ARRAY(Text), nullable=True)
+
+
+#: The destination shape each channel type must have, exactly one per row (`ck_notification_channels_destination`).
+_CHANNEL_DESTINATION_CHECK = (
+    "(type = 'email' AND slack_kind IS NULL AND slack_team_id IS NULL AND slack_target_id IS NULL"
+    " AND telegram_link_id IS NULL AND (account_email <> (email_id IS NOT NULL)))"
+    " OR (type = 'slack' AND NOT account_email AND email_id IS NULL AND telegram_link_id IS NULL"
+    " AND slack_kind IN ('dm', 'channel') AND slack_team_id IS NOT NULL AND slack_target_id IS NOT NULL)"
+    " OR (type = 'telegram' AND NOT account_email AND email_id IS NULL AND slack_kind IS NULL"
+    " AND slack_team_id IS NULL AND slack_target_id IS NULL AND telegram_link_id IS NOT NULL)"
+)
+
+
+class NotificationChannel(EntityMixin, OrgScoped, Base):
+    """One place one membership's alerts go, and which of them it wants (`app/notification_channels.py` owns
+    every rule; `app/notification_catalog.py` the settings document).
+
+    Owned by one `admin_users` row (CASCADE: a removed membership takes its channels). `type` picks the
+    destination columns, exactly one shape per type (`_CHANNEL_DESTINATION_CHECK`): an Email channel is the
+    login email (`account_email`, the address read live from the identity, never copied) or a typed address the
+    person proved (`email_id`); a Slack channel a DM to a member (`slack_kind='dm'`, `slack_target_id` the member
+    id) or a channel, in the workspace `slack_team_id` it was proven in (`''` on the operator plane); a Telegram
+    channel the person's linked chat (`telegram_link_id`, CASCADE: a blocked bot removes it; the link goes with its
+    last channel, `telegram_link.release` and `release_orphans`). One unique index per destination, so adding one
+    twice is refused. `name` is the server-written label naming the
+    destination (`label` on the wire). `settings` holds only explicit choices; `{}` is every default."""
+
+    __tablename__ = "notification_channels"
+    __table_args__ = (
+        CheckConstraint(_CHANNEL_DESTINATION_CHECK, name="ck_notification_channels_destination"),
+        _in_check("type", ("email", "slack", "telegram"), "ck_notification_channels_type"),
+        Index("ix_notification_channels_admin_user_id", "admin_user_id"),
+        Index(
+            "uq_notification_channels_account_email", "admin_user_id", unique=True,
+            postgresql_where=text("account_email"),
+        ),
+        Index(
+            "uq_notification_channels_email", "admin_user_id", "email_id", unique=True,
+            postgresql_where=text("email_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_notification_channels_slack", "admin_user_id", "slack_kind", "slack_team_id", "slack_target_id",
+            unique=True, postgresql_where=text("type = 'slack'"),
+        ),
+        # The inbound attribution lookup (`notify_targets.users_for_slack_member_id`).
+        Index(
+            "ix_notification_channels_slack_target", "slack_target_id",
+            postgresql_where=text("type = 'slack'"),
+        ),
+        Index(
+            "uq_notification_channels_telegram", "admin_user_id", "telegram_link_id", unique=True,
+            postgresql_where=text("telegram_link_id IS NOT NULL"),
+        ),
+    )
+
+    admin_user_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("admin_users.id", ondelete="CASCADE"), nullable=False
+    )
+    type: Mapped[str] = mapped_column(Text, nullable=False)
+    account_email: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    email_id: Mapped[Optional[UUID]] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("notification_emails.id", ondelete="CASCADE"), nullable=True
+    )
+    slack_kind: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    slack_team_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    slack_target_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    telegram_link_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("telegram_links.id", ondelete="CASCADE"), nullable=True
+    )
+    settings: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
+    )

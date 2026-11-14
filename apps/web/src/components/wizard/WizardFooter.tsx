@@ -18,6 +18,7 @@ export function WizardFooter<Id extends string>({
   disabled = false,
   nextDisabled = false,
   onNext,
+  advancing = false,
   onCancel,
   testId,
 }: {
@@ -34,6 +35,8 @@ export function WizardFooter<Id extends string>({
   nextDisabled?: boolean
   /** Replaces Next's plain advance, for a step that saves first; it calls `wizard.next()` itself. */
   onNext?: () => void
+  /** `onNext`'s work is running: Next is off and says so. */
+  advancing?: boolean
   /** Leaves the create (the consumer's unsaved-changes gate); a text button before Back. Absent: no Cancel. */
   onCancel?: () => void
   testId: string
@@ -73,8 +76,8 @@ export function WizardFooter<Id extends string>({
           {creating ? busyLabel : createLabel}
         </Button>
       ) : (
-        <Button type="button" variant="contained" disabled={nextDisabled} onClick={onNext ?? wizard.next} data-testid={primary} sx={tapTargetSx}>
-          Next
+        <Button type="button" variant="contained" disabled={nextDisabled || advancing} onClick={onNext ?? wizard.next} data-testid={primary} sx={tapTargetSx}>
+          {advancing ? 'Working…' : 'Next'}
         </Button>
       )}
     </FormActionBar>

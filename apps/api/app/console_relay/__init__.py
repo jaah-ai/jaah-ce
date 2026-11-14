@@ -28,7 +28,7 @@ the node leg's `NODE_TOKEN` (`app/node_bus.py::resolve_caller_async`).
 
 Close codes the browser keys its reconnect on: 1000 = the session itself ended (the node closed 4000),
 4401 = the viewer's session was revoked, 4503 = the relay's own transport broke — reconnect. A relay
-restart closes every leg with uvicorn's 1012, which the pane reads as recoverable and re-opens through
+restart closes every leg with a code the pane reads as recoverable (its close-code denylist), and it re-opens through
 the API. No hop negotiates WebSocket compression: PTY bytes do not compress profitably, and a stateful
 deflate context serializes every frame.
 """

@@ -12,16 +12,16 @@ Three kinds of node are the operator's to configure:
 
 On any of them, a tenant seat:
 
-  * uses it — its projects are placed on it (`PUT /api/nodes/{id}/projects` is unchanged) and its tasks run there;
+  * uses it — its projects run on it through All or its node groups (`app/placement_groups.py`);
   * changes only `TENANT_FIELDS`: its name, description and tags, Enabled/Draining and its NodeLinks;
   * never changes anything else — its auto-update override, the machine's parameters (MicroVM CPU, RAM and disk,
     its home and launch record, its desired config).
 
 Nor does a tenant re-issue its credential, add or change its CI runner pool, or mark it a MicroVM node
-(`locked_for`/`refuse`). An allocated node is never deleted by a tenant (`refuse_allocated`); a Jaah Cloud machine
-is ended through its hosting (`routes/nodes/delete.py::delete_node`). The operator is never locked.
+(`locked_for`/`refuse`). Deleting is not locked: an org administrator deletes any of its nodes, and a Jaah Cloud
+machine's Delete ends its hosting (`routes/nodes/delete.py::delete_node`). The operator is never locked.
 
-The one home for that rule: the routes ask `locked_for`, `refuse`, `refuse_allocated`, `refuse_locked_fields` and
+The one home for that rule: the routes ask `locked_for`, `refuse`, `refuse_locked_fields` and
 `jaah_cloud`, never the column or the hosting table. `placement` says where an operator's node runs."""
 from __future__ import annotations
 
@@ -35,15 +35,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import edition_features
-from app.entity_shape import optional_uuid
-from app.models.credentials import Credential
 from app.models.identity import AdminUser
 from app.models.nodes import Node
 from app.models.worktrees import VirtualNode
-from app.tenancy.ids import OPERATOR_PLANE_ORG_IDS, is_operator_plane
+from app.tenancy.ids import OPERATOR_PLANE_ORG_IDS, is_operator_user
 
 #: The `PUT /api/nodes/{id}` fields a tenant still changes on an operator's node (decided with the owner).
-TENANT_FIELDS = frozenset({"name", "description", "tags", "enabled", "draining"})
+TENANT_FIELDS = frozenset({"name", "description", "tags", "enabled", "draining", "max_running_tasks"})
 
 
 #: The field the operator flips; never a tenant's, on any node.
@@ -51,21 +49,15 @@ FIELD = "operator_allocated"
 
 #: What a tenant reads at every refusal: who can act.
 SETTINGS_LOCKED = "This node is run by the operator. Only the operator can change its settings."
-DELETE_LOCKED = "This node was allocated by the operator. Only the operator can delete it."
 CREDENTIAL_LOCKED = "This node is run by the operator. Only the operator can re-issue its credential."
 OPERATOR_ONLY = "Only the operator can allocate a node."
 OPERATOR_PLANE = "An operator node has no tenant to allocate it to. Move it to the tenant with Change org."
-OPERATOR_CLOUD = "This machine runs in the operator's cloud account. Only the operator can delete it."
-
-
-def operator(actor: AdminUser) -> bool:
-    return is_operator_plane(actor.org_id, actor.is_superadmin)
 
 
 def locked_for(row: Node, actor: AdminUser) -> bool:
     """Is `row` the operator's node (allocated, a Jaah Cloud machine, or carried by a shared machine) and `actor`
     not the operator?"""
-    if operator(actor):
+    if is_operator_user(actor):
         return False
     if bool(row.operator_allocated) or row.id in jaah_cloud([row.id]):
         return True
@@ -79,11 +71,16 @@ def refuse(row: Node, actor: AdminUser, detail: str) -> None:
         raise HTTPException(status_code=403, detail=detail)
 
 
-def refuse_allocated(row: Node, actor: AdminUser, detail: str) -> None:
-    """403 with `detail` when `row` is allocated and `actor` is not the operator — the delete door's question, where
-    a Jaah Cloud machine gets the hosting's own answer instead."""
-    if bool(row.operator_allocated) and not operator(actor):
-        raise HTTPException(status_code=403, detail=detail)
+#: The 409 when a node moved org between its authorization and an operator-plane step of its delete.
+NODE_MOVED = "This node changed organization. Reload and try again."
+
+
+def require_org(fleet: Session, node_uuid: UUID, org_scope: UUID) -> None:
+    """409 unless node `node_uuid` is still in `org_scope`, re-read under its row lock on the operator plane: the
+    org the delete was authorized for, which an operator's Change org may have moved since."""
+    org_id = fleet.scalar(select(Node.org_id).where(Node.id == node_uuid).with_for_update())
+    if org_id != org_scope:
+        raise HTTPException(status_code=409, detail=NODE_MOVED)
 
 
 def jaah_cloud(node_ids: Iterable[Optional[UUID]]) -> set[UUID]:
@@ -173,7 +170,7 @@ def refuse_locked_fields(fields: dict[str, Any], row: Node, actor: AdminUser) ->
     it shows) is dropped from the payload, so nothing of the locked half is ever written. A JSON field (`infra`)
     counts as unchanged when every key sent equals the stored one — the form sends a subset, and writing it back
     would delete the rest (it is replaced wholesale)."""
-    if operator(actor):
+    if is_operator_user(actor):
         if fields.get(FIELD) and row.org_id in OPERATOR_PLANE_ORG_IDS:
             raise HTTPException(status_code=422, detail=OPERATOR_PLANE)
         return
@@ -194,26 +191,6 @@ def drop_on_create(fields: dict[str, Any]) -> None:
     registration (a tenant would otherwise fake the operator's decision and lock itself out). Dropped from the
     payload, so `NodeCreateIn` keeps sharing `NodeUpdateIn`'s fields."""
     fields.pop(FIELD, None)
-
-
-def refuse_operator_cloud(session: Session, row: Node, actor: AdminUser) -> None:
-    """403 for a non-operator deleting ANY node whose launch credential is the operator plane's (an allocated
-    machine the operator later unlocked): the tenant's plane cannot sign that account's termination, so the
-    instance would outlive its row on the operator's bill. `delete_node` asks it after the hosting refusal, whose
-    sentence names the Billing page."""
-    if operator(actor):
-        return
-    credential_id = (row.infra or {}).get("credential_id") if isinstance(row.infra, dict) else None
-    if not credential_id:
-        return
-    if not edition_features.enabled("cloud_nodes"):
-        return  # The community edition has no operator plane.
-    from app import vnodes  # Local: `vnodes` imports the node routes' neighbours.
-
-    with vnodes.fleet_session() as fleet:
-        org_id = fleet.scalar(select(Credential.org_id).where(Credential.id == optional_uuid(credential_id)))
-    if org_id in OPERATOR_PLANE_ORG_IDS:
-        raise HTTPException(status_code=403, detail=OPERATOR_CLOUD)
 
 
 def _unchanged(sent: Any, stored: Any) -> bool:

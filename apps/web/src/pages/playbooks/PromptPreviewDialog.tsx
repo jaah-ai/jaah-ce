@@ -1,19 +1,23 @@
 import { type JSX, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
-import FormControlLabel from '@mui/material/FormControlLabel'
-import MenuItem from '@mui/material/MenuItem'
-import Switch from '@mui/material/Switch'
-import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import { ApiError, apiDetail } from '../../api'
 import { TabPanel, Tabs } from '../../components/Tabs'
 import Banner from '../../ui/Banner'
-import FormDialog from '../../ui/FormDialog'
+import FormDialog, { DIALOG_PAD_X } from '../../ui/FormDialog'
+import HelpLabel from '../../ui/HelpLabel'
 import { PHONE_QUERY } from '../../ui/listStyles'
 import LoadingState from '../../ui/LoadingState'
+import SelectField from '../../ui/SelectField'
+import SettingCheckbox from '../../ui/SettingCheckbox'
 import { type PlaybookIn, type StageIn, type Vocabulary, issuesOf, labelOf, previewPrompt } from './api'
 import { CodeBlock } from '../../ui/CodeBlock'
+import { grid, RADIUS } from '../../theme'
+
+/* The Expert picker stays a bare `ui/SelectField` (not `ui/FormField`, which forces full width in this header row),
+   so it carries its tip the way `ui/FormField` does: the label's hover and the select's description. */
+const EXPERT_TIP = 'Shows the prompt this allowed expert would get.'
 
 /* "PREVIEW PROMPT" — one stage's composed system and task prompt, rendered by the server against the fixed
  * sample fixture (`POST /api/playbooks/preview-prompt`, D4: no project picker). Rendered from the editor's
@@ -69,40 +73,35 @@ export default function PromptPreviewDialog({
       fullScreenOnPhone
       maxWidth="lg"
       testId="prompt-preview"
-      paperSx={{ height: 'min(90vh, 60rem)', [`@media ${PHONE_QUERY}`]: { height: '100%' } }}
+      paperSx={{ height: `min(90vh, ${grid(160)})`, [`@media ${PHONE_QUERY}`]: { height: '100%' } }}
       contentSx={{ p: 0 }}
       header={
         <>
-          <Box sx={{ px: 2, pb: 1, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 2 }}>
+          {/* `pt`: the Expert field's floating label rises above its box, and the form clips at its top edge. */}
+          <Box sx={{ px: DIALOG_PAD_X, pt: 1, pb: 1, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 2 }}>
             <Typography variant="body2" sx={{ color: 'text.secondary' }} data-testid="prompt-preview-tier">
               Model tier: {query.data ? labelOf(vocab, 'tier', query.data.model_tier) : '…'} · Sample project
             </Typography>
             {chosen && (
-              <TextField
-                select
-                size="small"
-                label="Expert"
+              <SelectField
+                label={<HelpLabel label="Expert" help={EXPERT_TIP} />}
                 value={expert}
-                onChange={e => setExpert(e.target.value)}
-                sx={{ minWidth: '12rem' }}
-                slotProps={{ htmlInput: { 'data-testid': 'prompt-preview-expert' } }}
-              >
-                {chosen.allowed.map(k => (
-                  <MenuItem key={k} value={k}>{labelOf(vocab, 'expert', k)}</MenuItem>
-                ))}
-              </TextField>
+                onChange={setExpert}
+                sx={{ minWidth: grid(32) }}
+                testId="prompt-preview-expert"
+                slotProps={{ htmlInput: { 'aria-description': EXPERT_TIP } }}
+                options={chosen.allowed.map(k => ({ value: k, label: labelOf(vocab, 'expert', k) }))}
+              />
             )}
             {interviews && (
-              <FormControlLabel
+              <SettingCheckbox
+                dense
+                name="full_auto"
                 label="Full Auto"
-                sx={{ minHeight: 44 }}
-                control={
-                  <Switch
-                    checked={fullAuto}
-                    onChange={(_, v) => setFullAuto(v)}
-                    slotProps={{ input: { 'data-testid': 'prompt-preview-full-auto' } as object }}
-                  />
-                }
+                help="Preview the prompt with Full Auto on or off."
+                checked={fullAuto}
+                onChange={setFullAuto}
+                testId="prompt-preview-full-auto"
               />
             )}
           </Box>
@@ -136,7 +135,7 @@ export default function PromptPreviewDialog({
             tabIndex={0}
             testId="prompt-preview-text"
             size="medium"
-            sx={{ p: 2, flex: 1, overflow: 'auto', borderRadius: 0 }}
+            sx={{ p: 2, flex: 1, overflow: 'auto', borderRadius: RADIUS.none }}
           >
             {text}
           </CodeBlock>

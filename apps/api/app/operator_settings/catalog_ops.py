@@ -12,9 +12,10 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="dashboard_ai_model",
         tier="operator",
         label="Model",
-        help=(
-            "The model that scores delivered tasks and writes the weekly digest, on the support agent's provider "
-            "and key."
+        help="Scores delivered tasks and writes the weekly quality digest.",
+        more=(
+            "Runs on the chat's provider and key. A model id from another provider maps to the "
+            "support provider's model of the same tier."
         ),
         # Free text, as `summary_model`: an API model id. Another provider's tier model maps to the support
         # provider's model of the same tier (`llm_client.provider_model`).
@@ -25,7 +26,8 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="dashboard_review_sample",
         tier="operator",
         label="Reviews per week",
-        help="How many tasks delivered in the last 7 days each weekly run scores.",
+        help="Each weekly review scores this many tasks delivered that week.",
+        more="Also shown on the Quality panel as the sample size.",
         kind="int", env=None, default=15, minimum=1, maximum=200,
         feature="operator_dashboard",
     ),
@@ -37,7 +39,8 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="dashboard_churn_drop_pct",
         tier="operator",
         label="Churn drop",
-        help="A tenant is a churn risk when its tasks created fall this much versus the period before.",
+        help="Tenants whose new tasks fall this much become churn risks.",
+        more="Tasks created in the range are compared with the period before it.",
         kind="int", env=None, default=40, minimum=1, maximum=100, unit="%",
         feature="operator_dashboard",
     ),
@@ -45,7 +48,11 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="dashboard_upsell_limit_days",
         tier="operator",
         label="Upsell days",
-        help="A tenant is an upsell lead after this many days in the last 30 at 95% quota or at its wallet floor.",
+        help="Tenants at quota this many recent days become upsell leads.",
+        more=(
+            "Counts days in the last 30 at 95% or more of a 5-hour or 7-day quota, or with the wallet at "
+            "its floor."
+        ),
         kind="int", env=None, default=3, minimum=1, maximum=30, unit="days",
         feature="operator_dashboard",
     ),
@@ -53,7 +60,7 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="dashboard_failure_amber_pct",
         tier="operator",
         label="Failure rate amber",
-        help="Tenant health turns amber at this failure rate.",
+        help="Tenants failing this share of tasks turn amber.",
         kind="int", env=None, default=15, minimum=0, maximum=100, unit="%",
         feature="operator_dashboard",
     ),
@@ -61,7 +68,7 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="dashboard_failure_red_pct",
         tier="operator",
         label="Failure rate red",
-        help="Tenant health turns red at this failure rate.",
+        help="Tenants failing this share of tasks turn red.",
         kind="int", env=None, default=30, minimum=0, maximum=100, unit="%",
         feature="operator_dashboard",
     ),
@@ -69,7 +76,8 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="dashboard_quota_amber_pct",
         tier="operator",
         label="Quota amber",
-        help="Tenant health turns amber when an account's 7-day quota peaks at this.",
+        help="Tenants whose 7-day quota peaks here turn amber.",
+        more="The peak is the highest 7-day quota reading among the tenant's accounts.",
         kind="int", env=None, default=80, minimum=0, maximum=100, unit="%",
         feature="operator_dashboard",
     ),
@@ -77,8 +85,86 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="dashboard_quota_red_pct",
         tier="operator",
         label="Quota red",
-        help="Tenant health turns red when an account's 7-day quota peaks at this.",
+        help="Tenants whose 7-day quota peaks here turn red.",
+        more="The peak is the highest 7-day quota reading among the tenant's accounts.",
         kind="int", env=None, default=95, minimum=0, maximum=100, unit="%",
+        feature="operator_dashboard",
+    ),
+    _Section("Dashboard", "Project health"),
+    # ── "Dashboard" > "Project health": the command center's per-project RAG (`app/exec_dashboard/`) ──
+    # Read per request; `dashboard_*`, so their values join the dashboard's cache key (`frame.knob_values`).
+    Knob(
+        key="dashboard_project_failed_amber",
+        tier="operator",
+        label="Failed tasks amber",
+        help="Projects with this many failed tasks show Watch.",
+        docs="using-jaah/command-center/how-the-command-center-works",
+        kind="int", env=None, default=1, minimum=1, maximum=1000, unit="tasks",
+        feature="operator_dashboard",
+    ),
+    Knob(
+        key="dashboard_project_failed_red",
+        tier="operator",
+        label="Failed tasks red",
+        help="Projects with this many failed tasks show At risk.",
+        docs="using-jaah/command-center/how-the-command-center-works",
+        kind="int", env=None, default=3, minimum=1, maximum=1000, unit="tasks",
+        feature="operator_dashboard",
+    ),
+    Knob(
+        key="dashboard_project_stuck_hours",
+        tier="operator",
+        label="Stuck after",
+        help="Tasks waiting on people or paused this long are stuck.",
+        docs="using-jaah/command-center/how-the-command-center-works",
+        kind="int", env=None, default=24, minimum=1, maximum=720, unit="hours",
+        feature="operator_dashboard",
+    ),
+    Knob(
+        key="dashboard_project_stuck_amber",
+        tier="operator",
+        label="Stuck tasks amber",
+        help="Projects with this many stuck tasks show Watch.",
+        docs="using-jaah/command-center/how-the-command-center-works",
+        kind="int", env=None, default=1, minimum=1, maximum=1000, unit="tasks",
+        feature="operator_dashboard",
+    ),
+    Knob(
+        key="dashboard_project_stuck_red",
+        tier="operator",
+        label="Stuck tasks red",
+        help="Projects with this many stuck tasks show At risk.",
+        docs="using-jaah/command-center/how-the-command-center-works",
+        kind="int", env=None, default=5, minimum=1, maximum=1000, unit="tasks",
+        feature="operator_dashboard",
+    ),
+    Knob(
+        key="dashboard_project_merge_fail_amber",
+        tier="operator",
+        label="Merge failures amber",
+        help="Projects with this many merge-lane failures show Watch.",
+        more="Counted over the selected range.",
+        docs="using-jaah/command-center/how-the-command-center-works",
+        kind="int", env=None, default=1, minimum=1, maximum=1000, unit="failures",
+        feature="operator_dashboard",
+    ),
+    Knob(
+        key="dashboard_project_merge_fail_red",
+        tier="operator",
+        label="Merge failures red",
+        help="Projects with this many merge-lane failures show At risk.",
+        more="Counted over the selected range.",
+        docs="using-jaah/command-center/how-the-command-center-works",
+        kind="int", env=None, default=3, minimum=1, maximum=1000, unit="failures",
+        feature="operator_dashboard",
+    ),
+    Knob(
+        key="dashboard_project_idle_days",
+        tier="operator",
+        label="Idle after",
+        help="Projects whose open tasks sat unmoved this long show Watch.",
+        docs="using-jaah/command-center/how-the-command-center-works",
+        kind="int", env=None, default=7, minimum=1, maximum=365, unit="days",
         feature="operator_dashboard",
     ),
     _Section("Retention", "Crons"),
@@ -89,7 +175,7 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="cron_runs_retention_days",
         tier="operator",
         label="History",
-        help="How many days of cron runs the nightly sweep keeps.",
+        help="Nightly sweep deletes cron runs older than this.",
         # Floor one day, so this morning's failure is still in the ledger. Ceiling: the operational policy
         # bound, mirrored from `app/cron_retention.py::POLICY_MAX_RETENTION_DAYS`.
         kind="int", env=None, default=90, minimum=1, maximum=365, unit="days",
@@ -98,7 +184,8 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="cron_runs_per_cron_cap",
         tier="operator",
         label="Rows each",
-        help="The most run rows any one cron keeps, whatever their age; what bounds a ten-second cadence.",
+        help="Nightly sweep trims each cron to this many newest runs.",
+        more="Applies whatever the runs' age, so it is what bounds a cron firing every ten seconds.",
         # Per-cron: 100 firings is a readable window; the ceiling is a typo guard.
         kind="int", env=None, default=10000, minimum=100, maximum=1000000, unit="runs",
     ),
@@ -107,8 +194,12 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="activity_events_retention_days",
         tier="operator",
         label="History",
-        help="How many days of the activity log the nightly sweep keeps. Older rows, the exclusion log "
-             "included, are deleted for good; task pipeline history stays.",
+        help="Older activity and exclusion log rows are deleted for good.",
+        more=(
+            "Shortening it permanently deletes the tenancy exclusion log, the standing evidence that "
+            "tenant data stays separated; it cannot be recovered. Task pipeline history is kept. It also "
+            "caps how long an org may keep its activity."
+        ),
         # In "Crons" though it bounds `activity_events` and `tenancy_exclusions`: both are bounds of the one
         # `retention_sweep`, so one panel holds the whole policy. The help names the exclusion log because
         # shortening this deletes the tenancy seam's standing evidence, unrecoverably. Why the two share a
@@ -125,7 +216,8 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="org_retention_min_days",
         tier="operator",
         label="Shortest",
-        help="The fewest days an org may keep its transcripts, activity and task artifacts.",
+        help="Org admins cannot pick a retention window shorter than this.",
+        more="Applies to an org's transcripts, activity and task artifacts.",
         # Floor one day: a zero window would delete what a runner is still writing.
         kind="int", env=None, default=7, minimum=1, maximum=365, unit="days",
     ),
@@ -133,7 +225,8 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="org_retention_max_days",
         tier="operator",
         label="Longest",
-        help="The most days an org may keep them. Never longer than the platform keeps them.",
+        help="Org admins cannot pick a retention window longer than this.",
+        more="Never longer than the platform's own window for each class: an org can only shorten.",
         kind="int", env=None, default=365, minimum=1, maximum=400, unit="days",
     ),
     _Section("Retention", "Sessions"),
@@ -145,7 +238,8 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="stale_session_after_hours",
         tier="operator",
         label="Stale after",
-        help="How long a session with no transcript may sit before Audit offers to delete it.",
+        help="Sessions without a transcript this long become deletable in Audit.",
+        docs="administration/security-and-audit/sessions",
         # Floor one hour, a safety bound: the session retry ladder works in minutes. A week is the ceiling.
         kind="int", env=None, default=6, minimum=1, maximum=168, unit="hours",
     ),
@@ -155,9 +249,11 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="compliance_github_credential_id",
         tier="operator",
         label="GitHub evidence token",
-        help="A token used for nothing else, with repository administration and Dependabot alerts read: the "
-             "daily evidence checks read the repository's rulesets, settings and alerts with it. Empty, both fail "
-             "and raise an alarm.",
+        help="Daily evidence checks read rulesets, settings and alerts with this.",
+        more=(
+            "A token used for nothing else, with repository administration and Dependabot alerts read "
+            "access. Empty, the checks fail and raise an alarm."
+        ),
         # On `git_app_credential_id`'s terms (0/36, no env). Read on the operator plane only
         # (`app/compliance_evidence/github.py::token`); set on prod by owner action I-15.
         kind="str", env=None, default="", minimum=0, maximum=36,
@@ -172,8 +268,11 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="alarm_project_id",
         tier="operator",
         label="Alarm project",
-        help="The project cron, node and evidence alarms are filed into, as hidden tasks its org's members can "
-             "read. Unset, no alarm is filed.",
+        help="Cron, node and evidence alarms file here as hidden tasks.",
+        more=(
+            "Its org's members can read those tasks, including alarm bodies naming other tenants' nodes. "
+            "Unset, no alarm is filed."
+        ),
         # Any org's project, not org zero alone: the operator's own projects live in its company org on dev and
         # prod. The help names the cost — a fleet alarm body (other tenants' nodes) is readable in that org.
         # 0..12: a `projects.id` as text, blank = unset. No env: the id differs per control plane.
@@ -187,17 +286,21 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="default_theme",
         tier="operator",
         label="Default theme",
-        help="The console theme for every user who has not picked their own.",
+        help="Users who never picked a theme see this one.",
         # Dark by operator decision.
         kind="str", env=None, default="dark",
         choices=("light", "dark"), choice_labels=("Light", "Dark"),
+        choice_help=(
+            "New users without a choice see the light console.",
+            "New users without a choice see the dark console.",
+        ),
     ),
     Knob(
         key="cron_timezone",
         tier="operator",
         label="Timezone",
-        help="The one zone the whole control plane keeps local time in: cron times and the task list's Today "
-             "grouping. Interval schedules stay on UTC.",
+        help="Cron times and the Today task grouping use this zone.",
+        more="One zone for the whole control plane. Interval schedules stay on UTC.",
         # A closed set: the string goes to `ZoneInfo` and DBOS's schedule table, where a bad name is
         # unroutable. Adding a zone is a one-line catalogue edit. Default `America/New_York`, the operator's
         # clock. The length bound backs the set against a value written straight into `system_state`, which
@@ -226,8 +329,11 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="unanswered_question_timeout_hours",
         tier="operator",
         label="Question timeout",
-        help="How long a runner waits on an unanswered question before it is stopped; answering starts a fresh "
-             "runner.",
+        help="Runners idle on an unanswered question this long are stopped.",
+        more=(
+            "The question stays answerable; answering starts a fresh runner. A clean slot is freed. The "
+            "week ceiling works as off."
+        ),
         # Two hours (operator's number). The one-hour floor is a safety bound (below it runners mid-answer
         # get stopped); the week ceiling doubles as "off".
         kind="int", env=None, default=2, minimum=1, maximum=168, unit="hours",
@@ -236,8 +342,11 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="unanswered_question_release_days",
         tier="operator",
         label="Question release",
-        help="How long a task waits on an unanswered question before it fails and its worktree is wiped, "
-             "unsaved work included.",
+        help="Tasks unanswered this long fail; their slot is wiped.",
+        more=(
+            "Unsaved work in the slot is lost. Shorter than the question timeout, a waiting task fails "
+            "without first being stopped."
+        ),
         # Fourteen days (operator's number). Set below the stop above and the row fails straight from a
         # live park, a coherent choice needing no guard.
         kind="int", env=None, default=14, minimum=1, maximum=365, unit="days",
@@ -248,8 +357,8 @@ KNOBS: tuple[Knob, ...] = _sectioned(
         key="cpu_profiling",
         tier="operator",
         label="CPU profiling",
-        help="Samples the control plane's CPU one minute in every five and logs its hottest stacks to "
-             "CloudWatch. Costs about 1% CPU and up to ~0.1 GB of logs a day per task.",
+        help="On: logs hottest CPU stacks one minute in every five.",
+        more="Logs go to CloudWatch. Costs about 1% CPU and up to about 0.1 GB of logs a day per api task.",
         kind="bool", env=None, default=False,
     ),
 )

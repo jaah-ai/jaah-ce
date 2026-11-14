@@ -71,9 +71,10 @@ def path_key(path: str) -> str:
     return text.rstrip("/") or ("/" if text else "")
 
 
-def is_under(path: str, root: str) -> bool:
-    """Whether `path` is `root` or inside it — a string rule, never a filesystem lookup."""
-    p, r = path_key(path), path_key(root)
+def is_under(path: str, root: str, *, key=path_key, sep: str = "/") -> bool:
+    """Whether `path` is `root` or inside it — a string rule, never a filesystem lookup. `key` spells both
+    sides comparably and `sep` separates components: Windows passes its own (THE one rule, one home)."""
+    p, r = key(path), key(root)
     if not p or not r:
         return False
-    return p == r or p.startswith(r.rstrip("/") + "/")
+    return p == r or p.startswith(r.rstrip(sep) + sep)

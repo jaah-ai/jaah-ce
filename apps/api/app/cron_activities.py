@@ -377,11 +377,6 @@ def all_descriptors() -> tuple[ActivityDescriptor, ...]:
     return tuple(sorted(_REGISTRY.values(), key=lambda d: (d.label.lower(), d.type)))
 
 
-def creatable_descriptors() -> tuple[ActivityDescriptor, ...]:
-    """The subset the activity picker offers."""
-    return tuple(d for d in all_descriptors() if d.creatable)
-
-
 # ── The reference descriptor ──────────────────────────────────────────────────────────────────────────
 
 # The reference descriptor: records a `noop` and touches nothing, making it the side-effect-free

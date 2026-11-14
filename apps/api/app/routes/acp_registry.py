@@ -18,18 +18,20 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
-from app import account_auth, acp_registry, acp_registry_icons, provider_auth_policy
+from app import account_auth, acp_registry, acp_registry_icons, db_async, provider_auth_policy
 from app.actors import stamp_actor
-from app.auth import require_user
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
+from app.authz.object_access import require_org_admin
+from app.authz.principal import AsyncCaller, Principal, current_caller, current_principal_async
 from app.clock import utcnow as _now
-from app.db import get_session
-from app.entity_shape import new_uuid7
+from app.db_async import DbDep
+from app.entity_shape import clean_text, new_uuid7, or_404, text_or_none
 from app.models.agent_sessions import Agent
 from app.models.identity import AdminUser
 from app.routes.agents import AgentOut, _committed, _out
@@ -42,11 +44,13 @@ REGISTRY_OFF = "ACP registry agents"
 ADMIN_ONLY = "Only org admins can install registry agents"
 
 
-def _registry_on_plan(
-    principal: Principal = Depends(current_principal), session: Session = Depends(get_session),
-) -> None:
+async def _registry_on_plan(db: DbDep, principal: Principal = Depends(current_principal_async)) -> None:
     """403 unless the caller's org's provider grid has a registry row on (`provider_auth_policy.registry_on`)."""
-    if principal.org_id is None or not provider_auth_policy.registry_on(session, principal.org_id):
+    on = principal.org_id is not None and await db.run_sync(provider_auth_policy.registry_on, principal.org_id)
+    # Resolved before the route's auth dependencies, whose identity reads open sessions of their own: hand the
+    # connection back first (a coroutine never holds two, `app/db_async.py`).
+    await db_async.release(db)
+    if not on:
         raise HTTPException(
             status_code=403, detail=provider_auth_policy.off_sentence(principal.org_id, REGISTRY_OFF, plural=True),
         )
@@ -74,16 +78,14 @@ class RegistryEntryOut(BaseModel):
     installed_version: Optional[str]
 
 
-def _entries() -> list[dict]:
+async def _entries(db: AsyncSession) -> list[dict]:
+    """The registry's entries (an HTTP read: off the event loop, the route session's connection handed back
+    first), or the 502."""
+    await db_async.release(db)
     try:
-        return acp_registry.fetch()
+        return await run_in_threadpool(acp_registry.fetch)
     except acp_registry.RegistryUnavailable:
         raise HTTPException(status_code=502, detail=acp_registry.FETCH_FAILED) from None
-
-
-def _text(entry: dict, field: str) -> Optional[str]:
-    value = entry.get(field)
-    return value if isinstance(value, str) and value else None
 
 
 def normalise_license(value: Optional[str]) -> Optional[str]:
@@ -111,9 +113,11 @@ def _entry_out(
         refusal = exc.sentence
     refusal = off or refusal
     return RegistryEntryOut(
-        id=entry["id"], name=entry["name"], version=entry["version"].strip(), description=_text(entry, "description") or "",
-        authors=[a for a in entry.get("authors") or [] if isinstance(a, str)], license=normalise_license(_text(entry, "license")),
-        website=_text(entry, "website"), repository=_text(entry, "repository"), icon=icon,
+        id=entry["id"], name=entry["name"], version=entry["version"].strip(),
+        description=clean_text(entry.get("description")),
+        authors=[a for a in entry.get("authors") or [] if isinstance(a, str)],
+        license=normalise_license(text_or_none(entry.get("license"))),
+        website=text_or_none(entry.get("website")), repository=text_or_none(entry.get("repository")), icon=icon,
         distribution=distribution, key_delivery=route, installable=refusal is None, refusal=refusal,
         installed_agent_id=installed[0] if installed else None, installed_version=installed[1] if installed else None,
     )
@@ -121,18 +125,32 @@ def _entry_out(
 
 @router.get("/api/agent-registry", response_model=list[RegistryEntryOut], dependencies=_ON_PLAN)
 @feature("agents", "view")
-def list_registry(
-    _: AdminUser = Depends(require_user),
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
+async def list_registry(
+    db: DbDep,
+    caller: AsyncCaller = Depends(current_caller),
 ) -> list[RegistryEntryOut]:
     """The registry's entries, each with whether it can be installed (or why not) and this org's install.
 
     `icon` is the entry's icon inlined as a `data:` URI (`acp_registry_icons`), or null: the console's CSP admits
     `data:` images and not the registry's CDN. An entry whose grid row is off is hidden from a tenant and shown refused,
     with the sentence naming the row, to an operator-plane org (which turns rows on in its Providers override)."""
-    allowed = provider_auth_policy.allowed(session, principal.org_id)
-    operator_plane = not is_tenant_org(principal.org_id)
+    allowed = await db.run_sync(provider_auth_policy.allowed, caller.principal.org_id)
+    operator_plane = not is_tenant_org(caller.principal.org_id)
+    entries = await _entries(db)
+    shown, installed = await db.run_sync(_list_registry, caller.principal, allowed, operator_plane, entries)
+    await db_async.release(db)
+    icons = await run_in_threadpool(
+        acp_registry_icons.data_uris, [text_or_none(entry.get("icon")) for entry, _ in shown])
+    return [
+        _entry_out(entry, installed.get(entry["id"]), icons.get(clean_text(entry.get("icon"))), why)
+        for entry, why in shown
+    ]
+
+
+def _list_registry(
+    session: Session, principal: Principal, allowed: frozenset, operator_plane: bool, entries: list[dict],
+) -> tuple[list[tuple[dict, Optional[str]]], dict[str, tuple[UUID, str]]]:
+    """The entries shown, each with its refusing sentence (or None), and this org's installed registry agents."""
 
     def off(entry: dict) -> Optional[str]:
         row = provider_auth_policy.registry_row(entry["id"])
@@ -140,9 +158,8 @@ def list_registry(
             return None
         return provider_auth_policy.refusal(session, principal.org_id, row, _KEY, label=entry["name"])
 
-    refused = [(entry, off(entry)) for entry in _entries()]
+    refused = [(entry, off(entry)) for entry in entries]
     shown = [(entry, why) for entry, why in refused if operator_plane or why is None]
-    icons = acp_registry_icons.data_uris(_text(entry, "icon") for entry, _ in shown)
     installed = {
         slug: (agent_id, version)
         for agent_id, slug, version in session.execute(
@@ -152,10 +169,7 @@ def list_registry(
             )
         )
     }
-    return [
-        _entry_out(entry, installed.get(entry["id"]), icons.get(_text(entry, "icon") or ""), why)
-        for entry, why in shown
-    ]
+    return shown, installed
 
 
 def _refused(sentence: str) -> JSONResponse:
@@ -166,18 +180,19 @@ def _refused(sentence: str) -> JSONResponse:
     "/api/agent-registry/{registry_id}/install", response_model=AgentOut, status_code=201, dependencies=_ON_PLAN,
 )
 @feature("agents", "edit")
-def install_registry_agent(
+async def install_registry_agent(
     registry_id: str,
-    user: AdminUser = Depends(require_user),
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
+    db: DbDep,
+    caller: AsyncCaller = Depends(current_caller),
 ):
     """Install `registry_id` as this org's agent, pinned at the registry's current version and distribution."""
-    if not principal.is_org_admin:
-        raise HTTPException(status_code=403, detail=ADMIN_ONLY)
-    entry = acp_registry.find(_entries(), registry_id)
-    if entry is None:
-        raise HTTPException(status_code=404, detail=f"No agent {registry_id} in the ACP registry")
+    require_org_admin(caller.principal, detail=ADMIN_ONLY)
+    entries = await _entries(db)
+    entry = or_404(acp_registry.find(entries, registry_id), detail=f"No agent {registry_id} in the ACP registry")
+    return await db.run_sync(_install_registry_agent, entry, caller.actor, caller.principal)
+
+
+def _install_registry_agent(session: Session, entry: dict, user: AdminUser, principal: Principal):
     provider_auth_policy.require_allowed(
         session, principal.org_id, provider_auth_policy.registry_row(entry["id"]), _KEY, label=entry["name"],
     )

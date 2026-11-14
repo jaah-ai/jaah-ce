@@ -15,38 +15,44 @@ import secrets
 import tempfile
 
 
-def replace_file(path: str, data: bytes | str, *, mode: int | None = None, gid: int | None = None,
-                 unchanged_from: bytes | None = None) -> bool:
+def replace_file(path: str, data: bytes | str, *, mode: int | None = None, uid: int | None = None,
+                 gid: int | None = None, owner_required: bool = False, fsync: bool = False,
+                 suffix: str = ".tmp", unchanged_from: bytes | None = None) -> bool:
     """Replace `path` atomically with `data`, so a reader never sees half a file.
 
-    The temp is created in `path`'s directory `O_CREAT|O_EXCL|O_NOFOLLOW` at 0600 (`mkstemp`) and, when `mode`
-    is given, set to it before any byte lands (`chmod` where the platform has no `fchmod`); `gid` (when given)
-    is the group it is given (`fchown(-1, gid)`), tolerated where that cannot happen. A str is written as text
-    (UTF-8, the platform's newline), bytes as they are. The rename replaces a symlink at `path`, never writes
-    through it.
+    The temp is created in `path`'s directory `O_CREAT|O_EXCL|O_NOFOLLOW` at 0600 (`mkstemp`, named
+    `.<name>.*<suffix>`) and, when `mode` is given, set to it before any byte lands (`chmod` where the platform
+    has no `fchmod`); `uid`/`gid` (when given) are the owner it is given (`fchown`, before the mode so a chown never clears a
+    setuid/setgid bit). A str is written as text
+    (UTF-8, the platform's newline), bytes as they are; `fsync` flushes the bytes to disk before the rename
+    (the caller fsyncs the directory when the rename itself must survive a power loss). The rename replaces a
+    symlink at `path`, never writes through it.
 
     `unchanged_from`: the bytes the caller read from `path`. When the file no longer holds them, nothing is
     written and False is returned (raced); otherwise True. Best effort: a writer landing between that re-read
     and the rename is not seen. The temp never outlives a failure."""
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=f".{os.path.basename(path)}.",
-                               suffix=".tmp")
+                               suffix=suffix)
     try:
+        if uid is not None or gid is not None:
+            try:
+                os.fchown(fd, -1 if uid is None else uid, -1 if gid is None else gid)
+            except (OSError, AttributeError):   # AttributeError: no `fchown` on Windows
+                # A gid alone is a courtesy (a non-member writer keeps going); a uid, or `owner_required`
+                # (a root helper's store), is an owner the caller asserts, so its failure propagates.
+                if uid is not None or owner_required:
+                    raise
         if mode is not None:
             if hasattr(os, "fchmod"):
                 os.fchmod(fd, mode)
             else:
                 os.chmod(tmp, mode)
-        if gid is not None:
-            try:
-                os.fchown(fd, -1, gid)
-            except (OSError, AttributeError):   # AttributeError: no `fchown` on Windows
-                pass
-        if isinstance(data, str):
-            with os.fdopen(fd, "w", encoding="utf-8") as text:
-                text.write(data)
-        else:
-            with os.fdopen(fd, "wb") as binary:
-                binary.write(data)
+        with os.fdopen(fd, "w" if isinstance(data, str) else "wb",
+                       encoding="utf-8" if isinstance(data, str) else None) as out:
+            out.write(data)
+            if fsync:
+                out.flush()
+                os.fsync(out.fileno())
         if unchanged_from is not None:
             with open(path, "rb") as current:
                 if current.read() != unchanged_from:

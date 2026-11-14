@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 from uuid import UUID
 
@@ -13,6 +13,7 @@ from app import (
     actors, agent_session_lifecycle, agent_sessions, launch_failures, merge_lane_state, runner_terminations, slot_destroy,
     slot_state,
 )
+from app.clock import utcnow
 from app.events import emit_console_event
 from app.models.agent_sessions import AgentSession
 from app.models.audit import ActivityEvent
@@ -30,6 +31,7 @@ from app.pr_stats import record_pr_stats
 from app.task_artifacts import visible_artifact_clause
 from app.task_settle import NO_BUILD_OUTCOME_REASON
 from app import carryover, edition_features, task_prs
+from app.outcome_ledger import writer as outcome_writer
 from app.task_lifecycle import (
     ACTIVE,
     AWAITING_RESPONSE,
@@ -63,6 +65,8 @@ def end_attempt(
     note_detail: Optional[str] = None,
     note_vm: Optional[str] = None,
     note_account: Optional[str] = None,
+    outcome_end: str = outcome_writer.END_ABANDONED,
+    review_tier: Any = None,
 ) -> Optional[str]:
     """The single home for what happens when a dispatch attempt ENDS — the reverse of the `ready → active`
     edge, and the only place the re-dispatch ceiling is evaluated. Returns the landed state, or None.
@@ -85,7 +89,7 @@ def end_attempt(
     The attempt's session row (Audit > Sessions) ends here too, on both branches, since the runner is killed on
     both: a MicroVM task has no slot, so the drain's release would never end it. Every other row of
     the task still `running` ends with it, carrying `note_detail`, so no session outlives a failed attempt."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     # The cap is the task's own org's; `org_id` never changes, so reading it ahead of the UPDATE is race-free.
     # Every caller is bound to the task's org or the operator scope; an unbound one reads `None` here (the
     # read filter), so say so rather than leave a runnerless task silently `active`. The runner session is read
@@ -116,6 +120,9 @@ def end_attempt(
     if row is None:
         return None
     _, final_state = row
+    # The dispatch's outcome row ends with its attempt: `failed` on the runner's own `task_fail`, `abandoned` on
+    # every other end (D6).
+    outcome_writer.end_row(session, task_id, end_kind=outcome_end, review_tier=review_tier, reason=cause)
     # A lane run's held rows go back to the queue with its end, in this transaction (L10).
     merge_lane_state.lane_task_left_active(session, task_id)
     # The task left the live states: a carry-over ends here, and any re-dispatch goes to its own org's nodes.
@@ -152,8 +159,7 @@ def end_attempt(
     if cause is not None:
         runner_terminations.record(session, task_id, cause, node=node, detail=note_detail, vm=note_vm,
                                    account=note_account)
-    emit_console_event(session, entity="task", id=task_id, action=final_state)
-    session.commit()
+    emit_console_event(session, entity="task", id=task_id, action=final_state, commit=True)
     send_minted_intents(issued)  # AFTER the commit — see `send_minted_intents`.
     if final_state == SYSTEM_FAILED:
         log.warning(
@@ -302,8 +308,7 @@ def reassert_active(task_id: int, session: Session, *, session_id: str, self_wak
                 # Someone moved the row out of `active`; their decision stands and nothing is written.
                 session.rollback()
                 return "wrong-state"
-            emit_console_event(session, entity="task", id=task_id, action=AWAITING_RESPONSE)
-            session.commit()
+            emit_console_event(session, entity="task", id=task_id, action=AWAITING_RESPONSE, commit=True)
             return "awaiting-operator"
         if task.runner_session_id == session_id:
             return "already-active"
@@ -320,7 +325,7 @@ def reassert_active(task_id: int, session: Session, *, session_id: str, self_wak
     hold = slot_state.task_hold(session, task_id)
     if hold is None or hold["session_id"] != session_id:
         return "no-hold"
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     # Mirrors apps/jaahd/fleet_launch.py::slot_ref's fleet-hold case (the API and the node daemon share no imports);
     # safe because a fleet lease's `slot` is always a plain int.
     worktree_ref = f"{hold['project']}-{hold['slot']}"
@@ -346,8 +351,7 @@ def reassert_active(task_id: int, session: Session, *, session_id: str, self_wak
             task_id, session_id,
         )
         return "race"
-    emit_console_event(session, entity="task", id=task_id, action=ACTIVE)
-    session.commit()
+    emit_console_event(session, entity="task", id=task_id, action=ACTIVE, commit=True)
     log.warning(
         "task %s heartbeat from session %s undid a false death — reasserted active from 'ready' on %s#%s "
         "(a Stop fired after the StopFailure that ended the attempt; the session never actually died, and "
@@ -397,8 +401,7 @@ def resume_from_console(task_id: int, session: Session, *, session_id: str) -> s
     if landed.rowcount == 0:
         session.rollback()
         return "wrong-state"
-    emit_console_event(session, entity="task", id=task_id, action=ACTIVE)
-    session.commit()
+    emit_console_event(session, entity="task", id=task_id, action=ACTIVE, commit=True)
     return "resumed"
 
 
@@ -471,7 +474,7 @@ def _discard_unused_refund(task_id: int, session: Session, *, refunded: bool) ->
 
     An orphaned refund is a free attempt on a row nobody reclaimed. `end_attempt`'s per-caller `guards`
     can decline beyond the state check; it then commits nothing, so rolling back here discards the
-    refund. Explicit rather than trusting `app/db.py::get_session` not to commit."""
+    refund. Explicit rather than trusting the route session not to commit."""
     if not refunded:
         return
     session.rollback()
@@ -517,7 +520,7 @@ def _vanished_trace(session: Session, task_id: int) -> _VanishedTrace:
     node and a VM instead of "left no trace". Read before `end_attempt`, which clears the runner binding.
 
     The node is the runner's session row's (`Task.runner_session_id`, else the task's newest session), else
-    its slot's, else its newest VM's. The VM is named only when no static slot carries the task
+    its slot's, else its newest VM's. The VM is named only when no worktree carries the task
     (`microvm_lifecycle.last_task_vm`). The sentence is the VM's when it failed, else the session's
     `end_detail` (already redacted by `agent_session_lifecycle.end_session`), but only one written in this
     attempt: a relaunch that resumes the same session id finds the row an earlier attempt already ended, and
@@ -622,7 +625,7 @@ def reclaim_active_task(
     `node_fault`: the whole node lost several runners (`app/runner_liveness.py::node_wide_runner_loss`,
     asked by the route), which buys one bounded refund (`_refund_node_fault_attempt`) and nothing else.
     `cause`: one of `runner_terminations.RUNNER_LOST_CAUSES` — `launch_failed` when the node never sighted
-    the launch running (`runner_liveness.runner_facts`), `stalled` from the stall detector, else `vanished`. A `launch_failed` on a node that already
+    the launch running (`runner_liveness.launch_never_sighted`), `stalled` from the stall detector, else `vanished`. A `launch_failed` on a node that already
     failed the task's launch under another account is refunded too (`launch_failures.cross_account_refund_due`).
 
     A persona gate would not protect a `merged_pr` row whose runner died after the merge but before
@@ -632,8 +635,7 @@ def reclaim_active_task(
 
     A crash is an ended attempt, so this delegates to `end_attempt` (ready, or `system_failed` at the
     ceiling). Called only by a sweep that confirmed the runner gone, failing closed. Both
-    `task_pipeline_cp.reclaim_active` and `reclaim_active_coder` land here, keeping their own
-    `_record_vanished_runner` source labels."""
+    `task_pipeline_cp.reclaim_active` and `reclaim_active_coder` land here."""
     if slot_destroy.destroy_pending(session, task_id):
         # The runner is gone because the CP destroyed its slot; that destroy's ack requeues it.
         log.info("task %s not reclaimed: its slot is being destroyed", task_id)
@@ -662,7 +664,7 @@ def reclaim_active_task(
         # Persisted only on the spent branch (`end_attempt`), hence its tail.
         reason=reason,
         final=refused is not None,
-        # `vanished`, not `crashed`: the evidence is the runner's absence (`runner_breaks`' definition).
+        # `vanished`, not `crashed`: the evidence is the runner's absence (`app/runner_causes.py`' definition).
         cause=cause,
         node=trace.node, note_detail=trace.detail, note_vm=trace.vm, note_account=trace.account,
     )
@@ -683,6 +685,7 @@ def settle_analysis_child_on_artifact(
     session: Session,
     *,
     sources: tuple[str, ...] = _ANALYSIS_ARTIFACT_SETTLE_STATES,
+    review_tier: Any = None,
 ) -> bool:
     """Done-on-artifact `active|system_failed → done` settle of a STALE analysis row whose stage output is
     already captured — the robust completion path, the opposite of `reclaim_active_task`.
@@ -695,7 +698,7 @@ def settle_analysis_child_on_artifact(
     `awaiting_response` is excluded from the default `sources` (settling would answer for a human);
     `sources` is overridable for the one runner-driven caller. `plan` is also held to
     `artifact_with_coders`."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     child = session.get(Task, task_id)
     if (
         child is not None
@@ -742,7 +745,7 @@ def settle_analysis_child_on_artifact(
     if not _settle_done(
         session, task_id,
         Task.persona.in_(_ANALYSIS_PERSONAS), Task.state.in_(sources), has_stage_output,
-        now=now,
+        now=now, review_tier=review_tier,
     ):
         return False
     log.info(
@@ -761,38 +764,52 @@ def settle_analysis_child_on_artifact(
     return True
 
 
-def _settle_done(session: Session, task_id: int, *where: Any, now: datetime) -> bool:
-    """The `→ done` UPDATE the runner-side settles share: `task_id` under `where` (the settle's own race
-    guard), `dispatch_attempts` reset, the runner binding cleared, the console told, committed. False when
-    the guard refused, so the caller logs and rolls up only a row it settled. An empty `where` is refused:
-    an unguarded `→ done` is never a settle."""
+def _done_update(
+    session: Session, task_id: int, *where: Any, now: datetime, review_tier: Any = None, awaits_merge: bool = False,
+    transition_extra: Optional[dict[str, Any]] = None, **values: Any,
+) -> Optional[int]:
+    """The id of the row a `→ done` UPDATE settled — `task_id` under `where`, `dispatch_attempts` reset, the
+    runner binding cleared, `values` on top, its outcome row ended and the console told — or None when the
+    guard admitted nothing. The `done` event rides beside the write: it is what starts the done workflow. An
+    empty `where` is refused: an unguarded `→ done` is never a settle."""
     if not where:
-        raise ValueError("_settle_done needs the caller's own race guard")
+        raise ValueError("_done_update needs the caller's own race guard")
     row = session.execute(
         update(Task)
         .where(Task.id == task_id, *where)
         .values(
             state=DONE, github_synced_at=now, dispatch_attempts=0, **_RUNNER_BINDING_CLEARED,
-            **actors.task_actor_values(session),
+            **actors.task_actor_values(session), **values,
         )
         .returning(Task.id)
     ).first()
     if row is None:
+        return None
+    outcome_writer.end_row(session, row[0], end_kind=outcome_writer.END_SETTLED, review_tier=review_tier,
+                           awaits_merge=awaits_merge)
+    emit_console_event(session, entity="task", id=row[0], action=DONE, transition_extra=transition_extra)
+    return row[0]
+
+
+def _settle_done(session: Session, task_id: int, *where: Any, now: datetime, review_tier: Any = None) -> bool:
+    """The `→ done` UPDATE the runner-side settles share: `task_id` under `where` (the settle's own race
+    guard), `dispatch_attempts` reset, the runner binding cleared, the console told, committed. False when
+    the guard refused, so the caller logs and rolls up only a row it settled."""
+    if _done_update(session, task_id, *where, now=now, review_tier=review_tier) is None:
         return False
-    emit_console_event(session, entity="task", id=row[0], action=DONE)
     session.commit()
     return True
 
 
 def settle_coder_on_merge(
     task_id: int, pr_url: str, session: Session, *, sources: tuple[str, ...] = (ACTIVE,),
-    pr_stats: Any = None, pr_provenance: Any = None, attestation: Any = None,
+    pr_stats: Any = None, pr_provenance: Any = None, attestation: Any = None, review_tier: Any = None,
 ) -> bool:
     """Done-on-merge `→ done` settle of a build child that delivered a merged PR — the merged-PR analogue
     of `settle_analysis_child_on_artifact`, guarded on `MERGED_PR_CRITERION_PERSONAS` alone.
 
     `sources` is widened only by the settle route, admitting `system_failed` so a runner declared dead
-    mid-delivery can still record its PR (`persona_registry.settle_sources`). A runner's `/settle`
+    mid-delivery can still record its PR (`persona_registry.settle_sources`). A runner's `/complete`
     settles because its charter polls the PR until MERGED; the compliance-group cascade
     (`routes/agent/task_terminal.py::_settle_compliance_group`) rests on the same charter. `merged_at` is the settle
     instant, within a poll interval of the merge.
@@ -801,7 +818,7 @@ def settle_coder_on_merge(
     writes no row, which is how the compliance-group mirrors avoid duplicating their group's. `pr_provenance`
     (`SettleIn.pr_provenance`, `app/pr_changes.py`) is stored the same way, and `attestation` (the settle's
     `app/task_prs.py::Attestation`) marks every PR it attests `merged`."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     merged_at_dt = now
     # Read before the UPDATE syncs the row, as in `settle_analysis_child_on_artifact`: a widened `sources`
     # makes this another exit from `system_failed`, which re-evaluates the epic.
@@ -810,71 +827,82 @@ def settle_coder_on_merge(
     settled_from = settling.state if settling is not None else "?"
     recovered_a_failed_child = settled_from == SYSTEM_FAILED
     recovered_childs_parent_id = settling.parent_task_id if settling is not None else None
-    row = session.execute(
-        update(Task)
-        .where(
-            Task.id == task_id,
-            Task.persona.in_(MERGED_PR_CRITERION_PERSONAS),
-            # No parent predicate: a parentless `coder` is a legitimate top-level build unit.
-            Task.state.in_(sources),
-        )
-        .values(
-            state=DONE,
-            dispatch_attempts=0,
-            # The runner's own summary over the canned line. A floor: `settle_task` writes `SettleIn.summary` in
-            # the same transaction first, so on that path it is never NULL.
-            outcome_summary=func.coalesce(Task.outcome_summary, "delivered — merged to develop"),
-            outcome_pr_url=pr_url,
-            merged_at=merged_at_dt,
-            github_synced_at=now,
-            **_RUNNER_BINDING_CLEARED,
-            **actors.task_actor_values(session),
-        )
-        .returning(Task.id)
-    ).first()
-    if row is None:
-        return False
-    emit_console_event(
-        session, entity="task", id=row[0], action=DONE,
+    done_id = _done_update(
+        session, task_id,
+        Task.persona.in_(MERGED_PR_CRITERION_PERSONAS),
+        # No parent predicate: a parentless `coder` is a legitimate top-level build unit.
+        Task.state.in_(sources),
+        now=now, review_tier=review_tier, awaits_merge=True,
         transition_extra={"merged_at": merged_at_dt.isoformat()},
+        # The runner's own summary over the canned line. A floor: `settle_task` writes `SettleIn.summary` in
+        # the same transaction first, so on that path it is never NULL.
+        outcome_summary=func.coalesce(Task.outcome_summary, "delivered — merged to develop"),
+        outcome_pr_url=pr_url,
+        merged_at=merged_at_dt,
     )
+    if done_id is None:
+        return False
     if pr_stats is not None and settling is not None:
         record_pr_stats(
-            session, row[0], settling.org_id, session.get(Project, settling.project_id), pr_url, pr_stats
+            session, done_id, settling.org_id, session.get(Project, settling.project_id), pr_url, pr_stats
         )
     if pr_provenance is not None and settling is not None:
         record_pr_provenance(
-            session, row[0], settling.org_id, session.get(Project, settling.project_id), pr_url, pr_provenance
+            session, done_id, settling.org_id, session.get(Project, settling.project_id), pr_url, pr_provenance
         )
     if attestation is not None and settling is not None:
         task_prs.record_attested(session, settling, attestation)
+        # Self-merge: the PR's commits arrived with the settle, so the ledger can tell runner commits from others.
+        commits = pr_provenance.get("commits") if isinstance(pr_provenance, dict) else None
+        if isinstance(commits, list):
+            outcome_writer.set_commit_facts(session, settling, pr_number=None, pr_commits=commits)
     session.commit()
     log.info(
         "task %s SETTLED %s->done on its runner-reported merged PR %s (done-on-merge; "
         "merged_at=%s, github_synced_at=%s)",
-        row[0], settled_from, pr_url, merged_at_dt, now,
+        done_id, settled_from, pr_url, merged_at_dt, now,
     )
     # Before the rollup (`complete_task`'s reason): a still-failed epic would fail `_try_complete_epic`.
     if recovered_a_failed_child:
         _reevaluate_epic_child_failure(recovered_childs_parent_id, session)
         session.commit()
-    _maybe_roll_up_parent(row[0], session)
+    _maybe_roll_up_parent(done_id, session)
     return True
 
 
-def settle_coder_no_pr(task_id: int, session: Session) -> bool:
+def settle_shadow_pr(task_id: int, pr_url: str, session: Session, *, review_tier: Any = None) -> bool:
+    """`active → done` settle of a benchmark shadow on its open DRAFT PR (`app/outcome_ledger/benchmark.py`): the
+    settle route already wrote `outcome_pr_url`; no merge is recorded and its ledger row ends `settled`, outside every
+    observational metric. The duel learns the PR here. Guarded on `shadow` itself, so no other task can take it."""
+    now = utcnow()
+    if not _settle_done(
+        session, task_id,
+        Task.persona.in_(MERGED_PR_CRITERION_PERSONAS), Task.shadow.is_(True), Task.state == ACTIVE,
+        now=now, review_tier=review_tier,
+    ):
+        return False
+    if edition_features.enabled("exec_dashboard"):  # a shadow is filed only where benchmark mode runs
+        from app.outcome_ledger import benchmark
+
+        benchmark.on_shadow_settled(session, task_id, pr_url)
+    session.commit()
+    log.info("task %s SETTLED active->done on its benchmark shadow PR %s (never merged)", task_id, pr_url)
+    return True
+
+
+def settle_coder_no_pr(task_id: int, session: Session, *, review_tier: Any = None) -> bool:
     """Done-on-no-PR `active → done` settle of a child that legitimately closed WITHOUT a PR (duplicate /
     already-shipped / no-code-needed) — the no-PR twin of `settle_coder_on_merge`, called on the runner's
     own `no_pr` settle. Idempotent (`state == ACTIVE` is the race guard); also requires
     `outcome_no_pr_reason IS NOT NULL`, and `outcome_pr_url` stays NULL for `_child_rollup_ready`."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     if not _settle_done(
         session, task_id,
         Task.persona.in_(MERGED_PR_CRITERION_PERSONAS),
         # NO PARENT PREDICATE, for the same reason as its sibling above.
         Task.state == ACTIVE,
         Task.outcome_no_pr_reason.is_not(None),
-        now=now,
+        now=now, review_tier=review_tier,
     ):
         return False
     log.info(

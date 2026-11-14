@@ -38,7 +38,7 @@ __all__ = ["next_key", "open_dialog", "watch_launch", "watch_pane", "watch_vm"]
 # `answer_delivery._LAUNCH_READY_SECS`, with headroom for a cold start that also shows dialogs.
 _WATCH_SECS = 120.0
 # A MicroVM launch lands while the guest may still be finishing cloud-init and waiting up to 30 s for its
-# Docker engine (`microvm_seed.JAAH_SESSION`) before the CLI even starts.
+# Docker engine (`microvm_seed.jaah_session`) before the CLI even starts.
 _VM_WATCH_SECS = 300.0
 _POLL_SECS = 1.0
 # Re-read after each key: the cursor moves, or the dialog closes, on the next paint.

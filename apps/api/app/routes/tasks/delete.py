@@ -9,9 +9,9 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app import edition_features, fleet_verdicts
-from app.auth import require_user
+from app.auth import adopt_user, require_user
 from app.authz.declarations import feature
-from app.db import get_session
+from app.db_async import defer_off_loop, on_session
 from app.events import emit_console_event
 from app.models.identity import AdminUser
 from app.models.task_extras import TaskAttachment
@@ -172,6 +172,12 @@ def delete_task_core(
     # recover those slots afterwards (no clock reaper), so this prevents the leak. Not a new
     # release edge: deleting the parent is the delete decision for each removed row, as the cascade defines.
     cascade_rows = _rows_the_cascade_will_remove(task_id, session)
+    # The outcome ledger keeps a deleted task's rows (`task_id` SET NULL), excluded from every metric: marked
+    # here, before the cascade, for the task and every row the cascade removes.
+    from app.outcome_ledger import writer as outcome_writer
+
+    for excluded_id in [task_id, *(doomed.id for doomed in cascade_rows)]:
+        outcome_writer.exclude(session, excluded_id, outcome_writer.EXCLUDE_DELETED)
     for doomed in cascade_rows:
         _, child_issued = kill_runner_keeping_hold(
             doomed.id, session,
@@ -236,8 +242,8 @@ def delete_task_core(
         _reevaluate_epic_child_failure(recovered_childs_parent_id, session)
     emit_console_event(
         session, entity="task", id=task_id, action="deleted", transition_org_id=task_org_id,
+        commit=True,
     )
-    session.commit()
     send_minted_intents(issued)  # AFTER the commit — see `send_minted_intents`.
     # Objects last, after the intents: this dials S3, and a slow bucket must not delay the `kill_runner`.
     # Each key goes through the single-attachment delete's guard, which spares a key still referenced.
@@ -246,18 +252,20 @@ def delete_task_core(
     from app.attachment_storage import reap_unreferenced_object
 
     for bucket, key in doomed_object_keys:
-        reap_unreferenced_object(session, key, bucket)
+        defer_off_loop(session, reap_unreferenced_object, session, key, bucket)
 
 
 @router.delete("/{task_id}", status_code=204)
 @feature("tasks", "delete", object_type="task", object_params=("task_id",), author_draft=True)
+@on_session(deferring=True)
 def delete_task(
+    session: Session,
     task_id: int,
     _user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> Response:
     """See `delete_task_core` for the kill-intent/cascade/dependency contract this route enforces. Any
     state is deletable here, a live one included (its runner is killed)."""
+    _user = adopt_user(session, _user)
     task = get_task_or_404(task_id, session)
     delete_task_core(task, session, allow_live=True, actor=_user)
     return Response(status_code=204)

@@ -12,10 +12,9 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from uuid import UUID
 
-import psycopg
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -49,8 +48,12 @@ def emit_console_event(
     transition_extra: Optional[dict[str, Any]] = None,
     transition_org_id: Optional[UUID] = None,
     org_id: Optional[UUID] = None,
+    commit: bool = False,
 ) -> None:
     """Queue a ``NOTIFY cockpit_events`` on the caller's transaction, delivered atomically on COMMIT.
+
+    ``commit=True`` runs ``session.commit()`` right after the NOTIFY is queued: the caller's write and its
+    event commit together; a NOTIFY is delivered on COMMIT, so this is the common tail.
 
     ``org_id`` is the org a collection sentinel (``id=0``) happened in. A sentinel names no row, so the
     relay (`routes/stream.py::_may_see`) serves it only to that org's subscribers and the operator
@@ -83,11 +86,22 @@ def emit_console_event(
         {"channel": CHANNEL, "payload": payload},
     )
     if entity == "task":
+        # Every task transition may move an item on its project's pipeline (`app/pipeline/events.py`).
+        from app.pipeline import events as pipeline_events
+
+        pipeline_events.touch_task(session, id)
         # Hurry the passes that read a task transition (`app/task_wake.py`), once this write commits.
         from app import cron_runtime, task_wake
 
         for activity_type in task_wake.wake_activities_for(action):
             cron_runtime.wake_after_commit(session, activity_type)
+    if entity == "task" and action in ("active", "set_state"):
+        # A linked support ticket shows the work started (`app/support_activity.py::move_on_task_running`, which
+        # reads the task's state: `set_state` may name any state). The module is the Help assistant's.
+        if edition_features.enabled("support_assistant"):
+            from app import support_activity
+
+            support_activity.move_on_task_running_after_commit(session, id)
     if entity == "task" and action == "done":
         # `tasks.done_at`, the compliance seal's clock (`app/durable/compliance_seal.py`), in the transaction of
         # the `done` write itself. HERE because every `done` writer emits this event in its own transaction
@@ -110,11 +124,20 @@ def emit_console_event(
 
         # `transition_org_id` is for the `deleted` transition, recorded after the row is gone.
         record_task_transition(session, id, action, extra=transition_extra, org_id=transition_org_id)
+        # A transition a webhook is made from (`app/webhooks/`): hurry the `webhooks` cron once this commits.
+        from app.webhooks import catalog as webhook_catalog
+
+        if f"task:{action}" in webhook_catalog.type_by_kind():
+            from app.webhooks.engine import nudge_after_commit
+
+            nudge_after_commit(session)
         # A task that left the working states ends its Jaah-account sessions (`app/jaah_routing/sessions.py`).
         if edition_features.enabled("jaah_ai_credit"):
             from app.jaah_routing import sessions as jaah_sessions
 
             jaah_sessions.end_for_task_state(session, id)
+    if commit:
+        session.commit()
 
 
 #: A browser session changed org (`login_funnel.switch_membership`). Names the session as `(identity_id, iat)`
@@ -167,6 +190,24 @@ class EventBroadcaster:
 # The one broadcaster for this API process. Endpoints import this singleton to subscribe.
 broadcaster = EventBroadcaster()
 
+#: In-process listeners on every relayed event, for a per-process read cache that must drop what an event moved
+#: (`app/task_tree.py`). Called on the listener's loop with the event, and with None when the LISTEN connection is
+#: (re)established — events may have been missed meanwhile. A hook must be cheap and must not raise.
+_event_hooks: list[Callable[[Optional[dict[str, Any]]], None]] = []
+
+
+def add_event_hook(hook: Callable[[Optional[dict[str, Any]]], None]) -> None:
+    """Register `hook` (see `_event_hooks`)."""
+    _event_hooks.append(hook)
+
+
+def _run_event_hooks(event: Optional[dict[str, Any]]) -> None:
+    for hook in _event_hooks:
+        try:
+            hook(event)
+        except Exception:  # noqa: BLE001 — a cache hook never stops the relay
+            log.exception("cockpit-events: event hook %r failed", hook)
+
 
 async def _listen_forever(broadcaster: EventBroadcaster, stop: asyncio.Event) -> None:
     """Hold one LISTEN cockpit_events connection and republish every notification to the broadcaster.
@@ -189,6 +230,7 @@ async def _listen_forever(broadcaster: EventBroadcaster, stop: asyncio.Event) ->
         try:
             await conn.execute(f"LISTEN {CHANNEL}")
             log.info("cockpit-events LISTEN established on channel %s", CHANNEL)
+            _run_event_hooks(None)
             backoff = 1.0
             gen = conn.notifies()
             async for notify in gen:
@@ -198,6 +240,7 @@ async def _listen_forever(broadcaster: EventBroadcaster, stop: asyncio.Event) ->
                     log.warning("cockpit-events: ignoring non-JSON NOTIFY payload %r", notify.payload)
                     continue
                 broadcaster.publish(event)
+                _run_event_hooks(event)
                 if stop.is_set():
                     break
         except Exception as exc:

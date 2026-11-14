@@ -7,7 +7,9 @@ import { OrgQualifier, orgQualifierFor } from '../../lib/projectLabel'
 
 // Imported: `ui/listStyles.ts` is its single home.
 import { PHONE } from '../../ui/listStyles'
+import { FONT_SIZE, FONT_WEIGHT, LETTER_SPACING, LINE_HEIGHT, RADIUS, SIZE, grid } from '../../theme'
 import { SystemChip } from '../../ui/MarkChip'
+import Tip from '../../ui/Tip'
 
 /** One row: the `Project` fields the menu reads (a `GET /api/projects` row satisfies it). */
 export type ProjectMenuRow = Pick<Project, 'id' | 'name' | 'system_kind'> & {
@@ -15,28 +17,27 @@ export type ProjectMenuRow = Pick<Project, 'id' | 'name' | 'system_kind'> & {
   org?: OrgRef | null
 }
 
-// The ≥44px touch floor at phone width, as `RowActionsOverflow` spells it (a literal; the number's home is
-// `theme.custom.tapTargetPx`). `whiteSpace: 'normal'` overrides MUI's `nowrap`: a long project name must
+// The ≥44px touch floor at phone width (`SIZE.tapTarget`). `whiteSpace: 'normal'` overrides MUI's `nowrap`: a long project name must
 // wrap whole rather than overflow or clip the capped paper ("the full name, untruncated, at every width");
-// `flexWrap` drops the reason chip to its own line.
-const MENU_ITEM_SX = {
+// `flexWrap` drops the reason chip to its own line. Also the breadcrumb's feature menu's (`TaskBreadcrumb.tsx`).
+export const MENU_ITEM_SX = {
   whiteSpace: 'normal',
   flexWrap: 'wrap',
-  gap: 0.75,
-  [PHONE]: { minHeight: 44 },
+  gap: 0.5,
+  [PHONE]: { minHeight: SIZE.tapTarget },
 } as const
 
 /* The reason chip: a bordered pill, since it answers "why is the one I want dead". */
 const REASON_SX = {
   // Slightly larger than `TAG_SX` (10px uppercase is the readable floor): this is the text to read.
-  fontSize: '0.625rem',
-  fontWeight: 700,
-  letterSpacing: '0.06em',
+  fontSize: FONT_SIZE.xxs,
+  fontWeight: FONT_WEIGHT.bold,
+  letterSpacing: LETTER_SPACING.caps,
   textTransform: 'uppercase',
-  lineHeight: 1,
-  px: '5px',
-  py: '3px',
-  borderRadius: '3px',
+  lineHeight: LINE_HEIGHT.tight,
+  px: 0.5,
+  py: 0.5,
+  borderRadius: RADIUS.sm,
   border: '1px solid',
   flex: '0 0 auto',
 } as const
@@ -57,15 +58,13 @@ const REFUSED_SX = {
    The task editor's breadcrumb (`TaskBreadcrumb`: CREATE target or MOVE) — the `/tasks` board's selection is
    the sidebar's (`pane/ScopeDropdown.tsx` on the phone).
    It lists PROJECTS (`GET /api/projects`) by name; `MENU_ITEM_SX` keeps names whole.
-   Host differences are props: `allProjectsLabel` (a view scope may be "all"; a task is always IN one)
-   and `pickRefusal` (only the host knows the act's key). */
+   The host difference is a prop: `pickRefusal` (only the host knows the act's key). */
 export default function ProjectMenu({
   anchorEl,
   onClose,
   projects,
   projectId,
   onPick,
-  allProjectsLabel,
   pickRefusal = () => null,
   testId,
   ariaLabel,
@@ -73,20 +72,18 @@ export default function ProjectMenu({
   anchorEl: HTMLElement | null
   onClose: () => void
   projects: ReadonlyArray<ProjectMenuRow>
-  /** The currently-selected project, or `null` for none / all projects. */
+  /** The currently-selected project, or `null` for none (the inline New task row before a target resolves). */
   projectId: number | null
   onPick: (id: number | null) => void
-  /** A leading item with this label selects `null`; absent for the breadcrumb (a task is always in one). */
-  allProjectsLabel?: string
   /** Why this host would refuse picking a row (a lower-case chip caption), or `null` to accept.
    *
    *  The project list is wider than the set the caller may write in (a `projects:view` grant lists a
    *  project that holds no task key), so a pick could 403 on save. The automatic ladder already guards this
    *  (`shared.tsx::resolveCreateProject`'s `canCreateIn`); this is the same answer for the manual picker.
    *  Host-owned: the key depends on the act (`tasks:create` for a create
-   *  target, `tasks:edit` on the DESTINATION for a move; a VIEW pick stays ungated), and a hook here would
-   *  force a permission mock on every test (as `TaskBreadcrumb`). Defaults to accepting everything. Never
-   *  asked about the current row (picking it is a no-op). */
+   *  target, `tasks:edit` on the DESTINATION for a move; a host whose list is already filtered passes none), and
+   *  a hook here would force a permission mock on every test (as `TaskBreadcrumb`). Defaults to accepting
+   *  everything. Never asked about the current row (picking it is a no-op). */
   pickRefusal?: (project: ProjectMenuRow) => string | null
   /** Forwarded to the Menu. */
   testId?: string
@@ -103,31 +100,16 @@ export default function ProjectMenu({
       slotProps={{
         list: { 'aria-label': ariaLabel },
         /* A ceiling for wide desktops; `min()` keeps MUI's phone cap underneath. */
-        paper: { sx: { maxWidth: 'min(380px, calc(100% - 32px))' } },
+        paper: { sx: { maxWidth: `min(${grid(63)}, calc(100% - ${grid(5)}))` } },
       }}
     >
-      {allProjectsLabel !== undefined && (
-        <MenuItem
-          selected={projectId === null}
-          /* `aria-current` (see below). Never disabled: "all projects" has no grant. */
-          aria-current={projectId === null ? 'true' : undefined}
-          onClick={() => {
-            onClose()
-            if (projectId !== null) onPick(null)
-          }}
-          sx={MENU_ITEM_SX}
-        >
-          {allProjectsLabel}
-        </MenuItem>
-      )}
       {projects.map(p => {
         const isCurrent = p.id === projectId
         // The host's refusal, never asked about the current row.
         const refusedBy = isCurrent ? null : pickRefusal(p)
         const refused = refusedBy !== null
         return (
-          <MenuItem
-            key={p.id}
+          <Tip key={p.id} title={refused ? `${p.name} — ${refusedBy}` : undefined}><MenuItem
             selected={isCurrent}
             /* MUI `selected` on a `menuitem` emits only a class (`aria-selected` is for `role="option"`), so
                `aria-current` carries the current scope. */
@@ -135,7 +117,6 @@ export default function ProjectMenu({
             // Listed either way (a vanished scope reads as a bug); the chip says why.
             disabled={refused}
             // The tooltip repeats the chip beside the name (it wraps below it at 390px).
-            title={refused ? `${p.name} — ${refusedBy}` : undefined}
             onClick={() => {
               // The guard behind `REFUSED_SX` (see its note).
               if (refused) return
@@ -161,7 +142,7 @@ export default function ProjectMenu({
                 {refusedBy}
               </Typography>
             )}
-          </MenuItem>
+          </MenuItem></Tip>
         )
       })}
     </Menu>

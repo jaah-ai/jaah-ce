@@ -19,6 +19,7 @@ from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+from app.entity_shape import PG_INT_MAX
 from app.forges import FORGES, repo_ref_or_none
 
 log = logging.getLogger(__name__)
@@ -36,8 +37,6 @@ REASON_MALFORMED = "malformed"
 COUNT_FIELDS = ("additions", "deletions", "files_changed", "excluded_additions", "excluded_deletions")
 _CAPTURED_REQUIRES = ("additions", "deletions", "files_changed")
 
-# Postgres `integer`: a larger count would fail the INSERT, which must never reach the settle.
-_INT_MAX = 2**31 - 1
 # A reason is a short operator-facing line; a longer one is cut, never refused.
 _REASON_MAX = 500
 
@@ -50,7 +49,7 @@ def _count(value: Any) -> tuple[bool, Optional[int]]:
     """`(ok, value)`: None, or a non-negative int within Postgres `integer`. A bool is not a count."""
     if value is None:
         return True, None
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _INT_MAX:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= PG_INT_MAX:
         return False, None
     return True, value
 

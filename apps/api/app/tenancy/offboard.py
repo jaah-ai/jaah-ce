@@ -44,15 +44,15 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Optional
 from uuid import UUID
 
-import httpx
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, aliased, object_session as session_of
 
-from app import account_auth, attachment_storage, data_residency, session_transcripts
+from app import account_auth, attachment_storage, data_residency, github_api, http_bounded, session_transcripts
+from app.clock import utcnow
 from app.data_access_events import opened_config_for
 from app.models.agent_sessions import AgentSession
 from app.models.credentials import Account, AccountObservation, Credential
@@ -95,7 +95,6 @@ SHARED_DELETE_VERB = "account_shared_delete"
 _VENDOR_TIMEOUT = 15.0
 _SLACK_REVOKE_URL = "https://slack.com/api/auth.revoke"
 _GITLAB_REVOKE_URL = "https://gitlab.com/oauth/revoke"
-_GITHUB_API = "https://api.github.com"
 
 
 class OffboardStopped(Exception):
@@ -180,7 +179,6 @@ def _slots(session: Session, org_id: UUID) -> list[SlotRef]:
         .join(Project, Project.id == Worktree.project_id)
         .outerjoin(node, node.id == Worktree.node_id)
         .where(or_(Worktree.org_id == org_id, node.org_id == org_id, Project.org_id == org_id))
-        # Numbered slots before slot 0: a numbered slot erased after its clone is a tree with a dangling `.git`.
         .order_by(Project.name, node.name, Worktree.number.desc())
     ).all()
     return [
@@ -356,7 +354,7 @@ def _vendor_revoke(credential_type: str, config: dict[str, Any], row: Optional[C
             token = str(config.get("token") or "")
             if not token:
                 return REVOKED, "no bot token stored"
-            with httpx.Client(timeout=_VENDOR_TIMEOUT, follow_redirects=False) as client:
+            with http_bounded.client(_VENDOR_TIMEOUT) as client:
                 response = client.post(_SLACK_REVOKE_URL, headers={"Authorization": f"Bearer {token}"})
             body = response.json() if response.status_code == 200 else {}
             if body.get("ok") or body.get("error") in ("invalid_auth", "token_revoked", "account_inactive"):
@@ -378,16 +376,16 @@ def _vendor_revoke(credential_type: str, config: dict[str, Any], row: Optional[C
                 # The app that minted it: a GitHub App's token is revoked only with that App's pair.
                 app = git_access.app_config(kind=git_access.token_app_kind(token))
                 # The GRANT, not the token: it takes the refresh token with it.
-                with httpx.Client(timeout=_VENDOR_TIMEOUT, follow_redirects=False) as client:
+                with http_bounded.client(_VENDOR_TIMEOUT) as client:
                     response = client.request(
-                        "DELETE", f"{_GITHUB_API}/applications/{app.client_id}/grant",
+                        "DELETE", f"{github_api.GITHUB_API_BASE}/applications/{app.client_id}/grant",
                         json={"access_token": token}, auth=(app.client_id, app.client_secret),
                         headers={"Accept": "application/vnd.github+json"},
                     )
                 ok = response.status_code in (204, 404)
                 return (REVOKED, "") if ok else (RETRY, f"GitHub answered HTTP {response.status_code}")
             app = git_access.forge_app_config("gitlab")
-            with httpx.Client(timeout=_VENDOR_TIMEOUT, follow_redirects=False) as client:
+            with http_bounded.client(_VENDOR_TIMEOUT) as client:
                 response = client.post(_GITLAB_REVOKE_URL, data={
                     "client_id": app.client_id, "client_secret": app.client_secret, "token": token,
                 })
@@ -587,7 +585,9 @@ async def delete_account_dirs(
     return {"deleted": deleted, "residual": residual}
 
 
-async def delete_slots(session: Session, slots: list[SlotRef], actor: AdminUser) -> dict[str, Any]:
+async def delete_slots(
+    session: Session, slots: list[SlotRef], actor: AdminUser,
+) -> dict[str, Any]:
     """Each slot through the console's own Delete: ledger closed, row gone, tree erased on its node."""
     from app.routes.pool_slots import delete_one_slot  # noqa: PLC0415
 
@@ -686,7 +686,7 @@ def record(org: dict, actor: AdminUser, started_at: str, stores: dict[str, Any],
         )
     caveats.append("each member's authorization of the GitHub OAuth App on github.com is theirs to remove")
     caveats.append("an org's own shared-accounts EFS lives in the tenant's AWS account and is theirs to delete")
-    completed = datetime.now(timezone.utc)
+    completed = utcnow()
     complete = stopped is None and not _residue(stores) and not unverifiable and set(stores) == set(STORES)
     return {
         "kind": "tenant_offboarding",

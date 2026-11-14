@@ -19,7 +19,7 @@ the daemon's `test_codex_acp_hooks.py`, which drives the installed codex-acp.
 
 - **codex-acp bump:** regenerate the patch against the new tarball's `dist/index.js` (`npm pack
   @agentclientprotocol/codex-acp@<v>`, edit, `diff -u` with `a/` and `b/` paths), regenerate the lock
-  (`runner_cli_pins.py lock @agentclientprotocol/codex-acp`), and run `test_runner_cli_pins_table.py`
+  (`runner_cli_pins.py lock @agentclientprotocol/codex-acp`), re-record its fixture (`test_runner_cli_pins_table.py record @agentclientprotocol/codex-acp`), and run `test_runner_cli_pins_table.py`
   and `test_codex_acp_hooks.py`.
 - **Drop it** when an upstream release lets a configured `projects` entry stand, or stops forcing trust: remove the
   file and the `patches` line, and keep the hooks test green against the unpatched build.

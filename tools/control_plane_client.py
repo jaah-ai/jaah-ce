@@ -24,16 +24,16 @@ because login shares the PUBLIC_RATE_LIMIT window (apps/api/app/main.py), and a 
 short-lived hook exhausts it and 429s. Hot callers (check_gh_pr_guard.py) add their own data cache.
 
 Raises ControlPlaneApiError on any failure — callers must fail loudly, never skip or fall back to stale
-data (spec R5, NFR Consistency). stdlib-only (urllib).
+data (spec R5, NFR Consistency). stdlib-only (urllib) plus two daemon leaves loaded by path through
+`jaahd_module` (never copied here): `env_helpers` for the `.env` rule and the clone-root rule, and
+`node_token_http` for the one opener that may carry `X-Agent-Token`.
 """
 from __future__ import annotations
 
 import http.cookiejar
 import json
 import os
-import re
 import urllib.error
-import urllib.parse
 import sys
 import urllib.request
 from pathlib import Path
@@ -43,7 +43,14 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runner_env  # noqa: E402
 import jaah_paths  # noqa: E402
+import jaahd_module  # noqa: E402
 from jaah_env_names import env_get  # noqa: E402
+
+# The daemon's leaves, by path (`tools/jaahd_module.py`): `env_helpers.dotenv_value` is THE `.env` reading
+# rule (last `KEY=` wins, inline `#` cut, quotes and spaces dropped) and `env_helpers.resolve_clone_root` THE
+# per-node clone-root rule; `node_token_http.OFF_HOST_SAFE_OPEN` is the one opener a node-token request may use.
+_env_helpers = jaahd_module.load("env_helpers.py", "env_helpers", siblings=True)
+_node_token_http = jaahd_module.load("node_token_http.py", "node_token_http")
 
 # The daemon socket: the FIRST transport (module docstring). Imported defensively: it reaches a node
 # only via the jaahd bundle manifest, and a hard ImportError would
@@ -98,17 +105,10 @@ class ControlPlaneApiError(RuntimeError):
 
 
 def _read_env_value(key: str, env_path: Path = DEFAULT_ENV_PATH) -> str:
-    """Read KEY from the hub's own .env (last-wins, inline-comment/quote stripped)."""
+    """KEY from the hub's own .env by the daemon's `dotenv_value` rule; "" when the file is absent."""
     if not env_path.is_file():
         return ""
-    value = ""
-    pattern = re.compile(rf"^\s*{re.escape(key)}=(.*)$")
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        m = pattern.match(line)
-        if m:
-            raw = m.group(1).split("#", 1)[0].strip()
-            value = raw.strip("\"'")
-    return value
+    return _env_helpers.dotenv_value(env_path.read_text(encoding="utf-8"), key)
 
 
 # No SSM-helper arm: the broker no longer serves `node_token`. Both remaining arms are the
@@ -122,30 +122,8 @@ def _resolve_node_token(env_path: Path = DEFAULT_ENV_PATH) -> str:
     )
 
 
-def caller_task_id() -> str:
-    """The `X-Agent-Task-Id` value for an agent-API call ON THE CREDENTIAL LEG ONLY: this process's own
-    console task id inside a fleet runner's session, else the `host` producer sentinel.
-
-    Not consulted on the socket leg, where the daemon DERIVES the header from the calling process
-    (`runner_registry.resolve_peer` → `agent_vocabulary.caller_task_header`) — which is what makes
-    `apps/api/app/routes/agent/auth.py::_guard_task_creating_caller` (R30) unforgeable.
-
-    The task-creating routes require this header and reject a persona other than `plan`/`finish`.
-    `CONTROL_TASK_ID` is exported only into a runner's shell (`fleet_dispatch.build_auth_lines`), so cron
-    declares `host` while the same tool inside an implementer's session declares that implementer. Never
-    hardcode the sentinel at a call site.
-
-    `host` is NOT an unconditional fallback (an identity never gets a safe-off default): inside a runner
-    (`CONTROL_RUNNER_SESSION_ID` set) a missing task id means the id was LOST, so this declares nothing
-    and the server 422s. Guards against accidental loss, not forgery. Not `COCKPIT_AGENT_BASE` or
-    `JAAH_WORKTREE` as the runner test: operator shells carry those. Mirror:
-    `apps/jaahd/control_plane_api.py::_caller_task_id`."""
-    task_id = runner_env.task_id().strip()
-    if task_id:
-        return task_id
-    if runner_env.runner_session_id().strip():
-        return ""                       # a runner that lost its id: refuse to claim producer status
-    return "host"
+# The `X-Agent-Task-Id` rule lives with the identity it reads (`runner_env.caller_task_id`); bound here for its callers.
+caller_task_id = runner_env.caller_task_id
 
 
 # ── The socket leg: ONE implementation of the three-way split ─────────────────────────────────────────
@@ -287,7 +265,7 @@ def _send_once(
     extra_headers: dict[str, str] | None = None,
 ) -> tuple[int, bytes]:
     """One HTTP attempt: (status_code, body) for ANY response, 4xx/5xx included — callers decide what a
-    status means (a 409 is success for `create_project`). Only a transport failure propagates.
+    status means. Only a transport failure propagates.
 
     `extra_headers` (the node-token fallback's `X-Agent-Token`) is merged LAST so the Content-Type default
     can never displace it."""
@@ -412,98 +390,37 @@ def fetch_projects(
     return data
 
 
-def fetch_port_grid(
-    timeout: float = DEFAULT_TIMEOUT,
-    env_path: Path = DEFAULT_ENV_PATH,
-) -> dict[str, Any]:
-    """The deterministic port grid's INPUTS (DB rows edited in Settings), daemon `port_grid.get` first,
-    else `GET /api/agent/port-grid` with this node's token. Returns the raw body: `range_start_by_var`
-    plus `block_size`/`stride`/`window`/`auto_port_floor`/`auto_port_ceiling`.
-
-    Two legs because `check_pool_ports.py` runs in runner sessions and operator shells.
-
-    Raises on any unreachable/refused/unparseable/wrong-typed field. NO cache, NO code-copy fallback: a
-    stale grid makes `--fix` rewrite live `.env`s onto ports nothing agrees with. An EMPTY
-    `range_start_by_var` is LEGITIMATE (every var tier 2)."""
-    data = _via_socket("port_grid.get", timeout=timeout)
-    source = "port_grid.get via the node daemon"
-    if data is _NO_SOCKET:
-        base = api_base(env_path)
-        path = "/api/agent/port-grid"
-        source = f"GET {base}{path}"
-        status, body = _token_api_request("GET", path, timeout=timeout, env_path=env_path)
-        if status >= 400:
-            raise ControlPlaneApiError(
-                f"{source} -> HTTP {status}: {body.decode(errors='replace')[:200]}"
-            )
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise ControlPlaneApiError(f"{source} returned unparseable JSON: {exc}") from exc
-    # Every field check runs on BOTH legs: these numbers are written into live `.env`s under `--fix`, so
-    # a partly-understood body must stop the run.
-    if not isinstance(data, dict):
-        raise ControlPlaneApiError(f"{source} returned a non-dict body: {type(data)!r}")
-
-    starts = data.get("range_start_by_var")
-    if not isinstance(starts, dict):
-        raise ControlPlaneApiError(
-            f"{source}: range_start_by_var is {type(starts)!r}, expected an object"
-        )
-    for var, start in starts.items():
-        # `bool` is an `int` subclass; reject explicitly so JSON `true` is not banded as port 1.
-        if not isinstance(var, str) or isinstance(start, bool) or not isinstance(start, int):
-            raise ControlPlaneApiError(
-                f"{source}: range_start_by_var[{var!r}] is {start!r}, expected an int"
-            )
-    for field in ("block_size", "stride", "window", "auto_port_floor", "auto_port_ceiling"):
-        value = data.get(field)
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ControlPlaneApiError(
-                f"{source}: {field} is {value!r}, expected a positive int"
-            )
-    return data
-
-
-def create_project(
-    fields: dict[str, Any],
-    timeout: float = DEFAULT_TIMEOUT,
-    env_path: Path = DEFAULT_ENV_PATH,
-    cookie_jar_path: Path | None = None,
-) -> tuple[int, dict[str, Any]]:
-    """POST /api/projects (Connect Existing — `apps/api/app/routes/projects.py`). (status_code,
-    parsed_body) for ANY final response, including 409 (a seeding caller treats a
-    duplicate as "already seeded", making re-runs idempotent). A non-JSON body is `{}`. Raises
-    `ControlPlaneApiError` only when the API cannot be reached even after a fresh login."""
-    status, body = api_request(
-        "POST", "/api/projects", payload=fields, timeout=timeout, env_path=env_path,
-        cookie_jar_path=cookie_jar_path,
-    )
-    try:
-        parsed = json.loads(body) if body else {}
-    except json.JSONDecodeError:
-        parsed = {}
-    return status, parsed if isinstance(parsed, dict) else {}
-
-
 # ── Local clone-path resolution ───────────────────────────────────────────────────────────────────────
-# A project's main clone is COMPUTED per node as `<JAAH_HOME>/repos/<project_id>/main` (one stored path
-# could be right on only one node). Reference implementation (do not diverge):
-# apps/api/app/node_clone.py::resolve_clone; this stdlib half keeps `tools/` free of app imports.
+# A project's repos root is COMPUTED per node as `<JAAH_HOME>/repos/<project_id>` (one stored path could be
+# right on only one node); its slots are `<N>` beneath it. The node-side rule is the daemon's
+# `env_helpers.resolve_clone_root` (its server twin: `apps/api/app/node_clone.py`), bound here for its
+# importers: "" when the id is missing or JAAH_HOME is unset/`/` — no implicit default, never a raise.
+resolve_clone_root = _env_helpers.resolve_clone_root
 
-def resolve_clone_root(project_id: int | None) -> str:
-    """THIS node's main-clone path for a project: <jaah_home>/repos/<project_id>/main (`projects.id`).
-    "" when either input is missing (no JAAH_HOME set here, or no id) — no implicit default."""
-    # An id is a non-negative int — a `bool` is an `int`, and a string could carry a path segment.
-    if not isinstance(project_id, int) or isinstance(project_id, bool) or project_id < 0:
-        return ""
-    value = env_get("JAAH_HOME", "").strip()
-    home = value.rstrip("/")
-    # Checked AFTER the rstrip: "/" strips to nothing and would anchor the path at filesystem root.
-    # Matches apps/jaahd/env_helpers.py's `jaah_home()`.
-    if not home:
-        return ""
-    return f"{home}/repos/{project_id}/main"
+
+def _digit_dirs(parent: str) -> list[str]:
+    """`parent`'s digit-named children, numerically ordered (`_repos`, `main` and scratch are not slots)."""
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return []
+    return [os.path.join(parent, n) for n in sorted((n for n in names if n.isascii() and n.isdigit()), key=int)]
+
+
+def resolve_slot_clones(project_id: int | None) -> list[str]:
+    """Every clone of a project's PRIMARY repository THIS node holds, in a stable order: a legacy `main` anchor
+    if one is still on disk, then each slot `<jaah_home>/repos/<id>/<N>` numerically. `[]` when
+    `resolve_clone_root` cannot place the project.
+
+    The pool has no slot 0 and `apps/jaahd/legacy_layout.py` erases `main` clones, so on a migrated node
+    `resolve_clone_root`'s path does not exist — a per-clone audit walks this list instead. Non-primary
+    repositories (`_repos/<rid>/<N>`) are left out: each may declare its own branch policy and base
+    (`apps/jaahd/slot_repos.py`), so the project row's values are not theirs to judge or install."""
+    anchor = resolve_clone_root(project_id)
+    if not anchor:
+        return []
+    candidates = [anchor, *_digit_dirs(os.path.dirname(anchor))]
+    return [c for c in candidates if os.path.exists(os.path.join(c, ".git"))]
 
 
 # ── Agent-token requests to /api/agent/* ──────────────────────────────────────────────────────────────
@@ -543,75 +460,13 @@ def _token_api_request(
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # Never plain `urlopen`: a 307 off the control plane would carry the token to the other host.
+        with _node_token_http.OFF_HOST_SAFE_OPEN(req, timeout=timeout) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise ControlPlaneApiError(f"{method} {url} failed: {exc}") from exc
-
-
-# (method, path) → verb for `agent_api_request`, a TABLE on purpose: a generic path passthrough is what
-# `agent_vocabulary` refuses to be. Only pairs in-repo callers pass; an unmapped pair is a loud error.
-# Adding a row means adding the matching `Verb` there first. Keyed on the path WITHOUT its query string
-# (the query becomes `args`, allowlisted CP-side).
-#
-# `_CREDENTIAL_ONLY_PATHS`: vetted AS operator-only, so they go straight to the credential leg (unlike
-# "unmapped", which raises). `purge-stale` archives the escalation trail fleet-wide; its only caller is
-# a cron script with a credential.
-_CREDENTIAL_ONLY_PATHS: frozenset[tuple[str, str]] = frozenset({
-    ("POST", "/api/agent/runner-breaks/purge-stale"),
-})
-
-_AGENT_PATH_VERBS: dict[tuple[str, str], str] = {
-    # The broken-sessions tool — `list` only; see `_CREDENTIAL_ONLY_PATHS` for `purge`.
-    ("GET", "/api/agent/runner-breaks"): "runner_breaks.list",
-}
-
-
-def agent_api_request(
-    method: str,
-    path: str,
-    payload: dict[str, Any] | None = None,
-    timeout: float = DEFAULT_TIMEOUT,
-    env_path: Path = DEFAULT_ENV_PATH,
-) -> tuple[int, bytes]:
-    """One request against an `/api/agent/*` endpoint — daemon first, NODE_TOKEN second — returning
-    `(status_code, body)` so no caller has to know which leg answered.
-
-    The pair maps to a verb through `_AGENT_PATH_VERBS`; UNMAPPED raises (read that table's comment
-    before adding a row).
-
-    THE SOCKET LEG SYNTHESISES `200`: the daemon returns a result only on an acceptable CP answer; a CP
-    4xx becomes a raised refusal instead. Callers branching on `status >= 400` keep working.
-
-    Three-way split as everywhere: result returned, refusal raised, only "no answer" reaches
-    `_token_api_request`."""
-    bare_path, _, query = path.partition("?")
-    pair = (method.upper(), bare_path)
-    # Vetted operator-only: skip the socket.
-    if pair in _CREDENTIAL_ONLY_PATHS:
-        return _token_api_request(method, path, payload, timeout=timeout, env_path=env_path)
-    verb = _AGENT_PATH_VERBS.get(pair)
-    if verb is None:
-        raise ControlPlaneApiError(
-            f"{method} {bare_path} has no verb in control_plane_client._AGENT_PATH_VERBS — this "
-            f"helper cannot forward an arbitrary agent path (that would be the passthrough "
-            f"apps/jaahd/agent_vocabulary.py refuses to be). Add a Verb there and a row here, or call the "
-            f"function that owns this route."
-        )
-    # Query parameters become `args` (last value wins, as urllib reads them); a body `payload` merges on
-    # top. The verb's `query` tuple splits them CP-side.
-    args: dict[str, Any] = {
-        key: values[-1]
-        for key, values in urllib.parse.parse_qs(query, keep_blank_values=True).items()
-    } if query else {}
-    if payload:
-        args.update(payload)
-    result = _via_socket(verb, args, timeout=timeout)
-    if result is not _NO_SOCKET:
-        return 200, json.dumps(result).encode("utf-8")
-    return _token_api_request(method, path, payload, timeout=timeout, env_path=env_path)
 
 
 def create_system_task(
@@ -656,68 +511,6 @@ def create_system_task(
     if status >= 400:
         raise ControlPlaneApiError(
             f"POST /api/agent/tasks/system (persona={persona} project={project}) -> HTTP {status}: "
-            f"{raw.decode(errors='replace')[:200]}"
-        )
-    return json.loads(raw) if raw else {}
-
-
-def find_open_system_task(
-    persona: str,
-    project: str,
-    dedup_key: str | None = None,
-    timeout: float = DEFAULT_TIMEOUT,
-    env_path: Path = DEFAULT_ENV_PATH,
-    project_id: int | None = None,
-) -> int | None:
-    """The id of the one open system Task for (persona, project) — daemon `system_task.open` first, else
-    `GET /api/agent/tasks/system/open`. None when nothing is open; raises `ControlPlaneApiError` on a
-    refusal or non-2xx. Nothing-open and a failed lookup must not converge.
-
-    `dedup_key` narrows to the row THAT key opened, for a producer with several rows per (persona,
-    project). `project_id`, when known, is the identity the CP matches on (as `create_system_task`)."""
-    params: dict[str, str] = {"persona": persona, "project": project}
-    if project_id is not None:
-        params["project_id"] = str(int(project_id))
-    if dedup_key:
-        params["dedup_key"] = dedup_key
-    data = _via_socket("system_task.open", dict(params), timeout=timeout)
-    if data is _NO_SOCKET:
-        query = urllib.parse.urlencode(params)
-        status, raw = _token_api_request(
-            "GET", f"/api/agent/tasks/system/open?{query}", timeout=timeout, env_path=env_path
-        )
-        if status >= 400:
-            raise ControlPlaneApiError(
-                f"GET /api/agent/tasks/system/open (persona={persona} project={project}) -> HTTP "
-                f"{status}: {raw.decode(errors='replace')[:200]}"
-            )
-        data = json.loads(raw) if raw else {}
-    task_id = data.get("id") if isinstance(data, dict) else None
-    return task_id if isinstance(task_id, int) else None
-
-
-def resolve_system_task(
-    task_id: int,
-    outcome_summary: str,
-    timeout: float = DEFAULT_TIMEOUT,
-    env_path: Path = DEFAULT_ENV_PATH,
-) -> dict[str, Any]:
-    """Resolve an OUTCOME-criterion system Task to `done` (states owned by
-    `task_lifecycle._RESOLVABLE_SYSTEM_TASK_STATES`) via `POST /api/agent/tasks/system/{id}/resolve`.
-    Returns `{"resolved": bool}`; raises `ControlPlaneApiError` on a refusal or any non-2xx.
-
-    `task_id` names SOMEONE ELSE'S row (an alarm this producer opened), not the caller's own task, which
-    `agent_vocabulary._TASK_ID_KEYS` refuses to let any caller name."""
-    # CREDENTIAL LEG ONLY, BY DESIGN — no `system_task.resolve` verb: ids are enumerable via
-    # `system_task.open` and the CP handler has no caller predicate, so any local caller could close any
-    # alarm. Every real caller runs as the operator or the daemon.
-    status, raw = _token_api_request(
-        "POST", f"/api/agent/tasks/system/{task_id}/resolve",
-        {"outcome_summary": outcome_summary}, timeout=timeout, env_path=env_path,
-    )
-    if status >= 400:
-        raise ControlPlaneApiError(
-            f"POST /api/agent/tasks/system/{task_id}/resolve -> HTTP {status}: "
             f"{raw.decode(errors='replace')[:200]}"
         )
     return json.loads(raw) if raw else {}

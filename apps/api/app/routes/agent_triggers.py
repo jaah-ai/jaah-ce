@@ -1,8 +1,8 @@
 """The agent-facing trigger channel: a runner creates an event-driven trigger in its own project, and edits or
 deletes only the triggers its own task created (`SHAPE_TRIGGER`).
 
-The twin of `routes/agent_crons.py`, whose docstring argues the shared parts: the licence is the filed-draft
-doors' (`routes/agent/agent_filing.py::_require_filing_caller`), the caller is a live filer held by THIS node, and the write
+The twin of `routes/agent_crons.py`, whose docstring argues the shared parts: any persona's runner, the loop guard on
+create and enable (`routes/agent/auth.py::require_human_started`), the caller a live filer held by THIS node, and the write
 runs as the chain's executor (`agent_crons._executor_authority`: an org admin of the trigger's org, or an
 operator — the bar the console's `@org_admin` trigger routes ask). Every validation is the console's own writer
 (`routes/triggers.py::write_trigger_*`), so nothing here re-decides a source, a persona or a template. Only the
@@ -17,22 +17,22 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Query
+from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app import node_credentials
+from app import config
+from app.automation_alerts import AUTOMATIONS_PATH
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
-from app.config import get_settings
-from app.db import get_session
+from app.db_async import on_session
+from app.entity_shape import from_row
 from app.models.automations import TaskTrigger
 from app.models.tasks import Task
-from app.persona_registry import SHAPE_TRIGGER
 
 # The one door onto `/api/agent/*` (`test_authz_policy.py::test_every_agent_surface_route_depends_on_the_token_check`)
-# and the filing licence the filed-draft doors share.
-from app.routes.agent.auth import _check_token
+# and the loop guard on every door that makes work run unattended.
+from app.routes.agent.auth import AgentDoor, require_human_started
 from app.routes.agent_crons import (
     _cron_caller, _executor_authority, _own_or_404, _project_org, _refuse_a_repeat,
 )
@@ -57,6 +57,12 @@ router = APIRouter(tags=["agent-triggers"])
 _NOUN = "trigger"
 #: The sentence a model relays to the operator; the secret itself is the console's to show (PRD R19).
 REVEAL_SENTENCE = "Reveal the signing secret once in the console: {url}"
+
+
+def next_step(url: str, owed: bool) -> str:
+    """The sentence a model relays about a saved row's console page: the reveal when one is still owed a person,
+    else where to manage it. Shared with `routes/agent_automations.py`."""
+    return REVEAL_SENTENCE.format(url=url) if owed else f"Manage it in the console: {url}"
 
 
 # ── The wire shapes ───────────────────────────────────────────────────────────────────────────────────
@@ -99,12 +105,6 @@ class AgentTriggerDeleteOut(BaseModel):
 # ── Who acts, and on what ─────────────────────────────────────────────────────────────────────────────
 
 
-def _trigger_caller(
-    session: Session, agent: node_credentials.AgentCaller, x_agent_task_id: str
-) -> Task:
-    return _cron_caller(session, agent, x_agent_task_id, shape=SHAPE_TRIGGER)
-
-
 def _own_trigger_or_404(session: Session, caller: Task, trigger_id: UUID) -> TaskTrigger:
     # A trigger a human moved to another project has left the runner's reach.
     return _own_or_404(
@@ -113,17 +113,15 @@ def _own_trigger_or_404(session: Session, caller: Task, trigger_id: UUID) -> Tas
 
 
 def _out(trigger: TaskTrigger) -> AgentTriggerOut:
-    url = f"{get_settings().frontend_url.rstrip('/')}/triggers/{trigger.id}"
+    # The automation's page, or the list for a trigger older than automations (`automation_id` is nullable).
+    tail = f"/{trigger.automation_id}" if trigger.automation_id else ""
+    url = config.console_url(f"{AUTOMATIONS_PATH}{tail}")
     # Owed only on an agent-created signed trigger whose reveal no human has spent yet.
     owed = trigger.secret_sealed is not None and trigger.secret_revealed_at is None
-    return AgentTriggerOut(
-        id=str(trigger.id),
-        name=trigger.name,
-        source_kind=trigger.source_kind,
-        persona=trigger.persona,
-        project_id=trigger.project_id,
+    return from_row(
+        AgentTriggerOut, trigger,
         console_url=url,
-        next_step=REVEAL_SENTENCE.format(url=url) if owed else f"Manage it in the console: {url}",
+        next_step=next_step(url, owed),
     )
 
 
@@ -132,15 +130,16 @@ def _out(trigger: TaskTrigger) -> AgentTriggerOut:
 
 @router.post("/api/agent/tasks/triggers", response_model=AgentTriggerOut, status_code=201)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def create_agent_trigger(
+    session: Session,
     body: AgentTriggerCreateIn,
-    x_agent_task_id: str = Header(default=""),
-    agent: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
+    door: AgentDoor,
 ) -> AgentTriggerOut:
     """Create one trigger in the caller's own project, owned by the chain's executor. The secret stays sealed
     and unrevealed; the answer names where a human reveals it."""
-    caller = _trigger_caller(session, agent, x_agent_task_id)
+    caller = _cron_caller(session, *door)
+    require_human_started(session, caller, what="creating a trigger")
     org_id = _project_org(session, caller)
     executor = _executor_authority(session, caller, org_id, noun=_NOUN)
     _refuse_a_repeat(session, caller, body.name, model=TaskTrigger, noun=_NOUN, twice="creating it twice")
@@ -159,15 +158,19 @@ def create_agent_trigger(
 
 @router.patch("/api/agent/tasks/triggers", response_model=AgentTriggerOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def update_agent_trigger(
+    session: Session,
     body: AgentTriggerUpdateIn,
-    x_agent_task_id: str = Header(default=""),
-    agent: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
+    door: AgentDoor,
 ) -> AgentTriggerOut:
     """Patch one trigger the caller's task created, as the executor."""
-    caller = _trigger_caller(session, agent, x_agent_task_id)
+    caller = _cron_caller(session, *door)
     trigger = _own_trigger_or_404(session, caller, body.trigger_id)
+    # A live trigger keeps filing unattended (enabled: `routes/triggers.py::TriggerOut`); this surface cannot
+    # resume one, so only an edit of a paused or failed trigger is free.
+    if trigger.paused_at is None and trigger.failed_at is None:
+        require_human_started(session, caller, what="changing a live trigger")
     executor = _executor_authority(session, caller, trigger.org_id, noun=_NOUN)
     # A model's client often sends `null` for an untouched field; only a clearable field takes it as "clear".
     sent = {
@@ -184,14 +187,14 @@ def update_agent_trigger(
 
 @router.delete("/api/agent/tasks/triggers", response_model=AgentTriggerDeleteOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def delete_agent_trigger(
+    session: Session,
+    door: AgentDoor,
     trigger_id: UUID = Query(..., description="the id trigger_create answered"),
-    x_agent_task_id: str = Header(default=""),
-    agent: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> AgentTriggerDeleteOut:
     """Delete one trigger the caller's task created, as the executor. Tasks it already filed stay."""
-    caller = _trigger_caller(session, agent, x_agent_task_id)
+    caller = _cron_caller(session, *door)
     trigger = _own_trigger_or_404(session, caller, trigger_id)
     executor = _executor_authority(session, caller, trigger.org_id, noun=_NOUN)
     write_trigger_delete(session, trigger, executor, via_task_id=caller.id)

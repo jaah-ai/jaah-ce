@@ -18,7 +18,7 @@ The engine runs it with no Target (`automation_fire._fire_untargeted`): one mess
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import timezone
 from typing import TYPE_CHECKING, Any, NoReturn, Optional
 from uuid import UUID
 
@@ -26,8 +26,9 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import edition_features, mail_message, plan_terms, trigger_template
+from app import ce_caps, edition_features, mail_message, plan_terms, trigger_template
 from app.automations import OUTCOME_FILED, WHEN_EVENT
+from app.clock import utcnow
 from app.entity_shape import optional_uuid
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
@@ -93,17 +94,10 @@ def validate(session: Session, draft: "AutomationDraft", params: dict[str, Any])
 
 def _max_recipients() -> int:
     if not edition_features.enabled("tenant_mail"):
-        raise _not_in_edition()
+        raise ce_caps.not_in_edition()
     from app.tenant_gmail import MAX_RECIPIENTS
 
     return MAX_RECIPIENTS
-
-
-def _not_in_edition() -> HTTPException:
-    """Send email's 404 in an edition without the org's connected Gmail (`ce_caps.NOT_IN_CE`)."""
-    from app.ce_caps import NOT_IN_CE
-
-    return HTTPException(status_code=404, detail=NOT_IN_CE)
 
 
 def _check_placeholders(field_name: str, template: str, when_kind: str) -> None:
@@ -131,7 +125,7 @@ def _connection_or_refuse(session: Session, draft: "AutomationDraft", value: Any
     from app.models.automations import Automation
 
     if not edition_features.enabled("tenant_mail"):
-        raise _not_in_edition()
+        raise ce_caps.not_in_edition()
     from app.tenant_gmail import connection, connections
 
     if value in (None, ""):
@@ -181,7 +175,7 @@ def own_fields(session: Session, ctx: "FireContext") -> dict[str, str]:
     from app.models.orgs import Org
 
     org_name = session.scalar(select(Org.name).where(Org.id == ctx.automation.org_id)) or ""
-    fired_at = (ctx.fired_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    fired_at = (ctx.fired_at or utcnow()).astimezone(timezone.utc)
     return {"automation.name": ctx.automation.name or "", "fired_at": fired_at.strftime("%Y-%m-%d %H:%M UTC"),
             "org.name": org_name}
 
@@ -213,7 +207,7 @@ def fire(ctx: "FireContext", _target: Any) -> "TargetOutcome":
     from app.automation_fire import REASON_SEND_FAILED, TargetFailed, TargetOutcome
 
     if not edition_features.enabled("tenant_mail"):
-        raise TargetFailed(REASON_SEND_FAILED.format(error=_not_in_edition().detail))
+        raise TargetFailed(REASON_SEND_FAILED.format(error=ce_caps.NOT_IN_CE))
     from app import tenant_gmail
 
     session, params = ctx.session, ctx.params

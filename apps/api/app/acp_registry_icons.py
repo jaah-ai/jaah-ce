@@ -84,7 +84,7 @@ def data_uris(urls: Iterable[Optional[str]]) -> dict[str, Optional[str]]:
     if not wanted:
         return {}
     with ThreadPoolExecutor(max_workers=min(_WORKERS, len(wanted)), thread_name_prefix="acp-icon") as pool:
-        return dict(zip(wanted, pool.map(data_uri, wanted)))
+        return dict(zip(wanted, pool.map(data_uri, wanted), strict=False))
 
 
 def clear_cache() -> None:

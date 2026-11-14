@@ -14,15 +14,13 @@
 # No NATS client and no PyNaCl: the WebSocket transport (bus and console PTY) and the apt-repo GPG signing
 # (jaah-package-distribution) leave nothing importing either.
 # WebSocket CLIENT for the node bus: apps/jaahd dials the CP's /api/node-bus. apps/api also
-# picks this up (its requirements.txt `-r`s this file): it serves websockets via uvicorn AND dials them itself
-# — Slack Socket Mode (`app/slack_socket.py`) and the console proxy to the peer task holding a ticket
+# picks this up (its requirements.txt `-r`s this file): it dials websockets itself (its server, Granian, has its
+# own) — Slack Socket Mode (`app/slack_socket.py`) and the console proxy to the peer task holding a ticket
 # (`apps/api/app/console_relay/server.py`).
-# THREE constraints fix the range:
+# TWO constraints fix the range:
 #   * The `jaah` package declares `python3 (>= 3.12)` and installs this library into the node's venv under that
 #     interpreter ⇒ requires-python must admit 3.12. 17.x declares `>=3.11`.
 #   * `websockets.asyncio.client` — what node_bus.py imports — landed in 13.0 ⇒ that is the floor.
-#   * The apps/api image installs the full wheel, `websockets.legacy` included, which uvicorn's
-#     `websockets` protocol impl imports (`websockets.legacy.server`) ⇒ a bump must still ship `legacy/`.
 websockets==17.3  # https://pypi.org/project/websockets/17.3/
 # YAML parser for the compliance scan's CI-definition primitive (the governance package's `primitives/ci.py`),
 # which imports it LAZILY and answers `error` without it, never a pass. The api image already resolved this

@@ -1,12 +1,12 @@
 import { Suspense, useCallback, useState } from 'react'
-import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import Box from '@mui/material/Box'
-import { automationTabAt, useAutomationTabs } from '../lib/automationTabs'
+import { Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { customizeTabAt, useCustomizeTabs } from '../lib/customizeTabs'
 import { directoryTabAt, useDirectoryTabs } from '../lib/directoryTabs'
-import { PHONE, PHONE_TAB_STRIP_SX } from '../ui/listStyles'
+import { agentsTabAt, useAgentsTabs } from '../pages/agents/agentsTabs'
 import LoadingState from '../ui/LoadingState'
 import { TabActionsSlot } from './TabActionsSlot'
-import { TabPanel, Tabs } from './Tabs'
+import { TabbedPanels } from './Tabs'
 
 type RouteTab<Id extends string> = { id: Id; label: string; path: string }
 
@@ -36,29 +36,25 @@ function RouteTabLayout<Id extends string>({ tabs, here, name, label }: {
 
   /* The strip renders even over a lone tab: it names the page, and the section stays where readers look for it. */
   return (
-    <>
-      {/* Both route-tab strips (Directory, Automation): the phone density and unshrinkable tabs ride the wrapper
-         (`components/Tabs` takes no `sx`), as on the Machines strip (`pages/nodes/machinesTabs.tsx`). Unshrinkable
-         because the density's `flex: 1 1 auto` lets a tab shrink: the fit's width probes then measured padding
-         only, every tab "fit", and the labels ran together. */}
-      <Box data-testid={`${name}-tabs`} sx={[{ mb: 2 }, PHONE_TAB_STRIP_SX, { [PHONE]: { '& .MuiTab-root': { flexShrink: 0 } } }]}>
-        <Tabs
-          tabs={tabs}
-          tab={active.id}
-          onSelect={selectTab}
-          label={label}
-          idPrefix={name}
-          /* One line at every width, the tabs that do not fit behind More (`components/Tabs`): wrapped,
-             Directory's Agents sat alone on a second line at 360px; scrolled, the list pane beside
-             an open detail pane clipped Secrets to "S" behind a chevron. */
-          overflowMenu
-          /* The active page's `PageHeader` actions portal here (`TabActionsSlot`), on the strip's row at every
-             width: each page's verb drops its word on a phone (`ui/CompactVerb`). */
-          compactActions
-          actions={<span ref={setActionsSlot} style={{ display: 'contents' }} />}
-        />
-      </Box>
-      <TabPanel id={active.id} current={active.id} idPrefix={name}>
+    <TabbedPanels
+      tabs={tabs}
+      tab={active.id}
+      onSelect={selectTab}
+      label={label}
+      idPrefix={name}
+      strip={{ phone: true, sx: { mb: 2 }, testId: `${name}-tabs` }}
+      /* One line at every width, the tabs that do not fit behind More (`components/Tabs`): wrapped,
+         Directory's Agents sat alone on a second line at 360px; scrolled, the list pane beside
+         an open detail pane clipped Secrets to "S" behind a chevron. */
+      overflowMenu
+      /* The active page's `PageHeader` actions portal here (`TabActionsSlot`), on the strip's row at every
+         width: each page's verb drops its word on a phone (`ui/CompactVerb`). */
+      compactActions
+      actions={<Box component="span" ref={setActionsSlot} sx={{ display: 'contents' }} />}
+    >
+      {/* Only the active page is mounted (each tab is its own route); every other tab's `aria-controls` still
+          resolves, to its empty hidden panel. */}
+      {(_t, isActive) => isActive && (
         <TabActionsSlot.Provider value={actionsSlot ?? undefined}>
           {/* The tab's page is a lazy chunk: suspending here, not at the shell's boundary, keeps the strip drawn
               over a list skeleton while it loads — a cold editor URL (`/users/<id>`) left both panes a bare
@@ -67,13 +63,8 @@ function RouteTabLayout<Id extends string>({ tabs, here, name, label }: {
             <Outlet />
           </Suspense>
         </TabActionsSlot.Provider>
-      </TabPanel>
-      {/* Every other tab's `aria-controls` must resolve too: an empty hidden panel each (only the active
-          page is mounted — each tab is its own route). */}
-      {tabs.filter(t => t.id !== active.id).map(t => (
-        <TabPanel key={t.id} id={t.id} current={active.id} idPrefix={name}>{null}</TabPanel>
-      ))}
-    </>
+      )}
+    </TabbedPanels>
   )
 }
 
@@ -82,8 +73,16 @@ export function DirectoryLayout() {
   return <RouteTabLayout tabs={useDirectoryTabs()} here={here} name="directory" label="Directory sections" />
 }
 
-/* Automations (`/automations`), Playbooks (`/playbooks`) and Slots (`/worktrees`). */
-export function AutomationLayout() {
-  const here = automationTabAt(useLocation().pathname)
-  return <RouteTabLayout tabs={useAutomationTabs()} here={here} name="automation" label="Automation sections" />
+/* Customize (`/playbooks`, `/templates`, `/agents`, `/compliance/packs`): what an org shapes its agents' work with. */
+export function CustomizeLayout() {
+  const here = customizeTabAt(useLocation().pathname)
+  return <RouteTabLayout tabs={useCustomizeTabs()} here={here} name="customize" label="Customize sections" />
+}
+
+/* Customize > Agents' sub-tabs (`/agents`, `/agents/catalog`, `/agents/registry`), nested under `CustomizeLayout` so
+ * the Customize strip stays above this one. The strip renders even for a viewer offered only one sub-tab (decided,
+ * not an oversight): it names the page and stays where readers look. */
+export function AgentsLayout() {
+  const here = agentsTabAt(useLocation().pathname)
+  return <RouteTabLayout tabs={useAgentsTabs()} here={here} name="agents" label="Agent sections" />
 }

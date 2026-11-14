@@ -1,0 +1,41 @@
+slug = "resend"
+label = "Resend"
+category = "messaging"
+vendor_docs_url = "https://resend.com/docs/dashboard/api-keys/introduction"
+summary = "Send transactional email from your own domains through Resend."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "Resend dashboard > API Keys (resend.com/api-keys) > Create API Key. Name it, choose Full access so Test and agents can read your domains, then copy the key: it starts with re_ and Resend shows it only once" },
+]
+
+[test]
+method = "GET"
+path = "https://api.resend.com/domains"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+list_field = "data"
+
+[docs]
+agent_uses = [
+  "Send an email from one of your verified domains, with HTML or a React Email template",
+  "Send a batch of up to 100 emails in one call",
+  "Check whether a sent email was delivered, opened or bounced",
+  "List and check the verification of your sending domains",
+]
+prerequisites = [
+  "A Resend account",
+  "A sending domain added and verified under Domains (resend.com/domains), with the DNS records Resend lists. Until then you can send only from onboarding@resend.dev to your own address",
+]
+limitations = [
+  "A Sending access key can only send email; Test reads your domains, so it reports such a key as rejected even though sending works",
+  "Resend limits each team to a few requests per second; a large send should use the batch endpoint",
+]
+troubleshooting = [
+  { symptom = "Test says Resend rejected the API key (401) but the key sends mail", fix = "It is a Sending access key. Create a Full access key under API Keys, or keep the sending key if agents only send and ignore the Test result" },
+  { symptom = "Test says Resend rejected the API key (401) or (403)", fix = "The key was deleted or mistyped. Create a new key under API Keys (resend.com/api-keys) and select Replace on the secret" },
+  { symptom = "Sending fails with The domain is not verified", fix = "Open Domains in Resend, add the DNS records it shows at your DNS provider, and wait for the status to read Verified" },
+]
+faq = [
+  { q = "Can I limit the key to one domain?", a = "Yes, when you create a Sending access key you can pick one domain. Test will then report it rejected, as above" },
+]

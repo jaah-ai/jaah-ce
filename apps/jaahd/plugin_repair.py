@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """plugin_repair.py — converge every Claude account on this node onto the agent config the fleet needs:
-the plugins (OMC, context7, playwright, jaah) and the managed `settings.json` block (hooks, model, flags).
+the plugins (OMC, playwright, jaah) and the managed `settings.json` block (hooks, model, flags).
 
 Run by the package's postinst on every install and upgrade; directly runnable:
 
@@ -17,7 +17,9 @@ Run by the package's postinst on every install and upgrade; directly runnable:
      a link to `<JAAH_HOME>/plugins`, seeded by renaming the newest account copy, so the cache and both
      registries exist once per node (a vnode's inside its own tree) and the registries record the shared
      root's paths (`plugins_owner`). A real copy that reappears is re-linked next run; each swap that freed
-     disk sends one `plugin_dedup` disk report.
+     disk sends one `plugin_dedup` disk report. Last, every old plugin version goes from the cache
+     (`prune_plugin_cache`): each plugin keeps its installed version, the one before it, and any a live
+     session still runs. The root reclaim pass runs the same prune periodically (`--prune-cache`).
 
 Never raises past `main`; per-account failures are isolated. Stdlib only (runs from the packaged tree).
 """
@@ -49,6 +51,7 @@ import file_io  # noqa: E402 — same
 import environment  # noqa: E402 — after the sys.path append above, by necessity
 import host_platform  # noqa: E402 — same
 import runner_env  # noqa: E402 — same
+import session_user  # noqa: E402 — same
 from jaah_env import env_get  # noqa: E402 — renamed env vars
 
 # ── what a fleet account is supposed to have ────────────────────────────────────────────────────────
@@ -68,11 +71,13 @@ OMC_MARKETPLACE_URL = MARKETPLACES["omc"]
 # pair as best-effort.
 OMC_PLUGIN = "oh-my-claudecode@omc"
 MCP_PLUGINS: tuple[str, ...] = (
-    "context7@claude-plugins-official",
     "playwright@claude-plugins-official",
     "jaah@jaah",
 )
 WANTED_PLUGINS: tuple[str, ...] = (OMC_PLUGIN, *MCP_PLUGINS)
+# Once shipped, now uninstalled and disabled on converge. Context7 reaches a project only as an org secret
+# linked on its MCP tab (`apps/api/app/mcp_links.py`), never as an unauthenticated fleet-wide plugin.
+RETIRED_PLUGINS: tuple[str, ...] = ("context7@claude-plugins-official",)
 # Every runner starts in a freshly-leased worktree, so anything narrower than `user` misses it.
 _FLEET_SCOPE = "user"
 
@@ -82,9 +87,14 @@ _REHOMEABLE_SUBTREES = ("cache", "marketplaces")
 # Generous (`marketplace add` clones) but bounded: the caller is a package script.
 _CLI_TIMEOUT_S = 180.0
 
-# The settings a fleet account must carry, as a JSON template shipped in the bundle — config an
-# operator can diff against a live `settings.json`, not hook commands buried in string escapes.
-MANAGED_SETTINGS_PATH = Path(__file__).resolve().parent / "fleet_account_settings.json"
+# The settings a fleet account must carry: the fleet-harness canonical, shipped in the bundle beside this
+# module (the single home), minus the keys another converger owns (`OWNED_ELSEWHERE`).
+MANAGED_SETTINGS_PATH = Path(__file__).resolve().parents[2] / "infra/host/fleet-harness/settings.json"
+OWNED_ELSEWHERE: tuple[str, ...] = (
+    "statusLine",  # accounts._hud_setup
+    "enabledPlugins",  # enable_plugins
+    "extraKnownMarketplaces",  # the fleet-harness reconcile (sources pinned by MARKETPLACES)
+)
 
 
 def marketplaces() -> dict[str, str]:
@@ -110,25 +120,6 @@ def rehomed(source: str) -> str:
 
 def _log(msg: str) -> None:
     print(f"plugin-repair: {msg}", file=sys.stderr)
-
-
-# ── JSON helpers ────────────────────────────────────────────────────────────────────────────────────
-
-# $JAAH_HOME is shared by `jaahd` and `jaah` via group `jaah` + setgid dirs + UMask=0002
-# (the package's postinst, D9); a registry rewritten 0644 by one could never be rewritten by the other. An
-# existing file keeps its own mode; only a created file takes this.
-SHARED_FILE_MODE = 0o664
-
-
-def _write_json(path: Path, data) -> None:
-    """Atomic replace (runners read these concurrently); an existing file's mode is restated, since the
-    helper's `mkstemp` temp file starts 0600 and the replace would otherwise narrow it."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        mode = path.stat().st_mode & 0o777
-    except OSError:
-        mode = SHARED_FILE_MODE
-    env_helpers.atomic_write_json(path, data, mode=mode, indent=2)
 
 
 # ── phase 1: offline path repair ────────────────────────────────────────────────────────────────────
@@ -195,7 +186,7 @@ def repair_marketplaces(config_dir: Path) -> dict:
             rec["installLocation"] = fixed
             rehomed.append(name)
     if rehomed:
-        _write_json(path, data)
+        env_helpers.atomic_write_json(path, data, mode=None, indent=2)
     return {"rehomed": rehomed, "error": None}
 
 
@@ -243,7 +234,7 @@ def repair_installed_plugins(config_dir: Path) -> dict:
         else:
             del plugins[key]
     if dirty:
-        _write_json(path, data)
+        env_helpers.atomic_write_json(path, data, mode=None, indent=2)
     return {"rehomed": sorted(set(rehomed)), "dropped": sorted(set(dropped)), "error": None}
 
 
@@ -272,8 +263,8 @@ def known_marketplaces(config_dir: Path) -> dict:
 
 
 def enable_plugins(config_dir: Path, plugins) -> list[str]:
-    """Set `enabledPlugins[<id>] = true` in `<config_dir>/settings.json` for each id given, and
-    return the ones newly turned on.
+    """Set `enabledPlugins[<id>] = true` in `<config_dir>/settings.json` for each id given, drop every
+    `RETIRED_PLUGINS` id, and return the ones newly turned on.
 
     Only ever called with plugins confirmed present in the registry: enabling one the CLI cannot load
     turns a missing plugin into a startup error. Other settings are preserved key-for-key."""
@@ -285,32 +276,36 @@ def enable_plugins(config_dir: Path, plugins) -> list[str]:
     if not isinstance(enabled, dict):
         enabled = {}
     newly = [p for p in plugins if enabled.get(p) is not True]
-    if not newly:
+    retired = [p for p in RETIRED_PLUGINS if p in enabled]
+    if not newly and not retired:
         return []
+    for plugin in retired:
+        del enabled[plugin]
     for plugin in newly:
         enabled[plugin] = True
     settings["enabledPlugins"] = enabled
-    _write_json(path, settings)
+    env_helpers.atomic_write_json(path, settings, mode=None, indent=2)
     return newly
 
 
 def load_managed_settings(path: Path | None = None) -> dict:
-    """The managed settings template as a dict, `{}` when it is missing or malformed.
+    """The managed settings template as a dict — the canonical minus `OWNED_ELSEWHERE` — `{}` when it is
+    missing or malformed.
 
     Tolerant: an unparseable template degrades to "manage nothing" rather than taking the repair down."""
     path = path or MANAGED_SETTINGS_PATH
     try:
         text = path.read_text(encoding="utf-8")
-        if runner_env.lib_root_relocated():
-            # The template's hook commands name the package path; a Windows, macOS or community-edition node's
-            # standard lives in the bundle (`runner_env.rehome_lib_paths`), and the fleet-harness reconcile
-            # re-roots the same way, so the two writers of an account's settings.json agree.
-            text = runner_env.rehome_lib_paths(text, host_platform.paths().lib_root)
-        # Its bare `python3` commands run on the node's interpreter, as the fleet-harness reconcile rehomes them.
-        data = json.loads(runner_env.rehome_python(text, runner_env.python_cmd()))
-    except (OSError, ValueError):
-        data = None
-    return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):  # ValueError: not UTF-8
+        return {}
+    if runner_env.lib_root_relocated():
+        # The template's hook commands name the package path; a Windows, macOS or community-edition node's
+        # standard lives in the bundle (`runner_env.rehome_lib_paths`), and the fleet-harness reconcile
+        # re-roots the same way, so the two writers of an account's settings.json agree.
+        text = runner_env.rehome_lib_paths(text, host_platform.paths().lib_root)
+    # Its bare `python3` commands run on the node's interpreter, as the fleet-harness reconcile rehomes them.
+    data = file_io.json_object(runner_env.rehome_python(text, runner_env.python_cmd())) or {}
+    return {key: value for key, value in data.items() if key not in OWNED_ELSEWHERE}
 
 
 def converge_settings(config_dir: Path, managed: dict | None = None) -> list[str]:
@@ -319,21 +314,20 @@ def converge_settings(config_dir: Path, managed: dict | None = None) -> list[str
 
     Whole-key replacement, not a deep merge: `hooks` is a list of groups of shell text, and merging
     would either duplicate a hook every converge or keep a stale one forever. Keys outside the template
-    are preserved — `enable_plugins` owns `enabledPlugins` and `accounts._hud_setup` owns `statusLine`,
-    so neither is in the template. Returns changed key names so the summary says which drifted."""
+    are preserved — the keys in `OWNED_ELSEWHERE` are dropped from the template, each to its own writer. Returns changed key names so the summary says which drifted."""
     managed = load_managed_settings() if managed is None else managed
     if not managed:
         return []
     path = config_dir / "settings.json"
     settings = file_io.read_json_or(path, None)
     if not isinstance(settings, dict):
-        # Includes a config dir with no settings.json at all; `_write_json` creates it.
+        # Includes a config dir with no settings.json at all; the write creates it.
         settings = {}
     changed = [key for key, value in managed.items() if settings.get(key) != value]
     if not changed:
         return []
     settings.update(managed)
-    _write_json(path, settings)
+    env_helpers.atomic_write_json(path, settings, mode=None, indent=2)
     return changed
 
 
@@ -397,15 +391,17 @@ def carried_consent_hash() -> str | None:
         return _carried_hash
 
 
-def account_uuid(config_dir: Path) -> str | None:
-    """This account's Claude `accountUuid`, or None when the dir holds no logged-in account.
-
-    Read from `.claude.json`'s `oauthAccount`. None is a real answer: a never-logged-in dir has no
-    account to consent for."""
+def _oauth_account_field(config_dir: Path, key: str) -> str | None:
+    """`.claude.json` → `oauthAccount` → `key`, or None when absent/empty: a never-logged-in dir."""
     data = file_io.read_json_or(config_dir / ".claude.json", None)
     oauth = data.get("oauthAccount") if isinstance(data, dict) else None
-    uuid = oauth.get("accountUuid") if isinstance(oauth, dict) else None
-    return uuid if isinstance(uuid, str) and uuid else None
+    value = oauth.get(key) if isinstance(oauth, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def account_uuid(config_dir: Path) -> str | None:
+    """This account's Claude `accountUuid`, or None (a real answer: no account to consent for)."""
+    return _oauth_account_field(config_dir, "accountUuid")
 
 
 def _consent_records(config_dir: Path) -> dict:
@@ -447,15 +443,10 @@ def consent_hash(config_dirs, *, env: dict | None = None) -> str | None:
 
 
 def account_org_uuid(config_dir: Path) -> str | None:
-    """This account's Claude `organizationUuid` (`.claude.json`'s `oauthAccount`), or None when absent.
-
-    The CLI keys its consent records BY THIS ID: it reads `records[organizationUuid]` and honours the record
-    only when its `accountUuid` is the live account's (Claude Code 2.1.289, `remote-settings-consent.json`).
-    A record under any other key is never found, and the runner sits at "Managed settings require approval"."""
-    data = file_io.read_json_or(config_dir / ".claude.json", None)
-    oauth = data.get("oauthAccount") if isinstance(data, dict) else None
-    org = oauth.get("organizationUuid") if isinstance(oauth, dict) else None
-    return org if isinstance(org, str) and org else None
+    """This account's Claude `organizationUuid`, or None. The CLI keys its consent records BY THIS ID
+    (`records[organizationUuid]`, honoured only with the live `accountUuid`; Claude Code 2.1.289) — a
+    record under any other key leaves the runner at "Managed settings require approval"."""
+    return _oauth_account_field(config_dir, "organizationUuid")
 
 
 def converge_remote_settings_consent(config_dir: Path, *, settings_hash: str | None) -> str:
@@ -477,7 +468,7 @@ def converge_remote_settings_consent(config_dir: Path, *, settings_hash: str | N
     document = consent_document(_consent_records(config_dir), org=org, uuid=uuid, settings_hash=settings_hash)
     if document is None:
         return "converged"
-    _write_json(config_dir / CONSENT_FILENAME, document)
+    env_helpers.atomic_write_json(config_dir / CONSENT_FILENAME, document, mode=None, indent=2)
     return "written"
 
 
@@ -554,22 +545,16 @@ def claude_bin() -> str | None:
 
 
 def _run(argv: list[str], env: dict, timeout: float) -> dict:
-    """One bounded CLI call → `{exit_code, stdout, stderr}`; a timeout or missing binary is a non-zero
-    result, never a raise."""
-    try:
-        proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout,
-                              stdin=subprocess.DEVNULL)
-        return {"exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
-    except subprocess.TimeoutExpired:
-        return {"exit_code": 124, "stdout": "", "stderr": f"timed out after {timeout:g}s"}
-    except OSError as exc:
-        return {"exit_code": 127, "stdout": "", "stderr": str(exc)}
+    """The positional `run` seam `converge`/`install_omc_runtime_deps` take, over `session_user.run_capped`
+    (the one capped, never-raising `{exit_code, stdout, stderr}` reply); stdin closed, as a CLI must never
+    prompt here."""
+    return session_user.run_capped(argv, env=env, timeout=timeout, stdin=subprocess.DEVNULL)
 
 
 def converge(config_dir: Path, *, binary: str, timeout: float = _CLI_TIMEOUT_S,
              run=_run) -> dict:
-    """Phase 2: add missing marketplaces, install missing plugins, update the rest, enable what
-    landed.
+    """Phase 2: add missing marketplaces, uninstall retired plugins, install missing ones, update the
+    rest, enable what landed.
 
     Marketplaces first: `claude plugin install` refuses a plugin from an unknown marketplace with a
     misleading "local copy may be out of date" message. Presence is re-read from the registry after
@@ -601,6 +586,10 @@ def converge(config_dir: Path, *, binary: str, timeout: float = _CLI_TIMEOUT_S,
 
     # User scope throughout, presence included (see `installed_plugin_keys`).
     present = installed_plugin_keys(config_dir, scope=_FLEET_SCOPE)
+    for plugin in RETIRED_PLUGINS:
+        if plugin in present:
+            _cli("uninstall", plugin, "--scope", _FLEET_SCOPE)
+    retired_before = [p for p in RETIRED_PLUGINS if p in present]
     installed: list[str] = []
     updated: list[str] = []
     for plugin in WANTED_PLUGINS:
@@ -619,6 +608,8 @@ def converge(config_dir: Path, *, binary: str, timeout: float = _CLI_TIMEOUT_S,
         "marketplaces_added": added,
         "installed": [p for p in installed if p in present],
         "updated": updated,
+        # Re-read, not the exit code: a retired plugin counts as gone only once the registry no longer records it.
+        "uninstalled": [p for p in retired_before if p not in present],
         "confirmed": confirmed,
         "missing": [p for p in WANTED_PLUGINS if p not in present],
         "enabled": repaired["enabled"],
@@ -705,6 +696,149 @@ def install_omc_runtime_deps(config_dir: Path, *, timeout: float = _CLI_TIMEOUT_
         else:
             result["errors"].append(f"npm install in {path}: {(res['stderr'] or res['stdout']).strip()[:400]}")
     return result
+
+
+# ── cache prune: old plugin versions ────────────────────────────────────────────────────────────────
+
+# Each `claude plugin update` extracts a new `cache/<mkt>/<plugin>/<version>` and never removes the old one, so
+# the cache grows by one payload per release (OMC: ~317 MB each, 31 of them filled a 19 GB root disk). Kept per
+# plugin: every version a registry entry names, the newest one before it (a session started just before the update
+# may still be loading it), and any a live process still names. A dir changed within the grace is kept too: a
+# peer converge extracts the new version BEFORE it rewrites the registry.
+PRUNE_GRACE_S = 3600
+_PROC = Path("/proc")
+
+
+def live_process_strings(proc: Path = _PROC) -> list[str] | None:
+    """Every cmdline argument, environment value and cwd of the processes this user can read — where a live
+    session's plugin install path shows (its MCP servers and hooks run from `${CLAUDE_PLUGIN_ROOT}`). None when
+    there is no `/proc` to read: then nothing can be proved idle, and the prune removes nothing."""
+    if not proc.is_dir():
+        return None
+    found: list[str] = []
+    try:
+        pids = [p for p in os.listdir(proc) if p.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        for name in ("cmdline", "environ"):
+            try:
+                raw = (proc / pid / name).read_bytes()
+            except OSError:
+                continue  # gone, or another user's environ
+            found.extend(t for t in raw.decode("utf-8", "replace").split("\0") if t)
+        try:
+            found.append(os.readlink(proc / pid / "cwd"))
+        except OSError:
+            pass
+    return found
+
+
+def _names(tail: str, strings: list[str]) -> bool:
+    """Whether any string names the version dir whose path ends in `tail` — by its `cache/...` tail, so every
+    spelling (the shared root, an account's `plugins` link, a resolved path) matches."""
+    pattern = re.compile(re.escape(tail) + r"(?![\w.+-])")
+    return any(pattern.search(s) for s in strings)
+
+
+def _order_key(versions: list[Path]):
+    """Oldest-first sort key: by numeric version when every one parses, else by mtime."""
+    if all(env_helpers.version_key(v) is not None for v in versions):
+        return env_helpers.version_key
+    def mtime(v: Path) -> float:
+        try:
+            return v.stat().st_mtime
+        except OSError:
+            return 0.0  # gone (a concurrent prune): sorts oldest, and its removal is a no-op
+    return mtime
+
+
+def _registered_paths(plugins_dir: Path) -> dict[str, set[str]]:
+    """`<mkt>/<plugin>` → the resolved `installPath`s the registry names for it, any scope."""
+    data = file_io.read_json_or(plugins_dir / "installed_plugins.json", None)
+    plugins = data.get("plugins") if isinstance(data, dict) else None
+    out: dict[str, set[str]] = {}
+    for key, entries in (plugins or {}).items() if isinstance(plugins, dict) else ():
+        name, _, mkt = key.partition("@")
+        if not all(part and "/" not in part and part not in (".", "..") for part in (name, mkt)):
+            continue  # never a path outside `cache/`
+        for entry in entries if isinstance(entries, list) else []:
+            path = entry.get("installPath") if isinstance(entry, dict) else None
+            if isinstance(path, str):
+                out.setdefault(f"{mkt}/{name}", set()).add(os.path.realpath(path))
+    return out
+
+
+def prune_plugin_cache(plugins_dir: Path, *, live: list[str] | None | str = "probe",
+                       now=time.time) -> dict:
+    """Remove the cached versions of each registered plugin under `plugins_dir` that are neither installed, nor
+    the newest before the installed one, nor named by a live process (`live_process_strings`), nor changed in the
+    last `PRUNE_GRACE_S`. A plugin the registry does not name is never touched. Logs one line per plugin pruned
+    (plugin, versions, bytes freed). Returns `{removed: [{plugin, versions, bytes}], freed_bytes, errors}`;
+    never raises."""
+    result: dict = {"removed": [], "freed_bytes": 0, "errors": []}
+    strings = live_process_strings() if isinstance(live, str) else live
+    if strings is None:
+        return result
+    cutoff = now() - PRUNE_GRACE_S
+    try:
+        registered = _registered_paths(plugins_dir)
+        for plugin, installed in sorted(registered.items()):
+            base = plugins_dir / "cache" / plugin
+            if base.is_symlink() or not base.is_dir():
+                continue
+            versions = [v for v in base.iterdir() if _is_real_dir(v) and not v.name.startswith(".")]
+            current = [v for v in versions if os.path.realpath(v) in installed]
+            if not current:
+                continue  # the registry names no version here: undeterminable, keep everything
+            order = _order_key(versions)
+            others = sorted((v for v in versions if v not in current), key=order)
+            newest = max(current, key=order)
+            keep = set([v for v in others if order(v) < order(newest)][-1:])  # the predecessor
+            removed, freed = [], 0
+            for version in others:
+                # A newer one is a peer converge's update not yet in the registry, whatever its mtime.
+                if version in keep or order(version) > order(newest) \
+                        or _names(f"/cache/{plugin}/{version.name}", strings):
+                    continue
+                try:
+                    if version.stat().st_mtime > cutoff:
+                        continue
+                except OSError:
+                    continue  # already gone: a concurrent prune took it
+                size = disk_events.tree_bytes(version)
+                shutil.rmtree(version, ignore_errors=True)
+                if os.path.lexists(version):
+                    result["errors"].append(f"{version}: not fully removed")
+                removed.append(version.name)
+                freed += max(size - disk_events.tree_bytes(version), 0)
+            if removed:
+                result["removed"].append({"plugin": plugin, "versions": removed, "bytes": freed})
+                result["freed_bytes"] += freed
+                _log(f"{plugins_dir}: pruned {plugin} {', '.join(removed)} — {freed} bytes freed")
+    except OSError as exc:
+        result["errors"].append(f"{plugins_dir}: {type(exc).__name__}: {exc}")
+    return result
+
+
+def prune_caches(config_dirs, jaah_home: str | None, *, live: list[str] | None | str = "probe") -> dict:
+    """`prune_plugin_cache` once per distinct plugin root of `config_dirs` and the node tree's shared root."""
+    strings = live_process_strings() if isinstance(live, str) else live
+    roots = [Path(d) / "plugins" for d in config_dirs]
+    if jaah_home:
+        roots.append(shared_plugin_root(jaah_home))
+    total: dict = {"removed": [], "freed_bytes": 0, "errors": []}
+    seen: set[str] = set()
+    for root in roots:
+        real = os.path.realpath(root)
+        if real in seen or not os.path.isdir(real):
+            continue
+        seen.add(real)
+        res = prune_plugin_cache(Path(real), live=strings)
+        total["removed"] += res["removed"]
+        total["freed_bytes"] += res["freed_bytes"]
+        total["errors"] += res["errors"]
+    return total
 
 
 # ── account discovery ───────────────────────────────────────────────────────────────────────────────
@@ -833,7 +967,7 @@ def _merge_registry(account_plugins: Path, root: Path, name: str, owner: Path) -
         theirs[key] = value
         added = True
     if added:
-        _write_json(shared_path, shared)
+        env_helpers.atomic_write_json(shared_path, shared, mode=None, indent=2)
 
 
 def _keep_unique(account_plugins: Path, root: Path) -> None:
@@ -945,7 +1079,7 @@ def share_plugin_root(jaah_home: str | Path, config_dirs, *, report=None) -> dic
 
 
 def _share_locked(home: Path, root: Path, config_dirs, result: dict, report) -> dict:
-    started, used_before = disk_events.utc_now(), _used_pct(home)
+    started, used_before = env_helpers.now_iso(), _used_pct(home)
     try:
         dirs = [Path(d) for d in config_dirs if _in_node_tree(Path(d), home)]
         if root.is_symlink() or (os.path.lexists(root) and not root.is_dir()):
@@ -985,7 +1119,7 @@ def _share_locked(home: Path, root: Path, config_dirs, result: dict, report) -> 
         disk_report = {
             "reclaim_id": str(uuid.uuid4()),
             "started_at": started,
-            "finished_at": disk_events.utc_now(),
+            "finished_at": env_helpers.now_iso(),
             "trigger": "converge",
             "used_pct_before": used_before,
             "used_pct_after": _used_pct(home),
@@ -1030,7 +1164,7 @@ def process(config_dir: Path, *, offline: bool, binary: str | None, timeout: flo
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="plugin_repair",
-        description="Repair and converge the fleet's Claude accounts — plugins (OMC, context7, "
+        description="Repair and converge the fleet's Claude accounts — plugins (OMC, "
                     "playwright, jaah) plus the managed settings block (hooks, model).")
     parser.add_argument("--all", action="store_true",
                         help="every fleet account under $JAAH_HOME/auth (and nothing else — the "
@@ -1045,11 +1179,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=_CLI_TIMEOUT_S, metavar="SECONDS",
                         help=f"per `claude plugin` call wall clock (default {_CLI_TIMEOUT_S:g})")
     parser.add_argument("--json", action="store_true", help="emit the full result as JSON on stdout")
+    parser.add_argument("--prune-cache", action="store_true",
+                        help="only prune old plugin versions of every account under $JAAH_HOME and its shared "
+                             "root (the root reclaim pass, as the root's owner); prints one JSON line")
     args = parser.parse_args(argv)
 
     # The daemon unit's UMask=0002 (the package's postinst, D9): files this process or its `claude plugin`
     # children create must stay group-rewritable, and a maintainer script's umask is dpkg's 022.
     os.umask(0o002)
+
+    if args.prune_cache:
+        home = resolve_jaah_home(args.jaah_home)
+        pruned = prune_caches(discover_config_dirs(home), home)
+        print(json.dumps({"plugin_prune": pruned["freed_bytes"], "removed": pruned["removed"],
+                          "error": pruned["errors"][0] if pruned["errors"] else None}))
+        return 0
 
     if args.config_dir:
         dirs = [Path(d).expanduser() for d in args.config_dir]
@@ -1090,6 +1234,10 @@ def main(argv: list[str] | None = None) -> int:
              "carries it to the rest)")
     results = [process(d, offline=args.offline, binary=binary, timeout=args.timeout,
                        settings_hash=settings_hash) for d in dirs]
+    # Every refresh: an update leaves the version it replaced in the cache. Online only, after the updates.
+    if binary and not host_platform.is_windows():
+        for err in prune_caches(dirs, jaah_home)["errors"]:
+            _log(f"  prune: {err}")
     if args.json:
         print(json.dumps({"results": results}, indent=2))
     for res in results:

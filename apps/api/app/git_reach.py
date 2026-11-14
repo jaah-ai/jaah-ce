@@ -29,10 +29,10 @@ import logging
 import threading
 import time
 from typing import Any, Literal, NamedTuple, Optional
-from urllib.parse import quote
 from uuid import UUID
 
 import httpx
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import git_access, github_api, github_oauth
@@ -41,7 +41,10 @@ from app.authz.visibility import git_identity_select
 from app.forges import RepoRef
 from app.models.credentials import Credential
 from app.models.identity import AdminUser
+from app.models.nodes import Node
+from app.models.projects import Project
 from app.models.tasks import Task
+from app.models.worktrees import Worktree
 
 log = logging.getLogger("app.git_reach")
 
@@ -55,17 +58,17 @@ _UNKNOWN_TTL_SECONDS = 60.0
 # The other credentials asked at most, and the wall clock one pick may spend asking GitHub.
 _MAX_OTHERS = 5
 _BUDGET_SECONDS = 10.0
-# Pages of an installation's repositories read (100 each) before the answer is `unknown`.
-_MAX_PAGES = 10
-_PAGE_SIZE = 100
 
 
 class Reach(NamedTuple):
-    """One credential's write reach on one repository. `problem` and `fix_url` are set only for `no`."""
+    """One credential's write reach on one repository. `problem` and `fix_url` are set only for `no`;
+    `blocks_read` marks a `no` that is no READ either (the repository is invisible to the login), so a clone
+    with it fails too (`routes/tasks/checkout_gate.py`'s Retry preflight)."""
 
     verdict: Verdict
     problem: str = ""
     fix_url: Optional[str] = None
+    blocks_read: bool = False
 
 
 class Pick(NamedTuple):
@@ -88,8 +91,9 @@ def forget() -> None:
         _cache.clear()
 
 
-def write_reach(credential: Credential, token: str, repo: RepoRef) -> Reach:
-    """`credential`'s write reach on `repo`, cached (see the module header). `unknown` off github.com."""
+def write_reach(credential: Credential, token: str, repo: RepoRef, *, fresh: bool = False) -> Reach:
+    """`credential`'s write reach on `repo`, cached (see the module header). `unknown` off github.com. `fresh`
+    asks GitHub past the cache (and stores the answer): a person who just granted access then pressed Retry."""
     if not _on_github(repo):
         return Reach("unknown")
     # A digest, never the token: a reconnect (a new token) is a new key, and the cache holds nothing secret.
@@ -97,7 +101,7 @@ def write_reach(credential: Credential, token: str, repo: RepoRef) -> Reach:
     now = time.monotonic()
     with _cache_lock:
         hit = _cache.get(key)
-    if hit is not None and now - hit[0] < (_UNKNOWN_TTL_SECONDS if hit[1].verdict == "unknown" else _TTL_SECONDS):
+    if not fresh and hit is not None and now - hit[0] < (_UNKNOWN_TTL_SECONDS if hit[1].verdict == "unknown" else _TTL_SECONDS):
         return hit[1]
     reach = _github_reach(credential.name, token, repo.path)
     with _cache_lock:
@@ -151,6 +155,85 @@ def writer_for_user(session: Session, user_id: UUID, repo: RepoRef) -> Pick:
     return Pick(selected, problem=problem, fix_url=reach.fix_url)
 
 
+class CloneBlock(NamedTuple):
+    """One node whose pool clone of a project cannot read its repository: the clone owner (`owner_id`, None when
+    nobody can be named) and why, with where to fix it when GitHub says. `connect`: the owner has no usable
+    connection, so the fix is theirs to make under Profile > Git. `slotted`: the pair has slots, whose drawer can
+    change the clone owner."""
+
+    node_id: UUID
+    owner_id: Optional[UUID]
+    problem: str
+    fix_url: Optional[str] = None
+    connect: bool = False
+    slotted: bool = True
+
+
+def clone_blocks(session: Session, project_id: int, repo: RepoRef) -> list[CloneBlock]:
+    """The nodes a clone of `project_id` may run on — those it may start work on (`slot_allocation.placement_node_ids`)
+    and those holding a row of it, whose declarers name the pair's clone owner — whose clone cannot read `repo`, by node:
+    its clone owner (`git_access.clone_owner_id`, the earliest human declarer of the pair's slots) has no usable
+    connection, or GitHub plainly says their login cannot see the repository (`Reach.blocks_read`). A node with no
+    slot yet has no clone owner to ask: its first slot is declared as the task's starter (`slot_allocation._declarer`),
+    whom the project's git-reach read asks before a Start. A clone uses the owner's login, never a later task
+    starter's, so a folder project that gains a repository can clone as someone who never could. An outage, a
+    read-only owner, a token that cannot be renewed now, or another forge says nothing. Each owner is asked once;
+    the whole read stops asking GitHub past `_BUDGET_SECONDS`."""
+    from app import slot_allocation  # noqa: PLC0415 — slot_allocation reads git_access, which this module imports
+
+    org_id = session.scalar(select(Project.org_id).where(Project.id == project_id))
+    deadline = time.monotonic() + _BUDGET_SECONDS
+    verdicts: dict[UUID, Optional[tuple[str, Optional[str], bool]]] = {}
+    blocks: list[CloneBlock] = []
+    holding = set(session.scalars(
+        select(Worktree.node_id).join(Node, Node.id == Worktree.node_id)
+        .where(Worktree.project_id == project_id, Worktree.retiring_at.is_(None), Node.org_id == org_id).distinct()
+    ).all())
+    for node_id in sorted(slot_allocation.placement_node_ids(session, project_id) | holding, key=str):
+        owner_id = git_access.clone_owner_id(session, node_id, project_id)
+        if owner_id is None or not _member(session, owner_id, org_id):
+            # No slot yet, or an outsider (an operator): `resolve_for_worktree_clone` names both at the clone, and
+            # a project page shows no one's connection but its own org's members'.
+            continue
+        if owner_id not in verdicts:
+            if time.monotonic() >= deadline:
+                break
+            verdicts[owner_id] = cannot_read(session, owner_id, repo)
+        verdict = verdicts[owner_id]
+        if verdict is not None:
+            blocks.append(CloneBlock(node_id, owner_id, verdict[0], verdict[1], connect=verdict[2]))
+    return blocks
+
+
+def _member(session: Session, user_id: UUID, org_id: Optional[UUID]) -> bool:
+    """Whether `user_id` is a member of `org_id`."""
+    return org_id is not None and session.scalar(
+        select(AdminUser.id).where(AdminUser.id == user_id, AdminUser.org_id == org_id)) is not None
+
+
+def cannot_read(
+    session: Session, user_id: UUID, repo: RepoRef, *, retry: str = "then reload this page",
+) -> Optional[tuple[str, Optional[str], bool]]:
+    """`(problem, fix_url, connect)` when `user_id`'s connection for `repo` cannot clone it, else None; `connect`:
+    they have no usable connection at all. A clone owner's (`clone_blocks`), or the task starter's at Start (the
+    project's git-reach read, which asks before a Start). `retry` ends a missing-connection sentence
+    (`git_access.resolve_for_user`)."""
+    try:
+        credential = git_access.resolve_for_user(session, user_id, repo, retry=retry)
+    except git_access.GitAccessError as exc:
+        return str(exc), None, True
+    if not _on_github(repo):
+        return None
+    try:
+        token = git_access.token_for(session, credential)
+    except git_access.GitAccessError:
+        return None
+    reach = write_reach(credential, token, repo)
+    if reach.verdict == "no" and reach.blocks_read:
+        return reach.problem, reach.fix_url, False
+    return None
+
+
 def _others(session: Session, user_id: UUID, repo: RepoRef, *, exclude: UUID) -> list[Credential]:
     """The person's own other credentials that authenticate `repo`'s root, newest first, at most `_MAX_OTHERS`:
     the ones they may push as (`authz.git_identity_select`, the selection's own rule) AND own (`owner_id`), of the
@@ -167,7 +250,7 @@ def _others(session: Session, user_id: UUID, repo: RepoRef, *, exclude: UUID) ->
     for credential in rows:
         if git_access.credential_root(credential) != repo.root:
             continue
-        if (credential.config or {}).get("grant_dead_at"):
+        if git_access.grant_dead(credential):
             continue
         out.append(credential)
     return out[:_MAX_OTHERS]
@@ -176,28 +259,19 @@ def _others(session: Session, user_id: UUID, repo: RepoRef, *, exclude: UUID) ->
 def _github_reach(name: str, token: str, owner_repo: str) -> Reach:
     try:
         if github_oauth.is_app_issued(token):
-            return _app_reach(token, owner_repo)
+            return _app_reach(name, token, owner_repo)
         return _token_reach(name, token, owner_repo)
     except (httpx.HTTPError, ValueError) as exc:
         log.warning("git reach: GitHub unreadable (%s)", type(exc).__name__)
         return Reach("unknown")
 
 
-def _get(token: str, path: str, params: Optional[dict[str, Any]] = None) -> tuple[int, Any]:
-    response = httpx.get(f"https://api.github.com/{path}", params=params, headers=github_api.headers(token),
-                         timeout=_TIMEOUT_SECONDS, follow_redirects=False)
-    if response.status_code == 429 or response.headers.get("x-ratelimit-remaining") == "0":
-        raise ValueError("rate limited")
-    return response.status_code, response.json() if response.content else None
-
-
 def _token_reach(name: str, token: str, owner_repo: str) -> Reach:
     """An OAuth App or pasted token: GitHub's own `permissions.push` for this token's user."""
-    owner, _, repo = owner_repo.partition("/")
-    status, body = _get(token, f"repos/{quote(owner, safe='')}/{quote(repo, safe='')}")
+    status, body = github_api.repo_json(token, owner_repo, timeout=_TIMEOUT_SECONDS, exhausted_is_wait=True)
     if status == 404:
         return Reach("no", f"Credential '{name}' cannot see {owner_repo} on GitHub. Grant its account access "
-                           f"to {owner_repo}, or use a token that has it.")
+                           f"to {owner_repo}, or use a token that has it.", blocks_read=True)
     if status != 200 or not isinstance(body, dict) or not isinstance(body.get("permissions"), dict):
         return Reach("unknown")
     if body["permissions"].get("push") is True:
@@ -208,61 +282,61 @@ def _token_reach(name: str, token: str, owner_repo: str) -> Reach:
     return Reach("unknown")
 
 
-def _app_reach(token: str, owner_repo: str) -> Reach:
-    """A GitHub App user token: the App installed on the owner, the repository in that installation, and
-    "Contents: write" on it."""
+def _app_reach(name: str, token: str, owner_repo: str) -> Reach:
+    """A GitHub App user token: the App installed on the owner, the repository in that installation, "Contents:
+    write" on it, and the repository visible to the token's own user: a user token reaches only what both the
+    installation and its user can, so an org-wide installation says nothing of one member (`_user_sees`); a
+    selected-repositories list is already filtered to what the user sees."""
     owner = owner_repo.split("/", 1)[0]
     installation = _installation_on(token, owner)
     if installation is None:
         return Reach("no", f"The GitHub App is not installed on {owner}, so it cannot write to {owner_repo}. "
-                           f"Install it on {owner} with access to {owner_repo}.", _install_url())
+                           f"Install it on {owner} with access to {owner_repo}.", app_install_url(), blocks_read=True)
     settings_url = _github_url(installation.get("html_url"))
     permissions = installation.get("permissions")
     if isinstance(permissions, dict) and permissions.get("contents") != "write":
         return Reach("no", f"The GitHub App's installation on {owner} lacks Contents: write. Approve the App's "
                            "requested permissions in the installation's settings.", settings_url)
     if installation.get("repository_selection") == "all":
-        return Reach("yes")
+        return _user_sees(name, token, owner_repo)
     found = _installation_has(token, installation.get("id"), owner_repo)
     if found is None:
         return Reach("unknown")
     if found:
+        # GitHub lists only the repositories the token's own user can see: nothing more to ask.
         return Reach("yes")
     return Reach("no", f"The GitHub App's installation on {owner} does not include {owner_repo}. Add "
-                       f"{owner_repo} to the installation's repository access.", settings_url)
+                       f"{owner_repo} to the installation's repository access.", settings_url, blocks_read=True)
+
+
+def _user_sees(name: str, token: str, owner_repo: str) -> Reach:
+    """`yes` unless GitHub hides `owner_repo` from this user token (404): its user was never given access."""
+    status, _ = github_api.repo_json(token, owner_repo, timeout=_TIMEOUT_SECONDS, exhausted_is_wait=True)
+    if status == 404:
+        return Reach("no", f"Credential '{name}' cannot see {owner_repo} on GitHub: its account has no access, "
+                           f"or the repository does not exist. Ask a repository admin to add it.", blocks_read=True)
+    return Reach("yes")
 
 
 def _installation_on(token: str, owner: str) -> Optional[dict[str, Any]]:
     """The installation on `owner` visible to this token, or None. Raises `ValueError` when unreadable."""
-    for page in range(1, _MAX_PAGES + 1):
-        status, body = _get(token, "user/installations", {"per_page": _PAGE_SIZE, "page": page})
-        entries = body.get("installations") if status == 200 and isinstance(body, dict) else None
-        if not isinstance(entries, list):
-            raise ValueError("installations unreadable")
-        for entry in entries:
-            account = entry.get("account") if isinstance(entry, dict) else None
-            if isinstance(account, dict) and str(account.get("login", "")).lower() == owner.lower():
-                return entry
-        if len(entries) < _PAGE_SIZE:
-            return None
-    raise ValueError("too many installations")
+    for entry in github_api.paged(token, "/user/installations", "installations", timeout=_TIMEOUT_SECONDS,
+                                   exhausted_is_wait=True):
+        if github_api.account_login(entry) == owner.lower():
+            return entry
+    return None
 
 
 def _installation_has(token: str, installation_id: Any, owner_repo: str) -> Optional[bool]:
     """Whether installation `installation_id` includes `owner_repo`; None when that cannot be read."""
     if not isinstance(installation_id, int):
         return None
-    for page in range(1, _MAX_PAGES + 1):
-        status, body = _get(token, f"user/installations/{installation_id}/repositories",
-                            {"per_page": _PAGE_SIZE, "page": page})
-        repos = body.get("repositories") if status == 200 and isinstance(body, dict) else None
-        if not isinstance(repos, list):
-            return None
-        if any(isinstance(r, dict) and str(r.get("full_name", "")).lower() == owner_repo.lower() for r in repos):
-            return True
-        if len(repos) < _PAGE_SIZE:
-            return False
-    return None
+    repos = github_api.paged(token, f"/user/installations/{installation_id}/repositories", "repositories",
+                             timeout=_TIMEOUT_SECONDS, exhausted_is_wait=True)
+    try:
+        return any(str(r.get("full_name", "")).lower() == owner_repo.lower() for r in repos)
+    except ValueError:
+        return None
 
 
 def _github_url(value: object) -> Optional[str]:
@@ -270,7 +344,7 @@ def _github_url(value: object) -> Optional[str]:
     return value if isinstance(value, str) and value.startswith("https://github.com/") else None
 
 
-def _install_url() -> Optional[str]:
+def app_install_url() -> Optional[str]:
     """The designated GitHub App's install page, or None when none is designated."""
     from app.routes.git_connect import install_url  # the one home of that URL; a route module, so imported late
 

@@ -1,0 +1,61 @@
+# Figma, over the hand-written `figma` type and provider (adopted, AS3: nothing of either changes; Connect runs on
+# the deployment's Figma app, knob `figma_app_credential_id`). Facts confirmed at the vendor's own docs: OAuth apps
+# (client pair as HTTP Basic, separate refresh endpoint) https://developers.figma.com/docs/rest-api/oauth-apps/ ;
+# scopes https://developers.figma.com/docs/rest-api/scopes/ ; personal access tokens (X-Figma-Token)
+# https://developers.figma.com/docs/rest-api/authentication/
+slug = "figma"
+label = "Figma"
+category = "dev_tools"
+credential_type = "figma"
+vendor_docs_url = "https://developers.figma.com/docs/rest-api/oauth-apps/"
+summary = "Read Figma designs, comments and design systems so agents build what was designed."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+# The registered provider's endpoints and scope catalogue (the conflict guard compares the endpoints).
+authorize_url = "https://www.figma.com/oauth"
+token_url = "https://api.figma.com/v1/oauth/token"
+refresh_url = "https://api.figma.com/v1/oauth/refresh"
+basic_auth = true
+refresh_grant_type = false
+scopes = [
+  { name = "current_user:read", label = "Read your name, email and avatar, so the connection shows whose it is" },
+  { name = "folders:read", label = "List a team's folders and their files, so agents can find a design" },
+  { name = "file_content:read", label = "Read a design file's frames, layers and styles" },
+  { name = "file_comments:read", label = "Read the comments on a design for context" },
+  { name = "library_content:read", label = "Read published components and styles of your design system" },
+  { name = "file_comments:write", label = "Reply on a design with questions or results", optional = true },
+]
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_token", label = "Personal access token", kind = "secret", required = false, placeholder = "figd_...", help = "Figma > your avatar > Settings > Security > Personal access tokens > Generate new token: name it Jaah, set an expiry, choose read scopes for File content, Comments and Library content, then copy it - Figma shows it once" },
+]
+
+[docs]
+agent_uses = [
+  "Read the frames, layers, text and styles of a design a task links to, and build the UI to match",
+  "Export images of frames to compare a build with the design",
+  "Read comments on a design for decisions and open questions",
+  "Use your published components and styles so code follows the design system",
+]
+prerequisites = [
+  "A Figma account with at least view access to the files agents should read",
+]
+limitations = [
+  "Agents see only the files the connected account can open",
+  "Figma's REST API reads designs; it cannot edit them. Changes go through comments",
+  "Personal access tokens expire after at most 90 days; a sign-in renews itself",
+  "Figma rate-limits REST API calls per user and plan, and very large files are slow to read",
+]
+troubleshooting = [
+  { symptom = "Test says Figma rejected the personal access token", fix = "The token expired or was revoked. Generate a new one in Settings > Security and select Replace, or select Connect Figma instead" },
+  { symptom = "The Connect button reads Jaah app not configured", fix = "This Jaah has no Figma app set up yet. Use a personal access token until your operator sets it up" },
+  { symptom = "Agents get 403 or 404 for a file", fix = "The connected account cannot open that file. Share the file or its project with that account in Figma" },
+]
+faq = [
+  { q = "Sign-in or personal access token", a = "Sign in for a connection that renews itself. A personal access token suits a quick start, but expires within 90 days" },
+  { q = "Can agents change my designs", a = "No. Figma's API only reads design files; agents can reply in comments if you allow it" },
+]

@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional, Sequence
 
 # Public in `dbos` and importable without a launched runtime, so the route can validate `status` anywhere.
 # Not mirrored: the library owns this closed set.
 from dbos import WorkflowStatusString
+from pydantic import BaseModel, ConfigDict
+
+from app.clock import epoch_ms_or_none
 
 log = logging.getLogger("cockpit-workflows")
 
@@ -33,17 +36,21 @@ PAYLOAD_MAX_CHARS = 500
 AGGREGATE_SCAN_LIMIT = 500
 
 
-@dataclass(frozen=True)
-class WorkflowRun:
-    """One workflow run, narrowed to what the runs page renders."""
+class WorkflowRun(BaseModel):
+    """One workflow run, narrowed to what the runs page renders — and the wire shape itself: the route's
+    `WorkflowRunOut` adds the registry label and nothing else."""
+
+    model_config = ConfigDict(frozen=True)
 
     workflow_id: str
     #: The DBOS function name — the join back to `workflow_registry`, where the label lives.
     name: str
+    #: DBOS's own closed set as a string, so a newer DBOS state reaches the page as itself.
     status: str
     queue_name: Optional[str]
     executor_id: Optional[str]
     app_version: Optional[str]
+    #: 1 for a run that ran once; above 1 means it was recovered by another executor.
     recovery_attempts: Optional[int]
     # Created/enqueued, dequeued by a worker (None while queued), completed (None while running).
     created_at: Optional[datetime]
@@ -68,19 +75,6 @@ class RunAggregate:
 
 #: The rollup for a never-run workflow, also substituted when the engine could not be asked.
 EMPTY_AGGREGATE = RunAggregate(runs=0, by_status={}, last_run_at=None, last_status=None)
-
-
-def _instant(epoch_ms: Any) -> Optional[datetime]:
-    """A DBOS epoch-millisecond field as an aware UTC datetime, or None.
-
-    Tolerant: a bad field costs one timestamp, not the page.
-    """
-    if epoch_ms is None:
-        return None
-    try:
-        return datetime.fromtimestamp(float(epoch_ms) / 1000.0, tz=timezone.utc)
-    except (TypeError, ValueError, OverflowError, OSError):
-        return None
 
 
 def _error_text(error: Any) -> Optional[str]:
@@ -121,9 +115,9 @@ def _run(status: Any) -> WorkflowRun:
         executor_id=getattr(status, "executor_id", None),
         app_version=getattr(status, "app_version", None),
         recovery_attempts=getattr(status, "recovery_attempts", None),
-        created_at=_instant(getattr(status, "created_at", None)),
-        dequeued_at=_instant(getattr(status, "dequeued_at", None)),
-        completed_at=_instant(getattr(status, "completed_at", None)),
+        created_at=epoch_ms_or_none(getattr(status, "created_at", None)),
+        dequeued_at=epoch_ms_or_none(getattr(status, "dequeued_at", None)),
+        completed_at=epoch_ms_or_none(getattr(status, "completed_at", None)),
         error=_error_text(getattr(status, "error", None)),
         input=_payload(getattr(status, "input", None)),
         output=_payload(getattr(status, "output", None)),
@@ -210,7 +204,7 @@ def aggregate(*, names: Sequence[str], scan_limit: int = AGGREGATE_SCAN_LIMIT) -
         state = str(getattr(row, "status", "") or "")
         counts[name][state] = counts[name].get(state, 0) + 1
         # `sort_desc=True`: the first row per name is newest, with no comparison (`created_at` may be None).
-        newest.setdefault(name, (_instant(getattr(row, "created_at", None)), state))
+        newest.setdefault(name, (epoch_ms_or_none(getattr(row, "created_at", None)), state))
 
     return {
         name: RunAggregate(

@@ -5,7 +5,8 @@ AF_UNIX socket is not the endpoint there.
 
 The CONTRACT is the Linux scripts', unchanged: one JSON line out, one back; FAIL CLOSED — on anything but a
 clean `{"ok": true, ...}` reply nothing reaches stdout and the exit is non-zero, with the reason on stderr
-(a `$(jaah-credential …)` that read an empty answer as success is the failure those scripts exist to end).
+(a `$(jaah-credential …)` that read an empty answer as success is the failure those scripts exist to end). Both
+ride `agent_socket` (`credential`/`call`): one client for the pipe, none of its own.
 `jaah-call` honours `JAAH_CALL_TIMEOUT_S` (positive, finite, at most `MAX_TIMEOUT_S`; anything else fails
 closed). Run by the Windows bundle's `bin` launchers, under the bundle's own Python — and by
 the macOS bundle's on a macOS node, where `host_platform.connect_socket` dials the AF_UNIX socket instead.
@@ -18,11 +19,8 @@ import os
 import sys
 
 import agent_socket
-import host_platform
-import environment
 
 MAX_TIMEOUT_S = 600.0
-_MAX_REPLY_BYTES = 262144
 
 
 def _fail(tool: str, message: str) -> int:
@@ -30,37 +28,15 @@ def _fail(tool: str, message: str) -> int:
     return 1
 
 
-def _exchange(request: dict, timeout: float) -> dict | None:
-    """One request line to the broker pipe, one reply line back as a dict, or None (unreachable/malformed)."""
-    path = environment.credential_socket_explicit() or environment.credential_socket()
-    try:
-        with host_platform.connect_socket(path, timeout=timeout) as sock:
-            sock.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
-            buf = b""
-            while b"\n" not in buf and len(buf) < _MAX_REPLY_BYTES:
-                chunk = sock.recv(65536)
-                if not chunk:
-                    break
-                buf += chunk
-    except OSError:
-        return None
-    try:
-        reply = json.loads(buf.split(b"\n", 1)[0])
-    except ValueError:
-        return None
-    return reply if isinstance(reply, dict) else None
-
-
 def credential_main(argv: list[str]) -> int:
     """`jaah-credential <name>`: the credential's value on stdout, or nothing and a non-zero exit."""
     if len(argv) != 1 or not argv[0]:
         return _fail("jaah-credential", "usage: jaah-credential <name>")
-    reply = _exchange({"credential": argv[0]}, agent_socket.TIMEOUT_S)
-    if reply is None:
-        return _fail("jaah-credential", "broker unreachable, or it answered malformed JSON")
-    if reply.get("ok") is not True or "value" not in reply:
-        return _fail("jaah-credential", str(reply.get("error") or "broker declined the credential"))
-    sys.stdout.write(str(reply["value"]))
+    try:
+        value = agent_socket.credential(argv[0])
+    except agent_socket.AgentSocketError as exc:
+        return _fail("jaah-credential", str(exc))
+    sys.stdout.write(value)
     return 0
 
 

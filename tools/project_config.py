@@ -14,7 +14,7 @@ Nothing outside the row supplies a VALUE. A caller can still move WHERE THE CACH
 and WHICH CONSOLE IS ASKED: the variables in `_API_REDIRECT_VARS`/`_NODE_BASE_VARS`, and `API_PORT` in
 the `.env` beside whichever copy of this resolver runs (a file `env -u` cannot scrub). Both were
 measured turning a blocked push into an allowed one and planting a fake `gate_quick_cmd` in the cache.
-Moving the lookup is a real affordance (the deterministic port grid), so it is fenced, not removed:
+Moving the lookup is a real affordance (the slot's own `.env`), so it is fenced, not removed:
   • NOTHING UNCORROBORATED IS EVER PERSISTED: `api_base_redirect_reason` is non-empty for every source
     above, and `governance_map` then answers live and skips the cache write.
   • THE TWO ENFORCING HOOKS SCRUB EVERY VARIABLE: the `pre-push` and
@@ -58,8 +58,8 @@ an integration branch is wrong in any repo). Do not "fix" one to match the other
 
 IDENTITY IS THE PROJECT ID, AND ONLY THE POOL LAYOUT SUPPLIES IT. `repo_url` is only where a project is
 cloned from and the forge coordinate its PRs go to; several projects may share one repo, each with its
-own branch pair and its own clone. A checkout under `<JAAH_HOME>/repos/<project id>/` (its git common
-dir is that project's main clone) is governed by THAT project's row (`checkout_project_id`), whatever its
+own branch pair and its own clone. A checkout under `<JAAH_HOME>/repos/<project id>/` (a standalone slot
+clone, or a worktree of that project's main clone) is governed by THAT project's row (`checkout_project_id`), whatever its
 remote says. A checkout anywhere else is not a Jaah project: `UnknownProject`, nothing to gate.
 
 A PROJECT MAY CONNECT SEVERAL REPOSITORIES. A non-primary one is cloned at
@@ -118,7 +118,7 @@ except ImportError as _exc:  # pragma: no cover — exercised by the vendored-la
             f"here; the caller should fall back to its own conservative default.",
             file=sys.stderr,
         )
-        raise SystemExit(4)
+        raise SystemExit(4) from _exc
     raise
 
 # 0 where the platform lacks the flag (Windows has neither).
@@ -209,13 +209,17 @@ class NoProjectData(UnresolvedProject):
 
 @dataclass(frozen=True)
 class RepoConfig:
-    """One repository the project connects (the row's `repos[]`): its id, `owner/name` slug and
-    integration branch, and whether it is the primary."""
+    """One repository the project connects (the row's `repos[]`): its id, `owner/name` slug, integration
+    branch, whether it is the primary, and its own Branch policy (an entry from a control plane older than the
+    per-repository fields carries the project's prefix and push flag, and no force push)."""
 
     id: int
     repo_slug: str
     integration_branch: str
     primary: bool
+    branch_prefix: str = ""
+    push_enabled: bool = True
+    allow_force_push: bool = False
 
 
 @dataclass(frozen=True)
@@ -240,14 +244,17 @@ class ProjectConfig:
     repos: tuple[RepoConfig, ...] = ()
     #: False for the view of a NON-primary repository (`for_repo`): no gate and no merge lane apply there.
     primary: bool = True
+    #: Allow force push: a push (forced or not) to `integration_branch` passes the pre-push hook. Read LENIENTLY
+    #: (absent or unreadable is False, never UNRESOLVED), as `merge_lane` is: it only ever lifts a refusal.
+    allow_force_push: bool = False
 
     def for_repo(self, repo_id: int | None) -> "ProjectConfig | None":
         """This project's governance as seen from a checkout of repository `repo_id` (`checkout_repo`), or
         None when the project lists repositories and that is not one of them.
 
         None id (the primary's checkouts: every single-repository project's) and the primary's own id answer
-        with the project's own values. A non-primary repository keeps the project-level prefix and push flag
-        (N2) and takes its own slug and integration branch, with the gate commands blanked and the merge lane off:
+        with the project's own values. A non-primary repository takes its own slug, integration branch, prefix,
+        push flag and Allow force push, with the gate commands blanked and the merge lane off:
         Jaah's gate and merge lane run on the primary only (D6). A row carrying no list (an older control plane
         or cache writer) cannot say what a non-primary checkout is: None, fail closed."""
         if repo_id is None:
@@ -260,6 +267,8 @@ class ProjectConfig:
         if repo.primary:
             return self
         return replace(self, repo_slug=repo.repo_slug, integration_branch=repo.integration_branch,
+                       branch_prefix=repo.branch_prefix, push_enabled=repo.push_enabled,
+                       allow_force_push=repo.allow_force_push,
                        gate_quick_cmd="", gate_full_cmd="", merge_lane=False, primary=False)
 
     @property
@@ -270,10 +279,14 @@ class ProjectConfig:
 
     def allows_ref(self, ref_or_branch: str) -> bool:
         """True when a destination ref (or bare branch name) may be pushed. `refs/heads/` is stripped;
-        a non-branch ref (`refs/tags/...`) can never match a branch prefix."""
+        a non-branch ref (`refs/tags/...`) can never match a branch prefix. Allow force push lets the
+        integration branch through whatever the prefix (`main`/`master` only when one IS it), as the git
+        hooks do; `allows_pr_from` takes no such exception."""
         if not self.push_enabled:
             return False
         branch = ref_or_branch[len("refs/heads/"):] if ref_or_branch.startswith("refs/heads/") else ref_or_branch
+        if self.allow_force_push and self.integration_branch and branch == self.integration_branch:
+            return True
         return branch.startswith(self.branch_prefix)
 
     def allows_pr_from(self, head_branch: str) -> bool:
@@ -440,6 +453,54 @@ def hermetic_git_env() -> dict[str, str]:
             if not k.startswith("GIT_") or k.startswith(_GIT_ENV_KEEP_PREFIXES)}
 
 
+# The toolboxes' own git (`duel_review.py`, `outcome_scan.py`): no hook, fsmonitor or replace ref ever runs or
+# counts, nor any user-level git config.
+TOOLBOX_GIT = ("git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "--no-replace-objects")
+_TOOLBOX_GIT_ENV_OVERRIDES = {"GIT_CONFIG_GLOBAL": os.devnull}
+
+
+def toolbox_git_env() -> dict:
+    """The repo-targeting `GIT_*` scrub (`hermetic_git_env`, its one home: a hook's environment exports them, so
+    `--repo` would not decide), keeping the daemon's `GIT_CONFIG_*` credential pins
+    (the daemon's git_env `broker_only`: the fetch authenticates through them), plus the toolbox's overrides."""
+    pins = {k: v for k, v in os.environ.items() if k.startswith("GIT_CONFIG_")}
+    return {**hermetic_git_env(), **pins, **_TOOLBOX_GIT_ENV_OVERRIDES}
+
+
+def run_git(cwd: str, *args: str, timeout: float | None,
+            env: dict[str, str] | None = None) -> subprocess.CompletedProcess | None:
+    """`git -C <cwd> <args>`, output captured, stdin closed, `check=False` — the ONE home for the guards' and
+    the gate runner's git calls (each keeps its own reading of the result). `env` defaults to
+    `hermetic_git_env()`: an inherited GIT_DIR/GIT_WORK_TREE overrides `-C` and would answer about another
+    repository. Stdin is closed because no caller is interactive and a replayed `git add` must never prompt.
+    None when git could not be run at all (no binary, a bad `cwd`, the timeout) or its output could not be
+    decoded (a non-UTF-8 remote URL: `UnicodeDecodeError`, a `ValueError`); a nonzero exit is returned. A
+    guard reads None as "could not look", so an undecodable answer never escapes as an exception that the hook
+    envelope would turn into an allow."""
+    try:
+        return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=timeout,
+                              env=hermetic_git_env() if env is None else env, check=False,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def git_lines(cwd: str, *args: str, timeout: float, env: dict[str, str] | None = None) -> list[str] | None:
+    """`run_git`'s stdout as lines when git ran AND exited 0, else None — the guards' reading of a git
+    probe (check_settle_clean_guard, architectural_guard, `checkout_repo`), where a failed probe is "could not
+    look", never an empty answer."""
+    proc = run_git(cwd, *args, timeout=timeout, env=env)
+    return proc.stdout.splitlines() if proc is not None and proc.returncode == 0 else None
+
+
+def git_out(cwd: str, *args: str, timeout: float | None = None, env: dict[str, str] | None = None) -> str | None:
+    """`run_git`'s stdout stripped when git ran AND exited 0, else None — the tools' reading of a git answer
+    (a date, a sha, a path) whose failure is "no answer", never an exception. `timeout` None: unbounded, as the
+    callers that never had one."""
+    proc = run_git(cwd, *args, timeout=timeout, env=env)
+    return proc.stdout.strip() if proc is not None and proc.returncode == 0 else None
+
+
 def tracked_files(root: Path, *, under: str | None = None, fallback_walk: bool = False,
                   untracked: bool = False) -> list[str] | None:
     """The files git tracks under `root` — sorted POSIX names relative to `root` — the ONE home for the
@@ -499,20 +560,17 @@ def checkout_repo(repo: str = ".") -> tuple[int | None, int | None]:
     THE LAYOUT ANSWERS: a slot `<JAAH_HOME>/repos/<id>/<N>` and the anchor `main` are always the
     primary's; `<JAAH_HOME>/repos/<id>/_repos/<rid>/<N|main>` is repository `<rid>`'s. Never a clone's
     `jaah.repoId` stamp: that file is the session's to rewrite, and a primary that could call itself another
-    repository would shed its gate. The checkout's git COMMON dir must also be one of that project's clones —
-    `<JAAH_HOME>/repos/<id>/main/.git` or `.../_repos/<x>/main/.git` — so a tree planted under the layout
-    borrows nothing. Anchored on the home (which the enforcing hooks re-supply from a root-owned file);
-    resolved with `realpath` so a symlink cannot move either answer."""
-    try:
-        result = subprocess.run(
-            ["git", "-C", repo or ".", "rev-parse", "--path-format=absolute", "--show-toplevel",
-             "--git-common-dir"],
-            capture_output=True, text=True, timeout=5, env=hermetic_git_env(), check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None, None
-    lines = result.stdout.strip().splitlines()
-    if result.returncode != 0 or len(lines) != 2:
+    repository would shed its gate. The checkout's git COMMON dir must be its OWN `<top>/.git` (a standalone
+    slot clone, every slot since the per-slot-clone layout) or one of that project's clones —
+    `<JAAH_HOME>/repos/<id>/main/.git` or `.../_repos/<x>/main/.git` (a linked worktree of the retired layout,
+    still held until its next lease) — so a worktree of a clone elsewhere, planted under the layout, borrows
+    nothing. A clone's own place in the layout names its project; that its origin is the project's repository
+    is the forge's slug check (`forge_cli.policy.governance`) and the push guard's target-slug check
+    (`check_gh_pr_guard.py`). Anchored on the home (which the enforcing hooks
+    re-supply from a root-owned file); resolved with `realpath` so a symlink cannot move either answer."""
+    lines = git_lines(repo or ".", "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir",
+                      timeout=5)
+    if lines is None or len(lines) != 2:
         # A bare common dir with no work tree prints one line: no checkout to govern.
         return None, None
     top, common = (_slashed(os.path.realpath(line.strip())) for line in lines)
@@ -521,8 +579,11 @@ def checkout_repo(repo: str = ".") -> tuple[int | None, int | None]:
     # answer at another repository's checkout. The two must agree, or the checkout governs nothing.
     here = _slashed(os.path.realpath(repo or "."))
     where = re.match(home + r"/repos/([0-9]+)/(?:_repos/([0-9]+)/)?(?:[0-9]+|main)(?=/|$)", here)
+    if not where or where.group(0) != top:
+        return None, None
     clone = re.fullmatch(home + r"/repos/([0-9]+)/(?:_repos/[0-9]+/)?main/\.git", common)
-    if not where or not clone or where.group(0) != top or where.group(1) != clone.group(1):
+    standalone = common == top + "/.git"
+    if not standalone and (not clone or where.group(1) != clone.group(1)):
         return None, None
     return int(where.group(1)), int(where.group(2)) if where.group(2) else None
 
@@ -555,9 +616,11 @@ def config_for(
     return key, (config.for_repo(repo_id) if config is not None else None)
 
 
-def _repos_from_row(row: dict[str, Any]) -> tuple[RepoConfig, ...]:
+def _repos_from_row(row: dict[str, Any], branch_prefix: str = "", push_enabled: bool = True) -> tuple[RepoConfig, ...]:
     """The row's `repos[]` (`ProjectOut.repos`) as `RepoConfig`s; a row that does not parse is dropped
-    alone, and an absent list (an older control plane) is `()`."""
+    alone (so `for_repo` fails closed for it), and an absent list (an older control plane) is `()`. A
+    per-repository field ABSENT from an entry is the project's (`branch_prefix`/`push_enabled`) or False
+    (`allow_force_push`); one present but unreadable drops the entry."""
     raw = row.get("repos")
     if not isinstance(raw, list):
         return ()
@@ -570,8 +633,17 @@ def _repos_from_row(row: dict[str, Any]) -> tuple[RepoConfig, ...]:
         if (not isinstance(rid, int) or isinstance(rid, bool) or not slug or not isinstance(branch, str)
                 or not branch.strip()):
             continue
+        prefix = entry.get("branch_prefix", branch_prefix)
+        push = _bool_field(entry.get("push_enabled", push_enabled))
+        force = _bool_field(entry.get("allow_force_push", False))
+        if not isinstance(prefix, str) or push is None or force is None:
+            continue
+        prefix = prefix.strip()
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
         out.append(RepoConfig(id=rid, repo_slug=slug, integration_branch=branch.strip(),
-                              primary=entry.get("is_primary") is True))
+                              primary=entry.get("is_primary") is True, branch_prefix=prefix,
+                              push_enabled=push, allow_force_push=force))
     return tuple(out)
 
 
@@ -633,7 +705,8 @@ def _config_from_row(row: dict[str, Any]) -> ProjectConfig | None:
         gate_full_cmd=values["gate_full_cmd"],
         push_enabled=values["push_enabled"],
         merge_lane=_lenient_merge_lane(row),
-        repos=_repos_from_row(row),
+        repos=_repos_from_row(row, prefix, values["push_enabled"]),
+        allow_force_push=_bool_field(row.get("allow_force_push")) is True,
     )
 
 
@@ -641,7 +714,7 @@ def _map_from_projects(projects: list[dict[str, Any]]) -> dict[str, ProjectConfi
     """{`project_key(id)`: config-or-None} for every project row carrying an id. An id is unique, so rows
     sharing a repo are simply separate entries.
 
-    check_gh_pr_guard.py and onboard_repo.py branch on `is None`: None ("ours, unreadable" →
+    check_gh_pr_guard.py branches on `is None`: None ("ours, unreadable" →
     block) differs from ABSENT ("not ours" → no-op)."""
     out: dict[str, ProjectConfig | None] = {}
     for row in projects:
@@ -674,8 +747,8 @@ def _load_cache(path: Path) -> dict[str, ProjectConfig | None] | None:
 
 
 def _save_cache(projects: list[dict[str, Any]], path: Path) -> None:
-    """Persist the RAW rows (the five columns, identity keys and the lenient `merge_lane`), not the parsed map, so an unparseable
-    entry reads back as UNRESOLVED rather than an invented value.
+    """Persist the RAW rows (the five columns, identity keys and the lenient `merge_lane`/`allow_force_push`),
+    not the parsed map, so an unparseable entry reads back as UNRESOLVED rather than an invented value.
 
     HARDEN FIRST, THEN WRITE: this file is an AUTHORIZATION INPUT (push permission, and gate commands a
     shell runs). `~/.jaah/cache` can be group-writable, so a planted symlink must not be followed:
@@ -683,7 +756,7 @@ def _save_cache(projects: list[dict[str, Any]], path: Path) -> None:
     file relative to it with `O_EXCL|O_NOFOLLOW` (no check-then-write window). Hardening failures abort
     the write: a lost write costs a refetch, writing where we cannot prove control costs the guard.
     """
-    keep = ("id", "name", "repo_url", *TEXT_FIELDS, *BOOL_FIELDS, "merge_lane", "repos")
+    keep = ("id", "name", "repo_url", *TEXT_FIELDS, *BOOL_FIELDS, "merge_lane", "allow_force_push", "repos")
     trimmed = [
         {k: row.get(k) for k in keep if k in row}
         for row in projects
@@ -867,6 +940,7 @@ def _shell_assignments(config: ProjectConfig, push_repo_slug: str = "") -> str:
         f"GATE_QUICK_CMD={shlex.quote(config.gate_quick_cmd)}",
         f"GATE_FULL_CMD={shlex.quote(config.gate_full_cmd)}",
         f"PUSH_ENABLED={'1' if config.push_enabled else '0'}",
+        f"ALLOW_FORCE_PUSH={'1' if config.allow_force_push else '0'}",
         f"PROJECT_RULES_BRIEF={shlex.quote(brief)}",
     ]
     return "\n".join(lines)

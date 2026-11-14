@@ -4,7 +4,7 @@ import Box from '@mui/material/Box'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
 import { ApiError } from '../../api'
-import { fmtTier } from '../../lib/models'
+import { capitalize } from '../../lib/humanize'
 import Breadcrumb from '../../components/Breadcrumb'
 import RichTextRenderer from '../../components/richtext/RichTextRenderer'
 import { stateLabel } from '../../components/tasks/shared'
@@ -13,14 +13,14 @@ import { useApiRead } from '../../hooks/useApiRead'
 import { useUrlTab } from '../../hooks/useUrlTab'
 import { AUDIT_TAB_PATHS } from '../../routeGroups'
 import Banner from '../../ui/Banner'
+import HelpLabel from '../../ui/HelpLabel'
+import DetailPage from '../../ui/detail/DetailPage'
+import DetailStatus from '../../ui/detail/DetailStatus'
 import { Mono } from '../../ui/DetailFields'
 import { KeyValue, KeyValueList } from '../../ui/KeyValueList'
-import LoadFailedState from '../../ui/LoadFailedState'
-import MissingRecordState from '../../ui/MissingRecordState'
 import { monoSx } from '../../ui/listStyles'
-import LoadingState from '../../ui/LoadingState'
-import PageHeader from '../../ui/PageHeader'
 import SectionCard from '../../ui/SectionCard'
+import { FONT_WEIGHT } from '../../theme'
 import { StatusChip, type Tone } from '../../ui/StatusChip'
 import {
   getPersona,
@@ -32,6 +32,7 @@ import {
   DELIVERY_LABEL, DONE_CRITERION_LABEL, LICENCE_SHAPE_LABEL, LICENCE_SHAPE_NOTE, MANIFEST_LEVEL_LABEL,
   MANIFEST_LEVEL_NOTE, MODE_LABEL, REFERENCE_LABEL, TERMINAL_LABEL,
 } from './vocabulary'
+import Tip from '../../ui/Tip'
 
 /* Audit > Personas > ONE PERSONA — `/workflows/personas/:persona`. `tasks:create` at the route
  * (`App.tsx`'s `RequireFeature` around it); no page-local duplicate gate.
@@ -137,48 +138,35 @@ export default function PersonaDetailPage() {
   const detail = data?.detail ?? null
   const missing = data !== null && data.detail === null
 
-  if (loading) return <LoadingState rows={6} />
-
-  if (missing) {
+  if (loading || detail === null) {
     return (
-      <MissingRecordState
-        breadcrumb={<Trail current={name} />}
-        heading="Unknown persona"
-        title={`No persona is declared as “${name}”`}
-        headerTestId="persona-detail-header"
-        backTo={PERSONAS_TAB}
-        backLabel="Back to personas"
+      <DetailStatus
+        trail={<Trail current={name} />} loading={loading} notFound={missing && `No persona is declared as “${name}”`}
+        error={error} failedTitle="Persona unavailable" onRetry={() => void load()}
       />
     )
   }
 
-  if (detail === null) {
-    return <LoadFailedState title="Persona unavailable" error={error} onRetry={() => void load()} testId="persona-detail-retry" />
-  }
-
   return (
-    <Box>
-      {/* THE SUBTITLE IS THE FOCUS'S LEDE, NOT THE FOCUS (see the block above `lede`). A NULL IS WORDED here
-          and only here (the server returns null, not a 500, so a half-registered persona shows which half
-          is missing); `Identity`'s focus block is skipped. */}
-      <PageHeader
-        breadcrumb={<Trail current={detail.label} />}
-        title={detail.label}
-        subtitle={
-          <Box
-            component="span"
-            sx={SUBTITLE_SX}
-            data-testid="persona-focus-lede"
-            title={detail.focus === null ? undefined : plainLede(detail.focus)}
-          >
-            {detail.focus === null
-              ? 'No role brief registered.'
-              : plainLede(detail.focus)}
-          </Box>
-        }
-        testId="persona-detail-header"
-      />
-
+    /* THE SUBTITLE IS THE FOCUS'S LEDE, NOT THE FOCUS (see the block above `lede`). A NULL IS WORDED here
+        and only here (the server returns null, not a 500, so a half-registered persona shows which half
+        is missing); `Identity`'s focus block is skipped. */
+    <DetailPage
+      breadcrumb={<Trail current={detail.label} />}
+      title={detail.label}
+      subtitle={
+        <Tip title={detail.focus === null ? undefined : plainLede(detail.focus)}><Box
+          component="span"
+          sx={SUBTITLE_SX}
+          data-testid="persona-focus-lede"
+        >
+          {detail.focus === null
+            ? 'No role brief registered.'
+            : plainLede(detail.focus)}
+        </Box></Tip>
+      }
+      headerTestId="persona-detail-header"
+    >
       {error && <Banner severity="error">{error}</Banner>}
 
       <Tabs tabs={PERSONA_TABS} tab={tab} onSelect={selectTab} label="Persona sections" idPrefix="persona" />
@@ -197,11 +185,11 @@ export default function PersonaDetailPage() {
             <Delivery detail={detail} />
           </SectionCard>
 
-          <SectionCard title="Hand-over">
+          <SectionCard title="Hand-over" help="Documents it must upload before it can finish.">
             <Manifest items={detail.manifest} />
           </SectionCard>
 
-          <SectionCard title="May create">
+          <SectionCard title="May create" help="Tasks it may file, and the rule it follows.">
             <Licence licence={detail.task_creation_licence} />
           </SectionCard>
         </Stack>
@@ -216,7 +204,7 @@ export default function PersonaDetailPage() {
           </SectionCard>
         </Box>
       </TabPanel>
-    </Box>
+    </DetailPage>
   )
 }
 
@@ -247,14 +235,14 @@ function Identity({ detail }: { detail: PersonaDetail }) {
 
       {/* THE CHARTER KEY is a separate fact: it can differ from the persona name (`coder` runs under
           `implementer`). */}
-      <KeyValue label="Charter key">
+      <KeyValue label={<HelpLabel label="Charter key" help="Names the instructions this persona works under." />}>
         <Mono testId="persona-charter-key">{detail.charter_key}</Mono>
       </KeyValue>
 
       {/* THE THREE REACH FLAGS AS ONE FACT: `dispatchable` (can a runner be this persona at all),
           `operator_selectable` (may a HUMAN pick it — narrower), `system_persona` (a MARKER, never a
           permission). Pills in both directions, on one wrapping line. */}
-      <KeyValue label="Who can dispatch it">
+      <KeyValue label={<HelpLabel label="Who can dispatch it" help="Whether it can run, and whether you can pick it." />}>
         <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'wrap' }}>
           <Flag on={detail.dispatchable} label="dispatchable" onTone="success" />
           <Flag on={detail.operator_selectable} label="operator-selectable" onTone="success" />
@@ -281,11 +269,11 @@ function Runtime({ detail }: { detail: PersonaDetail }) {
       {/* THE MODEL IS A DEFAULT, not a property: a per-request override, the task's pin and a card default all
           beat it (there is no per-persona pin). Here, not in Identity: what the runner runs on, and it
           pairs the half-width facts in both cards (an odd count orphans one beside an empty half). */}
-      <KeyValue label="Default model">
-        <Typography variant="body2" data-testid="persona-model">{fmtTier(detail.default_model)}</Typography>
+      <KeyValue label={<HelpLabel label="Default model" help="Model tier used when the task sets none." />}>
+        <Typography variant="body2" data-testid="persona-model">{capitalize(detail.default_model)}</Typography>
       </KeyValue>
 
-      <KeyValue label="Mode">
+      <KeyValue label={<HelpLabel label="Mode" help="Build changes code; analysis changes none." />}>
         {detail.mode === null ? (
           <Missing testId="persona-mode" />
         ) : (
@@ -295,7 +283,7 @@ function Runtime({ detail }: { detail: PersonaDetail }) {
 
       {/* THREE STATES: `autonomous_default` null means the row's own setting stands; "No" would claim a default
           the CP does not make. */}
-      <KeyValue label="Autonomy default">
+      <KeyValue label={<HelpLabel label="Autonomy default" help="Whether its tasks run without a person by default." />}>
         <Typography variant="body2" data-testid="persona-autonomous">
           {detail.autonomous_default === null
             ? 'Not defaulted'
@@ -305,7 +293,7 @@ function Runtime({ detail }: { detail: PersonaDetail }) {
 
       {/* The two interview flags together: the second (WHERE questioning happens) only means anything given the
           first. */}
-      <KeyValue label="Does it stop and ask">
+      <KeyValue label={<HelpLabel label="Does it stop and ask" help="Whether it may pause to ask, and where." />}>
         <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'wrap' }}>
           <Flag on={detail.interviews} label="interviews" onTone="info" />
           <Flag on={detail.console_interview} label="console interview" onTone="info" />
@@ -322,7 +310,7 @@ function Delivery({ detail }: { detail: PersonaDetail }) {
 
   return (
     <KeyValueList testId="persona-delivery">
-      <KeyValue label="Result channel">
+      <KeyValue label={<HelpLabel label="Result channel" help="What it delivers: pull request, document or outcome." />}>
         {detail.delivery === null ? (
           <Missing testId="persona-delivery-channel" />
         ) : (
@@ -332,7 +320,7 @@ function Delivery({ detail }: { detail: PersonaDetail }) {
 
       {/* A NULL DONE CRITERION IS THE SHARPEST: nothing can move this persona's row to done — hence per-field
           `Missing` sentences. */}
-      <KeyValue label="Done criterion">
+      <KeyValue label={<HelpLabel label="Done criterion" help="The check a settle must pass to reach done." />}>
         {detail.done_criterion === null ? (
           <Missing
             testId="persona-done-criterion"
@@ -345,7 +333,7 @@ function Delivery({ detail }: { detail: PersonaDetail }) {
 
       {/* The SOURCE states a settle may be made from (`Persona.settle_states`); every terminal lands `done`.
           Several is normal (DB-direct from `awaiting_response`; `finish` from parked/system-failed). */}
-      <KeyValue label="States it can complete from">
+      <KeyValue label={<HelpLabel label="States it can complete from" help="A settle from any other state is refused." />}>
         <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'wrap' }} data-testid="persona-settle-states">
           {detail.settle_states.length === 0
             ? <Typography variant="body2" sx={{ color: 'text.secondary' }}>None</Typography>
@@ -354,19 +342,19 @@ function Delivery({ detail }: { detail: PersonaDetail }) {
       </KeyValue>
 
       {/* How the session itself ends once settled: beside the settle states, the other half-width fact here. */}
-      <KeyValue label="Session close">
+      <KeyValue label={<HelpLabel label="Session close" help="On: the session ends at settle. Off: it parks." />}>
         <Flag on={detail.autoclose} label="autoclose" onTone="neutral" />
         {!detail.autoclose && <Note>Parked at the prompt is normal here, not stuck.</Note>}
       </KeyValue>
 
       {/* Each ending is a token, a sentence and obligations. */}
-      <KeyValue label="How it can end">
+      <KeyValue label={<HelpLabel label="How it can end" help="Each way it may finish, and what each must include." />}>
         {detail.terminal_types.length === 0 ? (
           <Typography variant="body2" sx={{ color: 'text.secondary' }} data-testid="persona-terminals">
             None
           </Typography>
         ) : (
-          <Stack spacing={1} sx={{ mt: 0.25 }} data-testid="persona-terminals">
+          <Stack spacing={1} sx={{ mt: 0 }} data-testid="persona-terminals">
             {detail.terminal_types.map(type => {
               const required = references.get(type) ?? []
               return (
@@ -376,7 +364,7 @@ function Delivery({ detail }: { detail: PersonaDetail }) {
                   {required.length > 0 && (
                     <Box sx={{ display: 'flex', columnGap: 1, alignItems: 'baseline' }}>
                       <Typography variant="body2" sx={{ color: 'text.secondary', flexShrink: 0 }}>Refused without</Typography>
-                      <Box sx={{ display: 'flex', flexWrap: 'wrap', columnGap: 1, rowGap: 0.25, alignItems: 'baseline', minWidth: 0 }}>
+                      <Box sx={{ display: 'flex', flexWrap: 'wrap', columnGap: 1, rowGap: 0, alignItems: 'baseline', minWidth: 0 }}>
                         {required.map(ref => <Term key={ref} id={ref} labels={REFERENCE_LABEL} />)}
                       </Box>
                     </Box>
@@ -440,7 +428,7 @@ function Licence({ licence }: { licence: PersonaDetail['task_creation_licence'] 
 
   return (
     <Box data-testid="persona-licence">
-      <Stack spacing={0.75}>
+      <Stack spacing={0.5}>
         {licence.shapes.map(shape => (
           <Box key={shape} data-testid="persona-licence-shape" data-status={shape}>
             <Term id={shape} labels={LICENCE_SHAPE_LABEL} />
@@ -449,10 +437,10 @@ function Licence({ licence }: { licence: PersonaDetail['task_creation_licence'] 
         ))}
       </Stack>
       {/* The constraint (the bound it must stay inside) as labelled body text, not a chip tooltip. */}
-      <Box sx={{ mt: 0.75 }} data-testid="persona-licence-bound">
+      <Box sx={{ mt: 0.5 }} data-testid="persona-licence-bound">
         <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>Bound</Typography>
         <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
-          {licence.constraint.charAt(0).toUpperCase() + licence.constraint.slice(1)}
+          {capitalize(licence.constraint)}
         </Typography>
       </Box>
     </Box>
@@ -474,8 +462,8 @@ function RoleBrief({ sections }: { sections: PersonaRoleSection[] }) {
     <Stack spacing={1.5} data-testid="persona-role-sections">
       {sections.map(section => (
         <Box key={section.key} data-testid="persona-role-section">
-          <Stack direction="row" spacing={0.75} sx={{ alignItems: 'baseline', flexWrap: 'wrap', rowGap: 0.25 }}>
-            <Typography variant="subtitle2" component="h3" sx={{ fontWeight: 600 }}>
+          <Stack direction="row" spacing={0.5} sx={{ alignItems: 'baseline', flexWrap: 'wrap', rowGap: 0 }}>
+            <Typography variant="subtitle2" component="h3" sx={{ fontWeight: FONT_WEIGHT.semibold }}>
               {section.title}
             </Typography>
             {/* The raw key beside the title: the name actually in the Python literal. */}
@@ -501,7 +489,7 @@ function Term({ id, labels, label = labels && Object.hasOwn(labels, id) ? labels
   testId?: string
 }) {
   return (
-    <Box component="span" data-testid={testId} sx={{ display: 'inline-flex', alignItems: 'baseline', gap: 0.75, flexWrap: 'wrap' }}>
+    <Box component="span" data-testid={testId} sx={{ display: 'inline-flex', alignItems: 'baseline', gap: 0.5, flexWrap: 'wrap' }}>
       {label !== undefined && <Typography variant="body2" component="span">{label}</Typography>}
       <Typography
         variant={label !== undefined ? 'caption' : 'body2'}

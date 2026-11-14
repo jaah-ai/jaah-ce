@@ -1,0 +1,67 @@
+slug = "zoho_crm"
+label = "Zoho CRM"
+category = "crm"
+vendor_docs_url = "https://www.zoho.com/crm/developer/docs/api/v8/auth-request.html"
+summary = "Read and write Zoho CRM leads, contacts, accounts, deals and custom modules."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://accounts.zoho.com/oauth/v2/auth"
+token_url = "https://accounts.zoho.com/oauth/v2/token"
+scope_separator = ","
+# Zoho returns a refresh token only for `access_type=offline`, and only on a fresh consent; it documents no PKCE.
+authorize_extra = { access_type = "offline", prompt = "consent" }
+pkce = false
+scopes = [
+  { name = "ZohoCRM.modules.ALL", label = "Read, create, update and delete records in every module, custom modules included" },
+  { name = "ZohoCRM.users.READ", label = "Read users: Test names who connected and agents can assign record owners" },
+  { name = "ZohoCRM.settings.READ", label = "Read layouts, fields and picklists so records match your setup", optional = true },
+  { name = "ZohoCRM.coql.READ", label = "Run COQL queries for filtered reads across modules", optional = true },
+]
+jaah_app = true
+
+[auth.oauth.registration]
+console_url = "https://api-console.zoho.com/"
+steps = [
+  "The owning account must be a zoho.com account in the US data center; in the API Console, select Add Client to create the app",
+  "Choose Server-based Applications and select Create Now",
+  "Enter Client Name Jaah and, as Homepage URL, the Jaah website address; the redirect URIs below go under Authorized Redirect URIs",
+  "Select Create, then open the Client Secret tab and copy the Client ID and Client Secret",
+  "Leave Multi-DC turned off on the Settings tab: Jaah's token address is the US data center's",
+]
+review = "Not required: a server-based client works for any Zoho account in the US data centre once created"
+
+[test]
+path = "https://www.zohoapis.com/crm/v8/users?type=CurrentUser"
+auth = "none"
+oauth_scheme = "Zoho-oauthtoken"
+identity = [["users", 0, "full_name"], ["users", 0, "email"]]
+
+[docs]
+agent_uses = [
+  "Create and update leads, contacts, accounts and deals, and convert leads",
+  "Read and write custom modules and their fields",
+  "Search records by criteria, email or phone, or query them with COQL",
+  "Add notes and tasks to records so the follow-up stays in Zoho CRM",
+]
+prerequisites = [
+  "A Zoho CRM user whose profile has API access (Zoho CRM Standard edition or higher)",
+  "A Zoho account in the US data center (you sign in at accounts.zoho.com)",
+]
+limitations = [
+  "Only Zoho accounts in the US data center (zoho.com) can connect today; accounts in the EU, India, Australia, Japan, Canada, China or Saudi Arabia data centers cannot",
+  "Agents act as the user who connected, with that user's profile permissions and data sharing rules",
+  "Zoho CRM counts every call against the org's API credits for 24 hours, set by edition and number of licenses",
+  "Agents send the token as `Authorization: Zoho-oauthtoken <access_token>` to https://www.zohoapis.com, Zoho's own scheme",
+]
+troubleshooting = [
+  { symptom = "The Zoho window shows invalid_client or 'Invalid Redirect Uri'", fix = "Your account is outside the US data center, or the Jaah app's redirect URI does not match. Check that you sign in at accounts.zoho.com; accounts in other data centers cannot connect yet" },
+  { symptom = "Test says Zoho CRM rejected the access token (401) or the secret shows Needs reconnect", fix = "The grant was revoked under Zoho Accounts > Sessions > Connected Apps, or Zoho dropped the refresh token after more than 20 were issued. Select Reconnect and approve again" },
+  { symptom = "An agent gets OAUTH_SCOPE_MISMATCH", fix = "You unticked an optional scope the call needs (settings or COQL). Select Reconnect and keep that scope ticked" },
+  { symptom = "An agent gets LIMIT_EXCEEDED or 'API calls limit exceeded'", fix = "The org's daily API credits are spent. A Zoho CRM admin checks Setup > Developer Hub > APIs and SDKs > Dashboard, or buys more credits" },
+]
+faq = [
+  { q = "Does connecting Zoho CRM give access to other Zoho apps", a = "No. Jaah asks only for Zoho CRM scopes; Zoho Books, Desk and the others need their own connection" },
+  { q = "Why does Zoho ask me to approve again each time I connect", a = "Jaah asks Zoho for a fresh consent so Zoho issues a refresh token; without one the connection would stop after an hour" },
+]

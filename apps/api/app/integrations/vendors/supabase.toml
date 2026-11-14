@@ -1,0 +1,50 @@
+# Supabase, as an API connector (not a project backend). Facts confirmed at the vendor's own docs: Management API
+# personal access tokens, Bearer https://supabase.com/docs/reference/api/introduction ; list projects
+# https://supabase.com/docs/reference/api/v1-list-all-projects ; a project's API keys (apikey header)
+# https://supabase.com/docs/guides/api/api-keys . Probed 2026-11-03: a bad token answers 401.
+slug = "supabase"
+label = "Supabase"
+category = "dev_tools"
+vendor_docs_url = "https://supabase.com/docs/reference/api/introduction"
+summary = "Manage Supabase projects and query a project's API with a management token and project key."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "access_token", label = "Personal access token", kind = "secret", required = true, placeholder = "sbp_...", help = "Supabase dashboard > your avatar > Account preferences > Access Tokens (supabase.com/dashboard/account/tokens) > Generate new token: name it Jaah, choose its permissions (Projects read at least), then copy it - Supabase shows it once" },
+  { key = "project_ref", label = "Project ref", kind = "text", required = false, placeholder = "abcdefghijklmnopqrst", help = "Optional: the project agents work on. Supabase dashboard > the project > Project Settings > General > Project ID (also the first part of the project's address, https://your-ref.supabase.co)" },
+  { key = "secret_key", label = "Project secret key", kind = "secret", required = false, placeholder = "sb_secret_...", help = "Optional: for agents to call the project's own Data and Storage APIs. Supabase dashboard > the project > Project Settings > API Keys > Secret keys > copy (or the legacy service_role key). It bypasses Row Level Security, so give it only to agents you trust with all data" },
+]
+
+[test]
+method = "GET"
+path = "https://api.supabase.com/v1/projects"
+auth = { field = "access_token", header = "Authorization", prefix = "Bearer" }
+accept = ""
+
+[docs]
+agent_uses = [
+  "List your Supabase projects and read a project's settings, health and logs",
+  "Run database migrations or read the schema through the Management API",
+  "Deploy or read Edge Functions and manage secrets for a project",
+  "Query or update the project's tables and storage with the project secret key, when you add one",
+]
+prerequisites = [
+  "A Supabase account that is a member of the organization owning the projects",
+  "Permission in that organization to do what agents should do (Developer, Administrator or Owner)",
+]
+limitations = [
+  "The access token acts as you across every organization you belong to, within the permissions you gave it; create a scoped token for least privilege",
+  "The project secret key bypasses Row Level Security: anyone holding it reads and writes all of the project's data",
+  "This connects agents to the Supabase APIs. It does not make Supabase the backend of a Jaah project",
+  "The Management API is rate-limited per token (about 120 requests a minute)",
+]
+troubleshooting = [
+  { symptom = "Test says Supabase rejected the personal access token (401)", fix = "The token was revoked, expired or mistyped. Generate a new one under Account preferences > Access Tokens and select Replace" },
+  { symptom = "Test says Supabase rejected the token (403)", fix = "The token's permissions do not include reading projects. Generate a token with Projects read" },
+  { symptom = "Agents get 401 from the project's REST API", fix = "The Project secret key is missing or rotated. Copy the current secret key from Project Settings > API Keys and select Replace" },
+]
+faq = [
+  { q = "Which key goes where", a = "The personal access token (sbp_) drives the Management API at api.supabase.com. The project secret key (sb_secret_) drives one project's own API at https://your-ref.supabase.co" },
+  { q = "Can I use the publishable or anon key", a = "Agents can, but it only reaches what Row Level Security allows the public role; Jaah does not ask for it" },
+]

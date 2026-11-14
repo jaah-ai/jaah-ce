@@ -1,5 +1,6 @@
 import type { SxProps, Theme } from '@mui/material/styles'
 import { enterActAs } from '../../lib/actAs'
+import { LINE_HEIGHT, RADIUS, SIZE } from '../../theme'
 import { safeHref } from '../../lib/safeHref'
 import type { OrgRef, PipelineTask, Worktree } from '../../types'
 import { OverflowMenu, type OverflowItem } from '../../ui/OverflowMenu'
@@ -13,8 +14,8 @@ import { isChatTask } from './taskPersona'
 // An absent handler withholds its affordance. Presentation (inline cluster, cell, width budget) stays
 // with the host; this module renders only the ⋯ trigger and its Menu.
 
-// A top-level row links its worktree only while a dispatched runner holds one.
-const IN_PROGRESS_STATES = new Set(['ready', 'active', 'awaiting_response'])
+// A top-level row links its worktree only while a dispatched runner holds one (the task page too, A5/R5).
+export const IN_PROGRESS_STATES = new Set(['ready', 'active', 'awaiting_response'])
 
 // Defense-in-depth: `worktree.urls` is node-reported and React does not block `javascript:`/`data:`
 // hrefs. Delegates to `safeHref` (which also rejects userinfo smuggles like
@@ -26,17 +27,16 @@ export function safeWorktreeHref(worktree: Worktree | undefined): string | undef
 /* The ⋯ trigger — every row's only action target, a 44x44 square. */
 const ROW_OVERFLOW_SX = {
   display: 'inline-flex',
-  width: 44,
-  minWidth: 44,
-  minHeight: 44,
+  width: SIZE.tapTarget,
+  minWidth: SIZE.tapTarget,
+  minHeight: SIZE.tapTarget,
   justifyContent: 'center',
-  fontSize: '1.25rem',
-  lineHeight: 1,
-  borderRadius: 1,
+  fontSize: (t: Theme) => t.typography.h6.fontSize,
+  lineHeight: LINE_HEIGHT.tight,
+  borderRadius: RADIUS.sm,
 } as const
 
-/* Row shape. `'root'`: Start declares the queueing intent. `'leaf'`: Start is the per-subtask Run (`'run'`,
-   bypassing hold mode and dependencies). Both offer Delete/Archive in every state. */
+/* Row shape: a top-level row (`'root'`) or a subtask (`'leaf'`). Both offer Delete/Archive in every state. */
 export type TaskRowVariant = 'root' | 'leaf'
 
 /* Row-action callbacks and worktree resolvers; each optional, absent withholds its affordance (a
@@ -50,19 +50,18 @@ export type TaskRowActionHandlers = {
   onReset?: (task: PipelineTask) => void
   onComplete?: (task: PipelineTask) => void
   onDelete?: (task: PipelineTask) => void
+  /* Discard on a Jaah suggestion (`SuggestionActions`): Delete with no confirm; shown where Delete is. */
+  onDiscard?: (task: PipelineTask) => void
   /* Opens the create surface pre-filled from this row (`lib/taskDuplicate.ts`); writes nothing here, so
      no state or persona gate — handler presence is the whole gate, supplied on `tasks:create`. */
   onDuplicate?: (task: PipelineTask) => void
-  /* "Move to feature…" and "Waiting on customer…": each opens the host's dialog. Both are writes needing
-     `tasks:edit` on the row (the host supplies them on the flat key; `canRunRow` narrows per row). Move is
-     ABSENT on a stage task (it moves with its epic, AC-1.4); Wait is absent on a `done` row and points a
-     stage task at its epic instead. */
-  onMoveToFeature?: (task: PipelineTask) => void
-  onWaitOnCustomer?: (task: PipelineTask) => void
-  /* "Priority…" opens the host's dialog (`PriorityDialog`): what the deleted Queue style's select did, on a
-     queued (`ready`) row only — the one state whose dispatch order priority moves. A `PATCH` edit,
-     so the host supplies it on `tasks:edit` and `canEditRow` narrows per row, as Edit. */
-  onSetPriority?: (task: PipelineTask) => void
+  /* This user's pin (`lib/taskPin.ts`, `hooks/useTaskPins.ts`): a preference write, so no permission gate — handler
+     presence is the whole gate. A top-level row only: a subtask stays in its epic's order. */
+  isPinned?: (task: PipelineTask) => boolean
+  onTogglePin?: (task: PipelineTask) => void
+  /* The row's Creator → Assignee cell reassigns in place (`../TaskPeople.tsx`): a `PUT` edit, so supplied on
+     `tasks:edit` and narrowed per row by `canEditRow`, as Edit. */
+  onAssign?: (task: PipelineTask, assigneeId: string) => void
   /* Per-row refinements for Edit and Delete: a `tasks:create` holder without `tasks:edit` may edit and
      delete their own `draft` rows (`authored_draft`; rule in `hooks/useTaskAccess.ts`). Absent means
      always-true (the opposite of the handlers). They only narrow, folded in with `&&` after the
@@ -98,9 +97,9 @@ export type TaskRowActionFlags = {
   showStop: boolean
   showEdit: boolean
   showDuplicate: boolean
-  showMoveToFeature: boolean
-  showWaitOnCustomer: boolean
-  showPriority: boolean
+  /* Pin or Unpin offered; `pinned` is the row's current pin (false when not offered). */
+  showPin: boolean
+  pinned: boolean
   consoleSlot: Worktree | undefined
   showConsole: boolean
   stackHref: string | undefined
@@ -160,9 +159,6 @@ export function taskRowActionFlags(
     onComplete,
     onDelete,
     onDuplicate,
-    onMoveToFeature,
-    onWaitOnCustomer,
-    onSetPriority,
     canEditRow,
     canDeleteRow,
     canRunRow,
@@ -180,14 +176,12 @@ export function taskRowActionFlags(
   const showEdit = onEdit !== undefined && isEditable(task) && canEditRow?.(task) !== false
   /* Handler presence alone: Duplicate writes nothing to this row. */
   const showDuplicate = onDuplicate !== undefined
+  const showPin = handlers.onTogglePin !== undefined && variant === 'root'
+  const pinned = showPin && handlers.isPinned?.(task) === true
   // Run-verb refinement narrows after handler presence; Stop included (the API 404s otherwise).
   const mayRun = canRunRow?.(task) !== false
   const showStart = mayRun && canStart && onStart !== undefined
   const showStop = mayRun && canStop && onStop !== undefined
-  const showMoveToFeature = mayRun && onMoveToFeature !== undefined && task.parent_task_id === null
-  const showWaitOnCustomer = mayRun && onWaitOnCustomer !== undefined && task.state !== 'done'
-  // Edit's gate (`canEditRow`), on the one state whose place in the queue priority moves.
-  const showPriority = onSetPriority !== undefined && task.state === 'ready' && canEditRow?.(task) !== false
   // The console is an Actions-cell item at phone width, so it counts toward `hasActions`.
   const consoleSlot = consoleSlotFor(task, variant, consoleWorktreeFor)
   const showConsole = consoleSlot !== undefined && onOpenConsole !== undefined
@@ -203,9 +197,7 @@ export function taskRowActionFlags(
     otherOrgOf?.(task.org) != null ||
     showEdit ||
     showDuplicate ||
-    showMoveToFeature ||
-    showWaitOnCustomer ||
-    showPriority ||
+    showPin ||
     showStart ||
     showStop ||
     showConsole ||
@@ -219,9 +211,8 @@ export function taskRowActionFlags(
     showStop,
     showEdit,
     showDuplicate,
-    showMoveToFeature,
-    showWaitOnCustomer,
-    showPriority,
+    showPin,
+    pinned,
     consoleSlot,
     showConsole,
     stackHref,
@@ -238,32 +229,14 @@ export function taskRowActionFlags(
 export function taskOverflowItems(
   task: PipelineTask,
   name: string,
-  variant: TaskRowVariant,
   handlers: TaskRowActionHandlers,
   flags: TaskRowActionFlags,
 ): OverflowItem[] {
   const {
-    onEdit, onStart, onStop, onReset, onComplete, onDelete, onDuplicate, onMoveToFeature, onWaitOnCustomer,
-    onSetPriority, onOpenConsole, otherOrgOf, duplicateAsOf,
+    onEdit, onStart, onStop, onReset, onComplete, onDelete, onDuplicate, onOpenConsole, otherOrgOf, duplicateAsOf,
   } = handlers
   const otherOrg = otherOrgOf?.(task.org) ?? null
   const duplicateAs = (duplicateAsOf ?? otherOrgOf)?.(task.org) ?? null
-  const {
-    showStart,
-    startBlockedReason,
-    showStop,
-    showEdit,
-    showDuplicate,
-    showMoveToFeature,
-    showWaitOnCustomer,
-    showPriority,
-    consoleSlot,
-    showConsole,
-    stackHref,
-    showReset,
-    showComplete,
-    showCleanup,
-  } = flags
   const overflowItems: OverflowItem[] = []
   /* Another org's row leads with the way into that org for this whole tab (`lib/actAs.ts`); its verbs below already
      go as the org one request at a time. */
@@ -275,12 +248,12 @@ export function taskOverflowItems(
       onClick: () => enterActAs(otherOrg),
     })
   }
-  if (showEdit) {
+  if (flags.showEdit) {
     overflowItems.push(editItem(name, () => onEdit!(task)))
   }
   /* Duplicate under Edit: both open a form; everything below acts on the row. Another org's row is copied into that
      org, so the label names the switch the press makes (act-as) before it is pressed. */
-  if (showDuplicate) {
+  if (flags.showDuplicate) {
     overflowItems.push({
       key: 'duplicate',
       icon: ACTION_ICON.duplicate,
@@ -289,40 +262,30 @@ export function taskOverflowItems(
       onClick: () => onDuplicate!(task),
     })
   }
-  /* Filing next: it moves the row, it does not run it. */
-  if (showMoveToFeature) {
+  /* Pin under Duplicate: the last item that changes nothing about the task itself (only where this user sees it). */
+  if (flags.showPin) {
+    const verb = flags.pinned ? 'Unpin' : 'Pin'
     overflowItems.push({
-      key: 'move-to-feature',
-      icon: ACTION_ICON.file,
-      label: 'Move…',
-      ariaLabel: `Move ${name} to a feature`,
-      onClick: () => onMoveToFeature!(task),
-    })
-  }
-  /* Beside Move: it reorders the queue, it does not run the row. */
-  if (showPriority) {
-    overflowItems.push({
-      key: 'priority',
-      // The dispatch order's lever; monochrome like its neighbours.
-      icon: '⇅',
-      label: 'Priority…',
-      ariaLabel: `Priority for ${name}`,
-      onClick: () => onSetPriority!(task),
+      key: 'pin',
+      icon: ACTION_ICON.pin,
+      label: verb,
+      ariaLabel: `${verb} ${name}`,
+      onClick: () => handlers.onTogglePin!(task),
     })
   }
   // Words and Start's intent come from the control registry (`startIntentFor`). Only `ready` pushes
   // both: Start, then Stop as its undo.
-  if (showStart) {
+  if (flags.showStart) {
     overflowItems.push({
       key: 'start',
       icon: CONTROLS.start.icon,
       label: CONTROLS.start.label,
       ariaLabel: `${CONTROLS.start.label} ${name}`,
-      ...(startBlockedReason ? { disabled: true, disabledReason: startBlockedReason } : {}),
-      onClick: () => onStart!(task, startIntentFor(task, variant)),
+      ...(flags.startBlockedReason ? { disabled: true, disabledReason: flags.startBlockedReason } : {}),
+      onClick: () => onStart!(task, startIntentFor(task)),
     })
   }
-  if (showStop) {
+  if (flags.showStop) {
     overflowItems.push({
       key: 'stop',
       icon: CONTROLS.stop.icon,
@@ -332,39 +295,27 @@ export function taskOverflowItems(
       onClick: () => onStop!(task),
     })
   }
-  /* Beside Stop: it stops the row with a reason. A stage task's reason belongs to its epic (the API 400s it). */
-  if (showWaitOnCustomer) {
-    const stage = task.parent_task_id !== null
-    overflowItems.push({
-      key: 'wait-on-customer',
-      icon: ACTION_ICON.wait,
-      label: 'Waiting…',
-      ariaLabel: `Waiting on customer: ${name}`,
-      ...(stage ? { disabled: true, disabledReason: 'set it on the epic' } : {}),
-      onClick: () => onWaitOnCustomer!(task),
-    })
-  }
-  if (showConsole) {
+  if (flags.showConsole) {
     overflowItems.push({
       key: 'console',
       icon: ACTION_ICON.console,
       label: CONSOLE_WORD,
       ariaLabel: `Open web console for ${name}`,
-      onClick: () => onOpenConsole!(consoleSlot!),
+      onClick: () => onOpenConsole!(flags.consoleSlot!),
     })
   }
   // Stack link right after the console; the full name is on `ariaLabel`.
-  if (stackHref) {
+  if (flags.stackHref) {
     overflowItems.push({
       key: 'stack',
       icon: ACTION_ICON.stack,
       label: 'Stack',
       // Contains the visible label (WCAG 2.5.3 Label in Name); the inline anchor uses the same name.
       ariaLabel: `Open Local Stack for ${name}`,
-      href: stackHref,
+      href: flags.stackHref,
     })
   }
-  if (showReset) {
+  if (flags.showReset) {
     overflowItems.push({
       key: 'reset',
       icon: CONTROLS.reset.icon,
@@ -373,7 +324,7 @@ export function taskOverflowItems(
       onClick: () => onReset!(task),
     })
   }
-  if (showComplete) {
+  if (flags.showComplete) {
     overflowItems.push({
       key: 'complete',
       icon: CONTROLS.complete.icon,
@@ -382,7 +333,7 @@ export function taskOverflowItems(
       onClick: () => onComplete!(task),
     })
   }
-  if (showCleanup) {
+  if (flags.showCleanup) {
     const archive = isArchiveRow(task)
     overflowItems.push({
       key: 'cleanup',

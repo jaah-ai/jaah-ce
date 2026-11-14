@@ -43,7 +43,7 @@ def env_lines(*, native: bool = False) -> str:
 def set_home(path: str) -> None:
     """Point the edition's one node at `path` (absolute, normalised); `ValueError` for any other shape, and
     `RuntimeError` outside the community edition or before its boot has created the node."""
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.models.nodes import Node
     from app.tenancy import seam
 
@@ -52,7 +52,7 @@ def set_home(path: str) -> None:
     home = PurePosixPath(path)
     if not home.is_absolute() or ".." in home.parts or any(ch in path for ch in "\0\n\r"):
         raise ValueError(f"the node's home must be an absolute path, not {path!r}")
-    with seam.operator_scope(), SessionLocal() as session:
+    with seam.operator_scope(), BridgedSession() as session:
         result = session.execute(
             update(Node).where(Node.org_id == ce_bootstrap.CE_ORG_ID).values(jaah_home=str(home))
         )

@@ -1,76 +1,102 @@
 // The Task page's static vocabulary: its tab ids and labels, and the layout `sx` its shell and sections share.
 import type { TabDef } from '../../components/Tabs'
-import { ABOVE_PHONE, BOTTOM_NAV_HEIGHT, TASK_TRAIL_CONTAINER } from '../../ui/listStyles'
+import { FONT_SIZE, LINE_HEIGHT, RADIUS, SIZE, grid } from '../../theme'
+import { ABOVE_PHONE, BOTTOM_NAV_HEIGHT, PHONE, TASK_TABS_ROW_CONTAINER, TASK_TABS_ROW_NARROW, TASK_TRAIL_CONTAINER } from '../../ui/listStyles'
 
-// The ≤480px phone boundary (`e2e/task-detail-fit.spec.ts` measures 390px). A literal because the
-// theme's `sm` is 600px.
-export const PHONE = 481
+// `subtasks` only with children; `artifacts` only once a runner handed one back; `qa` only at a gate or once
+// the task has a Q&A trail; `agent` only with an ACP session. `task`, `comments`, `routing` and `details` are
+// unconditional (`routing` off the Live Cast viewer).
+export type TaskTab =
+  'task' | 'subtasks' | 'artifacts' | 'qa' | 'comments' | 'agent' | 'routing' | 'details'
 
-// `answer` exists only at a gate (FIRST, so a gated task lands on it); `subtasks` only with children;
-// `artifacts` only once a runner handed one back; `metrics` only once there is a run to measure. The rest
-// are unconditional.
-export type TaskTab = 'answer' | 'task' | 'subtasks' | 'artifacts' | 'comments' | 'details' | 'agent' | 'metrics' | 'activity'
+/* Retired `?tab=` ids, so old links (notifications, bookmarks) still land: the gate's Answer merged into Q&A (once
+   Decisions), Discuss became Comments, Audit became Details, and Metrics, Activity, Outcome and Review findings are
+   Details' subtabs (`LEGACY_TAB_SUBTABS` lands the last two on theirs). */
+export const TASK_TAB_ALIASES: Readonly<Record<string, TaskTab>> = {
+  answer: 'qa',
+  decisions: 'qa',
+  discuss: 'comments',
+  audit: 'details',
+  metrics: 'details',
+  activity: 'details',
+  outcome: 'details',
+  findings: 'details',
+}
 
 export const TASK_TAB: TabDef<TaskTab> = { id: 'task', label: 'Task' }
 export const SUBTASKS_TAB: TabDef<TaskTab> = { id: 'subtasks', label: 'Subtasks' }
 export const ARTIFACTS_TAB: TabDef<TaskTab> = { id: 'artifacts', label: 'Artifacts' }
+/* What was asked and how it was settled: the open gate's form (answerable or read-only) over the Q&A trail. */
+export const QA_TAB: TabDef<TaskTab> = { id: 'qa', label: 'Q&A' }
 /* Unconditional: it is a place to WRITE, so hiding it would block the first comment. The count rides
    in the label. */
 export function commentsTab(count: number): TabDef<TaskTab> {
   return { id: 'comments', label: count > 0 ? `Comments (${count})` : 'Comments' }
 }
-
-export const DETAILS_TAB: TabDef<TaskTab> = { id: 'details', label: 'Details' }
-/* Run figures (tier 3, runs) split out of Details, so Details leads with what the task IS and how it ended.
-   After Details, before the Activity histories. */
-export const METRICS_TAB: TabDef<TaskTab> = { id: 'metrics', label: 'Metrics' }
 /* The ACP run's live event stream, its own tab: it sat under Details' field grid, a second scroll
    inside a tab about something else. Only once the task has an ACP session, and only for a reader of its events
    (`sessions:view` + `sessions:edit`, `TaskActivity`). */
 export const AGENT_TAB: TabDef<TaskTab> = { id: 'agent', label: 'Agent' }
-export const ACTIVITY_TAB: TabDef<TaskTab> = { id: 'activity', label: 'Activity' }
+/* What the agent router decided for this task's dispatches (`components/routing/RoutingPanel`): every task, every
+   mode, an empty state before the first decision, while the org's `intelligent_routing` switch is on (the operator
+   always). Not on the Live Cast viewer: the public API serves no routing. */
+export const ROUTING_TAB: TabDef<TaskTab> = { id: 'routing', label: 'Routing' }
+export const DETAILS_TAB: TabDef<TaskTab> = { id: 'details', label: 'Details' }
 
-/* One `id`, two words: `Answer` for a principal who can answer, `Question` for a `tasks:view` reader
-   (the panel keeps the content and withholds the controls). */
-export const ANSWER_TAB: TabDef<TaskTab> = { id: 'answer', label: 'Answer' }
-export const QUESTION_TAB: TabDef<TaskTab> = { id: 'answer', label: 'Question' }
+/* The Details tab's inner strip (`?details=`): everything ABOUT the run, one subtab each. Only the subtabs with something
+   to show are drawn (Summary always); the first drawn is the default. */
+export type DetailsSubtab = 'summary' | 'outcome' | 'metrics' | 'timeline' | 'versions' | 'review'
 
-/* The Activity tab's inner strip: one subtab per append-only history, so the long feed no longer buries
-   the others. `timeline` is the default and FIRST. */
-export type ActivityTab = 'timeline' | 'qa' | 'versions'
-
-export const ACTIVITY_TABS: readonly TabDef<ActivityTab>[] = [
+export const DETAILS_SUBTABS = [
+  { id: 'summary', label: 'Summary' },
+  // The outcome ledger's rows for the task (`TaskOutcomePanel`): only once it has one.
+  { id: 'outcome', label: 'Outcome' },
+  // Run figures (tier 3, runs) split out of Summary, so Summary leads with what the task IS and how it ended.
+  { id: 'metrics', label: 'Metrics' },
   { id: 'timeline', label: 'Timeline' },
-  { id: 'qa', label: 'Q&A' },
   { id: 'versions', label: 'Versions' },
-]
+  // What review lanes found in the task's change (`TaskReviewFindingsPanel`): only once there is one.
+  { id: 'review', label: 'Review' },
+] as const satisfies readonly TabDef<DetailsSubtab>[]
+
+/* Retired top-level tabs that are now Details' subtabs: `?tab=outcome` lands on `?tab=details&details=outcome`. */
+export const LEGACY_TAB_SUBTABS: Readonly<Record<string, DetailsSubtab>> = { outcome: 'outcome', findings: 'review' }
+
+/* SANCTIONED SCROLLPORT 3: a history feed (`data-testid="task-page-feed"`), unbounded by construction — Details' Timeline
+   and Versions share one, and Q&A's trail is the same kind of feed. No `overscroll-behavior: contain`: at
+   phone width this grows to its content and the shell is what scrolls, and a contained non-scroller swallows that
+   gesture (`PAGE_SX`'s "WHY NO SCROLLPORT ON THIS PAGE CONTAINS ITS OVERSCROLL"). */
+export const FEED_SX = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 1.5,
+  flex: '1 1 auto',
+  minHeight: grid(21),
+  overflowY: 'auto',
+} as const
 
 // AD-13: create mode shows only the `task` panel (the others would render empty). Same id, and the word
 // follows the `<h1>` ("Chat" under "New Chat").
 export const CREATE_TABS: readonly TabDef<TaskTab>[] = [{ id: 'task', label: 'Task' }]
 export const CREATE_CHAT_TABS: readonly TabDef<TaskTab>[] = [{ id: 'task', label: 'Chat' }]
 
-// The Details section the header's messages chip scrolls to.
-export const CONTROL_MESSAGES_ANCHOR = 'task-control-messages-section'
-
 /* ── THE TAB-STRIP ROW, and the rating's slot on its right ────────────────────
    `& > :first-of-type` is the `Tabs` root: `flex: '1 1 auto'` + `minWidth: 0` let the scrollable strip
    shrink (scrolling tabs, not clipping). Positional because `Tabs` exposes only a `className`. The row is a
-   size container (`TABS_ROW_CONTAINER`): the rating's place follows the ROW's width, so the page in the
+   size container (`TASK_TABS_ROW_CONTAINER`): the rating's place follows the ROW's width, so the page in the
    list's split pane at a wide viewport lays out as a narrow one does. */
-const TABS_ROW_CONTAINER = 'task-tabs-row'
 export const TABS_ROW_SX = {
   display: 'flex',
   alignItems: 'stretch',
   // Load-bearing in a narrow row (see `RATING_SLOT_SX`'s `flexBasis: '100%'`).
   flexWrap: 'wrap',
   containerType: 'inline-size',
-  containerName: TABS_ROW_CONTAINER,
+  containerName: TASK_TABS_ROW_CONTAINER,
   '& > :first-of-type': { flex: '1 1 auto', minWidth: 0 },
   /* A narrow row (the split pane, a phone) drops MUI's 90px tab floor and its 16px gutters, so more tabs fit
      before the strip's More (`overflowMenu`). */
-  [`@container ${TABS_ROW_CONTAINER} (max-width: 639px)`]: {
-    '& .MuiTab-root': { minWidth: 0, px: 1.25 },
+  [TASK_TABS_ROW_NARROW]: {
+    '& .MuiTab-root': { minWidth: 0, px: 1 },
   },
 } as const
 
@@ -95,7 +121,7 @@ export const RATING_SLOT_SX = {
 } as const
 
 /* The loading title crumb: about a title's width, inline in the trail, capped to the header on a phone. */
-export const TITLE_SKELETON_SX = { display: 'inline-block', width: '16rem', maxWidth: '60vw', verticalAlign: 'middle' } as const
+export const TITLE_SKELETON_SX = { display: 'inline-block', width: grid(42.5), maxWidth: '60vw', verticalAlign: 'middle' } as const
 
 /* The create surface's loading trail and, beside it, the phone's org-scope chip: where the loaded create header draws
    it, so it does not move when the form lands. */
@@ -119,24 +145,27 @@ export const LOADING_TABS_SX = {
   borderColor: 'divider',
   overflow: 'hidden',
 } as const
-export const LOADING_TAB_WIDTHS = ['2.5rem', '4.5rem', '3.5rem', '4rem'] as const
+export const LOADING_TAB_WIDTHS = [grid(6.5), grid(12), grid(9), grid(10.5)] as const
 export const LOADING_ACTIONS_SX = {
-  width: '6rem',
-  height: 32,
-  [`@media (max-width:${PHONE - 1}px)`]: { height: 44 },
+  width: grid(16),
+  height: SIZE.thumb,
+  [PHONE]: { height: SIZE.tapTarget },
 } as const
 
-/* The header's ⋯ ("Move…", "Waiting…"), sized to sit beside the state badge rather than
-   in a table cell; the 44px touch floor on the phone. `PHONE` is a number here, so the key is the media query. */
+/* The header's ⋯, sized to sit beside the state badge rather than
+   in a table cell; the 44px touch floor on the phone. */
 export const PAGE_OVERFLOW_SX = {
-  width: 32,
-  minWidth: 32,
-  height: 32,
-  fontSize: '1.125rem',
-  lineHeight: 1,
-  borderRadius: 1,
-  [`@media (max-width:${PHONE - 1}px)`]: { width: 44, minWidth: 44, height: 44 },
+  width: SIZE.thumb,
+  minWidth: SIZE.thumb,
+  height: SIZE.thumb,
+  fontSize: FONT_SIZE.lg,
+  lineHeight: LINE_HEIGHT.tight,
+  borderRadius: RADIUS.sm,
+  [PHONE]: { width: SIZE.tapTarget, minWidth: SIZE.tapTarget, height: SIZE.tapTarget },
 } as const
+
+// Details' visible subtab panel (and the shared Timeline · Versions feed section), a column like a top-level panel.
+const DETAILS_SUBPANEL = '& > #task-panel-details > [role="tabpanel"]:not([hidden]), & > #task-panel-details > [data-details-feed]:not([hidden])'
 
 /* The header and tab-strip slots, loaded or loading (the shell above): the loading id first, so the flattened rule
    still ends in the loaded id (`TaskDetailPage.header.test.tsx` reads it). */
@@ -149,6 +178,8 @@ const TABS_SLOT = '& > [data-testid="task-page-tabs-loading"], & > [data-testid=
    left are selectors naming this box's children (`& > …`), which must ride on THIS box, plus the ≤480px
    override of the measure (full bleed, `height: auto`, the visual-viewport guard). */
 export const PAGE_SX = {
+  /* 8px between the bands (the measure's 16px halved), at every width: the header sits right over its tabs. */
+  gap: 1,
   // The header and the tab strip are fixed chrome; only the active panel flexes.
   /* The status pill stays TOP-RIGHT whatever the title's length: the header never wraps, the trail takes the
      rest of the line (basis 0, so a long title wraps inside it instead of pushing the pill to a line below). */
@@ -165,16 +196,23 @@ export const PAGE_SX = {
     /* ON A PHONE THE TITLE TAKES ITS OWN LINE once the pill's cluster would leave it under ~10rem: a
        30-character title wrapped to three lines in the sliver between the crumbs and the pill. The header wraps, the
        lead keeps a 10rem basis (full width when wrapped), and the cluster lands right-aligned on the line below. */
-    [`@media (max-width:${PHONE - 1}px)`]: {
+    [PHONE]: {
       flexWrap: 'wrap',
-      '& > [data-slot="lead"]': { flex: '1 1 10rem' },
+      '& > [data-slot="lead"]': { flex: `1 1 ${grid(26.5)}` },
       '& > [data-slot="actions"]': { ml: 'auto' },
     },
   },
   [TABS_SLOT]: { flex: '0 0 auto', '& .MuiTabs-root': { mb: 0 } },
   /* `display` only on the visible panel — unconditional flex would override `[hidden]`. Direct
-     children only, so the Activity tab's nested tabs are untouched. */
+     children only; Details' subtab panels take the same column through their own rule below. */
   '& > [role="tabpanel"]:not([hidden])': {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 2,
+    flex: '1 1 auto',
+    minHeight: 0,
+  },
+  [DETAILS_SUBPANEL]: {
     display: 'flex',
     flexDirection: 'column',
     gap: 2,
@@ -203,17 +241,13 @@ export const PAGE_SX = {
 
   /* SANCTIONED SCROLLPORT 2 — the Subtasks rows (`components/tasks/SubtaskList.tsx`). Its phase headings are
      sticky, so they stay in view while their rows scroll under them. 12rem floors ~6 rows (30px each). */
-  '& > #task-panel-subtasks [data-testid="subtask-list"]': { flex: '1 1 auto', minHeight: '12rem', overflowY: 'auto' },
+  '& > #task-panel-subtasks [data-testid="subtask-list"]': { flex: '1 1 auto', minHeight: grid(32), overflowY: 'auto' },
 
-  [`@media (max-width:${PHONE - 1}px)`]: {
+  [PHONE]: {
     /* A1d — FULL-BLEED: cancel `.app-main`'s 1rem phone inset with the -1rem idiom (no fixed positioning,
        no viewport units); the gutter goes back to the header and tab strip. */
     marginLeft: '-1rem',
     marginRight: '-1rem',
-
-    /* Resting (keyboard-down) density: the inter-band gap drops to 6px (overriding the measure's
-       `gap: 2`); it appears twice on a phone. */
-    gap: 1,
 
 
     /* AC1d.2 — the software keyboard. `100dvh` ignores the on-screen keyboard, so the `visualViewport`
@@ -264,27 +298,22 @@ export const PAGE_SX = {
         right: 0,
         bottom: BOTTOM_NAV_HEIGHT,
         zIndex: 5,
-        paddingLeft: '1rem',
-        paddingRight: '1rem',
-        paddingBottom: '0.5rem',
+        paddingLeft: 2.5,
+        paddingRight: 2.5,
+        paddingBottom: 1,
       },
-      /* Reserve the bar's height below the form so its last control scrolls clear. `4.25rem` = the bar's
-         53px + 8px padding, rounded up. On the PANEL, not the card: padding inside the card inflates
+      /* Reserve the bar's height below the form so its last control scrolls clear. 11 units (66px) = the bar's
+         53px + 6px padding, rounded up. On the PANEL, not the card: padding inside the card inflates
          `scrollHeight`, which `tasks-mobile.spec.ts`'s AC-4 chrome-density guard bounds. */
       '& > [role="tabpanel"]:not([hidden]):has([data-testid="task-form-card"])': {
-        paddingBottom: '4.25rem',
-      },
-      /* A bar carrying a note (`FormActionBar`'s `note`, the acting push caption) is two caption lines and a gap
-         taller at 390px: reserve that too, or the last control stays under it. */
-      '& > [role="tabpanel"]:not([hidden]):has([data-testid="task-form-card"]):has([data-form-bar-note])': {
-        paddingBottom: '7.5rem',
+        paddingBottom: 11,
       },
     },
 
     // The full-bleed gutter is handed back to the two pieces of page chrome.
     [`${HEADER_SLOT}, ${TABS_SLOT}`]: {
-      paddingLeft: '1rem',
-      paddingRight: '1rem',
+      paddingLeft: 2.5,
+      paddingRight: 2.5,
     },
 
     /* AC1e.4 — the tab strip at 390px: 44px touch floor, scoped to this strip. Tabs GROW to fill a short strip
@@ -292,8 +321,9 @@ export const PAGE_SX = {
        neighbour ("TaskSubtasksArtifacts…"); the strip scrolls behind its edge fade instead
        (`components/Tabs.tsx`). */
     '& > [data-testid="task-page-tabs"] .MuiTab-root': {
-      minHeight: 44,
-      padding: '8px 10px',
+      minHeight: SIZE.tapTarget,
+      py: 1,
+      px: 1.5,
       flex: '1 0 auto',
       textAlign: 'center',
       whiteSpace: 'nowrap',
@@ -302,13 +332,19 @@ export const PAGE_SX = {
 
     /* A panel takes its CONTENT's height on a phone (a flex split would squeeze the shortest card), and
        carries the 12px phone gutter the full bleed removed (`tasks-mobile.spec.ts` floors flush-edge
-       content). rem, not spacing units (the theme unit is 6px). In ONE rule with the flex: a duplicate
+       content). In ONE rule with the flex: a duplicate
        key would replace it. */
     '& > [role="tabpanel"]:not([hidden])': {
       flex: '0 0 auto',
-      paddingLeft: '0.75rem',
-      paddingRight: '0.75rem',
+      paddingLeft: 2,
+      paddingRight: 2,
     },
+    [DETAILS_SUBPANEL]: { flex: '0 0 auto' },
+    /* …and the same gutter on the page's banners (`TaskDetailBanners`, and the acting-for notice's wrapper), which
+       sit outside the panels: full-bleed, they ran into the screen edge. The failure banner's dense Details fold
+       gets the 44px touch floor its `AdvancedSection` leaves off for table cells. */
+    '& > .MuiAlert-root, & > :has([data-testid="task-page-acting-for"])': { marginLeft: 2, marginRight: 2 },
+    '& [data-testid="task-page-terminal-cause-details-summary"]': { minHeight: SIZE.tapTarget, minWidth: SIZE.tapTarget },
     /* …except the panel hosting the edit form, whose Description editor is `flex: 1` and must grow.
        Keyed on the form, which is what changes the requirement. */
     '& > [role="tabpanel"]:not([hidden]):has([data-testid="task-form-card"])': {
@@ -319,7 +355,7 @@ export const PAGE_SX = {
     /* Desktop floors would force a scroll on a phone with the keyboard up. The Description is absent on
        purpose: `TaskEditForm` owns its larger phone floor, and a page-scoped rule here would out-specify
        and clamp it. */
-    '& [data-testid="task-page-feed"]': { minHeight: '6rem' },
+    '& [data-testid="task-page-feed"]': { minHeight: grid(16) },
 
     /* ── ONE SCROLLPORT PER PHONE ────────────────────────────────────────────────────────────────
        At <=480px the page grows, so these boxes can never scroll themselves; `visible` stops them being

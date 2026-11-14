@@ -8,13 +8,17 @@ cancel):
   pr create --title T --body-file F [--draft] [--base B] [--head H]
   pr view [N|BRANCH] [--json] [--body] [--ignore-check NAME]...   pr checks N [--watch [--interval S]]   (S >= 60)
   pr list [--state open|closed|all] [--author A] [--head B] [--base B] [--limit N]
+  pr list --state merged --since T [--limit N]    pr provenance N    checks --sha S
   pr auto-merge N [--disable]     pr merge N [--sha S]      pr ready N
   pr edit N [--title T] [--body-file F]                pr comment N --body-file F
   pr close N --body-file F        pr stats N
   pr status N --context C --state pending|success|failure [--description D] [--sha S]
   run list [--workflow FILE] [--branch B] [--limit N]  run view <run-id>   run rerun <run-id> [--failed]
-  run dispatch <workflow> --ref B [-f KEY=VALUE]...
+  run dispatch <workflow> --ref B [--sha S] [-f KEY=VALUE]...
   ci log <check-id>               api get <path>
+  var list [--env E]      var set NAME (--value V | --value-file F|-) [--env E]      var delete NAME [--env E]
+  secret list [--env E|--dependabot]   secret set NAME --value-file F|- [--env E|--dependabot]
+  secret delete NAME [--env E|--dependabot]
 
 Every verb prints JSON on stdout (`ci log` prints the log text). `pr view` prints the normalised shape
 `model.PullRequest.to_json` names, identical on every forge; given a BRANCH (or nothing: the checked-out
@@ -45,7 +49,9 @@ repository off `checkout` within the runner's own slot (`cred_broker._observed_r
 PINNED MERGE. `pr merge N --sha S` merges only the head S (a full commit id): when `view`'s head is not S it
 exits 2 before any write, and otherwise sends S as the forge's own head pin (GitHub `sha`, GitLab `sha`,
 Azure `lastMergeSourceCommit`), so a push landing between the view and the merge is refused by the forge.
-Bitbucket's merge takes no head commit: `--sha` there exits 5. The merge lane (`merge_lane.py`) merges
+Bitbucket's merge takes no head commit: there the pin is only the head check, against the PR's source
+commit resolved in full (`head_commit`) just before the merge, so a push in that gap is NOT refused — nil
+for a branch nothing else pushes (a Jaah-owned `release/<id>`), and why Bitbucket has no merge lane. The merge lane (`merge_lane.py`) merges
 only this way, at the head it tested.
 
 COMMIT STATUS (GitHub only so far; elsewhere exit 5). `pr status N --context C --state S` sets commit status C on
@@ -69,6 +75,19 @@ iteration's `changes`), at most 3,000 files (`partial` past that). Files `loc_fi
 (lockfiles, vendored, build output, generated) count in `files_changed` and in `excluded_*` only. Azure DevOps
 serves no per-file line counts: there `status` is `partial`, files are counted and every line count is null.
 
+OUTCOME SCAN READS (every forge; the outcome scan consumes these exact shapes). `pr list --state merged --since T`
+(T ISO-8601, required there and refused elsewhere; `--limit` 1..200, default 30; no `--author/--head/--base`) prints
+the PRs merged at or after T, newest merge first, each `{number, url, title, body, merged_at, files}` — `body` the
+description ("" for none), `merged_at` ISO-8601 UTC with a `Z`, `files` the first 100 paths. It reads a listing by
+recent update, at most ten pages (a busier window comes back short): GitHub closed PRs by `updated` (the first row
+updated before T ends it), GitLab `state=merged&updated_after=T`, Bitbucket `state=MERGED` with `updated_on>=T` —
+Bitbucket names no merge time, so `updated_on` stands in (a comment after the merge makes it read later) —, Azure
+completed PRs closed since T whose merge succeeded (`closedDate`). `checks --sha S` (7..64 hex) prints `{sha, checks}`,
+each `model.Check.to_json` with `required` true (a bare commit has no gating rule): GitHub check runs + statuses, GitLab
+and Azure commit statuses (latest per name), Bitbucket commit statuses. `pr provenance N` prints
+`model.Provenance.to_json` — the `pr_provenance` wire — on every forge; Bitbucket's `merge_sha` is the abbreviated
+`merge_commit.hash` it names, and Azure's commits name no account (`author_login` null).
+
 CI RE-RUN. `run rerun <run-id>` re-runs a run on a branch of THIS repo that is the runner's own (`policy.check_rerun`)
 — never the integration branch's runs, a tag's, a fork's or another repo's (the run it reads
 names no branch for those; on GitHub that takes one more call, to confirm the name is a branch), and never with `push_enabled=false` — printing `{id, rerun_of, branch, failed_only}`.
@@ -78,12 +97,20 @@ played manual job); an MR pipeline's branch is its MR's source branch. Azure ret
 `--failed` and otherwise queues a copy of the build (a new `id`); Bitbucket queues a copy of the pipeline
 and cannot re-run only the failed steps.
 
-CI DISPATCH (GitHub only so far; elsewhere exit 5). `run dispatch <workflow> --ref B -f K=V ...` starts a
-`workflow_dispatch` run of the workflow file on branch B with those inputs (each `-f` a `key=value`, a key at most
-once) and prints `{workflow, ref, inputs, dispatched: true}`, plus `id` where GitHub names the new run. B is the
-integration branch (a hand-run workflow: `run dispatch mirrors.yml --ref develop -f mirror=jaah-ce`) or your own
-branch, as for `run rerun` — never `master` or another branch no task delivers to — and never with
-`push_enabled=false` (`policy.check_dispatch`). A dispatched run is no PR's check run: it never satisfies one.
+CI DISPATCH (every forge). `run dispatch <workflow> --ref B -f K=V ...` starts a run on branch B with those inputs
+(each `-f` a `key=value`, a key at most once) and prints `{workflow, ref, inputs, dispatched: true}`, plus the started
+run's `id`, `url` (its web page) and `head_sha` where the forge names them. What `<workflow>` names is the forge's own:
+GitHub a `workflow_dispatch` workflow file; GitLab a job name — the ref's whole pipeline starts, variable
+`JAAH_GATE=<workflow>` (`*` = the whole pipeline) naming the job a gate is judged on, inputs as pipeline variables;
+Bitbucket a `custom:` pipeline of `bitbucket-pipelines.yml`, inputs as variables (on both, a pipeline variable
+overrides a project CI/CD variable of the same name: name only the inputs the pipeline reads); Azure a pipeline id, refused unless
+that pipeline builds THIS repo, inputs as template parameters. `--sha S` exits 3 "The branch moved before the run
+started" when the run builds another commit (a forge starts a branch's head, never a commit). B is the integration
+branch (a hand-run workflow: `run dispatch mirrors.yml --ref develop -f mirror=jaah-ce`), your own branch, as for
+`run rerun`, or a release's pinned `release/<id>` for the run the control plane says carries it (`release.authorize`
+with no base: the release executor, or the merge lane holding its PR) — never `master` or another branch no task
+delivers to — and never with `push_enabled=false` (`policy.check_dispatch`). A dispatched run is no PR's check run:
+it never satisfies one.
 
 READ-ONLY LISTS. `pr list` prints the newest PRs first, each `{number, title, head, base, author, state,
 merge_state, checks, url, auto_merge}` (`--state` defaults to `open`; `closed` is every settled PR, merged ones included;
@@ -114,6 +141,34 @@ and at most ten when one does (a list may then come back short), and never by po
   `auto_merge` off the listing (GitLab `merge_when_pipeline_succeeds`/`auto_merge_enabled`, Azure
   `autoCompleteSetBy`) — and prints `merge_state` and `checks` as null (`pr view N` names them). Bitbucket lists
   no mergeability either and views each listed PR in turn.
+
+CI VARIABLES AND SECRETS (every forge). `var` writes plain CI variables, `secret` encrypted ones, at the repository
+level or, with `--env E`, a deployment environment's. `list` prints `[{name, value}]` for variables and `[{name}]` for
+secrets — a secret's value is never read back. `set` creates or overwrites and prints `{kind, name, scope, action}`
+(`action` `created|updated`, `scope` `repository`, `environment:E` or `dependabot`); `delete` prints `{kind, name, scope,
+deleted: true}` and exits 3 on a name that does not exist. A name is letters, digits and `_`, not starting with a
+digit. A secret's value comes only from `--value-file` (`-` = stdin), never the command line `ps` shows; a value
+read from a file loses ONE trailing newline, and an empty value exits 5. Any runner may write them (the operator's
+choice) except a benchmark shadow (exit 2). A forge answering 403 (not a rate limit) exits 4 naming the right the login
+lacks (each adapter's `VARIABLE_RIGHTS`; `DEPENDABOT_RIGHTS` with `--dependabot`). Per forge:
+  - GitHub: Actions variables and secrets (`actions/variables`, `actions/secrets`; `environments/E/...`). A secret
+    is sealed with the repository's public key in-house (`sealed_box.py`, libsodium's `crypto_box_seal`).
+    `secret ... --dependabot` uses the repository's Dependabot secrets instead (`dependabot/secrets`, `scope`
+    `dependabot`), the only store a `dependabot.yml` `${{secrets.NAME}}` reads; it takes no `--env`, and on any
+    other forge exits 5.
+  - GitLab: project CI/CD variables; a secret is a masked, hidden, protected-off variable — GitLab masks only a
+    single line of at least 8 characters (else exit 3); `--env E` is the variable's `environment_scope` (repository
+    level is scope `*`, so `--env '*'` exits 5).
+  - Bitbucket: Pipelines repository variables; `--env E` is the deployment environment named E; a secret is
+    `secured`.
+  On GitLab and Bitbucket a name holds ONE of the two kinds: `set` over the other kind converts it; `delete` removes
+  only its own kind (exit 3 otherwise), as on Azure.
+  - Azure DevOps: no repository-level variables exist, so each level is a Library variable group of the project,
+    `jaah-<repo>` (`jaah-<repo>-<E>` with `--env`), created on first `set` and deleted with its last variable; a
+    secret is `isSecret`. Its description marks it jaah-forge's for that repo and level: a group of that name without
+    the mark (made by hand, or another repo's) is never written — exit 3. A write PUTs the whole group, so two writes
+    to one group at once can lose one. `set` and
+    `delete` also print `group` and `pipeline_yaml` — the `variables: - group:` line a pipeline needs to see it.
 
 EXIT CODES (`model.py`): 0 ok · 2 policy refusal (stderr carries the delivery recipe) · 3 forge error
 (message capped at 200 chars) · 4 credential refused (the broker's reason verbatim) · 5 misuse.

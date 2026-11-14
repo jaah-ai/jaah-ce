@@ -1,34 +1,33 @@
 import { type FormEvent, type JSX, useCallback, useState } from 'react'
-import { Link as RouterLink, useNavigate, useParams } from 'react-router-dom'
-import { useQueryClient } from '@tanstack/react-query'
+import { useNavigate, useParams } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Typography from '@mui/material/Typography'
+import { useAuth } from '../../../auth'
 import Breadcrumb from '../../../components/Breadcrumb'
 import { TabPanel, Tabs, type TabDef } from '../../../components/Tabs'
 import { useRowActions } from '../../../hooks/useBusyIds'
 import { useEditRecord } from '../../../hooks/useEditRecord'
 import { useSubmit } from '../../../hooks/useSubmit'
 import { useUrlTab } from '../../../hooks/useUrlTab'
-import { absoluteTime } from '../../../lib/relativeTime'
+import { isOrgAdminSeat } from '../../../lib/orgAdmin'
+import { absoluteTime, DAY_MS } from '../../../lib/relativeTime'
 import { localInputToIso } from '../../../lib/zonedTime'
 import Banner from '../../../ui/Banner'
 import { ChoiceField } from '../../../ui/ChoiceField'
 import { DetailPage } from '../../../ui/detail/DetailPage'
-import DetailStatus from '../../../ui/detail/DetailStatus'
-import FormActionBar from '../../../ui/FormActionBar'
+import { EditStatus } from '../../../ui/detail/DetailStatus'
+import CancelSaveBar from '../../../ui/CancelSaveBar'
 import { FormDialog } from '../../../ui/FormDialog'
+import { EntityNameFields } from '../../../ui/EntityNameFields'
 import FormTextField from '../../../ui/FormTextField'
 import { KeyValue, KeyValueList } from '../../../ui/KeyValueList'
 import { FORM_SX, TEXT_INPUT } from '../../../ui/formDensity'
 import { ID_SX, tapTargetSx } from '../../../ui/listStyles'
 import LoadingState from '../../../ui/LoadingState'
-import SavedNote from '../../../ui/SavedNote'
 import SecretOnceDialog from '../../../ui/SecretOnceDialog'
 import StatusChip from '../../../ui/StatusChip'
-import SubmitButton from '../../../ui/SubmitButton'
 import {
-  API_KEYS_KEY,
   API_KEYS_URL,
   type ApiKey,
   type ApiKeyUpdateBody,
@@ -42,14 +41,14 @@ import {
 } from './api'
 import ApiKeyActivity from './ApiKeyActivity'
 import { useCanCreateKey } from './ApiKeysSection'
-import { DEFAULT_OVERLAP, expiryText, isLive, lastUsedText, OVERLAP_OPTIONS, revokeConfirm, STATUS_LABEL, STATUS_TONE } from './keyFacts'
+import { DEFAULT_OVERLAP, expiryText, isLive, lastUsedText, OVERLAP_OPTIONS, revokeConfirm, STATUS } from './keyFacts'
 import KeyPermissionGrid from './KeyPermissionGrid'
 import { fromKey, preset, toGrants, type GridValue } from './keyPermissions'
 import { useGridRows } from './useGridRows'
 
 /* One API key: `/settings/api-keys/new` (`mode="create"`) and `/settings/api-keys/:keyId`. Overview (name,
  * description, expiry, IP allowlist), Permissions (the grid) and Activity (its audit rows). One Save bar.
- * Only the owner edits or rotates; any Org Owner or Admin revokes. The secret is shown once, in a dialog, after
+ * Only the owner edits or rotates; the owner or any Org Owner or Admin revokes. The secret is shown once, in a dialog, after
  * create and rotate — never again. Every rule is the server's (`app/api_keys.py`). */
 
 type Tab = 'overview' | 'permissions' | 'activity'
@@ -79,7 +78,7 @@ export function expiryFor(choice: ExpiryChoice, custom: string, now: Date = new 
   if (choice === 'custom') return localInputToIso(custom) || false
   const at = new Date(now)
   if (choice === '1y') at.setFullYear(at.getFullYear() + 1)
-  else at.setTime(at.getTime() + (DAYS[choice] ?? 0) * 86_400_000)
+  else at.setTime(at.getTime() + (DAYS[choice] ?? 0) * DAY_MS)
   return at.toISOString()
 }
 
@@ -92,8 +91,9 @@ export default function ApiKeyDetailPage({ mode }: { mode?: 'create' }): JSX.Ele
   const { keyId } = useParams<{ keyId: string }>()
   const creating = mode === 'create'
   const navigate = useNavigate()
-  const queryClient = useQueryClient()
   const canCreate = useCanCreateKey()
+  // Org administration is an Org Owner or Admin's to give (`routes/api_keys.py`): hidden, and never ticked, otherwise.
+  const orgAdminShown = isOrgAdminSeat(useAuth().admin)
   const { rows: grid, error: gridError } = useGridRows()
 
   const [detail, setDetail] = useState<ApiKey | null>(null)
@@ -127,20 +127,15 @@ export default function ApiKeyDetailPage({ mode }: { mode?: 'create' }): JSX.Ele
   const [tab, selectTab] = useUrlTab(creating ? TABS.slice(0, 2) : TABS, 'overview')
 
   // The grid's value: seeded from the key (or all ticked) on the first draw after the catalog arrives.
-  const value: GridValue | null = grants ?? (grid ? (detail ? fromKey(grid, detail) : preset(grid, 'all')) : null)
+  const value: GridValue | null = grants ?? (grid ? (detail ? fromKey(grid, detail) : preset(grid, 'all', orgAdminShown)) : null)
 
-  const changed = useCallback((row: ApiKey) => {
-    setDetail(row)
-    void queryClient.invalidateQueries({ queryKey: API_KEYS_KEY })
-  }, [queryClient])
+  const changed = useCallback((row: ApiKey) => setDetail(row), [])
 
   if (!creating && (loading || notFound || loadError || !detail)) {
     return (
-      <DetailStatus
+      <EditStatus
         trail={<Breadcrumb items={[{ label: 'API keys', to: API_KEYS_URL }, { label: 'API key' }]} />}
-        loading={loading || (!notFound && !loadError)}
-        notFound={notFound && 'API key not found'}
-        error={loadError || 'Could not load the API key.'}
+        loading={loading} notFound={notFound} loadError={loadError} notFoundTitle="API key not found"
       />
     )
   }
@@ -245,14 +240,8 @@ export default function ApiKeyDetailPage({ mode }: { mode?: 'create' }): JSX.Ele
   )
 
   const saveBar = !readOnly && (
-    <FormActionBar testId="api-key-actions" stretchTestIds={['api-key-save']}>
-      <SavedNote show={saved} sx={{ alignSelf: 'center', mr: 'auto' }} />
-      <Button component={RouterLink} to={API_KEYS_URL} variant="text" sx={tapTargetSx}>Cancel</Button>
-      <SubmitButton testId="api-key-save" busy={saving} busyLabel={creating ? 'Creating…' : 'Saving…'}
-        disabled={!complete || unchanged} onClick={() => submit()}>
-        {creating ? 'Create' : 'Save'}
-      </SubmitButton>
-    </FormActionBar>
+    <CancelSaveBar testId="api-key-actions" saveTestId="api-key-save" cancelTo={API_KEYS_URL} creating={creating}
+      busy={saving} disabled={!complete || unchanged} saved={saved} saveProps={{ onClick: () => submit() }} />
   )
 
   return (
@@ -260,7 +249,7 @@ export default function ApiKeyDetailPage({ mode }: { mode?: 'create' }): JSX.Ele
       breadcrumb={<Breadcrumb items={[{ label: 'API keys', to: API_KEYS_URL }, { label: heading }]} />}
       title={heading}
       titleAside={detail && (
-        <StatusChip label={STATUS_LABEL[detail.status]} tone={STATUS_TONE[detail.status]} data-status={detail.status} />
+        <StatusChip label={STATUS[detail.status].label} tone={STATUS[detail.status].tone} data-status={detail.status} />
       )}
       subtitle={detail && (
         <Box component="span" sx={ID_SX} data-testid="api-key-display">{detail.display}</Box>
@@ -285,20 +274,21 @@ export default function ApiKeyDetailPage({ mode }: { mode?: 'create' }): JSX.Ele
 
       <TabPanel id="overview" current={tab} idPrefix="api-key">
         <Box component="form" onSubmit={submit} sx={FORM_SX} data-testid="api-key-form">
-          <FormTextField label="Name" id="api-key-name" value={name} onChange={v => edited(() => setName(v))}
-            disabled={readOnly} required autoFocus={creating} testId="api-key-name"
-            slotProps={{ htmlInput: { ...TEXT_INPUT.htmlInput, maxLength: 100 } }} />
-          <FormTextField label="Description" id="api-key-description" value={description}
-            onChange={v => edited(() => setDescription(v))} disabled={readOnly} multiline minRows={2}
-            slotProps={{ htmlInput: { maxLength: 1000 } }} />
+          <EntityNameFields
+            idPrefix="api-key"
+            disabled={readOnly}
+            name={{ value: name, onChange: v => edited(() => setName(v)), autoFocus: creating, testId: 'api-key-name', maxLength: 100, help: 'Identifies the key in lists; calls never send it.' }}
+            description={{ value: description, onChange: v => edited(() => setDescription(v)), maxLength: 1000, help: 'Admins’ note; never changes what the key can do.' }}
+          />
           {creating ? (
             <>
               <FormTextField label="Expires" id="api-key-expiry" value={expiry}
                 onChange={v => edited(() => setExpiry(v as ExpiryChoice))} options={EXPIRY_OPTIONS} disabled={readOnly}
-                hint="Can't be extended later." testId="api-key-expiry" />
+                help="Calls are refused after this; it can't be extended." testId="api-key-expiry" />
               {expiry === 'custom' && (
                 <FormTextField label="Expiry date" id="api-key-expiry-custom" type="datetime-local" value={customExpiry}
                   onChange={v => edited(() => setCustomExpiry(v))} required disabled={readOnly} testId="api-key-expiry-custom"
+                  help="Calls with this key are refused from this moment."
                   error={expiryPast ? 'Pick a time in the future.' : undefined} />
               )}
             </>
@@ -323,6 +313,11 @@ export default function ApiKeyDetailPage({ mode }: { mode?: 'create' }): JSX.Ele
           )}
           <FormTextField label="IP allowlist" id="api-key-allowlist" value={allowlist}
             onChange={v => edited(() => setAllowlist(v))} disabled={readOnly} multiline minRows={2}
+            help={{
+              tip: 'Calls from any other address are refused.',
+              more: 'The organization’s own IP allowlist applies too. A change applies from the key’s next call.',
+              docs: 'administration/security-and-audit/api-keys',
+            }}
             hint="One address or CIDR per line. Empty: any address." testId="api-key-allowlist"
             slotProps={{ htmlInput: { ...TEXT_INPUT.htmlInput } }} />
           {/* Enter in a field submits; the visible Save is the page's bar. */}
@@ -335,7 +330,7 @@ export default function ApiKeyDetailPage({ mode }: { mode?: 'create' }): JSX.Ele
           {gridError && <Banner severity="error">{gridError}</Banner>}
           {!grid && !gridError && <LoadingState />}
           {grid && value && (
-            <KeyPermissionGrid rows={grid} value={value} disabled={readOnly}
+            <KeyPermissionGrid rows={grid} value={value} disabled={readOnly} orgAdminShown={orgAdminShown}
               onChange={next => edited(() => setGrants(next))} />
           )}
           <Typography variant="body2" sx={{ color: 'text.secondary', mt: 1.5 }}>
@@ -366,10 +361,11 @@ export default function ApiKeyDetailPage({ mode }: { mode?: 'create' }): JSX.Ele
           </Typography>
           <ChoiceField
             label="Old secret keeps working for"
+            help="Calls with the old secret still succeed until then."
             value={overlap}
             onChange={setOverlap}
             testId="api-key-overlap"
-            options={OVERLAP_OPTIONS.map(o => ({ value: o.value, label: o.label, hint: null, testId: `api-key-overlap-${o.value}` }))}
+            options={OVERLAP_OPTIONS.map(o => ({ value: o.value, label: o.label, help: null, testId: `api-key-overlap-${o.value}` }))}
           />
         </FormDialog>
       )}

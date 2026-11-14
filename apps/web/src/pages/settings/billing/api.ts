@@ -1,9 +1,9 @@
-// Billing's ONE API client (Settings › Billing › Stripe, Products › Plans and Hosting products): the Stripe status (`GET /api/billing/status`), the plan catalogue
-// (`routes/billing_plans.py`) and the hosting price catalogue (`/api/billing/rental-prices`). Operator-only.
+// Billing's ONE API client (Settings › Billing › Stripe, Products › Plans): the Stripe status (`GET /api/billing/status`) and the
+// plan catalogue (`routes/billing_plans.py`). Operator-only.
 
 import { del, get, patch, post } from '../../../api'
 import type { PlanPrice } from '../../../lib/orgPlan'
-import type { ProductLine, ProductLineIn } from '../../../lib/planProducts'
+import type { ProductLine } from '../../../lib/planProducts'
 
 export const BILLING_STATUS_PATH = '/api/billing/status'
 
@@ -47,6 +47,7 @@ export const PLAN_SWITCH_DEFAULTS = {
   nodelink_allowed: false,
   merge_lane_enabled: false,
   microvm_allowed: true,
+  node_vm_allowed: false,
   playbooks_enabled: false,
   ubuntu_nodes_allowed: true,
   macos_nodes_allowed: false,
@@ -68,6 +69,14 @@ export const PLAN_SWITCH_DEFAULTS = {
   gcp_cloud_allowed: false,
   azure_cloud_allowed: false,
   tenant_email_allowed: true,
+  intelligent_routing: false,
+  production_qa: false,
+  benchmark_mode: false,
+  agent_performance: false,
+  webhooks_enabled: true,
+  pipeline_custom_enabled: false,
+  custom_domains_allowed: false,
+  placement_groups_allowed: false,
   org_templates_enabled: false,
 } as const satisfies Record<string, boolean>
 export type PlanSwitchField = keyof typeof PLAN_SWITCH_DEFAULTS
@@ -81,7 +90,10 @@ export type EffectiveSwitch = { value: boolean; inherited_from: string | null; i
  *  `price` carries the monthly and yearly prices and per agent together; `providers` is the provider grid. */
 export const INHERITABLE_FIELDS = [
   'price', 'trial_days', 'min_agents', 'max_agents', ...PLAN_LIMIT_KINDS, 'task_attachment_mb', 'attachment_file_mb',
-  'org_attachment_gb', 'agent_requests_per_minute', 'cron_min_period_seconds', 'static_slots', 'duration_days',
+  'org_attachment_gb', 'agent_requests_per_minute', 'cron_min_period_seconds', 'outcome_survival_days',
+  'easy_mode_apps', 'easy_mode_requests_month', 'easy_mode_egress_gb_month', 'easy_mode_db_mb', 'easy_mode_emails_month', 'easy_mode_concurrency',
+  'easy_mode_domains_per_app',
+  'easy_mode_sponsor_end', 'duration_days',
   'then_plan_key', 'products', 'providers',
 ] as const
 export type InheritableField = (typeof INHERITABLE_FIELDS)[number]
@@ -92,6 +104,8 @@ export const DEFAULTS_KEY = '_default'
 export const DEFAULTS_NAME = '(default)'
 
 export type PlanAdmin = {
+  /** The row's id: its product lines' address (`lib/products.ts` getPlanLines). */
+  id: string
   key: string
   name: string
   blurb: string
@@ -117,15 +131,8 @@ export type PlanAdmin = {
   then_plan_key: string | null
   /** Every switch, included plans counted. */
   effective_switches: Record<PlanSwitchField, EffectiveSwitch>
-  /** Static worktrees a project may hold on one node, for orgs on the plan; 0 = none. */
-  static_slots: number
-  /** What one task may store, and the largest file one upload may carry, MB. */
-  task_attachment_mb?: number | null
-  attachment_file_mb?: number | null
-  /** What one org may store across its tasks, GB; the calls its nodes may make per minute; its fastest cron, seconds. */
-  org_attachment_gb?: number | null
-  agent_requests_per_minute?: number | null
-  cron_min_period_seconds?: number | null
+  /** Days after merge a build's outcome counts as survived (1–365). */
+  outcome_survival_days: number
   /** The fields this plan reads from `(default)`; always empty on `(default)` itself. */
   inherits?: InheritableField[]
   /** The bundled products, each with the server's readable `label`. */
@@ -148,7 +155,31 @@ export type PlanAdmin = {
   subscriber_count: number
   /* Each switch: on a plan true On, false Off, null = `(default)`'s value (an included plan's On wins either way);
      always a boolean on `(default)`. */
-} & Record<PlanSwitchField, boolean | null>
+} & PlanCaps & Record<PlanSwitchField, boolean | null>
+
+/** The caps a plan may set, the plan's own: null = `(default)`'s, and on a write an explicit null clears each back
+ *  to `(default)`'s. Absent from an older server. */
+export type PlanCaps = {
+  /** What one task may store, and the largest file one upload may carry, MB. */
+  task_attachment_mb?: number | null
+  attachment_file_mb?: number | null
+  /** What one org may store across its tasks, GB; the calls its nodes may make per minute; its fastest cron, seconds. */
+  org_attachment_gb?: number | null
+  agent_requests_per_minute?: number | null
+  cron_min_period_seconds?: number | null
+} & EasyModeCaps
+
+/** The Easy Mode caps (`app/plan_terms.py::EASY_MODE_TERMS`). The sponsorship end is a `YYYY-MM-DD` day, null = none. */
+export type EasyModeCaps = {
+  easy_mode_apps?: number | null
+  easy_mode_requests_month?: number | null
+  easy_mode_egress_gb_month?: number | null
+  easy_mode_db_mb?: number | null
+  easy_mode_emails_month?: number | null
+  easy_mode_concurrency?: number | null
+  easy_mode_domains_per_app?: number | null
+  easy_mode_sponsor_end?: string | null
+}
 
 /** One switch's human label (`switch_catalogue`), in display order. */
 export type SwitchLabel = { name: PlanSwitchField; label: string }
@@ -185,22 +216,14 @@ export type PlanCreate = {
   /** Explicit null clears the link. A duration needs a then plan (422 "Needs a then plan."). */
   includes_plan_key?: string | null
   then_plan_key?: string | null
-  static_slots?: number
-  /** Explicit null clears each back to `(default)`'s. */
-  task_attachment_mb?: number | null
-  attachment_file_mb?: number | null
-  org_attachment_gb?: number | null
-  agent_requests_per_minute?: number | null
-  cron_min_period_seconds?: number | null
+  outcome_survival_days?: number
   /** Replaces the whole list. Refused on `(default)`. */
   inherits?: InheritableField[]
-  /** Replaces the whole list. */
-  products?: ProductLineIn[]
   /** The provider grid's `[row, auth]` cells, the whole list. */
   providers?: string[][]
   self_serve?: boolean
   sort_order?: number
-} & Partial<Record<PlanSwitchField, boolean | null>>
+} & PlanCaps & Partial<Record<PlanSwitchField, boolean | null>>
 /** A price can be changed (a new Stripe Price) or cleared (null; the monthly one only while nobody subscribes). */
 export type PlanPatch = Partial<Omit<PlanCreate, 'key' | 'unit_amount' | 'yearly_unit_amount'>> & {
   /** null = no price: both Stripe Prices archived (409 while anyone subscribes). */
@@ -261,55 +284,3 @@ export const retireBillingPlan = (key: string) =>
   post<PlanAdmin>(`${BILLING_PLANS_PATH}/${encodeURIComponent(key)}/retire`)
 /** Only a `deletable` plan; 409 with a sentence otherwise. Its Stripe Prices are archived. */
 export const deleteBillingPlan = (key: string) => del(`${BILLING_PLANS_PATH}/${encodeURIComponent(key)}`)
-
-export const HOSTING_PRICES_PATH = '/api/billing/rental-prices'
-
-/** `instance` = a Dedicated host's instance type, `storage` = a size in GB, `shared` = a Shared tier, `windows` = the
- *  monthly Windows license on a Dedicated host of that instance type (key = the type). */
-export type HostingKind = 'instance' | 'storage' | 'shared' | 'windows'
-/** `live_cast`: Live Cast's one per-project price (key `project`) — Products › Live Cast, never a hosting list. */
-export type RentalPriceKind = HostingKind | 'live_cast'
-
-export type HostingPriceAdmin = {
-  id: string
-  kind: RentalPriceKind
-  /** The instance type, the size in GB, or the tier's key. Fixed once created. */
-  key: string
-  name: string
-  /** Integer cents per month. */
-  monthly_cents: number
-  active: boolean
-  sort_order: number
-  vcpu: number | null
-  ram_gb: number | null
-  /** A Shared tier's disk in GB: the cap its Shared nodes bind to. Null on instance and storage rows. */
-  disk_gb: number | null
-  /** Sells in Stripe at this price on the connected account. */
-  synced: boolean
-  /** An instance row: whether the allow-list still allows its type (false = stale). Null on storage and Shared. */
-  allowed: boolean | null
-  /** An instance row: `vcpu`/`ram_gb` are the allowed type's own specs, not the operator's. */
-  specs_from_type?: boolean
-}
-
-export type HostingPrices = { billing_connected: boolean; prices: HostingPriceAdmin[] }
-
-/** Saves without a Stripe connection too: the row is pushed on a later save or by the nightly reconcile. */
-export type HostingPriceCreate = {
-  /** `live_cast`: key and name are the server's own. */
-  kind: RentalPriceKind
-  key?: string
-  name?: string
-  monthly_cents: number
-  active?: boolean
-  sort_order?: number
-  vcpu?: number
-  ram_gb?: number
-  disk_gb?: number
-}
-export type HostingPricePatch = Partial<Pick<HostingPriceAdmin, 'name' | 'monthly_cents' | 'active' | 'sort_order' | 'vcpu' | 'ram_gb' | 'disk_gb'>>
-
-export const listHostingPrices = () => get<HostingPrices>(HOSTING_PRICES_PATH)
-export const createHostingPrice = (body: HostingPriceCreate) => post<HostingPriceAdmin>(HOSTING_PRICES_PATH, body)
-export const updateHostingPrice = (id: string, body: HostingPricePatch) =>
-  patch<HostingPriceAdmin>(`${HOSTING_PRICES_PATH}/${encodeURIComponent(id)}`, body)

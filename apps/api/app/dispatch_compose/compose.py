@@ -2,19 +2,22 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from typing import TypedDict
+from datetime import datetime
+from typing import Any, TypedDict
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import agent_providers, edition, edition_features, model_catalog, playbook_engine
+from app import agent_providers, edition, edition_features, mcp_links, model_catalog, playbook_engine
 from app.agent_providers import AgentProvider
+from app.clock import utcnow
 from app.dispatch_compose import task_prompt
+from app.dispatch_compose.directives import _autonomous_directive
 from app.dispatch_compose.input_staging import _attachment_workdir, _expected_inputs, stage_input_artifacts
-from app.dispatch_compose.placeholders import respell_vocabulary
 from app.dispatch_compose.role_tables import _CONSOLE_INTERVIEW, _NEVER_ASKS, _NO_AUTOCLOSE
-from app.dispatch_compose.system_prompt import build_system_prompt, build_system_prompt_with, resolve_provider
+from app.dispatch_compose.system_prompt import (
+    apply_provider_values, build_system_prompt, build_system_prompt_with, resolve_provider,
+)
 from app.dispatch_compose.task_prompt import PromptRepo, build_task_prompt
 from app.models.projects import Project
 from app.persona_registry import MODE_BUILD, PERSONA_CHARTER, charter_delivery, charter_mode
@@ -36,6 +39,8 @@ class _SharedPromptArgs(TypedDict):
     agent_instructions: str
     memory: bool
     merge_lane: bool
+    shadow: str
+    production_branch: str
 
 
 def _task_resolvers():
@@ -128,19 +133,6 @@ def _node_model_catalog(session: Session, node_id: str, provider: AgentProvider)
     return models if isinstance(models, list) else []
 
 
-def _node_reports(session: Session, node_id: str, key: str, value: str) -> bool:
-    """Whether the dispatching node's config snapshot reports `key: value`. False for an empty or unknown
-    node and for a snapshot not yet reported: the two naming probes below read False as "tell it the legacy
-    names", which every node resolves. Lazy import, as in `_node_model_catalog`."""
-    from app.models.nodes import Node
-    from app.node_identity import node_matches
-
-    if not node_id:
-        return False
-    snapshot = session.scalar(select(Node.config_snapshot).where(node_matches(node_id)))
-    return (snapshot.get(key) if isinstance(snapshot, dict) else None) == value
-
-
 def _mounted_nodelinks(session: Session, node_id: str) -> tuple[tuple[str, str], ...]:
     """Every NodeLink `node_id` reports mounted (`nodelinks.mounted_for_prompt`), `()` for an
     empty or unknown node. Degrades to `()` on any failure: the line is supplementary, never worth a dispatch.
@@ -163,13 +155,24 @@ def _mounted_nodelinks(session: Session, node_id: str) -> tuple[tuple[str, str],
         return ()
 
 
-def _node_uses_legacy_vocabulary(session: Session, node_id: str) -> bool:
-    """Whether the dispatching node must be told the pre-rename agent verbs and tools
-    (`agent_providers.VOCABULARY_SPELLINGS`): True unless its config snapshot reports `vocabulary: industry`.
-    The pre-rename names resolve on every node, the industry ones only on an upgraded node."""
-    return not _node_reports(
-        session, node_id, agent_providers.VOCABULARY_SNAPSHOT_KEY, agent_providers.CURRENT_VOCABULARY
-    )
+def _deployments_branch(session: Session, project_id: int) -> str:
+    """The Production stage's branch when the project's org has a Release step on its pipeline (the `production_qa` plan
+    switch, as the console offers the tab: `routes/auth.py`'s `production_qa`), else "". A project being onboarded
+    has not opted in yet, so the switch, not `gate.state`, decides. Read-only (`stages.for_read`); any failure
+    composes without the fact, logged."""
+    from app.production_qa import gate
+    from app.releases import stages
+
+    try:
+        with session.begin_nested():
+            row = session.scalars(select(Project).where(Project.id == project_id)).first()
+            if row is None or not gate.org_on(session, row.org_id):
+                return ""
+            production = stages.production_stage(stages.for_read(session, row))
+            return stages.branch_of(row, production) if production is not None else ""
+    except Exception:  # noqa: BLE001 — logged; the dispatch goes ahead without the fact
+        log.exception("compose: project %s's Deployments branch could not be read; composing without it", project_id)
+        return ""
 
 
 def _catalog_is_fresh(observed_at: object) -> bool:
@@ -181,7 +184,7 @@ def _catalog_is_fresh(observed_at: object) -> bool:
         return False
     if stamped.tzinfo is None:
         return False
-    age = (datetime.now(timezone.utc) - stamped).total_seconds()
+    age = (utcnow() - stamped).total_seconds()
     return age <= model_catalog.CATALOG_FRESH_SECONDS
 
 
@@ -207,6 +210,88 @@ def _model_for_provider(
     return tier, model_catalog.keep_context_suffix(concrete, model)
 
 
+def _role_of(persona: str, task_row: Any) -> tuple[str, str | None, Any, dict | None]:
+    """`(charter_key, stage default model, stage, staged role)` for a dispatchable PERSONA (in
+    `PERSONA_CHARTER`) on TASK_ROW — one derivation for `compose` and the live-edit helpers below.
+
+    A playbook stage row (`playbook_engine`): its prompt is its stage's expert × deliverable, its stage default
+    model its stage's tier (already capped by its container), its instructions the project's then the stage's
+    own. Its persona — chosen for the deliverable — still decides the charter key, which keys only the guards and
+    autoclose. No stage (None, None) runs the persona-keyed composition unchanged."""
+    charter_key, persona_model = PERSONA_CHARTER[persona]
+    stage = getattr(task_row, "playbook_stage", None) or None
+    staged = playbook_engine.system_role(stage) if stage else None
+    if stage and stage.get("tier"):
+        persona_model = stage["tier"]
+    return charter_key, persona_model, stage, staged
+
+
+def _ask_terms(charter_key: str, staged: dict | None) -> dict[str, bool]:
+    """`build_task_prompt`'s `asks_at_gate` (may this role's gate ask at all, `_NEVER_ASKS`) and `console_present`
+    (is its operator live at the console, `_CONSOLE_INTERVIEW`); a playbook stage carries its own."""
+    if staged:
+        return {"asks_at_gate": staged["asks_at_gate"], "console_present": staged["console_present"]}
+    return {"asks_at_gate": charter_key not in _NEVER_ASKS, "console_present": charter_key in _CONSOLE_INTERVIEW}
+
+
+def human_in_the_loop_directive(session: Session, task_row: Any, provider: str, *, autonomous: bool) -> str:
+    """The human-in-the-loop directive exactly as a fresh dispatch of TASK_ROW on PROVIDER renders it
+    (`task_prompt._autonomous_directive` through `apply_provider_values`), for `app/live_task_edits.py` to type
+    into a live runner whose involvement changed. AUTONOMOUS is the effective switch
+    (`_task_effective_autonomous`), as the dispatch projection serves it. Raises `KeyError` for a persona with no
+    charter and `ValueError` for an unknown provider (`resolve_provider`) — the caller's to log."""
+    from app import slot_allocation  # lazy, as `_node_model_catalog`'s: only this path needs it
+
+    charter_key, _model, _stage, staged = _role_of(task_row.persona, task_row)
+    provider_record = resolve_provider(provider)
+    return apply_provider_values(
+        _autonomous_directive(autonomous, **_ask_terms(charter_key, staged), provider=provider_record),
+        provider_record,
+        epic=task_row.parent_task_id is not None,
+        repo=slot_allocation.task_has_repo(session, task_row),
+    )
+
+
+def live_model_for(session: Session, task_row: Any, provider: str, node_id: str) -> str:
+    """The concrete `--model` a fresh dispatch of TASK_ROW on PROVIDER at NODE_ID would launch (`_resolve_model` then
+    `_model_for_provider`, no per-request override), for `app/live_task_edits.py`'s `switch_model`. "" means the
+    CLI's own default. Raises `model_catalog.ForeignModelRefused` as `compose` would see it."""
+    _charter, persona_model, _stage, _staged = _role_of(task_row.persona, task_row)
+    _tier, model = _model_for_provider(
+        session,
+        _resolve_model(session, "", task_row.model, persona_model, task_row.project_id),
+        resolve_provider(provider),
+        node_id,
+    )
+    return model
+
+
+def _review_lanes_line(session: Session, task_row: Any, task_id: object, persona: str, provider: AgentProvider,
+                       node_id: str) -> str:
+    """A coder's Start-here "Review lanes:" line: its decision's lanes (`agent_router.review_lanes_of`) on the
+    author's harness, each lane's tier resolved to a model this provider serves (`review_lanes.for_author`).
+    Advisory: a failure is logged and composes no line, never a refused dispatch."""
+    from app import agent_router
+    from app.agent_router import review_lanes
+
+    if persona != review_lanes.CODER:
+        return ""
+    try:
+        # A SAVEPOINT: a failed catalog read must not leave the dispatch's transaction aborted (R3).
+        with session.begin_nested():
+            stored = agent_router.review_lanes_of(session, int(str(task_id)), getattr(task_row, "review_tier", None))
+            # Compose serves built-in runs only (an SDK agent launches through `agent_resolution.launch_for`), so this
+            # author is never an SDK agent; `run_agent_id` may still hold an earlier attempt's agent until the claim.
+            lanes = review_lanes.for_author(
+                stored, agent_run=False, provider=provider.value,
+                resolve_model=lambda tier: _model_for_provider(session, tier, provider, node_id)[1],
+            )
+    except Exception:  # noqa: BLE001 — the lanes line is guidance; it never costs a dispatch
+        log.exception("compose: task %s's review lanes could not be read; composing without them", task_id)
+        return ""
+    return review_lanes.prompt_line(lanes)
+
+
 def _verdict(action: str, reason: str, **extra: object) -> dict:
     """A composer verdict dict. `action` ∈ dispatch|skip|error drives the dispatcher's branch; skip/error
     carry empty fields and an empty staging instruction, so the shape is stable.
@@ -228,6 +313,8 @@ def _verdict(action: str, reason: str, **extra: object) -> dict:
         "autoclose": True,
         # Project memory's dispatch facts when the arm is ON (`_project_memory_for`), else None.
         "memory": None,
+        # The launch contract's remote MCP servers (`app/mcp_links.py::connections_for_task`): no secret.
+        "mcp_connections": [],
     }
     out.update(extra)
     return out
@@ -302,15 +389,7 @@ def compose(
             f"task persona {persona!r} has no charter mapping (absent from PERSONA_CHARTER) — needs human "
             "triage; never defaulted to the implementer",
         )
-    charter_key, persona_model = PERSONA_CHARTER[persona]
-    # A playbook stage row (`playbook_engine`): its prompt is its stage's expert × deliverable, its stage
-    # default model its stage's tier (already capped by its container), its instructions the project's then
-    # the stage's own. Its persona — chosen for the deliverable — still decides the charter key, which keys
-    # only the guards and autoclose below. None runs today's persona-keyed composition unchanged.
-    stage = getattr(task_row, "playbook_stage", None) or None
-    staged = playbook_engine.system_role(stage) if stage else None
-    if stage and stage.get("tier"):
-        persona_model = stage["tier"]
+    charter_key, persona_model, stage, staged = _role_of(persona, task_row)
     # The projection's own `model` field, so a row's pin beats the persona's stage default.
     # A tier, resolved to the concrete model on THIS provider (and, for a catalog provider, this node).
     # Outside the `try`: an unknown provider is a hard refusal of its own (`resolve_provider`).
@@ -338,6 +417,16 @@ def compose(
     epic_child = task.get("parent_task_id") is not None
     # The lane's own run is the merger: the "lane merges, you do not" rewrites are for the PR runners it merges.
     merge_lane = merge_lane and persona != "merge_lane"
+    # A benchmark shadow is never enqueued, so neither half tells it about the lane.
+    is_shadow = bool(getattr(task_row, "shadow", False))
+    merge_lane = merge_lane and not is_shadow
+    # Its prompt section, base commit filled in (`outcome_ledger/benchmark.py::shadow_section`); "" for every other task.
+    shadow = ""
+    if is_shadow:
+        if edition_features.enabled("exec_dashboard"):  # benchmark mode is the Command center's
+            from app.outcome_ledger.benchmark import shadow_section
+
+            shadow = shadow_section(session, task_row.id)
     # The facts both builders take, spelled once: the staged branch supplies the role from the playbook,
     # the other from the charter key.
     shared = _SharedPromptArgs(
@@ -351,6 +440,11 @@ def compose(
         agent_instructions=agent_instructions,
         memory=memory_arm,
         merge_lane=merge_lane,
+        # A benchmark shadow (`app/outcome_ledger/benchmark.py`): never enqueued, settles `shadow_pr`.
+        shadow=shadow,
+        # Only the Repo Wizard (a charter dispatch or a playbook stage) is told the Release step promotes.
+        production_branch=(_deployments_branch(session, task.get("project_id"))
+                           if charter_key == "onboard" and has_repo else ""),
     )
     if staged is not None:
         system_prompt = build_system_prompt_with(
@@ -388,6 +482,10 @@ def compose(
 
         if memory_arm:
             memory_section, memory = project_memory._project_memory_or_nothing(session, task_row, task, persona)
+    review_line = (_review_lanes_line(session, task_row, task.get("id"), persona, provider_record, node_id)
+                   if has_repo else "")
+    from app import slot_allocation  # lazy, as `human_in_the_loop_directive`'s
+
     task_text = build_task_prompt(
         owner_repo,
         task.get("title") or "",
@@ -400,12 +498,16 @@ def compose(
         provider=provider,
         epic=epic_child,
         repo=has_repo,
+        # A folder slot on a project with a repository: its starter ran it without one (`TaskStartIn.without_repo`).
+        repo_withheld=(not has_repo and session is not None and task_row is not None
+                       and slot_allocation.runs_without_repo(session, task_row)),
         prior_stage_output=task.get("prior_stage_output") or "",
         merge_lane_verdict=task.get("merge_lane_verdict") or "",
         console_task_id=console_task_id,
         # `.get(..., True)` only covers a MISSING key; a present-but-null value (a legacy/partial
         # projection row) must still default ON, never silently coerce to OFF.
         autonomous=True if task.get("autonomous") is None else task["autonomous"],
+        language=getattr(task_row, "language", None),
         issue_state=task.get("state") or "",
         recon_map=task.get("prerequisite_recon_map") or None,
         attachments_dir=attachments_dir,
@@ -419,10 +521,8 @@ def compose(
         delivery=staged["delivery"] if staged else charter_delivery(charter_key),
         # …and whether this role integrates through a PR at all (`mode`; see `build_task_prompt`'s `ships_pr`).
         ships_pr=(staged["mode"] if staged else charter_mode(charter_key)) == MODE_BUILD,
-        # …and whether this role's gate may ask at all (`_NEVER_ASKS`).
-        asks_at_gate=staged["asks_at_gate"] if staged else charter_key not in _NEVER_ASKS,
-        # …and whether this role's operator is live at the console (`_CONSOLE_INTERVIEW`).
-        console_present=staged["console_present"] if staged else charter_key in _CONSOLE_INTERVIEW,
+        # …and whether this role's gate may ask at all, and whether its operator is live at the console.
+        **_ask_terms(charter_key, staged),
         # The relaunch-in-place terms (see `build_task_prompt`'s `resume_worktree`). Threaded: slot contents
         # are a pool fact this module cannot see (it never touches a worktree).
         resume_worktree=resume_worktree,
@@ -440,9 +540,8 @@ def compose(
         mounted_nodelinks=_mounted_nodelinks(session, node_id) if advertise_nodelinks else (),
         guard_rules=_guard_rules_for(session, task.get("project_id"), provider, has_repo),
         repos=repos,
+        review_lanes=review_line,
     )
-    if _node_uses_legacy_vocabulary(session, node_id):
-        system_prompt, task_text = respell_vocabulary(system_prompt), respell_vocabulary(task_text)
     return _verdict(
         "dispatch",
         f"persona={persona} charter={charter_key}",
@@ -465,4 +564,6 @@ def compose(
         # conversational role, which parks between messages. Consumed by `app/lease_drain.py`.
         autoclose=charter_key not in _NO_AUTOCLOSE,
         memory=memory,
+        # Only what the task's project linked (D5), and only what its roster grants.
+        mcp_connections=mcp_links.connections_for_task(session, task_row),
     )

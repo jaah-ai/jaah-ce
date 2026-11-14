@@ -24,7 +24,6 @@ from dataclasses import dataclass
 DECISIONS = ("accept", "accept_for_session", "accept_always", "decline", "cancel")
 ACP_PERMISSION_DECISIONS = {"allow_once": "accept", "allow_always": "accept_always", "reject_once": "decline",
                             "reject_always": "decline", "cancelled": "cancel"}
-ELICITATION_DECISIONS = {"accept": "accept", "decline": "decline", "cancel": "cancel"}
 DECIDED_BY_POLICY = "policy:full-access"
 
 MAX_QUESTIONS = 4

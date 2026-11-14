@@ -6,8 +6,7 @@
 //
 // THE TOKEN NEVER TOUCHES THE URL: it rides the handshake as a `tok.<token>` subprotocol, because a query
 // string lands in access logs, history and `Referer`. Nothing here logs, stores or interpolates it.
-import { get, ApiError, apiDetail } from '../api'
-import { sessionHeaders } from './activeOrg'
+import { get, ApiError, apiDetail, send } from '../api'
 import { readString, writeString } from './safeStorage'
 
 /** The subprotocol that names this wire version: the node echoes it back, never the credential. */
@@ -57,14 +56,13 @@ export function directSubprotocols(token: string): string[] {
 export function directHelloFrame(
   cols: number,
   rows: number,
-  attachOnly: boolean,
   view?: string,
   layout?: string,
 ): string {
   // `layout`: a designed grid the node builds as ONE tmux window. Never both — the node refuses a hello
   // carrying `view` and `layout`.
   return JSON.stringify({
-    cols, rows, attach_only: attachOnly, view: view ?? null, layout: layout ?? null,
+    cols, rows, attach_only: true, view: view ?? null, layout: layout ?? null,
   })
 }
 
@@ -83,6 +81,21 @@ export function isDirectAck(data: unknown): boolean {
 }
 
 /**
+ * Whether the node's ack advertises that it answers each keepalive with an empty binary frame
+ * (`apps/jaahd/console.py::KEEPALIVE_ACK`). Only then may the pane read its silence as a dead socket: a node
+ * that predates the ack says nothing, and is never torn down for being quiet.
+ */
+export function directAckPromisesKeepaliveAcks(data: unknown): boolean {
+  if (typeof data !== 'string') return false
+  try {
+    const parsed: unknown = JSON.parse(data)
+    return typeof parsed === 'object' && parsed !== null && (parsed as { acks?: unknown }).acks === true
+  } catch {
+    return false
+  }
+}
+
+/**
  * Ask the CP for a grant on this slot. Never throws: every failure becomes `ok: false` with a showable
  * reason — the caller retries indefinitely and the reason is the only thing on screen.
  */
@@ -91,12 +104,9 @@ export async function fetchDirectGrant(
   number: number,
   kind: 'clauded' | 'term',
   nodeId?: string,
-  provider?: string,
 ): Promise<DirectGrantResult> {
   const node = nodeId ? `&node=${encodeURIComponent(nodeId)}` : ''
-  // Absent = Any (the CP's Auto-assign pick); only a non-empty catalogue value is sent.
-  const prov = provider ? `&provider=${encodeURIComponent(provider)}` : ''
-  const path = `/api/console/${projectId}/${number}/direct?kind=${kind}${node}${prov}`
+  const path = `/api/console/${projectId}/${number}/direct?kind=${kind}${node}`
   let body: DirectIssueResponse
   try {
     body = await get<DirectIssueResponse>(path)
@@ -133,11 +143,13 @@ export function revokeDirectGrant(
   nodeId?: string,
 ): void {
   try {
-    void fetch(`/api/console/${projectId}/${number}/direct/revoke`, {
+    void send(`/api/console/${projectId}/${number}/direct/revoke`, {
       method: 'POST',
       credentials: 'same-origin',
       keepalive: true,
-      headers: sessionHeaders({ 'Content-Type': 'application/json' }, 'POST'),
+      // Sent as the page goes away: a relay socket would not outlive it.
+      relay: 'none',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind, node: nodeId ?? null, token }),
     }).catch(() => {
       /* the grant's own TTL is the backstop — there is nothing to tell the user */

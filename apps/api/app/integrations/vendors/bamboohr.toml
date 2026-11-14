@@ -1,0 +1,55 @@
+slug = "bamboohr"
+label = "BambooHR"
+category = "hr_other"
+vendor_docs_url = "https://documentation.bamboohr.com/docs/getting-started"
+summary = "HR system of record: agents read the employee directory, time off and reports through BambooHR's API."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "company_domain", label = "Company domain", kind = "text", required = true, placeholder = "acme", help = "The first part of the address you sign in at: for https://acme.bamboohr.com it is acme" },
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "In BambooHR, select your name or photo in the lower-left corner, choose API Keys, select Add New Key, name it Jaah and select Generate Key. Copy the key - BambooHR shows it once. The menu item appears only if your access level allows API keys" },
+]
+
+[test]
+method = "GET"
+path = "https://{company_domain}.bamboohr.com/api/v1/employees/0?fields=displayName,firstName"
+auth = { basic = ["api_key"], password = "x" }
+identity = [["displayName"], ["firstName"]]
+
+[docs]
+agent_uses = [
+  "Look up people in the employee directory: names, job titles, departments, managers and work contact details",
+  "Read who is out and upcoming time off, for planning work around absences",
+  "Run your saved custom reports and summarize headcount, tenure or turnover",
+  "Read the fields and tables your account exposes, so tasks can map BambooHR data to other systems",
+]
+prerequisites = [
+  "A BambooHR account whose access level is allowed to create API keys (ask your BambooHR admin if API Keys is missing from your menu)",
+  "Your company domain - the subdomain in your BambooHR address",
+]
+limitations = [
+  "An API key acts with exactly the access level of the BambooHR user who created it: agents see only the fields and employees that user can see",
+  "BambooHR offers no read-only key: if the user can edit records, so can agents using the key. Create the key on a user with a restricted access level when agents should only read",
+  "BambooHR blocks a key for a while after repeated failed requests with a bad key, so fix a rejected key before testing again",
+]
+
+[[docs.troubleshooting]]
+symptom = "Test says BambooHR rejected the API key (401 or 403)"
+fix = "The key was mistyped, revoked, or belongs to a user who has since been disabled or lost API access. Create a new key from your name > API Keys and select Replace on the secret. After several bad attempts BambooHR blocks the key briefly: wait a few minutes before testing again"
+
+[[docs.troubleshooting]]
+symptom = "Test says BambooHR cannot be reached at that address"
+fix = "Company domain must be only the subdomain (acme), not the full address and not your email domain. Check the address bar when you are signed in to BambooHR"
+
+[[docs.troubleshooting]]
+symptom = "The test passes, but an agent finds fields or employees missing"
+fix = "The key sees only what its user's access level allows. Ask a BambooHR admin to widen that user's access level under Settings > Access Levels, or create the key on a user who already has it"
+
+[[docs.faq]]
+q = "Which user should create the key?"
+a = "A dedicated BambooHR user with the narrowest access level that still covers what agents need. Everything agents do is then attributed to that user, and disabling it ends their access"
+
+[[docs.faq]]
+q = "How do I revoke the key in BambooHR?"
+a = "Select your name > API Keys and delete the Jaah key. Agents lose access on their next call"

@@ -1,19 +1,21 @@
 // Where the Task page files its task: the breadcrumb's staged title/project/feature, their pickers, the create seeds.
 import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiDetail, put } from '../../api'
-import { useCanOnProject } from '../../auth'
+import { useAuth, useCanOnProject } from '../../auth'
 import type { ProjectMenuRow } from '../../components/tasks/ProjectMenu'
-import { useFilingFeatures } from '../../components/tasks/featureFiling'
+import { invalidateFilingQueries, useFilingFeatures } from '../../components/tasks/featureFiling'
 import { personaLabel, personaOptions } from '../../components/tasks/personaRegistry'
 import { resolveCreateProject } from '../../components/tasks/shared'
 import { resolveTaskPrefill, templatePrefill } from '../../components/tasks/taskPrefill'
 import { getTemplate, templateAssetResolver, templateKey } from '../templates/api'
 import { usePersonaRegistryStatus } from '../../components/tasks/usePersonaRegistry'
-import { useFocusedProjectId } from '../../hooks/useFocusedProjectId'
+import { useNestedCreate } from '../../hooks/useNestedCreate'
 import { useTaskTree } from '../../hooks/useTaskTree'
 import type { OrgRef, PipelineTask, Project } from '../../types'
 import { useOwnOrgRows } from '../../ui/OrgIndicator'
+import { loadLastCreateProject } from '../../lib/lastCreateProject'
+import { readMuted, withoutHiddenProjects } from '../../lib/taskMute'
 import { keepLoaded } from './useTaskDetailActions'
 import type { TaskDetailNavState } from './useTaskDetailNavState'
 
@@ -26,9 +28,12 @@ export function savedProjectCrumbEditable(canEdit: boolean, script: boolean, par
   return canEdit && !script && parentTaskId == null
 }
 
+/** The nested-create pick key of the feature crumb's New feature…. */
+export const TASK_FEATURE_PICK = 'task_feature'
+
 export function useTaskDetailFiling({
-  id, isCreate, task, formTask, setTask, formDirty, cachedRow, projects, loading, keepsHandedRead, otherOrg, nav, canEditThisTask,
-  script,
+  id, isCreate, task, formTask, setTask, cachedRow, projects, loading, keepsHandedRead, otherOrg, nav, canEditThisTask,
+  script, formDirty = false,
 }: {
   id: string | undefined
   isCreate: boolean
@@ -38,8 +43,6 @@ export function useTaskDetailFiling({
   formTask: PipelineTask | null
   /** The page's row (`useTaskDetailLoad`), replaced by a crumb move's response. */
   setTask: Dispatch<SetStateAction<PipelineTask | null>>
-  /** Unsaved form edits: a crumb pick then STAGES (Save carries it) instead of moving at once. */
-  formDirty: boolean
   /** The board's row painting the loading trail (`useTaskDetailLoad`), whose feature crumb needs the tree. */
   cachedRow?: PipelineTask
 
@@ -50,9 +53,13 @@ export function useTaskDetailFiling({
   nav: TaskDetailNavState
   canEditThisTask: boolean
   script: boolean
+  /** The form holds unsaved edits (`useTaskDetailLoad`): leaving for the New page would drop them. */
+  formDirty?: boolean
 }) {
   const { prefillParams, pickedProject, boardProjectId, boardFeatureScope } = nav
   const canOnProject = useCanOnProject()
+  const { admin } = useAuth()
+  const client = useQueryClient()
   /* ── The breadcrumb's two editable values, held HERE and handed down to the form ──────────────────
      The trail is outside the tab panels and survives the form's remount on
      `${task.id}:${task.updated_at}`, so the page owns the draft and `TaskEditForm` submits it. `null` =
@@ -63,7 +70,7 @@ export function useTaskDetailFiling({
   currentIdRef.current = id
   const [draftTitle, setDraftTitle] = useState<string | null>(null)
   const [draftProjectId, setDraftProjectId] = useState<number | null>(null)
-  /* …and the third: the staged FEATURE (`null` = "No feature", `undefined` = not seeded). Kept in agreement
+  /* …and the third: the staged FEATURE (`null` = the project alone, `undefined` = not seeded). Kept in agreement
      with `draftProjectId` by `stageProject`/`stageFeature` below, so a mismatched pair cannot be staged
      from the UI (AC-8.2). */
   const [draftFeatureId, setDraftFeatureId] = useState<string | null | undefined>(undefined)
@@ -108,7 +115,6 @@ export function useTaskDetailFiling({
     (id: number) => canOnProject('tasks:create', id),
     [canOnProject],
   )
-  const focusedProjectId = useFocusedProjectId()
   /* The same grant question for the crumb picker the operator drives by hand, so Save is never refused.
      Two acts, two keys: create asks `tasks:create`; a move is `PUT project_id`, decided on the
      destination's `tasks:edit` (`hooks/useTaskAccess.ts`). */
@@ -155,6 +161,13 @@ export function useTaskDetailFiling({
   /* A seed holds the form until the vocabulary answers (or gives up): the form seeds in `useState`
      initialisers, so a late answer would be ignored. */
   const prefillPending = prefillParams !== null && (personaStatus === 'loading' || templateRead.isLoading)
+  /* A NEW task's picker and default skip this user's hidden projects (`lib/taskMute.ts::withoutHiddenProjects`),
+     but never one the operator named: the board's, the composer's pick, a seed's, or the one already staged. */
+  const createPickerProjects = useMemo(
+    () => withoutHiddenProjects(pickerProjects, readMuted(admin?.preferences),
+      [boardProjectId, pickedProject, prefill?.projectId, draftProjectId]),
+    [pickerProjects, admin?.preferences, boardProjectId, pickedProject, prefill?.projectId, draftProjectId],
+  )
   useEffect(() => {
     if (!isCreate || pickerProjects.length === 0) return
     // A seed waits for the projects and the vocabulary, or the ladder would win first.
@@ -167,14 +180,16 @@ export function useTaskDetailFiling({
       if (prefill?.projectId !== undefined) return prefill.projectId
       // The composer's own pick, when this viewer may still create there.
       if (pickedProject !== null
-        && resolveCreateProject(pickerProjects, pickedProject, canCreateInProject).id === pickedProject) {
+        && resolveCreateProject(createPickerProjects, pickedProject, canCreateInProject).id === pickedProject) {
         return pickedProject
       }
-      // The grant map, not the project list (see `canCreateInProject`).
-      return resolveCreateProject(pickerProjects, boardProjectId, canCreateInProject, focusedProjectId).id
+      // The grant map, not the project list (see `canCreateInProject`). Under All projects, the last hand-filed
+      // task's project first (`lib/lastCreateProject.ts`).
+      return resolveCreateProject(createPickerProjects, boardProjectId, canCreateInProject, null,
+        loadLastCreateProject(admin?.id ?? null)).id
     })
-  }, [isCreate, pickerProjects, boardProjectId, canCreateInProject, prefill, prefillParams, loading, prefillPending,
-    pickedProject, focusedProjectId])
+  }, [isCreate, pickerProjects, createPickerProjects, boardProjectId, canCreateInProject, prefill, prefillParams, loading,
+    prefillPending, pickedProject, admin?.id])
 
   /* ── THE TRAIL IS THE TITLE NOW ─────────────────────────────────────────────────────────────────────
      The trail `{Project} › [{Feature}] › {id}: {title}` carries the page `<h1>` (`currentComponent`): a page
@@ -190,16 +205,15 @@ export function useTaskDetailFiling({
     : savedProjectCrumbEditable(canEditThisTask, script, task?.parent_task_id)) && !moving
 
   /* ── THE PATH: Project › [Feature] (AC-1.1, AC-8.2) ─────────────────────────────────────────────────────
-     The tree names features (shipped ones too); the feature picker offers the STAGED project's active features
-     the caller may file into. The feature crumb is staged exactly like the project crumb (saved with the
-     form), and has the same child rule. */
+     The tree names features (deleted ones still holding tasks too); the feature picker offers the STAGED project's features
+     the caller may file into. On a saved task a pick of either crumb MOVES the task at once (`moveNow`); on a
+     create it is staged for the form's writes. Both crumbs share the child rule. */
   // Only once there is something to file: a not-found or erroring page fetches nothing it cannot use.
   const { tree: taskTree } = useTaskTree(isCreate || task !== null || cachedRow !== undefined)
   const stagedProjectId: number | null = draftProjectId ?? task?.project_id ?? null
-  /* A feature of ANOTHER project cannot ride the same PUT as the move into it: the API files before it moves and
-     refuses a cross-project feature. So once the staged project leaves the task's project, the feature crumb
-     offers "No feature" alone (file after saving the move). A create has no project yet — until auto-save files
-     it, its project is whatever is staged. */
+  /* While a move into another project is in flight the feature crumb offers the project's root alone: the old project's
+     features no longer apply and the new one's load once the move lands. A create has no project yet — until
+     auto-save files it, its project is whatever is staged. */
   const filedProjectId = isCreate ? undefined : task?.project_id
   const crossProjectMove = filedProjectId !== undefined && stagedProjectId !== filedProjectId
   const { features: projectFeatures } = useFilingFeatures(
@@ -213,16 +227,17 @@ export function useTaskDetailFiling({
     setMoveError('')
     setDraftProjectId(projectId)
     if (stagedFeatureId !== null) setDraftFeatureId(null)
-    /* AN UNTOUCHED FORM MOVES AT ONCE: a staged-only pick looked done, sent nothing, and a reload
-       reverted it. A partial PUT (`project_id` alone; the API drops the feature on a plain move); the response
-       re-seeds the drafts. Refused, the crumbs revert and the server's reason shows. With unsaved edits the pick
-       stays staged: it is part of that edit, and Save carries it. */
+    // A partial PUT (`project_id` alone; the API drops the feature on a plain move).
     moveNow({ project_id: projectId })
   }
-  /* The one immediate move, for both crumbs. A refusal that lands after the page moved on to another task must
-     not rewrite THAT task's drafts (`currentIdRef`). */
-  const moveNow = (body: { project_id: number; feature_id?: string | null }) => {
-    if (isCreate || formDirty || task === null) return
+  /* THE ONE IMMEDIATE MOVE, for both crumbs. A staged-only pick looked done, sent
+     nothing, and a reload reverted it. Unsaved form edits do not hold it back: the form keeps the row it opened
+     on while dirty (`useTaskDetailLoad`'s `formTask`), so the edits survive, and its Save sends no filing at
+     all (`TaskEditForm`'s `editFields`), so it never writes a stale one back. The response re-seeds the drafts; refused, the crumbs revert and
+     the server's reason shows. A refusal that lands after the page moved on to another task must not rewrite
+     THAT task's drafts (`currentIdRef`). */
+  const moveNow = (body: { project_id?: number; feature_id?: string | null }) => {
+    if (isCreate || task === null) return
     const from = task
     setMoving(true)
     put<PipelineTask>(`/api/tasks/${from.id}`, body)
@@ -236,28 +251,51 @@ export function useTaskDetailFiling({
       .finally(() => setMoving(false))
   }
   const stageFeature = (featureId: string | null, projectId?: number) => {
+    // A saved task's re-pick is no change; a create stages every pick, so its board-scope seed never overrides one.
+    if (!isCreate && featureId === stagedFeatureId && (projectId === undefined || projectId === stagedProjectId)) return
+    setMoveError('')
     setDraftFeatureId(featureId)
     if (projectId !== undefined) setDraftProjectId(projectId)
-    /* A feature of ANOTHER project is a move too: on an untouched form it saves at once, like the project crumb. */
-    if (projectId !== undefined && task !== null && projectId !== task.project_id) {
-      setMoveError('')
-      moveNow({ project_id: projectId, feature_id: featureId })
-    }
+    // A feature of ANOTHER project moves the task there in the same PUT; one of its own project files it alone.
+    const crossProject = projectId !== undefined && task !== null && projectId !== task.project_id
+    moveNow(crossProject ? { project_id: projectId, feature_id: featureId } : { feature_id: featureId })
   }
   /* CREATE: seed the feature from the board's scope once the project resolved and the tree can vouch for it
-     (active, and in THAT project); anything else is "No feature". Only while nothing is picked. */
+     (in THAT project); anything else files in the project alone. Only while nothing is picked. */
   useEffect(() => {
     if (!isCreate || draftFeatureId !== undefined || draftProjectId === null) return
     if (boardFeatureScope === null) { setDraftFeatureId(null); return }
     if (taskTree === undefined) return
-    const active = taskTree.projects.some(p =>
-      p.id === draftProjectId && p.features.some(f => f.id === boardFeatureScope && f.status === 'active'))
-    setDraftFeatureId(active ? boardFeatureScope : null)
+    const held = taskTree.projects.some(p => p.id === draftProjectId && p.features.some(f => f.id === boardFeatureScope))
+    setDraftFeatureId(held ? boardFeatureScope : null)
   }, [isCreate, draftFeatureId, draftProjectId, boardFeatureScope, taskTree])
 
+  /* "NEW FEATURE…", the feature crumb's last item: the feature's own New page (`/features/new`), back here with it
+     picked, and filed exactly as a menu pick is. Nothing to stash: a saved task's filing is written at once, never a
+     draft. Offered where a pick is (`projectCrumbEditable`: never a stage task, never mid-move) and the project lets
+     this viewer create. On another org's row the New page creates the feature as the project's org
+     (`FeatureEditPage`'s one-request act-as). Not while the form holds unsaved edits: the New page replaces this one
+     and nothing stashes the form. */
+  const nested = useNestedCreate<null>(null)
+  const canCreateFeature = taskTree?.projects.find(p => p.id === task?.project_id)?.can_create_tasks === true
+  const openNewFeature = !isCreate && task !== null && projectCrumbEditable && !crossProjectMove
+    && canCreateFeature && !formDirty
+    ? () => nested.openNew(`/features/new?project=${task.project_id}`, TASK_FEATURE_PICK)
+    : undefined
+  // Read once, on the mount the New page came back to; filed once the row it was opened from has loaded.
+  const pickedFeatureRef = useRef(nested.picked?.pick === TASK_FEATURE_PICK ? nested.picked.id : null)
+  useEffect(() => {
+    const featureId = pickedFeatureRef.current
+    if (featureId === null || task === null || String(task.id) !== id) return
+    pickedFeatureRef.current = null
+    // The pickers and the tree must see the new feature, or the crumb would name it "Feature".
+    invalidateFilingQueries(client)
+    stageFeature(featureId)
+  }, [task, id])
+
   return {
-    pickerProjects, crumbPickRefusal, prefill, prefillPending, draftTitle, setDraftTitle, draftProjectId,
+    pickerProjects, crumbProjects: isCreate ? createPickerProjects : pickerProjects, crumbPickRefusal, prefill, prefillPending, draftTitle, setDraftTitle, draftProjectId,
     draftFeatureId, stagedProjectId, stagedFeatureId, stageProject, stageFeature, taskTree, filingFeatures,
-    titleEditable, onTitleChange, projectCrumbEditable, moveError,
+    titleEditable, onTitleChange, projectCrumbEditable, moveError, openNewFeature,
   }
 }

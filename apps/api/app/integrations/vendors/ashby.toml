@@ -1,0 +1,55 @@
+slug = "ashby"
+label = "Ashby"
+category = "hr_other"
+vendor_docs_url = "https://developers.ashbyhq.com/docs/authentication"
+summary = "Recruiting: agents read jobs, candidates and applications, and can add notes, through Ashby's API."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "In Ashby (as an admin), open Admin > API Keys (app.ashbyhq.com/admin/api/keys) and select Create API Key. Name it Jaah, tick Read for Jobs plus every module agents need (Candidates, Applications, Interviews; add Write only where agents should change data), then save and copy the key - Ashby shows it once" },
+]
+
+[test]
+method = "POST"
+path = "https://api.ashbyhq.com/job.list"
+body = '{"limit":1}'
+auth = { basic = ["api_key"] }
+list_field = "results"
+
+[docs]
+agent_uses = [
+  "List open jobs and their hiring teams, stages and openings",
+  "Look up candidates and their applications, interviews and feedback",
+  "Add notes to a candidate, or move an application to another stage when the key has write access",
+  "Summarize the pipeline: applications per stage, time in stage, source of hire",
+]
+prerequisites = [
+  "An Ashby account with the Admin permission (only admins can create API keys)",
+  "Agreement on which Ashby modules agents may read or change: every key carries its own per-module permissions",
+]
+limitations = [
+  "The key reaches only the modules ticked when it was created; Jaah's test calls the job list, so the key needs at least Read on Jobs",
+  "Confidential jobs and private fields are hidden from a key unless its settings explicitly allow them",
+  "An Ashby key belongs to the organization, not a person: anything agents do appears as done through the API",
+]
+
+[[docs.troubleshooting]]
+symptom = "Test says Ashby rejected the API key (401 or 403)"
+fix = "The key was mistyped or deactivated, or it lacks Read access to Jobs. In Admin > API Keys, check that the key is active and that Jobs has Read ticked; create a new key if needed and select Replace on the secret"
+
+[[docs.troubleshooting]]
+symptom = "Test says Ashby did not answer with an API response"
+fix = "Ashby answered with success false, which usually means the key is missing a permission the call needs. Open the key in Admin > API Keys, tick Read for Jobs, and test again"
+
+[[docs.troubleshooting]]
+symptom = "An agent cannot see a confidential job or a private field"
+fix = "Keys skip confidential jobs and private fields by default. Open the key in Admin > API Keys and enable access to confidential jobs and projects, or to private fields, only if agents truly need them"
+
+[[docs.faq]]
+q = "Can I give agents read-only access?"
+a = "Yes. When creating the key, tick only Read for each module. Agents can then look things up but not change anything in Ashby"
+
+[[docs.faq]]
+q = "How do I revoke the key in Ashby?"
+a = "Open Admin > API Keys and deactivate or delete the Jaah key. Agents lose access on their next call"

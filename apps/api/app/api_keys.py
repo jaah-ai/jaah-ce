@@ -1,5 +1,5 @@
-"""Jaah API keys: every rule. A key is a personal bearer credential of its owner (an Org Owner or Org
-Admin), sent as `Authorization: Bearer jaah_…`.
+"""Jaah API keys: every rule. A key is a personal bearer credential of its owner (any member of a tenant org),
+sent as `Authorization: Bearer jaah_…`.
 
 THE SECRET. `jaah_` + 32 base62 random characters + 6 base62 characters of the CRC32 of the random part (43 in all),
 so a typo or a stray string is refused before any database read (`parse`). Only its SHA-256 is stored
@@ -9,12 +9,13 @@ logged, audited or read back.
 
 THE REQUEST. `auth.SessionAuthMiddleware` calls `verify` for a cookie-less request bearing a key (a cookie always
 wins). One read joins secret → key → owner; the key is refused (401) when the hash is unknown, the secret is past its
-rotation overlap, the key is revoked or expired, or its owner no longer holds it (`owner_refusal`: disabled, or a member
-not an Org Owner/Admin of the key's tenant org right now — a demoted owner's keys answer 401 until re-promotion; an
-operator's keys live in their own org or in a tenant org they made them in while acting as it). Outside the key's own IP
-allowlist → 403 `ip_not_allowed`; the org's allowlist (`app/ip_allowlist.py`) holds too. A passing key becomes
-`request.state.api_key` (`ApiKeyContext`) and the request runs as its owner, narrowed by `narrow`: the key's ticked
-keys ∩ the owner's own, no Org Admin rank unless the key's `org_admin` toggle is on. An operator's key made while acting
+rotation overlap, the key is revoked or expired, or its owner no longer holds it (`owner_refusal`: disabled, outside the
+key's tenant org, or that org's superadmin; an operator's keys live in their own org or in a tenant org they made them in
+while acting as it). Outside the key's own IP allowlist → 403 `ip_not_allowed`; the org's allowlist
+(`app/ip_allowlist.py`) holds too. A passing key becomes `request.state.api_key` (`ApiKeyContext`) and the request runs
+as its owner, narrowed by `narrow`: the key's ticked keys ∩ the owner's own right now, no Org Admin rank unless the key's
+`org_admin` toggle is on AND the owner is an Org Owner/Admin right now (a demoted owner's key keeps only their member
+rights). An operator's key made while acting
 runs as that org's Owner seat (`acting`, `authz.owner_seat`), so it does what the operator's tab acting as the org does;
 one in their own org keeps the operator's rights only with every permission and Org administration ticked
 (`superadmin`), else it holds just its ticked keys. A key never reaches a `@session_only` route
@@ -38,7 +39,6 @@ import string
 import threading
 import time
 import zlib
-from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Iterable, Optional
@@ -49,13 +49,14 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
 from starlette.requests import HTTPConnection, Request
 
-from app import access, edition_features
+from app import edition_features
 from app.authz.catalog import PERMISSION_KEYS, UNHONOURED_PERMISSION_KEYS
 from app.clock import utcnow
+from app.db import every_org_session
 from app.models.api_keys import ApiKey, ApiKeySecret
 from app.models.identity import AdminUser
 from app.tenancy import seam
-from app.tenancy.ids import is_operator_plane, is_tenant_org
+from app.tenancy.ids import is_operator_user, is_tenant_org
 
 if TYPE_CHECKING:
     from app.authz.principal import Principal
@@ -201,34 +202,21 @@ def networks(row: ApiKey) -> tuple["Network", ...]:
     return tuple(ipaddress.ip_network(str(cidr), strict=False) for cidr in row.ip_allowlist or ())
 
 
-def _owner_is_admin(session: Session, owner: AdminUser) -> bool:
-    """Whether `owner` is an Org Owner/Admin of a tenant org right now (R3)."""
-    from app.authz.principal import effective_access
-
-    if not is_tenant_org(owner.org_id):
-        return False
-    return effective_access(session, owner.id)[1].org_role in (access.ORG_OWNER, access.ORG_ADMIN)
-
-
-def is_operator(owner: AdminUser) -> bool:
-    return is_operator_plane(owner.org_id, owner.is_superadmin)
-
-
 def owner_refusal(session: Session, owner: Optional[AdminUser], org_id: UUID) -> Optional[str]:
     """Why `owner`'s keys in `org_id` do not work right now (`verify`'s audit reason), or None when they do. An
     operator holds keys in their own org and in any tenant org (made while acting as it); anyone else only in their
-    own tenant org, while an Org Owner/Admin there and never a superadmin."""
+    own tenant org, whatever their role there (`narrow` caps the key at it), and never as its superadmin."""
     if owner is None or owner.disabled_at is not None:
         return "owner"
-    if is_operator(owner):
+    if is_operator_user(owner):
         return None if owner.org_id == org_id or is_tenant_org(org_id) else "owner"
-    if owner.org_id != org_id or owner.is_superadmin:
+    if owner.org_id != org_id or owner.is_superadmin or not is_tenant_org(org_id):
         return "owner"
-    return None if _owner_is_admin(session, owner) else "owner_role"
+    return None
 
 
 def owner_row(session: Session, owner_id: UUID) -> Optional[AdminUser]:
-    """A key's owner by id, on the identity lane: an operator's row lives in their own org, which a tenant org's
+    """A key's owner by id, under the identity escape: an operator's row lives in their own org, which a tenant org's
     scope does not read."""
     with seam.identity_scope():
         return session.scalar(select(AdminUser).where(AdminUser.id == owner_id))
@@ -239,42 +227,57 @@ def owner_row(session: Session, owner_id: UUID) -> Optional[AdminUser]:
 _SECRET_BY_HASH = text("SELECT api_key_id, org_id FROM api_key_secrets WHERE token_hash = :token_hash")
 
 
-def verify(token: str, host: Optional[str]) -> ApiKeyContext | Refusal:
-    """Resolve a well-formed key (`parse` passed) for a request from `host`. Blocking, on the identity lane
-    (`app/db.py`): the middleware runs it on the thread pool. Touches `last_used_*` at most once per
+#: A foreign thread's bound on an identity read run on the serving loop (`app/authz/principal.py`'s figure).
+_IDENTITY_READ_TIMEOUT_SECONDS = 30.0
+
+
+async def verify_async(token: str, host: Optional[str]) -> ApiKeyContext | Refusal:
+    """Resolve a well-formed key (`parse` passed) for a request from `host`: an identity read on the async pool
+    (`app/db_async.py`), awaited by the middleware on the loop. Touches `last_used_*` at most once per
     `WRITE_THROTTLE`."""
+    from app import db_async
+
+    return await db_async.run_in_session(_verify_in, token, host, identity=True)
+
+
+def verify(token: str, host: Optional[str]) -> ApiKeyContext | Refusal:
+    """`verify_async` for a caller on a foreign thread (trigger intake): the read runs on the serving loop."""
+    from app import db_async
+
+    return db_async.run_on_loop(verify_async(token, host), timeout=_IDENTITY_READ_TIMEOUT_SECONDS)
+
+
+def _verify_in(session: Session, token: str, host: Optional[str]) -> ApiKeyContext | Refusal:
     from app import ip_allowlist
-    from app.db import IdentitySessionLocal
 
     now = utcnow()
-    with IdentitySessionLocal() as session:
-        hit = session.execute(_SECRET_BY_HASH, {"token_hash": hash_secret(token)}).first()
-        if hit is None:
+    hit = session.execute(_SECRET_BY_HASH, {"token_hash": hash_secret(token)}).first()
+    if hit is None:
+        return Refusal(401, "unknown")
+    with seam.bound_to(hit.org_id):
+        found = session.execute(
+            select(ApiKeySecret, ApiKey)
+            .join(ApiKey, ApiKey.id == ApiKeySecret.api_key_id)
+            .where(ApiKeySecret.api_key_id == hit.api_key_id, ApiKeySecret.token_hash == hash_secret(token))
+        ).first()
+        if found is None:
             return Refusal(401, "unknown")
-        with seam.bound_to(hit.org_id):
-            found = session.execute(
-                select(ApiKeySecret, ApiKey)
-                .join(ApiKey, ApiKey.id == ApiKeySecret.api_key_id)
-                .where(ApiKeySecret.api_key_id == hit.api_key_id, ApiKeySecret.token_hash == hash_secret(token))
-            ).first()
-            if found is None:
-                return Refusal(401, "unknown")
-            secret, key = found
-            refused = _refusal_of(key)
-            if secret.valid_until is not None and secret.valid_until <= now:
-                return refused(401, "rotated")
-            context = _live_context(session, key, now)
-            if isinstance(context, Refusal):
-                return context
-            allowlist = networks(key)
-            if allowlist and not ip_allowlist.allowed(allowlist, host):
-                return refused(403, "ip", detail=host)
-            if ip_allowlist.refusal(session, key.org_id, host) is not None:
-                return refused(403, "org_ip", detail=host)
-            last = key.last_used_at
-            if last is None or now - last >= WRITE_THROTTLE:
-                address = ip_allowlist.parse_address(host)
-                _touch(session, key.id, now, str(address) if address is not None else None)
+        secret, key = found
+        refused = _refusal_of(key)
+        if secret.valid_until is not None and secret.valid_until <= now:
+            return refused(401, "rotated")
+        context = _live_context(session, key, now)
+        if isinstance(context, Refusal):
+            return context
+        allowlist = networks(key)
+        if allowlist and not ip_allowlist.allowed(allowlist, host):
+            return refused(403, "ip", detail=host)
+        if ip_allowlist.refusal(session, key.org_id, host) is not None:
+            return refused(403, "org_ip", detail=host)
+        last = key.last_used_at
+        if last is None or now - last >= WRITE_THROTTLE:
+            address = ip_allowlist.parse_address(host)
+            _touch(session, key.id, now, str(address) if address is not None else None)
     return context
 
 
@@ -293,7 +296,7 @@ def _live_context(session: Session, key: ApiKey, now: datetime) -> ApiKeyContext
     assert owner is not None
     if not _org_admits(session, key.org_id):
         return refused(401, "org")
-    operator, own = is_operator(owner), owner.org_id == key.org_id
+    operator, own = is_operator_user(owner), owner.org_id == key.org_id
     return ApiKeyContext(
         key_id=key.id, name=key.name, owner_id=owner.id, org_id=key.org_id,
         keys=key_set(key), org_admin=bool(key.org_admin), acting=operator and not own,
@@ -303,10 +306,18 @@ def _live_context(session: Session, key: ApiKey, now: datetime) -> ApiKeyContext
 
 def context_of(key_id: UUID, org_id: UUID) -> ApiKeyContext | Refusal:
     """A key verified earlier (a webhook delivery's, `trigger_intake`), as it stands now: `verify` without the secret
-    or the address, which were judged when it was presented. Blocking, on the identity lane."""
-    from app.db import IdentitySessionLocal
+    or the address, which were judged when it was presented. Blocking, for a caller on a foreign thread: an identity
+    read run on the serving loop (`app/db_async.py`)."""
+    from app import db_async
 
-    with IdentitySessionLocal() as session, seam.bound_to(org_id):
+    return db_async.run_on_loop(
+        db_async.run_in_session(_context_of_in, key_id, org_id, identity=True),
+        timeout=_IDENTITY_READ_TIMEOUT_SECONDS,
+    )
+
+
+def _context_of_in(session: Session, key_id: UUID, org_id: UUID) -> ApiKeyContext | Refusal:
+    with seam.bound_to(org_id):
         key = session.scalar(select(ApiKey).where(ApiKey.id == key_id))
         if key is None:
             return Refusal(401, "unknown")
@@ -371,11 +382,14 @@ def key_user(user: AdminUser, context: ApiKeyContext) -> AdminUser:
     return user
 
 
-def narrow(principal: "Principal", context: ApiKeyContext) -> "Principal":
+def narrow(principal: "Principal", context: ApiKeyContext, session: Optional[Session] = None) -> "Principal":
     """The owner's principal (an acting key's: the org's Owner seat) cut down to what the key confers: every key set ∩
-    the key's, no bindings, and no Org Admin rank unless the key's "Org administration" toggle is on — whose loss also
+    the key's, no bindings, and no Org Admin rank unless the key's "Org administration" toggle is on (and then only the
+    owner's own: a member owner has none to keep) — whose loss also
     hides the org's system projects, as for any non-admin (`Principal.system_project_ids`). A superadmin owner holds
-    every key, so their key holds its own ticked ones; it stays superadmin only when `context.superadmin`."""
+    every key, so their key holds its own ticked ones; it stays superadmin only when `context.superadmin`. `session` is
+the caller's identity read (`app/authz/principal.py::_key_principal_in`); without one, a foreign thread's read runs on
+the serving loop."""
     from app.authz.principal import _system_project_ids
 
     keys = context.keys
@@ -392,10 +406,15 @@ def narrow(principal: "Principal", context: ApiKeyContext) -> "Principal":
         api_key_id=context.key_id,
     )
     if not narrowed.is_org_admin and narrowed.org_id is not None and not narrowed.system_project_ids:
-        from app.db import IdentitySessionLocal
-
-        with IdentitySessionLocal() as session:
+        if session is not None:
             hidden = _system_project_ids(session, narrowed.org_id)
+        else:
+            from app import db_async
+
+            hidden = db_async.run_on_loop(
+                db_async.run_in_session(_system_project_ids, narrowed.org_id, identity=True),
+                timeout=_IDENTITY_READ_TIMEOUT_SECONDS,
+            )
         if hidden:
             narrowed = replace(narrowed, system_project_ids=hidden)
     return narrowed
@@ -435,11 +454,11 @@ def record_refusal(refusal: Refusal, *, client_ip: Optional[str]) -> None:
     about to refuse. Best-effort: a failed write is logged and the refusal still answers."""
     if refusal.key_id is None or refusal.org_id is None or not _due(refusal.key_id, refusal.reason):
         return
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.user_activity import record_write
 
     try:
-        with SessionLocal() as session, seam.bound_to(refusal.org_id):
+        with BridgedSession() as session, seam.bound_to(refusal.org_id):
             owner = owner_row(session, refusal.owner_id) if refusal.owner_id is not None else None
             record_write(
                 session, owner, "api_key_refused",
@@ -490,7 +509,7 @@ def not_allowed_response():
 
 
 def status(row: ApiKey, *, owner_ok: bool, now: Optional[datetime] = None) -> str:
-    """`revoked` > `expired` > `suspended` (owner not an Org Owner/Admin right now) > `expiring` (≤ 7 days) >
+    """`revoked` > `expired` > `suspended` (the owner no longer holds it, `owner_refusal`) > `expiring` (≤ 7 days) >
     `active`."""
     now = now or utcnow()
     if row.revoked_at is not None:
@@ -521,12 +540,19 @@ def user_row(session: Session, user_id: Optional[UUID]) -> Optional[AdminUser]:
 
 def summary(context: ApiKeyContext) -> tuple[str, Optional[datetime], frozenset[int]]:
     """`(display, expires_at, hidden system project ids)` of a verified key, read bound to its own org on a fresh
-    identity-lane session — for `GET /api/auth/me`, an `@always` route that binds nothing. The system projects are
+    identity read on the async pool — for `GET /api/auth/me`, an `@always` route that binds nothing. The system projects are
     hidden as `narrow` hides them: only while the key's "Org administration" toggle is off."""
-    from app.authz.principal import _system_project_ids
-    from app.db import IdentitySessionLocal
+    from app import db_async
 
-    with IdentitySessionLocal() as session, seam.bound_to(context.org_id):
+    return db_async.run_on_loop(
+        db_async.run_in_session(_summary_in, context, identity=True), timeout=_IDENTITY_READ_TIMEOUT_SECONDS
+    )
+
+
+def _summary_in(session: Session, context: ApiKeyContext) -> tuple[str, Optional[datetime], frozenset[int]]:
+    from app.authz.principal import _system_project_ids
+
+    with seam.bound_to(context.org_id):
         expires_at = session.scalar(select(ApiKey.expires_at).where(ApiKey.id == context.key_id))
         current = current_secret(session, context.key_id)
         hidden = frozenset() if context.org_admin else _system_project_ids(session, context.org_id)
@@ -599,7 +625,7 @@ def forget_owner(session: Session, owner: AdminUser, actor: Optional[AdminUser])
     name and display id, since the row goes), then the keys themselves (secrets cascade) — `ON DELETE RESTRICT` keeps
     a delete that skips this from erasing them unaudited. `routes/users.py::delete_member`. An operator's keys in
     tenant orgs, which the caller's scope may not read, go first on the fleet plane (`_forget_elsewhere`)."""
-    gone = _forget_elsewhere(owner, actor) if is_operator(owner) else 0
+    gone = _forget_elsewhere(owner, actor) if is_operator_user(owner) else 0
     return gone + _forget(session, owner, actor)
 
 
@@ -665,7 +691,7 @@ def validate_allowlist(entries: Iterable[str]) -> list[str]:
 #: The reminders, furthest first: `(window, stamp column)`. A key inside the 1-day window owes no 7-day one.
 REMINDERS: tuple[tuple[timedelta, str], ...] = ((timedelta(days=7), "reminded_7d_at"), (timedelta(days=1), "reminded_1d_at"))
 
-#: The `user_notify` event name (a `preferences.NOTIFICATION_EVENTS` key) and the audit kind of a key that ran out.
+#: The `user_notify` event name (an `app/notification_catalog.py` event) and the audit kind of a key that ran out.
 REMINDER_EVENT = "api_key_expiry"
 EXPIRED_KIND = "api_key_expired"
 
@@ -720,16 +746,7 @@ class SweepReport:
 def sweep(now: Optional[datetime] = None) -> SweepReport:
     """One pass over every org holding an unrevoked key, on the operator plane; each org in its own transaction, so
     one org's fault leaves the rest (retried next pass). Idempotent: every act is stamped on the key it is about."""
-    fleet: AbstractContextManager[Session]
-    if edition_features.enabled("multi_node_hosts"):
-        from app import vnodes
-
-        fleet = vnodes.fleet_session()
-    else:
-        # Run only by its system cron, which already holds the operator plane (`cron_runtime`).
-        from app.db import SessionLocal
-
-        fleet = SessionLocal()
+    fleet = every_org_session()
     now = now or utcnow()
     report = SweepReport()
     with fleet as session:

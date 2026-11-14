@@ -1,0 +1,39 @@
+slug = "firecrawl"
+label = "Firecrawl"
+category = "search"
+vendor_docs_url = "https://docs.firecrawl.dev/api-reference/endpoint/credit-usage"
+summary = "Scrape, crawl, map and search the web as clean markdown or JSON from agent sessions."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, placeholder = "fc-...", help = "Sign in at firecrawl.dev, open the dashboard's API Keys page (firecrawl.dev/app/api-keys) and copy your key, or create a new one there. It starts with fc-" },
+]
+
+[test]
+method = "GET"
+path = "https://api.firecrawl.dev/v2/team/credit-usage"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+
+[docs]
+agent_uses = [
+  "Scrape a single page into clean markdown, HTML, screenshots or structured JSON",
+  "Crawl a whole site, or map its URLs, to research or audit it",
+  "Search the web and get the full content of each result in one call",
+  "Extract structured data from pages with a schema or a plain-language prompt",
+]
+prerequisites = [
+  "A Firecrawl account (the free plan includes a starter credit balance)",
+]
+limitations = [
+  "Every scrape, crawl and search spends Firecrawl credits; the Test only reads your remaining credit and spends none",
+  "Sites that block automated access, or pages behind a login, may return little or no content",
+]
+troubleshooting = [
+  { symptom = "The Test says Firecrawl rejected the API key (401)", fix = "The key was deleted or pasted incompletely. Copy it again from firecrawl.dev/app/api-keys, including the fc- prefix, and select Replace on the secret" },
+  { symptom = "Agents get 402 Payment Required", fix = "The team's credits are spent. Check the dashboard's Usage page and top up or upgrade" },
+  { symptom = "Agents get 429 Too Many Requests", fix = "Your plan's concurrency or rate limit was hit. Ask the agent to run fewer parallel scrapes, or upgrade the plan" },
+]
+faq = [
+  { q = "Does the Test use credits", a = "No. It reads your team's credit usage, which is free" },
+]

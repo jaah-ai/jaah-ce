@@ -16,23 +16,26 @@ operator-supplied third-party host. Six properties are security, not style:
 """
 from __future__ import annotations
 
+import functools
+import importlib
 import json
 import logging
 import re
 import string
 import threading
 import unicodedata
-from datetime import datetime, timezone
 from queue import Empty, Queue
 from time import monotonic
-from typing import Any, Callable, Iterator, Literal, Mapping, NamedTuple, Optional
+from typing import Any, Callable, Iterator, Literal, Mapping, NamedTuple, Optional, Sequence
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import httpx
 
+from app.clock import utcnow
 from app.credentials import sigv4
-from app import edition_features, github_api, http_bounded, oauth2_wire
+from app import account_auth, edition_features, github_api, http_bounded, mcp_client, oauth2_wire
 from app.credentials.oauth_wizards import connect_for_type
+from app.integrations import catalog
 from app.credentials.registry import CREDENTIAL_TYPES, FieldSpec, CredentialTypeSpec, host_field
 from app.entity_shape import is_blank
 
@@ -82,6 +85,29 @@ class TestResult(NamedTuple):
 
 # The deadline rides the signature, so a tester cannot call outside its budget.
 Tester = Callable[[dict[str, Any], float], TestResult]
+
+
+class _Verdict(Exception):
+    """A step helper's early verdict (`_prepare`, `_request`, `_gated_body`, …), raised so nothing after the
+    step runs and the helper's return type is the plain value. `_verdict_guard` turns it back into the
+    `TestResult` the `Tester` contract promises; it never leaves this module."""
+
+    def __init__(self, result: TestResult) -> None:
+        super().__init__(result.message)
+        self.result = result
+
+
+def _verdict_guard(tester: Tester) -> Tester:
+    """The one place a `_Verdict` becomes a return value: on every function `TESTERS` serves."""
+
+    @functools.wraps(tester)
+    def guarded(config: dict[str, Any], deadline: float) -> TestResult:
+        try:
+            return tester(config, deadline)
+        except _Verdict as verdict:
+            return verdict.result
+
+    return guarded
 
 
 def new_deadline() -> float:
@@ -171,6 +197,9 @@ def _field_problem(spec: CredentialTypeSpec, config: dict[str, Any]) -> Optional
     """
     # A blank optional header field is never sent (`_declared_tester`), so its edge whitespace is no problem.
     unsent_if_blank = {key for _header, key in spec.key_test.field_headers} if spec.key_test else set()
+    catalog_spec = catalog.spec_for_type(spec.slug)
+    if catalog_spec is not None and catalog_spec.http_test is not None:
+        unsent_if_blank |= {key for _header, key in catalog_spec.http_test.field_headers}
     for field in spec.fields:
         value = config.get(field.key)
         if field.required and is_blank(value):
@@ -306,8 +335,8 @@ def _effective_base_url(spec: CredentialTypeSpec, value: Any) -> Optional[str]:
     return spec.default_base_url if is_blank(value) else value
 
 
-def _destination(spec: CredentialTypeSpec, config: dict[str, Any]) -> _Destination | TestResult:
-    """Where a test of `spec` under `config` is going, or the failure for an unusable base URL.
+def _destination(spec: CredentialTypeSpec, config: dict[str, Any]) -> _Destination:
+    """Where a test of `spec` under `config` is going; an unusable base URL is the raised failure.
 
     `operator_supplied` is True only when the operator filled the host field, so `_host_advice` never
     sends them to a URL they never typed; `host_label` is that field's own label for it to name.
@@ -317,7 +346,7 @@ def _destination(spec: CredentialTypeSpec, config: dict[str, Any]) -> _Destinati
     base, host = _split_base_url(_effective_base_url(spec, raw))
     if base is None or host is None:
         # Operator-supplied only (reported first by `_field_problem`); fixed defaults are proved at import.
-        return _failure(_BAD_BASE_URL)
+        raise _Verdict(_failure(_BAD_BASE_URL))
     return _Destination(
         base=base,
         host=host,
@@ -461,16 +490,16 @@ def _gated_body(
     dest: _Destination,
     outcome: _HttpOutcome,
     container: type | tuple[type, ...] = dict,
-) -> dict[str, Any] | list[Any] | TestResult:
+) -> dict[str, Any] | list[Any]:
     """The shape gate itself: the decision a shape-gated tester calls rather than reimplements.
 
     Available, not mandatory (`jira` and the workflow-automation type are deliberately ungated). `container`
-    is a parameter because some providers answer a JSON array. Callers must check `isinstance(result, TestResult)`: an
-    empty `{}`/`[]` is a legitimate body, so `if not gated:` is wrong.
+    is a parameter because some providers answer a JSON array. The failure is raised, never signalled by the
+    value: an empty `{}`/`[]` is a legitimate body.
     """
     parsed = _json_body(outcome.body)
     if not isinstance(parsed, container):
-        return _unexpected_body(spec, dest)
+        raise _Verdict(_unexpected_body(spec, dest))
     return parsed
 
 
@@ -484,8 +513,12 @@ def _request(
     headers: Optional[dict[str, str]] = None,
     content: Optional[bytes] = None,
     allowed_origin: Optional[tuple[str, str, int]] = None,
-) -> _HttpOutcome | TestResult:
-    """One outbound call, or the mapped failure for it, inside the caller's remaining `deadline`.
+    addresses: tuple[str, ...] = (),
+) -> _HttpOutcome:
+    """One outbound call inside the caller's remaining `deadline`; the mapped failure for it is raised.
+
+    `addresses`, when given, are the only addresses dialled (`http_bounded.pin`): a tenant-chosen host is vetted by
+    the caller (`http_bounded.vetted_addresses`) and then never resolved again.
 
     The deadline is created once per request (`new_deadline`); a `0.0` budget is legal. The exchange runs
     on its own daemon thread under a bounded permit pool and the caller stops waiting at the deadline (see
@@ -507,14 +540,14 @@ def _request(
             "credential test refused: url origin does not match the pinned destination "
             "(url_origin=%s expected_origin=%s dest_host=%s)", actual_origin, expected_origin, dest.host,
         )
-        return _unreachable(dest)
+        raise _Verdict(_unreachable(dest))
     outcome: Queue = Queue(maxsize=1)  # a fresh queue per call, so no result can reach another caller
     handle = _Abandonment()
 
     def run() -> None:
         # Nothing may raise past `_exchange`, or the caller waits the whole deadline for an instant error.
         try:
-            result = _exchange(method, url, dest, auth, headers, content, deadline, handle)
+            result = _exchange(method, url, dest, auth, headers, content, deadline, handle, addresses)
         except BaseException:  # noqa: BLE001 - a worker thread has nowhere to raise TO
             result = _unreachable(dest)
         # One put, outside the guard: a failing put inside it could put again and block on the full queue.
@@ -523,10 +556,15 @@ def _request(
     # Daemon, so a hostile host cannot block interpreter shutdown (a pooled worker is joined at exit).
     threading.Thread(target=run, name="credential-test", daemon=True).start()
     try:
-        return outcome.get(timeout=max(0.0, deadline - monotonic()))
+        result = outcome.get(timeout=max(0.0, deadline - monotonic()))
     except Empty:
         handle.abandon()
-        return _timed_out(dest)
+        raise _Verdict(_timed_out(dest)) from None
+    # The worker returns its failure as a value (an exception has nowhere to go on that thread); it is
+    # raised here, on the caller's.
+    if isinstance(result, TestResult):
+        raise _Verdict(result)
+    return result
 
 
 class _Abandonment:
@@ -577,6 +615,7 @@ def _exchange(
     content: Optional[bytes],
     deadline: float,
     handle: _Abandonment,
+    addresses: tuple[str, ...] = (),
 ) -> _HttpOutcome | TestResult:
     """The actual request, on its own daemon thread. Never raises.
 
@@ -589,7 +628,7 @@ def _exchange(
     try:
         if monotonic() >= deadline:
             return _timed_out(dest)
-        return _exchange_locked(method, url, dest, auth, headers, content, deadline, handle)
+        return _exchange_locked(method, url, dest, auth, headers, content, deadline, handle, addresses)
     finally:
         _EXCHANGE_SLOTS.release()
 
@@ -603,6 +642,7 @@ def _exchange_locked(
     content: Optional[bytes],
     deadline: float,
     handle: _Abandonment,
+    addresses: tuple[str, ...] = (),
 ) -> _HttpOutcome | TestResult:
     """The one place a request is put on the wire: no second transport, and no path around the deadline,
     the permit or the abandonment handle.
@@ -610,6 +650,12 @@ def _exchange_locked(
     `content` is raw bytes, never `data=`/`json=`: a SigV4 request hashes the exact bytes it sends.
     """
     client = _client()
+    if addresses:
+        try:
+            http_bounded.pin(client, httpx.URL(url).raw_host.decode("ascii"), addresses)
+        except (httpx.InvalidURL, ValueError, UnicodeError):
+            client.close()
+            return _unreachable(dest)
     if not handle.adopt(client):
         # The caller gave up between the permit and here. Nothing is sent.
         client.close()
@@ -658,22 +704,17 @@ def _status_failure(outcome: _HttpOutcome, type_label: str) -> Optional[TestResu
 
 def _prepare(
     slug: str, config: dict[str, Any]
-) -> tuple[CredentialTypeSpec, _Destination] | TestResult:
+) -> tuple[CredentialTypeSpec, _Destination]:
     """The preamble every tester runs: its registry spec, the operator's fields checked, the destination
-    resolved, or the failure to return instead of calling anything.
+    resolved — or the failure raised instead of calling anything.
 
     `_field_problem` first: a blank required field is the better sentence than `_BAD_BASE_URL`.
     """
     spec = CREDENTIAL_TYPES[slug]
     problem = _field_problem(spec, config)
     if problem is not None:
-        return problem
-    dest = _destination(spec, config)
-    if isinstance(dest, TestResult):
-        # Already reported by `_field_problem` for an operator URL, and unreachable for fixed hosts by the
-        # import-time guard at the foot of this module. A belt.
-        return dest
-    return spec, dest
+        raise _Verdict(problem)
+    return spec, _destination(spec, config)
 
 
 def _checked_request(
@@ -688,26 +729,56 @@ def _checked_request(
     content: Optional[bytes] = None,
     allowed_origin: Optional[tuple[str, str, int]] = None,
     rejected_message: Optional[str] = None,
-) -> _HttpOutcome | TestResult:
+    addresses: tuple[str, ...] = (),
+) -> _HttpOutcome:
     """One outbound call whose non-2xx is already the operator's answer: `_request` then
-    `_status_failure`. Only a 2xx comes back as an outcome.
+    `_status_failure`. Only a 2xx comes back as an outcome; anything else is raised.
 
     `rejected_message` replaces the shared 401/403 sentence only, for types where it would misdirect
     (the generic type's header name). Callers needing their own sentence
-    for another status (Xero's 400, AWS's clock skew, Slack's 200 `ok:false`) call `_request` directly.
+    for another status (Xero's 400, AWS's clock skew, Telegram's 404) call `_request` directly.
     """
     outcome = _request(
         method, url, dest=dest, deadline=deadline, auth=auth, headers=headers,
-        content=content, allowed_origin=allowed_origin,
+        content=content, allowed_origin=allowed_origin, addresses=addresses,
     )
-    if isinstance(outcome, TestResult):
-        return outcome
     if rejected_message is not None and outcome.status_code in (401, 403):
-        return _failure(rejected_message, detail=f"HTTP {outcome.status_code}")._replace(http=outcome)
+        raise _Verdict(_failure(rejected_message, detail=f"HTTP {outcome.status_code}")._replace(http=outcome))
     failure = _status_failure(outcome, spec.label)
     if failure is not None:
-        return failure._replace(http=outcome)
+        raise _Verdict(failure._replace(http=outcome))
     return outcome
+
+
+def _bearer_headers(token: str) -> dict[str, str]:
+    """The header map of a JSON call carrying a token a first call minted. Those calls go to a fixed vendor host,
+    so no userinfo can displace `Authorization` (the `_HeaderAuth` rule guards operator-typed hosts)."""
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+
+def _access_token(spec: CredentialTypeSpec, dest: _Destination, outcome: _HttpOutcome) -> str:
+    """A 2xx token response's `access_token`, or the raised shape failure: the wire rule on the one third-party
+    value put into a request (a CRLF or unencodable byte would surface as a transport error). `is_blank` is
+    needed too: `_is_transmittable("")` is vacuously true."""
+    token = _json_field(_json_body(outcome.body), "access_token")
+    if not isinstance(token, str) or is_blank(token) or not _is_transmittable(token):
+        raise _Verdict(_unexpected_body(spec, dest))
+    return token
+
+
+def _follow_up(
+    url: str, *, dest: _Destination, deadline: float, headers: dict[str, str],
+    allowed_origin: Optional[tuple[str, str, int]], could_not: str,
+) -> _HttpOutcome:
+    """A two-host test's second call, `GET url` with the token the first minted: every way it fails to complete is
+    one sentence (`could_not`, naming the vendor rather than a host the operator never typed) and `detail` passes
+    through, keeping the timeout/transport distinction. `allowed_origin` is the pin; `dest` only names failures."""
+    try:
+        return _request("GET", url, dest=dest, deadline=deadline, headers=headers, allowed_origin=allowed_origin)
+    except _Verdict as verdict:
+        raise _Verdict(_failure(
+            f"{could_not} - check this server's network access.", detail=verdict.result.detail,
+        )) from None
 
 
 # When the operator names none; see the `generic_api_key` registry entry.
@@ -747,16 +818,18 @@ def _api_key_request(
     accept: Optional[str] = "application/json",
     extra_headers: Optional[dict[str, str]] = None,
     rejected_message: Optional[str] = None,
-) -> _HttpOutcome | TestResult:
+    basic_user: Optional[str] = None,
+    addresses: tuple[str, ...] = (),
+) -> _HttpOutcome:
     """`GET {dest.base}{path}` carrying `key` in one header: the shape most of these types share.
 
-    Every declarative type (`_declared_tester`, from its registry `KeyTestSpec`), Headscale and the generic type
-    differ only in header name, scheme word, path and `Accept`, so those are arguments. Jira/Xero (BasicAuth),
-    GitHub (host-dependent prefix), AWS (signed) and Slack (two POSTs) stay separate.
+    Every declarative type (`_declared_tester`, from its registry `KeyTestSpec`) and the generic type
+    differ only in header name, scheme word, path and `Accept`, so those are arguments. Xero (BasicAuth + a
+    second call), GitHub (host-dependent prefix), AWS (signed) and Slack (two POSTs) stay separate.
 
-    `value_prefix` is a scheme word; the space is supplied here. The key never reaches a query string;
-    `path` is the caller's literal. `Authorization` rides
-    an `httpx.Auth` flow, every other name the header map (see `_HeaderAuth`).
+    `value_prefix` is a scheme word; the space is supplied here. `basic_user` sends `Authorization: Basic`
+    (user:key) instead of the header. The key never reaches a query string; `path` is the caller's literal.
+    `Authorization` rides an `httpx.Auth` flow, every other name the header map (see `_HeaderAuth`).
     """
     headers: dict[str, str] = {}
     if accept is not None:
@@ -764,14 +837,16 @@ def _api_key_request(
     if extra_headers:
         headers.update(extra_headers)
     value = f"{value_prefix} {key}" if value_prefix else key
-    displaceable = header_name.lower() == _DEFAULT_API_KEY_HEADER.lower()
-    if not displaceable:
+    auth: Optional[httpx.Auth] = None
+    if basic_user is not None:
+        auth = httpx.BasicAuth(basic_user, key)
+    elif header_name.lower() == _DEFAULT_API_KEY_HEADER.lower():
+        auth = _HeaderAuth(header_name, value)
+    else:
         headers[header_name] = value
     return _checked_request(
         spec, dest, deadline, "GET", f"{dest.base}{path}",
-        auth=_HeaderAuth(header_name, value) if displaceable else None,
-        headers=headers,
-        rejected_message=rejected_message,
+        auth=auth, headers=headers, rejected_message=rejected_message, addresses=addresses,
     )
 
 
@@ -784,19 +859,40 @@ def _declared_tester(slug: str) -> Tester:
         raise ValueError(f"{slug}: declares no key_test")
 
     def test(config: dict[str, Any], deadline: float) -> TestResult:
-        prepared = _prepare(slug, config)
-        if isinstance(prepared, TestResult):
-            return prepared
-        spec, dest = prepared
+        spec, dest = _prepare(slug, config)
         # Read with `spec`, never captured at build time, so the request and the verdict share one spec.
         key_test = spec.key_test
         if key_test is None:
             raise ValueError(f"{slug}: declares no key_test")
         key = config.get(key_test.key_field)
-        if key_test.blank_key_reason is not None and is_blank(key):
-            return TestResult(ok=False, status="unsupported", message=key_test.blank_key_reason)
         key_label = _field_label(spec, key_test.key_field)
         bearer = key_test.bearer_when is not None and not is_blank(config.get(key_test.bearer_when))
+        rejected_message = key_test.rejected_message or (
+            _vendor_rejected_message(spec, dest, key_label) if key_test.reject_names_vendor else None
+        )
+        connect_token = config.get(key_test.connect_token_field) if key_test.connect_token_field else None
+        if is_blank(key) and not is_blank(connect_token):
+            # A Connect row: its cached OAuth access token, as Bearer. A lapsed one is renewed by the refresh
+            # path before its next use, so the Test spends nothing on it; with no refresh token, as
+            # `_catalog_http`, only the person can renew it.
+            if _cached_token_expired(config):
+                if is_blank(config.get("refresh_token")):
+                    return _failure(f"The {spec.label} access token has expired - press Connect to reauthorize.",
+                                    detail="expired")
+                return _unsupported(_RENEWS_MESSAGE)
+            key, bearer = connect_token, True
+            key_label = _field_label(spec, str(key_test.connect_token_field))
+            # Nobody pasted it, so "check it" is no remedy.
+            rejected_message = f"{spec.label} rejected the {key_label} - press Connect to reauthorize."
+        elif key_test.blank_key_reason is not None and is_blank(key):
+            return _unsupported(key_test.blank_key_reason)
+        addresses: tuple[str, ...] = ()
+        if key_test.vet_destination and dest.operator_supplied:
+            # No DNS oracle: one sentence whether the host is private, reserved or unresolvable.
+            refusal, addresses = http_bounded.vetted_addresses(f"{dest.base}{key_test.path}")
+            if refusal is not None or not addresses:
+                return _failure(f"{spec.label} can't be reached at that address. Use the site's public https:// address.",
+                                detail="refused_destination")
         outcome = _api_key_request(
             spec, dest, deadline,
             path=key_test.path,
@@ -808,27 +904,37 @@ def _declared_tester(slug: str) -> Tester:
                 header: str(config[field]) for header, field in key_test.field_headers
                 if not is_blank(config.get(field))
             },
-            rejected_message=_vendor_rejected_message(spec, dest, key_label) if key_test.reject_names_vendor else None,
+            rejected_message=rejected_message,
+            basic_user=str(config[key_test.basic_user_field]).strip() if key_test.basic_user_field else None,
+            addresses=addresses,
         )
-        if isinstance(outcome, TestResult):
-            return outcome
+        if key_test.identity_fallback_field is not None:
+            # Ungated: an unreadable 2xx is still an authenticated call, so the fallback names it. A non-string
+            # value is not a name while a fallback is at hand (`_identity_text` would coerce a number).
+            found = (_json_field(_json_body(outcome.body), *path) for path in key_test.identity)
+            fallback = str(config[key_test.identity_fallback_field]).strip()
+            identity = _identity_text(*(value for value in found if isinstance(value, str)), fallback) or fallback
+            return _success(f"Connected to {spec.label} {key_test.identity_phrase} {identity}.")
         if key_test.accept is None:
             # Not shape-gated: the body is bounded and never inspected.
             return _success(f"Connected to {spec.label} - {key_label} accepted.")
         if key_test.list_field is not None:
-            parsed = _gated_body(spec, dest, outcome)
-            if isinstance(parsed, TestResult) or not isinstance(_json_field(parsed, key_test.list_field), list):
+            listed = _json_field(_gated_body(spec, dest, outcome), key_test.list_field)
+            if not isinstance(listed, list):
                 return _unexpected_body(spec, dest)
+            if key_test.list_verdict is not None:
+                return _LIST_VERDICTS[key_test.list_verdict](spec, str(key), listed)
             return _credentials_accepted(spec)
         return _named(spec, dest, outcome, *key_test.identity, phrase=key_test.identity_phrase)
 
-    return test
+    return _verdict_guard(test)
 
 
 def _vendor_rejected_message(spec: CredentialTypeSpec, dest: _Destination, key_label: str) -> str:
     """A `reject_names_vendor` type's 401/403 sentence. With an operator host field (Make's zone) it names the
     host that refused, since a key valid on another host (an EU account left on `us1`) is rejected too."""
     field = _operator_host_field(spec)
+    key_label = _mid_sentence(key_label, spec.label)
     if field is None:
         return f"{spec.label} rejected the {key_label} - check it."
     return f"The {key_label} was rejected by {dest.host} - check the {key_label} and {field.label}."
@@ -842,48 +948,14 @@ def _named(
     phrase: str = "as",
 ) -> TestResult:
     """The identity verdict on a shape-gated JSON object: the first of `paths` that `_identity_text` keeps,
-    as "Connected to {label} {phrase} {identity}.", or `_credentials_accepted` when none survives."""
-    parsed = _gated_body(spec, dest, outcome)
-    if isinstance(parsed, TestResult):
-        return parsed
+    as "Connected to {label} {phrase} {identity}.", or `_credentials_accepted` when none survives. A path that starts
+    with an index reads a JSON array (Xero's `/connections`)."""
+    array = any(path and isinstance(path[0], int) and not isinstance(path[0], bool) for path in paths)
+    parsed = _gated_body(spec, dest, outcome, (dict, list) if array else dict)
     identity = _identity_text(*(_json_field(parsed, *path) for path in paths))
     if identity is None:
         return _credentials_accepted(spec)
     return _success(f"Connected to {spec.label} {phrase} {identity}.", identity=identity)
-
-
-# ── Jira ──────────────────────────────────────────────────────────────────────
-
-def test_jira(config: dict[str, Any], deadline: float) -> TestResult:
-    """`GET {base_url}/rest/api/3/myself` with Basic auth (email + API token).
-
-    Names who the credentials belong to. Not shape-gated: an unreadable 2xx body still proves the
-    credential worked, and gating would change a shipped sentence for no new signal.
-    """
-    prepared = _prepare("jira", config)
-    if isinstance(prepared, TestResult):
-        return prepared
-    spec, dest = prepared
-
-    email = str(config["email"]).strip()
-    outcome = _checked_request(
-        spec, dest, deadline, "GET", f"{dest.base}/rest/api/3/myself",
-        auth=httpx.BasicAuth(email, str(config["api_token"])),
-    )
-    if isinstance(outcome, TestResult):
-        return outcome
-    return _success(f"Connected to {spec.label} as {_jira_identity(outcome.body, email)}.")
-
-
-def _jira_identity(body: bytes, email: str) -> str:
-    """`displayName` from the response, falling back to the account email.
-
-    An unparsable, wrong-shape or truncated 2xx body is still a successful authenticated call. A
-    non-string `displayName` is narrowed away (so `_identity_text`'s number coercion does not apply); the
-    fallback is sanitised and capped. `or email` only keeps the return type `str`.
-    """
-    name = _json_field(_json_body(body), "displayName")
-    return _identity_text(name if isinstance(name, str) else None, email) or email
 
 
 # ── Xero ──────────────────────────────────────────────────────────────────────
@@ -898,6 +970,7 @@ _XERO_CONNECTIONS_URL = "https://api.xero.com/connections"
 _XERO_CONNECTIONS_ORIGIN = request_origin(_XERO_CONNECTIONS_URL)
 
 
+@_verdict_guard
 def test_xero(config: dict[str, Any], deadline: float) -> TestResult:
     """`POST {base}/connect/token`, then `GET api.xero.com/connections` with the token and Tenant ID.
 
@@ -908,38 +981,16 @@ def test_xero(config: dict[str, Any], deadline: float) -> TestResult:
     400; a tenant not on this connection -> 200 `[]`. So an empty list is a failure naming the Tenant ID.
     Custom Connections is a paid add-on; a plan without it cannot green.
     """
-    prepared = _prepare("xero", config)
-    if isinstance(prepared, TestResult):
-        return prepared
-    spec, dest = prepared
+    spec, dest = _prepare("xero", config)
 
     access_token = _xero_access_token(spec, dest, config, deadline)
-    if isinstance(access_token, TestResult):
-        return access_token
 
-    # `allowed_origin` is what the request is pinned to; `dest` only names failures, and every failure
-    # from this call is replaced below.
-    outcome = _request(
-        "GET",
-        _XERO_CONNECTIONS_URL,
-        dest=dest,
-        deadline=deadline,
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json",
-            # Proved present and transmittable by `_field_problem`; `str()` because values are untyped.
-            "Xero-Tenant-Id": str(config["tenant_id"]),
-        },
-        allowed_origin=_XERO_CONNECTIONS_ORIGIN,
+    outcome = _follow_up(
+        _XERO_CONNECTIONS_URL, dest=dest, deadline=deadline, allowed_origin=_XERO_CONNECTIONS_ORIGIN,
+        # Proved present and transmittable by `_field_problem`; `str()` because values are untyped.
+        headers={**_bearer_headers(access_token), "Xero-Tenant-Id": str(config["tenant_id"])},
+        could_not=f"{spec.label} accepted the credentials but could not complete the organisation lookup",
     )
-    if isinstance(outcome, TestResult):
-        # One sentence for every way call 2 fails to complete, naming Xero (not a host the operator never
-        # typed). `detail` passes through, keeping the timeout/transport distinction.
-        return _failure(
-            f"{spec.label} accepted the credentials but could not complete the organisation lookup"
-            " - check this server's network access.",
-            detail=outcome.detail,
-        )
     failure = _status_failure(outcome, spec.label)
     if failure is not None:
         return failure
@@ -959,8 +1010,8 @@ def test_xero(config: dict[str, Any], deadline: float) -> TestResult:
 
 def _xero_access_token(
     spec: CredentialTypeSpec, dest: _Destination, config: dict[str, Any], deadline: float
-) -> str | TestResult:
-    """Call 1: the client-credentials access token, or the failure to report instead of calling again.
+) -> str:
+    """Call 1: the client-credentials access token; the failure to report instead of calling again is raised.
 
     `scope` is omitted when blank: a Custom Connection's scope must subset what the Xero UI granted, so
     absent (Xero's default, everything granted) is the only universal value. A 400 (`invalid_client`,
@@ -984,62 +1035,44 @@ def _xero_access_token(
         },
         content=urlencode(form).encode("ascii"),
     )
-    if isinstance(outcome, TestResult):
-        return outcome
     if outcome.status_code == 400:
-        return _failure(
+        raise _Verdict(_failure(
             f"{spec.label} rejected the client credentials or the requested scope - check the "
             "Client ID, Client secret and Scope.",
             detail=f"HTTP {outcome.status_code}",
-        )
+        ))
     failure = _status_failure(outcome, spec.label)
     if failure is not None:
-        return failure
-    parsed = _json_body(outcome.body)
-    if not isinstance(parsed, dict):
-        return _unexpected_body(spec, dest)
-    access_token = _json_field(parsed, "access_token")
-    if (
-        not isinstance(access_token, str)
-        or is_blank(access_token)
-        or not _is_transmittable(access_token)
-    ):
-        # The wire rule on the one third-party value put into a request: a CRLF or unencodable byte would
-        # surface as a transport error. `is_blank` is needed too: `_is_transmittable("")` is vacuously true.
-        return _unexpected_body(spec, dest)
-    return access_token
+        raise _Verdict(failure)
+    return _access_token(spec, dest, outcome)
 
 
 # ── Slack ─────────────────────────────────────────────────────────────────────
 
-def test_slack(config: dict[str, Any], deadline: float) -> TestResult:
-    """`POST https://slack.com/api/auth.test` with the bot token, then `POST .../apps.connections.open`
-    with the app-level token: two credentials, one shared deadline, both required for a green.
+def _slack_tester(slug: str, token_field: str, app_token_field: Optional[str] = None) -> Tester:
+    """`POST https://slack.com/api/auth.test` with `config[token_field]`, then (`slack` only) `POST
+    .../apps.connections.open` with the app-level token: two credentials, one shared deadline, both required for a
+    green. A tenant's installed workspace (`slack_workspace`) holds the bot token alone.
 
     Slack answers HTTP 200 `{"ok": false, ...}` for a bad token, so `ok is True` is required on each
     call (`is not True` fails closed). Each rejection names that call's field; the vendor `error` is
     never read into a message. The `wss://` `url` from `apps.connections.open` is never read. POST with
     `content=b""`. Success names both workspace and user, or neither.
     """
-    prepared = _prepare("slack", config)
-    if isinstance(prepared, TestResult):
-        return prepared
-    spec, dest = prepared
 
-    auth_test = _slack_call(spec, dest, deadline, config, "/api/auth.test", "token")
-    if isinstance(auth_test, TestResult):
-        return auth_test
-    team = _identity_text(_json_field(auth_test, "team"))
-    user = _identity_text(_json_field(auth_test, "user"))
+    def test(config: dict[str, Any], deadline: float) -> TestResult:
+        spec, dest = _prepare(slug, config)
+        auth_test = _slack_call(spec, dest, deadline, config, "/api/auth.test", token_field)
+        team = _identity_text(_json_field(auth_test, "team"))
+        user = _identity_text(_json_field(auth_test, "user"))
+        if app_token_field is not None:
+            # Call 2, sharing the same deadline (one budget). Only `ok` is read (by `_ok_envelope`).
+            _slack_call(spec, dest, deadline, config, "/api/apps.connections.open", app_token_field)
+        if team is None or user is None:
+            return _credentials_accepted(spec)
+        return _success(f"Connected to Slack workspace {team} as {user}.")
 
-    # Call 2: the app-level token, sharing the same deadline (one budget). Only `ok` is read.
-    connections_open = _slack_call(spec, dest, deadline, config, "/api/apps.connections.open", "app_token")
-    if isinstance(connections_open, TestResult):
-        return connections_open
-
-    if team is None or user is None:
-        return _credentials_accepted(spec)
-    return _success(f"Connected to {spec.label} workspace {team} as {user}.")
+    return _verdict_guard(test)
 
 
 def _slack_call(
@@ -1049,49 +1082,26 @@ def _slack_call(
     config: dict[str, Any],
     path: str,
     token_field: str,
-) -> dict[str, Any] | TestResult:
-    """One empty-body Slack POST with `config[token_field]` as the Bearer token: the `ok: true` object, or
-    the failure naming that token's field."""
-    token_label = _field_label(spec, token_field)
-    outcome = _request(
-        "POST",
-        f"{dest.base}{path}",
-        dest=dest,
-        deadline=deadline,
-        headers={
-            "Authorization": f"Bearer {str(config[token_field])}",
-            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-            "Accept": "application/json",
-        },
-        content=b"",
+) -> dict[str, Any]:
+    """One empty-body Slack POST with `config[token_field]` as the Bearer token: the `ok: true` object; the
+    failure naming that token's field is raised."""
+    rejected = f"Authentication rejected - check the {_field_label(spec, token_field)}."
+    outcome = _checked_request(
+        spec, dest, deadline, "POST", f"{dest.base}{path}", content=b"", rejected_message=rejected,
+        headers={**_bearer_headers(str(config[token_field])),
+                 "Content-Type": "application/x-www-form-urlencoded; charset=utf-8"},
     )
-    if isinstance(outcome, TestResult):
-        return outcome
-    return _ok_envelope(spec, dest, outcome, token_label=token_label, rejected=(401, 403))
+    return _ok_envelope(spec, dest, outcome, rejected=rejected)
 
 
 def _ok_envelope(
-    spec: CredentialTypeSpec,
-    dest: _Destination,
-    outcome: _HttpOutcome,
-    *,
-    token_label: str,
-    rejected: tuple[int, ...],
-) -> dict[str, Any] | TestResult:
-    """A Slack/Telegram-style `{"ok": true, ...}` response read: a status in `rejected` or an `ok` that is
-    not `true` is the failure naming `token_label`; otherwise the gated body."""
-    if outcome.status_code in rejected:
-        return _failure(
-            f"Authentication rejected - check the {token_label}.", detail=f"HTTP {outcome.status_code}"
-        )
-    failure = _status_failure(outcome, spec.label)
-    if failure is not None:
-        return failure
+    spec: CredentialTypeSpec, dest: _Destination, outcome: _HttpOutcome, *, rejected: str
+) -> dict[str, Any]:
+    """A Slack/Telegram-style `{"ok": true, ...}` 2xx read: an `ok` that is not `true` raises `rejected`, the
+    sentence naming the token's field; otherwise the gated body."""
     parsed = _gated_body(spec, dest, outcome)
-    if isinstance(parsed, TestResult):
-        return parsed
     if _json_field(parsed, "ok") is not True:
-        return _failure(f"Authentication rejected - check the {token_label}.", detail="rejected")
+        raise _Verdict(_failure(rejected, detail="rejected"))
     return parsed
 
 
@@ -1106,6 +1116,7 @@ _GITHUB_ENTERPRISE_PREFIX = "/api/v3"
 _GITHUB_COM_ORIGIN = request_origin(CREDENTIAL_TYPES["github"].default_base_url)
 
 
+@_verdict_guard
 def test_github(config: dict[str, Any], deadline: float) -> TestResult:
     """`GET {base}/user` on github.com, `GET {base}/api/v3/user` on a GitHub Enterprise Server.
 
@@ -1113,10 +1124,7 @@ def test_github(config: dict[str, Any], deadline: float) -> TestResult:
     PAT-only: App installation and OAuth user tokens come from flows this module lacks. The host is
     operator-suppliable, so the shape gate matters (an SSO portal can answer 200 with HTML).
     """
-    prepared = _prepare("github", config)
-    if isinstance(prepared, TestResult):
-        return prepared
-    spec, dest = prepared
+    spec, dest = _prepare("github", config)
 
     on_public_api = _same_origin(request_origin(dest.base), _GITHUB_COM_ORIGIN)
     prefix = "" if on_public_api else _GITHUB_ENTERPRISE_PREFIX
@@ -1127,8 +1135,6 @@ def test_github(config: dict[str, Any], deadline: float) -> TestResult:
         auth=_HeaderAuth("Authorization", f"Bearer {config['token']}"),
         headers=github_api.headers(None),
     )
-    if isinstance(outcome, TestResult):
-        return outcome
     return _named(spec, dest, outcome, ("login",))
 
 
@@ -1143,16 +1149,6 @@ _DEVICE_FLOW_DISABLED = "device_flow_disabled"
 # GitHub's device-flow error for a client id it does not hold ("you must pass your app's client ID"): a red,
 # like the 404 an unknown id has been observed to answer.
 _DEVICE_CLIENT_UNKNOWN = "incorrect_client_credentials"
-
-
-def test_github_app(config: dict[str, Any], deadline: float) -> TestResult:
-    """The OAuth App's recognition test (`_test_github_client_id`)."""
-    return _test_github_client_id("github_app", config, deadline)
-
-
-def test_github_install_app(config: dict[str, Any], deadline: float) -> TestResult:
-    """The GitHub App's recognition test (`_test_github_client_id`); its `slug` is checked only as present."""
-    return _test_github_client_id("github_install_app", config, deadline)
 
 
 def _test_github_client_id(slug: str, config: dict[str, Any], deadline: float) -> TestResult:
@@ -1172,10 +1168,7 @@ def _test_github_client_id(slug: str, config: dict[str, Any], deadline: float) -
     A blank client secret still refuses the test (the registry's generic `required` check); left alone,
     as `routes/credentials/connection_test.py::_audit_test` notes.
     """
-    prepared = _prepare(slug, config)
-    if isinstance(prepared, TestResult):
-        return prepared
-    spec, dest = prepared
+    spec, dest = _prepare(slug, config)
 
     client_id_label = _field_label(spec, "client_id")
     outcome = _request(
@@ -1189,8 +1182,6 @@ def _test_github_client_id(slug: str, config: dict[str, Any], deadline: float) -
         },
         content=urlencode({"client_id": str(config["client_id"])}).encode("ascii"),
     )
-    if isinstance(outcome, TestResult):
-        return outcome
 
     # Read before the status, for this type only: GitHub's status for `device_flow_disabled` is not
     # documented, so the body decides. Bounded to 2xx/4xx: a 3xx (redirects disabled) or 5xx says nothing
@@ -1231,6 +1222,11 @@ def _test_github_client_id(slug: str, config: dict[str, Any], deadline: float) -
     )
 
 
+# The OAuth App's and the GitHub App's recognition tests; the GitHub App's `slug` is checked only as present.
+test_github_app = _verdict_guard(functools.partial(_test_github_client_id, "github_app"))
+test_github_install_app = _verdict_guard(functools.partial(_test_github_client_id, "github_install_app"))
+
+
 # ── Bitbucket Cloud ───────────────────────────────────────────────────────────
 
 #: The token kinds each forge's credential accepts, single-homed for the testers, the write path and
@@ -1254,13 +1250,11 @@ def _azure_org_clause(value: str) -> Optional[str]:
     return "must be an organization name as in dev.azure.com/<organization> - letters, digits and hyphens."
 
 
+@_verdict_guard
 def test_bitbucket(config: dict[str, Any], deadline: float) -> TestResult:
     """`GET https://api.bitbucket.org/2.0/user`: Basic (account email + API token) for an `api_token`, a
     Bearer token for `oauth`. Names the account. Fixed host, shape-gated all the same."""
-    prepared = _prepare("bitbucket", config)
-    if isinstance(prepared, TestResult):
-        return prepared
-    spec, dest = prepared
+    spec, dest = _prepare("bitbucket", config)
     kind = str(config.get("kind") or BITBUCKET_KINDS[0])
     if kind not in BITBUCKET_KINDS:
         return _failure(f"{_field_label(spec, 'kind')} {_kind_clause(BITBUCKET_KINDS)(kind)}")
@@ -1276,21 +1270,17 @@ def test_bitbucket(config: dict[str, Any], deadline: float) -> TestResult:
         spec, dest, deadline, "GET", f"{dest.base}/2.0/user",
         auth=auth, headers={"Accept": "application/json"},
     )
-    if isinstance(outcome, TestResult):
-        return outcome
     return _named(spec, dest, outcome, ("username",), ("display_name",))
 
 
 # ── Azure DevOps Services ─────────────────────────────────────────────────────
 
+@_verdict_guard
 def test_azure_devops(config: dict[str, Any], deadline: float) -> TestResult:
     """`GET https://dev.azure.com/{test_org}/_apis/connectionData`: Basic (any username + PAT) for a
     `pat`, a Bearer token for `oauth`. Names the authenticated user. Probed: a bad PAT answers 401 (or a
     203 sign-in page, which the shape gate refuses)."""
-    prepared = _prepare("azure_devops", config)
-    if isinstance(prepared, TestResult):
-        return prepared
-    spec, dest = prepared
+    spec, dest = _prepare("azure_devops", config)
     kind = str(config.get("kind") or AZURE_DEVOPS_KINDS[0])
     if kind not in AZURE_DEVOPS_KINDS:
         return _failure(f"{_field_label(spec, 'kind')} {_kind_clause(AZURE_DEVOPS_KINDS)(kind)}")
@@ -1309,8 +1299,6 @@ def test_azure_devops(config: dict[str, Any], deadline: float) -> TestResult:
         spec, dest, deadline, "GET", f"{dest.base}/{org}/_apis/connectionData",
         auth=auth, headers={"Accept": "application/json"},
     )
-    if isinstance(outcome, TestResult):
-        return outcome
     if outcome.status_code != 200:
         # A 203 is Azure's sign-in page for an unaccepted credential: a 2xx that is not the API.
         return _failure("Authentication rejected - check the credentials.", detail=f"HTTP {outcome.status_code}")
@@ -1332,6 +1320,7 @@ def _not_in_ce() -> TestResult:
     return _failure(NOT_IN_CE)
 
 
+@_verdict_guard
 def test_azure(config: dict[str, Any], deadline: float) -> TestResult:
     """A token for Azure Resource Manager, then the subscription read with it: names the subscription.
 
@@ -1339,10 +1328,7 @@ def test_azure(config: dict[str, Any], deadline: float) -> TestResult:
     exception); a 403 on the subscription says the app holds no role there."""
     if not edition_features.enabled("cloud_nodes"):
         return _not_in_ce()
-    prepared = _prepare("azure", config)
-    if isinstance(prepared, TestResult):
-        return prepared
-    spec, dest = prepared
+    spec, dest = _prepare("azure", config)
     for key, clause in (("tenant_id", azure_wire.tenant_clause), ("client_id", azure_wire.guid_clause),
                         ("subscription_id", azure_wire.guid_clause)):
         problem = clause(str(config[key]))
@@ -1357,28 +1343,19 @@ def test_azure(config: dict[str, Any], deadline: float) -> TestResult:
         "POST", azure_wire.token_url(str(config["tenant_id"])), dest=dest, deadline=deadline,
         headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}, content=form,
     )
-    if isinstance(outcome, TestResult):
-        return outcome
     parsed = _json_body(outcome.body)
     if not 200 <= outcome.status_code < 300:
         refusal = azure_wire.token_refusal(parsed, secret)
         if refusal is not None and outcome.status_code < 500:
             return _failure(f"{spec.label} refused the credentials: {refusal}", detail=f"HTTP {outcome.status_code}")
         return _status_failure(outcome, spec.label) or _unexpected_body(spec, dest)
-    access_token = _json_field(parsed, "access_token") if isinstance(parsed, dict) else None
-    if not isinstance(access_token, str) or is_blank(access_token) or not _is_transmittable(access_token):
-        return _unexpected_body(spec, dest)
+    access_token = _access_token(spec, dest, outcome)
     subscription = str(config["subscription_id"]).strip()
-    read = _request(
-        "GET", f"{azure_wire.ARM_BASE}/subscriptions/{subscription}?api-version=2022-12-01", dest=dest,
-        deadline=deadline, headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
-        allowed_origin=_AZURE_ARM_ORIGIN,
+    read = _follow_up(
+        f"{azure_wire.ARM_BASE}/subscriptions/{subscription}?api-version=2022-12-01", dest=dest, deadline=deadline,
+        headers=_bearer_headers(access_token), allowed_origin=_AZURE_ARM_ORIGIN,
+        could_not=f"{spec.label} accepted the credentials but the subscription could not be read",
     )
-    if isinstance(read, TestResult):
-        return _failure(
-            f"{spec.label} accepted the credentials but the subscription could not be read"
-            " - check this server's network access.", detail=read.detail,
-        )
     if read.status_code in (401, 403, 404):
         code, _message = azure_wire.arm_refusal(_json_body(read.body))
         return _failure(
@@ -1423,6 +1400,7 @@ _AWS_CLOCK_PATTERN = re.compile(
 )
 
 
+@_verdict_guard
 def test_aws(config: dict[str, Any], deadline: float) -> TestResult:
     """`POST https://sts.amazonaws.com/` with `Action=GetCallerIdentity`, signed with SigV4.
 
@@ -1430,10 +1408,7 @@ def test_aws(config: dict[str, Any], deadline: float) -> TestResult:
     mapping is passed through verbatim and `_AWS_BODY` unchanged: the signature covers them, and any
     difference would be a 403 misreported as bad credentials.
     """
-    prepared = _prepare("aws", config)
-    if isinstance(prepared, TestResult):
-        return prepared
-    spec, dest = prepared
+    spec, dest = _prepare("aws", config)
 
     url = f"{dest.base}/"
     # Temporary credentials only; blank is a long-lived key. Checked here so a refusal names the field
@@ -1453,7 +1428,7 @@ def test_aws(config: dict[str, Any], deadline: float) -> TestResult:
             payload=_AWS_BODY,
             content_type=_AWS_CONTENT_TYPE,
             # Read here, never in the signer, so its known-answer test stays byte-exact.
-            amz_date=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+            amz_date=utcnow().strftime("%Y%m%dT%H%M%SZ"),
         )
     except ValueError as exc:
         # The only reachable cause is the access key id (all else is constant or checked above, and
@@ -1466,8 +1441,6 @@ def test_aws(config: dict[str, Any], deadline: float) -> TestResult:
     outcome = _request(
         "POST", url, dest=dest, deadline=deadline, headers=headers, content=_AWS_BODY
     )
-    if isinstance(outcome, TestResult):
-        return outcome
 
     # A body that filled the cap is unreadable, decided once before either reader: no branch may key on
     # a tag that survived the cut (a padded skew code would misdirect a bad-key operator to the clock).
@@ -1532,68 +1505,235 @@ def _google_refusal(outcome: _HttpOutcome, label: str) -> Optional[TestResult]:
     return _failure(f"Google refused: {said}", detail=f"HTTP {outcome.status_code}")
 
 
-def test_gcp(config: dict[str, Any], deadline: float) -> TestResult:
-    """The key exchanged for a token at `oauth2.googleapis.com/token` (a signed JWT bearer grant, the key itself
-    sent nowhere), then `GET compute/v1/projects/{project}` with it — the project the key's nodes would launch in.
+def _google_access_token(
+    spec: CredentialTypeSpec, dest: _Destination, key: gcp_auth.ServiceAccountKey, deadline: float,
+    scopes: Optional[list[str]] = None,
+) -> str:
+    """An access token for `key` (`_service_account_grant`), or the raised failure in Google's own words. `dest` is
+    the token host's; `scopes` defaults to `cloud-platform`."""
+    outcome = _service_account_grant(key, scopes or [gcp_wire.SCOPE], dest, deadline)
+    refused = _google_refusal(outcome, spec.label)
+    if refused is not None:
+        raise _Verdict(refused)
+    return _access_token(spec, dest, outcome)
 
-    A refused key or project reads Google's own sentence ("Invalid JWT Signature.", "Required
-    'compute.projects.get' permission …"). The pasted key is re-serialised compactly before `_prepare`: its line
-    breaks are formatting, and it travels in no header for `_field_problem`'s transmittability rule to guard."""
-    if not edition_features.enabled("cloud_nodes"):
-        return _not_in_ce()
+
+def _google_get(
+    spec: CredentialTypeSpec, api: _Destination, url: str, access: str, deadline: float,
+    rejected: Optional[Callable[[int, Optional[str]], TestResult]] = None,
+) -> dict[str, Any]:
+    """`GET url` at a Google API with the minted token: the gated body, or the raised refusal in Google's own words.
+    `rejected` builds a catalog hook's own 401/403 sentence from the status and Google's reason (AC2.6: the vendor,
+    the field and the status by name)."""
+    outcome = _request("GET", url, dest=api, deadline=deadline, headers=_bearer_headers(access))
+    if rejected is not None and outcome.status_code in (401, 403):
+        raise _Verdict(rejected(outcome.status_code, _google_says(outcome)))
+    refused = _google_refusal(outcome, spec.label)
+    if refused is not None:
+        raise _Verdict(refused)
+    body = _gated_body(spec, api, outcome)
+    assert isinstance(body, dict)  # `_gated_body`'s default container
+    return body
+
+
+def _service_account_prepared(
+    type_slug: str, config: dict[str, Any]
+) -> tuple[CredentialTypeSpec, _Destination, "gcp_auth.ServiceAccountKey", dict[str, Any]]:
+    """`_prepare` for a type holding a pasted Google service account key (`gcp_auth.KEY_FIELD`): the key parsed, and
+    the config with the key re-serialised compactly — its line breaks are formatting, and it travels in no header
+    for `_field_problem`'s transmittability rule to guard. A refusal is raised, naming a field, never a value."""
     raw = config.get(gcp_auth.KEY_FIELD)
     key: Optional[gcp_auth.ServiceAccountKey] = None
     if isinstance(raw, str) and not is_blank(raw):
         try:
             key = gcp_auth.parse_key(raw)
         except ValueError as exc:
-            return _failure(str(exc))  # fixed sentences naming a field, never a value
+            raise _Verdict(_failure(str(exc))) from None  # fixed sentences naming a field, never a value
         config = {**config, gcp_auth.KEY_FIELD: json.dumps(json.loads(raw))}
-    prepared = _prepare("gcp", config)
-    if isinstance(prepared, TestResult):
-        return prepared
-    spec, dest = prepared
+    spec, dest = _prepare(type_slug, config)
     if key is None:  # a non-text value `_prepare` let through (a blank one it refused)
-        return _failure(f"{_field_label(spec, gcp_auth.KEY_FIELD)} must be the JSON key file's text.")
-    project = str(config.get(gcp_auth.PROJECT_FIELD) or "").strip() or key.project_id
-    if not project:
-        return _failure(f"{_field_label(spec, gcp_auth.PROJECT_FIELD)} is required: the key names no project.")
-    if not _GCP_PROJECT_PATTERN.fullmatch(project):
-        return _failure(f"{_field_label(spec, gcp_auth.PROJECT_FIELD)} is not a GCP project id.")
+        raise _Verdict(_failure(f"{_field_label(spec, gcp_auth.KEY_FIELD)} must be the JSON key file's text."))
+    return spec, dest, key, config
+
+
+def _service_account_grant(
+    key: "gcp_auth.ServiceAccountKey", scopes: list[str], dest: _Destination, deadline: float
+) -> _HttpOutcome:
+    """The JWT bearer grant at `gcp_auth.TOKEN_URL` (only the signed assertion is sent); an unsignable key raised."""
     try:
-        signed = gcp_auth.assertion(key, [gcp_wire.SCOPE])
+        signed = gcp_auth.assertion(key, scopes)
     except ValueError as exc:
-        return _failure(str(exc))
-    outcome = _request(
+        raise _Verdict(_failure(str(exc))) from None
+    return _request(
         "POST", gcp_auth.TOKEN_URL, dest=dest, deadline=deadline,
         headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
         content=urlencode(gcp_auth.grant_body(signed)).encode(),
     )
-    if isinstance(outcome, TestResult):
-        return outcome
-    refused = _google_refusal(outcome, spec.label)
-    if refused is not None:
-        return refused
-    access = _json_field(_json_body(outcome.body), "access_token")
-    if not isinstance(access, str) or not access or not _is_transmittable(access):
-        return _unexpected_body(spec, dest)
-    outcome = _request(
-        "GET", f"{_GCP_COMPUTE.base}/compute/v1/projects/{project}", dest=_GCP_COMPUTE, deadline=deadline,
-        headers={"Authorization": f"Bearer {access}", "Accept": "application/json"},
-    )
-    if isinstance(outcome, TestResult):
-        return outcome
-    refused = _google_refusal(outcome, spec.label)
-    if refused is not None:
-        return refused
-    gated = _gated_body(spec, _GCP_COMPUTE, outcome)
-    if isinstance(gated, TestResult):
-        return gated
+
+
+def _google_project_ready(
+    type_slug: str, config: dict[str, Any]
+) -> tuple[CredentialTypeSpec, _Destination, "gcp_auth.ServiceAccountKey", str]:
+    """The prelude shared by the Google Cloud project testers, before any call leaves: the cloud-edition gate (the
+    community edition ships no Google Cloud signer), the pasted key (`_service_account_prepared`) and the project —
+    the config's `gcp_auth.PROJECT_FIELD`, else the key's own, refused unless it is a project id. A refusal is
+    raised as the verdict; the token is the caller's (`_google_access_token`, its scopes vary)."""
+    if not edition_features.enabled("cloud_nodes"):
+        raise _Verdict(_not_in_ce())
+    spec, dest, key, config = _service_account_prepared(type_slug, config)
+    project = str(config.get(gcp_auth.PROJECT_FIELD) or "").strip() or key.project_id
+    if not project:
+        raise _Verdict(_failure(f"{_field_label(spec, gcp_auth.PROJECT_FIELD)} is required: the key names no project."))
+    if not _GCP_PROJECT_PATTERN.fullmatch(project):
+        raise _Verdict(_failure(f"{_field_label(spec, gcp_auth.PROJECT_FIELD)} is not a Google Cloud project id."))
+    return spec, dest, key, project
+
+
+@_verdict_guard
+def test_gcp(config: dict[str, Any], deadline: float) -> TestResult:
+    """The key exchanged for a token at `oauth2.googleapis.com/token` (a signed JWT bearer grant, the key itself
+    sent nowhere), then `GET compute/v1/projects/{project}` with it — the project the key's nodes would launch in.
+
+    A refused key or project reads Google's own sentence ("Invalid JWT Signature.", "Required
+    'compute.projects.get' permission …")."""
+    spec, dest, key, project = _google_project_ready("gcp", config)
+    access = _google_access_token(spec, dest, key, deadline)
+    gated = _google_get(spec, _GCP_COMPUTE, f"{_GCP_COMPUTE.base}/compute/v1/projects/{project}", access, deadline)
     named = _identity_text(_json_field(gated, "name"))
     who = _identity_text(key.client_email)
     if named is None or who is None:
         return _credentials_accepted(spec)
     return _success(f"Connected to {spec.label} as {who} (project {named}).")
+
+
+def _google_catalog_read(
+    type_spec: CredentialTypeSpec, dest: _Destination, key: "gcp_auth.ServiceAccountKey", deadline: float,
+    api: _Destination, url: str, *, vendor: str, said: str, remedy: Optional[str] = None,
+    scopes: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """A catalog vendor's Google read after `_google_project_ready`: the token minted for `scopes`
+    (`_google_access_token`), then `GET url` (`_google_get`). A 401/403 is AC2.6's sentence — the vendor and the key
+    field by name, then Google's own reason after `said` (a missing role, a disabled API), or `remedy` when Google
+    gave none."""
+    what = _mid_sentence(_field_label(type_spec, gcp_auth.KEY_FIELD), vendor)
+    access = _google_access_token(type_spec, dest, key, deadline, scopes)
+    return _google_get(
+        type_spec, api, url, access, deadline,
+        rejected=lambda status, reason: _catalog_rejected(
+            vendor, what, status, remedy=f"{said}: {reason}" if reason else remedy),
+    )
+
+
+# ── Discovery Engine (a catalog `tester` hook) ────────────────────────────────
+
+#: Each Discovery Engine location and the API host that serves it (a fixed map, so no value moves the call).
+_DISCOVERY_ENGINE_HOSTS: Mapping[str, str] = {
+    "global": "discoveryengine.googleapis.com",
+    "us": "us-discoveryengine.googleapis.com",
+    "eu": "eu-discoveryengine.googleapis.com",
+}
+_DISCOVERY_ENGINE_HOOK = f"{__name__}:test_discovery_engine"
+#: The spec field naming the location (the hook's spec must declare it; `tests/integrations/` pins that).
+DISCOVERY_ENGINE_LOCATION_FIELD = "location"
+
+
+@_verdict_guard
+def test_discovery_engine(config: dict[str, Any], deadline: float) -> TestResult:
+    """The catalog hook of the vendor whose spec names it: a service-account key exchanged for a token
+    (`_google_access_token`), then `GET v1/projects/{project}/locations/{location}/collections/default_collection/
+    engines` — a read the `roles/discoveryengine.viewer` role allows, naming how many apps the key can see.
+
+    Its type is the catalog spec that names this hook, so no vendor name is written here. Run under
+    `catalog_tester`'s verdict guard; the prelude is `_google_project_ready`'s."""
+    spec = next(item for item in catalog.INTEGRATIONS.values() if item.tester == _DISCOVERY_ENGINE_HOOK)
+    location = str(config.get(DISCOVERY_ENGINE_LOCATION_FIELD) or "").strip().lower() or "global"
+    host = _DISCOVERY_ENGINE_HOSTS.get(location)
+    type_spec, dest, key, project = _google_project_ready(spec.credential_type, config)
+    if host is None:
+        return _failure(f"{_field_label(type_spec, DISCOVERY_ENGINE_LOCATION_FIELD)} must be one of: "
+                        f"{', '.join(_DISCOVERY_ENGINE_HOSTS)}.")
+    api = _Destination(base=f"https://{host}", host=host, operator_supplied=False)
+    body = _google_catalog_read(
+        type_spec, dest, key, deadline, api,
+        f"{api.base}/v1/projects/{project}/locations/{location}/collections/default_collection/engines",
+        vendor=spec.label, said="Google said", remedy="check its roles.",
+    )
+    engines = _json_field(body, "engines")
+    count = len(engines) if isinstance(engines, list) else 0
+    who = _identity_text(key.client_email)
+    seen = f"{count} app{'' if count == 1 else 's'} in {location}"
+    if who is None:
+        return _success(f"Connected to {spec.label} - {seen}.")
+    return _success(f"Connected to {spec.label} as {who} ({seen}).", identity=who)
+
+
+# ── BigQuery (a catalog `tester` hook) ────────────────────────────────────────
+
+_BIGQUERY = _Destination(base="https://bigquery.googleapis.com", host="bigquery.googleapis.com",
+                         operator_supplied=False)
+_BIGQUERY_SCOPE = "https://www.googleapis.com/auth/bigquery.readonly"
+
+
+@_verdict_guard
+def test_bigquery(config: dict[str, Any], deadline: float) -> TestResult:
+    """The catalog BigQuery vendor's Test hook (`integrations/vendors/bigquery.toml`): a read-only token minted
+    from the key (`_google_access_token`), then `GET bigquery/v2/projects/{project}/datasets?maxResults=1`, the
+    cheapest read that proves the key may use BigQuery in that project. A 401/403 names the vendor, the field
+    and the status, followed by Google's own sentence (AC2.6). The prelude is `_google_project_ready`'s."""
+    spec, dest, key, project = _google_project_ready("bigquery", config)
+    _google_catalog_read(
+        spec, dest, key, deadline, _BIGQUERY, f"{_BIGQUERY.base}/bigquery/v2/projects/{project}/datasets?maxResults=1",
+        vendor=spec.label, said="Google says", scopes=[_BIGQUERY_SCOPE],
+    )
+    who = _identity_text(key.client_email)
+    if who is None:
+        return _credentials_accepted(spec)
+    return _success(f"Connected to {spec.label} as {who} (project {project}).")
+
+
+def google_service_account_grant(
+    type_slug: str, scopes: Sequence[str], config: dict[str, Any], deadline: float
+) -> TestResult:
+    """A catalog vendor's Test whose API is a Google one with no read-only call: the pasted service account key
+    (`gcp_auth.KEY_FIELD`) signs a JWT for `scopes` and `oauth2.googleapis.com/token` exchanges it — the grant every
+    call starts with, so a revoked, deleted or malformed key fails here; the key itself is sent nowhere. The type
+    must name that host as its base (its spec's `default_base_url`). A refusal names the vendor, the field and the
+    status, plus Google's own sentence; success names the key's account and project. A spec's `tester` hook binds
+    the type and scopes, and `catalog_tester`'s `_verdict_guard` turns a raised refusal into the result. The signer
+    is the cloud edition's (`app/gcp`), so the community edition answers `_not_in_ce`."""
+    if not edition_features.enabled("cloud_nodes"):
+        return _not_in_ce()
+    spec, dest, key, config = _service_account_prepared(type_slug, config)
+    what = _mid_sentence(_field_label(spec, gcp_auth.KEY_FIELD), spec.label)
+    outcome = _service_account_grant(key, list(scopes), dest, deadline)
+    if outcome.status_code in (400, 401, 403):
+        # The token endpoint answers a bad signature, a deleted key or a disabled account `400 invalid_grant`.
+        rejected = _catalog_rejected(spec.label, what, outcome.status_code)
+        said = _google_says(outcome)
+        if said is not None:
+            rejected = rejected._replace(message=f"{rejected.message} Google says: {said}")
+        return rejected._replace(http=outcome)
+    failure = _status_failure(outcome, spec.label)
+    if failure is not None:
+        return failure._replace(http=outcome)
+    access = _json_field(_json_body(outcome.body), "access_token")
+    if not isinstance(access, str) or not access:
+        return _unexpected_body(spec, dest)
+    who = _identity_text(key.client_email)
+    project = _identity_text(str(config.get(gcp_auth.PROJECT_FIELD) or "").strip() or key.project_id)
+    if who is None:
+        return _credentials_accepted(spec)
+    return _success(f"Connected to {spec.label} as {who}" + (f" (project {project})." if project else "."))
+
+
+def _mid_sentence(label: str, vendor: str) -> str:
+    """A field label as it reads after "the": "Access token" -> "access token", but "API key", "PostHog host" and
+    "Semantic Layer URL" (dbt Semantic Layer) keep their first word, an acronym or a brand. A brand is caught as
+    a word of the vendor's own label, or by any capital past its first letter."""
+    first, space, rest = label.partition(" ")
+    if not (first.isalpha() and first.istitle()) or first in vendor.split():
+        return label
+    return first.lower() + space + rest
 
 
 def _field_label(spec: CredentialTypeSpec, key: str) -> str:
@@ -1607,37 +1747,11 @@ def _field_label(spec: CredentialTypeSpec, key: str) -> str:
 
 # ── Headscale ─────────────────────────────────────────────────────────────────
 
-def test_headscale(config: dict[str, Any], deadline: float) -> TestResult:
-    """`GET {api_url}/api/v1/apikey` with a Bearer API key (headscale REST v1).
-
-    Green names the calling key's own expiry, found by prefix: headscale lists every key as its public
-    prefix plus `***` (`hscontrol/types/api_key.go::Proto`), and a silently lapsed key stops every node
-    join. `login_server` is only format-checked (https, by `_field_problem`); nodes dial it, the CP does not.
-    """
-    prepared = _prepare("headscale", config)
-    if isinstance(prepared, TestResult):
-        return prepared
-    spec, dest = prepared
-
-    key = str(config["api_key"])
-    outcome = _api_key_request(
-        spec, dest, deadline,
-        path="/api/v1/apikey",
-        key=key,
-        value_prefix="Bearer",
-        rejected_message=(
-            f"{spec.label} rejected the API key - check it has not expired or been revoked "
-            "(`headscale apikeys list`)."
-        ),
-    )
-    if isinstance(outcome, TestResult):
-        return outcome
-    parsed = _gated_body(spec, dest, outcome)
-    if isinstance(parsed, TestResult):
-        return parsed
-    listed = _json_field(parsed, "apiKeys")
-    if not isinstance(listed, list):
-        return _unexpected_body(spec, dest)
+def _headscale_key_verdict(spec: CredentialTypeSpec, key: str, listed: list[Any]) -> TestResult:
+    """The headscale `list_verdict` (`GET {api_url}/api/v1/apikey`, REST v1): green names the calling key's own
+    expiry, found by prefix - headscale lists every key as its public prefix plus `***`
+    (`hscontrol/types/api_key.go::Proto`), and a silently lapsed key stops every node join. `login_server` is
+    only format-checked (https, by `_field_problem`); nodes dial it, the CP does not."""
     expiry = _headscale_key_expiry(listed, key)
     if expiry is None:
         return _success(
@@ -1673,6 +1787,17 @@ _NO_CLIENT_MESSAGE = (
     "with - only the client that minted a token can refresh it."
 )
 _NOT_CONNECTED_MESSAGE = "No refresh token yet - press Connect, or paste one you already hold."
+#: A Connect row whose cached access token has lapsed: the refresh path renews it, so a Test spends nothing.
+_RENEWS_MESSAGE = "The cached access token has expired - Jaah renews it before the next use; test again then."
+#: A Connect row holding a refresh token but no access token yet: the refresh path mints one before its next use.
+_MINTS_MESSAGE = "No access token cached yet - Jaah mints one before the next use; test again then."
+
+
+def _cached_token_expired(config: dict[str, Any]) -> bool:
+    """Whether a Connect row's cached access token is past its `expiry_date` (epoch milliseconds, as
+    `oauth2_tokens.py` writes it). A missing or malformed expiry is not expired: the vendor judges the token."""
+    expiry = config.get("expiry_date")
+    return isinstance(expiry, str) and expiry.strip().isdigit() and int(expiry) / 1000 <= utcnow().timestamp()
 
 # `invalid_grant` (RFC 6749 §5.2, imported from `oauth2_wire`) is the one refusal a retry cannot fix,
 # and gets its own sentence because the fix is to reauthorize.
@@ -1685,10 +1810,7 @@ def _refresh_exchange(slug: str, config: dict[str, Any], deadline: float) -> Tes
     no tester (see the assertion below). No `scope` is sent: on a refresh it can only narrow (RFC 6749
     §6), and the check should verify everything the grant carries.
     """
-    prepared = _prepare(slug, config)
-    if isinstance(prepared, TestResult):
-        return prepared
-    spec, dest = prepared
+    spec, dest = _prepare(slug, config)
 
     client_id = config.get("client_id")
     client_secret = config.get("client_secret")
@@ -1709,6 +1831,12 @@ def _refresh_exchange(slug: str, config: dict[str, Any], deadline: float) -> Tes
             f"{slug}: a refresh-grant test needs a provider with a pinned token_url; refusing to "
             "spend a refresh token against an endpoint read from the credential row"
         )
+    # The form below is the RFC shape (client pair in the body, `grant_type` sent): a provider on the
+    # deployment's own app (no client on the row) or with Basic auth or its own refresh wire (Figma) has no
+    # refresh-grant test; its type is tested otherwise (`figma`: a `key_test` on a pasted token or the cached Connect token).
+    if (provider.platform_app or provider.basic_auth or provider.refresh_url or not provider.refresh_grant_type
+            or provider.client_id_param != "client_id"):
+        raise RuntimeError(f"{slug}: provider {provider.key!r} does not speak the refresh form this test sends")
     endpoint = provider.token_url
     form = urlencode(
         {
@@ -1730,8 +1858,6 @@ def _refresh_exchange(slug: str, config: dict[str, Any], deadline: float) -> Tes
         },
         content=form,
     )
-    if isinstance(outcome, TestResult):
-        return outcome
 
     # Body before status: RFC 6749 §5.2 puts the reason in a 400 body, which separates "reauthorize"
     # from "fix the secret".
@@ -1763,13 +1889,9 @@ def _refresh_exchange(slug: str, config: dict[str, Any], deadline: float) -> Tes
     return _unexpected_body(spec, dest)
 
 
-def test_google(config: dict[str, Any], deadline: float) -> TestResult:
-    """A refresh grant against `https://oauth2.googleapis.com/token`.
-
-    A row with the operator's own OAuth client is exchanged for real; a CLI-minted row (no client; see
-    `registry.py`'s `client_id` field) gets the neutral `_NO_CLIENT_MESSAGE`.
-    """
-    return _refresh_exchange("google", config, deadline)
+# A refresh grant against `https://oauth2.googleapis.com/token`. A row with the operator's own OAuth client is
+# exchanged for real; a CLI-minted row (no client; see `registry.py`'s `client_id` field) gets `_NO_CLIENT_MESSAGE`.
+test_google = _verdict_guard(functools.partial(_refresh_exchange, "google"))
 
 
 # ── Generic API key ───────────────────────────────────────────────────────────
@@ -1835,14 +1957,21 @@ def _stripe_publishable_clause(value: str) -> Optional[str]:
     return None if value.strip().startswith(("pk_live_", "pk_test_")) else "must be a Stripe publishable key (pk_...)"
 
 
+def _workspace_id_clause(value: str) -> Optional[str]:
+    """It rides a request header on every model call, so it is refused unless it is one."""
+    return None if account_auth.is_valid_workspace_id(value) else "must be wrkspc_ followed by letters and digits"
+
+
 # Keyed by type and field, so `write_time_problem` and the tester read the same check.
 _WRITE_TIME_CHECKS = {
+    (account_auth.API_KEY_CREDENTIAL_TYPE, account_auth.WORKSPACE_ID_CONFIG_KEY): _workspace_id_clause,
     ("stripe", "publishable_key"): _stripe_publishable_clause,
     ("generic_api_key", "header_name"): _header_name_clause,
     ("generic_api_key", "value_prefix"): _value_prefix_clause,
     ("bitbucket", "kind"): _kind_clause(BITBUCKET_KINDS),
     ("azure_devops", "kind"): _kind_clause(AZURE_DEVOPS_KINDS),
     ("azure_devops", "test_org"): _azure_org_clause,
+    ("mcp_server", "transport"): _kind_clause(mcp_client.TRANSPORTS),
 }
 if edition_features.enabled("cloud_nodes"):
     _WRITE_TIME_CHECKS.update({
@@ -1873,6 +2002,7 @@ def write_time_problem(spec: CredentialTypeSpec, field: FieldSpec, value: str) -
     return None if clause is None else f"{field.key} {clause}"
 
 
+@_verdict_guard
 def test_generic_api_key(config: dict[str, Any], deadline: float) -> TestResult:
     """`GET {base_url}` carrying the key in the operator's own header, assuming nothing about the answer.
 
@@ -1886,14 +2016,11 @@ def test_generic_api_key(config: dict[str, Any], deadline: float) -> TestResult:
       - 401/403 names all three fields, since the header name or scheme word is the likelier fault.
 
     A blank header name means `Authorization`; a blank prefix sends the key alone (the registry's rule).
-    The Base URL is optional with no default (the registry's rule), so a blank one has nowhere to send it.
+    The URL is optional with no default (the registry's rule), so a blank one has nowhere to send it.
     """
     if is_blank(config.get("base_url")):
-        return _failure("Base URL is required before testing.")
-    prepared = _prepare("generic_api_key", config)
-    if isinstance(prepared, TestResult):
-        return prepared
-    spec, dest = prepared
+        return _failure("URL is required before testing.")
+    spec, dest = _prepare("generic_api_key", config)
 
     header_name = str(config.get("header_name") or "").strip() or _DEFAULT_API_KEY_HEADER
     problem = _header_name_problem(spec, header_name)
@@ -1918,8 +2045,6 @@ def test_generic_api_key(config: dict[str, Any], deadline: float) -> TestResult:
             f"{_field_label(spec, 'header_name')} and the {_field_label(spec, 'value_prefix')}."
         ),
     )
-    if isinstance(outcome, TestResult):
-        return outcome
     # No `detail` on a green (`CredentialEditPage.tsx` renders it only on failure).
     return _success(
         f"{dest.host} answered HTTP {outcome.status_code} to a request carrying the "
@@ -1931,6 +2056,7 @@ def test_generic_api_key(config: dict[str, Any], deadline: float) -> TestResult:
 # ── Stripe ────────────────────────────────────────────────────────────────────
 
 
+@_verdict_guard
 def test_stripe(config: dict[str, Any], deadline: float) -> TestResult:
     """The Stripe keys' connection test (`app/billing/stripe_tester.py`); the community edition has no billing."""
     if not edition_features.enabled("billing"):
@@ -1945,6 +2071,7 @@ def test_stripe(config: dict[str, Any], deadline: float) -> TestResult:
 _OIDC_DISCOVERY_PATH = "/.well-known/openid-configuration"
 
 
+@_verdict_guard
 def test_oidc_client(config: dict[str, Any], deadline: float) -> TestResult:
     """`GET {issuer}/.well-known/openid-configuration`, green only when the document's `issuer` is exactly the
     operator's (OIDC Discovery 1.0 §4.3: a sign-in refuses any other spelling, a trailing slash included).
@@ -1952,20 +2079,18 @@ def test_oidc_client(config: dict[str, Any], deadline: float) -> TestResult:
     Proves the issuer, not the client: an unauthenticated call (property 1's limit), since the only check of the
     client pair is a real sign-in. Sends no secret. Each failure names the Issuer field, the one thing to fix.
     """
-    prepared = _prepare("oidc_client", config)
-    if isinstance(prepared, TestResult):
-        return prepared
-    spec, dest = prepared
+    spec, dest = _prepare("oidc_client", config)
     issuer_label = _field_label(spec, "issuer")
 
-    outcome = _request(
-        "GET", f"{dest.base}{_OIDC_DISCOVERY_PATH}", dest=dest, deadline=deadline,
-        headers={"Accept": "application/json"},
-    )
-    if isinstance(outcome, TestResult):
-        if outcome.detail == "transport_error":
+    try:
+        outcome = _request(
+            "GET", f"{dest.base}{_OIDC_DISCOVERY_PATH}", dest=dest, deadline=deadline,
+            headers={"Accept": "application/json"},
+        )
+    except _Verdict as verdict:
+        if verdict.result.detail == "transport_error":
             return _failure(f"Could not reach {dest.host} - check the {issuer_label}.", detail="transport_error")
-        return outcome
+        raise
     # Not `_status_failure`: the call carries no credential, so a 401/403 is no "Authentication rejected".
     if not 200 <= outcome.status_code < 300:
         return _failure(
@@ -1992,16 +2117,14 @@ def test_oidc_client(config: dict[str, Any], deadline: float) -> TestResult:
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 
+@_verdict_guard
 def test_telegram_bot(config: dict[str, Any], deadline: float) -> TestResult:
     """`GET https://api.telegram.org/bot<token>/getMe`: bespoke because the token rides the URL PATH, which no
     `KeyTestSpec` can place. Telegram answers 401 for a bad token and `{"ok": true, "result": {...}}` for a good
     one; `ok is True` is required. No message or log line carries the URL, which carries the token. Success
     names the bot's @username."""
-    prepared = _prepare("telegram_bot", config)
-    if isinstance(prepared, TestResult):
-        return prepared
-    spec, dest = prepared
-    token_label = _field_label(spec, "bot_token")
+    spec, dest = _prepare("telegram_bot", config)
+    rejected = f"Authentication rejected - check the {_field_label(spec, 'bot_token')}."
     outcome = _request(
         "GET",
         f"{dest.base}/bot{str(config['bot_token']).strip()}/getMe",
@@ -2009,12 +2132,12 @@ def test_telegram_bot(config: dict[str, Any], deadline: float) -> TestResult:
         deadline=deadline,
         headers={"Accept": "application/json"},
     )
-    if isinstance(outcome, TestResult):
-        return outcome
-    # 404 is Telegram's answer to a token that is not even token-shaped.
-    parsed = _ok_envelope(spec, dest, outcome, token_label=token_label, rejected=(401, 404))
-    if isinstance(parsed, TestResult):
-        return parsed
+    if outcome.status_code in (401, 404):  # 404 is Telegram's answer to a token that is not even token-shaped
+        return _failure(rejected, detail=f"HTTP {outcome.status_code}")
+    failure = _status_failure(outcome, spec.label)
+    if failure is not None:
+        return failure
+    parsed = _ok_envelope(spec, dest, outcome, rejected=rejected)
     username = _identity_text(_json_field(parsed, "result", "username"))
     if username is None:
         return _credentials_accepted(spec)
@@ -2022,10 +2145,126 @@ def test_telegram_bot(config: dict[str, Any], deadline: float) -> TestResult:
 
 
 # The hand-written testers: every type whose Test is more than the one GET a `KeyTestSpec` declares.
+# ── MCP servers (`app/mcp_client.py`) ─────────────────────────────────────────
+
+def _mcp_token(config: dict[str, Any], *, bearer_field: Optional[str]) -> tuple[Optional[str], Optional[TestResult]]:
+    """The token a Test sends, or the verdict that there is none worth sending yet: a Connect grant's live
+    access token first (its expiry judged as `_catalog_http` does), else the pasted bearer field, else None (a
+    server that takes no auth)."""
+    token = config.get("access_token")
+    if not is_blank(token):
+        if _cached_token_expired(config):
+            return None, _unsupported(_RENEWS_MESSAGE)
+        return str(token), None
+    if not is_blank(config.get("refresh_token")):
+        return None, _unsupported(_MINTS_MESSAGE)
+    if bearer_field is not None and not is_blank(config.get(bearer_field)):
+        return str(config[bearer_field]).strip(), None
+    return None, None
+
+
+def mcp_probe_result(label: str, url: str, transport: str, token: Optional[str], deadline: float) -> TestResult:
+    """The Test verdict for one MCP server: the handshake and the tool list (`mcp_client.probe`), its tool count on
+    success, "<Vendor> rejected the token (401)" on a 401/403, and the probe's own sentence otherwise."""
+    try:
+        found = mcp_client.probe(url, transport=transport, token=token, deadline=deadline)
+    except mcp_client.McpRefused as exc:
+        if exc.kind == "rejected":
+            what = "token" if token else "request (no token was sent)"
+            remedy = " - press Connect, or check the bearer token." if token else " - add a token or press Connect."
+            return _failure(f"{label} rejected the {what} ({exc.status}){remedy}", detail=f"HTTP {exc.status}")
+        return _failure(str(exc), detail=exc.kind)
+    tools = f"{found.tool_count} tool{'s' if found.tool_count != 1 else ''}"
+    named = f" ({found.server_name})" if found.server_name else ""
+    return _success(f"Connected to {label}{named} - {tools} available.", identity=found.server_name)
+
+
+def _mcp_label(url: str) -> str:
+    """A custom server's name in a sentence: its host."""
+    try:
+        return httpx.URL(url).host or "The MCP server"
+    except (httpx.InvalidURL, ValueError, UnicodeError):
+        return "The MCP server"
+
+
+@_verdict_guard
+def test_mcp_server(config: dict[str, Any], deadline: float) -> TestResult:
+    """An `mcp_server` row: the MCP handshake against its URL with its bearer token or Connect grant."""
+    spec = CREDENTIAL_TYPES["mcp_server"]
+    problem = _field_problem(spec, config)
+    if problem is not None:
+        return problem
+    url = str(config.get("url") or "").strip()
+    transport = str(config.get("transport") or "streamable_http").strip()
+    token, verdict = _mcp_token(config, bearer_field="bearer_token")
+    if verdict is not None:
+        return verdict
+    return mcp_probe_result(_mcp_label(url), url, transport, token, deadline)
+
+
+# ── Custom connectors (`app/integrations/custom.py`) ────────────────────────────
+# Not a `TESTERS` entry: a custom connection is a generic-type row whose Test is its connector's, run by
+# `routes/integrations_custom.py` with the connector in hand.
+
+
+def grant_token(config: dict[str, Any]) -> tuple[Optional[str], Optional[TestResult]]:
+    """An OAuth row's live access token, or the verdict that none is worth sending yet (`_mcp_token`'s rule)."""
+    return _mcp_token(config, bearer_field=None)
+
+
+def custom_rest_result(
+    label: str,
+    url: str,
+    deadline: float,
+    *,
+    header: Optional[tuple[str, str]] = None,
+    basic: Optional[tuple[str, str]] = None,
+) -> TestResult:
+    """`GET url` carrying one header or HTTP Basic, at addresses `http_bounded.vetted_addresses` passed (THE SSRF
+    rule: the URL is an org's own definition, so the metadata service or an RFC 1918 host is refused before
+    anything is sent, and the vetted addresses are the only ones dialled). Green on a 2xx; a 401/403 names the
+    secret; nothing the server wrote is echoed."""
+    refusal, addresses = http_bounded.vetted_addresses(url)
+    if refusal is not None or not addresses:
+        return _failure(f"{label} cannot be reached at that address - {refusal or 'it did not resolve'}.",
+                        detail="refused_destination")
+    host = httpx.URL(url).host
+    dest = _Destination(base=url, host=host, operator_supplied=True, host_label="Base URL")
+    headers = {"Accept": "application/json"}
+    auth: Optional[httpx.Auth] = None
+    if basic is not None:
+        auth = httpx.BasicAuth(*basic)
+    elif header is not None:
+        if header[0].lower() == _DEFAULT_API_KEY_HEADER.lower():
+            auth = _HeaderAuth(_DEFAULT_API_KEY_HEADER, header[1])
+        else:
+            headers[header[0]] = header[1]
+    try:
+        outcome = _request(
+            "GET", url, dest=dest, deadline=deadline, auth=auth, headers=headers,
+            allowed_origin=request_origin(url), addresses=addresses,
+        )
+    except _Verdict as verdict:
+        return verdict.result
+    if outcome.status_code in (401, 403):
+        what = "login and password" if basic is not None else "secret"
+        return _failure(f"{host} rejected the request ({outcome.status_code}) - check the {what}.",
+                        detail=f"HTTP {outcome.status_code}")
+    failure = _status_failure(outcome, label)
+    if failure is not None:
+        return failure
+    return _success(f"{host} answered HTTP {outcome.status_code} at {httpx.URL(url).path or '/'}.")
+
+
+#: `KeyTestSpec.list_verdict` by name: the green for a gated list, given the spec, the key sent and the list.
+_LIST_VERDICTS: dict[str, Callable[[CredentialTypeSpec, str, list[Any]], TestResult]] = {
+    "headscale_key_expiry": _headscale_key_verdict,
+}
+
 _BESPOKE_TESTERS: dict[str, Tester] = {
-    "jira": test_jira,
     "xero": test_xero,
-    "slack": test_slack,
+    "slack": _slack_tester("slack", "token", "app_token"),
+    "slack_workspace": _slack_tester("slack_workspace", "bot_token"),
     "telegram_bot": test_telegram_bot,
     "github": test_github,
     "github_app": test_github_app,
@@ -2035,11 +2274,426 @@ _BESPOKE_TESTERS: dict[str, Tester] = {
     "aws": test_aws,
     "azure": test_azure,
     "gcp": test_gcp,
-    "headscale": test_headscale,
     "stripe": test_stripe,
     "google": test_google,
     "generic_api_key": test_generic_api_key,
     "oidc_client": test_oidc_client,
+    "mcp_server": test_mcp_server,
+}
+
+
+# ── Catalog vendors (`app/integrations/catalog.py`) ───────────────────────────
+# One tester per catalog-defined credential type, built from its spec: a declared HTTP call, a format check, or a
+# `module:function` hook. A URL carrying a tenant value is dialled only at addresses `vetted_addresses` passed.
+
+#: The format check's verdict (AC3.2): the vendor was not called, and says so.
+FORMAT_CHECKED = "Format checked \u2014 {label} was not called."
+
+# One DNS label: what a `{field}` in a Test URL's host may hold, so a tenant value never leaves the vendor's domain.
+_DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+
+
+def _unsupported(message: str) -> TestResult:
+    # mypy reads the NamedTuple's `__test__` class attribute as a required field; it is not one.
+    return TestResult(ok=False, status="unsupported", message=message)  # type: ignore[call-arg]
+
+
+def _catalog_rejected(label: str, what: str, status: int | str, *, reconnect: bool = False,
+                      remedy: Optional[str] = None) -> TestResult:
+    """A catalog vendor's 401/403 (AC2.6): names the vendor, the field and the status (or the vendor's own refusal
+    code, for a `rejected_when` body), never a generic sentence."""
+    remedy = remedy or ("press Connect to reauthorize." if reconnect else "check it.")
+    return _failure(f"{label} rejected the {what} ({status}) - {remedy}",
+                    detail=f"HTTP {status}" if isinstance(status, int) else "rejected")
+
+
+def _catalog_fill(type_spec: CredentialTypeSpec, template: str, config: dict[str, Any]) -> str:
+    """A header value with each `{field}` placeholder filled from the row (stripped), or the raised failure naming
+    the first blank field. Transmittability was checked by `_field_problem`; the loader limited which fields."""
+
+    def value(match: re.Match[str]) -> str:
+        filled = str(config.get(match.group(1)) or "").strip()
+        if not filled:
+            raise _Verdict(_failure(f"{_field_label(type_spec, match.group(1))} is required before testing."))
+        return filled
+
+    return catalog.PLACEHOLDER.sub(value, template)
+
+
+def _under_suffixes(value: str, suffixes: tuple[str, ...]) -> bool:
+    """Whether `value` is a bare https origin (no path, query, userinfo or port) whose host, every label a plain
+    DNS label, is one of `suffixes` or a subdomain of one: the parsed host is what is compared."""
+    try:
+        parsed = httpx.URL(value.rstrip("/"))
+    except (httpx.InvalidURL, ValueError):
+        return False
+    host = (parsed.host or "").lower().rstrip(".")
+    return (parsed.scheme == "https" and not parsed.userinfo and parsed.port is None
+            and parsed.raw_path in (b"", b"/") and not parsed.query and not parsed.fragment
+            and all(_DNS_LABEL.fullmatch(label) for label in host.split("."))
+            and any(host == suffix or host.endswith("." + suffix) for suffix in suffixes))
+
+
+def _catalog_url(type_spec: CredentialTypeSpec, test: "catalog.HttpTestSpec", config: dict[str, Any]) -> str:
+    """The Test URL with its one `{field}` placeholder filled, or the raised failure naming the field."""
+    url = test.url
+    for name in test.placeholders:
+        field = next(item for item in type_spec.fields if item.key == name)
+        value = str(config.get(name) or "").strip()
+        if not value:
+            raise _Verdict(_failure(f"{field.label} is required before testing."))
+        if field.kind == "url":
+            url = url.replace(f"{{{name}}}", value.rstrip("/"))
+            if test.host_suffixes and not _under_suffixes(value, test.host_suffixes):
+                raise _Verdict(_failure(
+                    f"{field.label} must be an https address under "
+                    + " or ".join(test.host_suffixes) + " - check it."
+                ))
+        else:
+            if not _DNS_LABEL.fullmatch(value):
+                raise _Verdict(_failure(
+                    f"{field.label} must be a single name such as 'acme' - no dots, slashes or spaces."
+                ))
+            url = url.replace(f"{{{name}}}", value.lower())
+    return url
+
+
+_BODY_VALUE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+_PATH_SEGMENT = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,253}[A-Za-z0-9])?")
+
+
+def _catalog_token(
+    spec: "catalog.IntegrationSpec", type_spec: CredentialTypeSpec, dest: _Destination, config: dict[str, Any],
+    deadline: float,
+) -> str:
+    """A `[test.token]` Test's call 1: the client-credentials access token, or the raised failure.
+
+    The id and secret travel in the form body only. A refusal (400/401/403/404 - a vendor login answers a wrong
+    pair with any of them) names the vendor and the two fields; nothing the vendor wrote is echoed."""
+    test = spec.http_test
+    assert test is not None and test.token is not None  # narrowing: the caller dispatched on it
+    token = test.token
+    url = token.url
+    addresses: tuple[str, ...] = ()
+    for name in token.placeholders:
+        field = next(item for item in type_spec.fields if item.key == name)
+        value = str(config.get(name) or "").strip()
+        if not value:
+            raise _Verdict(_failure(f"{field.label} is required before testing."))
+        if field.kind == "url":
+            url = url.replace(f"{{{name}}}", value.rstrip("/"))
+            refusal, addresses = http_bounded.vetted_addresses(url)
+            if refusal is not None or not addresses:
+                raise _Verdict(_failure(
+                    f"{spec.label} cannot be reached at that address - {refusal or 'it did not resolve'}.",
+                    detail="refused_destination",
+                ))
+        elif _PATH_SEGMENT.fullmatch(value):
+            url = url.replace(f"{{{name}}}", value)
+        else:
+            raise _Verdict(_failure(f"{field.label} must be a single value with no slashes or spaces."))
+    client_id = str(config.get(token.client_id_field) or "").strip()
+    for name in (token.client_id_field, token.client_secret_field):
+        if is_blank(config.get(name)):
+            raise _Verdict(_failure(f"{_field_label(type_spec, name)} is required before testing."))
+    secret = str(config.get(token.client_secret_field) or "")
+    basic = token.client_auth == "basic"
+    # Basic: the pair in a header, never also in the body (a vendor that refuses the body pair, Aikido).
+    form: dict[str, str] = {} if basic else {"client_id": client_id, "client_secret": secret}
+    if token.grant_type:
+        form["grant_type"] = token.grant_type
+    if token.scope:
+        form["scope"] = token.scope
+    if token.audience:
+        form["audience"] = token.audience
+    outcome = _request(
+        "POST", url, dest=dest, deadline=deadline,
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+        content=urlencode(form).encode("utf-8"), allowed_origin=request_origin(url), addresses=addresses,
+        auth=httpx.BasicAuth(client_id, secret) if basic else None,
+    )
+    if outcome.status_code in (400, 401, 403, 404):
+        what = " and ".join(_mid_sentence(_field_label(type_spec, name), spec.label)
+                            for name in (token.client_id_field, token.client_secret_field))
+        raise _Verdict(_catalog_rejected(spec.label, what, outcome.status_code, remedy="check both.")._replace(http=outcome))
+    failure = _status_failure(outcome, spec.label)
+    if failure is not None:
+        raise _Verdict(failure._replace(http=outcome))
+    parsed = _json_body(outcome.body)
+    access_token = _json_field(parsed, "access_token") if isinstance(parsed, dict) else None
+    if not isinstance(access_token, str) or is_blank(access_token) or not _is_transmittable(access_token):
+        raise _Verdict(_unexpected_body(type_spec, dest))
+    return access_token
+
+
+def _catalog_http(spec: "catalog.IntegrationSpec", config: dict[str, Any], deadline: float) -> TestResult:
+    test = spec.http_test
+    assert test is not None  # narrowing: the caller dispatched on it
+    type_spec, dest = _prepare(spec.credential_type, config)
+    url = _catalog_url(type_spec, test, config)
+    addresses: tuple[str, ...] = ()
+    # The Test URL is the spec's own constant (or vetted below), so its origin is the pin, not the type's base.
+    allowed_origin = request_origin(url)
+    if test.placeholders:
+        # A host the tenant chose (THE SSRF rule): every address it resolves to must be public, and only those
+        # are dialled, so the metadata service or an RFC 1918 host is refused before anything is sent.
+        refusal, addresses = http_bounded.vetted_addresses(url)
+        if refusal is not None or not addresses:
+            return _failure(f"{spec.label} cannot be reached at that address - {refusal or 'it did not resolve'}.",
+                            detail="refused_destination")
+        dest = dest._replace(host=httpx.URL(url).host, operator_supplied=True)
+
+    headers: dict[str, str] = {}
+    if test.accept is not None:
+        headers["Accept"] = test.accept
+    headers.update(dict(test.extra_headers))
+    headers.update({header: str(config[name]).strip() for header, name in test.field_headers
+                    if not is_blank(config.get(name))})
+    body = test.body
+    for name in test.body_placeholders:
+        value = str(config.get(name) or "").strip()
+        if not value:
+            return _failure(f"{_field_label(type_spec, name)} is required before testing.")
+        if not _BODY_VALUE.fullmatch(value):
+            return _failure(f"{_field_label(type_spec, name)} may hold only letters, digits, dots, dashes and underscores.")
+        assert body is not None  # narrowing: a body placeholder implies a body
+        body = body.replace(f"{{{name}}}", value)
+    content = body.encode("utf-8") if body is not None else None
+    if content is not None and test.content_type:
+        headers["Content-Type"] = test.content_type
+    auth: Optional[httpx.Auth] = None
+
+    key = config.get(test.key_field) if test.key_field else None
+    oauth_row = spec.provider is not None and (test.key_field is None or is_blank(key))
+    if test.token is not None and not oauth_row:
+        minted = _catalog_token(spec, type_spec, dest, config, deadline)
+        # The pair was accepted; a refusal now is the account's access, not its key (named by its own sentence).
+        what = "access token it issued"
+        auth = _HeaderAuth("Authorization", f"{test.token.prefix} {minted}")
+    elif oauth_row:
+        token = config.get("access_token")
+        if is_blank(token):
+            return _unsupported(_NOT_CONNECTED_MESSAGE if is_blank(config.get("refresh_token")) else _MINTS_MESSAGE)
+        if _cached_token_expired(config):
+            if is_blank(config.get("refresh_token")):
+                # Nothing can renew it (`OAuthProvider.expiring_grant_ok`): only the person can, by reconnecting.
+                return _failure(f"The {spec.label} access token has expired - press Connect to reauthorize.",
+                                detail="expired")
+            return _unsupported(_RENEWS_MESSAGE)
+        what = "access token"
+        auth = _HeaderAuth("Authorization", f"{test.oauth_scheme} {token}")
+    else:
+        what = _mid_sentence(_field_label(type_spec, test.key_field), spec.label) if test.key_field else "request"
+        if test.auth == "header":
+            if test.value_template is not None:
+                value = _catalog_fill(type_spec, test.value_template, config)
+            else:
+                value = f"{test.value_prefix} {key}" if test.value_prefix else str(key)
+            if test.header_name.lower() == _DEFAULT_API_KEY_HEADER.lower():
+                auth = _HeaderAuth(test.header_name, value)
+            else:
+                headers[test.header_name] = value
+        elif test.auth == "basic":
+            # No user field: the key is the Basic user name and the password a constant (BambooHR's "x").
+            auth = (httpx.BasicAuth(str(key).strip(), test.basic_password or "") if test.user_field is None
+                    else httpx.BasicAuth(str(config.get(str(test.user_field)) or "").strip() + test.user_suffix, str(key)))
+        elif test.auth == "query":
+            # The vendor's own scheme (a key in the query string): the URL is never logged or echoed.
+            url = f"{url}{'&' if '?' in url else '?'}{urlencode({str(test.query_param): str(key)})}"
+        elif test.auth == "sigv4":
+            # The spec's x-amz-* headers are signed, not merely sent: S3 refuses an unsigned one.
+            amz = {name: headers.pop(name) for name in list(headers) if name.lower().startswith("x-amz-")}
+            try:
+                headers.update(sigv4.signed_headers(
+                    method=test.method, url=url, region=str(test.sigv4_region), service=str(test.sigv4_service),
+                    access_key_id=str(config.get(str(test.user_field)) or "").strip(), secret_access_key=str(key),
+                    payload=content or b"", content_type=test.content_type or "application/x-www-form-urlencoded",
+                    amz_date=utcnow().strftime("%Y%m%dT%H%M%SZ"), amz_headers=amz,
+                ))
+            except ValueError:
+                return untransmittable_field_result(_field_label(type_spec, str(test.user_field)))
+
+    outcome = _request(test.method, url, dest=dest, deadline=deadline, auth=auth, headers=headers,
+                       content=content, allowed_origin=allowed_origin, addresses=addresses)
+    remedy = (f"the client credentials are valid, so check the app's access in {spec.label}."
+              if test.token is not None and not oauth_row else None)
+    if test.rejected_path:
+        code = _json_field(_json_body(outcome.body), *test.rejected_path)
+        if isinstance(code, str) and code in test.rejected_values:
+            return _catalog_rejected(spec.label, what, code, reconnect=oauth_row, remedy=remedy)._replace(http=outcome)
+    if test.rejected_text is not None:
+        said = re.search(test.rejected_text, outcome.body.decode("utf-8", "replace"))
+        if said is not None:
+            # The vendor's own refusal code, bounded by the spec's pattern and sanitised as any third-party text.
+            return _catalog_rejected(spec.label, what, _identity_text(said.group(0)) or "refused", reconnect=oauth_row,
+                                     remedy=remedy)._replace(http=outcome)
+    if outcome.status_code in test.rejected_statuses:
+        return _catalog_rejected(spec.label, what, outcome.status_code, reconnect=oauth_row,
+                                 remedy=remedy)._replace(http=outcome)
+    failure = _status_failure(outcome, spec.label)
+    if failure is not None:
+        return failure._replace(http=outcome)
+    if test.accept is None:
+        return _success(f"Connected to {spec.label} - {what} accepted.")
+    if test.require_true and _json_field(_gated_body(type_spec, dest, outcome), *test.require_true) is not True:
+        # A vendor that answers 200 for an unknown key says so in a flag, not a status.
+        return _failure(f"{spec.label} did not accept the {what} - check it.", detail="not_accepted")._replace(
+            http=outcome)
+    if test.require_equal_field is not None:
+        expected = str(config.get(test.require_equal_field) or "").strip()
+        found = _json_field(_gated_body(type_spec, dest, outcome), *test.require_equal_path)
+        if not isinstance(found, (str, int)) or isinstance(found, bool) or str(found).strip() != expected:
+            # A token valid for another app: the check passes, then every real call fails (Twitch's Client-Id).
+            other = _mid_sentence(_field_label(type_spec, test.require_equal_field), spec.label)
+            return _failure(f"{spec.label} says the {what} belongs to another {other} - mint it for this {other}, "
+                            f"or change the {other} to the one it was minted for.", detail="mismatch")._replace(
+                http=outcome)
+    if test.list_field is not None:
+        if not isinstance(_json_field(_gated_body(type_spec, dest, outcome), test.list_field), list):
+            return _unexpected_body(type_spec, dest)
+        return _credentials_accepted(type_spec)
+    return _named(type_spec, dest, outcome, *test.identity, phrase=test.identity_phrase)
+
+
+def _catalog_mcp(spec: "catalog.IntegrationSpec", config: dict[str, Any], deadline: float) -> TestResult:
+    """A catalog MCP vendor's Test: its server URL (the row's own where the vendor lets it be edited, its `{field}`
+    placeholders filled from the row), the spec's transport, and the token its `auth` names."""
+    mcp = spec.mcp
+    assert mcp is not None  # narrowing: the caller dispatched on it
+    url, problem = mcp.server_url(config)
+    if url is None:
+        return _failure(problem or "The server URL is required before testing.")
+    bearer = mcp.auth.partition(":")[2] if mcp.auth.startswith("bearer_field:") else None
+    token, verdict = _mcp_token(config, bearer_field=bearer or None)
+    if verdict is not None:
+        return verdict
+    if token is None and mcp.auth != "none":
+        return _unsupported(_NOT_CONNECTED_MESSAGE if bearer is None else
+                            f"Enter the {bearer} before testing, or press Connect.")
+    return mcp_probe_result(spec.label, url, mcp.transport, token, deadline)
+
+
+def _catalog_format(spec: "catalog.IntegrationSpec", config: dict[str, Any]) -> TestResult:
+    check = spec.format_test
+    assert check is not None  # narrowing: the caller dispatched on it
+    type_spec = CREDENTIAL_TYPES[spec.credential_type]
+    problem = _field_problem(type_spec, config)
+    if problem is not None:
+        return problem
+    for key, pattern in check.patterns:
+        value = config.get(key)
+        if not is_blank(value) and not re.fullmatch(pattern, str(value).strip()):
+            return _failure(f"{_field_label(type_spec, key)} is not in the format {spec.label} uses.")
+    if check.public_host_field is not None:
+        raw = str(config.get(check.public_host_field) or "").strip()
+        host = urlsplit(raw).hostname if "://" in raw else raw.rsplit("@", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+        refusal = http_bounded.public_destination_refusal(f"https://{host}") if host else "it names no host"
+        if refusal is not None:
+            return _failure(
+                f"{_field_label(type_spec, check.public_host_field)} must name a public address - {refusal}."
+            )
+    return _success(FORMAT_CHECKED.format(label=spec.label))
+
+
+def resolve_hook(target: str) -> Callable[..., Any]:
+    """A `module:function` named by a spec (`tester`, `on_grant`), imported when first used so no spec can
+    create an import cycle; a missing target is a registry bug, raised."""
+    module_name, _, attribute = target.partition(":")
+    function = getattr(importlib.import_module(module_name), attribute, None)
+    if not callable(function):
+        raise RuntimeError(f"{target}: names nothing callable")
+    return function
+
+
+# ── Microsoft Entra service principals (catalog `tester` hooks) ────────────────────────────────────────────
+# Two calls across two fixed hosts, as `test_azure`: the client-credentials grant at Entra (the destination, which
+# receives the secret), then `GET graph.microsoft.com/v1.0/organization` with the token only. Not `azure_wire`: that
+# module is cloud-only, and these types ship in every edition.
+
+_ENTRA_LOGIN = "https://login.microsoftonline.com"
+_GRAPH_BASE = "https://graph.microsoft.com"
+_ENTRA_GUID = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
+# A tenant GUID or a verified domain (`yourtenant.onmicrosoft.com`): DNS labels only, so a safe URL path segment.
+_ENTRA_TENANT = re.compile(r"(?=.{4,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}")
+
+
+def _entra_graph(type_slug: str, config: dict[str, Any], deadline: float) -> TestResult:
+    """A Graph token for the service principal, then the tenant's organization read with it: names the tenant."""
+    spec, dest = _prepare(type_slug, config)
+    tenant, client_id = str(config["tenant_id"]).strip(), str(config["client_id"]).strip()
+    if not (_ENTRA_GUID.fullmatch(tenant) or _ENTRA_TENANT.fullmatch(tenant)):
+        return _failure(f"{_field_label(spec, 'tenant_id')} must be a tenant ID (a GUID) or a domain such as "
+                        "yourtenant.onmicrosoft.com.")
+    if not _ENTRA_GUID.fullmatch(client_id):
+        return _failure(f"{_field_label(spec, 'client_id')} must be a GUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).")
+    secret = str(config["client_secret"])
+    form = urlencode({"grant_type": "client_credentials", "client_id": client_id, "client_secret": secret,
+                      "scope": f"{_GRAPH_BASE}/.default"}).encode("ascii")
+    outcome = _request(
+        "POST", f"{_ENTRA_LOGIN}/{tenant}/oauth2/v2.0/token", dest=dest, deadline=deadline,
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}, content=form,
+    )
+    if outcome.status_code in (400, 401):
+        # Entra answers a wrong secret 401 (AADSTS7000215) and an unknown tenant or client 400 (AADSTS90002/700016).
+        what = "client secret" if outcome.status_code == 401 else "tenant ID or client ID"
+        return _catalog_rejected(spec.label, what, outcome.status_code)._replace(http=outcome)
+    failure = _status_failure(outcome, spec.label)
+    if failure is not None:
+        return failure._replace(http=outcome)
+    access_token = _access_token(spec, dest, outcome)
+    read = _follow_up(
+        f"{_GRAPH_BASE}/v1.0/organization?$select=id,displayName", dest=dest, deadline=deadline,
+        headers=_bearer_headers(access_token), allowed_origin=request_origin(_GRAPH_BASE),
+        could_not=f"{spec.label} accepted the client secret but Microsoft Graph could not be reached",
+    )
+    if read.status_code in (401, 403):
+        return _failure(
+            f"{spec.label} accepted the client secret, but Microsoft Graph refused the organization read "
+            f"({read.status_code}) - grant the app the Organization.Read.All application permission and admin consent.",
+            detail=f"HTTP {read.status_code}",
+        )._replace(http=read)
+    failure = _status_failure(read, spec.label)
+    if failure is not None:
+        return failure._replace(http=read)
+    name = _identity_text(_json_field(_json_body(read.body), "value", 0, "displayName"))
+    if name is None:
+        return _credentials_accepted(spec)
+    return _success(f"Connected to {spec.label} in tenant {name}.", identity=name)
+
+
+# The `tester` hooks of `vendors/azure_graph.toml` and `vendors/microsoft_copilot.toml`.
+test_azure_graph = functools.partial(_entra_graph, "azure_graph")
+test_microsoft_copilot = functools.partial(_entra_graph, "microsoft_copilot")
+
+
+def _mcp_signed_in(spec: "catalog.IntegrationSpec", config: Mapping[str, Any]) -> bool:
+    """Whether a row of a vendor with both an HTTP Test and an MCP sign-in holds the sign-in's grant and no key."""
+    key = spec.http_test.key_field if spec.http_test is not None else None
+    return (spec.mcp is not None and spec.mcp.sign_in and (key is None or is_blank(config.get(key)))
+            and not (is_blank(config.get("refresh_token")) and is_blank(config.get("access_token"))))
+
+
+def catalog_tester(spec: "catalog.IntegrationSpec") -> Tester:
+    """The Test of a catalog-defined credential type: its hook, its format check, or its declared HTTP call."""
+
+    def test(config: dict[str, Any], deadline: float) -> TestResult:
+        if spec.tester is not None:
+            return resolve_hook(spec.tester)(config, deadline)
+        if spec.format_test is not None:
+            return _catalog_format(spec, config)
+        if spec.mcp is not None and (spec.http_test is None or _mcp_signed_in(spec, config)):
+            # A spec whose only Test is its `[mcp]` block gets the MCP handshake with no code of its own, and so
+            # does a row connected by the MCP sign-in alone (no key for the HTTP Test to send).
+            return _catalog_mcp(spec, config, deadline)
+        return _catalog_http(spec, config, deadline)
+
+    return _verdict_guard(test)
+
+
+#: The catalog's testers, by credential type (its adopting specs keep their type's own tester).
+_CATALOG_TESTERS: dict[str, Tester] = {
+    spec.credential_type: catalog_tester(spec)
+    for spec in catalog.INTEGRATIONS.values() if not spec.adopts_existing_type
 }
 
 
@@ -2082,6 +2736,8 @@ def _check_tester_registry(
             problems.append(f"path {key_test.path!r} must start with / and hold no whitespace")
         if key_field is None or key_field.kind != "secret":
             problems.append(f"key_field {key_test.key_field!r} is not a declared secret field")
+        if key_test.connect_token_field is not None and getattr(fields.get(key_test.connect_token_field), "kind", None) != "secret":
+            problems.append(f"connect_token_field {key_test.connect_token_field!r} is not a declared secret field")
         unknown = [field for _header, field in key_test.field_headers if field not in fields]
         if unknown:
             problems.append(f"field_headers name undeclared fields {unknown}")
@@ -2096,21 +2752,74 @@ def _check_tester_registry(
             problems.append(f"only header_name may be {_DEFAULT_API_KEY_HEADER}")
         if (clause := _value_prefix_clause(key_test.value_prefix)) is not None:
             problems.append(f"value_prefix {clause}")
-        if key_field is not None and (key_test.blank_key_reason is not None) == key_field.required:
-            problems.append("blank_key_reason must be set exactly when key_field is optional")
+        # A field in a `require_one_of` group with the key is filled whenever the key is (a type a Connect extends,
+        # `catalog.extended_type`, whose Connect rows the grant Test takes instead, `_with_grant_test`).
+        grouped = {key for group in spec.require_one_of if key_test.key_field in group for key in group}
+        if key_field is not None and (
+            (key_test.blank_key_reason is not None and key_field.required)
+            or (key_test.blank_key_reason is None and not key_field.required and key_field.key not in grouped)
+        ):
+            problems.append("blank_key_reason must be set exactly when key_field is optional (a grouped one may omit it)")
         if key_test.list_field is not None and key_test.identity:
             problems.append("list_field and identity are exclusive")
+        for name in ("basic_user_field", "identity_fallback_field"):
+            # Required so a blank never reaches the wire; never a secret: the fallback is echoed in the green
+            # sentence, and a Basic user is sent beside the key, not as it.
+            if (field := getattr(key_test, name)) is not None and (
+                (declared := fields.get(field)) is None
+                or not (declared.required or field in grouped) or declared.kind == "secret"
+            ):
+                problems.append(f"{name} {field!r} is not a declared, required, non-secret field")
+        if key_test.basic_user_field is not None and (
+            key_test.connect_token_field or key_test.bearer_when
+            or key_test.header_name != _DEFAULT_API_KEY_HEADER or key_test.value_prefix
+        ):
+            # Basic auth carries the key itself: a header name, prefix or bearer rule beside it would be ignored.
+            problems.append("basic_user_field excludes header_name, value_prefix, bearer_when and connect_token_field")
+        if key_test.identity_fallback_field is not None and (key_test.accept is not None or not key_test.identity):
+            problems.append("identity_fallback_field needs accept=None and identity paths")
+        if key_test.list_verdict is not None and (key_test.list_field is None or key_test.list_verdict not in _LIST_VERDICTS):
+            problems.append(f"list_verdict {key_test.list_verdict!r} needs list_field and a _LIST_VERDICTS entry")
         if problems:
             raise RuntimeError(f"{slug}: key_test and its registry entry disagree - {'; '.join(problems)}")
 
 
-_check_tester_registry(CREDENTIAL_TYPES, _BESPOKE_TESTERS)
+_check_tester_registry(CREDENTIAL_TYPES, {**_BESPOKE_TESTERS, **_CATALOG_TESTERS})
 
-#: Every tester by slug: the bespoke functions plus one `_declared_tester` per `key_test`.
-TESTERS: dict[str, Tester] = {
-    **_BESPOKE_TESTERS,
-    **{slug: _declared_tester(slug) for slug, spec in CREDENTIAL_TYPES.items() if spec.key_test is not None},
-}
+def _with_grant_test(own: Tester, spec: "catalog.IntegrationSpec") -> Tester:
+    """A hand-written type's Test with the Connect a catalog spec layers over it (`catalog.extended_type`): a row
+    holding a refresh token is a Connect row, tested by the spec's `[test]` with its access token; any other row
+    keeps the type's own Test, unchanged."""
+    grant = catalog_tester(spec)
+    # A key row is checked against the type as written: each field it required still is (the extension made them
+    # optional only so a Connect row saves without them), in the same order and sentences as before.
+    as_written = catalog.hand_written_type(spec.credential_type)
+
+    def test(config: dict[str, Any], deadline: float) -> TestResult:
+        if not is_blank(config.get("refresh_token")):
+            return grant(config, deadline)
+        problem = _field_problem(as_written, config) if as_written is not None else None
+        return problem if problem is not None else own(config, deadline)
+
+    return test
+
+
+def _testers() -> dict[str, Tester]:
+    testers: dict[str, Tester] = {
+        **_BESPOKE_TESTERS,
+        **_CATALOG_TESTERS,
+        **{slug: _declared_tester(slug) for slug, spec in CREDENTIAL_TYPES.items() if spec.key_test is not None},
+    }
+    for slug, own in list(testers.items()):
+        spec = catalog.grant_test(slug)
+        if spec is not None:
+            testers[slug] = _with_grant_test(own, spec)
+    return testers
+
+
+#: Every tester by slug: the bespoke functions, the catalog's, and one `_declared_tester` per `key_test` - each a
+#: type a catalog Connect extends answering its Connect rows with the spec's grant Test (`_with_grant_test`).
+TESTERS: dict[str, Tester] = _testers()
 
 # Second and third guards, one loop over the `url`-field classification. Second: more than one url
 # field requires `base_url_field`, naming one of them (checked first; the third trusts it). Third:
@@ -2176,6 +2885,8 @@ def _check_save_rules(types: Mapping[str, CredentialTypeSpec]) -> None:
                     raise RuntimeError(f"{slug}: require_one_of names {key!r}, which the type does not declare")
                 if declared[key].required:
                     raise RuntimeError(f"{slug}: require_one_of names {key!r}, which is already required")
+        if spec.free_form_url and (spec.require_https_base_url or spec.allowed_hosts):
+            raise RuntimeError(f"{slug}: free_form_url cannot be combined with a url rule it would never enforce")
         if not spec.allowed_hosts:
             continue
         if any(not host or host != host.lower() for host in spec.allowed_hosts):

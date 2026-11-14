@@ -1,5 +1,6 @@
 import type { JSX } from 'react'
 import Box from '@mui/material/Box'
+import { capitalize } from '../../lib/humanize'
 import { listOrgs, ORG_LOOKUP_PER } from '../../lib/orgs'
 import { USER_STATUSES } from '../../lib/users'
 import { AsyncLookup, type LookupOption } from '../../ui/AsyncLookup'
@@ -7,6 +8,7 @@ import FilterBar from '../../ui/FilterBar'
 import { orgOption, useOrgsByIds } from '../../ui/OrgSelect'
 import { FilterRow, FilterSelect } from '../../ui/FilterRow'
 import { PEOPLE_FOLD_FILTERS } from '../../ui/listStyles'
+import { SIZE, grid } from '../../theme'
 import SearchBox from '../../ui/SearchBox'
 import ToolbarMenu, { filterRadioPage, PAGE_BODY_SX } from '../../ui/ToolbarMenu'
 import type { UserFilters } from './userFilters'
@@ -20,18 +22,18 @@ import type { UserFilters } from './userFilters'
  * create form's required field) has no unset state. It narrows WITHIN the global org scope (`lib/orgScope.ts`),
  * which the server applies first.
  * A NARROW ROSTER (a phone, or beside an open user) folds the operator's Status and Org behind one Filters button
- * (`ui/ToolbarMenu`), as the Nodes strip does (`pages/nodes/roster/RosterFilterStrips.tsx`): both are drawn and a
+ * (`ui/ToolbarMenu`), as `ui/SelectFilters.tsx` does for the Nodes strip: both are drawn and a
  * container query shows one, so opening a user never remounts the strip. A tenant's Search and Status share one
  * line at 390px already, so its strip never folds. */
 
 /** Top clearance for a Directory panel's filter strip: the panel sits flush under the tab strip, so a
- *  Search box's floated label would be clipped against it (seen at 390px). One home: People and Groups both use it. */
+ *  Search box's floated label would be clipped against it (seen at 390px). One home: People, Groups, Secrets and the Machines rosters use it. */
 export const FILTER_STRIP_SX = { pt: 1 } as const
 
-const SEARCH_SX = { flex: '1 1 190px', minWidth: 190, m: 0 } as const
-const ORG_SX = { flex: '1 1 180px', minWidth: 160, maxWidth: { sm: 260 } } as const
+const SEARCH_SX = { flex: `1 1 ${grid(31.5)}`, minWidth: grid(31.5), m: 0 } as const
+const ORG_SX = { flex: `1 1 ${grid(30)}`, minWidth: SIZE.fieldMd, maxWidth: { sm: grid(43) } } as const
 
-const STATUS_OPTIONS = USER_STATUSES.map(value => ({ value, label: value[0].toUpperCase() + value.slice(1) }))
+const STATUS_OPTIONS = USER_STATUSES.map(value => ({ value, label: capitalize(value) }))
 
 async function searchOrgs(q: string, signal: AbortSignal): Promise<LookupOption[]> {
   return (await listOrgs({ q, per: ORG_LOOKUP_PER }, signal)).items.map(orgOption)
@@ -75,7 +77,7 @@ export function UserFilterStrip({ filters, onChange, operator }: {
               onChange={status => onChange({ status: status as UserFilters['status'] })}
               allLabel="All"
               options={STATUS_OPTIONS}
-              minWidth={120}
+              minWidth={SIZE.fieldSm}
             />
             {operator && <OrgFilter value={filters.org} onChange={org => onChange({ org })} />}
           </Box>
@@ -109,7 +111,7 @@ function UserFilterMenu({ filters, onChange }: Pick<Parameters<typeof UserFilter
           label: 'Org',
           value: org?.label ?? 'All',
           render: () => (
-            <Box sx={{ ...PAGE_BODY_SX, px: 1.5, py: 1.5, minWidth: 240 }}>
+            <Box sx={{ ...PAGE_BODY_SX, px: 1.5, py: 1.5, minWidth: grid(40) }}>
               <OrgFilter value={filters.org} onChange={org => onChange({ org })} idSuffix="-menu" />
             </Box>
           ),

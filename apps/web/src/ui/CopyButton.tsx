@@ -8,6 +8,8 @@ import { CHECK_PATH, CLOSE_PATH } from './icons'
 import { tapTargetSx } from './listStyles'
 import { useCopyFlash } from './useCopyFlash'
 import { VISUALLY_HIDDEN } from './visuallyHidden'
+import { SIZE } from '../theme'
+import Tip from './Tip'
 
 /* ── A CLIPBOARD BUTTON THAT SAYS WHETHER IT WORKED ── the mechanism is `ui/useCopyFlash`'s.
  * THE LABEL FLIP IS NOT DECORATION: a refused clipboard is SAID in the label, never thrown. */
@@ -18,7 +20,7 @@ const FLASH_MS = 900
  * static one would hide the flip from screen readers. The live region below announces it. */
 const STATE_LABELS = { copied: 'Copied ✓', failed: 'Copy unavailable' } as const
 
-/* The `icon` faces, as 24-unit SVG paths (no icon package here — `ui/InfoTip.tsx`): the familiar
+/* The `icon` faces, as 24-unit SVG paths (no icon package here): the familiar
  * two-sheets copy mark; the check or cross replaces it for the flash. */
 const COPY_PATH =
   'M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z'
@@ -45,17 +47,19 @@ export function CopyButton({
   failedLabel = STATE_LABELS.failed,
   flashMs = FLASH_MS,
   onFailed,
+  announce = true,
 }: {
-  /** Built ON CLICK (see the header). */
-  text: () => string
+  /** Built ON CLICK (see the header). A copy whose write happens elsewhere passes `run` instead: it is handed the
+   *  flash and settles it when that write answers (`ConsoleTerminal`'s pane copy, written when the node replies). */
+  text: (() => string) | { run: (settle: (state: 'copied' | 'failed') => void) => void }
   label: string
   testId?: string
   title?: string
   ariaLabel?: string
   sx?: SxProps<Theme>
   /** `text`: a bare verb beside the value it copies (`ui/CopyableValue`) — no glyph, no outline.
-   *  `icon`: a 24px glyph that flips copy mark → green check / red cross; `label` is its accessible name AND
-   *  title, flipping with the face (`lib/credentialRow`'s inline copy-name control). */
+   *  `icon`: a 24px glyph that flips copy mark → green check / red cross; `label` is its accessible name,
+   *  flipping with the face (`lib/credentialRow`'s inline copy-name control). */
   variant?: 'outlined' | 'text' | 'icon'
   copiedLabel?: string
   /** A caller whose value is also selectable on screen keeps its verb (`label`); the refusal is still announced. */
@@ -63,8 +67,10 @@ export function CopyButton({
   flashMs?: number
   /** Told once per refused copy: a caller that shows no selectable value can reveal one (`ui/AuthorizeLink`). */
   onFailed?: () => void
+  /** `false` where the host owns its region's ONE live region (`ConsoleTerminal`): the flash stays in the name. */
+  announce?: boolean
 }): JSX.Element {
-  const [state, copy] = useCopyFlash(flashMs)
+  const [state, copy, flash] = useCopyFlash(flashMs)
   const onFailedRef = useRef(onFailed)
   onFailedRef.current = onFailed
   useEffect(() => {
@@ -74,15 +80,14 @@ export function CopyButton({
   const shown = state === 'idle' ? label : state === 'copied' ? copiedLabel : failedLabel
   // State-derived, never pinned to `label` — see `STATE_LABELS`.
   const said = state === 'idle' ? (ariaLabel ?? label) : shown
-  const common = { 'data-testid': testId, 'data-copy-state': state, 'aria-label': said, onClick: () => copy(text) }
+  const common = { 'data-testid': testId, 'data-copy-state': state, 'aria-label': said, onClick: () => (typeof text === 'function' ? copy(text) : text.run(flash)) }
   const outlined = variant === 'outlined'
   return (
     <>
       {variant === 'icon' ? (
-        <IconButton
+        <Tip title={title}><IconButton
           {...common}
           type="button"
-          title={title ?? said}
           sx={[
             (theme) => ({
               width: ICON_TARGET_MIN,
@@ -103,21 +108,20 @@ export function CopyButton({
             key={state}
             viewBox="0 0 24 24"
             sx={{
-              fontSize: 14,
+              fontSize: SIZE.iconXs,
               animation: state === 'idle' ? undefined : `${pop} 260ms ease-out`,
               '@media (prefers-reduced-motion: reduce)': { animation: 'none' },
             }}
           >
             <path d={state === 'copied' ? CHECK_PATH : state === 'failed' ? CLOSE_PATH : COPY_PATH} />
           </SvgIcon>
-        </IconButton>
+        </IconButton></Tip>
       ) : (
-        <Button
+        <Tip title={title}><Button
           size={outlined ? 'small' : 'medium'}
           variant={variant}
           color={outlined ? 'inherit' : 'primary'}
           {...common}
-          title={title}
           sx={[{ textTransform: 'none', whiteSpace: 'nowrap' }, tapTargetSx, ...(Array.isArray(sx) ? sx : [sx])]}
         >
           {outlined && (
@@ -126,13 +130,15 @@ export function CopyButton({
             </Box>
           )}
           {shown}
-        </Button>
+        </Button></Tip>
       )}
       {/* The outcome, ANNOUNCED (a renamed button is not an announcement). Visually hidden, not
           `display: none`, which is not read at all. A refusal is said even where the label keeps its verb. */}
-      <Box component="span" role="status" aria-live="polite" sx={VISUALLY_HIDDEN}>
-        {state === 'idle' ? '' : state === 'failed' && failedLabel === label ? STATE_LABELS.failed : shown}
-      </Box>
+      {announce && (
+        <Box component="span" role="status" aria-live="polite" sx={VISUALLY_HIDDEN}>
+          {state === 'idle' ? '' : state === 'failed' && failedLabel === label ? STATE_LABELS.failed : shown}
+        </Box>
+      )}
     </>
   )
 }

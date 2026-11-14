@@ -1,0 +1,48 @@
+# Amazon Redshift: an IAM access key, SigV4-signed; the Test lists clusters (DescribeClusters).
+slug = "amazon_redshift"
+label = "Amazon Redshift"
+category = "data"
+vendor_docs_url = "https://docs.aws.amazon.com/redshift/latest/APIReference/API_DescribeClusters.html"
+summary = "Let agents query your Amazon Redshift warehouse through the Redshift Data API."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "access_key_id", label = "Access key ID", kind = "text", required = true, placeholder = "AKIA...", help = "AWS console > IAM > Users > the agents' user > Security credentials > Access keys > Create access key; choose Application running outside AWS and copy the Access key ID" },
+  { key = "secret_access_key", label = "Secret access key", kind = "secret", required = true, help = "Shown once, beside the access key ID, when the key is created; download the .csv if you need to keep it" },
+  { key = "region", label = "Region", kind = "text", required = false, default = "us-east-1", placeholder = "us-east-1", help = "The region of your cluster or Serverless workgroup (Redshift console > the region picker at the top right)" },
+  { key = "cluster_or_workgroup", label = "Cluster or workgroup", kind = "text", required = false, placeholder = "analytics-cluster", help = "A provisioned cluster's identifier (Redshift console > Clusters) or a Serverless workgroup's name (Serverless dashboard > Workgroup configuration)" },
+  { key = "database", label = "Database", kind = "text", required = false, default = "dev", placeholder = "dev", help = "The database agents query; dev is Redshift's default" },
+]
+
+[test]
+method = "GET"
+path = "https://redshift.us-east-1.amazonaws.com/?Action=DescribeClusters&Version=2012-12-01&MaxRecords=20"
+auth = { sigv4 = { service = "redshift", region = "us-east-1", access_key_field = "access_key_id", secret_key_field = "secret_access_key" } }
+accept = ""
+
+[docs]
+agent_uses = [
+  "Run SQL through the Redshift Data API to answer data questions, with no database driver or open port",
+  "List schemas, tables and columns before writing a query or a migration",
+  "Read a statement's status and error when a load or transformation fails",
+  "Check that a nightly load wrote today's rows",
+]
+prerequisites = [
+  "An Amazon Redshift provisioned cluster or a Redshift Serverless workgroup.",
+  "An IAM user for agents with redshift:DescribeClusters (the Test needs it), the Data API actions (redshift-data:ExecuteStatement, DescribeStatement, GetStatementResult) and a way to sign in to the database: redshift:GetClusterCredentialsWithIAM for a cluster or redshift-serverless:GetCredentials for Serverless. The AWS managed policy AmazonRedshiftDataFullAccess covers the Data API.",
+]
+limitations = [
+  "Jaah tests by listing clusters in us-east-1 (DescribeClusters). It proves the key and that permission, not access to a database. An account with only Serverless still passes: the list is just empty.",
+  "Only long-lived IAM access keys are supported, not temporary (STS) credentials, and not a database user name and password.",
+  "Agents reach Redshift through the Data API, so queries return at most 100 MB of results each.",
+]
+troubleshooting = [
+  { symptom = "Test says Amazon Redshift rejected the secret access key (403)", fix = "Either the key pair is wrong or deactivated (check it in IAM and create a new one if needed), or the user lacks redshift:DescribeClusters. Add it to the user's policy" },
+  { symptom = "Test passes but queries fail with 'not authorized to get credentials'", fix = "Allow redshift:GetClusterCredentialsWithIAM (provisioned) or redshift-serverless:GetCredentials (Serverless) on the user" },
+  { symptom = "Queries fail with 'Cluster not found' or 'workgroup not found'", fix = "Set Region to the cluster's region and Cluster or workgroup to its exact identifier" },
+]
+faq = [
+  { q = "Do I need to open my cluster to the internet?", a = "No. The Data API is an AWS endpoint, so the cluster can stay private" },
+  { q = "Which database user do queries run as?", a = "With IAM credentials, a database user named after the IAM user (IAM:USER_NAME). Grant that user only the tables agents need" },
+]

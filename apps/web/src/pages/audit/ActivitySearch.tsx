@@ -6,6 +6,7 @@ import CircularProgress from '@mui/material/CircularProgress'
 import ListSubheader from '@mui/material/ListSubheader'
 import TextField from '@mui/material/TextField'
 import { get } from '../../api'
+import { FONT_SIZE, FONT_WEIGHT, grid, LETTER_SPACING, LINE_HEIGHT, RADIUS, SIZE } from '../../theme'
 import { useDebouncedCallback } from '../../hooks/useDebouncedCallback'
 import { highlight, OPTION_ROW_SX } from '../../ui/AsyncLookup'
 import { AUDIT_FOLD_FILTERS, ELLIPSIS_SX, fieldTapTargetSx, PHONE } from '../../ui/listStyles'
@@ -14,6 +15,7 @@ import { SEARCH_DEBOUNCE_MS, SEARCH_MAX_WAIT_MS } from '../../ui/SearchBox'
 import { FACET_LABEL, matchResults, matchSession, recordLabel, type ChipFacet } from './activityFilters'
 import { Q_MAX_LEN, Q_MIN_LEN } from './queryLimits'
 import type { AuditSuggestions } from './types'
+import Tip from '../../ui/Tip'
 
 /* AUDIT › ACTIVITY'S SEARCH BOX — free text and filter CHIPS in one field (MUI `Autocomplete` `multiple` +
  * `freeSolo`, so a typed phrase and the chips coexist).
@@ -59,18 +61,18 @@ const NO_SUGGESTIONS: AuditSuggestions = { users: [], orgs: [], subjects: [] }
 const CHIP_SX = {
   height: 'auto',
   maxWidth: '100%',
-  py: '3px',
-  borderRadius: '6px',
-  '& .MuiChip-label': { whiteSpace: 'normal', overflowWrap: 'anywhere', lineHeight: 1.35, px: '8px' },
+  py: 0.5,
+  borderRadius: RADIUS.sm,
+  '& .MuiChip-label': { whiteSpace: 'normal', overflowWrap: 'anywhere', lineHeight: LINE_HEIGHT.snug, px: 1 },
 } as const
 
 const PREFIX_SX = {
   color: 'text.secondary',
-  fontWeight: 600,
-  fontSize: '0.6875rem',
-  letterSpacing: '0.04em',
+  fontWeight: FONT_WEIGHT.semibold,
+  fontSize: FONT_SIZE.xs,
+  letterSpacing: LETTER_SPACING.caps,
   textTransform: 'uppercase',
-  mr: '6px',
+  mr: 1,
 } as const
 
 export default function ActivitySearch({
@@ -205,15 +207,15 @@ export default function ActivitySearch({
       getOptionDisabled={option => option.kind === 'note'}
       isOptionEqualToValue={(a, b) => typeof b !== 'string' && a.key === b.key}
       /* The popup can outgrow a narrow field, never the window (`ui/AsyncLookup`'s measurement). */
-      slotProps={{ popper: { style: { minWidth: 'min(22rem, calc(100vw - 2rem))' } } }}
+      slotProps={{ popper: { style: { minWidth: `min(${grid(58.5)}, calc(100vw - ${grid(5.5)}))` } } }}
       sx={{
-        flex: '1 1 420px',
-        minWidth: 260,
+        flex: `1 1 ${grid(70)}`,
+        minWidth: grid(43),
         // On a phone, and on a list folded beside an open event (`AUDIT_FOLD_FILTERS`), the frame's other controls
         // are the Filters button (and Clear): they share this row.
         [PHONE]: { flexBasis: 0, minWidth: 0 },
         [AUDIT_FOLD_FILTERS]: { flexBasis: 0, minWidth: 0 },
-        '& .MuiAutocomplete-inputRoot': { flexWrap: 'wrap', gap: '4px', py: '5px' },
+        '& .MuiAutocomplete-inputRoot': { flexWrap: 'wrap', gap: 0.5, py: 0.5 },
         '& .MuiAutocomplete-input': { minWidth: '8ch !important', flexGrow: 1 },
       }}
       onInputChange={(_event, next, reason) => {
@@ -262,8 +264,7 @@ export default function ActivitySearch({
           const { key, ...itemProps } = getItemProps({ index })
           const name = `${FACET_LABEL[item.facet]}: ${item.label}`
           return (
-            <Chip
-              key={key}
+            <Tip key={key} title={name}><Chip
               {...itemProps}
               size="small"
               variant="outlined"
@@ -271,7 +272,6 @@ export default function ActivitySearch({
               data-facet={item.facet}
               data-value={item.value}
               aria-label={name}
-              title={name}
               sx={CHIP_SX}
               label={
                 <>
@@ -279,7 +279,7 @@ export default function ActivitySearch({
                   <Box component="span">{item.label}</Box>
                 </>
               }
-            />
+            /></Tip>
           )
         })}
       renderGroup={params =>
@@ -289,7 +289,7 @@ export default function ActivitySearch({
             <li key={params.key}>
               <ListSubheader
                 component="div"
-                sx={{ lineHeight: '28px', fontSize: '0.6875rem', fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase' }}
+                sx={{ lineHeight: grid(4.5), fontSize: FONT_SIZE.xs, fontWeight: FONT_WEIGHT.semibold, letterSpacing: LETTER_SPACING.caps, textTransform: 'uppercase' }}
               >
                 {params.group}
               </ListSubheader>
@@ -301,41 +301,39 @@ export default function ActivitySearch({
         if (option.kind === 'search') {
           return (
             <Box component="li" key={option.key} {...rest} data-testid="audit-suggest-search">
-              <Box sx={{ ...ELLIPSIS_SX, fontSize: '0.8125rem' }} title={option.text}>
+              <Tip title={option.text}><Box sx={{ ...ELLIPSIS_SX, fontSize: FONT_SIZE.md }}>
                 Search for “{option.text}”
-              </Box>
+              </Box></Tip>
             </Box>
           )
         }
         if (option.kind === 'note') {
           return (
-            <Box component="li" key={option.key} {...rest} sx={{ fontSize: '0.75rem', color: 'text.secondary' }}>
+            <Box component="li" key={option.key} {...rest} sx={{ fontSize: FONT_SIZE.sm, color: 'text.secondary' }}>
               {option.text}
             </Box>
           )
         }
         const full = option.hint ? `${option.label} · ${option.hint}` : option.label
         return (
-          <Box
+          <Tip key={option.key} title={full}><Box
             component="li"
-            key={option.key}
             {...rest}
-            title={full}
             aria-label={`${FACET_LABEL[option.facet]}: ${full}`}
             data-testid="audit-suggest-option"
             data-facet={option.facet}
           >
             <Box sx={OPTION_ROW_SX}>
-              <Box component="span" sx={{ ...ELLIPSIS_SX, flex: '1 1 auto', fontSize: '0.8125rem' }}>
+              <Box component="span" sx={{ ...ELLIPSIS_SX, flex: '1 1 auto', fontSize: FONT_SIZE.md }}>
                 {highlight(option.label, text)}
               </Box>
               {option.hint && (
-                <Box component="span" sx={{ ...ELLIPSIS_SX, flex: '0 1 auto', maxWidth: '40%', fontSize: '0.75rem', color: 'text.secondary' }}>
+                <Box component="span" sx={{ ...ELLIPSIS_SX, flex: '0 1 auto', maxWidth: '40%', fontSize: FONT_SIZE.sm, color: 'text.secondary' }}>
                   {option.hint}
                 </Box>
               )}
             </Box>
-          </Box>
+          </Box></Tip>
         )
       }}
       renderInput={params => (
@@ -350,7 +348,7 @@ export default function ActivitySearch({
             input: {
               ...params.slotProps.input,
               endAdornment: busy
-                ? <CircularProgress size={14} thickness={5} aria-label="Finding suggestions" data-testid="audit-suggest-busy" />
+                ? <CircularProgress size={SIZE.iconXs} thickness={5} aria-label="Finding suggestions" data-testid="audit-suggest-busy" />
                 : null,
             },
             htmlInput: {

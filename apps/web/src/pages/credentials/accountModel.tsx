@@ -1,12 +1,14 @@
 import type { ReactNode } from 'react'
 import Box from '@mui/material/Box'
-import { useCan } from '../../auth'
-import type { Account, AccountAuthKind, ClaudeAccount, ProviderChoice } from '../../types'
+import { apiDetail, put } from '../../api'
+import { useCan, useCanOnAnyProject } from '../../auth'
+import type { Account, AccountAuthKind, ClaudeAccount } from '../../types'
 import type { NonBaaSurface } from '../../components/NonBaaWarning'
 import type { ProviderCatalogue } from '../../hooks/useAgentProviders'
 import { listNodes, workNodes } from '../../hooks/useNodesRoster'
 import { DEFAULT_SUBSCRIPTION_SURFACE, isDefaultProvider } from '../../lib/providerCatalogue'
 import { monoSx } from '../../ui/listStyles'
+import { FONT_SIZE } from '../../theme'
 
 /* The runner-account facts both surfaces read: the roster (`Accounts.tsx`) and the account form page
  * (`AccountEditPage.tsx`, New / Edit / Login). One home so the two cannot drift. */
@@ -34,11 +36,20 @@ export function slugOf(acct: ClaudeAccount): string | null {
 
 /* ── Auto-assign and the per-account runner cap ──
  * Auto-assign (`Account.auto_assign`) is on every account, so the words are shared by the three forms and
- * the roster chip. The cap (`Account.max_runners`) only for a provider declaring `per_account_runner_cap`. */
-export const AUTO_ASSIGN_HINT = 'Runs tasks that allow any provider. Off: only tasks that pick this provider.'
+ * the roster chip. The cap (`Account.max_runners`) where `takesRunnerCap` allows one. */
+export const AUTO_ASSIGN_TIP = 'On: also runs tasks that allow any provider.'
+export const AUTO_ASSIGN_HINT = 'Off: runs only tasks that pick this provider; the list shows explicit only.'
 export const EXPLICIT_ONLY_TITLE =
   'Auto-assign is off: this account runs only tasks and consoles that pick its provider. Turn it on from Edit.'
-export const MAX_RUNNERS_HINT = 'Blank: the fleet limit.'
+export const MAX_RUNNERS_TIP = 'Caps how many tasks use this account at once.'
+export const MAX_RUNNERS_HINT = "Blank: the organization's Concurrent runners setting."
+export const MAX_RUNNERS_HINT_API_KEY = 'Blank: no limit.'
+
+/* Whether an account may carry its own runner cap, mirroring `routes/accounts.py::takes_runner_cap`: any
+ * subscription account, and an API-key account only of a provider declaring `per_account_runner_cap`. */
+export function takesRunnerCap(provider: { per_account_runner_cap?: boolean } | null | undefined, kind: string): boolean {
+  return kind !== 'api_key' || !!provider?.per_account_runner_cap
+}
 export const MAX_RUNNERS_INVALID = 'A whole number of 1 or more, or blank.'
 
 /* The provider column's two hover sentences, one per absence `providerCell` distinguishes, shared by the
@@ -112,6 +123,30 @@ export function useCanLogIn(): boolean {
   return useCan()(LOGIN_PERMISSION)
 }
 
+/* ── Who may add a NEW account ──
+ * Every member of an org holds `accounts:create` (`app/access_catalog.py::MEMBER_KEYS`): anyone may bring their
+ * own account, by a login or a key. Without `system:create` the add is personal (the API decides:
+ * `_personal_account_path`, `_account_ownership`); re-login, enrolment and edits stay `useCanLogIn`/org admin. */
+export const ADD_PERMISSION = 'accounts:create'
+
+/** Whether this viewer may add a new account (Add account, the new-account form). */
+export function useCanAddAccount(): boolean {
+  const can = useCan()
+  return can(ADD_PERMISSION) || can(LOGIN_PERMISSION)
+}
+
+/** Whether this viewer may sign a NEW subscription in: a login runs on a node, and a non-administrator reaches
+ * a node only through a project (`authz/visibility.py::node_reach_clause`), so a member of no project adds a
+ * key instead. Every project role carries `projects:view`. */
+export function useCanSignInNewAccount(): boolean {
+  const canLogIn = useCanLogIn()
+  const onAnyProject = useCanOnAnyProject()
+  return canLogIn || onAnyProject('projects:view')
+}
+
+/** Why a member of no project is offered no subscription (`useCanSignInNewAccount`). */
+export const SIGN_IN_NEEDS_PROJECT = 'Subscription sign-in needs a project. Ask an admin to add you to one.'
+
 
 // ── Which node a login lands on, shared by the add and re-login steps ──
 /* One login target: the node's name plus `runner_clis` (`GET /api/nodes`). A provider login asks
@@ -130,13 +165,7 @@ export type NodeChoice = {
   unsupported?: Record<string, string>
 }
 
-/** Exactly `['api_key']`: a provider whose accounts are a key and nothing else, so Add account skips the
- *  login wizard for the key form. Read off the catalogue (`ProviderChoice.auth_kinds`), never a name. */
-export function isApiKeyOnly(p: ProviderChoice | null | undefined): boolean {
-  return !!p && p.auth_kinds?.length === 1 && p.auth_kinds[0] === 'api_key'
-}
-
-/* The max-runners text as the wire wants it: `null` for blank (the fleet limit), a whole number of 1 or
+/* The max-runners text as the wire wants it: `null` for blank (the org default, or no limit for an API key), a whole number of 1 or
 more, or `undefined` for anything else (the form refuses to send it). The server re-checks
 (`routes/accounts.py::_validated_max_runners`). */
 export function parseMaxRunners(raw: string): number | null | undefined {
@@ -193,6 +222,28 @@ export function takePendingDispatch(records: Record<string, Account>): { slug: s
   return out
 }
 
+/** Writes every held answer whose row is now in `records`: the roster and the form page both call it, whichever
+ *  sees the row first. Taken off the store before the write, so a re-read cannot send it twice. `written` is the
+ *  count of writes sent (0 when nothing was held, or every held answer already matched its row: a caller must not
+ *  re-read then, or its own re-read would call it again); `failure` is the first failure's sentence (the caller
+ *  shows it: the account would otherwise run work the box said it would not), or ''. One failure does not stop the
+ *  rest: each held answer is written on its own. */
+export async function applyPendingDispatch(records: Record<string, Account>): Promise<{ written: number; failure: string }> {
+  let written = 0
+  let failure = ''
+  for (const { slug, row, wanted } of takePendingDispatch(records)) {
+    const body = dispatchBody(row, wanted)
+    if (!body) continue
+    written += 1
+    try {
+      await put(`/api/accounts/${row.id}`, body)
+    } catch (err) {
+      failure ||= pendingDispatchFailure(row.name || slug, apiDetail(err, 'the write failed'))
+    }
+  }
+  return { written, failure }
+}
+
 /* The nodes a login can target. Best-effort: `null`, never `[]`, on a failed read — the form must not
  * assert anything about the fleet off a GET that did not answer. `runner_clis` absent stays `null` (never
  * attested), never `[]`. */
@@ -221,7 +272,7 @@ export function withInlineCode(text: string): ReactNode {
   const parts = text.split(INLINE_CODE)
   if (parts.length === 1) return text
   return parts.map((part, i) => (i % 2 === 1
-    ? <Box key={i} component="code" sx={[monoSx, { fontSize: '0.95em', overflowWrap: 'anywhere' }]}>{part}</Box>
+    ? <Box key={i} component="code" sx={[monoSx, { fontSize: FONT_SIZE.xs, overflowWrap: 'anywhere' }]}>{part}</Box>
     : part))
 }
 

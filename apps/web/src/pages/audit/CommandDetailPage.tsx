@@ -15,6 +15,7 @@ import DetailPage, { DETAIL_SECTIONS_SX, DetailField, DetailSection } from '../.
 import LoadingState from '../../ui/LoadingState'
 import StatusChip from '../../ui/StatusChip'
 import { toneFor } from '../../ui/statusTone'
+import { grid } from '../../theme'
 
 /* ONE NODE COMMAND, IN FULL (`/audit/nodes/commands/:commandId`) — the editor beside Audit > Nodes' command log
  * (`lib/listDetail.ts`), a full page below the dock width. The row keeps what is scanned down the log; this keeps
@@ -33,7 +34,7 @@ export const UNBOUND_NODE_LABEL = 'No node'
 type CommandDetail = Command & { actor: string | null }
 
 function Json({ value, testId }: { value: unknown; testId: string }): JSX.Element {
-  return <CodeBlock testId={testId} maxHeight={480}>{JSON.stringify(value, null, 2)}</CodeBlock>
+  return <CodeBlock testId={testId} maxHeight={grid(80)}>{JSON.stringify(value, null, 2)}</CodeBlock>
 }
 
 export default function CommandDetailPage(): JSX.Element {

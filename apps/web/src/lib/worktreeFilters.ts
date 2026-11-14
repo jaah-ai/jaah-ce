@@ -12,13 +12,13 @@
  * filtered by a value nothing matches ("the fleet is empty").
  */
 import { gitSummary, sessionSignal, slotIdentity, stackChipWord } from './poolSlot'
-import { uniqueNonEmpty } from './strings'
+import { oneOf, uniqueNonEmpty } from './strings'
 import { isFolderSlot } from './worktree'
 import type { NodeLabelFor } from './worktreeGrouping'
 import type { Worktree } from '../types'
 
 /** WHO HOLDS THE SLOT — `Worktree.state` (`apps/api/app/slot_state.py`), multi-select. */
-export type OccupancyFilter = 'free' | 'task' | 'user'
+export type OccupancyFilter = 'free' | 'task'
 
 /** IS A SESSION SITTING HERE. Single-select: both is the unfiltered list. */
 export type SessionFilter = 'live' | 'none'
@@ -58,15 +58,10 @@ export const EMPTY_WORKTREE_FILTERS: WorktreeFilters = {
   node: [], project: [], occupancy: [], session: null, stack: null, git: null, q: '',
 }
 
-const OCCUPANCY_VALUES: readonly OccupancyFilter[] = ['free', 'task', 'user']
+const OCCUPANCY_VALUES: readonly OccupancyFilter[] = ['free', 'task']
 const SESSION_VALUES: readonly SessionFilter[] = ['live', 'none']
 const STACK_VALUES: readonly StackFilter[] = ['up', 'down', 'not-built']
 const GIT_VALUES: readonly GitFilter[] = ['dirty', 'diverged', 'clean']
-
-/* Membership in a closed vocabulary. Exact match, never folded: these are values this module writes. */
-function pick<T extends string>(values: readonly T[], raw: string | null): T | null {
-  return raw != null && (values as readonly string[]).includes(raw) ? (raw as T) : null
-}
 
 /**
  * READ the filters out of a URL. Total: every unrecognised value is dropped. Takes `URLSearchParams`, as
@@ -81,9 +76,9 @@ export function readWorktreeFilters(searchParams: URLSearchParams): WorktreeFilt
     node: multi<string>('node', null),
     project: multi<string>('project', null),
     occupancy: multi('occupancy', OCCUPANCY_VALUES),
-    session: pick(SESSION_VALUES, searchParams.get('session')),
-    stack: pick(STACK_VALUES, searchParams.get('stack')),
-    git: pick(GIT_VALUES, searchParams.get('git')),
+    session: oneOf(SESSION_VALUES, searchParams.get('session')),
+    stack: oneOf(STACK_VALUES, searchParams.get('stack')),
+    git: oneOf(GIT_VALUES, searchParams.get('git')),
     q: searchParams.get('q') ?? '',
   }
 }
@@ -102,7 +97,7 @@ export function writeWorktreeFilters(filters: WorktreeFilters): URLSearchParams 
   for (const value of uniqueNonEmpty(filters.node)) params.append('node', value)
   for (const value of uniqueNonEmpty(filters.project)) params.append('project', value)
   for (const value of uniqueNonEmpty(filters.occupancy)) {
-    if (pick(OCCUPANCY_VALUES, value) != null) params.append('occupancy', value)
+    if (oneOf(OCCUPANCY_VALUES, value) != null) params.append('occupancy', value)
   }
   if (filters.session != null) params.set('session', filters.session)
   if (filters.stack != null) params.set('stack', filters.stack)
@@ -140,7 +135,7 @@ function matchesGit(slot: Worktree, want: GitFilter): boolean {
   return summary.kind === 'sync' && summary.dirty === false
 }
 
-/* FREE-TEXT SEARCH over identity (`poolSlot.ts::slotIdentity`, slot 0 = `main`), Title, branch, path,
+/* FREE-TEXT SEARCH over identity (`poolSlot.ts::slotIdentity`), Title, branch, path,
    and the node's NAME — the label is searched and the uuid is not (nobody types it), which is why the
    resolver is a parameter.
    NOT `poolSlot.ts::matchesQuery`, deliberately: that one also searches state, owner, session and model,

@@ -27,19 +27,19 @@ import hashlib
 import hmac
 import secrets
 import struct
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Callable, NamedTuple, Optional
 from urllib.parse import quote, urlencode
 from uuid import UUID
 
-from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from itsdangerous import BadSignature, SignatureExpired
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import auth, credential_crypto, hipaa
 # The TOTP clock, in epoch seconds, under this module's own name so a test can move time.
-from app.clock import epoch as _now
+from app.clock import epoch as _now, utcnow
 from app.operator_settings import reads as settings_reads
 from app.models.identity import AdminUser, UserMfaFactor, UserRecoveryCode, UserTrustedDevice
 from app.models.orgs import Org
@@ -126,18 +126,15 @@ def otpauth_uri(secret: str, email: str) -> str:
     return f"otpauth://totp/{label}?{query}"
 
 
-def _aad(user_id: UUID) -> bytes:
-    return b"user-mfa-totp|" + str(user_id).encode()
+_ENVELOPE = credential_crypto.RowEnvelope(b"user-mfa-totp|", "user_mfa_factors")
 
 
 def _seal_secret(user_id: UUID, secret: str) -> dict:
-    return credential_crypto.seal({"secret": secret}, aad=_aad(user_id))
+    return _ENVELOPE.seal(user_id, {"secret": secret})
 
 
 def _open_secret(factor: UserMfaFactor) -> str:
-    return credential_crypto.unseal(factor.secret_sealed, aad=_aad(factor.key_user_id), label="user_mfa_factors")[
-        "secret"
-    ]
+    return _ENVELOPE.open(factor.secret_sealed, factor.key_user_id)["secret"]
 
 
 # ── Rows ──────────────────────────────────────────────────────────────────────────────────────────
@@ -232,12 +229,11 @@ def start_enrolment(session: Session, user: AdminUser, nonce: str) -> Optional[s
 
 def _throttled(factor: UserMfaFactor) -> bool:
     """Out of tries: `MAX_BAD_CODES` failures, the last within `FAILURE_WINDOW`."""
-    last = factor.last_failure_at
-    return (
-        factor.pending_failures >= MAX_BAD_CODES
-        and last is not None
-        and datetime.now(timezone.utc) - last < FAILURE_WINDOW
-    )
+    return _out_of_tries(factor.pending_failures, factor.last_failure_at)
+
+
+def _out_of_tries(failures: int, last: Optional[datetime]) -> bool:
+    return failures >= MAX_BAD_CODES and last is not None and utcnow() - last < FAILURE_WINDOW
 
 
 def _nonce_live(factor: UserMfaFactor, nonce: str) -> bool:
@@ -265,7 +261,7 @@ def _refused_unchecked(factor: Optional[UserMfaFactor]) -> Check:
 
 def _failed(factor: UserMfaFactor) -> Check:
     factor.pending_failures += 1
-    factor.last_failure_at = datetime.now(timezone.utc)
+    factor.last_failure_at = utcnow()
     if factor.pending_failures >= MAX_BAD_CODES:
         factor.pending_nonce = None
         return Check(False, expired=True, throttled=True)
@@ -287,7 +283,7 @@ def confirm_enrolment(session: Session, user: AdminUser, nonce: str, code: str) 
     step = matching_step(_open_secret(factor), code, after=factor.last_used_step)
     if step is None:
         return _failed(factor), []
-    factor.confirmed_at = datetime.now(timezone.utc)
+    factor.confirmed_at = utcnow()
     factor.last_used_step = step
     _succeeded(factor)
     return Check(True, amr="otp"), _issue_recovery_codes(session, user)
@@ -311,7 +307,7 @@ def verify(
         row = _unspent_recovery_code(session, user, _normalise_recovery(recovery_code or ""))
         if row is None:
             return _failed(factor)
-        row.used_at = datetime.now(timezone.utc)
+        row.used_at = utcnow()
         amr = "recovery"
     _succeeded(factor)
     return Check(True, amr=amr)
@@ -336,17 +332,12 @@ def _unspent_recovery_code(session: Session, user: AdminUser, normalised: str) -
 
 def _step_up_throttled(factor: UserMfaFactor) -> bool:
     """`_throttled` for the step-up's own count."""
-    last = factor.step_up_last_failure_at
-    return (
-        factor.step_up_failures >= MAX_BAD_CODES
-        and last is not None
-        and datetime.now(timezone.utc) - last < FAILURE_WINDOW
-    )
+    return _out_of_tries(factor.step_up_failures, factor.step_up_last_failure_at)
 
 
 def _step_up_failed(factor: UserMfaFactor) -> Check:
     factor.step_up_failures += 1
-    factor.step_up_last_failure_at = datetime.now(timezone.utc)
+    factor.step_up_last_failure_at = utcnow()
     return Check(False, throttled=factor.step_up_failures >= MAX_BAD_CODES)
 
 
@@ -392,7 +383,7 @@ def verify_current_code(
         row = _unspent_recovery_code(session, user, _normalise_recovery(typed))
         if row is None:
             return failed(factor)
-        row.used_at = datetime.now(timezone.utc)
+        row.used_at = utcnow()
         succeeded(factor)
         return Check(True, amr="recovery")
     step = matching_step(_open_secret(factor), code, after=factor.last_used_step)
@@ -410,7 +401,7 @@ def bind_pending_nonce(session: Session, user: AdminUser, nonce: str) -> None:
         factor.pending_nonce = nonce
         # The count survives a new sign-in until its window has passed (`FAILURE_WINDOW`).
         last = factor.last_failure_at
-        if last is None or datetime.now(timezone.utc) - last >= FAILURE_WINDOW:
+        if last is None or utcnow() - last >= FAILURE_WINDOW:
             factor.pending_failures = 0
             factor.last_failure_at = None
 
@@ -504,7 +495,7 @@ def _trusted_device(session: Session, user: AdminUser, cookie: Optional[str]) ->
     tokens = _cookie_tokens(cookie)
     if not tokens or not is_enrolled(session, user):
         return None
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     devices = session.scalars(
         select(UserTrustedDevice).where(
             UserTrustedDevice.identity_id == user.identity_id,
@@ -524,7 +515,7 @@ def use_trusted_device(session: Session, user: AdminUser, cookie: Optional[str])
     """The live trusted device `cookie` names for `user`, its `last_used_at` stamped; None when there is none."""
     device = _trusted_device(session, user, cookie)
     if device is not None:
-        device.last_used_at = datetime.now(timezone.utc)
+        device.last_used_at = utcnow()
     return device
 
 
@@ -534,7 +525,7 @@ def trust_device(
     """Trust this browser for `days` (the caller reads `remember_days()` once): a new row, and the cookie
     carrying its token ahead of `cookie`'s (the request's `DEVICE_COOKIE`) still-live tokens of OTHER people,
     so their trust in this browser survives. The user's expired devices are removed while we are here."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     kept_hashes = {_token_hash(t): t for t in _cookie_tokens(cookie)}
     kept: list[tuple[str, datetime]] = []
     if kept_hashes:
@@ -569,7 +560,7 @@ def trust_device(
 
 def trusted_devices(session: Session, user: AdminUser) -> list[UserTrustedDevice]:
     """The person's live trusted devices, newest first."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     rows = session.scalars(
         select(UserTrustedDevice)
         .where(UserTrustedDevice.identity_id == user.identity_id)
@@ -581,7 +572,7 @@ def trusted_devices(session: Session, user: AdminUser) -> list[UserTrustedDevice
 def revoke_trusted_devices(session: Session, user: AdminUser, device_id: Optional[int] = None) -> list[str]:
     """Forget one of the person's devices (`device_id`), or all of them (None). The labels of the live ones
     removed, for the audit row; an unknown or someone else's id removes nothing."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     stmt = select(UserTrustedDevice).where(UserTrustedDevice.identity_id == user.identity_id)
     if device_id is not None:
         stmt = stmt.where(UserTrustedDevice.id == device_id)
@@ -606,14 +597,13 @@ class Pending(NamedTuple):
     iepoch: int = 0
 
 
-def _serializer() -> URLSafeTimedSerializer:
-    return URLSafeTimedSerializer(auth.resolve_session_secret(), salt="cockpit-mfa")
+_SALT = "cockpit-mfa"
 
 
 def set_pending_cookie(response, user: AdminUser, method: str, amr_first: str) -> str:
     """Issue the pending cookie for `user` and return its nonce (the caller binds it)."""
     nonce = secrets.token_urlsafe(16)
-    token = _serializer().dumps({
+    token = auth.signer(_SALT).dumps({
         "admin_id": str(user.id), "method": method, "amr_first": amr_first, "nonce": nonce,
         "epoch": user.session_epoch or 0,
         "iepoch": auth.identity_epoch(user),
@@ -633,7 +623,7 @@ def read_pending(token: Optional[str]) -> Optional[Pending]:
     if not token:
         return None
     try:
-        payload = _serializer().loads(token, max_age=PENDING_MAX_AGE)
+        payload = auth.signer(_SALT).loads(token, max_age=PENDING_MAX_AGE)
     except (BadSignature, SignatureExpired):
         return None
     try:

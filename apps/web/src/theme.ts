@@ -17,6 +17,86 @@ export const PAPER_GROUND = '--paper-ground'
 export const paperGround = (theme: Theme): string =>
   `var(${PAPER_GROUND}, ${(theme.vars ?? theme).palette.background.paper})`
 
+/* ── Style tokens: the ONE home of every type, radius, size and spacing value ────────────────────────
+   None varies by colour scheme. A page reads these (or a `ui/listStyles.ts` export), never a literal;
+   The style-token gate enforces it. Pick an existing token before adding one; compact wins.
+   The folding rules and each group's purpose: the UI style guide, § Style tokens. */
+
+/** The six type sizes. Above `lg` use ONLY `(t) => t.typography.h6/h5/h4.fontSize`, never a new token. */
+export const FONT_SIZE = {
+  xxs: '0.625rem', // the smallest legible caption: a count badge, a micro label
+  xs: '0.6875rem', // a column heading, an uppercase caption, a dense chip
+  sm: '0.75rem', // secondary metadata: timestamps, a row's meta line, helper text
+  md: '0.8125rem', // dense body: a feed row, a table cell, a chip label
+  base: '0.875rem', // body text (MUI's body2)
+  lg: '1rem', // emphasis body, a section title
+} as const
+
+/** The four weights (650 folds to semibold, 800 to bold). */
+export const FONT_WEIGHT = {
+  regular: 400, // body text
+  medium: 500, // a label, an active tab
+  semibold: 600, // a heading, a column heading, a record's name
+  bold: 700, // a page title, a figure
+} as const
+
+export const LINE_HEIGHT = {
+  tight: 1, // a one-line glyph or badge box
+  snug: 1.2, // a heading, a caption, a dense row
+  normal: 1.5, // running text
+} as const
+
+export const LETTER_SPACING = {
+  none: 0, // everything but caps
+  caps: '0.04em', // uppercase captions and column headings
+} as const
+
+const RADIUS_UNIT = 4
+/** The four radii: `sm` is the theme's `shape.borderRadius`. */
+export const RADIUS = {
+  none: 0, // a flush edge (a table, a full-bleed panel)
+  sm: `${RADIUS_UNIT}px`, // controls, chips, inputs, small panels
+  md: `${2 * RADIUS_UNIT}px`, // cards, dialogs, popovers
+  round: '999px', // pills, dots, avatars
+} as const
+
+/** Named one-off sizes, each used 3+ times for one purpose. Pixels, as `sx` reads a bare number. Closed:
+ *  a new size uses `grid()` or the nearest name below. */
+export const SIZE = {
+  iconXs: 14, // an inline glyph or a spinner inside a button
+  iconSm: 16, // a list-row icon, a small spinner
+  iconMd: 20, // a field adornment, a status glyph
+  iconLg: 24, // the brand mark, a panel spinner
+  chip: 22, // a compact chip, badge or row pill's height
+  avatar: 28, // a small avatar or square toolbar button
+  thumb: 32, // a gallery thumbnail, a chart's axis band, a compact control's height
+  tapTarget: 44, // the touch floor at ≤480px (e2e enforces it) — `custom.tapTargetPx`
+  fieldSm: 120, // a compact filter field's or column's minimum width
+  fieldMd: 160, // a filter select's or a name column's minimum width
+  measureNarrow: 360, // the widest a single short field or inline form grows
+  measure: 640, // a form column's reading measure
+} as const
+
+const SPACING_UNIT = 6 // MUI's default is 8: the density contract
+
+/** `n` spacing units (6px each) as a CSS length, for places `sx`'s unit shorthand cannot reach
+ *  (`calc()`, a template, a non-spacing key). `n` must be a multiple of 0.5. */
+export function grid(n: number): string {
+  if (!Number.isFinite(n) || !Number.isInteger(n * 2)) throw new Error(`grid(${n}): not a multiple of 0.5`)
+  return theme.spacing(n)
+}
+
+export type PaletteKey = 'primary' | 'secondary' | 'error' | 'warning' | 'info' | 'success'
+
+/** A palette colour at `alpha` opacity, following the colour scheme (its CSS channel variable). */
+export function tint(key: PaletteKey, alpha: number): string {
+  return `rgba(${theme.vars.palette[key].mainChannel} / ${alpha})`
+}
+
+/** A recessed ground under a set of controls: the segmented picker's track (`ui/SegmentedControl`) and the paperclip
+ *  beside the task form's axes. Channel form (`--mui-palette-*Channel`), so it follows the colour scheme. */
+export const SEGMENT_TRACK_GROUND = 'rgba(var(--mui-palette-common-onBackgroundChannel, 0 0 0) / 0.05)'
+
 /* ── The literal hex map, for every surface that cannot read CSS ──────────────────────────────────
    xterm, WebGL, canvas and `<meta name="theme-color">` parse colour STRINGS; under `cssVariables`
    `theme.palette.*` is `var(--mui-…)`, which they cannot resolve (silently black terminal). They read RAW. */
@@ -26,21 +106,26 @@ export const RAW = {
     // Light's `primary` already carries white text at 6.7:1, so a filled surface keeps it (dark's differs).
     primaryFill: '#1d4ed8',
     primaryFillHover: '#1e40af',
-    error: '#dc2626',
-    success: '#16a34a',
-    warning: '#ca8a04',
-    info: '#7c3aed',
+    /* State colours are TEXT on the page and row grounds (chips, marks, notes), so each holds 4.5:1 on
+       `backgroundDefault` and the selected-row tint: the 700/800 steps, not the 500/600 that read at 3:1. */
+    error: '#b91c1c',
+    success: '#15803d',
+    warning: '#965a05',
+    info: '#6d28d9',
     backgroundDefault: '#f1f5f9',
     backgroundPaper: '#ffffff',
     textPrimary: '#111827',
     textSecondary: '#374151',
+    // Dim text (dates, meta, section heads) is still read: 4.5:1 on every row ground, MUI's 38% black is 2.7:1.
+    textDisabled: '#566070',
     divider: '#e5e7eb',
     // No `sidebarBg`: the rail reads CSS, and its ground is single-homed in `SIDEBAR_LIGHT`/`SIDEBAR_DARK`.
     // The terminal canvas is dark in BOTH schemes (xterm's contrast assumes a dark ground).
     terminalBg: '#0b0e14',
   },
   dark: {
-    primary: '#3b82f6',
+    // Blue-400: accent text and the chosen segment on `backgroundPaper` at 5.7:1 (blue-500 was 4:1).
+    primary: '#60a5fa',
     /* The ground of a FILLED primary surface (contained button, filled chip) under dark: `primary` carries
        white text at only 3.67:1, under WCAG AA's 4.5:1; this one is 5.17:1. `primary` stays the accent
        for text and outlines on dark paper, where the lighter blue is what reads. */
@@ -49,12 +134,15 @@ export const RAW = {
     error: '#f87171',
     success: '#22c55e',
     warning: '#eab308',
-    info: '#7c3aed',
+    // Violet-400: light's violet-700 is 3:1 on the dark grounds.
+    info: '#a78bfa',
     backgroundDefault: '#0f172a',
     backgroundPaper: '#1e293b',
     textPrimary: '#f1f5f9',
-    // Slate-400: reads as muted beside `textPrimary`, still 5.7:1 on `backgroundPaper` (WCAG AA).
-    textSecondary: '#94a3b8',
+    // Muted beside `textPrimary`, still 4.5:1 on a selected item over `backgroundPaper` (slate-400 was 4.47:1).
+    textSecondary: '#9aa9be',
+    // MUI's 50% white, as slate: 5:1 on `backgroundPaper`.
+    textDisabled: '#8e98aa',
     divider: '#334155',
     terminalBg: '#0b0e14',
   },
@@ -69,6 +157,33 @@ export const RAW = {
 const SYMBOL_FALLBACK = "'Segoe UI Symbol', 'Apple Symbols', 'Noto Sans Symbols 2', 'DejaVu Sans'"
 const SANS_STACK = `system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', ${SYMBOL_FALLBACK}, sans-serif`
 const MONO_STACK = `ui-monospace, 'SFMono-Regular', Consolas, 'Liberation Mono', ${SYMBOL_FALLBACK}, monospace`
+
+/* The agents peak surge's stage (`components/AgentPeakSurge.tsx`): a canvas dial on its own dark ground, the same in
+   both schemes (as `terminalBg`). A canvas parses colour strings, so these are literals. */
+export const SURGE = {
+  ground: 'radial-gradient(circle at 50% 55%, #111c2b, #03060a 75%)',
+  ink: '#ffffff',
+  governor: '#e2e8f0',
+  muted: '#cbd5e1',
+  outline: '#475569',
+  ok: '#4ade80',
+  curbed: '#f87171',
+  red: '#ef4444',
+} as const
+
+/** A canvas 2D font string: `px` pixels of the console's sans stack at `weight`. */
+export function canvasFont(weight: number, px: number): string {
+  return `${weight} ${px}px ${SANS_STACK}`
+}
+
+/** `#rrggbb` the share `t` (0–1) along the green → amber → red ramp `ok` → `warn` → `error` (each `#rrggbb`): the agents
+ *  throttle's blocks and the surge's dial. */
+export function rampColor(ok: string, warn: string, error: string, t: number): string {
+  const u = Math.min(1, Math.max(0, t))
+  const [a, b, k] = u < 0.5 ? [ok, warn, u * 2] : [warn, error, (u - 0.5) * 2]
+  const ch = (hex: string, i: number) => parseInt(hex.slice(1 + i * 2, 3 + i * 2), 16)
+  return `#${[0, 1, 2].map(i => Math.round(ch(a, i) + (ch(b, i) - ch(a, i)) * k).toString(16).padStart(2, '0')).join('')}`
+}
 
 /* The wordmark's colours per logo theme and rail scheme: `mark` is its three gradient stops, `markCore` the lit
    tile (the dot of the j). The active theme is `logoTheme.ts`'s switch. */
@@ -120,6 +235,7 @@ const SIDEBAR_LIGHT = {
      rail. The dark half keeps the palette's value. */
   statusOk: '#15803d',
   statusWarn: '#a16207',
+  statusError: '#b91c1c',
   ...LOGO_COLORS[LOGO_THEME].light,
 } as const
 
@@ -139,6 +255,7 @@ const SIDEBAR_DARK = {
   buttonHoverBorder: '#64748b',
   statusOk: '#22c55e',
   statusWarn: '#eab308',
+  statusError: '#ef4444',
   ...LOGO_COLORS[LOGO_THEME].dark,
 } as const
 
@@ -174,6 +291,8 @@ export interface SidebarColors {
   /** The connection dot, overriding `palette.success/warning.main` for the rail's ground only. */
   statusOk: string
   statusWarn: string
+  /** The far, red end of the agents throttle (`components/TrialAgentsMeter.tsx`): green → amber → this. */
+  statusError: string
   /** The Jaah mark's and wordmark's three SVG gradient stops, set as `--sk-mark-*` custom properties by
    *  the rail and the login card. */
   mark: readonly [string, string, string]
@@ -226,6 +345,16 @@ declare module '@mui/material/Typography' {
   }
 }
 
+/* AC11's focus ring (see `MuiButtonBase`/`MuiLink` below, its two users).
+   `theme.vars.palette.primary.main`, NOT `theme.palette…`: the static literal stays `#1d4ed8` under dark
+   (verified in `theme.test.tsx`). */
+const FOCUS_RING = ({ theme }: { theme: Theme }) => ({
+  '&.Mui-focusVisible': {
+    outline: `2px solid ${theme.vars.palette.primary.main}`,
+    outlineOffset: '1px',
+  },
+})
+
 export const theme = createTheme({
   /* The palette is emitted as CSS variables under `[data-theme="light"|"dark"]` — the attribute `auth.tsx`
      writes and stays the SOLE writer of: MUI's init-color-scheme script is not mounted and its color-scheme
@@ -243,7 +372,7 @@ export const theme = createTheme({
         warning: { main: RAW.light.warning },
         info: { main: RAW.light.info },
         background: { default: RAW.light.backgroundDefault, paper: RAW.light.backgroundPaper },
-        text: { primary: RAW.light.textPrimary, secondary: RAW.light.textSecondary },
+        text: { primary: RAW.light.textPrimary, secondary: RAW.light.textSecondary, disabled: RAW.light.textDisabled },
         divider: RAW.light.divider,
       },
     },
@@ -256,7 +385,7 @@ export const theme = createTheme({
         warning: { main: RAW.dark.warning },
         info: { main: RAW.dark.info },
         background: { default: RAW.dark.backgroundDefault, paper: RAW.dark.backgroundPaper },
-        text: { primary: RAW.dark.textPrimary, secondary: RAW.dark.textSecondary },
+        text: { primary: RAW.dark.textPrimary, secondary: RAW.dark.textSecondary, disabled: RAW.dark.textDisabled },
         divider: RAW.dark.divider,
       },
     },
@@ -266,11 +395,16 @@ export const theme = createTheme({
      `body1` floor `e2e/tasks-tree-measure.spec.ts:128` asserts. */
   typography: {
     fontFamily: SANS_STACK,
+    fontWeightRegular: FONT_WEIGHT.regular,
+    fontWeightMedium: FONT_WEIGHT.medium,
+    fontWeightBold: FONT_WEIGHT.bold,
     mono: { fontFamily: MONO_STACK },
   },
 
+  shape: { borderRadius: RADIUS_UNIT },
+
   /* Density contract (MUI has no density API) — pinned once here. */
-  spacing: 6, // MUI default is 8.
+  spacing: SPACING_UNIT,
 
   /* MUI's 225ms Grow/Collapse re-pointed at the app's 120–220ms scale; specs measure right after a click. */
   transitions: {
@@ -300,7 +434,7 @@ export const theme = createTheme({
       dark: SIDEBAR_DARK,
     },
     minReadableCh: 12,
-    tapTargetPx: 44,
+    tapTargetPx: SIZE.tapTarget,
   },
 
   components: {
@@ -316,6 +450,8 @@ export const theme = createTheme({
           // Dark's filled primary ground, for AA contrast under white text (RAW.dark.primaryFill).
           '&.MuiButton-contained.MuiButton-colorPrimary:not(.Mui-disabled)': theme.applyStyles('dark', {
             backgroundColor: RAW.dark.primaryFill,
+            // White, not `primary.contrastText`: that is derived from the lighter accent and reads dark on this fill.
+            color: theme.palette.common.white,
             '&:hover, &.Mui-focusVisible': { backgroundColor: RAW.dark.primaryFillHover },
           }),
         }),
@@ -356,6 +492,8 @@ export const theme = createTheme({
       styleOverrides: {
         root: ({ theme }) => ({
           textTransform: 'none',
+          // An unchosen segment is read text: MUI's `action.active` (54% black) is 3.9:1 on the recessed track.
+          color: theme.vars.palette.text.secondary,
           /* A `primary` picker's chosen segment is FILLED: MUI's blue text on an ~8% tint read dimmer than the
              unselected grey under dark, so the toggle looked inverted. Grounds as `MuiButton`'s. */
           '&.Mui-selected.MuiToggleButton-primary:not(.Mui-disabled)': {
@@ -384,13 +522,13 @@ export const theme = createTheme({
        `theme.vars.palette…`, not `theme.palette…` (a static light literal) — the `RAW` trap, in a callback. */
     MuiTableCell: {
       styleOverrides: {
-        root: { paddingTop: 4, paddingBottom: 4 },
+        root: { paddingTop: 4, paddingBottom: 4 }, // px: the dense row, above MUI's own `small` cell
         head: ({ theme }) => ({
-          fontSize: '0.6875rem',
-          fontWeight: 600,
-          letterSpacing: '0.04em',
+          fontSize: FONT_SIZE.xs,
+          fontWeight: FONT_WEIGHT.semibold,
+          letterSpacing: LETTER_SPACING.caps,
           textTransform: 'uppercase',
-          lineHeight: 1.4,
+          lineHeight: LINE_HEIGHT.snug,
           color: theme.vars.palette.text.secondary,
         }),
       },
@@ -421,7 +559,7 @@ export const theme = createTheme({
       styleOverrides: {
         // IconButton has no default dimension, so both are pure raises (square: 44x28 is not 44px).
         root: ({ theme }) => ({
-          [theme.breakpoints.down('sm')]: { minHeight: 44, minWidth: 44 },
+          [theme.breakpoints.down('sm')]: { minHeight: SIZE.tapTarget, minWidth: SIZE.tapTarget },
         }),
       },
     },
@@ -429,7 +567,7 @@ export const theme = createTheme({
       styleOverrides: {
         root: ({ theme }) => ({
           textTransform: 'none',
-          [theme.breakpoints.down('sm')]: { minHeight: 'max(44px, 48px)' },
+          [theme.breakpoints.down('sm')]: { minHeight: `max(${SIZE.tapTarget}px, 48px)` },
         }),
       },
     },
@@ -438,7 +576,7 @@ export const theme = createTheme({
       styleOverrides: {
         // No `minWidth`: menu items (and list buttons below) are full-width by construction.
         root: ({ theme }) => ({
-          [theme.breakpoints.down('sm')]: { minHeight: 'max(44px, 48px)' },
+          [theme.breakpoints.down('sm')]: { minHeight: `max(${SIZE.tapTarget}px, 48px)` },
         }),
       },
     },
@@ -446,7 +584,7 @@ export const theme = createTheme({
       defaultProps: { dense: true },
       styleOverrides: {
         root: ({ theme }) => ({
-          [theme.breakpoints.down('sm')]: { minHeight: 'max(44px, 48px)' },
+          [theme.breakpoints.down('sm')]: { minHeight: `max(${SIZE.tapTarget}px, 48px)` },
         }),
       },
     },
@@ -488,26 +626,15 @@ export const theme = createTheme({
        Hence `MuiButtonBase` (every button/icon-button/tab/list-item-button/menu-item) AND `MuiLink` (its own
        focus-visible detection). Local copies should defer to this; the Sidebar rail is the one exception
        (rings in its `custom.sidebar` accent).
-       `theme.vars.palette.primary.main`, NOT `theme.palette…`: the static literal stays `#1d4ed8` under dark
-       (verified in `theme.test.tsx`). */
+       The rule itself is `FOCUS_RING`, above `createTheme`. */
     MuiButtonBase: {
       styleOverrides: {
-        root: ({ theme }) => ({
-          '&.Mui-focusVisible': {
-            outline: `2px solid ${theme.vars.palette.primary.main}`,
-            outlineOffset: '1px',
-          },
-        }),
+        root: FOCUS_RING,
       },
     },
     MuiLink: {
       styleOverrides: {
-        root: ({ theme }) => ({
-          '&.Mui-focusVisible': {
-            outline: `2px solid ${theme.vars.palette.primary.main}`,
-            outlineOffset: '1px',
-          },
-        }),
+        root: FOCUS_RING,
       },
     },
   },

@@ -4,6 +4,8 @@
  * The Nodes tab does not use it: the command log is its own source (`Command` in `src/types.ts`; epic D2).
  */
 
+import type { OrgRef } from '../../types'
+
 /** The entity an action was performed ON. `label` is null when the subject no longer exists, has no
  *  resolver, or is ungranted; `type` and `id` are always served — a renderer must handle an unnamed subject. */
 export type AuditSubject = {
@@ -80,6 +82,6 @@ export type AuditFilterLabels = {
  *  `<type>:<id>` the `subject` param takes. */
 export type AuditSuggestions = {
   users: { id: string; label: string; hint: string | null }[]
-  orgs: { id: string; name: string; slug: string }[]
+  orgs: OrgRef[]
   subjects: { type: string; id: string; label: string }[]
 }

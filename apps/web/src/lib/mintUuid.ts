@@ -1,5 +1,5 @@
 /* A v4 UUID minted in the browser, for a row or request named before the server sees it. One home for
- * `lib/billingOrgs.ts::mintRequestId` (a refund or charge) and `pages/credentials/ownership.ts::
+ * `mintRequestId` below (a write sent once however often it is retried) and `pages/credentials/ownership.ts::
  * mintCredentialId` (a credential row); each decides what its caller gets when none can be made. */
 
 /** `crypto.randomUUID` exists only in a SECURE context; over plain http on a LAN address
@@ -16,4 +16,13 @@ export function mintUuid(): string | undefined {
   } catch {
     return undefined
   }
+}
+
+/** What a dialog says when `mintRequestId` cannot make one. */
+export const NO_REQUEST_ID = 'This browser cannot make a request id — use a current browser.'
+
+/** A v4 UUID naming one write (a refund, a charge, a confirmed action) however often it is sent. Undefined when the
+ *  browser cannot make one: the server then mints one per request. */
+export function mintRequestId(): string | undefined {
+  return mintUuid()
 }

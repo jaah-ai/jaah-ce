@@ -12,24 +12,25 @@ naming the operator) are the PUT's own. An unsaved draft is refused: a title-onl
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
-from app.auth import require_user
+from app.auth import adopt_user
 from app.authz.catalog import Tenancy
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
-from app.db import get_session
+from app.authz.principal import AsyncCaller, Principal, current_caller
+from app.db_async import DbDep, on_session, run_deferring
 from app.models.identity import AdminUser
 from app.routes.tasks.create import TaskUpdate
 from app.routes.tasks.policy import MAX_TASK_TITLE_LEN
 from app.routes.tasks.task_wire import TaskOut, _task_out
 from app.routes.tasks.update import update_task
 from app.task_lookup import get_task_or_404
-from app.task_title import regenerated_title
+from app.task_title import RegeneratedTitle, regenerated_title, stamp_language
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 log = logging.getLogger(__name__)
@@ -60,16 +61,17 @@ def _saved_task_or_409(task_id: int, session: Session, principal: Principal | No
     "tasks", "edit", tenancy=Tenancy.CALLER_PLANE, object_type="task", object_params=("task_id",),
     author_draft=True,
 )
+@on_session(deferring=True)
 def rename_task(
+    session: Session,
     task_id: int,
     payload: TaskTitleIn,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> TaskOut:
     """Rename a Task: the PUT's title edit, on the caller's plane (module docstring)."""
-    _saved_task_or_409(task_id, session, principal)
-    return update_task(task_id, TaskUpdate(title=payload.title), _user, principal, session)
+    _user = adopt_user(session, caller.actor)
+    _saved_task_or_409(task_id, session, caller.principal)
+    return update_task.session_body(session, task_id, TaskUpdate(title=payload.title), _user, caller.principal)
 
 
 @router.post("/{task_id}/title/regenerate", response_model=TaskOut)
@@ -77,20 +79,47 @@ def rename_task(
     "tasks", "edit", tenancy=Tenancy.CALLER_PLANE, object_type="task", object_params=("task_id",),
     author_draft=True,
 )
-def regenerate_task_title(
+async def regenerate_task_title(
+    db: DbDep,
     task_id: int,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> TaskOut:
     """Re-derive the title from the current body with the auto-title model (`app/task_title.py`), overwriting
     whatever the row carries, and write it as a rename. Synchronous, as Re-tag: one short vendor call, no
     connection held across it (`regenerated_title` owns its own session; this one is released first).
 
+    On a top-level task the language is re-detected with it and written over the subtree, unless a person
+    picked one (`app/task_language.py`); a reply naming none leaves it as it is. A child keeps its epic's.
+
     A model that gives nothing new (no key, a failure, the same title) leaves the row as it is and answers it."""
+    await db.run_sync(_saved_task_or_409_rolled_back, task_id, caller.principal)
+    # The vendor call (and its own session) off the loop, with no connection held across it.
+    regenerated = await asyncio.to_thread(regenerated_title, task_id)
+    return await run_deferring(db, _regenerate_task_title, task_id, regenerated, caller.actor, caller.principal)
+
+
+def _saved_task_or_409_rolled_back(session: Session, task_id: int, principal: Principal | None) -> None:
+    """`_saved_task_or_409`, then the read's connection handed back before the vendor call."""
     _saved_task_or_409(task_id, session, principal)
     session.rollback()
-    title = regenerated_title(task_id)
-    if title is None:
-        return _task_out(get_task_or_404(task_id, session), session=session, principal=principal)
-    return update_task(task_id, TaskUpdate(title=title), _user, principal, session)
+
+
+def _regenerate_task_title(
+    session: Session,
+    task_id: int,
+    regenerated: RegeneratedTitle | None,
+    _user: AdminUser,
+    principal: Principal | None,
+) -> TaskOut:
+    """`regenerate_task_title`'s writes, over the route's async session (`run_sync`), once the model answered."""
+    _user = adopt_user(session, _user)
+    out = None
+    if regenerated is not None and regenerated.title is not None:
+        out = update_task.session_body(session, task_id, TaskUpdate(title=regenerated.title), _user, principal)
+    # After the rename, so a refused rename writes nothing.
+    if regenerated is not None and regenerated.language is not None:
+        task = get_task_or_404(task_id, session)
+        if task.parent_task_id is None and stamp_language(session, task, regenerated.language):
+            session.commit()
+            out = None
+    return out or _task_out(get_task_or_404(task_id, session), session=session, principal=principal)

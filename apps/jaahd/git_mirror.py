@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""The single home of CREDENTIALED git on a node: a daemon-owned bare mirror per (project, repository).
+"""The single home of CREDENTIALED git for a slot: a daemon-owned bare mirror per forge URL (`slot-<hash>.git`).
 
-Every network git op the daemon declares (`clone_identity.cloning`) runs HERE, with its cwd in a mirror no runner
-uid can write, as the daemon uid, reading only the system gitconfig, the mirror's own daemon-written config and
-command-line pins (`git_env.DECLARED_OP` cuts the global scope). No config, hook or include in a runner-writable
-tree can steer it, because no such tree is ever its repository. Runner clones and worktrees are then updated by
-a LOCAL fetch from the mirror (`local_fetch_args`) that runs undeclared — the broker serves it
-nothing — and is restricted to the `file` transport, so a planted `url.*.insteadOf`, `remote.*.*` or proxy can
-only point it at another local path.
+A slot is cloned and refreshed with the leasing task's login (`clone_identity.acting_for`), and every network op
+of it runs HERE, as the daemon uid, with its cwd in a mirror no runner uid can write, reading only the system
+gitconfig, the mirror's own daemon-written config and command-line pins (`git_env.DECLARED_OP` cuts the global
+scope). No config, hook or include in a runner-writable tree can steer it, because no such tree is ever its
+repository. The slot is then filled by a LOCAL fetch from the mirror (`local_fetch_args`) that runs undeclared —
+the broker serves it nothing — and is restricted to the `file` transport, so a planted `url.*.insteadOf`,
+`remote.*.*` or proxy can only point it at another local path.
 
-Two roots, chosen by the caller (a node is either static or MicroVM, so no node-kind predicate is needed):
-`shared=False` is the MicroVM root (`<daemon state>/mirrors`, 0700, as it always was); `shared=True` is the static
-pool's (`<daemon state>/pool-mirrors`, or `$JAAH_POOL_MIRRORS` where the session user cannot traverse the daemon's
-state dir: a vnode's, 0700, and a macOS node's; 2750 in the session group, each mirror `core.sharedRepository=0640`),
-which the session uid must READ to fetch from locally but can never write. On a host with no uid split the runner IS the daemon uid,
-and there is no such boundary to keep.
+The root is `<daemon state>/pool-mirrors`, or `$JAAH_POOL_MIRRORS` where the session user cannot traverse the
+daemon's state dir (a vnode's, a macOS node's): 2750 in the session group, each mirror `core.sharedRepository=0640`,
+which the session uid must READ to fetch from locally but can never write. On a host with no uid split the runner IS
+the daemon uid, and there is no such boundary to keep. `sweep` removes a slot mirror unused for
+`SLOT_MIRROR_GRACE_S`, and what an older daemon kept there (its per-project mirrors).
 
-IMPORTS: stdlib + the leaves `acp.session_store`, `clone_identity`, `env_helpers`, `environment`, `git_env` — `worktree_mechanics`
-imports this module, and its import rules apply here."""
+IMPORTS: stdlib + the leaves `clone_identity`, `env_helpers`, `environment`, `git_env` — `slot_clone` imports
+this module."""
 from __future__ import annotations
 
 import hashlib
@@ -31,7 +30,6 @@ import subprocess
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
@@ -39,7 +37,6 @@ import clone_identity
 import env_helpers
 import environment
 import git_env
-from acp.session_store import private_dir
 
 log = logging.getLogger("jaahd.git_mirror")
 
@@ -51,135 +48,83 @@ _SHARED_UMASK = 0o027
 
 _locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
-#: Mirror path → (monotonic time its last refresh completed, the URL it refreshed from): a refresh of the same URL
-#: that waited on the lock while another completed skips its own network fetch (no TTL: only a refresh that
-#: finished after this one asked counts).
+#: Mirror path → (monotonic time its last fetch completed, the URL it fetched from), read by the sweep's grace.
 _refreshed_at: dict[str, tuple[float, str]] = {}
-#: The longest wait for a mirror another thread is refreshing (a first clone holds it for minutes), as
-#: `clone_identity`'s own bound; a caller's `wait_s` lowers it.
-_LOCK_WAIT_S = 60.0
 #: The environment of every `local_fetch_args` call. `GIT_ALLOW_PROTOCOL` is git's one transport allowlist that
 #: outranks every `protocol.<name>.allow` key, which a tree's config could otherwise set past the argv's pins.
 LOCAL_FETCH_ENV: dict[str, str] = {"GIT_ALLOW_PROTOCOL": "file", "GIT_TERMINAL_PROMPT": "0"}
 
 
 class MirrorError(RuntimeError):
-    """A refresh, ls-remote or push of a mirror failed. Its text carries git's head and tail and never URL
+    """A fetch, ls-remote or push of a mirror failed. Its text carries git's head and tail and never URL
     userinfo."""
 
 
-@dataclass(frozen=True)
-class MirrorKey:
-    #: `projects.id`; None only on an older CP's roster (or a test's), when the mirror is keyed by its URL.
-    project_id: int | None
-    #: The mirror's repository: None = the project's primary (`<pid>.git`), else `<pid>-<rid>.git`.
-    repo_id: int | None
-    #: The declaration's name (`clone_identity.cloning(slug, ...)`).
-    slug: str
-    #: The CP's credential-free URL.
-    clone_url: str
-    #: The `repo_id` the declaration names (a non-primary repository's), so the CP serves that one's login.
-    declared_repo_id: int | None = None
-
-
-def gist(text: str, limit: int = 460) -> str:
-    """Git's output kept under the rail's 500-character report: its head AND its tail. The head is where a
-    credential refusal names the person and the fix; the tail is git's own `fatal:` line. A tail-only cut
-    reported the launcher as `h.ai`."""
-    if len(text) <= limit:
-        return text
-    tail = 150
-    return f"{text[:limit - tail - 3]} … {text[-tail:]}"
-
-
-def mirrors_root(*, shared: bool) -> Path:
-    if not shared:
-        return env_helpers.daemon_state_dir("mirrors")
+def mirrors_root() -> Path:
     relocated = environment.pool_mirrors_root()
     return Path(relocated) if relocated else env_helpers.daemon_state_dir("pool-mirrors")
 
 
-def mirror_path(key: MirrorKey, *, shared: bool) -> Path:
-    """`<pid>.git` or `<pid>-<rid>.git`: the caller's `MirrorKey.repo_id` decides. MicroVM keys every repository
-    of a multi-repository project by its id, so a primary change never retargets a mirror another VM clones
-    from; the static pool keys its primary `<pid>.git` and each other repository `<pid>-<rid>.git`. With no
-    project id, a name derived from the URL."""
-    if key.project_id is None:
-        name = f"url-{hashlib.sha256(key.clone_url.encode()).hexdigest()[:16]}.git"
-    elif key.repo_id is None:
-        name = f"{int(key.project_id)}.git"
-    else:
-        name = f"{int(key.project_id)}-{int(key.repo_id)}.git"
-    return mirrors_root(shared=shared) / name
-
-
-#: A static-pool mirror's name (`mirror_path`): `<pid>.git`, `<pid>-<rid>.git`, or an id-less roster's
-#: `url-<hash>.git`; `_ASIDE_NAME` is one moved aside (`_remove_mirror`) or a `_create` temp left by a crash.
-_SHARED_NAME = re.compile(r"(?:(?P<pid>\d+)(?:-(?P<rid>\d+))?|url-[0-9a-f]{16})\.git")
-_ASIDE_NAME = re.compile(r"\.(?P<mirror>(?:\d+(?:-\d+)?|url-[0-9a-f]{16})\.git)\.[0-9a-f]{8}")
-#: A mirror refreshed, or a temp written, this recently is never swept: a caller that refreshed it may still be
-#: fetching from it unlocked, under a newer roster than the sweeping pass read (a `create` of a just-enrolled
-#: project), or a caller no roster names may be using it (a trigger preflight's `url-<hash>.git`). Above a
-#: clone's budget, so a crashed `_create` temp is never one a live clone still writes.
+#: A slot's mirror (`_slot_mirror`); `_LEGACY_NAME` is an older daemon's per-project or per-URL mirror, read by
+#: nothing now; `_ASIDE_NAME` is one moved aside (`_remove_mirror`) or a temp left by a crash (`_create`,
+#: `shallow_for`).
+_SLOT_NAME = re.compile(r"slot-[0-9a-f]{16}\.git")
+_LEGACY_NAME = re.compile(r"(?:\d+(?:-\d+)?|url-[0-9a-f]{16})\.git")
+_ASIDE_NAME = re.compile(r"\.(?P<mirror>(?:\d+(?:-\d+)?|(?:url|slot)-[0-9a-f]{16})\.git)\.[0-9a-f]{8}")
+#: A mirror fetched, or a temp written, this recently is never swept: a lease may still be fetching from it. Above
+#: a clone's budget, so a crashed `_create` temp is never one a live clone still writes.
 SWEEP_GRACE_S = 3600.0
+#: A slot mirror goes only once unused this long: long enough that an idle project's next lease fetches a delta
+#: rather than cloning the repository again.
+SLOT_MIRROR_GRACE_S = 7 * 86400.0
 
 
-def sweep_shared(keep: dict[int, frozenset[int] | None], *, ids_complete: bool) -> list[str]:
-    """Remove the static pool's mirrors the roster no longer names → the names removed.
-
-    `keep` maps each rostered `projects.id` to its repository ids (None = unknown, so every `<pid>-<rid>.git`
-    of it stays). A `<pid>*.git` whose project is absent, or whose `rid` its project no longer lists, goes;
-    a `url-<hash>.git` goes only when `ids_complete` (every rostered project carries an id, so none is keyed
-    by URL). The caller passes only a roster it parsed whole. A mirror being refreshed (its lock is held) or
-    used within `SWEEP_GRACE_S` is skipped and swept on a later pass; so is a leftover aside or temp."""
-    root = mirrors_root(shared=True)
+def sweep() -> list[str]:
+    """Remove from the root every slot mirror unused for `SLOT_MIRROR_GRACE_S`, and every legacy mirror, aside or
+    temp unused for `SWEEP_GRACE_S` → the names removed. A mirror in use (its lock is held) is skipped and swept on
+    a later pass."""
+    root = mirrors_root()
     try:
         names = sorted(os.listdir(root))
     except OSError:
         return []
     removed: list[str] = []
     for name in names:
-        match = _SHARED_NAME.fullmatch(name)
-        aside = None if match else _ASIDE_NAME.fullmatch(name)
-        if aside is not None:
-            stale = True
-        elif match is None:
-            continue
-        elif match.group("pid") is None:
-            stale = ids_complete
-        elif int(match.group("pid")) not in keep:
-            stale = True
+        aside = _ASIDE_NAME.fullmatch(name)
+        if _SLOT_NAME.fullmatch(name):
+            grace = SLOT_MIRROR_GRACE_S
+        elif aside or _LEGACY_NAME.fullmatch(name):
+            grace = SWEEP_GRACE_S
         else:
-            repos, rid = keep[int(match.group("pid"))], match.group("rid")
-            stale = rid is not None and repos is not None and int(rid) not in repos
+            continue
         lock_path = root / (aside.group("mirror") if aside else name)
-        if stale and _remove_mirror(root / name, lock_path):
+        if _remove_mirror(root / name, lock_path, grace=grace):
             removed.append(name)
     return removed
 
 
-def _recently_used(path: Path) -> bool:
+def _recently_used(path: Path, grace: float = SWEEP_GRACE_S) -> bool:
     stamp, _url = _refreshed_at.get(str(path), (float("-inf"), ""))
-    if time.monotonic() - stamp < SWEEP_GRACE_S:
+    if time.monotonic() - stamp < grace:
         return True
     # Across a daemon restart: a fetch rewrites FETCH_HEAD, a clone's (or a temp's) directory is as new as it.
     for probe in (path, path / "FETCH_HEAD"):
         try:
-            if time.time() - os.lstat(probe).st_mtime < SWEEP_GRACE_S:
+            if time.time() - os.lstat(probe).st_mtime < grace:
                 return True
         except OSError:
             continue
     return False
 
 
-def _remove_mirror(path: Path, lock_path: Path) -> bool:
+def _remove_mirror(path: Path, lock_path: Path, *, grace: float = SWEEP_GRACE_S) -> bool:
     """Delete `path` under `lock_path`'s lock (the mirror's own), moved aside first so no reader ever sees half
     a mirror. False when busy, recently used, gone, not a real directory, or not fully deleted (logged)."""
     lock = _lock(lock_path)
     if not lock.acquire(blocking=False):
         return False
     try:
-        if not path.is_dir() or path.is_symlink() or _recently_used(path):
+        if not path.is_dir() or path.is_symlink() or _recently_used(path, grace):
             return False
         aside = path if path != lock_path else path.with_name(f".{path.name}.{secrets.token_hex(4)}")
         if aside != path:
@@ -203,24 +148,21 @@ def _lock(path: Path) -> threading.Lock:
 
 
 @contextmanager
-def _held(path: Path, wait_s: float | None) -> Iterator[None]:
-    """`path`'s lock, waited for at most `wait_s` (capped at `_LOCK_WAIT_S`); `ProjectBusy` past it, the
-    refusal every caller already translates (e.g. "clone-busy: ")."""
-    budget = _LOCK_WAIT_S if wait_s is None else max(0.0, min(wait_s, _LOCK_WAIT_S))
+def _held(path: Path, wait_s: float) -> Iterator[None]:
+    """`path`'s lock, waited for at most `wait_s`; `ProjectBusy` past it."""
+    budget = max(0.0, wait_s)
     lock = _lock(path)
     if not lock.acquire(timeout=budget):
         raise clone_identity.ProjectBusy(
-            f"the mirror {path.name} was still being refreshed by another operation after {budget:.0f}s")
+            f"the mirror {path.name} was still in use by another operation after {budget:.0f}s")
     try:
         yield
     finally:
         lock.release()
 
 
-def _ensure_root(shared: bool) -> Path:
-    root = mirrors_root(shared=shared)
-    if not shared:
-        return private_dir(root)
+def _ensure_root() -> Path:
+    root = mirrors_root()
     # setgid: every mirror under it lands in the root's group, the session user's, whatever the daemon's own.
     root.mkdir(mode=0o750, parents=True, exist_ok=True)
     os.chmod(root, 0o2750)
@@ -253,66 +195,21 @@ def _grant_runner_read(root: Path) -> None:
     _RUNNER_READ.add(str(root))
 
 
-def _run(cwd: Path, *args: str, shared: bool, timeout: float, network: bool = False) -> str:
-    """`git <args>` in `cwd` (inside the mirror root) as the daemon uid, registered under this thread's
-    declaration (`clone_identity.run_own`). A network op carries `git_env.DECLARED_OP`. Raises `MirrorError`."""
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", **(git_env.DECLARED_OP if network else git_env.NO_USER_CONFIG)}
-    try:
-        done = clone_identity.run_own(["git", *git_env.NO_REPO_CODE, *args], cwd=cwd, text=True, timeout=timeout,
-                                      env=env, umask=_SHARED_UMASK if shared else -1)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise MirrorError(git_env.redact_userinfo(f"git {args[0]} in the mirror {cwd.name} failed: {exc}")) from None
-    if done.returncode != 0:
-        out = git_env.redact_userinfo((done.stderr or done.stdout or "").strip())
-        raise MirrorError(f"git {' '.join(args[:2])} in the mirror {cwd.name} failed: {gist(out)}")
-    return done.stdout
+def _run(cwd: Path, *args: str, timeout: float, network: bool = False) -> str:
+    """`git <args>` in `cwd` (inside the mirror root) as the daemon uid (`git_env.run_own_git`). A network op
+    carries `git_env.DECLARED_OP`. Raises `MirrorError`."""
+    return git_env.run_own_git(args, cwd=cwd, timeout=timeout, error_cls=MirrorError,
+                               env=git_env.DECLARED_OP if network else git_env.NO_USER_CONFIG,
+                               umask=_SHARED_UMASK, where=f" in the mirror {cwd.name}")
 
 
-def _declared(key: MirrorKey, wait_s: float | None):
-    extra = {"repo_id": key.declared_repo_id} if key.declared_repo_id is not None else {}
-    return clone_identity.cloning(key.slug, wait_s=wait_s, project_id=key.project_id, **extra)
-
-
-def refresh(key: MirrorKey, *, shared: bool, timeout: float, wait_s: float | None = None,
-            create: bool = True) -> Path | None:
-    """The mirror of `key`, created (`clone --bare`) or fetched (`--prune`, branch heads only: a forge's PR refs
-    would multiply the fetch for nothing a tree uses) now, inside `key`'s declaration. Returns its path, or None
-    when it does not exist yet and `create` is False.
-
-    `timeout` bounds each git call — a creation is a full clone, so a caller that may create passes a clone's
-    budget (`node_clone_timeout_secs`). `wait_s` lowers the declaration's wait (`clone_identity.cloning`). Raises `clone_identity.ProjectBusy` unchanged (each
-    caller keeps its own translation, e.g. "clone-busy: ") and `MirrorError`."""
-    path = mirror_path(key, shared=shared)
-    asked = time.monotonic()
-    with _held(path, wait_s):
-        exists = (path / "HEAD").is_file()
-        stamp, url = _refreshed_at.get(str(path), (float("-inf"), ""))
-        if exists and stamp > asked and url == key.clone_url:
-            return path      # another refresh of this mirror completed while this one waited
-        if not exists and not create:
-            return None
-        with _declared(key, wait_s):
-            if not exists:
-                _create(key, path, shared=shared, timeout=timeout)
-            else:
-                if shared:
-                    # A root made before the grant existed: its mirrors are read by the runner too.
-                    _grant_runner_read(path.parent)
-                _run(path, "remote", "set-url", "origin", key.clone_url, shared=shared, timeout=min(60.0, timeout))
-                _run(path, "fetch", "--prune", "origin", shared=shared, timeout=timeout, network=True)
-        _refreshed_at[str(path)] = (time.monotonic(), key.clone_url)
-    return path
-
-
-def _create(key: MirrorKey, path: Path, *, shared: bool, timeout: float) -> None:
+def _create(url: str, path: Path, *, timeout: float) -> None:
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}")
     try:
-        root = _ensure_root(shared)
-        _run(root, "clone", "--quiet", "--bare", "--", key.clone_url, str(tmp), shared=shared, timeout=timeout,
-             network=True)
-        _run(tmp, "config", "remote.origin.fetch", "+refs/heads/*:refs/heads/*", shared=shared, timeout=60)
-        if shared:
-            _run(tmp, "config", "core.sharedRepository", _SHARED_MODE, shared=shared, timeout=60)
+        root = _ensure_root()
+        _run(root, "clone", "--quiet", "--bare", "--", url, str(tmp), timeout=timeout, network=True)
+        _run(tmp, "config", "remote.origin.fetch", "+refs/heads/*:refs/heads/*", timeout=60)
+        _run(tmp, "config", "core.sharedRepository", _SHARED_MODE, timeout=60)
         os.replace(tmp, path)
     except OSError as exc:
         raise MirrorError(git_env.redact_userinfo(f"the mirror {path.name} could not be created: {exc}")) from None
@@ -320,31 +217,22 @@ def _create(key: MirrorKey, path: Path, *, shared: bool, timeout: float) -> None
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def remote_head(key: MirrorKey, *, shared: bool, timeout: float = 120) -> str | None:
-    """The branch origin's HEAD names (its default branch), asked from the mirror; None when origin answers no
-    symref. Raises `ProjectBusy`/`MirrorError` as `refresh` does. The mirror must exist (`refresh` first)."""
-    path = mirror_path(key, shared=shared)
-    with _held(path, None), _declared(key, None):
-        out = _run(path, "ls-remote", "--symref", "origin", "HEAD", shared=shared, timeout=timeout, network=True)
-    for line in out.splitlines():
-        if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
-            return line[len("ref: refs/heads/"):-len("\tHEAD")]
-    return None
-
-
-def push_ref(key: MirrorKey, *, shared: bool, sha: str, ref: str, timeout: float = 120) -> None:
-    """`push origin <sha>:<ref>` from the mirror, declared. `sha` must be an object the mirror holds. Raises
-    `ProjectBusy`/`MirrorError` as `refresh` does."""
-    path = mirror_path(key, shared=shared)
-    with _held(path, None), _declared(key, None):
-        _run(path, "push", "--quiet", "origin", f"{sha}:{ref}", shared=shared, timeout=timeout, network=True)
-
-
 def branch_sha(mirror: Path, branch: str) -> str | None:
-    """The sha `refs/heads/<branch>` names in `mirror` (after a refresh: what origin names), or None. Local, read
+    """The sha `refs/heads/<branch>` names in `mirror` (after a fetch: what origin names), or None. Local, read
     as the daemon, undeclared."""
     sha = _read(mirror, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}")
     return sha if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) else None
+
+
+def has_branch(mirror: Path) -> bool:
+    """Whether `mirror` holds any branch — after a fetch, whether the forge has one (an empty repository has none).
+    Local, read as the daemon, undeclared. Raises `MirrorError` when git cannot say: a failed read is never "none"."""
+    done = subprocess.run(["git", *git_env.NO_REPO_CODE, "for-each-ref", "--count=1", "--format=%(refname)",
+                           "refs/heads"], cwd=mirror, capture_output=True, text=True,
+                          env={**os.environ, **git_env.NO_USER_CONFIG})
+    if done.returncode != 0:
+        raise MirrorError(f"the branches of the mirror {mirror.name} could not be read")
+    return bool(done.stdout.strip())
 
 
 def head_branch(mirror: Path) -> str | None:
@@ -359,7 +247,8 @@ def _read(mirror: Path, *args: str) -> str:
     return done.stdout.strip() if done.returncode == 0 else ""
 
 
-def local_fetch_args(mirror: Path, *refspecs: str, depth: int | None = None) -> tuple[str, ...]:
+def local_fetch_args(mirror: Path, *refspecs: str, depth: int | None = None, prune: bool = False
+                     ) -> tuple[str, ...]:
     """git arguments (the caller prepends `-C <tree>`) fetching `refspecs` from `mirror` with no credential. Run it
     UNDECLARED, so the broker serves it nothing, with `LOCAL_FETCH_ENV` in its environment.
 
@@ -386,4 +275,89 @@ def local_fetch_args(mirror: Path, *refspecs: str, depth: int | None = None) -> 
             # `objects/info/alternates`.
             "-c", "fetch.bundleURI=", "-c", "transfer.bundleURI=false", "-c", "core.alternateRefsCommand=true",
             "fetch", "--no-tags", "--no-recurse-submodules", f"--upload-pack={upload_pack}",
-            *(("--depth", str(depth)) if depth else ()), "--end-of-options", alias, *refspecs)
+            *(("--depth", str(depth)) if depth else ()), *(("--prune",) if prune else ()),
+            "--end-of-options", alias, *refspecs)
+
+
+# ── Acting: a slot's forge ops, with the access of the task (or trigger) it is for ───────────────────────
+#
+# The network op runs as the daemon uid (`git_env.run_own_git` → `clone_identity.run_own`, registered under the
+# acting subject), never on the session user's tmux channel: a process the daemon forks itself is the only one the
+# credential broker serves a login. One mirror per URL (swept by `sweep` once unused for `SLOT_MIRROR_GRACE_S`):
+# no project declaration, so no node-wide `clone_identity.cloning` lock —
+# two slots of two projects fetch at once, and two of one URL wait on the mirror's own lock for at most the op's
+# budget. Every call fetches with its own subject's login (no `_refreshed_at` short cut): a task whose login
+# cannot see the repository is refused even when another task's fetch just filled the mirror.
+
+#: What a slot mirror keeps of the forge: every branch and every tag, pruned with them.
+_SLOT_REFSPECS = ("+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*")
+
+
+def _slot_mirror(url: str) -> Path:
+    return mirrors_root() / f"slot-{hashlib.sha256(url.encode()).hexdigest()[:16]}.git"
+
+
+def fetch_for(acting: "clone_identity.Acting", url: str, *refspecs: str, timeout: float, head: bool = False
+              ) -> Path:
+    """The mirror of `url`, created (`clone --bare`) or fetched (`--prune` of its branches and tags, plus
+    `refspecs`: forge refs a slot needs beyond them, each `+<ref>:<ref>`) now with `acting`'s access. `head` also
+    points the mirror's HEAD at the forge's default branch now (a clone's `origin/HEAD`). Returns its path.
+    Raises `ProjectBusy` (another op held it past `timeout`) and `MirrorError`."""
+    path = _slot_mirror(url)
+    with _held(path, timeout), clone_identity.acting_for(acting):
+        created = not (path / "HEAD").is_file()
+        if created:
+            _create(url, path, timeout=timeout)
+        else:
+            _grant_runner_read(path.parent)
+        if refspecs or not created:
+            _run(path, "fetch", "--prune", "origin", *_SLOT_REFSPECS, *refspecs, timeout=timeout, network=True)
+        if head and not created:
+            _repoint_head(path, timeout)
+        _refreshed_at[str(path)] = (time.monotonic(), url)
+    return path
+
+
+def _repoint_head(path: Path, timeout: float) -> None:
+    """HEAD → the forge's default branch as it names it now (a bare mirror's HEAD is set once, at its clone)."""
+    out = _run(path, "ls-remote", "--symref", "origin", "HEAD", timeout=timeout, network=True)
+    for line in out.splitlines():
+        if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
+            ref = line[len("ref: "):-len("\tHEAD")]
+            if branch_sha(path, ref[len("refs/heads/"):]):
+                _run(path, "symbolic-ref", "HEAD", ref, timeout=60)
+            return
+
+
+@contextmanager
+def shallow_for(acting: "clone_identity.Acting", url: str, branch: str, *, depth: int, timeout: float
+                ) -> Iterator[Path]:
+    """A throwaway bare clone of `url`'s `branch` at `depth`, made now with `acting`'s access in the static pool's
+    root and removed on exit — for a one-off shallow tree (a trigger's preflight), which must not make the
+    slot mirror shallow. Named as a temp of `url`'s mirror, so one a crash left is swept. Raises `MirrorError`."""
+    tmp = _slot_mirror(url)
+    tmp = tmp.with_name(f".{tmp.name}.{secrets.token_hex(4)}")
+    try:
+        with clone_identity.acting_for(acting):
+            try:
+                root = _ensure_root()
+            except OSError as exc:
+                raise MirrorError(f"the mirrors root could not be prepared: {exc}") from None
+            _run(root, "clone", "--quiet", "--bare", "--depth", str(depth), "--single-branch", "--branch", branch,
+                 "--", url, str(tmp), timeout=timeout, network=True)
+        yield tmp
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def push_for(acting: "clone_identity.Acting", url: str, sha: str, dst: str, *, timeout: float) -> None:
+    """`push origin <sha>:<dst>` from `url`'s mirror with `acting`'s access; `sha` must be an object the mirror
+    holds (`fetch_for` first). Raises `ProjectBusy`/`MirrorError` as `fetch_for` does."""
+    path = _slot_mirror(url)
+    with _held(path, timeout), clone_identity.acting_for(acting):
+        _run(path, "push", "--quiet", "origin", f"{sha}:{dst}", timeout=timeout, network=True)
+
+
+def object_format(mirror: Path) -> str:
+    """The hash `mirror` stores objects by (`sha1`, `sha256`); `sha1` when git does not say."""
+    return _read(mirror, "rev-parse", "--show-object-format") or "sha1"

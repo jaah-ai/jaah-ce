@@ -2,11 +2,11 @@ import { useState } from 'react'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import { apiDetail } from '../api'
-import { TabPanel, Tabs, type TabDef } from '../components/Tabs'
+import { type TabDef, TabbedPanels } from '../components/Tabs'
 import { canMarkRead, canMarkUnread, describeItem, isCommentKind, isUnread, itemTarget } from '../components/inbox/inboxItem'
 import { hasMarkable, useInboxActions, useInboxFeed, type InboxView } from '../components/inbox/useInbox'
 import { useUrlTab } from '../hooks/useUrlTab'
-import { INBOX_LIMIT, INBOX_MAX, type InboxItem, type InboxKind } from '../lib/accessRequests'
+import { INBOX_LIMIT, INBOX_MAX, type InboxItem, type InboxKind } from '../lib/inbox'
 import { absoluteTime, relativeAge } from '../lib/relativeTime'
 import EmptyState from '../ui/EmptyState'
 import FeedList from '../ui/feed/FeedList'
@@ -14,7 +14,10 @@ import type { FeedIndicator, FeedRowSpec, OverflowItem } from '../ui/feed/types'
 import LoadFailedState from '../ui/LoadFailedState'
 import LoadingState from '../ui/LoadingState'
 import PageHeader from '../ui/PageHeader'
+import { LoadMoreFooter } from '../ui/PagedList'
+import { Icon } from '../ui/icons'
 import { PHONE, tapTargetSx } from '../ui/listStyles'
+import { SIZE } from '../theme'
 
 /* Every notification, as a page: the bell's tray (`components/MentionsBell.tsx`, its View all) at full size. The same
  * two feeds behind the same switch, Unread | All, as tabs in the URL (`?tab=all`; Unread is the bare path), and the
@@ -30,15 +33,21 @@ const TABS: readonly TabDef<InboxView>[] = [
 const KIND_LABEL: Record<InboxKind, string> = {
   mention: 'Mention',
   reaction: 'Reaction',
-  access_request: 'Access',
-  access_decision: 'Access',
   support_ticket: 'Support',
   support_task_done: 'Support',
   billing: 'Billing',
   trigger_failed: 'Trigger',
   trigger_digest: 'Trigger',
   automation_alert: 'Automation',
+  system_alert: 'Alert',
   api_key_expiring: 'API key',
+  release_approval: 'Release',
+  release_live: 'Release',
+  release_failed: 'Release',
+  release_rolled_back: 'Release',
+  release_approval_reminder: 'Release',
+  release_approval_timeout: 'Release',
+  release_rejected: 'Release',
 }
 
 const KIND_SLOT = 84
@@ -49,13 +58,10 @@ export default function NotificationsPage() {
   return (
     <Box data-testid="notifications-page">
       <PageHeader title="Notifications" />
-      <Tabs tabs={TABS} tab={tab} onSelect={select} label="Notifications" idPrefix="notifications" />
-      {TABS.map(t => (
-        <TabPanel key={t.id} id={t.id} current={tab} idPrefix="notifications">
-          {/* Mounted with its tab only: each is its own read, and its own Load more. */}
-          {tab === t.id && <NotificationList view={t.id} />}
-        </TabPanel>
-      ))}
+      <TabbedPanels tabs={TABS} tab={tab} onSelect={select} label="Notifications" idPrefix="notifications">
+        {/* Mounted with its tab only: each is its own read, and its own Load more. */}
+        {(t, active) => active && <NotificationList view={t.id} />}
+      </TabbedPanels>
     </Box>
   )
 }
@@ -99,14 +105,8 @@ function NotificationList({ view }: { view: InboxView }) {
         testId={`notifications-${view}`}
         sections={[{ key: view, rail: false, rows }]}
       />
-      {more && (
-        <Box sx={{ display: 'flex', justifyContent: 'center' }}>
-          <Button size="small" data-testid="notifications-more" sx={tapTargetSx} disabled={query.isFetching}
-            onClick={() => setLimit(next => Math.min(next + INBOX_LIMIT, INBOX_MAX))}>
-            {query.isFetching ? 'Loading…' : 'Load more'}
-          </Button>
-        </Box>
-      )}
+      <LoadMoreFooter hasMore={more} loading={query.isFetching} testId="notifications-more"
+        onMore={() => setLimit(next => Math.min(next + INBOX_LIMIT, INBOX_MAX))} />
     </Box>
   )
 }
@@ -135,6 +135,13 @@ function notificationRow(entry: InboxItem, { open, markRead, markUnread }: Actio
     indicator: indicatorOf(entry, { markRead, markUnread }),
     title: (
       <>
+        {/* The kind's glyph, as the bell's tray draws it, so one item looks the same in both places. */}
+        {text.glyph && (
+          <Icon viewBox="0 0 24 24" size={SIZE.iconSm} testId="notification-glyph"
+            sx={{ fill: 'currentColor', color: 'text.secondary', verticalAlign: 'text-bottom', mr: 0.5 }}>
+            <path d={text.glyph} />
+          </Icon>
+        )}
         {/* Off on a phone: two lines hold the subject and what was said, not an author on a line of its own. */}
         {who && <Box component="span" sx={{ color: 'text.secondary', [PHONE]: { display: 'none' } }}>{who} · </Box>}
         <Box component="span" sx={{ fontWeight: unread ? 600 : 400 }}>{text.title}</Box>
@@ -142,6 +149,7 @@ function notificationRow(entry: InboxItem, { open, markRead, markUnread }: Actio
       </>
     ),
     titleText,
+    href: null,
     titleLines: 2,
     onRowClick: () => open(entry),
     rowClickLabel: itemTarget(entry).external ? 'Open in a new tab' : 'Open',
@@ -158,10 +166,8 @@ function notificationRow(entry: InboxItem, { open, markRead, markUnread }: Actio
   }
 }
 
-/** The disc: ● unread, ○ read; a press marks it the other way. A pending request waits on a decision instead —
- *  it leaves the list once someone decides it. */
+/** The disc: ● unread, ○ read; a press marks it the other way. */
 function indicatorOf(entry: InboxItem, { markRead, markUnread }: Pick<Actions, 'markRead' | 'markUnread'>): FeedIndicator {
-  if (entry.kind === 'access_request') return { tone: 'warning', glyph: '?', label: 'Waiting for a decision' }
   if (isUnread(entry)) {
     return {
       tone: 'info', glyph: '●', label: 'Unread',

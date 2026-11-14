@@ -1,11 +1,11 @@
 """Task activity: the activity log, the questions list and run metrics."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Literal, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -14,13 +14,14 @@ from app import (
     actors, agent_sessions, hipaa, merge_lane_state, node_host_metrics, node_log_history, node_session_usage, request_caller,
     runner_terminations, task_source,
 )
+from app.clock import utcnow
 from app.account_fold import emails_for_slugs
-from app.auth import require_user
+from app.auth import adopt_user, require_user
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller
 from app.authz.visibility import granted_account_slugs, readable_account_slugs, visible_session_clause
-from app.db import get_session
-from app.entity_shape import SYSTEM_ACTOR_ID, optional_uuid
+from app.db_async import on_session
+from app.entity_shape import SYSTEM_ACTOR_ID, from_row, names_of, optional_uuid, or_404
 from app.launch_failures import START_ELSEWHERE_ACTION
 from app.models.agent_sessions import AgentSession
 from app.models.audit import ActivityEvent
@@ -94,6 +95,9 @@ def _note_label(action: str, data: dict[str, Any], actor: Optional[str] = None) 
         # An SDK agent's `notify` (`routes/agent_sdk.py::notify`), headed as its Slack post is; the text is the summary.
         agent = data.get("agent")
         return f"{agent if isinstance(agent, str) and agent else 'Agent'} posted"
+    if action == "placement_refused" and isinstance(data.get("title"), str) and data["title"]:
+        # Its title names what is missing (`placement_grants.PlacementRefusal`); rows written before it carry none.
+        return data["title"]
     return _ACTIVITY_NOTE_LABELS.get(action, action.replace("_", " ").capitalize())
 
 
@@ -210,8 +214,8 @@ def _resolved_actor(event: ActivityEvent, names: dict[UUID, str]) -> Optional[st
 def _name_machine_creators(
     session: Session, entries: list[ActivityLogEntryOut], *, name_foreign_orgs: bool = False
 ) -> None:
-    """IN PLACE: a `created` row nobody pressed, on a task a machine filed (any `source` but `console`), names who
-    filed it. A webhook delivery made with an API key reads "<key owner> via <key name>" (the key's name alone once
+    """IN PLACE: a `created` row nobody pressed, on a task a machine filed (any `source` but `console`, or a runner's
+    filing a person asked for), names who filed it. A webhook delivery made with an API key reads "<key owner> via <key name>" (the key's name alone once
     its owner is gone); any other trigger's filing "<trigger name> via <source label>" ("Webhook", "GitHub", …) —
     the trigger's own row, not a child a runner filed under its epic (which inherits only its source); every other
     filer "<name> via <brand>", or the brand alone when the filing's chain names nobody. That human is
@@ -231,7 +235,8 @@ def _name_machine_creators(
         row.id: row for row in session.execute(
             select(Task.id, Task.org_id, Task.source, Task.created_by_id, Task.created_by_task_id,
                    Task.created_by_api_key_name, Task.created_by_automation_name, Task.created_by_trigger_name)
-            .where(Task.id.in_(ids), Task.source != task_source.CONSOLE)
+            # A runner's filing a person asked for carries `console` (`task_source.requested_source`) yet is still named.
+            .where(Task.id.in_(ids), or_(Task.source != task_source.CONSOLE, Task.created_by_task_id.is_not(None)))
         ).all()
     }
     if not filed:
@@ -277,11 +282,11 @@ def _strip_ungranted_account_slugs(
 
 @router.get("/{task_id}/activity", response_model=list[ActivityLogEntryOut])
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
+@on_session
 def get_task_activity(
+    session: Session,
     task_id: int,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> list[ActivityLogEntryOut]:
     """The Activity Log tab's full event feed — every `task:%` transition PLUS every `task_note:%` content row
     for this task, merged chronologically. Read-only; 404 on unknown id. An epic's direct children's rows
@@ -297,18 +302,19 @@ def get_task_activity(
     The slug is gated on the reader's account grants (`_strip_ungranted_account_slugs`), since
     project `tasks:view` is a wide audience: no grant, no slug. The email additionally requires
     `system:view`. (`GET /api/worktrees` remains fleet-wide at `worktrees:view`, a deferred gap.)"""
+    _user = adopt_user(session, caller.actor)
     get_task_or_404(task_id, session)
     # The earlier attempts come back flagged rather than vanish on Reset: "what happened before?" is this tab's
     # question. The Live Cast viewer keeps the pristine read.
-    entries = task_activity_entries(session, principal, task_id, include_reset=True, name_foreign_orgs=True)
+    entries = task_activity_entries(session, caller.principal, task_id, include_reset=True, name_foreign_orgs=True)
     # A node's journal can name the org's other projects and accounts, and project `tasks:view` is a wide audience:
     # the lines need `system:view` org-wide, as the account email below does.
-    sees_the_org = principal is None or principal.has_org("system:view")
+    sees_the_org = caller.principal.has_org("system:view")
     if sees_the_org:
         # The tail's lines are raw terminal output: the pane-log viewer's own floor (`sessions:edit`, its route's
         # `@feature`) and its visibility too, so they reach exactly who could open the viewer.
         _add_node_errors(session, entries,
-                         pane_reader=principal if principal is not None and principal.has("sessions:edit") else None)
+                         pane_reader=caller.principal if caller.principal.has("sessions:edit") else None)
     _explain_terminations(session, entries, sees_every_node=sees_the_org)
     _add_session_engines(session, entries)
     return entries
@@ -504,17 +510,17 @@ def task_activity_entries(
     another `active`. Decided per owning task (`data.id`), on the rows' own `state`."""
     from app import task_notify
 
-    child_ids = session.scalars(
-        select(Task.id).where(Task.parent_task_id == task_id)
+    # The task and its direct children in one read: the feed's scope, each row's watermark, the task's own org.
+    scope_rows = session.execute(
+        select(Task.id, Task.parent_task_id, Task.artifacts_hidden_before, Task.org_id)
+        .where(or_(Task.id == task_id, Task.parent_task_id == task_id))
     ).all()
+    child_ids = [row.id for row in scope_rows if row.parent_task_id == task_id]
     scoped_ids = [str(task_id), *(str(cid) for cid in child_ids)]
     # The feed obeys the watermark for every row (operator decision): after a Reset the task reads pristine
     # until the next attempt writes, or, with `include_reset`, shows the earlier attempts flagged. See
     # `_row_predates_its_reset`. Nothing is deleted. Filtered in Python for `_verify_resolution_report`'s cast reason.
-    hidden_before = dict(session.execute(
-        select(Task.id, Task.artifacts_hidden_before)
-        .where(Task.id.in_([task_id, *child_ids]))
-    ).all())
+    hidden_before = {row.id: row.artifacts_hidden_before for row in scope_rows}
     events = [
         (event, hidden)
         for event in session.scalars(
@@ -540,7 +546,7 @@ def task_activity_entries(
     # Who acted, as a name: one batched lookup over every row carrying a person (a machine row carries none).
     event_actors = actors.actor_names(
         session, (_event_actor_id(event) for event, _ in events), name_acting=True,
-        home_org=session.scalar(select(Task.org_id).where(Task.id == task_id)) if name_foreign_orgs else None,
+        home_org=next((row.org_id for row in scope_rows if row.id == task_id), None) if name_foreign_orgs else None,
     )
     entries: list[ActivityLogEntryOut] = []
     last_active_at: dict[str, datetime] = {}
@@ -667,7 +673,7 @@ def task_activity_entries(
 
     # AC6.5: a runner phase still open at read time (no closing row or termination note yet) gets a running
     # duration; an earlier attempt's never does, a Reset having ended it.
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     for owner_id, started_at in last_active_at.items():
         start_entry = open_active_entry.get(owner_id)
         if start_entry is not None and not start_entry.earlier_attempt:
@@ -718,16 +724,18 @@ def task_activity_entries(
 # same history rides on `TaskOut.questions`.
 @router.get("/{task_id}/questions", response_model=list[TaskQuestionOut])
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
+@on_session
 def list_task_questions(
+    session: Session,
     task_id: int,
     status: Optional[str] = Query(default="open"),
     _user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> list[TaskQuestionOut]:
     """A Task's `task_questions` rows, oldest first — the runner's blocking questions and the multi-round
     Q&A history. Defaults to `status=open`; pass `?status=` (empty) for every status, or a value to
     scope. 404 on an unknown task. `round` is derived over the full visible trail before filtering, so
     the 3rd question reports `round=3` under `?status=open` (see `_load_task_questions_out`)."""
+    _user = adopt_user(session, _user)
     task = get_task_or_404(task_id, session)
     all_rows = session.scalars(
         select(TaskQuestion)
@@ -817,18 +825,13 @@ def _task_model_run(session: Session, task_id: int) -> Optional[TaskModelRunOut]
 
 @router.get("/{task_id}/run-metrics", response_model=TaskRunMetricsOut)
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
-def get_task_run_metrics(
-    task_id: int,
-    _user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-) -> TaskRunMetricsOut:
+@on_session
+def get_task_run_metrics(session: Session, task_id: int, _user: AdminUser = Depends(require_user)) -> TaskRunMetricsOut:
     """Total run time, agentic time, tokens in/out and token cost for this Task AND its whole subtree, from
     the transition trail and captured per-model usage. Read-only; 404 on an unknown id. Works for any
     Task — leaf, live epic, or never finished."""
-    metrics = compute_run_metrics(task_id, session)
-    if metrics is None:
-        # Spelled here: the scope query already answered existence, so `get_task_or_404` would ask again.
-        raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+    _user = adopt_user(session, _user)
+    metrics = or_404(compute_run_metrics(task_id, session), detail=f"task {task_id} not found")
     return TaskRunMetricsOut(
         **metrics, model=_task_model_run(session, task_id), **node_session_usage.task_peaks(session, task_id)
     )
@@ -873,36 +876,30 @@ class TaskSessionUsageOut(BaseModel):
 
 @router.get("/{task_id}/session-usage", response_model=TaskSessionUsageOut)
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
+@on_session
 def get_task_session_usage(
+    session: Session,
     task_id: int,
-    # 24h default; the ceiling is the series' retention, derived so it moves with it.
     hours: int = Query(24, ge=1, le=int(node_host_metrics.RETENTION_DAYS * 24)),
     _user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> TaskSessionUsageOut:
     """This Task's own runner sessions (not its subtree's): each one's CPU/RAM per bucket over the last `hours`
     and its lifetime peaks, only rows written under the task's own org (`app/node_session_usage.py`). Read-only;
     404 on an unknown id. A task no session reported for answers an empty `sessions`."""
+    _user = adopt_user(session, _user)
     task = get_task_or_404(task_id, session)
     window_start, window_end = node_host_metrics.window_bounds(session, hours=float(hours))
     found = node_session_usage.task_sessions(session, task_id, task.org_id, hours=float(hours))
-    wanted = {entry.node_id for entry in found}
-    names = dict(session.execute(select(Node.id, Node.name).where(Node.id.in_(wanted))).tuples().all()) if wanted else {}
+    names = names_of(session, Node, (entry.node_id for entry in found))
     return TaskSessionUsageOut(
         window_start=window_start.isoformat(),
         window_end=window_end.isoformat(),
         bucket_secs=node_host_metrics.bucket_secs_for(float(hours) * 60.0 * 60.0),
         sessions=[
-            TaskSessionUsageSessionOut(
+            from_row(
+                TaskSessionUsageSessionOut, entry,
                 node=TaskSessionUsageNodeOut(id=str(entry.node_id), name=names.get(entry.node_id, "")),
-                session_id=entry.session_id,
-                points=[
-                    TaskSessionUsagePointOut(at=point.at.isoformat(), cpu_pct=point.cpu_pct, rss_kb=point.rss_kb)
-                    for point in entry.points
-                ],
-                peak_rss_kb=entry.peak_rss_kb,
-                peak_cpu_pct=entry.peak_cpu_pct,
-                cpu_seconds=entry.cpu_seconds,
+                points=[from_row(TaskSessionUsagePointOut, p, at=p.at.isoformat()) for p in entry.points],
             )
             for entry in found
         ],

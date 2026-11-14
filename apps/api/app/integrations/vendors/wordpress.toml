@@ -1,0 +1,62 @@
+slug = "wordpress"
+label = "WordPress"
+category = "cms"
+vendor_docs_url = "https://developer.wordpress.org/rest-api/using-the-rest-api/authentication/"
+summary = "Your own WordPress site: agents read and publish posts, pages and media through its REST API."
+
+[[auth]]
+kind = "basic"
+fields = [
+  { key = "base_url", label = "Site URL", kind = "url", required = true, placeholder = "https://blog.example.com", help = "Your site's public address, starting with https:// - the address visitors type, without /wp-admin. If WordPress is installed in a subfolder, include it (https://example.com/blog)" },
+  { key = "username", label = "Username", kind = "text", required = true, help = "The WordPress username the agent acts as - in wp-admin, Users > Profile, the Username field at the top (not the display name). Use an account with the Editor role unless agents must change settings" },
+  { key = "application_password", label = "Application password", kind = "secret", required = true, help = "In wp-admin, open Users > Profile, scroll to Application Passwords, type Jaah in New Application Password Name and select Add New Application Password. Copy the 24-character password shown (spaces are fine) - WordPress shows it once" },
+]
+
+[test]
+method = "GET"
+path = "{base_url}/wp-json/wp/v2/users/me?context=edit"
+auth = { basic = ["username", "application_password"] }
+identity = [["name"], ["slug"]]
+
+[docs]
+agent_uses = [
+  "Draft, edit and publish posts and pages, including categories, tags and featured images",
+  "Upload images and files to the media library and use them in content",
+  "Read existing content, comments and users to answer questions or audit a site",
+  "Update custom post types and fields that plugins expose through the REST API",
+]
+prerequisites = [
+  "A self-hosted WordPress site (WordPress 5.6 or later) reachable from the internet over https",
+  "A WordPress user with the role the agents need: Editor for content, Administrator only if they must change settings or plugins",
+  "Application Passwords enabled: they are on by default, but some security plugins (and sites served over plain http) turn them off",
+  "For a site on WordPress.com, use the WordPress.com integration instead",
+]
+limitations = [
+  "The site must be reachable from the internet over https: Jaah refuses private, intranet and localhost addresses",
+  "Agents get exactly the WordPress role of the user whose application password you paste - there are no finer scopes",
+  "Plugins that block the REST API or Basic authentication (some security and firewall plugins, or a host's web application firewall) stop agents and the test alike",
+]
+
+[[docs.troubleshooting]]
+symptom = "Test says WordPress rejected the application password (401)"
+fix = "Check that Username is the login name from Users > Profile, not the display name or email, and that you pasted the application password rather than your normal password. If both are right, a security plugin or your host may strip the Authorization header: ask your host to pass it through to PHP, or allow Application Passwords in the plugin's settings"
+
+[[docs.troubleshooting]]
+symptom = "There is no Application Passwords section on the profile page"
+fix = "The feature is off. It needs WordPress 5.6 or later and a site served over https; a security plugin can also disable it (look for an Application Passwords or REST API setting). Update WordPress, enable https, or switch the setting back on"
+
+[[docs.troubleshooting]]
+symptom = "Test says WordPress cannot be reached at that address"
+fix = "Site URL must be the public https address of the site. Jaah never calls a private, intranet or localhost address, so a site only reachable on your company network or VPN cannot be connected"
+
+[[docs.troubleshooting]]
+symptom = "Test answers 404 or says WordPress did not answer with an API response"
+fix = "Open your Site URL followed by /wp-json/ in a browser. If that is not a JSON page, permalinks are set to Plain or a plugin hides the REST API: in wp-admin open Settings > Permalinks, choose any option other than Plain and save"
+
+[[docs.faq]]
+q = "Should I use my own WordPress account?"
+a = "Better not. Create a dedicated user (for example jaah-agent) with the Editor role in Users > Add New User, and create the application password on that user: everything agents do is then attributed to it, and you can revoke it without touching your own login"
+
+[[docs.faq]]
+q = "How do I revoke Jaah's access from WordPress?"
+a = "In wp-admin open Users > Profile for the user, scroll to Application Passwords and select Revoke next to Jaah. Agents lose access immediately"

@@ -8,6 +8,9 @@ import {
   useState,
   type ReactNode,
 } from 'react'
+import { flushClientEvents, setClientTelemetryEnabled } from './lib/clientTelemetry'
+import { resetReadRelay } from './net/relay'
+import { isOutageError, reachability, recoveries } from './net/reachability'
 import { del, get, post, put } from './api'
 import type { PlanPrice } from './lib/orgPlan'
 import {
@@ -19,7 +22,7 @@ import {
 import { clearAllTaskDrafts } from './lib/taskDraftStorage'
 import { clearTaskPageSeeds } from './lib/taskPageSeed'
 import { actingAs, exitActAs, useActingAs } from './lib/actAs'
-import { pinTabOrg } from './lib/activeOrg'
+import { announceSessionChanged, pinTabOrg, tabOrg } from './lib/activeOrg'
 import { bindOrgScopeViewer } from './lib/orgScope'
 import { isOrgAdminSeat } from './lib/orgAdmin'
 import { colorSchemeFor, subscribeSystemColorScheme } from './lib/colorScheme'
@@ -56,7 +59,7 @@ export type Admin = {
   that predates it (as for every optional field below). */
   git_credential_id?: string | null
   /* The viewer's own org, or null while none is bound — for pages with no record of their own
-  (`/projects/new`, `/tasks/new`, `/clients`). It is NOT where a new record will land: that stamp is
+  (`/projects/new`, `/tasks/new`, `/customers`). It is NOT where a new record will land: that stamp is
   `write_seam.stamp_org`'s, off the scope `authz_guard` binds per request, so announce it as the
   viewer's own only. */
   org?: MeOrgRef | null
@@ -107,6 +110,9 @@ export type Admin = {
   /* Is the task editor's Node field on for this org (`routes/auth.py::AdminOut.task_node_pin_enabled`)? Read by
   `components/tasks/TaskSpecFields::taskNodePinShown`; absent = off. An operator has the field regardless. */
   task_node_pin_enabled?: boolean
+  /* Does this session report its console failures (`AdminOut.client_telemetry`: the membership's flag or its org's)?
+  Read only by `setAdmin` into `lib/clientTelemetry.ts`; absent = off. */
+  client_telemetry?: boolean
   /* The largest file the org may upload, bytes (`org_quotas.file_cap_bytes`). Read only through
   `lib/maxFileBytes::useMaxFileBytes`, which owns the ceiling and the absent fallback. */
   max_file_bytes?: number
@@ -142,10 +148,11 @@ export type Admin = {
   or mid-operation)? Settings' NodeVault panel skips its `/api/nodevault` read while off, rather than earn a 403;
   absent = off. Presentation only: the routes refuse on their own. */
   nodevault_enabled?: boolean
-  /* MicroVM nodes and GitHub Actions runners on the org's plan (`routes/auth.py::AdminOut.microvm_allowed`,
-  `github_runners_allowed`: true while the plan's `github_runners` cap is not 0). Read through `lib/planSwitches.ts`:
+  /* MicroVM nodes, whole-node VM nodes and GitHub Actions runners on the org's plan (`routes/auth.py::AdminOut.microvm_allowed`,
+  `node_vm_allowed`, `github_runners_allowed`: true while the plan's `github_runners` cap is not 0). Read through `lib/planSwitches.ts`:
   a tenant's MicroVM and GitHub Runners tabs hide while off; absent = off. Presentation only: the writes refuse on their own. */
   microvm_allowed?: boolean
+  node_vm_allowed?: boolean
   github_runners_allowed?: boolean
   /* Which self-hosted node OS the org's plan lets it register (`routes/auth.py::AdminOut.ubuntu_nodes_allowed`,
   `macos_nodes_allowed`, `windows_nodes_allowed`). Read through `lib/planSwitches.ts::NODE_OS_SWITCH`: the node
@@ -170,6 +177,30 @@ export type Admin = {
   /* Tenant email on the org's plan (`routes/auth.py::AdminOut.tenant_email_allowed`): Settings › Organizations ›
   Email hides while off. Read through `lib/planSwitches.tsx`; the API refuses a connect on its own. */
   tenant_email_allowed?: boolean
+  /* Intelligent routing on the org's plan (`routes/auth.py::AdminOut.intelligent_routing`). Read through
+  `lib/planSwitches.tsx`; the org and project routing settings refuse on their own while off. */
+  intelligent_routing?: boolean
+  /* Production QA on the org (`routes/auth.py::AdminOut.production_qa`): off on every plan at release. Read through
+  `lib/planSwitches.tsx`; a project's opt-in is refused on its own while off. */
+  production_qa?: boolean
+  /* Benchmark mode on the org (`routes/auth.py::AdminOut.benchmark_mode`): off on every plan; an operator's org
+  override turns it on. Read through `lib/planSwitches.tsx`; shadow duels are gated on the server on their own. */
+  benchmark_mode?: boolean
+  /* Agent performance on the org (`routes/auth.py::AdminOut.agent_performance`): off on every plan. The outcome ledger's
+  tenant surfaces hide while off; read through `lib/planSwitches.tsx`; the ledger's routes answer 403 on their own. */
+  agent_performance?: boolean
+  /* Outgoing webhooks on the org (`routes/auth.py::AdminOut.webhooks_enabled`): ON on every plan. Read through
+  `lib/planSwitches.tsx`; `/api/webhooks` answers 403 on its own. */
+  webhooks_enabled?: boolean
+  /* Custom pipelines on the org (`routes/auth.py::AdminOut.pipeline_custom_enabled`): Business only. A project's
+  `GET …/pipeline/basic` answers for its own org. */
+  pipeline_custom_enabled?: boolean
+  /* Node groups on the org (`routes/auth.py::AdminOut.placement_groups_allowed`): Business only. Every node-group
+  write answers 403 on its own. */
+  placement_groups_allowed?: boolean
+  /* Custom domains (`plan_terms.CUSTOM_DOMAINS`): not on the identity payload — an app's Domains section reads
+     `DomainsOut.add_blocked` instead. Off when absent, as every switch. */
+  custom_domains_allowed?: boolean
   /* The enterprise plan switches (`routes/auth.py::AdminOut`, `app/plan_terms.py::SWITCHES`): Slack, SSO, SCIM, SIEM
   export, data residency, IP allowlist, retention, staging org, budgets. Read through `lib/planSwitches.tsx`; absent =
   off. Presentation only: each door answers 403 on its own. */
@@ -189,18 +220,8 @@ export type Admin = {
   (`routes/auth.py::AdminOut.hipaa_warnings`); empty while HIPAA is off. Read through `components/NonBaaWarning`.
   Absent reads as none. */
   hipaa_warnings?: { surface: string; acknowledged: boolean }[]
-  /* Static worktrees this principal's org's plan lets a project hold on one node (`AdminOut.static_slots`): 0 = none,
-  null = no cap (the operator plane). At 0 every control that adds a static slot is hidden or disabled (`staticSlotsOffered`);
-  presentation only, the writes refuse on their own. */
-  static_slots?: number | null
-  /* Notification channels this deployment can deliver to now — `['slack']` or `[]`
-  (`notify_targets.available_notification_methods`). A deployment capability, not a preference (one
-  `slack` credential per deployment), so `/users/:id` reads it here too. Carries no credential id or
-  name: this payload reaches every principal. Absent reads as "none available". */
-  notification_methods_available?: string[]
-  /* The events this user may see and set in Profile > Alerts (`app/preferences.subscribable_events`): billing and
-  the node alerts are an org Owner's or Admin's. Absent (an older snapshot) lists every event. */
-  notification_events?: string[]
+  /* The org's Users cap (`AdminOut.users_cap`), null for unlimited: at 1 a Jaah-managed project draws no Access tab. */
+  users_cap?: number | null
   /* The login email was proven by an SSO sign-in (Google, Microsoft, GitHub); email notifications go only
   to such an address. Absent reads as unknown — no caption. */
   email_verified?: boolean
@@ -259,7 +280,8 @@ export const signupEmailPassword = (password: string) =>
 
 /** GET /api/auth/signup/plans and `pending.plans`: one plan an applicant may choose (`app/signup_plans.py::offered`).
  *  `price` null is Free; `duration_days` null never ends; `products` the bundled products, in words; `trial_days`
- *  the free trial a purchase opens with; `paid` whether it charges once it starts. */
+ *  the free trial a purchase opens with; `paid` whether it charges once it starts. `per_agent`: `price` is per agent
+ *  and the sign-up picks a count in [`min_agents`, `max_agents`] (null = no upper bound). */
 export type SignupPlan = {
   key: string
   name: string
@@ -269,6 +291,9 @@ export type SignupPlan = {
   products: string[]
   trial_days: number | null
   paid: boolean
+  per_agent: boolean
+  min_agents: number
+  max_agents: number | null
 }
 export const signupPlans = () => get<SignupPlan[]>('/api/auth/signup/plans')
 
@@ -303,6 +328,8 @@ export type PendingSignup = {
   needs_password: boolean
   profile: Partial<Record<keyof SignupProfile, string | boolean | null>>
   plan_key: string | null
+  /** The agent count chosen for `plan_key` (a per-agent plan); null = none. */
+  agents: number | null
   plans: SignupPlan[]
   billing: SignupBilling | null
   billing_connected: boolean
@@ -320,15 +347,19 @@ export const signupForget = () => del('/api/auth/signup/pending')
 export const signupProfile = (profile: SignupProfile, planKey: string | null) =>
   post<{ next: 'plan' }>('/api/auth/signup/profile', { profile, plan_key: planKey })
 
-/** The plan's terms, as the Sign up page words them: never a hard-coded day count or price. */
+/** The plan's terms, as the Sign up page words them: never a hard-coded day count or price. `price` is per unit (per
+ *  agent on a per-agent plan); `agents` the count billed, null on a plan not sold per agent. */
 export type SignupTerms = {
   plan_key: string
   paid: boolean
   trial_days: number | null
   price: PlanPrice | null
   interval: string | null
+  agents: number | null
 }
-export const signupChoosePlan = (planKey: string) => put<SignupTerms>('/api/auth/signup/plan', { plan_key: planKey })
+/** `agents`: the count a per-agent plan bills once its trial ends (or at once); left out for any other plan. */
+export const signupChoosePlan = (planKey: string, agents?: number) =>
+  put<SignupTerms>('/api/auth/signup/plan', agents === undefined ? { plan_key: planKey } : { plan_key: planKey, agents })
 export const signupSaveBilling = (details: SignupBilling) =>
   put<{ ok: true }>('/api/auth/signup/billing', { details })
 /** The card step's SetupIntent. The secret lives in the page's state only: never stored or logged. */
@@ -393,6 +424,9 @@ const orgScopeViewer = (admin: Admin | null): string | null => (admin?.is_operat
 
 const actingId = (): string | null => actingAs()?.id ?? null
 
+/** The longest wait between boot identity reads that keep getting no answer (`AuthProvider`'s first read). */
+const BOOT_RETRY_CAP_MS = 30_000
+
 /** Adopt a live `/api/auth/me` answer to a read sent while acting as `sent` (null: not acting). Dropped when act-as
  *  has moved since — the change's own read answers. An acting read answered without `acting_as` (the session is
  *  no longer an operator's) leaves act-as, which reads again. */
@@ -425,7 +459,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const setAdmin = useCallback((next: Admin | null) => {
     const nextId = next?.id ?? null
+    const nextOrg = next ? currentOrgId(next) || null : null
+    /* Held failure reports belong to the session they happened in: send them under it before the identity or the
+       org below moves, or org A's events post as org B's (`lib/clientTelemetry.ts`). */
+    if (nextId !== cachedForIdRef.current || nextOrg !== tabOrg()) flushClientEvents(true)
     if (nextId !== cachedForIdRef.current) {
+      // The relay socket carries the session it opened with (`net/relay.ts`).
+      resetReadRelay()
+      // Signed in as someone (new): the other tabs' relay sockets hold the cookie this one replaced.
+      if (nextId !== null) announceSessionChanged()
       queryClient.clear()
       clearTaskPageSeeds()
       // An act-as tab never persists (`queryClient.ts`); the stored copy is the operator's own, so leave it.
@@ -436,7 +478,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     latestAdminRef.current = next
     /* Every caller hands a LIVE answer (the snapshot seeds `useState` directly), so this is the one place
        the org this tab acts as is pinned (`lib/activeOrg.ts`). */
-    pinTabOrg(next ? currentOrgId(next) : null)
+    pinTabOrg(nextOrg)
+    // A superadmin flagged this membership or its org: report client failures (`lib/clientTelemetry.ts`).
+    setClientTelemetryEnabled(next?.client_telemetry === true)
     bindOrgScopeViewer(orgScopeViewer(next))
     setAdminState(next)
     if (next) {
@@ -459,20 +503,57 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [readFor, setReadFor] = useState(acting)
   useEffect(() => {
     const current = () => actingId() === acting
-    get<Admin | undefined>('/api/auth/me', SIGNED_OUT_PROBE)
-      .then(answer => {
-        if (answer) adoptIdentity(acting, answer, setAdmin)
-        else if (current()) setAdmin(null)
+    /* AN UNANSWERED READ SETTLES NOTHING (`net/reachability.ts`): the API being unreachable is not "signed out", so
+       the snapshot (or the spinner) stays, the outage notice says why, and the read goes again once the API answers.
+       Only the read's own failure is classified (a throw while adopting is not an outage). A read that keeps failing
+       while the probe answers (this route alone 503ing) backs off rather than looping. */
+    let disposed = false
+    let unanswered = 0
+    let waitForRecovery: (() => void) | undefined
+    let retryTimer: ReturnType<typeof setTimeout> | undefined
+    const retryOnRecovery = () => {
+      const stop = recoveries.subscribe(() => {
+        stop()
+        const delay = unanswered <= 1 ? 0 : Math.min(1_000 * 2 ** (unanswered - 2), BOOT_RETRY_CAP_MS)
+        retryTimer = setTimeout(read, delay)
       })
-      .catch(() => {
-        if (current()) setAdmin(null)
-      })
-      .finally(() => {
-        if (!current()) return
-        setReadFor(acting)
-        setLoading(false)
-        setResolving(false)
-      })
+      waitForRecovery = stop
+    }
+    const read = () => {
+      let settled = true
+      get<Admin | undefined>('/api/auth/me', SIGNED_OUT_PROBE)
+        .then(
+          answer => {
+            if (answer) adoptIdentity(acting, answer, setAdmin)
+            else if (current()) setAdmin(null)
+          },
+          err => {
+            // Unrecorded (no `send.ts` observation, e.g. under a rewriter): no recovery will come to wait for.
+            if (!isOutageError(err) || reachability.get() === 'ok') {
+              if (current()) setAdmin(null)
+              return
+            }
+            settled = false
+            unanswered += 1
+            if (!disposed) retryOnRecovery()
+          },
+        )
+        .catch(() => {
+          if (current()) setAdmin(null)
+        })
+        .finally(() => {
+          if (!settled || !current()) return
+          setReadFor(acting)
+          setLoading(false)
+          setResolving(false)
+        })
+    }
+    read()
+    return () => {
+      disposed = true
+      waitForRecovery?.()
+      clearTimeout(retryTimer)
+    }
   }, [acting, setAdmin])
 
   useEffect(() => {
@@ -548,11 +629,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const seq = ++saveSeqRef.current
       const merged = { ...(base.preferences ?? {}), ...changes }
       setAdmin({ ...base, preferences: merged })
-      /* `notifications` is sent only when it is the change: the server keeps the stored one when it is
-         omitted (`preferences.CARRIED_FORWARD_FIELDS`), so this tab's copy cannot undo a Slack link the
-         bot wrote meanwhile (`components/SlackConnect`). */
-      const { notifications: _stale, ...rest } = merged as Record<string, unknown>
-      const body = 'notifications' in changes ? merged : rest
+      /* Never `notifications`: alerts are notification channels now, and an older snapshot's block is dead weight
+         the server ignores (`preferences.preferences_to_store`). */
+      const { notifications: _stale, ...body } = merged as Record<string, unknown>
       try {
         const answer = await put<Admin>('/api/auth/me', { preferences: body })
         if (seq === saveSeqRef.current) setAdmin(answer)
@@ -595,18 +674,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 }
 
 export const useAuth = () => useContext(AuthContext)
-
-/** Whether the console offers controls that add a static slot: not while the org's plan allows none
- *  (`Admin.static_slots` 0). Absent (a snapshot from before the field) offers them; the server still refuses. */
-export function useStaticSlotsOffered(): boolean {
-  return useAuth().admin?.static_slots !== 0
-}
-
-/** The plan's cap on static slots per project per node: a number, or null for no cap (absent reads as none). */
-export function useStaticSlotsCap(): number | null {
-  const cap = useAuth().admin?.static_slots
-  return typeof cap === 'number' ? cap : null
-}
 
 /** The org this identity acts as: its current membership, else its `org`. */
 export function currentOrgId(admin: Admin): string | null {

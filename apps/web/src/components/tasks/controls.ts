@@ -74,40 +74,28 @@ export const CONTROLS: Record<string, TaskControl> = {
 
 /**
  * What a `start` POST declares in `run_requested` — the ONE place both bodies are spelled.
- *  • `'run'`   — the per-subtask Run (tree subtask Start, dependency Re-run): dispatch ON DEMAND past a
- *                `hold`-mode parent and unmet prerequisites (the `run_requested_at` bypass) — MUST be `true`.
- *  • `'queue'` — claims no run-intent: an epic's Start (its route ignores the field), a row waiting on
- *                its own prerequisites, bulk "Send to build".
+ *  • `'run'`   — the per-subtask Run (tree subtask Start, dependency Re-run): releases a `hold`-mode parent
+ *                (`run_requested_at`) — MUST be `true`. Prerequisites, throttle and backoff still gate it
+ *                (`_sequencing_floors`).
+ *  • `'queue'` — claims no run-intent: an epic's Start (its route ignores the field), bulk "Send to build".
  * Both bodies are sent EXPLICITLY, never omitted: the server default was flipped relying on that.
  */
 export type StartIntent = 'run' | 'queue'
 
-/** `pushAs` is an acting operator's answer to "push as whom" (`PushIdentityDialog.tsx`); `{}` sends no
- *  `push_as_id`, which every non-acting Start does. */
+/** `pushAs` is the Start ask's answer (`PushIdentityDialog.tsx::usePushIdentity`): an acting operator's "push as
+ *  whom" (`push_as_id`), and `without_repo` when the starter runs without a repository they can't see
+ *  (`TaskStartIn.without_repo`); `{}` sends neither. */
 export function startBody(intent: StartIntent, pushAs: PushIdentity = {}): { run_requested: boolean } & PushIdentity {
   return { run_requested: intent === 'run', ...pushAs }
 }
 
 /**
- * WHICH intent a row's Start means — the single home every Start call site reads.
- *
- * A TOP-LEVEL ROW'S START IS A RUN: it has no parent hold to bypass, and the one-shot flag (cleared on
- * claim) keeps the reconciling re-entry reachable. The failure guarded against: a row that cannot
- * dispatch and does not say so, sitting "Queued" forever.
- * TWO ROWS STILL QUEUE: an EPIC container (its start branch never reads or clears the flag) and a row
- * with an UNMET PREREQUISITE OF ITS OWN (dispatching past an operator-drawn edge is a regression).
- * `variant` is `rowActions.tsx`'s `TaskRowVariant`, structural to avoid an import cycle.
- *
- * THE `?? 0` FAILS OPEN, DELIBERATELY: the server always sends the count, so this is only which way to be
- * wrong. Open dispatches past an edge (visible, recoverable with Stop); closed silently never dispatches.
+ * WHICH intent a row's Start means — the single home every Start call site reads. Every row's Start is a Run
+ * except an EPIC container's (its start branch never reads or clears the flag). A Run releases a parent's hold
+ * and nothing else, so it is safe on any other row.
  */
-export function startIntentFor(
-  task: { persona?: string | null; unmet_prerequisite_count?: number | null },
-  variant: 'root' | 'leaf',
-): StartIntent {
-  if (variant === 'leaf') return 'run'
-  if (task.persona === 'epic') return 'queue'
-  return (task.unmet_prerequisite_count ?? 0) > 0 ? 'queue' : 'run'
+export function startIntentFor(task: { persona?: string | null }): StartIntent {
+  return task.persona === 'epic' ? 'queue' : 'run'
 }
 
 /**

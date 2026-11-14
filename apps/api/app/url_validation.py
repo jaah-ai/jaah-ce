@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:  # annotations only: stdlib-only importers (app/operator_settings/) need no pydantic
     from pydantic import ValidationInfo
 
-__all__ = ["validated_http_url", "https_url_problem"]
+__all__ = ["validated_http_url", "https_url_problem", "sentry_dsn_problem"]
 
 # An allowlist, since a denylist misses whatever scheme a browser learns next. `http` stays because
 # a forge reachable only over the tailnet is a legitimate link.
@@ -81,4 +81,16 @@ def https_url_problem(value: str) -> Optional[str]:
         return "must start with https:// and be a full web address"
     if "@" in parsed.netloc:
         return "must not contain a user name or @ before the domain"
+    return None
+
+
+# A Sentry DSN: `https://<public key>@<host>/<project id>`. The user info is the public key ALONE — a legacy DSN's
+# `:<secret key>` is refused, since the console's DSN is served to signed-out visitors.
+_SENTRY_DSN = re.compile(r"https://[0-9a-f]{32}@[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::\d{1,5})?/\d+")
+
+
+def sentry_dsn_problem(value: str) -> Optional[str]:
+    """Why `value` is not a Sentry DSN — a reader-facing phrase — or None when it is one. Never echoes the value."""
+    if not _SENTRY_DSN.fullmatch(value):
+        return "must be a Sentry DSN: https://<public key>@<ingest host>/<project id>, without a secret key"
     return None

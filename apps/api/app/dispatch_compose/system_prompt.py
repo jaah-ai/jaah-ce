@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 
 from app import agent_providers, edition_features
@@ -38,6 +39,16 @@ _DOCTRINE_ROOT = Path(os.environ.get("DOCTRINE_ROOT") or "/app/doctrine")
 
 _FLEET_DIR = _DOCTRINE_ROOT / "fleet"
 _CONTEXT_ARCH = _DOCTRINE_ROOT / "context-architecture.md"
+
+#: The Repo Wizard's releases fact (`compose._deployments_branch`): appended to its inputs when its project's org has
+#: the pipeline page's Release step, so promotion past the integration branch reads as the step's job, never a value to ask about.
+#: `{production_branch}` is filled here, before `apply_project_values` fills `{integration_branch}`.
+#: The branch names `RELEASES_INPUT` renders: a git ref's plain alphabet, no braces, whitespace or backticks.
+_SAFE_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}")
+RELEASES_INPUT = (
+    "\n- `[RELEASES]` — the Release step on the project's pipeline page promotes `{integration_branch}` to `{production_branch}`. "
+    "Do not ask how publishing or promotion is handled; state this in your summary."
+)
 
 
 def _defanged_operator_text(
@@ -227,12 +238,14 @@ def build_system_prompt(
     agent_instructions: str = "",
     memory: bool = True,
     merge_lane: bool = False,
+    shadow: str = "",
+    production_branch: str = "",
 ) -> str:
     """The runner system prompt: the universal charter, this role's "Your Role" section from `_ROLES`,
     the recon block, then the context-architecture policy.
 
     `charter_key` (never None, no default role) selects the role prose; `persona` selects the manifest and
-    terminal types (see `_render_role_section`). The four project values, `epic` and
+    terminal types (see `render_role_section_with`). The four project values, `epic` and
     `provider` are required and undefaulted: a default would compose silently and tell the runner the
     wrong thing.
     `agent_instructions` alone defaults, because empty is the ordinary state and renders nothing.
@@ -257,6 +270,8 @@ def build_system_prompt(
         agent_instructions=agent_instructions,
         memory=memory,
         merge_lane=merge_lane,
+        shadow=shadow,
+        production_branch=production_branch,
     )
 
 
@@ -277,6 +292,8 @@ def build_system_prompt_with(
     agent_instructions: str = "",
     memory: bool = True,
     merge_lane: bool = False,
+    shadow: str = "",
+    production_branch: str = "",
 ) -> str:
     """`build_system_prompt` from data alone: `role` is the prose row, `mode`/`delivery`/`terms` the registry
     facts, `console_present` whether the operator is live at the console. Every other argument as there.
@@ -288,9 +305,22 @@ def build_system_prompt_with(
     `memory-off.md` (OMC working memory, charter-native CLIs only); see `project_memory.memory_section`.
     `merge_lane` True (the project is lane-active, `merge_lane.lane_state`) swaps in `_MERGE_LANE_REWRITES` and
     drops the bounded gate wait (the runner no longer runs the full gate); False composes exactly what it
-    always did. Inert on a folder slot."""
+    always did. Inert on a folder slot.
+    `shadow` non-empty (a benchmark shadow's section, `outcome_ledger/benchmark.py::shadow_section`) swaps its
+    endings for `shadow_pr` (`shadow_settle_terms`), drops the lane rewrites (it is never enqueued) and appends the
+    section after the project's instructions, which it overrides for this run; "" composes exactly what it always
+    did.
+    `production_branch` a plain ref name (the project has a Release step, `compose._deployments_branch`) appends
+    `RELEASES_INPUT` to the role's inputs; "" composes exactly what it always did. Inert on a folder slot."""
     provider_record = resolve_provider(provider)
-    lane = merge_lane and repo
+    lane = merge_lane and repo and not shadow
+    if repo and _SAFE_BRANCH_RE.fullmatch(production_branch):
+        # An operator-written stage column (`routes/releases.py` checks only its length): a value outside the plain
+        # ref alphabet could add a line or a placeholder token to trusted prose, so it renders no fact at all.
+        role = {**role, "input_slots": role.get("input_slots", "")
+                + RELEASES_INPUT.replace("{production_branch}", production_branch)}
+    if shadow:
+        terms = settle_terms.shadow_settle_terms(terms)
     # The charter, then the memory section its arm selects (`memory_section`): one file or the other, never
     # both, appended before the folder and outcome rewrites so they apply to it as to the charter. The ON
     # section reaches every CLI (the `memory_*` tools are the control plugin's); the OFF section is OMC's
@@ -360,6 +390,9 @@ def build_system_prompt_with(
             )
             + "\n"
         )
+    # A benchmark shadow's own terms, after the project's instructions: it never merges, whatever they say.
+    if shadow:
+        parts.append(shadow)
     # A policy for structuring a repository's files: a folder has none to apply it to.
     if repo:
         parts.append(

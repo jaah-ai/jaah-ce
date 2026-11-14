@@ -6,7 +6,7 @@ An opt-out default: the predicate attaches to every ORM select, so a forgotten c
 is `ENFORCING` (unbound reads nothing); recovery is reverting that constant (AD4), so `SHADOW` stays
 tested. Pitfalls are documented where decided: `criteria_for` (unbound is `false()`), `read_seam` (no
 lambda criteria), `stamp_scope` (identity-map hits), `identity_scope` (a scope, not a one-row read).
-Registered on `SessionLocal` in `app/db.py`, so migration and test-harness sessions are left alone.
+Registered on `BridgedSession` in `app/db.py`, so migration and test-harness sessions are left alone.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import os
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from enum import Enum
-from typing import Iterator, Optional, Union
+from typing import Any, Iterator, Optional, Union
 from uuid import UUID
 
 from sqlalchemy import Table, false, select
@@ -27,6 +27,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from app.models.access import Permission, UserGroupMembership
 from app.models.base import Base
 from app.models.identity import AdminUser
+from app.models.notifications import NotificationChannel
 from app.models.nodes import Node
 from app.tenancy import exclusion_log
 from app.tenancy.manifest import TENANT_OWNED
@@ -98,16 +99,21 @@ def on_request_plane() -> bool:
 
 
 @contextmanager
-def request_plane() -> Iterator[None]:
+def _held(var: ContextVar[bool], value: bool) -> Iterator[None]:
+    """`var` set to `value` for a block, then put back — the one body of every flag region below."""
+    token = var.set(value)
+    try:
+        yield
+    finally:
+        var.reset(token)
+
+
+def request_plane() -> AbstractContextManager[None]:
     """`mark_request_plane()` as a REGION, for a test or a caller that must put the flag back.
 
     Production uses the bare setter (a request's context is discarded whole); this lets a test arm the
     refusal without leaking the flag into later tests on the same thread."""
-    token = _REQUEST_PLANE.set(True)
-    try:
-        yield
-    finally:
-        _REQUEST_PLANE.reset(token)
+    return _held(_REQUEST_PLANE, True)
 
 
 def current_scope() -> Scope:
@@ -168,27 +174,17 @@ def _active_org_filter() -> Optional[frozenset[UUID]]:
 ORG_FILTER_EXEMPT_CLASSES: frozenset[type[Base]] = frozenset({AdminUser})
 
 
-@contextmanager
-def request_org_filter_applied() -> Iterator[None]:
+def request_org_filter_applied() -> AbstractContextManager[None]:
     """Re-apply this request's operator filter inside an escape, for a block. The ORM twin of
     `request_org_filter()`: a residue site whose LIST read runs inside `operator_scope()` enters this
     after it (`with seam.operator_scope(), seam.request_org_filter_applied(): ...`). With no filter set
     it changes nothing, so a mutation sharing the helper is unaffected."""
-    token = _ORG_FILTER_SUSPENDED.set(False)
-    try:
-        yield
-    finally:
-        _ORG_FILTER_SUSPENDED.reset(token)
+    return _held(_ORG_FILTER_SUSPENDED, False)
 
 
-@contextmanager
-def _org_filter_suspended() -> Iterator[None]:
+def _org_filter_suspended() -> AbstractContextManager[None]:
     """Suspend the operator filter for a block. ONE home for every escape's suspension."""
-    token = _ORG_FILTER_SUSPENDED.set(True)
-    try:
-        yield
-    finally:
-        _ORG_FILTER_SUSPENDED.reset(token)
+    return _held(_ORG_FILTER_SUSPENDED, True)
 
 
 def bind(scope: Union[UUID, _ScopeSentinel]) -> None:
@@ -223,6 +219,9 @@ IDENTITY_CLASSES: frozenset[type[Base]] = frozenset(
         Permission,
         UserGroupMembership,
         Node,
+        # Inbound Slack and Telegram resolve the SENDER by the chat they proved (`notify_targets.users_for_slack_member_id`,
+        # `slack_link.redeem`, `telegram_link.redeem`), before any org is known — the claim is a membership's channel.
+        NotificationChannel,
     }
 )
 
@@ -293,7 +292,7 @@ def operator_scope() -> Iterator[None]:
     Not the durable plane's answer: one-task work has the task's org (`bind_from()`).
 
     Refuses to widen a context that already decided an org: one `with` line would otherwise promote an
-    org-bound block to every org, and the per-session stamp does not catch a fresh `SessionLocal()`.
+    org-bound block to every org, and the per-session stamp does not catch a fresh `BridgedSession()`.
     Leave the scope first (`detached()`). `None` and `IDENTITY` are not deciding scopes (`_filters`).
     """
     prior = _SCOPE.get()
@@ -535,7 +534,7 @@ def stamp_scope(session: Session, transaction: object, connection: object) -> No
 
     `with_loader_criteria` never sees an identity-map hit, so a session re-bound from org A to B could
     serve A's objects; the stamp makes that detectable. Not in `bind()`: the guard's session predates the
-    bind, and the agent plane's `get_session` is a sub-dependency of `_check_token`.
+    bind, and the agent plane's route session is a sub-dependency of `_check_token`.
 
     The first deciding scope wins, not the first scope: the agent plane's first transaction is the token
     lookup under `identity_scope()`, and the cookie plane's is often an unbound probe, both compatible with
@@ -669,13 +668,38 @@ def _class_by_table() -> dict[Table, type[Base]]:
     return _CLASS_BY_TABLE
 
 
+#: `mapped_classes_of`'s answers by statement SHAPE (the structural part of SQLAlchemy's cache key, the bound
+#: values excluded): two statements with one cache key touch the same tables. Cleared whole when full; a miss
+#: only re-walks.
+_CLASSES_BY_SHAPE: dict[Any, tuple[type[Base], ...]] = {}
+_CLASSES_BY_SHAPE_MAX = 4096
+
+
 def mapped_classes_of(state: ORMExecuteState) -> tuple[type[Base], ...]:
     """Every mapped class this statement TOUCHES — selected, joined, or reached through a subquery.
 
     `all_mappers` is not enough: for `select(Permission.key).join(RolePermission, ...)` it reports only
-    `Permission`, leaving join-only entities unfiltered. So tables are read off the expression tree
-    (~25µs for a two-entity join; re-measure if a statement grows large) and mapped back to classes.
-    Shared with the recording listener that derives `IDENTITY_CLASSES`."""
+    `Permission`, leaving join-only entities unfiltered. So tables are read off the expression tree and mapped
+    back to classes. That walk (and `all_mappers`, which builds the statement's column collections) ran on every
+    ORM select and was among the control plane's top CPU costs, so its answer is cached by the statement's
+    cache key, which SQLAlchemy memoizes on the statement and computes for its own compiled cache anyway. A
+    statement with no cache key is walked every time. Shared with the recording listener that derives
+    `IDENTITY_CLASSES`."""
+    cache_key = state.statement._generate_cache_key()
+    if cache_key is None:
+        return _walk_classes(state)
+    shape = cache_key.key
+    cached = _CLASSES_BY_SHAPE.get(shape)
+    if cached is None:
+        cached = _walk_classes(state)
+        if len(_CLASSES_BY_SHAPE) >= _CLASSES_BY_SHAPE_MAX:
+            _CLASSES_BY_SHAPE.clear()
+        _CLASSES_BY_SHAPE[shape] = cached
+    return cached
+
+
+def _walk_classes(state: ORMExecuteState) -> tuple[type[Base], ...]:
+    """`mapped_classes_of` without the cache: the mappers the statement selects plus every table in its tree."""
     classes: dict[type[Base], None] = {}
     for mapper in state.all_mappers:
         classes[mapper.class_] = None

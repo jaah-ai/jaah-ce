@@ -1,22 +1,27 @@
-// The Activity tab's Timeline feed: one renderer over the task's unified `/activity` rows.
-import { Fragment, useMemo, useState } from 'react'
+// Details' Timeline feed: one renderer over the task's unified `/activity` rows.
+import { Fragment, useMemo, useState, type MouseEvent as ReactMouseEvent } from 'react'
 import { Link } from 'react-router-dom'
 import Box from '@mui/material/Box'
-import Button from '@mui/material/Button'
 import MuiLink from '@mui/material/Link'
+import ExternalLink from '../../ui/ExternalLink'
 import Typography from '@mui/material/Typography'
 import { taskRoleLabel } from '../../components/tasks/personaRegistry'
 import { deescapeMarkdownText, displayTitle, statusForState, TaskStatusBadge } from '../../components/tasks/shared'
-import { useMinuteTick } from '../../hooks/useMinuteTick'
-import { absoluteTime } from '../../lib/relativeTime'
+import { useNow } from '../../hooks/useNow'
+import { capitalize } from '../../lib/humanize'
+import { absoluteTime, briefTimestamp, fmtTimestamp, formatSpan } from '../../lib/relativeTime'
 import { sessionHref } from '../../lib/sessionLink'
-import { formatSpan } from '../../lib/spanTime'
-import type { PipelineTask } from '../../types'
+import type { PipelineTask, TaskControlMessage } from '../../types'
+import { withNotices } from './taskNotices'
+import { CodeBlock } from '../../ui/CodeBlock'
 import EmptyState from '../../ui/EmptyState'
 import StatusDot from '../../ui/StatusDot'
-import TextDiffDialog from '../../ui/TextDiffDialog'
+import { FONT_SIZE, FONT_WEIGHT, grid } from '../../theme'
+import { UNSTYLED_BUTTON_SX, ELLIPSIS_SX } from '../../ui/listStyles'
+import LinkButton from '../../ui/LinkButton'
 import { useCan } from '../../auth'
 import { paneLogPath } from '../audit/PaneLogPage'
+import Tip from '../../ui/Tip'
 
 // One Activity feed row — mirrors ActivityLogEntryOut in apps/api/app/routes/tasks/activity.py: every `task:%`
 // transition plus every `task_note:%` row, merged chronologically. On an epic `data.id` may be a CHILD's
@@ -68,7 +73,7 @@ const ACTIVITY_FIELD_LABELS: Readonly<Record<string, string>> = {
 }
 function activityFieldLabel(field: string): string {
   const words = field.replace(/_id$/, '').replace(/_/g, ' ').trim()
-  return ACTIVITY_FIELD_LABELS[field] ?? (words.charAt(0).toUpperCase() + words.slice(1))
+  return ACTIVITY_FIELD_LABELS[field] ?? capitalize(words)
 }
 
 // The states a run has finished in: no runner will move it again unless someone starts it.
@@ -79,30 +84,34 @@ const BOOLEAN_CHANGE_WORDS: Readonly<Record<string, readonly [string, string]>> 
   autonomous: ['Unattended', 'Guided'],
 }
 
-// A before/after value as a single readable line — never dumps a full multi-KB body edit verbatim.
-function fmtChangeValue(value: unknown, field = ''): string {
-  if (value === null || value === undefined || value === '') return '(empty)'
-  if (typeof value === 'boolean') {
+// A before/after value as the editor words it, whole: it shows only in an opened row, which has the room (a description,
+// the one multi-KB field, is never printed here — it links to Versions). A changed `title` reads as the trail shows it:
+// stored titles may carry CommonMark escapes (`\[ops\]`).
+function changeValue(field: string, v: unknown): string {
+  if (v === null || v === undefined || v === '') return '(empty)'
+  if (typeof v === 'boolean') {
     const [on, off] = BOOLEAN_CHANGE_WORDS[field] ?? ['On', 'Off']
-    return value ? on : off
+    return v ? on : off
   }
-  const oneLine = (typeof value === 'string' ? value : JSON.stringify(value)).replace(/\s+/g, ' ').trim()
-  return oneLine.length > 80 ? `${oneLine.slice(0, 80)}…` : oneLine
+  if (typeof v !== 'string') return JSON.stringify(v)
+  return field === 'title' ? deescapeMarkdownText(v) : v
 }
 
-// A text change the one-line form above cannot show whole (cut, or whitespace/lines collapsed) — the rows
-// that get a Compare. Non-text values (ids, flags) always fit.
-function changeNeedsDiff(change: ActivityChange): boolean {
-  const lossy = (v: unknown) => typeof v === 'string' && v !== '' && fmtChangeValue(v) !== v
-  const text = (v: unknown) => v === null || v === undefined || typeof v === 'string'
-  return text(change.before) && text(change.after) && (lossy(change.before) || lossy(change.after))
+// A summary this long, or on several lines, is shown whole in the row's expansion too: beside its label and time the
+// line cuts it well before 80 characters on a split pane, sooner on a phone.
+const LONG_SUMMARY_CHARS = 40
+
+// Each row's identity across re-reads: its index shifts when notices merge in after the feed. Identical rows (a
+// repeated edit in the same second) are told apart by their order among themselves.
+function rowKeys(entries: ActivityLogEntry[]): string[] {
+  const seen = new Map<string, number>()
+  return entries.map(e => {
+    const base = `${e.created_at}|${e.category}|${e.action}|${String(e.data.id ?? '')}|${e.label}`
+    const n = seen.get(base) ?? 0
+    seen.set(base, n + 1)
+    return `${base}#${n}`
+  })
 }
-
-const asText = (v: unknown): string => (typeof v === 'string' ? v : '')
-
-// A changed `title` reads as the trail shows it: stored titles may carry CommonMark escapes (`\[ops\]`).
-const shownChangeValue = (field: string, v: unknown): string =>
-  fmtChangeValue(field === 'title' && typeof v === 'string' ? deescapeMarkdownText(v) : v, field)
 
 // How often an open runner phase's duration re-renders; the operator chose 30s over a per-second tick.
 const RUNNING_DURATION_TICK_MS = 30_000
@@ -118,35 +127,43 @@ const TIMELINE_SX = { listStyle: 'none', m: 0, p: 0, display: 'flex', flexDirect
 const TIMELINE_ITEM_SX = {
   position: 'relative',
   display: 'flex',
-  gap: 1.75,
-  padding: '0 0 0.75rem 0.25rem',
+  gap: 1.5,
+  pb: 0.5,
+  pl: 0.5,
   borderLeft: 2,
   borderColor: 'divider',
-  marginLeft: '0.25rem',
+  ml: 0.5,
   '&:last-of-type': { paddingBottom: 0 },
 } as const
 
-const TIMELINE_BODY_SX = { display: 'flex', flexDirection: 'column', gap: 0.35, pl: 1.35, minWidth: 0 }
+const TIMELINE_BODY_SX = { display: 'flex', flexDirection: 'column', gap: 0, pl: 1, minWidth: 0, flex: '1 1 auto' }
 
 // The "Earlier attempts" fold's toggle: a text button in the caption tone.
 const EARLIER_TOGGLE_SX = {
-  border: 0, p: 0, background: 'none', color: 'text.secondary', font: 'inherit', fontSize: '0.875rem',
-  textAlign: 'left', cursor: 'pointer', '&:hover': { color: 'text.primary', textDecoration: 'underline' },
+  ...UNSTYLED_BUTTON_SX, color: 'text.secondary', fontSize: FONT_SIZE.base,
+  textAlign: 'left', '&:hover': { color: 'text.primary', textDecoration: 'underline' },
 } as const
 
-const TIMELINE_HEAD_SX = { display: 'flex', alignItems: 'center', gap: 1.35, flexWrap: 'wrap' }
+/* EVERY ROW IS ONE LINE: label, summary and time never wrap; the label and summary cut with an ellipsis (whole on
+   hover), so a phone-width feed truncates instead of scrolling sideways. */
+const TIMELINE_LINE_SX = { display: 'flex', alignItems: 'center', gap: 1, minWidth: 0, whiteSpace: 'nowrap' }
+
+// What a row folds away: shown under its line once the row is opened.
+const TIMELINE_EXPANSION_SX = { display: 'flex', flexDirection: 'column', gap: 0.5, minWidth: 0, pb: 0.5 }
+
+const CAPTION_SX = { color: 'text.secondary', overflowWrap: 'anywhere' } as const
 
 function TimelineDot({ note }: { note?: boolean }) {
   return (
     <StatusDot
       color={note ? 'primary.main' : 'secondary.main'}
-      sx={{ position: 'absolute', left: '-5px', top: '0.2rem' }}
+      sx={{ position: 'absolute', left: grid(-1), top: grid(0.5) }}
     />
   )
 }
 
 // A refused dispatch's `data.fix` value for a missing integration branch (`routes/agent/slot_intents.py::
-// DISPATCH_FIX_INTEGRATION_BRANCH`): the row links to the project's Governance tab, where that field is edited.
+// DISPATCH_FIX_INTEGRATION_BRANCH`): the row links to the project's Customize › Branches, where that field is shown.
 const DISPATCH_FIX_INTEGRATION_BRANCH = 'integration_branch'
 
 // A runner phase's own rows: its start, its end (the transition carrying the closed phase's duration) and a
@@ -168,21 +185,29 @@ export function gateParkEvent(entries: ActivityLogEntry[], taskId: number): { at
   return park ? { at: park.created_at, actor: park.actor ?? null } : null
 }
 
-// The Activity tab's Timeline feed — the page's ONE event renderer over the unified `/activity` feed.
+// Details' Timeline feed — the page's ONE event renderer over the unified `/activity` feed.
 // `epicId` + `childTasks` label rolled-up per-child rows (`data.id !== epicId`) with a deep link. `projectId`
 // is the task's own: a project move carries its subtree, so a child row shares it. `onOpenDetails` is where an
-// "Outcome reported" row points: Details already shows that summary in full. A `script` run (the merge lane) is
+// "Outcome reported" row points: Details already shows that summary in full. `onOpenVersions` is where a
+// description change points: the task's Versions view compares descriptions, the Timeline keeps none of its own. A `script` run (the merge lane) is
 // no Claude session, so its rows link no session. `gateLogHref` is a merge-lane run's latest gate log
 // (`components/tasks/laneRun.ts::latestGateLog`), linked from its runner rows. `currentState` is the task's
 // own: a FINISHED script run's many passes through the same states would chip every row, so only the row that
 // put it in its current state keeps its chip there.
 export default function ActivityLog(
-  { entries, epicId, childTasks, projectId, onOpenDetails, script, gateLogHref = null, currentState = null }:
   {
-    entries: ActivityLogEntry[]; epicId: number; childTasks: PipelineTask[]; projectId: number
-    onOpenDetails: () => void; script: boolean; gateLogHref?: string | null; currentState?: string | null
+    entries: feed, notices = null, epicId, childTasks, projectId, onOpenDetails, onOpenVersions, hasVersions = true, script,
+    gateLogHref = null, currentState = null,
+  }:
+  {
+    entries: ActivityLogEntry[]; notices?: TaskControlMessage[] | null; epicId: number; childTasks: PipelineTask[]
+    projectId: number; onOpenDetails: () => void; onOpenVersions: () => void; hasVersions?: boolean; script: boolean
+    gateLogHref?: string | null; currentState?: string | null
   },
 ) {
+  // The `/activity` feed with the control-plane notices merged in by time (`taskNotices.ts`).
+  const entries = useMemo(() => withNotices(feed, notices, epicId), [feed, notices, epicId])
+  const keys = useMemo(() => rowKeys(entries), [entries])
   /* THE RESET ROW STARTS THE CURRENT ATTEMPT: the server flags it earlier (`task:reset` stamps before its
      own watermark, `routes/tasks/activity.py::_row_predates_its_reset`), so a fresh Reset folded the whole trail and
      showed no row at all. A task's last earlier row, when it is its Reset, stays out of the fold. */
@@ -209,20 +234,26 @@ export default function ActivityLog(
   const chipOnlyAt = script && currentState !== null && FINISHED_STATES.has(currentState)
     ? entries.map((e, i) => (movesState[i] ? e.state : null)).lastIndexOf(currentState)
     : null
-  // The open Compare dialog: which field of which row.
-  const [diff, setDiff] = useState<{ field: string; change: ActivityChange } | null>(null)
+  // The rows opened to show what their one line folds away, by a key that survives notices merging in later.
+  const [opened, setOpened] = useState<ReadonlySet<string>>(() => new Set())
+  const toggleRow = (key: string) => setOpened(prev => {
+    const next = new Set(prev)
+    if (!next.delete(key)) next.add(key)
+    return next
+  })
   // Rows from before the last Reset fold under one disclosure, closed by default.
   const [earlierOpen, setEarlierOpen] = useState(false)
   // A runner phase still open at read time is the `active` transition the server gave a duration
   // (`routes/tasks/`, AC6.5). Its duration keeps growing on the wall clock: tick it every 30s from
-  // the moment this feed arrived — elapsed on the client's own clock, so client/server skew never shows.
-  const receivedAt = useMemo(() => Date.now(), [entries])
+  // the moment this feed arrived — elapsed on the client's own clock, so client/server skew never shows. Keyed on the
+  // `/activity` read alone: a notice landing carries no fresh duration.
+  const receivedAt = useMemo(() => Date.now(), [feed])
   // The pane-log viewer asks `sessions:edit`: a reader without it is not offered a link that only refuses.
   const can = useCan()
   const canOpenPaneLog = can('sessions:edit')
   // The account page asks `accounts:view`: without it the name stays text, not a link that only fails.
   const canOpenAccount = can('accounts:view')
-  useMinuteTick(RUNNING_DURATION_TICK_MS)
+  useNow(RUNNING_DURATION_TICK_MS)
   const now = Date.now()
   /* AN ASKING RUN'S CLOCK STOPS AT THE PARK: `awaiting_response` closes no phase (the runner waits alive in
      its question call), so the server keeps the phase open. Its first park after the open start is where the run stopped
@@ -302,268 +333,312 @@ export default function ActivityLog(
     const ownerId = typeof e.data.id === 'number' ? e.data.id : Number(e.data.id)
     const isChildRow = Number.isFinite(ownerId) && ownerId !== epicId
     const childTask = isChildRow ? childTasks.find(c => c.id === ownerId) : undefined
-    // A child's termination reads as ONE line: which child, what ended it, where
-    // ("#2 Analyze · Runner terminated: session vanished · dev-node").
-    const childEnd = terminated && isChildRow
     /* SHORT CHILD NAME: the child's id and its role ("#2 Analyze" — its playbook stage, else its persona),
-       not its whole title, which on an epic's feed wrapped every child row over several lines. The full title
-       rides the hover. */
+       not its whole title, which on an epic's feed would crowd every child row's line. The full title rides the
+       hover. */
     const childLink = isChildRow && (
-      <MuiLink
+      <Tip title={childTask ? displayTitle(childTask.title, { showPersona: true }) : undefined}><MuiLink
         component={Link}
         to={`/tasks/${ownerId}`}
-        title={childTask ? displayTitle(childTask.title, { showPersona: true }) : undefined}
+        sx={{ flex: '0 0 auto' }}
       >
         #{ownerId}{childTask ? ` ${taskRoleLabel(childTask)}` : ''}
-      </MuiLink>
+      </MuiLink></Tip>
     )
-    // A settle's summary is Details' Outcome: here it collapses to one line (whole on hover).
+    // A child's termination reads "#2 Analyze · Runner terminated: session vanished".
+    const childEnd = terminated && isChildRow
+    // A settle's summary is Details' Outcome: its line cuts it, and the expansion points to Details.
     const isOutcome = e.category === 'note' && e.action === 'outcome'
     /* Each fact once: a transition's summary that only restates the label ("Edit" over "edit") is
        dropped. A note's text is what someone wrote, so it always stays. */
     const summary = e.category === 'transition' && restatesLabel(e.summary, e.label) ? '' : e.summary
+    const hasSummary = summary.trim() !== ''
+    const longSummary = hasSummary && (summary.includes('\n') || summary.length > LONG_SUMMARY_CHARS)
+    // A control-plane notice's sender and how its delivery to the runner went.
+    const control = e.category === 'note' && e.action === 'control_message'
+    const controlSender = control && typeof e.data.sender === 'string' ? e.data.sender : null
+    const controlDelivery = control && typeof e.data.delivery === 'string' ? e.data.delivery : null
+    const outcomeDetails = isOutcome && hasSummary && !isChildRow
+    const changeList = changes ? Object.entries(changes) : []
+    const showsPaneLog = paneLogSession !== null && canOpenPaneLog
+    const showsGateLog = gateLogHref !== null && !isChildRow && isRunnerPhaseRow(e)
+    const showsRun = e.duration_seconds !== null || sessionId !== null || accountSlug !== null
+    const filedBy = typeof e.data.filed_by_task_id === 'number' ? e.data.filed_by_task_id : null
+    // A row opens only when its line folds something away; a row with nothing more is not clickable.
+    const expandable = longSummary || controlSender !== null || controlDelivery !== null || outcomeDetails
+      || fixesBranch || nodeName !== null || vmId !== null || leftNode !== null || detail !== null || nextStep !== null
+      || nodeErrors.length > 0 || paneLines.length > 0 || showsPaneLog || showsGateLog || changeList.length > 0
+      || (changedFields !== null && changedFields.length > 0) || showsRun || filedBy !== null
+    const key = keys[i]
+    const open = expandable && opened.has(key)
+    // A notice's text is the whole point of opening it, however short; an outcome's is Details' alone.
+    const fullSummary = (longSummary && !outcomeDetails) || (control && hasSummary)
+    // Opened, the whole text stands under the line, so the line drops its cut copy: the text shows once.
+    const lineSummary = hasSummary && !(open && fullSummary)
+    const labelText = (
+      <Typography
+        variant="body2"
+        component="span"
+        data-testid={childEnd ? 'task-timeline-child-end' : undefined}
+        sx={{ ...ELLIPSIS_SX, display: 'block', fontWeight: FONT_WEIGHT.semibold, color: 'text.primary' }}
+      >
+        {childEnd ? e.label.replace(/^(Runner terminated) — /, '$1: ') : e.label}
+      </Typography>
+    )
     return (
       <Box component="li" key={i} data-testid="task-timeline-item" sx={TIMELINE_ITEM_SX}>
         <TimelineDot note={e.category === 'note'} />
         <Box sx={TIMELINE_BODY_SX}>
-          <Box sx={TIMELINE_HEAD_SX}>
-            {childEnd ? (
-              <Typography
-                variant="body2"
-                data-testid="task-timeline-child-end"
-                sx={{ fontWeight: 600, color: 'text.primary', minWidth: 0, overflowWrap: 'anywhere' }}
+          {/* The button is the row's accessible toggle; a click anywhere else on the line (not on a link) opens it too. */}
+          <Box
+            sx={{ ...TIMELINE_LINE_SX, cursor: expandable ? 'pointer' : undefined }}
+            onClick={expandable
+              ? (ev: ReactMouseEvent) => { if (!(ev.target as Element).closest('a, button')) toggleRow(key) }
+              : undefined}
+          >
+            {childLink && <>{childLink}<Typography variant="body2" component="span" aria-hidden="true">·</Typography></>}
+            {expandable ? (
+              <Box
+                component="button"
+                type="button"
+                aria-expanded={open}
+                data-testid="task-timeline-toggle"
+                onClick={() => toggleRow(key)}
+                sx={{ ...UNSTYLED_BUTTON_SX, display: 'flex', minWidth: 0, flex: '0 1 auto', textAlign: 'left' }}
               >
-                {childLink} · {e.label.replace(/^(Runner terminated) — /, '$1: ')}
-                {nodeName && <> · <Typography variant="mono" sx={{ fontWeight: 400 }}>{nodeName}</Typography></>}
-                {vmId && <> · VM <Typography variant="mono" title={vmId} sx={{ fontWeight: 400 }}>{vmId.slice(0, 8)}</Typography></>}
-              </Typography>
-            ) : (
-              <Typography variant="body2" sx={{ fontWeight: 600, color: 'text.primary' }}>{e.label}</Typography>
-            )}
+                {labelText}
+              </Box>
+            ) : <Box sx={{ display: 'flex', minWidth: 0, flex: '0 1 auto' }}>{labelText}</Box>}
             {(e.repeat_count ?? 1) > 1 && (
-              <Typography
+              <Tip title={typeof e.data.last_at === 'string' ? `Last ${absoluteTime(e.data.last_at)}` : undefined}><Typography
                 variant="caption"
                 data-testid="task-timeline-repeat"
-                title={typeof e.data.last_at === 'string' ? `Last ${absoluteTime(e.data.last_at)}` : undefined}
-                sx={{ color: 'text.secondary', fontWeight: 600 }}
+                sx={{ color: 'text.secondary', fontWeight: FONT_WEIGHT.semibold, flex: '0 0 auto' }}
               >
                 ×{e.repeat_count}
-              </Typography>
+              </Typography></Tip>
             )}
             {/* A start row's "Running" is true only of the phase still open; a closed one says it in its label. */}
             {e.state !== null && movesState[i] && (chipOnlyAt === null || i === chipOnlyAt)
               && (e.action !== 'active' || e.category !== 'transition' || isOpenRunnerPhase(e)) && (
-              <TaskStatusBadge status={statusForState(e.state)} />
+              <Box sx={{ flex: '0 0 auto', display: 'flex' }}><TaskStatusBadge status={statusForState(e.state)} /></Box>
             )}
-          </Box>
-          {isChildRow && !childEnd && (
-            // AD-12: the `#` is KEPT in prose, so the number reads as a task id.
-            <Typography variant="caption" sx={{ color: 'text.secondary' }}>on {childLink}</Typography>
-          )}
-          {/* A transition row arrives with an empty summary (the id/verb duplicated the label);
-              prose rows and historical transitions still render theirs. */}
-          {isOutcome && summary.trim() !== '' ? (
-            <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1, minWidth: 0 }}>
-              <Typography
+            {/* A transition row arrives with an empty summary (the id/verb duplicated the label);
+                prose rows and historical transitions still render theirs, cut to the line. */}
+            {lineSummary ? (
+              <Tip title={summary}><Typography
                 variant="body2"
-                title={summary}
-                data-testid="task-timeline-outcome"
-                sx={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                component="span"
+                data-testid={isOutcome ? 'task-timeline-outcome' : undefined}
+                sx={{ ...ELLIPSIS_SX, flex: '1 1 0', color: 'text.secondary' }}
               >
                 {summary}
-              </Typography>
-              {/* A child's outcome lives on the child's own page, which the "on #id" link above opens. */}
-              {!isChildRow && (
-                <MuiLink
-                  component="button"
-                  type="button"
-                  variant="body2"
-                  onClick={onOpenDetails}
-                  aria-label="Outcome in Details"
-                  data-testid="task-timeline-outcome-details"
-                  sx={{ flex: '0 0 auto' }}
-                >
-                  Details
-                </MuiLink>
-              )}
-            </Box>
-          ) : summary.trim() !== '' && (
-            <Typography
-              variant="body2"
-              // An agent's message keeps its own line breaks.
-              sx={{ overflowWrap: 'anywhere', whiteSpace: e.action === 'agent_message' ? 'pre-wrap' : undefined }}
-            >
-              {summary}
+              </Typography></Tip>
+            ) : <Box sx={{ flex: '1 1 0' }} />}
+            {/* Who caused the row rides the timestamp; a machine row names no one. */}
+            <Typography variant="caption" sx={{ color: 'text.secondary', flex: '0 0 auto' }}>
+              <Tip title={fmtTimestamp(e.created_at)}><time dateTime={e.created_at}>{briefTimestamp(e.created_at)}</time></Tip>
             </Typography>
-          )}
-          {fixesBranch && (
-            <Typography variant="body2">
-              <MuiLink component={Link} to={`/projects/${projectId}?tab=governance`} data-testid="task-timeline-fix">
-                Project settings
-              </MuiLink>
-            </Typography>
-          )}
-          {!childEnd && (nodeName || vmId) && (
-            <Typography variant="caption" data-testid="task-timeline-where" sx={{ color: 'text.secondary' }}>
-              {nodeName && <>on <Typography variant="mono">{nodeName}</Typography></>}
-              {nodeName && vmId && ' · '}
-              {vmId && <>VM <Typography variant="mono" title={vmId}>{vmId.slice(0, 8)}</Typography></>}
-            </Typography>
-          )}
-          {leftNode && (
-            <Typography variant="caption" data-testid="task-timeline-left" sx={{ color: 'text.secondary' }}>
-              left <Typography variant="mono">{leftNode}</Typography>
-            </Typography>
-          )}
-          {detail && (
-            <Typography variant="body2" data-testid="task-timeline-detail" sx={{ overflowWrap: 'anywhere' }}>
-              {detail}
-            </Typography>
-          )}
-          {nextStep && (
-            <Typography
-              variant="caption"
-              data-testid="task-timeline-next-step"
-              sx={{ color: 'text.secondary', overflowWrap: 'anywhere' }}
-            >
-              {nextStep}
-            </Typography>
-          )}
-          {nodeErrors.length > 0 && (
-            <Box data-testid="task-timeline-node-errors" sx={{ minWidth: 0 }}>
-              <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
-                Node log before it ended:
-              </Typography>
-              {nodeErrors.map((line, j) => (
-                <Typography
-                  key={j}
-                  variant="mono"
-                  component="div"
-                  sx={{ color: 'text.secondary', fontSize: '0.75rem', overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}
-                >
-                  {line}
-                </Typography>
-              ))}
-            </Box>
-          )}
-          {paneLines.length > 0 && (
-            <Box data-testid="task-timeline-pane-lines" sx={{ minWidth: 0 }}>
-              <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
-                Last pane output:
-              </Typography>
-              <Typography
-                variant="mono"
-                component="pre"
-                sx={{ m: 0, color: 'text.secondary', fontSize: '0.75rem', overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}
+            {e.actor && (
+              <Tip title={e.actor}><Typography
+                variant="caption"
+                data-testid="task-timeline-actor"
+                sx={{ ...ELLIPSIS_SX, color: 'text.secondary', flex: '0 1 auto', maxWidth: grid(20) }}
               >
-                {paneLines.join('\n')}
-              </Typography>
-            </Box>
-          )}
-          {paneLogSession && canOpenPaneLog && (
-            <Typography variant="body2">
-              <MuiLink component={Link} to={paneLogPath(paneLogSession)} data-testid="task-timeline-pane-log">
-                Pane log
-              </MuiLink>
-            </Typography>
-          )}
-          {gateLogHref && !isChildRow && isRunnerPhaseRow(e) && (
-            <Typography variant="body2">
-              <MuiLink component={Link} to={gateLogHref} data-testid="task-timeline-gate-log">Gate log</MuiLink>
-            </Typography>
-          )}
-          {changes && Object.keys(changes).length > 0 ? (
-            <Box data-testid="task-timeline-changes">
-              {Object.entries(changes).map(([field, change]) => (
-                <Typography key={field} variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
-                  {activityFieldLabel(field)}: {shownChangeValue(field, change.before)} → {shownChangeValue(field, change.after)}
-                  {changeNeedsDiff(change) && (
-                    <Button
-                      size="small"
-                      data-testid="task-timeline-compare"
-                      aria-label={`Compare ${activityFieldLabel(field)} before and after`}
-                      onClick={() => setDiff({ field, change })}
-                      sx={{ ml: 0.5, py: 0, minWidth: 0, verticalAlign: 'baseline', fontSize: 'inherit' }}
-                    >
-                      Compare
-                    </Button>
+                {e.actor}
+              </Typography></Tip>
+            )}
+            {expandable && (
+              <Box component="span" aria-hidden="true" sx={{ color: 'text.secondary', flex: '0 0 auto', width: grid(1.5) }}>
+                {open ? '▾' : '▸'}
+              </Box>
+            )}
+          </Box>
+          {open && (
+            <Box data-testid="task-timeline-expansion" sx={TIMELINE_EXPANSION_SX}>
+              {fullSummary && (
+                <Typography
+                  variant="body2"
+                  data-testid="task-timeline-full-summary"
+                  sx={{ overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}
+                >
+                  {summary}
+                </Typography>
+              )}
+              {(controlSender || controlDelivery) && (
+                <Typography variant="caption" data-testid="task-timeline-control-from" sx={CAPTION_SX}>
+                  {controlSender && <>from {controlSender}</>}
+                  {controlSender && controlDelivery && ' · '}
+                  {controlDelivery}
+                </Typography>
+              )}
+              {/* A child's outcome lives on the child's own page, which its link on the line opens. */}
+              {outcomeDetails && (
+                <Typography variant="body2">
+                  <LinkButton
+                    variant="body2"
+                    onClick={onOpenDetails}
+                    aria-label="Outcome in Details"
+                    data-testid="task-timeline-outcome-details"
+                  >
+                    Details
+                  </LinkButton>
+                </Typography>
+              )}
+              {fixesBranch && (
+                <Typography variant="body2">
+                  <MuiLink component={Link} to={`/projects/${projectId}?tab=customize&section=branches`} data-testid="task-timeline-fix">
+                    Project settings
+                  </MuiLink>
+                </Typography>
+              )}
+              {(nodeName || vmId) && (
+                <Typography variant="caption" data-testid="task-timeline-where" sx={CAPTION_SX}>
+                  {nodeName && <>on <Typography variant="mono">{nodeName}</Typography></>}
+                  {nodeName && vmId && ' · '}
+                  {vmId && <>VM <Tip title={vmId}><Typography variant="mono">{vmId.slice(0, 8)}</Typography></Tip></>}
+                </Typography>
+              )}
+              {leftNode && (
+                <Typography variant="caption" data-testid="task-timeline-left" sx={CAPTION_SX}>
+                  left <Typography variant="mono">{leftNode}</Typography>
+                </Typography>
+              )}
+              {detail && (
+                <Typography variant="body2" data-testid="task-timeline-detail" sx={{ overflowWrap: 'anywhere' }}>
+                  {detail}
+                </Typography>
+              )}
+              {nextStep && (
+                <Typography variant="caption" data-testid="task-timeline-next-step" sx={CAPTION_SX}>
+                  {nextStep}
+                </Typography>
+              )}
+              {nodeErrors.length > 0 && (
+                <Box data-testid="task-timeline-node-errors" sx={{ minWidth: 0 }}>
+                  <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+                    Node log before it ended:
+                  </Typography>
+                  <CodeBlock tone="plain" sx={{ color: 'text.secondary' }}>{nodeErrors.join('\n')}</CodeBlock>
+                </Box>
+              )}
+              {paneLines.length > 0 && (
+                <Box data-testid="task-timeline-pane-lines" sx={{ minWidth: 0 }}>
+                  <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+                    Last pane output:
+                  </Typography>
+                  <CodeBlock tone="plain" sx={{ color: 'text.secondary' }}>{paneLines.join('\n')}</CodeBlock>
+                </Box>
+              )}
+              {paneLogSession && canOpenPaneLog && (
+                <Typography variant="body2">
+                  <MuiLink component={Link} to={paneLogPath(paneLogSession)} data-testid="task-timeline-pane-log">
+                    Pane log
+                  </MuiLink>
+                </Typography>
+              )}
+              {gateLogHref && showsGateLog && (
+                <Typography variant="body2">
+                  <MuiLink component={Link} to={gateLogHref} data-testid="task-timeline-gate-log">Gate log</MuiLink>
+                </Typography>
+              )}
+              {changeList.length > 0 ? (
+                <Box data-testid="task-timeline-changes">
+                  {changeList.map(([field, change]) => field === 'body' ? (
+                    // The description's versions are compared in the owner's Versions view, not here: a child's on its
+                    // own page, this task's on its subtab (offered once a snapshot exists).
+                    <Typography key={field} variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+                      Description changed
+                      {isChildRow ? (
+                        <>{' '}<MuiLink
+                          component={Link}
+                          to={`/tasks/${ownerId}?tab=details&details=versions`}
+                          data-testid="task-timeline-versions"
+                          sx={{ fontSize: 'inherit' }}
+                        >
+                          Versions
+                        </MuiLink></>
+                      ) : hasVersions && (
+                        <>{' '}<LinkButton
+                          variant="caption"
+                          onClick={onOpenVersions}
+                          data-testid="task-timeline-versions"
+                          sx={{ verticalAlign: 'baseline' }}
+                        >
+                          Versions
+                        </LinkButton></>
+                      )}
+                    </Typography>
+                  ) : (
+                    // Opened, the row has the room: the whole before and after, wrapped (a phone has no hover).
+                    <Typography key={field} variant="caption" sx={{ ...CAPTION_SX, display: 'block', overflowWrap: 'anywhere' }}>
+                      {activityFieldLabel(field)}: {changeValue(field, change.before)} → {changeValue(field, change.after)}
+                    </Typography>
+                  ))}
+                </Box>
+              ) : changedFields && changedFields.length > 0 && (
+                <Typography variant="caption" sx={CAPTION_SX}>
+                  changed: {changedFields.map(activityFieldLabel).join(', ')}
+                </Typography>
+              )}
+              {showsRun && (
+                <Typography variant="caption" sx={CAPTION_SX}>
+                  {e.duration_seconds !== null && <>duration: {formatSpan(liveDuration(e, e.duration_seconds) * 1000)}</>}
+                  {parkedAt.has(e) && <span data-testid="task-timeline-paused"> (paused, asking)</span>}
+                  {e.duration_seconds !== null && sessionId && ' · '}
+                  {sessionId && sessionLink && (
+                    <>
+                      session:{' '}
+                      {/* A Claude Code run opens on claude.ai (viewable only by the account that ran it, hence the
+                          account beside it); any other run opens its Audit › Sessions row. `variant="mono"` is a
+                          span, so it nests inside the anchor. */}
+                      {sessionLink.external ? (
+                        <ExternalLink
+                          href={sessionLink.href}
+                          aria-label={`Open session ${sessionId} on claude.ai`}
+                          sx={{ fontSize: 'inherit' }}
+                        >
+                          <Typography variant="mono">{sessionId}</Typography> ↗
+                        </ExternalLink>
+                      ) : (
+                        <MuiLink
+                          component={Link}
+                          to={sessionLink.href}
+                          aria-label={`Open session ${sessionId} in Sessions`}
+                          sx={{ fontSize: 'inherit' }}
+                        >
+                          <Typography variant="mono">{sessionId}</Typography>
+                        </MuiLink>
+                      )}
+                    </>
+                  )}
+                  {(e.duration_seconds !== null || sessionId) && accountSlug && ' · '}
+                  {/* Which credential spent this run, by its name (the slug when the read joined none). The email
+                      renders only when the read-time fold knows one. */}
+                  {accountSlug && (
+                    <>
+                      account:{' '}
+                      {accountId && canOpenAccount ? (
+                        <MuiLink component={Link} to={`/accounts/${encodeURIComponent(accountId)}`} sx={{ fontSize: 'inherit' }}>
+                          {accountName ?? <Typography variant="mono">{accountSlug}</Typography>}
+                        </MuiLink>
+                      ) : accountName ?? <Typography variant="mono">{accountSlug}</Typography>}
+                      {accountEmail && <> ({accountEmail})</>}
+                    </>
                   )}
                 </Typography>
-              ))}
+              )}
+              {/* A runner's filing names the task that filed it (`_name_machine_creators`). */}
+              {filedBy !== null && (
+                <Typography variant="caption" sx={CAPTION_SX}>
+                  {'filed from '}
+                  <MuiLink component={Link} to={`/tasks/${filedBy}`} data-testid="task-timeline-filed-by" sx={{ fontSize: 'inherit' }}>
+                    #{filedBy}
+                  </MuiLink>
+                </Typography>
+              )}
             </Box>
-          ) : changedFields && changedFields.length > 0 && (
-            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-              changed: {changedFields.map(activityFieldLabel).join(', ')}
-            </Typography>
           )}
-          {(e.duration_seconds !== null || sessionId || accountSlug) && (
-            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-              {e.duration_seconds !== null && <>duration: {formatSpan(liveDuration(e, e.duration_seconds) * 1000)}</>}
-              {parkedAt.has(e) && <span data-testid="task-timeline-paused"> (paused, asking)</span>}
-              {e.duration_seconds !== null && sessionId && ' · '}
-              {sessionId && sessionLink && (
-                <>
-                  session:{' '}
-                  {/* A Claude Code run opens on claude.ai (viewable only by the account that ran it, hence the
-                      account beside it); any other run opens its Audit › Sessions row. `variant="mono"` is a
-                      span, so it nests inside the anchor. */}
-                  {sessionLink.external ? (
-                    <MuiLink
-                      href={sessionLink.href}
-                      target="_blank"
-                      rel="noreferrer"
-                      aria-label={`Open session ${sessionId} on claude.ai`}
-                      sx={{ fontSize: 'inherit' }}
-                    >
-                      <Typography variant="mono">{sessionId}</Typography> ↗
-                    </MuiLink>
-                  ) : (
-                    <MuiLink
-                      component={Link}
-                      to={sessionLink.href}
-                      aria-label={`Open session ${sessionId} in Sessions`}
-                      sx={{ fontSize: 'inherit' }}
-                    >
-                      <Typography variant="mono">{sessionId}</Typography>
-                    </MuiLink>
-                  )}
-                </>
-              )}
-              {(e.duration_seconds !== null || sessionId) && accountSlug && ' · '}
-              {/* Which credential spent this run, by its name (the slug when the read joined none). The email
-                  renders only when the read-time fold knows one. */}
-              {accountSlug && (
-                <>
-                  account:{' '}
-                  {accountId && canOpenAccount ? (
-                    <MuiLink component={Link} to={`/accounts/${encodeURIComponent(accountId)}`} sx={{ fontSize: 'inherit' }}>
-                      {accountName ?? <Typography variant="mono">{accountSlug}</Typography>}
-                    </MuiLink>
-                  ) : accountName ?? <Typography variant="mono">{accountSlug}</Typography>}
-                  {accountEmail && <> ({accountEmail})</>}
-                </>
-              )}
-            </Typography>
-          )}
-          {/* Who caused the row rides the timestamp line; a machine row names no one. */}
-          <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-            <time dateTime={e.created_at} title={e.created_at}>{absoluteTime(e.created_at)}</time>
-            {e.actor && <span data-testid="task-timeline-actor"> · {e.actor}</span>}
-            {/* A runner's filing names the task that filed it (`_name_machine_creators`). */}
-            {typeof e.data.filed_by_task_id === 'number' && (
-              <>
-                {' · from '}
-                <MuiLink
-                  component={Link}
-                  to={`/tasks/${e.data.filed_by_task_id}`}
-                  data-testid="task-timeline-filed-by"
-                  sx={{ fontSize: 'inherit' }}
-                >
-                  #{e.data.filed_by_task_id}
-                </MuiLink>
-              </>
-            )}
-          </Typography>
         </Box>
       </Box>
     )
@@ -586,7 +661,7 @@ export default function ActivityLog(
                     onClick={() => setEarlierOpen(open => !open)}
                     sx={EARLIER_TOGGLE_SX}
                   >
-                    <Box component="span" aria-hidden="true" sx={{ display: 'inline-block', width: '1.1em' }}>
+                    <Box component="span" aria-hidden="true" sx={{ display: 'inline-block', width: grid(2.5) }}>
                       {earlierOpen ? '▾' : '▸'}
                     </Box>
                     Earlier attempts ({earlierCount})
@@ -598,14 +673,6 @@ export default function ActivityLog(
           </Fragment>
         )
       })}
-      {diff && (
-        <TextDiffDialog
-          title={`${activityFieldLabel(diff.field)} changes`}
-          before={asText(diff.change.before)}
-          after={asText(diff.change.after)}
-          onClose={() => setDiff(null)}
-        />
-      )}
     </Box>
   )
 }

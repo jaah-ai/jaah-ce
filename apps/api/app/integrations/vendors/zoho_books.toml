@@ -1,0 +1,69 @@
+# Zoho Books API v3: OAuth 2.0 at accounts.zoho.com (offline access for a refresh token); Zoho takes the access
+# token under its own scheme, `Zoho-oauthtoken`, hence `oauth_scheme`.
+slug = "zoho_books"
+label = "Zoho Books"
+category = "payments"
+vendor_docs_url = "https://www.zoho.com/books/api/v3/oauth/"
+summary = "Read and create Zoho Books invoices, bills, contacts, items and expenses."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://accounts.zoho.com/oauth/v2/auth"
+token_url = "https://accounts.zoho.com/oauth/v2/token"
+pkce = false
+scope_separator = ","
+authorize_extra = { access_type = "offline", prompt = "consent" }
+scopes = [
+  { name = "ZohoBooks.settings.READ", label = "Read your organizations and settings, so Test can name the organization and agents can find its ID" },
+  { name = "ZohoBooks.contacts.ALL", label = "Read and update customers and vendors", optional = true },
+  { name = "ZohoBooks.invoices.ALL", label = "Read, draft and update invoices", optional = true },
+  { name = "ZohoBooks.bills.ALL", label = "Read and record vendor bills", optional = true },
+  { name = "ZohoBooks.expenses.ALL", label = "Read and record expenses", optional = true },
+  { name = "ZohoBooks.customerpayments.ALL", label = "Read and record customer payments against invoices", optional = true },
+  { name = "ZohoBooks.reports.READ", label = "Run reports such as profit and loss or aged receivables", optional = true },
+]
+jaah_app = true
+[auth.oauth.registration]
+console_url = "https://api-console.zoho.com/"
+steps = [
+  "Select GET STARTED (or ADD CLIENT if the account already has clients) and choose Server-based Applications, then CREATE NOW",
+  "Under Client Name enter Jaah, and under Homepage URL enter the public homepage of the company that runs this Jaah (its https address)",
+  "Under Authorized Redirect URIs enter both redirect URIs (dev and prod, listed under Redirect URIs), adding a row for the second with the + button",
+  "Select CREATE, then open the Client Secret tab and copy the Client ID and Client Secret",
+  "Leave Multi-DC off: Jaah exchanges codes at accounts.zoho.com, so only US data-centre Zoho accounts can connect",
+]
+review = "Not required: a server-based client works for any Zoho account in the US data centre once created"
+
+[test]
+method = "GET"
+path = "https://www.zohoapis.com/books/v3/organizations"
+oauth_scheme = "Zoho-oauthtoken"
+identity = [["organizations", 0, "name"]]
+
+[docs]
+agent_uses = [
+  "List unpaid and overdue invoices and the customers who owe them",
+  "Draft invoices or record bills and expenses from a task's details for a person to approve",
+  "Look up or add customers, vendors and items",
+  "Run the profit and loss or aged receivables report for a period",
+]
+prerequisites = [
+  "A Zoho Books organization whose Zoho account is in the US data centre (you sign in at accounts.zoho.com, not .eu, .in or .com.au)",
+  "A Zoho Books user with the rights agents should have: agents act as the user who connects",
+]
+limitations = [
+  "Only Zoho accounts in the US data centre (zoho.com) can connect for now; accounts in the EU, India, Australia, Japan, Canada and other data centres are refused at sign-in",
+  "Most Zoho Books calls need the organization's ID; agents read it from the organizations list first",
+  "Zoho Books allows 100 calls a minute per organization and a daily quota by plan (1,000 on Free up to 10,000 on higher plans)",
+  "Agents send the access token under Zoho's own scheme, `Authorization: Zoho-oauthtoken <token>`, not as a Bearer token",
+]
+troubleshooting = [
+  { symptom = "Test says Zoho Books rejected the access token (401)", fix = "The grant was revoked in Zoho (Accounts > Sessions > Connected Apps) or the user lost access to Zoho Books. Select Reconnect" },
+  { symptom = "Signing in fails or never returns to Jaah", fix = "The Zoho account lives outside the US data centre. Only accounts that sign in at accounts.zoho.com can connect for now" },
+  { symptom = "Agents get error 44 or 45 from Zoho Books", fix = "The per-minute (44) or daily (45) API limit was reached. Wait for it to reset, or ask the agent to work in smaller batches" },
+]
+faq = [
+  { q = "Why does Zoho ask for consent every time I connect", a = "Jaah asks for offline access so it can renew the token on its own, and Zoho shows the consent screen each time it issues that" },
+  { q = "Does Test change anything", a = "No. It lists your Zoho Books organizations and nothing else" },
+]

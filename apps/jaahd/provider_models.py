@@ -10,7 +10,7 @@ and nowhere here. Each entry is reduced to `{slug, visibility, priority}` — no
 Per-provider sensing is a table keyed by provider value (`_SENSORS`);
 a catalogue provider without a sensor, an account or an answer is OMITTED — absence asserts nothing.
 
-The CLI runs AS THE SESSION USER (`_run_as_account_uid`), never as the daemon: the account home is
+The CLI runs AS THE SESSION USER (`session_user.run_or_refuse`), never as the daemon: the account home is
 runner-writable and the CLI obeys config found there. Its environment is spelled out, never `os.environ`
 (the daemon's carries `NODE_TOKEN`), and its output is never logged.
 """
@@ -22,8 +22,6 @@ import logging
 import os
 import re
 import stat
-import shutil
-import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -61,34 +59,6 @@ def _reduce(models: object) -> Optional[list[dict]]:
     return out or None
 
 
-def _run_as_account_uid(argv: list[str], auth_dir: Path) -> Optional[subprocess.CompletedProcess]:
-    """Run a vendor CLI against an account home AS THE SESSION USER — the uid that owns and writes that
-    home — never as the daemon. None (fail closed, logged) when this node cannot switch.
-
-    The home is runner-writable: a runner can plant config the CLI obeys (a command-backed provider auth,
-    a `.env`), so running it as `jaahd` would hand a runner the daemon uid and `NODE_TOKEN`. Run as the
-    session user, a planted config can only lie about a catalogue — bounded by `_reduce`, and read only
-    for this node's own dispatches. Same uid already (a dev host, an operator shell): run in-process, which
-    grants nothing the runner does not have."""
-    env = {provider_health.CODEX_HOME_ENV: str(auth_dir)}
-    if session_user.is_session_user():
-        binary = shutil.which(argv[0], path=session_user.delegated_path())
-        if not binary:
-            log.warning("model-catalogs: %s is not on the session user's PATH", argv[0])
-            return None
-        return subprocess.run(
-            [binary, *argv[1:]], capture_output=True, text=True,
-            env={**provider_health._probe_env(auth_dir, provider_health.CODEX_HOME_ENV),
-                 "PATH": session_user.delegated_path()},
-            timeout=_SENSE_TIMEOUT_SECONDS, check=False,
-        )
-    if not session_user.can_run_as_session_user():
-        log.warning("model-catalogs: this node cannot run a command as the session user — %s is not "
-                    "sensed (never run as the daemon: the account home is runner-writable)", argv[0])
-        return None
-    return session_user.run_as_session_user(argv, env=env, timeout=_SENSE_TIMEOUT_SECONDS)
-
-
 def _sense_codex(auth_dir: Path) -> Optional[list[dict]]:
     """`codex debug models` under this account's home, reduced; None when it could not be asked or read.
 
@@ -100,7 +70,11 @@ def _sense_codex(auth_dir: Path) -> Optional[list[dict]]:
     except OSError:
         return None
     try:
-        proc = _run_as_account_uid([agent_providers.CODEX.binary, *_CODEX_MODELS_ARGV], auth_dir)
+        # A planted config (a command-backed provider auth, a `.env`) run as the session user can only lie
+        # about a catalogue — bounded by `_reduce`, and read only for this node's own dispatches.
+        proc = session_user.run_or_refuse([agent_providers.CODEX.binary, *_CODEX_MODELS_ARGV],
+                                          env={provider_health.CODEX_HOME_ENV: str(auth_dir)},
+                                          timeout=_SENSE_TIMEOUT_SECONDS)
     except Exception as exc:  # noqa: BLE001 — TimeoutExpired, OSError: an unanswered sense, never a catalogue
         log.warning("model-catalogs: %s models failed for %s (%s)",
                     agent_providers.CODEX.binary, auth_dir, type(exc).__name__)

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from collections.abc import Mapping
 from typing import Any, Optional
 from uuid import UUID
@@ -24,36 +24,54 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator, model_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
 from app import (
+    user_activity,
     account_auth, account_fold, account_transfer, agent_providers, data_access_events, edition, http_bounded,
     ce_caps, provider_auth_policy, tenant_defaults,
 )
+from app.clock import utcnow
 from app.credential_crypto import has_sealed_secret, open_secret
 from app.account_slug import new_account_slug
 # Aliased only because `_account_out` takes the pre-resolved map under the same name.
-from app.actors import actor_names as resolve_actor_names, actor_names_for, stamp_actor
-from app.auth import require_user
+from app.actors import actor_names as resolve_actor_names, stamp_actor
 from app.authz.catalog import permission_key
 from app.authz.declarations import feature
-from app.authz.object_access import OWNERSHIP_PERSONAL, can_access, stamp_owner_on_create, validated_ownership
-from app.authz.principal import org_admin_writer, Principal, creates_org_rows, current_principal
-from app.authz.visibility import ObjectAccess, readable_account_clause, readable_account_select
+from app.authz.object_access import (
+    OWNERSHIP_ORG, OWNERSHIP_PERSONAL, can_access, stamp_owner_on_create, validated_ownership,
+    validated_reassignment,
+)
+from app.authz.principal import (
+    AsyncCaller,
+    Principal,
+    creates_org_rows,
+    current_caller,
+    current_principal_async,
+    org_admin_writer,
+)
+from app.authz.visibility import (
+    ObjectAccess, account_roster_clause, account_roster_select, readable_account_clause, readable_account_select,
+)
 from app.credentials.registry import CREDENTIAL_TYPES
 # The header-safety rule the Credentials testers apply, imported rather than restated.
 from app.credentials.testers import _is_transmittable
-from app.db import get_session
-from app.entity_shape import EntityOut, StrictModel, constraint_name, entity_fields, get_or_404, iso_or_none
+from app import db_async
+from app.db_async import DbDep, on_session
+from app.entity_shape import (
+    EntityOut, StrictModel, commit_row, constraint_name, entity_fields, from_row, get_or_404, iso_or_none,
+)
 from app.events import emit_console_event
 from app.models.credentials import Account, AccountObservation, Credential
 from app.models.identity import AdminUser
 from app.models.nodes import Node
+from app.offload import run_cpu
 from starlette.concurrency import run_in_threadpool
 
 from app.routes.commands import (
-    _SLUG_RE, SLUG_RULE, _credential_safe_args, _credential_safe_result,
-    _record_audit, account_slug_not_available, default_dispatch_node, dispatch_and_audit,
+    _SLUG_RE, SLUG_RULE, _audit_after_dispatch, _credential_safe_args, _credential_safe_result, _dispatch,
+    _record_audit, account_slug_not_available, default_dispatch_node,
 )
 from app.tenancy.copy import node_home_unrecorded
 from app.tenancy.ids import is_tenant_org
@@ -67,7 +85,7 @@ from app.node_clone import resolve_auth_dir
 from app.org_gate import require_org_active
 # `current_scope()` only: the bound org, read on the create door where no row exists yet.
 from app.tenancy import seam
-from app.node_identity import names_by_id, node_id_or_404, node_matches
+from app.node_identity import bus_key, names_by_id, node_id_or_404, node_matches
 
 log = logging.getLogger("app.routes.accounts")
 
@@ -120,11 +138,14 @@ class AccountOut(EntityOut):
     # Derived from the pointer, not the config, so the roster never loads the key.
     # `ck_accounts_api_key_has_credential` and `create_account`'s blank-key refusal make it faithful.
     api_key_set: bool = False
+    # The Anthropic workspace an unscoped key names on every request (`account_auth.WORKSPACE_ID_CONFIG_KEY`, a
+    # non-secret field of the key's credential row), so the edit form can show it. `""` when none is set.
+    workspace_id: str = ""
     # Whether the scheduler may pick this account for a task that did not ask for it. Existing rows answer
     # true (the column's server default).
     auto_assign: bool = True
-    # This account's own concurrent-runner cap; `None` = no per-account cap. Only a provider declaring
-    # `per_account_runner_cap` carries one.
+    # This account's own concurrent-runner cap; `None` = none of its own (`takes_runner_cap` says who may
+    # carry one).
     max_runners: Optional[int] = None
     # The pinned node's uuid (the identifier) and its name (display only); both `None` when unpinned.
     node_id: Optional[str] = None
@@ -138,6 +159,14 @@ class AccountOut(EntityOut):
     quota_updated_at: Optional[str] = None
     # When a node that held its session was deleted (`Account.node_removed_at`); `None` for none.
     node_removed_at: Optional[str] = None
+    # When its first sign-in completed (`Account.signed_in_at`); `None` while a sign-in is unfinished. A record-only
+    # create or an operator's enable stamps it too. The Accounts page reads a recent one as "initializing" until a
+    # node reports the login.
+    signed_in_at: Optional[str] = None
+    # `personal` (one member's: `owner_id`, `owner` their name) or `org` (shared through the Access list).
+    ownership: str = OWNERSHIP_ORG
+    owner_id: Optional[str] = None
+    owner: Optional[str] = None
     # Whose account this is, as a label (`app/tenancy/labels.py::OrgRef`): the operator's org chip and the
     # Change-org picker's "current org". `None` only for an id naming no `orgs` row.
     org: Optional[OrgRef] = None
@@ -191,6 +220,41 @@ def _validated_api_key(value: Any, credential_type: str) -> str:
     return _validated_value(spec, field, value).strip()
 
 
+def _validated_workspace_id(
+    value: Any, provider: Optional[agent_providers.AgentProvider], auth_kind: str,
+) -> Optional[str]:
+    """The submitted Anthropic workspace ID, trimmed: `None` for "not supplied" (PUT: unchanged), `""` for
+    "none" (PUT: clear), else a value `account_auth.is_valid_workspace_id` accepts.
+
+    422 for a malformed value (it rides a request header) and for a non-blank value on any account but an
+    API-key one whose credential type declares the field (`account_auth.WORKSPACE_ID_CONFIG_KEY` on the
+    provider's `api_key_credential_type`): stored on a row whose key has no workspace, it would be believed
+    applied and never be. Never echoes the value."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HTTPException(status_code=422, detail="workspace_id must be a string")
+    value = value.strip()
+    if not value:
+        return ""
+    spec = CREDENTIAL_TYPES.get(provider.api_key_credential_type or "") if provider is not None else None
+    declared = spec is not None and any(f.key == account_auth.WORKSPACE_ID_CONFIG_KEY for f in spec.fields)
+    if not declared or not account_auth.is_api_key(auth_kind):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "workspace_id is only accepted for an Anthropic API-key account (auth_kind "
+                f"'{account_auth.AUTH_KIND_API_KEY}'); nothing was stored"
+            ),
+        )
+    if not account_auth.is_valid_workspace_id(value):
+        raise HTTPException(
+            status_code=422,
+            detail="workspace_id must be an Anthropic workspace ID: wrkspc_ followed by letters and digits",
+        )
+    return value
+
+
 def _allowed_auth_kinds(
     session: Session, org_id, provider: Optional[agent_providers.AgentProvider], *, memo: Optional[dict] = None
 ) -> tuple[str, ...]:
@@ -225,23 +289,33 @@ def _validated_auth_kind_for(provider: Optional[agent_providers.AgentProvider], 
 _MAX_RUNNERS_CEILING = 2**31 - 1
 
 
+def takes_runner_cap(provider: Optional[agent_providers.AgentProvider], auth_kind: str) -> bool:
+    """Whether an account of this provider and auth kind may carry its own runner cap: any subscription
+    account (it overrides its org's default), and an API-key account only of a provider declaring
+    `per_account_runner_cap` (API-key accounts otherwise run uncapped, `jaah_scheduler.runner_cap`)."""
+    if not account_auth.is_api_key(auth_kind):
+        return True
+    return provider is not None and provider.per_account_runner_cap
+
+
 def _validated_max_runners(
     provider: Optional[agent_providers.AgentProvider], value: Optional[int], *, provider_value: str,
+    auth_kind: str,
 ) -> Optional[int]:
-    """The per-account runner cap, or `None` for "no cap". 422 when set on a provider that does not declare
-    `per_account_runner_cap` (its spend is gated by quota instead), or when not a positive whole number.
+    """The per-account runner cap, or `None` for "no cap of its own". 422 when the account may not carry one
+    (`takes_runner_cap`), or when not a positive whole number.
 
     Checked here, not left to `ck_accounts_max_runners_positive`: the IntegrityError would be misread as a slug
     collision."""
     if value is None:
         return None
-    if provider is None or not provider.per_account_runner_cap:
+    if not takes_runner_cap(provider, auth_kind):
         who = provider.label if provider is not None else f"provider '{provider_value}'"
         raise HTTPException(
             status_code=422,
             detail=(
-                f"max_runners is not accepted for {who} accounts: only a provider with no quota to gate "
-                "on takes a per-account runner cap"
+                f"max_runners is not accepted for {who} API-key accounts: they run without a runner "
+                "limit, and only a provider with no quota to gate on takes one"
             ),
         )
     # The upper bound is the column's INTEGER range: past it the flush raises a DataError, a bare 500.
@@ -263,15 +337,33 @@ def _probe_client() -> httpx.Client:
     return http_bounded.client(_PROBE_TIMEOUT_SECONDS)
 
 
-def _probe_api_key(provider: Optional[agent_providers.AgentProvider], api_key: str, *, outcome: str) -> None:
-    """Check `api_key` against its vendor BEFORE anything is written, when the provider declares a probe
-    (`agent_providers.api_key_probe`); a no-op otherwise (Anthropic's create path is unchanged).
+# Anthropic's sentences for a key the workspace header does not fit, matched in a capped read of a 400/404
+# body: an unscoped key sent without the header, and a header naming no workspace the key reaches (a malformed
+# ID is a 400, an unknown one a 404 "Workspace `<id>` not found").
+_PROBE_BODY_CAP = 4096
+_WORKSPACE_REQUIRED = "not scoped to a workspace"
+_WORKSPACE_INVALID = "must be a valid workspace id"
+# 4xx answers that say "not now", not "not this key": still "could not verify" (503).
+_PROBE_TRANSIENT = frozenset({408, 429})
 
-    401/403 -> 422 (the vendor rejected the key: never a silently enabled dead account). Anything else that
-    is not a 2xx, or no answer at all -> 503 (could not verify; nothing written). The key travels only in the
-    provider's own header (`Authorization` or Google's `x-goog-api-key`) and is never logged or echoed; the
-    httpx exception, which carries the request and so the header, is dropped (`from None`), never chained or
-    formatted. `outcome` names what the refusal left alone ("nothing was created" / "nothing was changed")."""
+
+def _probe_api_key(
+    provider: Optional[agent_providers.AgentProvider], api_key: str, *, outcome: str, workspace_id: str = "",
+) -> None:
+    """Check `api_key` against its vendor BEFORE anything is written, when the provider declares a probe
+    (`agent_providers.api_key_probe`); a no-op otherwise.
+
+    The non-credential headers come from the key's own registry `KeyTestSpec` (the Credentials page's
+    tester), so the two checks cannot disagree: its `extra_headers` (Anthropic's `anthropic-version`) and its
+    `field_headers` filled from `workspace_id` (Anthropic's `anthropic-workspace-id`, sent only when set).
+
+    401/403 -> 422 (the vendor rejected the key: never a silently enabled dead account). A 400/404 whose
+    capped body carries one of Anthropic's workspace sentences -> 422 naming the Workspace ID fix. Any other
+    4xx -> 422 naming the status (the vendor answered and refused). No answer, a 5xx, a 408/429 or any other
+    non-2xx -> 503 (could not verify; nothing written). The key travels
+    only in the provider's own header and is never logged or echoed; the httpx exception, which carries the
+    request and so the header, is dropped (`from None`), never chained or formatted. The body is matched,
+    never echoed. `outcome` names what the refusal left alone ("nothing was created" / "nothing was changed")."""
     probe = agent_providers.api_key_probe(provider.value) if provider is not None else None
     if provider is None or probe is None:
         return
@@ -283,26 +375,49 @@ def _probe_api_key(provider: Optional[agent_providers.AgentProvider], api_key: s
             status_code=422,
             detail=f"api_key contains characters an HTTP header cannot carry; {outcome}",
         )
+    spec = CREDENTIAL_TYPES.get(provider.api_key_credential_type or "")
+    key_test = spec.key_test if spec is not None else None
+    fields = {account_auth.WORKSPACE_ID_CONFIG_KEY: workspace_id}
+    headers = {
+        **(dict(key_test.extra_headers) if key_test is not None else {}),
+        **({name: fields[key] for name, key in key_test.field_headers if fields.get(key)}
+           if key_test is not None else {}),
+        header: f"{scheme} {api_key}" if scheme else api_key,
+    }
     unreachable = HTTPException(
         status_code=503,
         detail=f"could not reach {provider.label} to verify the key; {outcome}",
     )
+    body = b""
     try:
         with _probe_client() as client:
-            # Streamed and never read: the status is the whole answer, so no body is buffered.
-            value = f"{scheme} {api_key}" if scheme else api_key
-            with client.stream("GET", url, headers={header: value}) as response:
+            # Streamed: the status is the answer, so only a 400/404 has a capped prefix of its body read.
+            with client.stream("GET", url, headers=headers) as response:
                 status = response.status_code
+                if status in (400, 404):
+                    body, _ = http_bounded.read_capped(response, _PROBE_BODY_CAP)
     except (httpx.HTTPError, ValueError):
         # `ValueError` covers an encoding failure the check above did not foresee; dropped, never chained.
         raise unreachable from None
     if status in (401, 403):
+        raise HTTPException(status_code=422, detail=f"{provider.label} rejected this API key; {outcome}")
+    text = body[:_PROBE_BODY_CAP].decode("utf-8", "replace").lower()
+    if _WORKSPACE_REQUIRED in text:
         raise HTTPException(
             status_code=422,
-            detail=f"{provider.label} rejected this API key; {outcome}",
+            detail="Anthropic: API key is not scoped to a workspace: set Workspace ID, or use a "
+                   f"workspace-scoped key; {outcome}",
         )
-    if not 200 <= status < 300:
-        raise unreachable
+    if _WORKSPACE_INVALID in text or (status == 404 and "workspace" in text and "not found" in text):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Anthropic: workspace not found for this key: check Workspace ID; {outcome}",
+        )
+    if 200 <= status < 300:
+        return
+    if 400 <= status < 500 and status not in _PROBE_TRANSIENT:
+        raise HTTPException(status_code=422, detail=f"{provider.label} refused the check (HTTP {status}); {outcome}")
+    raise unreachable
 
 
 # Neither body takes `config_dir` (derived per node); `extra='forbid'` 422s a client still sending one,
@@ -334,9 +449,12 @@ class AccountCreateIn(StrictModel):
     # On the create form rather than a separate credential step, so no live key sits in the broker attached
     # to nothing: one transaction, both halves roll back together.
     api_key: Any = None
+    # The Anthropic workspace an unscoped key must name (`_validated_workspace_id`): Claude API-key accounts
+    # only, stored beside the key. `Any` for `api_key`'s reason (one rule for the body).
+    workspace_id: Any = None
     # Absent -> the provider's `auto_assign_default` (DeepSeek: off).
     auto_assign: Optional[bool] = None
-    # The per-account runner cap; only for a provider declaring `per_account_runner_cap`.
+    # The per-account runner cap; only where `takes_runner_cap` allows one.
     max_runners: Optional[int] = None
     # `personal` or `org` (`authz.validated_ownership`); absent is the caller's default — an administrator's
     # is `org`, and anyone else's account is always personal (G2).
@@ -380,9 +498,15 @@ class AccountUpdateIn(BaseModel):
     # Credentials page's rule for secret fields). The key cannot be read back or cleared: a keyless API-key
     # account is what the CHECK forbids.
     api_key: Any = None
+    # Absent or null means unchanged, `""` clears it, a value replaces it (`_validated_workspace_id`).
+    workspace_id: Any = None
     # As `enabled`: omitted means unchanged, an explicit null is refused.
     auto_assign: Optional[bool] = None
-    # Null clears the cap; a number sets it (only for a provider declaring `per_account_runner_cap`).
+    # The account's type (`personal` / `org`) and a personal one's owner (`authz.validated_reassignment`):
+    # omitted means unchanged. An API-key account's key row follows.
+    ownership: Optional[str] = None
+    owner_user_id: Optional[UUID] = None
+    # Null clears the cap; a number sets it (only where `takes_runner_cap` allows one).
     max_runners: Optional[int] = None
     # Two immutable-but-echoable fields, two mechanisms: `auth_kind` is declared (reachable from the setattr
     # loop; immutability rests on the handler check), `provider` is not a field at all (the loop cannot
@@ -417,9 +541,40 @@ class AccountUpdateIn(BaseModel):
 
 
 
+def _workspace_ids(session: Session, rows: list[Account]) -> dict[UUID, str]:
+    """Each API-key account's stored workspace ID by `credential_id`, for `_account_out`; none is `""`/absent.
+
+    One query for the page. Reads the non-secret tier only: the key stays a sealed envelope, never opened. A
+    config that will not open reads as no workspace rather than failing the roster."""
+    ids = [row.credential_id for row in rows if row.credential_id is not None and account_auth.is_api_key(row.auth_kind)]
+    if not ids:
+        return {}
+    out: dict[UUID, str] = {}
+    for credential in session.scalars(select(Credential).where(Credential.id.in_(ids))):
+        try:
+            value = (credential.config or {}).get(account_auth.WORKSPACE_ID_CONFIG_KEY)
+        except ValueError:
+            continue
+        if isinstance(value, str) and value:
+            out[credential.id] = value
+    return out
+
+
+def _one_account_out(session: Session, row: Account) -> AccountOut:
+    """`_account_out` for ONE row read or written by id: its quota reading, node name, actors, org label and
+    workspace resolved for it alone (the roster resolves them for the page at once)."""
+    return _account_out(row, account_fold.quota_reading_for(session, row.slug),
+                        db_now=account_fold.db_clock(session),
+                        node_name=names_by_id(session, [row.node_id]).get(row.node_id),
+                        actor_names=resolve_actor_names(session, (row.created_by_id, row.updated_by_id, row.owner_id)),
+                        org_labels=org_refs(session, [row.org_id]),
+                        workspace_ids=_workspace_ids(session, [row]))
+
+
 def _account_out(
     row: Account, reading: Optional[dict] = None, *, db_now: Optional[datetime] = None,
     node_name: Optional[str], actor_names: dict[UUID, str], org_labels: Mapping[UUID, OrgRef],
+    workspace_ids: Mapping[UUID, str],
 ) -> AccountOut:
     """One roster row as the API returns it, with the quota read through the observation fold.
 
@@ -431,8 +586,9 @@ def _account_out(
     including that an expired verdict is no verdict. `db_now` is the DB clock (`None` leaves a verdict
     standing, the safe direction).
 
-    `node_name`, `actor_names` and `org_labels` are pre-resolved by the caller and have no defaults, so a
-    caller cannot silently serve every row as unpinned, unattributed or orgless. No `config_dir` is served (per node)."""
+    `node_name`, `actor_names`, `org_labels` and `workspace_ids` (`_workspace_ids`) are pre-resolved by the
+    caller and have no defaults, so a caller cannot silently serve every row as unpinned, unattributed,
+    orgless or workspaceless. No `config_dir` is served (per node)."""
     observed = reading or {}
     quota_status = account_fold.resolved_quota_status(
         observed.get("quota_status"),
@@ -441,19 +597,14 @@ def _account_out(
         db_now=db_now,
     )
     standing = account_fold.standing_verdict(row.quota_status, row.quota_status_until, db_now=db_now)
-    return AccountOut(
+    return from_row(
+        AccountOut, row,
         **entity_fields(row, actor_names),
-        slug=row.slug,
-        # Straight off the row: a stored fact owned at creation.
-        provider=row.provider,
-        enabled=row.enabled,
         # The kind and the pointer, nothing behind it. As the one serializer for this table, this never loads
         # a key: `credential_id` is a uuid and the `Credential` relationship is not walked.
-        auth_kind=row.auth_kind,
         credential_id=str(row.credential_id) if row.credential_id is not None else None,
         api_key_set=account_auth.is_api_key(row.auth_kind) and row.credential_id is not None,
-        auto_assign=row.auto_assign,
-        max_runners=row.max_runners,
+        workspace_id=workspace_ids.get(row.credential_id, "") if row.credential_id is not None else "",
         node_id=str(row.node_id) if row.node_id is not None else None,
         node_name=node_name,
         five_hour_percent=observed.get("five_hour_percent"),
@@ -462,8 +613,9 @@ def _account_out(
         quota_status=quota_status,
         quota_status_detail=row.quota_status_detail if standing and standing == quota_status else None,
         quota_updated_at=iso_or_none(observed.get("quota_updated_at")),
-        node_removed_at=iso_or_none(row.node_removed_at),
         org=org_ref_of(org_labels, row.org_id),
+        ownership=OWNERSHIP_PERSONAL if row.owner_id is not None else OWNERSHIP_ORG,
+        owner=actor_names.get(row.owner_id) if row.owner_id is not None else None,
     )
 
 
@@ -525,7 +677,7 @@ class AgentProviderOut(BaseModel):
     # The subset of `auth_kinds` on the caller's org's provider grid (`app/provider_auth_policy.py`);
     # empty = this provider is not allowed at all.
     allowed_auth_kinds: list[str]
-    # True => the dialog offers a per-account runner cap (`accounts.max_runners`).
+    # True => an API-key account of this provider may carry its own runner cap (`takes_runner_cap`).
     per_account_runner_cap: bool
     # What a new account's Auto-assign box starts at.
     auto_assign_default: bool
@@ -549,10 +701,10 @@ def _capabilities_out(provider: agent_providers.AgentProvider, *, itemized: bool
 # path would parse as an account id and 422.
 @router.get("/api/accounts/providers", response_model=list[AgentProviderOut])
 @feature("accounts", "view")
+@on_session
 def list_agent_providers(
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    session: Session,
+    caller: AsyncCaller = Depends(current_caller),
 ) -> list[AgentProviderOut]:
     """The closed set of agent CLIs an account may be registered against, in catalogue order. The response
     changes when `app/agent_providers.py`'s `PROVIDERS` does, and `default_auth_kind`/`allowed_auth_kinds`
@@ -567,21 +719,15 @@ def list_agent_providers(
     seat, not a tenant org: a tenant's own superadmin holds that key by construction. Empty is already
     "nothing to render" (Claude Code's list is legitimately empty)."""
     # Org-wide (`has_org`): the deployment's harness notes are not a fact about any one project.
-    itemized = principal is None or principal.has_org(permission_key("system", "create"))
-    caller_org = seam.bound_org() or _user.org_id
+    itemized = caller.principal is None or caller.principal.has_org(permission_key("system", "create"))
+    caller_org = seam.bound_org() or caller.actor.org_id
     allowed_memo: dict = {}
     return [
-        AgentProviderOut(
-            value=p.value,
-            label=p.label,
-            binary=p.binary,
+        from_row(
+            AgentProviderOut, p,
             companions=list(p.companions),
-            node_pinned=p.node_pinned,
-            needs_attested_binary=p.needs_attested_binary,
-            login_completion=p.login_completion,
             authorize_url_prefix=agent_providers.authorize_url_prefix(p.value) or None,
             authorize_url_exact=agent_providers.authorize_url_exact(p.value),
-            has_quota_model=p.has_quota_model,
             quota_windows=list(p.quota_windows),
             auth_kinds=list(p.auth_kinds),
             default_auth_kind=tenant_defaults.default_auth_kind(
@@ -591,11 +737,8 @@ def list_agent_providers(
                 k for k in p.auth_kinds
                 if provider_auth_policy.is_allowed(session, caller_org, p.value, k, memo=allowed_memo)
             ],
-            per_account_runner_cap=p.per_account_runner_cap,
-            auto_assign_default=p.auto_assign_default,
             degradations=[
-                ProviderDegradationOut(key=d.key, capability=d.capability, consequence=d.consequence, harness=d.harness)
-                for d in p.degradations
+                from_row(ProviderDegradationOut, d) for d in p.degradations
             ] if itemized else [],
             capabilities=_capabilities_out(p, itemized=itemized),
         )
@@ -605,47 +748,45 @@ def list_agent_providers(
 
 @router.get("/api/accounts", response_model=list[AccountOut])
 @feature("accounts", "view")
+@on_session
 def list_accounts(
-    _user: AdminUser = Depends(require_user),
+    session: Session,
     # Gated by the `accounts:view` key plus the scoped select; scoping reads this frozen
     # principal, not the ORM user row.
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> list[AccountOut]:
-    rows = session.scalars(readable_account_select(principal).order_by(Account.slug)).all()
+    rows = session.scalars(account_roster_select(caller.principal).order_by(Account.slug)).all()
     readings = account_fold.quota_readings(session)
     db_now = account_fold.db_clock(session)
     names = names_by_id(session, [row.node_id for row in rows])
     # Every actor id on the page resolved in one query.
-    actors = actor_names_for(session, rows)
+    actors = resolve_actor_names(
+        session, [i for row in rows for i in (row.created_by_id, row.updated_by_id, row.owner_id)]
+    )
     orgs = org_refs(session, [row.org_id for row in rows])
+    workspaces = _workspace_ids(session, list(rows))
     return [
         _account_out(row, readings.get(row.slug), db_now=db_now, node_name=names.get(row.node_id),
-                     actor_names=actors, org_labels=orgs)
+                     actor_names=actors, org_labels=orgs, workspace_ids=workspaces)
         for row in rows
     ]
 
 
 @router.get("/api/accounts/{account_id}", response_model=AccountOut)
 @feature("accounts", "view")
+@on_session
 def get_account(
+    session: Session,
     account_id: UUID,
-    _user: AdminUser = Depends(require_user),
     # Same gate and scoping as `list_accounts`.
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> AccountOut:
-    # `readable_account_clause`, not a bare read: a row filtered out of the roster must not be readable
+    # `account_roster_clause`, not a bare read: a row filtered out of the roster must not be readable
     # by id, and a 404 (not 403) does not confirm it exists.
     row = get_or_404(
-        session, Account, account_id, detail=f"unknown account {account_id}", where=(readable_account_clause(principal),)
+        session, Account, account_id, detail=f"unknown account {account_id}", where=(account_roster_clause(caller.principal),)
     )
-    return _account_out(row, account_fold.quota_reading_for(session, row.slug),
-                        db_now=account_fold.db_clock(session),
-                        node_name=names_by_id(session, [row.node_id]).get(row.node_id),
-                        actor_names=resolve_actor_names(
-                            session, (row.created_by_id, row.updated_by_id)),
-                        org_labels=org_refs(session, [row.org_id]))
+    return _one_account_out(session, row)
 
 
 def _account_ownership(
@@ -680,16 +821,15 @@ def _account_ownership(
 
 @router.post("/api/accounts", response_model=AccountOut, status_code=201)
 @feature("accounts", "create")
-def create_account(
+async def create_account(
     body: AccountCreateIn,
+    db: DbDep,
     # Not `require_account_writer`: anyone holding `accounts:create` (a Developer or Maintainer anywhere,
     # G2) brings their OWN account here. The administrator bar decides only whether it may be the org's
     # (`_account_ownership`).
-    user: AdminUser = Depends(require_user),
     # For the owner stamp below, not scoping: a caller with no org role owns the account (and its API-key
     # credential), else neither is reachable by their author. As `credentials.py::create_credential`.
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> AccountOut:
     """Provision an account record and, for an API-key account, the `credentials` row holding its key.
 
@@ -697,6 +837,17 @@ def create_account(
     `ck_accounts_api_key_has_credential` requires it), nothing commits until both flush, and any failure
     rolls back both, so no orphan credential holds a live key. An OAuth create writes no credential and
     refuses an `api_key`."""
+    if body.api_key is not None:
+        # A key is probed at its vendor (`_probe_api_key`) and sealed under KMS at the flush, both inside the
+        # transaction that holds the community edition's org lock (`ce_caps`) to its commit: the whole create
+        # runs on a worker thread, never on the loop.
+        return await db_async.run_blocking_in_session(_create_account, body, caller.actor, caller.principal, actor=caller.actor)
+    return await db.run_sync(_create_account, body, caller.actor, caller.principal)
+
+
+def _create_account(
+    session: Session, body: AccountCreateIn, user: AdminUser, principal: Principal | None
+) -> AccountOut:
     # A pending org adds no AI account (`app/org_gate.py`): the org the row will be stamped into, which is
     # the bound scope, else the caller's own (the operator plane binds none).
     account_org = seam.bound_org() or user.org_id
@@ -715,7 +866,9 @@ def create_account(
     provider_auth_policy.require_allowed(session, account_org, provider_value, auth_kind)
     credential_type = provider.api_key_credential_type if provider is not None else ""
     api_key = _validated_api_key(body.api_key, credential_type)
-    max_runners = _validated_max_runners(provider, body.max_runners, provider_value=provider_value)
+    workspace_id = _validated_workspace_id(body.workspace_id, provider, auth_kind) or ""
+    max_runners = _validated_max_runners(provider, body.max_runners, provider_value=provider_value,
+                                         auth_kind=auth_kind)
     if account_auth.is_api_key(auth_kind) and not api_key:
         # Required: a keyless API-key account is undispatchable; caught here for a sentence, not an
         # IntegrityError.
@@ -745,7 +898,7 @@ def create_account(
         ce_caps.require_account_headroom(session, account_org)
     # The vendor's own verdict on the key, before any row is built: a refusal writes nothing.
     if api_key:
-        _probe_api_key(provider, api_key, outcome="nothing was created")
+        _probe_api_key(provider, api_key, outcome="nothing was created", workspace_id=workspace_id)
     row = Account(
         slug=body.slug,
         # The slug is the default label; blank counts as absent (NOT NULL, no server default).
@@ -787,7 +940,9 @@ def create_account(
                 "Rotate the key from the account's edit dialog, not here."
             ),
             # The only place the key is written: into a `credentials` config, never onto `accounts`.
-            config={account_auth.API_KEY_CONFIG_KEY: api_key},
+            # The workspace ID beside it, non-secret, only when set (absent reads as none).
+            config={account_auth.API_KEY_CONFIG_KEY: api_key}
+            | ({account_auth.WORKSPACE_ID_CONFIG_KEY: workspace_id} if workspace_id else {}),
         )
         stamp_actor(credential, user, created=True)
         # The same owner as its account, before the INSERT.
@@ -807,16 +962,10 @@ def create_account(
         session.rollback()
         if constraint_name(exc) == ce_caps.TRIGGER_CONSTRAINT:
             raise ce_caps.refusal("accounts") from exc
-        raise _slug_collision(session, exc, body.slug, principal, user.org_id)
+        raise _slug_collision(session, exc, body.slug, principal, user.org_id) from exc
     emit_console_event(session, entity="account", id=row.id, action="upserted")
-    session.commit()
-    session.refresh(row)
-    return _account_out(row, account_fold.quota_reading_for(session, row.slug),
-                        db_now=account_fold.db_clock(session),
-                        node_name=names_by_id(session, [row.node_id]).get(row.node_id),
-                        actor_names=resolve_actor_names(
-                            session, (row.created_by_id, row.updated_by_id)),
-                        org_labels=org_refs(session, [row.org_id]))
+    commit_row(session, row)
+    return _one_account_out(session, row)
 
 
 # ── Export / import between control planes (`app/account_transfer.py`) ───────────────────────────────
@@ -843,16 +992,26 @@ class AccountImportOut(BaseModel):
 
 @router.post("/api/accounts/{account_id}/export")
 @feature("accounts", "edit")
-def export_account(
+async def export_account(
     account_id: UUID,
     body: AccountExportIn,
+    db: DbDep,
     # The administrator bar, as every roster write: the bundle carries a live key.
     user: AdminUser = Depends(require_account_writer),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    principal: Principal | None = Depends(current_principal_async),
 ) -> dict[str, Any]:
     """The account as an export bundle: an API-key account's key opened and sealed again under `passphrase`,
     recorded as a `credential_read`; an OAuth account as its record alone."""
+    # Opening the key unwraps its data key at KMS inside the transaction that commits its `credential_read`
+    # before the key leaves: a worker thread. The scrypt seal (`account_transfer.build`) is CPU, off the loop.
+    fields = await db_async.run_blocking_in_session(_export_account, account_id, body, user, principal, actor=user)
+    return await run_cpu(account_transfer.build, **fields)
+
+
+def _export_account(
+    session: Session, account_id: UUID, body: AccountExportIn, user: AdminUser, principal: Principal | None
+) -> dict[str, Any]:
+    """`account_transfer.build`'s arguments for the account, the key opened and its read committed."""
     row = get_or_404(
         session, Account, account_id, detail=f"unknown account {account_id}", where=(readable_account_clause(principal),)
     )
@@ -886,20 +1045,20 @@ def export_account(
                   "credential_type": credential.type, "consumer": "account_export", "task_id": None},
             org_id=credential.org_id, user=user,
         )
-    return account_transfer.build(
+    return dict(
         provider=row.provider, auth_kind=row.auth_kind, name=row.name, description=row.description,
         max_runners=row.max_runners, api_key=api_key, passphrase=passphrase,
+        workspace_id=_workspace_ids(session, [row]).get(row.credential_id, "") if row.credential_id else "",
     )
 
 
 @router.post("/api/accounts/import", response_model=AccountImportOut, status_code=201)
 @feature("accounts", "create")
-def import_account(
+async def import_account(
     body: AccountImportIn,
+    db: DbDep,
     # As `create_account`, which this is: ownership and the OAuth administrator bar are decided there.
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> AccountImportOut:
     """Create an account from an export bundle through `create_account`, which seals the key under this
     control plane's own keys and probes it. A fresh slug, no node, Auto-assign off: an account arriving
@@ -909,7 +1068,8 @@ def import_account(
     try:
         head = account_transfer.header(body.bundle)
         api_key = (
-            account_transfer.opened_key(body.bundle, body.passphrase)
+            # scrypt: CPU, off the loop.
+            await run_cpu(account_transfer.opened_key, body.bundle, body.passphrase)
             if account_auth.is_api_key(head["auth_kind"]) else None
         )
     except account_transfer.BundleError as exc:
@@ -920,26 +1080,39 @@ def import_account(
             detail=f"this export is '{head['auth_kind']}' yet carries a key; nothing was imported",
         )
     needs_login = api_key is None
-    account = create_account(
+    account = await create_account(
         AccountCreateIn(
             name=head["name"], description=head["description"],
             provider=head["provider"], auth_kind=head["auth_kind"], api_key=api_key,
             max_runners=head["max_runners"], auto_assign=False,
+            # Absent in an older bundle: no workspace. Validated by `create_account` as any posted value.
+            workspace_id=head.get("workspace_id"),
         ),
-        user=user, principal=principal, session=session,
+        db=db, caller=caller,
     )
     return AccountImportOut(account=account, needs_login=needs_login)
 
 
 @router.put("/api/accounts/{account_id}", response_model=AccountOut)
 @feature("accounts", "edit")
-def update_account(
+async def update_account(
     account_id: UUID,
     body: AccountUpdateIn,
+    db: DbDep,
     user: AdminUser = Depends(require_account_writer),
     # For `_slug_collision`'s roster probe only.
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    principal: Principal | None = Depends(current_principal_async),
+) -> AccountOut:
+    if body.api_key is not None or body.workspace_id is not None:
+        # A rotation or workspace change probes the key at its vendor (`_probe_api_key`, a stored key opened at
+        # KMS first) and seals the new one at the flush, inside the one transaction nothing half-rotates in: the
+        # whole update runs on a worker thread, never on the loop.
+        return await db_async.run_blocking_in_session(_update_account, account_id, body, user, principal, actor=user)
+    return await db.run_sync(_update_account, account_id, body, user, principal)
+
+
+def _update_account(
+    session: Session, account_id: UUID, body: AccountUpdateIn, user: AdminUser, principal: Principal | None
 ) -> AccountOut:
     row = get_or_404(session, Account, account_id, detail=f"unknown account {account_id}")
     updates = body.model_dump(exclude_unset=True)
@@ -947,6 +1120,17 @@ def update_account(
     # would hang a live secret on the ORM instance), and `auth_kind` must never be written.
     posted_auth_kind = updates.pop("auth_kind", None)
     posted_api_key = updates.pop("api_key", None)
+    # Not a column either: it lives in the key's credential config, beside the key.
+    posted_workspace_id = updates.pop("workspace_id", None)
+    # The type and owner: decided here, assigned with the rest below.
+    posted_ownership = updates.pop("ownership", None)
+    posted_owner = updates.pop("owner_user_id", None)
+    if posted_ownership is not None or posted_owner is not None:
+        # Locked: two moves at once cannot record a stale "from".
+        session.refresh(row, with_for_update=True)
+    owner_id, _system = validated_reassignment(
+        session, principal, row, ownership=posted_ownership, owner_user_id=posted_owner,
+    )
     # The kind is immutable: the two kinds leave different artifacts (a node dir vs a broker row), and
     # flipping would strand one and lack the other, so the account stops authenticating. Delete and
     # recreate instead. An equal value passes; an explicit `null` is dropped.
@@ -983,7 +1167,7 @@ def update_account(
     # An operator enabling an account vouches for its credential, so it is no longer an unfinished sign-in's
     # row that a failed later login may drop (`durable/accounts.py::drop_abandoned_row`).
     if updates.get("enabled") is True and row.signed_in_at is None:
-        updates["signed_in_at"] = datetime.now(timezone.utc)
+        updates["signed_in_at"] = utcnow()
     # A blank `name` renders unidentifiable while passing NOT NULL. Refused (an update cannot borrow
     # create's slug fallback); `description` may be blank.
     if "name" in updates:
@@ -1029,26 +1213,34 @@ def update_account(
     provider = agent_providers.by_value(row.provider)
     if "max_runners" in updates:
         updates["max_runners"] = _validated_max_runners(
-            provider, updates["max_runners"], provider_value=row.provider,
+            provider, updates["max_runners"], provider_value=row.provider, auth_kind=row.auth_kind,
         )
     rotated_key = _validated_api_key(
         posted_api_key, provider.api_key_credential_type if provider is not None else "",
     )
-    if rotated_key:
-        if not account_auth.is_api_key(row.auth_kind):
-            # OAuth has no credential row to rotate; refused, not ignored, as on create.
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"this account is '{row.auth_kind}' and authenticates with a per-node credential "
-                    "directory, so there is no stored API key to rotate. The key was NOT stored and "
-                    "nothing was changed."
-                ),
-            )
-        credential = session.get(Credential, row.credential_id) if row.credential_id else None
+    workspace_id = _validated_workspace_id(posted_workspace_id, provider, row.auth_kind)
+    if rotated_key and not account_auth.is_api_key(row.auth_kind):
+        # OAuth has no credential row to rotate; refused, not ignored, as on create.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"this account is '{row.auth_kind}' and authenticates with a per-node credential "
+                "directory, so there is no stored API key to rotate. The key was NOT stored and "
+                "nothing was changed."
+            ),
+        )
+    credential = (
+        session.get(Credential, row.credential_id)
+        if row.credential_id is not None and account_auth.is_api_key(row.auth_kind) else None
+    )
+    stored = (credential.config or {}) if credential is not None else {}
+    stored_workspace = stored.get(account_auth.WORKSPACE_ID_CONFIG_KEY) or ""
+    # `""` on a row that never had one changes nothing, so it neither probes nor writes.
+    workspace_changed = workspace_id is not None and workspace_id != stored_workspace
+    if rotated_key or workspace_changed:
         if credential is None:
             # Unreachable through the schema (CHECK + RESTRICT) but possible from old or manual edits. 409: the
-            # operator can fix it by recreating the account.
+            # operator can fix it by recreating the account. (A blank workspace on OAuth never gets here.)
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -1056,19 +1248,55 @@ def update_account(
                     "there is nothing to rotate — recreate the account"
                 ),
             )
-        # The vendor's verdict on the NEW key before it replaces the old one: a rejected rotation changes nothing.
-        _probe_api_key(provider, rotated_key, outcome="nothing was changed")
+        effective_workspace = stored_workspace if workspace_id is None else workspace_id
+        # The vendor's verdict on the EFFECTIVE pair (new or stored key, new or stored workspace) before it
+        # replaces the old one: a rejected rotation changes nothing. A workspace-only change probes the stored
+        # key, opened here for that one request; a key this control plane cannot open (NodeVault-sealed) is
+        # not probed rather than refusing an edit no check could pass.
+        probe_key = rotated_key
+        if not probe_key and has_sealed_secret(stored, account_auth.API_KEY_CONFIG_KEY):
+            try:
+                probe_key = open_secret(credential, account_auth.API_KEY_CONFIG_KEY)
+            except ValueError:
+                probe_key = ""
+        if probe_key:
+            _probe_api_key(provider, probe_key, outcome="nothing was changed", workspace_id=effective_workspace)
         # Reassigned, never mutated in place (SQLAlchemy does not track plain JSONB mutation), and merged onto
-        # the stored config per `_merged_config`'s per-key contract.
-        credential.config = {**(credential.config or {}), account_auth.API_KEY_CONFIG_KEY: rotated_key}
+        # the stored config per `_merged_config`'s per-key contract. A cleared workspace is dropped, not blanked.
+        merged = {**stored}
+        if rotated_key:
+            merged[account_auth.API_KEY_CONFIG_KEY] = rotated_key
+        if workspace_changed:
+            merged.pop(account_auth.WORKSPACE_ID_CONFIG_KEY, None)
+            if workspace_id:
+                merged[account_auth.WORKSPACE_ID_CONFIG_KEY] = workspace_id
+        credential.config = merged
         # Authorship survives; only `updated_by_id` moves.
         stamp_actor(credential, user)
         # Flushed inside the scrub guard: the config-bearing UPDATE. The account's own flush stays outside for
         # the 409. One transaction, so nothing half-rotates.
         with _scrubbed_write(session, "rotate the API key for"):
             session.flush()
+        # The vendor accepted the new pair (the probe above), so a refusal of the old one no longer stands: lift the
+        # standing `auth_rejected` verdict now rather than leave the account out of dispatch for the rest of
+        # its TTL (`account_fold.verdict_ttl_seconds`). An unprobed change (a sealed key) proves nothing and
+        # lifts nothing. Same transaction as the rotation.
+        if probe_key:
+            account_fold.clear_auth_rejection(session, slug=row.slug, org_id=row.org_id)
     for field_name, value in updates.items():
         setattr(row, field_name, value)
+    if owner_id != row.owner_id:
+        was_owner = row.owner_id
+        row.owner_id = owner_id
+        _follow_account_owner(session, row, user)
+        user_activity.record_write(
+            session, user, "account_owner_changed", f"Changed the owner of account {row.name}",
+            data={
+                "account_id": str(row.id), "credential_id": str(row.credential_id) if row.credential_id else None,
+                "from": {"owner_user_id": str(was_owner) if was_owner else None},
+                "to": {"owner_user_id": str(owner_id) if owner_id else None},
+            },
+        )
     # After the field updates, without `created=True`, so authorship survives.
     stamp_actor(row, user)
     try:
@@ -1076,16 +1304,25 @@ def update_account(
     except IntegrityError as exc:
         session.rollback()
         # `updates`, not `row.slug` (expired by the rollback); no slug in the request is not a slug collision.
-        raise _slug_collision(session, exc, updates.get("slug"), principal, user.org_id)
+        raise _slug_collision(session, exc, updates.get("slug"), principal, user.org_id) from exc
     emit_console_event(session, entity="account", id=row.id, action="upserted")
-    session.commit()
-    session.refresh(row)
-    return _account_out(row, account_fold.quota_reading_for(session, row.slug),
-                        db_now=account_fold.db_clock(session),
-                        node_name=names_by_id(session, [row.node_id]).get(row.node_id),
-                        actor_names=resolve_actor_names(
-                            session, (row.created_by_id, row.updated_by_id)),
-                        org_labels=org_refs(session, [row.org_id]))
+    commit_row(session, row)
+    return _one_account_out(session, row)
+
+
+def _follow_account_owner(session: Session, row: Account, user: AdminUser) -> None:
+    """An API-key account's key row takes the account's new owner (created with it, `stamp_owner_on_create`), so
+    a personal account's key is its owner's and an org account's the org's. Only an org row has a project home."""
+    if row.credential_id is None:
+        return
+    credential = session.scalar(select(Credential).where(Credential.id == row.credential_id))
+    if credential is None:
+        return
+    credential.owner_id = row.owner_id
+    credential.system = False
+    if row.owner_id is not None:
+        credential.home_project_id = None
+    stamp_actor(credential, user)
 
 
 def _drop_owned_api_key_credential(
@@ -1122,11 +1359,8 @@ def _drop_owned_api_key_credential(
 
 @router.delete("/api/accounts/{account_id}", status_code=204)
 @feature("accounts", "delete")
-def delete_account(
-    account_id: UUID,
-    _user: AdminUser = Depends(require_account_writer),
-    session: Session = Depends(get_session),
-) -> Response:
+@on_session
+def delete_account(session: Session, account_id: UUID, _user: AdminUser = Depends(require_account_writer)) -> Response:
     """Delete the roster row only; the on-disk credential dir is left untouched, on every node.
 
     The account becomes undispatchable while its login stays on the host. The console uses deprovision
@@ -1140,8 +1374,7 @@ def delete_account(
     auth_kind, credential_id = row.auth_kind, row.credential_id
     session.delete(row)
     _drop_owned_api_key_credential(session, auth_kind=auth_kind, credential_id=credential_id)
-    emit_console_event(session, entity="account", id=account_id, action="deleted")
-    session.commit()
+    emit_console_event(session, entity="account", id=account_id, action="deleted", commit=True)
     return Response(status_code=204)
 
 
@@ -1149,22 +1382,38 @@ def delete_account(
 @feature("accounts", "delete")
 async def remove_account(
     account_id: UUID,
+    db: DbDep,
     user: AdminUser = Depends(require_account_writer),
-    session: Session = Depends(get_session),
 ) -> Response:
-    """The console's account Delete: stop the tasks running on the account, remove its token from its shared
-    folder and its credential dir from every node that holds it, then delete the roster row.
+    """The console's account Delete: stop the tasks running on the account, delete the roster row, and have its
+    token leave its shared folder and its credential dir leave every node that holds it — asynchronously.
 
-    The CP decides; the nodes carry it out. Each node kills every session using the account and force-removes its
-    files (`apps/jaahd/accounts.py`). A node that is offline or fails owes the removal (`app/account_removal.py`)
-    and gets it again on its next connect, so the answer names nothing left behind. A stopped task keeps its slot
-    and relaunches on another account (the row's delete clears its pins). The node-side steps are the
-    offboarding's own (`app/tenancy/offboard.py`). An API-key account has nothing on a node and takes
-    `delete_account`'s branch."""
+    The CP decides; the nodes carry it out. The route waits on no node: in the commit that deletes the row it
+    records every removal each node owes (`app/account_removal.py`), then a durable workflow delivers them
+    (`app/durable/account_remove.py`); a node offline or failing then gets it again on its next connect, so the
+    answer names nothing left behind. Each node kills every session using the account and force-removes its files
+    (`apps/jaahd/accounts.py`). A stopped task keeps its slot and relaunches on another account (the row's delete
+    clears its pins). An API-key account has nothing on a node and takes `delete_account`'s branch."""
+    removals = await db.run_sync(_remove_account, account_id, user)
+    if removals is not None:
+        from app.durable import account_remove
+
+        # The share nodes' leaves go first (`deliver_removals`), then every node's removals, each in node order.
+        # Off the loop: the enqueue writes the durable engine's own database, synchronously.
+        await run_in_threadpool(account_remove.enqueue_removal, str(account_id), *removals)
+    return Response(status_code=204)
+
+
+def _remove_account(
+    session: Session, account_id: UUID, user: AdminUser
+) -> Optional[tuple[list[str], list[str]]]:
+    """The Delete's database half, committed: `(share node ids, node ids)` for the removal enqueue when any
+    node owes one, else None."""
     row = get_or_404(session, Account, account_id, detail=f"unknown account {account_id}")
     auth_kind, credential_id = row.auth_kind, row.credential_id
+    owed: list[tuple[UUID, str, dict[str, str]]] = []
     if not account_auth.is_api_key(auth_kind):
-        from app import account_removal, node_bus
+        from app import account_removal
         from app.routes.tasks.slots import kill_runner_keeping_hold, send_minted_intents
         from app.tenancy import offboard
 
@@ -1179,17 +1428,12 @@ async def remove_account(
         session.commit()
         send_minted_intents(issued)
         ref = offboard.account_ref(session, row.org_id, slug, row.node_id, bool(row.shared))
-        connected = set(await node_bus.registry.connected_nodes_async())
-        owed: list[tuple[UUID, str, dict[str, str]]] = []
-        # The share first: a leaf there is every attached node's way back to this login. An account no node
-        # holds and no login recorded on a share never minted a token there.
+        # An account no node holds and no login recorded on a share never minted a token there.
         if ref.dirs or row.shared:
-            await offboard.delete_shared_leaves(session, [ref], connected, user.email, owed)
-        # An offline node is owed the removal, not dispatched to: the bus would only refuse it.
-        online = [d for d in ref.dirs if str(d[0]) in connected]
+            owed += [(node_id, offboard.SHARED_DELETE_VERB, {"slug": slug}) for node_id in ref.store_nodes]
+        # An empty path (a node with no Jaah home) must never reach a host.
         owed += [(node_id, "account_delete", {"config_dir": config_dir})
-                 for node_id, _name, config_dir in ref.dirs if str(node_id) not in connected and config_dir]
-        await offboard.delete_account_dirs(session, [dataclasses.replace(ref, dirs=tuple(online))], user.email, owed)
+                 for node_id, _name, config_dir in ref.dirs if config_dir]
         # In node order: `owe` locks each node row, and two Deletes must not take them in opposite orders.
         for node_id, verb, args in sorted(owed, key=lambda o: str(o[0])):
             account_removal.owe(session, node_id, verb, args, user.email)
@@ -1201,9 +1445,13 @@ async def remove_account(
         session.execute(delete(AccountObservation).where(AccountObservation.slug == row.slug))
     session.delete(row)
     _drop_owned_api_key_credential(session, auth_kind=auth_kind, credential_id=credential_id)
-    emit_console_event(session, entity="account", id=account_id, action="deleted")
-    session.commit()
-    return Response(status_code=204)
+    emit_console_event(session, entity="account", id=account_id, action="deleted", commit=True)
+    if not owed:
+        return None
+    return (
+        sorted({str(n) for n, verb, _a in owed if verb == offboard.SHARED_DELETE_VERB}),
+        sorted({str(n) for n, _v, _a in owed}),
+    )
 
 
 def _tasks_running_on(session: Session, account_id: UUID) -> list[int]:
@@ -1230,10 +1478,10 @@ def deprovision_consequence(slug: str) -> str:
 @feature("accounts", "delete")
 async def deprovision_account(
     account_id: UUID,
+    db: DbDep,
     user: AdminUser = Depends(require_account_writer),
     # For the unpinned fallback only: `default_dispatch_node` probes `can_access` with a `Principal`.
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    principal: Principal | None = Depends(current_principal_async),
 ) -> Response:
     """Fully deprovision an account: delete its on-disk credential dir on the node the row names, then, only
     if that host confirms, delete the roster row. 204 on success. An API-key account takes its own branch
@@ -1251,46 +1499,28 @@ async def deprovision_account(
     Dispatch runs through `app/durable/accounts.py::retire` synchronously; this route writes the
     `command_audit_log` row itself. A new route, not a flag on DELETE: under deploy skew an old API would
     404 (fail closed) rather than silently drop the flag."""
-    row = get_or_404(session, Account, account_id, detail=f"unknown account {account_id}")
-    if account_auth.is_api_key(row.auth_kind):
-        # No host leg for an API-key account: it holds no credential on any host, and the 409 below would
-        # give advice that could never work. The row and its `credentials` row go, under `delete_account`'s
-        # rule; the token-less home a node derived for it (plugins, transcripts) is NOT removed here.
-        auth_kind, credential_id = row.auth_kind, row.credential_id
-        session.delete(row)
-        _drop_owned_api_key_credential(session, auth_kind=auth_kind, credential_id=credential_id)
-        emit_console_event(session, entity="account", id=account_id, action="deleted")
-        session.commit()
+    target = await db.run_sync(_deprovision_account, account_id)
+    if target is None:
         return Response(status_code=204)
+    row, node_id, node_label, jaah_home = target
     slug = row.slug
-    # One read of the pin yields both the dispatch target (its uuid — bus routing and the audit row key on
-    # it) and the home (path source), so they cannot be about different nodes.
-    pinned = session.get(Node, row.node_id) if row.node_id is not None else None
-    if pinned is not None:
-        node_id = str(pinned.id)
-        node_label = pinned.name
-        jaah_home = pinned.jaah_home
-    else:
+    if node_id is None:
         # Per plane: for a tenant, `default_dispatch_node` answers a node of the caller's own org (or a 409);
         # otherwise the CP's own node would receive a tenant's delete with a path from the operator's home.
-        # Off the loop: `default_dispatch_node` reads the DB (`node_bus.registry.is_connected`), never
-        # on the event loop.
-        node_id = await run_in_threadpool(default_dispatch_node, session, principal)
+        # Off the loop: `default_dispatch_node` reads the DB on a session of its own (`node_bus.registry.
+        # is_connected`), so it runs on a worker thread, after the route's read transaction is handed back.
+        await db_async.release(db)
+        node_id = await db_async.run_blocking_in_session(default_dispatch_node, principal, actor=user)
         # Matched through `node_matches`: the node uuid (`app/node_identity.py`). The name only labels the
         # refusals below.
-        home_row = session.execute(select(Node.jaah_home, Node.name).where(node_matches(node_id))).first()
-        jaah_home = home_row.jaah_home if home_row else None
-        node_label = home_row.name if home_row else node_id
+        jaah_home, node_label = await db.run_sync(_dispatch_node_home, node_id)
     config_dir = resolve_auth_dir(jaah_home, slug)
     if not config_dir:
         # The highest-consequence line here: `resolve_auth_dir` fails closed to `""`, which is not a path.
         # Refused before dispatch, naming the undeclared node; guessing a default would delete the wrong
         # directory silently. Tenants read it via `tenancy/copy.py::node_home_unrecorded`.
         if is_tenant_org(user.org_id):
-            raise HTTPException(
-                status_code=409,
-                detail=node_home_unrecorded(node_label, deprovision_consequence(slug)),
-            )
+            raise HTTPException(status_code=409, detail=node_home_unrecorded(node_label, deprovision_consequence(slug)))
         raise HTTPException(
             status_code=409,
             detail=(
@@ -1309,17 +1539,19 @@ async def deprovision_account(
     # repeat per replay). Every outcome is recorded, as `dispatch_and_audit` does: a reply as itself, a
     # raised dispatch as `"dispatched"` with the reason, then re-raised. Through the usual scrubbers.
     audit_args = _credential_safe_args("account_delete", {"config_dir": config_dir})
+    # No read transaction idles through the node round trip.
+    await db_async.release(db)
     try:
         reply = await run_in_threadpool(durable_accounts.retire, slug, config_dir, [node_id])
     except HTTPException as exc:
-        _record_audit(
-            session, node_id, "account_delete", audit_args, "dispatched", {"reason": exc.detail}, user.email,
+        await db.run_sync(
+            _record_audit, node_id, "account_delete", audit_args, "dispatched", {"reason": exc.detail}, user.email,
         )
         raise
     status = str(reply.get("status") or "failed")
     result = reply.get("result") if isinstance(reply.get("result"), dict) else {}
-    _record_audit(
-        session, node_id, "account_delete", audit_args, status,
+    await db.run_sync(
+        _record_audit, node_id, "account_delete", audit_args, status,
         _credential_safe_result("account_delete", result), user.email,
     )
     if status != "done":
@@ -1334,9 +1566,51 @@ async def deprovision_account(
         )
 
     # Credentials are gone; drop the row. The observe pass builds from the DB roster, so nothing re-inserts it.
+    return await db.run_sync(_drop_deprovisioned, row, account_id)
+
+
+def _drop_api_key_account(session: Session, row: Account, account_id: UUID) -> bool:
+    """A deprovision's API-key branch, shared by the account-level and the per-node read: True once an API-key
+    account's rows are deleted (committed), False for an OAuth account, which has a host leg.
+
+    No host leg for an API-key account: it holds no credential on any host, so a per-node deprovision is its last
+    (an empty `remaining` would decide the same) and the host-side 409s would give advice that could never work.
+    The row and its `credentials` row go, under `delete_account`'s rule; the observation delete is skipped, and
+    the token-less home a node derived for it (plugins, transcripts) is NOT removed here."""
+    if not account_auth.is_api_key(row.auth_kind):
+        return False
+    auth_kind, credential_id = row.auth_kind, row.credential_id
     session.delete(row)
-    emit_console_event(session, entity="account", id=account_id, action="deleted")
-    session.commit()
+    _drop_owned_api_key_credential(session, auth_kind=auth_kind, credential_id=credential_id)
+    emit_console_event(session, entity="account", id=account_id, action="deleted", commit=True)
+    return True
+
+
+def _deprovision_account(
+    session: Session, account_id: UUID
+) -> Optional[tuple[Account, Optional[str], Optional[str], Optional[str]]]:
+    """`deprovision_account`'s first read: None once an API-key account's rows are deleted (committed), else
+    `(row, node uuid, node label, Jaah home)` of its pin — node uuid None for an unpinned account."""
+    row = get_or_404(session, Account, account_id, detail=f"unknown account {account_id}")
+    if _drop_api_key_account(session, row, account_id):
+        return None
+    # One read of the pin yields both the dispatch target (its uuid — bus routing and the audit row key on
+    # it) and the home (path source), so they cannot be about different nodes.
+    pinned = session.get(Node, row.node_id) if row.node_id is not None else None
+    if pinned is not None:
+        return row, str(pinned.id), pinned.name, pinned.jaah_home
+    return row, None, None, None
+
+
+def _dispatch_node_home(session: Session, node_id: str) -> tuple[Optional[str], str]:
+    """`(Jaah home, label)` of the unpinned fallback node; the label is the id itself for a node with no row."""
+    home_row = session.execute(select(Node.jaah_home, Node.name).where(node_matches(node_id))).first()
+    return (home_row.jaah_home if home_row else None), (home_row.name if home_row else node_id)
+
+
+def _drop_deprovisioned(session: Session, row: Account, account_id: UUID) -> Response:
+    session.delete(row)
+    emit_console_event(session, entity="account", id=account_id, action="deleted", commit=True)
     return Response(status_code=204)
 
 
@@ -1345,8 +1619,8 @@ async def deprovision_account(
 async def deprovision_account_on_node(
     account_id: UUID,
     node_id: str,
+    db: DbDep,
     user: AdminUser = Depends(require_account_writer),
-    session: Session = Depends(get_session),
 ) -> Response:
     """Deprovision one account on one named node: delete its credential dir there, then drop the roster row
     only if no other node still holds the account. 204 on success.
@@ -1358,20 +1632,40 @@ async def deprovision_account_on_node(
     Same ordering: credentials first, roster second. The row survives while another node holds the
     account, and a pin naming the cleared node is repointed at one that still holds it. An API-key account
     is held by no node and takes its own branch after the node 404."""
+    target = await db.run_sync(_deprovision_account_on_node, account_id, node_id, user)
+    if target is None:
+        return Response(status_code=204)
+    row, node_uuid, node_label, config_dir = target
+
+    # Dispatch failures propagate untouched: nothing may be deleted, and the caller needs the real reason.
+    reply = await _dispatch_and_audit(db, node_id, "account_delete", {"config_dir": config_dir}, user.email)
+    if str(reply.get("status") or "failed") != "done":
+        result = reply.get("result") if isinstance(reply.get("result"), dict) else {}
+        reason = str(result.get("stderr") or result.get("reason") or "").strip()
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"host {node_label} failed to remove credentials at {config_dir}"
+                + (f": {reason}" if reason else "")
+                + " — nothing deleted"
+            ),
+        )
+    return await db.run_sync(_drop_node_copy, row, node_uuid, account_id, user)
+
+
+def _deprovision_account_on_node(
+    session: Session, account_id: UUID, node_id: str, user: AdminUser
+) -> Optional[tuple[Account, UUID, str, str]]:
+    """`deprovision_account_on_node`'s first read: None once an API-key account's rows are deleted (committed),
+    else `(row, node uuid, node label, credential dir)`, refused (409) before any dispatch when the dir
+    cannot be resolved."""
     row = get_or_404(session, Account, account_id, detail=f"unknown account {account_id}")
     # `node_id` is the path's uuid (bus key, 502 text); resolved once, fail-closed: an unresolvable node
     # would make `remaining` empty and delete the row on an unregistered node.
     node_uuid = node_id_or_404(session, node_id)
-    if account_auth.is_api_key(row.auth_kind):
-        # No node holds an API-key account (see the account-level branch), so this is the last deprovision and
-        # the row goes, as an empty `remaining` would decide. The observation delete is skipped too. The node 404
-        # still runs: naming an unregistered node is a caller bug.
-        auth_kind, credential_id = row.auth_kind, row.credential_id
-        session.delete(row)
-        _drop_owned_api_key_credential(session, auth_kind=auth_kind, credential_id=credential_id)
-        emit_console_event(session, entity="account", id=account_id, action="deleted")
-        session.commit()
-        return Response(status_code=204)
+    # The node 404 still runs first: naming an unregistered node is a caller bug.
+    if _drop_api_key_account(session, row, account_id):
+        return None
 
     # Derived for this node, read off the uuid just resolved, so path and 404 are about the same row. The name
     # only labels the refusals below.
@@ -1396,23 +1690,36 @@ async def deprovision_account_on_node(
                 "home and retry"
             ),
         )
+    return row, node_uuid, node_label, config_dir
 
-    # Dispatch failures propagate untouched: nothing may be deleted, and the caller needs the real reason.
-    reply, _audit_id = await dispatch_and_audit(
-        session, node_id, "account_delete", {"config_dir": config_dir}, user.email,
-    )
-    if str(reply.get("status") or "failed") != "done":
-        result = reply.get("result") if isinstance(reply.get("result"), dict) else {}
-        reason = str(result.get("stderr") or result.get("reason") or "").strip()
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"host {node_label} failed to remove credentials at {config_dir}"
-                + (f": {reason}" if reason else "")
-                + " — nothing deleted"
-            ),
+
+async def _dispatch_and_audit(
+    db: AsyncSession, node_id: str, command_type: str, args: dict[str, Any], actor: str,
+) -> dict[str, Any]:
+    """`routes/commands.py::dispatch_and_audit` over the route's `AsyncSession`: the bus key read, the read
+    transaction handed back for the node round trip, then the audit row — `"dispatched"` with the reason
+    before a refusal is re-raised."""
+    audit_args = _credential_safe_args(command_type, args)
+    bus_target = await db.run_sync(bus_key, node_id)
+    await db_async.release(db)
+    try:
+        reply = await _dispatch(node_id, command_type, args, bus_target=bus_target)
+    except HTTPException as exc:
+        await db.run_sync(
+            _audit_after_dispatch, node_id, command_type, audit_args, "dispatched", {"reason": exc.detail}, actor,
         )
+        raise
+    status = str(reply.get("status") or "failed")
+    result = reply.get("result") if isinstance(reply.get("result"), dict) else None
+    await db.run_sync(
+        _audit_after_dispatch, node_id, command_type, audit_args, status,
+        _credential_safe_result(command_type, result), actor,
+    )
+    return reply
 
+
+def _drop_node_copy(session: Session, row: Account, node_uuid: UUID, account_id: UUID, user: AdminUser) -> Response:
+    """After the node confirmed: its observation goes, and the roster row with it unless another node holds it."""
     # Drop this node's observation now so it stops listing an account it just deleted.
     session.execute(
         AccountObservation.__table__.delete().where(
@@ -1431,9 +1738,8 @@ async def deprovision_account_on_node(
             row.node_id = remaining[0]
             # Stamped: re-pinning is an operator mutation, and the trigger moves `updated_at` regardless.
             stamp_actor(row, user)
-        emit_console_event(session, entity="account", id=account_id, action="upserted")
+        emit_console_event(session, entity="account", id=account_id, action="upserted", commit=True)
     else:
         session.delete(row)
-        emit_console_event(session, entity="account", id=account_id, action="deleted")
-    session.commit()
+        emit_console_event(session, entity="account", id=account_id, action="deleted", commit=True)
     return Response(status_code=204)

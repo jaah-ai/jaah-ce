@@ -27,7 +27,7 @@ import posixpath
 import re
 import tarfile
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional
 from uuid import UUID
 
@@ -37,6 +37,8 @@ from sqlalchemy.orm import Session
 
 from app import acp_registry, agents, attachment_storage, forges, git_access, github_api
 from app.agents import MANIFEST_FILENAME, STATUS_ACTIVE, Manifest, short_sha, validate_manifest
+from app.clock import utcnow
+from app.entity_shape import slug_taken
 from app.models.agent_sessions import Agent
 from app.models.identity import AdminUser
 
@@ -127,7 +129,7 @@ def resolve_commit(repo: forges.RepoRef, ref: str, *, token: str) -> str:
     """The 40-hex commit `ref` (a branch, tag or sha) names in `repo`."""
     owner, name = repo.path.split("/", 1)
     try:
-        with github_api._client(token) as client:
+        with github_api.client(token) as client:
             resp = client.get(
                 f"/repos/{owner}/{name}/commits/{ref}", headers={"Accept": "application/vnd.github.sha"}
             )
@@ -155,7 +157,7 @@ def fetch_archive(forge: str, repo: forges.RepoRef, sha: str, *, token: str) -> 
     total = 0
     try:
         # The tarball endpoint redirects to codeload; httpx drops the Authorization header cross-origin.
-        with github_api._client(token, timeout=_ARCHIVE_TIMEOUT) as client:
+        with github_api.client(token, timeout=_ARCHIVE_TIMEOUT) as client:
             with client.stream("GET", f"/repos/{owner}/{name}/tarball/{sha}", follow_redirects=True) as resp:
                 if resp.status_code != 200:
                     raise _unreachable(repo, f"archive download answered HTTP {resp.status_code}")
@@ -317,14 +319,6 @@ def store_bundle(agent_id: UUID, snapshot: Snapshot) -> str:
     return key
 
 
-def slug_taken(session: Session, org_id: UUID, slug: str, *, other_than: Optional[UUID] = None) -> bool:
-    """Whether `org_id` already has an agent named `slug` (`uq_agents_org_slug`), besides `other_than`."""
-    query = select(Agent.id).where(Agent.org_id == org_id, Agent.slug == slug)
-    if other_than is not None:
-        query = query.where(Agent.id != other_than)
-    return session.scalars(query.limit(1)).first() is not None
-
-
 def slug_taken_sentence(slug: str) -> str:
     return f"An agent named {slug} is already registered in this organization; rename `name` in {MANIFEST_FILENAME}"
 
@@ -389,7 +383,7 @@ def refresh(session: Session, agent: Agent, *, now: datetime) -> Optional[Snapsh
                          retry=REFRESH_RETRY)
         if source.commit != agent.resolved_commit or not agent.bundle_key:
             snapshot = _snapshot_of(source)
-            if slug_taken(session, agent.org_id, snapshot.manifest.name, other_than=agent.id):
+            if slug_taken(session, Agent, snapshot.manifest.name, where=(Agent.org_id == agent.org_id,), exclude=agent.id):
                 raise SnapshotRefused([slug_taken_sentence(snapshot.manifest.name)])
             refuse_secret_env(snapshot.manifest.to_json(), agent.env)
             key = store_bundle(agent.id, snapshot)
@@ -428,11 +422,11 @@ def sweep_refresh(*, now: Optional[datetime] = None) -> int:
     Catalog connectors are pinned to an exact commit (`routes/agents.py::publish_catalog_agent`), so they
     never move and are skipped by construction as well as by the `is_catalog` filter. ACP registry installs
     (`manifest.kind = acp_registry`) have no repo to re-read and are skipped too."""
-    from app.db import SessionLocal
+    from app.db import BridgedSession
 
-    now = now or datetime.now(timezone.utc)
+    now = now or utcnow()
     due_before = now - REFRESH_INTERVAL
-    with SessionLocal() as session:
+    with BridgedSession() as session:
         ids = session.scalars(
             select(Agent.id).where(
                 Agent.status == STATUS_ACTIVE,
@@ -446,7 +440,7 @@ def sweep_refresh(*, now: Optional[datetime] = None) -> int:
     done = 0
     for agent_id in ids:
         try:
-            with SessionLocal() as session:
+            with BridgedSession() as session:
                 agent = session.scalars(select(Agent).where(Agent.id == agent_id)).one_or_none()
                 if agent is None:
                     continue

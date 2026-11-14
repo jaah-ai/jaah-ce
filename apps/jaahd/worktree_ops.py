@@ -15,32 +15,31 @@ auto-starts. Asserted by the tests.
 """
 from __future__ import annotations
 
-import errno
 import json
 import logging
 import os
 import re
+import stat
 import shlex
 import subprocess
 import sys
-import threading
 import time
+import uuid
 from pathlib import Path
+from typing import Iterator
 
 import clone_identity  # which project a network git op belongs to, for the node's credential helper
-import fleet_launch   # slot_window_name(): the ONE composer of a slot's tmux window name
-import git_env
-import git_mirror   # the project's daemon-owned mirror: the one place a network git op holds a credential
 import host_platform
-import node_settings   # node_clone_timeout_secs: a mirror bootstrap's budget
 from jaah_env import env_get  # renamed env vars
 import runner_env   # docker_env(): the node-managed engine's endpoint
 import session_user   # which tmux server a client call must name (`-S`)
 import slot_repos     # a multi-repo slot's other trees: the clone that owns a slot tree, removed with it on erase
+import slot_clone     # a standalone forge clone: the preflight's throwaway checkout
 import slot_residue   # what a slot leaves outside its tree: its scratch dirs
 
 from commands import EXECUTE_TIMEOUT_SECONDS, native_command
 import env_helpers
+import environment
 from env_helpers import _tmux_safe_env, jaah_home
 
 log = logging.getLogger("jaahd.worktree_ops")
@@ -50,25 +49,18 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 # The NON-agent windows a slot can also have (`console.py`'s plain-shell and web-console tabs). Both are
-# resolved BY NAME, so renaming one orphans the live window and duplicates it on the next attach.
-# `_tmux_window_id_for` returns the FIRST pane at the worktree path, so the skip must be explicit.
+# resolved BY NAME, so a teardown must skip them explicitly.
 _NON_AGENT_WINDOW_SUFFIXES = ("|term", "|web")
 #: A docker compose project name (`docker compose -p`): lowercase alphanumerics, `-` and `_`, as the CP mints them
 #: (`p<project>-<number>`, `app/slot_allocation.py::_mint_destroy`).
 _COMPOSE_PROJECT = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 
 
-def _tmux_window_id_for(path: str, run, *, skip_name_suffixes: tuple[str, ...] = ()) -> tuple[str, str]:
-    """`(socket, window_id)` of the live tmux window whose pane cwd is `path` (exact match wins, else the
-    first match UNDER it), skipping any window whose name ends in one of `skip_name_suffixes`. `("", "")`
-    when nothing matches, and then the rename is skipped.
-
-    Uses `#{window_id}`, not `session:index`, because an index is unstable under `renumber-windows on`.
-    THE SOCKET TRAVELS WITH THE ID: window ids are per-SERVER and both servers are live during an
-    in-place-upgrade drain, so renaming on the wrong socket relabels a stranger's window. An absent socket
-    path is skipped rather than probed: a tmux client with no server starts one AS ITSELF."""
-    if not path:
-        return "", ""
+def _panes_per_socket(run) -> Iterator[tuple[str, list[tuple[str, str, str]]]]:
+    """Every live tmux server's panes, `(socket, [(pane cwd, window_id, window_name), …])` per socket — the one
+    `list-panes` read behind `_agent_windows_under`. An absent socket path is skipped
+    rather than probed: a tmux client with no server starts one AS ITSELF; a server that does not answer is
+    skipped too."""
     for socket in session_user.manage_sockets():
         if socket and not os.path.exists(socket):
             continue
@@ -77,47 +69,27 @@ def _tmux_window_id_for(path: str, run, *, skip_name_suffixes: tuple[str, ...] =
             env=_tmux_safe_env())
         if reply.get("exit_code") != 0:
             continue
-        prefix = ""
+        panes = []
         for line in (reply.get("stdout") or "").splitlines():
             pane_path, _, rest = line.partition("\t")
             target, _, name = rest.partition("\t")
-            if not pane_path or not target:
-                continue
-            if any(name.endswith(suffix) for suffix in skip_name_suffixes):
-                continue
-            if host_platform.path_key(pane_path) == host_platform.path_key(path):
-                return socket, target
-            if not prefix and host_platform.is_under(pane_path, path):
-                prefix = target
-        if prefix:
-            return socket, prefix
-    return "", ""
+            if pane_path and target:
+                panes.append((pane_path, target, name))
+        yield socket, panes
 
 
 def _agent_windows_under(path: str, run) -> list[tuple[str, str]]:
     """EVERY distinct `(socket, window_id)` with a pane at — or under — `path`, minus the non-agent tabs.
 
-    Unlike `_tmux_window_id_for`, which arbitrates ONE window (right for a rename), a teardown needs them
-    all: `kill_gates`' `expect_cwd` fence cannot tell sibling windows in one tree apart. The same set as
+    A teardown needs them all: `kill_gates`' `expect_cwd` fence cannot tell sibling windows in one tree apart. The same set as
     `reconcile/context.py::wt_tmux_targets` (which needs a pass snapshot this sync command lacks). Scans BOTH
     sockets: during an in-place-upgrade drain a tree's windows can be split across servers."""
     if not path:
         return []
     found: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for socket in session_user.manage_sockets():
-        if socket and not os.path.exists(socket):
-            continue
-        reply = run(*session_user.tmux_cmd(
-            socket, "list-panes", "-a", "-F", "#{pane_current_path}\t#{window_id}\t#{window_name}"),
-            env=_tmux_safe_env())
-        if reply.get("exit_code") != 0:
-            continue
-        for line in (reply.get("stdout") or "").splitlines():
-            pane_path, _, rest = line.partition("\t")
-            target, _, name = rest.partition("\t")
-            if not pane_path or not target:
-                continue
+    for socket, panes in _panes_per_socket(run):
+        for pane_path, target, name in panes:
             if not host_platform.is_under(pane_path, path):
                 continue
             if any(name.endswith(suffix) for suffix in _NON_AGENT_WINDOW_SUFFIXES):
@@ -186,55 +158,22 @@ def _install_access_guard() -> str:
 
 # `run` ops whose script AUTHENTICATES TO THE CP, so they inherit the daemon's real env (see `run_op`),
 # never the strict tmux-safe allowlist, which strips the credential. Governs the SAME-UID branch only;
-# under the uid switch the two ports ops are delegated with `_PORT_GRID_ENV_KEYS` (`_PORT_GRID_OPS`).
-_CTL_BUS_OPS = frozenset({"ports_audit", "ports_reband", "doctor"})
+# under the uid switch the ports op is delegated with `_PORT_GRID_ENV_KEYS` (`_PORT_GRID_OPS`).
+_CTL_BUS_OPS = frozenset({"ports_audit", "doctor"})
 
-# The two ops that shell the pool port audit, which reads (audit) and writes (`--fix`) every
-# pool slot's `.env` — `0600 jaah:jaah`, holding real secrets — so both are EACCES for uid `jaahd`
-# and are delegated to the session user. That also gives `--restart`'s `./dc up -d` the only docker
-# engine a fleet uid may reach (`jaah`'s rootless one).
-_PORT_GRID_OPS = frozenset({"ports_audit", "ports_reband"})
+# The op that shells the pool port audit, which reads every pool slot's `.env` — `0600 jaah:jaah`,
+# holding real secrets — so it is EACCES for uid `jaahd` and is delegated to the session user.
+_PORT_GRID_OPS = frozenset({"ports_audit"})
 
 # What a DELEGATED port-grid run may carry — an allowlist, since tmux `run-shell` otherwise hands over
 # its own frozen env. `HOME`/`PATH` absent: the seam fills the session user's. JAAH_HOME is required
 # (resolve_clone_root has no default); the socket overrides only if non-default; locale/TZ because the
 # script prints non-ASCII. NODE_TOKEN and the CP base are WITHHELD: every read it makes is a socket verb
 # on the `0660` group-`jaah` credential socket, and the token is the one secret
-# `jaah-runner@.service` refuses to list (see `check`).
+# `jaah-runner@.service` refuses to list.
 _PORT_GRID_ENV_KEYS: tuple[str, ...] = (
     "JAAH_HOME", "JAAH_CRED_SOCKET", "JAAHD_CTL", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
 )
-
-
-@native_command("rename_tmux")
-def rename_tmux(command_type: str, args: dict, run) -> dict:
-    """Relabel a slot's LIVE tmux window to the recomposed `{Project}-{N}|{Title}`.
-
-    Args `{project, number, path, title}`; the name comes from `fleet_launch.slot_window_name` and `path`
-    finds the window. The CP-owned Title travels one way — never forwarded back. `|term`/`|web` windows
-    are skipped (`_NON_AGENT_WINDOW_SUFFIXES`)."""
-    project = args.get("project")
-    number = args.get("number")
-    title = (args.get("title") or "").strip()
-    path = str(args.get("path") or "").strip()
-    if project is None or number is None:
-        return {"exit_code": 1, "stdout": "", "stderr": "rename_tmux needs project + number"}
-    if not title:
-        return {"exit_code": 1, "stdout": "", "stderr": "title is required"}
-    if not path:
-        # Loud: success here would report a rename that never happened.
-        return {"exit_code": 1, "stdout": "", "stderr": "path is required to find the live window"}
-    if any(c in title for c in ("\n", "\r", "\0")):
-        return {"exit_code": 1, "stdout": "", "stderr": "title contains invalid characters"}
-
-    name = fleet_launch.slot_window_name(project, number, title)
-    socket, window = _tmux_window_id_for(path, run, skip_name_suffixes=_NON_AGENT_WINDOW_SUFFIXES)
-    if not window:
-        # No live window is not an error: the next window this slot opens is named from the stored Title.
-        return {"exit_code": 0, "stdout": f"no live window at {path} — nothing to rename", "stderr": ""}
-    # A tmux client call on the SAME socket the id came from (ids are per-server).
-    return run(*session_user.tmux_cmd(socket, "rename-window", "-t", window, "--", name),
-               env=_tmux_safe_env())
 
 
 @native_command("logs")
@@ -248,118 +187,6 @@ def logs(command_type: str, args: dict, run) -> dict:
              f"{shlex.quote(path)} {shlex.quote('./dc logs -f --tail=200')}")
     # `_tmux_safe_env()`: a long-lived desktop terminal; `./dc` reads the worktree's own .env.
     return run("bash", "-lc", inner, env=_tmux_safe_env())
-
-
-@native_command("sync_develop")
-def sync_develop(command_type: str, args: dict, run) -> dict:
-    # Clean-rebase-ONLY sync of the integration base. The executor holds the whole safety decision:
-    # decline as a quiet no-op (exit 0, tree untouched, never a reset) when it would need to stash or
-    # merge. Never `--autostash` — it stashes a live session's work out from under it.
-    path = args.get("path", "")
-    if not path:
-        return {"exit_code": -1, "stdout": "", "stderr": "sync_develop needs a worktree path"}
-    # The base comes from the CP (`projects.integration_branch`); a node may not author it. FAILS CLOSED,
-    # no git probe and no `"develop"` default (absence-is-not-a-state). Refused before any git call.
-    base = str(args.get("base") or "").strip()
-    if not base:
-        return {"exit_code": -1, "stdout": "",
-                "stderr": ("sync_develop needs base (the project's integration_branch, sent by the CP) — "
-                           "the node does not derive it; nothing was synced")}
-    # The remote too: the project's mirror refreshes from the CP's URL, never the tree's `origin` (`git_mirror`).
-    clone_url = str(args.get("clone_url") or "").strip()
-    if not clone_url:
-        return {"exit_code": -1, "stdout": "",
-                "stderr": ("sync_develop needs clone_url (the project's remote, sent by the CP) — the node "
-                           "does not read it from the tree; nothing was synced")}
-    project = str(args.get("project") or "").strip()
-    project_id = args.get("project_id") if isinstance(args.get("project_id"), int) else None
-    # The mirror is keyed by the id, never the editable name; the CP always sends it (it names the slot).
-    if project_id is None or isinstance(project_id, bool):
-        return {"exit_code": -1, "stdout": "",
-                "stderr": ("sync_develop needs project_id (the project's id, sent by the CP with the slot) — the "
-                           "node keys the project's git mirror by it; nothing was synced. Update the control "
-                           "plane if it sent none")}
-    return _sync_develop_body(path, base, clone_url, run, project, project_id)
-
-
-def _sync_develop_body(path: str, base: str, clone_url: str, run, project: str, project_id: int) -> dict:
-    """`sync_develop`'s git calls. Only the mirror's REFRESH is declared (`git_mirror.refresh`, run here as the
-    daemon, never through `run`, which delegates git to the session user): every call in this tree — `status`
-    runs clean filters, the local fetch, `rebase` checks out (smudge filters, hooks) — runs undeclared, so a
-    driver planted in this tree's own config sees no token. Each is still registered as this daemon's op
-    (`_native_run`) with no declaration of its own (`clone_identity._own_declaration`), so the broker serves
-    it nothing. `_native_run` pins repo-local code off. A host with no uid split has no such boundary to keep:
-    there runners share the daemon's uid."""
-    git = ("git", "-C", path)
-    # A `.git` DIRECTORY is never genuinely bare — core.bare=true there is corruption. Linked worktrees
-    # have a `.git` FILE, so this never fires for them.
-    repair_failed = False
-    if (Path(path) / ".git").is_dir():
-        bare = run(*git, "config", "--get", "core.bare")
-        if bare["stdout"].strip() == "true":
-            repair = run(*git, "config", "core.bare", "false")
-            repair_failed = repair["exit_code"] != 0
-
-    def _with_repair_note(text: str) -> str:
-        return text + "\n[sync_develop] core.bare self-heal failed" if repair_failed else text
-
-    def _skip(reason: str) -> dict:
-        return {"exit_code": 0, "stdout": "", "stderr": _with_repair_note(f"[sync_develop] skipped: {reason}")}
-
-    # Any uncommitted TRACKED change blocks (a stash would take it). Untracked files never block a
-    # rebase, so this is deliberately narrower than `Worktree.dirty` (`reconcile/context.py::wt_dirty`); safe
-    # because Sync-All pre-filters on the wider column.
-    dirty = run(*git, "status", "--porcelain", "--untracked-files=no")
-    if dirty["exit_code"] != 0:
-        # "Could not ask" is not "clean": an errored probe must not fall through to the rebase.
-        return {"exit_code": dirty["exit_code"], "stdout": "",
-                "stderr": _with_repair_note("[sync_develop] could not read the worktree's status — "
-                                            "not synced\n" + (dirty.get("stderr") or "").strip())}
-    if dirty["stdout"].strip():
-        return _skip("worktree has uncommitted changes (a clean sync would require stashing) — not synced")
-    # FETCH failure (credential, network) is a real, visible failure with git's stderr; REBASE failure
-    # (divergence) is the deliberate quiet no-op after an abort.
-    # The node's credential helper serves a credential chosen by the project declared in flight, in
-    # the refresh alone. The cost of the declaration: a sync queued behind another project's clone is refused
-    # with `ProjectBusy`.
-    key = git_mirror.MirrorKey(project_id=project_id, repo_id=None, slug=project, clone_url=clone_url)
-    try:
-        # The bus budget `run` is clamped to: a handler cannot be killed once its git runs (`_native_run`).
-        mirror = git_mirror.refresh(key, shared=True, timeout=EXECUTE_TIMEOUT_SECONDS)
-    except clone_identity.ProjectBusy as exc:
-        return {"exit_code": -1, "stdout": "",
-                "stderr": _with_repair_note(
-                    f"[sync_develop] another git operation for a different project is in flight on this node — "
-                    f"the tree is untouched and NOT synced\n{exc}")}
-    except git_mirror.MirrorError as exc:
-        fetched = {"exit_code": 1, "stdout": "", "stderr": str(exc)}
-    else:
-        fetched = run(*git, *git_mirror.local_fetch_args(mirror, git_env.tracking_refspec(base)),
-                      env=git_mirror.LOCAL_FETCH_ENV)
-    if fetched["exit_code"] != 0:
-        detail = (fetched.get("stderr") or "").strip()
-        return {
-            "exit_code": fetched["exit_code"], "stdout": "",
-            "stderr": _with_repair_note(
-                f"[sync_develop] fetch of origin/{base} failed — the tree is untouched and NOT synced"
-                + (f"\n{detail}" if detail else "")
-            ),
-        }
-    # FETCH_HEAD, not origin/<base>: exactly what the fetch wrote, whatever the tracking-ref behaviour.
-    res = run(*git, "rebase", "FETCH_HEAD")
-    if res["exit_code"] != 0:
-        run(*git, "rebase", "--abort")   # never leave the tree half-applied
-        detail = (res.get("stderr") or "").strip()
-        return _skip(
-            "rebase is not clean (conflicts / would require merging) — tree restored intact, not synced"
-            + (f"\n{detail}" if detail else "")
-        )
-    # Keep git's "From <mirror>" line: the audit-log receipt of what the sync fetched from.
-    res["stderr"] = _with_repair_note(
-        "\n".join(part for part in ((fetched.get("stderr") or "").strip(),
-                                    (res.get("stderr") or "").strip()) if part)
-    ).strip()
-    return res
 
 
 def erase_lock_path(project: str, number: int | str) -> Path:
@@ -388,6 +215,26 @@ def _python() -> str:
     """The interpreter a delegated repo tool runs under: `runner_env.python_cmd()` on posix (the node's own on
     Linux, PATH `python3` on macOS); on Windows the bundle's own `python.exe`, since no `python3` is on its PATH."""
     return host_platform.paths().python if host_platform.is_windows() else runner_env.python_cmd()
+
+
+def _hold_erase_lock(project: str, number: int, who: str) -> tuple:
+    """The slot's erase lock, taken without waiting: `(lock file, None)`, or `(None, the refusal)` — the command
+    result naming why not, prefixed `who`."""
+    locks_dir = env_helpers.fleet_locks_dir()
+    locks_err = _ensure_locks_dir(locks_dir)
+    if locks_err:
+        return None, {"exit_code": 1, "stdout": "", "stderr": f"{who}: could not create {locks_dir}: {locks_err}"}
+    try:
+        lock_fh = open_erase_lock(project, number)
+    except OSError as exc:
+        # ELOOP: something planted a symlink where the lock lives.
+        return None, {"exit_code": 1, "stdout": "", "stderr": f"{who}: cannot open this slot's lock ({exc}) — refusing"}
+    try:
+        host_platform.lock(lock_fh, blocking=False)
+    except OSError:
+        lock_fh.close()
+        return None, {"exit_code": 1, "stdout": "", "stderr": "another worktree operation is in progress for this slot"}
+    return lock_fh, None
 
 
 def _ensure_locks_dir(locks_dir: Path) -> str:
@@ -472,8 +319,7 @@ def worktree_erase(command_type: str, args: dict, run) -> dict:
     again (the org transfer, whose volumes hold the old org's data)."""
     import shutil
 
-    from worktree_mechanics import core
-    from worktree_mechanics.core import _git, slot_path
+    from worktree_mechanics.core import slot_path
 
     project = str(args.get("project") or "").strip()
     raw_number = args.get("number")
@@ -526,40 +372,21 @@ def worktree_erase(command_type: str, args: dict, run) -> dict:
             purged, why = _purge_volumes(compose_project, str(home_resolved))
             if not purged:
                 return {"exit_code": 1, "stdout": "", "stderr": f"worktree_erase: {why}"}
-        # No lock: a retry must converge. The prune matters — a stale registration fails the next
-        # `git worktree add`.
+        # No lock: a retry must converge.
         if number != 0:
-            _git(str(clone_resolved), "worktree", "prune", "--expire=now")
             # A multi-repo slot's other trees, their stacks and scratch, and its manifest (`slot_repos`).
             slot_repos.release_slot_repos(str(clone_resolved), number)
-        # Noted here too: a retry lands here while the row is still declared.
-        core.note_erased(str(resolved))
         slot_residue.purge_scratch(str(resolved))
         return {"exit_code": 0,
                 "stdout": json.dumps({"deleted": True, "already_absent": True, "path": str(resolved)}),
                 "stderr": ""}
 
-    locks_dir = env_helpers.fleet_locks_dir()
-    locks_err = _ensure_locks_dir(locks_dir)
-    if locks_err:
-        return {"exit_code": 1, "stdout": "",
-                "stderr": f"worktree_erase: could not create {locks_dir}: {locks_err}"}
-    try:
-        lock_fh = open_erase_lock(project, number)
-    except OSError as exc:
-        # ELOOP: something planted a symlink where the lock lives.
-        return {"exit_code": 1, "stdout": "",
-                "stderr": f"worktree_erase: cannot open this slot's lock ({exc}) — refusing"}
-    try:
-        host_platform.lock(lock_fh, blocking=False)
-    except OSError:
-        lock_fh.close()
-        return {"exit_code": 1, "stdout": "",
-                "stderr": "another worktree operation is in progress for this slot"}
+    lock_fh, refused = _hold_erase_lock(project, number, "worktree_erase")
+    if refused:
+        return refused
 
     try:
         wt = str(resolved)
-        is_valid_repo = _git(wt, "rev-parse", "--git-dir")[0] == 0
 
         # ── CLEAR THE TREE, then stop the stack, then remove the directory ──
         # The sweep is first because it exempts docker (the stack's own shutdown stops those) and because a
@@ -587,27 +414,26 @@ def worktree_erase(command_type: str, args: dict, run) -> dict:
                 log.warning("worktree_erase %s #%s: %s — left for the residue sweep", project, number, why)
 
         try:
-            removed = False
-            # The clone that OWNS the tree: the anchor, or — after a multi-repo primary swap — the primary's own
-            # `_repos/<rid>/main` (`slot_repos`); removing or pruning through any other leaves its registration.
-            owner = (slot_repos.worktree_clone(wt) if is_valid_repo else "") or str(clone_resolved)
-            if number != 0 and is_valid_repo:
-                # `git worktree remove` also clears the `.git/worktrees/N` registration (else a
-                # re-declared slot N fails). `--force --force`: past git's dirty-tree refusal and its
-                # LOCKED-worktree refusal — the erase never refuses.
-                removed = _git(owner, "worktree", "remove", "--force", "--force", wt)[0] == 0
-            if not removed:
-                if host_platform.is_windows():
-                    # The runner account removes its own tree there: the daemon deletes nothing under the
-                    # runner-writable home itself.
-                    err = session_user.remove_tree_as_session_user(str(resolved))
-                    if err:
-                        raise OSError(err)
-                else:
+            # The tree is a standalone clone (`slot_clone`): removing the directory is the whole erase, dirty or
+            # not — the erase never refuses.
+            if host_platform.is_windows():
+                # The runner account removes its own tree there: the daemon deletes nothing under the
+                # runner-writable home itself.
+                err = session_user.remove_tree_as_session_user(str(resolved))
+                if err:
+                    raise OSError(err)
+            elif session_user.switch_needed():
+                # Under the uid split the session user owns the tree, and its tools make `2755` directories
+                # (npm's `node_modules`) that the daemon, only in the group, cannot empty: the owner removes it.
+                # What it leaves (root-owned residue) the daemon tries next, so the hint below still names it.
+                err = session_user.remove_tree_as_session_user(str(resolved))
+                if err:
+                    log.warning("worktree_erase %s #%s: the session user's delete failed (%s) — trying as "
+                                "the daemon", project, number, err)
                     shutil.rmtree(resolved, ignore_errors=False)
+            else:
+                shutil.rmtree(resolved, ignore_errors=False)
             if number != 0:
-                # Best-effort: covers a `remove` fallback that left the registration, or a broken `.git`.
-                _git(str(clone_resolved), "worktree", "prune", "--expire=now")
                 # A multi-repo slot's other trees, their stacks and scratch, and its manifest (`slot_repos`).
                 slot_repos.release_slot_repos(str(clone_resolved), number)
         except OSError as exc:
@@ -628,9 +454,6 @@ def worktree_erase(command_type: str, args: dict, run) -> dict:
                                           "killed_processes": killed_procs,
                                           "killed_windows": killed_windows}),
                     "stderr": f"failed to erase {wt}: {exc}{hint}"}
-        # The CP has not dropped the row yet, so this looks like a slot convergence should rebuild;
-        # `note_erased` makes `reconcile.orchestrate._unmaterialised_candidates` skip it meanwhile.
-        core.note_erased(wt)
         # Claude Code's per-cwd scratch under /tmp: keyed by this path, so a later slot at it would inherit it.
         scratch = slot_residue.purge_scratch(wt)
         return {"exit_code": 1 if (down_failed and compose_project) else 0,
@@ -671,7 +494,7 @@ def folder_erase(project: str, number: int, clone_path: str, project_id: int | N
     Every containment check is kept and tightened to the folder layout — the target must be
     `<jaah_home>/repos/<project_id>/<number>` EXACTLY, after resolving links; slot 0 is never a folder; the
     per-slot flock is held. Whatever the folder holds goes."""
-    from worktree_mechanics.core import note_erased, slot_path  # noqa: PLC0415 — deferred, as every caller here
+    from worktree_mechanics.core import slot_path  # noqa: PLC0415 — deferred, as every caller here
 
     def _refuse(why: str) -> dict:
         return {"exit_code": -1, "stdout": "", "stderr": f"folder_erase: {why}"}
@@ -691,29 +514,17 @@ def folder_erase(project: str, number: int, clone_path: str, project_id: int | N
                        f"refusing to touch it")
 
     if not resolved.exists():
-        note_erased(str(resolved))
         return {"exit_code": 0,
                 "stdout": json.dumps({"deleted": True, "already_absent": True, "path": str(resolved)}),
                 "stderr": ""}
 
-    locks_dir = env_helpers.fleet_locks_dir()
-    locks_err = _ensure_locks_dir(locks_dir)
-    if locks_err:
-        return {"exit_code": 1, "stdout": "", "stderr": f"folder_erase: could not create {locks_dir}: {locks_err}"}
-    try:
-        lock_fh = open_erase_lock(project, number)
-    except OSError as exc:
-        return {"exit_code": 1, "stdout": "", "stderr": f"folder_erase: cannot open this slot's lock ({exc})"}
-    try:
-        host_platform.lock(lock_fh, blocking=False)
-    except OSError:
-        lock_fh.close()
-        return {"exit_code": 1, "stdout": "", "stderr": "another worktree operation is in progress for this slot"}
+    lock_fh, refused = _hold_erase_lock(project, number, "folder_erase")
+    if refused:
+        return refused
     try:
         err = _remove_folder(str(resolved))
         if err:
             return {"exit_code": 1, "stdout": "", "stderr": f"failed to erase folder {resolved}: {err}"}
-        note_erased(str(resolved))
         slot_residue.purge_scratch(str(resolved))
         return {"exit_code": 0, "stdout": json.dumps({"deleted": True, "path": str(resolved)}), "stderr": ""}
     finally:
@@ -770,7 +581,7 @@ def _run_port_grid_op(argv: list[str], run) -> dict:
 
     Returns `_native_run`'s shape and caps, so the reply and the exit code (0 clean, 1 drift) are
     byte-stable across both branches. Switch needed but unavailable is a REFUSAL, not a fall-through
-    that would report the fix as having run."""
+    that would report the audit as having run."""
     from worktree_mechanics.core import SWITCH_UNAVAILABLE_RC
 
     if not session_user.switch_needed():
@@ -779,9 +590,8 @@ def _run_port_grid_op(argv: list[str], run) -> dict:
     if not session_user.can_run_as_session_user():
         return {"exit_code": SWITCH_UNAVAILABLE_RC, "stdout": "",
                 "stderr": ("port grid: session-user switch required but unavailable — refusing to run "
-                           "the pool port audit as the daemon uid, which cannot read (let alone "
-                           "rewrite) a pool slot's 0600 jaah:jaah .env; nothing was audited or "
-                           "fixed. Check jaah-runner@<node name>.service")}
+                           "the pool port audit as the daemon uid, which cannot read "
+                           "a pool slot's 0600 jaah:jaah .env; nothing was audited. Check jaah-runner@<node name>.service")}
     # `cwd` stated (the session user must be able to enter it); the ~170s bus budget, not the seam's
     # 120s default.
     return session_user.run_capped(
@@ -799,11 +609,6 @@ def run_op(command_type: str, args: dict, run) -> dict:
     # Dispatch rides the CP's `lease_slot` intents; there is no node-side pass to poke.
     ops: dict[str, list[str]] = {
         "doctor": [_python(), _fleet_doctor()],
-        # `--fix` rewrites every slot's band, `--restart` brings back only the stacks that were live.
-        # Unscoped by default: moving a range start moves every project's band on this node (this org's).
-        "ports_reband": (
-            [_python(), _check_pool_ports(), "--fix", "--restart"] + ([project] if project else [])
-        ),
     }
     if project:
         ops["ports_audit"] = [_python(), _check_pool_ports(), project]
@@ -811,7 +616,7 @@ def run_op(command_type: str, args: dict, run) -> dict:
     if argv is None:
         return {"exit_code": -1, "stdout": "",
                 "stderr": f"unknown or unavailable run op: {op!r}; allowed: {sorted(ops)}"}
-    # The port-grid ops need the session-user seam (see `_PORT_GRID_OPS`).
+    # The port-grid op needs the session-user seam (see `_PORT_GRID_OPS`).
     if op in _PORT_GRID_OPS:
         return _run_port_grid_op(argv, run)
     # CP-authenticating ops inherit the daemon's env; `_tmux_safe_env()` would strip it. Pinned by the
@@ -834,80 +639,28 @@ def _gate_env() -> dict:
     return env
 
 
-@native_command("check")
-def check(command_type: str, args: dict, run) -> dict:
-    # Run the PROJECT'S CONFIGURED gate at the resolved clone path, within `_native_run`'s ~170s cap.
-    # One tier, the CP's call (`gate_cmd` from `projects.gate_quick_cmd`). The CP resolver writes
-    # `clone_path` and pops `repo_root`, so neither can smuggle a path; `_REPO_ROOT` only when neither is set.
-    clone_path = args.get("clone_path") or args.get("repo_root") or str(_REPO_ROOT)
-    # Fails closed when the CP sent no gate (no default gate here). A SENT blank is the project declaring
-    # no quick gate — a deliberate "no gate", so nothing runs and nothing fails.
-    if "gate_cmd" in args and not str(args["gate_cmd"] or "").strip():
-        message = "project declares no quick gate — nothing to run"
-        return {"exit_code": 0, "stdout": message, "stderr": message}
-    gate_cmd = str(args.get("gate_cmd") or "").strip()
-    if not gate_cmd:
-        return {"exit_code": 1, "stdout": "",
-                "stderr": ("check needs gate_cmd (the project's gate command, sent by the CP from "
-                           "projects.gate_quick_cmd) — the node has no gate command of its own; "
-                           "nothing was run")}
-    # A SHELL: the value is a command line, not an argv; `-l` puts docker/node on PATH. The string is
-    # NOT sanitised — what bounds it is PROVENANCE (`gate_cmd` is overwritten server-side from the project
-    # row, authored by a governance-authorized author or seeded from the org's Projects > Defaults settings,
-    # which an operator or the tenant's Org Admin writes) plus the curated env and session-user delegation.
-    argv = ["bash", "-lc", gate_cmd]
-    # AS THE SESSION USER where the uid split applies: `_native_run`'s seam keys on `argv[0] == "git"`,
-    # so a `bash` gate would run as the daemon (full env with `NODE_TOKEN`; root on cloud). Not fixed by
-    # widening that test: `logs`/`open_*` need their desktop session. Env is curated on both branches.
-    from worktree_mechanics.core import SWITCH_UNAVAILABLE_RC
-
-    if session_user.switch_needed():
-        if not session_user.can_run_as_session_user():
-            return {"exit_code": SWITCH_UNAVAILABLE_RC, "stdout": "",
-                    "stderr": "check: session-user switch required but unavailable — refusing to run "
-                              "the project's gate command as the daemon uid; "
-                              "check jaah-runner@<node name>.service"}
-        # Two legs keep the token out: `_gate_env()`, and the session user's tmux server env —
-        # `jaah-runner@.service` refusing `node.env` is a security requirement. ~170s budget.
-        return session_user.run_capped(
-            argv, cwd=clone_path, env=_gate_env(), timeout=EXECUTE_TIMEOUT_SECONDS,
-            as_session_user=True, failure_rc=SWITCH_UNAVAILABLE_RC, failure_prefix="check: ")
-    # No uid split: in process, env still curated — a root cloud node lands here, and a gate reading
-    # `/proc/self/environ` must not find `NODE_TOKEN`.
-    return run(*argv, cwd=clone_path, env={
-        **_gate_env(),
-        # This process is the runner here. PATH must be present: `subprocess.run(env=…)` resolves
-        # argv[0] against the PATH it is handed.
-        "HOME": os.environ.get("HOME") or os.path.expanduser("~"),
-        "PATH": os.environ.get("PATH") or "/usr/local/bin:/usr/bin:/bin",
-    })
-
-
-# Git's refname rules, mirrored only to keep a malformed DB value out of the installer's argv; the
-# installer is the authority.
-_BAD_PREFIX_CHARS = re.compile(r"[\s~^:?*\[\\\x00-\x1f]")
+# Git's refname rules (single-homed in `slot_repos`), also applied to a branch name below.
+_BAD_PREFIX_CHARS = slot_repos.BAD_REF_CHARS
 
 
 # ── Trigger preflight (the "Repo script" trigger) ───────────────────────────────────────────────────────
 #
 # CP-INTERNAL, like `worktree_erase`: absent from `app/routes/commands.py`'s `VALID_TYPES`, so only the
 # trigger processor (`app/trigger_preflight_script.py`) reaches it. It runs the OWNER'S script from the
-# project's repo — the trust `check` already extends to the gate command — against the integration branch,
-# in a dedicated checkout `<repos>/<project id>/preflight` beside the main clone: no `worktrees` row, never
-# leased, so neither a pool slot nor the main clone's working copy is touched. The script runs as the
-# session user, with no credential admitted and a curated env (`_gate_env()` plus the input path).
+# project's repo — the trust the merge gate already extends to the gate command — against the integration branch,
+# in a throwaway shallow clone `<state>/preflight/<uuid>` made from the forge for this run alone and removed after
+# it, whatever happened: no `worktrees` row, never leased, so no pool slot is touched.
 #
-# The script can write its checkout's `.git` (same uid), so that `.git` is never trusted: the checkout is
-# recreated on every run, ONLY the fetch runs credential-admitted (inside `clone_identity.cloning`), and
-# every git call pins repo-local code off (`_NO_REPO_CODE`) — a hook or fsmonitor planted by one run cannot
-# execute under the next run's credential.
+# The clone spends the trigger OWNER'S git login: it runs inside `clone_identity.acting_for` a `trigger` subject
+# carrying the CP's grant, which the credential broker trades at the CP's trigger arm (`cred_broker._resolve_trigger`).
+# The script then runs as the session user, with no credential admitted and a curated env (`_gate_env()` plus the
+# input path); every git call pins repo-local code off (`git_env.NO_REPO_CODE`, `worktree_mechanics.core._run_git`).
 
 #: The env var naming the file that holds the preflight input (`{"event","state","seen_keys"}`), also on stdin.
 PREFLIGHT_INPUT_ENV = "JAAH_PREFLIGHT_INPUT"
 #: One byte over the CP's 64 KiB output cap, so an oversized answer still reads as "over 64 KiB" there.
 PREFLIGHT_STDOUT_CAP = 64 * 1024 + 1
 _PREFLIGHT_STDERR_LINE_CAP = 500
-_PREFLIGHT_LOCK_WAIT_S = 30.0
 # A script without its executable bit still runs when its suffix names the interpreter (`.py`: the node's own,
 # `runner_env.python_cmd()`, resolved at call time).
 _PREFLIGHT_INTERPRETERS = {".sh": "bash", ".js": "node", ".mjs": "node"}
@@ -917,10 +670,6 @@ _PREFLIGHT_WRAPPER = (
     f'F=$(mktemp) || exit 111; trap \'rm -f "$F"\' EXIT; trap \'exit 143\' TERM INT; '
     f'export {PREFLIGHT_INPUT_ENV}="$F"; cat >"$F" || exit 111; "$@" <"$F"'
 )
-# Repo-local code a git call must never run: hooks, fsmonitor, templates, the `ext::` transport.
-_NO_REPO_CODE = git_env.NO_REPO_CODE
-# `flock` contention; anything else from the lock call is a real fault.
-_LOCK_BUSY_ERRNOS = frozenset({errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK, getattr(errno, "EDEADLK", -1)})
 
 
 def _preflight_result(exit_code: int, stderr: str, *, stdout: str = "", **flags) -> dict:
@@ -941,17 +690,18 @@ def _cap_stdout(text: str) -> str:
 
 def _preflight_args(args: dict) -> tuple[dict, str]:
     """The validated arguments, or `({}, reason)`. Every value is CP-supplied; re-checked so a malformed one
-    never reaches a path or an argv."""
-    clone_path = str(args.get("clone_path") or "")
+    never reaches a path, an argv or a URL. A CP older than the grant sends none, and is refused: this node will
+    not clone with any other login."""
     branch = str(args.get("integration_branch") or "").strip()
     script = str(args.get("script_path") or "").strip()
     clone_url = str(args.get("clone_url") or "").strip()
+    grant = str(args.get("grant") or "")
     try:
         timeout = int(args.get("timeout_seconds") or 0)
     except (TypeError, ValueError):
         timeout = 0
-    if not clone_path or not os.path.isabs(clone_path) or Path(clone_path).name != "main":
-        return {}, "needs clone_path (the project's main clone, …/main)"
+    if not clone_identity.GRANT_RE.match(grant):
+        return {}, "needs grant (the control plane's clone authorization; this control plane is older than the node)"
     if not branch or branch.startswith("-") or _BAD_PREFIX_CHARS.search(branch) or ".." in branch:
         return {}, "needs integration_branch (a valid branch name)"
     if not clone_url:
@@ -962,16 +712,12 @@ def _preflight_args(args: dict) -> tuple[dict, str]:
         return {}, f"needs timeout_seconds between 1 and {int(EXECUTE_TIMEOUT_SECONDS)}"
     if not isinstance(args.get("input"), str):
         return {}, "needs input (the JSON document the script reads)"
-    project_id = args.get("project_id")
-    if not isinstance(project_id, int) or isinstance(project_id, bool):
-        # Without it the mirror would be a second, URL-keyed full clone beside the project's `<pid>.git`.
-        return {}, "needs project_id (the project's id, which keys the node's mirror)"
-    return {"clone_path": clone_path, "clone_url": clone_url, "branch": branch, "script": script, "timeout": timeout,
-            "input": args["input"], "project": str(args.get("project") or ""), "project_id": project_id}, ""
+    return {"clone_url": clone_url, "branch": branch, "script": script, "timeout": timeout, "input": args["input"],
+            "grant": grant}, ""
 
 
 class _OutOfTime(Exception):
-    """The run's whole budget (checkout refresh + script) is spent."""
+    """The run's whole budget (clone + script) is spent."""
 
 
 def _left(deadline: float) -> float:
@@ -983,11 +729,11 @@ def _left(deadline: float) -> float:
 
 @native_command("trigger_preflight")
 def trigger_preflight(command_type: str, args: dict, run) -> dict:
-    """Recreate the preflight checkout at `origin/<integration_branch>`, run the script there, and return
-    `{exit_code, stdout (≤64 KiB + 1), stderr (its first line)}`. A reply flagged `unavailable` (lock or git
-    identity busy, session-user switch down) is the node's "not now", never the script's "no"; one flagged
-    `setup` failed before the script ran; `timed_out` spent the whole `timeout_seconds` budget, which the
-    checkout refresh and the script share so the CP's wait is never outrun."""
+    """Clone the integration branch (depth 1) into a fresh directory, run the script there, remove the clone, and
+    return `{exit_code, stdout (≤64 KiB + 1), stderr (its first line)}`. A reply flagged `unavailable` (session-user
+    switch down) is the node's "not now", never the script's "no"; one flagged `setup` failed before the script ran
+    (a clone failure names the forge's host and the cause); `timed_out` spent the whole `timeout_seconds` budget,
+    which the clone and the script share so the CP's wait is never outrun."""
     from worktree_mechanics.core import SWITCH_UNAVAILABLE_RC
 
     parsed, why = _preflight_args(args)
@@ -997,41 +743,48 @@ def trigger_preflight(command_type: str, args: dict, run) -> dict:
     if session_user.switch_needed() and not session_user.can_run_as_session_user():
         return _preflight_result(
             SWITCH_UNAVAILABLE_RC, "the node cannot switch to its session user right now", unavailable=True)
-    checkout = str(Path(parsed["clone_path"]).parent / "preflight")
-    locks_dir = env_helpers.fleet_locks_dir()
-    locks_err = _ensure_locks_dir(locks_dir)
-    if locks_err:
-        return _preflight_result(1, f"could not create {locks_dir}: {locks_err}", setup=True)
+    checkout = str(env_helpers.state_dir("preflight", uuid.uuid4().hex))
     try:
-        lock_fh = _open_lock(locks_dir / f"trigger-preflight-{Path(checkout).parent.name}.lock")
-    except OSError as exc:
-        return _preflight_result(1, f"cannot open the preflight lock ({exc})", setup=True)
-    lock_until = time.monotonic() + min(_PREFLIGHT_LOCK_WAIT_S, parsed["timeout"] - 1)
-    try:
-        while True:
-            try:
-                host_platform.lock(lock_fh, blocking=False)
-                break
-            except OSError as exc:
-                if exc.errno not in _LOCK_BUSY_ERRNOS:
-                    return _preflight_result(1, f"cannot take the preflight lock ({exc})", setup=True)
-                if time.monotonic() >= lock_until:
-                    return _preflight_result(
-                        -1, "another preflight for this project is running on this node", unavailable=True)
-                time.sleep(0.5)
-        try:
-            refused = _refresh_preflight_checkout(parsed, checkout, deadline, run)
-            if refused:
-                return refused
-            return _run_preflight_script(parsed, checkout, deadline)
-        except _OutOfTime:
-            return _timed_out(parsed)
+        refused = _clone_for_preflight(parsed, checkout, deadline)
+        if refused:
+            return refused
+        return _run_preflight_script(parsed, checkout, deadline)
+    except _OutOfTime:
+        return _timed_out(parsed)
     finally:
-        lock_fh.close()
+        _remove_preflight_clone(checkout)
 
 
 def _timed_out(parsed: dict) -> dict:
     return _preflight_result(124, f"timed out after {parsed['timeout']}s", timed_out=True)
+
+
+def _clone_for_preflight(parsed: dict, checkout: str, deadline: float) -> dict | None:
+    """Clone `clone_url` at `origin/<branch>`, depth 1, as the trigger's owner. None when ready, else the `setup`
+    failure. Raises `_OutOfTime` when the budget ran out under it."""
+    from worktree_mechanics.core import ResetRefused
+
+    acting = clone_identity.Acting(kind=clone_identity.ACTING_TRIGGER, id=parsed["grant"])
+    try:
+        slot_clone.clone(checkout, parsed["clone_url"], parsed["branch"], acting, depth=1, timeout=_left(deadline))
+    except slot_clone.CloneFailed as exc:
+        _left(deadline)   # a clone cut off by the budget is a timeout, not a forge fault
+        return _preflight_result(1, f"preflight {exc}", setup=True)
+    except ResetRefused as exc:
+        return _preflight_result(1, f"preflight clone: {_first_line(str(exc))}", setup=True)
+    return None
+
+
+def _remove_preflight_clone(checkout: str) -> None:
+    """Remove the run's clone (and a staging dir a cut-off clone left); a failure is logged, never raised: the
+    reply is already decided."""
+    from worktree_mechanics.core import ResetRefused
+
+    for path in (checkout, checkout + slot_clone.STAGING_SUFFIX):
+        try:
+            slot_clone.erase(path)
+        except ResetRefused as exc:
+            log.warning("trigger_preflight: could not remove %s: %s", path, exc)
 
 
 def _unadmitted(argv: list[str], *, cwd: str | None, timeout: float, stdin: str | None = None,
@@ -1040,113 +793,12 @@ def _unadmitted(argv: list[str], *, cwd: str | None, timeout: float, stdin: str 
     credential admitted. Raises `TimeoutExpired`, and `RuntimeError` when the switch went away."""
     env = {**_gate_env(), **(env or {})}
     if session_user.switch_needed():
-        # No `on_child_pid`: nothing is admitted to the credential helper. The far side's `timeout` fires 5s
+        # Nothing on the session user's channel is admitted to the credential helper. The far side's `timeout` fires 5s
         # inside the deadline it is given, so the budget handed over is `timeout + 5`.
         return session_user.run_as_session_user(argv, cwd=cwd, env=env, timeout=timeout + 5, input=stdin)
-    return _run_in_own_group(argv, stdin, cwd=cwd, timeout=timeout, env={
+    return session_user.run_bounded(argv, input=stdin or "", cwd=cwd, timeout=timeout, kill_group=True, env={
         **env, "HOME": os.environ.get("HOME") or os.path.expanduser("~"),
         "PATH": os.environ.get("PATH") or "/usr/local/bin:/usr/bin:/bin"})
-
-
-#: Replies carrying it set `mirror_bootstrapping`, so the CP retries them for the clone budget, not its short window.
-_MIRROR_BOOTSTRAPPING = "the project's mirror is being created on this node; retry shortly"
-#: Mirror paths a background first clone is running for: a full clone outlasts any preflight budget, and one
-#: cut off by it leaves nothing to resume, so it runs on a clone's budget and preflights answer "not now".
-_bootstrapping: set[str] = set()
-#: Mirror path → why its last background clone failed: the next preflight reports it once, then retries the clone.
-_bootstrap_failed: dict[str, str] = {}
-_bootstrapping_guard = threading.Lock()
-
-
-def _bootstrap_running(key: git_mirror.MirrorKey) -> bool:
-    with _bootstrapping_guard:
-        return str(git_mirror.mirror_path(key, shared=True)) in _bootstrapping
-
-
-def _start_mirror_bootstrap(key: git_mirror.MirrorKey) -> None:
-    """Create `key`'s pool mirror in a daemon thread, at most one per mirror."""
-    path = str(git_mirror.mirror_path(key, shared=True))
-    with _bootstrapping_guard:
-        if path in _bootstrapping:
-            return
-        _bootstrapping.add(path)
-
-    def create() -> None:
-        try:
-            git_mirror.refresh(key, shared=True, timeout=float(node_settings.get("node_clone_timeout_secs")))
-        except Exception as exc:   # noqa: BLE001 — a daemon thread: every failure is logged and reported
-            log.warning("trigger_preflight: creating the mirror %s failed: %s", Path(path).name, exc)
-            with _bootstrapping_guard:
-                _bootstrap_failed[path] = str(exc)
-        finally:
-            with _bootstrapping_guard:
-                _bootstrapping.discard(path)
-
-    threading.Thread(target=create, name=f"mirror-bootstrap-{Path(path).name}", daemon=True).start()
-
-
-def _refresh_preflight_checkout(parsed: dict, checkout: str, deadline: float, run) -> dict | None:
-    """Recreate the checkout: `init` → origin = the CP's `clone_url` → refresh the project's mirror from that URL
-    (`git_mirror.refresh`, never the checkout's `origin`) → shallow local `fetch` from it → `checkout --detach --force origin/<branch>` → `clean -fdx`. None when ready, else the setup
-    failure, or `unavailable` while the mirror's first clone runs in the background. Raises `_OutOfTime`."""
-    branch = parsed["branch"]
-
-    def failed(step: str, rc: int, stderr: str) -> dict:
-        detail = _first_line(stderr) or f"exit {rc}"
-        return _preflight_result(rc or 1, f"preflight checkout: {step} failed: {detail}", setup=True)
-
-    def local(step: str, *argv: str) -> tuple[subprocess.CompletedProcess | None, dict | None]:
-        try:
-            proc = _unadmitted(list(argv), cwd=None, timeout=_left(deadline))
-        except subprocess.TimeoutExpired:
-            raise _OutOfTime from None
-        except (RuntimeError, OSError) as exc:
-            return None, failed(step, 1, str(exc))
-        return proc, (failed(step, proc.returncode, proc.stderr) if proc.returncode != 0 else None)
-
-    for step, argv in (
-        ("removing the previous checkout", ("rm", "-rf", "--", checkout)),
-        ("git init", ("git", *_NO_REPO_CODE, "init", "-q", checkout)),
-        ("setting origin", ("git", *_NO_REPO_CODE, "-C", checkout, "config", "remote.origin.url",
-                            parsed["clone_url"])),
-    ):
-        _proc, refused = local(step, *argv)
-        if refused:
-            return refused
-    # The one credential-admitted call: the mirror's refresh, inside the project's git-identity declaration.
-    key = git_mirror.MirrorKey(project_id=parsed["project_id"], repo_id=None, slug=parsed["project"],
-                               clone_url=parsed["clone_url"])
-    if _bootstrap_running(key):
-        return _preflight_result(-1, _MIRROR_BOOTSTRAPPING, unavailable=True, mirror_bootstrapping=True)
-    try:
-        mirror = git_mirror.refresh(key, shared=True, timeout=_left(deadline),
-                                    wait_s=min(_PREFLIGHT_LOCK_WAIT_S, _left(deadline)), create=False)
-        if mirror is None:
-            with _bootstrapping_guard:
-                last_failure = _bootstrap_failed.pop(str(git_mirror.mirror_path(key, shared=True)), None)
-            if last_failure is not None:
-                return failed("git clone", 1, last_failure)
-            _start_mirror_bootstrap(key)
-            return _preflight_result(-1, _MIRROR_BOOTSTRAPPING, unavailable=True, mirror_bootstrapping=True)
-    except clone_identity.ProjectBusy as exc:
-        return _preflight_result(-1, f"another project's git operation is in flight: {exc}", unavailable=True)
-    except git_mirror.MirrorError as exc:
-        _left(deadline)
-        return failed("git fetch", 1, str(exc))
-    fetched = run("git", "-C", checkout, *git_mirror.local_fetch_args(
-        mirror, git_env.tracking_refspec(branch), depth=1), timeout=_left(deadline), env=git_mirror.LOCAL_FETCH_ENV)
-    if fetched["exit_code"] != 0:
-        _left(deadline)   # a fetch cut off by the budget is a timeout, not a checkout fault
-        return failed("git fetch", fetched["exit_code"], fetched.get("stderr") or "")
-    for step, argv in (
-        ("git checkout", ("git", *_NO_REPO_CODE, "-C", checkout, "checkout", "--quiet", "--detach", "--force",
-                          f"origin/{branch}")),
-        ("git clean", ("git", *_NO_REPO_CODE, "-C", checkout, "clean", "-fdxq")),
-    ):
-        _proc, refused = local(step, *argv)
-        if refused:
-            return refused
-    return None
 
 
 def _preflight_script_argv(checkout: str, script: str) -> tuple[list[str], str]:
@@ -1192,44 +844,27 @@ def _run_preflight_script(parsed: dict, checkout: str, deadline: float) -> dict:
     return _preflight_result(proc.returncode, _first_line(proc.stderr), stdout=_cap_stdout(proc.stdout))
 
 
-def _run_in_own_group(argv: list[str], stdin: str | None, *, cwd: str | None, timeout: float,
-                      env: dict) -> subprocess.CompletedProcess:
-    """`subprocess.run(input=…)`, but a timeout kills the whole process group: the script is the wrapper
-    shell's child, and killing only the shell would leave it running. (Delegated, the far side's `timeout`
-    signals its own group; Windows, which has no group to kill and ignores `start_new_session`, kills the shell.)"""
-    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, cwd=cwd, env=env, start_new_session=hasattr(os, "killpg"))
-    try:
-        out, err = proc.communicate(stdin or "", timeout=timeout)
-    except subprocess.TimeoutExpired:
-        try:
-            if hasattr(os, "killpg"):
-                os.killpg(proc.pid, 9)
-            else:
-                proc.kill()
-        except OSError:
-            pass
-        proc.communicate()
-        raise
-    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
-
-
 @native_command("sync_access_guard")
 def sync_access_guard(command_type: str, args: dict, run) -> dict:
     # Re-install the git-native push guard with the declared branch prefix and push flag,
-    # fired by `PUT /api/projects/{id}`. `repo_root` is CP-resolved. Idempotent; revert is not an
+    # fired by `PUT /api/projects/{id}`. The project's directory is derived from this node's own home and
+    # `project_id` (`core.project_anchor`), never a path the frame names. Idempotent; revert is not an
     # uninstall — empty prefix + push enabled is the declared unrestricted pair, a no-op hook.
-    clone_path = args.get("repo_root")
+    from worktree_mechanics.core import SWITCH_UNAVAILABLE_RC, project_anchor
+
+    raw_pid = args.get("project_id")
+    clone_path = (project_anchor(environment.pool_root_or_empty(), raw_pid)
+                  if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) else "")
     if not clone_path:
         return {"exit_code": 1, "stdout": "",
-                "stderr": "sync_access_guard needs repo_root (no local clone set for this project)"}
+                "stderr": "sync_access_guard needs project_id and this node's Jaah home"}
     # PRESENCE, not truthiness: `""` is a legitimate prefix value, so an absent key cannot mean it.
     if "branch_prefix" not in args:
         return {"exit_code": 1, "stdout": "",
                 "stderr": ("sync_access_guard needs branch_prefix (the project's, sent by the CP; '' is a "
                            "legal value, an absent key is not)")}
     branch_prefix = str(args.get("branch_prefix") or "")
-    if _BAD_PREFIX_CHARS.search(branch_prefix) or ".." in branch_prefix or branch_prefix.startswith("/"):
+    if not slot_repos.legal_ref_prefix(branch_prefix):
         return {"exit_code": 1, "stdout": "",
                 "stderr": f"sync_access_guard: '{branch_prefix}' is not a legal git ref prefix"}
     # A REAL BOOLEAN or nothing: `bool()` reads absent/None/"false" wrongly and silently — fail-open
@@ -1241,18 +876,35 @@ def sync_access_guard(command_type: str, args: dict, run) -> dict:
                            f"{push_enabled!r}) — the node does not infer it")}
     # AS THE SESSION USER: the installer writes new inodes into `.git`, and as the daemon they would be
     # `jaahd`-owned and unwritable for `jaah`. Fails closed.
-    from worktree_mechanics.core import SWITCH_UNAVAILABLE_RC
 
-    # `integration_branch` is informational (names where work goes in a refusal), so optional — and the
-    # primary's, so only the anchor clone is told it.
+    # `integration_branch` names where work goes in a refusal and, with `allow_force_push`, the one branch that
+    # lets through; the anchor's is the primary's. `allow_force_push` is not a real boolean only from a CP older
+    # than it: False (absent reads as refused), never inferred open.
     integration_branch = str(args.get("integration_branch") or "")
-    # `branch_prefix`/`push_enabled` are project-level (AS1): every clone of the project gets the same pair —
-    # the anchor and each `_repos/<rid>/main` of a multi-repo project (`slot_repos`).
-    clones = [str(clone_path), *_repo_clones(str(clone_path))]
+    allow_force_push = args.get("allow_force_push") is True
+    # The project's `jaah_repo_prefix` (project-level: every clone takes it). Absent — an older CP — is None, which
+    # leaves each clone's marker as it is; `""` clears it. Anything but a string is refused, never guessed.
+    jaah_repo_prefix = args.get("jaah_repo_prefix")
+    if jaah_repo_prefix is not None and not isinstance(jaah_repo_prefix, str):
+        return {"exit_code": 1, "stdout": "",
+                "stderr": ("sync_access_guard: jaah_repo_prefix must be a string "
+                           f"(got {type(jaah_repo_prefix).__name__})")}
+    # Every repository directory of the project is its own clone (`slot_clone`), so each carries the guard: a
+    # slot's primary takes the top-level values, a `_repos/<rid>/<N>` clone ITS repository's from `repos[]`, else
+    # (an older CP, which sent project-level values only) the top-level pair with no integration branch and force
+    # push refused. The derived anchor only locates the project's directory.
+    per_repo = _per_repo_guard(args.get("repos"))
+    if isinstance(per_repo, str):
+        return {"exit_code": 1, "stdout": "", "stderr": f"sync_access_guard: {per_repo}"}
+    primary_values = (branch_prefix, push_enabled, integration_branch, allow_force_push)
+    clones = _project_clones(os.path.dirname(str(clone_path).rstrip("/")))
+    if not clones:
+        return {"exit_code": 0, "stdout": "no clone of this project on this node — nothing to guard", "stderr": ""}
     results = []
-    for i, clone in enumerate(clones):
-        argv = access_guard_argv(clone, branch_prefix, push_enabled,
-                                 integration_branch if i == 0 else "")
+    for clone, rid in clones:
+        fallback = primary_values if rid is None else (branch_prefix, push_enabled, "", False)
+        argv = access_guard_argv(clone, *(per_repo.get(rid, fallback) if rid is not None else fallback),
+                                 jaah_repo_prefix=jaah_repo_prefix)
         if session_user.switch_needed():
             if not session_user.can_run_as_session_user():
                 return {"exit_code": SWITCH_UNAVAILABLE_RC, "stdout": "",
@@ -1272,28 +924,79 @@ def sync_access_guard(command_type: str, args: dict, run) -> dict:
         return results[0]
     # The first nonzero exit wins; every clone's output is kept, each under its path.
     return {"exit_code": next((r["exit_code"] for r in results if r.get("exit_code")), 0),
-            "stdout": "\n".join(f"{c}: {(r.get('stdout') or '').strip()}" for c, r in zip(clones, results))[-8000:],
-            "stderr": "\n".join(f"{c}: {(r.get('stderr') or '').strip()}" for c, r in zip(clones, results)
+            "stdout": "\n".join(f"{c}: {(r.get('stdout') or '').strip()}"
+                               for (c, _rid), r in zip(clones, results, strict=False))[-8000:],
+            "stderr": "\n".join(f"{c}: {(r.get('stderr') or '').strip()}"
+                               for (c, _rid), r in zip(clones, results, strict=False)
                                 if r.get("stderr"))[-2000:]}
 
 
-def access_guard_argv(clone: str, branch_prefix: str, push_enabled: bool, integration_branch: str = "") -> list[str]:
+def _per_repo_guard(raw: object) -> dict[int, tuple[str, bool, str, bool]] | str:
+    """`repos[]` -> {repo_id: (branch_prefix, push_enabled, integration_branch, allow_force_push)}, or the
+    refusal text for a row that names a repository but carries an unusable value (never guessed open). An
+    absent list (an older CP) is `{}`."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, list):
+        return f"repos must be a list (got {type(raw).__name__})"
+    out: dict[int, tuple[str, bool, str, bool]] = {}
+    for row in raw:
+        rid = row.get("repo_id") if isinstance(row, dict) else None
+        if not isinstance(rid, int) or isinstance(rid, bool):
+            return f"repos row without an integer repo_id: {row!r}"
+        prefix, push, force = row.get("branch_prefix"), row.get("push_enabled"), row.get("allow_force_push")
+        if not isinstance(prefix, str) or not slot_repos.legal_ref_prefix(prefix):
+            return f"repository {rid}: '{prefix}' is not a legal git ref prefix"
+        if not isinstance(push, bool) or not isinstance(force, bool):
+            return f"repository {rid}: push_enabled and allow_force_push must be booleans"
+        out[rid] = (prefix, push, str(row.get("integration_branch") or ""), force)
+    return out
+
+
+def access_guard_argv(clone: str, branch_prefix: str, push_enabled: bool, integration_branch: str = "",
+                      allow_force_push: bool | None = None, protect_integration: bool = False,
+                      jaah_repo_prefix: str | None = None) -> list[str]:
     """The installer argv for one clone. Flags, not positionals: an empty positional prefix is easily
-    dropped, and `--push-enabled true|false` must never be readable from absence."""
+    dropped, and `--push-enabled true|false` must never be readable from absence. `allow_force_push=None`
+    and `jaah_repo_prefix=None` leave the clone's marker as it is (`""` clears the latter); `protect_integration`
+    False writes nothing (the marker only adds)."""
     argv = [_python(), _install_access_guard(), clone,
             "--branch-prefix", branch_prefix,
             "--push-enabled", "true" if push_enabled else "false"]
     if integration_branch:
         argv += ["--integration-branch", integration_branch]
+    if allow_force_push is not None:
+        argv += ["--allow-force-push", "true" if allow_force_push else "false"]
+    if protect_integration:
+        argv += ["--protect-integration", "true"]
+    if jaah_repo_prefix is not None:
+        argv += ["--jaah-repo-prefix", jaah_repo_prefix]
     return argv
 
 
-def _repo_clones(anchor: str) -> list[str]:
-    """Every `_repos/<rid>/main` clone beside the anchor `<home>/repos/<pid>/main` (`slot_repos`' layout)."""
-    root = slot_repos.repos_root(anchor)
-    try:
-        names = sorted(os.listdir(root))
-    except OSError:
-        return []
-    return [clone for name in names if name.isdigit()
-            and os.path.isdir(os.path.join(clone := os.path.join(root, name, "main"), ".git"))]
+def _project_clones(project_dir: str) -> list[tuple[str, int | None]]:
+    """`(path, repo id)` of every standalone clone of the project at `project_dir` (`<home>/repos/<pid>`): each
+    slot `<N>` (the primary: None) and each `_repos/<rid>/<N>` (repository `<rid>`), static and dynamic alike —
+    and a retired `main` (or `_repos/<rid>/main`) still on disk, whose config its held linked worktrees share. A directory whose `.git` is
+    not a real directory (a symlink, a linked worktree's pointer file) is no clone of its own and is skipped."""
+    def standalone(path: str) -> bool:
+        try:
+            return stat.S_ISDIR(os.lstat(os.path.join(path, ".git")).st_mode) and not os.path.islink(path)
+        except OSError:
+            return False
+
+    def names(path: str) -> list[str]:
+        try:
+            return sorted(os.listdir(path))
+        except OSError:
+            return []
+
+    out: list[tuple[str, int | None]] = [
+        (path, None) for name in names(project_dir)
+        if (name.isdigit() or name == "main") and standalone(path := os.path.join(project_dir, name))]
+    root = os.path.join(project_dir, slot_repos.NON_PRIMARY_DIRNAME)
+    for rid in names(root):
+        if rid.isdigit() and not os.path.islink(os.path.join(root, rid)):
+            out += [(path, int(rid)) for n in names(os.path.join(root, rid))
+                    if (n.isdigit() or n == "main") and standalone(path := os.path.join(root, rid, n))]
+    return out

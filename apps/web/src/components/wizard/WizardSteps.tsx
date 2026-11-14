@@ -6,6 +6,7 @@ import StepButton from '@mui/material/StepButton'
 import Stepper from '@mui/material/Stepper'
 import Typography from '@mui/material/Typography'
 import useMediaQuery from '@mui/material/useMediaQuery'
+import { FONT_WEIGHT, RADIUS, grid, theme } from '../../theme'
 import type { Wizard, WizardStep } from './useWizard'
 
 /* The wizard's step indicator (module contract: `useWizard.ts`'s header). Two layouts, never a third:
@@ -13,7 +14,6 @@ import type { Wizard, WizardStep } from './useWizard'
  *     ellipsized); a step already reached is a button back to it, a future step is disabled.
  *   - < 600px: ONE line, "Step 2 of 5 · When", over a thin progress bar. A row of five labels cannot stay
  *     legible at 390px, so the phone gets the current step's name in full rather than all five shredded. */
-export const WIZARD_NARROW_QUERY = '(max-width:599.95px)'
 
 export function WizardSteps<Id extends string>({
   steps,
@@ -27,21 +27,21 @@ export function WizardSteps<Id extends string>({
   label: string
   testId: string
 }): JSX.Element {
-  const narrow = useMediaQuery(WIZARD_NARROW_QUERY, { noSsr: true })
+  const narrow = useMediaQuery(theme.breakpoints.down('sm'), { noSsr: true })
   const { index, furthest } = wizard
 
   if (narrow) {
     const position = `Step ${index + 1} of ${steps.length}`
     return (
-      <Box component="nav" aria-label={label} data-testid={testId} sx={{ display: 'grid', gap: 0.75 }}>
-        <Typography variant="body2" data-testid={`${testId}-count`} sx={{ fontWeight: 500 }}>
+      <Box component="nav" aria-label={label} data-testid={testId} sx={{ display: 'grid', gap: 0.5 }}>
+        <Typography variant="body2" data-testid={`${testId}-count`} aria-live="polite" sx={{ fontWeight: FONT_WEIGHT.medium }}>
           {position} · <Box component="span" aria-current="step">{steps[index].label}</Box>
         </Typography>
         <LinearProgress
           variant="determinate"
           value={((index + 1) / steps.length) * 100}
           aria-label={position}
-          sx={{ height: 4, borderRadius: 2 }}
+          sx={{ height: grid(0.5), borderRadius: RADIUS.md }}
         />
       </Box>
     )

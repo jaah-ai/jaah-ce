@@ -3,32 +3,17 @@ from __future__ import annotations
 
 from app.dispatch_compose.doctrine import BUNDLE
 from app.dispatch_compose.role_tables import _folder_rewritten
-from app.dispatch_compose.settle_terms import SettleTerms, _settle_tool_for, settle_terms_of
-from app.persona_registry import DELIVERY_OUTCOME, DELIVERY_PR, MODE_BUILD, charter_delivery, charter_mode
+from app.dispatch_compose.settle_terms import SettleTerms, _settle_tool_for
+from app.persona_registry import DELIVERY_OUTCOME, DELIVERY_PR, MODE_BUILD
 
 def _waits_for_a_merge(role: dict[str, str], *, mode: str) -> bool:
     """Whether this role can open a PR (a build role, which reads the Engineering rules) and has a terminal
     call to time against its merge.
 
     The one filter shared by `_WAIT_FOR_PR_MERGE` and `_BOUNDED_GATE_WAIT` (which refers to it), so the
-    two can never reach different roles; a build role it excludes has `_MERGE_WAIT_POINTER` dropped."""
-    return mode == MODE_BUILD and not role.get("no_terminal_call")
-
-
-def _render_role_section(role: dict[str, str], *, charter_key: str, persona: str) -> str:
-    """Render one role's prose (`_ROLES[charter_key]`) into the "Your Role" section after the charter.
-
-    `charter_key` reaches `charter_mode()` / `charter_delivery()`. `persona` is required rather than
-    derived: `PERSONA_MANIFEST` and `PERSONA_TERMINALS` key on it and `PERSONA_CHARTER` is not injective."""
-    return render_role_section_with(
-        role,
-        mode=charter_mode(charter_key),
-        delivery=charter_delivery(charter_key),
-        terms=settle_terms_of(persona),
-        # The repository shape: a folder's role section is composed only through `build_system_prompt_with`,
-        # which applies `_FOLDER_REWRITES` first.
-        repo=True,
-    )
+    two can never reach different roles; a build role it excludes has `_MERGE_WAIT_POINTER` dropped. A role marked
+    `no_merge_wait` opens a PR it must never see merged (`repo_move`: the PR is the project owner's to merge)."""
+    return mode == MODE_BUILD and not role.get("no_terminal_call") and not role.get("no_merge_wait")
 
 
 def render_role_section_with(

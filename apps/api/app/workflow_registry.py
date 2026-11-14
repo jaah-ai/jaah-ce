@@ -1,7 +1,7 @@
 """The curated catalogue of durable workflows — the one place a workflow's operator-facing identity lives.
 
 Hand-maintained, not derived from DBOS rows: a workflow that never ran, or whose runs were pruned, must
-still appear (absence is not a state). `tests/test_workflow_registry.py` AST-walks `app/durable/` and
+still appear (absence is not a state). `test_workflow_registry.py` (apps/api top level, quick gate) AST-walks `app/durable/` and
 fails unless this set plus `CRON_TICK_WORKFLOW` is exactly what it finds.
 
 `cron_tick` is excluded: `cron_runs` and the per-cron Runs tab are a richer ledger, and the ten-second
@@ -159,12 +159,27 @@ REGISTRY: tuple[WorkflowDescriptor, ...] = (
         label="Support notification delivery",
         description=(
             "Sends one person the Slack DM for one support ticket event — a new ticket, a reply, or a "
-            "linked task done — through their own notification preferences. The bell does not depend on "
-            "it: its items derive from the ticket rows, so losing one costs only the Slack message."
+            "linked task done — and, for an operator, the email, through their own notification "
+            "preferences. The bell does not depend on it: its items derive from the ticket rows, so losing "
+            "one costs only the Slack message and the email."
         ),
         trigger=(
             "Enqueued once per recipient after a ticket write commits (`support_activity.record_event`), "
             "and by the task-done workflow for a linked task."
+        ),
+        queue="support-notify",
+    ),
+    WorkflowDescriptor(
+        name="deliver_requester_email",
+        label="Support ticket email to the requester",
+        description=(
+            "Emails a ticket's requester that it was received, that support replied, or that it is solved or "
+            "closed (`support_mail.send`), at their login email whatever their notification settings say. "
+            "Losing one costs that email: an operator can resend it from the ticket page."
+        ),
+        trigger=(
+            "Enqueued once per item after a ticket write commits (`support_activity.record_event`, "
+            "`support_activity.record_status_write`)."
         ),
         queue="support-notify",
     ),
@@ -202,12 +217,12 @@ REGISTRY: tuple[WorkflowDescriptor, ...] = (
     ),
     WorkflowDescriptor(
         name="deliver_forward",
-        label="Lead and access-request forward",
+        label="Lead forward",
         description=(
             "Runs one named send that records its own outcome on its row: a site enquiry's, sign-up's or trust "
-            "request's Slack and HubSpot forward, or an access request's approver cards."
+            "request's Slack and HubSpot forward."
         ),
-        trigger="Enqueued by `notify_outbox.forward` when the lead or request is stored.",
+        trigger="Enqueued by `notify_outbox.forward` when the lead is stored.",
         queue="notify-forward",
     ),
     WorkflowDescriptor(
@@ -330,17 +345,6 @@ REGISTRY: tuple[WorkflowDescriptor, ...] = (
         ),
         trigger="Enqueued after a task is created, by an operator, a cron or a runner that filed it, and "
                 "after a runner rewrites a filed draft's title.",
-        queue="task-title",
-    ),
-    WorkflowDescriptor(
-        name="reword_question_round",
-        label="Question rewording",
-        description=(
-            "Rewords a runner's question round in plain terms (a headline, one line of why, short option "
-            "labels) for the task page. Display only and best-effort: a failure leaves the runner's own "
-            "wording on screen, and answers always post the original labels."
-        ),
-        trigger="Enqueued after a runner asks a question round, from either question route.",
         queue="task-title",
     ),
     WorkflowDescriptor(
@@ -511,6 +515,82 @@ REGISTRY: tuple[WorkflowDescriptor, ...] = (
         trigger="Enqueued when an operator stops a Your Cloud node and the cloud has not finished stopping it.",
         queue="cloud-change",
     ),
+    WorkflowDescriptor(
+        name="deliver_removals",
+        label="Account removal on nodes",
+        description=(
+            "Sends each node a deleted account's owed removals, token-share nodes first. The owed "
+            "removals are the durable record: when this never lands, each node still carries them out "
+            "on its next connect."
+        ),
+        trigger="Enqueued when an operator deletes an account in the console, after the delete commits.",
+        queue="account-remove",
+    ),
+    WorkflowDescriptor(
+        name="provision_hosted_app",
+        label="Easy Mode app provisioning",
+        description=(
+            "Builds an Easy Mode app step by step: its repo, database, function and address, then its dev stage. "
+            "Every step is safe to re-run. When it fails, the app shows the failed step and its reason, and "
+            "Retry runs the steps again from the top."
+        ),
+        trigger="Enqueued when a member creates an Easy Mode app, and again on each Retry.",
+        queue="hosted-app",
+    ),
+    WorkflowDescriptor(
+        name="delete_hosted_app",
+        label="Easy Mode app deletion",
+        description=(
+            "Takes an Easy Mode app down: its route and address first, then its site, function, image repository "
+            "and database. The repo is kept. Each removal tolerates what is already gone."
+        ),
+        trigger="Enqueued when an operator deletes an Easy Mode app, or its Easy Mode project is deleted.",
+        queue="hosted-app-delete",
+    ),
+    WorkflowDescriptor(
+        name="dev_stage_hosted_app",
+        label="Easy Mode app dev stage",
+        description=(
+            "Gives an Easy Mode app made before dev stages its own: a develop branch, a dev address with its own "
+            "empty database, then the project onto develop. Its live address is never touched. An app with an "
+            "open task waits for the next pass."
+        ),
+        trigger="Enqueued by the hourly Easy Mode edge cron for each live or paused app still on main.",
+        queue="hosted-app-converge",
+    ),
+    WorkflowDescriptor(
+        name="dev_admin_hosted_app",
+        label="Easy Mode app dev admin",
+        description=(
+            "Gives a web app moved onto its dev stage the live admin login on its dev address, once the dev "
+            "deploy is green. A deploy still running is looked at again by the next pass; an admin already "
+            "active there is left as it is."
+        ),
+        trigger="Enqueued by the hourly Easy Mode edge cron for each live web app on develop with no dev admin yet.",
+        queue="hosted-app-converge",
+    ),
+    WorkflowDescriptor(
+        name="rename_org_repos",
+        label="Org repo rename",
+        description=(
+            "Renames each of an org's Jaah-made repos on GitHub to carry the org's current slug prefix, dropping an "
+            "old prefix first, and updates the repo's project and web app to match. When it fails, the repos keep "
+            "their old names until the next api start's sweep."
+        ),
+        trigger="Enqueued when an operator renames an org's slug, after the rename commits.",
+        queue="jaah-repo-prefix",
+    ),
+    WorkflowDescriptor(
+        name="sweep",
+        label="Org slug and repo prefix sweep",
+        description=(
+            "Gives every org whose slug predates the letters-and-digits rule a conforming one, retagging its tailnet "
+            "devices, then renames every org's repos still missing the prefix. A no-op once all conform; a failed "
+            "run is tried again on the next api start."
+        ),
+        trigger="Enqueued once on each api start; concurrent starts collapse into one run.",
+        queue="jaah-repo-prefix",
+    ),
 )
 
 #: The names, in registry order, for `list_workflows`. The explicit list is also what keeps cron ticks
@@ -542,6 +622,10 @@ FEATURE_OF: dict[str, str] = {
     "converge_shared_account": "nodelink",
     "change_machine": "hostings",
     "converge_gha_pool": "gha_runners",
+    "provision_hosted_app": "easy_mode_hosting",
+    "delete_hosted_app": "easy_mode_hosting",
+    "dev_stage_hosted_app": "easy_mode_hosting",
+    "dev_admin_hosted_app": "easy_mode_hosting",
 }
 CLOUD_ONLY_NAMES: frozenset[str] = frozenset(FEATURE_OF)
 

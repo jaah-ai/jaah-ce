@@ -4,7 +4,8 @@
 import { get, post } from '../../api'
 import type { Page } from '../../hooks/useListPage'
 import type { NodeOs } from '../../lib/nodeOs'
-import { onboardingScript } from '../NodeOnboardingDialog'
+import type { Shape } from '../../lib/nodeShape'
+import { onboardingScript } from '../../lib/onboardingScript'
 
 /** How a node is made — a `POST /api/node-orders` path. */
 export type OrderPath = 'rent_dedicated' | 'rent_shared' | 'cloud' | 'self_hosted' | 'co_locate'
@@ -44,12 +45,9 @@ export type HostingCatalog = {
   setup_href?: string | null
   /** Why no node can be added for this org right now, by any way; null when one can. Said on the first step. */
   refusal?: string | null
-  /** Operator only (`/api/billing/plans/product-catalog`): Live Cast's per-project price and Backfill default.
-   *  `offered` false = no price yet, so a Live Cast line is refused. */
-  live_cast?: LiveCastOffer
+  /** Operator only: the console path of the setting `refusal` names; null otherwise. */
+  refusal_href?: string | null
 }
-
-export type LiveCastOffer = { offered: boolean; monthly_cents: number | null; default_backfill: number }
 
 export type HostState = 'provisioning' | 'ready' | 'failed' | 'stopped' | 'deleting'
 
@@ -95,6 +93,8 @@ export type OrderCreated = {
   onboarding_joins_tailnet?: boolean
   /** The headscale server to join; null = no tailnet configured. */
   tailnet_login_server?: string | null
+  /** The single-use key the join presents; null = the join asks for an interactive login. */
+  tailnet_auth_key?: string | null
 }
 
 /** What `OrderProgress` shows a self-hosted machine: the one command it runs. */
@@ -102,14 +102,16 @@ export type OrderCommand = {
   command: string
   /** The machine's OS: the steps after the command (`NodeOsGuide`). */
   os?: NodeOs
-  /** The command is wrapped in the interactive tailnet join, so it cannot run as user-data. */
+  /** The command is wrapped in a tailnet join with no key, whose interactive login cannot run as user-data. */
   joinsTailnet?: boolean
 }
 
 export function orderCommand(created: Omit<OrderCreated, 'order' | 'payment'>, os?: NodeOs): OrderCommand | null {
   if (!created.onboarding_command) return null
-  const command = onboardingScript(created.onboarding_command, created.onboarding_joins_tailnet, created.tailnet_login_server ?? null)
-  return { command, os, joinsTailnet: Boolean(created.onboarding_joins_tailnet) }
+  // A key counts only with its server (`selfHostedScript` drops it otherwise).
+  const key = created.tailnet_login_server ? created.tailnet_auth_key ?? null : null
+  const command = onboardingScript(created.onboarding_command, created.onboarding_joins_tailnet, created.tailnet_login_server ?? null, key)
+  return { command, os, joinsTailnet: Boolean(created.onboarding_joins_tailnet) && !key }
 }
 
 export type NodeOrderView = {
@@ -133,6 +135,9 @@ export type NodeOrderView = {
    *  (absent from an older server). */
   os?: NodeOs | null
   instance_type?: string | null
+  /** A cloud order's connection, which a refused launch links to editing; null on other paths (absent from an
+   *  older server). */
+  connection_id?: string | null
 }
 
 export type HostingBody = {
@@ -150,7 +155,6 @@ export type NodeOrderBody = {
   org_id: string
   path: OrderPath
   name: string
-  project_ids: number[]
   /* The org's NodeLinks the new node is born attached to (cloud, self-hosted, co-located only). Absent = the
      server's default: the accounts NodeLink iff the org's NodeLink allows it; `[]` = none; a non-empty list
      while the org's NodeLink is off is a 403, another org's id a 404. */
@@ -160,7 +164,12 @@ export type NodeOrderBody = {
   cloud?: { connection_id: string; instance_type: string; os?: NodeOs }
   self_hosted?: { os: NodeOs }
   co_locate?: { host_id: string }
+  /* Absent = the server's preselected shape for the path. Sent only while the wizard shows the Shape choice. */
+  shape?: Shape
 }
+
+/** `GET /api/node-orders/shapes`: the shapes a path offers (the server's call alone) and the one to preselect. */
+export type NodeShapes = { offered: Shape[]; preselected: Shape }
 
 const q = encodeURIComponent
 
@@ -174,6 +183,12 @@ export function suggestNodeName(orgId: string, opts: { hostId?: string; name?: s
   if (opts.hostId) params.push(`host_id=${q(opts.hostId)}`)
   if (opts.name !== undefined) params.push(`name=${q(opts.name)}`)
   return get<NameSuggestion>(`/api/node-names/suggest?${params.join('&')}`)
+}
+
+export function getNodeShapes(orgId: string, path: OrderPath, os?: NodeOs) {
+  const params = [`org_id=${q(orgId)}`, `path=${q(path)}`]
+  if (os) params.push(`os=${q(os)}`)
+  return get<NodeShapes>(`/api/node-orders/shapes?${params.join('&')}`)
 }
 
 export const createNodeOrder = (body: NodeOrderBody) => post<OrderCreated>('/api/node-orders', body)
@@ -203,3 +218,13 @@ export const STAGE_LABELS: Record<Exclude<OrderStage, 'failed'>, { active: strin
 export const BOOTING_LABEL = 'Booting'
 /** A `waiting_for_machine` order whose machine fetched its install script: it is installing, no longer awaited. */
 export const INSTALLING_LABEL = 'Installing on your machine'
+
+/** The words for an order's stage while it runs: the progress dialog's step and a host's status, one home. A launch
+ *  whose machine exists is a boot; a wait whose machine fetched its script is the install. */
+export function activeStageLabel(
+  stage: Exclude<OrderStage, 'failed'>, order: { instance_started?: boolean; install_fetched_at?: string | null },
+): string {
+  if (stage === 'launching' && order.instance_started === true) return BOOTING_LABEL
+  if (stage === 'waiting_for_machine' && order.install_fetched_at) return INSTALLING_LABEL
+  return STAGE_LABELS[stage]?.active ?? 'In progress'
+}

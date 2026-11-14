@@ -9,7 +9,8 @@ import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Paper from '@mui/material/Paper'
 import Typography from '@mui/material/Typography'
-import { RAW } from '../theme'
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, RADIUS, RAW, grid, tint } from '../theme'
+import { useWindowDrag } from '../hooks/useWindowDrag'
 import {
   TABBED_DEFAULT,
   applyDrop,
@@ -30,6 +31,7 @@ import {
   type Rect,
   type WindowRef,
 } from '../lib/consoleLayout'
+import Tip from '../ui/Tip'
 
 type Props = {
   /** The live window list, in the order the enumeration endpoint returned it. */
@@ -86,10 +88,10 @@ export function designerScale(canvas: { w: number; h: number }): number {
 
 function px(rect: Rect, scale: number) {
   return {
-    left: `${rect.x * scale}px`,
-    top: `${rect.y * scale}px`,
-    width: `${rect.w * scale}px`,
-    height: `${rect.h * scale}px`,
+    left: rect.x * scale,
+    top: rect.y * scale,
+    width: rect.w * scale,
+    height: rect.h * scale,
   }
 }
 
@@ -127,7 +129,7 @@ const designerSurfaceSx = {
 
 /* The proxy is a PICTURE OF THE TERMINAL, so it keeps the terminal's dark ground in both schemes (the
    `RAW.dark` map ConsolePane's XTERM_THEME uses). */
-const CANVAS_BORDER = 'rgba(255, 255, 255, 0.14)'
+const CANVAS_BORDER = `color-mix(in srgb, ${RAW.dark.textPrimary} 14%, transparent)`
 
 export default function LayoutDesigner({ windows, initialModel, canvas, cells, onApply, onCancel }: Props) {
   // TWO TREES, DELIBERATELY — do not collapse them:
@@ -144,9 +146,7 @@ export default function LayoutDesigner({ windows, initialModel, canvas, cells, o
 
   const dialogRef = useRef<HTMLDivElement | null>(null)
   const canvasRef = useRef<HTMLDivElement | null>(null)
-  // Stashed so an unmount mid-drag removes the window listeners (as in ConsoleTerminal).
-  const dragTeardownRef = useRef<(() => void) | null>(null)
-  useEffect(() => () => dragTeardownRef.current?.(), [])
+  const attachDrag = useWindowDrag()
 
   useEffect(() => {
     dialogRef.current?.focus()
@@ -177,15 +177,10 @@ export default function LayoutDesigner({ windows, initialModel, canvas, cells, o
 
   function startDrag(win: WindowRef, e: React.PointerEvent) {
     if (e.button !== 0) return
-    // The tab is a button; without this the browser starts a text selection over the label instead.
-    e.preventDefault()
-    setDrag({ windowId: win.id, clientX: e.clientX, clientY: e.clientY })
-
     const onMove = (ev: PointerEvent) => {
       setDrag((d) => (d ? { ...d, clientX: ev.clientX, clientY: ev.clientY } : d))
     }
     const onUp = (ev: PointerEvent) => {
-      teardown()
       setDrag(null)
       // Resolved against the CURRENT model inside the updater, not the tree captured at drag start.
       setModel((cur) => {
@@ -195,14 +190,10 @@ export default function LayoutDesigner({ windows, initialModel, canvas, cells, o
         return applyDrop(cur, win.id, zone)
       })
     }
-    function teardown() {
-      window.removeEventListener('pointermove', onMove)
-      window.removeEventListener('pointerup', onUp)
-      dragTeardownRef.current = null
-    }
-    window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', onUp)
-    dragTeardownRef.current = teardown
+    if (!attachDrag(onMove, onUp)) return
+    // The tab is a button; without this the browser starts a text selection over the label instead.
+    e.preventDefault()
+    setDrag({ windowId: win.id, clientX: e.clientX, clientY: e.clientY })
   }
 
   const hoverZone = drag ? zoneAt(model, drag) : null
@@ -241,10 +232,10 @@ export default function LayoutDesigner({ windows, initialModel, canvas, cells, o
         }}
       >
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
-          <Typography variant="h6" component="h2" sx={{ fontSize: '1rem', fontWeight: 600 }}>
+          <Typography variant="h6" component="h2" sx={{ fontSize: FONT_SIZE.lg, fontWeight: FONT_WEIGHT.semibold }}>
             Console layout
           </Typography>
-          <Typography variant="body2" sx={{ color: 'text.secondary', maxWidth: '56ch', lineHeight: 1.4 }}>
+          <Typography variant="body2" sx={{ color: 'text.secondary', maxWidth: '56ch', lineHeight: LINE_HEIGHT.snug }}>
             Drag a tab onto a tile’s edge to split it, or onto a tab strip to group it there.
           </Typography>
         </Box>
@@ -257,11 +248,11 @@ export default function LayoutDesigner({ windows, initialModel, canvas, cells, o
           sx={{
             position: 'relative',
             overflow: 'hidden',
-            borderRadius: 1,
+            borderRadius: RADIUS.sm,
             bgcolor: RAW.dark.terminalBg,
             touchAction: 'none',
           }}
-          style={{ width: `${canvas.w * scale}px`, height: `${canvas.h * scale}px` }}
+          style={{ width: canvas.w * scale, height: canvas.h * scale }}
         >
           {tiles(model).map((tile) => {
             const rect = rects.get(tile.key)
@@ -279,8 +270,8 @@ export default function LayoutDesigner({ windows, initialModel, canvas, cells, o
                   flexDirection: 'column',
                   overflow: 'hidden',
                   border: `1px solid ${CANVAS_BORDER}`,
-                  borderRadius: 1,
-                  bgcolor: 'rgba(255, 255, 255, 0.03)',
+                  borderRadius: RADIUS.sm,
+                  bgcolor: `color-mix(in srgb, ${RAW.dark.textPrimary} 3%, transparent)`,
                   boxSizing: 'border-box',
                 }}
                 style={px(rect, scale)}
@@ -293,60 +284,58 @@ export default function LayoutDesigner({ windows, initialModel, canvas, cells, o
                   sx={{
                     display: 'flex',
                     alignItems: 'stretch',
-                    gap: '2px',
+                    gap: 0,
+                    height: TAB_STRIP_PX,
                     flexShrink: 0,
-                    p: '2px',
+                    p: 0,
                     overflowX: 'auto',
                     overflowY: 'hidden',
                     scrollbarWidth: 'thin',
-                    borderBottom: '1px solid rgba(255, 255, 255, 0.1)',
-                    bgcolor: 'rgba(255, 255, 255, 0.06)',
+                    borderBottom: `1px solid color-mix(in srgb, ${RAW.dark.textPrimary} 10%, transparent)`,
+                    bgcolor: `color-mix(in srgb, ${RAW.dark.textPrimary} 6%, transparent)`,
                     boxSizing: 'border-box',
                   }}
-                  style={{ height: `${TAB_STRIP_PX}px` }}
                 >
                   {tile.tabs.map((w, i) => (
-                    <Box
+                    <Tip key={w.id} title={w.name}><Box
                       component="button"
-                      key={w.id}
                       type="button"
                       role="tab"
                       aria-selected={i === tile.activeTab}
                       data-testid="layout-tab"
                       data-dragging={drag?.windowId === w.id ? 'true' : undefined}
                       // The FULL name, always; the label's elision must not be the only copy.
-                      title={w.name}
                       data-window-id={w.id}
                       onPointerDown={(e: React.PointerEvent) => startDrag(w, e)}
                       onClick={() => setModel((m) => setActiveTab(m, tile.key, i))}
                       sx={(theme) => ({
                         flex: '0 0 auto',
                         maxWidth: 'none',
-                        px: '0.4rem',
+                        px: 1,
                         py: 0,
                         border: '1px solid transparent',
-                        borderRadius: '3px',
+                        borderRadius: RADIUS.sm,
                         bgcolor: 'transparent',
                         color: RAW.dark.textSecondary,
                         fontFamily: theme.typography.mono.fontFamily,
-                        fontSize: '11px',
-                        lineHeight: 1,
+                        fontSize: FONT_SIZE.xs,
+                        lineHeight: LINE_HEIGHT.tight,
                         // Already elided by elideMiddle; eliding again would re-cut it at the tail.
                         whiteSpace: 'nowrap',
                         cursor: 'grab',
                         touchAction: 'none',
                         userSelect: 'none',
-                        '&:hover': { bgcolor: 'rgba(255, 255, 255, 0.06)', color: RAW.dark.textPrimary },
+                        '&:hover': { bgcolor: `color-mix(in srgb, ${RAW.dark.textPrimary} 6%, transparent)`, color: RAW.dark.textPrimary },
                         '&[aria-selected="true"]': {
-                          borderColor: 'rgba(255, 255, 255, 0.18)',
-                          bgcolor: 'rgba(255, 255, 255, 0.08)',
+                          borderColor: `color-mix(in srgb, ${RAW.dark.textPrimary} 18%, transparent)`,
+                          bgcolor: `color-mix(in srgb, ${RAW.dark.textPrimary} 8%, transparent)`,
                           color: RAW.dark.textPrimary,
                         },
                         '&[data-dragging="true"]': { opacity: 0.4, cursor: 'grabbing' },
                       })}
                     >
                       {elideMiddle(w.name, chars)}
-                    </Box>
+                    </Box></Tip>
                   ))}
                 </Box>
                 <Box
@@ -356,7 +345,7 @@ export default function LayoutDesigner({ windows, initialModel, canvas, cells, o
                     minHeight: 0,
                     alignItems: 'center',
                     justifyContent: 'center',
-                    p: '0.25rem',
+                    p: 0.5,
                     overflow: 'hidden',
                   }}
                 >
@@ -366,9 +355,9 @@ export default function LayoutDesigner({ windows, initialModel, canvas, cells, o
                       component="span"
                       data-testid="layout-tile-caption"
                       sx={(theme) => ({
-                        color: 'rgba(255, 255, 255, 0.45)',
+                        color: `color-mix(in srgb, ${RAW.dark.textPrimary} 45%, transparent)`,
                         fontFamily: theme.typography.mono.fontFamily,
-                        fontSize: '11px',
+                        fontSize: FONT_SIZE.xs,
                         whiteSpace: 'nowrap',
                       })}
                     >
@@ -390,8 +379,8 @@ export default function LayoutDesigner({ windows, initialModel, canvas, cells, o
                 pointerEvents: 'none',
                 border: 2,
                 borderColor: 'primary.main',
-                borderRadius: 1,
-                bgcolor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.22)',
+                borderRadius: RADIUS.sm,
+                bgcolor: tint('primary', 0.22),
                 boxSizing: 'border-box',
               }}
               style={px(previewRect, scale)}
@@ -410,8 +399,8 @@ export default function LayoutDesigner({ windows, initialModel, canvas, cells, o
                 p: 1,
                 border: '2px dashed',
                 borderColor: RAW.dark.error,
-                borderRadius: 1,
-                bgcolor: 'rgba(var(--mui-palette-error-mainChannel) / 0.14)',
+                borderRadius: RADIUS.sm,
+                bgcolor: tint('error', 0.14),
                 boxSizing: 'border-box',
               }}
               style={px(refusalRect, scale)}
@@ -423,8 +412,8 @@ export default function LayoutDesigner({ windows, initialModel, canvas, cells, o
                   maxWidth: '32ch',
                   // On the canvas's dark ground in BOTH schemes, so the on-dark error token.
                   color: RAW.dark.error,
-                  fontSize: '11px',
-                  lineHeight: 1.3,
+                  fontSize: FONT_SIZE.xs,
+                  lineHeight: LINE_HEIGHT.snug,
                   textAlign: 'center',
                 }}
               >
@@ -441,22 +430,21 @@ export default function LayoutDesigner({ windows, initialModel, canvas, cells, o
           component="p"
           role="status"
           data-testid="layout-designer-status"
-          sx={{ color: 'error.main', minHeight: '1.1rem', lineHeight: '1.1rem' }}
+          sx={{ color: 'error.main', minHeight: grid(3), lineHeight: LINE_HEIGHT.snug }}
         >
           {hoverRefusal ?? ''}
         </Typography>
 
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
           {/* Reset returns to TABS even when opened on a grid, so the tooltip names the tabbed arrangement. */}
-          <Button
+          <Tip title="Back to tabs — one tile, every window"><Button
             type="button"
             variant="outlined"
             color="inherit"
             onClick={() => setModel(openSnapshot)}
-            title="Back to tabs — one tile, every window"
           >
             Reset
-          </Button>
+          </Button></Tip>
           <Box sx={{ flex: 1 }} />
           <Button type="button" variant="outlined" color="inherit" onClick={onCancel}>
             Cancel
@@ -474,20 +462,20 @@ export default function LayoutDesigner({ windows, initialModel, canvas, cells, o
           aria-hidden="true"
           sx={(theme) => ({
             position: 'fixed',
-            zIndex: 3,
+            zIndex: 1,
             pointerEvents: 'none',
-            transform: 'translate(12px, 12px)',
-            px: '0.4rem',
-            py: '2px',
+            transform: `translate(${grid(2)}, ${grid(2)})`,
+            px: 1,
+            py: 0,
             border: `1px solid ${CANVAS_BORDER}`,
-            borderRadius: '3px',
+            borderRadius: RADIUS.sm,
             bgcolor: RAW.dark.backgroundPaper,
             color: RAW.dark.textPrimary,
             fontFamily: theme.typography.mono.fontFamily,
-            fontSize: '11px',
+            fontSize: FONT_SIZE.xs,
             whiteSpace: 'nowrap',
           })}
-          style={{ left: `${drag.clientX}px`, top: `${drag.clientY}px` }}
+          style={{ left: drag.clientX, top: drag.clientY }}
         >
           {elideMiddle(draggedName, 24)}
         </Box>

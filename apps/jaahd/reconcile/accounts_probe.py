@@ -31,10 +31,12 @@ log = logging.getLogger(__name__)
 _registry_norm = registry_norm
 
 
-# `account_roster()` is the one read behind `main._read_account_sources` and `_fleet_auth_dirs`. The TTL
-# (60s, an operator decision) floors the network read only: `account_dir_usable` is re-applied every tick, and
-# `invalidate_account_roster()` surfaces a new account next tick.
-ACCOUNT_ROSTER_TTL_SECS = 60.0
+# `account_roster()` is the one read behind `main._read_account_sources` and `_fleet_auth_dirs`. The TTL floors
+# the network read only: `account_dir_usable` is re-applied every tick, and `invalidate_account_roster()`
+# surfaces a change next tick — called on the CP's `refresh` frame (topic `accounts`, sent when a roster field
+# changes), on every node-bus reconnect, and after an account command. 300s is the backstop for a lost frame
+# (an operator decision: idle nodes poll less).
+ACCOUNT_ROSTER_TTL_SECS = 300.0
 
 
 # The last successful rows and their monotonic stamp (None = re-read). The rows outlive TTL and invalidation:
@@ -363,8 +365,8 @@ def _agents_full_scan_interval() -> int:
 def _agents_failed_retry_interval() -> int:
     """Freshness floor for a dir whose last probe failed — the recovery lane.
 
-    Neither lane above can serve it: `note_leased` needs a resolved session, and one failed dir makes the
-    all-or-nothing snapshot unusable, so nothing is noted leased and the node would wait out the full-scan
+    Neither lane above can serve it: `note_leased` needs a resolved session, and a failed dir blinds every slot
+    its account could be running, so nothing there is noted leased and the node would wait out the full-scan
     floor with `session_id=None` everywhere (every `deliver_answer` refused and parked). Same default as the
     leased floor; bounded by the failure clearing."""
     return node_settings.get("node_agents_failed_retry_secs")
@@ -445,14 +447,28 @@ class AgentsProbeCache:
     def snapshot(self, dirs: list[str]) -> tuple[bool, list[dict], list[str]]:
         """(ok, merged sessions, cwds) over `dirs`, from cache alone — no probe.
 
-        All-or-nothing `ok`: a partial union would look like "that account has no sessions". Deduped by
-        `sessionId`, first wins, each tagged with its account."""
+        All-or-nothing `ok`, for the node-wide readers (reaps, erase, deliver): a partial union would look like
+        "that account has no sessions". The per-slot reader takes `partial` instead."""
+        sessions, cwds, blind = self.partial(dirs)
+        if blind:
+            return False, [], []
+        return True, sessions, cwds
+
+    def partial(self, dirs: list[str]) -> tuple[list[dict], list[str], frozenset[str]]:
+        """(merged sessions, cwds, blind dirs) over `dirs`, from cache alone — no probe.
+
+        Per account: the union covers only the accounts whose last probe returned a list, and `blind` names the
+        rest (no entry, or a failed probe). One slow or failing account then blinds only the slots it could be
+        running, not every slot on the node (`ReconcileContext.slot_agents`). Deduped by `sessionId`, first
+        wins, each tagged with its account."""
         merged: list[dict] = []
         seen_sids: set = set()
+        blind: set[str] = set()
         for config_dir in dirs:
             cached = self._entries.get(config_dir)
             if cached is None or not cached.ok:
-                return False, [], []
+                blind.add(config_dir)
+                continue
             for sess in cached.sessions:
                 tagged = {**sess, "_account": config_dir}
                 sid = tagged.get("sessionId")
@@ -460,7 +476,7 @@ class AgentsProbeCache:
                     continue
                 seen_sids.add(sid)
                 merged.append(tagged)
-        return True, merged, [s.get("cwd") for s in merged if s.get("cwd")]
+        return merged, [s.get("cwd") for s in merged if s.get("cwd")], frozenset(blind)
 
     # ── refresh ───────────────────────────────────────────────────────────────
     def due_dirs(self, dirs: list[str]) -> list[str]:
@@ -566,11 +582,7 @@ class AgentsProbeCache:
             return
         argv = provision_accounts.detached_command(config_dir)
         try:
-            if session_user.switch_needed():
-                await asyncio.to_thread(session_user.run_as_session_user, argv, timeout=60)
-            else:
-                await asyncio.to_thread(
-                    subprocess.run, argv, capture_output=True, text=True, timeout=60)
+            await asyncio.to_thread(session_user.run_as_session_user_or_here, argv, timeout=60)
         except Exception as exc:  # noqa: BLE001 — best-effort by contract, see the docstring
             # The stamp stays: a broken switch retries per cooldown, not per tick.
             log.warning("reconcile: could not start a converge for %s (%s: %s)",
@@ -586,7 +598,7 @@ class AgentsProbeCache:
         await self.converge_unprovisioned(dirs)
         results = await _gather_agents_probes(self._agents_probe, dirs)
         now = time.monotonic()
-        for config_dir, (_rc, out) in zip(dirs, results):
+        for config_dir, (_rc, out) in zip(dirs, results, strict=False):
             try:
                 arr = json.loads(out)
             except ValueError:

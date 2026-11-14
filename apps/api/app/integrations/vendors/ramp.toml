@@ -1,0 +1,51 @@
+# Ramp's Developer API has no static API key: a developer app's client ID and secret mint a token with the client
+# credentials grant (Basic auth, form body). The Test is that mint, with no scope, so it proves the pair and nothing
+# else; the token it returns is discarded.
+slug = "ramp"
+label = "Ramp"
+category = "payments"
+vendor_docs_url = "https://docs.ramp.com/developer-api/v1/authorization"
+summary = "Read Ramp cards, transactions, bills, users and departments for spend reporting and reconciliation."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "client_id", label = "Client ID", kind = "text", required = true, help = "In Ramp, open Company > Developer and select Create New App (an Admin role is required). Name it Jaah, tick the scopes agents need under Scopes (for example transactions:read, cards:read, users:read, business:read), select Client credentials as a grant type and save. The client ID is on the app's page" },
+  { key = "client_secret", label = "Client secret", kind = "secret", required = true, help = "Shown on the same app page in Company > Developer, next to the client ID. Copy it when it is shown: Ramp lets you regenerate it later, which ends the old one" },
+]
+
+[test]
+method = "POST"
+path = "https://api.ramp.com/developer/v1/token"
+body = "grant_type=client_credentials"
+content_type = "application/x-www-form-urlencoded"
+auth = { basic = ["client_id", "client_secret"] }
+# A wrong client answers 400 with this code, not 401.
+rejected_when = { path = ["error_v2", "error_code"], values = ["DEVELOPER_7012"] }
+
+[docs]
+agent_uses = [
+  "Pull card transactions for a period and match them to receipts, vendors or departments",
+  "List cards, their limits and holders to answer who can spend what",
+  "Find bills awaiting approval or payment and report them",
+  "Read users and departments to build spend reports by team",
+]
+prerequisites = [
+  "A Ramp business account and a user with the Admin role, who can open Company > Developer",
+  "Decide the scopes first: a client credentials token can only use the scopes ticked on the app",
+]
+limitations = [
+  "Agents mint their own access token from the client ID and secret (POST https://api.ramp.com/developer/v1/token with the scopes they need); each token lasts 10 days and Jaah does not cache it",
+  "Only Ramp production (api.ramp.com) is supported; a sandbox app at demo-api.ramp.com is rejected",
+  "Ramp allows 200 requests per 10 seconds per address and 100 token requests per 10 seconds; agents that hit the limit are paused for up to a minute",
+  "Some scopes (for example cards:read_vault) are reserved for approved Ramp partners and cannot be ticked on your own app",
+]
+troubleshooting = [
+  { symptom = "Test says Ramp rejected the client secret (DEVELOPER_7012)", fix = "The client ID or secret is wrong, or the secret was regenerated. Copy both again from Company > Developer and select Replace" },
+  { symptom = "An agent gets 403 from Ramp", fix = "The app lacks the scope that call needs. Tick it on the app in Company > Developer and have the agent mint a new token" },
+  { symptom = "Test fails with a 400 that names the grant type", fix = "Client credentials is not enabled on the app. Edit the app in Company > Developer and add it under Grant types" },
+]
+faq = [
+  { q = "Why does Ramp ask for a client ID and secret instead of a key", a = "Ramp issues short-lived tokens only. The ID and secret let an agent mint one whenever it needs it" },
+  { q = "Does Test change anything in Ramp", a = "No. It asks Ramp for a token with no scopes, which can read nothing, and discards it" },
+]

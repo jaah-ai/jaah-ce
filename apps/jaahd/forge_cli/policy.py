@@ -2,7 +2,9 @@
 
 The rules are the `gh` PR guard's, carried to every forge (AC4.4):
   * the base must be the project's `integration_branch` and the head under its `branch_prefix`
-    (`tools/project_config.py::ProjectConfig`, read unchanged — the pool checkout's own project);
+    (`tools/project_config.py::ProjectConfig`, read unchanged — the pool checkout's own project); the one
+    exception is a release PR (`<branch_prefix>release/<id>` into a stage branch), and only when the control plane
+    says this run carries that open release (`release.authorize`, `cli.py::_release_ok`);
   * `push_enabled=false` refuses every PR write that could land work (create, merge, auto-merge);
   * no closing keyword next to an issue reference in a PR's title or body, in THAT forge's dialect,
     unless opted in exactly as the commit-msg guard allows (`Closes-Intentionally:` / `ALLOW_CLOSING_KEYWORD`);
@@ -13,9 +15,10 @@ The rules are the `gh` PR guard's, carried to every forge (AC4.4):
     the runner's own `fleet/task-<CONTROL_TASK_ID>` — never with `push_enabled=false`: the integration
     branch's own runs are not a runner's to retrigger;
   * `pr close` and `pr ready` act only on an open PR; `pr close` posts its reason as a comment first (`cli.py`).
-  * `run dispatch` starts a workflow on the integration branch or your own branch only, never with
-    `push_enabled=false` (`check_dispatch`).
-`api` has only `get`, and `run` never cancels (`cli.py`).
+  * `run dispatch` starts a workflow on the integration branch or your own branch only — or on a release's pinned
+    branch for the run the control plane says carries it — never with `push_enabled=false` (`check_dispatch`).
+`api` has only `get`, and `run` never cancels (`cli.py`). `var`/`secret` writes are any runner's (the operator's
+choice) — but never a benchmark shadow's (`check_shadow`).
 
 Every refusal exits 2 with the project's delivery recipe on stderr (`ProjectConfig.delivery_recipe`).
 """
@@ -183,11 +186,19 @@ def check_push(config) -> None:
         raise refuse(config, "this project has push_enabled=false: no PR may be opened or merged here")
 
 
-def check_branches(config, head: str, base: str) -> None:
+def is_release_head(config, head: str) -> bool:
+    """`head` is a release executor's pinned branch: `<branch_prefix>release/<id>`."""
+    return re.fullmatch(re.escape(config.branch_prefix) + r"release/\d+", head) is not None
+
+
+def check_branches(config, head: str, base: str, release_ok=None) -> None:
+    """`release_ok(head, base)`: the control plane's answer whether this run carries an open release from `head` into
+    `base` (`cli.py::_release_ok`); only then may a PR target a branch other than the integration branch."""
     if config is None:
         return
     check_push(config)
-    if base != config.integration_branch:
+    if base != config.integration_branch and not (
+            base and release_ok is not None and is_release_head(config, head) and release_ok(head, base)):
         raise refuse(config, f"base '{base}' is not this project's integration branch '{config.integration_branch}'")
     if not config.allows_pr_from(head):
         raise refuse(config, f"head '{head}' is not under this project's branch prefix '{config.branch_prefix}'")
@@ -199,6 +210,27 @@ _BRANCH = re.compile(r"[A-Za-z0-9._/+\-]+")
 def is_branch_name(value: str) -> bool:
     """A git branch name a list filter may carry (Bitbucket splices it into a BBQL literal)."""
     return bool(_BRANCH.fullmatch(value)) and ".." not in value and not value.startswith(("-", "/"))
+
+
+SHADOW_REFUSAL = ("a benchmark shadow's PR stays an open draft: never merged, readied or auto-merged "
+                  "(create it with --draft)")
+
+
+# The CI-settings writes a shadow refuses: they change what every other run of the repository sees.
+SHADOW_VARIABLE_WRITES = ("var set", "var delete", "secret set", "secret delete")
+
+
+def check_shadow(verb: str, args, environ) -> None:
+    """A benchmark shadow (`JAAH_TASK_SHADOW=1`) never lands, readies or arms its PR, and opens it only as a draft:
+    the backstop behind the lexical PR guard hook (family 0c). Disarming auto-merge stays allowed."""
+    if environ.get("JAAH_TASK_SHADOW") != "1":
+        return
+    if (verb in ("pr merge", "pr ready") or (verb == "pr auto-merge" and not args.disable)
+            or (verb == "pr create" and not args.draft)):
+        raise PolicyRefusal(SHADOW_REFUSAL)
+    if verb in SHADOW_VARIABLE_WRITES:
+        raise PolicyRefusal("a benchmark shadow never changes the repository's CI variables or secrets: "
+                            "the live task it shadows owns them")
 
 
 def check_open(pr: PullRequest) -> None:
@@ -224,26 +256,31 @@ def check_rerun(config, run, task_id: str = "") -> None:
             "only your own branch's runs are yours to re-run"))
 
 
-def check_dispatch(config, ref: str, task_id: str = "") -> None:
+def check_dispatch(config, ref: str, task_id: str = "", release_ok=None) -> None:
     """`run dispatch`: a run on the integration branch (its hand-run workflows) or on your own branch, as for
-    `check_rerun` — never on a branch no task of this project delivers to (`master`, a release branch)."""
+    `check_rerun` — never on a branch no task of this project delivers to (`master`, a release branch). The one
+    exception is a release's pinned branch, and only when the control plane says this run carries that open release
+    (`release_ok(ref, "")`: the release executor, or the merge lane holding its PR — `release.authorize`)."""
     if config is None:
         return
     check_push(config)
     task_id = task_id.strip()
     own = (config.allows_pr_from(ref) if config.branch_prefix
            else task_id.isdigit() and ref == f"fleet/task-{task_id}")
-    if ref != config.integration_branch and not own:
-        raise refuse(config, (
-            f"--ref '{ref}' is neither this project's integration branch '{config.integration_branch}' nor your "
-            "own branch: only those are yours to start a workflow on"))
+    if ref == config.integration_branch or own:
+        return
+    if release_ok is not None and is_release_head(config, ref) and release_ok(ref, ""):
+        return
+    raise refuse(config, (
+        f"--ref '{ref}' is neither this project's integration branch '{config.integration_branch}' nor your "
+        "own branch: only those are yours to start a workflow on"))
 
 
-def check_target(config, pr: PullRequest) -> None:
+def check_target(config, pr: PullRequest, release_ok=None) -> None:
     """A merge / auto-merge is judged against the PR the forge reports, not the command line."""
     if pr.state != "open":
         raise refuse(config, f"PR #{pr.number} is {pr.state}, not open")
-    check_branches(config, pr.head, pr.base)
+    check_branches(config, pr.head, pr.base, release_ok)
 
 
 def check_head(config, pr: PullRequest, sha: str) -> None:
@@ -251,7 +288,7 @@ def check_head(config, pr: PullRequest, sha: str) -> None:
     if (pr.extra.get("head_sha") or "").lower() != sha:
         raise refuse(config, (
             f"PR #{pr.number}'s head moved: the forge reports {pr.extra.get('head_sha') or '(none)'}, "
-            f"not the pinned {sha}"))
+            f"not the pinned {sha}; nothing merged — re-pin: gate that head, then merge with its `--sha`"))
 
 
 # A PR merges on a green REQUIRED rollup (`PullRequest.checks`), or on NO checks at all: a repo with no CI is

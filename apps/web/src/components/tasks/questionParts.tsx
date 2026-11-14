@@ -1,8 +1,10 @@
 import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
-import type { ReactNode } from 'react'
 import type { QuestionOption } from '../../types'
 import { CodeBlock } from '../../ui/CodeBlock'
+import { ELLIPSIS_SX, PHONE } from '../../ui/listStyles'
+import { FONT_SIZE, FONT_WEIGHT, LETTER_SPACING, LINE_HEIGHT, RADIUS, grid } from '../../theme'
+import Tip from '../../ui/Tip'
 
 /* ── THE PARTS EVERY QUESTION-ROUND SURFACE RENDERS WITH ────────────────────────────────────────────
    One home for the rules about the same agent-authored strings: an option's label, description, mono
@@ -12,8 +14,8 @@ import { CodeBlock } from '../../ui/CodeBlock'
    Its own file because `QATrail` is rendered by `GateForm` and by the Q&A subtab; the shared parts inside
    either would create an import cycle. */
 
-/* The option-label bound — ONE definition for every placement (single-choice button, multi-choice row,
-   settled trail's option list).
+/* The option-label bound — ONE definition for every placement (the legacy gate's option button,
+   `EasyModeFields`' rows).
    Three LINES and an ellipsis, never a character clamp; `title={opt}` is the unclamped fallback.
    `anywhere`/`break-word` keep paths and URLs inside the panel (R1).
    UNCLAMPED AT <=480px: touch has no hover to recover a cut label, and the panel is not a scrollport
@@ -27,7 +29,7 @@ export const OPTION_LABEL_SX = {
   overflow: 'hidden',
   overflowWrap: 'anywhere',
   wordBreak: 'break-word',
-  '@media (max-width:480px)': { display: 'block', WebkitLineClamp: 'unset', overflow: 'visible' },
+  [PHONE]: { display: 'block', WebkitLineClamp: 'unset', overflow: 'visible' },
 } as const
 
 /* ── What an option MEANS, not just what it is called ───────────────────────────────────────────────
@@ -35,7 +37,7 @@ export const OPTION_LABEL_SX = {
    explanation each (`QuestionOption.description` was stored but unread).
    ALWAYS VISIBLE under its label (the operator's choice): not a tooltip (no hover on phones), not behind
    an expand toggle (the decision turns on it).
-   ONE definition for every placement (option button, multi-choice row, `QATrail`).
+   ONE definition for every placement (`QATrail`, `EasyModeFields`).
    Three lines with `title` for the rest; UNCLAMPED at <=480px (no hover, no scrollport —
    `SCROLLPORT_PHONE_SX`). The clamp is the only height mechanism.
    `inherit` AT 0.82 OPACITY, NOT `text.secondary` (MEASURED): translucent black over a `contained`
@@ -59,8 +61,8 @@ const OPTION_DESCRIPTION_SX = {
   maxWidth: '100%',
   // Normal case and weight explicitly: on a `contained` Button it would inherit uppercase and 500 weight.
   textTransform: 'none',
-  fontWeight: 400,
-  '@media (max-width:480px)': { display: 'block', WebkitLineClamp: 'unset', overflow: 'visible' },
+  fontWeight: FONT_WEIGHT.regular,
+  [PHONE]: { display: 'block', WebkitLineClamp: 'unset', overflow: 'visible' },
 } as const
 
 /* An option's `preview`, a box-drawing MOCKUP: never re-wrap (`pre`, not `pre-wrap`); width is paid by ITS
@@ -76,14 +78,14 @@ const OPTION_DESCRIPTION_SX = {
    different kind of mark. */
 const RECOMMENDED_SX = {
   flexShrink: 0,
-  px: 0.67,
-  py: 0.08,
-  borderRadius: 1,
-  fontSize: '0.6rem',
-  fontWeight: 700,
-  letterSpacing: '0.04em',
+  px: 0.5,
+  py: 0,
+  borderRadius: RADIUS.sm,
+  fontSize: FONT_SIZE.xxs,
+  fontWeight: FONT_WEIGHT.bold,
+  letterSpacing: LETTER_SPACING.caps,
   textTransform: 'uppercase',
-  lineHeight: 1.6,
+  lineHeight: LINE_HEIGHT.normal,
   color: 'success.dark',
   backgroundColor: 'success.light',
   whiteSpace: 'nowrap',
@@ -95,36 +97,22 @@ const RECOMMENDED_SX = {
    (the ordinal is what an answer routes on). */
 const ROUND_HEADER_SX = {
   flexShrink: 0,
-  px: 0.67,
-  py: 0.08,
+  px: 0.5,
+  py: 0,
   border: '1px solid',
   borderColor: 'divider',
-  borderRadius: 1,
-  fontSize: '0.65rem',
-  fontWeight: 600,
-  lineHeight: 1.6,
+  borderRadius: RADIUS.sm,
+  fontSize: FONT_SIZE.xxs,
+  fontWeight: FONT_WEIGHT.semibold,
+  lineHeight: LINE_HEIGHT.normal,
   color: 'text.secondary',
-  maxWidth: '10rem',
-  overflow: 'hidden',
-  textOverflow: 'ellipsis',
-  whiteSpace: 'nowrap',
-} as const
-
-// Label and badge on one line, wrapping (R1). `alignItems: 'baseline'` keeps the badge by the FIRST line.
-export const LABEL_LINE_SX = {
-  display: 'flex',
-  flexWrap: 'wrap',
-  alignItems: 'baseline',
-  gap: 0.5,
-  minWidth: 0,
-  // Full width, so the label's 3-line clamp counts against this box.
-  width: '100%',
+  maxWidth: grid(26.5),
+  ...ELLIPSIS_SX,
 } as const
 
 /* One option's detail by its SOURCE index: `option_details` is index-aligned with `options` by
-   construction. Callers must pass the raw index, not a rendered-row position (the multi-choice branch
-   filters blank-glyph options with `hasGlyph`, which would pair a wrong description — cf. the `ticked`
-   note). Missing is normal (old rounds, short arrays, bare labels): `undefined`, rendering nothing. */
+   construction. Callers must pass the raw index, not a rendered-row position (`GateSteps` filters a
+   multi-choice round's blank-glyph options with `hasGlyph`, which would pair a wrong description). Missing is normal (old rounds, short arrays, bare labels): `undefined`, rendering nothing. */
 export function optionDetail(details: QuestionOption[] | null | undefined, source: number): QuestionOption | undefined {
   return details?.[source]
 }
@@ -188,18 +176,17 @@ export function OptionDescription({ text, id }: { text: string; id?: string }) {
   // Bounded HERE, at the render boundary, for every placement at once — see `OPTION_DETAIL_MAX_CHARS`.
   const shown = clampDetail(text)
   return (
-    <Typography
+    <Tip title={shown}><Typography
       component="span"
       variant="caption"
       id={id}
       data-testid="gate-option-description"
       /* The unclamped fallback where there is hover (the <=480px arm covers the rest). Un-CSS-clamped only:
          it carries the same length bound, or a raw 250 KB would reopen the hole. */
-      title={shown}
       sx={OPTION_DESCRIPTION_SX}
     >
       {shown}
-    </Typography>
+    </Typography></Tip>
   )
 }
 
@@ -211,7 +198,7 @@ export function OptionPreview({ text }: { text: string }) {
       testId="gate-option-preview"
       wrap={false}
       bordered
-      maxHeight="12rem"
+      maxHeight={grid(32)}
       /* A short label, not the content: box-drawing art read aloud is noise. `role="img"` + a name
          announces one object; the description says what the option means. */
       role="img"
@@ -219,7 +206,7 @@ export function OptionPreview({ text }: { text: string }) {
       /* Not part of the hit target: `FormControlLabel` forwards label clicks to the checkbox, so scrolling
          the mockup would TICK the option. The row's label text stays the target. */
       onClick={e => e.stopPropagation()}
-      sx={{ mt: 0.5, py: 0.75, fontSize: '0.7rem', lineHeight: 1.5, color: 'text.secondary', overscrollBehavior: 'auto' }}
+      sx={{ mt: 0.5, py: 0.5, fontSize: FONT_SIZE.xs, lineHeight: LINE_HEIGHT.normal, color: 'text.secondary', overscrollBehavior: 'auto' }}
     >
       {shown}
     </CodeBlock>
@@ -239,71 +226,17 @@ export function RecommendedBadge({ id }: { id?: string }) {
 export function RoundHeaderChip({ header }: { header: string | null }) {
   if (!nonBlank(header)) return null
   return (
-    <Box
+    <Tip title={header ?? undefined}><Box
       component="span"
       data-testid="gate-round-header"
       /* The full name where the 10rem ellipsis cut it — a real fallback: ~12 chars is only the tool's
          convention (`models/tasks.py::TaskQuestion.header`: "nothing here enforces it"); the one ceiling is 200
          (`routes/agent/task_terminal.py::TaskQuestionIn.header`). Not `OPTION_DETAIL_MAX_CHARS`-clamped: it already has a
          far tighter ceiling. */
-      title={header ?? undefined}
       sx={ROUND_HEADER_SX}
     >
       {header}
-    </Box>
-  )
-}
-
-/* ── ROUNDS FROM ONE `AskUserQuestion` CALL, UNDER ONE HEADER ──────────────────────────────────────
-   One call with several questions lands as one round per question, posted back to back
-   (`apps/jaahd/acp/host.py::_post_questions`, the capture hook's one `input.request` per question): the wire
-   carries no batch id, so neighbours with the same header raised within `BATCH_WINDOW_MS` of each other read
-   as one call. Render-only: grouping changes no ordinal, key or route — each round is still its own block,
-   answered by its own id; only the repeated header chip collapses into the group's one label. */
-export const BATCH_WINDOW_MS = 10_000
-
-type BatchRound = { header: string | null; created_at: string }
-
-/** `items` in their order, split into runs of neighbours from one call sharing one non-blank header. An item
- *  whose `roundOf` is undefined (no live row) is always a run of its own. */
-export function batchGroups<T>(items: T[], roundOf: (item: T) => BatchRound | undefined): T[][] {
-  const groups: T[][] = []
-  let prev: BatchRound | undefined
-  for (const item of items) {
-    const round = roundOf(item)
-    const joins = prev !== undefined && round !== undefined && nonBlank(round.header) !== null
-      && round.header === prev.header
-      && Math.abs(Date.parse(round.created_at) - Date.parse(prev.created_at)) <= BATCH_WINDOW_MS
-    if (joins) groups[groups.length - 1].push(item)
-    else groups.push([item])
-    prev = round
-  }
-  return groups
-}
-
-/* A group of rounds under its one header: the label, then the rounds as their own list (a `li` in the
-   host's list, so the outer list's count is its groups). `ordered` for the Answer tab's `ol`; `gap` the host
-   list's own, so grouped rounds sit as far apart as ungrouped ones. */
-export function RoundBatch({ header, ordered = false, gap, testId, children }: {
-  header: string | null
-  ordered?: boolean
-  gap: number
-  testId: string
-  children: ReactNode
-}) {
-  return (
-    <Box component="li" data-testid={testId} sx={{ display: 'flex', flexDirection: 'column', gap: 0.75, minWidth: 0 }}>
-      <Box sx={{ display: 'flex' }}>
-        <RoundHeaderChip header={header} />
-      </Box>
-      <Box
-        component={ordered ? 'ol' : 'ul'}
-        role="list"
-        sx={{ listStyle: 'none', m: 0, p: 0, display: 'flex', flexDirection: 'column', gap }}
-      >
-        {children}
-      </Box>
-    </Box>
+    </Box></Tip>
   )
 }
 

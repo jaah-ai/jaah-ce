@@ -14,15 +14,16 @@ import time
 from fastapi import APIRouter, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from app import account_removal, console_direct, edition_features, node_bus
+from app import account_removal, console_direct, db_async, edition_features, node_bus
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
-from app.db import SessionLocal
 from app.node_bus import (
     FRAME_CONSOLE_DIRECT_USED,
     FRAME_HB_ACK,
     FRAME_HEARTBEAT,
     FRAME_HELLO,
+    FRAME_PING,
+    FRAME_PONG,
     FRAME_REPLY,
     registry,
     resolve_caller_async,
@@ -30,6 +31,7 @@ from app.node_bus import (
 from app.node_identity import bus_identity
 from app.jaah_discovery import record_ws_connected, record_ws_disconnect, record_ws_presence
 from app.tenancy import seam
+from app.ws_keepalive import Keepalive, PeerSilent, run_with_keepalive
 
 if edition_features.enabled("cloud_nodes"):
     from app import cloud_node_enrolled
@@ -68,7 +70,7 @@ async def node_bus_ws(websocket: WebSocket) -> None:
     # Keyed by the machine key, not the wire spelling: every lookup names the node by NAME while
     # `node.env` may present the uuid, and a dict applies no shim. Resolved once here (a DB probe per
     # heartbeat would cost a round trip for an answer that cannot change while the socket is open).
-    node_id, name = await asyncio.to_thread(_identity, wire_id)
+    node_id, name = await _identity(wire_id)
 
     conn = registry.register(node_id, websocket)
     # The `try` opens on the registration: the `finally` is the only release, and cancellation during
@@ -76,7 +78,7 @@ async def node_bus_ws(websocket: WebSocket) -> None:
     # placement row cannot be written (a held socket no row names is a split brain):
     # the `except` below then closes the socket so the node redials rather than sits on a dead session.
     # Awaited, not threaded: it keeps dict writes on the loop and hops only the DB work to a worker; a
-    # bare `SessionLocal()` here would block the loop on a saturated pool, starving `GET /api/health`.
+    # blocking sync session here would stall the loop on a saturated pool, starving `GET /api/health`.
     try:
         # Placement first: until the row names this process, a peer routes commands for this node nowhere.
         await record_ws_connected(node_id, conn.socket_id)
@@ -85,9 +87,19 @@ async def node_bus_ws(websocket: WebSocket) -> None:
         # After the presence commit, off the frame loop: NodeVault enrolment and its wake-ups for this node
         # (`app/durable/nodevault.py::on_node_online`). Never fatal, never awaited by the socket.
         _spawn_node_online(node_id)
-        await _read_forever(websocket, node_id, name, conn)
+        # The CP's own keepalive (`app/ws_keepalive.py`): a `ping` after 20s of silence, closed 20s later if the
+        # node still says nothing — the half-open window the node's own pings give its end.
+        keepalive = Keepalive(ping=lambda: conn.notify({"t": FRAME_PING}))
+        await run_with_keepalive(_read_forever(websocket, node_id, name, conn, keepalive), keepalive)
     except WebSocketDisconnect:
         pass
+    except PeerSilent as exc:
+        log.warning("node-bus: %s went silent (%s) — closing the half-open socket", name, exc)
+        # Bounded: a close frame queues behind the same dead send buffer the keepalive gave up on.
+        try:
+            await asyncio.wait_for(_close(websocket, 1011, "keepalive timeout"), 2.0)
+        except asyncio.TimeoutError:
+            pass
     except Exception as exc:
         # `exc_info` because `str(exc)` alone is empty for a bare `TimeoutError`.
         log.warning("node-bus: %s session error: %s", name, exc, exc_info=True)
@@ -142,21 +154,22 @@ def _spawn_after_enrolled(node_id: str) -> None:
     future.add_done_callback(_node_online_tasks.discard)
 
 
-def _identity(wire_id: str) -> tuple[str, str]:
-    """`(machine key, name)` for a dialling node — `node_identity.bus_identity` in its own session.
+async def _identity(wire_id: str) -> tuple[str, str]:
+    """`(machine key, name)` for a dialling node — `node_identity.bus_identity` in its own short async session.
 
     The machine key keys the socket and presence; the name is for logs and for
-    `console_direct.record_used`, whose tokens are minted with the name. The session uses this handler's
-    own maker (the WebSocket scope has no request-scoped one).
+    `console_direct.record_used`, whose tokens are minted with the name. The session is its own (the WebSocket
+    scope has no request-scoped one) and closes before the handler's next socket await, so no connection is
+    held across the socket's life; a saturated pool makes this dial wait, never the loop (`GET /api/health`).
 
     Never fatal: an unreachable database must not refuse a dial, so the fallback addresses the node by the
     spelling it presented."""
-    # On the fleet-wide plane (`seam.detached`, as `jaah_discovery._sync_roster`): this runs on a
-    # `to_thread` worker with no org bound, and under the enforcing read seam the lookup would return zero
-    # rows silently, degrading every name to the uuid.
+    # On the fleet-wide plane (`seam.detached`, as `jaah_discovery._sync_roster`): a dial binds no org, and
+    # under the enforcing read seam the lookup would return zero rows silently, degrading every name to the uuid.
     try:
-        with seam.detached(), seam.operator_scope(), SessionLocal() as session:
-            return bus_identity(session, wire_id)
+        with seam.detached(), seam.operator_scope():
+            async with db_async.async_session(identity=True) as session:
+                return await session.run_sync(bus_identity, wire_id)
     except Exception as exc:  # noqa: BLE001 — see the docstring: a DB fault must not refuse presence
         log.warning("node-bus: could not resolve %r to a machine key (%s) — keying the socket by the "
                     "value the node presented; commands addressed by name may 503 until it redials",
@@ -211,11 +224,14 @@ async def _handshake(websocket: WebSocket) -> str | None:
 
 async def _read_forever(
     websocket: WebSocket, node_id: str, name: str, conn: node_bus.NodeConnection,
+    keepalive: Keepalive | None = None,
 ) -> None:
     """Pump this socket's frames. `node_id` is the machine key; `name` is for log lines and the
-    name-keyed report — see `_identity`."""
+    name-keyed report — see `_identity`. Every frame, whatever it is, tells `keepalive` the node is alive."""
     while True:
         raw = await websocket.receive_text()
+        if keepalive is not None:
+            keepalive.seen()
         try:
             frame = json.loads(raw)
         except ValueError:
@@ -239,6 +255,8 @@ async def _read_forever(
             # A re-hello on a live socket is harmless; treat it as presence.
             await record_ws_presence(node_id)
             await _ack_heartbeat(node_id, conn)
+        elif kind == FRAME_PONG:
+            pass   # the keepalive's answer; `seen()` above already counted it
         elif kind == FRAME_CONSOLE_DIRECT_USED:
             # A direct console opened/closed on this node — a report, not a request, and the CP's only
             # view of shell access (`app/console_direct.py`). `node_id` is passed, never read from the

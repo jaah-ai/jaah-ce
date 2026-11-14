@@ -8,16 +8,19 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
-    DateTime,
+    event,
     ForeignKey,
+    func,
     Identity,
     Index,
+    insert,
     Integer,
     String,
     Text,
     select,
     text,
     UniqueConstraint,
+    update,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
@@ -30,8 +33,8 @@ from app.models.base import Base, EntityMixin, org_unique, OrgScoped, timestamp_
 
 
 #: The person-level columns: one home on `identities` (`UserIdentity`), read off a membership row through
-#: `AdminUser`'s read-only hybrids. Their `admin_users` copies are the `_legacy_*` attributes, kept and
-#: dual-written (`set_identity_fields`) until the revision-2 contraction drops them.
+#: `AdminUser`'s read-only hybrids and written by `set_identity_fields`. The `admin_users` columns of the same
+#: names are unmapped (`migrations/env.py::_RETIRING_COLUMNS`) until the revision-2 contraction drops them.
 IDENTITY_FIELDS: tuple[str, ...] = (
     "email",
     "email_verified_at",
@@ -68,8 +71,8 @@ class UserIdentity(EntityMixin, Base):
     (`app/auth.py::session_row_is_live`). `last_active_admin_id` is the membership the next sign-in opens
     first (`app/login_funnel.py::pick_membership`).
 
-    A row is made by the `admin_users` insert trigger (find-or-create by email, revision 0360), never by
-    hand: a membership is created as an `AdminUser` and the trigger attaches or creates its identity."""
+    A row is made by a membership's insert (find-or-create by email, `_attach_identity`), never by hand: a
+    membership is created as an `AdminUser` and its insert attaches or creates its identity."""
 
     __tablename__ = "identities"
     # Unmaps `EntityMixin.name`; see the class docstring.
@@ -82,8 +85,7 @@ class UserIdentity(EntityMixin, Base):
             "(microsoft_tenant_id IS NULL) = (microsoft_object_id IS NULL)",
             name="ck_identities_microsoft_identity_pair",
         ),
-        # The credential roster's operator search by owner email (revision 202610232130): here, not
-        # on `admin_users`, whose `email` is the legacy copy `AdminUser.email` no longer reads.
+        # The credential roster's operator search by owner email (revision 202610232130).
         Index(
             "ix_identities_email_trgm", text("lower(email)"),
             postgresql_using="gin", postgresql_ops={"lower(email)": "gin_trgm_ops"},
@@ -142,21 +144,19 @@ class IdentityFieldIsReadOnly(AttributeError):
 def _identity_hybrid(field: str) -> hybrid_property:
     """`AdminUser.<field>`: the identity's value, read-only. One builder for all nine fields.
 
-    Instance: the loaded identity's value, or the dual-written legacy column while the row has no identity
-    yet (pending, before the insert trigger fills `identity_id`) or is detached with it unloaded — the two
-    agree in revision 1 because every write goes through `set_identity_fields`. Class: a correlated scalar
-    subquery, so `select(...).where(AdminUser.email == ...)` still compiles (the email census in
+    Instance: the loaded identity's value, or — while none is loaded (pending before its insert attaches one,
+    or detached before it was read) — the value the row was made with (`AdminUser._pending_identity`).
+    Class: a correlated scalar subquery, so `select(...).where(AdminUser.email == ...)` still compiles (the email census in
     `tests/test_identity_email_census.py` says where such a comparison is allowed). Setter: refuses."""
-    legacy = f"_legacy_{field}"
 
     def fget(self):
         identity = self._loaded_identity()
-        return getattr(identity, field) if identity is not None else getattr(self, legacy)
+        return getattr(identity, field) if identity is not None else self._pending_fields().get(field)
 
     def fset(self, value):
         raise IdentityFieldIsReadOnly(
             f"AdminUser.{field} is the identity's (`identities.{field}`); write it with "
-            "app.models.identity.set_identity_fields, which also keeps the legacy column in step"
+            "app.models.identity.set_identity_fields"
         )
 
     def expr(cls):
@@ -195,10 +195,6 @@ class AdminUser(EntityMixin, OrgScoped, Base):
         UniqueConstraint("identity_id", "org_id", name="uq_admin_users_identity_id_org_id"),
         # At most one system actor.
         Index("uq_admin_users_one_system", "is_system", unique=True, postgresql_where=text("is_system")),
-        CheckConstraint(
-            "(microsoft_tenant_id IS NULL) = (microsoft_object_id IS NULL)",
-            name="ck_admin_users_microsoft_identity_pair",
-        ),
         Index(
             "uq_admin_users_slack_link_code_hash",
             "slack_link_code_hash",
@@ -213,12 +209,12 @@ class AdminUser(EntityMixin, OrgScoped, Base):
             postgresql_where=text("sso_subject IS NOT NULL"),
         ),
     )
-    # The insert trigger fills `identity_id`; RETURNING brings it back on the flush that inserts the row.
+    # RETURNING brings the server defaults back on the flush that inserts the row.
     __mapper_args__ = {"eager_defaults": True}
 
-    # The person (revision 0360). Nullable until the revision-2 contraction; the BEFORE INSERT trigger
-    # find-or-creates it from the legacy columns, so no insert — this release's or the outgoing one's —
-    # lands without one.
+    # The person (revision 0360). Nullable until the revision-2 contraction: this release names it on every
+    # insert (`_attach_identity`), and the outgoing release's inserts still reach revision 0360's BEFORE
+    # INSERT trigger, which find-or-creates it from the unmapped legacy columns.
     identity_id: Mapped[Optional[UUID]] = mapped_column(
         PG_UUID(as_uuid=True),
         # `use_alter`: identities' own keys point back at admin_users (actors, last active membership).
@@ -232,27 +228,10 @@ class AdminUser(EntityMixin, OrgScoped, Base):
         UserIdentity, foreign_keys=lambda: [AdminUser.identity_id], lazy="selectin"
     )
 
-    # The legacy copies of `IDENTITY_FIELDS`, under private names (revision-1 overlap, dual-written).
-    _legacy_email: Mapped[str] = mapped_column("email", String(255), nullable=False)
-    _legacy_password_hash: Mapped[Optional[str]] = mapped_column("password_hash", String(255), nullable=True)
-    _legacy_first_name: Mapped[Optional[str]] = mapped_column("first_name", String(120), nullable=True)
-    _legacy_last_name: Mapped[Optional[str]] = mapped_column("last_name", String(120), nullable=True)
-    _legacy_email_verified_at: Mapped[Optional[datetime]] = mapped_column(
-        "email_verified_at", DateTime(timezone=True), nullable=True
-    )
-    _legacy_google_sub: Mapped[Optional[str]] = mapped_column("google_sub", String(255), nullable=True)
-    _legacy_github_user_id: Mapped[Optional[int]] = mapped_column("github_user_id", BigInteger, nullable=True)
-    _legacy_microsoft_tenant_id: Mapped[Optional[UUID]] = mapped_column(
-        "microsoft_tenant_id", PG_UUID(as_uuid=True), nullable=True
-    )
-    _legacy_microsoft_object_id: Mapped[Optional[UUID]] = mapped_column(
-        "microsoft_object_id", PG_UUID(as_uuid=True), nullable=True
-    )
-
     email = _identity_hybrid("email")
     # When a Google, Microsoft or GitHub sign-in last proved `email` (the provider verified it), cleared
     # whenever the email changes. Email notifications go only to a proven address
-    # (`notify_targets.email_destination`); NULL means never proven since the last change.
+    # (`notify_targets.email_routes`); NULL means never proven since the last change.
     email_verified_at = _identity_hybrid("email_verified_at")
     password_hash = _identity_hybrid("password_hash")
     first_name = _identity_hybrid("first_name")
@@ -276,6 +255,11 @@ class AdminUser(EntityMixin, OrgScoped, Base):
     mfa_exempt: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # The operator's client-error reporting switch for this membership (revision 202610312100): set, the console
+    # reports its render errors, chunk failures, stalls and uncaught errors (`app/client_events.py`).
+    client_telemetry: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     role: Mapped[str] = mapped_column(
         String(16), nullable=False, default="admin", server_default="admin"
     )
@@ -295,10 +279,10 @@ class AdminUser(EntityMixin, OrgScoped, Base):
     # expiry, which is how `slack_link.link_state` tells redeemed from expired.
     slack_link_code_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     slack_link_code_expires_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
-    # The pre-0291 single Git Access pointer, KEPT while two releases overlap: per-forge
-    # connections live in `UserGitConnection`, and this is read only as the fallback for its own
-    # credential's root (`git_access.selected_credential_id`); `app/git_connections.py` keeps it in step.
-    # A preference, not an authorization: `git_access.resolve_for_user` re-checks the row each time.
+    # The retiring pre-0291 Git Access pointer: selections live in `UserGitConnection` (`app/git_connections.py`),
+    # and this is read only as the grandfather of an org credential selected before the org-role rule
+    # (`authz.git_identity_select`'s `current_id`). Never written, except that `git_connections.delete_connection`
+    # clears it when it names a deleted connection (the outgoing release still falls back to it).
     # SET NULL fails users closed. `use_alter` breaks the FK cycle with `credentials.created_by_id`.
     git_credential_id: Mapped[Optional[UUID]] = mapped_column(
         PG_UUID(as_uuid=True),
@@ -344,36 +328,99 @@ class AdminUser(EntityMixin, OrgScoped, Base):
     sso_subject: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     def __init__(self, **kwargs: Any) -> None:
-        # The person-level fields land in the legacy columns; the insert trigger copies them into a new
-        # identity, or attaches the row to the existing identity of that email (revision 0360).
-        for field in IDENTITY_FIELDS:
-            if field in kwargs:
-                kwargs[f"_legacy_{field}"] = kwargs.pop(field)
+        # The person-level fields wait on the instance until the insert attaches the row to the identity of
+        # that email, or creates one from them (`_attach_identity`).
+        pending = {field: kwargs.pop(field) for field in IDENTITY_FIELDS if field in kwargs}
         super().__init__(**kwargs)
+        if pending:
+            self._pending_identity = pending
+
+    def _pending_fields(self) -> dict[str, Any]:
+        """The person-level values this row was made with (or `set_identity_fields` gave it before an identity
+        was loaded): what the insert makes the identity from, and the read while none is loaded."""
+        return self.__dict__.get("_pending_identity") or {}
 
     def _loaded_identity(self) -> Optional[UserIdentity]:
-        """The identity, when it can be read without a detached load; None means "read the legacy copy"."""
+        """The identity, when it can be read without a detached load; None while the row has none yet."""
         state = instance_dict(self)
         if state.get("identity") is not None:
             return state["identity"]
         if object_session(self) is None:
-            # Detached with the identity never loaded: the legacy copy (dual-written, so equal in revision 1).
             return None
-        # Attached: `identity_id` reloads an expired row; None only while pending (before the insert trigger).
+        # Attached: `identity_id` reloads an expired row; None only while pending (before its insert).
         return self.identity if self.identity_id is not None else None
 
 
 def set_identity_fields(user: AdminUser, **fields: Any) -> None:
-    """THE ONE WRITE PATH for a person-level field: the identity's column, plus this row's legacy copy
-    (dual-written until revision 2). Refuses a name outside `IDENTITY_FIELDS`."""
+    """THE ONE WRITE PATH for a person-level field: the identity's column, or — on a row not inserted yet —
+    the values its insert makes the identity from. Refuses a name outside `IDENTITY_FIELDS`."""
     unknown = set(fields) - set(IDENTITY_FIELDS)
     if unknown:
         raise ValueError(f"not identity fields: {sorted(unknown)}")
     identity = user._loaded_identity()
+    if identity is None:
+        user._pending_identity = {**user._pending_fields(), **fields}
+        return
     for field, value in fields.items():
-        if identity is not None:
-            setattr(identity, field, value)
-        setattr(user, f"_legacy_{field}", value)
+        setattr(identity, field, value)
+
+
+#: Revision 0360's refusal, raised by the database so a caller sees the same `IntegrityError` either release raises.
+_EMAIL_HELD = (
+    "DO $$ BEGIN RAISE EXCEPTION 'an account already holds this email' "
+    "USING ERRCODE = 'unique_violation', CONSTRAINT = 'admin_users_email_key'; END $$"
+)
+
+
+@event.listens_for(AdminUser, "before_insert")
+def _attach_identity(_mapper, connection, user: AdminUser) -> None:
+    """Every membership insert names its person: the row's own `identity_id`/`identity` when the caller gave
+    one, else the identity of its email (case-insensitive, oldest first) — an orphaned one (no membership
+    left) is adopted and takes the new row's values, a live one refuses the insert exactly as revision 0360's
+    trigger does — else a new identity made from the row's values and its display preferences. Core writes
+    on the flush's connection, so it binds every session and runs before the row's INSERT."""
+    from app.preferences import IDENTITY_PREFERENCE_KEYS
+
+    if user.identity_id is not None or instance_dict(user).get("identity") is not None:
+        return
+    values = {field: user._pending_fields().get(field) for field in IDENTITY_FIELDS}
+    if not values["email"]:
+        raise ValueError("a membership is made with its person's email or names its identity")
+    identities = UserIdentity.__table__
+    existing = connection.execute(
+        select(identities.c.id)
+        # Both sides fold in Postgres, as revision 0360's trigger does: Python's `str.lower` differs on
+        # some Unicode (final sigma), which would let a case variant of a live email make a second person.
+        .where(func.lower(identities.c.email) == func.lower(values["email"]))
+        .order_by(identities.c.created_at, identities.c.id)
+        .limit(1)
+        .with_for_update()
+    ).scalar()
+    if existing is None:
+        held = user.preferences if isinstance(user.preferences, dict) else {}
+        if any(key in held for key in IDENTITY_PREFERENCE_KEYS):
+            # The display keys are the person's alone (`app/preferences.py`): they move, not copy.
+            user.preferences = {key: value for key, value in held.items() if key not in IDENTITY_PREFERENCE_KEYS}
+        actors = {
+            column: getattr(user, column)
+            for column in ("created_by_id", "updated_by_id")
+            if getattr(user, column) is not None
+        }
+        user.identity_id = connection.execute(
+            insert(identities)
+            .values(
+                **values, **actors,
+                preferences={key: held[key] for key in IDENTITY_PREFERENCE_KEYS if key in held},
+            )
+            .returning(identities.c.id)
+        ).scalar_one()
+    elif connection.execute(
+        select(AdminUser.__table__.c.id).where(AdminUser.__table__.c.identity_id == existing).limit(1)
+    ).first():
+        connection.execute(text(_EMAIL_HELD))
+    else:
+        connection.execute(update(identities).where(identities.c.id == existing).values(**values))
+        user.identity_id = existing
 
 
 def assert_member_row_not_superadmin(user: AdminUser) -> None:
@@ -469,17 +516,27 @@ class UserTrustedDevice(PersonRowMixin, Base):
 
 
 class TelegramLink(Base):
-    """The Telegram chat one PERSON (`identity_id`) receives notifications in, and the one-time code
-    that proves it. `app/telegram_link.py` owns every rule: the console issues a code (`code_hash`, only the
-    hash, until `code_expires_at`), the person opens the bot's deep link, and the webhook stores the chat
-    Telegram names as the sender (`chat_id`, `linked_at`). Per person, so one link serves every org they act
-    in; which org sends it anything is each membership's own Telegram method (`preferences`). Unlink deletes
-    the row. `code_admin_user_id` is the membership that asked, which the link turns its Telegram method on
-    for; NULL once that membership is deleted. Machine-written, so no entity shape."""
+    """One Telegram chat a PERSON (`identity_id`) receives notifications in — a private chat or a group the bot was
+    added to — or the one-time code that will prove one. `app/telegram_link.py` owns every rule: the console issues a
+    code (`code_hash`, only the hash, until `code_expires_at`) on a row with no chat yet (one per person,
+    `uq_telegram_links_identity_pending`),
+    the person opens the bot's deep link (`start` for a private chat, `startgroup` for a group), and the webhook
+    stores the chat Telegram names (`chat_id`, `chat_type`, `linked_at`). A person may link several chats, each once
+    (`uq_telegram_links_identity_chat`). Per person, so one link serves every org they act in; which org sends it
+    anything is each membership's own Telegram channel at it (`notification_channels`). `code_admin_user_id` is the
+    membership that asked, which the redeem adds a channel for; NULL once that membership is deleted.
+    Machine-written, so no entity shape."""
 
     __tablename__ = "telegram_links"
     __table_args__ = (
-        UniqueConstraint("identity_id", name="uq_telegram_links_identity_id"),
+        Index(
+            "uq_telegram_links_identity_chat", "identity_id", "chat_id", unique=True,
+            postgresql_where=text("chat_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_telegram_links_identity_pending", "identity_id", unique=True,
+            postgresql_where=text("chat_id IS NULL"),
+        ),
         Index(
             "uq_telegram_links_code_hash", "code_hash", unique=True,
             postgresql_where=text("code_hash IS NOT NULL"),
@@ -490,17 +547,47 @@ class TelegramLink(Base):
     identity_id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("identities.id", ondelete="CASCADE"), nullable=False
     )
-    # NULL until the person opens the deep link; Telegram's private-chat id, which can exceed 32 bits.
+    # NULL until the person opens the deep link; Telegram's chat id, which can exceed 32 bits (a group's is negative).
     chat_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    # Telegram's `chat.type`: `private`, `group` or `supergroup`; NULL while pending.
+    chat_type: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     linked_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
-    # Who Telegram says the linked sender is (`@username`, else their name), so the console can show WHICH
-    # account is connected.
+    # The chat's name as Telegram gives it — a private chat's sender (`@username`, else their name), a group's
+    # title — so the console can show WHICH chat is connected.
     chat_label: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     code_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     code_expires_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
     code_admin_user_id: Mapped[Optional[UUID]] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("admin_users.id", ondelete="SET NULL"), nullable=True
     )
+    created_at: Mapped[datetime] = timestamp_column()
+    updated_at: Mapped[datetime] = timestamp_column(onupdate=True)
+
+
+class NotificationEmail(UuidPkMixin, Base):
+    """An email address one PERSON (`identity_id`) typed to receive notifications at, and the proof it is theirs.
+
+    Per person, as `TelegramLink`: one verified address serves every org they act in, and which org sends it
+    anything is each membership's own Email channel (`notification_channels.email_id`). `address` is lower-cased
+    through `mail_message.single_address` before it is stored. Only the HASHES of the code and the link token are
+    kept, each until its expiry; `attempts`, `last_sent_at` and `sends_in_window` bound guessing and resending.
+    Machine-written, so no entity shape."""
+
+    __tablename__ = "notification_emails"
+    __table_args__ = (UniqueConstraint("identity_id", "address", name="uq_notification_emails_identity_address"),)
+
+    identity_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("identities.id", ondelete="CASCADE"), nullable=False
+    )
+    address: Mapped[str] = mapped_column(Text, nullable=False)
+    verified_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
+    code_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    link_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    code_expires_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
+    link_expires_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    last_sent_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
+    sends_in_window: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     created_at: Mapped[datetime] = timestamp_column()
     updated_at: Mapped[datetime] = timestamp_column(onupdate=True)
 

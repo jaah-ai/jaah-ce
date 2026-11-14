@@ -26,7 +26,7 @@ from app.agent_sessions import END_REASON_SUPERSEDED
 from app.fleet_decide import _UNKNOWN_AGE_SENTINEL as UNKNOWN_AGE_SENTINEL
 from app.models.nodes import Node
 from app.models.projects import Project
-from app.models.worktrees import WORKTREE_KIND_DYNAMIC, WORKTREE_KIND_STATIC, Worktree
+from app.models.worktrees import Worktree
 from app.node_identity import node_ref
 from app.clock import utcnow as _now
 
@@ -36,19 +36,15 @@ from app.clock import utcnow as _now
 # string under `node_id` (address it by that) and the node's display name under `node_name`. Node names
 # repeat (`app/hosts.py` NAMING), so a name never addresses a node.
 
-# The three states. A worktree belongs to a TASK, to a USER, or to NOBODY. Whether a runner is currently
-# alive is a liveness question, answered off the launch columns against the sensed ones, never off
-# `state` (`app/models/worktrees.py::Worktree.state` mirrors this DDL).
+# The two states. A worktree belongs to a TASK or to NOBODY. Whether a runner is currently alive is a
+# liveness question, answered off the launch columns against the sensed ones, never off `state`
+# (`app/models/worktrees.py::Worktree.state` mirrors this DDL).
 FREE = "free"
 # A fleet Task owns this tree (`task_id`), from lease through settle, whether or not a runner is running.
 TASK = "task"
-# A human owns this tree (`owner_user_id`), released on that user's `/exit` (reported to
-# `POST /api/agent/user-session-ended`) or an operator's console release (edges in `release`).
-# Invisible to dispatch and untouchable by any sweep or reset.
-USER = "user"
 
-# Every state a row may carry, for the CHECK constraint (`ck_worktrees_state`). `FREE` first.
-STATES = (FREE, TASK, USER)
+# Every state this code writes, `FREE` first; `ck_worktrees_state` admits exactly these.
+STATES = (FREE, TASK)
 
 # ── When a session in a `free` slot becomes the CP's problem ──────────────────────────────────────────
 #
@@ -103,6 +99,18 @@ def _require_org(org_id: Optional[UUID], site: str) -> None:
         )
 
 
+def _arm(session, statement, worktree_id: UUID) -> Any:
+    """Execute an arming UPDATE (`lease`, `redispatch`): the new `(generation, dispatch_id)` row, or None when
+    its WHERE matched nothing. A hit snapshots the slot's kind in the take's own transaction (the caller's
+    commit), never a later one — a task dispatched before slots had a kind has none recorded yet."""
+    row = session.execute(statement.returning(Worktree.generation, Worktree.dispatch_id)).first()
+    if row is not None:
+        from app.slot_allocation import snapshot_task_kind  # deferred: slot_allocation imports this module
+
+        snapshot_task_kind(session, worktree_id)
+    return row
+
+
 def lease(
     session,
     *,
@@ -115,27 +123,26 @@ def lease(
     """Take the hold on one slot for a task, IN ONE ORG. Returns `{"generation", "dispatch_id"}`, or None
     when it is already held — or when the slot belongs to another org.
 
-    One statement: `UPDATE … WHERE id = … AND org_id = … AND state = 'free' AND number > 0 RETURNING`,
+    One statement: `UPDATE … WHERE id = … AND org_id = … AND state = 'free' RETURNING`,
     so the org floor has no read-write window. It compares `worktrees.org_id` (kept equal to the node's
     by revision 0181's composite FK; cf. `app/placement_grants.py::_placeable_slot_exists`). A `None`
-    org raises (`_require_org`). Only `lease` and `claim_for_user` bind a new occupant and carry the
-    floor; the other `worktrees` updates are generation-fenced, free the row, or observe
-    (`tests/test_slot_org_floor.py`).
+    org raises (`_require_org`). Only `lease` binds a new occupant and carries the floor; the other
+    `worktrees` updates are generation-fenced, free the row, or observe (`tests/test_slot_org_floor.py`).
 
     An UPDATE, never an upsert: only a declaration creates a slot row. Only a `free`
     row is takeable, so `reset_to_base` is safe after a hit; check `task_hold`/`read` first and use
-    `redispatch` for an existing hold. `generation` 0 means never leased; slot 0 (main clone) is excluded.
+    `redispatch` for an existing hold. `generation` 0 means never leased.
     A node's sighting never vetoes the lease (`occupied_free_slots` feeds the reaper instead)."""
     _require_org(org_id, "lease")
     token = dispatch_id or new_dispatch_id()
-    row = session.execute(
+    row = _arm(
+        session,
         Worktree.__table__.update()
         .where(
             Worktree.id == worktree_id,
             # The org floor, above `state`: another org's slot is not a busy slot, it is not this caller's.
             Worktree.org_id == org_id,
             Worktree.state == FREE,
-            Worktree.number > 0,
             # A row being destroyed is never handed to new work (`slot_allocation.retire`).
             Worktree.retiring_at.is_(None),
         )
@@ -157,68 +164,13 @@ def lease(
             # the reader's `state == 'task'` guard, which this very statement satisfies.
             leased_account_id=None,
             reason=reason or None,
-        )
-        .returning(Worktree.generation, Worktree.dispatch_id)
-    ).first()
-    if row is not None:
-        # In the take's own transaction (the commit below), never a later one.
-        from app.slot_allocation import snapshot_task_kind  # deferred: slot_allocation imports this module
-
-        snapshot_task_kind(session, worktree_id)
+        ),
+        worktree_id,
+    )
     session.commit()
     if row is None:
         return None
     return {"generation": row.generation, "dispatch_id": row.dispatch_id}
-
-
-def claim_for_user(
-    session, *, worktree_id: UUID, user_id, org_id: UUID, reason: str = "", folder: bool = False,
-) -> Optional[dict[str, Any]]:
-    """Claim a free slot for a human — `state='user'`, named by `owner_user_id`. Returns `{"generation"}`,
-    or None when it is already held, or when the slot belongs to another org.
-
-    The same org floor as `lease`, sourced from the claiming principal (a console claim has no task), so
-    the parameter is on the function. Same shape: `UPDATE … WHERE id = … AND state = 'free' AND number > 0
-    RETURNING`; pool slots only. Never touches `task_id` (`ck_worktrees_state_ownership` requires NULL,
-    and a free row has it NULL). Bumps `generation`. Released through `release`, on the user's `/exit`.
-
-    `folder` claims instead the dynamic FOLDER slot a console just declared for its own session
-    (`slot_allocation.add_user_folder`) — a repo-less project holds no static slot to claim. False
-    keeps the static-only rule."""
-    _require_org(org_id, "claim_for_user")
-    row = session.execute(
-        Worktree.__table__.update()
-        .where(
-            Worktree.id == worktree_id,
-            Worktree.org_id == org_id,
-            Worktree.state == FREE,
-            Worktree.number > 0,
-            # A console claims a static slot only: a dynamic one exists for its dispatch and goes when freed (A9)
-            # — except the folder slot a console declared for itself, which goes when its session frees it.
-            *((Worktree.kind == WORKTREE_KIND_DYNAMIC, Worktree.has_repo.is_(False)) if folder
-              else (Worktree.kind == WORKTREE_KIND_STATIC,)),
-            Worktree.retiring_at.is_(None),
-        )
-        .values(
-            state=USER,
-            state_since=func.now(),
-            owner_user_id=user_id,
-            generation=Worktree.generation + 1,
-            dispatch_id=None,
-            dispatched_at=None,
-            acked_at=None,
-            pid=None,
-            pid_start_time=None,
-            launch_session_id=None,
-            last_seen_live=None,
-            reason=reason or None,
-        )
-        .returning(Worktree.generation)
-    ).first()
-    session.commit()
-    if row is None:
-        return None
-    return {"generation": row.generation}
 
 
 def record_launch(
@@ -287,15 +239,16 @@ def claim_launch(session, *, worktree_id: UUID, generation: int, dispatch_id: st
 def release(
     session, *, worktree_id: UUID, generation: int, reason: str = "", commit: bool = True
 ) -> bool:
-    """End the hold: back to `free`, launch identity cleared, both owner columns unbound. Idempotent on an
+    """End the hold: back to `free`, launch identity cleared, `task_id` unbound. Idempotent on an
     already-free row, which answers False so a caller can tell a release from a no-op.
 
     Task-hold edges only: the task went terminal, was deleted, reset or moved to another project; its runner was stopped on a
-    question with an observed-clean tree (`stopped_question_clean_holds`); its launches on that node never
+    question with an observed-clean tree (`stopped_question_clean_holds`); it is an epic, which never runs
+    (`epic_holds`); its launches on that node never
     announced themselves twice (`lease_drain._move_off_node`); its node refused the launch at its session cap
     (`node_capacity.return_to_queue`); or an operator's console
-    release (`app/routes/pool_slots.py::release_slot`). No runner or session ends a task hold. A user hold
-    also ends on its owner's `/exit`, fenced on the session id. No caller may borrow another's trigger.
+    release (`app/routes/pool_slots.py::release_slot`). No runner or session ends a task hold. No caller
+    may borrow another's trigger.
 
     `commit=False` lets `end_attempt` commit its terminal state and this release as one unit. Fenced on
     `generation` and does not bump it. Does not end the session record: callers pass a better
@@ -318,7 +271,6 @@ def release(
             state=FREE,
             state_since=func.now(),
             task_id=None,
-            owner_user_id=None,
             dispatch_id=None,
             dispatched_at=None,
             acked_at=None,
@@ -379,7 +331,8 @@ def redispatch(
             Worktree.id == worktree_id, Worktree.generation == int(generation)
         )
     )
-    row = session.execute(
+    row = _arm(
+        session,
         Worktree.__table__.update()
         .where(
             Worktree.id == worktree_id,
@@ -405,14 +358,9 @@ def redispatch(
             # keep the last bind's account until this pass's `bind_account`.
             leased_account_id=None,
             reason=reason or None,
-        )
-        .returning(Worktree.generation, Worktree.dispatch_id)
-    ).first()
-    if row is not None:
-        # A task dispatched before slots had a kind has none recorded yet.
-        from app.slot_allocation import snapshot_task_kind  # deferred: slot_allocation imports this module
-
-        snapshot_task_kind(session, worktree_id)
+        ),
+        worktree_id,
+    )
     if row is not None and old_session_id and old_session_id != keep_session_id:
         # `note_end`, not `end_session`: its savepoint keeps a bookkeeping failure from aborting the re-arm.
         agent_session_lifecycle.note_end(
@@ -454,46 +402,28 @@ def read(session, *, worktree_id: UUID) -> Optional[Worktree]:
     return session.get(Worktree, worktree_id)
 
 
-def held_slots(session, project_id: int, *, node_id: Optional[str] = None) -> list[str]:
-    """The BUSY set for `project_id` — slot numbers with a non-`free` hold, as strings, for
-    `fleet_decide.select_slot`'s `exclude`.
+def held_slots_by_project(
+    session, project_ids: Iterable[int], *, node_id: Optional[str] = None
+) -> dict[int, list[str]]:
+    """`{project id: its BUSY set}` in one read — slot numbers with a non-`free` hold, as strings, for
+    `fleet_decide.select_slot`'s `exclude`: the dispatch plan's busy sets for every project it walks
+    (`routes/fleet.py::build_dispatch_plan`). A project holding nothing is absent. No ids, no statement.
 
     Not redundant with `fleet_decide.held_slots_from_records` (who is sitting there): this is who the CP
     promised it to, covering a dispatch with no session yet. `node_id` (uuid) narrows to one host; omitting it
     gives the fleet-wide answer."""
-    where = [Worktree.project_id == int(project_id), Worktree.state != FREE]
+    wanted = sorted({int(p) for p in project_ids})
+    out: dict[int, list[str]] = {}
+    if not wanted:
+        return out
+    where = [Worktree.project_id.in_(wanted), Worktree.state != FREE]
     if node_id is not None:
         where.append(Worktree.node_id == node_ref(node_id))
-    return [
-        str(number)
-        for number in session.scalars(
-            select(Worktree.number).where(*where).order_by(Worktree.number)
-        ).all()
-    ]
-
-
-def free_slots_by_node(session, project_id: int) -> dict[str, int]:
-    """How many LEASABLE static slots for `project_id` are free right now, per node uuid string (a node's
-    dynamic room is `slot_allocation.dynamic_room`).
-
-    The fleet-wide capacity question for `app/pool_state.py::assign_nodes`. `number > 0` matches `lease`
-    (slot 0 is the main clone). Uuid strings, like every node key on this path; a mismatch would silently
-    report zero room. A node with no free slot is absent; callers default to 0."""
-    rows = session.execute(
-        select(Worktree.node_id, func.count())
-        .where(
-            Worktree.project_id == int(project_id),
-            Worktree.state == FREE,
-            Worktree.number > 0,
-            # Static and not being destroyed: a free dynamic row is destroyed, never leased again.
-            Worktree.kind == WORKTREE_KIND_STATIC,
-            Worktree.retiring_at.is_(None),
-            # Of the project's kind: a git worktree is never leased to a folder task, nor the reverse.
-            Worktree.has_repo == select(Project.has_repo).where(Project.id == int(project_id)).scalar_subquery(),
-        )
-        .group_by(Worktree.node_id)
-    ).all()
-    return {str(node_id): int(count) for node_id, count in rows}
+    for project_id, number in session.execute(
+        select(Worktree.project_id, Worktree.number).where(*where).order_by(Worktree.project_id, Worktree.number)
+    ).all():
+        out.setdefault(project_id, []).append(str(number))
+    return out
 
 
 def occupied_slots_by_node(session) -> dict[str, int]:
@@ -501,14 +431,13 @@ def occupied_slots_by_node(session) -> dict[str, int]:
 
     What `app/pool_state.py::assign_nodes` divides by core count for its density tie-break: idle runners
     cost little CPU, so load alone would keep piling work onto a node full of waiting runners. Across
-    every project because runner count is a fact about the host. `state = 'task'` only (a user session
+    every project because runner count is a fact about the host. `state = 'task'` only (a console session
     is not a runner; CPU covers its load); an un-acked lease counts, so a pass cannot place into room its
-    previous pass took. `number > 0`. A node carrying nothing is absent; callers default to 0."""
+    previous pass took. A node carrying nothing is absent; callers default to 0."""
     rows = session.execute(
         select(Worktree.node_id, func.count())
         .where(
             Worktree.state == TASK,
-            Worktree.number > 0,
         )
         .group_by(Worktree.node_id)
     ).all()
@@ -519,10 +448,17 @@ def leased_task_ids(session) -> set[str]:
     """Task ids currently holding a slot — the dedup that stops a task whose dispatch is already out from
     being dispatched a second time. Complements `fleet_decide.inflight_task_ids` (observation roster) by
     covering the gap before the first observation. A task with a hold is in flight."""
+    return set(leased_task_nodes(session))
+
+
+def leased_task_nodes(session) -> dict[str, str]:
+    """`{task id: node uuid string}` for every task holding a slot (`leased_task_ids` with each hold's node), in
+    one read: the lease drain reads it once per pass for every node's plan and for its idle-node test
+    (`app/lease_drain.py::_dispatch_node`). A task with two `task` rows keeps one."""
     return {
-        str(task_id)
-        for task_id in session.scalars(
-            select(Worktree.task_id).where(Worktree.state == TASK, Worktree.task_id.isnot(None))
+        str(task_id): str(node_id)
+        for task_id, node_id in session.execute(
+            select(Worktree.task_id, Worktree.node_id).where(Worktree.state == TASK, Worktree.task_id.isnot(None))
         ).all()
     }
 
@@ -581,8 +517,8 @@ def task_hold(session, task_id: object) -> Optional[dict[str, Any]]:
 
 def task_holds(session, task_ids: Iterable[int]) -> dict[int, dict[str, Any]]:
     """`{task id: task_hold(session, task id)}` for those of `task_ids` holding a slot, in one read: the dispatch
-    plan's answer for one project's candidates (`routes/fleet.py::build_dispatch_plan`), which had asked
-    `task_hold` once per waiting task per node. A task absent from it holds nothing (`task_hold`'s None).
+    plan's answer for the candidates of every project it offers (`routes/fleet.py::build_dispatch_plan`), which had
+    asked `task_hold` once per waiting task per node. A task absent from it holds nothing (`task_hold`'s None).
 
     Only the asked ids, never the fleet's every hold, so a plan's read stays its candidates' size. A task with
     two `task` rows keeps the first read, as `task_hold`'s `.first()` does. No ids, no statement."""
@@ -637,8 +573,7 @@ def _task_hold_dict(row) -> dict[str, Any]:
 # Feeds a destructive order, so every conjunct fails closed: an affirmative `session IS TRUE`; `state =
 # 'free'` (no decision accounts for the occupant); a run started before the release
 # (`session_since < state_since`, the primary guard against a reopened console or SSH shell) plus
-# `console = 'not_attached'` by equality (console claims are best effort); `generation > 0` (ever leased);
-# `number > 0` (never the main clone).
+# `console = 'not_attached'` by equality; `generation > 0` (ever leased).
 _OCCUPIED_FREE_SLOT_SQL = text(
     """
     SELECT w.id AS worktree_id, w.project_id, p.name AS project, w.number AS slot,
@@ -662,7 +597,6 @@ _OCCUPIED_FREE_SLOT_SQL = text(
       JOIN projects p ON p.id = w.project_id
       JOIN nodes n ON n.id = w.node_id
      WHERE w.state = 'free'
-       AND w.number > 0
        AND w.generation > 0
        AND w.console = :console_free
        AND w.session IS TRUE
@@ -675,7 +609,7 @@ _OCCUPIED_FREE_SLOT_SQL = text(
        -- this run was already going when the slot was freed. That is the prod case (04:01 session,
        -- 04:52 release) and it is the only story this reaper has.
        -- WHAT IT EXCLUDES, PERMANENTLY, is every session that STARTED on an already-free slot — a
-       -- console user whose claim failed, a person at an SSH shell, anything. The console conjunct above
+       -- person at an SSH shell, anything. The console conjunct above
        -- only holds while a websocket is ATTACHED (a review lane's finding: on detach it flips to
        -- `not_attached` while `state_since` is already old, so the grace is spent and the reap fires
        -- seconds after somebody closes a tab). This one does not care whether anyone is watching.
@@ -683,7 +617,7 @@ _OCCUPIED_FREE_SLOT_SQL = text(
        -- the release, it stops matching and is never reaped. That is a slot left dirty, which is the
        -- safe direction; the alternative reading kills a session nobody can account for.
        AND w.session_since < w.state_since
-       -- A STALE OBSERVATION IS NOT EVIDENCE OF AN OCCUPANT — the same freshness floor the leaked-hold
+       -- A STALE OBSERVATION IS NOT EVIDENCE OF AN OCCUPANT — the same freshness floor the legacy-hold
        -- sweep applies, for the same reason: past it the node's reported occupancy stops being trusted.
        -- **READ EXACTLY WHAT IT PROVES, WHICH IS LESS THAN ITS NAME SUGGESTS.** `observed_at` stamps the
        -- PUBLISH, not the agents probe behind `session`, and the node republishes a cached probe reading
@@ -706,10 +640,9 @@ def occupied_free_slots(session, *, grace_secs: float, fresh_secs: float) -> lis
 
     The population of `lease_drain._reap_occupied_free_slots`. Its conjuncts (see the SQL) live in the
     statement so none can be loosened in Python; without the console and release-instant fences a human
-    whose console failed to claim its slot would be killed within a minute.
+    at a shell in a free slot would be killed within a minute.
 
-    No org floor: like `settled_holds` and `leaked_user_holds`, a fleet-wide system pass with no caller
-    to scope to.
+    No org floor: like `settled_holds`, a fleet-wide system pass with no caller to scope to.
 
     `freed_at` is a fence, not a label: the node warrants every session registered against the path, so
     it re-applies the release instant per session (`jaahd/reconcile/enact_reset.py::_enact_release_slot`), and an
@@ -776,7 +709,7 @@ _SETTLED_HOLDS_SQL = text(
 def settled_holds(session, terminal_states) -> list[dict[str, Any]]:
     """Every non-`free`, non-retiring hold whose task has already reached a terminal state.
 
-    The store has no expiry, so without this `held_slots` would grow to the whole pool. A hold still
+    The store has no expiry, so without this the held set would grow to the whole pool. A hold still
     waiting on a human never appears (its task is not terminal). Carries the launch session and pid for
     the teardown that must name its process."""
     rows = session.execute(_SETTLED_HOLDS_SQL, {"terminal": list(terminal_states)}).all()
@@ -812,46 +745,28 @@ def stopped_question_clean_holds(session) -> list[dict[str, Any]]:
     return [_hold(r) for r in rows]
 
 
-_LEAKED_USER_HOLDS_SQL = text(
-    _HOLD_SELECT + """
-         , w.owner_user_id, EXTRACT(EPOCH FROM (now() - w.state_since)) / 3600.0 AS held_hours
-    """ + _HOLD_FROM + """
-     WHERE w.state = 'user'
-       AND w.number > 0
-       AND w.state_since < now() - make_interval(secs => :held_secs)
-       AND w.console = :console_free
-       AND w.session IS FALSE
-       AND w.session_id IS NULL
-       AND w.observed_at > now() - make_interval(secs => :fresh_secs)
+_EPIC_HOLDS_SQL = text(
+    _HOLD_SELECT + _HOLD_FROM + """
+      JOIN tasks t ON t.id = w.task_id
+     WHERE w.state = 'task'
+       AND t.persona = 'epic'
+       -- Nobody the teardown would cut off: no observed session and no attached console (a runner task
+       -- converted to an epic keeps its slot until its session is gone).
+       AND w.session IS NOT TRUE
+       AND w.console IS DISTINCT FROM 'attached'
+       -- A retiring hold is released by the node's destroy ack, never here.
+       AND w.retiring_at IS NULL
      ORDER BY p.name, w.number
     """
 )
 
 
-def leaked_user_holds(session, *, held_secs: float, fresh_secs: float) -> list[dict[str, Any]]:
-    """Every `user` hold that has outlived `held_secs` with NO SESSION IN IT, on a slot the node is
-    currently reporting. The rows `lease_drain._release_leaked_user_holds` releases.
-
-    The one release without a recorded decision (the exception to "only a recorded
-    decision ends a hold"): a console killed without its `SessionEnd` hook leaves a `user` row nothing ages
-    out. Guards, all conjuncts:
-    `state = 'user'`; `number > 0`; `console = 'not_attached'` by equality (a `term` shell registers no
-    agent session; `fleet_verdicts.CONSOLE_NOT_ATTACHED`); `session IS FALSE`, never `IS NOT TRUE` (NULL
-    keeps the hold); a fresh `observed_at`, so silence never releases. A dirty tree is still a leak:
-    `release` resets nothing, the following `release_slot` intent does."""
-    rows = session.execute(
-        _LEAKED_USER_HOLDS_SQL,
-        {
-            "held_secs": float(held_secs),
-            "fresh_secs": float(fresh_secs),
-            # Bound from `fleet_verdicts`, the one home for which console value licenses a reclaim.
-            "console_free": fleet_verdicts.CONSOLE_NOT_ATTACHED,
-        },
-    ).all()
-    return [
-        {**_hold(r), "owner_user_id": r.owner_user_id, "held_hours": float(r.held_hours or 0.0)}
-        for r in rows
-    ]
+def epic_holds(session) -> list[dict[str, Any]]:
+    """Every task hold whose task is an epic. An epic is a container that never runs (compose skips it), so its
+    hold owns nothing; kept, it starves the project of a worktree — and a folder slot of a project that has since
+    connected a repository blocks every new git worktree on that node (`slot_allocation.mixed_kind_wait`)."""
+    rows = session.execute(_EPIC_HOLDS_SQL).all()
+    return [_hold(r) for r in rows]
 
 
 # ── The read-time expression that replaces a stored column ────────────────────────────────────────────

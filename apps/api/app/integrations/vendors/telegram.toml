@@ -1,0 +1,39 @@
+# Catalog metadata over the existing `telegram_bot` type (its fields, Test and the notification bot are unchanged).
+slug = "telegram"
+label = "Telegram"
+category = "messaging"
+credential_type = "telegram_bot"
+vendor_docs_url = "https://core.telegram.org/bots/api#authorizing-your-bot"
+summary = "Send and read messages as your own Telegram bot."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "bot_token", label = "Bot token", kind = "secret", required = true, help = "In Telegram, open a chat with @BotFather and send /newbot (or /token for a bot you already have). Copy the token it replies with, in the form 123456789:AAH4hk-example-token" },
+]
+
+[docs]
+agent_uses = [
+  "Send a message to a chat, group or channel, for example a release note or an alert",
+  "Read the messages people send to the bot and act on them",
+  "Post files and photos to a chat",
+  "Pin or edit the bot's own messages",
+]
+prerequisites = [
+  "A Telegram account to talk to @BotFather",
+  "The bot added to each group or channel it should post to; in a channel it must be an administrator with Post Messages",
+]
+limitations = [
+  "A bot cannot start a conversation with a person: they must message the bot first (or add it to a group) before it can write to them",
+  "In groups a bot sees only commands and replies to it unless its privacy mode is turned off with /setprivacy in @BotFather",
+  "This connection is a bot your organization owns. Jaah's own Telegram notifications to you are set up separately under your profile and do not use it",
+]
+troubleshooting = [
+  { symptom = "Test says the bot token was rejected", fix = "The token was revoked or mistyped. Send /token to @BotFather, pick the bot, copy the new token and select Replace on the secret" },
+  { symptom = "The agent gets 403 Forbidden: bot was blocked by the user", fix = "That person blocked or never started the bot. Ask them to open the bot and press Start" },
+  { symptom = "The agent gets 400 Bad Request: chat not found", fix = "The chat ID is wrong or the bot is not a member. Add the bot to the group or channel, then send it a message so the chat appears in getUpdates" },
+]
+faq = [
+  { q = "How does an agent find a chat ID?", a = "Have someone message the bot or add it to the group, then the agent calls getUpdates and reads message.chat.id. A public channel can also be addressed as @channelname" },
+  { q = "Can I reuse one bot for several projects?", a = "Yes. Attach the same secret to each project, or create one bot per project in @BotFather if you want their messages kept apart" },
+]

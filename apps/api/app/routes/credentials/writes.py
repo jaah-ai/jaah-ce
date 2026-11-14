@@ -2,30 +2,33 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Literal, Mapping, Optional, Sequence
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Response
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.actors import stamp_actor
-from app.auth import require_user
 from app.authz.declarations import feature
-from app.authz.object_access import stamp_owner_on_create, validated_owner_user
-from app.authz.principal import Principal, current_principal
+from app.authz.object_access import (
+    require_project_key, stamp_owner_on_create, validated_owner_user, validated_reassignment,
+)
+from app.authz.principal import AsyncCaller, Principal, current_caller
 from app.authz.catalog import permission_key
-from app.authz.visibility import has_project_key
-from app.db import get_session
 from app import edition_features, nodevault_policy
+from app.db_async import DbDep, defer_off_loop, on_session
 from app.operator_settings import reads as settings_reads
 from app.credential_crypto import SealedSecret
 from app import git_probe
 from app.git_access import GIT_CREDENTIAL_TYPES
 from app.models.credentials import (
+    Account,
     Credential,
     CredentialIdTombstone,
+    ProjectCredential,
 )
 from app.models.identity import AdminUser
 from app.tenancy.labels import org_refs
@@ -35,6 +38,7 @@ from app.routes.credentials.roster import _uuid_array
 from app.routes.credentials.guards import (
     _DELETE_KEY,
     _EDIT_KEY,
+    _VIEW_KEY,
     _may_edit,
     _not_in_plan,
     _org_of,
@@ -54,6 +58,7 @@ from app.routes.credentials.credential_wire import (
     _credential_ownership,
     _merged_config,
     _optional_uuid,
+    _with_owner_id,
     _parsed_body,
     _require_declared_fields,
     _scrubbed_write,
@@ -80,13 +85,21 @@ log = logging.getLogger(__name__)
 
 @router.post("/api/credentials", response_model=CredentialOut, status_code=201)
 @feature("credentials", "create", own_credential=True)
+@on_session
 def create_credential(
+    session: Session,
     raw_body: Any = Body(default=None),
-    user: AdminUser = Depends(require_user),
     # For the owner stamp below (`owned_credential_clause`): a caller with no org role owns its row.
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CredentialOut:
+    return _create_credential(session, raw_body, caller.actor, caller.principal)
+
+
+def _create_credential(
+    session: Session, raw_body: Any, user: AdminUser, principal: Principal | None
+) -> CredentialOut:
+    """The one create writer: this route's body, and the runner door's (`routes/agent_credentials.py`), which
+    asks `@feature`'s admission of the launcher itself first."""
     body = _parsed_body(raw_body)
     spec = _validated_type(body.type)
     name = _validated_name(body.name)
@@ -121,9 +134,7 @@ def create_credential(
         if any(isinstance(value, SealedSecret) for value in config.values()):
             # A browser envelope is bound to the id the browser sealed under; without it nothing could
             # ever open the secret.
-            raise HTTPException(
-                status_code=400, detail="id is required when config carries sealed secrets"
-            )
+            raise HTTPException(status_code=400, detail="id is required when config carries sealed secrets")
         credential_id = uuid4()
 
     row = Credential(
@@ -151,35 +162,37 @@ def create_credential(
                    f"Turned NodeVault on for {spec.label} credential {name}", row)
         session.commit()
         session.refresh(row)
-    return _credential_out(
-        row,
-        actor_names=_actor_names(session, [row]),
-        org_labels=org_refs(session, [row.org_id]),
-        home_labels=_home_labels(session, [row]),
-        editable=_may_edit(principal, row),
-    )
+    return _one_out(session, principal, row)
 
 
 @router.patch("/api/credentials/{credential_id}", response_model=CredentialOut)
 @feature("credentials", "edit", own_credential=True)
+# `deferring`: the Telegram re-registration `_update_credential` queues runs after the commit, off the loop.
+@on_session(deferring=True)
 def update_credential(
+    session: Session,
     credential_id: UUID,
     raw_body: Any = Body(default=None),
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CredentialOut:
     """Partial update. A field absent from the body is untouched, including each key inside `config`
     (per-key merge, `_merged_config`), since a swap would drop the secret the form cannot send back.
 
     Everything is validated before anything is assigned, so no autoflush persists half an update."""
+    return _update_credential(session, credential_id, raw_body, caller.actor, caller.principal)
+
+
+def _update_credential(
+    session: Session, credential_id: UUID, raw_body: Any, user: AdminUser, principal: Principal | None
+) -> CredentialOut:
+    """The one update writer: this route's body, and the runner door's (`routes/agent_credentials.py`)."""
     body = _parsed_body(raw_body)
     if "id" in body.model_fields_set:
         raise HTTPException(status_code=400, detail="id is not editable")
     if body.model_fields_set & {"ownership", "owner_user_id"}:
-        # Personal or org is decided once, at create: flipping a live row would hand a colleague's
-        # personal secret to the org, or take an org row away from every project that uses it.
-        raise HTTPException(status_code=400, detail="ownership is not editable")
+        # An owner change is its own act (`PUT /api/credentials/{id}/owner`, an Org Owner/Admin's): an edit
+        # never moves a row between people.
+        raise HTTPException(status_code=400, detail="ownership is not editable here; use the owner route")
     row = _scoped_row_or_404(session, principal, credential_id, _EDIT_KEY)
     submitted = body.model_fields_set
 
@@ -257,7 +270,80 @@ def update_credential(
         session.commit()
         session.refresh(row)
     if edition_features.enabled("telegram") and spec.slug == telegram_bot.CREDENTIAL_TYPE and posted.get("bot_token"):
-        _reregister_designated_bot(row.id)
+        # Telegram's webhook call is outbound HTTP: after the commit, with no transaction held.
+        defer_off_loop(session, _reregister_designated_bot, row.id)
+    return _one_out(session, principal, row)
+
+
+class CredentialOwnerIn(BaseModel):
+    """`PUT /api/credentials/{id}/owner`: the row's type and, for `personal`, whose it is (absent keeps the
+    current owner, else the caller)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ownership: Literal["personal", "org", "system"]
+    owner_user_id: Optional[UUID] = None
+
+
+@router.put("/api/credentials/{credential_id}/owner", response_model=CredentialOut)
+@feature("credentials", "edit")
+@on_session
+def change_credential_owner(
+    session: Session,
+    credential_id: UUID,
+    body: CredentialOwnerIn,
+    caller: AsyncCaller = Depends(current_caller),
+) -> CredentialOut:
+    """Change ANY credential's type (personal / org / system) and a personal one's owner — an Org Owner/Admin's
+    act (`authz.validated_reassignment`, 403 for anyone else), over every row they can read, a member's
+    personal row included (PATCH stays the owner's: an edit re-points a secret, this only moves it). What the new
+    type cannot carry goes with the move: a project home off an org row, every project pool for a system row.
+    Names need not be unique in the new home: nothing is refused for one."""
+    from app import credential_consumers
+
+    principal = caller.principal
+    row = _scoped_row_or_404(session, principal, credential_id, _VIEW_KEY)
+    # Locked: an owner's PATCH that read the row before this move cannot re-point it after.
+    session.refresh(row, with_for_update=True)
+    was_owner, was_system = row.owner_id, bool(row.system)
+    owner_id, system = validated_reassignment(
+        session, principal, row, ownership=body.ownership, owner_user_id=body.owner_user_id,
+    )
+    if (owner_id, system) == (was_owner, was_system):
+        return _one_out(session, principal, row)
+    if session.scalar(select(Account.id).where(Account.credential_id == row.id)) is not None:
+        # An account's key follows its account (`routes/accounts.py::_follow_account_owner`).
+        raise HTTPException(status_code=422, detail="this is an AI account's key: change the account's owner")
+    if was_system and not system:
+        # The control plane's own secret (a cloud launch key, a Slack or Gmail link) would reach tasks or a member.
+        used_by = credential_consumers.references_of(session, [row]).get(row.id)
+        if used_by:
+            raise HTTPException(status_code=409, detail=f"In use by {', '.join(used_by)}.")
+    if system:
+        # A system row is never in a project pool (`project_pool.attach_project_credential`).
+        session.execute(sql_delete(ProjectCredential).where(ProjectCredential.credential_id == row.id))
+    if owner_id is not None or system:
+        # Only an org row has a project home (`ck_credentials_home_project_org_row`).
+        row.home_project_id = None
+    row.owner_id = owner_id
+    row.system = system
+    stamp_actor(row, caller.actor)
+    with _scrubbed_write(session, "change the owner of"):
+        _audit(
+            session, caller.actor, "credential_owner_changed", f"Changed the owner of credential {row.name}", row,
+            owner_user_id=owner_id,
+            extra={
+                "from": {"owner_user_id": str(was_owner) if was_owner else None, "system": was_system},
+                "to": {"owner_user_id": str(owner_id) if owner_id else None, "system": system},
+            },
+        )
+        session.commit()
+        session.refresh(row)
+    return _with_owner_id(_one_out(session, principal, row), row)
+
+
+def _one_out(session: Session, principal: Principal | None, row: Credential) -> CredentialOut:
+    """The written row's own wire shape: labels looked up for this one row, `editable` for this caller."""
     return _credential_out(
         row,
         actor_names=_actor_names(session, [row]),
@@ -282,12 +368,11 @@ def _require_homing(
     for project_id, attaching in ((joining, True), (leaving, False)):
         if project_id is None:
             continue
-        if not has_project_key(principal, _PROJECTS_EDIT_KEY, project_id):
-            raise HTTPException(
-                status_code=403,
-                detail=f"{_PROJECTS_EDIT_KEY} on the project is required to "
-                + ("home a credential in it" if attaching else "move a credential out of it"),
-            )
+        require_project_key(
+            principal, _PROJECTS_EDIT_KEY, project_id,
+            detail=f"{_PROJECTS_EDIT_KEY} on the project is required to "
+            + ("home a credential in it" if attaching else "move a credential out of it"),
+        )
         _require_pool_manager(principal, row, attaching=attaching)
 
 
@@ -341,12 +426,17 @@ def rename_credentials(
 
 @router.delete("/api/credentials/{credential_id}", status_code=204)
 @feature("credentials", "delete", own_credential=True)
-def delete_credential(
+async def delete_credential(
     credential_id: UUID,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    db: DbDep,
+    caller: AsyncCaller = Depends(current_caller),
 ) -> Response:
+    await db.run_sync(_delete_credential, credential_id, caller.actor, caller.principal)
+    return Response(status_code=204)
+
+
+def _delete_credential(session: Session, credential_id: UUID, user: AdminUser, principal: Principal | None) -> None:
+    """The one single-row delete: this route's body, and the runner door's (`routes/agent_credentials.py`)."""
     row = _scoped_row_or_404(session, principal, credential_id, _DELETE_KEY)
     # The community edition has no Jaah-managed NodeLink storage.
     if edition_features.enabled("nodelink"):
@@ -354,13 +444,22 @@ def delete_credential(
 
         nodelinks.refuse_managed_credential(session, row.id)
     delete_credentials(session, user, [row])
-    return Response(status_code=204)
 
 
 def delete_credentials(session: Session, user: AdminUser, rows: Sequence[Credential]) -> None:
     """Delete `rows` (found under the caller's delete scope, managed rows refused) and commit: the one delete
     behind the single-row route and the bulk one (`bulk.py`). A fixed number of statements whatever the count:
-    the audit rows and tombstones flush as batched inserts, the rows go in one `DELETE … = ANY(:ids)`."""
+    the audit rows and tombstones flush as batched inserts, the rows go in one `DELETE … = ANY(:ids)`. A system row
+    another page owns (`registry.MANAGED_ELSEWHERE`) is a 409 saying where to remove it."""
+    from app import credential_consumers
+    from app.credentials.registry import MANAGED_ELSEWHERE
+
+    managed = [row for row in rows if row.system and row.type in MANAGED_ELSEWHERE]
+    # Only while its owner still points at it: an orphan (its owner gone) is deleted here like any row.
+    in_use = credential_consumers.references_of(session, managed) if managed else {}
+    owned = next((row for row in managed if row.id in in_use), None)
+    if owned is not None:
+        raise HTTPException(status_code=409, detail=f"{owned.name} is in use. {MANAGED_ELSEWHERE[owned.type]}")
     ids = [row.id for row in rows]
     with _scrubbed_write(session, "delete"):
         for row in rows:

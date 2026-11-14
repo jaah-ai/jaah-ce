@@ -10,7 +10,7 @@ import { capitalize } from '../../lib/humanize'
  * capitalisation. */
 
 /** Kinds that sign their requests and so carry a URL and a secret (`app/triggers.py::HTTP_SOURCE_KINDS`). */
-export const HTTP_SOURCE_KINDS: ReadonlySet<string> = new Set(['webhook', 'github'])
+export const HTTP_SOURCE_KINDS: ReadonlySet<string> = new Set(['webhook', 'github', 'gitlab', 'sentry', 'datadog', 'pagerduty', 'cloudwatch', 'bitbucket'])
 
 /** `trigger:<kind>` → label, from the cached vocabulary (`readTaskSources`); unread, the kind capitalised. */
 export function useSourceKindLabels(): (kind: string) => string {
@@ -32,6 +32,8 @@ const GITHUB_EVENT_LABELS: Record<string, string> = {
   discussion: 'Discussions',
   discussion_comment: 'Discussion comments',
   workflow_run: 'Workflow runs',
+  workflow_job: 'Workflow jobs',
+  deployment_status: 'Deployment statuses',
   check_run: 'Check runs',
   check_suite: 'Check suites',
   create: 'Branch or tag creation',
@@ -42,4 +44,17 @@ const GITHUB_EVENT_LABELS: Record<string, string> = {
 
 export function githubEventLabel(event: string): string {
   return GITHUB_EVENT_LABELS[event] ?? event
+}
+
+/* GitLab's names for the webhook triggers its form lists, keyed by the `X-Gitlab-Event` header a delivery carries
+ * (`app/trigger_config.py::GITLAB_DEPLOY_EVENTS`). */
+const GITLAB_EVENT_LABELS: Record<string, string> = {
+  'Push Hook': 'Push events',
+  'Pipeline Hook': 'Pipeline events',
+  'Job Hook': 'Job events',
+  'Deployment Hook': 'Deployment events',
+}
+
+export function gitlabEventLabel(event: string): string {
+  return GITLAB_EVENT_LABELS[event] ?? event
 }

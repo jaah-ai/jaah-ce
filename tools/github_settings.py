@@ -93,7 +93,7 @@ def http_fetch(token: str, api: str = "https://api.github.com") -> Fetch:
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403, 404) and method == "GET":
                 raise Unreadable(f"HTTP {exc.code}") from None
-            raise SystemExit(f"github_settings: {method} {path}: HTTP {exc.code}: {exc.read()[:300]!r}")
+            raise SystemExit(f"github_settings: {method} {path}: HTTP {exc.code}: {exc.read()[:300]!r}") from exc
         return json.loads(raw) if raw else None
     return fetch
 

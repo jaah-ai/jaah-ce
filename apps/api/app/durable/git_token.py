@@ -15,12 +15,13 @@ it replaces (`_REPLACES`) so a replay never overwrites a human's reconnect.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Callable, Optional
 from uuid import UUID
 
 from dbos import DBOS, SetWorkflowID
 
+from app.clock import utcnow
 from app.durable import runtime
 from app.entity_shape import iso_or_none
 
@@ -114,7 +115,7 @@ def retry_workflow_id(
     callers still agree on. `floor(now / _RETRY_WINDOW_SECONDS)` is epoch-aligned, so every caller in the
     bucket gets the same id. `now` is for tests only; production never passes it.
     """
-    window = int((now or datetime.now(timezone.utc)).timestamp()) // _RETRY_WINDOW_SECONDS
+    window = int((now or utcnow()).timestamp()) // _RETRY_WINDOW_SECONDS
     return f"{token_refresh_workflow_id(credential_id, grant_expires_at_iso)}:retry-{window}"
 
 
@@ -154,7 +155,7 @@ def rotate(credential_id: str) -> dict[str, Any]:
     # `task_notify_queue.deliver_task_notification`.
     from app import oauth2_wire
     from app.credential_crypto import DURABLE_GIT_TOKEN_AAD, has_sealed_secret, open_secret, seal
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.models.credentials import Credential
     from app.tenancy import exclusion_log, seam
 
@@ -169,7 +170,7 @@ def rotate(credential_id: str) -> dict[str, Any]:
             # would otherwise be refused the derivation. Detached, the inline run binds exactly
             # as a recovered run on a DBOS worker does. ENTITLEMENT (`seam.detached`): `credential_id` is
             # only ever a row `git_access.token_for` was handed by a scoped `resolve_*` read.
-            with seam.detached(), SessionLocal() as session, seam.bind_from(session, Credential, UUID(credential_id)):
+            with seam.detached(), BridgedSession() as session, seam.bind_from(session, Credential, UUID(credential_id)):
                 credential = session.get(Credential, UUID(credential_id))
                 if credential is None:
                     # Unreachable while `bind_from` resolves the same row first; handled anyway.
@@ -256,7 +257,7 @@ def persist(credential_id: str, sealed: dict[str, Any]) -> bool:
     fence returns False. An unopenable envelope costs three attempts; a deleted row returns False.
     """
     from app.credential_crypto import DURABLE_GIT_TOKEN_AAD, unseal
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.git_access import store_grant
     from app.github_oauth import TokenGrant
     from app.models.credentials import Credential
@@ -279,7 +280,7 @@ def persist(credential_id: str, sealed: dict[str, Any]) -> bool:
         try:
             # The same derivation `rotate` makes, taken again and detached for the same reason: a replay of
             # this step alone must bind for itself (`runtime.py`).
-            with seam.detached(), SessionLocal() as session, seam.bind_from(session, Credential, UUID(credential_id)):
+            with seam.detached(), BridgedSession() as session, seam.bind_from(session, Credential, UUID(credential_id)):
                 credential = session.get(
                     Credential, UUID(credential_id), with_for_update=True
                 )

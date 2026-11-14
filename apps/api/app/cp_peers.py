@@ -20,8 +20,8 @@ which is right for the one-process local stack and wrong for anything else.
 Liveness is the heartbeat: a peer whose `heartbeat_at` is older than `PEER_STALE_SECONDS` is not routed
 to, and one older than twice that is deleted by the next peer whose tick sweeps (every
 `SWEEP_EVERY_TICKS`-th; its socket and ticket rows cascade). Every tick also sweeps `console_tickets`
-(`app/console_relay/tickets.py::sweep`: prune and revoke), and every sweeping tick hour-old `rate_limit_hits` and
-`login_failures`, so those tables need no sweeper of their own.
+(`app/console_relay/tickets.py::sweep`: prune and revoke), and every sweeping tick `rate_limit_hits` past
+their bucket's window (a day at most) and hour-old `login_failures`, so those tables need no sweeper of their own.
 """
 from __future__ import annotations
 
@@ -32,15 +32,16 @@ import os
 import time
 import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
 
 import httpx
-from sqlalchemy import delete, func
+from sqlalchemy import delete, func, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from app import ratelimit
+from app.clock import utcnow
 from app.models.control_plane import CpPeer, RateLimitHit
 from app.models.identity import LoginFailure
 
@@ -52,10 +53,13 @@ HEARTBEAT_INTERVAL_SECONDS = 15
 # The dead-peer prune and the two retention DELETEs run on every this-many-th tick (the first tick included),
 # not every tick (to save idle CPU). None of them is latency-bound: a dead peer is already unrouted after
 # `PEER_STALE_SECONDS`, so its row lingering one cadence (60 s) past `2 * PEER_STALE_SECONDS` routes nothing to
-# it, and the retention windows are an hour against readers that filter by time anyway.
+# it, and the retention windows are an hour or a day against readers that filter by time anyway.
 SWEEP_EVERY_TICKS = 4
-# `rate_limit_hits` older than this are pruned on every sweeping tick (the widest window a limiter reads is an hour).
-RATE_LIMIT_HIT_RETENTION_SECONDS = 3600
+# Each `rate_limit_hits` bucket this process knows is pruned past its own window (`ratelimit.bucket_windows`); any
+# row older than this is pruned on every sweeping tick whatever its bucket. It must cover the widest window any
+# `SharedRateLimiter` reads (the daily invitation and Add-email budgets): a shorter one would let every other
+# server forget a hit its own memory still counts.
+RATE_LIMIT_HIT_RETENTION_SECONDS = 86400
 # `login_failures` older than this likewise (the lockout reads back at most `WINDOW + LOCK_FOR`, 30 minutes).
 LOGIN_FAILURE_RETENTION_SECONDS = 3600
 
@@ -235,7 +239,7 @@ def register(session: Session) -> datetime:
     written (measured: the row vanished within one heartbeat interval of the dial)."""
     global _started_at
     if _started_at is None:
-        _started_at = datetime.now(timezone.utc)
+        _started_at = utcnow()
     stmt = pg_insert(CpPeer).values(
         id=self_id(), address=self_address(), started_at=_started_at, heartbeat_at=func.now(),
     )
@@ -246,14 +250,6 @@ def register(session: Session) -> datetime:
         )
     )
     return _started_at
-
-
-def heartbeat_tick(session: Session, local_sockets: Optional[list[tuple[str, uuid.UUID]]] = None) -> int:
-    """One heartbeat in ONE transaction: `register` then `housekeeping` (each documented below). The
-    lifespan actor (`_tick_committed`) commits the two separately; this combined form is for a caller
-    that owns its transaction (tests). Does not commit. Returns the number of peers pruned."""
-    register(session)
-    return housekeeping(session, local_sockets)
 
 
 def housekeeping(
@@ -297,6 +293,15 @@ def housekeeping(
             CpPeer.heartbeat_at < func.now() - timedelta(seconds=2 * PEER_STALE_SECONDS),
         )
     ).rowcount
+    windows = ratelimit.bucket_windows()
+    if windows:
+        session.execute(
+            text(
+                "DELETE FROM rate_limit_hits h USING unnest(CAST(:buckets AS text[]), CAST(:secs AS float8[])) "
+                "AS w(bucket, secs) WHERE h.bucket = w.bucket AND h.hit_at < now() - make_interval(secs => w.secs)"
+            ),
+            {"buckets": list(windows), "secs": list(windows.values())},
+        )
     session.execute(
         delete(RateLimitHit).where(
             RateLimitHit.hit_at < func.now() - timedelta(seconds=RATE_LIMIT_HIT_RETENTION_SECONDS)
@@ -313,9 +318,9 @@ def housekeeping(
 
 
 def _register_committed() -> datetime:
-    from app.db import SessionLocal
+    from app.db import BridgedSession
 
-    with SessionLocal() as session:
+    with BridgedSession() as session:
         started = register(session)
         session.commit()
         return started
@@ -333,12 +338,12 @@ def _tick_committed(local_sockets: list[tuple[str, uuid.UUID]]) -> int:
     it must never be rolled back by a lock wait, a deadlock or a fault in the N upserts and four DELETEs
     beside it — and it must not hold this peer's row lock across them either, since every node connect
     (`node_presence.record_connected`) re-registers and would queue behind it."""
-    from app.db import SessionLocal
+    from app.db import BridgedSession
 
     global _ticks
     sweep = _ticks % SWEEP_EVERY_TICKS == 0
     _ticks += 1
-    with SessionLocal() as session:
+    with BridgedSession() as session:
         register(session)
         session.commit()
         pruned = housekeeping(session, local_sockets, sweep=sweep)
@@ -346,24 +351,10 @@ def _tick_committed(local_sockets: list[tuple[str, uuid.UUID]]) -> int:
         return pruned
 
 
-# The heartbeat's own thread. NOT the default `to_thread` executor: that one is shared with every
-# presence hop, every `route` holder read and the answer lock, and a converge fan-out could hold all of
-# its workers for longer than the prune window — a live peer pruned for being busy. One dedicated worker
-# cannot be starved by them, and one is enough (ticks are serial).
-_heartbeat_executor: Optional[ThreadPoolExecutor] = None
-
-
-def _heartbeat_thread() -> ThreadPoolExecutor:
-    global _heartbeat_executor
-    if _heartbeat_executor is None:
-        _heartbeat_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cp-peer-heartbeat")
-    return _heartbeat_executor
-
-
 def _deregister_committed() -> None:
-    from app.db import SessionLocal
+    from app.db import BridgedSession
 
-    with SessionLocal() as session:
+    with BridgedSession() as session:
         session.execute(delete(CpPeer).where(CpPeer.id == self_id()))
         session.commit()
 
@@ -371,15 +362,18 @@ def _deregister_committed() -> None:
 async def _heartbeat_forever() -> None:
     """The lifespan actor: tick every `HEARTBEAT_INTERVAL_SECONDS`; a failed tick logs and the next one
     retries, so a transient DB fault never ends the heartbeat (and so never gets this peer pruned).
-    The socket snapshot is taken here, on the loop that owns the registry, and handed to the thread."""
+    The socket snapshot is taken here, on the loop that owns the registry. The tick is sync ORM code run in a
+    greenlet on this loop, its session on the async pool (`app/db_async.py::sync_bind`): no thread, so no busy
+    `to_thread` pool can starve it into a prune."""
+    from sqlalchemy.util.concurrency import greenlet_spawn
+
     from app import node_bus  # lazy: see `housekeeping`
 
-    loop = asyncio.get_running_loop()
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
         try:
             local_sockets = node_bus.registry.local_sockets()
-            await loop.run_in_executor(_heartbeat_thread(), _tick_committed, local_sockets)
+            await greenlet_spawn(_tick_committed, local_sockets)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — see the docstring
@@ -413,12 +407,7 @@ async def stop(app: Any) -> None:
         except asyncio.CancelledError:
             pass
         app.state.cp_peer_task = None
-    # The tick thread first, and WAITED for: a tick already running on it would re-insert this peer's
-    # row after the delete below, showing a gone peer as live for a stale window (as after a crash).
-    global _heartbeat_executor
-    if _heartbeat_executor is not None:
-        executor, _heartbeat_executor = _heartbeat_executor, None
-        await asyncio.to_thread(executor.shutdown, True)
+    # The tick ran in the task awaited above, so none is left to re-insert this peer's row after the delete below.
     try:
         await asyncio.to_thread(_deregister_committed)
     except Exception as exc:  # noqa: BLE001 — see the docstring

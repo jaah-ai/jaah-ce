@@ -11,14 +11,13 @@ from sqlalchemy import case, distinct, false, func, or_, select
 from sqlalchemy.orm import Session
 
 from app import fleet_verdicts, node_identity, project_identity
-from app.auth import require_user
 from app.authz.catalog import Tenancy
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, current_caller
 from app.authz.visibility import node_reach_clause
-from app.db import get_session
+from app.db_async import on_session
 from app.entity_shape import RefOut, iso_or_none
-from app.models.identity import AdminUser
+from app.list_page import PageQuery, sql_page
 from app.models.worktrees import SlotIntent
 from app.node_identity import is_uuid_shaped
 
@@ -352,7 +351,9 @@ class IntentPageOut(BaseModel):
 
 @router.get("/api/nodes/intents", response_model=IntentPageOut)
 @feature("nodes", "view", tenancy=Tenancy.CALLER_PLANE)
+@on_session
 def list_intents(
+    session: Session,
     page: int = Query(default=1, ge=1, le=_INTENTS_PAGE_MAX),
     per: int = Query(default=_INTENTS_PER_PAGE, ge=1, le=_INTENTS_PER_MAX),
     set_: str = Query(default=_SET_PENDING, alias="set", max_length=_INTENT_FILTER_MAX_LEN),
@@ -365,9 +366,7 @@ def list_intents(
     outcome: Optional[str] = Query(default=None, max_length=_INTENT_FILTER_MAX_LEN),
     state: Optional[str] = Query(default=None, max_length=_INTENT_FILTER_MAX_LEN),
     refusing: bool = Query(default=False),
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> IntentPageOut:
     """One page of the fleet's slot-intent queue, with its counts: the Audit surface. The rows are paged in
     full and narrowed by node, verb, outcome and whether the row has refused. Declared early (see the
@@ -391,7 +390,7 @@ def list_intents(
     if set_ not in _INTENT_SETS:
         raise HTTPException(status_code=422, detail=f"unknown set '{set_}'")
     # The grant scope, built once and applied to every statement, so none of the seven can forget it.
-    scope: list[Any] = [node_reach_clause(principal, SlotIntent.node_id)]
+    scope: list[Any] = [node_reach_clause(caller.principal, SlotIntent.node_id)]
     node_clauses = list(scope)
     if node is not None:
         # A non-uuid yields `false()`, not `node_id == None` (NULL compares UNKNOWN and could admit rows under a
@@ -405,18 +404,13 @@ def list_intents(
     )
     # Set clause and node scope only (see `IntentPageOut.total_unfiltered`).
     unfiltered = [*node_clauses, _intent_set_clause(set_)]
-    total = session.scalar(select(func.count()).select_from(SlotIntent).where(*filters)) or 0
     total_unfiltered = (
         session.scalar(select(func.count()).select_from(SlotIntent).where(*unfiltered)) or 0
     )
-    rows = list(
-        session.scalars(
-            select(SlotIntent)
-            .where(*filters)
-            .order_by(*_intent_ordering(set_))
-            .offset((page - 1) * per)
-            .limit(per)
-        ).all()
+    *lead, tie = _intent_ordering(set_)
+    rows, total = sql_page(
+        session, select(SlotIntent).where(*filters), PageQuery(page=page, per=per, sort=None, dir="asc"),
+        sorts={}, default=lead, tie=tie,
     )
     # Two bulk name reads per page, never per row.
     names = project_identity.names_by_id(session, [r.project_id for r in rows])

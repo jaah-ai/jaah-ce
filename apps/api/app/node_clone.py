@@ -1,14 +1,17 @@
-"""Where a project's main clone and an account's config dir live on a given node; the one resolution.
+"""Where a project's slots and an account's config dir live on a given node; the one resolution.
 
-Two readers must never disagree about the same slot: `app/routes/pool_slots.py` writes `path` when a
-slot is declared, and the pool tick in `app/routes/agent/pool_tick.py` ships `clone` to the node, which runs
-`git -C <clone> worktree add` from it. A mismatch would make the complement DELETE read the declared
-row as a slot with no tree.
+Two readers must never disagree about the same slot: `app/slot_allocation.py` writes `path` when a slot is
+declared (`slot_path`), and the pool tick in `app/routes/agent/pool_tick.py` ships that `path` to the node.
 
-`resolve_clone` returns `<jaah_home>/repos/<project_id>/main`, keyed on project identity
-(`projects.id`), so a repo rename moves nothing and two projects sharing one repo never collide; or `""`
-when either input is missing: no implicit default. Callers already refuse on `""` (the tick omits the
-slots, the declare route answers 409).
+`slot_path` returns `<jaah_home>/repos/<project_id>/<N>`, keyed on project identity (`projects.id`), so a
+repo rename moves nothing and two projects sharing one repo never collide; or `""` when an input is
+missing: no implicit default. Callers already refuse on `""`.
+
+`legacy_clone` and `clone_for_slot_path` derive `<jaah_home>/repos/<project_id>/main`, the anchor a node derives its
+slot paths from (`apps/jaahd/worktree_mechanics/core.py::slot_anchor`, else `project_anchor`). Nothing on the control
+plane declares, leases or erases that directory; it is named only as the erase frame's `clone_path`, from which the
+node derives the slot as `dirname(clone_path)/N`. A main clone an older layout left is the node's own
+`legacy_layout`'s to erase.
 """
 from __future__ import annotations
 
@@ -40,39 +43,55 @@ def node_path_segments(path: str) -> list[str]:
     return path.replace("\\", "/").split("/")
 
 
-def resolve_clone(jaah_home: Optional[str], project_id: Optional[int]) -> str:
-    """The main-clone absolute path for a project on a node (module docstring has the rule).
-    `project_id` is `projects.id`."""
-    home = (jaah_home or "").strip().rstrip("/")
+def _home(jaah_home: Optional[str]) -> str:
+    """A node's recorded home as a path root: trimmed, no trailing slash; `""` for none (a blank or a bare `/`)."""
+    return (jaah_home or "").strip().rstrip("/")
+
+
+def has_home(jaah_home: Optional[str]) -> bool:
+    """Whether a node recorded a usable home — the one test every derived path below starts from."""
+    return bool(_home(jaah_home))
+
+
+def _project_root(jaah_home: Optional[str], project_id: Optional[int]) -> str:
+    """`<home>/repos/<project_id>`, or `""` when either input is missing."""
+    home = _home(jaah_home)
     if not home or project_id is None:
         return ""
-    return f"{home}/{REPOS_DIRNAME}/{project_id}/main"
+    return f"{home}/{REPOS_DIRNAME}/{project_id}"
 
 
-def _non_primary_root(jaah_home: Optional[str], project_id: Optional[int]) -> str:
-    """Beside the main clone, so the home and missing-input rules stay `resolve_clone`'s."""
-    clone = resolve_clone(jaah_home, project_id)
-    return f"{clone.rsplit('/', 1)[0]}/{NON_PRIMARY_DIRNAME}" if clone else ""
+def slot_path(jaah_home: Optional[str], project_id: Optional[int], number: Optional[int]) -> str:
+    """Slot `number`'s directory, `<home>/repos/<project_id>/<N>`; `""` on a missing input.
+
+    Mirrored by the node's own layout; `path` is what the node materialises and what the port grid reasons
+    about, so it is derived, never caller-supplied."""
+    root = _project_root(jaah_home, project_id)
+    return f"{root}/{number}" if root and number is not None else ""
 
 
-def repo_clone(jaah_home: Optional[str], project_id: Optional[int], repo_id: Optional[int]) -> str:
-    """A non-primary repo's own clone, `<home>/repos/<pid>/_repos/<rid>/main`; `""` on a missing input."""
-    root = _non_primary_root(jaah_home, project_id)
-    return f"{root}/{repo_id}/main" if root and repo_id is not None else ""
-
-
-def repo_worktree(
+def repo_slot_path(
     jaah_home: Optional[str], project_id: Optional[int], repo_id: Optional[int], number: Optional[int]
 ) -> str:
-    """That repo's worktree for slot `number`, `<home>/repos/<pid>/_repos/<rid>/<N>`; `""` on a missing input."""
-    root = _non_primary_root(jaah_home, project_id)
-    return f"{root}/{repo_id}/{number}" if root and repo_id is not None and number is not None else ""
+    """A non-primary repo's directory for slot `number`, `<home>/repos/<pid>/_repos/<rid>/<N>`; `""` on a
+    missing input."""
+    root = _project_root(jaah_home, project_id)
+    if not root or repo_id is None or number is None:
+        return ""
+    return f"{root}/{NON_PRIMARY_DIRNAME}/{repo_id}/{number}"
+
+
+def legacy_clone(jaah_home: Optional[str], project_id: Optional[int]) -> str:
+    """`<home>/repos/<project_id>/main`: the project's anchor path on a node, an erase frame's `clone_path` (module
+    docstring), byte for byte the node's `core.project_anchor`. `""` on a missing input."""
+    root = _project_root(jaah_home, project_id)
+    return f"{root}/main" if root else ""
 
 
 def clone_for_slot_path(jaah_home: Optional[str], path: Optional[str], number: int) -> str:
-    """The main clone a slot's STORED path implies — `path` itself for slot 0, else `<dirname>/main` — or
-    `""` when `path` is not shaped `.../{main,N}` for this `number` or does not sit under the node's
-    recorded `jaah_home` (the same containment the node's erase applies; no home, no answer).
+    """The erase frame's `clone_path` a slot's STORED path implies, `<dirname>/main`, or `""` when `path` is not
+    shaped `.../N` for this `number` or does not sit under the node's recorded `jaah_home` (the same
+    containment the node's erase applies; no home, no answer).
 
     What an erase must aim at: the row's `worktrees.path` is where the node last reported the tree."""
     home = (jaah_home or "").strip().rstrip("/")
@@ -82,12 +101,10 @@ def clone_for_slot_path(jaah_home: Optional[str], path: Optional[str], number: i
     # A `..` segment could climb out of the home a prefix test says it is under: refused, not normalized.
     if not home or not raw.startswith(home + "/") or ".." in raw.split("/"):
         return ""
-    # A non-primary repo's worktree is shaped `.../<rid>/<N>` too, but it is no slot and has no main clone of its own.
+    # A non-primary repo's directory is shaped `.../<rid>/<N>` too, but it is no slot.
     if NON_PRIMARY_DIRNAME in raw[len(home) + 1:].split("/"):
         return ""
     parent, base = raw.rsplit("/", 1)
-    if number == 0:
-        return raw if base == "main" else ""
     return f"{parent}/main" if base == str(number) else ""
 
 
@@ -110,8 +127,6 @@ def _windows_clone_for_slot_path(home: str, path: Optional[str], number: int) ->
         return ""
     cut = max(raw.rfind("/"), raw.rfind("\\"))
     parent, separator, base = raw[:cut], raw[cut], raw[cut + 1:]
-    if number == 0:
-        return raw if base == "main" else ""
     return f"{parent}{separator}main" if base == str(number) else ""
 
 AUTH_DIRNAME = "auth"
@@ -123,7 +138,7 @@ def resolve_auth_dir(jaah_home: Optional[str], slug: Optional[str]) -> str:
     The CP answers it and the node obeys verbatim; jaahd has no say (owner directive). It is per-node
     because one global `accounts.config_dir` could only be right for one host.
 
-    Fails closed to `""` like `resolve_clone`; never a literal `/home/jaah` fallback, which would point a
+    Fails closed to `""` like `slot_path`; never a literal `/home/jaah` fallback, which would point a
     runner at a directory nobody provisioned."""
     home = (jaah_home or "").strip().rstrip("/")
     slug = (slug or "").strip().strip("/")

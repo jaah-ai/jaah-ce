@@ -42,6 +42,13 @@ class Knob:
     choice_labels: Optional[tuple[str, ...]] = None
     #: A warning the page shows while that choice is selected, paired positionally ("" = none).
     choice_notes: Optional[tuple[str, ...]] = None
+    #: The explanation pop-up ("More", `apps/web/src/ui/HelpLabel.tsx`): `more` is its paragraph (≤ 60 words),
+    #: `choice_help` one ≤ 10-word effect line per entry of `choices` (paired positionally), `docs` a reader-docs
+    #: route path (no leading/trailing slash, never ending `/index`; a page of the reader docs' content tree). `help`
+    #: is the tooltip (≤ 10 words, the setting's effect). Budgets: the UI copy standard's explanation pop-up row.
+    more: Optional[str] = None
+    choice_help: Optional[tuple[str, ...]] = None
+    docs: Optional[str] = None
     credential_type: Optional[tuple[str, ...]] = None
     #: The value is an operator host's `vnode_hosts.node_id` (str only): the page renders the
     #: host picker. A rendering declaration like `credential_type`, exclusive with it and with `choices`.
@@ -79,6 +86,9 @@ class Knob:
     #: The value is a comma-separated list of email domains (str only), each stored in its canonical form
     #: (`app/access.py::normalized_domain`); blank is a real setting.
     domain_list: bool = False
+    #: The value is a Sentry DSN (str only): refused unless `app/url_validation.py::sentry_dsn_problem` accepts it;
+    #: blank is a real setting (error tracking off).
+    sentry_dsn: bool = False
     #: With `https_url`: blank is a real setting too, meaning the knob's documented fallback (the reader
     #: resolves it, e.g. `app/legal_pages.py::signup_link`). Needs `minimum=0`.
     blank_ok: bool = False
@@ -96,6 +106,9 @@ class Knob:
     #: The value is the `data_regions` JSON list (str only): refused on write unless `data_residency.parse` reads
     #: it, and stored in its canonical form. Rendered by its own panel, not as a row.
     data_regions: bool = False
+    #: `(regex, what it is in words)` (str only): a non-blank value is refused on write unless it fully matches,
+    #: and the refusal names the words (`writes._validate_value`). Blank is a real setting (the reader's default).
+    pattern: Optional[tuple[str, str]] = None
     #: The edition-map feature this knob configures (`packages/editions/features.toml`), or None for one every
     #: edition has. An edition without it is neither served the knob nor may write it (`catalog.in_edition`).
     feature: Optional[str] = None
@@ -119,6 +132,10 @@ class Knob:
             self.choices is None or len(self.choice_notes) != len(self.choices)
         ):
             raise ValueError(f"{self.key}: choice_notes must pair one-to-one with choices")
+        if self.choice_help is not None and (
+            self.choices is None or len(self.choice_help) != len(self.choices)
+        ):
+            raise ValueError(f"{self.key}: choice_help must pair one-to-one with choices")
         for flag, exclusive in _STR_FLAG_EXCLUSIONS:
             if getattr(self, flag) and (self.kind != "str" or any(getattr(self, other) for other in exclusive)):
                 raise ValueError(f"{self.key}: {flag} is a str, exclusive with {'/'.join(exclusive)}")
@@ -149,11 +166,13 @@ _STR_FLAG_EXCLUSIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("project", ("choices", "credential_type", "vnode_host", "instance_type", "plan", "cloud_connection")),
     ("https_url", ("choices",)),
     ("email_list", ("choices",)),
+    ("sentry_dsn", ("choices", "https_url", "email_list")),
     ("single_email", ("choices",)),
     ("email_local_part", ("choices", "single_email")),
     ("domain_list", ("choices",)),
     ("command_line", ("choices",)),
     ("data_regions", ("choices",)),
+    ("pattern", ("choices",)),
 )
 
 

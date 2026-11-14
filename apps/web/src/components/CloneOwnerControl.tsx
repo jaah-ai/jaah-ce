@@ -2,11 +2,11 @@ import { useState } from 'react'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Typography from '@mui/material/Typography'
-import { saveCloneOwner, type CloneRef } from '../lib/cloneOwner'
-import type { TitleNotice } from '../lib/slotTitle'
+import { saveCloneOwner, type CloneRef, type OwnerNotice } from '../lib/cloneOwner'
 import { searchUserOptions } from '../lib/users'
 import { AsyncLookup, type LookupOption } from '../ui/AsyncLookup'
 import Banner from '../ui/Banner'
+import { grid } from '../theme'
 
 /**
  * "Clone as" — pick whose GitHub account this project's pool clone on this node uses.
@@ -20,7 +20,7 @@ export default function CloneOwnerControl({ clone, onSaved }: { clone: CloneRef;
   const [owner, setOwner] = useState<LookupOption | null>(null)
   const userId = owner?.key ?? ''
   const [saving, setSaving] = useState(false)
-  const [notice, setNotice] = useState<TitleNotice | null>(null)
+  const [notice, setNotice] = useState<OwnerNotice | null>(null)
 
   async function save() {
     setSaving(true)
@@ -39,8 +39,8 @@ export default function CloneOwnerControl({ clone, onSaved }: { clone: CloneRef;
     <Box sx={{ mt: 2 }} data-testid="clone-owner">
       {notice && <Banner severity={notice.kind === 'error' ? 'error' : 'info'}>{notice.text}</Banner>}
       {!open ? (
-        /* Pulled left by the small text button's 5px inline padding, so its label lines up with the drawer's rows. */
-        <Button size="small" variant="text" onClick={() => { setNotice(null); setOpen(true) }} sx={{ ml: '-5px' }}>
+        /* Pulled left by the small text button's inline padding, so its label lines up with the drawer's rows. */
+        <Button size="small" variant="text" onClick={() => { setNotice(null); setOpen(true) }} sx={{ ml: -0.5 }}>
           Change clone owner
         </Button>
       ) : (
@@ -49,7 +49,7 @@ export default function CloneOwnerControl({ clone, onSaved }: { clone: CloneRef;
             GitHub account that clones {clone.project} on {clone.nodeLabel}, for all its slots.
           </Typography>
           <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', flexWrap: 'wrap' }}>
-            <Box sx={{ minWidth: 220, flex: '1 1 220px' }}>
+            <Box sx={{ minWidth: grid(36), flex: `1 1 ${grid(36)}` }}>
               <AsyncLookup
                 id="clone-owner"
                 testId="clone-owner-user"

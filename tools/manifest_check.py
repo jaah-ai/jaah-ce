@@ -5,7 +5,7 @@ which LOADS this file by path and re-exports it (`app/shared_module.py`). STDLIB
 for that loader.
 
 `validate_manifest(text, *, tree=None, read=None)` returns a `Manifest` or the list of
-`ManifestError`s; `read_agent_root(root)` gathers `tree` from an unpacked bundle.
+`ManifestError`s.
 
 One manifest version is accepted: `[agent] manifest = 2`, an SDK v2 agent, which is just an ACP agent. It names a
 `command` the node runs as the engine of `jaah-acp-host` from the agent root. The bundle carries no third-party
@@ -19,7 +19,6 @@ it nor names what installs it. A manifest with no `manifest` key or `manifest = 
 from __future__ import annotations
 
 import json
-import os
 import posixpath
 import re
 import shlex
@@ -74,6 +73,28 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 DISPLAY_NAME_MAX = 60
 DESCRIPTION_MAX = 280
+
+#: Keys a manifest may not carry at any depth: a performance, cost or quality figure about the agent. The marketplace
+#: shows only the outcome ledger's numbers, never a vendor's own (`apps/api/app/routes/agent_marketplace.py`), so a
+#: self-reported figure is refused at publish, registration and refresh rather than stored and ignored.
+SELF_REPORTED_KEY = re.compile(r"^(?:success|score|benchmark|cost|price|quality|latency).*|.*_rate$", re.I)
+
+
+def self_reported_errors(data: Mapping[str, Any], where: str = "") -> list[ManifestError]:
+    """One error per key in `data` (tables walked, arrays of tables too) that names a self-reported figure."""
+    errors: list[ManifestError] = []
+    for key, value in data.items():
+        path = f"{where}.{key}" if where else str(key)
+        if SELF_REPORTED_KEY.fullmatch(str(key)):
+            errors.append(ManifestError(str(key), (
+                f"`{path}` is a performance, cost or quality figure; Jaah shows only what its own outcome ledger "
+                f"measured, so remove it from {MANIFEST_FILENAME}"
+            )))
+        children = value if isinstance(value, list) else [value]
+        for child in children:
+            if isinstance(child, Mapping):
+                errors.extend(self_reported_errors(child, path))
+    return errors
 
 
 @dataclass(frozen=True)
@@ -314,6 +335,7 @@ def validate_manifest(
         ))
     if command and tree is not None and read is not None:
         errors.extend(v2_sdk_errors(command, tree, read))
+    errors.extend(self_reported_errors(data))
     if errors:
         return errors
     return Manifest(
@@ -337,21 +359,3 @@ def _command(raw: Any, errors: list[ManifestError]) -> tuple[str, ...]:
         errors.append(ManifestError("command", "`command` must not contain a NUL character"))
         return ()
     return tuple(raw)
-
-
-def read_agent_root(root: str) -> tuple[Optional[str], set[str]]:
-    """`(manifest text or None, every file path relative to root)` of an unpacked agent root — the inputs
-    `validate_manifest` takes, read off disk. `node_modules` is skipped: it is an install's output, never part of
-    the bundle."""
-    tree: set[str] = set()
-    for here, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if d != "node_modules"]
-        rel = os.path.relpath(here, root)
-        for name in files:
-            tree.add(posixpath.normpath(name if rel == "." else posixpath.join(rel.replace(os.sep, "/"), name)))
-    manifest_path = os.path.join(root, MANIFEST_FILENAME)
-    text = None
-    if os.path.isfile(manifest_path):
-        with open(manifest_path, encoding="utf-8", errors="replace") as handle:
-            text = handle.read()
-    return text, tree

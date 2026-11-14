@@ -23,10 +23,8 @@ release's notes.
       publish), and expect the first release that carries `SHA256SUMS` to be the oldest one any installer accepts.
 - [ ] **Upgrade.** From the previous release, `install.sh --upgrade` (or `install.ps1 -Upgrade`) moves every image
       to the new tag and keeps the account, projects and tasks.
-- [ ] **Removed S3 and KMS settings.** The release notes say the edition no longer reads `SESSION_TRANSCRIPT_BUCKET`,
-      `CREDENTIAL_KMS_KEY_ID` or `CREDENTIAL_KMS_PREVIOUS_KEY_IDS` and point to the README's upgrade steps (copy the
-      bucket into the volumes, then unset it; under KMS, re-enter credentials or stay on the previous release).
-      Starting with one still set refuses with a message naming it.
+- [ ] **Removed S3 and KMS settings.** The release notes point to the README's upgrade steps for
+      `SESSION_TRANSCRIPT_BUCKET`, `CREDENTIAL_KMS_KEY_ID` and `CREDENTIAL_KMS_PREVIOUS_KEY_IDS`.
 
 ## Platforms the pipeline does not cover
 

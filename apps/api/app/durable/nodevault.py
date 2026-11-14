@@ -26,7 +26,7 @@ blob — steps take and return ids, hashes, states and closed-vocabulary words o
 grant row and the node inside one step and is never returned (AC-7.2). Node calls hop to the serving loop
 as `app/durable/accounts.py::dispatch` does; only the dispatch crosses, and the `command_audit_log` row is
 written on the step's own thread with the NodeVault ciphertext redacted (`commands._credential_safe_args`).
-DB work runs through `SessionLocal` bound to the node's org (`seam.bind_from`), never holding a connection
+DB work runs through `BridgedSession` bound to the node's org (`seam.bind_from`), never holding a connection
 across a node call.
 """
 from __future__ import annotations
@@ -48,7 +48,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app import node_presence, nodevault_grants, user_activity
-from app.db import SessionLocal
+from app.clock import capped_doubling
+from app.db import BridgedSession
 from app.durable import runtime
 from app.entity_shape import optional_uuid
 from app.models.credentials import (
@@ -132,7 +133,7 @@ def grant_error(word: Any) -> str:
 
 def backoff_seconds(failures: int) -> float:
     """The durable sleep before attempt `failures + 1`: exponential from `BACKOFF_BASE_SECONDS`, capped."""
-    return min(BACKOFF_CAP_SECONDS, BACKOFF_BASE_SECONDS * (2 ** max(0, failures - 1)))
+    return capped_doubling(failures - 1, BACKOFF_BASE_SECONDS, BACKOFF_CAP_SECONDS)
 
 
 # ── Sessions ─────────────────────────────────────────────────────────────────────────────────────────
@@ -143,7 +144,7 @@ def _node_session(node_id: str | UUID) -> Iterator[tuple[Session, UUID]]:
     """A fresh session bound to the node's OWN org, derived from its row (`seam.bind_from`), and that org.
     Raises `seam.TenancyRowMissing` when the node is gone. The one door every step's DB work goes through:
     a DBOS worker thread has nothing bound, and the node is the subject of every grant workflow."""
-    with SessionLocal() as session, seam.bind_from(session, Node, UUID(str(node_id))) as org_id:
+    with BridgedSession() as session, seam.bind_from(session, Node, UUID(str(node_id))) as org_id:
         yield session, org_id
 
 
@@ -151,7 +152,7 @@ def _node_session(node_id: str | UUID) -> Iterator[tuple[Session, UUID]]:
 def _org_session(org_id: UUID) -> Iterator[Session]:
     """A fresh session bound to `org_id`, an org a step already derived from a node row (`org_of`, the
     grant's own org) — for work whose node may be gone: the operation signal and the abandoned-key cleanup."""
-    with SessionLocal() as session, seam.bound_to(org_id):
+    with BridgedSession() as session, seam.bound_to(org_id):
         yield session
 
 
@@ -274,6 +275,24 @@ def _live_key(session: Session, org_id: UUID, key_hash: str) -> Optional[NodeVau
     ))):
         return None
     return key
+
+
+def _online_holders(
+    session: Session, org_id: UUID, key_hash: str, online: set[str], *, excluding: UUID | None = None,
+) -> list[str]:
+    """The DELIVERED holders of `key_hash` among the `online` node ids, oldest holder first: a node that only
+    just claimed the key is the last one asked. `excluding` leaves one node (the asker) out."""
+    clauses = [
+        NodeVaultGrant.org_id == org_id, NodeVaultGrant.key_hash == key_hash,
+        NodeVaultGrant.state == NV_GRANT_DELIVERED,
+    ]
+    if excluding is not None:
+        clauses.append(NodeVaultGrant.node_id != excluding)
+    return [
+        str(holder) for holder in session.scalars(
+            select(NodeVaultGrant.node_id).where(*clauses).order_by(NodeVaultGrant.delivered_at.asc().nulls_last())
+        ) if str(holder) in online
+    ]
 
 
 def restart_state(session: Session, org_id: UUID, key_hash: str) -> str:
@@ -418,20 +437,7 @@ def produce_blob(node_id: str, key_hash: str, generation: int) -> dict[str, Any]
             if not target_key:
                 return {"state": GONE}
             online = set(node_presence.connected_node_ids(session))
-            holders = [
-                str(holder) for holder in session.scalars(
-                    select(NodeVaultGrant.node_id)
-                    .where(
-                        NodeVaultGrant.org_id == org_id,
-                        NodeVaultGrant.key_hash == key_hash,
-                        NodeVaultGrant.state == NV_GRANT_DELIVERED,
-                        NodeVaultGrant.node_id != node_uuid,
-                    )
-                    # Oldest holder first: a node that only just claimed the key is the last one asked.
-                    .order_by(NodeVaultGrant.delivered_at.asc().nulls_last())
-                )
-                if str(holder) in online
-            ]
+            holders = _online_holders(session, org_id, key_hash, online, excluding=node_uuid)
             session.rollback()   # no connection held across the node calls below
     except seam.TenancyRowMissing:
         return {"state": GONE}
@@ -690,6 +696,32 @@ def _wait(topic: str, deadline: Optional[float]) -> bool:
     return True
 
 
+def _note_failure(node_id: str, key_hash: str, generation: int, outcome: str, failures: int) -> bool:
+    """Record a failed attempt (`outcome` is a `FAILED_PREFIX` word or a bare one) and sleep the backoff before the
+    next; False once `MAX_ATTEMPTS` is spent, the failure recorded as final."""
+    word = outcome[len(FAILED_PREFIX):] if outcome.startswith(FAILED_PREFIX) else outcome
+    if failures >= MAX_ATTEMPTS:
+        record_error(node_id, key_hash, generation, word, True)
+        return False
+    record_error(node_id, key_hash, generation, word, False)
+    DBOS.sleep(backoff_seconds(failures))
+    return True
+
+
+def _retry_tail(
+    node_id: str, key_hash: str, generation: int, outcome: str, failures: int, deadline: float,
+) -> tuple[Optional[str], int]:
+    """Both loops' tail for an outcome that is neither done nor gone: `(verdict, failures)`, the verdict None to
+    go round again. `offline` records the wait and parks past the deadline; anything else is a counted failure,
+    final once `MAX_ATTEMPTS` is spent. Plain control flow between steps: the steps it reaches are the same, in
+    the same order, as when each loop spelled it."""
+    if outcome == OFFLINE:
+        record_error(node_id, key_hash, generation, OFFLINE, False)
+        return (None if _wait(NODE_ONLINE, deadline) else PARKED), failures
+    failures += 1
+    return (None if _note_failure(node_id, key_hash, generation, outcome, failures) else FAILED), failures
+
+
 @nodevault_grants.register(nodevault_grants.DELIVER)
 @DBOS.workflow()
 def deliver_key(node_id: str, key_hash: str, generation: int) -> str:
@@ -711,18 +743,9 @@ def deliver_key(node_id: str, key_hash: str, generation: int) -> str:
             return ENDED
         if outcome == NO_BLOB:
             continue
-        if outcome == OFFLINE:
-            record_error(node_id, key_hash, generation, OFFLINE, False)
-            if not _wait(NODE_ONLINE, deadline):
-                return PARKED
-            continue
-        failures += 1
-        word = outcome[len(FAILED_PREFIX):] if outcome.startswith(FAILED_PREFIX) else outcome
-        if failures >= MAX_ATTEMPTS:
-            record_error(node_id, key_hash, generation, word, True)
-            return FAILED
-        record_error(node_id, key_hash, generation, word, False)
-        DBOS.sleep(backoff_seconds(failures))
+        verdict, failures = _retry_tail(node_id, key_hash, generation, outcome, failures, deadline)
+        if verdict is not None:
+            return verdict
 
 
 @nodevault_grants.register(nodevault_grants.RETIRE_NODE)
@@ -736,18 +759,9 @@ def retire_node_key(node_id: str, key_hash: str, generation: int) -> str:
         outcome = retire(node_id, key_hash, generation, org_id)
         if outcome in (RETIRED, GONE):
             break
-        if outcome == OFFLINE:
-            record_error(node_id, key_hash, generation, OFFLINE, False)
-            if not _wait(NODE_ONLINE, deadline):
-                return PARKED
-            continue
-        failures += 1
-        word = outcome[len(FAILED_PREFIX):] if outcome.startswith(FAILED_PREFIX) else outcome
-        if failures >= MAX_ATTEMPTS:
-            record_error(node_id, key_hash, generation, word, True)
-            return FAILED
-        record_error(node_id, key_hash, generation, word, False)
-        DBOS.sleep(backoff_seconds(failures))
+        verdict, failures = _retry_tail(node_id, key_hash, generation, outcome, failures, deadline)
+        if verdict is not None:
+            return verdict
     if org_id is not None:
         cleanup_abandoned_key(org_id, key_hash)
     return RETIRED if outcome == RETIRED else ENDED
@@ -918,7 +932,7 @@ def item_retry_workflow_id(op_id: UUID | str, credential_id: UUID | str, n: int)
 def _op_session(op_id: str | UUID) -> Iterator[tuple[Session, UUID]]:
     """A fresh session bound to the operation's own org (derived from its row). Raises `seam.TenancyRowMissing`
     when the operation is gone."""
-    with SessionLocal() as session, seam.bind_from(session, NodeVaultOperation, UUID(str(op_id))) as org_id:
+    with BridgedSession() as session, seam.bind_from(session, NodeVaultOperation, UUID(str(op_id))) as org_id:
         yield session, org_id
 
 
@@ -1275,15 +1289,7 @@ def _verify_item(op_id: str, credential_id: str) -> str:
                 return ITEM_FAILED
             key_hash = item.staged["key_hash"]
             request = {"items": _verify_request(session, item, credential)}
-            online = set(node_presence.connected_node_ids(session))
-            holders = [
-                str(holder) for holder in session.scalars(
-                    select(NodeVaultGrant.node_id).where(
-                        NodeVaultGrant.org_id == org_id, NodeVaultGrant.key_hash == key_hash,
-                        NodeVaultGrant.state == NV_GRANT_DELIVERED,
-                    ).order_by(NodeVaultGrant.delivered_at.asc().nulls_last())
-                ) if str(holder) in online
-            ]
+            holders = _online_holders(session, org_id, key_hash, set(node_presence.connected_node_ids(session)))
             session.rollback()   # no connection held across the node calls below
     except seam.TenancyRowMissing:
         return GONE
@@ -1709,13 +1715,7 @@ def _rekey_batch(op_id: str) -> str:
                 NodeVaultGrant.org_id == org_id, NodeVaultGrant.key_hash == old,
                 NodeVaultGrant.state == NV_GRANT_DELIVERED,
             ))}
-            holders = [
-                str(n) for n in session.scalars(select(NodeVaultGrant.node_id).where(
-                    NodeVaultGrant.org_id == org_id, NodeVaultGrant.key_hash == new,
-                    NodeVaultGrant.state == NV_GRANT_DELIVERED,
-                ).order_by(NodeVaultGrant.delivered_at.asc().nulls_last()))
-                if str(n) in online and str(n) in holders_old
-            ]
+            holders = [n for n in _online_holders(session, org_id, new, online) if n in holders_old]
             session.rollback()   # no connection held across the node calls below
     except seam.TenancyRowMissing:
         return GONE

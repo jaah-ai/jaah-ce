@@ -7,24 +7,22 @@ import json
 import logging
 import os
 import subprocess
-import time
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
-import clone_identity
 import control_plane_api
 import edition
 import host_platform
 import console as console_mod  # sibling module import, mirroring commands.py's `import console as ...`
-import git_env
-import git_mirror
 import runner_env
 import session_user
-from worktree_mechanics import core, env_file, processes
+from worktree_mechanics import env_file, processes
 from env_helpers import compose_project_name, now_iso
 from reconcile import vocab, accounts_probe
 from reconcile.vocab import CONSOLE_ATTACHED, CONSOLE_NOT_ATTACHED, CONSOLE_PROBE_UNAVAILABLE, GIT_FAST_TIMEOUT
-from reconcile.tick_wire import RosterSlot
 from reconcile.accounts_probe import AgentsProbeCache, AgentsProbeFn
+
+if TYPE_CHECKING:
+    import runner_registry
 
 log = logging.getLogger(__name__)
 
@@ -57,11 +55,8 @@ class ReconcileContext:
         # `probe_unavailable`, never `not_attached` (R1).
         self._console_live_probe = console_live_probe
         self._node_id = node_id
-        # The tier-2 range from the tick's `grid`; None ⇒ `worktree_mechanics`' defaults, applied there only.
+        # The node-assigned port range from the tick's `grid`; None ⇒ `worktree_mechanics`' defaults, applied there only.
         self._auto_ports = auto_ports
-        # Projects fetched this pass (`fetch_base_if_stale`): within the pass gate 1 (the CP's age is a
-        # pre-pass snapshot); after it, the POST's `fetched_projects`.
-        self.fetched: set[str] = set()
         # Gate-0 answers per slot path from one `scan_pool_cwds` walk. None ⇒ `cwd_scan` scans the one tree
         # asked about (an optimisation, not a precondition).
         self._cwd_scans: dict[str, "processes.CwdScan"] | None = None
@@ -69,6 +64,10 @@ class ReconcileContext:
         self._agents_ok = False
         self._agents_json: list[dict] = []
         self._agent_cwds: list[str] = []
+        # The per-account reading behind `slot_agents`: the union over the accounts that were read, and the
+        # accounts that were not. `_agents_blind` None = no per-account reading (every slot blind).
+        self._agents_partial: tuple[list[dict], list[str]] = ([], [])
+        self._agents_blind: frozenset[str] | None = None
         self._docker_done = False
         self._docker_ok = False
         self._docker_names: list[str] = []
@@ -83,15 +82,6 @@ class ReconcileContext:
         # One lock per memo, so a concurrent caller (`execute_intents` runs chains at once) waits for the first
         # answer instead of reading the memo stamped before its first await. Created unbound (3.10+).
         self._memo_locks = {name: asyncio.Lock() for name in ("agents", "docker", "tmux", "worktrees")}
-
-    def fresh(self) -> "ReconcileContext":
-        """A context with this one's wiring and none of its snapshots: for work that outlives the pass that
-        started it (`_handoff_then_ack`), whose snapshots are as old as that pass by the time it enacts."""
-        return ReconcileContext(
-            config_dirs=list(self._config_dirs), agents_probe=self._agents_probe,
-            console_live_probe=self._console_live_probe, node_id=self._node_id, agents_cache=self._agents_cache,
-            auto_ports=self._auto_ports, coverage_known=self._coverage_known,
-        )
 
     @property
     def config_dirs(self) -> list[str]:
@@ -119,13 +109,13 @@ class ReconcileContext:
 
     @property
     def auto_ports(self) -> "tuple[int, int] | None":
-        """The `(floor, ceiling)` for this pass's tier-2 walk, or None for the module defaults. On the
+        """The `(floor, ceiling)` for this pass's port walk, or None for the module defaults. On the
         context: one fact per pass (a node belongs to one org), not an argument threaded through every
         executor."""
         return self._auto_ports
 
     def adopt_auto_ports(self, auto_ports: "tuple[int, int] | None") -> None:
-        """Bind this pass's tier-2 range from the tick, after construction (the two callers build and tick
+        """Bind this pass's port range from the tick, after construction (the two callers build and tick
         in opposite orders). None is a no-op, not a clear."""
         if auto_ports is not None:
             self._auto_ports = auto_ports
@@ -181,10 +171,13 @@ class ReconcileContext:
         array; union and dedup by sessionId, tagging each with its account.
 
         With a cache wired, reads it and forks nothing; without, probes every dir once. Answers
-        affirmatively only when this process knows which accounts exist (`_roster_coverage_known`)."""
+        affirmatively only when this process knows which accounts exist (`_roster_coverage_known`). Also
+        memoises the per-account reading `slot_agents` serves."""
         if self._agents_done:
             return self._agents_ok, self._agents_json, self._agent_cwds
         self._agents_done = True
+        # Blind everywhere until a per-account reading is taken below.
+        self._agents_blind = None
         dirs = self._config_dirs
         if not dirs:
             self._agents_ok = False
@@ -202,45 +195,40 @@ class ReconcileContext:
             return self._agents_ok, self._agents_json, self._agent_cwds
 
         if self._agents_cache is not None:
-            self._agents_ok, self._agents_json, self._agent_cwds = self._agents_cache.snapshot(dirs)
-            return self._agents_ok, self._agents_json, self._agent_cwds
-
-        results = await accounts_probe._gather_agents_probes(self._agents_probe, dirs)
-        parsed: list[list[dict]] = []
-        all_ok = True
-        for (_rc, out) in results:
-            try:
-                arr = json.loads(out)
-            except ValueError:
-                arr = None
-            if not isinstance(arr, list):
-                all_ok = False
-                parsed.append([])
-            else:
-                parsed.append(arr)
-
-        if not all_ok:
-            self._agents_ok = False
-            self._agents_json = []
-            self._agent_cwds = []
-            return self._agents_ok, self._agents_json, self._agent_cwds
-
-        # Union across dirs, tag with account, dedup by sessionId (first occurrence wins).
-        merged: list[dict] = []
-        seen_sids: set = set()
-        for account, arr in zip(dirs, parsed):
-            for sess in arr:
-                tagged = {**sess, "_account": account}
-                sid = tagged.get("sessionId")
-                if sid in seen_sids:
-                    continue
-                seen_sids.add(sid)
-                merged.append(tagged)
-
-        self._agents_ok = True
-        self._agents_json = merged
-        self._agent_cwds = [s.get("cwd") for s in merged if s.get("cwd")]
+            sessions, cwds, blind = self._agents_cache.partial(dirs)
+        else:
+            sessions, cwds, blind = _merge_probe_results(
+                dirs, await accounts_probe._gather_agents_probes(self._agents_probe, dirs))
+        self._agents_partial = (sessions, cwds)
+        self._agents_blind = blind
+        self._agents_ok = not blind
+        self._agents_json = sessions if not blind else []
+        self._agent_cwds = cwds if not blind else []
         return self._agents_ok, self._agents_json, self._agent_cwds
+
+    def slot_agents(self, wt: str, account: str | None) -> tuple[bool, list[dict], list[str]]:
+        """`agents()`'s answer for ONE slot, after `agents()` ran this pass: per account, not all-or-nothing.
+
+        With every account read it is `agents()`'s. With some blind (a slow or failing probe) the slot is blind
+        when `account` — the account this node launched the slot's runner on — is one of them; otherwise it reads
+        ok when a read account lists a session in `wt` (positive evidence from a list that was read), or when
+        `account` was read and lists none there.
+        Otherwise the slot is blind, as every slot was before. The node-wide readers (reaps, erase, deliver)
+        keep `agents()`'s all-or-nothing answer."""
+        if self._agents_ok or self._agents_blind is None:
+            return self._agents_ok, self._agents_json, self._agent_cwds
+        sessions, cwds = self._agents_partial
+        norm = accounts_probe._registry_norm
+        mine = norm(account) if account else ""
+        if mine and mine in {norm(d) for d in self._agents_blind}:
+            # The runner's own account was not read: another account's session in the tree (a predecessor, an
+            # operator's CLI) is not this runner, and reading it would rule the launch DEAD on a mismatch.
+            return False, [], []
+        if live_session_in(wt, cwds):
+            return True, sessions, cwds
+        if mine and mine in {norm(d) for d in self._config_dirs}:
+            return True, sessions, cwds
+        return False, [], []
 
     async def docker(self) -> tuple[bool, list[str]]:
         """`_docker_once` under its memo lock (`_memo_locks`)."""
@@ -408,140 +396,6 @@ async def branch_merged(wt: str, base: str) -> bool | None:
     return None
 
 
-# Gate 3: `{project: monotonic time of the last fetch}`, module-level to outlive the per-pass memo, node-local
-# so it limits while the POST fails. One extra fetch per project per restart.
-_LAST_FETCH_MONOTONIC: dict[str, float] = {}
-
-
-# Gate 4: a project's in-flight fetch. Gates 1 and 3 are written after the fetch returns, so concurrent slot
-# probes would each fork one; waiters join instead. Reset when the loop changes (a future is bound to its loop
-# — `_SLOT_LOCKS`).
-_FETCH_IN_FLIGHT: dict[str, "asyncio.Future[None]"] = {}
-
-_FETCH_IN_FLIGHT_LOOP: "asyncio.AbstractEventLoop | None" = None
-
-
-def _fetch_flights() -> "dict[str, asyncio.Future[None]]":
-    """The in-flight fetch table for the current loop (mirrors `_slot_locks`)."""
-    global _FETCH_IN_FLIGHT, _FETCH_IN_FLIGHT_LOOP
-    loop = asyncio.get_running_loop()
-    if loop is not _FETCH_IN_FLIGHT_LOOP:
-        _FETCH_IN_FLIGHT_LOOP = loop
-        _FETCH_IN_FLIGHT = {}
-    return _FETCH_IN_FLIGHT
-
-
-async def fetch_base_if_stale(
-    slot: RosterSlot, *, age_secs: int | None, fetched: set[str],
-) -> None:
-    """Refresh `origin/<base>` in the project's clone (shared by every linked worktree); without it
-    `wt_ahead_behind` reads a ref nothing updates, silently.
-
-    One fetch per project per `POOL_FETCH_INTERVAL` (60s), by gates each covering a window the others miss:
-    `fetched` (this pass; `age_secs` is a pre-pass snapshot), `age_secs` (the CP's `fetch_stamps`, the
-    SSOT; None = never fetched, fetch), `_LAST_FETCH_MONOTONIC` (backstop while the POST is failing), and
-    the in-flight join. Failure-swallowed; stamps record the attempt, so a failing remote does not re-fork.
-
-    A folder slot (no repository) has no clone and nothing to fetch: skipped, and NOT stamped, so no fetch
-    stamp is ever reported for a project that cannot have one."""
-    if not slot.has_repo:
-        return
-    if slot.project in fetched:
-        return
-    interval = vocab._env_int("POOL_FETCH_INTERVAL", 60)
-    if age_secs is not None and age_secs < interval:
-        return
-    now = time.monotonic()
-    last = _LAST_FETCH_MONOTONIC.get(slot.project)
-    if last is not None and (now - last) < interval:
-        return
-    # Gate 4: the owner runs it; waiters join, shielded so a cancelled waiter cannot cancel the owner's fetch.
-    flights = _fetch_flights()
-    flight = flights.get(slot.project)
-    if flight is not None:
-        await asyncio.shield(flight)
-    else:
-        owned = asyncio.ensure_future(_fetch_base(slot))
-        flights[slot.project] = owned
-        try:
-            await owned
-        finally:
-            flights.pop(slot.project, None)
-    # Every caller stamps the attempt, waiters included, or a waiter would re-fork next pass.
-    fetched.add(slot.project)
-    _LAST_FETCH_MONOTONIC[slot.project] = time.monotonic()
-
-
-def _fetch_base_blocking(slot: RosterSlot) -> None:
-    """`origin/<base>` refreshed in the slot's clone, on one thread: the project's mirror is refreshed inside
-    its declaration (`git_mirror.refresh`; the credential-less URL goes credential helper → `cred_broker` → CP,
-    which refuses a request naming no project), then the clone fetches from the mirror locally, undeclared.
-    This path swallows failure, so each one is logged — an unauthenticated fetch would otherwise surface as
-    nothing while every reset hands runners stale code.
-
-    A thread, not a coroutine: `clone_identity` guards with a `threading.RLock`, per-thread, so held across
-    an `await` on the loop thread it would re-enter for another coroutine and trip its two-projects arm
-    (and an `asyncio.Lock` there would not exclude `to_thread` clones). `ProjectBusy` is swallowed like any
-    failure (the next pass fetches); the wait is capped at this fetch's own budget, since it is awaited
-    inline in the slot probe."""
-    # The clone the slot's tree belongs to: the anchor, or a multi-repo primary's own (`slot_repos`).
-    config = slot.pool_config()
-    clone = config.source_clone if slot.repos else slot.clone
-    # The network half runs in the project's mirror, as the daemon (`git_mirror`). A mirror not made yet is left
-    # to the next materialisation, reset or release sync, which bound a full clone by the clone budget: here it
-    # would hold the slot probe for minutes.
-    try:
-        mirror = git_mirror.refresh(core.mirror_key(config), shared=True, timeout=vocab.GIT_FETCH_TIMEOUT,
-                                    wait_s=vocab.GIT_FETCH_TIMEOUT, create=False)
-    except clone_identity.ProjectBusy as exc:
-        log.info("fetch_base_if_stale: %s not refreshed this pass — %s", slot.project, exc)
-        return
-    except git_mirror.MirrorError as exc:
-        log.warning("fetch_base_if_stale: the %s mirror was not refreshed — %s", slot.project, exc)
-        return
-    if mirror is None:
-        log.debug("fetch_base_if_stale: %s has no mirror on this node yet — origin/%s not refreshed this pass",
-                  slot.project, slot.base)
-        return
-    # The local half, undeclared and credential-free (`git_mirror.local_fetch_args`).
-    argv = ["git", *git_env.NO_REPO_CODE, "-C", clone, *git_mirror.local_fetch_args(
-        mirror, git_env.tracking_refspec(slot.base))]
-    if session_user.switch_needed():
-        # The one writing git op here: daemon-uid files in `.git` break the ownership contract
-        # (`worktree_mechanics.core._run_git`).
-        if not session_user.can_run_as_session_user():
-            log.warning(
-                "fetch_base_if_stale: session-user switch required but unavailable — skipping "
-                "the origin/%s fetch for %s rather than fetching as the daemon uid",
-                slot.base, slot.project)
-            return
-        try:
-            proc = session_user.run_as_session_user(argv, env=dict(git_mirror.LOCAL_FETCH_ENV),
-                                                    timeout=vocab.GIT_FETCH_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001 — TimeoutExpired / RuntimeError (raced away)
-            log.warning("fetch_base_if_stale: delegated fetch failed for %s: %s", slot.project, exc)
-            return
-    else:
-        try:
-            proc = subprocess.run(argv, capture_output=True, text=True, timeout=vocab.GIT_FETCH_TIMEOUT,
-                                  env={**os.environ, **git_mirror.LOCAL_FETCH_ENV})
-        except (OSError, subprocess.SubprocessError) as exc:
-            log.warning("fetch_base_if_stale: fetch failed for %s: %s", slot.project, exc)
-            return
-    # The rc is read too, so a fetch failing for any other reason is reported (never raised).
-    if proc is not None and proc.returncode:
-        log.warning(
-            "fetch_base_if_stale: origin/%s fetch for %s exited %s — this project's "
-            "ahead/behind is now reading a ref nothing updates: %s",
-            slot.base, slot.project, proc.returncode, (proc.stderr or proc.stdout or "").strip()[:200])
-
-
-async def _fetch_base(slot: RosterSlot) -> None:
-    """The base fetch, failure-swallowed: `_fetch_base_blocking` on a worker thread, split out so callers
-    can share one flight. Nothing else belongs here — it would sit outside the project declaration."""
-    await asyncio.to_thread(_fetch_base_blocking, slot)
-
-
 async def wt_ahead_behind(wt: str, base: str) -> tuple[int, int] | None:
     """(behind, ahead), or None on error. `rev-list --left-right --count origin/base...HEAD` gives
     left=behind, right=ahead."""
@@ -566,8 +420,7 @@ async def wt_ahead_behind(wt: str, base: str) -> tuple[int, int] | None:
 async def wt_unpushed(wt: str) -> int | None:
     """How many commits at HEAD are absent from every `origin/*` ref, or None on probe failure (R1).
 
-    The same computation as `worktree_mechanics.reset.reset_to_base`'s gate 3, so the CP and node agree on what
-    counts. On `HEAD` so a detached checkout answers. A branch pushed from elsewhere over-reports, holding
+    The CP reads it as unpushed work, so it counts the same commits a push would carry. On `HEAD` so a detached checkout answers. A branch pushed from elsewhere over-reports, holding
     the slot — the safe direction."""
     rc, out, _err = await vocab._sh(
         ["git", "-C", wt, "rev-list", "--count", "HEAD", "--not", "--remotes=origin"], GIT_FAST_TIMEOUT
@@ -585,8 +438,7 @@ async def wt_dirty(wt: str) -> bool | None:
     1 differences, else failure.
 
     Untracked files count (`ls-files --others --exclude-standard`): `app/slot_state.py`'s "uncommitted work
-    never reaches `free`" reads this value. Do not narrow it back. (`worktree_ops.sync_develop` asks the
-    narrow question on purpose: untracked files cannot block a rebase.)"""
+    never reaches `free`" reads this value. Do not narrow it back."""
     rc1, _o, _e = await vocab._sh(["git", "-C", wt, "diff", "--quiet"], GIT_FAST_TIMEOUT)
     if rc1 == 1:
         return True
@@ -644,6 +496,31 @@ def cpn_of(wt: str, fallback: str = "") -> str:
 
 def stack_running(wt: str, docker_names: list[str], fallback: str = "") -> bool:
     return f"{cpn_of(wt, fallback)}-postgres-1" in docker_names
+
+
+def _merge_probe_results(dirs: list[str], results: list[tuple[int, str]]
+                         ) -> tuple[list[dict], list[str], frozenset[str]]:
+    """`AgentsProbeCache.partial`'s shape from one fresh probe per dir (`results` in `dirs` order): the union
+    over the dirs whose stdout is a JSON array, and the rest as blind."""
+    merged: list[dict] = []
+    seen_sids: set = set()
+    blind: set[str] = set()
+    for account, (_rc, out) in zip(dirs, results, strict=False):
+        try:
+            arr = json.loads(out)
+        except ValueError:
+            arr = None
+        if not isinstance(arr, list):
+            blind.add(account)
+            continue
+        for sess in arr:
+            tagged = {**sess, "_account": account}
+            sid = tagged.get("sessionId")
+            if sid in seen_sids:
+                continue
+            seen_sids.add(sid)
+            merged.append(tagged)
+    return merged, [s.get("cwd") for s in merged if s.get("cwd")], frozenset(blind)
 
 
 def live_session_in(wt: str, agent_cwds: list[str]) -> bool:
@@ -724,6 +601,26 @@ def _vendor_runner_meta(wt: str) -> tuple[dict, bool] | None:
         return None
     return ({"status": VENDOR_SESSION_STATUS, "id": ident.session_id, "account": "", "started": "",
              "pid": ident.pane_pid, "proc_started": started}, is_acp)
+
+
+def launched_pane(wt: str) -> tuple[runner_registry.RunnerIdentity | None, bool]:
+    """The runner pane this node launched into `wt`, while it is still the recorded process, for ANY provider —
+    or None — and whether that None is definite (`runner_registry.live_in_worktree_certain`). Read once per slot
+    by `observe_slot`: its account picks the slot's session list (`ReconcileContext.slot_agents`), its pid is
+    the identity a blind list still ships, and a definite None is `probes.launched_pane: false`."""
+    import runner_registry  # noqa: PLC0415 — deferred, as `_vendor_runner_meta`
+
+    return runner_registry.live_in_worktree_certain(wt)
+
+
+def launched_pane_identity(ident: runner_registry.RunnerIdentity | None) -> tuple[int, str] | None:
+    """`(pid, proc_started)` of a `launched_pane` answer, or None. Exactly the launch ack's pair
+    (`fleet_dispatch` acks the pane pid, and every `exec` in `launch.sh` keeps it), so it is an identity, not a
+    guess. For `observe_slot` when the session list could not be read: that blindness is not "no runner"."""
+    if ident is None:
+        return None
+    started = proc_started_at(ident.pane_pid)
+    return (ident.pane_pid, started) if started else None
 
 
 def _session_meta_for(wt: str, agents_json: list[dict]) -> dict:
@@ -810,6 +707,20 @@ def new_reconcile_lock() -> asyncio.Lock:
     """A fresh reconcile-serialization lock, built lazily by its first user (binding its loop) and shared
     across both drivers by `main._serve`. Without injection a component serializes only its own reconciles."""
     return asyncio.Lock()
+
+
+class ReconcileLockHolder:
+    """The two drivers' (`commands.CommandBridge`, `main.NodeStatePublisher`) lazy reconcile lock: each sets
+    `_reconcile_lock` to the one `main._serve` injects (shared with the other driver), or None standalone."""
+
+    _reconcile_lock: asyncio.Lock | None
+
+    def _serialization_lock(self) -> asyncio.Lock:
+        """The shared reconcile-serialization lock, created lazily on first use so it binds to the running
+        event loop."""
+        if self._reconcile_lock is None:
+            self._reconcile_lock = new_reconcile_lock()
+        return self._reconcile_lock
 
 
 def _matched_record(records: list[dict], project: str, number: str) -> dict | None:

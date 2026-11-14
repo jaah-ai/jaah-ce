@@ -103,7 +103,7 @@ class Expert:
 
 
 EXPERT_RECORDS: tuple[Expert, ...] = (
-    Expert("engineer", "Engineer", "implementer", "coder", PULL_REQUEST),
+    Expert("engineer", "Coder", "implementer", "coder", PULL_REQUEST),
     Expert("analyst", "Analyst", "ba", "business_analysis", DOCUMENT, HAND_OFF_PRD),
     Expert("architect", "Architect", "architect", "architecture", DOCUMENT, HAND_OFF_ARCHITECTURE),
     Expert("planner", "Planner", "planner", "plan", PLAN),
@@ -112,7 +112,7 @@ EXPERT_RECORDS: tuple[Expert, ...] = (
     Expert("advisor", "Advisor", "advisor", "advisor", CONVERSATION),
     Expert("researcher", "Researcher", "researcher", "researcher", PULL_REQUEST),
     Expert("test_optimizer", "Test optimizer", "test_optimizer", "test_optimizer", PULL_REQUEST),
-    Expert("onboarding", "Onboarding engineer", "onboard", "onboard", PULL_REQUEST),
+    Expert("onboarding", "Repo Wizard", "onboard", "onboard", PULL_REQUEST),
     Expert("translator", "Translator", "translate", "translate", PULL_REQUEST),
     Expert("marketer", "Marketer", "marketer", "marketer", PULL_REQUEST),
 )

@@ -1,18 +1,48 @@
-"""Mount discovery, unmount and tree removal for a root teardown — never deleting through a live mount.
+"""The kernel's mount table, read in ONE place — and mount discovery, unmount and tree removal for a root
+teardown, never deleting through a live mount.
 
-`vnodehelper` (its destroy, its NodeLink staging) is the caller; stdlib only, like every `rootlib` module.
+`rows` is the one parser of `/proc/self/mountinfo` (`vnodehelper`, `shared_storage`, the root filesystem
+reader; `nodelink_mount.py` keeps its own under `-I`, where it may import nothing). Stdlib only, like every
+`rootlib` module.
 """
 from __future__ import annotations
 
 import os
 import re
 import shutil
-from pathlib import Path
+from typing import Iterator, NamedTuple
 
 from .runner import run
 
-# /proc/self/mountinfo's octal escape (`\040` for a space, …).
-MOUNT_ESCAPE = re.compile(r"\\(\d{3})")
+MOUNTINFO = "/proc/self/mountinfo"
+
+# mountinfo(5) escapes a space, tab, newline or backslash in a path as octal (`\040` for a space, …).
+MOUNT_ESCAPE = re.compile(r"\\([0-7]{3})")
+
+
+class Mount(NamedTuple):
+    """One mountinfo(5) line: the fields before the ` - ` separator a reader uses, and the three after it."""
+    id: str        # mount id
+    dev: str       # `major:minor` of the mounted device (field 3), what `os.stat(...).st_dev` names
+    point: str     # the mount point, its octal escapes undone
+    fstype: str
+    source: str
+    options: str   # the super options
+
+
+def rows(table: str = "") -> Iterator[Mount]:
+    """Every entry of the mountinfo TABLE (`MOUNTINFO` unless given), in the kernel's order — a stacked mount
+    is the LAST line naming its point. A line short of the fields is skipped; an unreadable table raises
+    `OSError`, since each caller has its own "no table" answer."""
+    with open(table or MOUNTINFO, encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().splitlines()
+    for line in lines:
+        head, sep, tail = line.partition(" - ")
+        fields, after = head.split(), tail.split()
+        if not sep or len(fields) < 5 or len(after) < 3:
+            continue
+        point = MOUNT_ESCAPE.sub(lambda m: chr(int(m.group(1), 8)), fields[4])
+        yield Mount(fields[0], fields[2], point, after[0], after[1], after[2])
 
 
 def remove_tree(path: str, failures: list[str]) -> None:
@@ -28,22 +58,13 @@ def remove_tree(path: str, failures: list[str]) -> None:
 
 
 def mounts_below(root: str) -> list[str]:
-    """Every mount point at or under `root`, from /proc/self/mountinfo."""
+    """Every mount point at or under `root`, from the mount table (escapes undone by `rows`, or `umount`
+    silently misses the point and the rmtree deletes through it)."""
     try:
-        mountinfo = Path("/proc/self/mountinfo").read_text()
-    except FileNotFoundError:  # pragma: no cover — /proc is always there on a node
+        points = [m.point for m in rows()]
+    except OSError:  # pragma: no cover — /proc is always there on a node
         return []
-    points = []
-    for line in mountinfo.splitlines():
-        fields = line.split()
-        if len(fields) < 5:
-            continue
-        # Field 4 escapes space/tab/newline/backslash as octal; un-escape, or `umount` silently misses
-        # the point and the rmtree deletes through it.
-        point = MOUNT_ESCAPE.sub(lambda m: chr(int(m.group(1), 8)), fields[4])
-        if point == root or point.startswith(root.rstrip("/") + "/"):
-            points.append(point)
-    return points
+    return [p for p in points if p == root or p.startswith(root.rstrip("/") + "/")]
 
 
 def unmount_below(root: str) -> list[str]:

@@ -24,12 +24,11 @@ import os
 import signal
 import sys
 import time
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Mapping, Sequence
 
-import re
 
 # ── THE SANDBOX BOOTSTRAP, AND IT MUST STAY ABOVE THE SIBLING IMPORTS BELOW ──────────────────────────
 #
@@ -146,8 +145,10 @@ import cred_broker as cred_broker_mod
 # Imported for its STARTUP SWEEP alone (see `_serve`) — the command verbs it registers arrive through
 # `commands` above, which already imports it.
 import node_bus as node_bus_mod
+import poll_pace
 import node_settings as node_settings_mod   # the CP's node tunables, off each pool tick
 import env_helpers   # `share_home_readable`: the node-local data root's share bit
+import git_env   # `redact_userinfo`: the one mask for a URL's userinfo before it is logged or published
 # The host CPU/RAM sampler whose reading rides the observation POST as its `host_metrics` block.
 import host_metrics as host_metrics_mod
 # Single home for the config_dir join key: the DB roster's `config_dir` and the probe's must
@@ -155,11 +156,9 @@ import host_metrics as host_metrics_mod
 from env_helpers import _norm_dir
 # The managed-settings consent block is single-homed in `plugin_repair`; only its read helpers are used
 # here, so the snapshot can REPORT what this node would consent to.
-import agent_providers   # the naming the snapshot reports (`NAMING_SNAPSHOT_KEY`)
-import node_frame_auth   # the CP frame label the snapshot reports (`WIRE_LABELS_SNAPSHOT_KEY`)
 import pkgmgr_loader   # the installed `jaah` version, apt or dnf
 import plugin_repair as plugin_repair_mod
-from reconcile import tick_wire, accounts_probe, context, orchestrate
+from reconcile import tick_wire, accounts_probe, context, execute, orchestrate
 # The cloud node's own steps, command handlers and bus callbacks (MicroVM, NodeLink, the GHA pool, the apt
 # upgrade, the vnode host) are discovered, not imported: none of them ship in the community edition.
 import cloud_modules
@@ -183,6 +182,7 @@ import provider_models as provider_models_mod
 import vendor_turn_errors as vendor_turn_errors_mod
 import bedrock_usage_tail as bedrock_usage_tail_mod
 import secret_modes as secret_modes_mod
+import tmux_jail_health as tmux_jail_health_mod
 import windows_anchor_health as windows_anchor_health_mod
 import windows_engine_health as windows_engine_health_mod
 import shared_storage as shared_storage_mod
@@ -293,6 +293,10 @@ class ScheduledTask:
     # Log the child's stderr even on exit 0: `run_scheduled_task` otherwise reads stderr only on failure,
     # so a task whose product is a silent decision is invisible.
     log_output: bool = False
+    # The exit code by which the child says "nothing to do": a success, after which `run` waits
+    # `idle_interval` instead of `interval` (`poll_pace`). None = never idle.
+    idle_rc: int | None = None
+    idle_interval: float | None = None
 
 
 # The interpreter running THIS daemon: the node's venv (/usr/lib/jaahd/venv), the bundle's own python, the test
@@ -304,21 +308,25 @@ _TASK_OUTPUT_LOG_CHARS = 4000
 
 
 def resolve_console_python() -> str:
-    """Resolve `${JAAH_PYTHON:-<this interpreter>}` exactly as the `worktree-agents` task's script does — `or`,
-    not a dict default, so a set-but-empty var also falls back (bash's `:-`, not `-`).
+    """Resolve `${JAAH_PYTHON:-<this interpreter>}` — `or`, not a dict default, so a set-but-empty var also
+    falls back (bash's `:-`, not `-`).
 
     Load-bearing: the sweeps re-run `main.py`, which imports the pinned `websockets`; only the interpreter this
     daemon runs under (the node's venv) is known to carry it, never the ambient or the OS `python3`."""
     return env_get("JAAH_PYTHON") or DEFAULT_JAAH_PYTHON
 
 
+# `--sweep-sessions`'s exit code for "nothing owed, nothing open" (`session_sweep.is_idle`). Not 0, 1 or 2:
+# those are success, an exception and argparse's usage error.
+SWEEP_IDLE_RC = 3
+
+
 def build_scheduled_tasks(hub_root: Path = HUB_ROOT) -> tuple[ScheduledTask, ...]:
     """The scheduled tasks this daemon fires, each mapped to a one-shot argv.
 
     Every task's scope IS the host, so every node daemon fires it, always, with no flag in front:
-    per-task arms left node duties registered, tested and never fired on hosts that run the flags off. The
-    one surviving arm is `worktree-agents`, which KILLS processes. Portfolio-wide work is not a node duty:
-    it belongs on a console cron (DBOS), never here.
+    per-task arms left node duties registered, tested and never fired on hosts that run the flags off.
+    Portfolio-wide work is not a node duty: it belongs on a console cron (DBOS), never here.
     """
     jaahd_main = str(hub_root / "apps" / "jaahd" / "main.py")
     return (
@@ -345,6 +353,9 @@ def build_scheduled_tasks(hub_root: Path = HUB_ROOT) -> tuple[ScheduledTask, ...
             # Its whole output is `sweep_once`'s summary; without it a sweep reporting every session
             # `unavailable` looks like one that uploaded everything.
             log_output=True,
+            # A work list with nothing owed and nothing open: re-ask every 5 min until the node is busy again.
+            idle_rc=SWEEP_IDLE_RC,
+            idle_interval=poll_pace.BACKGROUND_IDLE_INTERVAL_SECS,
         ),
         ScheduledTask(
             name="slot-residue-sweep",
@@ -361,13 +372,6 @@ def build_scheduled_tasks(hub_root: Path = HUB_ROOT) -> tuple[ScheduledTask, ...
             log_output=True,
         ),
         # `node-liveness` is an in-process CP job (`node_liveness_job.py`); do not re-add it here.
-        ScheduledTask(
-            name="worktree-agents",
-            interval=300.0,
-            # Not in `FIRE_AT_STARTUP_NAMES`: it kills processes, and at boot there is nothing to reap.
-            argv=(sys.executable, str(hub_root / "tools" / "worktree_agents.py")),
-            timeout=600.0,
-        ),
     )
 
 
@@ -385,12 +389,6 @@ DEFAULT_SCHEDULED_TASKS = build_scheduled_tasks()
 FIRE_AT_STARTUP_NAMES = ("oauth-endpoint-canary", "model-catalogs", "secret-modes", "nodevault-identity",
                          "disk-reclaim", "fleet-anchor")
 
-def resolve_worktree_agents_enabled() -> bool:
-    """`JAAHD_COCKPIT_AGENTS=on` fires the `worktree-agents` reaper on its own; its scope is this machine.
-    Default `off`, because this task KILLS processes."""
-    return env_get("JAAHD_COCKPIT_AGENTS", "off").strip().lower() == "on"
-
-
 def resolve_autoupdate_enabled() -> bool:
     """Whether this daemon may ASK for a package upgrade: the CP's answer for this node (Settings ›
     Infrastructure › Updates › Auto-update, overridden on the node's or its host's page). A network call.
@@ -399,9 +397,6 @@ def resolve_autoupdate_enabled() -> bool:
     ends in a ROOT apt transaction. The root updater asks the same question last."""
     return control_plane_api_mod.agent_api_autoupdate_enabled() is True
 
-
-# card↔DB sync is retired: the `projects` table is the single home for project metadata
-# (a render is not a merge).
 
 # ── Per-node folded loops ────────────────────────────────────────────────────────────────────────────
 # Each on its own next_due interval timer (`PeriodicStep`).
@@ -415,8 +410,10 @@ class PeriodicStep:
     A raised exception is logged-and-continued, never fatal (the idle-loop resilience contract)."""
 
     name: str
-    step: Callable[[], Awaitable[None]]
+    step: Callable[[], Awaitable[object]]
     interval: float
+    # The interval after a pass that returned `poll_pace.IDLE`, until node activity snaps it back. None = fixed.
+    idle_interval: float | None = None
 
 
 async def _vnode_account_converge_step() -> None:
@@ -426,6 +423,11 @@ async def _vnode_account_converge_step() -> None:
     from fleet_dispatch import converge_accounts_on_upgrade
     await asyncio.to_thread(lambda: converge_accounts_on_upgrade(resolve_daemon_version(),
                                                                  stamp_dir=daemon_state_dir()))
+
+
+async def _launch_reports_step() -> None:
+    """Re-send the launch reports a transient CP failure dropped (`control_plane_api.retry_launch_reports`)."""
+    await asyncio.to_thread(control_plane_api_mod.retry_launch_reports)
 
 
 async def _upgrade_check_on_connect() -> None:
@@ -440,14 +442,16 @@ async def _upgrade_check_on_connect() -> None:
     cloud_node.request_upgrade(installed, desired)
 
 
-async def run_scheduled_task(task: ScheduledTask, cwd: Path = HUB_ROOT) -> None:
+async def run_scheduled_task(task: ScheduledTask, cwd: Path = HUB_ROOT) -> bool:
     """Invoke one scheduled task's argv. A failing script, a missing one, or a raising argv-builder is
-    logged, never raised. A callable `task.argv` is resolved per call, so env-derived argv is fresh."""
+    logged, never raised. A callable `task.argv` is resolved per call, so env-derived argv is fresh.
+
+    Returns `poll_pace.IDLE` when the child exited with `task.idle_rc` ("nothing to do"), else False."""
     try:
         argv = task.argv() if callable(task.argv) else task.argv
     except Exception as exc:  # noqa: BLE001 — a bad argv-builder must never kill the idle loop
         log.warning("scheduled task '%s' argv could not be resolved: %s", task.name, exc)
-        return
+        return False
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -464,12 +468,15 @@ async def run_scheduled_task(task: ScheduledTask, cwd: Path = HUB_ROOT) -> None:
             log.warning(
                 "scheduled task '%s' timed out after %ss — killed", task.name, task.timeout,
             )
-            return
+            return False
         except asyncio.CancelledError:
             # Kill the child too, or it outlives the daemon. No `await proc.wait()`: under a sticky
             # cancellation any await re-raises; the child watcher reaps it.
             proc.kill()
             raise
+        if task.idle_rc is not None and proc.returncode == task.idle_rc:
+            log.debug("scheduled task '%s' ok — nothing to do", task.name)
+            return poll_pace.IDLE
         if proc.returncode != 0:
             log.warning(
                 "scheduled task '%s' failed (rc=%s): %s",
@@ -486,9 +493,10 @@ async def run_scheduled_task(task: ScheduledTask, cwd: Path = HUB_ROOT) -> None:
             log.debug("scheduled task '%s' ok", task.name)
     except OSError as exc:
         log.warning("scheduled task '%s' could not start (%s): %s", task.name, argv, exc)
+    return False
 
 
-ScheduledTaskRunner = Callable[[ScheduledTask], Awaitable[None]]
+ScheduledTaskRunner = Callable[[ScheduledTask], Awaitable[object]]
 
 
 async def _noop_publish() -> None:
@@ -506,7 +514,6 @@ async def run(
     idle_interval: float,
     stop_event: asyncio.Event,
     publish: PublishFn = _noop_publish,
-    worktree_agents_enabled: bool = False,
     scheduled_tasks: tuple[ScheduledTask, ...] = DEFAULT_SCHEDULED_TASKS,
     run_task: ScheduledTaskRunner = run_scheduled_task,
     periodic_steps: tuple[PeriodicStep, ...] = (),
@@ -538,14 +545,11 @@ async def run(
             "the hostname or the tailnet name — those disagree with the assigned id on every node "
             "measured."
         )
-    # Every task fires on every node, always. `worktree-agents` is the one exception: it KILLS
-    # processes, which earns a per-host off switch.
-    eligible = [t for t in scheduled_tasks if t.name != "worktree-agents" or worktree_agents_enabled]
-    # Backdated so the canary is due on the first tick: every deploy restarts the daemon and would reset
-    # a 6h `next_due` forever.
+    # Every task fires on every node, always. Backdated so the canary is due on the first tick: every
+    # deploy restarts the daemon and would reset a 6h `next_due` forever.
     next_due = {
         t.name: loop.time() - (t.interval if t.name in FIRE_AT_STARTUP_NAMES else 0.0)
-        for t in eligible
+        for t in scheduled_tasks
     }
     step_next_due = {
         s.name: loop.time() - (s.interval if s.name in FIRE_AT_STARTUP_NAMES else 0.0)
@@ -555,10 +559,12 @@ async def run(
     # One task slot per step name: a step still running when it next comes due is skipped (its timer not
     # advanced), never stacked; past STEP_WEDGE_WARN_SECS it warns.
     inflight: dict[str, asyncio.Task] = {}
+    # Names whose last pass returned `poll_pace.IDLE`: they wait their `idle_interval` next (`poll_pace.interval`).
+    idle: set[str] = set()
     skipping_since: dict[str, float] = {}
     last_wedge_warn: dict[str, float] = {}
 
-    def spawn_step(name: str, step: Callable[[], Awaitable[None]]) -> bool:
+    def spawn_step(name: str, step: Callable[[], Awaitable[object]]) -> bool:
         prior = inflight.get(name)
         if prior is not None and not prior.done():
             now = loop.time()
@@ -580,9 +586,15 @@ async def run(
 
         async def guarded() -> None:
             try:
-                await step()
+                result = await step()
             except Exception as exc:
+                idle.discard(name)
                 log.warning("%s failed: %s", name, exc)
+                return
+            if result is poll_pace.IDLE:
+                idle.add(name)
+            else:
+                idle.discard(name)
 
         inflight[name] = asyncio.create_task(guarded(), name=name)
         return True
@@ -603,15 +615,15 @@ async def run(
             spawn_step("share-home-readable",
                        lambda: asyncio.to_thread(env_helpers.share_home_readable, account_tree=False))
             now = loop.time()
-            for task in eligible:
-                if now - next_due[task.name] >= task.interval and spawn_step(
-                    f"scheduled task '{task.name}'", lambda task=task: run_task(task)
-                ):
+            for task in scheduled_tasks:
+                label = f"scheduled task '{task.name}'"
+                wait = poll_pace.interval(task.interval, task.idle_interval, idle=label in idle)
+                if now - next_due[task.name] >= wait and spawn_step(label, lambda task=task: run_task(task)):
                     next_due[task.name] = now
             for pstep in periodic_steps:
-                if now - step_next_due[pstep.name] >= pstep.interval and spawn_step(
-                    f"periodic step {pstep.name}", pstep.step
-                ):
+                label = f"periodic step {pstep.name}"
+                wait = poll_pace.interval(pstep.interval, pstep.idle_interval, idle=label in idle)
+                if now - step_next_due[pstep.name] >= wait and spawn_step(label, pstep.step):
                     step_next_due[pstep.name] = now
 
     # Shutdown drain: a bounded grace, then cancel; a step on an uncancellable thread is logged and
@@ -649,7 +661,6 @@ CONFIG_SNAPSHOT_ALLOWLIST = (
     "NODE_ID",
     # `node_liveness`'s CONFIG-DRIFT verdict compares `nodes.config_desired` against this snapshot, so a
     # key published here must be one the daemon actually reads.
-    "JAAHD_COCKPIT_AGENTS",
     "JAAH_CP_BASE_URL",
     "JAAH_HOME",
 )
@@ -667,22 +678,9 @@ CONSENT_NONE = "none"
 # (`apps/api/app/node_config.py::CONSENT_UPDATED_AT_SNAPSHOT_KEY`). Absent with `"none"` or no stamp.
 CONSENT_UPDATED_AT_SNAPSHOT_KEY = "remote_settings_consent_updated_at"
 
-# URL-valued keys, scrubbed of userinfo. Explicit, not `endswith("_URL")`: a silent miss leaks a credential.
+# URL-valued keys, their userinfo masked by `git_env.redact_userinfo` (the one home of that rule, shared with
+# the startup posture line and the node-bus dial line). Explicit, not `endswith("_URL")`: a silent miss leaks a credential.
 _URL_VALUED_CONFIG_KEYS = ("JAAH_CP_BASE_URL",)
-
-
-def _scrub_url_userinfo(value: str) -> str:
-    """Strip any userinfo (`user:pass@` / `token@`) from a URL before it is written down anywhere, so a
-    credential in `JAAH_CP_BASE_URL` is never published; unchanged when it has no parseable host.
-    Single home, three callers: the config snapshot, the startup posture line, the node-bus dial line."""
-    try:
-        parts = urlsplit(value)
-    except ValueError:
-        return value
-    if not parts.hostname:
-        return value
-    netloc = parts.hostname if parts.port is None else f"{parts.hostname}:{parts.port}"
-    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def resolve_remote_settings_consent(jaah_home: str | None = None) -> tuple[str, int | None]:
@@ -762,16 +760,16 @@ def build_config_snapshot(
 ) -> dict[str, str]:
     """Build this node's redacted config snapshot — the read-only effective config the console Nodes
     editor renders. Strict allowlist, daemon-side; values are strings, file contents are
-    never read, URL-valued keys are userinfo-scrubbed. At most sixteen keys: the four allowlisted env keys
+    never read, URL-valued keys are userinfo-scrubbed. At most twelve keys: the four allowlisted env keys
     plus `version`, `direct_console_url`, `remote_settings_consent`, `remote_settings_consent_updated_at`,
-    `tailnet_dns_name`, `nodelink`, `nodelinks`, `shared_accounts_root`, `naming`, `env_naming`, `vocabulary` and `wire_labels`."""
+    `tailnet_dns_name`, `nodelink`, `nodelinks` and `shared_accounts_root`."""
     source = os.environ if env is None else env
     snapshot: dict[str, str] = {}
     for key in CONFIG_SNAPSHOT_ALLOWLIST:
         value = env_get(key, None, source)
         if value is not None:
             text = str(value)
-            snapshot[key] = _scrub_url_userinfo(text) if key in _URL_VALUED_CONFIG_KEYS else text
+            snapshot[key] = git_env.redact_userinfo(text) if key in _URL_VALUED_CONFIG_KEYS else text
     # Derived fields are injected explicitly. Absent when dpkg cannot name the installed package.
     if version is not None:
         snapshot["version"] = str(version)
@@ -796,12 +794,6 @@ def build_config_snapshot(
         snapshot[CONSENT_SNAPSHOT_KEY] = str(remote_settings_consent)
         if remote_settings_consent_updated_at is not None and remote_settings_consent != CONSENT_NONE:
             snapshot[CONSENT_UPDATED_AT_SNAPSHOT_KEY] = str(int(remote_settings_consent_updated_at))
-    # Always: this daemon speaks the current names.
-    snapshot[agent_providers.NAMING_SNAPSHOT_KEY] = agent_providers.CURRENT_NAMING
-    snapshot[agent_providers.ENV_NAMING_SNAPSHOT_KEY] = agent_providers.CURRENT_ENV_NAMING
-    snapshot[agent_providers.VOCABULARY_SNAPSHOT_KEY] = agent_providers.CURRENT_VOCABULARY
-    # Always: this daemon verifies the current CP frame label, so a CP of the previous release signs with it.
-    snapshot[node_frame_auth.WIRE_LABELS_SNAPSHOT_KEY] = node_frame_auth.CURRENT_WIRE_LABELS
     return snapshot
 
 
@@ -858,6 +850,12 @@ def _usable_account_rows(rows: list[dict]) -> list[dict]:
         # every non-default account from the availability bucket.
         and account_dir_usable(r.get("config_dir"), provider=r.get("provider"))
     ]
+
+
+def _launch_keys(intent: tick_wire.SlotIntent) -> set[tuple[str, object]]:
+    """The slot and the task a launch-lane intent touches — what `execute._intent_chains` chains on."""
+    task_id = str(intent.payload.get("task_id") or "").strip()
+    return {("slot", intent.ref), *((("task", task_id),) if task_id else ())}
 
 
 def _read_account_sources() -> tuple[list[dict], bool, list[str]]:
@@ -975,7 +973,7 @@ def _microvm_facts():
     return cloud_node.microvm_facts()
 
 
-class NodeStatePublisher:
+class NodeStatePublisher(context.ReconcileLockHolder):
     """Owns this node's observation projection and its presence heartbeat, published each idle tick.
     Every sink is HTTP or the node-bus socket; a failed sink retries next tick.
 
@@ -1026,6 +1024,8 @@ class NodeStatePublisher:
         self._shared_accounts_root: str | None = None
         # Wired to `ConsoleBridge.has_live_session` after construction; None ⇒ `console_live()` is False.
         self._console_live_probe = None
+        # Wired to `ConsoleBridge.has_any_session`: a person in a console keeps the pass at its fast pace.
+        self._console_any_probe: Callable[[], bool] | None = None
         # Wired to `DirectConsoleListener.published_url`; a callable, asked at each snapshot tick.
         self._direct_console_url_probe = None
         # Serializes this projection against the CommandBridge's `reconcile` verb (no concurrent CAS).
@@ -1041,10 +1041,12 @@ class NodeStatePublisher:
         # the pool-tick fetch and roster read, not the locked body (`_project_pushed_pass`). A second pass
         # seeing it stands down losslessly: the first has not yet run `_take_pushed_intents`.
         self._pushed_pass_waiting = False
-        # The launch lane's own lock, separate from the reconcile lock; lazily created.
-        self._launch_lock: asyncio.Lock | None = None
-        # The pane-write lane's own lock (`orchestrate.SIGNAL_LANE_VERBS`): a launch that hangs holds the launch
-        # lock, and an answer must not wait behind it. Lazily created.
+        # The launch lane's node-wide bound on launches in flight, shared by every launch-lane pass; lazily created.
+        self._launch_slots: asyncio.Semaphore | None = None
+        # The slots and tasks the launch lane's passes are enacting (`_claim_launch_keys`).
+        self._launch_in_flight: set[tuple[str, object]] = set()
+        # The pane-write lane's own lock (`orchestrate.SIGNAL_LANE_VERBS`): a launch that hangs holds a launch
+        # place, and an answer must not wait behind it. Lazily created.
         self._signal_lock: asyncio.Lock | None = None
         # The in-flight `reconcile.accounts_probe.start_agents_refresh` task, so `close()` can cancel it on SIGTERM.
         self._agents_refresh_task: asyncio.Task | None = None
@@ -1085,22 +1087,31 @@ class NodeStatePublisher:
                 "flip this node OFFLINE on TTL expiry: %s", exc
             )
 
-    async def project_state(self, *, wait_for_lock: bool = False) -> None:
+    async def project_state(self, *, wait_for_lock: bool = False) -> bool:
         """One observation pass: probe reality, execute the CP's intents, and POST the lot. Heavy (up to
         15s per slot probe), so `_serve` runs it as a single-flight `bus-projection` step, never inline.
 
         `wait_for_lock` waits out the serialization lock instead of skipping: False for the periodic step
         (an in-flight pass covers the same keys), True for a CP-pushed intent's pass, which carries work no
-        other pass is doing."""
+        other pass is doing.
+
+        Returns `poll_pace.IDLE` when the pass found this node idle (`_pass_was_idle`), so the periodic step
+        stretches to `poll_pace.PROJECTION_IDLE_INTERVAL_SECS`; a busy pass notes node activity."""
         # Sampled above the pass, so ticks abandoned on the lock are covered too. Once per pass that
         # runs, so intervals are unequal (longest when busiest) — hence `host_metrics.reading()`'s
         # time-weighting. Never raises. Off the loop: every 30s it walks all of /proc (`process_metrics`), which
         # on a build-heavy host is long enough to stall lease pushes and the credential socket.
         await asyncio.to_thread(self._host_metrics.sample)
         try:
-            await self._project_node_state(wait_for_lock=wait_for_lock)
+            idle = await self._project_node_state(wait_for_lock=wait_for_lock)
         except Exception as exc:
             log.warning("node-state projection for %s failed: %s", self._node_id, exc)
+            return False
+        if idle is True:
+            return poll_pace.IDLE
+        if idle is False:
+            poll_pace.note_activity()
+        return False
 
     def _direct_console_url(self) -> str | None:
         """The direct console origin to publish, or None when nothing is bound. Never raises: a fault
@@ -1168,13 +1179,7 @@ class NodeStatePublisher:
         await self.publish_heartbeat()
         await self.project_state()
 
-    def _serialization_lock(self) -> asyncio.Lock:
-        """The shared reconcile-serialization lock, created lazily so it binds to the running loop."""
-        if self._reconcile_lock is None:
-            self._reconcile_lock = context.new_reconcile_lock()
-        return self._reconcile_lock
-
-    async def _project_node_state(self, *, wait_for_lock: bool = False) -> None:
+    async def _project_node_state(self, *, wait_for_lock: bool = False) -> bool | None:
         """Serialize the per-tick projection against the CommandBridge's `reconcile` verb, then run it.
 
         A reconcile in flight means this tick is SKIPPED, not queued: it already refreshes the same keys
@@ -1184,19 +1189,19 @@ class NodeStatePublisher:
         lock = self._serialization_lock()
         if wait_for_lock:
             await self._project_pushed_pass(lock)
-            return
+            return False
         if lock.locked():
             log.debug(
                 "bus tick: a reconcile is already in flight — skipping this tick's projection "
-                "(avoids concurrent CAS writers on worktree.*/fetch_stamp.*)"
+                "(avoids concurrent CAS writers on worktree.*)"
             )
-            return
+            return None
         roster, roster_ok, config_dirs = await self._pass_inputs()
         if lock.locked():
             log.debug("bus tick: a reconcile started while reading the account roster — skipping")
-            return
+            return None
         async with lock:
-            await self._project_node_state_locked(roster, roster_ok, config_dirs)
+            return await self._project_node_state_locked(roster, roster_ok, config_dirs)
 
     async def _pass_inputs(self) -> tuple[list[dict] | None, bool | None, list[str] | None]:
         """What every projection pass needs before taking the lock, in the order both callers require.
@@ -1257,9 +1262,10 @@ class NodeStatePublisher:
         roster: list[dict] | None = None,
         roster_ok: bool | None = None,
         config_dirs: list[str] | None = None,
-    ) -> None:
+    ) -> bool:
         """Maintain the COMPLETE `node_state_<nodeId>` projection each tick. `roster`/`roster_ok` are
-        read by the caller outside the serialization lock; omitted ⇒ read here.
+        read by the caller outside the serialization lock; omitted ⇒ read here. Returns whether the pass
+        found the node idle (`_pass_was_idle`).
 
         This tick is the single writer of `account.*` — `state.py`'s D2 invariant (one writer per node)
         is what makes lock-free per-key revision CAS safe. Never move this write to another process."""
@@ -1302,6 +1308,9 @@ class NodeStatePublisher:
                 probe_covered=self._account_probe_covered,
             )
 
+        # Pushed intents, merged ahead of the polled ones and de-duplicated by id. Drained here, past every
+        # early return, so an abandoned pass leaves them queued.
+        pushed = self._take_pushed_intents()
         # (1) The one sink: the observation POST, inside the pass. `accounts_ok` is the COMPLEMENT-DELETE
         # gate and must never be a constant True, or a blind roster read deletes every account row.
         observed = await orchestrate.reconcile_pass(
@@ -1313,9 +1322,7 @@ class NodeStatePublisher:
             # None omits the wire KEY, so the CP stores nothing and ERASES nothing — unlike the three
             # families above, absence here asserts nothing.
             host_metrics=self._host_metrics.reading(),
-            # Pushed intents, merged ahead of the polled ones and de-duplicated by id. Drained here, past
-            # every early return, so an abandoned pass leaves them queued.
-            extra_intents=self._take_pushed_intents(),
+            extra_intents=pushed,
             # The backstop lane: an intent landing mid-pass is enacted between slot probes.
             drain_pushed=self._take_pushed_intents,
             # Joined between the execute arm and the probe loop.
@@ -1325,6 +1332,24 @@ class NodeStatePublisher:
         disk_reclaim_trigger_mod.record_observe_response(observed)
         # `root_grow`: the CP enlarged this machine's root volume; ask for the partition to follow it.
         root_grow_request_mod.record_observe_response(observed)
+        return await self._pass_was_idle(pool_tick, ctx, pushed)
+
+    async def _pass_was_idle(self, pool_tick: "tick_wire.PoolTick", ctx: "context.ReconcileContext",
+                             pushed: list[dict]) -> bool:
+        """Whether this pass found nothing happening here: the CP answered with no intent for this node,
+        none was pushed, the session snapshot read cleanly and holds no runner, and nobody is in a console.
+        Anything unknown counts as busy — an idle verdict only ever slows the next poll."""
+        if not pool_tick.ok or pool_tick.intents or pool_tick.microvm_intents or pushed:
+            return False
+        agents_ok, agents_json, _cwds = await ctx.agents()
+        if not agents_ok or agents_json:
+            return False
+        probe = self._console_any_probe
+        try:
+            return not (probe is not None and probe())
+        except Exception as exc:  # noqa: BLE001 — an unanswerable console probe is "busy", never a failed pass
+            log.warning("console session probe failed (%s) — treating this node as busy", exc)
+            return False
 
     # A FAILED probe is retried this soon instead of after a whole interval: until one succeeds, every drain
     # pass declines this node ("no credential account ... is usable"), so a first probe that raced a CP
@@ -1470,6 +1495,8 @@ class NodeStatePublisher:
 
         A `microvm` rail frame is not a slot intent: it goes straight to that rail's executor (which never
         blocks), and only on a marked node; elsewhere the pool tick's copy is ignored the same way."""
+        # Pushed work is activity: every paced poll returns to its fast interval (`poll_pace`).
+        poll_pace.note_activity()
         if isinstance(intent, dict) and intent.get("rail") == "microvm":
             if _microvm_marked() and host_platform.is_windows():
                 bridge = cloud_modules.load("microvm_bridge")
@@ -1508,8 +1535,7 @@ class NodeStatePublisher:
             # the point. The pane-write lane goes first and under its own lock: an answer never waits on a
             # launch.
             took = False
-            for verbs, lock, pane_write in ((orchestrate.SIGNAL_LANE_VERBS, self._signal_lane_lock(), True),
-                                            (orchestrate.LAUNCH_LANE_VERBS, self._launch_lane_lock(), False)):
+            for verbs, pane_write in ((orchestrate.SIGNAL_LANE_VERBS, True), (orchestrate.LAUNCH_LANE_VERBS, False)):
                 lane = self._take_lane_intents(verbs)
                 if not lane:
                     continue
@@ -1517,7 +1543,7 @@ class NodeStatePublisher:
                 try:
                     # A declined intent (an older one still pending for its slot) is requeued for the
                     # projection pass, which can order both channels.
-                    declined = list(await self._run_launch_lane(lane, lock, pane_write=pane_write))
+                    declined = list(await self._run_launch_lane(lane, pane_write=pane_write))
                 except Exception as exc:  # noqa: BLE001 — one lane's fault must not strand the next lane's work
                     log.warning("pushed slot-intent lane failed: %s — its intents stay pending for the next "
                                 "tick", exc)
@@ -1546,50 +1572,90 @@ class NodeStatePublisher:
         self._pushed_intents = list(rest)
         return list(lane)
 
-    def _launch_lane_lock(self) -> asyncio.Lock:
-        """The launch lane's own mutual exclusion, created lazily so it binds to the running loop.
+    def _launch_lane_slots(self) -> asyncio.Semaphore:
+        """The launch lane's bound on its launches in flight, shared by all its passes (`execute._intent_concurrency()`,
+        read once, at the first launch), created lazily so it binds to the running loop. The projection pass keeps
+        its own per-pass bound, as before.
 
-        Not the serialization lock — a lease writes none of the projection keys. This only keeps two
-        launch passes from interleaving; per-tree exclusion is `reconcile.execute.slot_lock`, inside
-        `execute_intent`."""
-        if self._launch_lock is None:
-            self._launch_lock = asyncio.Lock()
-        return self._launch_lock
+        A bound, not a lock: launch-lane passes overlap, so a `lease_slot` pushed while an earlier batch is
+        launching starts the moment a place frees, not after that whole batch (measured: five resumes
+        started together on one node, and the two pushed a second later waited out the first three's
+        launches). Not the serialization lock — a lease writes none of the projection keys; per-tree exclusion
+        is `reconcile.execute.slot_lock` inside `execute_intent`, a twin served by two passes is enacted
+        once (`reconcile.execute._enact_once`), and passes never reorder one slot's or task's leases
+        (`_claim_launch_keys`)."""
+        if self._launch_slots is None:
+            self._launch_slots = asyncio.Semaphore(execute._intent_concurrency())
+        return self._launch_slots
 
     def _signal_lane_lock(self) -> asyncio.Lock:
-        """The pane-write lane's mutual exclusion, as `_launch_lane_lock` and created lazily for the same reason."""
+        """The pane-write lane's mutual exclusion, created lazily so it binds to the running loop. Its passes take
+        turns: two answers for one pane must be typed in the order they came."""
         if self._signal_lock is None:
             self._signal_lock = asyncio.Lock()
         return self._signal_lock
 
-    async def _run_launch_lane(self, intents: "list", lock: asyncio.Lock, *,
-                               pane_write: bool = False) -> "tuple[dict, ...]":
-        """Enact one fast lane's pushed intents under that lane's LOCK, without touching the projection.
+    async def _run_launch_lane(self, intents: "list", *, pane_write: bool = False) -> "tuple[dict, ...]":
+        """Enact one fast lane's pushed intents without touching the projection: a PANE_WRITE lane under its
+        lock (`_signal_lane_lock`), the launch lane alongside its other passes under the shared bound
+        (`_launch_lane_slots`).
 
         The launch lane joins the pool tick when this pass already started one. A PANE_WRITE lane fetches its
         own: the tick's pending set is what orders the write behind an older intent for its slot
         (`orchestrate.launch_pass`), and a joined tick up to one idle interval old misses a `kill_runner`
         minted since — the answer would be typed into a session about to die, and typing cannot be undone. It
         reads no accounts either; a pane write uses none. Nothing here publishes."""
-        async with lock:
-            if pane_write:
-                roster_ok, config_dirs = None, None
+        if pane_write:
+            async with self._signal_lane_lock():
                 tick = tick_wire.parse_pool_tick(await self._fresh_pool_tick_body())
-            else:
-                # Off the loop, as in `_pass_inputs`: a blocking call of up to 60s against a hung CP, on the
-                # path a human is waiting on.
-                _roster, roster_ok, config_dirs = await asyncio.to_thread(_read_account_sources)
-                tick = tick_wire.parse_pool_tick(await self._pool_tick_body(join=True))
-            ctx = context.ReconcileContext(
-                config_dirs=config_dirs,
-                # Same reading, same reason as the projection pass.
-                coverage_known=roster_ok or None,
-                agents_probe=self._agents_probe,
-                console_live_probe=self._console_live_probe,
-                node_id=self._node_id,
-                agents_cache=self._agents_cache,
-            )
-            return await orchestrate.launch_pass(ctx, tick, intents)
+                return await orchestrate.launch_pass(self._lane_context(None, None), tick, intents)
+        # Off the loop, as in `_pass_inputs`: a blocking call of up to 60s against a hung CP, on the path a human
+        # is waiting on.
+        intents, behind = self._claim_launch_keys(intents)
+        keys = {key for intent, _entry in intents for key in _launch_keys(intent)}
+        try:
+            if not intents:
+                return behind
+            _roster, roster_ok, config_dirs = await asyncio.to_thread(_read_account_sources)
+            tick = tick_wire.parse_pool_tick(await self._pool_tick_body(join=True))
+            declined = await orchestrate.launch_pass(self._lane_context(config_dirs, roster_ok), tick, intents,
+                                                     running=self._launch_lane_slots())
+            return (*behind, *declined)
+        finally:
+            self._launch_in_flight -= keys
+
+    def _claim_launch_keys(self, intents: "list") -> "tuple[list, tuple[dict, ...]]":
+        """Split a launch-lane pass's intents into `(its own, the raw entries of those left behind)`, claiming each
+        kept intent's slot and task for this pass.
+
+        Synchronous, so arrival order decides: launch-lane passes overlap, and one that reached its roster read
+        sooner could otherwise enact a newer lease before an older one for the same slot or task that is still
+        launching in another pass. One behind such an intent goes to the projection pass, which orders by mint
+        order (`execute._merge_intents`)."""
+        kept: list = []
+        behind: list[dict] = []
+        others = set(self._launch_in_flight)   # another pass's claims; this pass's own chain in mint order
+        for intent, entry in intents:
+            keys = _launch_keys(intent)
+            if keys & others:
+                log.info("launch lane: intent %s (%s %s #%s) shares a slot or task with a launch in flight — "
+                         "leaving it to the projection pass", intent.id, intent.verb, intent.project, intent.number)
+                behind.append(entry)
+                continue
+            self._launch_in_flight |= keys
+            kept.append((intent, entry))
+        return kept, tuple(behind)
+
+    def _lane_context(self, config_dirs: "list[str] | None", roster_ok: "bool | None") -> context.ReconcileContext:
+        """A fast lane's reconcile context; `roster_ok` is read as the projection pass reads it."""
+        return context.ReconcileContext(
+            config_dirs=config_dirs,
+            coverage_known=roster_ok or None,
+            agents_probe=self._agents_probe,
+            console_live_probe=self._console_live_probe,
+            node_id=self._node_id,
+            agents_cache=self._agents_cache,
+        )
 
     def _take_pushed_intents(self) -> list[dict]:
         """Drain the push queue into the pass that is about to run.
@@ -1648,10 +1714,10 @@ def log_startup_posture() -> str:
     First, because it distinguishes a node idle because contained from one idle because its own
     configuration could not be read. The control plane is reported as RESOLVED: in sandbox posture with
     none given that is the refusal (AD-3), not a loopback guess. The URL goes through
-    `_scrub_url_userinfo`, the same rule as the config snapshot."""
+    `git_env.redact_userinfo`, the same rule as the config snapshot."""
     posture = environment_mod.posture()
     try:
-        target = _scrub_url_userinfo(control_plane_api_mod.resolve_control_plane_api_base())
+        target = git_env.redact_userinfo(control_plane_api_mod.resolve_control_plane_api_base())
     except environment_mod.SandboxControlPlaneUnset:
         target = "none — refused to guess one (set JAAH_CP_BASE_URL, or --sandbox-cp)"
     log.info(
@@ -1660,6 +1726,16 @@ def log_startup_posture() -> str:
         environment_mod.node_env_path(), target,
         f", sandbox root {SANDBOX_ROOT}" if SANDBOX_ROOT else "")
     return posture
+
+
+def _refresh_topic(topic: str | None, project_id: int | None = None) -> None:
+    """The node bus's `refresh` frame: drop the named cache so its next read is live — `accounts` (the roster TTL)
+    or `memory` (the bundles of `project_id`, every one when None, re-asked now). A topic of None, after every
+    (re)connect, means all of them. An unknown topic is ignored: a newer CP may name one this node does not cache."""
+    if topic in (None, "accounts"):
+        accounts_probe.invalidate_account_roster()
+    if topic in (None, "memory") and edition_features.enabled("project_memory"):
+        project_memory_bundle_mod.request_refresh(project_id)
 
 
 async def _serve(idle_interval: float) -> None:
@@ -1672,6 +1748,9 @@ async def _serve(idle_interval: float) -> None:
     # install, never a quiet community-edition posture.
     if cloud_node is None and any(edition_features.enabled(name) for name in CLOUD_NODE_FEATURES):
         raise SystemExit("jaahd: this cloud node's tree lacks cloud_node.py — a broken install; reinstall the package")
+    # A vnode reads no journal: its log also goes to a file of its own, which the `node-logs` step ships.
+    if edition_features.enabled("node_log_archive"):
+        node_logs_mod.tee_vnode_log()
     log_startup_posture()
     # FIRST, before any tmux client: one hands the runner-owned server its whole environment
     # (`env_helpers.scrub_node_token_from_environ`).
@@ -1701,7 +1780,6 @@ async def _serve(idle_interval: float) -> None:
     reconcile_lock = context.new_reconcile_lock()
     # The publisher's "same pass" window tracks the loop's actual interval.
     publisher = NodeStatePublisher(node_id, reconcile_lock=reconcile_lock, idle_interval=idle_interval)
-    worktree_agents_enabled = resolve_worktree_agents_enabled()
 
     async def _config_snapshot_step() -> None:
         # Publish-on-change is internal, so firing every tick is a cheap compare that also retries a
@@ -1711,9 +1789,16 @@ async def _serve(idle_interval: float) -> None:
     linux_only = _linux_only_steps_run()
     periodic_steps: list[PeriodicStep] = [
         # The node-state projection — single-flight in the background, never delaying the heartbeat.
-        PeriodicStep("bus-projection", publisher.project_state, 0.0),
+        PeriodicStep("bus-projection", publisher.project_state, 0.0,
+                     idle_interval=poll_pace.PROJECTION_IDLE_INTERVAL_SECS),
         # The redacted config snapshot — publishes only on change.
         PeriodicStep("config-snapshot", _config_snapshot_step, 0.0),
+        # A launch's runner binding and `ready → active` claim a CP failure dropped, re-sent while the runner lives.
+        PeriodicStep("launch-reports", _launch_reports_step, control_plane_api_mod.LAUNCH_REPORT_RETRY_INTERVAL_S),
+        # Unjailed tmux command clients on a runner-reachable server (no Landlock, Windows): a warning line the CP
+        # reads as a Health finding (`tmux_jail_health`).
+        PeriodicStep("tmux-jail-health", tmux_jail_health_mod.JailHealthReporter().step,
+                     tmux_jail_health_mod.INTERVAL_SECONDS),
         # The cloud node's GHA runner pool, NodeLink re-ask and vnode-host converge (`cloud_node`).
         *(cloud.periodic_steps(PeriodicStep, linux_only=linux_only) if cloud is not None else []),
         *([
@@ -1751,7 +1836,7 @@ async def _serve(idle_interval: float) -> None:
         # community-edition node.
         *([PeriodicStep("egress-report", egress_report_mod.EgressReporter().step,
                         egress_report_mod.INTERVAL_SECONDS)] if edition_features.enabled("tailnet") else []),
-        # This node's own journal, redacted, to CloudWatch Logs via the CP (SOC2 G-18); no-op on a vnode. A cloud
+        # This node's own journal, redacted, to CloudWatch Logs via the CP (SOC2 G-18); a vnode's own log file instead. A cloud
         # feature: a local node has no CloudWatch behind its CP, and its container no journalctl.
         *([PeriodicStep("node-logs", node_logs_mod.NodeLogForwarder().step, node_logs_mod.INTERVAL_SECONDS)]
           if edition_features.enabled("node_log_archive") else []),
@@ -1809,6 +1894,7 @@ async def _serve(idle_interval: float) -> None:
 
     # The reconcile pass's DONE-close gate; None ⇒ `console_live()` reports False.
     publisher._console_live_probe = console_bridge.has_live_session if console_bridge is not None else None
+    publisher._console_any_probe = console_bridge.has_any_session if console_bridge is not None else None
     # Only a listener that actually BOUND advertises itself — see `_direct_console_url`.
     publisher._direct_console_url_probe = (
         direct_listener.published_url if direct_listener is not None else None)
@@ -1828,7 +1914,7 @@ async def _serve(idle_interval: float) -> None:
 
     def _new_command_bridge() -> "commands_bridge_mod.CommandBridge":
         return commands_bridge_mod.CommandBridge(
-            node_id, HUB_ROOT,
+            node_id,
             console_live_probe=console_bridge.has_live_session if console_bridge is not None else None,
             reconcile_lock=reconcile_lock,
             # Ungated: the account probe runs on every node.
@@ -1839,9 +1925,8 @@ async def _serve(idle_interval: float) -> None:
         )
 
     if commands_bridge_mod.COMMANDS_ENABLED:
-        # Fed by `deliver()` from the node-bus client; `start()` only binds the semaphore.
+        # Fed by `deliver()` from the node-bus client.
         commands_bridge = _new_command_bridge()
-        await commands_bridge.start()
 
     # The WebSocket node bus: built unconditionally because it carries PRESENCE, which must
     # not depend on whether this node accepts commands.
@@ -1870,6 +1955,8 @@ async def _serve(idle_interval: float) -> None:
         on_send_intent=publisher.push_slot_intent,
         on_vnode_converge=cloud.on_vnode_converge if cloud is not None else None,
         on_uninstall=uninstall_request_mod.request_uninstall,
+        # "Something you cache changed": re-read it now instead of at its slow poll.
+        on_refresh=_refresh_topic,
     )
     if direct_listener is not None:
         # Post-construction: the listener is built before the bus. Audit logging is local regardless.
@@ -1888,17 +1975,15 @@ async def _serve(idle_interval: float) -> None:
                      if cp_ws_url else None)
     if cp_ws_url:
         # Scrubbed like the snapshot and posture line: derived from `JAAH_CP_BASE_URL`.
-        log.info("node-bus: dialling %s", _scrub_url_userinfo(cp_ws_url))
+        log.info("node-bus: dialling %s", git_env.redact_userinfo(cp_ws_url))
 
     # Operator alerts POST to `POST /api/agent/alerts`; the CP owns dedup and relay. No latency
     # wake here: dispatch is CP-side, and the pool tick executing `lease_slot` runs every tick.
     log.info(
-        "jaahd started (idle_interval=%ss, node_id=%s, cp=%s, "
-        "worktree_agents_enabled=%s, console=%s, commands=%s)",
+        "jaahd started (idle_interval=%ss, node_id=%s, cp=%s, console=%s, commands=%s)",
         idle_interval,
         node_id,
         cp_ws_url or "none (sandbox posture, no control plane given)",
-        worktree_agents_enabled,
         console_bridge is not None,
         commands_bridge is not None,
     )
@@ -1908,7 +1993,6 @@ async def _serve(idle_interval: float) -> None:
             stop_event,
             # The inline liveness signal only; the projection rides `bus-projection`.
             publish=publisher.publish_heartbeat,
-            worktree_agents_enabled=worktree_agents_enabled,
             periodic_steps=tuple(periodic_steps),
         )
     finally:
@@ -1996,8 +2080,10 @@ def main() -> None:
         # Lazy: path-loads `hooks/break_cause.py`, only reached through this one-shot.
         import session_sweep
 
-        # Exceptions propagate (non-zero exit); per-session failures stay inside `sweep_once`.
-        session_sweep.sweep_once()
+        # Exceptions propagate (non-zero exit); per-session failures stay inside `sweep_once`. A pass with
+        # nothing to do says so by its exit code, which the daemon paces on (`ScheduledTask.idle_rc`).
+        if session_sweep.is_idle(session_sweep.sweep_once()):
+            sys.exit(SWEEP_IDLE_RC)
         return
     if args.sweep_slot_residue:
         # Lazy so import cost and import-time failure land in this one-shot's exit code.

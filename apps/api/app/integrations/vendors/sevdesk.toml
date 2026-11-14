@@ -1,0 +1,45 @@
+# sevdesk API v1: the user's API token in the Authorization header with no scheme word.
+slug = "sevdesk"
+label = "sevdesk"
+category = "payments"
+vendor_docs_url = "https://api.sevdesk.de/"
+summary = "Read and create sevdesk invoices, contacts, vouchers and bank transactions."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_token", label = "API token", kind = "secret", required = true, help = "In sevdesk, open Einstellungen (Settings) > Benutzer (Users), select the user agents should act as, and copy the API-Token shown on that user's page: 32 letters and digits. Use a user with only the rights agents need, since the token carries all of that user's rights" },
+]
+
+# One sevdesk user: the smallest read the token's own user may always make.
+[test]
+method = "GET"
+path = "https://my.sevdesk.de/api/v1/SevUser?limit=1"
+auth = { field = "api_token", header = "Authorization" }
+list_field = "objects"
+
+[docs]
+agent_uses = [
+  "Find an invoice or credit note and report its status, amount and due date",
+  "Create draft invoices from a task's line items for a person to check and send",
+  "Look up or add customers and suppliers",
+  "List vouchers and bank transactions for a period to support bookkeeping",
+]
+prerequisites = [
+  "A sevdesk plan that includes API access (sevdesk lists it from its Buchhaltung Pro plan up)",
+  "A sevdesk user whose API token agents may use; an administrator can see each user's token under Einstellungen > Benutzer",
+]
+limitations = [
+  "The token has every right its user has and never expires; restrict what agents can do by choosing a user with fewer rights",
+  "Regenerating the token in sevdesk ends every connection that uses the old one, including this one",
+  "Whether the account runs bookkeeping system 1.0 or 2.0 changes how some endpoints behave; agents check it before writing vouchers",
+]
+troubleshooting = [
+  { symptom = "Test says sevdesk rejected the API token (401)", fix = "The token was regenerated, its user was deactivated, or it was mistyped. Copy the current token from Einstellungen > Benutzer and select Replace" },
+  { symptom = "Agents get 401 although Test passed earlier", fix = "Someone regenerated the user's token in sevdesk. Copy the new one and select Replace" },
+  { symptom = "An agent's request fails with 400", fix = "A list was asked for with a limit outside 1 to 1000, or a field sevdesk does not know. Ask the agent to retry with smaller pages" },
+]
+faq = [
+  { q = "Can I create a separate token for Jaah", a = "sevdesk has one token per user. Create a sevdesk user for Jaah with only the rights agents need, and use its token" },
+  { q = "Does Test change anything", a = "No. It reads one user record and discards it" },
+]

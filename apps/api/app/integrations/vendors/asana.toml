@@ -1,0 +1,76 @@
+# Asana. Facts confirmed at the vendor's own docs: OAuth (client in the POST body, PKCE S256 supported, granular
+# scopes) https://developers.asana.com/docs/oauth and https://developers.asana.com/docs/oauth-scopes ; personal
+# access tokens https://developers.asana.com/docs/personal-access-token ; users/me
+# https://developers.asana.com/reference/getuser
+slug = "asana"
+label = "Asana"
+category = "productivity"
+vendor_docs_url = "https://developers.asana.com/docs/oauth"
+summary = "Find, create and update Asana tasks and projects from agent work."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://app.asana.com/-/oauth_authorize"
+token_url = "https://app.asana.com/-/oauth_token"
+pkce = true
+scopes = [
+  { name = "users:read", label = "Read your profile, so the connection shows whose it is" },
+  { name = "workspaces:read", label = "List your workspaces, so agents know where to look" },
+  { name = "teams:read", label = "List teams, to find a team's projects" },
+  { name = "projects:read", label = "Read projects and their sections" },
+  { name = "tasks:read", label = "Read tasks, their fields and subtasks" },
+  { name = "stories:read", label = "Read task comments and history for context" },
+  { name = "tasks:write", label = "Create tasks, update fields and complete tasks when a task reports back", optional = true },
+  { name = "stories:write", label = "Comment on tasks with progress and results", optional = true },
+]
+jaah_app = true
+[auth.oauth.registration]
+console_url = "https://app.asana.com/0/my-apps"
+steps = [
+  "Select Create new app, enter the app name Jaah, choose the purpose that fits (an integration for others), and accept the API terms",
+  "Open the app's OAuth tab and add the redirect URLs below with Add redirect URL",
+  "Under Permission scopes choose specific scopes (not Full permissions) and tick users:read, workspaces:read, teams:read, projects:read, tasks:read, stories:read, tasks:write and stories:write",
+  "Open Manage distribution and choose Any workspace, so members of every workspace can connect",
+  "On the Basic information tab set the app icon to the Jaah logo, the website to the Jaah website, and the support contact to the Jaah support address, then Save changes",
+]
+review = "Not required for Any workspace distribution. Listing Jaah in Asana's public App Directory is optional and needs a separate submission"
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "Personal access token", kind = "secret", required = true, placeholder = "2/1234...", help = "Asana > your profile photo > My settings > Apps > View developer console (app.asana.com/0/my-apps) > Create new token: give it a description such as Jaah, accept the terms, then copy the token - Asana shows it once" },
+]
+
+[test]
+method = "GET"
+path = "https://app.asana.com/api/1.0/users/me?opt_fields=name,email"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+identity = [["data", "email"], ["data", "name"]]
+
+[docs]
+agent_uses = [
+  "Find the Asana task a Jaah task names and read its description, custom fields, subtasks and comments",
+  "Create a follow-up task in the right project when an agent finds more work",
+  "Post a comment with progress or a pull request link on the task being worked",
+  "Mark a task complete or move it to another section when the work is done, if you granted write access",
+]
+prerequisites = [
+  "An Asana account that is a member of the workspaces and projects agents should reach",
+  "On a workspace that restricts third-party apps, an Asana admin must allow Jaah (Admin console > Apps)",
+]
+limitations = [
+  "Agents act as the connected Asana user: they see only what that user can see, and their changes show under that user's name",
+  "Agents cannot manage workspace members, admin settings, billing or portfolios' permissions",
+  "Asana rate-limits each user to about 150 requests a minute on free plans and 1,500 on paid ones",
+]
+troubleshooting = [
+  { symptom = "Test says Asana rejected the personal access token (401)", fix = "The token was deauthorized or mistyped. Create a new one in the developer console and select Replace on the secret" },
+  { symptom = "Consent fails with a forbidden_scopes or invalid_scope error", fix = "Jaah's app at Asana is missing one of the scopes listed above. An operator adds it on the app's OAuth tab; with your own app, add it to yours" },
+  { symptom = "Agents get 403 Forbidden on a project", fix = "The connected user is not a member of that project or its team. Add the user in Asana, or connect an account that is" },
+  { symptom = "The secret shows Needs reconnect", fix = "Asana revoked the grant, for example after the user removed Jaah under My settings > Apps. Select Reconnect" },
+]
+faq = [
+  { q = "Can I limit agents to read-only", a = "Yes. Untick tasks:write and stories:write on the Connect screen, or use a token of a user who has comment-only access to the projects" },
+  { q = "Does connecting cost an Asana seat", a = "No. Jaah uses the connected user's own seat" },
+]

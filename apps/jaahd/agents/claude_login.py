@@ -20,10 +20,10 @@ import host_platform
 from env_helpers import jaah_home
 from host_platform import windows  # importable everywhere: no native call at import
 
-from .base import LoginAdapterBase, credential_file_present
+from .base import SMALL_CREDENTIAL_MAX_BYTES, LoginAdapterBase, credential_file_present
 
-# The read bound on `.credentials.json` (a few hundred bytes when real), as the sibling login adapters'.
-MAX_CREDENTIAL_BYTES = 256 * 1024
+# The read bound on `.credentials.json` (`base.SMALL_CREDENTIAL_MAX_BYTES`).
+MAX_CREDENTIAL_BYTES = SMALL_CREDENTIAL_MAX_BYTES
 
 
 def has_oauth_token(raw: bytes) -> bool:

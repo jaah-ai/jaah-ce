@@ -1,11 +1,16 @@
-"""Your Cloud node lifecycle: `POST /api/nodes/{node_id}/cloud/stop` and `/start`, `PUT …/cloud/instance-type` and
-`…/cloud/disk`. Delete stays `DELETE /api/nodes/{node_id}` (`delete.py`).
+"""Your Cloud node lifecycle: `POST /api/nodes/{node_id}/cloud/stop`, `/start` and `/restart`, `PUT
+…/cloud/instance-type` and `…/cloud/disk`. Delete stays `DELETE /api/nodes/{node_id}` (`delete.py`).
 
 Each door is an org admin's (`@org_admin`, then `_administers_own_hosts` on the node's own org), refused 403 while the
 org's plan has the node's cloud off (`clouds.require_provider`), and answers 202 with the node's `cloud` block. The
 work is `app/cloud_lifecycle.py`'s, the type change `app/durable/cloud_change.py`'s; nothing here knows the cloud.
 A Jaah Hosted machine keeps its own lifecycle (Billing) and an operator-allocated one is the operator's: both refused,
 as is a dynamic node group's member (409: its group decides its machines). Delete stays open to a group's member.
+
+Restart is narrower in what it refuses: a reboot changes neither capacity nor product, so a group's member
+may be restarted, and the operator plane may restart a Jaah Hosted machine (a tenant still may not). Each write is
+audited by the activity capture (`app/user_activity.py`, kind = the handler's name, sentence in
+`app/activity_kinds.py`), refusals included.
 """
 from __future__ import annotations
 
@@ -16,16 +21,14 @@ from typing import Iterator, Optional
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import Field
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import edition_features, node_allocation
-from app.auth import require_user
 from app.authz.catalog import Tenancy
 from app.authz.declarations import org_admin
-from app.authz.principal import Principal, current_principal
-from app.db import get_session
-from app.entity_shape import StrictModel
+from app.authz.principal import AsyncCaller, Principal, current_caller
+from app.db_async import on_thread
+from app.entity_shape import StrictModel, get_or_404
 from app.models.identity import AdminUser
 from app.models.nodes import Node
 from app.routes.nodes.delete import HOSTED_MACHINE, _writable_node_uuid
@@ -52,6 +55,12 @@ class StopIn(StrictModel):
     force: bool = False
 
 
+class RestartIn(StrictModel):
+    #: Restart past the live work the 409 named, or past slots the control plane can't see. Ends no task: each
+    #: runner is restarted in its slot once the node reconnects.
+    force: bool = False
+
+
 class InstanceTypeIn(StrictModel):
     instance_type: str = Field(min_length=1)
     #: As Stop's: the change stops the machine, so tasks running on it are refused (409) unless forced.
@@ -64,14 +73,16 @@ class DiskIn(StrictModel):
     force: bool = False
 
 
-def _cloud_node(session: Session, node_id: str, user: AdminUser, principal: Optional[Principal]) -> Node:
+def _cloud_node(
+    session: Session, node_id: str, user: AdminUser, principal: Optional[Principal], *, restart: bool = False,
+) -> Node:
     """The node to act on, locked; 403/404/409 for every node these doors refuse. The plan switch is asked last,
-    of the node's own org, before any cloud call."""
+    of the node's own org, before any cloud call. `restart` lifts the node-group refusal, and the Hosted one for an
+    operator-plane caller."""
     node_uuid = _writable_node_uuid(session, node_id, user, principal)
-    row = session.scalar(select(Node).where(Node.id == node_uuid))
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"unknown node '{node_id}'")
-    if node_allocation.jaah_cloud([row.id]):
+    row = get_or_404(session, Node, node_uuid, detail=f"unknown node '{node_id}'")
+    hosted = bool(node_allocation.jaah_cloud([row.id]))
+    if hosted and (not restart or is_tenant_org(user.org_id)):
         raise HTTPException(status_code=409, detail=HOSTED_MACHINE)
     if row.operator_allocated and is_tenant_org(user.org_id):
         raise HTTPException(status_code=403, detail=ALLOCATED_MACHINE)
@@ -83,10 +94,11 @@ def _cloud_node(session: Session, node_id: str, user: AdminUser, principal: Opti
         ref = None
     if ref is None:
         raise HTTPException(status_code=409, detail=NO_CLOUD_INSTANCE)
-    group = cloud_lifecycle.group_name(session, row)
+    group = None if restart else cloud_lifecycle.group_name(session, row)
     if group is not None:
         raise HTTPException(status_code=409, detail=cloud_lifecycle.IN_GROUP.format(name=group))
-    clouds.require_provider(session, row.org_id, ref.provider)
+    if not hosted:  # A Hosted machine is Jaah's, not on the tenant's Your Cloud plan.
+        clouds.require_provider(session, row.org_id, ref.provider)
     if cloud_lifecycle.change_running(row.infra):
         raise HTTPException(status_code=409, detail=cloud_lifecycle.CHANGE_RUNNING)
     return row
@@ -96,6 +108,15 @@ def _tasks_running(exc: cloud_lifecycle.TasksRunning) -> JSONResponse:
     """The 409 a door answers while tasks run on the machine: the sentence, and the tasks a Force would interrupt."""
     return JSONResponse(status_code=409, content={
         "detail": str(exc), "tasks": [{"id": task.id, "title": task.title} for task in exc.tasks],
+    })
+
+
+def work_at_risk(exc: "cloud_lifecycle.WorkAtRisk") -> JSONResponse:
+    """The 409 a reboot answers while the machine holds live work: the sentence, the tasks it would cut, and the nodes
+    whose slots can't be seen. A node's Restart and a host's (`routes/host_restart.py`) answer it alike."""
+    return JSONResponse(status_code=409, content={
+        "detail": str(exc), "tasks": [{"id": task.id, "title": task.title} for task in exc.work.tasks],
+        "silent": exc.work.silent,
     })
 
 
@@ -118,16 +139,18 @@ def _accepted(session: Session, row: Node) -> CloudOut:
 
 @router.post("/api/nodes/{node_id}/cloud/stop", response_model=CloudOut, status_code=202)
 @org_admin(Tenancy.CALLER_PLANE)
+@on_thread
 def stop_cloud_node(
+    session: Session,
     node_id: str,
     body: Optional[StopIn] = Body(default=None),
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CloudOut | JSONResponse:
     """Take the node out of dispatch, then stop its machine (the disk kept). 409 on a machine not running, and
     naming the running tasks unless `force`, which sends each back to `ready` (`cloud_lifecycle.stop`)."""
-    row = _cloud_node(session, node_id, user, principal)
+    # In a thread: `cloud_lifecycle` calls the cloud between its commits, and `node_allocation.jaah_cloud` reads
+    # the operator plane on a session of its own.
+    row = _cloud_node(session, node_id, caller.actor, caller.principal)
     if cloud_lifecycle.state_of(row.infra) != "running":
         raise HTTPException(status_code=409, detail=cloud_lifecycle.NOT_RUNNING)
     try:
@@ -141,15 +164,15 @@ def stop_cloud_node(
 
 @router.post("/api/nodes/{node_id}/cloud/start", response_model=CloudOut, status_code=202)
 @org_admin(Tenancy.CALLER_PLANE)
+@on_thread
 def start_cloud_node(
+    session: Session,
     node_id: str,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CloudOut:
     """Start the node's machine; it takes work again once it connects. A machine still stopping answers `starting`:
     it starts once stopped (`cloud_lifecycle.start`). 409 on one running or already starting."""
-    row = _cloud_node(session, node_id, user, principal)
+    row = _cloud_node(session, node_id, caller.actor, caller.principal)
     state = cloud_lifecycle.state_of(row.infra)
     if state in ("running", "starting"):
         raise HTTPException(status_code=409, detail=(
@@ -160,14 +183,38 @@ def start_cloud_node(
     return _accepted(session, row)
 
 
+@router.post("/api/nodes/{node_id}/cloud/restart", response_model=CloudOut, status_code=202)
+@org_admin(Tenancy.CALLER_PLANE)
+@on_thread
+def restart_cloud_node(
+    session: Session,
+    node_id: str,
+    body: Optional[RestartIn] = Body(default=None),
+    caller: AsyncCaller = Depends(current_caller),
+) -> CloudOut | JSONResponse:
+    """Reboot the node's machine in place (disk, type and dispatch kept). 409 on a machine not running, and while it
+    holds live work or its slots can't be seen — naming the tasks, open sessions and silent nodes — unless `force`
+    (`cloud_lifecycle.restart`)."""
+    row = _cloud_node(session, node_id, caller.actor, caller.principal, restart=True)
+    if cloud_lifecycle.state_of(row.infra) != "running":
+        raise HTTPException(status_code=409, detail=cloud_lifecycle.NOT_RUNNING)
+    try:
+        with _errors():
+            cloud_lifecycle.restart(session, row, force=bool(body and body.force))
+    except cloud_lifecycle.WorkAtRisk as exc:
+        session.rollback()
+        return work_at_risk(exc)
+    return _accepted(session, row)
+
+
 @router.put("/api/nodes/{node_id}/cloud/instance-type", response_model=CloudOut, status_code=202)
 @org_admin(Tenancy.CALLER_PLANE)
+@on_thread
 def change_cloud_node_type(
+    session: Session,
     body: InstanceTypeIn,
     node_id: str,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CloudOut | JSONResponse:
     """Record the change, take the node out of dispatch and enqueue `app/durable/cloud_change.py` (stop → set →
     start) in one transaction; the 202 shows it running. Tasks running on the machine: 409 as Stop's, unless
@@ -175,7 +222,7 @@ def change_cloud_node_type(
     if edition_features.enabled("cloud_nodes"):  # `_cloud_node` refuses every node in the community edition.
         from app.durable import cloud_change
 
-    row = _cloud_node(session, node_id, user, principal)
+    row = _cloud_node(session, node_id, caller.actor, caller.principal)
     tasks = cloud_lifecycle.running_tasks(session, row.id)
     if tasks and not body.force:
         return _tasks_running(cloud_lifecycle.TasksRunning(tasks))
@@ -189,17 +236,17 @@ def change_cloud_node_type(
 
 @router.put("/api/nodes/{node_id}/cloud/disk", response_model=CloudOut, status_code=202)
 @org_admin(Tenancy.CALLER_PLANE)
+@on_thread
 def grow_cloud_node_disk(
+    session: Session,
     body: DiskIn,
     node_id: str,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CloudOut | JSONResponse:
     """Grow the boot disk (422 for a size not larger); the node grows its root filesystem into it on its next
     check-in (`cloud_lifecycle.grow_disk`). A cloud that stops the machine to grow it: 409 as Stop's while tasks
     run, unless `force`."""
-    row = _cloud_node(session, node_id, user, principal)
+    row = _cloud_node(session, node_id, caller.actor, caller.principal)
     try:
         with _errors():
             cloud_lifecycle.grow_disk(session, row, body.size_gb, force=body.force)

@@ -23,7 +23,7 @@ WORKTREE_ENV_MODE = 0o600
 # Files in a leased worktree whose mode this module owns. Tracked files are eligible: `_run_git` delegates
 # every git call to the session user (the owner), git records only the EXECUTE bit (a 0664→0600 chmod
 # leaves `git status` clean), and a checkout that RECREATES a file does so at the umask — which is why
-# this table is converged AFTER `reset_to_base` on every claim, not once at create time.
+# this table is converged AFTER the lease's clone or refresh on every claim, not once at create time.
 WORKTREE_PRIVATE_MODES: "tuple[tuple[str, int], ...]" = (
     (".env", WORKTREE_ENV_MODE),
     (".env.local", WORKTREE_ENV_MODE),
@@ -115,7 +115,7 @@ def _env_text_for_rewrite(path: str) -> str:
 
 def _env_write_text(path: str, text: str) -> None:
     """Replace a worktree `.env`'s WHOLE text, delegating when this uid may not write it. Raises `OSError`
-    on failure: a port band that could not be written is not a no-op.
+    on failure: a port that could not be written is not a no-op.
 
     The direct leg REWRITES AN EXISTING INODE and inherits its mode; only the delegated leg forces
     `WORKTREE_ENV_MODE` (`cp && chmod`). Fine while every caller writes a file `env_text` just read — a
@@ -136,7 +136,7 @@ def _env_write_text(path: str, text: str) -> None:
 
 
 def harden_worktree_modes(wt: str) -> None:
-    """Converge this slot's secret files onto `WORKTREE_PRIVATE_MODES`, on every claim AFTER `reset_to_base`
+    """Converge this slot's secret files onto `WORKTREE_PRIVATE_MODES`, on every claim AFTER the clone or refresh
     (a checkout recreates files at the umask; the CLI writes `settings.local.json` mid-session under
     `UMask=0002`). `lstat` first, delegated `chmod` only where the mode differs. NEVER RAISES: a mode that
     could not be tightened is a logged non-narrowing, not a failed lease.
@@ -194,19 +194,26 @@ def _ensure_eol_nl(path: str) -> None:
         log.warning("could not append the trailing newline to %s: %s", path, exc)
 
 
-def _apply_env_assignments(text: str, assignments: "dict[str, str]") -> str:
+def _apply_env_assignments(text: str, assignments: "dict[str, str]", *, every_line: bool = False) -> str:
     """TEXT with each `KEY=value` rewritten in place (the first `^\\s*KEY=` line wins, its leading
-    whitespace kept and everything after the `=` replaced) or appended when the key is absent."""
+    whitespace kept and everything after the `=` replaced) or appended when the key is absent.
+
+    `every_line` rewrites EVERY `^\\s*KEY=` line instead of the first: the daemon's reader (`ports._env_port`) is
+    first-wins, but the pool-port audit reads LAST-wins (`env_helpers.dotenv_value`, as compose resolves it), so
+    a fix that left a duplicate's later line alone would report the same drift again."""
     lines = text.splitlines(keepends=True)
     for key, value in assignments.items():
         pat = re.compile(r"^(\s*" + re.escape(key) + r"=).*")
+        found = False
         for i, line in enumerate(lines):
             match = pat.match(line)
             if match:
                 nl = "\n" if line.endswith("\n") else ""
                 lines[i] = match.group(1) + value + nl
-                break
-        else:
+                found = True
+                if not every_line:
+                    break
+        if not found:
             lines.append(f"{key}={value}\n")
     return "".join(lines)
 
@@ -272,10 +279,10 @@ def _set_env_vars(path: str, assignments: "dict[str, str]",
     in ONE read and ONE write. Batched because at `WORKTREE_ENV_MODE` a daemon write is a delegated tmux
     round trip and the applicators set half a dozen keys on EVERY claim. Unchanged text writes nothing.
 
-    AN UNDELIVERABLE WRITE RAISES: a band that did not land leaves the slot on the `.env.example` seed,
+    AN UNDELIVERABLE WRITE RAISES: a port that did not land leaves the slot on the `.env.example` seed,
     identical in every slot, so every slot claimed in the window binds the SAME host ports. The READ side
     only warns because a failed read leaves the file untouched (absent `.env` = repo-contract fault
-    `apply_port_band` must not make unmaterialisable; over-cap = refused so the bytes stay as they are),
+    `apply_auto_ports` must not make unmaterialisable; over-cap = refused so the bytes stay as they are),
     whereas a failed write may already have reached disk."""
     if not assignments and not embedded:
         return

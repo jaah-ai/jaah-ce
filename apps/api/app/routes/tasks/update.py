@@ -1,9 +1,9 @@
 """Task update: `PUT /api/tasks/{task_id}`, its `_apply_*` edits, and tags/retag."""
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -12,16 +12,19 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import actors, edition_features, fleet_verdicts, merge_lane_state, node_targets, runner_terminations, slot_retitle
-from app.auth import require_user
+from app import (
+    actors, cron_runtime, edition_features, fleet_verdicts, live_task_edits, merge_lane_state, node_targets,
+    runner_terminations, task_wake,
+)
+from app.clock import utcnow
+from app.auth import adopt_user, require_user
 from app.authz.catalog import permission_key
 from app.authz.declarations import feature
-from app.authz.object_access import can_access
+from app.authz.object_access import can_access, require_project_key
 from app.authz.principal import Principal, current_principal
 from app.authz.visibility import ObjectAccess, has_project_key
-from app.db import get_session
+from app.db_async import DbDep, defer_off_loop, on_session
 from app.events import emit_console_event
-from app.features import FEATURE_SHIPPED
 from app.models.credentials import Account
 from app.models.identity import AdminUser
 from app.models.projects import Feature, Project
@@ -29,9 +32,13 @@ from app.models.tasks import Task
 from app.entity_shape import get_or_404
 from app.persona_registry import CREATABLE_PERSONAS, PERSONA_CREATE_AUTONOMOUS
 from app import placement_grants, playbook_engine
+from app import agent_router
+from app.agent_router import pins
+from app.task_language import effective_language, normalized_language
 from app.task_lifecycle import PAUSED, TRANSITION_BY_NAME, _LIVE_STATES, _RUNNER_RUNNING_STATES
 from app.task_lookup import get_task_or_404
-from app.task_retag import retag_task
+from app.task_classifier import budget_for_attempt, classify_task_tags
+from app.task_retag import apply_retag, prepare_retag
 from app.task_tags import TagRefOut, replace_task_tags
 from app.tenancy.copy import unavailable_now
 from app.tenancy.ids import is_tenant_org
@@ -50,7 +57,6 @@ from app.routes.tasks.create import (
     TaskUpdate,
     _AGENT_OR_PROVIDER,
     _BODY_VERSION_SOURCE_AUTOSAVE,
-    _FEATURE_SHIPPED_DETAIL,
     _KEEP_PIN,
     _account_pick_or_422,
     _agent_pick_or_422,
@@ -59,7 +65,6 @@ from app.routes.tasks.create import (
     _close_autosave_body_version,
     _create_analysis_children,
     _provider_on_plan_or_422,
-    _external_issue_or_422,
     _model_pin_or_refuse,
     _open_autosave_body_version_id,
     _plan_from_snapshot,
@@ -70,7 +75,10 @@ from app.routes.tasks.create import (
     _validated_assignee,
     sync_epic_child_autonomous,
 )
+from app.routes.tasks import tracker_pick
+from app.trackers import project_links
 from app.routes.tasks.dispatch import _RUNNER_BINDING_CLEARED, _finalize_unsaved_draft
+from app.routes.tasks.transitions import throttle_epic_children
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 log = logging.getLogger(__name__)
@@ -187,6 +195,11 @@ def _apply_project_move(
             ),
         )
 
+    # A moved subtree's outcome rows describe dispatches in the old project: out of every metric.
+    from app.outcome_ledger import writer as outcome_writer
+
+    for moved_id in ids:
+        outcome_writer.exclude(session, moved_id, outcome_writer.EXCLUDE_MOVED)
     # The paused rows' worktrees and runner binding stay behind in the old project.
     paused_ids = [r.id for r in rows if r.state == PAUSED]
     issued: list[fleet_verdicts.IssuedIntents] = []
@@ -265,20 +278,19 @@ def _apply_feature_filing(
     # rather than interleave, on either path below.
     session.execute(select(Task.id).where(Task.id == task.id).with_for_update())
     if feature_id is not None:
-        # `FOR SHARE`, for `_create_feature_or_refuse`'s reason: no ship or delete between check and write.
+        # `FOR SHARE`, for `_create_feature_or_refuse`'s reason: no delete between check and write.
         feature_row = session.get(Feature, feature_id, with_for_update={"read": True})
-        # "Does not exist" and "not yours to file into" are one 422: a view-only feature is as unfileable
-        # as an invisible one.
+        # "Does not exist", "deleted" and "not yours to file into" are one 422: a view-only feature is as
+        # unfileable as an invisible one.
         if (
             feature_row is None
+            or feature_row.deleted_at is not None
             or not can_access(session, principal, "feature", feature_id, mode=ObjectAccess.READ)
             or not has_project_key(principal, permission_key("tasks", "edit"), feature_row.project_id)
         ):
             raise HTTPException(status_code=422, detail="feature not found")
         if feature_row.project_id != target_project_id:
             raise HTTPException(status_code=422, detail=f"feature {feature_id} is in another project")
-        if feature_row.status == FEATURE_SHIPPED:
-            raise HTTPException(status_code=400, detail=_FEATURE_SHIPPED_DETAIL)
     if target_project_id != task.project_id:
         return _apply_project_move(
             task, target_project_id, session, principal, feature_id=feature_id, landing_pin=landing_pin,
@@ -320,6 +332,26 @@ def _apply_hidden(
     session.execute(
         update(Task).where(Task.id.in_(_subtree_task_ids(task.id, session)))
         .values(hidden=hidden, **actors.task_actor_values(session))
+    )
+    session.flush()
+
+
+def _apply_language(task: Task, language: Optional[str], session: Session) -> None:
+    """Set a person's pick of `task`'s language on it AND ITS WHOLE SUBTREE, and pin it against re-detection
+    (`app/task_language.py`). Mutates the session, never commits. Null or a non-code is a 422; a change on a
+    child a 400 (children carry their epic's); a resend of the current value only pins it."""
+    code = normalized_language(language)
+    if code is None:
+        raise HTTPException(status_code=422, detail="language must be an ISO 639-1 code such as en, de or ru")
+    if task.parent_task_id is not None:
+        if code != effective_language(task.language):
+            raise HTTPException(status_code=400, detail="a stage task takes its epic's language")
+        return
+    task.language_pinned = True
+    # One statement over the subtree, as `_apply_hidden`, so children never disagree with their epic.
+    session.execute(
+        update(Task).where(Task.id.in_(_subtree_task_ids(task.id, session)))
+        .values(language=code, **actors.task_actor_values(session))
     )
     session.flush()
 
@@ -394,7 +426,7 @@ def _apply_persona_conversion(
     # Epic → a runner persona. Two guarded UPDATEs, not a read-modify-write loop: otherwise
     # `claim_task_active_ready_by_id` could claim a `ready` child that then gets archived. Park first, then
     # archive (reversed, the archive would remove rows from the park's predicate).
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     # Pre-read, then park: the children are then archived, so this is the last moment their runners are
     # attributable. Locked for `_roll_up_epic`'s reason.
     converted_running = list(session.scalars(select(Task.id).where(
@@ -473,14 +505,13 @@ def _apply_playbook(
         plan = _plan_from_snapshot(task.playbook or {}, persona, task.model)
     if plan.persona == PERSONA_ADVISOR and plan.persona != task.persona:
         # A Chat stage is a chat: the create door's two gates, judged on the persona the playbook resolved.
-        if not has_project_key(principal, permission_key("worktrees", "edit"), task.project_id):
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "saving a chat requires worktrees:edit on this project — the advisor's deliverable is "
-                    "a two-way console session, and without that permission the console is read-only"
-                ),
-            )
+        require_project_key(
+            principal, permission_key("worktrees", "edit"), task.project_id,
+            detail=(
+                "saving a chat requires worktrees:edit on this project — the advisor's deliverable is "
+                "a two-way console session, and without that permission the console is read-only"
+            ),
+        )
         _advisor_chat_cap_or_409(
             session, project_id=task.project_id, creator_id=task.created_by_id, persona=plan.persona,
         )
@@ -506,22 +537,36 @@ def _same_simple_expert(task: Task, persona: str) -> bool:
 #: What a lane run (`merge_lane.is_lane_persona`) keeps: `update_task` refuses a write to any of these.
 _LANE_RUN_FROZEN = frozenset({"persona", "body", "title", "project_id", "feature_id", "hidden", "playbook_id"})
 
+def _pick_project(session: Session, kwargs: dict[str, Any]) -> Optional[int]:
+    """The project an edit's picked issue must be linked to: the task's, after any move in the same request."""
+    current_project = session.scalar(select(Task.project_id).where(Task.id == kwargs["task_id"]))
+    if current_project is None or tracker_pick.unchanged(session, kwargs["task_id"], kwargs["body"].tracker_issue):
+        return None
+    project_id = kwargs["body"].project_id or current_project
+    return tracker_pick.may_pick(kwargs["principal"], project_id, "edit")
+
+
 @router.put("/{task_id}", response_model=TaskOut)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",), author_draft=True)
+@tracker_pick.with_tracker_pick(_pick_project)
+@on_session(deferring=True)
 def update_task(
+    session: Session,
     task_id: int,
     body: TaskUpdate,
     _user: AdminUser = Depends(require_user),
     principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
 ) -> TaskOut:
     """Edit a Task in ANY state, `active` included: no state gate, because an epic's `transition_mode` has
     to be changeable mid-run.
 
-    A runner reads body/title at dispatch, so a mid-run edit applies to the next dispatch. `persona`
+    A runner reads title at dispatch, so a mid-run title edit applies to the next dispatch; an explicit Save that
+    changes the body, the human-in-the-loop involvement or the model pin also reaches a live runner now
+    (`app/live_task_edits.py`). `persona`
     edits in every state too (conversions reconcile children by archiving). `project_id` is the one
     exception: a live subtree row holds a slot in the old project, so the move is refused. Resending
     the current persona or project is a no-op. See `_apply_project_move`."""
+    _user = adopt_user(session, _user)
     task = get_task_or_404(task_id, session)
     fields = body.model_dump(exclude_unset=True)
     if "project_id" in fields and fields["project_id"] is None:
@@ -530,6 +575,14 @@ def update_task(
     # `autosave` is not a column: every reader below treats a key as a task field (`getattr` would raise,
     # and `changed_fields` would name it). See `TaskUpdate.autosave`.
     autosave = bool(fields.pop("autosave", False))
+    # Not columns either: the picked issue is a `tracker_issue_links` row (`tracker_pick.apply`), and the old
+    # external pair is accepted and ignored (the link row is the one home of a task's issue).
+    fields.pop("tracker_issue", None)
+    fields.pop("external_task_system", None)
+    fields.pop("external_task_id", None)
+    # Present only while the form shows a recommendation (`TaskCreate.routing_accepted_config`).
+    routing_shown = "routing_accepted_config" in fields
+    routing_accepted = fields.pop("routing_accepted_config", None)
     # `playbook_id` is not a column either (`tasks.playbook` holds a snapshot): taken out for `_apply_playbook`.
     playbook_submitted = "playbook_id" in fields
     playbook_id = fields.pop("playbook_id", None)
@@ -583,13 +636,14 @@ def update_task(
     # Snapshot the significant fields before mutating: staleness fires on a value change, not presence (the
     # form resends title/body every save).
     old_significant_values = {f: getattr(task, f) for f in _SIGNIFICANT_EDIT_FIELDS}
+    # What a live runner must hear about, read before any field moves; an auto-save tick injects nothing, and a
+    # finalizing draft has no runner. None on a failed read (`snapshot`): nothing is injected.
+    live_before = None if autosave or task.unsaved else live_task_edits.snapshot(session, task)
     # Snapshot every incoming field's current value so the "what changed" row names every altered field.
     old_field_values = {f: getattr(task, _FIELD_COLUMN.get(f, f)) for f in fields}
     # The addressee before this request, snapshotted unconditionally: the notice also fires at finalize,
     # on saves that may not submit the field.
     old_assignee = task.assigned_to_id
-    # Epic children re-stamped with the epic's new title, for the slot relabel after the commit.
-    rederived_children: list[int] = []
     if "title" in fields:
         if not (fields["title"] or "").strip():
             raise HTTPException(status_code=422, detail="title cannot be empty")
@@ -598,7 +652,7 @@ def update_task(
         if task.persona == PERSONA_EPIC and task.title != old_title:
             # The children wear `[<persona>] <epic title>` (`derived_child_title`); a hand rename re-stamps them
             # as the LLM refine does (`app/task_title.py`), or a child's own page keeps the old epic title.
-            rederived_children = _rederive_children(session, task, old_title, task.title)
+            _rederive_children(session, task, old_title, task.title)
     if "body" in fields:
         if not (fields["body"] or "").strip():
             raise HTTPException(status_code=422, detail="body cannot be empty")
@@ -630,6 +684,12 @@ def update_task(
         if fields["sweep_opt_out"] is None:
             raise HTTPException(status_code=422, detail="sweep_opt_out cannot be null")
         task.sweep_opt_out = fields["sweep_opt_out"]
+    if "notify_when_done" in fields:
+        if fields["notify_when_done"] is None:
+            raise HTTPException(status_code=422, detail="notify_when_done cannot be null")
+        task.notify_when_done = fields["notify_when_done"]
+    # The runner and model as they stood, so a person's change to them stamps `pin_source` below.
+    pinned_before = (task.model, task.bound_provider, task.agent_id)
     # The model pin: superadmin-only, refused here because a hidden UI field is not an access control. No
     # feature key reaches it (`authz.Access.SUPERADMIN`), and authorization precedes validation (403 before
     # `validate_model`'s 422). `principal is None` is allow-all. Presence, not change, is gated; the form
@@ -670,13 +730,15 @@ def update_task(
         pinned = session.get(Account, task.bound_account_id)
         if task.agent_id is not None or pinned is None or pinned.provider != task.bound_provider:
             task.bound_account_id = None
-    # The external-issue pair; an explicit null clears its half. Judged on the resulting row, so a
-    # one-sided edit can never leave it half-linked; both are written (the other half re-normalised).
-    if "external_task_system" in fields or "external_task_id" in fields:
-        task.external_task_system, task.external_task_id = _external_issue_or_422(
-            fields.get("external_task_system", task.external_task_system),
-            fields.get("external_task_id", task.external_task_id),
-        )
+    if (task.model, task.bound_provider, task.agent_id) != pinned_before:
+        # A person changed the runner or model, or cleared it (`agent_router/pins.py`). Only a change: the form
+        # resends every key, and a resent vendor the claim stamped is nobody's choice.
+        pins.stamp(task, pins.HUMAN)
+        # A change while the form shows a recommendation: an answer to it (`agent_router.record_answer`).
+        if routing_shown and routing_accepted is None:
+            agent_router.record_answer(session, task, session.get(Project, task.project_id))
+    if routing_accepted is not None:
+        agent_router.record_answer(session, task, session.get(Project, task.project_id), accepted=routing_accepted)
     # Editable any time; null is Default. Not significant: it is read at the next dispatch, nothing goes stale.
     if "project_memory" in fields:
         task.project_memory = fields["project_memory"]
@@ -692,6 +754,20 @@ def update_task(
                 ),
             )
         task.transition_mode = fields["transition_mode"]
+    # The epic throttle (`models.Task.max_running`), editable any time; null lifts it, out of range is the model's 422,
+    # a value on a row that is not (or does not stay) an epic a 422. Lowered on an epic below its running count, the
+    # excess is preempted in this save's transaction (`throttle_epic_children`); raised or lifted, the drain is woken
+    # after the commit so the waiting children start now rather than at its next interval.
+    throttle_issued: list[fleet_verdicts.IssuedIntents] = []
+    if "max_running" in fields:
+        if fields["max_running"] is not None and resulting_persona != PERSONA_EPIC:
+            raise HTTPException(status_code=422, detail="max_running applies to an epic only")
+        old_throttle, task.max_running = task.max_running, fields["max_running"]
+        if task.persona == PERSONA_EPIC and task.max_running is not None:
+            session.flush()
+            throttle_issued = throttle_epic_children(task.id, task.max_running, session)
+        if old_throttle is not None and (task.max_running is None or task.max_running > old_throttle):
+            cron_runtime.wake_after_commit(session, task_wake.DISPATCH_ACTIVITY)
     # Applied before the persona conversion: `_create_analysis_children` stamps children from the epic's
     # project, so moving first gives them the new one. A filing names its feature's project (a `project_id`
     # beside it must agree); without one, a submitted move runs alone.
@@ -709,6 +785,11 @@ def update_task(
         )
     elif "project_id" in fields:
         move_issued = _apply_project_move(task, fields["project_id"], session, principal, landing_pin=landing_pin)
+    # The picked issue, after any move: it was read against the landing project (`_pick_project`), and a hand link
+    # the landing project does not link goes, with its write-backs (the linked containers are the boundary).
+    tracker_pick.apply(session, task, body)
+    if "project_id" in fields or "feature_id" in fields:
+        project_links.drop_outside_project(session, task)
     # The node pin, after any move (the pin must name a node of the landing project). Presence is
     # gated (`_pinned_node_or_refuse`); only a changed value is validated, so the operator form's resend of a kept
     # pin cannot wedge a save, a node task's automation-set pin included.
@@ -747,6 +828,9 @@ def update_task(
     # records it in the feed (an auto-save emits nothing). The form resends it on Save.
     if "hidden" in fields and not autosave:
         _apply_hidden(task, fields["hidden"], session, principal)
+    # Before the conversion too, so analysis children a runner→epic conversion builds are born with it.
+    if "language" in fields and not autosave:
+        _apply_language(task, fields["language"], session)
     # The last field applied, so a rejected conversion leaves nothing half-committed.
     converted_children: Optional[list[Task]] = None
     if playbook_submitted or task.playbook:
@@ -804,16 +888,7 @@ def update_task(
             } if changed_fields else None,
         )
     session.commit()
-    send_minted_intents(move_issued)  # AFTER the commit — see `send_minted_intents`.
-    # ── The slot and its tmux window follow the title (I1) ────────────────────────────────────────────
-    # Labels are composed at dispatch, so renames (including the async `app/task_title.py` title) go stale;
-    # both title writers call one helper. On an actual change, not presence. After the commit, since the
-    # helper re-reads the row. No try/except: `retitle_task_slot` never raises, and a label is cosmetic.
-    if "title" in changed_fields:
-        # The route's own `task_id`: the commit expired the instance.
-        slot_retitle.retitle_task_slot(session, task_id)
-    for child_id in rederived_children:
-        slot_retitle.retitle_task_slot(session, child_id)
+    send_minted_intents(move_issued + throttle_issued)  # AFTER the commit — see `send_minted_intents`.
     # ── The "assigned to you" notice ──────────────────────────────────
     # Not on an auto-save; not to the actor; only when the assignee is new to the row (changed on this save,
     # or this save finalized an `unsaved` draft). No "un-assigned" notice. After the commit (it reads the row);
@@ -827,13 +902,24 @@ def update_task(
     ):
         from app import task_notify
 
-        task_notify.announce_assignment(task_id, assignee_id=new_assignee, assigned_by_id=actor_id)
+        defer_off_loop(
+            session, task_notify.announce_assignment, task_id, assignee_id=new_assignee, assigned_by_id=actor_id,
+        )
     # The refinement the create withheld, now that the body is finished; after commit, deferred, never
     # raises. The worker will not overwrite a chosen title (`task_title.is_placeholder_title`).
     if finalizing:
         from app.durable.task_title_queue import enqueue_title
 
-        enqueue_title(task_id)
+        defer_off_loop(session, enqueue_title, task_id)
+    # The edit reaches the runner already working it, after the commit (its mints commit on their own); a
+    # finalizing save has no runner. Never raises (`inject_edit`).
+    if live_before is not None and not finalizing:
+        live_task_edits.inject_edit(session, task_id, live_before, editor_id=actor_id)
+    if finalizing and task.parent_task_id is None:
+        # Saving an auto-saved draft is creating the idea: "By itself" on the pipeline's first step starts it.
+        from app.routes.tasks.create import start_on_save  # noqa: PLC0415 — create imports this package
+
+        start_on_save(session, task_id, _user, principal)
     session.refresh(task)
     # A conversion changed the child set, so project it (`coder → epic` returns three children, `epic →
     # coder` an explicit 0). A finalized epic's fresh children are projected the same way, or the board
@@ -878,11 +964,12 @@ class TaskTagsOut(BaseModel):
 
 @router.put("/{task_id}/tags", response_model=TaskTagsOut)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",), author_draft=True)
+@on_session
 def replace_tags(
+    session: Session,
     task_id: int,
     payload: TaskTagsIn,
     _user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> TaskTagsOut:
     """Replace this Task's tags across every active tag group. `app/task_tags.py` is the single home of
     the replace rules; this handler is the transport and the event.
@@ -894,12 +981,13 @@ def replace_tags(
     The row lock makes last-write-wins true: under READ COMMITTED concurrent PUTs would otherwise commit
     the union, possibly two tags from a single-select group (as `app/routes/groups.py::_require_group`).
     No state guard; object denial is 404 (`app/authz.py`)."""
+    _user = adopt_user(session, _user)
     task = get_or_404(session, Task, task_id, detail=f"task {task_id} not found", lock=True)
     tags = replace_task_tags(session, task, payload.tag_ids)
     emit_console_event(
-        session, entity="task", id=task_id, action="tagged", record_transition=False
+        session, entity="task", id=task_id, action="tagged", record_transition=False,
+        commit=True,
     )
-    session.commit()
     return TaskTagsOut(tags=tags)
 
 
@@ -924,10 +1012,10 @@ def _retag_refusal_for(exc: HTTPException, reader_org: Optional[UUID]) -> HTTPEx
 
 @router.post("/{task_id}/retag", response_model=TaskTagsOut)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",), author_draft=True)
-def retag(
+async def retag(
+    db: DbDep,
     task_id: int,
     _user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> TaskTagsOut:
     """Classify this Task with the LLM and REPLACE its tags across every active group.
 
@@ -937,17 +1025,35 @@ def retag(
 
     Every failure writes nothing (raised before the writer; the session never commits).
     `record_transition=False`, 404 object denial and no state guard, as in the PUT route."""
-    task = get_task_or_404(task_id, session)
-    # Read before `retag_task`'s rollback expires `_user`; a later read would lazy-refresh (or raise
-    # `ObjectDeletedError`). `org_id` likewise, for the refusal.
-    actor = str(_user.id)
-    reader_org = _user.org_id
+    # Three steps, the LLM call on a thread between them with no connection held (`retag_task`'s order).
+    task_id, groups, document, actor, reader_org = await db.run_sync(_retag_prepare, task_id, _user)
     try:
-        tags = retag_task(session, task, actor=actor)
+        tag_ids = await asyncio.to_thread(
+            classify_task_tags, document, groups, max_tokens=budget_for_attempt(1),
+        )
+        tags = await db.run_sync(_retag_apply, task_id, groups, tag_ids, actor)
     except HTTPException as exc:
         refusal = _retag_refusal_for(exc, reader_org)
         if refusal is exc:
             raise
         raise refusal from exc
-    session.commit()
     return TaskTagsOut(tags=tags)
+
+
+def _retag_prepare(session: Session, task_id: int, _user: AdminUser) -> tuple[int, Any, Any, str, Optional[UUID]]:
+    """`retag`'s first step: the object check, the actor, and what the classifier reads (`prepare_retag`)."""
+    _user = adopt_user(session, _user)
+    task = get_task_or_404(task_id, session)
+    # Read before `prepare_retag`'s rollback expires `_user`; a later read would lazy-refresh (or raise
+    # `ObjectDeletedError`). `org_id` likewise, for the refusal.
+    actor = str(_user.id)
+    reader_org = _user.org_id
+    task_id, groups, document = prepare_retag(session, task)
+    return task_id, groups, document, actor, reader_org
+
+
+def _retag_apply(session: Session, task_id: int, groups: Any, tag_ids: Any, actor: str) -> list[Any]:
+    """`retag`'s last step: write the classified tags and commit (`apply_retag`)."""
+    tags = apply_retag(session, task_id, groups, tag_ids, actor=actor)
+    session.commit()
+    return tags

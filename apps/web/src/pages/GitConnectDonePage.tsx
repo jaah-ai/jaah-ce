@@ -2,6 +2,7 @@ import { useEffect, type JSX } from 'react'
 import { Navigate, useSearchParams } from 'react-router-dom'
 import Typography from '@mui/material/Typography'
 import type { GitConnectDoneMessage } from '../components/projects/githubOAuthPopup'
+import { PROFILE_GIT_PATH } from '../ui/RepoUrlLookup'
 
 /** Where the create wizard's GitHub popup lands (`githubOAuthPopup.ts`): tell the opener how the connect
  *  ended, then close. Opened any other way, it is Profile's Git tab with the same answer. */
@@ -16,6 +17,6 @@ export default function GitConnectDonePage(): JSX.Element {
     opener.postMessage(message, window.location.origin)
     window.close()
   }, [opener, params])
-  if (!opener) return <Navigate to={`/profile?tab=git-accounts&${params.toString()}`} replace />
+  if (!opener) return <Navigate to={`${PROFILE_GIT_PATH}&${params.toString()}`} replace />
   return <Typography sx={{ p: 2 }}>Done. You can close this window.</Typography>
 }

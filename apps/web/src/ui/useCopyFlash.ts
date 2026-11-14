@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 
 /* ── A CLIPBOARD WRITE THAT SAYS WHETHER IT WORKED ──
- * The one home of the mechanism behind `ui/CopyButton` (and `ui/CopyableValue` and `lib/credentialRow`'s
- * copy-name icon through it) and `pages/Login`'s escape link; `copyText` alone backs `ConsolePane`'s copies.
+ * The one home of the mechanism behind `ui/CopyButton` (every copy control composes it: `ui/CopyableValue`,
+ * `ui/DetailFields`' id field, `lib/credentialRow`'s runner-path icon) and `ui/feed/FeedList`'s lead cell;
+ * `copyText` alone backs `ConsolePane`'s copies and `lib/credentialRow`'s ⋯ copy item (no flash in a closing menu).
  * THREE REFUSALS, ALL `failed`, NEVER A THROW: no `navigator.clipboard` (insecure origin, jsdom), a `.catch`
  * (permission), and the `try` — `writeText` may be missing or throw SYNCHRONOUSLY, and React error
  * boundaries do not catch event-handler throws, so the operator would get no flash at all.
@@ -28,7 +29,8 @@ export function copyText(text: () => string, onSettled: (state: 'copied' | 'fail
 
 /**
  * The state flashes to `copied`/`failed` for `flashMs`, then back to `idle`. The third element flashes an
- * outcome learned elsewhere (`ConsoleTerminal`'s pane copy, whose write happens when the node answers).
+ * outcome learned elsewhere (`ui/CopyButton`'s `run`: `ConsoleTerminal`'s pane copy, whose write happens
+ * when the node answers).
  */
 export function useCopyFlash(
   flashMs: number,

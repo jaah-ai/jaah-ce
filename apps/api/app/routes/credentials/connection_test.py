@@ -7,13 +7,14 @@ from uuid import UUID
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
-from app.auth import require_user
+from app import db_async
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller
 from app.authz.visibility import scoped_credential_select_for
-from app.db import get_session
-from app.entity_shape import is_blank
+from app.db_async import DbDep
+from app.entity_shape import is_blank, refused_as, from_row
 from app.credentials import health as credential_health
 from app.credentials.registry import (
     CredentialTypeSpec,
@@ -29,6 +30,7 @@ from app.credential_crypto import (
 )
 from app.credentials.testers import (
     TESTERS,
+    Tester,
     TestResult,
     _effective_base_url,
     _operator_host_field,
@@ -76,7 +78,7 @@ class CredentialTestOut(BaseModel):
 def _test_out(result: TestResult) -> CredentialTestOut:
     """The wire form of one test: its four fields by name, so the forge's raw answer a `TestResult`
     carries for `git_access` (`TestResult.http`) never reaches a response."""
-    return CredentialTestOut(ok=result.ok, status=result.status, message=result.message, detail=result.detail)
+    return from_row(CredentialTestOut, result)
 
 
 # The test body's own shape: no `name`/`description`, plus `id`, which the CRUD body rejects.
@@ -89,11 +91,10 @@ _TEST_BODY_FIELDS = frozenset({"type", "config", "id"})
 # explicitly delegated; widening this route needs the guard written first.
 @router.post("/api/credentials/test", response_model=CredentialTestOut)
 @feature("credentials", "edit")
-def test_credential(
+async def test_credential(
+    db: DbDep,
     raw_body: Any = Body(default=None),
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CredentialTestOut:
     """Test the connection described by `{type, config, id?}` — on demand, one bounded exchange.
 
@@ -121,7 +122,7 @@ def test_credential(
     # Refused for every tenant org (`tenancy/ids.py::is_tenant_org`), before the config is read: a
     # tenant superadmin could grant `credentials:edit` and aim the CP's egress at internal hosts. The
     # operator's own staff keep Test. Restoring it for tenants needs the egress guard.
-    if is_tenant_org(user.org_id):
+    if is_tenant_org(caller.actor.org_id):
         # The tenant's sentence, in their console's words (`tenancy/copy.py`).
         raise HTTPException(
             status_code=403,
@@ -135,6 +136,41 @@ def test_credential(
     posted_sealed = {key: value for key, value in config.items() if isinstance(value, SealedSecret)}
     if posted_sealed and credential_id is None:
         raise HTTPException(status_code=400, detail="id is required to test a sealed secret")
+    # Every private operation (KMS `Decrypt`) and the tester's requests run off the loop, between the DB steps
+    # and in the same order; each DB step commits or is released first, so no transaction spans them.
+    row, saved_id, tester, early = await db.run_sync(
+        _test_credential, spec, config, credential_id, posted_sealed, caller.actor, caller.principal
+    )
+    if early is not None:
+        return early
+    if posted_sealed and tester is not None:
+        # Audited first by `_test_credential` (committed); opened here.
+        await db_async.release(db)
+        config = await run_in_threadpool(_opened_inline_secrets, spec, credential_id, config)
+    fillable: set[str] = set()
+    if row is not None:
+        config, withheld, fillable = await db.run_sync(_with_stored_secrets, row, spec, config, caller.actor, caller.principal)
+        if withheld is not None:
+            return withheld
+    await db_async.release(db)
+    out, result = await run_in_threadpool(_tested, spec, tester, row, config, fillable)
+    if result is not None and saved_id is not None:
+        await db.run_sync(credential_health.record_test, saved_id, result.ok, result.message)
+    return out
+
+
+def _test_credential(
+    session: Session,
+    spec: CredentialTypeSpec,
+    config: dict[str, Any],
+    credential_id: Optional[UUID],
+    posted_sealed: dict[str, SealedSecret],
+    user: AdminUser,
+    principal: Principal | None,
+) -> tuple[Optional[Credential], Optional[UUID], Optional[Tester], Optional[CredentialTestOut]]:
+    """The test's first DB step: the row its `id` resolves to, the saved id a result is stamped on, the tester,
+    and a result to return instead of testing (`None` to go on). A sealed envelope is refused and audited here,
+    before it is opened."""
     # `_EDIT_KEY` on both arms: this route has no `own_credential`.
     row: Optional[Credential] = None
     # Only this arm's row is stamped with the result (`credential_health.record_test`): an envelope's or an
@@ -155,7 +191,7 @@ def test_credential(
         )
     if row is not None and row.nodevault:
         # D12/AC-5.9: the test runs here, and this process can open no NodeVault secret. Before any open.
-        return _test_out(nodevault_untestable_result())
+        return row, saved_id, None, _test_out(nodevault_untestable_result())
     # A bad request is an error even for an untestable type, so `{"id": "7", "type": "xero"}` is a 400.
     tester = TESTERS.get(spec.slug)
     if posted_sealed:
@@ -164,35 +200,42 @@ def test_credential(
         _refuse_replayed_stored_envelopes(session, posted_sealed)
         if tester is not None:
             # Audited like a fill, first (a hung request still leaves a trace); never opened for an
-            # untestable type, which would spend a private operation to send nothing.
+            # untestable type, which would spend a private operation to send nothing. The open is the route's.
             _audit_test(
                 session, user, spec, credential_id, row.name if row is not None else None,
                 _posted_origin(spec, config),
             )
-            config = _opened_inline_secrets(spec, credential_id, config)
-    if row is not None:
-        config, withheld = _with_stored_secrets(session, row, spec, config, user, principal)
-        if withheld is not None:
-            return withheld
+    return row, saved_id, tester, None
 
+
+def _tested(
+    spec: CredentialTypeSpec,
+    tester: Optional[Tester],
+    row: Optional[Credential],
+    config: dict[str, Any],
+    fillable: set[str],
+) -> tuple[CredentialTestOut, Optional[TestResult]]:
+    """The test's off-loop step (a worker thread; no DB): the stored secrets `_with_stored_secrets` cleared for a
+    fill opened, then the tester's one bounded exchange. The wire result, plus the `TestResult` to stamp on a
+    saved row (`None` when nothing was tested)."""
+    if row is not None and fillable:
+        config, withheld = _filled_from_row(row, spec, config, fillable)
+        if withheld is not None:
+            return withheld, None
     if tester is None:
         # The reason the types endpoint serves, Connect remedy included, so pressing Test never drops it.
         result = unsupported_result(spec.slug)
         reason = _untestable_reason_out(spec, connect_served=_connect_out(spec.slug) is not None)
-        return _test_out(result._replace(message=reason) if reason is not None else result)
+        return _test_out(result._replace(message=reason) if reason is not None else result), None
     # One time budget for all outbound calls, created after DB work so latency is not charged to it.
     deadline = new_deadline()
     try:
         result = tester(config, deadline)
     except Exception as exc:  # noqa: BLE001 - see below
-        # Unreachable by design (testers map transport failures); guards against uvicorn logging the
+        # Unreachable by design (testers map transport failures); guards against the server logging the
         # row. `from None` keeps the original off the response.
-        raise HTTPException(
-            status_code=500, detail=f"connection test failed ({type(exc).__name__})"
-        ) from None
-    if saved_id is not None:
-        credential_health.record_test(session, saved_id, result.ok)
-    return _test_out(result)
+        raise HTTPException(status_code=500, detail=f"connection test failed ({type(exc).__name__})") from None
+    return _test_out(result), result
 
 
 def _parsed_test_body(raw: Any) -> dict[str, Any]:
@@ -231,27 +274,20 @@ def _validated_test_config(spec: CredentialTypeSpec, value: Any) -> dict[str, An
     config: dict[str, Any] = {}
     for key in sorted(posted):
         if key not in declared:
-            raise HTTPException(
-                status_code=400,
-                detail=f"unknown field '{key}' for credential type '{spec.slug}'",
-            )
+            raise HTTPException(status_code=400, detail=f"unknown field '{key}' for credential type '{spec.slug}'")
         submitted = posted[key]
         # An explicit `null` means "not supplied", exactly like a blank string.
         if submitted is None:
             continue
         if isinstance(submitted, dict) and key in secret_keys(spec.slug):
             # A browser-sealed value typed into the form; opened under the body's `id` by the caller.
-            try:
+            with refused_as(400, ValueError):
                 config[key] = sealed_secret_from_wire(submitted, field=key)
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from None
             continue
         if not isinstance(submitted, str):
             raise HTTPException(status_code=400, detail=f"{key} must be a string")
         if len(submitted) > _VALUE_MAX_LEN:
-            raise HTTPException(
-                status_code=400, detail=f"{key} must be at most {_VALUE_MAX_LEN} characters"
-            )
+            raise HTTPException(status_code=400, detail=f"{key} must be at most {_VALUE_MAX_LEN} characters")
         if "\x00" in submitted:
             raise HTTPException(status_code=400, detail=f"{key} must not contain a NUL byte")
         config[key] = submitted
@@ -300,9 +336,9 @@ def _with_stored_secrets(
     config: dict[str, Any],
     user: AdminUser,
     principal: Principal | None,
-) -> tuple[dict[str, Any], Optional[CredentialTestOut]]:
-    """`config` with each blank secret filled from the stored row, or a result to return instead of
-    testing.
+) -> tuple[dict[str, Any], Optional[CredentialTestOut], set[str]]:
+    """Which blank secrets of `config` the stored row fills (opened off the loop by `_filled_from_row`), or a
+    result to return instead of testing.
 
     The stored secret is pinned to the row's own host: filling it for a request-supplied `base_url`
     would make Test a read primitive for every token. A differing scheme/host/port fills nothing and
@@ -313,7 +349,7 @@ def _with_stored_secrets(
     # `row` is the caller's editable row for the body's `id` (resolved by the route); a type mismatch
     # fills nothing (keys overlap between types).
     if row.type != spec.slug:
-        return config, None
+        return config, None, set()
 
     stored = dict(row.config or {})
     declared = {field.key for field in spec.fields}
@@ -323,7 +359,7 @@ def _with_stored_secrets(
         if is_blank(config.get(key)) and not is_blank(stored.get(key))
     }
     if not fillable:
-        return config, None
+        return config, None, set()
 
     # Both sides go through `_effective_base_url`. A fill needs both origins non-`None` and equal.
     host = _operator_host_field(spec)
@@ -335,18 +371,28 @@ def _with_stored_secrets(
     if posted_origin is None or stored_origin is None:
         # No comparable origin on a side: fill nothing. Its own branch because `None == None` once
         # matched an unparseable posted URL to a stored `http://` row.
-        return config, None
+        return config, None, set()
     if not _same_origin(posted_origin, stored_origin):
         # The host moved, so the secret stays; named per field. Only when a tester exists: an
         # untestable type makes no request.
         if spec.slug not in TESTERS:
-            return config, None
+            return config, None, set()
         label = next(field.label for field in spec.fields if field.key in fillable)
-        return config, _test_out(withheld_secret_result(label, host_label))
+        return config, _test_out(withheld_secret_result(label, host_label)), set()
 
     # Audited only when a tester exists; an untestable type sends nothing.
     if spec.slug in TESTERS:
         _audit_test(session, user, spec, row.id, row.name, posted_origin)
+    return config, None, fillable
+
+
+def _filled_from_row(
+    row: Credential, spec: CredentialTypeSpec, config: dict[str, Any], fillable: set[str]
+) -> tuple[dict[str, Any], Optional[CredentialTestOut]]:
+    """`config` with each of `fillable` (`_with_stored_secrets`'s verdict) opened from the stored row, or the
+    withheld result when one will not open. Runs off the loop (KMS `Decrypt`); reads only the loaded row."""
+    host = _operator_host_field(spec)
+    host_label = host.label if host else "base URL"
     # Opened here, where the value is consumed by the tester; one private operation per filled field.
     filled = dict(config)
     for key in fillable:

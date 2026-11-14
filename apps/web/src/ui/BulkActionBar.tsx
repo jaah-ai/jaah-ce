@@ -1,19 +1,25 @@
-import { useState, type JSX, type ReactNode } from 'react'
+import { useState, type JSX } from 'react'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import MenuItem from '@mui/material/MenuItem'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
+import { countOf } from '../lib/humanize'
 import FilterBar from './FilterBar'
 import { PHONE } from './listStyles'
+import { OverflowMenu } from './OverflowMenu'
 import { GLYPH_BUTTON_SX } from './ToolbarMenu'
+import { FONT_WEIGHT, RADIUS, SIZE, tint } from '../theme'
+import Tip from './Tip'
 
 /* The console's one bulk-action strip: count said out loud, one way to clear, destructive verbs look
- * destructive. A refused action is `aria-disabled` on a live button, never `disabled`: a disabled
- * button leaves the tab order and MUI sets `pointer-events: none`, hiding the `disabledReason`. The
+ * destructive. A refused INLINE action is `aria-disabled` on a live button, never `disabled`: a disabled
+ * button leaves the tab order and MUI sets `pointer-events: none`, hiding the `disabledReason`. Its
  * press is refused in `run`, which says why on a line under the strip — a `title` never shows on a tap. Every verb
- * keeps its word at every width (a bare ✓ beside ⊘ read as nothing on a phone): the strip wraps rather
- * than overflows, each button keeps a 44px phone height, and extra actions collapse into `FilterBar`'s ⋯ menu. */
+ * keeps its word at every width (a bare ✓ beside ⊘ read as nothing on a phone): the verbs wrap rather
+ * than overflow, each button keeps a 44px phone height, and extra actions collapse into a `ui/OverflowMenu`
+ * pinned to the strip's end (never wrapped onto a second line); a lone inline verb (`maxInline` 1) never wraps either:
+ * its words ellipsize, its full name staying its accessible name and tip. A refused ⋯-menu row carries its own reason,
+ * printed under the verb and reachable by arrow key, so `run`'s line under the strip is the inline verbs'. */
 
 /** One verb the bar offers. */
 export type BulkAction = {
@@ -22,7 +28,7 @@ export type BulkAction = {
   /** The word on the button, at every width, and its accessible name. */
   label: string
   /** The mark before the word. A text glyph, like every other icon in this repo. */
-  icon?: ReactNode
+  icon?: string
   /* `error` + `outlined` (`listStyles.ts`'s `ROW_ACTION_SX` says why never `contained`). */
   destructive?: boolean
   disabled?: boolean
@@ -31,30 +37,35 @@ export type BulkAction = {
   onRun: () => void
 }
 
-/* Accent tint, not `action.selected` (a neutral wash). The `rgba(var(--mui-palette-…-mainChannel) / …)`
-   spelling repaints on theme flip where `alpha()` does not.
+/* Accent tint, not `action.selected` (a neutral wash). `tint()` (the palette's channel variable)
+   repaints on theme flip where `alpha()` does not.
    Border as well as fill so the band is not a colour-only cue (WCAG 1.4.1). */
 const BAR_SX = {
   px: 1,
-  borderRadius: 1,
+  borderRadius: RADIUS.sm,
   border: '1px solid',
   borderColor: 'primary.main',
-  bgcolor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)',
+  bgcolor: tint('primary', 0.08),
 } as const
 
 /* The count never truncates: every verb acts on it. */
 const COUNT_SX = {
   flex: '0 0 auto',
-  fontWeight: 700,
+  fontWeight: FONT_WEIGHT.bold,
   color: 'text.primary',
   whiteSpace: 'nowrap',
 } as const
 
 /* A verb with its word: the 44px phone height, its natural width (the strip wraps). */
-const ACTION_SX = { [PHONE]: { flex: '0 0 auto', minHeight: 44 } } as const
+const ACTION_SX = { [PHONE]: { flex: '0 0 auto', minHeight: SIZE.tapTarget } } as const
 
 /* `textTransform`: the word is a `variant="button"` Typography, which `typography.button` uppercases. */
 const LABEL_SX = { textTransform: 'none' } as const
+
+/* A LONE inline verb (`maxInline` 1) keeps the strip one line: it shrinks and ellipsizes its words rather than wrap
+   under the count — its full name stays its accessible name and hover tip. */
+const LONE_ACTION_SX = { minWidth: 0, flex: '0 1 auto', [PHONE]: { flex: '0 1 auto', minHeight: SIZE.tapTarget } } as const
+const LONE_LABEL_SX = { ...LABEL_SX, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } as const
 
 /* Clear is wordless at every width — the escape hatch must fit 390px; `aria-label`/`title` carry the words. */
 const CLEAR_SX = {
@@ -75,8 +86,8 @@ export default function BulkActionBar({
   onClear: () => void
   /** The verbs, in the order they should be reached. */
   actions: BulkAction[]
-  /* How many stay inline — nominated by position (`FilterBar`'s overflow contract), not measured.
-     Three fits beside the count and ✕ at 390px with 44px buttons. */
+  /* How many stay inline — nominated by position, not measured. Three fits beside the count and ✕ at
+     390px with 44px buttons. */
   maxInline?: number
   /** The region's accessible name. Defaulted, because most lists have nothing more specific to say. */
   label?: string
@@ -90,16 +101,15 @@ export default function BulkActionBar({
 
   const inline = actions.slice(0, maxInline)
   const overflowed = actions.slice(maxInline)
+  const lone = inline.length === 1 && maxInline === 1
 
   /* One press handler for button and menu item, so the ⋯ cannot run a refused verb. */
-  const run = (action: BulkAction, close?: () => void) => {
+  const run = (action: BulkAction) => {
     if (action.disabled) {
       setRefusedAt({ id: action.id, count })
-      close?.()
       return
     }
     setRefusedAt(null)
-    close?.()
     action.onRun()
   }
 
@@ -114,81 +124,71 @@ export default function BulkActionBar({
   return (
     /* A named region (landmark). The count is `role="status"` so growth is announced while inside. */
     <Box role="region" aria-label={label} data-testid="bulk-action-bar" sx={BAR_SX}>
-      <FilterBar
-        overflowLabel={`More ${label.toLowerCase()}`}
-        overflow={
-          overflowed.length === 0
-            ? undefined
-            : close =>
-                overflowed.map(action => (
-                  <MenuItem
-                    key={action.id}
-                    onClick={() => run(action, close)}
-                    /* Live-but-refused, as with the buttons: a `disabled` MenuItem is unfocusable. */
-                    aria-disabled={action.disabled || undefined}
-                    title={action.disabled ? action.disabledReason : undefined}
-                    aria-label={actionName(action)}
-                    data-testid={`bulk-action-${action.id}`}
-                    sx={{
-                      gap: 1,
-                      color: action.destructive ? 'error.main' : 'text.primary',
-                      ...(action.disabled ? { opacity: 0.5 } : {}),
-                    }}
-                  >
-                    {action.icon && <Box component="span" aria-hidden="true">{action.icon}</Box>}
-                    {action.label}
-                  </MenuItem>
-                ))
-        }
-      >
-        {/* One child: `FilterBar` stacks children in a column below `sm`, wrong for a row of tap targets. */}
-        <Stack direction="row" sx={{ alignItems: 'center', gap: 1, flexWrap: 'wrap', minWidth: 0 }}>
-          <Typography
-            component="span"
-            variant="body2"
-            role="status"
-            data-testid="bulk-action-bar-count"
-            sx={COUNT_SX}
-          >
-            {count} selected
-          </Typography>
-
-          <Button
-            variant="text"
-            color="inherit"
-            onClick={onClear}
-            aria-label={`Clear the selection of ${count} ${count === 1 ? 'row' : 'rows'}`}
-            title="Clear the selection"
-            data-testid="bulk-action-bar-clear"
-            sx={CLEAR_SX}
-          >
-            <Box component="span" aria-hidden="true">✕</Box>
-          </Button>
-
-          {inline.map(action => (
-            <Button
-              key={action.id}
-              variant="outlined"
-              color={action.destructive ? 'error' : 'inherit'}
-              onClick={() => run(action)}
-              /* Not `disabled` — see the file header; `run` makes the press a no-op. */
-              aria-disabled={action.disabled || undefined}
-              title={actionName(action)}
-              aria-label={actionName(action)}
-              data-testid={`bulk-action-${action.id}`}
-              sx={{
-                ...ACTION_SX,
-                /* The theme's disabled face by hand, since the element is not disabled. */
-                ...(action.disabled ? { color: 'text.disabled', borderColor: 'action.disabledBackground' } : {}),
-              }}
+      <FilterBar>
+        {/* One child: `FilterBar` stacks children in a column below `sm`, wrong for a row of tap targets. Inside it,
+            the verbs wrap and the ⋯ keeps the row's end — in the wrapping Stack it landed alone on a second line. */}
+        <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1, minWidth: 0, width: '100%' }}>
+          <Stack direction="row" sx={{ alignItems: 'center', gap: 1, flexWrap: lone ? 'nowrap' : 'wrap', minWidth: 0, flex: '1 1 auto' }}>
+            <Typography
+              component="span"
+              variant="body2"
+              role="status"
+              data-testid="bulk-action-bar-count"
+              sx={COUNT_SX}
             >
-              {action.icon && <Box component="span" aria-hidden="true">{action.icon}</Box>}
-              <Typography component="span" variant="button" sx={LABEL_SX}>
-                {action.icon ? <>&nbsp;{action.label}</> : action.label}
-              </Typography>
+              {count} selected
+            </Typography>
+
+            <Button
+              variant="text"
+              color="inherit"
+              onClick={onClear}
+              aria-label={`Clear the selection of ${countOf(count, 'row')}`}
+              data-testid="bulk-action-bar-clear"
+              sx={CLEAR_SX}
+            >
+              <Box component="span" aria-hidden="true">✕</Box>
             </Button>
-          ))}
-        </Stack>
+
+            {inline.map(action => (
+              <Tip key={action.id} title={actionName(action)}><Button
+                variant="outlined"
+                color={action.destructive ? 'error' : 'inherit'}
+                onClick={() => run(action)}
+                /* Not `disabled` — see the file header; `run` makes the press a no-op. */
+                aria-disabled={action.disabled || undefined}
+                aria-label={actionName(action)}
+                data-testid={`bulk-action-${action.id}`}
+                sx={{
+                  ...(lone ? LONE_ACTION_SX : ACTION_SX),
+                  /* The theme's disabled face by hand, since the element is not disabled. */
+                  ...(action.disabled ? { color: 'text.disabled', borderColor: 'action.disabledBackground' } : {}),
+                }}
+              >
+                {action.icon && <Box component="span" aria-hidden="true">{action.icon}</Box>}
+                <Typography component="span" variant="button" sx={lone ? LONE_LABEL_SX : LABEL_SX}>
+                  {action.icon ? <>&nbsp;{action.label}</> : action.label}
+                </Typography>
+              </Button></Tip>
+            ))}
+          </Stack>
+
+          <OverflowMenu
+            ariaLabel={`More ${label.toLowerCase()}`}
+            sx={{ ...ACTION_SX, ml: 'auto' }}
+            items={overflowed.map(action => ({
+              key: action.id,
+              testId: `bulk-action-${action.id}`,
+              icon: action.icon,
+              label: action.label,
+              ariaLabel: action.label,
+              danger: action.destructive,
+              disabled: action.disabled,
+              disabledReason: action.disabledReason,
+              onClick: () => run(action),
+            }))}
+          />
+        </Box>
       </FilterBar>
       {/* Mounted empty so a screen reader announces the reason when it lands. */}
       <Typography variant="caption" component="div" role="status" sx={{ color: 'text.secondary', pb: refused ? 0.75 : 0 }}>

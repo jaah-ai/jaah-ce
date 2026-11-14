@@ -1,0 +1,46 @@
+# Microsoft Copilot Managed Runtime: an Entra service principal (operator decision: tenant id, client id, secret;
+# Test: Graph /organization). Facts confirmed at the vendor's own docs: Copilot APIs authenticate through Microsoft
+# Graph and Entra https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/copilot-apis-security-authentication ;
+# client-credentials grant https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow ;
+# GET /organization https://learn.microsoft.com/en-us/graph/api/organization-list
+slug = "microsoft_copilot"
+label = "Microsoft Copilot Managed Runtime"
+category = "ai_media"
+vendor_docs_url = "https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/copilot-apis-security-authentication"
+summary = "Let agents reach Microsoft 365 Copilot and Copilot Studio agents in your tenant as a registered app."
+default_base_url = "https://login.microsoftonline.com"
+
+[[auth]]
+kind = "service_account"
+fields = [
+  { key = "tenant_id", label = "Tenant ID", kind = "text", required = true, placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", help = "Microsoft Entra admin center > Entra ID > Overview > Tenant ID, or a domain such as acme.onmicrosoft.com" },
+  { key = "client_id", label = "Client ID", kind = "text", required = true, placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", help = "Entra ID > App registrations > New registration (name it Jaah Copilot, single tenant), then the app's Overview > Application (client) ID" },
+  { key = "client_secret", label = "Client secret", kind = "secret", required = true, help = "The app's Certificates & secrets > Client secrets > New client secret: copy the Value column (not the Secret ID) - Entra shows it once" },
+]
+
+[test]
+kind = "hook"
+tester = "app.credentials.testers:test_microsoft_copilot"
+
+[docs]
+agent_uses = [
+  "Call a Copilot Studio agent your organization built, through the Microsoft 365 Agents SDK, and use its answer in a task",
+  "Use the Microsoft Graph application permissions you grant this app alongside Copilot, for example to read the organization's details",
+]
+prerequisites = [
+  "A Microsoft 365 tenant with Copilot or Copilot Studio, and a Global Administrator or Privileged Role Administrator to grant admin consent",
+  "An app registration for Jaah with the Microsoft Graph application permission Organization.Read.All (what the Test reads), plus the Copilot permissions your tenant offers for app-only access (API permissions > APIs my organization uses > Power Platform API, such as CopilotStudio.Copilots.Invoke), then Grant admin consent",
+]
+limitations = [
+  "Microsoft documents most Copilot APIs for signed-in users only; app-only (service principal) access to Copilot Studio agents is in preview and must be enabled for your tenant. Check the permissions your tenant offers before relying on it",
+  "The Test proves the app and its secret against Microsoft Graph; it does not call Copilot itself, so a missing Copilot permission shows up only when an agent calls it",
+  "Client secrets expire (at most 24 months). Add a new secret before the old one expires and select Replace",
+]
+troubleshooting = [
+  { symptom = "Test says Microsoft Copilot Managed Runtime rejected the client secret (401)", fix = "You copied the Secret ID, or the secret expired (AADSTS7000215). Create a new client secret, copy its Value, and select Replace" },
+  { symptom = "Test says Microsoft Graph refused the organization read (403)", fix = "The app lacks Organization.Read.All, or admin consent was not granted. Add it under API permissions > Microsoft Graph > Application permissions and select Grant admin consent" },
+  { symptom = "Agents get 401 or 403 calling a Copilot Studio agent", fix = "The app lacks the Copilot invoke permission, the agent is not published, or app-only access is not enabled in your tenant. Add the permission and grant admin consent, then publish the agent" },
+]
+faq = [
+  { q = "Does this use a Copilot license", a = "Calls made through a Copilot Studio agent are billed to your tenant's Copilot Studio capacity, as for any other channel" },
+]

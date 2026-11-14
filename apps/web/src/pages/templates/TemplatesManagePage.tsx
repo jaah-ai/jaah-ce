@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import { apiDetail } from '../../api'
+import { useBusyIds } from '../../hooks/useBusyIds'
 import { useSettled } from '../../hooks/useSettled'
 import { deleteItem, editItem } from '../../components/tasks/rowActions'
 import Banner from '../../ui/Banner'
@@ -17,6 +18,7 @@ import type { FeedColumn, FeedRowSpec } from '../../ui/feed/types'
 import { MANAGE_KEY, type TemplateCard, listManagedTemplates, purposeLabel } from './api'
 import { useTemplateDelete, useTemplateEditing } from './access'
 import { TEMPLATE_PATHS } from '../../routeGroups'
+import { grid } from '../../theme'
 
 /* THE TEMPLATE MANAGE LIST — `/templates/manage`: every template the viewer edits, drafts included
  * (`GET /api/templates/manage`) — the operator's global library and, for an org template editor, the org's own.
@@ -43,7 +45,7 @@ export default function TemplatesManagePage(): JSX.Element {
   const query = useSettled(q, SEARCH_DEBOUNCE_MS)
   const editing = useTemplateEditing()
   const [askDelete, deleteDialog] = useTemplateDelete()
-  const [busyId, setBusyId] = useState<string | null>(null)
+  const [busy, withBusy] = useBusyIds<string>()
   const list = useQuery({
     queryKey: [...MANAGE_KEY, query.trim()],
     queryFn: () => listManagedTemplates(query),
@@ -51,14 +53,8 @@ export default function TemplatesManagePage(): JSX.Element {
   })
   const rows = list.data ?? []
 
-  async function onDelete(t: TemplateCard) {
-    setBusyId(t.id)
-    try {
-      await askDelete(t)
-    } finally {
-      setBusyId(null)
-    }
-  }
+  // `askDelete` resolves to whether it deleted; the row only needs to know it settled.
+  const onDelete = (t: TemplateCard) => withBusy(t.id, async () => void (await askDelete(t)))
 
   const rowOf = (t: TemplateCard): FeedRowSpec => ({
     key: t.id,
@@ -70,14 +66,14 @@ export default function TemplatesManagePage(): JSX.Element {
     // A name is at most 80 characters: two lines hold it whole at every width.
     titleLines: 2,
     href: `/templates/${t.id}`,
-    busy: busyId === t.id,
+    busy: busy.has(t.id),
     markers: t.featured ? [{ key: 'featured', glyph: '★', label: 'Featured', hug: true }] : undefined,
     slots: [
-      { key: 'purpose', width: 128, gate: 'templatesMeta', align: 'left', dim: true, testId: 'template-purpose', node: purposeLabel(t.purpose) },
-      { key: 'origin', width: 48, gate: 'templatesMeta', align: 'left', dim: true, testId: 'template-origin', node: ORIGIN_LABEL[t.origin] },
-      { key: 'status', width: 64, align: 'left', testId: 'template-status', node: t.published ? 'Published' : 'Draft' },
+      { key: 'purpose', width: grid(21), gate: 'templatesMeta', align: 'left', dim: true, testId: 'template-purpose', node: purposeLabel(t.purpose) },
+      { key: 'origin', width: grid(8), gate: 'templatesMeta', align: 'left', dim: true, testId: 'template-origin', node: ORIGIN_LABEL[t.origin] },
+      { key: 'status', width: grid(10.5), align: 'left', testId: 'template-status', node: t.published ? 'Published' : 'Draft' },
       {
-        key: 'starts', width: 48, align: 'right', testId: 'template-starts', title: `${t.starts_90d} starts in the last 90 days`,
+        key: 'starts', width: grid(8), align: 'right', testId: 'template-starts', title: `${t.starts_90d} starts in the last 90 days`,
         node: String(t.starts_90d),
       },
     ],

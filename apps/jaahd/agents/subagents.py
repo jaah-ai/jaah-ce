@@ -202,7 +202,9 @@ def render(agent: dict, dialect: str) -> tuple[str, str]:
 # ── finding the sources ────────────────────────────────────────────────────────────────────────────
 
 def _version_key(path: Path) -> list:
-    # Segments tagged (0, int) / (1, str) so a stray non-numeric segment cannot raise TypeError.
+    # The daemon's `env_helpers.version_key` is out of reach: this file runs by path at the account's uid
+    # with only its own directory importable (the `sys.path` note above), so the release ordering is spelled
+    # once more here. Segments tagged (0, int) / (1, str) so a stray non-numeric segment cannot raise TypeError.
     return [(0, int(t)) if t.isdigit() else (1, t) for t in re.split(r"(\d+)", path.name)]
 
 

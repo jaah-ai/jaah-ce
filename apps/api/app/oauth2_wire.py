@@ -11,13 +11,12 @@ here logs a token, code, verifier or secret — only outcomes and provider error
 """
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import logging
 import secrets
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from time import monotonic
 from typing import Any, Mapping, Optional
 from urllib.parse import urlencode
@@ -25,6 +24,8 @@ from urllib.parse import urlencode
 import httpx
 
 from app import http_bounded
+from app.b64url import b64url
+from app.clock import utcnow
 
 log = logging.getLogger("oauth2-wire")
 
@@ -77,6 +78,12 @@ class TokenGrant:
     expires_at: Optional[datetime]
     # The OIDC `id_token`, when the provider sends one (Microsoft sign-in reads it); None for GitHub.
     id_token: Optional[str] = None
+    # The scope the provider says it granted (RFC 6749 §5.1), when it says; a consent that let the person untick a
+    # scope (Google's granular consent) is read here, never from the redirect's query.
+    scope: Optional[str] = None
+    # Non-standard members of the vendor's answer that a provider's `on_grant` hook needs (Slack's team and bot user,
+    # filled by its `ConnectHooks.exchange`). Never a token: those are the fields above.
+    extra: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)
@@ -92,9 +99,9 @@ class PkcePair:
 
 def new_pkce_pair() -> PkcePair:
     """A fresh PKCE pair: 32 `secrets` bytes, base64url unpadded (inside RFC 7636's 43..128 chars)."""
-    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
+    verifier = b64url(secrets.token_bytes(32))
     digest = hashlib.sha256(verifier.encode("ascii")).digest()
-    challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    challenge = b64url(digest)
     return PkcePair(verifier=verifier, challenge=challenge)
 
 
@@ -113,6 +120,7 @@ def authorize_url(
     scope: Optional[str] = None,
     extra: Optional[Mapping[str, str]] = None,
     response_type: Optional[str] = "code",
+    client_id_param: str = "client_id",
 ) -> str:
     """The URL to send the user's browser to.
 
@@ -124,7 +132,7 @@ def authorize_url(
     `challenge`; blank omits both PKCE parameters.
     """
     params: dict[str, str] = dict(extra or {})
-    params.update({"client_id": client_id, "redirect_uri": redirect_uri, "state": state})
+    params.update({client_id_param: client_id, "redirect_uri": redirect_uri, "state": state})
     # A blank `challenge` sends no PKCE pair, for a provider without it (Bitbucket Cloud).
     if challenge:
         params.update({"code_challenge": challenge, "code_challenge_method": _PKCE_METHOD})
@@ -150,6 +158,8 @@ def exchange_code(
     error_cls: type[OAuth2Error] = OAuth2Error,
     send_grant_type: bool = True,
     basic_auth: bool = False,
+    extra: Optional[Mapping[str, str]] = None,
+    client_id_param: str = "client_id",
 ) -> TokenGrant:
     """Trade an authorization code for an access token.
 
@@ -159,10 +169,13 @@ def exchange_code(
     `send_grant_type=False` keeps the GitHub exchange's bytes unchanged (it never sent it). A blank
     `verifier` sends no `code_verifier` (a provider without PKCE). `basic_auth` moves the client pair
     from the body to an HTTP Basic header, for a provider that documents only that (Bitbucket Cloud).
+    `extra` carries non-secret parameters beside the fixed ones, which win (RFC 8707's `resource`). A blank
+    `client_secret` is a public client's (RFC 6749 §2.1, as Dynamic Client Registration hands out): none is sent.
     """
     form = {
-        "client_id": client_id,
-        "client_secret": client_secret,
+        **dict(extra or {}),
+        client_id_param: client_id,
+        **({"client_secret": client_secret} if client_secret or basic_auth else {}),
         "code": code,
         "redirect_uri": redirect_uri,
     }
@@ -179,6 +192,7 @@ def exchange_code(
         status_hint=status_hint,
         error_cls=error_cls,
         basic_auth=basic_auth,
+        client_id_param=client_id_param,
     )
 
 
@@ -194,18 +208,25 @@ def refresh(
     status_hint: Optional[str] = None,
     error_cls: type[OAuth2Error] = OAuth2Error,
     basic_auth: bool = False,
+    send_grant_type: bool = True,
+    extra: Optional[Mapping[str, str]] = None,
+    client_id_param: str = "client_id",
 ) -> TokenGrant:
     """Trade a refresh token for a new access token.
 
     If the response carries a refresh token, store it (GitHub rotates and retires the spent one);
-    otherwise keep the one you sent. `basic_auth` as for `exchange_code`.
+    otherwise keep the one you sent. `basic_auth` as for `exchange_code`. `send_grant_type=False` for a
+    refresh endpoint that takes the refresh token alone (Figma's `/v1/oauth/refresh`). `extra` and a blank
+    `client_secret` as for `exchange_code`. `client_id_param` names the client parameter on all three calls for a
+    vendor that does not call it `client_id` (TikTok's `client_key`).
     """
-    form = {
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    }
+    form = {**dict(extra or {}), client_id_param: client_id}
+    if client_secret or basic_auth:
+        form["client_secret"] = client_secret
+    # `grant_type` before `refresh_token`, the order every provider has always been sent.
+    if send_grant_type:
+        form["grant_type"] = "refresh_token"
+    form["refresh_token"] = refresh_token
     if scope:
         form["scope"] = scope
     return _token_request(
@@ -217,6 +238,7 @@ def refresh(
         status_hint=status_hint,
         error_cls=error_cls,
         basic_auth=basic_auth,
+        client_id_param=client_id_param,
     )
 
 
@@ -230,6 +252,7 @@ def _token_request(
     status_hint: Optional[str],
     error_cls: type[OAuth2Error],
     basic_auth: bool = False,
+    client_id_param: str = "client_id",
 ) -> TokenGrant:
     """POST to the token endpoint and parse the one response shape both callers share.
 
@@ -238,7 +261,7 @@ def _token_request(
     """
     auth: Optional[tuple[str, str]] = None
     if basic_auth:
-        auth = (form.pop("client_id"), form.pop("client_secret"))
+        auth = (form.pop(client_id_param), form.pop("client_secret"))
     try:
         # `auth` only when set, so the no-Basic call keeps its three-argument shape.
         status_code, body = _post_bounded(endpoint, form, accept, **({"auth": auth} if auth else {}))
@@ -255,6 +278,12 @@ def _token_request(
     )
 
     error = payload.get("error")
+    if error is True:
+        # Figma's REST error shape (`{"error": true, "status": 400, "message": ...}`): no RFC code, so the
+        # message is the detail and the code stays None.
+        message = payload.get("message")
+        log.warning("oauth2 %s: refused (HTTP %s, no error code)", what, status_code)
+        raise error_cls(f"{vendor} refused the {what}: {message if isinstance(message, str) and message else status_code}")
     if isinstance(error, str) and error:
         description = payload.get("error_description")
         detail = description if isinstance(description, str) and description else error
@@ -274,6 +303,7 @@ def _token_request(
         refresh_token=optional_str(payload.get("refresh_token")),
         expires_at=expires_at(payload.get("expires_in")),
         id_token=optional_str(payload.get("id_token")),
+        scope=optional_str(payload.get("scope")),
     )
 
 
@@ -283,13 +313,11 @@ def _post_bounded(
     """POST `form` and read at most `_MAX_RESPONSE_BYTES`, inside `_DEADLINE_SECONDS` of wall clock.
 
     Returns `(status_code, body)`: `bytes`, or `_TRUNCATED` when the cap or deadline stopped the read.
-    The client is built here (the tests' seam) with redirects off: following a 302 would carry the
-    client secret to an unvalidated host.
+    The client is `http_bounded`'s (the tests' seam): redirects off, since following a 302 would carry
+    the client secret to an unvalidated host.
     """
     deadline = monotonic() + _DEADLINE_SECONDS
-    with httpx.Client(
-        timeout=TIMEOUT_SECONDS, follow_redirects=False, headers={"Accept-Encoding": "identity"}
-    ) as client:
+    with http_bounded.client(TIMEOUT_SECONDS) as client:
         with client.stream(
             "POST", endpoint, data=form, headers={"Accept": accept}, **({"auth": auth} if auth else {})
         ) as response:
@@ -347,4 +375,4 @@ def expires_at(expires_in: Any) -> Optional[datetime]:
         return None
     if expires_in <= 0:
         return None
-    return datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
+    return utcnow() + timedelta(seconds=int(expires_in))

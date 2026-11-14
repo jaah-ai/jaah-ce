@@ -27,6 +27,7 @@ export const TERMINAL_LABEL: Readonly<Record<string, string>> = {
   no_pr: 'No pull request',
   finish: 'Finished',
   outcome: 'Outcome reported',
+  review: 'Review findings reported',
 }
 
 export const REFERENCE_LABEL: Readonly<Record<string, string>> = {

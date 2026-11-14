@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Callable, Final, Optional
 from uuid import UUID
 
@@ -34,6 +34,7 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session, aliased
 
 from app import cron_retention, plan_terms
+from app.clock import utcnow
 from app.operator_settings import reads as settings_reads
 from app.models.agent_sessions import AgentSession
 from app.models.orgs import Org
@@ -304,10 +305,10 @@ def sweep_orgs(*, now: Optional[datetime] = None, session_factory: Optional[Call
     window equals the deployment's is left to the deployment pass. An org whose pass raises is logged and counted;
     the rest still run."""
     from app.automation_service import reap_attachment_keys
-    from app.db import SessionLocal
+    from app.db import BridgedSession
 
-    at = now or datetime.now(timezone.utc)
-    factory = session_factory or SessionLocal
+    at = now or utcnow()
+    factory = session_factory or BridgedSession
     out = OrgsSwept()
     with factory() as session:
         org_ids = _orgs_with_windows(session)

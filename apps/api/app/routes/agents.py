@@ -8,7 +8,7 @@ the operator org flagged `is_catalog`, published by the operator and opted into 
 Authz: `agents:view` reads, `agents:edit` writes — held by exactly the roles that carry `tasks:edit`
 (DD13). Publishing and withdrawing a connector is the operator's alone. Org agents are read through the
 read seam, so another org's id is a 404; catalog rows live in the operator org, which the seam hides from a
-tenant, so they are read on a fleet session of their own (`_catalog_rows`) and never written there.
+tenant, so they are read on a fleet session of their own (`_catalog_rows_async`) and never written there.
 
 Every route here answers 403 `agent_resolution.agents_off` while the caller's org's provider grid has no agent row on
 (`_agents_on_plan`: neither `sdk` nor any `acp:*`); registering an agent and enabling or publishing a connector also
@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Iterable, Literal, Optional
+from typing import Literal, Optional
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -42,16 +42,19 @@ from app.agents import (
     is_commit_sha,
     unsupported,
 )
-from app.auth import require_operator, require_user
+from app.auth import require_operator
 from app.clock import utcnow as _now
 from app.credential_keys import NodeVaultSealed, WrappingKeyUnavailable
 from app.authz.catalog import PROJECTS_VIEW_KEY, Tenancy
 from app.authz.declarations import feature, superadmin_only
-from app.authz.principal import Principal, current_principal
+from app.authz.object_access import require_org_admin, require_org_key
+from app.authz.principal import AsyncCaller, Principal, current_caller, current_principal_async
 from app.authz.visibility import scoped_project_select, scoped_task_select
-from app.db import get_session
+from app.db_async import DbDep, async_session, on_session, on_thread, release
 from app.entity_shape import (
-    StrictModel, conflict_as_409, constraint_name, iso_or_none, new_uuid7, optional_uuid, row_by_uuid_or_404,
+    or_404,
+    StrictModel, conflict_as_409, constraint_name, from_row, new_uuid7, optional_uuid, row_by_uuid_or_404,
+    slug_taken,
 )
 from app.models.agent_sessions import Agent, AgentEnablement
 from app.models.credentials import Account
@@ -192,16 +195,12 @@ class ChoiceOut(BaseModel):
 
 
 def _out(row: Agent, *, enabled: Optional[bool] = None, org: Optional[OrgRef] = None) -> AgentOut:
-    return AgentOut(
-        id=row.id, slug=row.slug, display_name=row.display_name, description=row.description or "",
-        agent_type=row.agent_type, language=row.language, entrypoint=row.entrypoint, version=row.version,
-        maintainer=row.maintainer, personas=list(row.personas or []), repo_url=row.repo_url,
-        subpath=row.subpath or "", ref=row.ref, resolved_commit=row.resolved_commit,
-        bundle_sha256=row.bundle_sha256, bundle_bytes=row.bundle_bytes, status=row.status,
-        resolve_error=row.resolve_error, resolved_at=iso_or_none(row.resolved_at), is_catalog=row.is_catalog,
+    return from_row(
+        AgentOut, row,
+        description=row.description or "", personas=list(row.personas or []), subpath=row.subpath or "",
         source="acp_registry" if acp_registry.is_registry(row) else "repo",
-        env=dict(row.env or {}), key_account_id=acp_registry.key_account_id(row), org_id=row.org_id, org=org, enabled=enabled,
-        unsupported=unsupported(row.manifest), created_at=iso_or_none(row.created_at), updated_at=iso_or_none(row.updated_at),
+        env=dict(row.env or {}), key_account_id=acp_registry.key_account_id(row), org=org, enabled=enabled,
+        unsupported=unsupported(row.manifest),
     )
 
 
@@ -253,27 +252,16 @@ def _require_editor(principal: Principal, user: AdminUser, row: Agent) -> None:
     )
 
 
-def _require_org_editor(principal: Principal) -> None:
-    """A connector is turned on or off for the whole org, so it takes `agents:edit` org-wide."""
-    if not principal.has_org(_EDIT_KEY):
-        raise HTTPException(status_code=403, detail="Turning a catalog connector on or off needs agents:edit for the whole organization")
+# A connector is turned on or off for the whole org, so it takes `agents:edit` org-wide.
+_ORG_EDIT = "Turning a catalog connector on or off needs agents:edit for the whole organization"
 
 
-def _catalog_rows(ids: Optional[Iterable[UUID]] = None) -> list[Agent]:
-    """Catalog connectors (all, or those in `ids`), read on a fleet session: they live in the operator org,
-    which a tenant's bound session cannot see. Read-only and returned detached — never written through."""
-    from app.db import SessionLocal
-
-    with seam.detached(), seam.operator_scope(), SessionLocal() as fleet:
-        query = select(Agent).where(Agent.is_catalog.is_(True))
-        if ids is not None:
-            wanted = list(ids)
-            if not wanted:
-                return []
-            query = query.where(Agent.id.in_(wanted))
-        rows = list(fleet.scalars(query.order_by(Agent.display_name)))
-        fleet.expunge_all()
-        return rows
+async def _catalog_rows_async() -> list[Agent]:
+    """`agent_resolution.catalog_rows()` for an async route, on an async fleet session of its own. Called before
+    the route's own session takes a connection: a task never holds two (`app/db_async.py`)."""
+    with seam.detached(), seam.operator_scope():
+        async with async_session() as fleet:
+            return await fleet.run_sync(agent_resolution.read_catalog, None)
 
 
 def _enabled_ids(session: Session, principal: Principal, *, listed: bool = False) -> set[UUID]:
@@ -284,40 +272,51 @@ def _enabled_ids(session: Session, principal: Principal, *, listed: bool = False
     return set(session.scalars(select(AgentEnablement.agent_id).where(AgentEnablement.org_id.in_(orgs))))
 
 
-def _visible_catalog(session: Session, principal: Principal, *, listed: bool = False) -> list[tuple[Agent, bool]]:
+def _visible_catalog(
+    session: Session, principal: Principal, catalog: list[Agent], *, listed: bool = False,
+) -> list[tuple[Agent, bool]]:
     """Every catalog connector the caller's org may see, with its enabled flag: the active ones, plus a
-    removed one ONLY where this org enabled it (AC-13) — it is marked, never silently gone."""
+    removed one ONLY where this org enabled it (AC-13) — it is marked, never silently gone. `catalog` is
+    `_catalog_rows_async()`'s answer, read before the route's session."""
     enabled = _enabled_ids(session, principal, listed=listed)
     return [
         (row, row.id in enabled)
-        for row in _catalog_rows()
+        for row in catalog
         if row.status == STATUS_ACTIVE or (row.status == STATUS_REMOVED and row.id in enabled)
     ]
 
 
-def _catalog_row(session: Session, principal: Principal, agent_id: str) -> tuple[Agent, bool]:
-    key = optional_uuid(agent_id)
-    if key is None:
-        raise HTTPException(status_code=404, detail="no such connector")
-    for row, enabled in _visible_catalog(session, principal):
+def _catalog_row(session: Session, principal: Principal, agent_id: str, catalog: list[Agent]) -> tuple[Agent, bool]:
+    key = or_404(optional_uuid(agent_id), detail="no such connector")
+    for row, enabled in _visible_catalog(session, principal, catalog):
         if row.id == key:
             return row, enabled
     raise HTTPException(status_code=404, detail="no such connector")
 
 
-def _agents_on_plan(
-    principal: Principal = Depends(current_principal), session: Session = Depends(get_session),
-) -> None:
+async def _agents_on_plan(db: DbDep, principal: Principal = Depends(current_principal_async)) -> None:
     """403 unless the caller's own org's provider grid has an agent row on (`agent_resolution.agents_on`). A
     principal with no org is refused (fail closed), never answered from the operator default."""
+    try:
+        await db.run_sync(_agents_on_plan_check, principal)
+    finally:
+        await release(db)
+
+
+def _agents_on_plan_check(session: Session, principal: Principal) -> None:
     if principal.org_id is None or not agent_resolution.agents_on(session, principal.org_id):
         raise HTTPException(status_code=403, detail=agent_resolution.agents_off(principal.org_id))
 
 
-def _sdk_on_plan(
-    principal: Principal = Depends(current_principal), session: Session = Depends(get_session),
-) -> None:
+async def _sdk_on_plan(db: DbDep, principal: Principal = Depends(current_principal_async)) -> None:
     """403 naming the cell unless the caller's own org's provider grid runs SDK agents (`sdk`/`own`)."""
+    try:
+        await db.run_sync(_sdk_on_plan_check, principal)
+    finally:
+        await release(db)
+
+
+def _sdk_on_plan_check(session: Session, principal: Principal) -> None:
     row, auth = provider_auth_policy.SDK_ROW, provider_auth_policy.OWN
     if principal.org_id is None or not provider_auth_policy.is_allowed(session, principal.org_id, row, auth):
         raise HTTPException(status_code=403, detail=provider_auth_policy.refusal(session, principal.org_id, row, auth))
@@ -342,19 +341,27 @@ _SDK_ON_PLAN = [Depends(_sdk_on_plan)]
 
 @router.get("/api/agents", response_model=list[AgentOut], dependencies=_ON_PLAN)
 @feature("agents", "view")
-def list_agents(
-    _: AdminUser = Depends(require_user),
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
+async def list_agents(
+    db: DbDep,
+    caller: AsyncCaller = Depends(current_caller),
 ) -> list[AgentOut]:
     """The org's own agents, then the catalog connectors it enabled (a removed one flagged by `status`).
 
     No org predicate of its own: the read seam narrows it — to the caller's org, or for an operator to the
     orgs their filter selected (`authz._principal_scope`), as every Directory list."""
+    catalog = await _catalog_rows_async()
+    return await db.run_sync(_list_agents, principal=caller.principal, catalog=catalog)
+
+
+def _list_agents(
+    session: Session,
+    principal: Principal,
+    catalog: list[Agent],
+) -> list[AgentOut]:
     own = list(session.scalars(
         select(Agent).where(Agent.is_catalog.is_(False)).order_by(Agent.display_name, Agent.slug)
     ))
-    catalog = [row for row, enabled in _visible_catalog(session, principal, listed=True) if enabled]
+    catalog = [row for row, enabled in _visible_catalog(session, principal, catalog, listed=True) if enabled]
     refs = org_refs(session, [row.org_id for row in own])
     out = [_out(row, org=org_ref_of(refs, row.org_id)) for row in own]
     out += [_out(row, enabled=True) for row in catalog]
@@ -363,15 +370,17 @@ def list_agents(
 
 @router.post("/api/agents", response_model=AgentOut, status_code=201, dependencies=_SDK_ON_PLAN)
 @feature("agents", "edit")
+@on_thread
 def register_agent(
+    session: Session,
     body: AgentIn,
-    user: AdminUser = Depends(require_user),
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ):
     """Register an agent: snapshot the repo as the caller (their own GitHub connection), validate it, store
     the bundle, write the row. Any failure is a 422 of sentences and writes nothing (AC-9, AC-15)."""
-    return _create(session, user, body, org_id=principal.org_id, is_catalog=False)
+    # The snapshot interleaves the reader's token (a rotation may wait on DBOS) with forge reads and the bundle
+    # put (`agent_bundles`): on a sync session of its own in a worker thread, never on the loop.
+    return _create(session, caller.actor, body, org_id=caller.principal.org_id, is_catalog=False)
 
 
 def _create(session: Session, user: AdminUser, body: AgentIn, *, org_id: UUID, is_catalog: bool):
@@ -381,7 +390,7 @@ def _create(session: Session, user: AdminUser, body: AgentIn, *, org_id: UUID, i
             session, user_id=user.id, repo_url=body.repo_url, subpath=body.subpath, ref=body.ref,
             retry=_REGISTER_RETRY,
         )
-        if agent_bundles.slug_taken(session, org_id, snapshot.manifest.name):
+        if slug_taken(session, Agent, snapshot.manifest.name, where=(Agent.org_id == org_id,)):
             raise agent_bundles.SnapshotRefused([agent_bundles.slug_taken_sentence(snapshot.manifest.name)])
         agent_bundles.refuse_secret_env(snapshot.manifest.to_json(), body.env)
         agent_id = new_uuid7()
@@ -410,22 +419,24 @@ def _create(session: Session, user: AdminUser, body: AgentIn, *, org_id: UUID, i
 
 @router.patch("/api/agents/{agent_id}", response_model=AgentOut, dependencies=_ON_PLAN)
 @feature("agents", "edit")
+@on_thread
 def update_agent(
+    session: Session,
     agent_id: str,
     body: AgentPatch,
-    user: AdminUser = Depends(require_user),
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ):
     """Change `ref`/`subpath` (re-snapshotted now, as the caller; a failure is a 422 and changes nothing),
     `status` active|disabled, `env` (the whole map) and/or a registry agent's `key_account_id`."""
-    row = _org_agent(session, principal, agent_id)
-    _require_editor(principal, user, row)
+    # The snapshot interleaves the reader's token (a rotation may wait on DBOS) with forge reads and the bundle
+    # put (`agent_bundles`): on a sync session of its own in a worker thread, never on the loop.
+    row = _org_agent(session, caller.principal, agent_id)
+    _require_editor(caller.principal, caller.actor, row)
     if body.ref is not None or body.subpath is not None or body.env is not None:
-        _require_cell(session, principal, row)
+        _require_cell(session, caller.principal, row)
     rebind = "key_account_id" in body.model_fields_set
     if rebind:
-        refusal = _key_account_refusal(session, principal, row, body.key_account_id)
+        refusal = _key_account_refusal(session, caller.principal, row, body.key_account_id)
         if refusal is not None:
             return refusal
     if acp_registry.is_registry(row) and (body.ref is not None or body.subpath is not None):
@@ -433,7 +444,7 @@ def update_agent(
     if acp_registry.is_registry(row) and body.env is not None:
         return _refused(agent_bundles.SnapshotRefused([acp_registry.env_sentence(row)]))
     env = row.env if body.env is None else body.env
-    result = _edit(session, user, row, ref=body.ref, subpath=body.subpath, env=env)
+    result = _edit(session, caller.actor, row, ref=body.ref, subpath=body.subpath, env=env)
     if result is not None:
         return result
     if body.status is not None:
@@ -450,12 +461,7 @@ def update_agent(
             session.rollback()
             return _refused(exc)
         row.env = body.env
-    stamp_actor(row, user)
-    wanted = row.slug
-    if not _committed(session, row):
-        return _refused(agent_bundles.SnapshotRefused([agent_bundles.slug_taken_sentence(wanted)]))
-    session.refresh(row)
-    return _out(row)
+    return _saved(session, caller.actor, row)
 
 
 def _key_account_refusal(session: Session, principal: Principal, row: Agent,
@@ -463,8 +469,7 @@ def _key_account_refusal(session: Session, principal: Principal, row: Agent,
     """The refusal of binding `account_id` (None: unbinding) to `row`, or None when it may: a 403 unless the caller is
     the org admin (the account's key is billable, as the install is theirs), a 422 unless `row` is a registry agent
     and the account an enabled API-key account of the row's org whose pair the org's provider grid runs."""
-    if not principal.is_org_admin:
-        raise HTTPException(status_code=403, detail="Only an org admin can bind a key account to an agent")
+    require_org_admin(principal, detail="Only an org admin can bind a key account to an agent")
     if not acp_registry.is_registry(row):
         return _refused(agent_bundles.SnapshotRefused([acp_registry.key_only_sentence(row)]))
     if account_id is None:
@@ -498,7 +503,7 @@ def _edit(
             session, user_id=user.id, repo_url=row.repo_url, subpath=new_subpath, ref=new_ref,
             retry=_REGISTER_RETRY,
         )
-        if agent_bundles.slug_taken(session, row.org_id, snapshot.manifest.name, other_than=row.id):
+        if slug_taken(session, Agent, snapshot.manifest.name, where=(Agent.org_id == row.org_id,), exclude=row.id):
             raise agent_bundles.SnapshotRefused([agent_bundles.slug_taken_sentence(snapshot.manifest.name)])
         agent_bundles.refuse_secret_env(snapshot.manifest.to_json(), env)
         key = agent_bundles.store_bundle(row.id, snapshot)
@@ -515,11 +520,11 @@ def _edit(
 
 @router.delete("/api/agents/{agent_id}", status_code=204, dependencies=_ON_PLAN)
 @feature("agents", "edit")
+@on_session
 def delete_agent(
+    session: Session,
     agent_id: str,
-    user: AdminUser = Depends(require_user),
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> Response:
     """Delete an agent no task or project names; otherwise 409 naming the counts (disable it instead), and
     listing the first `_IN_USE_LISTED` of each the caller may see (`tasks: [{id, title}]`,
@@ -527,8 +532,8 @@ def delete_agent(
 
     The bundle objects stay in storage: the control plane holds no delete grant outside
     `task-attachments/`, and a run's recorded commit may still be read back."""
-    row = _org_agent(session, principal, agent_id)
-    _require_editor(principal, user, row)
+    row = _org_agent(session, caller.principal, agent_id)
+    _require_editor(caller.principal, caller.actor, row)
     tasks = int(session.scalar(select(func.count()).select_from(Task).where(Task.agent_id == row.id)) or 0)
     projects = int(
         session.scalar(select(func.count()).select_from(Project).where(Project.default_agent_id == row.id)) or 0
@@ -539,14 +544,14 @@ def delete_agent(
             "tasks": [
                 {"id": task_id, "title": title}
                 for task_id, title in session.execute(
-                    scoped_task_select(principal).with_only_columns(Task.id, Task.title)
+                    scoped_task_select(caller.principal).with_only_columns(Task.id, Task.title)
                     .where(Task.agent_id == row.id).order_by(Task.id.desc()).limit(_IN_USE_LISTED)
                 )
             ],
             "projects": [
                 {"id": project_id, "name": name}
                 for project_id, name in session.execute(
-                    scoped_project_select(principal, key=PROJECTS_VIEW_KEY).with_only_columns(Project.id, Project.name)
+                    scoped_project_select(caller.principal, key=PROJECTS_VIEW_KEY).with_only_columns(Project.id, Project.name)
                     .where(Project.default_agent_id == row.id)
                     .order_by(Project.name).limit(_IN_USE_LISTED)
                 )
@@ -570,25 +575,38 @@ def _in_use_sentence(name: str, tasks: int, projects: int) -> str:
 
 @router.post("/api/agents/{agent_id}/refresh", response_model=AgentOut, dependencies=_ON_PLAN)
 @feature("agents", "edit")
+@on_thread
 def refresh_agent(
+    session: Session,
     agent_id: str,
-    user: AdminUser = Depends(require_user),
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ):
     """Re-resolve the ref, re-snapshot, re-validate. A failure is recorded on the row as `resolve_error`,
     the last good snapshot keeps serving (DD4), and the sentences come back as a 422."""
-    row = _org_agent(session, principal, agent_id)
-    _require_editor(principal, user, row)
+    # The snapshot interleaves the reader's token (a rotation may wait on DBOS) with forge reads and the bundle
+    # put (`agent_bundles`): on a sync session of its own in a worker thread, never on the loop.
+    row = _org_agent(session, caller.principal, agent_id)
+    _require_editor(caller.principal, caller.actor, row)
     if acp_registry.is_registry(row):
         raise HTTPException(status_code=409, detail=acp_registry.pinned_sentence(row))
-    _require_cell(session, principal, row)
+    _require_cell(session, caller.principal, row)
     refused = agent_bundles.refresh(session, row, now=_now())
     wanted = row.slug
     if not _committed(session, row):
         return _refused(agent_bundles.SnapshotRefused([agent_bundles.slug_taken_sentence(wanted)]))
     if refused is not None:
         return _refused(refused)
+    session.refresh(row)
+    return _out(row)
+
+
+def _saved(session: Session, user: AdminUser, row: Agent) -> JSONResponse | AgentOut:
+    """The edited row stamped, committed and read back — or the slug-taken refusal when a concurrent
+    registration won the name. The one tail of both PATCH routes."""
+    stamp_actor(row, user)
+    wanted = row.slug
+    if not _committed(session, row):
+        return _refused(agent_bundles.SnapshotRefused([agent_bundles.slug_taken_sentence(wanted)]))
     session.refresh(row)
     return _out(row)
 
@@ -620,16 +638,25 @@ def _unrunnable_reason(row: Agent, persona: Optional[str]) -> Optional[str]:
 
 @router.get("/api/agents/choices", response_model=list[ChoiceOut])
 @feature("agents", "view")
-def agent_choices(
+async def agent_choices(
+    db: DbDep,
     persona: Optional[str] = Query(default=None),
-    _: AdminUser = Depends(require_user),
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> list[ChoiceOut]:
     """The one picker's entries. Built-ins are derived from `agent_providers.PROVIDERS` at read time (DD11),
     only those the org has an account for and its provider grid runs (`provider_auth_policy.provider_on_plan`); then the
     org's active agents and its enabled connectors whose own grid cell is on (`agent_resolution.cell_refusal`). An
     agent that cannot run `persona` (or at all) comes back disabled, with the reason."""
+    catalog = await _catalog_rows_async()
+    return await db.run_sync(_agent_choices, persona=persona, principal=caller.principal, catalog=catalog)
+
+
+def _agent_choices(
+    session: Session,
+    persona: Optional[str],
+    principal: Principal,
+    catalog: list[Agent],
+) -> list[ChoiceOut]:
     held = set(session.scalars(select(distinct(Account.provider)).where(Account.org_id == principal.org_id)))
     memo: dict = {}
     out = [
@@ -648,7 +675,7 @@ def agent_choices(
         .where(Agent.org_id == principal.org_id, Agent.is_catalog.is_(False), Agent.status == STATUS_ACTIVE)
         .order_by(Agent.display_name)
     )
-    catalog = [row for row, enabled in _visible_catalog(session, principal) if enabled]
+    catalog = [row for row, enabled in _visible_catalog(session, principal, catalog) if enabled]
     for row in [*own, *catalog]:
         if agent_resolution.cell_refusal(session, row, principal.org_id) is not None:
             continue  # its row is off the org's grid: not offered (an existing pick is named at dispatch)
@@ -670,26 +697,44 @@ _CATALOG_REF_SENTENCE = "A catalog connector is pinned to the reviewed commit: `
 
 @router.get("/api/agent-catalog", response_model=list[AgentOut], dependencies=_ON_PLAN)
 @feature("agents", "view")
-def list_catalog(
-    _: AdminUser = Depends(require_user),
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
+async def list_catalog(
+    db: DbDep,
+    caller: AsyncCaller = Depends(current_caller),
 ) -> list[AgentOut]:
     """Every active connector with this org's enabled flag; a removed one only where this org enabled it. An
     operator's org filter picks whose flags (`_enabled_ids`)."""
-    return [_out(row, enabled=enabled) for row, enabled in _visible_catalog(session, principal, listed=True)]
+    catalog = await _catalog_rows_async()
+    return await db.run_sync(_list_catalog, principal=caller.principal, catalog=catalog)
+
+
+def _list_catalog(
+    session: Session,
+    principal: Principal,
+    catalog: list[Agent],
+) -> list[AgentOut]:
+    return [_out(row, enabled=enabled) for row, enabled in _visible_catalog(session, principal, catalog, listed=True)]
 
 
 @router.post("/api/agent-catalog/{agent_id}/enable", response_model=AgentOut, dependencies=_SDK_ON_PLAN)
 @feature("agents", "edit")
-def enable_catalog_agent(
+async def enable_catalog_agent(
     agent_id: str,
-    user: AdminUser = Depends(require_user),
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
+    db: DbDep,
+    caller: AsyncCaller = Depends(current_caller),
 ) -> AgentOut:
-    _require_org_editor(principal)
-    row, enabled = _catalog_row(session, principal, agent_id)
+    catalog = await _catalog_rows_async()
+    return await db.run_sync(_enable_catalog_agent, agent_id=agent_id, user=caller.actor, principal=caller.principal, catalog=catalog)
+
+
+def _enable_catalog_agent(
+    session: Session,
+    agent_id: str,
+    user: AdminUser,
+    principal: Principal,
+    catalog: list[Agent],
+) -> AgentOut:
+    require_org_key(principal, _EDIT_KEY, detail=_ORG_EDIT)
+    row, enabled = _catalog_row(session, principal, agent_id, catalog)
     if row.status != STATUS_ACTIVE:
         raise HTTPException(status_code=409, detail=f"{row.display_name} was removed from the catalog and cannot be enabled")
     if not enabled:
@@ -703,14 +748,23 @@ def enable_catalog_agent(
 
 @router.post("/api/agent-catalog/{agent_id}/disable", response_model=AgentOut, dependencies=_ON_PLAN)
 @feature("agents", "edit")
-def disable_catalog_agent(
+async def disable_catalog_agent(
     agent_id: str,
-    _: AdminUser = Depends(require_user),
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
+    db: DbDep,
+    caller: AsyncCaller = Depends(current_caller),
 ) -> AgentOut:
-    _require_org_editor(principal)
-    row, _enabled = _catalog_row(session, principal, agent_id)
+    catalog = await _catalog_rows_async()
+    return await db.run_sync(_disable_catalog_agent, agent_id=agent_id, principal=caller.principal, catalog=catalog)
+
+
+def _disable_catalog_agent(
+    session: Session,
+    agent_id: str,
+    principal: Principal,
+    catalog: list[Agent],
+) -> AgentOut:
+    require_org_key(principal, _EDIT_KEY, detail=_ORG_EDIT)
+    row, _enabled = _catalog_row(session, principal, agent_id, catalog)
     session.execute(
         delete(AgentEnablement).where(
             AgentEnablement.org_id == principal.org_id, AgentEnablement.agent_id == row.id
@@ -722,13 +776,16 @@ def disable_catalog_agent(
 
 @router.post("/api/agent-catalog", response_model=AgentOut, status_code=201, dependencies=_SDK_ON_PLAN)
 @superadmin_only(Tenancy.OPERATOR)
+@on_thread
 def publish_catalog_agent(
+    session: Session,
     body: AgentIn,
     user: AdminUser = Depends(require_operator),
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
+    principal: Principal = Depends(current_principal_async),
 ):
     """Publish a reviewed connector, pinned to an exact commit, read with the operator's own connection."""
+    # The snapshot interleaves the reader's token (a rotation may wait on DBOS) with forge reads and the bundle
+    # put (`agent_bundles`): on a sync session of its own in a worker thread, never on the loop.
     if not is_commit_sha(body.ref.strip()):
         return _refused(agent_bundles.SnapshotRefused([_CATALOG_REF_SENTENCE]))
     # The operator's own org: `require_operator` holds it to the operator plane, where the catalog lives.
@@ -737,15 +794,18 @@ def publish_catalog_agent(
 
 @router.patch("/api/agent-catalog/{agent_id}", response_model=AgentOut, dependencies=_ON_PLAN)
 @superadmin_only(Tenancy.OPERATOR)
+@on_thread
 def update_catalog_agent(
+    session: Session,
     agent_id: str,
     body: CatalogPatch,
     user: AdminUser = Depends(require_operator),
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
+    principal: Principal = Depends(current_principal_async),
 ):
     """Withdraw (`removed`) or restore (`active`) a connector, and/or move it to another exact commit. A
     withdrawn connector keeps its enablements, so those orgs see it marked rather than vanished."""
+    # The snapshot interleaves the reader's token (a rotation may wait on DBOS) with forge reads and the bundle
+    # put (`agent_bundles`): on a sync session of its own in a worker thread, never on the loop.
     row = row_by_uuid_or_404(session, Agent, agent_id, detail="no such connector")
     if not row.is_catalog:
         raise HTTPException(status_code=404, detail="no such connector")
@@ -754,10 +814,5 @@ def update_catalog_agent(
         return result
     if body.status is not None:
         row.status = body.status
-    stamp_actor(row, user)
-    wanted = row.slug
-    if not _committed(session, row):
-        return _refused(agent_bundles.SnapshotRefused([agent_bundles.slug_taken_sentence(wanted)]))
-    session.refresh(row)
-    return _out(row)
+    return _saved(session, user, row)
 

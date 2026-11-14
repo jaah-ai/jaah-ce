@@ -13,12 +13,14 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from sqlalchemy import delete
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app import runner_causes
+from app.models.audit import ActivityEvent
 from app.models.identity import AdminUser
-from app.models.tasks import TaskQuestion
+from app.models.tasks import Task, TaskQuestion
+from app.task_artifacts import visible_artifact_clause
 from app.user_activity import record_task_note
 
 #: The note key a runner's own reason rides in (`record(detail=...)`).
@@ -86,6 +88,12 @@ CAUSES: tuple[str, ...] = (
     "balance",
     # The platform Bedrock account stopped working; the system paused the task until it recovers.
     "jaah_unavailable",
+    # The node refused the slot's clone at lease (authentication, repository not found), so no runner started
+    # (`routes/agent/slot_intents.py::_end_attempt_on_clone_refusal`, the `clone_refused` ack).
+    "clone_failed",
+    # The runner's own `task.wait` (`routes/agent/task_terminal.py::wait_task`): its work is owed only once another
+    # task ships, so its attempt ended refunded and the task waits on that prerequisite. Its sentence rides `detail`.
+    "waiting_on_task",
 )
 
 # ── The call sites' handles on that vocabulary ────────────────────────────────────────────────────
@@ -114,6 +122,8 @@ CAUSE_NODE_FAULT = "node_fault"
 CAUSE_LAUNCH_REFUNDED = "launch_refunded"
 CAUSE_BALANCE = "balance"
 CAUSE_JAAH_UNAVAILABLE = "jaah_unavailable"
+CAUSE_CLONE_FAILED = "clone_failed"
+CAUSE_WAITING_ON_TASK = "waiting_on_task"
 
 # ── The causes that mean "a session ended and this task's work did not" ───────────────────────────
 # Read by `routes/tasks/task_wire.py::_task_prior_session_ended`: whether the next runner is starting or resuming.
@@ -134,6 +144,7 @@ RESTART_HINT_CAUSES: frozenset[str] = frozenset({
     CAUSE_NODE_FAULT,
     CAUSE_BALANCE,
     CAUSE_JAAH_UNAVAILABLE,
+    CAUSE_WAITING_ON_TASK,
 })
 
 # The prefix every label shares, so the feed reads uniformly whatever stopped the runner.
@@ -171,6 +182,8 @@ CAUSE_LABELS: dict[str, str] = {
     "superseded": "superseded, the branch moved on",
     "balance": "paused, balance below floor",
     "jaah_unavailable": "paused, Jaah account unavailable",
+    "clone_failed": "the node could not clone the repository",
+    "waiting_on_task": "waiting on another task",
 }
 
 
@@ -204,8 +217,8 @@ def record(
     `cause` is stored rather than rejected so the write never fails its transition.
 
     Also drops undelivered questions (`drop_undelivered_questions`), except for causes whose own path
-    retires them (`_QUESTIONS_RETIRED_ELSEWHERE`). `launch_unannounced` is charged only from `ready`,
-    where no round can be open.
+    retires them (`_QUESTIONS_RETIRED_ELSEWHERE`) and causes that keep them for a later run
+    (`_QUESTIONS_KEPT_ANSWERABLE`). `launch_unannounced` is charged only from `ready`, where no round can be open.
 
     `node` (a node uuid) is recorded where the runner ran, for the per-node launch count
     (`app/launch_failures.py`); absent when the caller does not know it. `detail` is the runner's own
@@ -233,17 +246,24 @@ def record(
 # (`tests/test_tasks_routes_transitions.py::test_reset_hides_every_question_round_but_keeps_the_rows`).
 _QUESTIONS_RETIRED_ELSEWHERE: frozenset[str] = frozenset({CAUSE_OPERATOR_RESET})
 
-# Causes whose rounds must survive the runner: a runner stopped on an unanswered question leaves the row
-# `awaiting_response`, and the answer goes to a fresh runner via its prompt's Q&A trail.
-_QUESTIONS_KEPT_ANSWERABLE: frozenset[str] = frozenset({CAUSE_QUESTION_RUNNER_STOPPED})
+# Causes whose rounds must survive the runner, answerable with no session to deliver into: the answer, or the
+# still-open question, goes to the next runner via its prompt's Q&A trail (`routes/tasks/qa_render.py::_task_qa_trail`),
+# and that runner's claim retires what is still open (`routes/tasks/dispatch.py::claim_task_active_ready_by_id`).
+# * `question_runner_stopped`: the row stays `awaiting_response`; the last answer resumes it.
+# * `operator_stop` / `operator_preempt`: a human paused the work with its tree held for a resume; the rounds
+#   stay on the board and the human's Start (or the preemption's requeue) runs it again.
+_QUESTIONS_KEPT_ANSWERABLE: frozenset[str] = frozenset({
+    CAUSE_QUESTION_RUNNER_STOPPED, CAUSE_OPERATOR_STOP, CAUSE_OPERATOR_PREEMPT,
+})
 
 
 def drop_undelivered_questions(session: Session, task_id: int) -> None:
     """Hard-delete every still-`open` `task_questions` round on `task_id`. Does not commit — same
     transaction as the termination row and the state change.
 
-    An open round is answerable only by delivery into the live session that asked it; once that
-    session is gone the round is a permanent phantom gate (the board's `?`). Delete, not `dismissed`:
+    For the causes that do not keep the rounds (`_QUESTIONS_KEPT_ANSWERABLE`), an open round is answerable
+    only by delivery into the live session that asked it; once that session is gone the round is a
+    permanent phantom gate (the board's `?`). Delete, not `dismissed`:
     a dismissal records an operator declining to answer. The `task_note:question_raised` event keeps
     the history.
 
@@ -256,6 +276,42 @@ def drop_undelivered_questions(session: Session, task_id: int) -> None:
             TaskQuestion.status == "open",
         )
     )
+
+
+def drop_kept_questions(session: Session, task: Task) -> None:
+    """Hard-delete the visible rounds still `open` on `task` as a NEW runner claims it — the claim's half of
+    `_QUESTIONS_KEPT_ANSWERABLE` — or as an operator Complete closes the stopped row with no runner to end
+    (`routes/tasks/transitions.py::apply_complete`). Does not commit — the caller's transaction.
+
+    Such a round was asked by an earlier runner and kept past it. The new runner's prompt, composed before
+    the claim, carried it as unanswered (`routes/tasks/qa_render.py::_task_qa_trail`); left open, it would
+    hold this runner's own gate (`_settle_gate_if_nothing_outstanding` waits for every open round) and refuse
+    its settle. Only rounds asked at or before the task's latest `operator_stop`/`operator_preempt` row: those
+    are the ones a Stop kept, and any other open round is not this claim's to retire. Reset-hidden rounds stay
+    as history (`_QUESTIONS_RETIRED_ELSEWHERE`). The `task_note:question_raised` event keeps the asking."""
+    stopped_at = (
+        select(func.max(ActivityEvent.created_at))
+        .where(
+            ActivityEvent.kind == f"task_note:{NOTE_ACTION}",
+            ActivityEvent.data["id"].astext == str(task.id),
+            ActivityEvent.data["cause"].astext.in_(sorted(_STOP_CAUSES_KEEPING_ROUNDS)),
+        )
+        .scalar_subquery()
+    )
+    session.execute(
+        delete(TaskQuestion).where(
+            TaskQuestion.task_id == task.id,
+            TaskQuestion.status == "open",
+            visible_artifact_clause(TaskQuestion.created_at, task.artifacts_hidden_before),
+            # No such row: NULL, so nothing is deleted.
+            TaskQuestion.created_at <= stopped_at,
+        )
+    )
+
+
+# The `_QUESTIONS_KEPT_ANSWERABLE` causes whose rounds a later claim retires (`drop_kept_questions`). Not
+# `question_runner_stopped`: its row resumes only once every round is answered, so none is open at the claim.
+_STOP_CAUSES_KEEPING_ROUNDS: frozenset[str] = frozenset({CAUSE_OPERATOR_STOP, CAUSE_OPERATOR_PREEMPT})
 
 
 def record_many(

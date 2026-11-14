@@ -21,7 +21,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 from uuid import UUID
 
 from sqlalchemy import Float, case, cast, delete, extract, func, literal, null, select, true
@@ -32,10 +32,12 @@ from sqlalchemy.orm import Session
 
 from app.agent_sessions import STATUS_RUNNING
 from app.clock import as_utc
+from app.db import excluded_of
 from app.entity_shape import float_or_none
 from app.models.agent_sessions import AgentSession
 from app.models.nodes import Node, NodeHostMetric
 from app.models.worktrees import VirtualNode
+from app.node_identity import is_uuid_shaped
 
 # ── The storage grain ─────────────────────────────────────────────────────────────
 # One row per node per minute: ~12 observation posts (every ~5s) collapse into one row via
@@ -184,6 +186,8 @@ class LatestReading:
     psi_mem_pct: Optional[float] = None
     psi_io_pct: Optional[float] = None
     top_processes: Optional[list] = None
+    # The OS's reboot-required flag (`/var/run/reboot-required`) as last reported; `None` is "said nothing".
+    reboot_required: Optional[bool] = None
 
     @property
     def stale_bound_seconds(self) -> float:
@@ -389,9 +393,10 @@ def _bucket_expr(moment: Any, width_secs: float):
     return func.to_timestamp(func.floor(epoch / width) * width)
 
 
-def _db_now_minus(seconds: float):
+def db_now_minus(seconds: float):
     """`now() - <seconds>` on the database's clock, the same clock that wrote the stamps; spelled with
-    `to_timestamp` so the constant stays a bound parameter."""
+    `to_timestamp` so the constant stays a bound parameter. The launch gates' window bound too
+    (`launch_gates`): one spelling of "the recent buckets"."""
     return func.to_timestamp(
         cast(extract("epoch", func.now()), Float(precision=53)) - _seconds(seconds)
     )
@@ -399,10 +404,20 @@ def _db_now_minus(seconds: float):
 
 # ── The two writers (statements only — the caller's transaction executes them) ────
 
-# The scalar pressure columns, written straight off the block; named once for both arms.
+# The per-reading columns, named once for every arm that restates them: the upsert's INSERT and its
+# conflict SET, `latest_map`'s lateral SELECT and the `LatestReading` it builds. The split is the wire's:
+# `_REQUIRED_COLUMNS` every block carries (`fleet_observe.HostMetricsIn`'s required fields), the rest are
+# optional there and absent means "said nothing" (`NodeHostMetric`'s `None`). The scalar pressure signals
+# are `_SIGNAL_COLUMNS`; `last_upgrade_at` is written but not read back into `LatestReading`, and
+# `reboot_required`/`top_processes` are read back outside the reading columns.
+_REQUIRED_COLUMNS = ("cpu_pct", "mem_pct", "cpu_count", "mem_total_kb", "window_secs", "samples")
 _SIGNAL_COLUMNS = (
     "load_1", "load_5", "load_15", "swap_total_kb", "swap_free_kb", "psi_cpu_pct", "psi_mem_pct", "psi_io_pct",
 )
+_OPTIONAL_COLUMNS = (
+    "disk_free_kb", "disk_total_kb", "tmp_inodes_free", "tmp_inodes_total", "net_rx_bps", "net_tx_bps",
+) + _SIGNAL_COLUMNS
+_READING_COLUMNS = _REQUIRED_COLUMNS + _OPTIONAL_COLUMNS
 
 
 def _own_processes(node_uuid: UUID, processes: Optional[list]):
@@ -442,53 +457,33 @@ def upsert_statement(node_uuid: UUID, block: Any):
     insert = pg_insert(NodeHostMetric).values(
         node_id=node_uuid,
         # Named here: a `pg_insert` is invisible to the write seam's `stamp_org`
-        # (`fleet_verdicts._persist_intents` has the argument). A subquery keeps the builder
+        # (`fleet_verdicts._persist_kwargs` has the argument). A subquery keeps the builder
         # session-free; the `(node_id, org_id)` FK accepts only the node's own value.
         org_id=select(Node.org_id).where(Node.id == node_uuid).scalar_subquery(),
         bucket_at=_bucket_expr(func.now(), BUCKET_SECS),
-        cpu_pct=block.cpu_pct,
-        mem_pct=block.mem_pct,
-        cpu_count=block.cpu_count,
-        mem_total_kb=block.mem_total_kb,
-        window_secs=block.window_secs,
-        samples=block.samples,
+        # No fallback: a block without a required column is a caller bug, and raises while building.
+        **{key: getattr(block, key) for key in _REQUIRED_COLUMNS},
         # `getattr` with a `None` fallback: duck-typed callers (fixtures, replays) may lack the newest
         # fields, and absent means "said nothing".
-        disk_free_kb=getattr(block, "disk_free_kb", None),
-        disk_total_kb=getattr(block, "disk_total_kb", None),
-        tmp_inodes_free=getattr(block, "tmp_inodes_free", None),
-        tmp_inodes_total=getattr(block, "tmp_inodes_total", None),
-        net_rx_bps=getattr(block, "net_rx_bps", None),
-        net_tx_bps=getattr(block, "net_tx_bps", None),
+        **{key: getattr(block, key, None) for key in _OPTIONAL_COLUMNS},
         reboot_required=getattr(block, "reboot_required", None),
         last_upgrade_at=None if epoch is None else datetime.fromtimestamp(epoch, tz=timezone.utc),
-        **{key: getattr(block, key, None) for key in _SIGNAL_COLUMNS},
         top_processes=_own_processes(node_uuid, _entries_json(getattr(block, "top_processes", None))),
         updated_at=func.now(),
     )
+    excluded = excluded_of(NodeHostMetric.__table__)
     return insert.on_conflict_do_update(
         index_elements=[NodeHostMetric.node_id, NodeHostMetric.bucket_at],
         set_={
-            "cpu_pct": insert.excluded.cpu_pct,
-            "mem_pct": insert.excluded.mem_pct,
-            "cpu_count": insert.excluded.cpu_count,
-            "mem_total_kb": insert.excluded.mem_total_kb,
-            "window_secs": insert.excluded.window_secs,
-            "samples": insert.excluded.samples,
-            "disk_free_kb": insert.excluded.disk_free_kb,
-            "disk_total_kb": insert.excluded.disk_total_kb,
-            "tmp_inodes_free": insert.excluded.tmp_inodes_free,
-            "tmp_inodes_total": insert.excluded.tmp_inodes_total,
-            "net_rx_bps": insert.excluded.net_rx_bps,
-            "net_tx_bps": insert.excluded.net_tx_bps,
-            "reboot_required": insert.excluded.reboot_required,
-            "last_upgrade_at": insert.excluded.last_upgrade_at,
-            **{key: getattr(insert.excluded, key) for key in _SIGNAL_COLUMNS + ("top_processes",)},
+            **{
+                key: excluded[key]
+                for key in _READING_COLUMNS + ("reboot_required", "last_upgrade_at", "top_processes")
+            },
             # Set explicitly: raw SQL bypasses the ORM's `onupdate=`.
             "updated_at": func.now(),
             # Coalesced, never re-stamped: a node's org is immutable (`app/tenancy/node_org.py`), so
             # this only repairs a NULL row.
-            "org_id": func.coalesce(NodeHostMetric.org_id, insert.excluded.org_id),
+            "org_id": func.coalesce(NodeHostMetric.org_id, excluded.org_id),
         },
     )
 
@@ -501,11 +496,21 @@ def prune_statement(node_uuid: UUID):
     is deleted (CASCADE)."""
     return delete(NodeHostMetric).where(
         NodeHostMetric.node_id == node_uuid,
-        NodeHostMetric.bucket_at < _db_now_minus(RETENTION_SECONDS),
+        NodeHostMetric.bucket_at < db_now_minus(RETENTION_SECONDS),
     )
 
 
 # ── The two readers ──────────────────────────────────────────────────────────────
+
+
+def blocked_node_ids(
+    session: Session, node_ids: Iterable[str], judge: Callable[[Session, Iterable[UUID]], dict],
+) -> frozenset[str]:
+    """Which of these node uuid strings `judge` (one read over all of them, `{uuid: figure}`) holds: the launch
+    gates' placement answer. A non-uuid entry is never blocked: it fails open, like a missing reading."""
+    ids = {node_id: UUID(node_id) for node_id in node_ids if is_uuid_shaped(node_id)}
+    held = judge(session, ids.values())
+    return frozenset(node_id for node_id, node_uuid in ids.items() if node_uuid in held)
 
 def latest_map(
     session: Session, node_uuids: Iterable[UUID], *, with_processes: bool = False
@@ -528,20 +533,9 @@ def latest_map(
         select(
             NodeHostMetric.node_id,
             NodeHostMetric.bucket_at,
-            NodeHostMetric.cpu_pct,
-            NodeHostMetric.mem_pct,
-            NodeHostMetric.cpu_count,
-            NodeHostMetric.mem_total_kb,
-            NodeHostMetric.window_secs,
-            NodeHostMetric.samples,
-            NodeHostMetric.disk_free_kb,
-            NodeHostMetric.disk_total_kb,
-            NodeHostMetric.tmp_inodes_free,
-            NodeHostMetric.tmp_inodes_total,
-            NodeHostMetric.net_rx_bps,
-            NodeHostMetric.net_tx_bps,
-            *(getattr(NodeHostMetric, key) for key in _SIGNAL_COLUMNS),
+            *(getattr(NodeHostMetric, key) for key in _READING_COLUMNS),
             (NodeHostMetric.top_processes if with_processes else null()).label("top_processes"),
+            NodeHostMetric.reboot_required,
             cast(
                 extract("epoch", func.now() - NodeHostMetric.bucket_at), Float(precision=53)
             ).label("age_seconds"),
@@ -556,21 +550,10 @@ def latest_map(
         row.node_id: LatestReading(
             node_id=row.node_id,
             bucket_at=row.bucket_at,
-            cpu_pct=row.cpu_pct,
-            mem_pct=row.mem_pct,
-            cpu_count=row.cpu_count,
-            mem_total_kb=row.mem_total_kb,
-            window_secs=row.window_secs,
-            samples=row.samples,
             age_seconds=row.age_seconds,
-            disk_free_kb=row.disk_free_kb,
-            disk_total_kb=row.disk_total_kb,
-            net_rx_bps=row.net_rx_bps,
-            net_tx_bps=row.net_tx_bps,
-            tmp_inodes_free=row.tmp_inodes_free,
-            tmp_inodes_total=row.tmp_inodes_total,
-            **{key: getattr(row, key) for key in _SIGNAL_COLUMNS},
+            **{key: getattr(row, key) for key in _READING_COLUMNS},
             top_processes=row.top_processes,
+            reboot_required=row.reboot_required,
         )
         for row in rows
     }
@@ -586,7 +569,7 @@ def window_bounds(session: Session, *, hours: float) -> tuple[datetime, datetime
     The client supplies no domain and does no clock arithmetic. A node with no rows still gets real bounds."""
     row = session.execute(
         select(
-            _db_now_minus(hours * 60.0 * 60.0).label("window_start"),
+            db_now_minus(hours * 60.0 * 60.0).label("window_start"),
             func.now().label("window_end"),
         )
     ).one()
@@ -653,7 +636,7 @@ def series(session: Session, node_uuid: UUID, *, hours: float) -> list[SeriesPoi
         )
         .where(
             NodeHostMetric.node_id == node_uuid,
-            NodeHostMetric.bucket_at >= _db_now_minus(hours * 60.0 * 60.0),
+            NodeHostMetric.bucket_at >= db_now_minus(hours * 60.0 * 60.0),
         )
         # Grouped and ordered by the same expression object as the label, so they cannot diverge.
         .group_by(bucket)

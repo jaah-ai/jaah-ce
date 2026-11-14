@@ -16,7 +16,7 @@
 # lays out the runtime tree, then drops each process to its uid.
 
 # ── the node bundle, staged as a packaged node holds it (node/stage_bundle.py) ─────────────────────────────────
-FROM --platform=linux/amd64 python:3.14-slim-trixie@sha256:cd89c30eda26ee911a4611b18680086e0ea42e6f5f8cbe653d07fa7958c9cec8 AS bundle
+FROM --platform=linux/amd64 python:3.14-slim-trixie@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f AS bundle
 WORKDIR /src
 COPY . .
 # The launchers are rendered for the venv's interpreter, built in the final stage below: the path is a string in each
@@ -24,10 +24,10 @@ COPY . .
 RUN python3 node/stage_bundle.py /src /stage /usr/lib/jaahd/venv/bin/python3
 
 # ── Node.js, for the npm-installed CLIs ────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/amd64 node:24-trixie-slim@sha256:54f84b4cf8432b21aaffd5d3ce8d41e12cea0d10d33c09d2f3c9879d49d6b446 AS node
+FROM --platform=linux/amd64 node:24-trixie-slim@sha256:0820eaa85e07d0490446dd01d14707e17e6108a36988cf374899cd057eb3812d AS node
 
 # ── the node ───────────────────────────────────────────────────────────────────────────────────────────────────
-FROM --platform=linux/amd64 python:3.14-slim-trixie@sha256:cd89c30eda26ee911a4611b18680086e0ea42e6f5f8cbe653d07fa7958c9cec8
+FROM --platform=linux/amd64 python:3.14-slim-trixie@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git tmux procps ca-certificates curl unzip xz-utils \
  && rm -rf /var/lib/apt/lists/*

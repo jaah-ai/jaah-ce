@@ -2,6 +2,7 @@
 // boundary decisions (no `state` on create; absent `tag` derives the code; reorder takes the whole list).
 
 import { del, get, post, put } from '../../../api'
+import { commonRefusalField } from '../../../hooks/useSubmit'
 import type { Tag, TagGroup } from '../../../types'
 
 /** `GET /api/tags/groups/{id}/usage` and `/api/tags/{id}/usage` — QUERIED, never estimated. */
@@ -34,6 +35,13 @@ export type TagUpdateBody = {
   name?: string
   description?: string
 }
+
+/* The Settings list and the two record pages under it (`TagGroupEditPage`, `TagEditPage`). */
+export const TAGS_SETTINGS_URL = '/settings?area=tasks&section=tags'
+export const NEW_TAG_GROUP_URL = '/settings/tags/new'
+export const tagGroupUrl = (groupId: string) => `/settings/tags/${encodeURIComponent(groupId)}`
+export const newTagUrl = (groupId: string) => `${tagGroupUrl(groupId)}/tags/new`
+export const tagUrl = (groupId: string, tagId: string) => `${tagGroupUrl(groupId)}/tags/${encodeURIComponent(tagId)}`
 
 /** `?include_draft=true` is allowed for `tags:view` OR superadmin on top of `tasks:view`
  *  (`apps/api/app/routes/tags.py`; its docstring says why). */
@@ -77,8 +85,6 @@ export function fieldForDetail(detail: string): TagFormField | null {
   if (/^a tag group named/.test(detail)) return 'name'
   if (/cannot become single-select/.test(detail)) return 'multi_select'
   if (/cannot be activated/.test(detail) || /^state /.test(detail)) return 'state'
-  if (/^name /.test(detail)) return 'name'
-  if (/^description /.test(detail)) return 'description'
   if (/^tag(?! group)/.test(detail) || /no tag code can be derived/.test(detail)) return 'tag'
-  return null
+  return commonRefusalField(detail)
 }

@@ -1,21 +1,27 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Link as RouterLink, useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 import Box from '@mui/material/Box'
-import Button from '@mui/material/Button'
-import Typography from '@mui/material/Typography'
 import useMediaQuery from '@mui/material/useMediaQuery'
-import { ApiError, apiDetail } from '../../api'
+import { ApiError } from '../../api'
 import { useAuth, useCan } from '../../auth'
 import { isEnabled } from '../../lib/editionFeatures'
 import { useChangeOrgAction } from '../../components/ChangeOrgDialog'
-import { useConfirm } from '../../components/ConfirmDialog'
+import { danger, useConfirm } from '../../components/ConfirmDialog'
 import { useOpenDetailPath } from '../../components/ListDetail'
 import { useDebouncedCallback } from '../../hooks/useDebouncedCallback'
-import { credentialFeedRow, credentialTypeSlotWidth, DESCRIPTION_QUERY } from '../../lib/credentialRow'
-import { CompactVerbLabel, compactVerbProps } from '../../ui/CompactVerb'
+import { usePagedList } from '../../hooks/usePagedList'
+import {
+  CREDENTIAL_SLOT_COLUMNS,
+  CREDENTIAL_TITLE_COLUMN,
+  credentialFeedRow,
+  credentialTypeSlotWidth,
+  DESCRIPTION_QUERY,
+} from '../../lib/credentialRow'
+import NewButton from '../../ui/NewButton'
 import { useOrgVisible, useOtherOrgOf } from '../../ui/OrgIndicator'
 import { actAsOnce } from '../../lib/actAs'
 import CredentialTreeView from './CredentialTreeView'
+import { deletesLastGithub, withLastGithubWarning } from './lastGithubWarning'
 import {
   clearCredentialFilters,
   CREDENTIAL_VIEW_ONLY_FIELDS,
@@ -30,9 +36,9 @@ import Banner from '../../ui/Banner'
 import EmptyState from '../../ui/EmptyState'
 import NoMatchesState from '../../ui/NoMatchesState'
 import ListStates from '../../ui/feed/ListStates'
-import type { FeedRowSpec } from '../../ui/feed/types'
+import type { FeedColumns, FeedRowSpec } from '../../ui/feed/types'
 import { CREDENTIALS_LIST_CONTAINER_SX, CREDENTIALS_TYPE_UNDER, tapTargetSx } from '../../ui/listStyles'
-import { Pager } from '../../ui/Pager'
+import { LoadMoreFooter } from '../../ui/PagedList'
 import PageHeader from '../../ui/PageHeader'
 import SortMenu, { type SortMenuColumn } from '../../ui/SortMenu'
 import { useCredentialBulk } from './CredentialBulk'
@@ -40,6 +46,7 @@ import CredentialFilterStrip, {
   useCredentialFilterRosters,
 } from './CredentialFilterStrip'
 import { useCredentialTypes } from './useCredentialTypes'
+import { testsCredentials } from './ownership'
 import {
   deleteCredential,
   listCredentials,
@@ -58,12 +65,12 @@ import {
 // enumerates them.
 //
 // The row is `lib/credentialRow.tsx`'s, the single home for every column decision. This page
-// owns the fetch, pager, delete confirmation, permission reads and the one viewport decision the row
+// owns the fetch, Load more footer, delete confirmation, permission reads and the one viewport decision the row
 // builder cannot make (`DESCRIPTION_QUERY`, a hook).
 //
 // Tree mode (lazy-loaded) is `./CredentialTreeView.tsx`: the server lists one level per
 // request (tenants, homes, folders), so the tree is never a slice of the roster. This page owns the flat fetch and
-// whether the pager is drawn, and lends the tree its row deps, its writes and their re-read. Naming is untouched:
+// whether the footer is drawn, and lends the tree its row deps, its writes and their re-read. Naming is untouched:
 // the tree is a VIEW over names; dragging RENAMES, one `PATCH /api/credentials/{id}`.
 
 /** Skeleton rows while loading: a handful, not `PER_PAGE`, so the page does not SHRINK on settle. */
@@ -110,39 +117,16 @@ function nextSort(current: CredentialSort, key: SortKey): CredentialSort {
   return current === 'newest' ? 'oldest' : 'newest'
 }
 
-/** `1–25 of 1,234`, or `26–50 of 10,000+` where keyset paging capped the count (`total_capped`); a whole
- *  uncapped roster is its bare count. */
-function rosterRange(shown: { first: number; last: number }, total: number, capped: boolean): string {
-  if (shown.first === 1 && shown.last === total && !capped) return total.toLocaleString()
-  return `${shown.first.toLocaleString()}–${shown.last.toLocaleString()} of ${total.toLocaleString()}${capped ? '+' : ''}`
-}
-
-/** `1–25 of 1,234` and the order menu, on one line above the rows. The Org order only where the viewer sees
- *  tenants (`useOrgVisible`): a tenant's roster is one org. */
-function RosterSummary({ range, sort, onSort, showOrg }: {
-  range: string
-  sort: CredentialSort
-  onSort: (sort: CredentialSort) => void
-  showOrg: boolean
-}) {
-  return (
-    <Box data-testid="credentials-summary" sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1, mt: 0.5 }}>
-      <Typography variant="body2" sx={{ color: 'text.secondary' }}>{range}</Typography>
-      <SortMenu
-        noun="secrets"
-        columns={showOrg ? SORT_COLUMNS : SORT_COLUMNS.filter(column => column.key !== 'org')}
-        // A stored `org` order with no Org item (no longer an operator) reads as Name: one org orders the same.
-        sort={sortMenuState(!showOrg && sort === 'org' ? 'name' : sort)}
-        onSort={key => onSort(nextSort(sort, key))}
-      />
-    </Box>
-  )
+/* A header press on Name, Type or Org orders by it (the route sorts those A–Z only); pressing the sorted one again
+   returns to the default, newest first. */
+function headerSort(current: CredentialSort, key: string): CredentialSort {
+  return current === key ? 'newest' : (key as CredentialSort)
 }
 
 /** Tree mode's stand-in for the flat rows: a module constant (stable identity, no allocation). */
 const NO_ROWS: FeedRowSpec[] = []
 
-/** Does this patch touch ONLY how the roster is drawn (no pager reset, request or debounce)? Which fields
+/** Does this patch touch ONLY how the roster is drawn (no restart, request or debounce)? Which fields
  *  those are is `CREDENTIAL_VIEW_ONLY_FIELDS`'s (shared with `hasActiveCredentialFilters` and
  *  `clearCredentialFilters`). A mixed patch counts as a filter change (re-fetch is the safe answer); an
  *  empty patch answers `true` and does nothing. */
@@ -151,22 +135,12 @@ function isViewOnlyPatch(patch: Partial<CredentialView>): boolean {
   return keys.every(key => CREDENTIAL_VIEW_ONLY_FIELDS.includes(key))
 }
 
+/** `view` with a "Last test failed" narrowing dropped for a viewer who cannot test; the same object otherwise. */
+function withoutTestFilter(view: CredentialView, showTest: boolean): CredentialView {
+  return showTest || view.health !== 'test_failed' ? view : { ...view, health: '' }
+}
+
 export default function Credentials() {
-  const [items, setItems] = useState<Credential[]>([])
-  const [total, setTotal] = useState(0)
-  /* KEYSET PAGING: the API serves `next_cursor` and no previous one, so the page holds the stack of
-     cursors it walked — `[null]` is page 1, Previous pops, Next pushes. A reload lands on page 1 (there is no
-     "jump to page N"). Tree mode reads its own levels and ignores the stack, so switching modes keeps Flat's place. */
-  const [cursors, setCursors] = useState<(string | null)[]>([null])
-  const page = cursors.length
-  const cursor = cursors[cursors.length - 1]
-  const [nextCursor, setNextCursor] = useState<string | null>(null)
-  const [totalCapped, setTotalCapped] = useState(false)
-  /* The ordinal of the first row held — set with the rows, so the range never pairs one page's rows with
-     another's number (a mode switch or a stale-cursor restart re-renders before the fetch lands). */
-  const [firstShown, setFirstShown] = useState(1)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
   const [busyId, setBusyId] = useState<string | null>(null)
   const can = useCan()
   const { admin } = useAuth()
@@ -197,12 +171,17 @@ export default function Credentials() {
     () => loadCredentialView(admin?.id ?? null),
     next => saveCredentialView(admin?.id ?? null, next),
   )
-  const { view, toggleGroup } = listView
+  /* A viewer who can never test sees no test-only control (`./ownership.ts::testsCredentials`); a "Last test
+     failed" filter stored before that changed reads as none, so nothing narrows the list invisibly. */
+  const showTest = testsCredentials(admin, can('credentials:edit'))
+  const view = withoutTestFilter(listView.view, showTest)
+  const { toggleGroup } = listView
   /* The tree's own writes to the open set (a reveal, the silent drop): the list view's patch (view-only), not the
-     page's `patchView`, which also moves the pager. Stable, so the tree's effect does not re-run per render. */
+     page's `patchView`, which also re-reads the roster. Stable, so the tree's effect does not re-run per render. */
   const patchListView = listView.patchView
   const setExpanded = useCallback((expanded: string[]) => { patchListView({ expanded }) }, [patchListView])
-  const [appliedView, setAppliedView] = useState<CredentialView>(view)
+  const [rawAppliedView, setAppliedView] = useState<CredentialView>(view)
+  const appliedView = withoutTestFilter(rawAppliedView, showTest)
 
   /* The hook reads its callback from a ref at fire time, so it sees the LATEST `view`. */
   const { trigger: scheduleSearch, cancel: cancelSearch } = useDebouncedCallback(
@@ -214,29 +193,18 @@ export default function Credentials() {
   /* ── Tree mode: `treeMode` is read off `view`, never `appliedView` (debouncing the toggle would lag
      it); filters still come from `appliedView`. The tree fetches its own levels: the flat page is not read. */
   const treeMode = view.mode === 'tree'
-  const per = PER_PAGE
 
-  /* One writer for every control: the view moves, the pager resets (R2.7 — page 4 of a two-page result is
-     blank), and the change persists. Only Search is debounced.
-     The five FILTERS reset the pager and re-fetch; `mode`/`expanded` (view-only, per
-     `hasActiveCredentialFilters`) must not reset the pager, apply a pending search, or re-fetch. */
+  /* One writer for every control: the view moves, the roster restarts at its first page (R2.7), and the change
+     persists. Only Search is debounced.
+     The five FILTERS and the order re-fetch; `mode`/`expanded` (view-only, per `hasActiveCredentialFilters`) must
+     not apply a pending search or re-fetch — `appliedView` is deliberately NOT touched: `next` carries the
+     unapplied `q`, and nothing reads view fields off `appliedView`. `view` is their one home. */
   function patchView(patch: Partial<CredentialView>) {
     const next = listView.patchView(patch)
+    if (treeMode && patch.mode === 'flat') setFlatVisit(visit => visit + 1)
 
-    if (isViewOnlyPatch(patch)) {
-      /* Tree ignores the cursor stack, so Flat's page waits there untouched. `expanded` alone touches nothing. */
-      if (patch.mode !== undefined && patch.mode !== view.mode) {
-        /* Mark loading in the same commit as the flip: back in Flat, the page fetched afresh paints, never the
-           page Flat left behind. */
-        setLoading(true)
-      }
-      /* `appliedView` is deliberately NOT touched: `next` carries the unapplied `q`, and nothing reads view
-         fields off `appliedView`. `view` is their one home. */
-      return
-    }
+    if (isViewOnlyPatch(patch)) return
 
-    /* Back to page 1, in Tree mode too: a cursor belongs to the filters it was minted under. */
-    setCursors([null])
     if ('q' in patch && Object.keys(patch).length === 1) {
       scheduleSearch()
       return
@@ -246,98 +214,71 @@ export default function Credentials() {
     setAppliedView(next)
   }
 
-  /* Back to the whole roster in one gesture, via the same writer (pager resets, cleared view persists). */
+  /* Back to the whole roster in one gesture, via the same writer (the roster restarts, the cleared view persists). */
   function clearFilters() {
     /* The narrowings only (`lib/credentialFilterStorage.ts`'s `clearCredentialFilters`): the default view
        would also drop Tree mode and collapse folders. */
     patchView(clearCredentialFilters(view))
   }
 
-  /* The roster request with its signal: the effect aborts the previous controller, and both tails check
-     `aborted` FIRST so a late superseded answer cannot write state (`ui/AsyncLookup`'s discipline, R2.9). */
-  const load = useCallback(async (signal?: AbortSignal) => {
-    // The tree reads its own levels (`CredentialTreeView`); Flat's page is fetched when Flat is back.
-    if (treeMode) return
-    try {
-      const data = await listCredentials(1, per, {
-        type: appliedView.type,
-        q: appliedView.q,
-        mine: appliedView.mine,
-        ownerIds: appliedView.ownerIds,
-        secrets: appliedView.secrets,
-        health: appliedView.health,
-        sort: appliedView.sort,
-        keyset: true,
-        cursor,
-        signal,
-      })
-      if (signal?.aborted) return
-      /* A later page gone empty (its rows deleted from the pane beside the list, or by someone else) steps back
-         rather than drawing "No secrets yet" with no pager to leave by. */
-      if (cursor !== null && data.items.length === 0) {
-        setCursors(current => current.slice(0, -1))
-        return
-      }
-      setItems(data.items)
-      setFirstShown((page - 1) * per + 1)
-      setTotal(data.total)
-      setTotalCapped(data.total_capped === true)
-      setNextCursor(data.next_cursor ?? null)
-      setError('')
-      setLoading(false)
-    } catch (err) {
-      if (signal?.aborted) return
-      /* A cursor the server no longer honours (422, "This page link is out of date") restarts at page 1, quietly:
-         the operator asked for rows, not for the reason a link went stale. Loading stays on through the restart. */
-      if (cursor !== null && err instanceof ApiError && err.status === 422) {
-        setCursors([null])
-        return
-      }
-      setError(apiDetail(err, 'Failed to load secrets'))
-      setLoading(false)
-    }
-    /* The six filter fields and the order one by one, NOT `appliedView` whole: its identity also changes on
-       `expanded`, which would re-fetch per group toggle. `treeMode` is listed: Flat's page is read on the way back. */
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    cursor,
-    page,
-    treeMode,
-    per,
-    appliedView.type,
-    appliedView.q,
-    appliedView.mine,
-    /* Joined: a new array of the same ids must not re-fetch. */
-    appliedView.ownerIds.join(','),
-    appliedView.secrets,
-    appliedView.health,
-    appliedView.sort,
-  ])
+  /* THE ROSTER READ (`hooks/usePagedList.ts`, keyset "Load more"), keyed on the request: the filter and order
+     fields, NOT `appliedView` whole (its identity also changes on `expanded`, which would re-read per group toggle).
+     Disabled in Tree mode (the tree reads its own levels); Flat's first page is re-read on the way back. Each answer
+     carries the filters it answers, so the rows alone never have to say whose they are — and the visit to Flat it
+     was read in: the rows Flat left may have been deleted or renamed in Tree. */
+  const { type, q, mine, ownerIds, secrets, health, sort } = appliedView
+  const [flatVisit, setFlatVisit] = useState(0)
+  const filterKey = JSON.stringify({ type, q, mine, ownerIds, secrets, health, flatVisit })
+  const restart = useRef(() => {})
+  const fetchPage = useCallback(
+    (cursor: string | null) =>
+      listCredentials(1, PER_PAGE, { type, q, mine, ownerIds, secrets, health, sort, keyset: true, cursor })
+        .then(list => ({ list, filterKey }), err => {
+          /* A cursor the server no longer honours (422, "This page link is out of date") restarts at page one,
+             quietly: the restart supersedes this read, so its error is never shown. */
+          if (cursor !== null && err instanceof ApiError && err.status === 422) restart.current()
+          throw err
+        }),
+    [type, q, mine, ownerIds, secrets, health, sort, filterKey],
+  )
+  const paging = usePagedList({
+    fetchPage,
+    rowsOf: page => page.list.items,
+    nextOf: page => page.list.next_cursor ?? null,
+    errorFallback: 'Failed to load secrets',
+    enabled: !treeMode,
+  })
+  const { rows: items, lastPage, loading, error, refresh } = paging
+  restart.current = () => void paging.reload()
+  const total = lastPage?.list.total ?? 0
+  const totalCapped = lastPage?.list.total_capped === true
+  /* ROWS THAT ANSWER THESE FILTERS STAY ON SCREEN while a read is in flight (a new order, a write's re-read, the
+     next page): the order controls are the header row's, and a skeleton unmounting it dropped the pressed header's
+     focus to the body. A new filter shows the skeleton instead (the held rows answer another question, and would
+     pair the new filter with the old total). */
+  const skeleton = loading && lastPage?.filterKey !== filterKey
+
+  /* A write's re-read, in whichever mode is up: Flat's loaded pages, its rows on screen until the fresh ones land
+     (page one alone would drop the place and the ticks below it); the tree's open levels in place (`reloads` is `CredentialTreeView`'s `reloadToken`). */
+  const [reloads, setReloads] = useState(0)
+  const reread = useCallback(() => {
+    if (treeMode) setReloads(n => n + 1)
+    else void refresh()
+  }, [treeMode, refresh])
 
   /* THE EDITOR BESIDE THE LIST CLOSING IS A RE-READ: this page stays mounted behind an open
      editor (components/ListDetail.tsx), so a credential created, edited or deleted there — Save and Delete
      both navigate back here, closing the pane — would otherwise stay invisible until a reload. Keyed on the
-     close, not on every open or editor-to-editor move. Full-page editors (narrow viewports) remount this
-     page instead, so `openPath` stays null there and nothing fires twice. A bump of `reloads`, so the re-read
-     rides the abortable effect below and a filter change made meanwhile still wins. */
-  const [reloads, setReloads] = useState(0)
+     close, not on every open or editor-to-editor move (`reread` is a dependency only for its freshness: a
+     re-run without a close does nothing). Full-page editors (narrow viewports) remount this page instead, so
+     `openPath` stays null there and nothing fires twice. */
   const openPath = useOpenDetailPath()
   const lastOpenPath = useRef(openPath)
   useEffect(() => {
     const wasOpen = lastOpenPath.current !== null
     lastOpenPath.current = openPath
-    if (wasOpen && openPath === null) setReloads(n => n + 1)
-  }, [openPath])
-
-  const lastReloads = useRef(reloads)
-  useEffect(() => {
-    const controller = new AbortController()
-    // A re-read keeps the rows on screen; a new filter or page shows the skeleton.
-    if (lastReloads.current === reloads) setLoading(true)
-    lastReloads.current = reloads
-    void load(controller.signal)
-    return () => controller.abort()
-  }, [load, reloads])
+    if (wasOpen && openPath === null) reread()
+  }, [openPath, reread])
 
   async function handleDelete(row: Credential) {
     /* One write at a time: `busyId` is a single slot, so a Delete's `finally` would clear an in-flight
@@ -345,13 +286,14 @@ export default function Credentials() {
     if (busyId !== null) return
     /* The DELETE runs inside the confirm: a refusal stays in the dialog with its reason. Another org's
        row goes as that org for this one request (`actAsOnce`), as a task's Delete does. */
-    const ok = await confirm({
+    const lastGithub = await deletesLastGithub(row, otherOrgOf(row.org))
+    if (!await confirm(danger('Delete', {
       title: 'Delete secret',
       identity: `${row.type_label} · ${row.name}`,
-      message:
+      message: withLastGithubWarning(
         'This removes the secret and the values stored with it. This cannot be undone.',
-      confirmLabel: 'Delete',
-      destructive: true,
+        lastGithub,
+      ),
       run: {
         action: async () => {
           setBusyId(row.id)
@@ -365,24 +307,9 @@ export default function Credentials() {
         failed: 'Failed to delete secret',
         busyLabel: 'Deleting…',
       },
-    })
-    if (!ok) return
-    if (treeMode) {
-      // The tree re-reads its open levels in place.
-      setReloads(n => n + 1)
-      setBusyId(null)
-      return
-    }
+    }))) return
     try {
-      // Deleting a page's LAST row past page 1: step back BEFORE re-reading, avoiding an empty page N
-      // ("No secrets yet") and a second round trip. Popping the cursor re-runs `load` once.
-      if (items.length === 1 && page > 1) {
-        setCursors(current => current.slice(0, -1))
-        return
-      }
-      /* Otherwise re-read (rows shift up from the next page; `total` drives Next) through the abortable effect, so a
-         Next pressed meanwhile wins rather than being overwritten by this answer. */
-      setReloads(n => n + 1)
+      reread()
     } finally {
       setBusyId(null)
     }
@@ -397,7 +324,7 @@ export default function Credentials() {
     try {
       await renameCredential(row.id, name, actAsOnce(otherOrgOf(row.org)))
       // Re-read: a renamed credential can fall out of the current filter.
-      setReloads(n => n + 1)
+      reread()
     } finally {
       setBusyId(null)
     }
@@ -420,6 +347,7 @@ export default function Credentials() {
     showDescription,
     typeWidth,
     showOrg,
+    showTest,
     besideDetail,
     canEdit: can('credentials:edit'),
     canDelete: can('credentials:delete'),
@@ -432,7 +360,7 @@ export default function Credentials() {
   }
 
   /* BULK ACTIONS (`./CredentialBulk.tsx`): Flat mode's ticks, select-all-matching and the action bar.
-     Re-reads through `reloads`, as a closing editor does. */
+     Re-reads through `reread`, as a closing editor does. */
   const bulk = useCredentialBulk({
     items,
     total,
@@ -440,7 +368,7 @@ export default function Credentials() {
     applied: appliedView,
     isOperator: admin?.is_operator === true,
     confirm,
-    onDone: () => setReloads(n => n + 1),
+    onDone: reread,
   })
 
   /* Each mode builds only its own rows: nothing is memoized and this re-renders per keystroke, so building
@@ -452,9 +380,27 @@ export default function Credentials() {
         return { ...spec, slots: [...(spec.slots ?? []), bulk.rowSlot(row)] }
       })
 
-  const shown = { first: firstShown, last: firstShown + items.length - 1 }
-  // Rows deleted since an earlier page can leave a later one past the re-counted total: never "26–50 of 45".
-  const range = rosterRange(shown, Math.max(total, shown.last), totalCapped)
+  /* THE HEADER ROW (Flat mode's; the tree is always in name order): a label over every value, the page tick over
+     the rows' ticks, and the order menu over the ⋯ column — the one home of Created, which no column heads. The
+     roster's size is the footer's caption. The Org order only where the
+     viewer sees tenants (`useOrgVisible`): a tenant's roster is one org. */
+  const flatColumns: FeedColumns = {
+    title: CREDENTIAL_TITLE_COLUMN,
+    slots: [...CREDENTIAL_SLOT_COLUMNS.filter(column => showTest || column.key !== 'last-test'), bulk.selectColumn],
+    actions: (
+      <SortMenu
+        compact
+        noun="secrets"
+        columns={showOrg ? SORT_COLUMNS : SORT_COLUMNS.filter(column => column.key !== 'org')}
+        // A stored `org` order with no Org item (no longer an operator) reads as Name: one org orders the same.
+        sort={sortMenuState(!showOrg && view.sort === 'org' ? 'name' : view.sort)}
+        onSort={key => patchView({ sort: nextSort(view.sort, key) })}
+      />
+    ),
+  }
+  const headerSortState = view.sort === 'name' || view.sort === 'type' || (showOrg && view.sort === 'org')
+    ? { key: view.sort, dir: 'asc' as const }
+    : { key: null, dir: 'asc' as const }
 
   return (
     /* The query container `credentialTypeSlotWidth`'s `cqw` cap and the Type slot's gate read: the list's own
@@ -463,11 +409,7 @@ export default function Credentials() {
       {/* ADD CREDENTIAL, on the Directory strip via a titleless header (`components/TabActionsSlot`).
           Ungated: `POST /api/credentials` admits every session to create its OWN row (`own_credential`). */}
       <PageHeader
-        actions={
-          <Button component={RouterLink} to="/credentials/new" variant="contained" color="primary" {...compactVerbProps('Add secret', tapTargetSx)}>
-            <CompactVerbLabel label="Add secret" />
-          </Button>
-        }
+        actions={<NewButton label="Add secret" to="/credentials/new" sx={tapTargetSx} />}
       />
 
       {/* The filter strip (R2.1), above the data it narrows; it holds no state of its own. */}
@@ -478,24 +420,12 @@ export default function Credentials() {
         typesError={credentialTypes.error}
         typesLoading={credentialTypes.loading}
         rosters={rosters}
+        showTest={showTest}
       />
 
       {error && <Banner severity="error">{error}</Banner>}
 
-      {/* HOW MANY, AND IN WHAT ORDER: the roster's size was nowhere on the page, and its order fixed.
-          Outside the filter strip, whose chrome budget is pinned (`e2e/credentials-filters.spec.ts`). Kept mounted
-          through a re-fetch (the last page's numbers): unmounting it jumped the rows a line and dropped the ⇅
-          trigger's focus to the body after a pick. */}
-      {/* Flat mode's: the tree counts beside every node and is always in name order. */}
-      {!treeMode && items.length > 0 && (
-        <RosterSummary
-          range={range}
-          sort={view.sort}
-          onSort={sort => patchView({ sort })}
-          showOrg={showOrg}
-        />
-      )}
-
+      {/* Never over rows a new read is replacing: "Select all N matching" would pair the new filter with the old N. */}
       {!treeMode && !loading && bulk.header}
       {!treeMode && bulk.bar}
 
@@ -525,29 +455,33 @@ export default function Credentials() {
            forked on the FILTERS (R2.6), not `items.length`: "No secrets yet" over a filtered-out full roster
            invited duplicates. The filtered arm offers the undo. */
         <ListStates
-          loading={loading}
+          loading={skeleton}
           skeleton={{ rows: PAGE_SKELETON_ROWS }}
           empty={items.length === 0}
           noMatch={hasActiveCredentialFilters(appliedView) && <NoMatchesState onClear={clearFilters} />}
           emptyTitle="No secrets yet"
           emptyScoped
-          feed={{ ariaLabel: 'Secrets', testId: 'credentials-list', sections: [{ key: 'credentials', rows: flatRows }] }}
+          feed={{
+            ariaLabel: 'Secrets',
+            testId: 'credentials-list',
+            sections: [{ key: 'credentials', rows: flatRows }],
+            columns: flatColumns,
+            sort: headerSortState,
+            onSort: key => patchView({ sort: headerSort(view.sort, key) }),
+          }}
         />
       )}
 
-      {/* The pager is Flat mode's alone (R3.4); HIDDEN, not disabled, in Tree mode (no page to move to). Its readout is
-          the summary's range: keyset paging knows no page count. Next is live while the server hands a cursor. */}
-      {!treeMode && items.length > 0 && (page > 1 || nextCursor !== null) && (
-        <Pager
-          testId="pagination"
-          page={page}
-          totalPages={page + (nextCursor === null ? 0 : 1)}
-          label={range}
-          noun="secrets"
-          previousDisabled={loading || page <= 1}
-          nextDisabled={loading || nextCursor === null}
-          onPrevious={() => setCursors(current => (current.length > 1 ? current.slice(0, -1) : current))}
-          onNext={() => { if (nextCursor !== null) setCursors(current => [...current, nextCursor]) }}
+      {/* The footer is Flat mode's alone (R3.4). Its caption is the roster's one count: rows loaded of the wire
+          `total` (`N+` when capped), never below the rows on screen (rows deleted since can leave it behind). */}
+      {!treeMode && !skeleton && items.length > 0 && (
+        <LoadMoreFooter
+          hasMore={paging.hasMore}
+          loading={loading}
+          onMore={() => void paging.loadMore()}
+          testId="credentials-load-more"
+          caption={`${items.length.toLocaleString()} of ${Math.max(total, items.length).toLocaleString()}${totalCapped ? '+' : ''}`}
+          sx={{ mt: 1 }}
         />
       )}
 

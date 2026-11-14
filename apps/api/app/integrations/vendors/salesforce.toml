@@ -1,0 +1,68 @@
+slug = "salesforce"
+label = "Salesforce"
+category = "crm"
+vendor_docs_url = "https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_web_server_flow.htm&type=5"
+summary = "Query and update Salesforce records - accounts, contacts, leads, opportunities and cases - as the user who signed in."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://login.salesforce.com/services/oauth2/authorize"
+token_url = "https://login.salesforce.com/services/oauth2/token"
+scopes = [
+  { name = "api", label = "Read and write your Salesforce data through the REST and SOAP APIs" },
+  { name = "refresh_token", label = "Stay connected: lets Jaah renew access without asking you to sign in again" },
+  { name = "openid", label = "Know who signed in: lets Test name the user and agents find the org's API address" },
+]
+account_url = "https://login.salesforce.com/services/oauth2/userinfo"
+account_field = "preferred_username"
+# Salesforce sends no `expires_in`: its access token lives as long as the org's session timeout (2 hours by
+# default), so Jaah assumes 30 minutes and renews it before then.
+token_ttl_seconds = 1800
+jaah_app = true
+
+[auth.oauth.registration]
+console_url = "https://login.salesforce.com/lightning/setup/NavigationMenus/home"
+steps = [
+  "Use a Salesforce Developer Edition org that Jaah owns (sign up for one at developer.salesforce.com if there is none): a Connected App made there can be authorized by any customer org, while an External Client App reaches other orgs only as an installed managed package",
+  "The app is a Connected App: in Setup, type App Manager in Quick Find, open it and select New Connected App (if only New External Client App is offered, open Setup > External Client Apps > Settings, turn on the option that allows creating connected apps, and come back)",
+  "Enter Connected App Name Jaah, API Name Jaah, and the shared operations mailbox as Contact Email",
+  "Under API (Enable OAuth Settings) tick Enable OAuth Settings; the redirect URIs below go in Callback URL, one per line",
+  "Move these three into Selected OAuth Scopes: Manage user data via APIs (api), Perform requests at any time (refresh_token, offline_access) and Access unique user identifiers (openid)",
+  "Keep Require Secret for Web Server Flow, Require Secret for Refresh Token Flow and Require Proof Key for Code Exchange (PKCE) Extension for Supported Authorization Flows ticked, then select Save (Salesforce takes up to 10 minutes to activate the app)",
+  "On the app's page select Manage Consumer Details, and confirm the verification code Salesforce emails you to reveal the Consumer Key and Consumer Secret",
+]
+review = "Not required: a Connected App created in a Developer Edition org can be authorized by users of any Salesforce org once created; AppExchange security review applies only to a listing"
+
+[test]
+path = "https://login.salesforce.com/services/oauth2/userinfo"
+auth = "none"
+identity = [["preferred_username"], ["email"]]
+
+[docs]
+agent_uses = [
+  "Run SOQL queries, for example every open opportunity closing this quarter",
+  "Create and update accounts, contacts, leads, opportunities and cases",
+  "Read object and field metadata (describe calls) so new records match your org's required fields and picklists",
+  "Attach notes and log activities against a record",
+]
+prerequisites = [
+  "A Salesforce user with API Enabled in their profile or a permission set (Enterprise, Unlimited, Performance or Developer Edition; Professional Edition needs the API add-on)",
+  "If your org restricts which apps users may authorize, an admin who can approve the Jaah app",
+]
+limitations = [
+  "Agents act as the user who signed in and see only what that user's profile, permission sets and sharing rules allow",
+  "Connect signs in through login.salesforce.com, so it reaches production and Developer Edition orgs; sandboxes (test.salesforce.com) cannot be connected yet",
+  "Every API call counts against your org's daily API request limit, shared with your other integrations",
+  "An agent learns the org's API address from the userinfo endpoint (`urls.rest` in its answer); the secret itself stores no instance URL",
+]
+troubleshooting = [
+  { symptom = "The Salesforce window says OAUTH_APPROVAL_ERROR_GENERIC or that the user is not approved to access this app", fix = "Your org restricts app access. A Salesforce admin opens Setup > Connected Apps OAuth Usage, finds Jaah, selects Install, then sets Permitted Users to All users may self-authorize (or assigns the app to your profile)" },
+  { symptom = "Test says Salesforce rejected the access token (401) or the secret shows Needs reconnect", fix = "The refresh token was revoked, the user's password was reset with a policy that revokes tokens, or the user was frozen. Select Reconnect and sign in again" },
+  { symptom = "An agent gets API_DISABLED_FOR_ORG or 'The REST API is not enabled for this Organization'", fix = "The org's edition or the user's profile has no API access. Ask your Salesforce admin to enable API Enabled on the profile or a permission set" },
+  { symptom = "An agent gets REQUEST_LIMIT_EXCEEDED", fix = "The org's 24-hour API allowance is spent. Check Setup > Company Information > API Requests, Last 24 Hours, and spread heavy jobs out" },
+]
+faq = [
+  { q = "Can I connect a sandbox", a = "Not yet. Connect uses the production login address; a sandbox needs test.salesforce.com, which the Jaah app does not use today" },
+  { q = "Does Jaah store my Salesforce password", a = "No. You sign in at Salesforce; Jaah keeps only the tokens Salesforce issues, encrypted, and renews them itself" },
+]

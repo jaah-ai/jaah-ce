@@ -5,6 +5,7 @@ import Button from '@mui/material/Button'
 import LinearProgress from '@mui/material/LinearProgress'
 import Link from '@mui/material/Link'
 import Typography from '@mui/material/Typography'
+import { FONT_WEIGHT, grid } from '../../../theme'
 import { useApiRead } from '../../../hooks/useApiRead'
 import { useRowActions } from '../../../hooks/useBusyIds'
 import Banner from '../../../ui/Banner'
@@ -32,7 +33,7 @@ export function NoteList({ title, testId, items }: {
   if (items.length === 0) return null
   return (
     <Box>
-      <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.5 }}>{title}</Typography>
+      <Typography variant="body2" sx={{ fontWeight: FONT_WEIGHT.semibold, mb: 0.5 }}>{title}</Typography>
       <Box component="ul" sx={{ m: 0, pl: 2.5 }} data-testid={testId}>
         {items.map(item => (
           <li key={item.id}>
@@ -135,12 +136,12 @@ export default function ResultStep({
 
       {failed.length > 0 && (
         <Box>
-          <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.5 }}>Failed</Typography>
+          <Typography variant="body2" sx={{ fontWeight: FONT_WEIGHT.semibold, mb: 0.5 }}>Failed</Typography>
           <Box component="ul" sx={{ m: 0, p: 0, listStyle: 'none' }} data-testid="nodevault-result-failed-list">
             {failed.map(item => (
-              <Box component="li" key={item.credential_id} sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap', py: 0.25 }}>
+              <Box component="li" key={item.credential_id} sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap', py: 0 }}>
                 <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>{item.name}</Typography>
-                <Typography variant="body2" sx={{ color: 'text.secondary', flex: '1 1 200px' }}>{item.message ?? 'The move failed. Retry.'}</Typography>
+                <Typography variant="body2" sx={{ color: 'text.secondary', flex: `1 1 ${grid(33)}` }}>{item.message ?? 'The move failed. Retry.'}</Typography>
                 {op.state !== 'failed' && <Button size="small" disabled={busy.has(item.credential_id)} onClick={() => void retry(item)}>Retry</Button>}
               </Box>
             ))}

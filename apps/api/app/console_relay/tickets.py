@@ -10,14 +10,14 @@ import logging
 import secrets
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 from uuid import UUID
 
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app import hipaa
-from app.db import SessionLocal
+from app.db import BridgedSession
 from app.models.control_plane import ConsoleTicket
 from app.models.identity import AdminUser
 from app.tenancy import seam
@@ -88,11 +88,12 @@ def mint(
     session_ref: tuple[UUID, int, int] | None, client_ip: Optional[str] = None,
 ) -> Minted:
     """Insert one session's row and return its two tickets. Committed; raises on a DB fault, which the
-    caller refuses the open on. `client_ip` is the viewer's address: the browser leg must be claimed from it
-    (`claim`), and the sweep ends the console once it leaves the org's IP allowlist."""
+    caller refuses the open on. `session_ref` is the viewer's sign-in, which the browser leg must carry
+    (`claim`); `client_ip` the viewer's address, which the claim replaces with the leg's own, and the sweep ends
+    the console once it leaves the org's IP allowlist."""
     minted = Minted(browser=secrets.token_urlsafe(32), node=secrets.token_urlsafe(32))
     user_id, epoch, iepoch = session_ref if session_ref is not None else (None, None, None)
-    with SessionLocal() as session:
+    with BridgedSession() as session:
         session.add(ConsoleTicket(
             ticket_hash=ticket_hash(minted.node), browser_ticket_hash=ticket_hash(minted.browser),
             node_id=node_id, node_name=node_name, read_only=read_only,
@@ -107,7 +108,7 @@ def discard(minted: Minted) -> None:
     """Delete an open's row — the API's cleanup on every path that fails after the mint, so an abandoned
     open leaves no redeemable capability. Best effort: an undeleted row expires on its own."""
     try:
-        with SessionLocal() as session:
+        with BridgedSession() as session:
             session.execute(delete(ConsoleTicket).where(ConsoleTicket.ticket_hash == ticket_hash(minted.node)))
             session.commit()
     except Exception as exc:  # noqa: BLE001 — see the docstring; the sweep prunes it at expiry
@@ -116,12 +117,19 @@ def discard(minted: Minted) -> None:
 
 def claim(
     leg: str, ticket: object, *, self_address: str, node_id: object = None, client_ip: Optional[str] = None,
+    session_ref: tuple[UUID, int, int] | None = None,
 ) -> Optional[Claim]:
     """Claim `leg` of the session `ticket` opens, naming this relay task its owner unless one already is.
     None for every refusal — unknown, expired, already claimed (single-use), (node leg) a dial from a
-    node the ticket was not minted for, or (browser leg) a dial from an address other than the one that
-    minted it (`client_ip`, the relay's `server.client_address`) or outside the viewer's org's IP allowlist.
-    A refused claim consumes nothing.
+    node the ticket was not minted for, or (browser leg) a dial that does not carry the sign-in that minted
+    it (`session_ref`, the dial's own session cookie) or comes from outside the viewer's org's IP allowlist
+    (`client_ip`, the relay's `server.client_address`). A refused claim consumes nothing.
+
+    The browser leg is bound to the SIGN-IN, not the address: a network that sends each connection out through
+    a different public address (a hotel's or an office's multi-uplink gateway) dials the relay from another
+    address than the open's, and an address binding refused every reconnect. A stolen ticket stays useless
+    without the viewer's own cookie. Only a row minted without a sign-in (`user_id` NULL) keeps the address
+    binding.
 
     One UPDATE, so two relay tasks claiming the two legs at once agree on one owner (the row lock orders
     them; `coalesce` keeps the first)."""
@@ -144,11 +152,12 @@ def claim(
         where = and_(
             ConsoleTicket.browser_ticket_hash == hashed,
             ConsoleTicket.browser_redeemed_at.is_(None),
-            # A bearer token no more: only the minting address may redeem it (NULL: a row the outgoing release
-            # minted). Re-asked here, so the read above cannot be raced.
-            or_(ConsoleTicket.client_ip.is_(None), ConsoleTicket.client_ip == client_ip),
+            _browser_bound_to(client_ip, session_ref),
         )
         redeemed = {"browser_redeemed_at": func.now()}
+        if client_ip is not None:
+            # The sweep judges the address the console is actually used from (`touch`).
+            redeemed["client_ip"] = client_ip
     statement = (
         update(ConsoleTicket)
         .where(where, ConsoleTicket.expires_at > func.now(), ConsoleTicket.revoked.is_(False))
@@ -162,12 +171,31 @@ def claim(
         )
         .execution_options(synchronize_session=False)
     )
-    with SessionLocal() as session:
+    with BridgedSession() as session:
         row = session.execute(statement).first()
         session.commit()
     if row is None:
         return None
     return Claim(key=row[0], owner_address=row[1], read_only=bool(row[2]), seconds_left=max(float(row[3]), 0.0))
+
+
+def _browser_bound_to(client_ip: Optional[str], session_ref: tuple[UUID, int, int] | None) -> Any:
+    """A bearer token no more: the browser leg is redeemed only by the sign-in that minted it, or — a row minted
+    without one — from the minting address (NULL: a row an older release minted). Part of the claim's one
+    UPDATE, so no read can be raced."""
+    by_address = and_(
+        ConsoleTicket.user_id.is_(None),
+        or_(ConsoleTicket.client_ip.is_(None), ConsoleTicket.client_ip == client_ip),
+    )
+    if session_ref is None:
+        return by_address
+    user_id, epoch, iepoch = session_ref
+    by_sign_in = and_(
+        ConsoleTicket.user_id == user_id,
+        ConsoleTicket.session_epoch == epoch,
+        ConsoleTicket.session_iepoch == iepoch,
+    )
+    return or_(by_address, by_sign_in)
 
 
 def _browser_address_refused(hashed: str, client_ip: Optional[str]) -> bool:
@@ -176,11 +204,11 @@ def _browser_address_refused(hashed: str, client_ip: Optional[str]) -> bool:
     refuses it."""
     from app import ip_allowlist  # lazy: it imports the login funnel
 
-    with SessionLocal() as session:
+    with BridgedSession() as session:
         user_id = session.scalar(
             select(ConsoleTicket.user_id).where(ConsoleTicket.browser_ticket_hash == hashed)
         )
-    return user_id is not None and ip_allowlist.session_refusal(user_id, client_ip) is not None
+        return user_id is not None and ip_allowlist.session_refusal_in(session, user_id, client_ip) is not None
 
 
 @dataclass(frozen=True)
@@ -205,7 +233,7 @@ def touch(keys: Iterable[str], typed: Iterable[str] = ()) -> Touched:
     if not keys:
         return Touched(frozenset(), frozenset())
     typed = set(typed)
-    with SessionLocal() as session:
+    with BridgedSession() as session:
         if typed:
             session.execute(
                 update(ConsoleTicket).where(ConsoleTicket.ticket_hash.in_(typed)).values(last_input_at=func.now())
@@ -231,7 +259,7 @@ def touch(keys: Iterable[str], typed: Iterable[str] = ()) -> Touched:
 def finish(key: str) -> None:
     """Delete a session's row once its relay is done with it. Best effort: the sweep reaps it when stale."""
     try:
-        with SessionLocal() as session:
+        with BridgedSession() as session:
             session.execute(delete(ConsoleTicket).where(ConsoleTicket.ticket_hash == key))
             session.commit()
     except Exception as exc:  # noqa: BLE001 — see the docstring
@@ -245,7 +273,7 @@ def sweep(session: Session) -> int:
     PRUNE: a row whose deadline passed with a leg still unclaimed (an abandoned open), and a paired row
     its relay has stopped touching (a relay task that died). REVOKE: a paired row whose viewer's login
     session is no longer live (disabled, logged out, password changed) — the relay reads the flag on its
-    next touch and closes the browser with 4401 —, as `REVOKED_IP`, a row whose minting address its
+    next touch and closes the browser with 4401 —, as `REVOKED_IP`, a row whose claimed address its
     viewer's org's IP allowlist now leaves out (its own close code, 4403), and, as `REVOKED_IDLE`, a row whose viewer's org
     is HIPAA ON and whose last keystroke (or, with none, the browser's arrival) is more than
     `hipaa.IDLE_TIMEOUT` ago, which the relay closes with its idle code."""

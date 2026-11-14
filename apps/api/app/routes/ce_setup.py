@@ -17,10 +17,10 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import edition, ce_admin
+from app import db_async, edition, ce_admin
 from app.authz.catalog import Tenancy
 from app.authz.declarations import always, session_only
-from app.db import get_session
+from app.db_async import DbDep
 from app.routes.public import check_rate_limit
 
 router = APIRouter(prefix="/api/ce", tags=["ce"])
@@ -68,9 +68,9 @@ def _adopt_timezone(session: Session, zone: Optional[str]) -> None:
 
 @router.get("/setup", dependencies=[Depends(_ce_only), Depends(check_rate_limit)])
 @always(Tenancy.BOOTSTRAP)
-def setup_state(session: Session = Depends(get_session)) -> dict[str, bool]:
+async def setup_state(*, db: DbDep) -> dict[str, bool]:
     """`needs_setup`: true until the one user exists. Says nothing else about anyone."""
-    return {"needs_setup": ce_admin.the_user(session) is None}
+    return {"needs_setup": await db.run_sync(ce_admin.the_user) is None}
 
 
 @router.post(
@@ -79,11 +79,10 @@ def setup_state(session: Session = Depends(get_session)) -> dict[str, bool]:
 )
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def create_the_user(body: SetupIn, request: Request, response: Response, session: Session = Depends(get_session)):
+async def create_the_user(body: SetupIn, request: Request, response: Response, *, db: DbDep):
     """Create the one user and sign them in (module docstring). 409 once anyone exists; 422 with a readable
     reason for an unusable email or password."""
     from app import identities, login_funnel, seed
-    from app.db import SessionLocal
     from app.models.orgs import Org
     from app.operator_settings import cache
     from app.routes.auth import _admin_out, finish_first_factor
@@ -97,9 +96,7 @@ def create_the_user(body: SetupIn, request: Request, response: Response, session
     refusal = ce_admin.password_refusal(body.password, email)
     if refusal is not None:
         raise HTTPException(status_code=422, detail=refusal)
-    # Created on a session of its own, on the operator plane, as the seed creates the bootstrap admin: the
-    # request's session then signs the new person in on their own org (a session keeps one scope for life).
-    with SessionLocal() as writer, seam.operator_scope():
+    def create(writer: Session) -> None:
         # Serializes two first runs racing: the second waits here, then finds the first one's user.
         writer.execute(select(Org.id).where(Org.id == ORG_ZERO_ID).with_for_update())
         if writer.scalars(ce_admin.people_query().limit(1)).first() is not None:
@@ -111,10 +108,21 @@ def create_the_user(body: SetupIn, request: Request, response: Response, session
         # Last: the settings writer commits the session itself, so nothing may follow it under the row lock.
         _adopt_timezone(writer, body.timezone)
         writer.commit()
+
+    # Created on a session of its own, on the operator plane, as the seed creates the bootstrap admin: the
+    # request's session then signs the new person in on their own org (a session keeps one scope for life).
+    with seam.operator_scope():
+        await db_async.run_in_session(create)
     cache.invalidate_cache()
-    person = identities.by_email(session, email)
-    admin = login_funnel.pick_membership(session, person, "password", request=request) if person else None
-    if admin is None:
-        raise HTTPException(status_code=500, detail="The user was created but could not be signed in. Sign in instead.")
-    challenge = finish_first_factor(session, request, response, admin, "password")
-    return challenge or _admin_out(admin, session)
+
+    def sign_in(session: Session):
+        person = identities.by_email(session, email)
+        admin = login_funnel.pick_membership(session, person, "password", request=request) if person else None
+        if admin is None:
+            raise HTTPException(
+                status_code=500, detail="The user was created but could not be signed in. Sign in instead."
+            )
+        challenge = finish_first_factor(session, request, response, admin, "password")
+        return challenge or _admin_out(admin, session)
+
+    return await db.run_sync(sign_in)

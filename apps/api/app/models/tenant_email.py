@@ -7,7 +7,7 @@ from typing import Optional
 from uuid import UUID
 
 from sqlalchemy import BigInteger, Boolean, CheckConstraint, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -20,10 +20,10 @@ class GmailConnection(EntityMixin, OrgScoped, Base):
     naming the mailbox (`kind = 'service_account'`, send and read). `name` is the mailbox address as connected. No slug:
     a connection is reached from Settings › Organizations › Email, never by a typed handle.
 
-    `sealed_secret` is the OAuth refresh token or the service-account JSON key, a tier-1 envelope bound to the row id
-    (`tenant_gmail.seal_secret`). A COLUMN, never a credential row: credential rows are dispatched to runners, and no
-    dispatch path reads this table (`tests/test_tenant_gmail.py` holds that), so the secret never reaches a node.
-    Disconnecting deletes the row and its secret; its sends stay (`tenant_email_sends.connection_id` keeps the id).
+    The secret (the OAuth refresh token or the service-account JSON key) lives in the linked SYSTEM credential
+    (`credential_id`, `tenant_gmail.write_credential`): a system row is never dispatched to a runner, so the secret
+    never reaches a node. Disconnecting deletes the row and its credential; its sends stay
+    (`tenant_email_sends.connection_id` keeps the id).
 
     `history_id` (the Gmail history cursor), `last_sync_at` and `sync_error` belong to receiving
     (`app/tenant_gmail/receive.py`); `last_error` names the latest send failure; `can_receive` is true for a
@@ -40,7 +40,6 @@ class GmailConnection(EntityMixin, OrgScoped, Base):
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     #: The mailbox, a bare lowercased address: what mail is sent From.
     address: Mapped[str] = mapped_column(Text, nullable=False)
-    sealed_secret: Mapped[dict] = mapped_column(JSONB, nullable=False)
     can_receive: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     history_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     last_sync_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
@@ -49,6 +48,11 @@ class GmailConnection(EntityMixin, OrgScoped, Base):
     #: Why the latest receive sync failed or what it skipped (an expired cursor); NULL after one worked.
     sync_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     last_used_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
+    #: The system credential holding this mailbox's secret (the integration catalog); SET NULL on that row's delete,
+    #: which leaves the connection needing a reconnect.
+    credential_id: Mapped[Optional[UUID]] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("credentials.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 class TenantEmailSend(UuidPkMixin, OrgScoped, Base):
@@ -71,7 +75,7 @@ class TenantEmailSend(UuidPkMixin, OrgScoped, Base):
     from_address: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     actor_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     #: The sending task's id. Column `sent_by_task_id`: the first `task_id` column was a uuid, which no task id is
-    #: (revision 202610240300); it stays unmapped until a later release drops it.
+    #: (revision 202610240300; dropped by 202610292200).
     task_id: Mapped[Optional[int]] = mapped_column("sent_by_task_id", Integer, nullable=True)
     #: A schedule run's `cron_runs` id; an event run's is `trigger_delivery_id` (revision 202610240800).
     automation_run_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)

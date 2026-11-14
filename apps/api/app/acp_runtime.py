@@ -27,14 +27,12 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session
 
 from app import account_auth, agent_providers, node_platform, provider_auth_policy
+from app.agent_sessions import RUNTIME_ACP, RUNTIME_LEGACY  # the vocabulary's home; re-exported for dispatch callers
 from app.operator_settings import (
     catalog as settings_catalog,
     errors as settings_errors,
     reads as settings_reads,
 )
-
-RUNTIME_ACP = "acp"
-RUNTIME_LEGACY = "legacy"
 
 #: The key inside the operator-settings row.
 SETTING_KEY = "acp_runtime"
@@ -92,7 +90,7 @@ def pair_key(provider: str, auth_kind: str) -> str:
 
 def switchable_pairs() -> tuple[Pair, ...]:
     """Every pair this build serves that has a switch, in catalogue order, then each `EXTRA_LANES` lane."""
-    return tuple(pair for pair in provider_auth_policy.supported_pairs()
+    return tuple(pair for pair in provider_auth_policy.builtin_cells()
                  if pair not in LEGACY_ONLY and pair not in ACP_ONLY) + EXTRA_LANES
 
 

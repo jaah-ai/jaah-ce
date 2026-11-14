@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Iterable, Literal, Optional
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -15,13 +16,12 @@ from app import edition, edition_features, hosts, jaah_discovery, ce_caps, node_
 from app.actors import stamp_actor
 from app.auth import require_user
 # Module scope: `assignments` reaches `routes/projects.py` and `routes/pool_slots.py`, neither of which imports this.
-from app.routes.assignments import auto_assign_as
 from app.authz.catalog import Tenancy
 from app.authz.declarations import org_admin, session_only
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller
 from app.config import get_settings
-from app.db import get_session
-from app.entity_shape import StrictModel, iso_or_none
+from app.db_async import on_thread
+from app.entity_shape import StrictModel, commit_row, iso_or_none, or_404
 from app.events import emit_console_event
 from app.models.identity import AdminUser
 from app.models.nodes import Node
@@ -30,6 +30,7 @@ from app.models.nodes import Node
 from app.node_bootstrap import (
     _NODE_NAME_RE,
     BootstrapInputError,
+    cp_scheme_allowed,
     provisioned_jaah_home,
     FETCH_SHELLS,
     is_undialable,
@@ -41,7 +42,7 @@ from app.node_identity import is_uuid_shaped
 from app.access_admin import refuse_foreign_org
 from app.tenancy.create_surface import named_org
 from app.org_gate import require_org_active
-from app.tenancy.ids import is_operator_plane
+from app.tenancy.ids import is_operator_user
 from app.routes.nodes import reads
 from app.routes.nodes.node_wire import (
     NodeCounts,
@@ -94,6 +95,9 @@ class NodeTokenIssuedOut(StrictModel):
     # Whether the console wraps `onboarding_command` in the tailnet join (`_joins_tailnet_first`). Otherwise the
     # line runs alone and the bootstrap it fetches joins the tailnet itself.
     onboarding_joins_tailnet: bool = False
+    # The single-use key that join's `tailscale up` presents (`_join_auth_key`), so it needs no headscale admin;
+    # None = the join asks for an interactive login. A credential: redacted from audit by name (`auth_key`).
+    tailnet_auth_key: Optional[str] = None
 
 
 class NodeTailnetReenrolOut(NodeTokenIssuedOut):
@@ -113,7 +117,7 @@ class NodeRegisteredOut(NodeDetailOut):
 
 class NodeCreateIn(NodeUpdateIn):
     """POST body — `node_id` plus the same editable fields: the register-only door into the fleet
-    (`CloudNodeCreateIn`/`SelfHostedNodeCreateIn` provision). Self-report paths are update-only.
+    (an Add-node order, `routes/node_orders.py`, provisions). Self-report paths are update-only.
 
     `node_id` is the node's `name`, spelled as in `/etc/jaah/node.env`; `name` is not accepted as a
     second spelling.
@@ -136,7 +140,7 @@ class NodeCreateIn(NodeUpdateIn):
 
 
 def _issue_credential(
-    session: Session, row: Node, cp_base_url: str, fetch_base_url: Optional[str] = None
+    session: Session, row: Node, cp_base_url: str, fetch_base_url: Optional[str] = None, *, join_key: JoinKey = "none",
 ) -> NodeTokenIssuedOut:
     """Mint a credential for `row` and render the one response that ever carries its plaintext.
 
@@ -150,6 +154,7 @@ def _issue_credential(
     `cp_base_url`."""
     plaintext = node_credentials.issue(session, row)
     joins = _joins_tailnet_first(row.os)
+    join = _join_auth_key(session, row, join_key) if joins else None
     return NodeTokenIssuedOut(
         node_id=str(row.id),
         name=row.name,
@@ -159,8 +164,10 @@ def _issue_credential(
         # tailnet it just joined, so from the address nodes dial.
         onboarding_command=_fetch_command(plaintext, cp_base_url if joins else fetch_base_url or cp_base_url, row.os),
         onboarding_shell=FETCH_SHELLS[row.os],
-        tailnet_login_server=_tailnet_login_server(session),
+        # The key's own server where one was minted, so the line never presents it to another.
+        tailnet_login_server=join.login_server if join is not None else _tailnet_login_server(session),
         onboarding_joins_tailnet=joins,
+        tailnet_auth_key=join.auth_key if join is not None else None,
     )
 
 
@@ -171,6 +178,54 @@ def _joins_tailnet_first(os: str) -> bool:
     any machine, and the bootstrap joins the tailnet itself. Only on Ubuntu: the macOS and Windows installers
     install Tailscale and join themselves, so their line keeps fetching from the console."""
     return os == "ubuntu" and not get_settings().console_public
+
+
+#: What a headscale pre-auth key is spelled with, checked before the browser puts one in a shell line.
+_JOIN_KEY_RE = re.compile(r"[A-Za-z0-9_-]{8,512}")
+
+#: Which join key a credential carries (`_join_auth_key`): none (every door but the self-hosted ones, whose machine
+#: gets its key from the launch or the enrolment), one minted for a row this transaction creates, or the replayed
+#: per-window key of a row already committed.
+JoinKey = Literal["none", "new", "reissue"]
+
+
+def _join_auth_key(session: Session, row: Node, join_key: JoinKey) -> Optional[Any]:
+    """The `TailnetJoin` (single-use key + its login server) the join-first line's `tailscale up` presents, or None.
+
+    Without one, `tailscale up --login-server` on a console the internet cannot reach (dev) prints a headscale
+    `/register/` URL whose approval is `headscale auth register` on the server: no tenant can finish it, and the
+    bootstrap's own key cannot help, since the bootstrap is fetched over the tailnet this join opens.
+
+    Rationed like the bootstrap's key (`routes/agent_bootstrap.py::_may_mint_a_tailnet_key`): never for a node
+    already seen online, and a re-issue takes `durable/bootstrap_key.py`'s once-per-window key, so repeated
+    re-issues replay one key rather than farm many — the same key the bootstrap then replays, unused, to a box
+    the join already enrolled. A new row is not yet visible to that workflow's own session, so its first key is
+    minted directly, once per registration. Both live `KEY_EXPIRY_SECONDS`: a line pasted later fails at
+    `tailscale up` and is re-issued. Accepted residual, as for every key: a leaked line enrols one device until
+    the key expires, and a re-issue or delete cannot recall it. Minted inside the caller's transaction, as the
+    bootstrap mints under its row lock; a rollback strands one unused key until it expires.
+
+    A failed mint degrades to the interactive join rather than refusing the registration."""
+    # Its own statement, so the community-edition tree check sees the imports below never run there.
+    if not edition_features.enabled("tailnet"):
+        return None
+    if join_key == "none" or row.last_seen is not None:
+        return None
+    from app.cloud_node_launch import CloudNodeUpstreamError
+    from app.durable import bootstrap_key
+
+    try:
+        if join_key == "reissue":
+            joined = bootstrap_key.key_for_node(str(row.id))
+        else:
+            joined = cloud_node_launch.mint_tailnet_join(session, node_name=row.name, org_id=row.org_id)
+    except (CloudNodeError, CloudNodeUpstreamError, ValueError) as exc:
+        log.warning("nodes: no tailnet key for %s's join line, so it asks for an interactive login: %s", row.name, exc)
+        return None
+    # Never a key without the server it belongs to: presented to Tailscale's own, a headscale key is disclosed.
+    if joined is None or not joined.login_server or not _JOIN_KEY_RE.fullmatch(joined.auth_key):
+        return None
+    return joined
 
 
 def _tailnet_login_server(session: Session) -> Optional[str]:
@@ -224,6 +279,8 @@ def _fetch_command(plaintext: str, cp_base_url: str, os: str) -> str:
     except BootstrapInputError as exc:
         if not edition_features.enabled("cloud_nodes"):
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not cp_scheme_allowed(cp_base_url):
+            raise cloud_node_launch.control_plane_url_refusal(cloud_node_launch.CP_URL_NOT_HTTPS) from exc
         raise cloud_node_launch.control_plane_url_refusal(
             f"{exc} — set 'Control plane URL' in "
             "Settings > Infrastructure > Cloud to the address nodes should dial"
@@ -240,13 +297,13 @@ def _validated_new_node_name(
 ) -> str:
     """The refusals every `nodes` INSERT owes, in one place: trimmed name, or an HTTPException.
 
-    Shared by all three creation routes because they are properties of the name column: empty (unreadable
+    Shared by every creation path because they are properties of the name column: empty (unreadable
     label) and uuid-shaped (`_UUID_SHAPED_NAME_REFUSAL`). A name is a label, never an identity (the id is), so
     a name another node already carries is allowed. `org_id` is the org that will own the row.
 
     `require_dns_label` (the name is also the systemd and tailnet hostname, `node_bootstrap._NODE_NAME_RE`)
     is hoisted here because `node_bootstrap` applies it only after a real Tailscale key has been minted.
-    Imported, not re-spelled. Opt-in: only the two provisioning doors ask; `POST /api/nodes` registers an
+    Imported, not re-spelled. Opt-in: only the two provisioning row builders ask; `POST /api/nodes` registers an
     existing machine. The late check in `node_bootstrap` stays as the backstop.
 
     A name ending `-host` is refused on every door (`hosts.HOST_SUFFIX`): it is the shape of a host's machine
@@ -280,10 +337,10 @@ def _registered_node(
     org_id: UUID,
     charge_nodes_cap: bool = True,
     runs_work: bool = True,
-    onboarding_assign: bool = True,
     nodelinks: Optional[Iterable[UUID]] = None,
     cloud: Optional[str] = None,
     fetch_base_url: Optional[str] = None,
+    join_key: JoinKey = "none",
     **fields: Any,
 ) -> tuple[Node, NodeTokenIssuedOut]:
     """The `nodes` row and its credential, in the caller's open transaction and uncommitted.
@@ -297,7 +354,7 @@ def _registered_node(
     Setdefaults (`enabled` True per `NodeCreateIn`, `jaah_home`; `shared_accounts_enabled` is
     always written false)
     live here, the one door every row comes through; callers may override by naming the field.
-    `jaah_home` must be set: NULL makes `node_clone.resolve_clone` answer `""`, so the node gets no
+    `jaah_home` must be set: NULL makes `node_clone.slot_path` answer `""`, so the node gets no
     roster, never observes, and silently reports nothing. Seeded from
     `node_bootstrap.provisioned_jaah_home(os)`, the home a FRESH box is given.
 
@@ -312,11 +369,8 @@ def _registered_node(
     when `desired` was raised (`routes/node_groups.py`), and a Multi-Node Host (the cloud and self-hosted
     doors' `kind="vnode_host"`) is excluded from the count altogether.
 
-    While the org is onboarding (D15) the new node is assigned every project of its org — on this one door,
-    so a registration, a launch, a self-hosted create and a group's scale-out all get it. `runs_work=False`
-    is a Multi-Node Host's, whose `vnode_hosts` marker its door adds only after this returns.
-    `onboarding_assign=False` is a node order's: the order carries the person's explicit project pick
-    (`app/node_orders.py::apply_projects`, an empty pick meaning none), which the review step showed them.
+    A new node is in its org's All group with no write (`app/placement_groups.py`). `runs_work=False` is a
+    Multi-Node Host's, whose `vnode_hosts` marker its door adds only after this returns.
 
     A Multi-Node Host (`runs_work=False`) mounts no NodeLink, so a non-empty `nodelinks` is a 422 for it.
     `nodelinks` is a create door's NodeLink list (`app/nodelinks.py::birth_set` proves it, before the row):
@@ -358,20 +412,17 @@ def _registered_node(
     session.flush()
     if born_with:
         nodelinks_service.attach_at_birth(session, row, born_with, actor_id=user.id if user is not None else None)
-    if runs_work and onboarding_assign:
-        # Attributed only to a member of the node's own org: an operator's credential cannot serve a tenant's clone.
-        auto_assign_as(session, user if user is not None and user.org_id == org_id else None, node_id=row.id)
-    return row, _issue_credential(session, row, cp_base_url, fetch_base_url)
+    return row, _issue_credential(session, row, cp_base_url, fetch_base_url, join_key=join_key)
 
 
 def _refuse_a_registered_launch_record(fields: dict[str, Any], actor: AdminUser) -> None:
     """422 when a non-operator's registration names a `_SUPERADMIN_ONLY_INFRA_KEYS` key in `infra`.
 
-    Registration provisions nothing, so it has no launch record or share to write: those come from
-    `POST /api/nodes/cloud` and `/api/nodes/self-hosted`, which resolve the credential through the
+    Registration provisions nothing, so it has no launch record or share to write: those come from an
+    Add-node order (`routes/nodes/cloud.py`'s row builders), which resolve the credential through the
     caller's seam. Refused outright rather than checked, so a tenant cannot stamp another org's
     credential onto a new row. The operator keeps authoring them (e.g. a terraform-placed machine)."""
-    if is_operator_plane(actor.org_id, actor.is_superadmin):
+    if is_operator_user(actor):
         return
     infra = fields.get("infra")
     named = [key for key in _SUPERADMIN_ONLY_INFRA_KEYS if isinstance(infra, dict) and key in infra]
@@ -385,18 +436,43 @@ def _refuse_a_registered_launch_record(fields: dict[str, Any], actor: AdminUser)
         )
 
 
+def _registration_payload(
+    session: Session,
+    row: Node,
+    credential: NodeTokenIssuedOut,
+    reader: AdminUser,
+    principal: Principal | None,
+) -> dict[str, Any]:
+    """The ordinary node detail payload plus its freshly minted credential, as kwargs: the one home the
+    creation routes share (`create_node` here, an order's answer in `routes/node_orders.py`). Narrowed for a
+    tenant creator."""
+    counts = _counts_map(session, [row.id]).get(
+        row.id, NodeCounts(worktrees=0, runners=0, accounts=0)
+    )
+    detail = _node_out(
+        session,
+        str(row.id),
+        row,
+        jaah_discovery.presence_map(session),
+        counts,
+        detail=True,
+        published=reads._published_release(session, [row]),
+    )
+    return {**_narrow_for_tenant(detail, reader, principal).model_dump(), "credential": credential}
+
+
 @router.post("/api/nodes", response_model=NodeRegisteredOut, status_code=201)
 @org_admin(Tenancy.CALLER_PLANE)
 @session_only
+@on_thread
 def create_node(
+    session: Session,
     body: NodeCreateIn,
     request: Request,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> Any:
-    """Register a node that already exists: one of three `nodes` creators and the only one that provisions
-    nothing (`POST /api/nodes/cloud` launches, `/api/nodes/self-hosted` is hand provisioning); all insert
+    """Register a node that already exists: the one `nodes` creator that provisions nothing (an Add-node
+    order, `POST /api/node-orders`, launches a cloud machine or hands over the self-hosted one-liner); all insert
     through `_registered_node`. No self-report path creates a row: with `enabled` defaulting true, any
     token holder dialling in would otherwise become a dispatchable member without anyone deciding so.
 
@@ -411,6 +487,8 @@ def create_node(
 
     Presence is unaffected: the socket row (`app/node_presence.py`) still tracks any dialling node, so `GET /api/nodes`
     shows an unregistered node as present (for callers who see presence). Visible and member are two facts."""
+    # In a thread: the tailnet key mint (headscale, or the DBOS key workflow) runs inside this transaction, and
+    # the node's allocation reads the operator plane on a session of its own.
     if edition.IS_CE:
         # The community edition has exactly one node, the one its boot creates (`app/ce_bootstrap.py`).
         return ce_caps.not_in_ce()
@@ -442,7 +520,7 @@ def create_node(
     # here: these columns' Python-side defaults run on INSERT, so a sent null was silently replaced with the default (landing a node on the
     # wrong side of the shared-credential switch). The existing functions are called, in `update_node`'s
     # order (null before value).
-    _refuse_a_registered_launch_record(fields, user)
+    _refuse_a_registered_launch_record(fields, caller.actor)
     _reject_an_explicit_null_on_a_not_null_column(fields)
     # `draining` is refused outright: inherited from `NodeUpdateIn`, it would reach `Node(**fields)`, yet no
     # registration can describe a drain; `{"draining": true}` would be disabled on the next pass, and with
@@ -460,7 +538,7 @@ def create_node(
 
     # MicroVM is a later decision with refusals that read the live node (`microvm_mode.blocker`): refused here,
     # as `draining` is, rather than dropped.
-    if fields.keys() & set(_MICROVM_FIELDS):
+    if fields.keys() & {*_MICROVM_FIELDS, "node_vm_size"}:
         raise HTTPException(
             status_code=422,
             detail="Register the node first, then turn MicroVM on or set its VM size from its page.",
@@ -478,47 +556,32 @@ def create_node(
     with _cloud_node_errors():
         row, credential = _registered_node(
             session,
-            user,
+            caller.actor,
             node_id,
             cp_base_url=cloud_node_launch.onboarding_cp_base_url(_request_origin(request)),
             fetch_base_url=console_fetch_origin(request),
             org_id=org_id,
+            join_key="new",
             **fields,
         )
     emit_console_event(session, entity="node", id=row.id, action="upserted")
-    session.commit()
-    session.refresh(row)
+    commit_row(session, row)
 
-    counts = _counts_map(session, [row.id]).get(
-        row.id, NodeCounts(worktrees=0, runners=0, accounts=0)
-    )
-    detail = _narrow_for_tenant(
-        _node_out(
-            session,
-            str(row.id),
-            row,
-            jaah_discovery.presence_map(session),
-            counts,
-            detail=True,
-            published=reads._published_release(session, [row]),
-        ),
-        user,
-        principal,
-    )
     # The one response that carries a plaintext credential: attached here, so no other node-serving route has
     # a token field to leave empty.
-    return NodeRegisteredOut(**detail.model_dump(), credential=credential)
+    return NodeRegisteredOut(**_registration_payload(session, row, credential, caller.actor, caller.principal))
 HOST_NODELINKS = "A host runs no work, so it mounts no NodeLinks. Pick NodeLinks for the nodes on it."
 
 
 @router.post("/api/nodes/{node_id}/token", response_model=NodeTokenIssuedOut, status_code=201)
 @org_admin(Tenancy.CALLER_PLANE)
 @session_only
+@on_thread
 def reissue_node_token(
+    session: Session,
     node_id: str,
     request: Request,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> NodeTokenIssuedOut | JSONResponse:
     """Mint this node a new credential, returning the plaintext once: rotation, recovery and revocation.
 
@@ -533,21 +596,18 @@ def reissue_node_token(
     if edition.IS_CE:
         # The community edition's node holds the token its boot wrote (`app/ce_bootstrap.py`).
         return ce_caps.not_in_ce()
-    row = _node_row(session, node_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"unknown node '{node_id}'")
+    row = or_404(_node_row(session, node_id), detail=f"unknown node '{node_id}'")
     node_allocation.refuse(row, user, node_allocation.CREDENTIAL_LOCKED)
     require_org_active(session, row.org_id)
     with _cloud_node_errors():
         issued = _issue_credential(
             session, row, cloud_node_launch.onboarding_cp_base_url(_request_origin(request)),
-            console_fetch_origin(request),
+            console_fetch_origin(request), join_key="reissue",
         )
     # A plain re-issue supersedes an open re-enrol: this command must not mint a key, nor 409 on an
     # expired arming (`routes/agent_bootstrap.py::_reenrolment_is_open`).
     row.tailnet_reenrol_until = None
-    emit_console_event(session, entity="node", id=row.id, action="upserted")
-    session.commit()
+    emit_console_event(session, entity="node", id=row.id, action="upserted", commit=True)
     return issued
 
 
@@ -556,11 +616,12 @@ def reissue_node_token(
 )
 @org_admin(Tenancy.CALLER_PLANE)
 @session_only
+@on_thread
 def reenrol_node_on_tailnet(
+    session: Session,
     node_id: str,
     request: Request,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> NodeTailnetReenrolOut | JSONResponse:
     """Re-issue this node's token AND let its bootstrap mint one tailnet key, for a node already reported in.
 
@@ -574,9 +635,7 @@ def reenrol_node_on_tailnet(
     # Deferred: `routes/agent_bootstrap` imports this package (`node_wire`).
     from app.routes.agent_bootstrap import open_tailnet_reenrolment
 
-    row = _node_row(session, node_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"unknown node '{node_id}'")
+    row = or_404(_node_row(session, node_id), detail=f"unknown node '{node_id}'")
     node_allocation.refuse(row, user, node_allocation.CREDENTIAL_LOCKED)
     require_org_active(session, row.org_id)  # a re-issue, as `reissue_node_token`
     # Refused BEFORE the re-issue: with no tailnet there is no key to hand out, and rotating the token
@@ -595,7 +654,6 @@ def reenrol_node_on_tailnet(
             console_fetch_origin(request),
         )
     until = open_tailnet_reenrolment(row)
-    emit_console_event(session, entity="node", id=row.id, action="upserted")
-    session.commit()
+    emit_console_event(session, entity="node", id=row.id, action="upserted", commit=True)
     log.info("nodes: tailnet re-enrolment opened for node=%s until=%s", row.name, until.isoformat())
     return NodeTailnetReenrolOut(**issued.model_dump(), tailnet_reenrol_until=until.isoformat())

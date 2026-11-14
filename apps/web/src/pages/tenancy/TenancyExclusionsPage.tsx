@@ -18,10 +18,15 @@ import NoMatchesState from '../../ui/NoMatchesState'
 import LoadingState from '../../ui/LoadingState'
 import StatusChip, { type Tone } from '../../ui/StatusChip'
 import { DateTimeBoundFields } from '../../ui/DateTimeBoundFields'
-import { FULL_BLEED_SX, monoSx, PHONE, PHONE_CARD_SX } from '../../ui/listStyles'
-import { ClearFiltersButton, LogPagerFooter, StaleResultBanner } from '../../ui/LogPagerFooter'
-import { logPages, PER_PAGE, setRangeParams, usePagedLogFilters } from '../../hooks/usePagedLogFilters'
-import { humanize } from '../../lib/humanize'
+import { FULL_BLEED_SX, monoSx, PHONE, PHONE_CARD_SX, phoneColumnOrder } from '../../ui/listStyles'
+import { FONT_WEIGHT, SIZE, grid } from '../../theme'
+import { ClearFiltersButton } from '../../ui/FilterStates'
+import RetryBanner from '../../ui/RetryBanner'
+import ListPager from '../../ui/ListPager'
+import { useListPage } from '../../hooks/useListPage'
+import { OFFSET_MAX, setRangeParams, usePagedLogFilters } from '../../hooks/usePagedLogFilters'
+import { countOf, groupedCount, groupedCountOf, humanize } from '../../lib/humanize'
+import Tip from '../../ui/Tip'
 
 /* Audit > Exclusions — the tenancy read seam's trail: what an ORM read's org predicate held back (the
  * seam ships enforcing), shown before a first external tenant is onboarded. The seam mode is the loudest
@@ -90,48 +95,36 @@ const SAME_INSTANT_MS = 90_000
    `unbound_write`, expected until the operator plane gets an org-bearing write path) are `warning`;
    `derived_unstamped` is `info` (a bound org with an unstamped parent — clears as the backlog drains);
    `org` is `info`, never `success`. */
-const SCOPE_TONE: Record<string, Tone> = {
-  unbound: 'warning',
-  identity_denied: 'error',
-  derived_unstamped: 'info',
-  operator: 'warning',
-  org: 'info',
+const SCOPE: Record<string, { tone: Tone; glyph: string }> = {
+  unbound: { tone: 'warning', glyph: '∅' },
+  identity_denied: { tone: 'error', glyph: '⊘' },
+  derived_unstamped: { tone: 'info', glyph: '↑' },
+  operator: { tone: 'warning', glyph: '◇' },
+  org: { tone: 'info', glyph: '◈' },
 }
 
-const SCOPE_GLYPH: Record<string, string> = {
-  unbound: '∅',
-  identity_denied: '⊘',
-  derived_unstamped: '↑',
-  operator: '◇',
-  org: '◈',
-}
-
-const MODE_TONE: Record<string, Tone> = {
-  read: 'neutral',
-  unbound_write: 'warning',
-}
-
-const MODE_GLYPH: Record<string, string> = {
-  read: '▤',
-  unbound_write: '✎',
+const MODE: Record<string, { tone: Tone; glyph: string }> = {
+  read: { tone: 'neutral', glyph: '▤' },
+  unbound_write: { tone: 'warning', glyph: '✎' },
 }
 
 /* The phone card's line layout (`listStyles.PHONE_CARD_SX` leaves it to the caller): `When` leads with
- * the count beside it, the short tokens flow, and `Route or job` takes its own last line so it wraps.
- * `order`, not DOM moves, keeps reading order. Selected by `data-col`, not `nth-of-type`. */
+ * the count beside it, the short tokens flow, and `Route or job` takes its own last line so it wraps. */
 const EXCLUSION_PHONE_CARD_SX = {
   [PHONE]: {
-    '& tbody td[data-col="when"]': { order: 0, flex: '1 1 auto', fontWeight: 600 },
-    /* `flexDirection: 'row'` undoes `TableCell`'s `align="right"` `row-reverse`, which would put the
-       `CellLabel` after the value on the card. */
-    '& tbody td[data-col="count"]': { order: 1, flex: '0 0 auto', flexDirection: 'row' },
-    '& tbody td[data-col="class"]': { order: 2, flex: '0 0 auto' },
-    '& tbody td[data-col="scope"]': { order: 3, flex: '0 0 auto' },
-    '& tbody td[data-col="org"]': { order: 4, flex: '0 1 auto' },
-    '& tbody td[data-col="mode"]': { order: 5, flex: '0 0 auto' },
-    /* Heading on its own line above the route, so the route gets the full card width. `> span` is the
-       `CellLabel`; the value is a bare text node. */
-    '& tbody td[data-col="route"]': { order: 6, flex: '1 1 100%', flexWrap: 'wrap' },
+    ...phoneColumnOrder([
+      ['when', { flex: '1 1 auto', fontWeight: FONT_WEIGHT.semibold }],
+      /* `flexDirection: 'row'` undoes `TableCell`'s `align="right"` `row-reverse`, which would put the
+         `CellLabel` after the value on the card. */
+      ['count', { flex: '0 0 auto', flexDirection: 'row' }],
+      ['class', { flex: '0 0 auto' }],
+      ['scope', { flex: '0 0 auto' }],
+      ['org', { flex: '0 1 auto' }],
+      ['mode', { flex: '0 0 auto' }],
+      /* Heading on its own line above the route, so the route gets the full card width. `> span` is the
+         `CellLabel`; the value is a bare text node. */
+      ['route', { flex: '1 1 100%', flexWrap: 'wrap' }],
+    ]),
     '& tbody td[data-col="route"] > span': { flex: '1 1 100%' },
   },
 } as const
@@ -149,29 +142,33 @@ const COLUMNS: readonly { key: string; label: string; align?: 'right' }[] = [
 
 export default function TenancyExclusionsPage(): JSX.Element {
   /* The viewer's zone, named on the page: inputs take a zoneless wall clock, so display and filter
-     must agree. Every filter change goes through `applyFilter`, resetting the page index, so a narrowed
-     result is not shown past its end. */
+     must agree. Every filter change goes through `applyFilter`, re-pinning the instant. */
   const {
-    zone, from, to, page, setPage, narrow: applyFilter, clearShared, sharedFiltersSet, rangeFields,
+    zone, from, to, narrow: applyFilter, clearShared, sharedFiltersSet, rangeFields,
   } = usePagedLogFilters()
 
   const [mappedClass, setMappedClass] = useState('')
   const [org, setOrg] = useState('')
   const [scopeKind, setScopeKind] = useState('')
   const [mode, setMode] = useState('')
+  /* A filter change lands on page 1 (`resetKey`), so a narrowed result is not shown past its end. `prefix`: the
+     Audit shell keeps every opened panel mounted on ONE URL, so each panel's page keys are its own. */
+  const { page, per, setPage, setPer } = useListPage({
+    prefix: 'exclusions_', resetKey: JSON.stringify([mappedClass, org, scopeKind, mode, from, to]),
+  })
 
   /* Cleared means omitted: a blank param has no API value. */
   const url = useMemo(() => {
     const params = new URLSearchParams()
-    params.set('limit', String(PER_PAGE))
-    params.set('offset', String(page * PER_PAGE))
+    params.set('limit', String(per))
+    params.set('offset', String((page - 1) * per))
     if (mappedClass) params.set('mapped_class', mappedClass)
     if (org) params.set('bound_org', org)
     if (scopeKind) params.set('scope_kind', scopeKind)
     if (mode) params.set('mode', mode)
     setRangeParams(params, from, to)
     return `/api/tenancy-exclusions?${params.toString()}`
-  }, [mappedClass, org, scopeKind, mode, from, to, page])
+  }, [mappedClass, org, scopeKind, mode, from, to, page, per])
 
   /* On a failed read the hook keeps `data`: stale rows under a banner beat none. Superseded responses
      are fenced by the hook. */
@@ -184,13 +181,14 @@ export default function TenancyExclusionsPage(): JSX.Element {
   const items = data?.items ?? []
   const total = data?.total ?? 0
   const totalUnfiltered = data?.total_unfiltered ?? 0
-  const pages = logPages(total, page)
-  const { totalPages, maxPageIndex } = pages
-
-  /* A clamp: rows age out under the operator, shrinking the page count. */
+  /* The pager's reach: the last page the endpoint will seek to (`OFFSET_MAX`), which a deep log may fall
+     past; rows ageing out under the operator shrink the page count, and `ListPager` clamps back. */
+  const lastReachablePage = Math.floor(OFFSET_MAX / per) + 1
+  const atLastReachablePage = page >= lastReachablePage
+  /* A hand-typed `?page=` past the reach would be a 422, not a page: snap to the last one the endpoint seeks to. */
   useEffect(() => {
-    if (page > maxPageIndex) setPage(Math.max(0, maxPageIndex))
-  }, [page, maxPageIndex])
+    if (page > lastReachablePage) setPage(lastReachablePage)
+  }, [page, lastReachablePage, setPage])
 
   const hasFilters = sharedFiltersSet || mappedClass !== '' || org !== '' || scopeKind !== '' || mode !== ''
 
@@ -299,7 +297,7 @@ export default function TenancyExclusionsPage(): JSX.Element {
               {writerDetail ??
                 'The exclusion writer on the API process serving this page is failing, and it did not report why.'}
             </Box>
-            <Box component="span" sx={{ display: 'block', mt: 0.5, fontWeight: 600 }}>
+            <Box component="span" sx={{ display: 'block', mt: 0.5, fontWeight: FONT_WEIGHT.semibold }}>
               Every count below is a floor, not a total, and an empty result is not evidence that the
               seam excluded nothing. This page cannot support the flip until the writer recovers.
             </Box>
@@ -314,7 +312,7 @@ export default function TenancyExclusionsPage(): JSX.Element {
           data-testid="tenancy-exclusions-window"
           sx={{ display: 'block', mb: 1, color: 'text.secondary' }}
         >
-          {`Retained ${data.retention_days} day${data.retention_days === 1 ? '' : 's'}, covering ${formatZoned(data.covering_since, zone)} onward`}
+          {`Retained ${countOf(data.retention_days, 'day')}, covering ${formatZoned(data.covering_since, zone)} onward`}
           {/* A clause replacing the full stop — see `windowBoundByLogAge`. */}
           {windowBoundByLogAge ? ' — this log has only existed since then. ' : '. '}
           {data.latest_occurred_at !== null
@@ -325,42 +323,23 @@ export default function TenancyExclusionsPage(): JSX.Element {
       )}
 
       <FilterRow>
-        <FilterSelect
-          label="Class"
-          ariaLabel="Filter by ORM class"
-          value={mappedClass}
-          onChange={next => applyFilter(() => setMappedClass(next))}
-          allLabel="Any class"
-          options={classOptions}
-          minWidth={170}
-        />
-        <FilterSelect
-          label="Org"
-          ariaLabel="Filter by bound org"
-          value={org}
-          onChange={next => applyFilter(() => setOrg(next))}
-          allLabel="Any org"
-          options={orgOptions}
-          minWidth={190}
-        />
-        <FilterSelect
-          label="Scope"
-          ariaLabel="Filter by scope kind"
-          value={scopeKind}
-          onChange={next => applyFilter(() => setScopeKind(next))}
-          allLabel="Any scope"
-          options={scopeOptions}
-          minWidth={170}
-        />
-        <FilterSelect
-          label="Mode"
-          ariaLabel="Filter by seam mode"
-          value={mode}
-          onChange={next => applyFilter(() => setMode(next))}
-          allLabel="Any mode"
-          options={modeOptions}
-          minWidth={160}
-        />
+        {([
+          ['Class', 'Filter by ORM class', mappedClass, setMappedClass, 'Any class', classOptions],
+          ['Org', 'Filter by bound org', org, setOrg, 'Any org', orgOptions],
+          ['Scope', 'Filter by scope kind', scopeKind, setScopeKind, 'Any scope', scopeOptions],
+          ['Mode', 'Filter by seam mode', mode, setMode, 'Any mode', modeOptions],
+        ] as const).map(([label, ariaLabel, value, set, allLabel, options]) => (
+          <FilterSelect
+            key={label}
+            label={label}
+            ariaLabel={ariaLabel}
+            value={value}
+            onChange={next => applyFilter(() => set(next))}
+            allLabel={allLabel}
+            options={options}
+            minWidth={SIZE.fieldMd}
+          />
+        ))}
 
         <DateTimeBoundFields {...rangeFields} />
 
@@ -368,12 +347,11 @@ export default function TenancyExclusionsPage(): JSX.Element {
       </FilterRow>
 
       {error && data !== null && (
-        <StaleResultBanner
-          error={error}
-          onRetry={retry}
-          testId="tenancy-exclusions-error"
-          retryTestId="tenancy-exclusions-retry"
-        />
+        <Box sx={{ mt: 1 }}>
+          <RetryBanner onRetry={retry} testId="tenancy-exclusions-error" retryTestId="tenancy-exclusions-retry">
+            {error} Showing the last result that loaded.
+          </RetryBanner>
+        </Box>
       )}
 
       <Box sx={{ mt: 1 }}>
@@ -437,7 +415,7 @@ export default function TenancyExclusionsPage(): JSX.Element {
                         {/* Never ellipsised: the table scrolls instead. */}
                         <TableCell
                           data-col="class"
-                          sx={[monoSx, { whiteSpace: 'nowrap', fontWeight: 600 }]}
+                          sx={[monoSx, { whiteSpace: 'nowrap', fontWeight: FONT_WEIGHT.semibold }]}
                         >
                           <CellLabel>Class</CellLabel>
                           {row.mapped_class}
@@ -447,8 +425,8 @@ export default function TenancyExclusionsPage(): JSX.Element {
                           <CellLabel>Scope</CellLabel>
                           <StatusChip
                             label={scopeWord}
-                            tone={SCOPE_TONE[row.scope_kind] ?? 'neutral'}
-                            glyph={SCOPE_GLYPH[row.scope_kind] ?? '·'}
+                            tone={SCOPE[row.scope_kind]?.tone ?? 'neutral'}
+                            glyph={SCOPE[row.scope_kind]?.glyph ?? '·'}
                             data-status={`scope-${row.scope_kind}`}
                           />
                         </TableCell>
@@ -457,8 +435,8 @@ export default function TenancyExclusionsPage(): JSX.Element {
                         <TableCell
                           data-col="org"
                           sx={{
-                            minWidth: 130,
-                            maxWidth: 220,
+                            minWidth: SIZE.fieldSm,
+                            maxWidth: grid(36.5),
                             whiteSpace: 'normal',
                             overflowWrap: 'anywhere',
                             ...(unbound ? { fontStyle: 'italic', color: 'text.secondary' } : null),
@@ -469,14 +447,14 @@ export default function TenancyExclusionsPage(): JSX.Element {
                         </TableCell>
 
                         {/* Route (~60 chars) wraps, `anywhere` (no spaces) — its tail is the resource.
-                            260px floor measured: the longest route settles into two lines. */}
+                            grid(43) floor measured: the longest route settles into two lines. */}
                         <TableCell
                           data-col="route"
                           sx={[
                             monoSx,
                             {
-                              minWidth: 260,
-                              maxWidth: 460,
+                              minWidth: grid(43),
+                              maxWidth: grid(76.5),
                               whiteSpace: 'normal',
                               overflowWrap: 'anywhere',
                             },
@@ -490,31 +468,30 @@ export default function TenancyExclusionsPage(): JSX.Element {
                           <CellLabel>Mode</CellLabel>
                           <StatusChip
                             label={modeWord}
-                            tone={MODE_TONE[row.mode] ?? 'neutral'}
-                            glyph={MODE_GLYPH[row.mode] ?? '·'}
+                            tone={MODE[row.mode]?.tone ?? 'neutral'}
+                            glyph={MODE[row.mode]?.glyph ?? '·'}
                             data-status={`mode-${row.mode}`}
                           />
                         </TableCell>
 
                         {/* Right-aligned `tabular-nums` so digits line up. */}
-                        <TableCell
+                        <Tip title={`${groupedCountOf(row.excluded_count, 'row')} would have been excluded in this minute`}><TableCell
                           data-col="count"
                           align="right"
                           sx={[
                             monoSx,
                             {
                               whiteSpace: 'nowrap',
-                              fontWeight: 600,
+                              fontWeight: FONT_WEIGHT.semibold,
                               fontVariantNumeric: 'tabular-nums',
                               // The phone card has no column; lead with the label.
                               [PHONE]: { justifyContent: 'flex-start' },
                             },
                           ]}
-                          title={`${row.excluded_count.toLocaleString()} row${row.excluded_count === 1 ? '' : 's'} would have been excluded in this minute`}
                         >
                           <CellLabel>Count</CellLabel>
-                          {row.excluded_count.toLocaleString()}
-                        </TableCell>
+                          {groupedCount(row.excluded_count)}
+                        </TableCell></Tip>
                       </TableRow>
                     )
                   })}
@@ -522,15 +499,25 @@ export default function TenancyExclusionsPage(): JSX.Element {
               </DataTable>
             </Box>
 
-            <LogPagerFooter
+            <ListPager
               page={page}
-              setPage={setPage}
-              pages={pages}
-              logName="exclusion log"
+              per={per}
+              total={data ? total : null}
+              onPage={setPage}
+              onPer={setPer}
+              nextDisabled={atLastReachablePage}
               testId="tenancy-exclusions-pagination"
-              ceilingTestId="tenancy-exclusions-offset-ceiling"
-              label={`Page ${page + 1} of ${totalPages} — ${total.toLocaleString()} row${total === 1 ? '' : 's'}`}
             />
+            {/* Why Next is off when the endpoint's reach, not the log, ends. */}
+            {atLastReachablePage && total > lastReachablePage * per && (
+              <Typography
+                variant="caption"
+                data-testid="tenancy-exclusions-offset-ceiling"
+                sx={{ display: 'block', textAlign: 'center', mt: 0.5, color: 'text.secondary' }}
+              >
+                This is as deep as the exclusion log can be paged. Narrow the filters to reach older rows.
+              </Typography>
+            )}
           </>
         )}
       </Box>

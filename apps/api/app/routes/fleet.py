@@ -15,11 +15,11 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
@@ -29,6 +29,8 @@ from app import (
     acp_runtime,
     agent_providers,
     agent_resolution,
+    agent_router,
+    blind_review,
     budgets,
     dispatch_wait,
     edition,
@@ -37,10 +39,8 @@ from app import (
     fleet_verdicts,
     forges,
     git_access,
-    launch_cpu,
-    launch_disk,
     launch_failures,
-    launch_memory,
+    launch_gates,
     ce_caps,
     merge_lane_state,
     node_platform,
@@ -53,16 +53,19 @@ from app import (
     slot_state,
 )
 from app.operator_settings import reads as settings_reads
+from app.pipeline_gates import full_gate
 from app.account_runners import fleet_assigned_runner_counts
+from app.agent_router.personas import REVIEW_PERSONAS
 from app.authz.visibility import AllowedObjects
 from app.models.credentials import Account
 from app.models.nodes import Node
 from app.models.projects import Project
 from app.models.tasks import Task
-from app.models.worktrees import WORKTREE_KIND_DYNAMIC, Worktree
+from app.models.worktrees import Worktree
 from app.node_identity import node_id_or_none, node_matches, node_org, node_ref
 from app.node_clone import resolve_auth_dir
-from app.routes.tasks.dispatch import dispatchable_tasks
+from app.routes.tasks.dispatch import dispatchable_tasks  # noqa: F401 — the tests read it through this module
+from app.routes.tasks.dispatch import EpicThrottleBudget, dispatchable_tasks_among, dispatchable_tasks_by_project
 
 log = logging.getLogger("fleet-decide")
 
@@ -86,6 +89,17 @@ def _integration_branch_or_422(project_row: Project) -> str:
 
 # ══ dispatch-plan ══════════════════════════════════════════════════════════════════════════════════════
 
+class McpConnectionOut(BaseModel):
+    """One remote MCP server a dispatched task's project linked (`app/mcp_links.py::connections_for_task`). No
+    secret: the node's bridge fetches the token by `credential_path` (the roster path, `credential_get`'s name).
+    The node's twin is `apps/jaahd/agents/base.py::McpConnection`, which refuses a malformed entry."""
+
+    name: str = Field(pattern=r"^[a-z0-9_]{1,40}$")  # unique per task; the engine sees `mcp_<name>`
+    credential_path: str
+    url: str  # https, no userinfo, query or fragment
+    transport: Literal["streamable_http", "sse"]
+
+
 class DispatchDecision(BaseModel):
     task_id: int
     # dispatch | skip-inflight | skip-no-granted-account | skip-node-missing-runner-cli
@@ -93,12 +107,18 @@ class DispatchDecision(BaseModel):
     #   | skip-no-account-of-bound-provider:<provider>   (the ONE code carrying a payload)
     decision: str
     lease_target: Optional[int] = None
-    # True when `lease_target` names no row yet: no static slot was free, so the take declares a `dynamic`
+    # True when `lease_target` names no row yet: no worktree was free, so the take declares a `dynamic`
     # worktree at that index and leases it (`slot_allocation.add_dynamic`, R6).
     create_dynamic: bool = False
     # Why a `skip-dynamic-refused` task waits (`slot_allocation.dynamic_headroom`'s reason); a
     # `skip-acp-adapter-missing`'s sentence.
     why: Optional[str] = None
+    # Which `skip-no-granted-account` wait this is, so the drain picks its sentence without parsing `why`
+    # (`_no_account_why`): `not_granted` (the launcher may use none of the org's accounts here), `auth_expired`
+    # (every account it may use has a dead sign-in), `busy` (any other exclusion of its accounts: quota, runner
+    # limits, attestation). `busy` and None (the plan did not tell: a pinned or contended decline, Auto-assign off)
+    # keep the capacity sentence.
+    account_wait: Optional[Literal["not_granted", "auth_expired", "busy"]] = None
     # True when `lease_target` is this task's own prior slot (`select_slot` rule 2, a `task_id` match): the
     # executor must not reset the tree. Derived from the pick, never requested, so it cannot be forged.
     resume: bool = False
@@ -111,6 +131,9 @@ class DispatchDecision(BaseModel):
     # The SDK agent this task runs (`agent_resolution.Sdk`), as a uuid string: no account and no
     # prompt — the executor issues `fleet_verdicts.agent_launch` (`lease_drain._dispatch_agent`). None otherwise.
     agent_id: Optional[str] = None
+    # The task's linked remote MCP servers (AC4.2), filled from the composer's verdict when the intent is built
+    # (`app/lease_drain.py`); `[]` when its project links none.
+    mcp_connections: list[McpConnectionOut] = []
 
 
 class RepoDispatchPlan(BaseModel):
@@ -148,7 +171,7 @@ class DispatchPassFacts:
 
     `waiting`: the ids of projects with any dispatchable Task when `fleet_allocation` ran (see
     `build_dispatch_plan`). `live_by_project` / `allowed_by_task`: memos of `pool_state.live_nodes_for_project`
-    (only for a pass without `hosting_by_project`) and the task's placement-grant node uuids (strings, C10),
+    (only for a pass without `placement_by_project`) and the task's placement-grant node uuids (strings, C10),
     filled by whichever node asks first. Plain data, never ORM rows, so the
     node workers (one session each) can share them; a racing double fill computes the same value. Every
     input moves within a pass anyway, which is why the allocation table is shared the same way."""
@@ -174,29 +197,61 @@ class DispatchPassFacts:
     # out (no slot, a disk or memory wait, a contained raise) gives exactly its own place back (`give_back`).
     account_booked: dict[tuple[str, int], UUID] = field(default_factory=dict)
     # The rest is filled by `read_node_independent` (the drain); None (a direct plan) reads per node.
-    # `{waiting project id: hosting node uuid strings}` (`slot_allocation.hosting_node_ids_by_project`): the
+    # `{waiting project id: placement node uuid strings}` (`slot_allocation.placement_node_ids_by_project`): the
     # project half of `pool_state.live_nodes_for_project`. Its node half is each plan's own read of its own row
     # (`pool_state.allocation_roster_clause`), so a node fresh since this was filled is judged fresh.
-    hosting_by_project: Optional[dict[int, frozenset[str]]] = None
+    placement_by_project: Optional[dict[int, frozenset[str]]] = None
     # `pool_state.max_observation_age_secs`, a fleet-tier knob: one bound for every node's pool and roster read.
     observation_age_secs: Optional[float] = None
     # Every account row's dispatch columns (`account_rows`), plain rows: `_account_candidates`' enabled set and
-    # the drain's provider map and shared slugs (`lease_drain._account_providers`, `_shared_store_facts`).
+    # the drain's provider map (`lease_drain._account_providers`).
     accounts: Optional[list] = None
-    # `{org id: port_grid.Grid}`, filled by whichever node of the org asks first (`lease_drain._dispatch_node`).
-    grid_by_org: dict = field(default_factory=dict)
+    # `{task id: its live routing pick}` (`agent_router.live_pick_memo`), read once per pass after the prelude's pick
+    # refresh, for the allocation and every node's plan.
+    live_picks: dict = field(default_factory=dict)
+    # `{project id: its dispatchable task ids, priority DESC, id}`: the allocation's own read (`fleet_allocation`'s
+    # `dispatchable_out`), which each node's plan reloads by id (`dispatch.dispatchable_tasks_among`).
+    dispatchable_by_project: Optional[dict[int, list[int]]] = None
+    # `{held task id: its node uuid string}` (`slot_state.leased_task_nodes`): with `taken`, every plan's held-task
+    # dedup (`leased_ids`), and the drain's idle-node test (`lease_drain._dispatch_node`).
+    holder_by_task: Optional[dict[str, str]] = None
+    # `{dispatchable task id: its hold}` (`slot_state.task_holds`): the pin each plan's `owns_candidate` reads.
+    holds: Optional[dict[int, dict[str, Any]]] = None
+    # `{project id: merge-step command}` for every project (`full_gate.full_gate_commands`).
+    full_gates: Optional[dict[int, str]] = None
+    # Task ids this pass's nodes took a slot for (`note_taken`, from `lease_drain._taken_slot`), under `taken_lock`:
+    # holds `holder_by_task` predates, which a later plan's dedup must still see. A hint: a task is offered by one
+    # node only (`fleet_allocation`, or its hold's node), and the take is the authority.
+    taken: set[str] = field(default_factory=set)
+    taken_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def read_node_independent(self, session: Session) -> None:
         """Fill the pass's node-independent reads that every node's plan used to repeat. Each is
-        only as old as the pass, which is the bound `waiting` and the allocation already hold every node to."""
-        # All three read before any is set: a raise leaves every field None, so each node reads its own.
-        hosting = {
+        only as old as the pass, which is the bound `waiting` and the allocation already hold every node to; a
+        hold taken since is in `taken`."""
+        # All read before any is set: a raise leaves every field None, so each node reads its own.
+        placement = {
             project_id: frozenset(str(n) for n in nodes)
-            for project_id, nodes in slot_allocation.hosting_node_ids_by_project(session, self.waiting).items()
+            for project_id, nodes in slot_allocation.placement_node_ids_by_project(session, self.waiting).items()
         }
         observation_age_secs = pool_state.max_observation_age_secs()
-        accounts = account_rows(session)
-        self.hosting_by_project, self.observation_age_secs, self.accounts = hosting, observation_age_secs, accounts
+        # Kept when the drain read them before its allocation.
+        accounts = self.accounts if self.accounts is not None else account_rows(session)
+        holder_by_task = slot_state.leased_task_nodes(session)
+        holds = (slot_state.task_holds(session, [t for ids in self.dispatchable_by_project.values() for t in ids])
+                 if self.dispatchable_by_project is not None else None)
+        full_gates = full_gate.full_gate_commands(session, session.scalars(select(Project)).all())
+        self.placement_by_project, self.observation_age_secs, self.accounts = placement, observation_age_secs, accounts
+        self.holder_by_task, self.holds, self.full_gates = holder_by_task, holds, full_gates
+
+    def note_taken(self, task_id: object) -> None:
+        with self.taken_lock:
+            self.taken.add(str(task_id))
+
+    def leased_ids(self) -> set[str]:
+        """Every task holding a slot as this pass knows it: the pass's read plus its own takes since."""
+        with self.taken_lock:
+            return set(self.holder_by_task or ()) | self.taken
 
     def book(self, node_id: str, task_id: int, account_id: UUID, seen: int) -> bool:
         """Book one place on `account_id` for this decision, if the ledger still reads `seen` for it: the pick
@@ -522,7 +577,7 @@ def _slots_the_org_cannot_take(
     ]
 
 
-# No free static slot, and no dynamic worktree may be made on this node (R6, D1, D10): the task waits `ready`.
+# No free worktree, and no dynamic worktree may be made on this node (R6, D1, D10): the task waits `ready`.
 SKIP_DYNAMIC_REFUSED = "skip-dynamic-refused"
 # A task the Jaah account holds (`app/jaah_routing/routing.py::task_hold`, `app/lease_drain.py`).
 SKIP_JAAH_HELD = "skip-jaah-held"
@@ -566,14 +621,15 @@ SKIP_AGENT_UNRUNNABLE = "skip-agent-unrunnable"
 
 def _dynamic_index(
     session: Session, node_uuid: Optional[UUID], project_id: int, occupied: set[int],
+    has_repo: Optional[bool] = None,
 ) -> tuple[Optional[int], Optional[str]]:
-    """`(index, None)` for a new dynamic worktree on this node, `(None, why)` when none may be made, or
-    `(None, None)` when the project is not assigned here, so no dynamic worktree is this node's to make.
-    `occupied` is every index the plan knows is taken — the roster (retiring rows included) plus this
-    pass's own picks."""
-    if node_uuid is None or not slot_allocation.is_assigned(session, node_uuid, project_id):
+    """`(index, None)` for a new dynamic worktree of kind `has_repo` (default the project's) on this node,
+    `(None, why)` when none may be made, or `(None, None)` when the project may not start work here
+    (`slot_allocation.placement_node_ids`), so no dynamic worktree is this node's to make. `occupied` is every index the plan knows is taken — the roster (retiring rows
+    included) plus this pass's own picks."""
+    if node_uuid is None or node_uuid not in slot_allocation.placement_node_ids(session, project_id):
         return None, None
-    return slot_allocation.dynamic_headroom(session, node_uuid, project_id, occupied=occupied)
+    return slot_allocation.dynamic_headroom(session, node_uuid, project_id, occupied=occupied, has_repo=has_repo)
 
 
 def _vm_capacity(session: Session, project_id: int, node_ids: list[str]) -> dict[str, Any]:
@@ -586,12 +642,11 @@ def _vm_capacity(session: Session, project_id: int, node_ids: list[str]) -> dict
 
 
 def _room_by_node(session: Session, project_id: int, node_ids: list[str]) -> dict[str, int]:
-    """`assign_nodes`' room for one project, per node uuid string: its free static slots plus the dynamic
-    worktrees it could still make (`slot_allocation.dynamic_room`); a MicroVM node's is the VMs it admits
-    (`microvm_placement.capacity`)."""
-    room = slot_state.free_slots_by_node(session, project_id)
-    for node in node_ids:
-        room[node] = room.get(node, 0) + slot_allocation.dynamic_room(session, UUID(node), project_id)
+    """`assign_nodes`' room for one project, per node uuid string: the dynamic worktrees it could still make
+    (`slot_allocation.dynamic_room_by_pair`, one batched read; no free row is ever leased again); a MicroVM node's
+    is the VMs it admits (`microvm_placement.capacity`)."""
+    rooms = slot_allocation.dynamic_room_by_pair(session, [(project_id, UUID(node)) for node in node_ids])
+    room = {node: rooms.get((project_id, UUID(node)), 0) for node in node_ids}
     for node, cap in _vm_capacity(session, project_id, node_ids).items():
         room[node] = cap.room
     return room
@@ -742,7 +797,7 @@ def _stamp_lane_gating(
 ) -> None:
     """Name the wait of each unplaced task whose every usable node is gating a lane batch, so the pause
     is visible rather than a bare `ready`. Unplaced for any other reason, nothing is written. `blocked` is the
-    nodes `launch_disk`/`launch_memory` hold back, which are not usable either way."""
+    nodes `launch_gates` holds back, which are not usable either way."""
     usable = [n for n in pool_state.live_nodes_for_project(session, project_id) if n not in blocked]
     for task_id in unplaced:
         allowed = allowed_node_names(task_id)
@@ -752,12 +807,11 @@ def _stamp_lane_gating(
 
 
 def _blocked_reason(session: Session, node_id: str, memo: dict[str, Optional[str]]) -> Optional[str]:
-    """The sentence `launch_disk`/`launch_memory`/`launch_cpu` give for a node they hold back, in the drain's
-    order (`lease_drain._dispatch_node`), or None; once per node per pass (`memo`). No `task_id`: an unplaced task
+    """The sentence `launch_gates` gives for a node it holds back, in the drain's order
+    (`lease_drain._dispatch_node`), or None; once per node per pass (`memo`). No `task_id`: an unplaced task
     holds no slot, so it has none of its own to discount."""
     if node_id not in memo:
-        memo[node_id] = (launch_disk.wait_reason(session, node_id) or launch_memory.wait_reason(session, node_id)
-                         or launch_cpu.wait_reason(session, node_id))
+        memo[node_id] = launch_gates.wait_reason(session, node_id)
     return memo[node_id]
 
 
@@ -778,8 +832,8 @@ def _stamp_unplaced(
     if candidates is not None:
         live = [n for n in live if n in candidates]
     if not live:
-        why = dispatch_wait.NODES_OFFLINE if slot_allocation.hosting_node_ids(session, project_id) else (
-            dispatch_wait.NO_NODE)
+        why = dispatch_wait.NODES_OFFLINE if slot_allocation.placement_node_ids(session, project_id) else (
+            dispatch_wait.no_node_for(session, project_id))
         waits_out.update({task_id: why for task_id in unplaced})
         return
     for task_id in unplaced:
@@ -801,6 +855,8 @@ def fleet_allocation(
     allowed_out: Optional[dict[int, Optional[frozenset[str]]]] = None,
     wait_reasons_out: Optional[dict[int, str]] = None,
     demand_out: Optional[dict[UUID, int]] = None,
+    pass_facts: Optional[DispatchPassFacts] = None,
+    dispatchable_out: Optional[dict[int, list[int]]] = None,
 ) -> dict[int, str]:
     """`{task_id: node uuid string}` for every waiting task in the fleet — the pass's whole allocation, built once.
 
@@ -811,6 +867,8 @@ def fleet_allocation(
 
     `waiting_out` collects the id of every project with any dispatchable Task, pinned ones included: the
     one read of that fact per pass, which `build_dispatch_plan` reuses to skip the rest per node.
+    `dispatchable_out`, when given, is filled with that read's task ids per project, in its order
+    (`DispatchPassFacts.dispatchable_by_project`).
     `failed_on` is the pass's `launch_failures.excluded_node_ids`; `allowed_out`, when given, is filled with each
     task's allowed node uuids (that exclusion applied) for the drain to share with every node's plan.
     `wait_reasons_out`, when given, is filled with `{task id: sentence}` for each task left unplaced for a reason the
@@ -820,12 +878,35 @@ def fleet_allocation(
     disk, memory or CPU) — and the drain stamps it as the task's wait reason.
     `demand_out`, when given, is filled with each live per-agent trial's agents wanted this pass
     (`org_limits.DispatchBudget.demand`), which the drain keeps as the trial's peak (`app/trial_agents.py`).
+    `pass_facts`, when given, serves `_account_candidates`' fleet-wide reads (account rows, runner counts, the DB
+    clock, each org's provider grid) once for the allocation and every node's plan, instead of once per node.
 
-    A node `app/launch_disk.py` blocks (disk-paused, or below the launch disk floor) or `app/launch_memory.py`
-    blocks (memory pressure, or at its runner ceiling) is offered no task here: it would only hold one waiting on
+    A node `app/launch_gates.py` blocks (disk-paused, below the launch disk floor, memory pressure or CPU
+    saturation) is offered no task here: it would only hold one waiting on
     disk or memory while another node has room. Nor is a node gating a lane batch (`merge_lane.gating_node_ids`)
     offered a model task until that gate ends. A task already holding a slot there is not in this walk. A lane run is placed on the most idle cores (`pool_state.assign_nodes`'
     `free_cores`)."""
+    armed_here = pass_facts is not None and _PASS_FACTS not in session.info
+    if armed_here:
+        session.info[_PASS_FACTS] = pass_facts
+    try:
+        return _fleet_allocation(session, waiting_out=waiting_out, failed_on=failed_on, allowed_out=allowed_out,
+                                 wait_reasons_out=wait_reasons_out, demand_out=demand_out,
+                                 dispatchable_out=dispatchable_out)
+    finally:
+        if armed_here:
+            session.info.pop(_PASS_FACTS, None)
+
+
+def _fleet_allocation(
+    session: Session, *, waiting_out: Optional[set[int]],
+    failed_on: Optional[dict[int, frozenset[str]]],
+    allowed_out: Optional[dict[int, Optional[frozenset[str]]]],
+    wait_reasons_out: Optional[dict[int, str]],
+    demand_out: Optional[dict[UUID, int]],
+    dispatchable_out: Optional[dict[int, list[int]]] = None,
+) -> dict[int, str]:
+    """`fleet_allocation`'s body."""
     # Keyed by id: a name repeats across orgs (`uq_projects_org_name`).
     row_by_id = {p.id: p for p in session.scalars(select(Project)).all()}
     projects = [{"id": p.id, "name": p.name, "repo_url": p.repo_url} for p in row_by_id.values()]
@@ -844,11 +925,8 @@ def fleet_allocation(
     # The shared booking ledger — mutated by every call below (reason 2 above).
     booked: dict = {}
     grant_memo: dict = {}
-    # Disk, memory and CPU hold a node back the same way (`launch_disk`, `launch_memory`, `launch_cpu`).
-    low_resources = (
-        launch_disk.ids_blocked(session, live) | launch_memory.ids_blocked(session, live)
-        | launch_cpu.ids_blocked(session, live)
-    )
+    # Disk, memory and CPU hold a node back the same way (`launch_gates`).
+    low_resources = launch_gates.ids_blocked(session, live)
     # A node gating a lane batch takes no NEW model run until the gate ends: the runners waiting
     # on that merge outrank the next one's build. Lane runs themselves are still placed there.
     gating = merge_lane_state.gating_node_ids(session)
@@ -862,15 +940,22 @@ def fleet_allocation(
     # fleet-wide `priority DESC, id` order — the dispatch plan's own (`fleet_priority_order`) — so a capped
     # org's first-named project never starves a higher-priority task in another.
     budget = org_limits.DispatchBudget(session)
+    # Each throttled epic's room (`EpicThrottleBudget`), spent the same way: the pass's one read of the dispatchable
+    # tasks cannot see its own placements, so without it a Throttle of 1 placed every ready child at once.
+    epic_budget = EpicThrottleBudget(session)
     # The monthly budgets over 100%, each org's read once for the pass (`app/budgets.py`).
     money_budgets = budgets.Ledger(session)
     account_nodes = _AccountNodes(session, grant_memo)
     # `_stamp_unplaced`'s per-node sentences, read once each for the pass.
     blocked_why: dict[str, Optional[str]] = {}
     walks = []
+    # One fleet-wide read, not one per project (`dispatchable_tasks_by_project`).
+    waiting_by_project = dispatchable_tasks_by_project(session)
+    if dispatchable_out is not None:
+        dispatchable_out.update({p: [t.id for t in tasks] for p, tasks in waiting_by_project.items()})
     for project in enrolled:
         row = row_by_id[project["id"]]
-        waiting = dispatchable_tasks(row.id, session)
+        waiting = waiting_by_project.get(row.id, [])
         if waiting and waiting_out is not None:
             waiting_out.add(row.id)
         # A lane run is placed like any task, but spends no runner budget and is never Jaah-held (it runs no
@@ -892,14 +977,14 @@ def fleet_allocation(
         # An SDK agent run is placed like a lane run — no runner budget, never Jaah-held — but only on a node
         # that can run agents; with none, it waits naming why (architecture §3.4). A refused one is the
         # prelude's (`lease_drain._fail_unrunnable_agents`) and is placed nowhere.
-        choices = {t.id: agent_resolution.resolve_agent(session, t, row) for t in waiting
+        choices = {t.id: agent_router.effective_choice(session, t, row) for t in waiting
                    if not merge_lane_state.is_lane_persona(t.persona)}
         # A run whose git credential its forge reported revoked would only be refused its token (410): it stays
         # `ready`, waiting on one reconnect (`git_access.revoked_holds`, its reason derived at read).
         git_held = git_access.revoked_holds(session, [t for t in waiting if t.id in choices])
         agent_runs = [t for t in waiting if isinstance(choices.get(t.id), agent_resolution.Sdk)
                       and slot_state.task_hold(session, t.id) is None and money_budgets.hold_reason(t) is None
-                      and t.id not in git_held]
+                      and t.id not in git_held and epic_budget.take(t)]
         if agent_runs:
             project_live = pool_state.live_nodes_for_project(session, row.id)
             # A manifest 2 agent needs a node that runs it under `jaah-acp-host` too, and a registry install one
@@ -927,6 +1012,9 @@ def fleet_allocation(
                     _stamp_unplaced(session, row.id, [t.id for t in runs if t.id not in table], low_resources,
                                     allowed_node_names, failed_on, wait_reasons_out, blocked_why,
                                     candidates=sorted(capable))
+            for t in agent_runs:
+                if t.id not in table:
+                    epic_budget.refund(t)
         models = [t for t in waiting if not merge_lane_state.is_lane_persona(t.persona)
                   and isinstance(choices.get(t.id), agent_resolution.Builtin)]
         # A task the Jaah account holds back (`app/jaah_routing/`) will not dispatch, so it spends no budget; nor
@@ -951,7 +1039,11 @@ def fleet_allocation(
             for t in ordered:
                 if t.id in offered:
                     continue
+                # The epic first: a child its throttle holds is not demand on the org's cap.
+                if not epic_budget.take(t):
+                    continue
                 if not budget.take(t.org_id, task_id=t.id):
+                    epic_budget.refund(t)
                     continue
                 offered.add(t.id)
                 admitted.add(t.id)
@@ -968,6 +1060,14 @@ def fleet_allocation(
                     if t.id in admitted:
                         allowed_by_task[t.id] = account_nodes(t, choices[t.id].provider, allowed_by_task[t.id],
                                                               project_live)
+                        # A task run without the repository goes to a node that holds folder slots beside git
+                        # worktrees while one may take it; with none, the plan says which node needs updating.
+                        if slot_allocation.task_wants_folder(session, t, row):
+                            allowed = allowed_by_task[t.id]
+                            mixing = frozenset(n for n in (project_live if allowed is None else allowed)
+                                               if n in project_live
+                                               and slot_allocation.node_mixes_kinds(session, UUID(n)))
+                            allowed_by_task[t.id] = mixing or allowed
                 # Room is per project (slots are declared per project per node); the reads above are host
                 # facts.
                 table.update(_assign(
@@ -988,6 +1088,7 @@ def fleet_allocation(
                 break
             for t in unplaced:
                 budget.refund(t.org_id)
+                epic_budget.refund(t)
     if wait_reasons_out is not None:
         for row, _, unheld, _ in walks:
             _stamp_unplaced(session, row.id, [t.id for t in unheld if t.id in offered and t.id not in table],
@@ -995,7 +1096,7 @@ def fleet_allocation(
     if edition.IS_CE:
         ce_caps.record_held_back(budget.held_back())
     if demand_out is not None:
-        demand_out.update(budget.demand([(t.org_id, t.id) for t in ordered if t.id in offered and t.id in table]))
+        demand_out.update(budget.demand())
     return table
 
 
@@ -1013,7 +1114,10 @@ def build_dispatch_plan(
     api's CPU, re-read per node). Nothing is lost: a task readied since is absent from the
     allocation too, so no live node could have owned it this pass — except a pinned task, whose hold node
     bypasses the allocation — and it dispatches on a later pass. `None` (a direct call with its own table)
-    skips nothing. `pass_facts` also carries the pass's shared memos (`DispatchPassFacts`)."""
+    skips nothing. `pass_facts` also carries the pass's shared memos and node-independent reads
+    (`DispatchPassFacts`): the dispatchable tasks, held tasks, holds and full gates are the pass's, not this
+    plan's, so a task readied since dispatches on a later pass, pinned or not; the node-scoped reads (pool,
+    redispatch candidates, busy slots) stay this plan's own."""
     project_rows = session.scalars(select(Project)).all()
     # The phase-1 loop reads its rows from this one read, not one SELECT per project per node.
     # Keyed by id: a name repeats across orgs.
@@ -1036,7 +1140,7 @@ def build_dispatch_plan(
     # roster now (`pool_state.allocation_roster_clause`, the node half of `live_nodes_for_project`).
     node_row = session.execute(
         select(Node.org_id, Node.draining, Node.name, Node.runner_clis, Node.senses_acp_adapters, Node.os,
-               Node.arch, Node.microvm,
+               Node.arch, Node.microvm, Node.launch_kinds,
                and_(*pool_state.allocation_roster_clause(observation_age)).label("in_roster"))
         .where(node_matches(body.node_id))
     ).first()
@@ -1064,8 +1168,11 @@ def build_dispatch_plan(
         _log_pool_state_outcome("no-node-org", "pool state NOT evaluated: %s", org_detail)
         pool_ok = False
     # Two dedup sources unioned: the roster's `session` flag lags a dispatch by a pass. `leased_task_ids`
-    # covers every held task; the subtractions below let `_take_for_dispatch` reach `resume`.
-    in_flight = fleet_decide.inflight_task_ids(pool_records) | slot_state.leased_task_ids(session)
+    # covers every held task (the pass's read plus its takes since, `DispatchPassFacts.leased_ids`); the
+    # subtractions below let `_take_for_dispatch` reach `resume`.
+    leased = (pass_facts.leased_ids() if pass_facts is not None and pass_facts.holder_by_task is not None
+              else slot_state.leased_task_ids(session))
+    in_flight = fleet_decide.inflight_task_ids(pool_records) | leased
     # This node's non-live holds are dispatchable back into (`resume`), judged off the CP's own
     # `acked_at`/`dispatched_at` (`fleet_decide.dispatch_is_redispatchable`): a fresh lease has no
     # sighting yet. `leased_account_id` feeds `avoid_account_by_task`.
@@ -1127,8 +1234,9 @@ def build_dispatch_plan(
         waiting_projects: set[int] = set()
         allocation = fleet_allocation(session, waiting_out=waiting_projects)
         pass_facts = DispatchPassFacts(waiting=frozenset(waiting_projects))
-    # Each waiting project's candidates' holds (`slot_state.task_holds`), one read per project, not one per
-    # waiting task. Per plan, not per pass: another node's lease this pass is a hold this plan must see.
+    # Every offered project's candidates' holds (`slot_state.task_holds`, the pass's when it has them) and busy
+    # slots (`slot_state.held_slots_by_project`, node-scoped, per plan). A hold another node took this pass after
+    # the pass's read is in `in_flight` (`DispatchPassFacts.taken`), and that task is not this node's to offer.
     # Each org's Jaah route (`jaah_routing.org_route`), read once per org per pass; and the asking node's uuid,
     # which a Jaah session is bound to.
     jaah_memo: dict = {}
@@ -1136,10 +1244,18 @@ def build_dispatch_plan(
     # Phase 1's task rows, so phase 2 reads none again.
     task_by_id: dict[int, Task] = {}
 
+    # Every project's dispatchable tasks (`dispatchable_tasks_by_project`), read once on first need.
+    waiting_by_project: Optional[dict[int, list[Task]]] = None
+    holds: dict[int, dict[str, Any]] = {}
+    held_by_project: dict[int, list[str]] = {}
+
     # ── PHASE 1 of 2: per-project context. ───────────────────────────────────────────────────────────
     # Nothing here takes a slot. Taking happens after, over all projects' candidates merged into one
     # fleet-wide `priority DESC, id` order, so a high-priority task in a late project is not starved.
     passes: list[_RepoPass] = []
+    # Every enrolled project's merge-step command, in a few queries (`full_gate.full_gate_commands`): the pass's.
+    full_gates = (pass_facts.full_gates if pass_facts is not None and pass_facts.full_gates is not None
+                  else full_gate.full_gate_commands(session, [row_by_id[p["id"]] for p in enrolled]))
     for project in enrolled:
         name = project["name"]
         # `enrolled` is built from these same rows, so every id resolves.
@@ -1171,7 +1287,8 @@ def build_dispatch_plan(
             # Stripped but not refused (a 422 would abort the whole pass): a whitespace-only gate would
             # otherwise pass `lease_drain`'s emptiness check.
             plan.gate_quick_cmd = (row.gate_quick_cmd or "").strip()
-            plan.gate_full_cmd = (row.gate_full_cmd or "").strip()
+            # The merge step's command gates: the one control for the full gate (`app/pipeline_gates/`).
+            plan.gate_full_cmd = full_gates.get(row.id, "").strip()
 
         if pass_facts is not None and row.id not in pass_facts.waiting:
             # Nothing was dispatchable here at pass start (see the docstring): the repo reports, offers none.
@@ -1185,7 +1302,7 @@ def build_dispatch_plan(
         # handed names only itself, which is all `owns_assignment` reads of it. Otherwise the pass's
         # shared list serves only when it already names this node, else this node reads its own: a node fresh
         # since the list was filled must not be judged by it.
-        hosting = pass_facts.hosting_by_project if pass_facts is not None else None
+        hosting = pass_facts.placement_by_project if pass_facts is not None else None
         live_nodes: Optional[list[str]]
         if hosting is not None:
             hosts = hosting.get(row.id, frozenset())
@@ -1193,7 +1310,7 @@ def build_dispatch_plan(
                 # Assigned to this project since the pass read its map (a console assignment lands mid-pass):
                 # the per-node path's own hosting read would see it and judge this node live, not hand it the
                 # whole queue as a non-member (`owns_assignment`), so read this one project's hosting fresh.
-                hosts = frozenset(str(n) for n in slot_allocation.hosting_node_ids(session, row.id))
+                hosts = frozenset(str(n) for n in slot_allocation.placement_node_ids(session, row.id))
             live_nodes = [shard_id] if node_in_roster and shard_id in hosts else []
         else:
             live_nodes = pass_facts.live_by_project.get(row.id) if pass_facts is not None else None
@@ -1201,16 +1318,33 @@ def build_dispatch_plan(
                 live_nodes = pool_state.live_nodes_for_project(session, row.id, max_age_secs=observation_age)
                 if pass_facts is not None and shard_id in live_nodes:
                     pass_facts.live_by_project.setdefault(row.id, live_nodes)
-        # Materialised once so the allocation walk and the filter see the same rows.
-        waiting = dispatchable_tasks(row.id, session)
+        # Materialised once so the allocation walk and the filter see the same rows; one read for the plan's
+        # every project, at its first project that reaches here: the pass's ids reloaded by key when it has
+        # them (`dispatch.dispatchable_tasks_among`), else a fleet-wide read.
+        if waiting_by_project is None:
+            walked = [
+                p["id"] for p in enrolled if pass_facts is None or p["id"] in pass_facts.waiting
+            ]
+            shared_ids = pass_facts.dispatchable_by_project if pass_facts is not None else None
+            waiting_by_project = (
+                dispatchable_tasks_among(session, {p: shared_ids.get(p, []) for p in walked})
+                if shared_ids is not None else dispatchable_tasks_by_project(session)
+            )
+            # The plan's two per-project reads, each taken once for every project it walks: phase 1 takes
+            # nothing, so one read at its start is the same answer the per-project reads gave.
+            holds = pass_facts.holds if pass_facts is not None and pass_facts.holds is not None else (
+                slot_state.task_holds(
+                    session, [t.id for project_id in walked for t in waiting_by_project.get(project_id, [])]
+                ))
+            held_by_project = slot_state.held_slots_by_project(session, walked, node_id=body.node_id)
+        waiting = waiting_by_project.get(row.id, [])
         task_by_id.update({t.id: t for t in waiting})
         # Shared by table and predicate, which must agree.
         allowed_by_task = {t.id: allowed_node_names(t.id) for t in waiting}
-        holds = slot_state.task_holds(session, [t.id for t in waiting])
         hold_node_by_task = {t.id: (holds.get(t.id) or {}).get("node_id") or None for t in waiting}
         # Each task's effective agent (`agent_resolution`); a built-in's provider is the narrowing input —
         # `bound_provider`, else the project's default built-in. NULL (never dispatched) narrows nothing.
-        choice_by_task = {t.id: agent_resolution.resolve_agent(session, t, row) for t in waiting}
+        choice_by_task = {t.id: agent_router.effective_choice(session, t, row) for t in waiting}
         bound_provider_by_task = {
             t.id: (choice_by_task[t.id].provider or None)
             if isinstance(choice_by_task[t.id], agent_resolution.Builtin) else None
@@ -1218,13 +1352,15 @@ def build_dispatch_plan(
         }
         # Confinement filters as the list is built, before the resume branch, so a resume cannot land on
         # a revoked node.
+        # A blind review child places only where its PR can be checked out blind (`blind_review.node_can_run`); a
+        # hold on another node waits rather than launching a tree the node cannot prepare.
         candidates = [
             {"task": t.id}
             for t in waiting
             if owns_candidate(
                 shard_id, live_nodes, allowed_by_task[t.id], t.id,
                 hold_node_by_task[t.id], allocation, node_draining=node_draining,
-            )
+            ) and (t.persona not in REVIEW_PERSONAS or blind_review.node_can_run(node_row))
         ]
         plan.ready = len(candidates)
 
@@ -1233,7 +1369,7 @@ def build_dispatch_plan(
         # dispatch is observed by nobody yet. Node-scoped (A10).
         assigned: set[int] = {
             int(number)
-            for number in slot_state.held_slots(session, row.id, node_id=body.node_id)
+            for number in held_by_project.get(row.id, [])
             if str(number).isdigit()
         } | {
             int(number)
@@ -1247,11 +1383,11 @@ def build_dispatch_plan(
             unpickable={
                 number for number, record in roster.items()
                 if record.get("_retiring")
-                or (record.get("_kind") == WORKTREE_KIND_DYNAMIC and record.get("holder") == slot_state.FREE)
-                # A free slot of the other kind (git worktree vs folder) is never leased; a held one bound to
-                # its task is still resumed into, whatever the project's repositories now are.
-                or (record.get("holder") == slot_state.FREE
-                    and record.get("_has_repo", True) != row.has_repo)
+                # Any free row, whatever its `kind`: a free row is destroyed, never leased again — a `static` row an
+                # older release re-declares during the release overlap included.
+                or record.get("holder") == slot_state.FREE
+                # A held one bound to its task is still resumed into, whatever its kind or the project's
+                # repositories now are.
             },
             candidates=[(t.id, t.priority) for t in waiting if t.id in candidate_ids],
             bound_provider_by_task=bound_provider_by_task,
@@ -1358,14 +1494,16 @@ def build_dispatch_plan(
             else:
                 decision = "skip-no-granted-account"
             why = _CONTENDED_WHY if contended else None
+            account_wait = None
             if decision == "skip-no-granted-account" and own_slot is None and not contended:
                 try:
-                    why = _no_account_why(session, body.node_id, task_id, grant_memo,
-                                          bound_provider_by_task.get(task_id), in_pass_runners,
-                                          account_pin=task_row.bound_account_id if task_row else None)
+                    why, account_wait = _no_account_why(
+                        session, body.node_id, task_id, grant_memo, bound_provider_by_task.get(task_id),
+                        in_pass_runners, account_pin=task_row.bound_account_id if task_row else None)
                 except Exception:  # noqa: BLE001 — a diagnostic must never cost the node its plan
                     log.exception("dispatch-plan: could not explain the account decline of task %s", task_id)
-            plan.dispatches.append(DispatchDecision(task_id=task_id, decision=decision, why=why))
+            plan.dispatches.append(DispatchDecision(task_id=task_id, decision=decision, why=why,
+                                                    account_wait=account_wait))
             continue
         # From here a booked place is given back on every path that dispatches nothing, a raise included: held,
         # it would push the rest of the pass's nodes off an account no runner is on. The drain gives back what
@@ -1375,8 +1513,11 @@ def build_dispatch_plan(
             # it. Slots this task's org cannot lease are excluded too, `own_slot` included: sparing a
             # cross-tenant held slot would stall the resume forever (knowingly trades A2 for progress).
             # An unpickable slot is excluded too, `own_slot` included: a retiring one's task waits for the
-            # destroy's requeue.
-            slot = fleet_decide.select_slot(
+            # destroy's requeue. A task its starter chose to run without the repository takes no git worktree:
+            # with no slot of its own it goes straight to a new folder slot below.
+            wants_folder = task_row is not None and slot_allocation.task_wants_folder(
+                session, task_row, row_by_id[repo_pass.project_id])
+            slot = None if wants_folder and own_slot is None else fleet_decide.select_slot(
                 roster,
                 exclude=([str(i) for i in assigned if i != own_slot]
                          + _slots_the_org_cannot_take(
@@ -1386,11 +1527,12 @@ def build_dispatch_plan(
             )
             # A resume is what the pick means: rule 2 returned the slot this task's `task_id` already names.
             resume = slot is not None and slot == own_slot
-            # No free static slot and no slot of its own: on an assigned node, a dynamic worktree at the lowest free
+            # No free worktree and no slot of its own: on an assigned node, a dynamic worktree at the lowest free
             # index (R6), or a wait naming why none may be made. Elsewhere the empty pick stands ("no free slot").
             create_dynamic = False
             if slot is None and own_slot is None:
-                slot, why = _dynamic_index(session, node_uuid, int(repo_pass.project_id), set(roster) | assigned)
+                slot, why = _dynamic_index(session, node_uuid, int(repo_pass.project_id), set(roster) | assigned,
+                                           has_repo=False if wants_folder else None)
                 if why is not None:
                     ledger.give_back(str(body.node_id), task_id)
                     plan.dispatches.append(DispatchDecision(task_id=task_id, decision=SKIP_DYNAMIC_REFUSED, why=why))
@@ -1414,7 +1556,7 @@ def build_dispatch_plan(
             raise
 
     # The pin's lifetime is this plan, not the session (see `_CANDIDATE_PIN`). The early return runs
-    # before arming, and on an exception the caller's `with SessionLocal()` discards `session.info`.
+    # before arming, and on an exception the caller's `with BridgedSession()` discards `session.info`.
     _unpin_account_candidates(session)
     session.info.pop(_PASS_FACTS, None)
     # Return `out` itself; rebuilding it would drop every field but `repos`.
@@ -1424,13 +1566,14 @@ def build_dispatch_plan(
 # `/task-target` is deleted (D10): the CP names no branch for any path, so it had nothing to compute.
 
 
-def _max_runners_per_account() -> int:
-    """The `max_runners_per_account` operator override, else `jaah_scheduler`'s code default.
+def _max_runners_per_account(org_id: UUID) -> int:
+    """The default concurrent-runner cap of a subscription account owned by `org_id`: that org's
+    `max_runners_per_account` override, else the operator's, else `jaah_scheduler`'s code default.
 
-    Resolved here and passed in (`jaah_scheduler` does no I/O); one function so the gate and any
-    refusal text use the same number. Operator-tier, so no `org`: a per-tenant cap on a shared
-    credential account would not bind."""
-    return settings_reads.get_int("max_runners_per_account")
+    Resolved here per account and carried on the candidate (`org_max_runners`; `jaah_scheduler` does no I/O).
+    Keyed on the ACCOUNT's org, never the asking node's: the account is the org's own resource, and its
+    Org Admin sets the number from Settings."""
+    return settings_reads.get_int("max_runners_per_account", org=org_id)
 
 
 # How often a pick is retried after another node booked the picked account between pick and book; past it the
@@ -1524,7 +1667,13 @@ def _acp_engine_refusal(provider: str, api_key_slug: str, node_row) -> Optional[
             f"(it installs runner tools in the background)")
 
 
-def _cli_eligible(candidates: list[dict]) -> list[dict]:
+# `_cli_eligible`'s log state: node id -> the refusal it last logged for that node (absent: launchable).
+# Per process, like `lease_drain._declines`: each CP task logs a change once, not every pass.
+_cli_outages: dict[str, str] = {}
+_cli_outages_lock = threading.Lock()
+
+
+def _cli_eligible(session: Session, node_id: str, candidates: list[dict]) -> list[dict]:
     """`candidates` minus the ones the asking node has no runner CLI for — the eligibility half of R8.3,
     applied by `_best_account` only.
 
@@ -1532,18 +1681,28 @@ def _cli_eligible(candidates: list[dict]) -> list[dict]:
     reader sees why. Separate from `jaah_scheduler.exclusion_reason`: this is a host fact, and the
     scheduler takes no node.
 
-    Logs at ERROR when it empties a non-empty list: that is a node outage (`lease_drain` would otherwise
-    decline with a credential message naming no binary), and this is the one place every pick passes."""
+    When the refusal empties a non-empty list, NO account is launchable on the node: logged at WARNING once
+    per change of its distinct reasons (and once when it clears), naming the node, since every pass asks again
+    and a fresh node is in this state until its runner tools install. The operator's signal is the node page
+    (`NodeOut.agent_cli_missing`) and the task's wait (`_node_launches_no_cli`), not this line."""
     eligible = [c for c in candidates if not c.get("node_missing_cli")]
-    # A node still installing an ACP engine is a wait (`_node_installing_engine`), not the outage this alarms on.
-    if candidates and not eligible and not all(c.get("node_installing_engine") for c in candidates):
-        log.error(
-            "runner-CLI refusal emptied the candidate set: NO account is launchable on this node, so "
-            "dispatch to it stops until its `runner_clis` attestation or its installed CLIs are "
-            "repaired. Per candidate: %s",
-            "; ".join(
-                f"{jaah_scheduler.account_ref(c)}: {c.get('node_missing_cli')}" for c in candidates
-            ),
+    # A node still installing an ACP engine is a wait (`_node_installing_engine`), not the outage this logs.
+    outage = bool(candidates) and not eligible and not all(c.get("node_installing_engine") for c in candidates)
+    reasons = "; ".join(sorted({str(c.get("node_missing_cli")) for c in candidates})) if outage else None
+    with _cli_outages_lock:
+        if _cli_outages.get(node_id) == reasons:
+            return eligible
+        if reasons is None:
+            _cli_outages.pop(node_id, None)
+        else:
+            _cli_outages[node_id] = reasons
+    name = session.scalar(select(Node.name).where(node_matches(node_id))) or node_id
+    if reasons is None:
+        log.info("runner-CLI refusal cleared: node %s is no longer missing the runner CLIs its accounts need", name)
+    else:
+        log.warning(
+            "runner-CLI refusal emptied the candidate set: NO account is launchable on node %s, so dispatch to it "
+            "stops until its runner CLIs are installed (logged once until this changes): %s", name, reasons,
         )
     return eligible
 
@@ -1553,7 +1712,7 @@ def account_rows(session: Session) -> list:
     node workers can share them — `DispatchPassFacts.accounts`). One column list for the shared and the fresh
     read, so neither can serve a field the other lacks."""
     return session.execute(
-        select(Account.id, Account.slug, Account.org_id, Account.enabled, Account.shared, Account.provider,
+        select(Account.id, Account.slug, Account.org_id, Account.enabled, Account.provider,
                Account.auth_kind, Account.auto_assign, Account.max_runners, Account.quota_status,
                Account.quota_status_until)
         .order_by(Account.slug)
@@ -1573,9 +1732,8 @@ def _account_candidates(session: Session, node_id: Optional[str] = None) -> list
     (`account_fold.resolved_quota_status`).
 
     Provider keys (PRD R5.1, R8.3), from `app/agent_providers.py`: `provider`, `has_quota_model` (the
-    scheduler does no lookups; narrowed per account by the node's `quota_model` word), `api_key_lane`
-    (`jaah_scheduler.is_spillover`) and `node_missing_cli` (`_cli_eligible`'s filter). Account keys:
-    `auto_assign` (`_auto_assign_narrowed`) and `max_runners` (`jaah_scheduler.runner_cap`)."""
+    scheduler does no lookups; narrowed per account by the node's `quota_model` word) and `node_missing_cli` (`_cli_eligible`'s filter). Account keys:
+    `auto_assign` (`_auto_assign_narrowed`), `max_runners` and `org_max_runners` (`jaah_scheduler.runner_cap`)."""
     # The per-pass pin, keyed by node (see `_CANDIDATE_PIN`); a plain miss for other callers.
     pinned = session.info.get(_CANDIDATE_PIN)
     if pinned is not None and node_id in pinned:
@@ -1620,6 +1778,8 @@ def _account_candidates(session: Session, node_id: Optional[str] = None) -> list
     # Per org: its provider grid's cells (`app/provider_auth_policy.py`); the pass's
     # memo when there is one, so one read per org serves every node.
     allowed_memo: dict = facts.allowed_pairs_by_org if facts is not None else {}
+    # Per org: the default runner cap of its subscription accounts, read once per org in this call.
+    cap_memo: dict[UUID, int] = {}
     candidates = []
     for row in rows:
         # `None` (no node attested it recently: nothing to dispatch against) differs from `{}` (attested,
@@ -1650,12 +1810,17 @@ def _account_candidates(session: Session, node_id: Optional[str] = None) -> list
         # Else the engine this account's run would spawn here, not installed yet: a wait, not a host fault.
         engine_refusal = None if cli_refusal else _acp_engine_refusal(
             row.provider, row.slug if account_auth.is_api_key(row.auth_kind) else "", node_row)
+        org_cap = None
+        if not account_auth.is_api_key(row.auth_kind):
+            if row.org_id not in cap_memo:
+                cap_memo[row.org_id] = _max_runners_per_account(row.org_id)
+            org_cap = cap_memo[row.org_id]
         candidates.append({
             # The identity every fairness structure keys on.
             "account_id": row.id,
             "config_dir": config_dir,
-            # Auth kind: `jaah_scheduler` partitions on it with `api_key_lane` (a spillover API key after
-            # the rest, a peer one beside OAuth), exempts API-key rows from quota exclusions and weights them
+            # Auth kind: `jaah_scheduler` partitions on it (every API key spills over after the
+            # subscriptions), exempts API-key rows from quota exclusions and weights them
             # constant. Present on every row.
             "auth_kind": row.auth_kind,
             # Name identity, from which the scheduler composes the `apikey:` reference with no I/O.
@@ -1676,16 +1841,13 @@ def _account_candidates(session: Session, node_id: Optional[str] = None) -> list
             "node_missing_cli": cli_refusal or engine_refusal,
             # True when that refusal is only the ACP engine still to be installed (`_task_awaits_engine`).
             "node_installing_engine": engine_refusal is not None,
-            # Which lane an API-key account rides: "spillover" behind the OAuth set, or "peer" beside it.
-            # An unknown provider reads as spillover, the old position (fail-safe).
-            "api_key_lane": provider_record.api_key_lane if provider_record is not None else "spillover",
             # May the scheduler pick it for a task that did not ask for its provider (`_auto_assign_narrowed`).
             "auto_assign": row.auto_assign,
-            # This account's own runner cap, only for a provider declaring one; None = the fleet's cap.
-            "max_runners": (
-                row.max_runners
-                if provider_record is not None and provider_record.per_account_runner_cap else None
-            ),
+            # This account's own runner cap (what the account writer accepts: `routes/accounts.py`
+            # `_validated_max_runners`); None = its org's default for a subscription, no cap for an API key.
+            "max_runners": row.max_runners,
+            # Its org's default cap (`jaah_scheduler.runner_cap`), read for subscription accounts only.
+            "org_max_runners": org_cap,
             "five_hour_percent": observed.get("five_hour_percent"),
             "weekly_percent": observed.get("weekly_percent"),
             "over_quota_spend_percent": observed.get("over_quota_spend_percent"),
@@ -1695,6 +1857,9 @@ def _account_candidates(session: Session, node_id: Optional[str] = None) -> list
             # (1) A standing verdict: membership in `account_fold.BLOCKING_QUOTA_STATUSES` (historical key
             # name).
             "auth_rejected": quota_status in account_fold.BLOCKING_QUOTA_STATUSES,
+            # (1a) Of those, the dead sign-in a human must redo (not a usage or credit wall): names the wait
+            # (`_no_account_why`), never gates.
+            "login_expired": quota_status == "auth_rejected",
             # (1b) The org's provider grid no longer has this account's (provider, auth kind) cell.
             "auth_pair_disallowed": not provider_auth_policy.is_allowed(
                 session, row.org_id, row.provider, row.auth_kind, memo=allowed_memo
@@ -1765,7 +1930,7 @@ def _acp_adapter_missing(node_row) -> Optional[str]:
 
 
 def _node_launches_no_cli(session: Session, node_id: Optional[str]) -> bool:
-    """Does the runner-CLI refusal empty this node's WHOLE candidate set — `_cli_eligible`'s ERROR case?
+    """Does the runner-CLI refusal empty this node's WHOLE candidate set — `_cli_eligible`'s outage case?
 
     Node-wide over every enabled account, not the task's grants: it errs toward an ordinary account wait
     (a node holding one launchable account anywhere is not called a host fault), never toward blaming the
@@ -1835,6 +2000,29 @@ def _auto_assign_narrowed(candidates: list[dict], provider: Optional[str]) -> li
     return [c for c in candidates if c.get("auto_assign", True)]
 
 
+def gate_accounts(
+    candidates: list[dict], *, allowed: Optional[AllowedObjects], provider: Optional[str],
+    org_id: Optional[UUID], apply_runner_cap: bool = True,
+) -> tuple[str, list[dict], list[dict]]:
+    """THE account gate a task's pick passes: the per-task narrowings (grant, vendor, Auto-assign), before the gate
+    (E8), then `jaah_scheduler.gate_and_tier` at the org's thresholds — `_best_account`'s, and the agent router's
+    read-only availability question (`app/agent_router/features.py`), so the two cannot disagree. No I/O but the
+    threshold reads."""
+    # Both quota gates are org-tier, read for the asking node's org, never the ambient (operator) scope,
+    # which would trip `_refuse_unscoped_read` once any org overrides a knob. `None` is the org-less read
+    # and raises in that case (unlike the budget read, which is skipped); see
+    # `tests/test_operator_settings.py`.
+    return jaah_scheduler.gate_and_tier(
+        _auto_assign_narrowed(_provider_narrowed(_narrowed(candidates, allowed), provider), provider),
+        spend_gate=False,
+        high_pct=settings_reads.get_int("quota_high_pct", org=org_id),
+        weekly_high_pct=settings_reads.get_int("quota_weekly_high_pct", org=org_id),
+        # `None` applies no cap (see `apply_runner_cap`). Otherwise each candidate carries its own org's
+        # default (`org_max_runners`); the code default only backs a candidate built without one.
+        max_runners_per_account=jaah_scheduler.DEFAULT_MAX_RUNNERS_PER_ACCOUNT if apply_runner_cap else None,
+    )
+
+
 def _best_account(
     session: Session, node_id: str, *, node_org_id: Optional[UUID],
     allowed: Optional[AllowedObjects] = None,
@@ -1874,24 +2062,13 @@ def _best_account(
                 + in_pass_runners.get(jaah_scheduler.account_ref(c), 0)}
             for c in candidates
         ]
-    # Before the gate (E8); `_cli_eligible`'s own alarm is the operator's signal here.
-    candidates = _cli_eligible(candidates)
+    # Before the gate (E8); `_cli_eligible` logs a node that can launch nothing.
+    candidates = _cli_eligible(session, node_id, candidates)
     if oauth_only:
         # Before the gate, like `allowed`: with no API-key candidates the spillover arm has nobody.
         candidates = [c for c in candidates if not account_auth.is_api_key(c.get("auth_kind"))]
-    # Both quota gates are org-tier, read for the asking node's org, never the ambient (operator) scope,
-    # which would trip `_refuse_unscoped_read` once any org overrides a knob. `None` is the org-less read
-    # and raises in that case (unlike the budget read, which is skipped); see
-    # `tests/test_operator_settings.py`.
-    status, enabled, tier = jaah_scheduler.gate_and_tier(
-        # The per-task narrowings (grant, vendor, Auto-assign), before the gate (E8).
-        _auto_assign_narrowed(_provider_narrowed(_narrowed(candidates, allowed), provider), provider),
-        spend_gate=False,
-        high_pct=settings_reads.get_int("quota_high_pct", org=node_org_id),
-        weekly_high_pct=settings_reads.get_int("quota_weekly_high_pct", org=node_org_id),
-        # `None` applies no cap (see `apply_runner_cap`) and skips the knob read.
-        max_runners_per_account=_max_runners_per_account() if apply_runner_cap else None,
-    )
+    status, enabled, tier = gate_accounts(candidates, allowed=allowed, provider=provider, org_id=node_org_id,
+                                          apply_runner_cap=apply_runner_cap)
     if status == "tier":
         return jaah_scheduler.account_ref(tier[0])
     if status == "cold_start":
@@ -1899,13 +2076,20 @@ def _best_account(
     return None
 
 
+#: `jaah_scheduler.exclusion_reason`'s sentences for the `auth_rejected` exclusion (OAuth, API key).
+_AUTH_REJECTED_REASONS = frozenset(
+    {reason for key, _, reason in jaah_scheduler.EXCLUSION_REASONS if key == "auth_rejected"}
+    | {jaah_scheduler.API_KEY_REJECTED_REASON})
+
+
 def _no_account_why(
     session: Session, node_id: str, task_id: int, grant_memo: dict, bound_provider: Optional[str],
     in_pass_runners: Optional[dict[str, int]], account_pin: Optional[UUID] = None,
-) -> str:
+) -> tuple[str, Optional[str]]:
     """Why `_best_account` found no account for this unpinned task on this node, tallied per reason
     (`jaah_scheduler.exclusion_reason`), so a `skip-no-granted-account` names its cause rather than five
-    possible ones. Read only on a decline; the narrowing mirrors `_best_account`'s."""
+    possible ones; and which wait it is (`DispatchDecision.account_wait`), or None when neither the grant,
+    the sign-in nor capacity explains it. Read only on a decline; the narrowing mirrors `_best_account`'s."""
     candidates = _account_candidates(session, node_id)
     if in_pass_runners:
         candidates = [
@@ -1913,28 +2097,37 @@ def _no_account_why(
                 + in_pass_runners.get(jaah_scheduler.account_ref(c), 0)}
             for c in candidates
         ]
-    candidates = _cli_eligible(candidates)
+    runnable = _cli_eligible(session, node_id, candidates)
     allowed = _account_pin_narrowed(
         placement_grants.allowed_accounts(session, task_id, memo=grant_memo), account_pin)
-    granted = _narrowed(candidates, allowed)
+    granted = _narrowed(runnable, allowed)
     if not granted:
         # Counted within the task's org, never fleet-wide: another org's accounts are not this task's business.
         org = placement_grants.placement_org(session, task_id)
-        in_org = _narrowed(candidates, AllowedObjects(
+        in_org = _narrowed(runnable, AllowedObjects(
             unrestricted=False, ids=frozenset(placement_grants.org_floor(session, "account", org)))) if org else []
-        return f"the launcher is granted none of the org's {len(in_org)} account(s) usable here"
+        # A grant is the fix only when the org has an account usable here to grant, and the launcher holds none
+        # this node merely cannot run (a missing CLI is the node's fix, not a grant).
+        not_granted = bool(in_org) and not _narrowed(candidates, allowed)
+        return (f"the launcher is granted none of the org's {len(in_org)} account(s) usable here",
+                "not_granted" if not_granted else None)
     of_provider = _provider_narrowed(granted, bound_provider)
     if not of_provider:
-        return f"{len(granted)} granted, none of its bound vendor {bound_provider[:_PROVIDER_ECHO_CAP]!r}"
+        return f"{len(granted)} granted, none of its bound vendor {bound_provider[:_PROVIDER_ECHO_CAP]!r}", None
     narrowed = _auto_assign_narrowed(of_provider, bound_provider)
     if not narrowed:
-        return f"{len(granted)} granted, all with Auto-assign off"
-    cap = _max_runners_per_account()
+        return f"{len(granted)} granted, all with Auto-assign off", None
+    cap = jaah_scheduler.DEFAULT_MAX_RUNNERS_PER_ACCOUNT  # A fallback: each candidate carries its org's.
     tally: dict[str, int] = {}
+    expired = 0
     for c in narrowed:
         reason = jaah_scheduler.exclusion_reason(c, max_runners_per_account=cap) or "over a quota gate"
+        # A dead sign-in, not a usage or credit wall under the same exclusion: only a re-login ends it.
+        if reason in _AUTH_REJECTED_REASONS and c.get("login_expired"):
+            expired += 1
         # One key for every account at its runner cap: the scheduler's sentence carries per-account numbers.
         if reason.startswith("it is already carrying"):
             reason = "at its runner limit"
         tally[reason] = tally.get(reason, 0) + 1
-    return "; ".join(f"{n}x {reason}" for reason, n in sorted(tally.items(), key=lambda kv: -kv[1]))
+    why = "; ".join(f"{n}x {reason}" for reason, n in sorted(tally.items(), key=lambda kv: -kv[1]))
+    return why, "auth_expired" if expired == len(narrowed) else "busy"

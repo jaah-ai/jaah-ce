@@ -24,9 +24,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import actors
-from app.auth import require_user
+from app.auth import adopt_user, require_user
 from app.authz.declarations import feature
-from app.db import get_session
+from app.db_async import on_session
 from app.fleet_verdicts import (
     OUTCOME_DONE,
     SLOT_INTENT_RETIRING_OUTCOMES,
@@ -81,12 +81,14 @@ def _message_text(row: SlotIntent) -> str:
 
 @router.get("/api/tasks/{task_id}/control-messages", response_model=list[ControlMessageOut])
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
+@on_session
 def list_control_messages(
+    session: Session,
     task_id: int,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> list[ControlMessageOut]:
     """This task's `deliver_message` and `deliver_answer` intents, oldest first (see the module docstring)."""
+    user = adopt_user(session, user)
     get_task_or_404(task_id, session)
     rows = list(reversed(session.scalars(
         select(SlotIntent)

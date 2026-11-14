@@ -3,22 +3,21 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link as RouterLink, useNavigate } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import Chip from '@mui/material/Chip'
 import Link from '@mui/material/Link'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
-import type { SxProps, Theme } from '@mui/material/styles'
-import { ApiError, apiDetail, del, post, put } from '../../api'
+import { ApiError, apiDetail, del, post } from '../../api'
 import { useAuth } from '../../auth'
 import { actAsOnce, enterActAs } from '../../lib/actAs'
 import { isEnabled } from '../../lib/editionFeatures'
+import { editionModule } from '../../lib/editionModule'
 import { isOrgAdminSeat } from '../../lib/orgAdmin'
 import { toggled } from '../../lib/sets'
 import { useChangeOrgAction } from '../../components/ChangeOrgDialog'
 import { useOpenDetailPath } from '../../components/ListDetail'
-import { useConfirm } from '../../components/ConfirmDialog'
-import HoverCard from '../../components/HoverCard'
+import { danger, useConfirm } from '../../components/ConfirmDialog'
 import { useLiveRefetch } from '../../hooks/useLiveRefetch'
+import { useNow } from '../../hooks/useNow'
 import { useEventStream } from '../../hooks/useEventStream'
 import {
   isAuthRejected, isRefreshBlocked, quotaAgeMs, quotaClass, QUOTA_STALE_MS,
@@ -28,15 +27,15 @@ import { absoluteTime, compactSpan, humanDuration } from '../../lib/relativeTime
 import type {
   Account, AccountNode, AccountWorktree, ClaudeAccount, ClaudeResources, OrgRef, ProviderChoice, QuotaData,
 } from '../../types'
-import { CompactVerbLabel, compactVerbProps } from '../../ui/CompactVerb'
-import { PRESS_SWAP_SX, PressSwap } from '../../ui/pressSwap'
+import EnableToggle from '../../ui/EnableToggle'
 import Banner from '../../ui/Banner'
-import { Icon } from '../../ui/icons'
+import { NodeIcon, NodeLinkIcon } from '../../ui/icons'
 import LoadFailedState from '../../ui/LoadFailedState'
 import ListStates from '../../ui/feed/ListStates'
 import { rowPadLeft } from '../../ui/feed/geometry'
 import type { FeedColumn, FeedRowSpec, OverflowItem } from '../../ui/feed/types'
 import { editItem } from '../../components/tasks/rowActions'
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, RADIUS, SIZE, grid } from '../../theme'
 import { ACCOUNTS_LIST_CONTAINER_SX, ACCOUNTS_NO_ENABLED, ACCOUNTS_PROVIDER_UNDER, ELLIPSIS_SX, FEED_NO_ID, PHONE, tapTargetSx } from '../../ui/listStyles'
 import { orgSlots, useOrgVisible, useOtherOrgOf } from '../../ui/OrgIndicator'
 import StatusChip from '../../ui/StatusChip'
@@ -45,26 +44,33 @@ import type { Tone } from '../../ui/StatusChip'
 import { useRowActions } from '../../hooks/useBusyIds'
 import { DisabledReason } from '../../ui/DisabledReason'
 import PageHeader from '../../ui/PageHeader'
+import LinkButton from '../../ui/LinkButton'
 import { useAwaitingApprovalReason } from '../../lib/orgLifecycle'
 import { useAgentProviders } from '../../hooks/useAgentProviders'
 import { isDefaultProvider } from '../../lib/providerCatalogue'
 import {
-  accountEditPath, accountLoginPath, dispatchBody, EXPLICIT_ONLY_TITLE,
-  NEW_ACCOUNT_PATH, NO_LOGIN_PERMISSION_REASON, othersAccountCell, pendingDispatchFailure, providerCell, slugOf, takePendingDispatch,
-  useCanLogIn,
+  accountEditPath, accountLoginPath, applyPendingDispatch, EXPLICIT_ONLY_TITLE,
+  NEW_ACCOUNT_PATH, NO_LOGIN_PERMISSION_REASON, othersAccountCell, providerCell, slugOf,
+  useCanAddAccount, useCanLogIn,
 } from './accountModel'
 import { ACCOUNTS_KEY, getResources, listAccounts, RESOURCES_KEY, setAccountEnabled } from './api'
-import { nodeLinkUrl } from '../nodes/nodeLinkStore/api'
 import { nodesAddPath } from '../../components/addNode/deepLink'
-import ShareSubscriptionsAction, { useShareSubscriptionsShown } from '../nodes/nodeLinkStore/ShareSubscriptionsAction'
-import { ImportAccountAction } from './AccountTransfer'
+import { nodeLinkUrl } from '../../routeGroups'
+import NewButton from '../../ui/NewButton'
+import Tip from '../../ui/Tip'
 
-/* Agents > Agents (the runner accounts): the credential accounts the fleet's runners log in as, their per-node OAuth
- * sessions and remaining quota. A tab panel: `pages/nodes/BrainsPage.tsx` owns the strip; Add account rides
- * it (see its call site).
- * Served at `/accounts` (`routeGroups.ts`'s `MACHINES_TAB_PATHS`). Gated `accounts:view` at the route
+/* Directory > AI Accounts (the runner accounts): the credential accounts the fleet's runners log in as, their per-node OAuth
+ * sessions and remaining quota. A tab's page: `components/RouteTabLayout.tsx`'s `DirectoryLayout` owns the strip;
+ * Add account rides it (see its call site).
+ * Served at `/accounts` (`routeGroups.ts`'s `DIRECTORY_TAB_PATHS`). Gated `accounts:view` at the route
  * (App.tsx); DB writes stay org-admin-only.
  */
+
+/* Share subscriptions over a NodeLink (`nodelink`'s), loaded where present (`lib/editionModule.ts`). The edition is
+   fixed for the page's life, so its hook runs on every render or on none. */
+type ShareModule = { default: () => JSX.Element | null; useShareSubscriptionsShown: () => boolean }
+const shareModule = () => editionModule(isEnabled('nodelink'),
+  () => import.meta.glob<ShareModule>('../nodes/nodeLinkStore/ShareSubscriptionsAction.tsx', { eager: true }))
 
 // ── Page-scoped Material spellings ──
 // `quotaClass()` (lib/quota.ts) owns the thresholds; this is the one place its verdict becomes a palette
@@ -118,6 +124,9 @@ const NO_RECORD_TITLE = 'Name and description did not load. Reload to edit.'
 /* `GET /api/resources` refused this seat (403): nothing on the roster is theirs to see. */
 const REFUSED_TITLE = 'Your role can’t view account status. Ask an admin for access.'
 
+/* A member without the status roster who may add one: their own accounts are what they see. */
+const NO_OWN_ACCOUNTS_TITLE = 'No accounts yet. Add your own.'
+
 /* Why an operator is offered no login on another org's account: Re-login, Sign in, Add to node and a
  * node's Login open the login page, which reads and dispatches (`POST /api/commands`) as the viewer's own org. */
 const actAsToLogIn = (org: OrgRef) => `Act as ${org.name} to log it in`
@@ -126,8 +135,6 @@ const actAsToLogIn = (org: OrgRef) => `Act as ${org.name} to log it in`
 function loginRefusal(canLogIn: boolean, otherOrg: OrgRef | null): string {
   return canLogIn && otherOrg ? actAsToLogIn(otherOrg) : NO_LOGIN_PERMISSION_REASON
 }
-/* A refused row's disc: grey `?`, as the per-node `no_reading` — the state is not ours to see, not a fault. */
-const REFUSED_MARK = { tone: toneFor(null), glyph: '?', label: 'status hidden', title: REFUSED_TITLE } as const
 
 
 
@@ -265,13 +272,12 @@ function QuotaCell({
     if (authRejected) {
       // Not "re-login": the Nodes column says it per node, which is what tells you which node to fix.
       return (
-        <Typography
+        <Tip title="No quota reading — a node cannot use this account (the Nodes column says which, and why)"><Typography
           variant="caption"
           sx={{ color: 'text.disabled' }}
-          title="No quota reading — a node cannot use this account (the Nodes column says which, and why)"
         >
           —
-        </Typography>
+        </Typography></Tip>
       )
     }
     if (refreshBlocked) {
@@ -301,10 +307,10 @@ function QuotaCell({
       <Typography
         variant="mono"
         sx={{
-          fontSize: '0.8125rem',
-          fontWeight: 600,
+          fontSize: FONT_SIZE.md,
+          fontWeight: FONT_WEIGHT.semibold,
           // A reserved measure so a column of readings stays a column of magnitudes.
-          minWidth: 32,
+          minWidth: grid(5),
           textAlign: 'right',
           color: dulled ? 'text.secondary' : (QUOTA_TONE_COLOR[tier] ?? 'text.primary'),
         }}
@@ -313,30 +319,27 @@ function QuotaCell({
       </Typography>
       {/* The number and countdown share one slot whose `meta` gate drops them below 900px. */}
       {refreshBlocked ? (
-        <Typography
+        <Tip title={`Last successful reading: ${ageLabel}. The token refresh is being refused — see the\n`
+            + "jaahd log for 'oauth refresh BLOCKED'."}><Typography
           variant="mono"
-          sx={{ fontSize: '0.6875rem', color: 'warning.main', display: 'inline' }}
-          title={`Last successful reading: ${ageLabel}. The token refresh is being refused — see the\n`
-            + "jaahd log for 'oauth refresh BLOCKED'."}
+          sx={{ fontSize: FONT_SIZE.xs, color: 'warning.main', display: 'inline' }}
         >
           ⚠ blocked · {ageLabel}
-        </Typography>
+        </Typography></Tip>
       ) : stale ? (
-        <Typography
+        <Tip title={`Last successful reading: ${ageLabel}`}><Typography
           variant="mono"
-          sx={{ fontSize: '0.6875rem', color: 'warning.main', display: 'inline' }}
-          title={`Last successful reading: ${ageLabel}`}
+          sx={{ fontSize: FONT_SIZE.xs, color: 'warning.main', display: 'inline' }}
         >
           ⚠ {ageLabel}
-        </Typography>
+        </Typography></Tip>
       ) : resetsAt ? (
-        <Typography
+        <Tip title={`Resets in ${fmtResetsIn(resetsAt)}`}><Typography
           variant="mono"
-          sx={{ fontSize: '0.6875rem', color: 'text.secondary', display: 'inline' }}
-          title={`Resets in ${fmtResetsIn(resetsAt)}`}
+          sx={{ fontSize: FONT_SIZE.xs, color: 'text.secondary', display: 'inline' }}
         >
           {fmtResetsIn(resetsAt)}
-        </Typography>
+        </Typography></Tip>
       ) : null}
     </Box>
   )
@@ -350,31 +353,30 @@ function QuotaCell({
  */
 function NoQuotaCell({ title }: { title: string }) {
   return (
-    <Typography
+    <Tip title={title}><Typography
       variant="mono"
       data-testid="acct-no-quota"
-      title={title}
       sx={{
-        fontSize: '0.8125rem',
-        fontWeight: 600,
-        minWidth: 32,
+        fontSize: FONT_SIZE.md,
+        fontWeight: FONT_WEIGHT.semibold,
+        minWidth: grid(5),
         textAlign: 'right',
         color: 'text.disabled',
       }}
     >
       n/a
-    </Typography>
+    </Typography></Tip>
   )
 }
 
 // The project-worktrees this account is active on, on hovering the Sessions count.
 function SessionsTip({ worktrees }: { worktrees: AccountWorktree[] }) {
   if (worktrees.length === 0) {
-    return <Typography variant="caption" sx={{ color: 'text.secondary' }}>No live slots</Typography>
+    return <Typography variant="caption">No live slots</Typography>
   }
   return (
     <Box sx={{ minWidth: 0 }}>
-      <Typography variant="caption" sx={{ fontWeight: 600, display: 'block', mb: 0.25 }}>
+      <Typography variant="caption" sx={{ fontWeight: FONT_WEIGHT.semibold, display: 'block', mb: 0 }}>
         Active slots
       </Typography>
       {worktrees.map((w, i) => (
@@ -382,7 +384,7 @@ function SessionsTip({ worktrees }: { worktrees: AccountWorktree[] }) {
           key={`${w.project}-${w.number}-${i}`}
           sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1 }}
         >
-          <Typography variant="mono" sx={{ fontSize: '0.75rem' }}>{w.project} #{w.number ?? '—'}</Typography>
+          <Typography variant="mono" sx={{ fontSize: FONT_SIZE.sm }}>{w.project} #{w.number ?? '—'}</Typography>
           <StatusChip
             label={w.session_status ?? 'idle'}
             tone={toneFor(w.session_status === 'busy' ? 'badge-running' : 'badge-idle')}
@@ -393,23 +395,12 @@ function SessionsTip({ worktrees }: { worktrees: AccountWorktree[] }) {
   )
 }
 
-/* The toggle pill sized to TOGGLE_SLOT: "Disabled" at the 11px slot face, 3px padding and its border fit 56px. */
-// The swapping label lays its two faces out in a row (`ui/pressSwap.tsx`); a plain label keeps its ellipsis.
-const SWAP_LABEL_SX = { '& .MuiChip-label': { display: 'inline-flex' } } as const
-
-const STATE_CHIP_SX = {
-  height: 20,
-  maxWidth: '100%',
-  '& .MuiChip-label': { px: '3px', fontSize: '0.6875rem' },
-  '&.Mui-disabled': { pointerEvents: 'auto', cursor: 'not-allowed' },
-} as const
-
 /* The state's narrow home, wherever the toggle's slot is gated off (`acctEnabled`: a phone, a narrow roster): the
 mark in the identity, read-only — the ⋯ item toggles it there. A wider gap after it keeps it apart from the email. */
-const STATE_UNDER_SHOWN = { display: 'inline', mr: 0.75 } as const
+const STATE_UNDER_SHOWN = { display: 'inline', mr: 0.5 } as const
 const STATE_UNDER_SX = {
   display: 'none',
-  fontSize: '0.6875rem',
+  fontSize: FONT_SIZE.xs,
   [FEED_NO_ID]: STATE_UNDER_SHOWN,
   [ACCOUNTS_NO_ENABLED]: STATE_UNDER_SHOWN,
   /* A phone carries it on the provider line instead (`STATE_ON_PROVIDER_LINE_SX`): here it would stand alone on a third line.
@@ -418,87 +409,18 @@ const STATE_UNDER_SX = {
 } as const
 const STATE_ON_PROVIDER_LINE_SX = { display: 'none', [PHONE]: STATE_UNDER_SHOWN } as const
 
-/** The state's narrow mark: the toggle's own (`StateToggle`), so the state reads the same at every width. */
+/** The state's narrow mark: the toggle's own (`ui/EnableToggle`), so the state reads the same at every width. */
 function StateUnderMark({ enabled, testId, sx }: { enabled: boolean; testId: string; sx: object }) {
   return (
     <Box
       component="span"
       data-testid={testId}
+      role="img"
       aria-label={enabled ? 'enabled' : 'disabled'}
-      title={enabled ? 'Enabled' : 'Disabled'}
       sx={[sx, { color: enabled ? 'success.main' : 'text.secondary' }]}
     >
       {enabled ? '✓' : 'Disabled'}
     </Box>
-  )
-}
-
-// Per-row enable toggle → `PUT /api/accounts/{account_id}` `{ enabled }`: `Account.enabled` is what
-// dispatch gates on and what GET /api/resources re-reads, so the write sticks. Flips optimistically
-// (`onOptimistic`) until the refetch lands. Disabling the last enabled account is allowed; the parent's
-// `warning` rides the Disable title, so it is read at the moment it matters, not as a standing row mark.
-// Keyed on `account_id`, not `config_dir`: `GET /api/resources` blanks `config_dir` for tenants
-// (`routes/portfolio.py`'s tenant pass), which disabled the optimistic path for them, and two rows can
-// share a dir. `account_id` is what the write addresses and what `noRow` requires.
-function StateToggle({
-  account, warning, otherOrg, onOptimistic, onCompleted, onError,
-}: {
-  account: ClaudeAccount
-  warning?: string
-  otherOrg?: OrgRef | null
-  onOptimistic: (accountId: string, enabled: boolean) => void
-  onCompleted: () => void
-  onError: (msg: string) => void
-}) {
-  const [busy, setBusy] = useState(false)
-  const accountId = account.account_id
-  const next = !account.enabled
-  const noRow = accountId == null
-
-  async function submit() {
-    if (busy || noRow) return
-    setBusy(true)
-    onOptimistic(accountId, next)
-    try {
-      // Another org's row goes as that org for this one request.
-      await setAccountEnabled(accountId, next, actAsOnce(otherOrg ?? null))
-      // The row is the authority the projection re-reads, so refetch straight away.
-      onCompleted()
-    } catch (err) {
-      // Revert the optimistic flip and say why.
-      onOptimistic(accountId, account.enabled)
-      onError(apiDetail(err, 'Failed to update the account'))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return (
-    /* The state in one word, pressable: a toggle button (`aria-pressed`) whose title names the change. A clickable
-    pill, as the row's other pressable marks (`ui/StatusChip`'s `onClick`): the chip's own hover and focus fill. A real
-    `<button>`, so `disabled` holds. */
-    <Chip
-      component="button"
-      size="small"
-      variant="outlined"
-      color={account.enabled ? 'success' : 'default'}
-      clickable
-      /* Enabled is the normal state, so a ✓ (`ui/EnabledChip`'s mark); the exception keeps its word. */
-      /* Pointed at, the pill shows the flip it makes (`ui/pressSwap.tsx`); a disabled pill keeps its state. */
-      label={busy || noRow
-        ? (account.enabled ? '✓' : 'Disabled')
-        : <PressSwap rest={account.enabled ? '✓' : 'Disabled'} press={account.enabled ? { glyph: '⊘', label: 'Disable' } : { glyph: '✓', label: 'Enable' }} />}
-      disabled={busy || noRow}
-      aria-pressed={account.enabled}
-      aria-label={account.enabled ? 'enabled' : 'disabled'}
-      title={
-        noRow ? NO_ROW_TITLE
-        : account.enabled ? `Disable${warning ? `. ${warning}` : ''}`
-        : 'Enable'
-      }
-      onClick={() => void submit()}
-      sx={[STATE_CHIP_SX, busy || noRow ? null : PRESS_SWAP_SX, busy || noRow ? null : SWAP_LABEL_SX]}
-    />
   )
 }
 
@@ -561,20 +483,34 @@ const REJECTION: Record<string, { label: string; hint: string }> = {
   seat: { label: 'Seat', hint: 'Seat suspended or forbidden (403) — needs an admin, not a re-login' },
 }
 
-/* The state slot for a viewer who may not log in, shared by all three login-offering arms. The verb is
+/* The state slot for a viewer who may not log in, shared by every login-offering arm (`loginNode`). The verb is
 removed (a permission), but the slot is not left empty: the node's state is also drawn by the disc
 (`NODE_STATE_MARK`, `ui/feed/FeedList`) and `data-node-state`, and an empty slot would assert an absence.
 So it reverts to the word, as `no_reading`, `ok` and `RejectedNode`'s billing/seat arms do. Not a
 disabled `Link`: a disabled verb promises a change, and a missing key is not a state. */
-function noLoginPermissionNode(word: string, fact: string, reason: string) {
+function noLoginPermissionNode(word: string, fact: string, reason: string, color = 'text.secondary') {
   return (
-    <Typography
+    <Tip title={`${fact} — ${reason}`}><Typography
       variant="caption"
-      sx={{ color: 'text.secondary' }}
-      title={`${fact} — ${reason}`}
+      sx={{ color }}
     >
       {word}
-    </Typography>
+    </Typography></Tip>
+  )
+}
+
+/* The state slot of every login-offering arm: the verb (hover: the fact and what pressing does) for a viewer
+with the key, else `noLoginPermissionNode`'s word. `onPress` is the arm's own login — `onEnrol` for a node
+with no session dir, `onRelogin` for one whose credential exists but is refused or unreadable. */
+function loginNode(canLogIn: boolean, noLoginReason: string, arm: {
+  word: string; fact: string; verb: string; onPress: () => void; wordColor?: string
+}) {
+  const { word, fact, verb, onPress, wordColor } = arm
+  if (!canLogIn) return noLoginPermissionNode(word, fact, noLoginReason, wordColor)
+  return (
+    <LinkButton variant="caption" underline="hover" onClick={onPress} title={`${fact} — ${verb}`}>
+      Login
+    </LinkButton>
   )
 }
 
@@ -593,35 +529,16 @@ function RejectedNode({ nodeId, nodeLabel, quota, canLogIn, noLoginReason, onRel
   if (stated) {
     // Not a button: there is no action we can take for them.
     return (
-      <Typography variant="caption" sx={{ color: 'warning.main' }} title={`${stated.hint} (${nodeLabel})`}>
+      <Tip title={`${stated.hint} (${nodeLabel})`}><Typography variant="caption" sx={{ color: 'warning.main' }}>
         {stated.label}
-      </Typography>
+      </Typography></Tip>
     )
   }
   /* No key, no button: `needs login` is the state (see `noLoginPermissionNode`), in `warning.main`. */
-  if (!canLogIn) {
-    return (
-      <Typography
-        variant="caption"
-        sx={{ color: 'warning.main' }}
-        title={`OAuth token rejected on ${nodeLabel} — ${noLoginReason}`}
-      >
-        needs login
-      </Typography>
-    )
-  }
-  return (
-    <Link
-      component="button"
-      type="button"
-      variant="caption"
-      underline="hover"
-      onClick={() => onRelogin(nodeId)}
-      title={`OAuth token rejected on ${nodeLabel} — log this node in again`}
-    >
-      Login
-    </Link>
-  )
+  return loginNode(canLogIn, noLoginReason, {
+    word: 'needs login', fact: `OAuth token rejected on ${nodeLabel}`, verb: 'log this node in again',
+    onPress: () => onRelogin(nodeId), wordColor: 'warning.main',
+  })
 }
 
 // Does this account need me, in one word, or null. Healthy accounts are fully described by their 5h/7d/
@@ -633,6 +550,20 @@ function RejectedNode({ nodeId, nodeLabel, quota, canLogIn, noLoginReason, onRel
 export function credentialsNowhere(acct: ClaudeAccount, nodes: AccountNode[]): boolean {
   if (acct.status !== 'no_credentials') return false
   return !nodes.some(n => n.present !== false && n.status !== 'no_credentials')
+}
+
+/** How long after a completed sign-in an account no node has confirmed yet reads `initializing`, not
+ *  `no credentials`: the node's first probe and report follow the login. Past it, the error is real. */
+export const INITIALIZING_MS = 5 * 60_000
+const INITIALIZING_TICK_MS = 5_000
+
+/** Was this account's sign-in completed within `INITIALIZING_MS` of `now`? `signed_in_at` is the record's
+ *  (`AccountOut.signed_in_at`, server clock); null while a sign-in is unfinished. A stamp "in the future" counts
+ *  only up to `INITIALIZING_MS` ahead, so a browser clock running behind never hides the error for long. */
+export function signedInRecently(signedInAt: string | null | undefined, now: number): boolean {
+  if (!signedInAt) return false
+  const age = now - Date.parse(signedInAt)
+  return Number.isFinite(age) && age > -INITIALIZING_MS && age < INITIALIZING_MS
 }
 
 /* A `node_pinned` provider's sign-in stays on the node that ran it: every other node reads `no_credentials`
@@ -667,13 +598,35 @@ export function summarizeNodes(nodes: AccountNode[], nodePinned = false): string
  *   ● available — enabled, authenticated, with room.
  * Shape first, colour second: the glyphs separate in greyscale, the tones do not. `quotaClass` stays
  * the single home of the THRESHOLDS. */
-type AccountHealth = 'disabled' | 'erroring' | 'exhausted' | 'available'
+type AccountHealth = 'disabled' | 'initializing' | 'erroring' | 'exhausted' | 'available'
 
+/* `initializing` — signed in, no node has confirmed it yet (`signedInRecently`): not a fault. */
 const ACCOUNT_HEALTH_MARK: Record<AccountHealth, { tone: Tone; glyph: string }> = {
   disabled: { tone: 'neutral', glyph: '⊘' },
+  initializing: { tone: 'info', glyph: '◌' },
   erroring: { tone: 'error', glyph: '✕' },
   exhausted: { tone: 'warning', glyph: '▲' },
   available: { tone: 'success', glyph: '●' },
+}
+
+/* A row read from the record alone (`recordRows`: a seat without the status roster). No node evidence, so no
+`erroring` from a node; the record's own verdicts (`quota_status`) and sign-in stamp say what they can. */
+type RecordHealth = AccountHealth | 'unfinished'
+const RECORD_HEALTH_MARK: Record<RecordHealth, { tone: Tone; glyph: string; label: string }> = {
+  disabled: { ...ACCOUNT_HEALTH_MARK.disabled, label: 'disabled' },
+  initializing: { ...ACCOUNT_HEALTH_MARK.initializing, label: 'signing in' },
+  erroring: { ...ACCOUNT_HEALTH_MARK.erroring, label: 'sign-in rejected' },
+  exhausted: { ...ACCOUNT_HEALTH_MARK.exhausted, label: 'usage limit' },
+  available: { ...ACCOUNT_HEALTH_MARK.available, label: 'ready' },
+  unfinished: { tone: 'warning', glyph: '!', label: 'sign-in not finished' },
+}
+
+function recordHealth(row: Account, now: number): RecordHealth {
+  if (!row.enabled) return row.signed_in_at ? 'disabled' : 'unfinished'
+  if (row.quota_status === 'auth_rejected') return 'erroring'
+  if (row.quota_status === 'usage_limit' || row.quota_status === 'credit_exhausted') return 'exhausted'
+  if (signedInRecently(row.signed_in_at, now)) return 'initializing'
+  return 'available'
 }
 
 function accountHealth(
@@ -713,7 +666,7 @@ puts the truncation on the text. */
 const NO_CREDENTIALS_CHIP_CLASS = 'acct-no-credentials-chip'
 
 /* The identity's wrapped shape: the name on its own line, the provider under it, then the chips. */
-const IDENTITY_WRAPPED = { flexWrap: 'wrap', rowGap: 0.25, '& > *': { maxWidth: '100%' } } as const
+const IDENTITY_WRAPPED = { flexWrap: 'wrap', rowGap: 0, '& > *': { maxWidth: '100%' } } as const
 const IDENTITY_SX = {
   display: 'inline-flex', alignItems: 'center', gap: 0.5, minWidth: 0, maxWidth: '100%',
   '& > *': { flexShrink: 0 },
@@ -726,7 +679,7 @@ const IDENTITY_SX = {
 
 /** The provider slot's narrow home (that slot is gated `acctProvider`): under the name, whole. On a narrow roster
  *  the chips share its line (two-line rows, as Secrets' type line); a phone gives it a line of its own. */
-const PROVIDER_UNDER = { display: 'block', fontSize: '0.6875rem', color: 'text.secondary' } as const
+const PROVIDER_UNDER = { display: 'block', fontSize: FONT_SIZE.xs, color: 'text.secondary' } as const
 const PROVIDER_UNDER_SX = {
   display: 'none',
   // Ellipsized, not wrapped, once it carries the folded "no credentials".
@@ -742,24 +695,24 @@ const NO_CREDENTIALS_UNDER_SX = { display: 'none', [ACCOUNTS_PROVIDER_UNDER]: { 
 const DASH_GONE_SX = { [ACCOUNTS_PROVIDER_UNDER]: { display: 'none' }, [PHONE]: { display: 'none' } } as const
 
 /** An identity carrying chips that must stay whole: they wrap to the next line instead of clipping. */
-const IDENTITY_WRAP_SX = { display: 'flex', flexWrap: 'wrap', rowGap: 0.25 } as const
+const IDENTITY_WRAP_SX = { display: 'flex', flexWrap: 'wrap', rowGap: 0 } as const
 
 /** The identity's text, the part that shrinks first. Wrapped, a zero basis keeps the chips after it (the plan)
  *  on its line rather than a line of their own; it still never shrinks below a readable floor. */
-const EMAIL_WRAPPED = { '&&': { flex: '1 1 0', minWidth: '8em' } } as const
+const EMAIL_WRAPPED = { '&&': { flex: '1 1 0', minWidth: grid(17) } } as const
 const EMAIL_SX = {
-  minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  ...ELLIPSIS_SX,
   /* Flex shrink is weighted by size, so a merely larger factor still clipped a long name beside a long email: this
   one leaves the name whole until the email is down to its floor. */
-  '&&': { flexShrink: 10000, minWidth: '3em' },
+  '&&': { flexShrink: 10000, minWidth: grid(6.5) },
   [ACCOUNTS_PROVIDER_UNDER]: EMAIL_WRAPPED,
   [PHONE]: EMAIL_WRAPPED,
 } as const
 const IDENTITY_DISABLED_SX = { opacity: 0.5 } as const
 /** The plan tag beside the email: a quiet outlined word, never shrunk (a clipped plan names nothing). */
 const PLAN_SX = {
-  fontSize: '0.6875rem', color: 'text.secondary', border: 1, borderColor: 'divider', borderRadius: 0.5, px: 0.5,
-  lineHeight: 1.5, whiteSpace: 'nowrap',
+  fontSize: FONT_SIZE.xs, color: 'text.secondary', border: 1, borderColor: 'divider', borderRadius: RADIUS.sm, px: 0.5,
+  lineHeight: LINE_HEIGHT.normal, whiteSpace: 'nowrap',
 } as const
 /** The account's name, the row's label: first and weighted, it takes its natural width and shrinks only
  *  after the email has, never below a floor that still names the account; the full name is on its `title`. */
@@ -769,10 +722,10 @@ const NAME_WRAPPED = {
   whiteSpace: 'normal', overflowWrap: 'anywhere',
 } as const
 const NAME_SX = {
-  minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600,
+  ...ELLIPSIS_SX, fontWeight: FONT_WEIGHT.semibold,
   /* The floor is `min()`ed with the name's own width (`--name-ch`, set per row): a min-width wider than a short
   name stretched its box and left a gap before the email. */
-  '&&': { flexShrink: 1, minWidth: 'min(6.5em, var(--name-ch, 6.5em))' },
+  '&&': { flexShrink: 1, minWidth: `min(${grid(14)}, var(--name-ch, ${grid(14)}))` },
   /* On a phone or a narrow roster it takes the identity's whole first line and wraps to a second, clamped
   there (unclamped, a long name ran to three lines and pushed the row's height around). */
   [ACCOUNTS_PROVIDER_UNDER]: { '&&': NAME_WRAPPED },
@@ -785,7 +738,7 @@ const nameWidthStyle = (name: string) => ({ '--name-ch': `${name.length}ch` }) a
 /** A per-node row's identity: the server icon, then its label (name, chip, host), which alone wraps. */
 const NODE_IDENTITY_SX = { display: 'inline-flex', alignItems: 'flex-start', gap: 0.5, minWidth: 0, maxWidth: '100%' } as const
 /* Centred on the label's first line (the 20px chip's), wherever the label wraps to. */
-const NODE_ICON_SX = { color: 'text.secondary', mt: '2px' } as const
+const NODE_ICON_SX = { color: 'text.secondary', mt: 0 } as const
 const NODE_LABEL_SX = {
   display: 'inline-flex', alignItems: 'center', gap: 0.5, minWidth: 0, maxWidth: '100%',
   '& > *': { flexShrink: 0, maxWidth: '100%' },
@@ -793,8 +746,8 @@ const NODE_LABEL_SX = {
 
 /** A per-node row's name beside its chips: it shrinks before they do, never below a few characters. */
 const NODE_NAME_SX = {
-  minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-  '&&': { flexShrink: 1, minWidth: '4em' },
+  ...ELLIPSIS_SX,
+  '&&': { flexShrink: 1, minWidth: grid(8.5) },
 } as const
 
 /* The em-dash for a value not read, matching `MetaRow`/`MetaActor` (which render nodes, not text). */
@@ -900,21 +853,10 @@ function nodeStateNode(
     in the disc's `○`/`missing` and `data-node-state="missing"`; the hover separates it from
     `no_credentials`. */
     /* …and the word is what a viewer without the key gets back. */
-    if (!canLogIn) {
-      return noLoginPermissionNode('missing', `This account is not logged in on ${nodeName(n)}`, noLoginReason)
-    }
-    return (
-      <Link
-        component="button"
-        type="button"
-        variant="caption"
-        underline="hover"
-        onClick={() => onEnrol(n.node_id)}
-        title={`This account is not logged in on ${nodeName(n)} — log it in there`}
-      >
-        Login
-      </Link>
-    )
+    return loginNode(canLogIn, noLoginReason, {
+      word: 'missing', fact: `This account is not logged in on ${nodeName(n)}`, verb: 'log it in there',
+      onPress: () => onEnrol(n.node_id),
+    })
   }
   if (state === 'syncing') {
     /* A chip, no spinner: it ends on its own after two probe intervals (`app/account_sharing.py`). */
@@ -939,15 +881,14 @@ function nodeStateNode(
   }
   if (state === 'provisioning') {
     return (
-      <Typography
+      <Tip title={`${nodeName(n)} is still being set up: it has not read any account yet. This shows its real state `
+          + 'after its first successful check. Nothing to do here.'}><Typography
         variant="caption"
         data-testid="acct-node-provisioning"
         sx={{ color: 'text.secondary' }}
-        title={`${nodeName(n)} is still being set up: it has not read any account yet. This shows its real state `
-          + 'after its first successful check. Nothing to do here.'}
       >
         provisioning
-      </Typography>
+      </Typography></Tip>
     )
   }
   if (state === 'no_credentials') {
@@ -955,38 +896,17 @@ function nodeStateNode(
     `_account_reauth` refuses to create a dir (`account_not_found`). Labelled 'Login', not 'Add'. */
     /* `needs login` without the key, as `rejected` gets: `summarizeNodes` collapses the two. The disc keeps
     `no credentials`. */
-    if (!canLogIn) {
-      return noLoginPermissionNode('needs login', `No OAuth session in this account's dir on ${nodeName(n)}`, noLoginReason)
-    }
-    return (
-      <Link
-        component="button"
-        type="button"
-        variant="caption"
-        underline="hover"
-        onClick={() => onEnrol(n.node_id)}
-        title={`No OAuth session in this account's dir on ${nodeName(n)} — log this node in`}
-      >
-        Login
-      </Link>
-    )
+    return loginNode(canLogIn, noLoginReason, {
+      word: 'needs login', fact: `No OAuth session in this account's dir on ${nodeName(n)}`, verb: 'log this node in',
+      onPress: () => onEnrol(n.node_id),
+    })
   }
   if (state === 'unreadable') {
     const fact = `${nodeName(n)} found no credential it can read for this account`
       + (n.quota?.credentialPath ? ` (looked in ${n.quota.credentialPath})` : '')
-    if (!canLogIn) return noLoginPermissionNode('can’t read', fact, noLoginReason)
-    return (
-      <Link
-        component="button"
-        type="button"
-        variant="caption"
-        underline="hover"
-        onClick={() => onRelogin(n.node_id)}
-        title={`${fact} — log this node in again`}
-      >
-        Login
-      </Link>
-    )
+    return loginNode(canLogIn, noLoginReason, {
+      word: 'can’t read', fact, verb: 'log this node in again', onPress: () => onRelogin(n.node_id),
+    })
   }
   if (state === 'rejected') {
     return (
@@ -1001,25 +921,24 @@ function nodeStateNode(
     // which — an unknown reason falls back to the bare words rather than guessing.
     const why = NO_READING_REASON[n.no_reading_reason ?? ''] ?? NO_READING_UNKNOWN
     return (
-      <Typography
+      <Tip title={`${nodeName(n)}: ${why.title} — unverified, not known-good`}><Typography
         variant="caption"
         data-no-reading-reason={n.no_reading_reason ?? undefined}
         sx={{ color: 'text.secondary' }}
-        title={`${nodeName(n)}: ${why.title} — unverified, not known-good`}
       >
         {why.label}
-      </Typography>
+      </Typography></Tip>
     )
   }
   return (
-    <Typography variant="caption" sx={{ color: 'text.secondary' }} title={`Usable on ${nodeName(n)}`}>
+    <Typography variant="caption" sx={{ color: 'text.secondary' }}>
       ok
     </Typography>
   )
 }
 
 /* An open account's lines under its row, at its children's indent: the feed's `detail` region. */
-const DETAIL_LINE_SX = [rowPadLeft(1), { pb: 0.5, fontSize: '0.75rem', color: 'text.secondary' }] as const
+const DETAIL_LINE_SX = [rowPadLeft(1), { pb: 0.5, fontSize: FONT_SIZE.sm, color: 'text.secondary' }] as const
 
 function AccountDetailLines({ lines }: { lines: { key: string; testId: string; text: ReactNode }[] }) {
   if (lines.length === 0) return null
@@ -1040,44 +959,27 @@ is said: `shared` is what the account row's NodeLink mark already tells, so only
 older node that does not say gets none — never a guess. */
 const LOCAL_SOURCE_CHIP: { label: string; tone: Tone } = { label: 'Local', tone: 'neutral' }
 
-/* Material's `Dns` (a server) and `FolderShared` paths, inlined: `@mui/icons-material` is not a dependency
-(`ui/InfoTip`). The server marks a node row as a node; the folder is a NodeLink. */
-const SERVER_PATH =
-  'M20 13H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1v-6c0-.55-.45-1-1-1M7 19c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2M20 3H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1V4c0-.55-.45-1-1-1M7 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2'
-const NODELINK_PATH =
-  'M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2m-5 3c1.1 0 2 .9 2 2s-.9 2-2 2-2-.9-2-2 .9-2 2-2m4 8h-8v-1c0-1.33 2.67-2 4-2s4 .67 4 2v1z'
-
-function GlyphIcon({ path, sx }: { path: string; sx?: SxProps<Theme> }) {
-  return (
-    <Icon viewBox="0 0 24 24" sx={[{ fill: 'currentColor' }, ...(Array.isArray(sx) ? sx : [sx])]}>
-      <path d={path} />
-    </Icon>
-  )
-}
-
 /* The token-folder NodeLinks a node reads this account from, one folder mark each, to that NodeLink.
 `titleAside`, outside the row's link, so the press is the mark's own. */
 function SharedViaLinks({ links, onOpen }: { links: { id: string; name: string }[]; onOpen: (id: string) => void }) {
   return (
-    <Box component="span" sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.25, ml: 0.5, [PHONE]: { display: 'none' } }}>
+    <Box component="span" sx={{ display: 'inline-flex', alignItems: 'center', gap: 0, ml: 0.5, [PHONE]: { display: 'none' } }}>
       {links.map(link => (
-        <Box
-          key={link.id}
+        <Tip key={link.id} title={`Shared via NodeLink ${link.name}`}><Box
           component="button"
           type="button"
           data-testid="acct-shared-via"
           aria-label={`Open NodeLink ${link.name}`}
-          title={`Shared via NodeLink ${link.name}`}
           onClick={() => onOpen(link.id)}
           sx={{
-            display: 'inline-flex', alignItems: 'center', p: '2px', border: 0, borderRadius: 1, cursor: 'pointer',
-            background: 'none', color: 'info.main', fontSize: '1rem',
+            display: 'inline-flex', alignItems: 'center', p: 0, border: 0, borderRadius: RADIUS.sm, cursor: 'pointer',
+            background: 'none', color: 'info.main', fontSize: SIZE.iconSm,
             '&:hover': { bgcolor: 'action.hover' },
             '&:focus-visible': { outline: '2px solid', outlineColor: 'primary.main' },
           }}
         >
-          <GlyphIcon path={NODELINK_PATH} />
-        </Box>
+          <NodeLinkIcon />
+        </Box></Tip>
       ))}
     </Box>
   )
@@ -1092,9 +994,9 @@ function SharedViaMark({ links }: { links: { id: string; name: string }[] }) {
       data-testid="acct-shared-via-phone"
       role="img"
       aria-label={`Shared via NodeLink ${links.map(link => link.name).join(', ')}`}
-      sx={{ display: 'none', [PHONE]: { display: 'inline-flex', verticalAlign: '-0.125em', ml: 0.5, color: 'info.main' } }}
+      sx={{ display: 'none', [PHONE]: { display: 'inline-flex', verticalAlign: 'text-bottom', ml: 0.5, color: 'info.main' } }}
     >
-      <GlyphIcon path={NODELINK_PATH} />
+      <NodeLinkIcon />
     </Box>
   )
 }
@@ -1142,7 +1044,7 @@ function accountNodeRows({
       indicator: { tone: mark.tone, glyph: mark.glyph, label: mark.label },
       title: (
         <Box component="span" sx={NODE_IDENTITY_SX}>
-          <GlyphIcon path={SERVER_PATH} sx={NODE_ICON_SX} />
+          <NodeIcon sx={NODE_ICON_SX} />
           {/* The icon stays outside the wrap, so a wrapped `on <host>` starts under the name, not left of the icon. */}
           <Box component="span" data-testid="acct-node-label" sx={[NODE_LABEL_SX, source || where ? IDENTITY_WRAP_SX : null]}>
             <Box component="span" sx={NODE_NAME_SX}>{name}</Box>
@@ -1154,6 +1056,7 @@ function accountNodeRows({
         </Box>
       ),
       titleText: [nodeName(n), where && `(${where})`, source?.label].filter(Boolean).join(' '),
+      href: null,
       // The chip and the host wrap under the name rather than being clipped on a phone.
       titleLines: source || where ? 'all' : undefined,
       busy,
@@ -1204,23 +1107,6 @@ function accountNodeRows({
   })
 }
 
-// The account auth wizard, shared by two flows (`mode`):
-//   • 'add'    — slug input → account_add → poll → awaiting_code → account_add_submit_code (finalize).
-//   • 'reauth' — fixed slug, a start step (node) → account_reauth → poll → awaiting_code → finish; no
-//                create/enable side effects.
-// Both poll /api/accounts/provisioning. How it finishes is `loginNeedsCode`'s: a paste-code provider
-// (Claude included) gets a code field; an await-credentials provider (device auth) finishes on the node,
-// so the wizard waits and drives `*_await_login`.
-// The handoff is sealed (`lib/loginSeal.ts`): phase 1 sends this page's `peer_key`, the node
-// answers a `sealed_url` only this page can open plus its own `seal_key`, and the pasted code goes back as
-// `sealed_code`. The control plane relays ciphertext and never holds the URL or the code. It never
-// renders a token or credential material, only the authorization URL it unsealed.
-
-
-
-
-
-
 export default function Accounts() {
   const { admin } = useAuth()
   /* ── The two write gates this page reads; neither is the route's boundary ──
@@ -1232,8 +1118,10 @@ export default function Accounts() {
    * with `system:create` can log an account in but cannot create an API-key account. */
   const isOrgAdmin = isOrgAdminSeat(admin)
   const canLogIn = useCanLogIn()
-  // The community edition has no NodeLink to share subscriptions over.
-  const shareShown = useShareSubscriptionsShown() && isEnabled('nodelink')
+  /* Add account's own gate: every member may bring their own account (`accountModel.tsx::useCanAddAccount`). */
+  const canAdd = useCanAddAccount()
+  const share = shareModule()
+  const shareShown = share?.useShareSubscriptionsShown() ?? false
   /* An open account beside the roster narrows it (`components/ListDetail.tsx`): the header goes compact. */
   const besideDetail = useOpenDetailPath() !== null
   /* A pending org may not add an AI account (the API 403s it): disabled with the reason, never hidden. */
@@ -1267,10 +1155,6 @@ export default function Accounts() {
     setExpandedSlugs(prev => toggled(prev, slug))
   }
 
-  // account_ids just toggled, overlaid until /api/resources catches up. Keyed on `account_id`, not
-  // `config_dir` (see `StateToggle`).
-  const [optimistic, setOptimistic] = useState<Record<string, boolean>>({})
-
   /* The second roster: the table renders `GET /api/resources`; `name`, `description` and provenance live
    * only on `GET /api/accounts`. The first is `system:view`, the second `accounts:view`, each over a
    * grant-scoped select (`authz.readable_account_select`), so they cover the same accounts. Held by row id, joined by `account_id`.
@@ -1291,44 +1175,29 @@ export default function Accounts() {
       : Object.fromEntries(recordsQuery.data.map(row => [row.id, row]))),
     [recordsQuery.data, recordsQuery.isError],
   )
+  /* The clock `initializing` reads, ticking only while some record was signed in recently, so the row turns to
+  its real state when `INITIALIZING_MS` lapses on a quiet page. Frozen, it is older, never newer. */
+  const [clockOn, setClockOn] = useState(false)
+  const now = useNow(clockOn ? INITIALIZING_TICK_MS : null)
+  const anyRecent = !!recordsQuery.data?.some(row => row.enabled && signedInRecently(row.signed_in_at, now))
+  useEffect(() => setClockOn(anyRecent), [anyRecent])
   const fetchResources = () => queryClient.invalidateQueries({ queryKey: RESOURCES_KEY })
   const fetchAccountRecords = () => queryClient.invalidateQueries({ queryKey: ACCOUNTS_KEY })
 
-  /* Write each pending login's Auto-assign/cap/description once its row is on `/api/accounts`, then re-read so the
-  roster shows it ("explicit only"). Taken off the map before the write, so a refetch cannot send it twice;
-  a failure goes to the page banner, since the account would otherwise run work the box said it would not. */
+  /* Apply held login answers once their rows are on `/api/accounts` (`accountModel.tsx::applyPendingDispatch`),
+  then re-read so the roster shows them; a failure goes to the page banner. */
   useEffect(() => {
     if (!records) return
-    for (const { slug, row, wanted } of takePendingDispatch(records)) {
-      const body = dispatchBody(row, wanted)
-      if (!body) continue
-      put(`/api/accounts/${row.id}`, body)
-        .then(() => fetchAccountRecords())
-        .catch(err => setWriteError(pendingDispatchFailure(row.name || slug, apiDetail(err, 'the write failed'))))
-    }
+    void applyPendingDispatch(records).then(({ written, failure }) => {
+      if (failure) setWriteError(failure)
+      if (written) fetchAccountRecords()
+    })
   }, [records])
 
   /* The provider catalogue at page level via the wizard's hook (a separate GET; affordable: the response is
   static per `app/agent_providers.py`, best-effort, unread = empty list). The roster reads only
   `has_quota_model`. Not on the live-refetch path: an `account` event cannot change a vendor. */
   const providerCatalogue = useAgentProviders()
-
-  /* Drop overrides the server now agrees with, on every fresh read, keyed on `account_id` like the overlay
-  (this pass rebuilds the map, so a different key would drop every entry the toggle wrote). */
-  useEffect(() => {
-    if (!resQuery.data) return
-    const accounts = resQuery.data.accounts
-    setOptimistic(prev => {
-      const next: Record<string, boolean> = {}
-      for (const a of accounts) {
-        const key = a.account_id
-        if (key && prev[key] !== undefined && prev[key] !== a.enabled) {
-          next[key] = prev[key]
-        }
-      }
-      return next
-    })
-  }, [resQuery.dataUpdatedAt])
 
   // Scoped to `account`: this page's rows are the only thing such an event can change.
   // Both rosters: `emit_console_event(entity="account")` fires on writes that change either, including
@@ -1340,21 +1209,9 @@ export default function Accounts() {
     { poll: () => void fetchResources() },
   )
 
-  // Keyed on `account_id` (see `StateToggle`).
-  function applyOptimistic(accountId: string, enabled: boolean) {
-    setOptimistic(prev => ({ ...prev, [accountId]: enabled }))
-  }
-
-  // Effective (optimistic-overlaid) enabled state for an account.
-  function effEnabled(acct: ClaudeAccount): boolean {
-    const key = acct.account_id
-    if (key && optimistic[key] !== undefined) return optimistic[key]
-    return acct.enabled
-  }
-
   const accounts = res?.accounts ?? []
 
-  const enabledCount = accounts.filter(effEnabled).length
+  const enabledCount = accounts.filter(a => a.enabled).length
 
   /* The write runs inside the confirm: a refusal stays in the dialog with its reason. Another org's row
   goes as that org for this one request (`actAsOnce`), as a task's Delete does. */
@@ -1365,11 +1222,9 @@ export default function Accounts() {
     if (accountId == null) return
     const asOrg = actAsOnce(otherOrg)
     const id = encodeURIComponent(accountId)
-    const ok = await confirm({
+    if (!await confirm(danger('Delete', {
       title: 'Delete account',
       message: deleteQuestion(account, name, isApiKey),
-      confirmLabel: 'Delete',
-      destructive: true,
       run: {
         action: () => withBusy(rowKey, async () => {
           if (isApiKey) {
@@ -1381,8 +1236,7 @@ export default function Accounts() {
         failed: 'Failed to delete the account',
         busyLabel: 'Deleting…',
       },
-    })
-    if (!ok) return
+    }))) return
     await fetchResources()
   }
 
@@ -1390,13 +1244,7 @@ export default function Accounts() {
     rowKey: string, accountId: string | null | undefined, nodeId: string, nodeLabel: string, nodeCount: number,
   ) {
     if (accountId == null) return
-    const ok = await confirm({
-      title: 'Remove credentials from node',
-      message: removeNodeQuestion(nodeLabel, nodeCount),
-      confirmLabel: 'Remove',
-      destructive: true,
-    })
-    if (!ok) return
+    if (!await confirm(danger('Remove', { title: 'Remove credentials from node', message: removeNodeQuestion(nodeLabel, nodeCount) }))) return
     await withBusy(rowKey, async () => {
       setWriteError('')
       try {
@@ -1423,12 +1271,11 @@ export default function Accounts() {
   /* Per row, the quota windows its columns read (null: no quota to show), for the header (`quotaColumnWindows`). */
   const rowWindows: (string[] | null)[] = []
   const builtRows: FeedRowSpec[] = accounts.map((acct, i): FeedRowSpec => {
-    const enabled = effEnabled(acct)
+    const { enabled } = acct
     /* Said on the Disable control, not as a row marker: `enabledCount` counts the org-narrowed roster, so
     `=== 1` is the steady state of an org with one account, and a mark would sit on it forever. */
     const lastEnabledWarning = enabled && enabledCount === 1
       ? 'Disabling this leaves no account eligible for new runner launches' : undefined
-    const displayAcct = { ...acct, enabled }
     const slug = slugOf(acct)
     // `config_dir` is not unique (only `slug` is), so key on account_id first.
     const rowKey = String(acct.account_id ?? acct.config_dir ?? acct.email ?? i)
@@ -1486,9 +1333,16 @@ export default function Accounts() {
     being expanded. */
     const blockedOn = blockedNodes(askingRows, nodePinned).map(nodeName)
     /* The account-level "no credentials": only when no node holds a session (`credentialsNowhere`). */
-    const noCredentials = !isApiKey && credentialsNowhere(acct, workRows)
-    /* Nodes it could still be logged in on that no row offers. Never a host: it runs no work. */
-    const addable = rowCanLogIn && !!slug
+    const signedInNowhere = !isApiKey && credentialsNowhere(acct, workRows)
+    /* Just signed in, and no node has reported it yet: `initializing`, not the `no credentials` error, for
+    `INITIALIZING_MS`. Enabled only: phase 1 of a sign-in writes a disabled row with no `signed_in_at`. */
+    /* Never over a verdict that is a fault on its own (a rejected login, a standing break). */
+    const initializing = signedInNowhere && enabled && signedInRecently(record?.signed_in_at, now)
+      && !isAuthRejected(acct.quota) && !record?.quota_status_detail
+    const noCredentials = signedInNowhere && !initializing
+    /* Nodes it could still be logged in on that no row offers. Never a host: it runs no work. None while initializing:
+    the sign-in that just completed needs no second one. */
+    const addable = rowCanLogIn && !!slug && !initializing
       && workRows.some(n => n.present === false && !servingRows.includes(n))
     /* An account signed in nowhere: the one next step is a first login, on a node whose dir holds no session (as its
     node row's Login), else on one it is missing from (`addable`'s picker, when it stands in for Add to node). */
@@ -1530,7 +1384,8 @@ export default function Accounts() {
       : null
     /* An API-key account whose stored key is gone (its credential row was deleted): nothing can run on it. */
     const keyMissing = isApiKey && record?.api_key_set === false
-    const healthState = keyMissing && enabled ? 'erroring'
+    const healthState: AccountHealth = keyMissing && enabled ? 'erroring'
+      : initializing ? 'initializing'
       : accountHealth(acct, enabled, summary, isApiKey, noQuota, noCredentials)
     const health = ACCOUNT_HEALTH_MARK[healthState]
     const editBlocked = editBlockedReason(acct.account_id, record)
@@ -1546,9 +1401,7 @@ export default function Accounts() {
     const loginSentence = (verb: string, to: string) => (
       <>
         {nodeRemoved ? 'Its node was removed.' : notServingText}{' '}
-        <Link
-          component="button"
-          type="button"
+        <LinkButton
           variant="inherit"
           underline="hover"
           onClick={() => navigate(to)}
@@ -1556,7 +1409,7 @@ export default function Accounts() {
           sx={{ verticalAlign: 'baseline' }}
         >
           {verb}
-        </Link>
+        </LinkButton>
       </>
     )
 
@@ -1597,8 +1450,8 @@ export default function Accounts() {
       actions.push({
         key: 'new-node',
         icon: '+',
-        label: 'Add node',
-        ariaLabel: `Add node — no node to sign ${name} in on yet`,
+        label: 'New node',
+        ariaLabel: `New node — no node to sign ${name} in on yet`,
         onClick: () => navigate(nodesAddPath(rowOrg?.id)),
       })
     }
@@ -1621,8 +1474,8 @@ export default function Accounts() {
         disabledReason: editBlocked ?? undefined,
       }))
       actions.push({
-        /* The toggle's second home at every width, sharing `setAccountEnabled`, without the optimistic overlay
-        (the menu closes on press). */
+        /* The toggle's second home at every width, sharing `setAccountEnabled` (the menu closes on
+        press, so no optimistic flip). */
         key: 'enabled',
         icon: enabled ? '⏸' : '▶',
         label: enabled ? 'Disable' : 'Enable',
@@ -1679,7 +1532,7 @@ export default function Accounts() {
         dim: true,
         testId: 'acct-sessions',
         node: acct.sessions && acct.sessions.total > 0 ? (
-          <HoverCard content={<SessionsTip worktrees={acct.worktrees ?? []} />}>
+          <Tip title={<SessionsTip worktrees={acct.worktrees ?? []} />}>
             <Box component="span" sx={{ display: 'inline-flex', alignItems: 'center' }}>
               <Box component="span">{acct.sessions.total}</Box>
               {acct.sessions.busy > 0 && (
@@ -1688,7 +1541,7 @@ export default function Accounts() {
                 </Box>
               )}
             </Box>
-          </HoverCard>
+          </Tip>
         ) : '—',
       },
     ]
@@ -1702,13 +1555,16 @@ export default function Accounts() {
         below `sm`. Off a narrow roster too (`ACCOUNTS_NO_ENABLED`). */
         gate: 'acctEnabled',
         node: (
-          <StateToggle
-            account={displayAcct}
-            warning={lastEnabledWarning}
-            otherOrg={otherOrg}
-            onOptimistic={applyOptimistic}
-            onCompleted={() => void fetchResources()}
+          <EnableToggle
+            variant="chip"
+            enabled={enabled}
+            // Another org's row goes as that org for this one request.
+            write={next => setAccountEnabled(acct.account_id as string, next, actAsOnce(otherOrg))}
+            onToggled={() => void fetchResources()}
             onError={setWriteError}
+            failMessage={next => `Failed to ${next ? 'enable' : 'disable'} the account`}
+            disabledReason={acct.account_id == null ? NO_ROW_TITLE : undefined}
+            warning={lastEnabledWarning}
           />
         ),
       })
@@ -1796,7 +1652,7 @@ export default function Accounts() {
     const markers = []
     /* A mark, not the word: a marker reserves no width on rows without it. Warning-toned ⚠ so it never reads as a
     stray grey dot; not on a no-credentials row, whose chip and ✕ already say it. */
-    if (summary && !noCredentials) {
+    if (summary && !noCredentials && !initializing) {
       markers.push({ key: 'attention', glyph: '⚠', tone: 'warning' as const, label: `Needs attention: ${summary} on ${blockedOn.join(', ')}` })
     }
     return {
@@ -1812,15 +1668,14 @@ export default function Accounts() {
           data-testid="acct-identity"
           sx={[IDENTITY_SX, enabled ? null : IDENTITY_DISABLED_SX]}
         >
-          <Box component="span" data-testid="acct-name" sx={NAME_SX} style={nameWidthStyle(name)} title={identityTitle}>
+          <Tip title={identityTitle}><Box component="span" data-testid="acct-name" sx={NAME_SX} style={nameWidthStyle(name)}>
             {name}
             {sharedVia.length > 0 && <SharedViaMark links={sharedVia} />}
-          </Box>
-          <Box
+          </Box></Tip>
+          <Tip title={noCredentials ? [provider.title, noCredentialsTitle].filter(Boolean).join(' ') : provider.title}><Box
             component="span"
             data-testid="acct-provider-phone"
             sx={PROVIDER_UNDER_SX}
-            title={noCredentials ? [provider.title, noCredentialsTitle].filter(Boolean).join(' ') : provider.title}
           >
             {/* A phone's state leads the provider line rather than hanging on a line of its own (`STATE_UNDER_SX`). */}
             {isOrgAdmin && <StateUnderMark enabled={enabled} testId="acct-state-provider-line" sx={STATE_ON_PROVIDER_LINE_SX} />}
@@ -1829,7 +1684,7 @@ export default function Accounts() {
               <Box component="span" data-testid="acct-no-credentials-under" sx={NO_CREDENTIALS_UNDER_SX}>no credentials · </Box>
             )}
             {provider.label ?? NO_ACTOR}
-          </Box>
+          </Box></Tip>
           {isOrgAdmin && <StateUnderMark enabled={enabled} testId="acct-state-phone" sx={STATE_UNDER_SX} />}
           {/* The kind chip takes the identity region, where a subscription shows its email; an API-key account has
           none, so the kinds separate on sight. Only on this kind. No glyph: "API key" is already the whole signal,
@@ -1848,6 +1703,8 @@ export default function Accounts() {
               says something the name above does not. */}
               {acct.email && acct.email !== name && <Box component="span" sx={EMAIL_SX}>{acct.email}</Box>}
             </>
+          ) : initializing ? (
+            <StatusChip label="initializing" tone="info" testId="acct-initializing" />
           ) : noCredentials ? (
             <>
               <StatusChip
@@ -1857,15 +1714,15 @@ export default function Accounts() {
                 title={noCredentialsTitle}
               />
               {/* A probed identity the name above does not already say. */}
-              {acct.email && acct.email !== name && <Box component="span" sx={EMAIL_SX} title={identityTitle}>{acct.email}</Box>}
+              {acct.email && acct.email !== name && <Tip title={identityTitle}><Box component="span" sx={EMAIL_SX}>{acct.email}</Box></Tip>}
             </>
           ) : (
             /* Wrapped, not a bare text node, so `EMAIL_SX` can ellipsize it. Not repeated when it is the name. */
-            acct.email !== name && <Box component="span" sx={EMAIL_SX} title={identityTitle}>{acct.email ?? NO_ACTOR}</Box>
+            acct.email !== name && <Tip title={identityTitle}><Box component="span" sx={EMAIL_SX}>{acct.email ?? NO_ACTOR}</Box></Tip>
           )}
           {/* The plan the node's probe read (`tier`), for every provider alike: identity, beside the login it names. */}
           {acct.tier && !isApiKey && (
-            <Box component="span" data-testid="acct-plan" sx={PLAN_SX} title={`Plan: ${acct.tier}`}>{acct.tier}</Box>
+            <Tip title={`Plan: ${acct.tier}`}><Box component="span" data-testid="acct-plan" sx={PLAN_SX}>{acct.tier}</Box></Tip>
           )}
           {/* Out of rotation on a runner's break: the verdict, its sentence (e.g. the vendor refusing the account). */}
           {record?.quota_status_detail && (
@@ -1879,6 +1736,10 @@ export default function Accounts() {
           so a neutral chip beside the others, never a warning. */}
           {record?.auto_assign === false && (
             <StatusChip label="explicit only" tone="neutral" title={EXPLICIT_ONLY_TITLE} />
+          )}
+          {/* One member's account: an admin sees every member's, so the row says whose (on hover). */}
+          {record?.ownership === 'personal' && (
+            <StatusChip label="personal" tone="neutral" testId="acct-personal" title={record.owner ?? undefined} />
           )}
         </Box>
       ),
@@ -1900,8 +1761,8 @@ export default function Accounts() {
           )}
           {sharedVia.length > 0 && <SharedViaLinks links={sharedVia} onOpen={id => navigate(nodeLinkUrl(id))} />}
         </>
-      ) : undefined,
-      href: linked && acct.account_id != null ? accountEditPath(acct.account_id) : undefined,
+      ) : null,
+      href: linked && acct.account_id != null ? accountEditPath(acct.account_id) : null,
       // Wraps only where the identity does (the phone band and a narrow roster, `IDENTITY_SX`/`NAME_SX`); one line elsewhere.
       titleLines: 'all',
       busy: busyRows.has(rowKey),
@@ -1940,7 +1801,7 @@ export default function Accounts() {
               and not tenant vocabulary: `apps/api/app/tenancy/copy.py`). */
               ...(isApiKey
                 ? [{ key: 'api-key-kind', testId: 'acct-api-key-note', text: 'The key is write-only: rotate it from Edit.' }]
-                : nodeRows.length === 0 || needsNode
+                : (nodeRows.length === 0 || needsNode) && !initializing
                 ? [{
                     key: 'no-nodes',
                     testId: 'acct-no-nodes',
@@ -1952,8 +1813,8 @@ export default function Accounts() {
                           {isOrgAdmin && (
                             <>
                               {' '}
-                              <Link component={RouterLink} to={nodesAddPath(rowOrg?.id)} underline="hover" aria-label={`Add node: ${name}`}>
-                                Add node
+                              <Link component={RouterLink} to={nodesAddPath(rowOrg?.id)} underline="hover" aria-label={`New node: ${name}`}>
+                                New node
                               </Link>
                             </>
                           )}
@@ -1961,12 +1822,15 @@ export default function Accounts() {
                       )
                       : 'No node has reported yet',
                   }]
-                : servingRows.length === 0
+                /* Initializing: no node has confirmed the sign-in yet, so its rows would only read a warning and a Login
+                that is not needed. The one line says so instead. */
+                : servingRows.length === 0 || initializing
                 ? [{
                     key: 'no-nodes',
                     testId: 'acct-no-nodes',
                     /* The verb is the action itself, so a phone reader need not find it in the ⋯ menu. */
-                    text: addable && slug
+                    text: initializing ? 'Initializing…'
+                      : addable && slug
                       ? loginSentence(offersSignIn ? 'Sign in' : 'Add to node', accountLoginPath(slug, null, true))
                       : notServingText,
                   }]
@@ -1980,7 +1844,7 @@ export default function Accounts() {
       notes: !isOpen && offersSignIn && slug
         ? [{ key: 'sign-in', tone: 'muted', text: nodeRemoved ? 'Its node was removed.' : notServingText }]
         : undefined,
-      children: isOpen
+      children: isOpen && !initializing
         ? accountNodeRows({
             nodes: servingRows,
             accountId: acct.account_id,
@@ -2003,28 +1867,38 @@ export default function Accounts() {
     : []
   const statusRows = dashedEverywhere.length === 0 ? builtRows
     : builtRows.map(row => ({ ...row, slots: row.slots?.filter(slot => !dashedEverywhere.includes(slot.key)) }))
-  /* A seat refused the status read (`refused`) still reads the records (`accounts:view`): their names, the status
-  cells blank, rather than an empty page. Only while no status row was ever read; cached rows keep their place. */
+  /* A seat refused the status read (`refused`) still reads the records (`accounts:view`) — a member's own
+  accounts (`access_catalog.MEMBER_KEYS`): the state and quota the record carries, without the per-node cells.
+  Only while no status row was ever read; cached rows keep their place. */
   const recordRows: FeedRowSpec[] = refused && accounts.length === 0 && !recordsQuery.isError
     ? (recordsQuery.data ?? []).map((row): FeedRowSpec => {
         const provider = providerCell(row, providerCatalogue)
+        const state = recordHealth(row, now)
+        const mark = RECORD_HEALTH_MARK[state]
+        const noQuota = isApiKeyAccount(row) || providerHasNoQuota(row, providerCatalogue.rows)
+        const noQuotaTitle = isApiKeyAccount(row) ? NO_QUOTA_TITLE : PROVIDER_NO_QUOTA_TITLE
+        const quotaWindows = providerQuotaWindows(row, providerCatalogue.rows)
+        const quotaNode = (pct: number | null, windowIndex: number) => (noQuota
+          ? <NoQuotaCell title={noQuotaTitle} />
+          : windowIndex >= quotaWindows.length ? <NoQuotaCell title={noWeeklyWindowTitle(quotaWindows[0])} />
+          : <QuotaCell pct={pct} resetsAt={null} />)
         return {
           key: row.id,
           title: (
-            <Box component="span" data-testid="acct-name" sx={NAME_SX} style={nameWidthStyle(row.name)} title={row.description ? `${row.name} — ${row.description}` : row.name}>
+            <Tip title={row.description ? `${row.name} — ${row.description}` : row.name}><Box component="span" data-testid="acct-name" sx={NAME_SX} style={nameWidthStyle(row.name)}>
               {row.name}
-            </Box>
+            </Box></Tip>
           ),
           titleText: row.name,
           href: accountEditPath(row.id),
-          indicator: REFUSED_MARK,
-          data: { status: 'unread' },
+          indicator: { tone: mark.tone, glyph: mark.glyph, label: mark.label },
+          data: { status: state },
           slots: [
             ...orgSlots(orgVisible, row.org, { gate: 'acctOrg' }),
             { key: 'sessions', width: SESSIONS_SLOT, gate: 'acctSessions', node: null },
             { key: 'provider', width: PROVIDER_SLOT, gate: 'acctProvider', align: 'left', title: provider.title, node: provider.label ?? NO_ACTOR },
-            { key: 'five', width: QUOTA_SLOT, node: null },
-            { key: 'week', width: QUOTA_SLOT, gate: 'acctWeek', node: null },
+            { key: 'five', width: QUOTA_SLOT, align: 'right', mono: true, testId: 'acct-5h', node: quotaNode(row.five_hour_percent, 0) },
+            { key: 'week', width: QUOTA_SLOT, gate: 'acctWeek', align: 'right', mono: true, testId: 'acct-7d', node: quotaNode(row.weekly_percent, 1) },
           ],
         }
       })
@@ -2044,38 +1918,54 @@ export default function Accounts() {
   return (
     /* The roster's own width gates its slots (`ACCOUNTS_LIST_CONTAINER`): an open account beside it narrows it. */
     <Box sx={ACCOUNTS_LIST_CONTAINER_SX}>
-      {/* Add account, on the Machines strip via a titleless header (`components/TabActionsSlot`).
-      Labelled, not a bare `+`: sibling tabs offer their primary action in the same shape ("Add node"). Visible text and `aria-label` match: `Add account` is asserted by
+      {/* Add account, on the Agents strip via a titleless header (`components/TabActionsSlot`).
+      Labelled, not a bare `+`: sibling tabs offer their primary action in the same shape ("New node"). Visible text and `aria-label` match: `Add account` is asserted by
       `Accounts.test.tsx`, and WCAG 2.5.3 Label in Name requires it. `tapTargetSx` gives the 44px phone floor.
       Absent without the key — only a verb, so it goes (contrast `components/NodeEnableToggle.tsx`).
       `canLogIn`, not `isOrgAdmin`: a `system:create` holder completes `account_add` (`LOGIN_PERMISSION`);
       `kindField` gates the API-key form. Beside an open account the list is narrow: Add says only "Add" (a word,
       not a bare `+`), so it keeps Share's line beside the strip. */}
       <PageHeader
-        actions={canLogIn || shareShown ? (
+        actions={canAdd || canLogIn || shareShown ? (
           <Box sx={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 1 }}>
           {/* Absent without `credentials:edit` or the plan's NodeLink term (the NodeLink list is that upsell's
           one home). */}
-          {shareShown && <ShareSubscriptionsAction />}
+          {shareShown && share && <share.default />}
           {/* An account exported from another console (`AccountTransfer.tsx`); the create door decides who may. */}
-          {canLogIn && !besideDetail && <ImportAccountAction />}
-          {canLogIn && (
+          {canLogIn && !besideDetail && (
+            <Tip title="Import an account exported from another console"><Button
+              component={RouterLink}
+              to={`${NEW_ACCOUNT_PATH}?via=import`}
+              variant="outlined"
+              color="primary"
+              aria-label="Import account"
+              data-testid="account-import"
+              sx={[{ whiteSpace: 'nowrap' }, tapTargetSx]}
+            >
+              Import
+            </Button></Tip>
+          )}
+          {canAdd && (
           <DisabledReason reason={addBlocked}>
-            <Button
-              type="button"
+            {besideDetail ? (
               /* Beside an open account both compact actions are outlined, Share's weight: the open editor's Save
               is that view's primary action, and a lone contained `+` read as louder than its neighbour. */
-              variant={besideDetail ? 'outlined' : 'contained'}
-              color="primary"
-              onClick={() => navigate(NEW_ACCOUNT_PATH)}
-              disabled={addBlocked !== undefined}
-              aria-label="Add account"
-              title={addBlocked ?? 'Add account — log a new account in on a node'}
-              data-testid={besideDetail ? 'add-account-compact' : undefined}
-              sx={besideDetail ? tapTargetSx : compactVerbProps('Add account', tapTargetSx).sx}
-            >
-              {besideDetail ? 'Add' : <CompactVerbLabel label="Add account" />}
-            </Button>
+              <Tip title={addBlocked ?? 'Add account — log a new account in on a node'}><Button
+                type="button"
+                variant="outlined"
+                color="primary"
+                onClick={() => navigate(NEW_ACCOUNT_PATH)}
+                disabled={addBlocked !== undefined}
+                aria-label="Add account"
+                data-testid="add-account-compact"
+                sx={tapTargetSx}
+              >
+                Add
+              </Button></Tip>
+            ) : (
+              <NewButton label="Add account" onClick={() => navigate(NEW_ACCOUNT_PATH)} disabled={addBlocked !== undefined}
+                title={addBlocked ?? 'Add account — log a new account in on a node'} sx={tapTargetSx} />
+            )}
           </DisabledReason>
           )}
           </Box>
@@ -2085,8 +1975,9 @@ export default function Accounts() {
       <Stack spacing={1} sx={{ mb: 1 }}>
         {/* A failed read with no rows says it in `LoadFailedState` below, not twice. */}
         {error && accountRows.length > 0 && <Banner severity="error">{error}</Banner>}
-        {/* Refused after an earlier read: the cached rows stay, so the refusal says it over them. */}
-        {refused && accountRows.length > 0 && <Banner severity="warning">{REFUSED_TITLE}</Banner>}
+        {/* Refused after an earlier read: the cached rows stay, so the refusal says it over them. Rows read from
+        the records carry their own state, so no refusal is said over them. */}
+        {refused && accountRows.length > 0 && recordRows.length === 0 && <Banner severity="warning">{REFUSED_TITLE}</Banner>}
         {writeError && <Banner severity="error" onDismiss={() => setWriteError('')}>{writeError}</Banner>}
       </Stack>
 
@@ -2101,7 +1992,7 @@ export default function Accounts() {
         noMatch={false}
         /* One empty state. The roster is narrowed server-side to the viewer's plane (`tenancy/seam.py`) and to
         granted accounts, so the title says "visible". */
-        emptyTitle={refused ? REFUSED_TITLE : 'No runner accounts visible'}
+        emptyTitle={refused ? (canAdd && !recordsQuery.isError ? NO_OWN_ACCOUNTS_TITLE : REFUSED_TITLE) : 'No runner accounts visible'}
         /* One `ui/feed/FeedList`; no full-bleed wrapper (no horizontal scrollport). Full content width, as every
         other list page. */
         feed={{

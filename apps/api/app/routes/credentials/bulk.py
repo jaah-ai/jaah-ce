@@ -22,12 +22,12 @@ from sqlalchemy.orm import Session
 
 from app import credential_consumers, edition_features
 from app.actors import stamp_actor
-from app.auth import require_operator, require_user
+from app.auth import require_operator
 from app.authz.catalog import Tenancy
 from app.authz.declarations import feature, superadmin_only
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller, current_principal_async
 from app.authz.visibility import credential_write_clause
-from app.db import get_session
+from app.db_async import on_session
 from app.entity_shape import StrictModel
 from app.models.credentials import Credential
 from app.models.identity import AdminUser
@@ -159,16 +159,16 @@ def _refuse_in_use(rows: Sequence[Credential], used_by: dict[UUID, list[str]]) -
 
 @router.post("/api/credentials/bulk/delete", response_model=BulkOut)
 @feature("credentials", "delete", own_credential=True)
+@on_session
 def bulk_delete_credentials(
+    session: Session,
     body: BulkIn,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> BulkOut:
     """Delete the set, as `DELETE /api/credentials/{id}` deletes one row: tombstoned, audited, and refused while a
     row backs Jaah-managed storage (`nodelinks.managed_credentials`). A row a consumer's RESTRICT key holds is a
     409 naming it (`credential_consumers.delete_blockers`), where the single-row route meets the database's refusal."""
-    rows = _locked_set(session, principal, body, _DELETE_KEY, "delete")
+    rows = _locked_set(session, caller.principal, body, _DELETE_KEY, "delete")
     # The community edition has no Jaah-managed NodeLink storage.
     managed: set[UUID] = set()
     if edition_features.enabled("nodelink"):
@@ -182,30 +182,30 @@ def bulk_delete_credentials(
     blockers = credential_consumers.delete_blockers(session, [row.id for row in rows])
     if blockers:
         _refuse_in_use(rows, blockers)
-    delete_credentials(session, user, rows)
+    delete_credentials(session, caller.actor, rows)
     return BulkOut(count=len(rows))
 
 
 @router.post("/api/credentials/bulk/move-folder", response_model=BulkOut)
 @feature("credentials", "edit", own_credential=True)
+@on_session
 def bulk_move_credentials(
+    session: Session,
     body: BulkMoveIn,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> BulkOut:
     """File every row of the set under the folder `to`, keeping its leaf name: `a/b/x` moved to `c` is `c/x`. A
     renamed name colliding in its home refuses the whole set (409 `name_collision`, naming it)."""
     if len(body.to or "") > _NAME_MAX_LEN:
         raise HTTPException(status_code=400, detail=f"a folder must be at most {_NAME_MAX_LEN} characters")
     dest = _name_segments(body.to or "")
-    rows = _locked_set(session, principal, body, _EDIT_KEY, "change")
+    rows = _locked_set(session, caller.principal, body, _EDIT_KEY, "change")
     renamed = {
         row.id: _validated_name(_PATH_SEPARATOR.join([*dest, (_name_segments(row.name) or [row.name])[-1]]))
         for row in rows
     }
     try:
-        rename_credentials(session, user, rows, renamed)
+        rename_credentials(session, caller.actor, rows, renamed)
     except DuplicateName as exc:
         _refuse(409, "name_collision", 1, f"A credential named {exc.name} is already there.", name=exc.name)
     return BulkOut(count=len(rows))
@@ -213,11 +213,12 @@ def bulk_move_credentials(
 
 @router.post("/api/credentials/bulk/change-org", response_model=BulkOut)
 @superadmin_only(Tenancy.OPERATOR)
+@on_session
 def bulk_change_credential_org(
+    session: Session,
     body: BulkChangeOrgIn,
     user: AdminUser = Depends(require_operator),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    principal: Principal | None = Depends(current_principal_async),
 ) -> BulkOut:
     """[op] Move the set into the org `org_id`. Operator plane only (not acting as a tenant). Refused (409, each
     naming its reason) for a row that is `system`, homed in a project, personal with an owner outside the target

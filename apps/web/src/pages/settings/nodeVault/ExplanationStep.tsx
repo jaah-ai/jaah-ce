@@ -1,6 +1,7 @@
 import type { JSX } from 'react'
 import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
+import { FONT_WEIGHT } from '../../../theme'
 import FlowDiagram from './FlowDiagram'
 
 /* Setup's Explanation step (AC-4.1): the flow diagram, what Jaah can't see, then how the operator keeps secrets
@@ -38,11 +39,11 @@ export default function ExplanationStep(): JSX.Element {
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.5 }} data-testid="nodevault-explanation">
       <FlowDiagram />
       <Box>
-        <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.5 }}>What Jaah can’t see</Typography>
+        <Typography variant="body2" sx={{ fontWeight: FONT_WEIGHT.semibold, mb: 0.5 }}>What Jaah can’t see</Typography>
         <Points items={CANNOT_SEE} testId="nodevault-cannot-see" />
       </Box>
       <Box>
-        <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.5 }}>Keeping secrets sealed</Typography>
+        <Typography variant="body2" sx={{ fontWeight: FONT_WEIGHT.semibold, mb: 0.5 }}>Keeping secrets sealed</Typography>
         <Points items={SAFEGUARDS} testId="nodevault-safeguards" />
       </Box>
       <Typography variant="body2" sx={{ color: 'text.secondary' }}>

@@ -22,16 +22,15 @@ _PARKED_TASK_STATES = frozenset({AWAITING_RESPONSE, PAUSED})
 
 # ══ C. Pure pool arithmetic ════════════════════════════════════════════════════════════════════════════
 
-# `record["holder"]` is `Worktree.state` verbatim (`free` | `task` | `user` | `main` display override).
-# The concurrency cap counts `task`-held slots only: a human's `user` session consumes no fleet budget.
-# `held_slots_from_records` is wider on purpose, since a `user` slot must still refuse a pick.
+# `record["holder"]` is `Worktree.state` verbatim (`free` | `task`). The concurrency cap counts `task`-held
+# slots only; `held_slots_from_records` is wider on purpose (any holder but `free` refuses a pick).
 def is_active_record(record: dict) -> bool:
     """`holder == 'task'`, unless that task is parked with no live runner.
 
     Not the branch or session: a fresh lease leaves the worktree detached with no session yet,
     so those proxies under-count every in-flight dispatch and the plan over-dispatches. `holder` is the
     CP's own decision, true from the leasing statement onward. A task-held slot whose runner
-    died still counts (the conservative direction). A `user` slot never counts.
+    died still counts (the conservative direction).
 
     The one exception: a task waiting for an answer or stopped (`_PARKED_TASK_STATES`) whose runner is gone
     keeps its tree but no runner place. Nothing relaunches it until a human acts, which returns it to
@@ -158,16 +157,13 @@ def select_slot(
       1. a forced number wins, only if the roster declares it and it is not excluded;
       2. else the slot whose `task_id` is this task; if excluded, None (wait), never another slot;
       3. else the lowest existing non-excluded slot, preferring one no task owns.
-    None when nothing is available — fail closed. `user`-held slots are invisible to every rule. It never
+    None when nothing is available — fail closed. It never
     allocates: the CP dictates which slots exist (the roster's own numbers, walked ascending from 1), so an
     empty roster returns None."""
     excluded = {str(e) for e in (exclude or [])}
 
     def is_excluded(i: object) -> bool:
         return str(i) in excluded
-
-    # User-owned rows are filtered out before every rule.
-    pickable = {i: r for i, r in roster.items() if r.get("holder") != "user"}
 
     if force_num is not None:
         if is_excluded(force_num):
@@ -176,14 +172,14 @@ def select_slot(
             forced = int(force_num)
         except (TypeError, ValueError):
             return None
-        return forced if forced in pickable else None
+        return forced if forced in roster else None
 
     # (2) A requirement, not a preference: falling through would abandon the tree holding the previous
     # attempt's uncommitted work to `reset_to_base`. Waiting costs one cycle (~10s).
-    numbers = sorted(i for i in pickable if i >= 1)
+    numbers = sorted(i for i in roster if i >= 1)
     if task_id is not None:
         for i in numbers:
-            if pickable[i].get("task_id") is not None and str(pickable[i]["task_id"]) == str(task_id):
+            if roster[i].get("task_id") is not None and str(roster[i]["task_id"]) == str(task_id):
                 return None if is_excluded(i) else i
     # (3) Prefer a slot no other task's `task_id` names, so an unbound tree is not taken by a different
     # task. Only a preference: without I/O we cannot tell if that task is still live, and refusing would
@@ -192,7 +188,7 @@ def select_slot(
     for i in numbers:
         if is_excluded(i):
             continue
-        if pickable[i].get("task_id") is None:
+        if roster[i].get("task_id") is None:
             return i
         if fallback is None:
             fallback = i
@@ -202,21 +198,21 @@ def select_slot(
 def held_slots_from_records(records: List[dict], project_id: int) -> List[str]:
     """The BUSY set — slot numbers for `project_id` whose roster record shows a non-free holder.
 
-    Mirrors jaahd's `CommandBridge._held_slots` (`holder not in (None, "free", "main")`); any divergence
+    Mirrors jaahd's `CommandBridge._held_slots` (`holder not in (None, "free")`); any divergence
     is a dispatch stall (`ResetRefused`). Kept separate from `is_active_record`: different question
     (pickability vs concurrency). Differences from the mirror resolve safe; non-JSON fails the lease loudly."""
     held: List[str] = []
     for number, record in roster_from_records(records, project_id).items():
-        if record.get("holder") not in (None, "free", "main"):
+        if record.get("holder") not in (None, "free"):
             held.append(str(number))
     return held
 
 
 def roster_from_records(records: List[dict], project_id: int) -> dict[int, dict]:
     """Build the {slot_number: record} roster `select_slot` reads from the raw pool-worktree KV payloads,
-    keyed by the `_project_id`/`_number` the reader injects. Only this project's slots with a positive numeric
-    slot are included — the number-0 main clone is never a pool lease slot. Matched on the id, never the
-    name: a node may host two orgs' projects that share a name (`uq_projects_org_name`)."""
+    keyed by the `_project_id`/`_number` the reader injects. Only this project's slots with a numeric slot
+    are included. Matched on the id, never the name: a node may host two orgs' projects that share a name
+    (`uq_projects_org_name`)."""
     roster: dict[int, dict] = {}
     for record in records:
         if record.get("_project_id") != project_id:
@@ -226,8 +222,7 @@ def roster_from_records(records: List[dict], project_id: int) -> dict[int, dict]
             number = int(raw_number)
         except (TypeError, ValueError):
             continue
-        if number > 0:
-            roster[number] = record
+        roster[number] = record
     return roster
 
 
@@ -243,11 +238,6 @@ def roster_from_records(records: List[dict], project_id: int) -> dict[int, dict]
 
 # `secs_since("")` returns this on the node — "so long ago it is past every threshold".
 _UNKNOWN_AGE_SENTINEL = 999999
-
-# ── The deterministic port grid — the COMPARISON half ───────────────────────────────────────────────────────
-# The grid is resolved from the DB by `app/port_grid.py` and passed in, keeping this module pure.
-# `expected_port`'s None is the tier-2 exemption; an empty map means all tier 2.
-
 
 # ── R1 primitives: "was this observed?" ────────────────────────────────────────────────────────────────
 
@@ -290,50 +280,4 @@ def urls_from_ports(ports: object) -> dict:
         urls[role] = f"http://localhost:{value}"
     return urls
 
-
-def expected_port(
-    var: str,
-    block: object,
-    n: object,
-    *,
-    range_start: object,
-    block_size: object,
-    stride: object,
-) -> Optional[int]:
-    """The port grid's expected port for `var` at slot `n` of `block`:
-    `range_start + block*block_size + n*stride`. None when not bandable (an unknown var is not drift).
-
-    No grid input has a default, so an omitted keyword is a `TypeError`; a keyword passed as None
-    silently answers None (fail closed)."""
-    if range_start is None:
-        return None
-    try:
-        return int(range_start) + int(block) * int(block_size) + int(n) * int(stride)
-    except (TypeError, ValueError):
-        return None
-
-
-def port_band(
-    block: object,
-    n: object,
-    port_vars: object = None,
-    *,
-    range_start_by_var: dict,
-    block_size: object,
-    stride: object,
-) -> dict[str, int]:
-    """The port grid BAND for slot `n` of `block`: `{var: port}` for every bandable var.
-
-    Reuses `expected_port`. Empty `port_vars` falls back to every grid var; a var with no range start is
-    omitted. The node only writes these values (`apply_port_band`)."""
-    names = [str(v) for v in (port_vars or [])] or sorted(range_start_by_var)
-    band: dict[str, int] = {}
-    for var in names:
-        port = expected_port(
-            var, block, n,
-            range_start=range_start_by_var.get(var), block_size=block_size, stride=stride,
-        )
-        if port is not None:
-            band[var] = port
-    return band
 

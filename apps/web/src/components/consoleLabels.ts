@@ -13,7 +13,7 @@
 //
 // An HTML overlay, not xterm decorations: `registerDecoration` returns nothing on the alternate buffer, which is
 // the only buffer a tmux attach ever shows.
-import { RAW } from '../theme'
+import { FONT_WEIGHT, LETTER_SPACING, RADIUS, RAW } from '../theme'
 
 /** Mirror of `CONTROL_PLANE_LABEL` in apps/api/app/live_runner.py (its home); a parity test gates
  *  drift. */
@@ -26,9 +26,9 @@ export const OPERATOR_ANSWER_FRAME = "Answer to your question '"
 export type LabelKind = 'control' | 'operator'
 
 /** Each voice: the literal that opens its message, what the badge over that literal reads, and its colour. */
-const MARKERS: readonly { kind: LabelKind; literal: string; badge: string; title: string; color: string; testId: string }[] = [
-  { kind: 'control', literal: CONTROL_PLANE_LABEL, badge: 'control plane', title: 'Control-plane message', color: RAW.dark.warning, testId: 'cp' },
-  { kind: 'operator', literal: OPERATOR_ANSWER_FRAME, badge: 'operator', title: 'Operator answer', color: RAW.dark.info, testId: 'op' },
+const MARKERS: readonly { kind: LabelKind; literal: string; badge: string; color: string; testId: string }[] = [
+  { kind: 'control', literal: CONTROL_PLANE_LABEL, badge: 'control plane', color: RAW.dark.warning, testId: 'cp' },
+  { kind: 'operator', literal: OPERATOR_ANSWER_FRAME, badge: 'operator', color: RAW.dark.info, testId: 'op' },
 ]
 
 /** Where a label sits in the visible grid: at most one hit per row, row 0 = the viewport's top row. `span` is
@@ -116,15 +116,14 @@ function paintHit(layer: HTMLElement, hit: LabelHit, cellW: number, cellH: numbe
   const badge = document.createElement('div')
   badge.dataset.testid = `console-${marker.testId}-badge`
   badge.textContent = marker.badge
-  badge.title = marker.title
   Object.assign(badge.style, {
     position: 'absolute', top, height, lineHeight: height,
     left: `${hit.col * cellW}px`, width: `${labelW}px`,
-    boxSizing: 'border-box', borderRadius: '3px', textAlign: 'center', overflow: 'hidden',
+    boxSizing: 'border-box', borderRadius: RADIUS.sm, textAlign: 'center', overflow: 'hidden',
     background: RAW.dark.backgroundPaper, color: marker.color,
     border: `1px solid ${marker.color}80`,
-    fontFamily: 'system-ui, -apple-system, sans-serif', fontSize, fontWeight: '600',
-    letterSpacing: '0.02em', whiteSpace: 'nowrap',
+    fontFamily: 'system-ui, -apple-system, sans-serif', fontSize, fontWeight: String(FONT_WEIGHT.semibold),
+    letterSpacing: String(LETTER_SPACING.none), whiteSpace: 'nowrap',
   })
   layer.append(tint, badge)
 }

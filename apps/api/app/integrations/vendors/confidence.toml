@@ -1,0 +1,40 @@
+# Confidence: hosted MCP server. Facts confirmed at https://confidence.spotify.com/docs/quickstarts/use-mcp and the server's own OAuth metadata (mcp.confidence.dev/.well-known/oauth-protected-resource/mcp; Dynamic Client Registration at /register).
+# The Flags server. Its 401 names an http:// metadata URL; discovery reads the https well-known document instead (`app/mcp_oauth.py`).
+slug = "confidence"
+label = "Confidence"
+category = "mcp"
+vendor_docs_url = "https://confidence.spotify.com/docs/quickstarts/use-mcp"
+summary = "Create and manage feature flags in Spotify Confidence through its Flags MCP server."
+
+[[auth]]
+kind = "mcp"
+
+[mcp]
+url = "https://mcp.confidence.dev/mcp/flags"
+url_editable = false
+transport = "streamable_http"
+auth = "oauth_dcr"
+
+[docs]
+agent_uses = [
+  "List feature flags and read a flag's variants, rules and current targeting",
+  "Create a flag for a new feature and add the variants the task describes",
+  "Check which clients resolve a flag before a rollout and report it in the task",
+]
+prerequisites = [
+  "A Confidence account (confidence.spotify.com) with access to the workspace whose flags agents should manage",
+]
+limitations = [
+  "This card reaches Confidence's Flags server only; experiment analysis lives on a separate Experiments server that you can add as a custom MCP server",
+  "Agents act as the signed-in user and can change any flag that user can change: review flag changes before a rollout",
+]
+troubleshooting = [
+  { symptom = "Test says Confidence rejected the token (401)", fix = "The sign-in expired. Select Reconnect and sign in to Confidence again" },
+  { symptom = "Agents can read flags but cannot change them", fix = "Your Confidence user lacks edit rights in that workspace. Ask a Confidence admin to grant them, then Reconnect" },
+  { symptom = "The secret shows Needs reconnect", fix = "Confidence ended the grant (a password change, a revoked connection or a long idle period). Select Reconnect on the secret and sign in to Confidence again" },
+  { symptom = "New tasks on the project have no Confidence tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with, and an agent marked Not supported on that tab cannot load MCP servers" },
+]
+faq = [
+  { q = "Does Jaah need an app registered at Confidence", a = "No. Jaah registers itself with Confidence's sign-in server the first time anyone connects, and every later connection reuses that registration" },
+  { q = "What does Test do", a = "It opens an MCP session with Confidence's server and lists its tools, then closes the session. It reads and changes nothing in your Confidence account" },
+]

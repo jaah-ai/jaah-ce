@@ -2,7 +2,7 @@
  * server's (`app/tenant_gmail/`); these mirror its wire shapes field for field. No read ever carries a secret: a
  * connection says only that one is stored. */
 
-import { del, get, post } from '../../../api'
+import { del, get, post, withQuery } from '../../../api'
 
 export type GmailConnectionKind = 'oauth' | 'service_account'
 
@@ -106,15 +106,20 @@ export const EMAIL_SETTINGS_URL = '/settings?area=organizations&section=email'
 /** The Email card's Addresses tab (`EmailSection.tsx`'s `?mail=` strip). */
 export const EMAIL_ADDRESSES_URL = `${EMAIL_SETTINGS_URL}&mail=addresses`
 export const gmailConnectionUrl = (id: string) => `/settings/email/${encodeURIComponent(id)}`
+/** The create-only pages: neither record has a read or update route, so no `/:id` page beside them. */
+export const SERVICE_ACCOUNT_NEW_URL = '/settings/email/service-accounts/new'
+export const NEW_ADDRESS_URL = '/settings/email/addresses/new'
+/** New address in another org (an operator filing an automation there): its `?org=`; the server's `@org_admin` decides. */
+export const newAddressUrl = (orgId: string) => `${NEW_ADDRESS_URL}?org=${encodeURIComponent(orgId)}`
+/** The location state `NewAddressPage` lands on the Addresses tab with: the address it made, for the Created banner. */
+export const CREATED_ADDRESS_STATE = 'createdAddress'
 
 const base = (orgId: string) => `/api/orgs/${encodeURIComponent(orgId)}/email`
 const one = (orgId: string, id: string) => `${base(orgId)}/connections/${encodeURIComponent(id)}`
 
 /** The sends read's path (`useListPageQuery` reads it): newest first, optionally one connection's. */
 export function sendsPath(orgId: string, params: { connectionId?: string; page: number; per: number }): string {
-  const query = new URLSearchParams({ page: String(params.page), per: String(params.per) })
-  if (params.connectionId) query.set('connection_id', params.connectionId)
-  return `${base(orgId)}/sends?${query}`
+  return withQuery(`${base(orgId)}/sends`, { page: params.page, per: params.per, connection_id: params.connectionId })
 }
 
 export const getOrgEmail = (orgId: string) => get<OrgEmail>(base(orgId))

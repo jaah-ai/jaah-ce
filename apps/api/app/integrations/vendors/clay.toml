@@ -1,0 +1,39 @@
+slug = "clay"
+label = "Clay"
+category = "crm"
+vendor_docs_url = "https://developers.clay.com/public-api/quickstart"
+summary = "Read and run Clay workspaces, tables and enrichments with a Clay API key."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "In Clay, open your workspace settings, select API and CLI, open the API keys tab, select Create API key, name it Jaah and copy the key (Clay shows it once)" },
+]
+
+[test]
+path = "https://api.clay.com/public/v0/me"
+auth = { field = "api_key", header = "clay-api-key" }
+identity = [["user", "email"], ["user", "name"]]
+
+[docs]
+agent_uses = [
+  "Read the workspaces, tables and rows the key's user can see",
+  "Add rows to a table so Clay's enrichment columns run on them",
+  "Read enriched results back, for example the work email and company size Clay found for a lead",
+]
+prerequisites = [
+  "A Clay account with access to the workspace agents should use",
+]
+limitations = [
+  "A key carries the permissions of the user who created it, in that user's workspaces only",
+  "Enrichments that agents trigger spend your Clay credits like they do in the app",
+  "Clay's public API is versioned v0: Clay may change endpoints, and agents follow its current reference",
+]
+troubleshooting = [
+  { symptom = "Test says Clay rejected the API key (401)", fix = "The key was deleted or mistyped. Create a new one under API and CLI > API keys and select Replace on the secret" },
+  { symptom = "Test says Clay rejected the API key (403)", fix = "The key's user lost access to the workspace. Ask a workspace admin to restore the access, or create the key as a user who has it" },
+  { symptom = "An agent gets 429 Too Many Requests", fix = "Clay throttles bursts per key. Ask the agent to send rows in batches and retry after the wait Clay returns" },
+]
+faq = [
+  { q = "Which account does Test show", a = "The email (or name) of the Clay user who created the key, read from Clay's /me endpoint" },
+]

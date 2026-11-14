@@ -1,0 +1,80 @@
+# Xero: adopts the hand-written `xero` type (a Custom Connection's client credentials, tested by its own two-call
+# tester in credentials/testers.py) and layers a sign-in over it (`catalog.extended_type`): the organisation the
+# consent chose is read from /connections (`grant_hooks.xero_tenant`), and [test] is the Test of Connect rows only.
+# Endpoints and scopes: https://developer.xero.com/documentation/guides/oauth2/auth-flow/ .
+slug = "xero"
+label = "Xero"
+category = "payments"
+credential_type = "xero"
+vendor_docs_url = "https://developer.xero.com/documentation/guides/oauth2/auth-flow/"
+summary = "Read and create Xero invoices, contacts, payments and reports for one organisation."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://login.xero.com/identity/connect/authorize"
+token_url = "https://identity.xero.com/connect/token"
+# Xero takes the client pair as HTTP Basic on the token endpoint.
+basic_auth = true
+scopes = [
+  { name = "offline_access", label = "Stay connected: lets Jaah renew access without asking you to sign in again" },
+  { name = "accounting.invoices", label = "Read and create invoices, bills and credit notes" },
+  { name = "accounting.contacts", label = "Read and add contacts and their balances" },
+  { name = "accounting.payments", label = "Read and record payments" },
+]
+jaah_app = true
+on_grant_config = "app.integrations.grant_hooks:xero_tenant"
+grant_fields = ["tenant_id"]
+
+[auth.oauth.registration]
+console_url = "https://developer.xero.com/app/manage"
+steps = [
+  "Select New app, enter App name Jaah, choose Web app as the integration type, and enter Jaah's website as the Company or application URL",
+  "Enter the first redirect URI below as the Redirect URI and select Create app, then open Configuration and add the other redirect URI",
+  "On Configuration select Generate a secret and copy the Client id and the secret straight away: Xero shows the secret once",
+]
+review = "Not required to start: an uncertified app connects a limited number of organisations (25 at the time of writing); past that Xero's app partner certification is needed"
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "client_id", label = "Client ID", kind = "secret", required = true, help = "At https://developer.xero.com/app/manage select New app, choose Custom connection as the integration type, name it Jaah, tick the scopes agents need, and pick the user who authorises it. Once that user approves it in Xero and the connection is paid for, open the app's Configuration page and copy the Client id" },
+  { key = "client_secret", label = "Client secret", kind = "secret", required = true, help = "On the same Configuration page select Generate a secret and copy it straight away: Xero shows it only once" },
+  { key = "tenant_id", label = "Tenant ID", kind = "text", required = true, help = "Connect fills it. For a Custom Connection: the ID of the Xero organisation the connection was authorised for. A developer can read it as tenantId from GET https://api.xero.com/connections with the connection's token; Xero support can also give it to you" },
+  { key = "scope", label = "Scope", kind = "text", required = false, help = "Leave blank to get every scope the custom connection was granted. Otherwise list a subset separated by spaces, such as accounting.invoices.read accounting.contacts.read" },
+]
+
+[test]
+# A Connect row's Test: the organisation it chose, read with its access token (/connections filters by the
+# Xero-Tenant-Id header, observed live - see `testers.test_xero`). A Custom Connection keeps its own Test.
+path = "https://api.xero.com/connections"
+field_headers = { "Xero-Tenant-Id" = "tenant_id" }
+identity = [[0, "tenantName"]]
+
+[docs]
+agent_uses = [
+  "Find invoices, bills and credit notes and report what is overdue or unpaid",
+  "Create draft invoices or bills from a task's line items for a person to approve",
+  "Look up or add contacts and check their balances",
+  "Pull the profit and loss, balance sheet or aged receivables report for a period",
+]
+prerequisites = [
+  "A Xero organisation, and a Xero user who may connect apps to it (Connect), or a paid Xero Custom Connection for it",
+  "For a Custom Connection: an account at https://developer.xero.com to create it, and a user with the Adviser role in the organisation to authorise it",
+]
+limitations = [
+  "One secret reaches one Xero organisation: Connect keeps the organisation you pick at consent, and a Custom Connection is tied to the one it was authorised for. Connect again for another organisation",
+  "Connect asks for invoices, contacts and payments; reports need a Custom Connection granted the report scopes",
+  "Xero limits each organisation to 60 calls a minute and 5,000 a day; agents that reach the limit wait for it to reset",
+  "Connections created since March 2026 use Xero's granular scopes, such as accounting.invoices.read, instead of the older broad ones",
+]
+troubleshooting = [
+  { symptom = "Test says Xero rejected the client credentials or the requested scope", fix = "The client ID or secret is wrong, the secret was regenerated, or Scope names a scope the connection was not granted. Copy both values again from the app's Configuration page, clear Scope, and select Replace" },
+  { symptom = "Test says Xero accepted the credentials but no organisation matches this Tenant ID", fix = "Tenant ID belongs to another organisation. Read tenantId again from GET https://api.xero.com/connections and correct it" },
+  { symptom = "Test fails although the values are right", fix = "The Custom Connection is not paid for or not yet authorised. Check its status at https://developer.xero.com/app/manage" },
+  { symptom = "Connect ends with no organisation or site for this sign-in", fix = "No organisation was ticked on Xero's consent page. Select Connect again and tick the organisation agents should reach" },
+]
+faq = [
+  { q = "Should I connect or use a Custom Connection", a = "Connect is free and acts as you. A Custom Connection is paid per organisation but needs no person to stay signed in" },
+  { q = "Does Test change anything in Xero", a = "No. It reads the connected organisation with the secret's token" },
+]

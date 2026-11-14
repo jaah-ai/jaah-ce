@@ -1,9 +1,18 @@
 // The age formatters, one home: `relativeAge` is prose ("4m ago"), `compactAge` the fixed-slot cell
 // form ("4m"); `absoluteTime` is the `title` both owe the reader. Do not hand-roll another.
 
+import { countOf } from './humanize'
+
 const MINUTE = 60
 const HOUR = 60 * MINUTE
 const DAY = 24 * HOUR
+
+/** The same spans in ms, for `Date` arithmetic; the minute is `hooks/useNow::MINUTE_MS`, the clock's tick. */
+export const HOUR_MS = HOUR * 1000
+export const DAY_MS = DAY * 1000
+
+/** The UTC calendar day (`YYYY-MM-DD`) of an instant, never the local one: UTC+13 would say tomorrow. */
+export const utcDay = (at: string | number | Date): string => new Date(at).toISOString().slice(0, 10)
 
 /** Rendered when there is no timestamp at all — the app's established "no value" glyph. */
 export const NO_VALUE = '—'
@@ -41,9 +50,12 @@ export function compactAge(iso: string | null | undefined): string {
 }
 
 /** `compactAge`'s units for a span already in ms, either direction of `now` (a quota's age, a login's
- *  time left); a zero reads `0m`, not `now`, because the caller's words carry the tense. */
-export function compactSpan(ms: number): string {
-  const minutes = Math.floor(Math.max(0, ms) / 60_000)
+ *  time left); a zero reads `0m`, not `now`, because the caller's words carry the tense. `seconds` spells
+ *  the sub-minute band as seconds (`45s`) where `0m` would say nothing — a run's time in `active`. */
+export function compactSpan(ms: number, { seconds = false }: { seconds?: boolean } = {}): string {
+  const clamped = Math.max(0, ms)
+  if (seconds && clamped < 60_000) return `${Math.floor(clamped / 1000)}s`
+  const minutes = Math.floor(clamped / 60_000)
   if (minutes < 60) return `${minutes}m`
   const hours = Math.floor(minutes / 60)
   if (hours < 24) return `${hours}h`
@@ -92,10 +104,15 @@ export function clockTime(iso: string, { seconds = false, h23 = true } = {}): st
   })
 }
 
-/** Date only, in the viewer's locale; an unparseable value is echoed back as given. */
-export function shortDay(iso: string): string {
-  const at = new Date(iso)
-  return Number.isNaN(at.getTime()) ? iso : at.toLocaleDateString()
+/** The ONE short date: "Nov 3", or "Nov 3, 2027" outside the current year; `withTime` adds the clock
+ *  ("Nov 3, 2:05 PM"). Local time, en-US. An unparseable date reads as itself. */
+export function shortDate(iso: string, now: Date = new Date(), withTime = false): string {
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return iso
+  const sameYear = date.getFullYear() === now.getFullYear()
+  return date.toLocaleString('en-US', {
+    month: 'short', day: 'numeric', ...(sameYear ? {} : { year: 'numeric' }), ...(withTime ? { hour: 'numeric', minute: '2-digit' } : {}),
+  })
 }
 
 /** A date-only reading ("Oct 13, 2026") of a UTC calendar day or an instant, read in UTC; a bare
@@ -126,4 +143,62 @@ export function humanDuration(seconds: number, wholeMinutes = false): string {
  *  clock is a fact the server asserts (worse than late), whereas `—` means "no value". */
 export function humanAge(seconds: number | null | undefined): string {
   return seconds === null || seconds === undefined ? 'never' : `${humanDuration(seconds)} ago`
+}
+
+/** A span in ms at the precision it has, the scale stepping down with the value: `240ms`, `4.2s`, `42s`, `3m 5s`,
+ *  `2h 10m`. Not `humanDuration` (whole seconds): cron firings settle in 120–400ms. Negative, NaN or infinite is
+ *  not a measurable span: `NO_VALUE`. */
+export function formatSpan(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return NO_VALUE
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  const seconds = ms / 1000
+  // Round before banding: `toFixed(1)` on 9.96 yields `10.0` in the one-decimal band.
+  if (Math.round(seconds * 10) / 10 < 10) return `${(Math.round(seconds * 10) / 10).toFixed(1)}s`
+  const wholeSeconds = Math.round(seconds)
+  if (wholeSeconds < 60) return `${wholeSeconds}s`
+  const minutes = Math.floor(wholeSeconds / 60)
+  if (minutes < 60) return `${minutes}m ${wholeSeconds % 60}s`
+  const hours = Math.floor(minutes / 60)
+  return `${hours}h ${minutes % 60}m`
+}
+
+/** `to − from` as a `formatSpan`, or `NO_VALUE` when either end is missing/unparseable. A negative span (clock
+ *  skew) is refused, not clamped to `0ms`. */
+export function formatSpanBetween(from: string | null | undefined, to: string | null | undefined): string {
+  if (!from || !to) return NO_VALUE
+  const a = Date.parse(from)
+  const b = Date.parse(to)
+  return Number.isNaN(a) || Number.isNaN(b) ? NO_VALUE : formatSpan(b - a)
+}
+
+/** Seconds, split into the count and unit an operator reads it as. */
+export type IntervalUnits = {
+  /** Null when there is no interval yet (renders empty, not `0`). */
+  count: number | null
+  /** The unit's size in seconds: 1, 60, 3600 or 86400. */
+  unit: number
+}
+
+/* Largest first: the BIGGEST unit dividing exactly (3600 -> "1 hour"). Anything else shows as seconds,
+ * never rounded. */
+const UNIT_SIZES = [DAY, HOUR, MINUTE, 1] as const
+
+export function intervalUnits(seconds: number | null): IntervalUnits {
+  if (seconds === null) return { count: null, unit: 1 }
+  const unit = UNIT_SIZES.find(size => seconds % size === 0 && seconds >= size) ?? 1
+  return { count: seconds / unit, unit }
+}
+
+const UNIT_WORDS: Record<number, string> = { [DAY]: 'day', [HOUR]: 'hour', [MINUTE]: 'minute', 1: 'second' }
+
+/** A period as words, in its largest whole unit (`intervalUnits`): `10 seconds`, `1 hour`, `90 seconds`. */
+export function periodWords(seconds: number): string {
+  const { unit } = intervalUnits(seconds)
+  return countOf(seconds / unit, UNIT_WORDS[unit])
+}
+
+/** A countdown as a clock, `3:05` for 185 seconds: ceilinged, never negative. */
+export function countdown(seconds: number): string {
+  const s = Math.max(0, Math.ceil(seconds))
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 }

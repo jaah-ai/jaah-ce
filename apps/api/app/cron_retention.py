@@ -6,8 +6,8 @@ for the DBOS private shapes it depends on.
 
 DBOS's collector runs on no schedule, and `crons.retention_mode` governs writes, not lifetime (no bound
 reads it, so a mode change is not retroactive). `activity_events` is never a blanket prune (note above
-`_DELETE_ACTIVITY_EVENTS_BY_AGE_SQL`); `tenancy_exclusions` rides its knob (note above
-`_DELETE_TENANCY_EXCLUSIONS_BY_AGE_SQL`). The DBOS half also deletes unclaimed rows (mirroring
+`_ACTIVITY_EVENTS_BY_AGE`); `tenancy_exclusions` rides its knob (note above
+`_TENANCY_EXCLUSIONS_BY_AGE`). The DBOS half also deletes unclaimed rows (mirroring
 `SystemDatabase._name_filter`), so no second DBOS application may share this schema.
 """
 from __future__ import annotations
@@ -19,10 +19,11 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence, TypeVar
 from uuid import UUID
 
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, select, text, tuple_
 from sqlalchemy.orm import Session
 
 from app import edition_features
+from app.clock import from_epoch_ms, to_epoch_ms
 from app.operator_settings import reads as settings_reads
 from app.activity_kinds import SECURITY_EVENT_KINDS
 from app.cron_activities import (
@@ -339,8 +340,10 @@ _SWEEP_PARAMS: dict[str, Any] = {
 
 @dataclass(frozen=True)
 class RunsSwept:
-    """The `cron_runs` half's exact result. `by_age` is history ageing out; `by_cap` is one cron writing
-    faster than the ledger holds."""
+    """One by-age bound's exact result: `by_age` is history ageing out; `by_cap` (`cron_runs` alone) is one cron
+    writing faster than the ledger holds. For `tenancy_exclusions` the number is buckets, not exclusions: each row
+    carries an `excluded_count`, and what the operator needs is how much of the trail aged out. No per-actor,
+    per-kind or per-class cap elsewhere: on the exclusion log that would delete exactly the seam's evidence."""
 
     by_age: int = 0
     by_cap: int = 0
@@ -357,34 +360,9 @@ class RunsSwept:
         return self.by_age >= self.ceiling or self.by_cap >= self.ceiling
 
 
-@dataclass(frozen=True)
-class ActivityEventsSwept:
-    """The `activity_events` half's result: one number, one bound (no per-actor or per-kind cap)."""
-
-    by_age: int = 0
-    ceiling: int = MAX_ROWS_PER_SWEEP
-
-    @property
-    def truncated(self) -> bool:
-        """Whether the bound stopped at its per-firing ceiling (see `RunsSwept.truncated`)."""
-        return self.by_age >= self.ceiling
-
-
-@dataclass(frozen=True)
-class TenancyExclusionsSwept:
-    """The `tenancy_exclusions` half's result: one number, one bound. A per-class cap would delete exactly
-    the evidence the seam's enforcement rests on.
-
-    The number is buckets deleted, not exclusions: each row carries an `excluded_count`, and what the
-    operator needs is how much of the trail aged out."""
-
-    by_age: int = 0
-    ceiling: int = EXCLUSIONS_ROWS_PER_SWEEP
-
-    @property
-    def truncated(self) -> bool:
-        """Whether the bound stopped at its per-firing ceiling (see `RunsSwept.truncated`)."""
-        return self.by_age >= self.ceiling
+# The `activity_events` and `tenancy_exclusions` halves' results: the same shape with `by_cap` always 0.
+ActivityEventsSwept = RunsSwept
+TenancyExclusionsSwept = RunsSwept  # the real sweep passes its own ceiling; the default is RunsSwept's
 
 
 @dataclass(frozen=True)
@@ -403,12 +381,73 @@ class HistorySwept:
         return max(0, self.before - self.after)
 
 
+# ── The raw-SQL age bounds: one descriptor per table, one runner ──────────────────────────────────────
+
+
+#: The only tables the raw-SQL bounds may name: a descriptor's identifiers are module constants, never a value,
+#: and this closed set is what keeps that true if one is ever built elsewhere.
+_SWEEPABLE_TABLES = frozenset({"cron_runs", "activity_events", "tenancy_exclusions", "sessions"})
+
+
+def _oldest_first(table: str, stamp: str, where: str = "") -> str:
+    """`table`'s rows stamped before `:cutoff` (and matching `where`), oldest first, at most `:ceiling`. Ordering
+    before limiting means a truncated firing always consumes the oldest rows."""
+    if table not in _SWEEPABLE_TABLES or not stamp.isidentifier():
+        raise ValueError(f"not a sweepable table/column: {table}.{stamp}")
+    return (f"DELETE FROM {table} WHERE id IN (\n    SELECT id FROM {table}\n    WHERE {stamp} < :cutoff{where}\n"
+            f"    ORDER BY {stamp}\n    LIMIT :ceiling\n)")
+
+
+@dataclass(frozen=True)
+class _AgeBound:
+    """One table's by-age statement (`:cutoff`, `:ceiling`, and `{org}` for an optional org clause), its log line
+    (`%d` rows, `%s` cutoff) and, when `guard` names what a non-positive window would delete, the refusal."""
+
+    table: str
+    sql: str
+    logged: str
+    guard: str = ""
+
+    def __post_init__(self) -> None:
+        if self.table not in _SWEEPABLE_TABLES:
+            raise ValueError(f"not a sweepable table: {self.table}")
+
+
+def _sweep_aged(
+    session: Session, bound: _AgeBound, *, days: float, now: Optional[datetime], ceiling: int,
+    org_id: Optional[UUID] = None, detail: str = "", **params: Any,
+) -> int:
+    """Run `bound` once at `days` before `now`, at most `ceiling` rows, and log what it took. Caller-transactional.
+
+    The guard is the statement's own invariant: a non-positive window would take the whole population in one
+    firing. Unreachable through the activity (7-day floor, validated on write), so it raises on the programming
+    error rather than clamping."""
+    if bound.guard and days <= 0:
+        raise ValueError(
+            f"{bound.table} retention window must be positive, got {days} — a cutoff at or after now() would "
+            f"delete {bound.guard} in one firing"
+        )
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=days)
+    if org_id is not None:
+        params["org_id"] = org_id
+    # `replace`, not `format`: the statement is a SQL literal and only `{org}` is a slot.
+    statement = bound.sql.replace("{org}", "" if org_id is None else " AND org_id = :org_id")
+    # `max(0, ...)`, not `or 0`: a driver's `-1` rowcount would otherwise make a total negative.
+    rows = max(0, session.execute(text(statement), {**params, "cutoff": cutoff, "ceiling": ceiling}).rowcount or 0)
+    if rows:
+        log.info("cron retention: " + bound.logged + "%s", rows, cutoff.isoformat(), detail)
+    return rows
+
+
 # ── The `cron_runs` sweep ─────────────────────────────────────────────────────────────────────────────
 
-# Both statements order before they limit, so a truncated firing always consumes the oldest rows.
+# No index serves the age bound: `ix_cron_runs_cron_id_fired_at` leads on `cron_id`, so it is a nightly
+# sequential scan. An index on `fired_at` would fix it (DDL, deferred). No guard either; follow-up.
+_CRON_RUNS_BY_AGE = _AgeBound("cron_runs", _oldest_first("cron_runs", "fired_at"),
+                              "removed %d cron_runs row(s) older than %s")
 
 # A window function, not a per-cron loop: one plan over `ix_cron_runs_cron_id_fired_at`. `id DESC`
-# breaks `fired_at` ties so survivors are deterministic.
+# breaks `fired_at` ties so survivors are deterministic; ordered before limited, like the age bound.
 _DELETE_BY_CAP_SQL = """
 DELETE FROM cron_runs WHERE id IN (
     SELECT id FROM (
@@ -420,14 +459,6 @@ DELETE FROM cron_runs WHERE id IN (
     WHERE ranked.rank_in_cron > :cap
     ORDER BY ranked.rank_in_cron DESC
     LIMIT :ceiling
-)
-"""
-
-# No index serves it: `ix_cron_runs_cron_id_fired_at` leads on `cron_id`, so this is a nightly
-# sequential scan. An index on `fired_at` would fix it (DDL, deferred).
-_DELETE_BY_AGE_SQL = """
-DELETE FROM cron_runs WHERE id IN (
-    SELECT id FROM cron_runs WHERE fired_at < :cutoff ORDER BY fired_at LIMIT :ceiling
 )
 """
 
@@ -448,27 +479,21 @@ def sweep_cron_runs(
     """
     # A low-cadence cron is bounded by age alone (no keep-newest-N floor); specified behaviour, a per-cron
     # floor is a follow-up.
-    at = now or datetime.now(timezone.utc)
-    cutoff = at - timedelta(days=max_age_days)
-    # `max(0, ...)`, not `or 0`: a driver's `-1` rowcount would otherwise make the total negative.
-    by_age = max(0, session.execute(
-        text(_DELETE_BY_AGE_SQL), {"cutoff": cutoff, "ceiling": ceiling}
-    ).rowcount or 0)
+    by_age = _sweep_aged(session, _CRON_RUNS_BY_AGE, days=max_age_days, now=now, ceiling=ceiling)
     by_cap = max(0, session.execute(
         text(_DELETE_BY_CAP_SQL), {"cap": per_cron_cap, "ceiling": ceiling}
     ).rowcount or 0)
-    if by_age or by_cap:
-        log.info("cron retention: removed %d cron_runs row(s) older than %s and %d over the %d cap",
-                 by_age, cutoff.isoformat(), by_cap, per_cron_cap)
+    if by_cap:
+        log.info("cron retention: removed %d cron_runs row(s) over the %d cap", by_cap, per_cron_cap)
     return RunsSwept(by_age=by_age, by_cap=by_cap, ceiling=ceiling)
 
 
 def _committed(sweep: Callable[..., Any], session_factory, **kwargs: Any) -> Any:
     """Run a caller-transactional `sweep` on a session of its OWN, committed before it returns (the
     activity's entry point; the uncommitted form stays caller-transactional for tests)."""
-    from app.db import SessionLocal
+    from app.db import BridgedSession
 
-    with (session_factory or SessionLocal)() as session:
+    with (session_factory or BridgedSession)() as session:
         swept = sweep(session, **kwargs)
         session.commit()
     return swept
@@ -490,14 +515,16 @@ def _committed_form(sweep: Callable[..., T]) -> Callable[..., T]:
 
 def _delete_oldest(
     session: Session, model: Any, stamp_column: Any, cutoff: datetime, ceiling: int, *extra_where: Any,
+    key: Sequence[Any] = (),
 ) -> int:
     """Delete `model` rows stamped before `cutoff` (and matching `extra_where`), oldest first, at most `ceiling`;
-    the number removed. A Core statement on the mapped table, so the write seam sees it. Caller-transactional.
-
-    `max(0, ...)`, not `or 0`: a driver's `-1` rowcount would otherwise make a total negative."""
+    the number removed. `key` names the identifying columns when the table has no `id`. A Core statement on the
+    mapped table, so the write seam sees it. Caller-transactional; `max(0, ...)` as in `_sweep_aged`."""
+    cols = tuple(key) or (model.id,)
+    target = cols[0] if len(cols) == 1 else tuple_(*cols)
     return max(0, session.execute(
-        delete(model).where(model.id.in_(
-            select(model.id).where(*extra_where, stamp_column < cutoff).order_by(stamp_column).limit(ceiling)
+        delete(model).where(target.in_(
+            select(*cols).where(*extra_where, stamp_column < cutoff).order_by(stamp_column).limit(ceiling)
         ))
     ).rowcount or 0)
 
@@ -521,17 +548,14 @@ sweep_committed_cron_runs = _committed_form(sweep_cron_runs)
 #
 # `{org}` is empty for the deployment-wide pass and `AND org_id = :org_id` for one org's own, shorter window
 # (`app/org_retention.py`): one statement, so the two passes can never spare different rows.
-_DELETE_ACTIVITY_EVENTS_BY_AGE_SQL = """
-DELETE FROM activity_events WHERE id IN (
-    SELECT id FROM activity_events
-    WHERE created_at < :cutoff{org}
-      AND kind NOT LIKE 'task:%'
-      AND kind NOT LIKE 'task_note:%'
-      AND (kind <> ALL(:security_kinds) OR created_at < :security_cutoff)
-    ORDER BY created_at
-    LIMIT :ceiling
+_ACTIVITY_EVENTS_BY_AGE = _AgeBound(
+    "activity_events",
+    _oldest_first("activity_events", "created_at", "{org}\n      AND kind NOT LIKE 'task:%'"
+                  "\n      AND kind NOT LIKE 'task_note:%'"
+                  "\n      AND (kind <> ALL(:security_kinds) OR created_at < :security_cutoff)"),
+    "removed %d activity_events row(s) older than %s",
+    guard="the whole prunable activity log",
 )
-"""
 
 
 def sweep_activity_events(
@@ -543,39 +567,16 @@ def sweep_activity_events(
     org_id: Optional[UUID] = None,
 ) -> ActivityEventsSwept:
     """Prune the activity log by age, excluding the task-pipeline history and holding security events to
-    their one-year floor — see the note above `_DELETE_ACTIVITY_EVENTS_BY_AGE_SQL`. With `org_id`, that org's
-    rows alone.
-
-    Does NOT commit (caller-transactional, like `sweep_cron_runs`); the activity uses
-    `sweep_committed_activity_events`.
-    """
-    # The statement's own invariant: a non-positive window would take the whole prunable population in one
-    # firing. Unreachable through the activity (7-day floor, validated on write), so it raises on the
-    # programming error rather than clamping. `sweep_cron_runs` lacks this guard; follow-up.
-    if max_age_days <= 0:
-        raise ValueError(
-            f"activity_events retention window must be positive, got {max_age_days} — a cutoff at or "
-            "after now() would delete the whole prunable activity log in one firing"
-        )
+    their one-year floor — see the note above `_ACTIVITY_EVENTS_BY_AGE`. With `org_id`, that org's rows alone.
+    Raises `ValueError` on a non-positive window (`_sweep_aged`). Caller-transactional."""
     at = now or datetime.now(timezone.utc)
-    cutoff = at - timedelta(days=max_age_days)
-    # `max(0, ...)`, never `or 0` (see `sweep_cron_runs`).
-    security_cutoff = min(cutoff, at - timedelta(days=SECURITY_EVENT_MIN_RETENTION_DAYS))
-    params: dict[str, Any] = {
-        "cutoff": cutoff,
-        "security_cutoff": security_cutoff,
-        "security_kinds": sorted(SECURITY_EVENT_KINDS),
-        "ceiling": ceiling,
-    }
-    if org_id is not None:
-        params["org_id"] = org_id
-    statement = _DELETE_ACTIVITY_EVENTS_BY_AGE_SQL.format(org="" if org_id is None else " AND org_id = :org_id")
-    by_age = max(0, session.execute(text(statement), params).rowcount or 0)
-    if by_age:
-        log.info("cron retention: removed %d activity_events row(s) older than %s%s "
-                 "(task pipeline history excluded, security events kept to %s)",
-                 by_age, cutoff.isoformat(), "" if org_id is None else f" for org {org_id}",
-                 security_cutoff.isoformat())
+    security_cutoff = min(at - timedelta(days=max_age_days), at - timedelta(days=SECURITY_EVENT_MIN_RETENTION_DAYS))
+    by_age = _sweep_aged(
+        session, _ACTIVITY_EVENTS_BY_AGE, days=max_age_days, now=at, ceiling=ceiling, org_id=org_id,
+        detail=("" if org_id is None else f" for org {org_id}")
+        + f" (task pipeline history excluded, security events kept to {security_cutoff.isoformat()})",
+        security_cutoff=security_cutoff, security_kinds=sorted(SECURITY_EVENT_KINDS),
+    )
     return ActivityEventsSwept(by_age=by_age, ceiling=ceiling)
 
 
@@ -588,12 +589,11 @@ sweep_committed_activity_events = _committed_form(sweep_activity_events)
 # `activity_events_retention_days()`: the counter and event halves of one trail need one window. Cost:
 # shortening it permanently deletes the seam's exclusion evidence (the knob's `help=` in
 # `app/operator_settings/catalog.py::CATALOG` says so). Cuts on `occurred_at`, oldest first, served only while
-# `occurred_at` leads `uq_tenancy_exclusions_bucket`.
-_DELETE_TENANCY_EXCLUSIONS_BY_AGE_SQL = """
-DELETE FROM tenancy_exclusions WHERE id IN (
-    SELECT id FROM tenancy_exclusions WHERE occurred_at < :cutoff ORDER BY occurred_at LIMIT :ceiling
-)
-"""
+# `occurred_at` leads `uq_tenancy_exclusions_bucket`. Guarded like `activity_events`: nothing re-derives the log.
+_DELETE_TENANCY_EXCLUSIONS_BY_AGE_SQL = _oldest_first("tenancy_exclusions", "occurred_at")
+_TENANCY_EXCLUSIONS_BY_AGE = _AgeBound("tenancy_exclusions", _DELETE_TENANCY_EXCLUSIONS_BY_AGE_SQL,
+                                       "removed %d tenancy_exclusions bucket(s) older than %s",
+                                       guard="the whole exclusion log")
 
 
 def sweep_tenancy_exclusions(
@@ -604,26 +604,9 @@ def sweep_tenancy_exclusions(
     ceiling: int = EXCLUSIONS_ROWS_PER_SWEEP,
 ) -> TenancyExclusionsSwept:
     """Prune the tenancy seam's durable exclusion log by age — a blanket bound, correct here (see the note
-    above `_DELETE_TENANCY_EXCLUSIONS_BY_AGE_SQL`).
-
-    Does NOT commit (caller-transactional); the activity uses `sweep_committed_tenancy_exclusions`.
-    """
-    # The statement's own invariant, as in `sweep_activity_events`: a non-positive window would delete the
-    # whole exclusion log, which nothing re-derives. Unreachable through the activity, so it raises.
-    if max_age_days <= 0:
-        raise ValueError(
-            f"tenancy_exclusions retention window must be positive, got {max_age_days} — a cutoff at "
-            "or after now() would delete the whole exclusion log in one firing"
-        )
-    at = now or datetime.now(timezone.utc)
-    cutoff = at - timedelta(days=max_age_days)
-    # `max(0, ...)`, never `or 0` (see `sweep_cron_runs`).
-    by_age = max(0, session.execute(
-        text(_DELETE_TENANCY_EXCLUSIONS_BY_AGE_SQL), {"cutoff": cutoff, "ceiling": ceiling}
-    ).rowcount or 0)
-    if by_age:
-        log.info("cron retention: removed %d tenancy_exclusions bucket(s) older than %s",
-                 by_age, cutoff.isoformat())
+    above `_DELETE_TENANCY_EXCLUSIONS_BY_AGE_SQL`). Raises `ValueError` on a non-positive window.
+    Caller-transactional."""
+    by_age = _sweep_aged(session, _TENANCY_EXCLUSIONS_BY_AGE, days=max_age_days, now=now, ceiling=ceiling)
     return TenancyExclusionsSwept(by_age=by_age, ceiling=ceiling)
 
 
@@ -638,7 +621,7 @@ sweep_committed_tenancy_exclusions = _committed_form(sweep_tenancy_exclusions)
 # the recorded error.
 TRANSCRIPT_EXPIRED_ERROR = "deleted by the transcript retention policy (180 days)"
 
-_EXPIRE_TRANSCRIPTS_SQL = """
+_EXPIRED_TRANSCRIPTS = _AgeBound("sessions", """
 UPDATE sessions SET transcript_status = 'unavailable', transcript_error = :why
 WHERE id IN (
     SELECT id FROM sessions
@@ -646,23 +629,15 @@ WHERE id IN (
     ORDER BY started_at
     LIMIT :ceiling
 )
-"""
+""", "retired %d expired transcript(s) started before %s")
 
 
 def sweep_expired_transcripts(
     session: Session, *, now: Optional[datetime] = None, ceiling: int = MAX_ROWS_PER_SWEEP,
 ) -> int:
     """Mark `uploaded` sessions past the transcript bound `unavailable`. Caller-transactional."""
-    at = now or datetime.now(timezone.utc)
-    cutoff = at - timedelta(days=POLICY_MAX_RETENTION_DAYS[RETENTION_CLASS_TRANSCRIPT])
-    expired = max(0, session.execute(
-        text(_EXPIRE_TRANSCRIPTS_SQL),
-        {"why": TRANSCRIPT_EXPIRED_ERROR, "cutoff": cutoff, "ceiling": ceiling},
-    ).rowcount or 0)
-    if expired:
-        log.info("cron retention: retired %d expired transcript(s) started before %s",
-                 expired, cutoff.isoformat())
-    return expired
+    return _sweep_aged(session, _EXPIRED_TRANSCRIPTS, days=POLICY_MAX_RETENTION_DAYS[RETENTION_CLASS_TRANSCRIPT],
+                       now=now, ceiling=ceiling, why=TRANSCRIPT_EXPIRED_ERROR)
 
 
 sweep_committed_expired_transcripts = _committed_form(sweep_expired_transcripts)
@@ -688,20 +663,18 @@ def sweep_trigger_tables(
     event body inside one after 30 (the readable preview stays for the log), dedup entries after 90 (A5).
     Oldest first, at most `ceiling` rows per statement. Core statements on mapped tables, so the write seam
     sees them. Caller-transactional."""
-    from sqlalchemy import delete, select, tuple_, update
+    from sqlalchemy import update
 
     from app.models.automations import TriggerDedup, TriggerDelivery
-    from app.triggers import DEDUP_RETENTION_DAYS, DELIVERY_RETENTION_DAYS, EVENT_RETENTION_DAYS, QUEUED, TRANSIENT_STATES
+    from app.triggers import (
+        DEDUP_RETENTION_DAYS, DELIVERY_RETENTION_DAYS, EVENT_RETENTION_DAYS, HELD, QUEUED, TRANSIENT_STATES,
+    )
 
     at = now or datetime.now(timezone.utc)
 
-    deliveries = max(0, session.execute(
-        delete(TriggerDelivery).where(TriggerDelivery.id.in_(
-            select(TriggerDelivery.id)
-            .where(TriggerDelivery.received_at < at - timedelta(days=DELIVERY_RETENTION_DAYS))
-            .order_by(TriggerDelivery.received_at).limit(ceiling)
-        ))
-    ).rowcount or 0)
+    deliveries = _delete_oldest(
+        session, TriggerDelivery, TriggerDelivery.received_at, at - timedelta(days=DELIVERY_RETENTION_DAYS), ceiling,
+    )
     events = max(0, session.execute(
         update(TriggerDelivery).where(TriggerDelivery.id.in_(
             select(TriggerDelivery.id)
@@ -709,19 +682,14 @@ def sweep_trigger_tables(
                 TriggerDelivery.received_at < at - timedelta(days=EVENT_RETENTION_DAYS),
                 TriggerDelivery.event.is_not(None),
                 # A row still waiting to file renders its event later; it is never emptied under it.
-                TriggerDelivery.state.not_in((*TRANSIENT_STATES, QUEUED)),
+                TriggerDelivery.state.not_in((*TRANSIENT_STATES, QUEUED, HELD)),
             )
             .order_by(TriggerDelivery.received_at).limit(ceiling)
         )).values(event=None)
     ).rowcount or 0)
-    dedup_cut = at - timedelta(days=DEDUP_RETENTION_DAYS)
-    dedup = max(0, session.execute(
-        delete(TriggerDedup).where(tuple_(TriggerDedup.trigger_id, TriggerDedup.dedup_key).in_(
-            select(TriggerDedup.trigger_id, TriggerDedup.dedup_key)
-            .where(TriggerDedup.first_seen_at < dedup_cut)
-            .order_by(TriggerDedup.first_seen_at).limit(ceiling)
-        ))
-    ).rowcount or 0)
+    dedup = _delete_oldest(session, TriggerDedup, TriggerDedup.first_seen_at,
+                           at - timedelta(days=DEDUP_RETENTION_DAYS), ceiling,
+                           key=(TriggerDedup.trigger_id, TriggerDedup.dedup_key))
     if deliveries or events or dedup:
         log.info("cron retention: trigger deliveries %d removed, %d event bodies purged, %d dedup entries removed",
                  deliveries, events, dedup)
@@ -800,7 +768,7 @@ def sweep_dmarc_reports(
     Nothing to sweep in an edition without `system_mail`, which stores no report."""
     if not edition_features.enabled("system_mail"):
         return 0
-    from sqlalchemy import delete, exists, select
+    from sqlalchemy import exists
 
     from app.dmarc import RETENTION_DAYS
     from app.models.notifications import DmarcReport, DmarcReportRow
@@ -858,29 +826,17 @@ def sweep_live_viewer_activity(
     (the dashboard's 1y range and its slack), presence rows after 2 (the realtime view reads 30 minutes). Oldest
     first, at most `events_limit` / `minutes_limit` rows (0 skips that table). Core statements on mapped tables, so
     the write seam sees them. Caller-transactional; `sweep_committed_live_viewer_activity` loops it."""
-    from sqlalchemy import delete, select, tuple_
-
     from app.live_cast.models import EVENT_RETENTION_DAYS, MINUTE_RETENTION_DAYS, LiveViewerEvent, LiveViewerMinute
 
     at = now or datetime.now(timezone.utc)
     events = minutes = 0
     if events_limit > 0:
-        events = max(0, session.execute(
-            delete(LiveViewerEvent).where(LiveViewerEvent.id.in_(
-                select(LiveViewerEvent.id)
-                .where(LiveViewerEvent.at < at - timedelta(days=EVENT_RETENTION_DAYS))
-                .order_by(LiveViewerEvent.at).limit(events_limit)
-            ))
-        ).rowcount or 0)
+        events = _delete_oldest(session, LiveViewerEvent, LiveViewerEvent.at,
+                                at - timedelta(days=EVENT_RETENTION_DAYS), events_limit)
     if minutes_limit > 0:
-        key = (LiveViewerMinute.minute, LiveViewerMinute.visitor_id, LiveViewerMinute.tab_id)
-        minutes = max(0, session.execute(
-            delete(LiveViewerMinute).where(tuple_(*key).in_(
-                select(*key)
-                .where(LiveViewerMinute.minute < at - timedelta(days=MINUTE_RETENTION_DAYS))
-                .order_by(LiveViewerMinute.minute).limit(minutes_limit)
-            ))
-        ).rowcount or 0)
+        minutes = _delete_oldest(session, LiveViewerMinute, LiveViewerMinute.minute,
+                                 at - timedelta(days=MINUTE_RETENTION_DAYS), minutes_limit,
+                                 key=(LiveViewerMinute.minute, LiveViewerMinute.visitor_id, LiveViewerMinute.tab_id))
     return LiveViewersSwept(events=events, minutes=minutes)
 
 
@@ -932,7 +888,7 @@ def count_dbos_history(dbos: Any, *, session_factory=None) -> Optional[int]:
     silent: an ERROR log and "row count unavailable" on the ledger; CI's canary catches the move. Its
     own short session, so a missing relation cannot poison a caller's transaction.
     """
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.durable import runtime as durable_runtime
 
     try:
@@ -940,7 +896,7 @@ def count_dbos_history(dbos: Any, *, session_factory=None) -> Optional[int]:
     except DbosGarbageCollectUnavailable as exc:
         log.error("cron retention: %s", exc)
         return None
-    factory = session_factory or SessionLocal
+    factory = session_factory or BridgedSession
     # This app's rows plus unclaimed pre-upgrade ones (`IS NULL`); omitting those would report "0 removed"
     # after deleting thousands. The 3.x collector applies no application filter at all — equal here only
     # because `durable_dbos_sys` holds this one application.
@@ -956,49 +912,6 @@ def count_dbos_history(dbos: Any, *, session_factory=None) -> Optional[int]:
         return None
 
 
-_DBOS_OWNED_TABLES = ("workflow_status", "queues", "workflow_schedules", "operation_outputs")
-
-
-def adopt_retired_dbos_rows(dbos: Any, *, session_factory=None) -> Optional[int]:
-    """Move rows written under `RETIRED_APP_NAME` to `APP_NAME`, so this executor recovers and dequeues them.
-
-    Only a release that was still draining when migration 202610291800 ran writes such rows; once none is
-    left this updates nothing. `application_versions` stays with the migration: its owner/version pair is
-    unique. Fails soft like the count: a table the engine never created is skipped.
-    """
-    from app.db import SessionLocal
-    from app.durable import runtime as durable_runtime
-
-    try:
-        schema = dbos_system_schema(dbos)
-    except DbosGarbageCollectUnavailable as exc:
-        log.error("cron retention: %s", exc)
-        return None
-    factory = session_factory or SessionLocal
-    moved = 0
-    try:
-        with factory() as session:
-            present = set(session.execute(
-                text("SELECT table_name FROM information_schema.columns "
-                     "WHERE table_schema = :schema AND column_name = :column"),
-                {"schema": schema, "column": DBOS_APP_NAME_COLUMN},
-            ).scalars())
-            for table in _DBOS_OWNED_TABLES:
-                if table in present:
-                    moved += session.execute(
-                        text(f'UPDATE "{schema}"."{table}" SET "{DBOS_APP_NAME_COLUMN}" = :new '
-                             f'WHERE "{DBOS_APP_NAME_COLUMN}" = :old'),
-                        {"new": durable_runtime.APP_NAME, "old": durable_runtime.RETIRED_APP_NAME},
-                    ).rowcount or 0
-            session.commit()
-    except Exception as exc:  # noqa: BLE001 — adoption is a repair, never a reason to stop sweeping
-        log.warning("cron retention: could not adopt retired DBOS rows (%s)", exc)
-        return None
-    if moved:
-        log.info("cron retention: adopted %d DBOS rows from the retired application name", moved)
-    return moved
-
-
 def sweep_dbos_history(
     dbos: Any,
     *,
@@ -1012,7 +925,7 @@ def sweep_dbos_history(
     `dbos` is the launched runtime; an unlaunched one raises rather than pruning nothing quietly.
     """
     at = now or datetime.now(timezone.utc)
-    cutoff_ms = int((at - timedelta(days=retention_days)).timestamp() * 1000)
+    cutoff_ms = to_epoch_ms(at - timedelta(days=retention_days))
     # A tripwire: 2.x's collector also pruned an application database's `transaction_outputs`, with no
     # application filter — the console's own database, had one been configured. 3.x removed that database,
     # so this cannot fire today; it stays so a release that brings one back is refused loudly.
@@ -1027,7 +940,7 @@ def sweep_dbos_history(
     collect(dbos, cutoff_ms, rows_threshold, batch_size=GC_BATCH_SIZE)
     after = count_dbos_history(dbos, session_factory=session_factory)
     log.info("cron retention: DBOS history collected to cutoff %s / %d rows (%s -> %s)",
-             datetime.fromtimestamp(cutoff_ms / 1000, timezone.utc).isoformat(), rows_threshold,
+             from_epoch_ms(cutoff_ms).isoformat(), rows_threshold,
              before, after)
     return HistorySwept(before=before, after=after)
 
@@ -1069,7 +982,6 @@ def _invoke_retention_sweep(scheduled_at: datetime, context: ActivityContext) ->
     dbos, why_not = _live_dbos()
     history, failure = HistorySwept(skipped=why_not), None
     if dbos is not None:
-        adopt_retired_dbos_rows(dbos)
         try:
             history = sweep_dbos_history(
                 dbos, retention_days=retention_days, rows_threshold=rows_threshold
@@ -1099,28 +1011,14 @@ def _invoke_retention_sweep(scheduled_at: datetime, context: ActivityContext) ->
         max_age_days=activity_max_age_days, ceiling=EXCLUSIONS_ROWS_PER_SWEEP,
     )
 
-    # Committed separately and not caught, as above.
+    # The rest likewise: each committed separately and not caught, as above.
     leases = sweep_committed_console_key_leases()
-
-    # Committed separately and not caught, as above.
     transcripts = sweep_committed_expired_transcripts()
-
-    # Committed separately and not caught, as above.
     triggers = sweep_committed_trigger_tables()
-
-    # Committed separately and not caught, as above.
     snapshots = sweep_committed_ops_snapshots()
-
-    # Committed separately and not caught, as above.
     live_viewers = sweep_committed_live_viewer_activity()
-
-    # Committed separately and not caught, as above.
     email_sends = sweep_committed_tenant_email_sends()
-
-    # Committed separately and not caught, as above.
     deliveries = sweep_committed_email_deliveries()
-
-    # Committed separately and not caught, as above.
     dmarc_reports = sweep_committed_dmarc_reports() if edition_features.enabled("system_mail") else None
 
     # Each org's own, shorter windows (`app/org_retention.py`), one committed transaction per org, after the
@@ -1177,19 +1075,16 @@ def _detail(
     parts = [
         f"cron_runs: {runs.by_age} older than {max_age_days}d, "
         f"{runs.by_cap} over the {per_cron_cap:,}-run per-cron cap"
-        + (f" (stopped at this firing's {runs.ceiling:,}-row ceiling; any remainder waits for the "
-           "next firing)" if runs.truncated else ""),
+        + _stopped(runs),
         # Says what it spared, or a small count against a large table would read as a failing sweep.
         f"activity_events: {activity.by_age} older than {activity_max_age_days}d "
         "(task pipeline history excluded)"
-        + (f" (stopped at this firing's {activity.ceiling:,}-row ceiling; any remainder waits for the "
-           "next firing)" if activity.truncated else ""),
+        + _stopped(activity),
         # Names the unit (a bucket carries an `excluded_count`), and repeats the shared window so drift between
         # the two halves is visible on the ledger.
         f"tenancy_exclusions: {exclusions.by_age} bucket(s) older than {activity_max_age_days}d "
         "(the activity log's window, shared)"
-        + (f" (stopped at this firing's {exclusions.ceiling:,}-row ceiling; any remainder waits for the "
-           "next firing)" if exclusions.truncated else ""),
+        + _stopped(exclusions),
         f"console_api_key_leases: {leases} expired",
         f"sessions: {transcripts} transcript(s) retired past "
         f"{POLICY_MAX_RETENTION_DAYS[RETENTION_CLASS_TRANSCRIPT]}d",
@@ -1216,6 +1111,8 @@ def _detail(
         from app.email_deliveries import RETENTION_DAYS as DELIVERIES_RETENTION_DAYS
 
         parts.append(f"email_deliveries: {deliveries} older than {DELIVERIES_RETENTION_DAYS}d")
+    # The feature guard, not the `None` check, is what lets the community-edition tree checker see that this import
+    # of a module the edition drops never runs there.
     if edition_features.enabled("system_mail"):
         from app.dmarc import RETENTION_DAYS as DMARC_RETENTION_DAYS
 
@@ -1236,6 +1133,12 @@ def _detail(
             f"at {retention_days:g}d / {rows_threshold:,} rows"
         )
     return "; ".join(parts)
+
+
+def _stopped(swept: RunsSwept) -> str:
+    """The Runs-tab note on a bound that stopped at its ceiling, or nothing."""
+    return (f" (stopped at this firing's {swept.ceiling:,}-row ceiling; any remainder waits for the next firing)"
+            if swept.truncated else "")
 
 
 RETENTION_SWEEP_ACTIVITY = register(

@@ -1,6 +1,6 @@
 import ToolbarMenu, {
-  CheckboxPage,
-  RadioPage,
+  checkItem,
+  radioItem,
   SearchPage,
   searchRowValue,
   type ToolbarMenuItem,
@@ -45,58 +45,6 @@ function manyValue<V extends string>(picked: readonly V[], labelOf: (v: V) => st
   return `${picked.length} ${noun}s`
 }
 
-/* ONE BUILDER PER PAGE SHAPE, so a setting is a line of data, not a restated `render`. */
-
-/** A single-select setting: the row shows the picked option's word (the first option is the off state). */
-function radioItem<V extends string | null>({ id, label, testId, options, value, onPick }: {
-  id: string
-  label: string
-  testId: string
-  options: { value: V; label: string; hint: string }[]
-  value: V
-  onPick: (next: V) => void
-}): ToolbarMenuItem {
-  return {
-    kind: 'page',
-    id,
-    label,
-    value: options.find(o => o.value === value)?.label ?? options[0].label,
-    render: nav => (
-      <RadioPage testId={testId} label={label} options={options} value={value} onPick={onPick} nav={nav} />
-    ),
-  }
-}
-
-/** A multi-select setting: the row shows `manyValue`'s word or count. */
-function checkItem<V extends string>({ id, label, testId, options, values, onToggle, labelOf, noun, emptyNote }: {
-  id: string
-  label: string
-  testId: string
-  options: { value: V; label: string }[]
-  values: readonly V[]
-  onToggle: (value: V) => void
-  labelOf: (v: V) => string
-  noun: string
-  emptyNote?: string
-}): ToolbarMenuItem {
-  return {
-    kind: 'page',
-    id,
-    label,
-    value: manyValue(values, labelOf, noun),
-    render: () => (
-      <CheckboxPage
-        testId={testId}
-        label={label}
-        options={options}
-        values={values}
-        onToggle={onToggle}
-        emptyNote={emptyNote}
-      />
-    ),
-  }
-}
-
 const GROUP_OPTIONS: { value: WorktreeGroupBy; label: string; hint: string }[] = [
   {
     value: GROUP_BY_PROJECT_NODE,
@@ -118,7 +66,6 @@ const GROUP_OPTIONS: { value: WorktreeGroupBy; label: string; hint: string }[] =
 const OCCUPANCY_OPTIONS: { value: OccupancyFilter; label: string }[] = [
   { value: 'free', label: 'Free' },
   { value: 'task', label: 'Held by a task' },
-  { value: 'user', label: 'Held by a person' },
 ]
 
 const SESSION_OPTIONS: { value: SessionFilter | null; label: string; hint: string }[] = [
@@ -181,7 +128,7 @@ export default function WorktreeToolbar({
       id: 'node', label: 'Node', testId: 'worktree-filter-node',
       options: nodeIds.map(id => ({ value: id, label: nodeLabelFor(id) })),
       values: filters.node, onToggle: value => patch({ node: toggle(filters.node, value) }),
-      labelOf: nodeLabelFor, noun: 'node',
+      value: manyValue(filters.node, nodeLabelFor, 'node'),
       /* A REAL STATE: facets of the loaded rows can be empty before the payload lands or for a reader
          with nothing, and blank would look broken. (Occupancy's options are a constant.) */
       emptyNote: 'Nothing to choose from — no slots are loaded.',
@@ -190,14 +137,14 @@ export default function WorktreeToolbar({
       id: 'project', label: 'Project', testId: 'worktree-filter-project',
       options: projects.map(name => ({ value: name, label: name })),
       values: filters.project, onToggle: value => patch({ project: toggle(filters.project, value) }),
-      labelOf: name => name, noun: 'project',
+      value: manyValue(filters.project, name => name, 'project'),
       emptyNote: 'Nothing to choose from — no slots are loaded.',
     }),
     checkItem({
       id: 'occupancy', label: 'Occupancy', testId: 'worktree-filter-occupancy',
       options: OCCUPANCY_OPTIONS,
       values: filters.occupancy, onToggle: value => patch({ occupancy: toggle(filters.occupancy, value) }),
-      labelOf: v => OCCUPANCY_OPTIONS.find(o => o.value === v)?.label ?? v, noun: 'kind',
+      value: manyValue(filters.occupancy, v => OCCUPANCY_OPTIONS.find(o => o.value === v)?.label ?? v, 'kind'),
     }),
     radioItem({
       id: 'session', label: 'Session', testId: 'worktree-filter-session',

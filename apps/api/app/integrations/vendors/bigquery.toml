@@ -1,0 +1,46 @@
+# BigQuery: a Google Cloud service account's JSON key; the Test mints a read-only token and lists one dataset.
+slug = "bigquery"
+label = "BigQuery"
+category = "data"
+vendor_docs_url = "https://cloud.google.com/bigquery/docs/authentication/service-account-file"
+summary = "Let agents query and inspect your BigQuery datasets with a Google Cloud service account."
+# Where the key's signed assertion goes (the key itself is sent nowhere): the type's sealing destination.
+default_base_url = "https://oauth2.googleapis.com"
+
+[[auth]]
+kind = "service_account"
+fields = [
+  { key = "service_account_json", label = "Service account key", kind = "secret", required = true, placeholder = '{"type": "service_account", ...}', help = "Google Cloud console > IAM & Admin > Service Accounts > your account > Keys > Add key > Create new key > JSON; paste the whole downloaded file" },
+  { key = "project_id", label = "Project ID", kind = "text", required = false, placeholder = "my-analytics-project", help = "The project whose datasets agents query (the project picker at the top of the console shows its ID); blank uses the key's own project" },
+]
+
+[test]
+tester = "app.credentials.testers:test_bigquery"
+
+[docs]
+agent_uses = [
+  "Run standard SQL queries to answer data questions, for example weekly active users or revenue by plan",
+  "List datasets and tables and read their schemas before writing a query or a dbt model",
+  "Estimate a query's cost with a dry run before running it",
+  "Check that a scheduled load or transfer wrote today's partition",
+]
+prerequisites = [
+  "A Google Cloud project with the BigQuery API enabled.",
+  "A service account for agents, granted BigQuery Job User on the project (to run queries) and BigQuery Data Viewer on the datasets they should read.",
+  "Permission to create a key for it. Some organizations block key creation with the iam.disableServiceAccountKeyCreation policy; an organization admin can make an exception for the project.",
+]
+limitations = [
+  "Jaah tests with a read-only token and lists one dataset. It proves the key and project, not access to a given table.",
+  "Only service account keys are supported. Signing in with your own Google account, and keyless Workload Identity Federation, are not.",
+  "Queries are billed to the project the job runs in. Set a custom quota or a maximum bytes billed to cap what agents can spend.",
+  "In the community edition, which has no Google Cloud support, the Test is not available.",
+]
+troubleshooting = [
+  { symptom = "Test says Google refused: Invalid JWT Signature", fix = "The key was deleted or disabled. Create a new JSON key for the service account and select Replace on the secret" },
+  { symptom = "Test says BigQuery rejected the service account key (403)", fix = "Grant the service account BigQuery Job User and BigQuery Data Viewer on the project in IAM & Admin > IAM, and check that the BigQuery API is enabled there. Google's own sentence after the dash names the missing permission" },
+  { symptom = "Test says the key names no project", fix = "Fill in Project ID with the project whose datasets agents should query" },
+]
+faq = [
+  { q = "Can I query datasets in another project?", a = "Yes. Set Project ID to that project and grant the service account access there. Jobs run in that project and are billed to it" },
+  { q = "Does Jaah send my key to Google?", a = "No. Jaah signs a short-lived request with the key and sends only that signature to Google's token service" },
+]

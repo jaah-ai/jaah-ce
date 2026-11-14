@@ -29,7 +29,8 @@ from app import identities, login_funnel
 from app.authz.object_access import can_access, key_scope_satisfied
 from app.authz.principal import principal_for_user
 from app.authz.visibility import OBJECT_SPEC_BY_NAME, ObjectAccess
-from app.db import SessionLocal
+from app.db import BridgedSession
+from app.entity_shape import PG_BIGINT_MAX
 from app.models.identity import AdminUser
 from app.tenancy import seam
 from app.tenancy.labels import OrgRef, org_refs
@@ -53,10 +54,6 @@ _UNKEYED = sorted(
 if _UNKEYED:
     raise RuntimeError(f"object type(s) {_UNKEYED} key-scope READ but name no detail key here (app/org_locate.py)")
 
-#: Postgres `bigint`: a larger integer id is no row, never a driver error (a 500 would break the one 404).
-_MAX_INT_ID = 2**63 - 1
-
-
 def _parsed_id(object_type: str, raw: str) -> Optional[int | UUID]:
     """`raw` in the type's id domain, or None — a malformed id is a not-found, never a 422."""
     spec = OBJECT_SPEC_BY_NAME.get(object_type)
@@ -66,14 +63,14 @@ def _parsed_id(object_type: str, raw: str) -> Optional[int | UUID]:
         parsed = spec.id_type(raw)
     except (TypeError, ValueError):
         return None
-    if isinstance(parsed, int) and not 0 < parsed <= _MAX_INT_ID:
+    if isinstance(parsed, int) and not 0 < parsed <= PG_BIGINT_MAX:  # past `bigint` is no row, never a driver error
         return None
     return parsed
 
 
 def _opens_in(member: AdminUser, object_type: str, object_id: int | UUID) -> bool:
     """Could `member` (a membership in its own org) open this object? Asked inside that org alone."""
-    with SessionLocal() as session, seam.bind_from(session, AdminUser, member.id):
+    with BridgedSession() as session, seam.bind_from(session, AdminUser, member.id):
         principal = principal_for_user(session, member)
         key = _DETAIL_READ_KEY.get(object_type)
         return can_access(session, principal, object_type, object_id, mode=ObjectAccess.READ) and (

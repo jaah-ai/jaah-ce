@@ -8,20 +8,24 @@ every read below answers "none".
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, aliased
 
 from app import edition_features, plan_terms, secret_redact
-from app.models.merge_lane import MergeLaneRow
+from app.clock import utcnow
+from app.models.merge_lane import MergeLaneCertificate, MergeLaneRow
 from app.models.orgs import Org
 from app.models.projects import Project
 from app.models.tasks import Task
 from app.models.worktrees import Worktree
-from app.task_lifecycle import ACTIVE
+from app.task_lifecycle import ACTIVE, DONE, SYSTEM_FAILED
+from app.pipeline_gates.full_gate import current_hash, has_full_gate_sql
 
 #: The persona every lane task carries (`persona_registry`'s merge-lane persona).
 LANE_PERSONA = "merge_lane"
@@ -46,20 +50,13 @@ def is_lane_persona(persona_name: Optional[str]) -> bool:
 
 
 def _note_line(text: str) -> str:
-    """Text as a `note`-sized line: redacted, whitespace collapsed, head-capped at `_NOTE_MAX` with an ellipsis
-    where the cut falls."""
-    line = " ".join(secret_redact.redact(str(text))[0].split())
-    return line if len(line) <= _NOTE_MAX else line[:_NOTE_MAX - 1] + "…"
+    """Text as a `note`-sized line (`secret_redact.one_line` at `_NOTE_MAX`)."""
+    return secret_redact.one_line(text, _NOTE_MAX)
 
 
 #: How the merge-lane toolbox opens its `task.fail` reason (`merge lane stopped: FenceError: …`): redundant on a
 #: run row, as the exception's class name is to an operator.
 _RUN_FAILURE_LEAD = re.compile(r"^merge lane stopped: (?:[A-Z]\w*(?:Error|Exception): )?")
-
-
-def redacted_reason(reason: str) -> str:
-    """A lane run's whole `task.fail` reason, secret-shaped values replaced (`app/secret_redact.py`)."""
-    return secret_redact.redact(str(reason))[0]
 
 
 def run_failure_line(reason: str) -> str:
@@ -97,7 +94,8 @@ def _ineligible_reason(project: Project) -> Optional[str]:
 def lane_states(session: Session, projects: Iterable[Project]) -> dict[int, LaneState]:
     """`lane_state` for many projects in a fixed number of queries (the project list's projection).
 
-    The org flag is read once per org through `plan_terms.merge_lane_enabled`, never off the columns. An edition
+    The org flag is read once per org through `plan_terms.merge_lane_enabled`, never off the columns; then the
+    project's own switch (`projects.merge_lane_enabled`), then L3. An edition
     without the lane (it ships no sandboxed gate to run PR code under) refuses it whatever the flag says, so no
     runner settles on a queue nobody drains."""
     projects = list(projects)
@@ -108,12 +106,21 @@ def lane_states(session: Session, projects: Iterable[Project]) -> dict[int, Lane
         return {project.id: LaneState(active=False, reason=NOT_IN_CE, offered=False) for project in projects}
     flags: dict[Any, bool] = {}
     out: dict[int, LaneState] = {}
+    # A page's orgs in one read, held here (the identity map holds rows weakly), so each `get` below is a hit.
+    org_ids = sorted({project.org_id for project in projects if project.org_id is not None})
+    orgs = {org.id: org for org in session.scalars(select(Org).where(Org.id.in_(org_ids)))} if len(org_ids) > 1 else {}
     for project in projects:
         if project.org_id not in flags:
-            org = session.get(Org, project.org_id) if project.org_id is not None else None
+            org = orgs.get(project.org_id) or (
+                session.get(Org, project.org_id) if project.org_id is not None else None
+            )
             flags[project.org_id] = bool(org is not None and plan_terms.merge_lane_enabled(session, org))
         if not flags[project.org_id]:
             out[project.id] = LaneState(active=False, reason=None, offered=False)
+            continue
+        if not project.merge_lane_enabled:
+            # The project's own switch, off by default: offered, not chosen. Open rows drain (`lane_running`).
+            out[project.id] = LaneState(active=False, reason=None, offered=True)
             continue
         reason = _ineligible_reason(project)
         out[project.id] = LaneState(active=reason is None, reason=reason, offered=True)
@@ -139,7 +146,7 @@ def gating_node_ids(session: Session) -> set[str]:
             Worktree.state == "task",
             Task.persona == LANE_PERSONA,
             Task.state == ACTIVE,
-            func.length(func.btrim(Project.gate_full_cmd, ' \t\r\n')) > 0,
+            has_full_gate_sql(Project),
             gating,
         )
     )}
@@ -200,3 +207,193 @@ def redispatch_label(data: Mapping[str, Any]) -> str:
     append-only row."""
     label = REDISPATCH_LABELS.get(str(data.get("cause")), REDISPATCH_LABELS[REDISPATCH_FAILED])
     return label.format(pr=data.get("pr"))
+
+
+# ── a lane run's wall time and gate count (`run_stats`) ──
+
+#: `tasks.metrics`: the lane run's own `run_stats` (`merge_lane.apply_event`), read back as the wire's `lane_run`.
+RUN_STATS_KEY = "merge_lane_run"
+#: A run is slow past twice the project's last full gate, never below this.
+LANE_SLOW_FLOOR_S = 600
+#: The full gate's seconds assumed while no lane run of the project has timed one.
+LANE_FULL_GATE_FALLBACK_S = 3600
+
+
+def last_full_gate_seconds(session: Session, project_ids: Iterable[int]) -> dict[int, int]:
+    """Each project's newest stored `last_full_gate_s` among its lane runs, one query; absent when none timed one."""
+    ids = sorted({int(i) for i in project_ids if i is not None})
+    if not ids:
+        return {}
+    seconds = Task.metrics[RUN_STATS_KEY]["last_full_gate_s"].astext
+    rows = session.execute(
+        select(Task.project_id, seconds)
+        .where(Task.project_id.in_(ids), Task.persona == LANE_PERSONA, seconds.is_not(None))
+        .distinct(Task.project_id).order_by(Task.project_id, Task.id.desc())
+    ).all()
+    return {int(pid): int(float(s)) for pid, s in rows}
+
+
+def lane_run_view(task: Task, last_full_gate_s: Optional[int], now: datetime) -> Optional[dict[str, Any]]:
+    """`lane_run` for one lane task: its gates, its wall time (an active run's elapsed so far, computed now, so it
+    grows with no new event) and `slow` past max(2 × the project's last full gate, LANE_SLOW_FLOOR_S). None for
+    another persona or a run that has reported nothing yet."""
+    stats = (task.metrics or {}).get(RUN_STATS_KEY) if task.persona == LANE_PERSONA else None
+    if not isinstance(stats, Mapping):
+        return None
+    wall = int(stats.get("wall_s") or 0)
+    if task.state == ACTIVE and not stats.get("final"):
+        try:
+            wall = max(wall, int((now - datetime.fromisoformat(str(stats["started_at"]))).total_seconds()))
+        except (KeyError, ValueError, TypeError):
+            pass
+    bound = max(2 * (last_full_gate_s or LANE_FULL_GATE_FALLBACK_S), LANE_SLOW_FLOOR_S)
+    return {"gates": int(stats.get("gates") or 0), "wall_s": wall, "slow": wall > bound}
+
+
+def lane_runs(session: Session, tasks: Iterable[Task]) -> dict[int, dict[str, Any]]:
+    """`lane_run_view` for every lane task among `tasks` with stats: one query for their projects' full gates."""
+    lanes = [t for t in tasks
+             if t.persona == LANE_PERSONA and isinstance((t.metrics or {}).get(RUN_STATS_KEY), Mapping)]
+    if not lanes:
+        return {}
+    full = last_full_gate_seconds(session, [t.project_id for t in lanes])
+    now = utcnow()
+    views = {t.id: lane_run_view(t, full.get(t.project_id), now) for t in lanes}
+    return {i: v for i, v in views.items() if v is not None}
+
+
+def lane_run(session: Session, task: Task) -> Optional[dict[str, Any]]:
+    """`lane_runs` for one task."""
+    return lane_runs(session, [task]).get(task.id)
+
+
+# ── Certificates every edition reads (the release executor's pin, `releases/runs.py`) ─────────────────────────
+
+
+def gate_cmd_hash(gate_full_cmd: Optional[str]) -> str:
+    """`sha256(gate_full_cmd.strip())` — the gate a certificate was earned under."""
+    return hashlib.sha256((gate_full_cmd or "").strip().encode()).hexdigest()
+
+
+#: A base-check run's `Task.metrics` key naming the integration-branch commit it gates (`merge_lane.BASE_CHECK_KEY`).
+BASE_SHA_KEY = "merge_lane_base"
+#: In a certification run's `metrics`: the branch head its toolbox gated in place of its filed commit (`tip` on the
+#: `certified`/`develop_red` event, `merge_lane._follow_tip`); the run's `merge_lane_base` then names that head too.
+TIP_SHA_KEY = "merge_lane_tip"
+#: How many of the newest certificates `certified_pin` ranks by place on the branch: an older one cannot be further
+#: along than all of them.
+_PIN_CANDIDATES = 50
+
+
+@dataclass(frozen=True)
+class CertifiedPin:
+    """The integration-branch commit a promote pins (`latest_certified_sha`): `sha`, when its certificate was earned
+    (`certified_at`), when that commit was the branch's head (`head_at`), and how many lane merges into the branch
+    came after it (`behind`; a hand merge the CP never saw is not counted) and their merge shas (`newer_shas`): what the
+    pinned commit does not contain."""
+
+    sha: str
+    certified_at: datetime
+    head_at: datetime
+    behind: int
+    newer_shas: frozenset[str] = frozenset()
+
+
+def certified_pin(session: Session, project: Project) -> Optional[CertifiedPin]:
+    """The certificate FURTHEST ALONG the integration branch under the project's CURRENT gate, or None. The CP asks
+    no git, so a commit's place is when it was the branch's head: its lane merge's `merged_at`, else, for a tip a
+    certification followed (`merge_lane._certify_idle`), when that run started, so before it fetched the tip, and for any
+    other base check when it was filed. Creation order is not place: a
+    base check certifies an older commit after a batch certified a newer one."""
+    certs = list(session.execute(
+        select(MergeLaneCertificate.develop_sha, MergeLaneCertificate.created_at, MergeLaneCertificate.lane_task_id)
+        .where(MergeLaneCertificate.project_id == project.id,
+               MergeLaneCertificate.gate_cmd_hash == current_hash(session, project))
+        .order_by(MergeLaneCertificate.created_at.desc(), MergeLaneCertificate.id.desc())
+        .limit(_PIN_CANDIDATES)
+    ).all())
+    if not certs:
+        return None
+    merged = dict(session.execute(
+        select(MergeLaneRow.merge_sha, func.max(MergeLaneRow.merged_at))
+        .where(MergeLaneRow.project_id == project.id, MergeLaneRow.state == MERGED,
+               MergeLaneRow.base_branch == project.integration_branch, MergeLaneRow.merged_at.is_not(None),
+               MergeLaneRow.merge_sha.in_({c.develop_sha for c in certs}))
+        .group_by(MergeLaneRow.merge_sha)
+    ).all())
+    runs = {task_id: (metrics or {}, created) for task_id, metrics, created in session.execute(
+        select(Task.id, Task.metrics, Task.created_at)
+        .where(Task.id.in_({c.lane_task_id for c in certs if c.lane_task_id is not None}))
+    ).all()}
+
+    def head_at(cert: Any) -> datetime:
+        if cert.develop_sha in merged:
+            return merged[cert.develop_sha]
+        if cert.lane_task_id not in runs:
+            return cert.created_at
+        metrics, created = runs[cert.lane_task_id]
+        # A run that followed the tip fetched it as it started; any other gated a commit that was the head when the
+        # run was filed (a batch's base), never later.
+        return run_started(metrics, created) if metrics.get(TIP_SHA_KEY) == cert.develop_sha else created
+
+    # `max` keeps the first of equals: the newest certificate wins a tie.
+    best = max(certs, key=head_at)
+    at = head_at(best)
+    newer = list(session.scalars(select(MergeLaneRow.merge_sha).where(
+        MergeLaneRow.project_id == project.id, MergeLaneRow.state == MERGED,
+        MergeLaneRow.base_branch == project.integration_branch, MergeLaneRow.merged_at > at,
+        MergeLaneRow.merge_sha.is_distinct_from(best.develop_sha))))
+    return CertifiedPin(sha=best.develop_sha, certified_at=best.created_at, head_at=at, behind=len(newer),
+                        newer_shas=frozenset(s for s in newer if s))
+
+
+#: Why a pin lags the branch (`pin_stall`): the newest full check found the branch red, a full check is on its way, or
+#: none has been filed since the merges after the pin (lane batches gated with a quick tier never certify).
+STALL_RED, STALL_CHECKING, STALL_WAITING = "red", "checking", "waiting"
+
+
+def pin_stall(session: Session, project: Project, pin: Optional[CertifiedPin]) -> Optional[dict[str, Any]]:
+    """Why the certified pin has not advanced past lane merges into the branch, or None when nothing is behind it:
+    `reason` (`STALL_RED` while the project's red-develop record under the current gate names a commit other than the
+    pin, `STALL_CHECKING` while a base-check run is open, else `STALL_WAITING`: none filed since), `since` (when the pinned commit was the
+    branch's head), and for red the red commit and how many tests fail on it."""
+    if pin is None or pin.behind == 0:
+        return None
+    out: dict[str, Any] = {"reason": STALL_WAITING, "since": pin.head_at.isoformat(), "red_sha": None,
+                           "failing": None, "check_task_id": None}
+    red = project.merge_lane_develop_red
+    if red and red.get("gate_cmd_hash") == current_hash(session, project) and red.get("develop_sha") != pin.sha:
+        return {**out, "reason": STALL_RED, "red_sha": red.get("develop_sha"), "failing": len(red.get("tests") or [])}
+    check = session.scalar(select(Task.id).where(
+        Task.project_id == project.id, Task.persona == LANE_PERSONA, Task.state.not_in((DONE, SYSTEM_FAILED)),
+        Task.metrics.has_key(BASE_SHA_KEY)).order_by(Task.id.desc()).limit(1))
+    if check is not None:
+        return {**out, "reason": STALL_CHECKING, "check_task_id": check}
+    return out
+
+
+def run_started(metrics: Optional[Mapping[str, Any]], created: datetime) -> datetime:
+    """When a lane run began (its toolbox's first stats post, `RUN_STATS_KEY`), else when it was filed."""
+    stats = (metrics or {}).get(RUN_STATS_KEY)
+    try:
+        started = datetime.fromisoformat(str(stats["started_at"])) if isinstance(stats, Mapping) else created
+    except (KeyError, ValueError, TypeError):
+        return created
+    return started if started.tzinfo is not None else started.replace(tzinfo=timezone.utc)
+
+
+def latest_certified_sha(session: Session, project: Project) -> Optional[str]:
+    """The integration-branch commit a promote pins: the certificate furthest along the branch (`certified_pin`)."""
+    pin = certified_pin(session, project)
+    return pin.sha if pin is not None else None
+
+
+def certified_tree(session: Session, project: Project, develop_sha: str) -> Optional[str]:
+    """The tree the lane certified at integration-branch commit `develop_sha` under the CURRENT gate, or None."""
+    return session.scalar(
+        select(MergeLaneCertificate.tree_hash)
+        .where(MergeLaneCertificate.project_id == project.id, MergeLaneCertificate.develop_sha == develop_sha,
+               MergeLaneCertificate.gate_cmd_hash == current_hash(session, project))
+        .order_by(MergeLaneCertificate.created_at.desc(), MergeLaneCertificate.id.desc())
+        .limit(1)
+    )

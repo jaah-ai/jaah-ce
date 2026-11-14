@@ -1,0 +1,44 @@
+# Neon: a Postgres connection string; no driver on the CP, so the Test is a format check plus a public-host check.
+slug = "neon"
+label = "Neon"
+category = "data"
+vendor_docs_url = "https://neon.com/docs/connect/connect-from-any-app"
+summary = "Let agents query and migrate your Neon serverless Postgres database."
+
+[[auth]]
+kind = "db"
+fields = [
+  { key = "connection_string", label = "Connection string", kind = "secret", required = true, placeholder = "postgresql://role:password@ep-cool-name-123456.us-east-2.aws.neon.tech/neondb?sslmode=require", help = "In the Neon console, open the project and select Connect (top of the dashboard); pick the branch, database and role, then copy the connection string with the password shown" },
+]
+
+[test]
+kind = "format"
+patterns = { connection_string = 'postgres(?:ql)?://[^:/@\s]+:[^@\s]+@ep-[a-z0-9-]+\.[a-z0-9.-]*neon\.tech(?::\d+)?/[^\s?/]+(?:\?\S*)?' }
+public_host_field = "connection_string"
+
+[docs]
+agent_uses = [
+  "Query the database to answer a question or to check what a bug left behind",
+  "Run a schema migration on a branch database before it reaches production",
+  "Inspect tables, indexes and query plans with psql or the language's Postgres driver",
+  "Seed a development branch with test data",
+]
+prerequisites = [
+  "A Neon project, and a role and database for agents in it.",
+  "A Postgres client where the agent runs (psql, or a driver such as psycopg or node-postgres).",
+  "A connection string for a branch agents may change. Prefer a development branch over the main one.",
+]
+limitations = [
+  "Jaah cannot open a Postgres connection to test: it adds no database drivers. Test checks that the string is a Neon connection string and that its host is a public address. The first real check is the agent's first query.",
+  "The string carries one role and one database. Add a secret per branch or role agents need.",
+  "Pooled strings (host ending in -pooler) suit many short queries; use the direct string for migrations that need session features.",
+]
+troubleshooting = [
+  { symptom = "Test says the connection string is not in the format Neon uses", fix = "Copy the string from Connect with the password shown (not masked). It must start with postgresql:// and name a host ending in neon.tech" },
+  { symptom = "The agent's query fails with 'password authentication failed'", fix = "The role's password was reset. Copy a new connection string from Connect and select Replace on the secret" },
+  { symptom = "The agent's connection is refused from its address", fix = "Neon IP Allow may be on for the project. Add the agent's address under Settings > Network security, or turn the rule off for the branch" },
+]
+faq = [
+  { q = "Can I use the Neon API instead?", a = "Not on this card. It connects agents to a database; managing projects through the Neon API needs a custom connector" },
+  { q = "Does a sleeping compute break the Test?", a = "No. Test does not connect, and the first agent query wakes the compute, which takes a moment" },
+]

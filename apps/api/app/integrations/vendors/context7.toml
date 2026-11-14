@@ -1,0 +1,53 @@
+# Context7 (Upstash): hosted MCP server of up-to-date library documentation. Facts confirmed at
+# https://context7.com/docs/howto/api-keys and https://context7.com/docs/resources/all-clients (one endpoint,
+# Streamable HTTP, the API key as a Bearer token, keys prefixed ctx7sk-) and https://context7.com/plans (the Free
+# plan's monthly call cap). Probed 2026-11-10: the MCP initialize accepts any key, so Test reads the search API, which
+# answers 401 invalid_api_key on a bad key (no key at all is served anonymously, which is why the key is required).
+slug = "context7"
+label = "Context7"
+category = "mcp"
+vendor_docs_url = "https://context7.com/docs/howto/api-keys"
+summary = "Look up current, version-specific library and framework documentation through the Context7 MCP server."
+
+[[auth]]
+kind = "mcp"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, placeholder = "ctx7sk-...", help = "Sign in at https://context7.com/dashboard, create an API key and copy it - Context7 shows it once. A key on the organization's Context7 team lets every linked project share its plan" },
+]
+
+[test]
+method = "GET"
+path = "https://context7.com/api/v1/search?query=react"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+list_field = "results"
+
+[mcp]
+url = "https://mcp.context7.com/mcp"
+url_editable = false
+transport = "streamable_http"
+auth = "bearer_field:api_key"
+
+[docs]
+agent_uses = [
+  "Resolve a library name to its Context7 ID and read its current documentation before writing code against it",
+  "Check the API of the exact library version a project pins instead of relying on model memory",
+  "Pull short, focused code examples for a framework topic a task names",
+]
+prerequisites = [
+  "A Context7 account; a team account lets one key serve the whole organization",
+  "An Org Owner or Admin adds the key as an organization secret, then links it on each project's MCP tab",
+]
+limitations = [
+  "Context7 counts every tool call against the key's plan: the Free plan allows 1,000 calls a month, then calls fail until the next month or an upgrade",
+  "Only public libraries Context7 has indexed are covered, plus private repositories added to the Context7 team",
+  "Agents get Context7 only in the projects the secret is linked to",
+]
+troubleshooting = [
+  { symptom = "Test says Context7 rejected the API key (401)", fix = "The key was deleted or mistyped, or does not start with ctx7sk-. Create a new key at https://context7.com/dashboard and select Replace" },
+  { symptom = "Agents' Context7 calls start failing mid-month", fix = "The key's plan ran out of calls. Check usage at https://context7.com/dashboard and upgrade the plan or wait for the monthly reset" },
+  { symptom = "New tasks on the project have no Context7 tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with, and an agent marked Not supported on that tab cannot load MCP servers" },
+]
+faq = [
+  { q = "Why is the key required when Context7 works without one", a = "Without a key Context7 serves calls anonymously under a shared, tight rate limit. The key ties every call to your organization's plan and limits" },
+  { q = "What does Test do", a = "It runs one Context7 library search with the key and checks Context7 accepts it. It changes nothing in your Context7 account" },
+]

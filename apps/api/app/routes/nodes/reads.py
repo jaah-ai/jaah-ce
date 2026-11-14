@@ -11,13 +11,12 @@ from sqlalchemy.orm import Session
 
 from app import account_fold, activity_rank, jaah_discovery, node_host_metrics, node_liveness, node_allocation
 from app.actors import actor_names_for
-from app.auth import require_user
 from app.authz.catalog import Tenancy
 from app.authz.declarations import feature
 from app.authz.object_access import can_access
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller
 from app.authz.visibility import ObjectAccess, scoped_node_select, sees_all_nodes
-from app.db import get_session
+from app.db_async import on_session
 from app.entity_shape import count_by
 from app.models.credentials import Account, AccountObservation
 from app.models.identity import AdminUser
@@ -74,7 +73,7 @@ def _counts_map(session: Session, node_ids: list[UUID]) -> dict[UUID, NodeCounts
     wt_counts = count_by(session, Worktree.node_id, wanted)
     retiring_counts = count_by(session, Worktree.node_id, wanted, where=(Worktree.retiring_at.isnot(None),))
     task_slot_counts = count_by(
-        session, Worktree.node_id, wanted, where=(Worktree.number >= 1, Worktree.retiring_at.is_(None))
+        session, Worktree.node_id, wanted, where=(Worktree.retiring_at.is_(None),)
     )
     runner_counts = count_by(session, Runner.node_id, wanted)
     account_counts = dict(
@@ -135,12 +134,12 @@ def _published_release(session: Optional[Session], rows: list[Optional[Node]]) -
 
 @router.get("/api/nodes", response_model=list[NodeOut])
 @feature("nodes", "view", tenancy=Tenancy.CALLER_PLANE)
+@on_session(side_reads=True)
 def list_nodes(
+    session: Session,
     # `activity`: most tasks run there in the last 30 days first, then the roster's order (`app/activity_rank.py`).
     order: Literal["name", "activity"] = "name",
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> list[NodeOut]:
     """The node roster, node-grant scoped (`authz.scoped_node_select`).
 
@@ -151,12 +150,14 @@ def list_nodes(
     (`authz.visible_node_clause`), and a synthetic identity would be a second node identity. Registering
     the node makes it grantable and visible. An operator's org filter (`X-Jaah-Org-Scope`) drops the union
     too: a presence-only host belongs to no org, and a presence key can name a filtered-out org's node."""
-    rows, presence, node_ids = _roster(session, principal)
+    # `side_reads`: the wire rows read the operator plane on sessions of their own (`node_allocation.jaah_cloud`,
+    # `placement`, `vnodes.disk_usage_of`, all through `vnodes.fleet_session`), on the async pool.
+    rows, presence, node_ids = _roster(session, caller.principal)
     if order == "activity":
         counts = activity_rank.node_task_counts(session, (row.id for row in rows.values()))
         # Stable: equal counts keep the roster's order. A presence-only host has no row, so no count.
         node_ids.sort(key=lambda key: -(counts.get(rows[key].id, 0) if key in rows else 0))
-    return _node_outs(session, user, principal, node_ids, rows, presence)
+    return _node_outs(session, caller.actor, caller.principal, node_ids, rows, presence)
 
 
 def _roster(
@@ -342,7 +343,9 @@ def _roster_entry_matches(
 
 @router.get("/api/nodes/page", response_model=Page[NodeOut])
 @feature("nodes", "view", tenancy=Tenancy.CALLER_PLANE)
+@on_session(side_reads=True)
 def list_nodes_page(
+    session: Session,
     q: Optional[str] = Query(default=None, max_length=_INTENT_FILTER_MAX_LEN),
     status: Optional[str] = Query(default=None, max_length=_INTENT_FILTER_MAX_LEN),
     enabled: Optional[str] = Query(default=None, max_length=_INTENT_FILTER_MAX_LEN),
@@ -350,9 +353,7 @@ def list_nodes_page(
     group: Optional[str] = Query(default=None, max_length=_INTENT_FILTER_MAX_LEN),
     nodevault: Optional[str] = Query(default=None, max_length=_INTENT_FILTER_MAX_LEN),
     paging: PageQuery = Depends(page_query(_ROSTER_SORTS)),
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> Page[NodeOut]:
     """One page of the node roster: the Nodes page's read once a fleet runs to thousands of nodes, where
     `list_nodes`'s full serialization is the cost. `list_nodes` stays as it is: many consumers read the
@@ -375,6 +376,7 @@ def list_nodes_page(
     reported `generation`, compared as a release number); a node without the value (never seen, unreported
     or unreadable version) sits last either way. Without `sort`, `list_nodes`'s name-then-key order, which
     also breaks every tie. `total` is the filtered set's size."""
+    # `side_reads`, as `list_nodes`.
     if status is not None and status not in _ROSTER_STATUSES:
         raise HTTPException(status_code=422, detail=f"unknown status '{status}'")
     if enabled is not None and enabled not in _ROSTER_ENABLED_STATES:
@@ -394,7 +396,7 @@ def list_nodes_page(
             if is_uuid_shaped(group) else set()
         )
 
-    rows, presence, node_ids = _roster(session, principal)
+    rows, presence, node_ids = _roster(session, caller.principal)
     # One statement for the whole roster: which rows are hosts (`_node_outs` reads the page's hosting again,
     # for the wire; this read decides membership).
     host_ids = {
@@ -411,7 +413,7 @@ def list_nodes_page(
     ]
     # A tenant is served no reported version (`_narrow_for_tenant`), so it may not order by one either: the order
     # would answer what the blank withholds. Refused as any sort this reader is not offered.
-    if paging.sort == "version" and is_tenant_org(user.org_id):
+    if paging.sort == "version" and is_tenant_org(caller.actor.org_id):
         raise HTTPException(status_code=422, detail="unknown sort 'version'")
     # Sorted and cut over keys, so only the page's entries are serialized.
     def seen(node_id: str) -> tuple[str, Optional[str]]:
@@ -425,7 +427,7 @@ def list_nodes_page(
         "version": lambda node_id: node_liveness.parse_version(_reported_generation(rows.get(node_id))),
     })
     return Page[NodeOut](
-        items=_node_outs(session, user, principal, page_ids, rows, presence),
+        items=_node_outs(session, caller.actor, caller.principal, page_ids, rows, presence),
         total=total,
         page=paging.page,
         per=paging.per,
@@ -434,15 +436,16 @@ def list_nodes_page(
 
 @router.get("/api/nodes/{node_id}", response_model=NodeDetailOut)
 @feature("nodes", "view", tenancy=Tenancy.CALLER_PLANE)
+@on_session(side_reads=True)
 def get_node(
+    session: Session,
     node_id: str,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> NodeDetailOut:
     """One node's detail, node-grant scoped, so a node filtered out of `list_nodes` is not readable by URL
     (D13). Addressed by `NodeOut.id`, the row's uuid (see `_readable_node_or_404`)."""
-    presence, row = _readable_node_or_404(session, principal, node_id)
+    # `side_reads`, as `list_nodes` (`_microvm_editable` reads `node_allocation.jaah_cloud` too).
+    presence, row = _readable_node_or_404(session, caller.principal, node_id)
     empty = NodeCounts(worktrees=0, runners=0, accounts=0)
     counts = _counts_map(session, [row.id]).get(row.id, empty) if row is not None else empty
     out = _node_out(
@@ -455,6 +458,8 @@ def get_node(
         published=_published_release(session, [row]),
     )
     if row is not None and isinstance(out, NodeDetailOut):
-        out.microvm_editable = _microvm_editable(session, row, user, principal)
-        out.session_kvm_editable = _session_kvm_editable(session, row, user, principal)
-    return _narrow_for_tenant(out, user, principal)
+        out.microvm_editable = _microvm_editable(session, row, caller.actor, caller.principal)
+        if not out.microvm_editable:
+            out.shape_options = [out.shape]  # nothing this reader may change it to
+        out.session_kvm_editable = _session_kvm_editable(session, row, caller.actor, caller.principal)
+    return _narrow_for_tenant(out, caller.actor, caller.principal)

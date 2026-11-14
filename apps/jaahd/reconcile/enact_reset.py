@@ -1,4 +1,4 @@
-"""Executors that return a tree to base: `reset_to_base`, `stop_stack`, `release_slot`, `_clear_tree`."""
+"""Executors that end a slot's use: `reset_to_base`, `stop_stack`, `release_slot`, `_clear_tree`."""
 from __future__ import annotations
 
 import asyncio
@@ -6,11 +6,11 @@ import functools
 import logging
 
 import control_plane_api
-from worktree_mechanics import core, reap, reset
+from worktree_mechanics import reap
 from env_helpers import now_iso
 from reconcile import context
 from reconcile.vocab import OUTCOME_DONE, OUTCOME_FAILED, OUTCOME_REFUSED_PRECONDITION
-from reconcile.tick_wire import RosterSlot, SLOT_FREE, SLOT_TASK, SLOT_USER, SlotIntent
+from reconcile.tick_wire import RosterSlot, SLOT_FREE, SLOT_TASK, SlotIntent
 from reconcile.context import ReconcileContext
 
 log = logging.getLogger(__name__)
@@ -45,29 +45,6 @@ async def _stamp_slot_last_used(ctx: ReconcileContext, slot: RosterSlot) -> None
         )
 
 
-async def _reset_to_base(ctx: ReconcileContext, slot: RosterSlot, branch: str | None, *,
-                          detach_base: bool = False, own_branch: str | None = None,
-                          abandon: bool = False, delete_branch: bool = False) -> None:
-    """Enact `reset_to_base` through `worktree_mechanics.reset.reset_to_base`, the one destructive chokepoint, off
-    the event loop. Its gates (unpushed commits; a dirty tree on its own identity branch, also on the detached
-    path) raise `ResetRefused`, reported `refused_precondition` by `_enact_reset_to_base`.
-
-    `abandon` waives only the dirty-tree gate (the operator's console Reset); unpushed commits are still
-    tagged first. That label is diagnosis only; what prevents wedges elsewhere is the dirty gate's branch
-    discrimination — do not weaken it, and do not widen `abandon` past its one caller."""
-    await asyncio.to_thread(
-        reset.reset_to_base,
-        slot.pool_config(),
-        slot.path,
-        branch,
-        fresh=False,
-        detach_base=detach_base,
-        own_branch=own_branch,
-        abandon=abandon,
-        delete_branch=delete_branch,
-    )
-
-
 async def _abandon_address_is_still_ours(
     ctx: "ReconcileContext", intent: SlotIntent, task_id: str,
 ) -> tuple[str | None, str]:
@@ -92,12 +69,6 @@ async def _abandon_address_is_still_ours(
         )
     state = str(matched.get("state") or "")
     holder = str(matched.get("task_id") or "")
-    if state == SLOT_USER:
-        # A human's claimed tree is never an abandonment's to wipe (`slot_state.py`).
-        return OUTCOME_DONE, (
-            "nothing wiped: the slot is user-owned now, and a human's tree is never an abandoned task's "
-            "to reset"
-        )
     if state != SLOT_FREE and holder != task_id:
         log.warning(
             "abandon: %s #%s is STALE — the slot is now %s, not task %s, so the binding this reset was "
@@ -114,16 +85,12 @@ async def _abandon_address_is_still_ours(
 
 async def _enact_reset_to_base(ctx: "ReconcileContext", slot: RosterSlot, intent: SlotIntent,
                                obs: dict | None) -> tuple[str, str, dict]:
-    """Reset a slot to its base.
+    """Reset a slot to its base: no git runs here. Every repository slot is a standalone clone the next lease
+    refreshes onto its start point (`slot_clone.prepare`), so a plain reset has nothing to do and is `done`.
 
-    `DETACHED` is the ordinary shape of a fresh tree under D10 and is accepted; an absent `branch`
-    is refused (nothing to act on); a real branch gets the ordinary reset.
-
-    The abandonment arm (`payload["abandon"]`, the operator's console Reset) returns the tree to a clean
-    detached base and deletes the `fleet/task-<id>` ref, derived node-side
-    (`worktree_mechanics.lifecycle.claim_mechanics`). It is the one path that ends a session and rewrites a tree, so
-    it carries both behind one proof of address, in order: `_abandon_address_is_still_ours`, `_clear_tree`,
-    then git (why not two intents: `routes/tasks/slots.py::abandon_task_slots`)."""
+    The abandonment arm (`payload["abandon"]`, the operator's console Reset) ends the slot's session behind one
+    proof of address, in order: `_abandon_address_is_still_ours`, then `_clear_tree` (why one intent:
+    `routes/tasks/slots.py::abandon_task_slots`)."""
     if obs is None:
         # Unstamped verbs do not refuse an absent tree; nothing to reset is `done`, as in
         # `_enact_release_slot`.
@@ -142,37 +109,12 @@ async def _enact_reset_to_base(ctx: "ReconcileContext", slot: RosterSlot, intent
         blocked, why = await _abandon_address_is_still_ours(ctx, intent, task_id)
         if blocked is not None:
             return blocked, why, {}
-        # Teardown first (`_clear_tree`): a `git reset --hard` under a live runner gets written straight back
-        # over.
+        # An abandonment is a release: end the session and leave the files. The tree is a standalone clone the
+        # destroy erases — no git runs here.
         await _clear_tree(ctx, slot.path, f"abandon {intent.project} #{intent.number} (task {task_id})")
-        if not slot.has_repo:
-            # A folder has no base and no branch: ending the session is the whole abandon. Never git here —
-            # run from a folder, git would climb into whatever repository sits above it.
-            await _stamp_slot_last_used(ctx, slot)
-            return OUTCOME_DONE, "folder cleared — a folder slot has no base to reset to", {}
-        # Always detached; the derived branch rides as `own_branch`, the identity the destructive gates key
-        # off (as in a D10 dispatch).
-        prefix = slot.pool_config().branch_prefix
-        reset_branch, detach, own_branch = None, True, f"{prefix}fleet/task-{task_id}"
-    else:
-        if not slot.has_repo:
-            return OUTCOME_DONE, "a folder slot has no base to reset to — left as it is", {}
-        branch = obs.get("branch")
-        if not branch:
-            return OUTCOME_REFUSED_PRECONDITION, f"no branch to reset onto (observed {branch!r})", {}
-        detach = branch == "DETACHED"
-        reset_branch, own_branch = (None if detach else branch), None
-    try:
-        # `delete_branch` tracks `abandon`; separate parameters so no other caller inherits either.
-        await _reset_to_base(ctx, slot, reset_branch, detach_base=detach, own_branch=own_branch,
-                             abandon=abandon, delete_branch=abandon)
-    except core.ResetRefused as exc:
-        # Explicit, so a considered veto and a git crash do not look the same CP-side (both re-served).
-        return OUTCOME_REFUSED_PRECONDITION, f"reset refused: {exc}", {}
-    if abandon:
-        # As `_enact_release_slot`: `last_used` has no other writer.
         await _stamp_slot_last_used(ctx, slot)
-    return OUTCOME_DONE, "", {}
+        return OUTCOME_DONE, "session ended — the tree is reset at the slot's next lease", {}
+    return OUTCOME_DONE, "nothing to reset here — the tree is refreshed at the slot's next lease", {}
 
 
 async def _enact_stop_stack(ctx: "ReconcileContext", slot: RosterSlot, intent: SlotIntent, obs: dict
@@ -264,19 +206,13 @@ async def _clear_tree_detail(ctx: "ReconcileContext", path: str, what: str, *,
 
 async def _enact_release_slot(ctx: "ReconcileContext", slot: RosterSlot, intent: SlotIntent,
                               obs: dict | None) -> tuple[str, str, dict]:
-    """Enact `release_slot` — clear the tree (`_clear_tree`), sync it back to base, and stamp the slot.
+    """Enact `release_slot` — clear the tree (`_clear_tree`) and stamp the slot. No git operation runs: the
+    tree is a standalone clone whose next lease resets it (`slot_clone.refresh`), or which a destroy erases.
 
-    The sync lives here because `release_slot` is minted on every hold-ending edge, making "a free slot is at
-    base" true everywhere with no new verb (a node-side convergence sweep would decide on its own initiative,
-    which a node never does). Order: `_clear_tree` first, or a process in the tree writes back over the reset (docker
-    is exempt, so a watching dev server can still race it — accepted). The sync never raises and never
-    changes the `done` outcome; what it could not do rides the ack.
-
-    `reap: True` is a different order (from `lease_drain._reap_occupied_free_slots`, for a slot already
-    `free` whose tree was never emptied): fenced by `_release_sync_address_is_still_free` before the sweep
-    (it re-orders every 10 minutes, and a new runner reports a live session exactly as the survivor did),
-    and never synced (an unkillable occupant would get `reset --hard` every ten minutes). Keyed on the
-    explicit marker, never on a missing `task_id` (a `user` hold's teardown has none)."""
+    `reap: True` (from `lease_drain._reap_occupied_free_slots`, for a slot already `free` whose tree was never
+    emptied) is fenced by `_release_sync_address_is_still_free` before the sweep (it re-orders every 10 minutes,
+    and a new runner reports a live session exactly as the survivor did). Keyed on the explicit marker, never
+    on a missing `task_id`."""
     if obs is None:
         # No tree: only the `last_used` stamp is left (the CP already freed the hold).
         await _stamp_slot_last_used(ctx, slot)
@@ -312,13 +248,8 @@ async def _enact_release_slot(ctx: "ReconcileContext", slot: RosterSlot, intent:
     import project_memory_bundle  # noqa: PLC0415 — deferred with it
     project_memory_bundle.ship_orphan_spool_later(slot.path, hub_root=str(fleet_dispatch.HUB_ROOT))
     if is_reap:
-        # A reap sweeps and stops: the slot was synced when genuinely released.
         await _stamp_slot_last_used(ctx, slot)
-        return OUTCOME_DONE, (
-            f"tree cleared — {procs} process(es) signalled, {windows} window(s) torn down; not synced to "
-            f"base: a reap sweeps only, and re-ordering the sync every 10 minutes while an occupant "
-            f"survives would reset the tree out from under whatever is put in it"
-        ), {}
+        return OUTCOME_DONE, f"tree cleared — {procs} process(es) signalled, {windows} window(s) torn down", {}
 
     if not slot.has_repo:
         # A folder has no base to sync to: cleared is the whole release. Its files stay until the CP's
@@ -329,24 +260,20 @@ async def _enact_release_slot(ctx: "ReconcileContext", slot: RosterSlot, intent:
             f"has no base to sync to"
         ), {}
 
-    blocked = await _release_sync_address_is_still_free(ctx, intent)
-    if blocked:
-        await _stamp_slot_last_used(ctx, slot)
-        return OUTCOME_DONE, blocked, {}
-    synced = await asyncio.to_thread(
-        reset.sync_released_to_base, slot.pool_config(), slot.path,
-    )
+    # No git: the tree is a standalone clone the destroy erases. Unpushed work is not backed up (D8).
     await _stamp_slot_last_used(ctx, slot)
-    return OUTCOME_DONE, synced, {}
+    return OUTCOME_DONE, (
+        f"tree cleared — {procs} process(es) signalled, {windows} window(s) torn down; the files stay until "
+        f"the slot's next lease resets it"
+    ), {}
 
 
 async def _release_sync_address_is_still_free(ctx: "ReconcileContext", intent: SlotIntent) -> str:
-    """Is the slot this release names still unheld? `""` to sync, else the one line saying why not.
+    """Is the slot a reap names still unheld? `""` to sweep, else the one line saying why not.
 
     A pending `release_slot` matches by `(project, number)` with no generation fence, and the drain re-leases
-    freed capacity in the same pass — a late sync would wipe a fresh lease's tree and prune its new branch.
-    For a hold-ending release this guards the sync alone (the sweep's older exposure is a separate decision,
-    `routes/pool_slots.py`); for a reap it runs before the sweep (the fork is in `_enact_release_slot`).
+    freed capacity in the same pass — a late reap would sweep a fresh lease's runner. It runs before the sweep
+    (the fork is in `_enact_release_slot`).
 
     `state` from the CP's projection is the whole test (as `_abandon_address_is_still_ours`), but every
     answer is a reason string: a release always retires `done`. Unreachable reads as held — an un-synced

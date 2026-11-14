@@ -22,28 +22,33 @@ from __future__ import annotations
 
 import inspect
 import logging
+import sys
+from contextlib import contextmanager
+from dataclasses import replace
 from functools import lru_cache
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse
 from fastapi.exceptions import ResponseValidationError
 from fastapi.params import Depends as DependsParam
 from fastapi.routing import APIRoute
 from pydantic.fields import FieldInfo
-from sqlalchemy import and_, select
+from sqlalchemy import and_, event, select
 from sqlalchemy.orm import Session
 # Starlette's, the base of FastAPI's: a refusal raised as either is a refusal.
 from starlette.exceptions import HTTPException
 
-from app.auth import require_user
+from app.auth import adopt_user, require_user
 from app.authz.declarations import declaration_of, feature
 from app.authz.enforce import enforce_in_process
 from app.authz.guard import authz_guard
-from app.authz.principal import Principal, current_principal
-from app.db import get_session
-from app.models.identity import AdminUser
+from app.authz.principal import AsyncCaller, current_caller, current_principal
+from app.db_async import DbDep, get_db
+from app.offload import run_cpu
 from app.models.projects import Feature, Project
 from app.models.tasks import Task
+from app.task_lookup import page_memo
 from app.route_inventory import dispatched_dependants
 from app import edition_features
 from app.routes import attachments, task_comments, task_control_messages, task_ratings
@@ -76,10 +81,34 @@ _PANELS: tuple[tuple[str, Callable[..., Any]], ...] = (
 
 # The dependencies this route resolves, by the callable a handler names in its `Depends(...)`: each part gets
 # the very objects its own GET would (FastAPI caches a dependency per request, so it is one call either way).
-_RESOLVED_DEPENDENCIES = {require_user: "user", current_principal: "principal", get_session: "session"}
-# Every dependency a composed route may RUN: the resolved three, and the global guard, which this route runs
+# `get_db` is the route's session: an `on_session` handler's body takes its sync facade first. `current_caller`
+# is the three as one (`AsyncCaller`), the route's own, its actor adopted into the session.
+_RESOLVED_DEPENDENCIES = {
+    require_user: "user", current_principal: "principal", get_db: "session", current_caller: "caller",
+}
+# Every dependency a composed route may RUN: the resolved ones, and the global guard, which this route runs
 # too and whose per-route decision `authz.enforce_in_process` replays. Anything else would be skipped in-process.
 _RUN_DEPENDENCIES = frozenset((*_RESOLVED_DEPENDENCIES, authz_guard))
+
+
+def _body_of(handler: Callable[..., Any]) -> Callable[..., Any]:
+    """What a part runs: an `on_session` handler's sync body (`session_body`, `def name(session, ...)`), an async
+    handler's private one (`_<name>`, the handler being `await db.run_sync(_<name>, ...)`), else the sync handler
+    itself."""
+    body = getattr(handler, "session_body", None)
+    if body is not None:
+        return body
+    if not inspect.iscoroutinefunction(inspect.unwrap(handler)):
+        return handler
+    return getattr(sys.modules[handler.__module__], f"_{handler.__name__}")
+
+
+def _annotated_dependency(param: inspect.Parameter) -> Any:
+    """The `Depends(...)` an `Annotated[..., Depends(...)]` parameter carries (`DbDep`), else None."""
+    for marker in getattr(param.annotation, "__metadata__", ()):
+        if isinstance(marker, DependsParam):
+            return marker
+    return None
 
 
 def _arguments_plan(handler: Callable[..., Any]) -> dict[str, str]:
@@ -89,14 +118,15 @@ def _arguments_plan(handler: Callable[..., Any]) -> dict[str, str]:
     `Query(...)`/`Header(...)`/`Cookie(...)`/`Body(...)` default is refused, since the marker itself would be
     passed in where FastAPI would have resolved a value."""
     plan: dict[str, str] = {}
-    for name, param in inspect.signature(handler).parameters.items():
+    for name, param in inspect.signature(handler, eval_str=True).parameters.items():
         if isinstance(param.default, FieldInfo):
             raise TypeError(f"{handler.__name__}.{name} defaults to a FastAPI parameter marker, which "
                             "GET /api/tasks/{task_id}/page cannot resolve — give it a plain default")
-        if isinstance(param.default, DependsParam):
-            source = _RESOLVED_DEPENDENCIES.get(param.default.dependency)
+        depends = param.default if isinstance(param.default, DependsParam) else _annotated_dependency(param)
+        if depends is not None:
+            source = _RESOLVED_DEPENDENCIES.get(depends.dependency)
             if source is None:
-                raise TypeError(f"{handler.__name__}.{name} depends on {param.default.dependency!r}, which "
+                raise TypeError(f"{handler.__name__}.{name} depends on {depends.dependency!r}, which "
                                 "GET /api/tasks/{task_id}/page does not resolve — resolve it there too")
             plan[name] = source
         elif name in ("task_id", "request"):
@@ -107,7 +137,23 @@ def _arguments_plan(handler: Callable[..., Any]) -> dict[str, str]:
     return plan
 
 
+def _body_call(handler: Callable[..., Any], plan: dict[str, str]) -> Callable[[dict[str, Any]], Any]:
+    """How a part runs `handler`'s body over the resolved values: a session body takes the session
+    first and every other parameter by name, a defaulted plain one (`list_comments`'s `limit`) at its default, as
+    the web sends none; a sync handler takes its plan as keywords."""
+    body = _body_of(handler)
+    if body is handler:
+        return lambda resolved: handler(**{name: resolved[source] for name, source in plan.items()})
+    defaults = {name: param.default for name, param in inspect.signature(handler).parameters.items()
+                if name not in plan and param.default is not inspect.Parameter.empty}
+    named = {name: source for name, source in plan.items() if source != "session"}
+    return lambda resolved: body(
+        resolved["session"], **defaults, **{name: resolved[source] for name, source in named.items()}
+    )
+
+
 _PLANS = {handler: _arguments_plan(handler) for handler in (read.get_task, *(h for _, h in _PANELS))}
+_CALLS = {handler: _body_call(handler, plan) for handler, plan in _PLANS.items()}
 
 
 def _check_dependencies(route: APIRoute, dependant: Any) -> None:
@@ -159,7 +205,7 @@ def _serialized(route: APIRoute, content: Any) -> Any:
 
 def _trail(session: Session, task_id: int) -> dict[str, str | None]:
     """The breadcrumb's names: the task's project and feature, one query; `feature_name` is null for a
-    task in no feature. Pinned to the task's org, though the composite keys already hold it there."""
+    task filed in the project itself. Pinned to the task's org, though the composite keys already hold it there."""
     row = session.execute(
         select(Project.name, Feature.name)
         .select_from(Task)
@@ -172,13 +218,12 @@ def _trail(session: Session, task_id: int) -> dict[str, str | None]:
 
 @router.get("/api/tasks/{task_id}/page", response_model=None)
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
-def get_task_page(
+async def get_task_page(
+    db: DbDep,
     task_id: int,
     request: Request,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
-) -> dict[str, Any]:
+    caller: AsyncCaller = Depends(current_caller),
+) -> JSONResponse:
     """The task detail page's cold load: `{"task": <GET /api/tasks/{id}>, "<panel>": <its GET>, ...}`.
 
     Keys: `task`, `trail`, `activity`, `artifacts`, `run_metrics`, `rating`, `comments`, `body_versions`,
@@ -193,7 +238,20 @@ def get_task_page(
     One verdict per distinct declaration, since the decision reads only the connection and the declaration.
     This route's own is seeded admitted — the guard just decided it — and `get_task` and eight panels share it,
     so only `live_cast` (`@org_admin`) is decided here."""
-    resolved = {"task_id": task_id, "request": request, "user": user, "principal": principal, "session": session}
+    page = await db.run_sync(_get_task_page, task_id, request, caller)
+    # Every part is already its route's JSON-mode serialization (`_serialized`), so the dict goes out as it is:
+    # handed back as a dict, FastAPI re-walked it through `jsonable_encoder` — over half the handler's time on a
+    # long-history task, on the GIL. Encoded off the loop: a long-history page is megabytes.
+    return await run_cpu(JSONResponse, page)
+
+
+def _get_task_page(session: Session, task_id: int, request: Request, caller: AsyncCaller) -> dict[str, Any]:
+    """`get_task_page`'s body, over the route's async session (`run_sync`): the page, each part serialized."""
+    caller = replace(caller, actor=adopt_user(session, caller.actor))
+    resolved = {
+        "task_id": task_id, "request": request, "user": caller.actor, "principal": caller.principal,
+        "session": session, "caller": caller,
+    }
     routes = _composed_routes(request.app)
     verdicts: dict[Any, HTTPException | None] = {declaration_of(get_task_page): None}
 
@@ -207,35 +265,73 @@ def get_task_page(
                 verdicts[declaration] = refusal
         if verdicts[declaration] is not None:
             raise verdicts[declaration]
-        content = handler(**{name: resolved[source] for name, source in _PLANS[handler].items()})
+        content = _CALLS[handler](resolved)
         return _serialized(routes[handler], content)
 
-    page: dict[str, Any] = {"task": run(read.get_task)}
-    # The breadcrumb's names: after `task`, so a refusal never reaches it; its own savepoint, like a panel.
-    savepoint = session.begin_nested()
-    try:
-        page["trail"] = _trail(session, task_id)
-    except Exception:
-        log.exception("task page: the trail failed for task %s; omitted", task_id)
-        if savepoint.is_active:
-            savepoint.rollback()
-    else:
-        if savepoint.is_active:
-            savepoint.commit()
-    for key, handler in _PANELS:
-        # A SAVEPOINT per panel: one panel's DB error cannot leave the shared session aborted for the next.
-        savepoint = session.begin_nested()
-        try:
-            page[key] = run(handler)
-        except HTTPException:
-            if savepoint.is_active:
-                savepoint.rollback()
-            continue
-        except Exception:
-            log.exception("task page: the %s panel failed for task %s; omitted", key, task_id)
-            if savepoint.is_active:
-                savepoint.rollback()
-            continue
-        if savepoint.is_active:
-            savepoint.commit()
+    # One row read per page, not per panel: `get_task_or_404` serves every part the row `task` loaded.
+    with page_memo(session):
+        page: dict[str, Any] = {"task": run(read.get_task)}
+        with _isolation(session) as isolated:
+            # The breadcrumb's names: after `task`, so a refusal never reaches it; isolated like a panel.
+            try:
+                with isolated():
+                    page["trail"] = _trail(session, task_id)
+            except Exception:
+                log.exception("task page: the trail failed for task %s; omitted", task_id)
+            for key, handler in _PANELS:
+                try:
+                    with isolated():
+                        page[key] = run(handler)
+                except HTTPException:
+                    continue
+                except Exception:
+                    log.exception("task page: the %s panel failed for task %s; omitted", key, task_id)
     return page
+
+
+@contextmanager
+def _isolation(session: Session) -> Iterator[Callable[[], Any]]:
+    """`isolated()` blocks that each fail alone: a part's error rolls back to a SAVEPOINT taken before it, so it
+    cannot leave the shared session aborted for the next part. The SAVEPOINT is SHARED by consecutive parts that
+    write nothing — rolling back to it then undoes only the failing part, exactly what one SAVEPOINT per part
+    did — and a fresh one is taken after a part that wrote (`after_flush`, or a non-SELECT through the session),
+    after a failure, or once a part's own commit ended it. Two statements per page instead of two per part."""
+    state: dict[str, Any] = {"savepoint": None, "wrote": False}
+
+    def flushed(*_args: Any) -> None:
+        state["wrote"] = True
+
+    def executed(orm_execute_state: Any) -> None:
+        if not orm_execute_state.is_select:
+            state["wrote"] = True
+
+    @contextmanager
+    def isolated() -> Iterator[None]:
+        savepoint = state["savepoint"]
+        if savepoint is None or not savepoint.is_active:
+            savepoint = state["savepoint"] = session.begin_nested()
+            state["wrote"] = False
+        try:
+            yield
+            # A part that only staged rows (`session.add`, no flush) wrote too: flushing here, inside its own
+            # savepoint, marks it a writer (`after_flush`), so a later part's failure never rolls its rows back.
+            session.flush()
+        except BaseException:
+            if savepoint.is_active:
+                savepoint.rollback()
+            state["savepoint"] = None
+            raise
+        if state["wrote"] and savepoint.is_active:
+            savepoint.commit()
+            state["savepoint"] = None
+
+    event.listen(session, "after_flush", flushed)
+    event.listen(session, "do_orm_execute", executed)
+    try:
+        yield isolated
+    finally:
+        event.remove(session, "after_flush", flushed)
+        event.remove(session, "do_orm_execute", executed)
+        savepoint = state["savepoint"]
+        if savepoint is not None and savepoint.is_active:
+            savepoint.commit()

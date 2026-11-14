@@ -1,0 +1,40 @@
+slug = "klipy"
+label = "KLIPY"
+category = "ai_media"
+vendor_docs_url = "https://docs.klipy.com/"
+summary = "Search GIFs, stickers, clips and memes from KLIPY's library to add to apps and content."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "Open docs.klipy.com and select Create API Key in the top bar; sign up or sign in to KLIPY's partner dashboard it opens, create a key for your app and copy it" },
+]
+
+# KLIPY answers a refused key with 404 and `"The provided API key is invalid."`, so 404 reads as rejected.
+[test]
+method = "GET"
+path = "https://api.klipy.com/v2/featured?limit=1"
+auth = { query = "key", field = "api_key" }
+accept = ""
+rejected_statuses = [401, 403, 404]
+
+[docs]
+agent_uses = [
+  "Search GIFs, stickers, clips and memes by keyword, and fetch trending ones",
+  "Add a GIF or sticker picker to an app the agent is building, wired to your own key",
+  "Read categories and autocomplete suggestions for a search box",
+]
+prerequisites = [
+  "A KLIPY partner account (free), created from Create API Key on docs.klipy.com",
+]
+limitations = [
+  "A new key is a test key with a request cap until KLIPY grants production access",
+  "Jaah tests the key against KLIPY's Tenor-compatible API; KLIPY's own v1 API takes the same key in the URL path",
+]
+troubleshooting = [
+  { symptom = "The Test says KLIPY rejected the API key (404)", fix = "KLIPY answers an unknown key with 404. Copy the key again from KLIPY's partner dashboard (Create API Key on docs.klipy.com) and select Replace" },
+  { symptom = "Agents get 429 Too Many Requests", fix = "The test key's limit was reached. Request production access in KLIPY's partner dashboard" },
+]
+faq = [
+  { q = "Is KLIPY free", a = "Yes. KLIPY's API is free to use; production access lifts the test key's request cap" },
+]

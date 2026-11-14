@@ -1,5 +1,6 @@
 import type { JSX } from 'react'
 import { CHECK_PATH, Icon } from './icons'
+import { RADIUS } from '../theme'
 
 /** THE DONE BADGE: a ✓ in a success-filled circle — onboarding's "every step done" glyph, wherever a progress
  *  ring stands for the same progress (the widget, the sidebar's Setup button, the celebration). `aria-hidden`:
@@ -13,8 +14,9 @@ export function DoneBadge({ size, testId }: { size: number; testId?: string }): 
       sx={{
         flex: '0 0 auto',
         display: 'block',
-        p: `${Math.round(size / 8)}px`,
-        borderRadius: '50%',
+        // The old `size / 8` px, rounded, folded down to the 0.5-unit spacing grid (6px units).
+        p: Math.floor(Math.round(size / 8) / 3) / 2,
+        borderRadius: RADIUS.round,
         bgcolor: 'success.main',
         fill: 'var(--mui-palette-success-contrastText)',
       }}

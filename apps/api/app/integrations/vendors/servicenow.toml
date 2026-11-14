@@ -1,0 +1,49 @@
+# ServiceNow. Facts confirmed at the vendor's own docs: the Table API (GET /api/now/table/{tableName}, Basic auth,
+# sysparm_query encoded queries, sysparm_fields, sysparm_display_value, an envelope `{"result": [...]}`)
+# https://developer.servicenow.com/dev.do#!/reference/api/latest/rest/c_TableAPI ; change requests live in the
+# `change_request` table and their states are `sys_choice` rows (name=change_request, element=state)
+# https://docs.servicenow.com/bundle/latest/page/product/change-management/concept/c_ChangeStateModel.html .
+# A pipeline ticket gate reads a change request's state with this credential (`app/pipeline_gates/tickets.py`).
+slug = "servicenow"
+label = "ServiceNow"
+category = "dev_tools"
+vendor_docs_url = "https://developer.servicenow.com/dev.do#!/reference/api/latest/rest/c_TableAPI"
+summary = "Check a ServiceNow change request's state before a pipeline step runs, and read change requests from agent work."
+
+[[auth]]
+kind = "basic"
+fields = [
+  { key = "instance_url", label = "Instance URL", kind = "url", required = true, placeholder = "https://acme.service-now.com", help = "The address you open ServiceNow at, such as https://acme.service-now.com, with nothing after it" },
+  { key = "username", label = "User name", kind = "text", required = true, help = "The ServiceNow user Jaah signs in as (User Administration > Users > User ID). Give it a role that may read the change_request and sys_choice tables, such as itil" },
+  { key = "password", label = "Password", kind = "secret", required = true, help = "That user's password. Tick Web service access only on the user record so it cannot sign in to the web interface" },
+]
+
+[test]
+method = "GET"
+path = "{instance_url}/api/now/table/change_request?sysparm_limit=1&sysparm_fields=number"
+auth = { basic = ["username", "password"] }
+list_field = "result"
+
+[docs]
+agent_uses = [
+  "Hold a pipeline step until a change request reaches an approved state, such as Scheduled or Implement",
+  "Ask for a change number when someone presses a deploy, and check that change before it runs",
+  "Read change requests and their states to answer questions about upcoming releases",
+]
+prerequisites = [
+  "A ServiceNow instance reachable from the internet over https",
+  "A ServiceNow user with read access to the change_request and sys_choice tables (the itil role covers both)",
+]
+limitations = [
+  "Only Basic authentication (user name and password) is supported; OAuth and multi-factor sign-in are not",
+  "The instance must be reachable from the internet over https: Jaah refuses private and intranet addresses",
+  "Jaah reads change requests only: it never approves, moves or edits one",
+]
+troubleshooting = [
+  { symptom = "Test says ServiceNow rejected the login (401)", fix = "The user name or password is wrong, or the user is locked out. Check both on the user record and select Replace" },
+  { symptom = "Test answers 403", fix = "The user may not read the change_request table. Give it the itil role, or a role with read access to change_request and sys_choice" },
+  { symptom = "Test cannot reach the instance", fix = "Instance URL must be the public https address, such as https://acme.service-now.com, with nothing after it" },
+]
+faq = [
+  { q = "Which states can a ticket gate wait for", a = "Any state of the change request table. Settings > Pipeline lists them from your instance once you pick this credential" },
+]

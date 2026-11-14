@@ -10,20 +10,24 @@ user lists and forgets their trusted devices under `/api/auth/me/trusted-devices
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
+from uuid import UUID
 
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, model_validator
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
-from app import ip_allowlist, login_funnel, mfa
-from app.auth import require_person, session_row_is_live
+from app import identities, ip_allowlist, login_funnel, mfa
+from app.auth import adopt_user, require_person, session_row_is_live
 from app.authz.catalog import Tenancy
 from app.authz.declarations import always, session_only
-from app.db import get_session
+from app.db_async import DbDep, on_session
+from app.entity_shape import from_row
 from app.models.identity import AdminUser
 from app.models.orgs import Org
 from app.routes.auth import AdminOut, _admin_out, _revoke_direct_console_grants
@@ -116,9 +120,7 @@ def _refuse(session: Session, request: Request, user: AdminUser, pending: mfa.Pe
     """Record a refused second factor (committing the failure count with it) and raise its 401."""
     login_funnel.record_login_failure(session, request, user, method=pending.method, reason="bad_factor")
     log.info("mfa: refused user=%s expired=%s throttled=%s", user.id, check.expired, check.throttled)
-    raise HTTPException(
-        status_code=401, detail=_THROTTLED if check.throttled else _EXPIRED if check.expired else _BAD
-    )
+    raise HTTPException(status_code=401, detail=_THROTTLED if check.throttled else _EXPIRED if check.expired else _BAD)
 
 
 def _signed_in(
@@ -154,7 +156,8 @@ def _trust_device(session: Session, request: Request, response: Response, user: 
 @router.get("/mfa/pending", response_model=PendingOut, dependencies=[Depends(check_rate_limit)])
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def mfa_pending(request: Request, session: Session = Depends(get_session)):
+@on_session
+def mfa_pending(session: Session, request: Request):
     """Which second-factor page the pending sign-in is on, for the console to render."""
     _, user = _pending(request, session)
     stage = "verify" if mfa.is_enrolled(session, user) else "enrol"
@@ -169,7 +172,8 @@ def mfa_pending(request: Request, session: Session = Depends(get_session)):
 @router.post("/mfa/verify", response_model=AdminOut, dependencies=[Depends(check_rate_limit)])
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def mfa_verify(body: VerifyIn, request: Request, response: Response, session: Session = Depends(get_session)):
+@on_session
+def mfa_verify(session: Session, body: VerifyIn, request: Request, response: Response):
     """Prove the second factor with a TOTP code or a recovery code; the session is minted on success."""
     pending, user = _pending(request, session)
     check = mfa.verify(session, user, pending.nonce, code=body.code, recovery_code=body.recovery_code)
@@ -184,7 +188,8 @@ def mfa_verify(body: VerifyIn, request: Request, response: Response, session: Se
 @router.post("/mfa/enrol/start", response_model=EnrolStartOut, dependencies=[Depends(check_rate_limit)])
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def mfa_enrol_start(request: Request, session: Session = Depends(get_session)):
+@on_session
+def mfa_enrol_start(session: Session, request: Request):
     """A new authenticator secret for a user with no factor yet. Calling again replaces it."""
     pending, user = _pending(request, session)
     if mfa.is_enrolled(session, user):
@@ -199,7 +204,8 @@ def mfa_enrol_start(request: Request, session: Session = Depends(get_session)):
 @router.post("/mfa/enrol/confirm", response_model=ConfirmOut, dependencies=[Depends(check_rate_limit)])
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def mfa_enrol_confirm(body: ConfirmIn, request: Request, response: Response, session: Session = Depends(get_session)):
+@on_session
+def mfa_enrol_confirm(session: Session, body: ConfirmIn, request: Request, response: Response):
     """Confirm the new factor with its first code: the factor goes live, the recovery codes are shown
     this once, and the session is minted."""
     pending, user = _pending(request, session)
@@ -214,13 +220,37 @@ def mfa_enrol_confirm(body: ConfirmIn, request: Request, response: Response, ses
 @router.post("/me/mfa/recovery-codes", response_model=RecoveryCodesOut)
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def regenerate_recovery_codes(
-    body: RegenerateIn, request: Request, response: Response, user: AdminUser = Depends(require_person),
-    session: Session = Depends(get_session),
+async def regenerate_recovery_codes(
+    db: DbDep,
+    body: RegenerateIn,
+    request: Request,
+    response: Response,
+    user: AdminUser = Depends(require_person),
 ):
     """A fresh recovery-code set for the caller (the old one dies), stepped up by a current TOTP code so a
     stolen session cannot mint a lasting second factor. Ends every other session of theirs; this one is
     re-minted at the new epoch."""
+    owed: list[tuple[UUID, int]] = []
+    try:
+        return await db.run_sync(_regenerate_recovery_codes, body, request, response, user, owed)
+    finally:
+        # After the commit, on a worker thread (its bridge to the loop runs there) — and whatever happens after
+        # the commit (the re-mint failing, the request cancelled), the retired epoch's grants are revoked.
+        for user_id, retired_epoch in owed:
+            await asyncio.shield(run_in_threadpool(_revoke_direct_console_grants, user_id, retired_epoch))
+
+
+def _regenerate_recovery_codes(
+    session: Session,
+    body: RegenerateIn,
+    request: Request,
+    response: Response,
+    user: AdminUser,
+    owed: list[tuple[UUID, int]],
+):
+    """`regenerate_recovery_codes`'s body, over the route's async session (`run_sync`). The caller's id and retired
+    epoch go to `owed` the moment their commit lands, for the route to revoke its direct-console grants."""
+    user = adopt_user(session, user)
     if not mfa.is_enrolled(session, user):
         raise HTTPException(status_code=409, detail="two-factor is not set up")
     check = mfa.verify_current_code(session, user, body.code)
@@ -229,10 +259,9 @@ def regenerate_recovery_codes(
         raise HTTPException(status_code=401, detail=_THROTTLED if check.throttled else _BAD)
     codes = mfa.regenerate_recovery_codes(session, user)
     record_write(session, user, "mfa_recovery_regenerated", f"{user.email} replaced their recovery codes")
-    retired_epoch = user.session_epoch or 0
-    user.session_epoch = retired_epoch + 1
+    retired = identities.retire_session(user)
     session.commit()
-    _revoke_direct_console_grants(user.id, retired_epoch)
+    owed.append(retired)
     login_funnel.reissue_session(request, response, user)
     return RecoveryCodesOut(recovery_codes=codes)
 
@@ -240,59 +269,91 @@ def regenerate_recovery_codes(
 @router.get("/me/trusted-devices", response_model=list[TrustedDeviceOut])
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def list_trusted_devices(
-    request: Request, user: AdminUser = Depends(require_person), session: Session = Depends(get_session)
-):
+@on_session
+def list_trusted_devices(session: Session, request: Request, user: AdminUser = Depends(require_person)):
     """The caller's live trusted devices, newest first; `current` marks the browser asking."""
+    user = adopt_user(session, user)
     current = mfa.device_id_for(session, user, request.cookies.get(mfa.DEVICE_COOKIE))
     return [
-        TrustedDeviceOut(
-            id=d.id, label=d.label, created_at=d.created_at, last_used_at=d.last_used_at,
-            expires_at=d.expires_at, current=d.id == current,
-        )
+        from_row(TrustedDeviceOut, d, current=d.id == current)
         for d in mfa.trusted_devices(session, user)
     ]
 
 
 def _forget(
     session: Session, request: Request, response: Response, user: AdminUser, device_id: Optional[int]
-) -> None:
+) -> Optional[tuple[UUID, int]]:
     """Forget devices and end the sessions they may hold: a lost laptop's live session must not outlive the
-    revoke. The caller's own session is re-minted at the new epoch, as a recovery-code regeneration does."""
+    revoke. The caller's own session is re-minted at the new epoch, as a recovery-code regeneration does.
+    Returns the caller's id and retired epoch, whose direct-console grants the route revokes (`_forgotten`), or
+    None when nothing was forgotten."""
     labels = mfa.revoke_trusted_devices(session, user, device_id)
     if not labels:
         session.commit()
-        return
+        return None
     record_write(
         session, user, "mfa_device_revoked",
         f"{user.email} stopped trusting {labels[0] if len(labels) == 1 else f'{len(labels)} devices'}",
         data={"labels": labels},
     )
-    retired_epoch = user.session_epoch or 0
-    user.session_epoch = retired_epoch + 1
+    retired = identities.retire_session(user)
     session.commit()
-    _revoke_direct_console_grants(user.id, retired_epoch)
     login_funnel.reissue_session(request, response, user)
+    return retired
+
+
+async def _forgotten(retired: Optional[tuple[UUID, int]]) -> None:
+    """`_forget`'s direct-console revoke, after its commit, on a worker thread (its bridge to the loop runs there)."""
+    if retired is not None:
+        await run_in_threadpool(_revoke_direct_console_grants, *retired)
 
 
 @router.delete("/me/trusted-devices/{device_id}", status_code=204)
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def revoke_trusted_device(
-    device_id: int, request: Request, response: Response, user: AdminUser = Depends(require_person),
-    session: Session = Depends(get_session),
+async def revoke_trusted_device(
+    db: DbDep,
+    device_id: int,
+    request: Request,
+    response: Response,
+    user: AdminUser = Depends(require_person),
 ):
     """Stop trusting one of the caller's devices: it asks for the code at its next sign-in, and every other
     session of the caller's ends. Idempotent."""
-    _forget(session, request, response, user, device_id)
+    await _forgotten(await db.run_sync(_revoke_trusted_device, device_id, request, response, user))
+
+
+def _revoke_trusted_device(
+    session: Session,
+    device_id: int,
+    request: Request,
+    response: Response,
+    user: AdminUser,
+):
+    """`revoke_trusted_device`'s body, over the route's async session (`run_sync`)."""
+    user = adopt_user(session, user)
+    return _forget(session, request, response, user, device_id)
 
 
 @router.delete("/me/trusted-devices", status_code=204)
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def revoke_trusted_devices(
-    request: Request, response: Response, user: AdminUser = Depends(require_person),
-    session: Session = Depends(get_session),
+async def revoke_trusted_devices(
+    db: DbDep,
+    request: Request,
+    response: Response,
+    user: AdminUser = Depends(require_person),
 ):
     """Stop trusting every one of the caller's devices, ending every other session of theirs. Idempotent."""
-    _forget(session, request, response, user, None)
+    await _forgotten(await db.run_sync(_revoke_trusted_devices, request, response, user))
+
+
+def _revoke_trusted_devices(
+    session: Session,
+    request: Request,
+    response: Response,
+    user: AdminUser,
+):
+    """`revoke_trusted_devices`'s body, over the route's async session (`run_sync`)."""
+    user = adopt_user(session, user)
+    return _forget(session, request, response, user, None)

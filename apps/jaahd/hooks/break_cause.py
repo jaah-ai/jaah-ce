@@ -9,8 +9,9 @@ absent because no node can observe them.
 
 NEVER WRONG-BY-DEFAULT: an unreadable transcript, an unmatched tail or any OSError yields `unknown`,
 never a guess — a mis-attributed break inflates one bucket while emptying another. `classify_transcript`'s
-`detail` tells "read, nothing matched" from "nothing was read". Stdlib only and nothing may raise at
-import: a hook that fails to import kills the Claude Code session running it.
+`detail` tells "read, nothing matched" from "nothing was read". Stdlib only (plus the stdlib-only `file_io`
+leaf beside the hooks) and nothing may raise at import: a hook that fails to import kills the Claude Code
+session running it.
 """
 from __future__ import annotations
 
@@ -18,7 +19,16 @@ import glob
 import json
 import os
 import re
+import sys
 import time
+
+# `file_io` (the transcript tail read) lives one directory up, APPENDED to `sys.path` as the hooks that load
+# this file do (never inserted, so nothing here shadows a stdlib module): this file is loaded by path, before
+# its loader's own append.
+_JAAHD_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _JAAHD_DIR not in sys.path:
+    sys.path.append(_JAAHD_DIR)
+import file_io  # noqa: E402 — stdlib-only at import, like this file
 
 # ── The cause vocabulary (node half) ────────────────────────────────────────────────────────────────
 # Ordered most-specific first — `classify` returns the FIRST match. Loose about punctuation, strict
@@ -82,6 +92,20 @@ MODEL_REFUSED = re.compile(
 # engine's error (`agent_providers.py::ANTIGRAVITY`'s `AcpDialect`).
 CLIENT_UNSUPPORTED_CAUSE = "client_unsupported"
 CLIENT_UNSUPPORTED = re.compile(r"This client is no longer supported for Gemini Code Assist", re.I)
+
+# ── AN UNSCOPED ANTHROPIC API KEY SENT WITHOUT ITS WORKSPACE ──────────────────────────────────────────
+# Anthropic's own sentences: no workspace header (400), a malformed one (400), an unknown one (404). The cause
+# stays `auth_expired` — no relaunch on that key clears it, so the account is benched — but the detail names the
+# fix (`WORKSPACE_REQUIRED_DETAIL`, the one home of that sentence) instead of a bare 400. People QUOTE these
+# sentences (the task that fixed this did), so like `MODEL_REFUSED` they are read ONLY off a vendor-written error
+# record (`classify_api_error`, `workspace_detail`), never over prose. The ACP host reads the same phrases off
+# its engine's error (`agent_providers.py::_CLAUDE_CODE_ACP`; a test pins them).
+WORKSPACE_REQUIRED = re.compile(
+    r"This API key is not scoped to a workspace|"
+    r"anthropic-workspace-id header must be a valid workspace ID|"
+    r"Workspace `[^`\n]*` not found", re.I)
+WORKSPACE_REQUIRED_DETAIL = (
+    "API key is not scoped to a workspace: set the account's Workspace ID, or use a workspace-scoped key")
 
 # ── A VENDOR'S OWN ERROR RECORD: extra alternatives, never scanned over a transcript's prose ────────────
 # `classify_vendor_error` alone reads these: its input is one structured error record a non-Claude CLI
@@ -209,7 +233,7 @@ def session_transcript_path(proj_dir: str):
 
 def classify(text: str, *, extra=None):
     """(cause, detail) for a blob of transcript text. `(UNKNOWN, "")` when nothing matches — never a
-    guess. `detail` is the matched line, trimmed, so the incident carries the words that produced the
+    guess. `detail` is the matched line, trimmed, so the break report carries the words that produced the
     verdict and not just the verdict. `extra` (cause -> pattern) widens a cause for a caller whose text
     is not prose (`classify_vendor_error`)."""
     for cause, pattern in _PATTERNS:
@@ -228,14 +252,30 @@ def classify(text: str, *, extra=None):
 
 def classify_api_error(text: str, *, extra=None):
     """(cause, detail) for ONE vendor-written API-error record's text: the terminal refusals first
-    (`CLIENT_UNSUPPORTED`, `MODEL_REFUSED`, readable only here), then `classify`."""
+    (`CLIENT_UNSUPPORTED`, `MODEL_REFUSED`, readable only here), then an unscoped key (`WORKSPACE_REQUIRED`, also
+    readable only here: `auth_expired` with the actionable detail), then `classify`."""
     for cause, pattern in _TERMINAL_PATTERNS:
         match = pattern.search(text)
         if match is not None:
             start = text.rfind("\n", 0, match.start()) + 1
             end = text.find("\n", match.end())
             return cause, text[start:end if end != -1 else len(text)].strip()[:_DETAIL_CHARS]
+    if detail := workspace_detail(text):
+        return "auth_expired", detail
     return classify(text, extra=extra)
+
+
+def workspace_detail(text: str) -> str:
+    """For ONE vendor-written error record: `WORKSPACE_REQUIRED_DETAIL` followed by the vendor's own sentence in
+    parentheses, capped to `_DETAIL_CHARS`, when the record is Anthropic refusing an unscoped key's workspace;
+    "" otherwise. Never called on prose (see `WORKSPACE_REQUIRED`)."""
+    match = WORKSPACE_REQUIRED.search(text or "")
+    if match is None:
+        return ""
+    start = text.rfind("\n", 0, match.start()) + 1
+    end = text.find("\n", match.end())
+    said = vendor_message(text[start:end if end != -1 else len(text)].strip())
+    return f"{WORKSPACE_REQUIRED_DETAIL} ({said})"[:_DETAIL_CHARS]
 
 
 def classify_vendor_error(text: str):
@@ -243,6 +283,8 @@ def classify_vendor_error(text: str):
     shared patterns plus `_VENDOR_ERROR_PATTERNS`, which only a structured error record may be read with.
     `detail` is the vendor's own sentence (`vendor_message`) when the record wraps one."""
     cause, detail = classify_api_error(text, extra=_VENDOR_ERROR_PATTERNS)
+    if detail.startswith(WORKSPACE_REQUIRED_DETAIL):
+        return cause, detail  # already the actionable sentence, the vendor's in parentheses
     message = vendor_message(text)
     return cause, (message[:_DETAIL_CHARS] if cause != UNKNOWN and message != text else detail)
 
@@ -316,18 +358,16 @@ def classify_transcript(
         # Sleep before a re-read, never the first: an already-flushed break pays nothing.
         if attempt:
             sleep(delay)
-        try:
-            with open(path, "rb") as handle:
-                if os.fstat(handle.fileno()).st_size > _TAIL_BYTES:
-                    handle.seek(-_TAIL_BYTES, os.SEEK_END)
-                tail = handle.read()
-        except OSError:
+        tail = file_io.read_tail(path, _TAIL_BYTES)
+        if tail is None:
             # (b) one step further: resolved but unreadable (rotated/being created) — retried, same race.
             result = (UNKNOWN, f"transcript unreadable: {path}"[:_DETAIL_CHARS])
             continue
-        # The newest API-error record first: a terminal refusal is read off it alone (`_TERMINAL_PATTERNS`).
+        # The newest API-error record first: a terminal refusal, or an unscoped key, is read off it alone
+        # (`_TERMINAL_PATTERNS`, `WORKSPACE_REQUIRED`).
         api_error = _last_api_error_text(tail)
-        if api_error and any(pattern.search(api_error) for _, pattern in _TERMINAL_PATTERNS):
+        if api_error and any(pattern.search(api_error) for pattern in (
+                *(p for _, p in _TERMINAL_PATTERNS), WORKSPACE_REQUIRED)):
             return classify_api_error(api_error)
         result = classify(_record_text(tail))
         if result[0] != UNKNOWN:
@@ -364,12 +404,8 @@ def turn_usage_limit_note(path: str):
     Never raises — a hook exception kills the live session."""
     if not path:
         return UNKNOWN, ""
-    try:
-        with open(path, "rb") as handle:
-            if os.fstat(handle.fileno()).st_size > _NOTE_TAIL_BYTES:
-                handle.seek(-_NOTE_TAIL_BYTES, os.SEEK_END)
-            tail = handle.read()
-    except OSError:
+    tail = file_io.read_tail(path, _NOTE_TAIL_BYTES)
+    if tail is None:
         return UNKNOWN, ""
     if USAGE_LIMIT_NOTE_KEY.encode() not in tail:
         return UNKNOWN, ""   # the hot path: one byte scan per tool call
@@ -399,12 +435,8 @@ def _classify_last_record(path: str):
     """`classify_turn_end`'s read of the turn's last text-carrying record (its docstring)."""
     if not path:
         return UNKNOWN, ""
-    try:
-        with open(path, "rb") as handle:
-            if os.fstat(handle.fileno()).st_size > _TAIL_BYTES:
-                handle.seek(-_TAIL_BYTES, os.SEEK_END)
-            tail = handle.read()
-    except OSError:
+    tail = file_io.read_tail(path, _TAIL_BYTES)
+    if tail is None:
         return UNKNOWN, ""
     last = None
     for raw in tail.splitlines():

@@ -6,11 +6,10 @@ import MenuItem from '@mui/material/MenuItem'
 import MenuList from '@mui/material/MenuList'
 import Popover from '@mui/material/Popover'
 import TextField from '@mui/material/TextField'
-import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import type { Theme } from '@mui/material/styles'
-import useMediaQuery from '@mui/material/useMediaQuery'
 import { useLayoutEffect, useMemo, useRef, useState, type JSX, type KeyboardEvent } from 'react'
+import type { OverflowItem } from './OverflowMenu'
 import { useAuth } from '../auth'
 import { useApplyOrgScope } from '../hooks/useOrgScopeUrl'
 import { createExternalStore, useExternalStore } from '../lib/externalStore'
@@ -19,7 +18,11 @@ import { ORG_IDS_MAX, useOrgSearch } from '../lib/orgs'
 import { OPERATOR_PLANE_LABEL, scopeNames, scopeRoster, useOrgScope, type OrgScope, type ScopeOrg } from '../lib/orgScope'
 import EmptyState from './EmptyState'
 import { isEnabled } from '../lib/editionFeatures'
-import { PHONE_QUERY, schemed } from './listStyles'
+import { usePhone } from '../hooks/usePhone'
+import { HOVERLESS_OR_NARROW, schemed, ELLIPSIS_SX } from './listStyles'
+import { FONT_SIZE, FONT_WEIGHT, RADIUS, SIZE, grid } from '../theme'
+import LoadingState from './LoadingState'
+import Tip from './Tip'
 
 /* THE OPERATOR'S GLOBAL ORG FILTER PICKER (state in `lib/orgScope.ts`). Rendered only for
  * an operator (`is_operator`), never for anyone else.
@@ -38,7 +41,8 @@ import { PHONE_QUERY, schemed } from './listStyles'
  * Where it sits: the expanded rail's top (`variant="rail"`), a compact count on the collapsed rail
  * (`"collapsed"`), and on phones a strip above every page (`"bar"`, `App.tsx::AuthLayout`) — the phone rail is a
  * bottom bar with no room, and the scope must stay visible there too. A page whose header has room on the phone draws
- * it there instead (`OrgScopeInline`), and the strip then steps aside. */
+ * it there instead (`OrgScopeInline`), or in its ⋯ menu where even a chip would crowd the row
+ * (`useOrgScopeOverflowItem`, the `"detached"` picker); the strip then steps aside. */
 
 const ALL_ORGS = 'All orgs'
 
@@ -56,7 +60,7 @@ const ONLY_REVEAL_SX = {
   py: 0.5,
   [`& .${ONLY_CLASS}`]: { opacity: 0 },
   [`& .MuiMenuItem-root:hover .${ONLY_CLASS}, & .MuiMenuItem-root:focus-within .${ONLY_CLASS}`]: { opacity: 1 },
-  [`@media (hover: none), (max-width: 600px)`]: { [`& .${ONLY_CLASS}`]: { opacity: 1 } },
+  [HOVERLESS_OR_NARROW]: { [`& .${ONLY_CLASS}`]: { opacity: 1 } },
 } as const
 
 /** The chip's words: "All orgs", or the first name and how many more. */
@@ -65,16 +69,24 @@ export function scopeChip(scope: OrgScope): { first: string; more: number } {
   return { first: scope[0].name, more: scope.length - 1 }
 }
 
-export type OrgScopeVariant = 'rail' | 'collapsed' | 'bar'
+export type OrgScopeVariant = 'rail' | 'collapsed' | 'bar' | 'detached'
 
-export default function OrgScopeControl({ variant }: { variant: OrgScopeVariant }): JSX.Element | null {
+/** `"detached"` draws no trigger: the host mounts it open, anchored at `anchorEl`, and unmounts it on `onDone`. */
+export default function OrgScopeControl({ variant, anchorEl = null, onDone }: {
+  variant: OrgScopeVariant
+  anchorEl?: HTMLElement | null
+  onDone?: () => void
+}): JSX.Element | null {
   const { admin } = useAuth()
   const operator = admin?.is_operator === true
   const scope = useOrgScope()
   const apply = useApplyOrgScope()
   const anchor = useRef<HTMLButtonElement | null>(null)
-  const [open, setOpen] = useState(false)
-  const [draft, setDraft] = useState<OrgScope>(null)
+  const detached = variant === 'detached'
+  const [triggered, setOpen] = useState(false)
+  const open = detached || triggered
+  // A detached picker mounts open, so its draft starts as the scope `openPicker` would have seeded.
+  const [draft, setDraft] = useState<OrgScope>(detached ? scope : null)
   /* One page of the roster as the filter names and orders it (`scopeRoster`): the first `ORG_IDS_MAX`, or those
      the search matches. */
   const { query: roster, typed: query, searched, type: search, clear: clearSearch } =
@@ -99,8 +111,9 @@ export default function OrgScopeControl({ variant }: { variant: OrgScopeVariant 
     clearSearch()
     setOpen(true)
   }
+  const close = () => (detached ? onDone?.() : setOpen(false))
   const commit = (next: OrgScope) => {
-    setOpen(false)
+    close()
     apply(next)
   }
   const draftIds = new Set((draft ?? []).map(org => org.id))
@@ -130,24 +143,24 @@ export default function OrgScopeControl({ variant }: { variant: OrgScopeVariant 
   const { first, more: moreNamed } = scopeChip(scope)
   const full = scope ? scope.map(org => org.name).join(', ') : ALL_ORGS
   const label = scope ? `Org filter: ${scopeNames(scope)}` : 'Org filter: All orgs'
+  // Both trigger shapes are the same button: the popover's anchor, named for a screen reader.
+  const triggerProps = {
+    ref: anchor, 'data-testid': 'org-scope-trigger', onClick: openPicker,
+    'aria-label': `${label}. Change`, 'aria-haspopup': 'dialog', 'aria-expanded': open,
+  } as const
 
-  const trigger = variant === 'collapsed'
+  const trigger = detached ? null : variant === 'collapsed'
     ? (
       <ButtonBase
-        ref={anchor}
-        data-testid="org-scope-trigger"
-        onClick={openPicker}
-        aria-label={`${label}. Change`}
-        aria-haspopup="dialog"
-        aria-expanded={open}
+        {...triggerProps}
         sx={(t: Theme) => ({
-          minWidth: 36,
-          height: 26,
+          minWidth: grid(6),
+          height: grid(4),
           px: 0.5,
-          borderRadius: '4px',
+          borderRadius: RADIUS.sm,
           border: '1px solid',
-          fontSize: '0.6875rem',
-          fontWeight: 700,
+          fontSize: FONT_SIZE.xs,
+          fontWeight: FONT_WEIGHT.bold,
           ...schemed(t, c => ({ color: scope ? c.accent : c.text, borderColor: c.buttonBorder })),
           '&.Mui-focusVisible': { ...schemed(t, c => ({ outline: `2px solid ${c.accent}` })), outlineOffset: '2px' },
         })}
@@ -157,23 +170,20 @@ export default function OrgScopeControl({ variant }: { variant: OrgScopeVariant 
     )
     : (
       <ButtonBase
-        ref={anchor}
-        data-testid="org-scope-trigger"
-        onClick={openPicker}
-        aria-label={`${label}. Change`}
-        aria-haspopup="dialog"
-        aria-expanded={open}
+        {...triggerProps}
         sx={(t: Theme) => ({
           display: 'flex',
           alignItems: 'center',
-          gap: '0.375rem',
+          gap: 1,
           minWidth: 0,
           maxWidth: '100%',
-          minHeight: variant === 'bar' ? 32 : 30,
-          padding: '0 0.5rem',
-          borderRadius: '4px',
+          // The phone strip's trigger takes the 44px touch floor there (`theme.custom.tapTargetPx`).
+          minHeight: variant === 'bar' ? { xs: t.custom?.tapTargetPx ?? SIZE.tapTarget, sm: SIZE.thumb } : grid(5),
+          py: 0,
+          px: 1,
+          borderRadius: RADIUS.sm,
           border: '1px solid',
-          fontSize: '0.8125rem',
+          fontSize: FONT_SIZE.md,
           textAlign: 'left',
           ...(variant === 'rail'
             ? {
@@ -190,22 +200,22 @@ export default function OrgScopeControl({ variant }: { variant: OrgScopeVariant 
             }),
         })}
       >
-        <Box component="span" className="org-scope-word" sx={{ flexShrink: 0, fontSize: '0.6875rem', fontWeight: 600, opacity: 0.75 }}>
+        <Box component="span" className="org-scope-word" sx={{ flexShrink: 0, fontSize: FONT_SIZE.xs, fontWeight: FONT_WEIGHT.semibold, opacity: 0.75 }}>
           Orgs
         </Box>
         <Box
           component="span"
           data-testid="org-scope-chip"
-          sx={{ minWidth: 0, maxWidth: '24ch', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 }}
+          sx={{ ...ELLIPSIS_SX, maxWidth: '24ch', fontWeight: FONT_WEIGHT.semibold }}
         >
           {first}
         </Box>
         {moreNamed > 0 && (
-          <Box component="span" data-testid="org-scope-more" sx={{ flexShrink: 0, fontWeight: 600 }}>
+          <Box component="span" data-testid="org-scope-more" sx={{ flexShrink: 0, fontWeight: FONT_WEIGHT.semibold }}>
             +{moreNamed}
           </Box>
         )}
-        <Box component="span" aria-hidden="true" sx={{ flexShrink: 0, marginLeft: 'auto', fontSize: '0.625rem', opacity: 0.7 }}>
+        <Box component="span" aria-hidden="true" sx={{ flexShrink: 0, marginLeft: 'auto', fontSize: grid(1.5), opacity: 0.7 }}>
           ▾
         </Box>
       </ButtonBase>
@@ -213,14 +223,16 @@ export default function OrgScopeControl({ variant }: { variant: OrgScopeVariant 
 
   return (
     <>
-      <Tooltip title={open ? '' : `Showing: ${full}`} placement={variant === 'bar' ? 'bottom' : 'right'}>
-        {trigger}
-      </Tooltip>
+      {trigger && (
+        <Tip describeChild={false} title={open ? '' : `Showing: ${full}`} placement={variant === 'bar' ? 'bottom' : 'right'}>
+          {trigger}
+        </Tip>
+      )}
       <Popover
         open={open}
-        anchorEl={anchor.current}
+        anchorEl={detached ? anchorEl : anchor.current}
         // Click-away keeps the edit (it is the picker's "done"); Escape discards it.
-        onClose={(_e, reason) => (reason === 'escapeKeyDown' ? setOpen(false) : commit(draft))}
+        onClose={(_e, reason) => (reason === 'escapeKeyDown' ? close() : commit(draft))}
         anchorOrigin={{ vertical: 'bottom', horizontal: 'left' }}
         transformOrigin={{ vertical: 'top', horizontal: 'left' }}
         slotProps={{
@@ -228,7 +240,7 @@ export default function OrgScopeControl({ variant }: { variant: OrgScopeVariant 
             role: 'dialog',
             'aria-label': 'Filter by org',
             'data-testid': 'org-scope-picker',
-            sx: { width: 300, maxWidth: 'calc(100vw - 32px)', display: 'flex', flexDirection: 'column', maxHeight: 'min(480px, calc(100dvh - 96px))' },
+            sx: { width: grid(50), maxWidth: `calc(100vw - ${grid(5.5)})`, display: 'flex', flexDirection: 'column', maxHeight: `min(${grid(80)}, calc(100dvh - ${grid(16)}))` },
           } as object,
         }}
       >
@@ -255,7 +267,7 @@ export default function OrgScopeControl({ variant }: { variant: OrgScopeVariant 
               onClick={() => commit(null)}
             >
               <Checkbox size="small" checked={draft === null} tabIndex={-1} disableRipple sx={{ p: 0.5, mr: 1 }} />
-              <Typography variant="body2" sx={{ fontWeight: 600 }}>{ALL_ORGS}</Typography>
+              <Typography variant="body2" sx={{ fontWeight: FONT_WEIGHT.semibold }}>{ALL_ORGS}</Typography>
             </MenuItem>
           )}
           {shown.map(org => {
@@ -270,7 +282,7 @@ export default function OrgScopeControl({ variant }: { variant: OrgScopeVariant 
               >
                 <Checkbox size="small" checked={checked} tabIndex={-1} disableRipple sx={{ p: 0.5, mr: 1 }} />
                 <Box sx={{ minWidth: 0, flex: 1 }}>
-                  <Typography variant="body2" noWrap title={org.name}>{org.name}</Typography>
+                  <Tip title={org.name}><Typography variant="body2" noWrap>{org.name}</Typography></Tip>
                   <Typography variant="caption" sx={{ color: 'text.secondary' }} noWrap component="div">{org.slug}</Typography>
                 </Box>
                 <Button
@@ -301,7 +313,7 @@ export default function OrgScopeControl({ variant }: { variant: OrgScopeVariant 
             {countOf(more, 'more org')} · search to narrow
           </Typography>
         )}
-        {roster.isLoading && <Typography variant="body2" sx={{ color: 'text.secondary', px: 2, py: 1 }}>Loading orgs…</Typography>}
+        {roster.isLoading && <Box sx={{ px: 1, py: 0.5 }}><LoadingState label="Loading orgs…" /></Box>}
         {roster.isError && <Typography variant="body2" color="error" sx={{ px: 2, py: 1 }}>Could not load orgs</Typography>}
         <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 1, p: 1, borderTop: 1, borderColor: 'divider' }}>
           <Button size="small" onClick={() => setDraft(null)} disabled={draft === null} data-testid="org-scope-clear">
@@ -316,7 +328,7 @@ export default function OrgScopeControl({ variant }: { variant: OrgScopeVariant 
   )
 }
 
-/* HOW MANY `OrgScopeInline`s ARE MOUNTED: while one is, the strip draws nothing — one scope chip, never two. A
+/* HOW MANY STAND-INS (`useStripStandIn`) ARE MOUNTED: while one is, the strip draws nothing — one scope chip, never two. A
    module store, not a context: the strip (`App.tsx`'s `mainTop`) and the page's header are siblings under the shell,
    and a count needs no provider wired around both. */
 const inlineCount = createExternalStore(0)
@@ -340,19 +352,47 @@ export function OrgScopeBar(): JSX.Element | null {
  *  the strip, which it suppresses while mounted. It shrinks (the name ellipsises) and, in a wrapping row, takes a
  *  line of its own where even the shrunk chip does not fit. */
 export function OrgScopeInline(): JSX.Element | null {
-  const { admin } = useAuth()
-  // Never without Multiple orgs: one org, nothing to filter (as `OrgScopeBar`).
-  const shown = useMediaQuery(PHONE_QUERY) && admin?.is_operator === true && isEnabled('multi_org_tenancy')
-  /* A layout effect, so the strip is gone before the first paint rather than a frame after. */
-  useLayoutEffect(() => {
-    if (!shown) return
-    inlineCount.set(inlineCount.get() + 1)
-    return () => inlineCount.set(inlineCount.get() - 1)
-  }, [shown])
+  const shown = useStripStandIn()
   if (!shown) return null
   return (
     <Box data-testid="org-scope-inline" sx={{ display: 'flex', alignItems: 'center', flex: '0 1 auto', minWidth: 0, maxWidth: '100%' }}>
       <OrgScopeControl variant="bar" />
     </Box>
   )
+}
+
+/** Whether this page carries the phone's scope in place of the strip (`enabled`), and while it does, the strip steps
+ *  aside. Phone-only and operator-only like the strip; never without Multiple orgs (one org, nothing to filter). A
+ *  page whose ⋯ item is still loading calls it directly, so the strip does not drop out from above it a moment later. */
+export function useStripStandIn(enabled = true): boolean {
+  const { admin } = useAuth()
+  const phone = usePhone()
+  const shown = enabled && phone && admin?.is_operator === true && isEnabled('multi_org_tenancy')
+  /* A layout effect, so the strip is gone before the first paint rather than a frame after. */
+  useLayoutEffect(() => {
+    if (!shown) return
+    inlineCount.set(inlineCount.get() + 1)
+    return () => inlineCount.set(inlineCount.get() - 1)
+  }, [shown])
+  return shown
+}
+
+/** The strip as a ⋯ item, for a header whose first row has no room even for the chip (the task page at 390px:
+ *  Back, the trail and the state pill). The item names the scope ("Orgs: All orgs"), so it stays in sight one press
+ *  away; it opens the same picker, anchored at `anchor()`. `item` and `picker` are null where the strip would not
+ *  draw. */
+export function useOrgScopeOverflowItem(anchor: () => HTMLElement | null): { item: OverflowItem | null; picker: JSX.Element | null } {
+  const shown = useStripStandIn()
+  const scope = useOrgScope()
+  const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null)
+  if (!shown) return { item: null, picker: null }
+  const { first, more } = scopeChip(scope)
+  const named = more > 0 ? `${first} +${more}` : first
+  return {
+    item: {
+      key: 'org-scope', icon: '◎', label: `Orgs: ${named}`, ariaLabel: `Org filter: ${scope ? scopeNames(scope) : ALL_ORGS}. Change`,
+      testId: 'org-scope-item', onClick: () => setAnchorEl(anchor()),
+    },
+    picker: anchorEl && <OrgScopeControl variant="detached" anchorEl={anchorEl} onDone={() => setAnchorEl(null)} />,
+  }
 }

@@ -18,18 +18,20 @@ from __future__ import annotations
 import base64
 import logging
 from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, StrictBool, StrictStr
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
-from app import node_credentials, nodevault_grants
+from app import node_credentials
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
 from app.credential_keys import nodevault_key_hash, parse_nodevault_public_key
-from app.db import get_session
-from app.entity_shape import get_or_404, StrictModel
+from app.db_async import DbDep
+from app.entity_shape import get_or_404, StrictModel, refused_as
 from app.models.nodes import Node
 # The one door onto `/api/agent/*`; `test_authz_policy.py` fails any route under the prefix without it.
 from app.routes.agent.auth import _check_token, caller_node_id
@@ -58,19 +60,32 @@ class NodeVaultIdentityOut(BaseModel):
 
 @router.post("/api/agent/nodevault/identity", response_model=NodeVaultIdentityOut)
 @infra(Tenancy.ORG_SCOPED)
-def register_nodevault_identity(
+async def register_nodevault_identity(
     body: NodeVaultIdentityIn,
+    db: DbDep,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> NodeVaultIdentityOut:
     """Register (or re-confirm) the CALLING node's identity key and its `capable` flag."""
+    out, node_id = await db.run_sync(_register_nodevault_identity, body=body, caller=caller)
+    if out.fingerprint is not None:
+        # After the commit and off the loop: enrolment reads DBOS workflow status and starts workflows (blocking),
+        # so it runs in a session of its own on a worker thread. Never raises; `hello` re-runs it on failure.
+        from app.durable.nodevault import _ensure_grants_detached
+
+        await run_in_threadpool(_ensure_grants_detached, str(node_id))
+    return out
+
+
+def _register_nodevault_identity(
+    session: Session,
+    body: NodeVaultIdentityIn,
+    caller: node_credentials.AgentCaller,
+) -> tuple[NodeVaultIdentityOut, UUID]:
     node_id = caller_node_id(session, caller, body.node_id or "")
     if body.public_key is None:
-        return _record_incapable(session, node_id, capable=body.capable)
-    try:
+        return _record_incapable(session, node_id, capable=body.capable), node_id
+    with refused_as(422, ValueError):
         spki = parse_nodevault_public_key(body.public_key)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
     fingerprint = nodevault_key_hash(spki)
     node = get_or_404(session, Node, node_id, detail="node not found", lock=True)
     if node.nodevault_identity_fp is not None and node.nodevault_identity_fp != fingerprint:
@@ -82,13 +97,7 @@ def register_nodevault_identity(
     node.nodevault_capable = body.capable
     node.nodevault_capable_at = func.now()
     session.commit()
-    try:
-        nodevault_grants.ensure_grants(session, node_id)
-        session.commit()
-    except Exception:  # noqa: BLE001 — the identity is registered; `hello` re-runs enrolment
-        session.rollback()
-        log.warning("NodeVault enrolment of node %s failed after its identity registered", node_id, exc_info=True)
-    return NodeVaultIdentityOut(fingerprint=fingerprint)
+    return NodeVaultIdentityOut(fingerprint=fingerprint), node_id
 
 
 def _record_incapable(session: Session, node_id, *, capable: bool) -> NodeVaultIdentityOut:

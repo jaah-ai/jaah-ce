@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -23,23 +24,26 @@ from app import (
     forges,
     git_access,
     git_reach,
+    jaah_repos,
     node_credentials,
     nodevault_grants,
     oauth2_tokens,
+    oauth_providers,
     slot_allocation,
     slot_state,
     task_ancestry,
 )
 # `principal_for_user`: the sanctioned way to build a `Principal` outside a request; the task-credential
 # routes need one for a user who is NOT the caller (they carry no session cookie, only the node token).
-from app.authz.catalog import Tenancy
+from app.authz.catalog import Tenancy, permission_key
 from app.authz.declarations import infra
 from app.authz.principal import Principal, principal_for_user
-from app.authz.visibility import task_roster_select
+from app.authz.visibility import has_project_key, task_roster_select
 from app.credential_crypto import has_sealed_secret, open_secret
 from app.credentials import health as credential_health
+from app.credentials.oauth_wizards import connect_for_type
 from app.credentials.registry import field_keys, type_label
-from app.db import SessionLocal, get_session
+from app.db_async import DbDep, on_session, on_thread, run_blocking_in_session
 from app.tenancy import seam
 from app.task_ancestry import launcher_user_id
 from app.models.credentials import Account, Credential, NV_GRANT_DELIVERED, NodeVaultGrant
@@ -47,9 +51,10 @@ from app.models.identity import AdminUser
 from app.models.projects import Project, ProjectRepo
 from app.models.tasks import Task
 from app.models.worktrees import Worktree
-from app.entity_shape import StrictModel
+from app.entity_shape import StrictModel, names_of, or_404, from_row
 from app.routes.agent import auth
 from app.routes.agent.auth import (
+    AgentDoor,
     _check_token,
     _check_token_for_task,
     _task_has_live_vm_on,
@@ -58,6 +63,8 @@ from app.routes.agent.auth import (
 )
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
+# The header a node sends a trigger preflight's grant in (`apps/jaahd/cred_broker.py::_fetch_trigger_git_login`).
+TRIGGER_GRANT_HEADER = "X-Trigger-Grant"
 log = logging.getLogger("agent-routes")
 
 
@@ -125,7 +132,9 @@ class GitTokenOut(BaseModel):
     git credential helper (`apps/jaahd/git_credential_helper.py`) refuses to answer git for any other
     host, or a path outside a sub-path root (C5). `api_username` is additive: the REST API's Basic
     username where it differs from git's (`git_access._REST_USERNAME_FIELDS`), else `""`; git never
-    reads it, so an older node keeps working for git. Never log `token`.
+    reads it, so an older node keeps working for git. `jaah_repo_prefix` is additive: `<github org>/<org slug>-` for the
+    asking project's org (`jaah_repos.jaah_repo_prefix`), else `""`; the node's credential helper refuses a destination
+    in the Jaah org whose path does not start with it. Never log `token`.
     """
 
     scheme: str
@@ -142,9 +151,17 @@ class GitTokenOut(BaseModel):
     # (`git_reach.writer_for_task`) — what is missing and where to fix it, so `jaah-forge` names it on a refused
     # write. `""` when the served login can write, or it cannot be told.
     write_problem: str = ""
+    jaah_repo_prefix: str = ""
 
 
-def _git_token_or_refusal(session: Session, resolve, *, repo_name: str = "") -> GitTokenOut:
+def _prefix_of(session: Session, org_id: UUID) -> str:
+    """`GitTokenOut.jaah_repo_prefix` for org `org_id`."""
+    return jaah_repos.jaah_repo_prefix(jaah_repos.org_slug_of(session, org_id))
+
+
+def _git_token_or_refusal(
+    session: Session, resolve, *, repo_name: str = "", jaah_repo_prefix: str = "",
+) -> GitTokenOut:
     """Run one `git_access` resolution — `resolve()` returns `(credential, repo)`, or `(credential, repo,
     write_problem)` from `git_reach` — and turn its failure into an HTTP answer.
 
@@ -172,10 +189,65 @@ def _git_token_or_refusal(session: Session, resolve, *, repo_name: str = "") -> 
         scheme=login.scheme, username=login.username, token=login.token, api_username=login.api_username,
         host=repo.host, root=repo.root, forge=repo.forge, api_base=repo.api_base(),
         repo_path=repo.path, web_url=repo.web_url(), write_problem=problem[0] if problem else "",
+        jaah_repo_prefix=jaah_repo_prefix,
     )
     # Best-effort, after the answer is built (`credential_health.record_use`): never fails or alters it.
     credential_health.record_use(session, [credential_id])
     return out
+
+
+def _jaah_repo_token_or_none(session: Session, project: Optional[Project], repo_of, *,
+                             node_id: Optional[UUID]) -> Optional[GitTokenOut]:
+    """A Jaah-made repository's runner login (`easy_mode_runner_tokens`): a one-repo installation token of the
+    console's GitHub App when `repo_of()` — any of the project's repositories — is the project's own `jaah_repos` row
+    in a served state (`jaah_repos.runner_app_repo`), else None and the caller resolves a person exactly as before. Write
+    while the row is `active`, read-only while the project moves off it (`jaah_repos.permissions_for`).
+
+    Node rule: an Easy Mode project's login is served only on its org's Easy Mode shared node (`easy_mode.shared_node`;
+    none, or any other node, is refused), so a tenant's own machine never holds a token on Jaah's GitHub org for a
+    project Jaah hosts. Any other Jaah-made project runs on its org's own machines: every node the route already
+    admits is served its one-repo login. The App's key never leaves the control plane. Refusals are 409 (they name
+    what to fix). Every caller runs `_require_org_prefix` before this, in every edition."""
+    if not edition_features.enabled("customers"):
+        return None
+    from app import easy_mode  # cloud edition only (`customers`), checked above
+
+    if project is None:
+        return None
+    try:
+        repo = repo_of()
+        row = jaah_repos.runner_app_repo(session, project, repo)
+        if row is None:
+            return None
+        if project.easy_mode:
+            shared = easy_mode.shared_node(session, project.org_id)
+            if node_id is None or shared is None or node_id != shared.id:
+                raise git_access.GitAccessError(
+                    "This Easy Mode project's git login is served only on its organization's shared node.")
+        login = jaah_repos.login_for(row, repo)
+    except git_access.GitAccessError as exc:
+        log.warning("git access: refused jaah repo runner login project=%s (%s)", project.id, exc)
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return GitTokenOut(
+        scheme=login.scheme, username=login.username, token=login.token, host=repo.host, root=repo.root,
+        forge=repo.forge, api_base=repo.api_base(), repo_path=repo.path, web_url=repo.web_url(),
+        jaah_repo_prefix=_prefix_of(session, project.org_id),
+    )
+
+
+def _require_org_prefix(session: Session, org_id: UUID, repo_of, *, repo_name: str = "") -> None:
+    """409 when `repo_of()` is in the Jaah org without org `org_id`'s prefix (`jaah_repos.require_org_prefix`) — run
+    by every git-login route before any login, the App's or a person's, is resolved. A `repo_of()` that itself fails is
+    left to the login path, which refuses it with its own reason."""
+    try:
+        repo = repo_of()
+    except git_access.GitAccessError:
+        return
+    try:
+        jaah_repos.require_org_prefix(session, org_id, repo)
+    except git_access.GitAccessError as exc:
+        log.warning("git access: refused %s (not this org's Jaah repo)", repo.path)
+        raise HTTPException(status_code=409, detail=f"Repository {repo_name}: {exc}" if repo_name else str(exc)) from exc
 
 
 def _connected_repo_or_404(session: Session, project_id: Optional[int], repo_id: int, *, subject: str) -> ProjectRepo:
@@ -195,11 +267,11 @@ def _connected_repo_or_404(session: Session, project_id: Optional[int], repo_id:
 
 @router.get("/tasks/{task_id}/git-token", response_model=GitTokenOut)
 @infra(Tenancy.ORG_SCOPED)
-def get_task_git_token(
+async def get_task_git_token(
     task_id: int,
+    db: DbDep,
     repo_id: Optional[int] = None,
     caller: node_credentials.AgentCaller = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> GitTokenOut:
     """The git credential for one task — the credential of whoever started it, or its parent epic.
 
@@ -214,6 +286,38 @@ def get_task_git_token(
     its own task only (D18): `_check_token_for_task` has already refused any other task, and the token is
     minted exactly as at launch — the same person, read in the org their git connection lives in.
     """
+    # Both halves interleave DB work with forge HTTP (the reach check, a token refresh, the revocation probe): each
+    # runs in a worker thread on a session of its own (`app/db_async.py::run_blocking_in_session`).
+    out = await run_blocking_in_session(
+        _get_task_git_token,
+        task_id=task_id,
+        repo_id=repo_id,
+        caller=caller,
+        route=db,
+    )
+    if isinstance(out, _CarriedSource):
+        # A carried-over runner's login is read in the org it came FROM, on a session of its own (one session belongs
+        # to one org).
+        out = await run_blocking_in_session(
+            _carried_over_git_token,
+            out,
+            task_id=task_id,
+            node_id=caller.node_id,
+            route=db,
+        )
+    # Task and node, never the token or config: answers "which task borrowed whose access".
+    log.info("git access: served task=%s node=%s repo=%s%s", task_id, caller.node_id,
+             repo_id if repo_id is not None else "primary",
+             " (carried over)" if carryover.request_task() is not None else "")
+    return out
+
+
+def _get_task_git_token(
+    session: Session,
+    task_id: int,
+    repo_id: Optional[int],
+    caller: node_credentials.AgentCaller,
+) -> "GitTokenOut | _CarriedSource":
     carried = carryover.request_task() is not None
     if not carried:
         _require_derived_node(caller)
@@ -231,9 +335,17 @@ def get_task_git_token(
     def _repo() -> forges.RepoRef:
         return git_access.project_repo_ref(row) if row is not None else git_access.task_repo(session, task)
 
+    repo_name = row.name if row else ""
+    _require_org_prefix(session, task.org_id, _repo, repo_name=repo_name)
     if carried:
-        out = _carried_over_git_token(session, caller, task, _repo, repo_name=row.name if row else "")
+        return _carried_source(session, caller, task, _repo, repo_name=repo_name)
     else:
+        easy = _jaah_repo_token_or_none(
+            session, session.scalar(select(Project).where(Project.id == task.project_id)), _repo,
+            node_id=caller.node_id)
+        if easy is not None:
+            return easy
+
         def _resolve() -> tuple[Credential, forges.RepoRef, str]:
             repo = _repo()
             # The starter's credential that can write to it (`git_reach`), else their selected one and why not.
@@ -241,11 +353,8 @@ def get_task_git_token(
             problem = f"{pick.problem} {pick.fix_url}".strip() if pick.fix_url else pick.problem
             return pick.credential, repo, problem
 
-        out = _git_token_or_refusal(session, _resolve, repo_name=row.name if row else "")
-    # Task and node, never the token or config: answers "which task borrowed whose access".
-    log.info("git access: served task=%s node=%s repo=%s%s", task_id, caller.node_id,
-             repo_id if repo_id is not None else "primary", " (carried over)" if carried else "")
-    return out
+        return _git_token_or_refusal(session, _resolve, repo_name=repo_name,
+                                     jaah_repo_prefix=_prefix_of(session, task.org_id))
 
 
 class ForgeAuthIn(StrictModel):
@@ -280,66 +389,91 @@ def _forge_auth_report(session: Session, caller: node_credentials.AgentCaller, t
 
 @router.post("/tasks/{task_id}/forge-auth-rejected", response_model=ForgeAuthOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_thread
 def post_forge_auth_rejected(
+    session: Session,
     task_id: int,
     body: ForgeAuthIn,
     caller: node_credentials.AgentCaller = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> ForgeAuthOut:
     """The forge refused the task's git login after the node's fresh read. A merge-lane run's second refusal
     in one attempt ends it `system_failed` naming the credential, with one alert (`lane_forge_auth`)."""
+    # Interleaves DB work with blocking I/O (a run-ending refusal raises an alert, whose mail and chat legs open their own sessions): a worker thread on its own session (`app/db_async.py::run_blocking_in_session`).
     return _forge_auth_report(session, caller, task_id, body, rejected=True)
 
 
 @router.post("/tasks/{task_id}/forge-auth-accepted", response_model=ForgeAuthOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def post_forge_auth_accepted(
+    session: Session,
     task_id: int,
     body: ForgeAuthIn,
     caller: node_credentials.AgentCaller = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> ForgeAuthOut:
     """The forge took the login after a refusal: the retry in place worked, and the refusal is closed."""
     return _forge_auth_report(session, caller, task_id, body, rejected=False)
 
 
-def _carried_over_git_token(
+@dataclass(frozen=True)
+class _CarriedSource:
+    """What a carried-over runner's git login is read from: the org the carry-over came from, the task's
+    started-by chain and its repo, all read in the request's (new) org."""
+
+    from_org: UUID
+    chain: list[UUID]
+    repo: forges.RepoRef
+    repo_name: str
+    jaah_repo_prefix: str = ""
+
+
+def _carried_source(
     session: Session, caller: node_credentials.AgentCaller, task: Task, task_repo, *, repo_name: str = "",
-) -> GitTokenOut:
-    """`get_task_git_token` for a carried-over runner. The repo (`task_repo()`, the asked-for one of the task's
-    repositories) and the person are the task's, read in the request's (new) org; the person's git connection
-    is read in the org the carry-over came FROM, on a session of its own, since one session belongs to one org
-    (`seam.check_session_stamp`)."""
-    from_org = carryover.from_org_for(session, node_id=caller.node_id, task_id=task.id)
-    if from_org is None:
-        # Closed between the bind and here: the node is back to today's answer.
-        raise HTTPException(status_code=404, detail=f"task {task.id} not found")
+) -> _CarriedSource:
+    """`get_task_git_token` for a carried-over runner, its first half. The repo (`task_repo()`, the asked-for one of
+    the task's repositories) and the person are the task's, read in the request's (new) org; the person's git
+    connection is read in the org the carry-over came FROM by `_carried_over_git_token`, on a session of its own,
+    since one session belongs to one org (`seam.check_session_stamp`)."""
+    # Closed between the bind and here: the node is back to today's answer.
+    from_org = or_404(
+        carryover.from_org_for(session, node_id=caller.node_id, task_id=task.id),
+        detail=f"task {task.id} not found",
+    )
     try:
         repo = task_repo()
     except git_access.GitAccessError as exc:
         raise HTTPException(status_code=409, detail=f"Repository {repo_name}: {exc}" if repo_name else str(exc)) from exc
     chain = task_ancestry.started_by_chain(session, task.id)
-    with SessionLocal() as source, seam.detached(), seam.bound_to(from_org):
-        person_id = task_ancestry.first_human_starter(source, chain)
+    return _CarriedSource(from_org=from_org, chain=chain, repo=repo, repo_name=repo_name,
+                          jaah_repo_prefix=_prefix_of(session, task.org_id))
+
+
+def _carried_over_git_token(source: Session, carried: _CarriedSource, *, task_id: int, node_id: Any) -> GitTokenOut:
+    """`_carried_source`'s second half, on its own session (`db_async.run_in_session`) in the source org."""
+    repo, repo_name = carried.repo, carried.repo_name
+    with seam.detached(), seam.bound_to(carried.from_org):
+        person_id = task_ancestry.first_human_starter(source, carried.chain)
         if person_id is not None:
             out = _git_token_or_refusal(
-                source, lambda: (git_access.resolve_for_user(source, person_id, repo), repo), repo_name=repo_name)
+                source, lambda: (git_access.resolve_for_user(source, person_id, repo), repo), repo_name=repo_name,
+                jaah_repo_prefix=carried.jaah_repo_prefix)
             source.commit()
             return out
     # No starter of the source org: the task's new org must not lend its own people's access to this node.
-    log.warning("git access: refused carried task=%s node=%s (no starter in source org %s)", task.id,
-                caller.node_id, from_org)
-    raise HTTPException(status_code=404, detail=f"task {task.id} not found")
+    log.warning("git access: refused carried task=%s node=%s (no starter in source org %s)", task_id,
+                node_id, carried.from_org)
+    raise HTTPException(status_code=404, detail=f"task {task_id} not found")
 
 
 @router.get("/git-token", response_model=GitTokenOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_thread
 def get_clone_git_token(
+    session: Session,
     project: str = "",
     project_id: Optional[int] = None,
     repo_id: Optional[int] = None,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> GitTokenOut:
     """The git credential for a pool clone — work that belongs to no task, on behalf of the operator who
     declared that project's slots on this node.
@@ -348,11 +482,12 @@ def get_clone_git_token(
     (`git_access.resolve_for_worktree_clone`). `project` selects, it does not authorize (the node credential
     plus the declarer's grant, re-checked in `resolve_for_user`); without it a clone could use access given
     for another project. The daemon supplies it from its own clone context (`apps/jaahd/clone_identity.py`),
-    not the askpass request: `project_id`, else (an older daemon) `project` as a name inside this node's org
-    (`_wire_project`). Requires a derived caller, as the task route does. `repo_id` is one of that project's
+    not the askpass request: `project_id` (`project`, the display name, never resolves — `_wire_project`).
+    Requires a derived caller, as the task route does. `repo_id` is one of that project's
     connected repositories, from the roster's `repos[].id` the daemon declared the clone with;
     absent, the primary; a repository the project does not connect is 404.
     """
+    # Interleaves DB work with blocking I/O (a token refresh and the revocation probe): a worker thread on its own session (`app/db_async.py::run_blocking_in_session`).
     _require_derived_node(caller)
     if project_id is None and not project.strip():
         # Defaulted and refused here rather than declared required, so the refusal names a fix instead of
@@ -366,7 +501,7 @@ def get_clone_git_token(
                 "the daemon ran outside that context, and it has no declarer to resolve"
             ),
         )
-    project_row = _wire_project(session, caller, project_id, project)
+    project_row = _wire_project(session, project_id)
     if project_row is None:
         # 404 on the project: nothing an operator could connect would fix it.
         named = project_id if project_id is not None else repr(project)
@@ -377,20 +512,102 @@ def get_clone_git_token(
         row = None  # the primary asked for by id answers exactly as without one
     credential_id: Optional[UUID] = None
 
+    def _repo() -> forges.RepoRef:
+        return (git_access.project_repo_ref(row, retry=git_access.CLONE_RETRY) if row is not None
+                else git_access.project_repo(project_row, retry="then materialise the slot again"))
+
+    _require_org_prefix(session, project_row.org_id, _repo, repo_name=row.name if row else "")
+    # Only for a node that declared this project's slots: the person resolution below refuses any other, and a
+    # Jaah repo's clone must not skip that check.
+    easy = (_jaah_repo_token_or_none(session, project_row, _repo, node_id=caller.node_id)
+            if caller.node_id is not None
+            and git_access.clone_owner_id(session, caller.node_id, project_row.id) is not None else None)
+    if easy is not None:
+        log.info("git access: served clone jaah repo runner login node=%s project=%s repo=%s",
+                 caller.node_id, project_row.id, repo_id if repo_id is not None else "primary")
+        return easy
+
     def _resolve() -> tuple[Credential, forges.RepoRef]:
         nonlocal credential_id
-        repo = (git_access.project_repo_ref(row, retry=git_access.CLONE_RETRY) if row is not None
-                else git_access.project_repo(project_row, retry="then materialise the slot again"))
+        repo = _repo()
         credential = git_access.resolve_for_worktree_clone(session, caller.node_id, project_row.id, repo)
         # Read now: a failed use stamp's rollback expires the row (`credential_health._stamp`).
         credential_id = credential.id
         return credential, repo
 
-    out = _git_token_or_refusal(session, _resolve, repo_name=row.name if row else "")
+    out = _git_token_or_refusal(session, _resolve, repo_name=row.name if row else "",
+                                jaah_repo_prefix=_prefix_of(session, project_row.org_id))
     # The credential id (never token or config), so the journal says whose access was borrowed.
     log.info(
         "git access: served clone credential node=%s project=%s repo=%s credential=%s",
         caller.node_id, project_row.id, repo_id if repo_id is not None else "primary", credential_id)
+    return out
+
+
+@router.get("/trigger-preflights/git-token", response_model=GitTokenOut)
+@infra(Tenancy.ORG_SCOPED)
+@on_thread
+def get_trigger_preflight_git_token(
+    session: Session,
+    grant: str = Header(default="", alias=TRIGGER_GRANT_HEADER, max_length=2048),
+    caller: node_credentials.AgentCaller = Depends(_check_token),
+) -> GitTokenOut:
+    """The git credential for a "Repo script" trigger's throwaway clone: the trigger OWNER'S login for the
+    project's primary repository (D14). The only credential path a preflight has.
+
+    The grant (`X-Trigger-Grant`, a header so no URL or access log ever carries it) is the blob
+    `trigger_preflight_script.mint_grant` put in the node's dispatch; it authorizes, nothing else does. Refused 403
+    unless its MAC is ours, it has not expired and it names THIS node; then 404 unless the trigger still exists in
+    the caller's org, is a script preflight of the grant's project, is neither paused nor failed, the node is still
+    assigned that project, and the owner still holds `tasks:create` on it — each re-asked now, never read from the
+    grant. A replay by the same node inside the grant's expiry is the accepted residual (R-7).
+    """
+    # Deferred: trigger_intake pulls the route layer.
+    from app import automation_fire, trigger_intake, trigger_preflight_script  # noqa: PLC0415
+    from app.models.automations import TaskTrigger  # noqa: PLC0415
+    from app.triggers import PREFLIGHT_SCRIPT  # noqa: PLC0415
+
+    _require_derived_node(caller)
+    claims = trigger_preflight_script.verify_grant(grant, node_id=caller.node_id)
+    if claims is None:
+        log.warning("git access: refused trigger preflight node=%s (grant invalid, expired or another node's)",
+                    caller.node_id)
+        raise HTTPException(status_code=403, detail="the trigger preflight grant is invalid, expired or not this node's")
+    trigger = session.scalar(select(TaskTrigger).where(TaskTrigger.id == claims.trigger_id))
+    owner: Optional[AdminUser] = None
+    project_row: Optional[Project] = None
+    if trigger is None:
+        refusal = "trigger gone"
+    elif trigger.project_id != claims.project_id or trigger.preflight_kind != PREFLIGHT_SCRIPT:
+        refusal = "trigger's project or preflight changed"
+    elif trigger.paused_at is not None or trigger.failed_at is not None:
+        refusal = "trigger paused or failed"
+    elif caller.node_id not in slot_allocation.hosting_node_ids(session, claims.project_id):
+        refusal = "node no longer runs the project"
+    else:
+        owner = trigger_intake.trigger_owner(session, trigger)
+        project_row = session.scalar(select(Project).where(Project.id == claims.project_id))
+        refusal = ("owner lacks tasks:create" if owner is None
+                   or automation_fire.owner_outside_org(owner.org_id, trigger.org_id)
+                   or not has_project_key(principal_for_user(session, owner), permission_key("tasks", "create"),
+                                          claims.project_id)
+                   else "project gone" if project_row is None else "")
+    if refusal or owner is None or project_row is None:
+        log.warning("git access: refused trigger preflight trigger=%s node=%s (%s)", claims.trigger_id,
+                    caller.node_id, refusal)
+        raise HTTPException(status_code=404, detail="trigger not found")
+    owner_id, project = owner.id, project_row
+    retry = "then fire the trigger again"
+
+    def _resolve() -> tuple[Credential, forges.RepoRef]:
+        repo = git_access.project_repo(project, retry=retry)
+        return git_access.resolve_for_user(session, owner_id, repo, retry=retry), repo
+
+    _require_org_prefix(session, project.org_id, lambda: git_access.project_repo(project, retry=retry))
+    out = _git_token_or_refusal(session, _resolve, jaah_repo_prefix=_prefix_of(session, project.org_id))
+    # Trigger, node and owner — never the token.
+    log.info("git access: served trigger preflight trigger=%s node=%s owner=%s project=%s", claims.trigger_id,
+             caller.node_id, owner_id, claims.project_id)
     return out
 
 
@@ -404,14 +621,18 @@ class AccountApiKeyOut(BaseModel):
     """One API-key account's key, for the runner launching on it. NEVER LOG `api_key`."""
 
     api_key: str
+    # The Anthropic workspace an unscoped key must name on every request (`account_auth.WORKSPACE_ID_CONFIG_KEY`,
+    # non-secret, stored beside the key); `""` when none. The Claude adapter turns it into a header.
+    workspace_id: str = ""
 
 
 @router.get("/accounts/{slug}/api-key", response_model=AccountApiKeyOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_thread
 def get_account_api_key(
+    session: Session,
     slug: str,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> AccountApiKeyOut:
     """The API key one enabled API-key account authenticates with (Anthropic or DeepSeek).
 
@@ -419,9 +640,11 @@ def get_account_api_key(
     otherwise walk every slug. The slug is validated before any query by
     `account_auth.slug_from_node_credential_name`, an exact parse to one plain segment.
     """
+    # Interleaves DB work with blocking I/O (opening the sealed key may call KMS): a worker thread on its own
+    # session (`on_thread`).
     _require_derived_node(caller)
-    # The strict parser on the caller's raw slug: composing via `node_credential_name` first would strip
-    # whitespace and give one account two spellings (see `slug_from_node_credential_name`).
+    # The strict parser on the caller's raw slug: a composer that stripped whitespace first would
+    # give one account two spellings (see `slug_from_node_credential_name`).
     parsed = account_auth.slug_from_node_credential_name(account_auth.NODE_CREDENTIAL_PREFIX + slug)
     account = session.scalar(
         select(Account).where(
@@ -478,28 +701,35 @@ def get_account_api_key(
         raise HTTPException(status_code=404, detail="credential not available")
     # Account and node, never the key. `api_key` must never be interpolated into any log line here.
     log.info("account api-key: served account=%s node=%s", parsed, caller.node_id)
-    out = AccountApiKeyOut(api_key=api_key)
+    # `credential` is not None here (a key was opened from it); the workspace is tier-1 plaintext in its config,
+    # served only when well-formed: it becomes a request header on the node.
+    workspace_id = (credential.config or {}).get(account_auth.WORKSPACE_ID_CONFIG_KEY)
+    if not isinstance(workspace_id, str) or not account_auth.is_valid_workspace_id(workspace_id):
+        workspace_id = ""
+    out = AccountApiKeyOut(api_key=api_key, workspace_id=workspace_id)
     credential_health.record_use(session, [account.credential_id])
     return out
 
 
 @router.get("/bedrock-credentials")
 @infra(Tenancy.ORG_SCOPED)
+@on_thread
 def get_bedrock_credentials(
+    session: Session,
+    door: AgentDoor,
     name: str = "",
-    x_agent_task_id: str = Header(default=""),
-    caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> JSONResponse:
     """K3: 15-minute, invoke-only Bedrock credentials for one open Jaah session routed to THIS node
     (`app/jaah_routing/credentials.py` decides). 200 `{"Credentials": {...}}` — Claude Code's
     `awsCredentialExport` shape; 403 `{"reason": ...}`. `_require_derived_node`: a shared token names no node,
     and the node IS the binding. The answer is never logged and never cached."""
+    # Interleaves DB work with blocking I/O (the STS mint on every answer): a worker thread on its own session (`app/db_async.py::run_blocking_in_session`).
     if not edition_features.enabled("jaah_ai_credit"):
         raise HTTPException(status_code=404, detail=_NO_JAAH_ACCOUNT)
     from app import bedrock
     from app.jaah_routing import credentials as jaah_credentials
 
+    caller, x_agent_task_id = door
     _require_derived_node(caller)
     answer = jaah_credentials.issue(
         session, name=name, node_id=caller.node_id, node_org_id=caller.org_id, task_header=x_agent_task_id,
@@ -567,11 +797,12 @@ class JaahUsageOut(BaseModel):
 
 @router.post("/jaah-sessions/{jaah_session_id}/usage", response_model=JaahUsageOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def post_jaah_session_usage(
+    session: Session,
     jaah_session_id: UUID,
     body: JaahUsageIn,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> JaahUsageOut:
     """K4: the node's live report of one Jaah session's model calls, each metered and debited at once
     (`app/token_billing/metering.py::ingest` decides). 404 for a session that is not this node's, 410 for one
@@ -593,7 +824,7 @@ def post_jaah_session_usage(
         )
     except metering.NotTaken as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from None
-    return JaahUsageOut(accepted=result.accepted, duplicates=result.duplicates, unpriced=result.unpriced)
+    return from_row(JaahUsageOut, result)
 
 
 # ── Task-scoped credential access: the console's OWN credential rows ──────────
@@ -668,7 +899,7 @@ def runner_path(row: Any, principal_user_id: UUID, project_names: Mapping[int, s
     """The scope-relative path a runner addresses a granted credential by (`Credential`'s NAMING) — the ONE
     place it is computed: `me/<name>` for the launcher's own row, `projects/<lowercased project name>/<name>`
     for a row homed in a project, else `org/<name>`. `row` is a `Credential` or a row of its `name`,
-    `owner_id` and `home_project_id` columns; `project_names` maps home project ids to names (`_project_names`).
+    `owner_id` and `home_project_id` columns; `project_names` maps home project ids to names (`entity_shape.names_of`).
     A personal row on a task's roster is always the launcher's (`usable_credential_clause`). The project
     segment is percent-escaped (`%` as `%25`, then `/` as `%2f`), so it stays ONE segment and project `a/b`'s
     `x` can never share a path with project `a`'s `b/x`."""
@@ -679,14 +910,6 @@ def runner_path(row: Any, principal_user_id: UUID, project_names: Mapping[int, s
         segment = project.lower().replace("%", "%25").replace("/", "%2f")
         return f"projects/{segment}/{row.name}"
     return f"org/{row.name}"
-
-
-def _project_names(session: Session, rows: Sequence[Any]) -> dict[int, str]:
-    """The home project names `runner_path` needs for `rows`, in one query."""
-    ids = {row.home_project_id for row in rows if row.home_project_id is not None}
-    if not ids:
-        return {}
-    return dict(session.execute(select(Project.id, Project.name).where(Project.id.in_(ids))).tuples().all())
 
 
 def _granted_credentials(
@@ -703,9 +926,19 @@ def _granted_credentials(
     principal = _task_grant_principal(session, task)
     if principal is None:
         return []
+    return granted_to(session, principal, task.project_id, path)
+
+
+def granted_to(
+    session: Session, principal: Principal, project_id: Optional[int], path: str | None = None
+) -> list[tuple[str, Credential]]:
+    """`_granted_credentials` for a task on `project_id` that `principal` would launch: the broker's one rule,
+    also what a pipeline save checks a gate's or target's credential against (`app/releases/pipeline.py`)."""
+    if principal is None:  # never `authz`'s allow-all reading of None
+        return []
     # The rule lives in `authz.task_roster_select` (also used by project-env resolution), with both
     # subtractions (no superadmin bypass; no account API key, by reference). Never copy it.
-    stmt = task_roster_select(principal, task.project_id).order_by(
+    stmt = task_roster_select(principal, project_id).order_by(
         Credential.created_at.desc(), Credential.id.desc()
     )
     if path is not None:
@@ -714,23 +947,24 @@ def _granted_credentials(
                 Credential.id, Credential.name, Credential.owner_id, Credential.home_project_id
             )
         ).all()
-        names = _project_names(session, heads)
+        names = names_of(session, Project, (h.home_project_id for h in heads))
         wanted = path.lower()
         ids = [h.id for h in heads if runner_path(h, principal.user_id, names).lower() == wanted]
         if not ids:
             return []
         stmt = stmt.where(Credential.id.in_(ids))
     rows = list(session.scalars(stmt))
-    names = _project_names(session, rows)
+    names = names_of(session, Project, (r.home_project_id for r in rows))
     return [(runner_path(row, principal.user_id, names), row) for row in rows]
 
 
 @router.get("/tasks/{task_id}/credentials", response_model=TaskCredentialListOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def list_task_credentials(
+    session: Session,
     task_id: int,
     caller: node_credentials.AgentCaller = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> TaskCredentialListOut:
     """The credentials this task may reach — path (as `name`, `runner_path`), type and description only,
     never a secret.
@@ -783,13 +1017,14 @@ def _enrol_on_nodevault_miss(
 
 @router.get("/tasks/{task_id}/credential", response_model=TaskCredentialOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_thread
 def get_task_credential(
+    session: Session,
     task_id: int,
     name: str = Query(
         ..., min_length=1, description="the credential's scope-relative path, as the roster reports it"
     ),
     caller: node_credentials.AgentCaller = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> TaskCredentialOut:
     """Hand back one granted credential's configuration, secrets included.
 
@@ -798,6 +1033,8 @@ def get_task_credential(
     the per-home rule, `app/models/credentials.py::Credential`) resolves to nothing rather than serving an
     arbitrary row.
     """
+    # Interleaves DB work with blocking I/O (an OAuth2 refresh, a KMS unwrap, a NodeVault grant workflow): a
+    # worker thread on its own session (`on_thread`).
     _refuse_a_carried_over_caller(caller)
     task = auth._task_or_404_for_node(session, caller, task_id)
 
@@ -819,6 +1056,33 @@ def get_task_credential(
         )
 
     path, row = matches[0]
+    if row.needs_reconnect_at is not None:
+        # 410, not a stale token: the grant is dead (a refused refresh or a revocation the vendor reported) and only
+        # a person pressing Connect revives it; 409 already means an ambiguous path. AC1.4: never a silent failure.
+        log.warning("task credential: refused path=%s for task=%s (needs reconnect)", path, task_id)
+        raise HTTPException(
+            status_code=410,
+            detail=f"credential {path!r} needs reconnect - {row.needs_reconnect_reason or 'its grant was revoked.'}"
+            " Ask its owner to press Connect on it.",
+        )
+    # A Connect-minted forge grant (GitHub App user token, GitLab, Bitbucket) carries `token`/`token_expires_at`,
+    # which `oauth2_tokens` does not read: renew it the way a git use would, before the config is opened, so the
+    # runner never gets a token the control plane would have renewed.
+    try:
+        git_access.renew_if_expiring(session, row)
+    except git_access.GitAccessNeedsReconnect as exc:
+        log.warning("task credential: refused path=%s for task=%s (forge grant dead)", path, task_id)
+        raise HTTPException(status_code=410, detail=str(exc)) from exc
+    except git_access.GitAccessError as exc:
+        # Retryable (`token_for`): a 503, never the expired token it could not renew. The message names the credential
+        # and the forge's bounded text, never a token.
+        log.warning("task credential: renewal failed path=%s task=%s reason=%s", path, task_id, exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 — an unreachable durable engine is retryable too, never a 500
+        log.warning("task credential: renewal failed path=%s task=%s", path, task_id, exc_info=True)
+        raise HTTPException(
+            status_code=503, detail=f"could not renew credential {path!r} right now; try again shortly"
+        ) from exc
     # Minted before the config is opened: a refresh commits the new token on its own session and expires
     # `config` here, so opening first would serve a stale `access_token` beside the fresh one. None for
     # non-OAuth2 and unmintable rows (`TaskCredentialOut.access_token`).
@@ -834,6 +1098,18 @@ def get_task_credential(
         session, row, consumer="task", task_id=task_id, node_id=caller.node_id, keep_nodevault=True
     )
     config, nodevault = credential_crypto.nodevault_wire(row, config)
+    provider = connect_for_type(row.type)
+    if provider is not None and (oauth_providers.uses_platform_client(provider, config) or provider.discovery):
+        # The deployment's app renews this grant, and a runner needs only the access token beside it: a refresh
+        # token leaked from a runner would otherwise stay renewable by anyone holding the app's client. A
+        # discovery provider's (an MCP server's) renews on the control plane too; its bridge reads the access token.
+        config.pop("refresh_token", None)
+        if provider.discovery:
+            config.pop("client_secret", None)
+    if git_access.is_connect_grant(row):
+        # Renewed on the control plane above; a forge's refresh token is single-use, so one a runner spent would
+        # kill the grant for everyone.
+        config.pop("refresh_token", None)
     # Read before the commit: a failed enrolment's rollback expires `row`, and the answer must not need it.
     row_type, row_id = row.type, row.id
     session.commit()

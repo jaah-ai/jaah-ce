@@ -2,6 +2,7 @@
  * bundles the host hands it. Every field below `deepLinkedId` is OPTIONAL: an ABSENT field is the permission
  * gate (no handler, no affordance).
  */
+import type { ReleaseParts } from '../../../lib/pipelineBoard'
 import type { PipelineTask, TaskTree, TaskTreeCounts } from '../../../types'
 import type { ExpandedEntry } from '../shared'
 import type { InlineTaskCreateInput } from '../useInlineTaskCreate'
@@ -10,13 +11,11 @@ import type { TaskRowActionHandlers } from '../rowActions'
 import type { PickStore } from '../../../lib/pickStore'
 
 /** The board's pick for its bulk verbs (`pages/Tasks.tsx`): which top-level rows may be picked, which are (`store`,
- *  which each tick reads for its own row — `lib/pickStore.ts` says why), whether any is (`picking`), and
- *  `onToggle` to change one. `onDrawn` hands the
+ *  which each tick reads for its own row — `lib/pickStore.ts` says why), and `onToggle` to change one. `onDrawn` hands the
  *  host every pickable row the feed draws NOW, so a pick that left the board (deleted, started, collapsed away)
  *  is dropped and the rest act on fresh rows. */
 export type PaneSelection = {
   store: PickStore<PipelineTask>
-  picking: boolean
   isSelectable: (task: PipelineTask) => boolean
   onToggle: (task: PipelineTask) => void
   onDrawn: (tasks: readonly PipelineTask[]) => void
@@ -84,4 +83,23 @@ export type TaskListViewProps = {
    *  it draws for which `isSelectable` answers, and reports them through `onDrawn` so a pick folded or scrolled
    *  out of sight is dropped. */
   selection?: PaneSelection
+  /** The columns this viewer hid (Filter & view > Columns, `lib/taskColumns.ts`). Absent = every column. */
+  hiddenColumns?: ReadonlySet<string>
+  /** Every row in ONE labelled section that folds (a stage's Automatic work): `groupBy` is then not read. Force-opened
+   *  while it holds the deep-linked row. Absent = the sections `groupBy` names. */
+  fold?: TaskListFold
+  /** A release's list (`releaseParts`): each epic listed for its children's merges, with the children it ships. An
+   *  open epic named here shows those children alone (Focus aside), and an unfinished one reads "Part" for "Epic". */
+  parts?: ReleaseParts
+}
+
+/** One labelled, folding section holding the whole feed (`TaskListViewProps.fold`). */
+export type TaskListFold = {
+  label: string
+  open: boolean
+  onToggle: () => void
+  /** The header's number when the fold holds more than its rows (lines its host draws under it). */
+  count?: number
+  /** The row's mark: ⚙ (automatic work) when absent. */
+  glyph?: string
 }

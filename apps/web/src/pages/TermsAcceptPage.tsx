@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useState } from 'react'
+import { Navigate } from 'react-router-dom'
 import Button from '@mui/material/Button'
 import Typography from '@mui/material/Typography'
 import { ApiError, get, post } from '../api'
 import { useAuth } from '../auth'
+import { useApiRead } from '../hooks/useApiRead'
 import { useSubmit } from '../hooks/useSubmit'
 import Banner from '../ui/Banner'
 import { EntryCard, EntryFooter, EntryHeading, EntryLoading, EntrySubmit, footerActionSx } from './authEntry'
@@ -12,7 +14,8 @@ import { refusalCode } from '../lib/refusalCode'
 /* `/terms/accept` — the Terms gate (the API's legal-acceptance route): an owner whose org an operator
  * submitted for them accepts the Terms of Service and the Privacy Policy before any console page, as the second
  * factor's enrolment gates a first sign-in. Outside the shell. Declining is signing out: the session stays gated.
- * Accepting reloads the console, which opens where the visitor was headed (`lib/loginReturn.ts`). */
+ * Accepting reloads the console, which opens where the visitor was headed (`lib/loginReturn.ts`). A member with
+ * nothing pending (`terms_pending` false on `/api/auth/me`) is sent home: there is nothing here to accept. */
 
 interface Terms {
   legal_version: string
@@ -26,22 +29,19 @@ export const TERMS_CHANGED_COPY = 'The terms just changed. Review them, then acc
 const isUnauthorized = (err: unknown) => err instanceof ApiError && err.status === 401
 
 export default function TermsAcceptPage() {
-  const { logout } = useAuth()
-  const [terms, setTerms] = useState<Terms | null>(null)
-  const [loadError, setLoadError] = useState<string>()
+  const { admin, loading, logout } = useAuth()
   const [changed, setChanged] = useState(false)
   const { busy, formError, run } = useSubmit()
-
-  const load = useCallback(async () => {
-    try {
-      setTerms(await get<Terms>('/api/auth/terms'))
-    } catch (err) {
-      if (isUnauthorized(err)) window.location.replace('/login')
-      else setLoadError('Could not load the terms. Reload the page.')
-    }
-  }, [])
-
-  useEffect(() => { void load() }, [load])
+  const { data: terms, error: loadError, refresh } = useApiRead(
+    ['auth-terms'],
+    () => get<Terms>('/api/auth/terms').catch((err: unknown) => {
+      if (!isUnauthorized(err)) throw err
+      window.location.replace('/login')
+      // Never settles: the spinner holds until the sign-in page loads, with no error flashed first.
+      return new Promise<Terms>(() => {})
+    }),
+    'Could not load the terms. Reload the page.',
+  )
 
   async function accept() {
     if (!terms) return
@@ -51,7 +51,7 @@ export default function TermsAcceptPage() {
       } catch (err) {
         if (refusalCode(err) !== 'legal_version_changed') throw err
         setChanged(true)
-        await load()
+        await refresh()
         return
       }
       // A full load: the console reads its identity afresh, now without the gate.
@@ -64,7 +64,10 @@ export default function TermsAcceptPage() {
     window.location.replace('/login')
   }
 
-  if (!terms) return <EntryLoading label="Loading the terms" error={loadError} />
+  if (!loading && admin && !admin.terms_pending) return <Navigate to="/" replace />
+
+  // One fixed sentence, never the server's detail: nothing a signed-in person can act on lives in it.
+  if (!terms) return <EntryLoading label="Loading the terms" error={loadError ? 'Could not load the terms. Reload the page.' : undefined} />
 
   return (
     <EntryCard>

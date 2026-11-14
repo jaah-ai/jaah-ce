@@ -5,8 +5,8 @@ token is served, and when Git Access is listed, the forge's own connection teste
 the one forge read the control plane allows itself, since no control-plane decision rests on Git content)
 is run against it — at most once per credential per `CHECK_INTERVAL`, bounded at `CHECK_BUDGET_SECONDS`. Only
 `forges.revoked` decides that an answer is a revocation; anything else (a 403, a 429, a timeout, an unreachable
-host) is `UNKNOWN`, and the token is served as before. A revocation is recorded as `config.grant_dead_at`,
-which `git_access` refuses on.
+host) is `UNKNOWN`, and the token is served as before. A revocation is recorded as the credential's
+`needs_reconnect_at`, which `git_access.grant_dead` refuses on.
 
 The last-check clock is per process: a restart or a second worker re-checks early, which costs one extra
 tester call and nothing else. Nothing here logs a token.
@@ -15,13 +15,13 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 from time import monotonic
 from typing import Any, Literal, Optional
 from uuid import UUID
 
 from app import forges, http_bounded
-from app.clock import now_iso
+from app.clock import utcnow
 from app.credential_crypto import SealedSecret
 from app.credentials.testers import TESTERS, TestResult, unsupported_result
 
@@ -68,7 +68,7 @@ def just_stored(updated_at: Optional[datetime]) -> bool:
     to be recorded (`FRESH_GRANT_SECONDS`). A connect or a renewal is a write, so it restarts the window."""
     if updated_at is None:
         return False
-    return (datetime.now(timezone.utc) - updated_at).total_seconds() < FRESH_GRANT_SECONDS
+    return (utcnow() - updated_at).total_seconds() < FRESH_GRANT_SECONDS
 
 
 def forget(credential_id: UUID) -> None:
@@ -140,7 +140,7 @@ REASON_FORGE = "was reported revoked by its forge"
 
 
 def mark_revoked(credential_id: UUID, *, reason: str = REASON_FORGE) -> None:
-    """Record `grant_dead_at` on the credential, on its own session bound from the row (the caller's
+    """Mark the credential Needs reconnect (`needs_reconnect_at`), on its own session bound from the row (the caller's
     session may be scoped to a node, not the credential's org). A row already marked keeps its time.
     `reason` completes the log line ("credential id=... <reason>"); a fixed phrase, never forge text.
 
@@ -148,21 +148,24 @@ def mark_revoked(credential_id: UUID, *, reason: str = REASON_FORGE) -> None:
     ever a row the caller itself resolved through a scoped read — `git_access.resolve_*` for the token it
     is about to serve, or the person's own Git Access listing — and the one write is a timestamp that
     stops that token being served; nothing is read out."""
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.models.credentials import Credential
     from app.tenancy import exclusion_log, seam
 
     with exclusion_log.caller("git_probe.mark_revoked"):
         try:
-            with seam.detached(), SessionLocal() as session, seam.bind_from(session, Credential, credential_id):
+            with seam.detached(), BridgedSession() as session, seam.bind_from(session, Credential, credential_id):
                 row = session.get(Credential, credential_id, with_for_update=True)
                 if row is None:
                     return
-                config = dict(row.config or {})
-                if not config.get("grant_dead_at"):
-                    config["grant_dead_at"] = now_iso()
-                    row.config = config
-                    session.commit()
+                if row.needs_reconnect_at is None:
+                    # The column every reader shares (a runner fetch answers 410 on it); the grant is dead from now,
+                    # so it files under Expired too (a new token's config write derives `expires_at` afresh).
+                    now = utcnow()
+                    row.needs_reconnect_at = now
+                    row.needs_reconnect_reason = "The forge reported this token revoked."
+                    row.expires_at = now
+                session.commit()
         except seam.TenancyRowMissing:
             return
     log.warning("git-probe: credential id=%s %s", credential_id, reason)

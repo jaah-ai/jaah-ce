@@ -8,15 +8,16 @@ step of `app/durable/task_done.py`, and `tasks.auto_retagged_at IS NULL` makes a
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
+from app.clock import utcnow
 from app.operator_settings import reads as settings_reads
-from app.db import SessionLocal
+from app.db import BridgedSession
 from app.events import emit_console_event
 from app.models.tasks import Task
 from app.entity_shape import get_or_404
@@ -63,12 +64,26 @@ def retag_task(session: Session, task: Task, *, actor: str, attempt: int = 1) ->
     pending work on `session`, hence the `TaskDocument` snapshot and id read beforehand.
 
     The row lock is still mandatory for the write: two concurrent replaces would otherwise commit the
-    union of their selections under READ COMMITTED. Every failure raises before the write."""
+    union of their selections under READ COMMITTED. Every failure raises before the write. A caller on the
+    event loop runs the three steps itself, the LLM call on a thread: `prepare_retag`, `classify_task_tags`,
+    `apply_retag`."""
+    task_id, groups, document = prepare_retag(session, task)
+    tag_ids = classify_task_tags(document, groups, max_tokens=budget_for_attempt(attempt))
+    return apply_retag(session, task_id, groups, tag_ids, actor=actor)
+
+
+def prepare_retag(session: Session, task: Task) -> tuple[int, Any, TaskDocument]:
+    """`retag_task`'s first step: what the classifier reads — `(task id, active groups, task snapshot)` — and the
+    rollback that releases the connection before the LLM call."""
     task_id = task.id
     groups = active_groups(session)
     document = TaskDocument.from_task(task)
     session.rollback()
-    tag_ids = classify_task_tags(document, groups, max_tokens=budget_for_attempt(attempt))
+    return task_id, groups, document
+
+
+def apply_retag(session: Session, task_id: int, groups: Any, tag_ids: Any, *, actor: str) -> list[TagRefOut]:
+    """`retag_task`'s last step: lock the row, refuse a catalogue that moved during the call, write the tags."""
     locked = get_or_404(session, Task, task_id, detail=f"task {task_id} not found", lock=True)
     # Narrowed, not closed: a group published between this read and the delete in `replace_task_tags`
     # still loses its rows (the lock is on `tasks`, not `tag_groups`). Closing it needs `FOR SHARE` or
@@ -123,7 +138,7 @@ def retag_done_task(task_id: int, *, org: UUID) -> str:
     # First, before a session is opened: an off knob must cost this row nothing.
     if not settings_reads.get_bool(SETTING_KEY, org=org):
         return "disabled"
-    with SessionLocal() as session:
+    with BridgedSession() as session:
         task = session.get(Task, task_id)
         if task is None or task.state != DONE:
             # Vanished, or moved on since admission.
@@ -172,6 +187,6 @@ def retag_done_task(task_id: int, *, org: UUID) -> str:
                 task_id, reason, attempt, ceiling,
             )
             raise
-        mark_task_columns(session, task_id, auto_retagged_at=datetime.now(timezone.utc))
+        mark_task_columns(session, task_id, auto_retagged_at=utcnow())
         session.commit()
         return "done"

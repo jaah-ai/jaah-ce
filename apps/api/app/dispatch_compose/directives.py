@@ -18,8 +18,9 @@ def _interview_unavailable_directive(provider: AgentProvider) -> str:
         "ask nothing, and at every gate or decision point pick the recommended option and proceed.\n"
         f"{provider.label} has no question tool that reaches the operator.\n"
         "Resolve every ambiguity on the most defensible reading, record each as a documented decision "
-        "(\"Assumed X because Y; say so if wrong\"), and state in your settle summary AND your report that "
-        "THE INTERVIEW WAS SKIPPED because this provider cannot ask."
+        "(\"Assumed X because Y; say so if wrong\"), and state in your report that THE INTERVIEW WAS "
+        "SKIPPED because this provider cannot ask; your settle summary says: \"Answered my own questions; "
+        "check the assumptions in the report.\""
     )
 
 

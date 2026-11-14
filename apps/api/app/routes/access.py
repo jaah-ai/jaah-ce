@@ -20,16 +20,18 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app import access, staging_org
+from app.access_admin import BYPASS_GROUP_NAME, LEGACY_ROLE_GROUP_IDS
 from app.access_catalog import ROLES_BY_SLUG, SCOPES
-from app.auth import require_user
+from app.auth import adopt_user, require_user
 from app.authz.catalog import PERMISSION_CATALOG, Tenancy, permission_description
 from app.authz.declarations import always, feature
-from app.authz.principal import Principal, current_principal
-from app.db import get_session
-from app.access_admin import revoke_direct_grants_current_epoch, revoke_orphaned_project_roles
+from app.authz.principal import AsyncCaller, Principal, current_caller, current_principal
+from app.db_async import DbDep, on_session
 from app.entity_shape import StrictModel, from_row, get_or_404
+from app.routes.groups import after_narrowing
 from app.identities import label_expr
 from app.list_page import like_pattern
 from app.models.access import Group, Permission, Role, RoleBinding, RolePermission, UserGroupMembership
@@ -56,11 +58,8 @@ class RoleOut(BaseModel):
     capabilities: list[str]
 
 
-def _roles(session: Session, role_id: UUID | None = None) -> list[RoleOut]:
-    query = select(Role).order_by(Role.rank.desc())
-    if role_id is not None:
-        query = query.where(Role.id == role_id)
-    roles = session.scalars(query).all()
+def _roles(session: Session) -> list[RoleOut]:
+    roles = session.scalars(select(Role).order_by(Role.rank.desc())).all()
     keys: dict[UUID, list[str]] = defaultdict(list)
     for rid, key in session.execute(
         select(RolePermission.role_id, Permission.key)
@@ -84,22 +83,11 @@ def _roles(session: Session, role_id: UUID | None = None) -> list[RoleOut]:
 
 @router.get("/roles", response_model=list[RoleOut])
 @always(Tenancy.BOOTSTRAP)
-def list_roles(
-    _user: AdminUser = Depends(require_user), session: Session = Depends(get_session)
-) -> list[RoleOut]:
+@on_session
+def list_roles(session: Session, _user: AdminUser = Depends(require_user)) -> list[RoleOut]:
     """Every built-in role, highest rank first."""
+    _user = adopt_user(session, _user)
     return _roles(session)
-
-
-@router.get("/roles/{role_id}", response_model=RoleOut)
-@always(Tenancy.BOOTSTRAP)
-def get_role(
-    role_id: UUID, _user: AdminUser = Depends(require_user), session: Session = Depends(get_session)
-) -> RoleOut:
-    found = _roles(session, role_id)
-    if not found:
-        raise HTTPException(status_code=404, detail="role not found")
-    return found[0]
 
 
 # ── Role bindings: members, per-binding writes, the picker, reach and the explainer (C4) ──────────
@@ -113,7 +101,7 @@ def get_role(
 
 
 class ScopeIn(BaseModel):
-    """A binding or access-request scope. Its `type` is one of `access_catalog.SCOPES`, else a 422."""
+    """A binding's scope. Its `type` is one of `access_catalog.SCOPES`, else a 422."""
 
     type: str
     id: str
@@ -218,11 +206,8 @@ def _target_user(session: Session, user_id: UUID) -> AdminUser:
 
 @router.get("/members", response_model=list[MemberOut])
 @feature("projects", "view", tenancy=Tenancy.CALLER_PLANE)
-def list_members(
-    scope: str,
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
-) -> list[dict]:
+@on_session
+def list_members(session: Session, scope: str, principal: Principal = Depends(current_principal)) -> list[dict]:
     """Who holds a role at `scope` (`<type>:<id>`), inheritance and groups expanded, each row labelled
     with its source. Readable by anyone who sees the scope, or may manage it."""
     resolved = _scope(session, scope)
@@ -234,14 +219,29 @@ def list_members(
 
 @router.post("/bindings", response_model=list[BindingOut], status_code=201)
 @feature("projects", "edit", tenancy=Tenancy.CALLER_PLANE)
-def add_bindings(
+async def add_bindings(
+    db: DbDep,
     body: BindingsIn,
-    actor: AdminUser = Depends(require_user),
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> list[BindingOut]:
     """Bind each of `principals` to `role` at `scope` — one row each, idempotent (a binding that already
     exists is returned with `created: false`). All or nothing: any refusal writes no row."""
+    out, staging_parent = await db.run_sync(_add_bindings, body, caller.actor, caller.principal)
+    if staging_parent is not None:
+        # Opens its own sessions and pushes on the node bus: a worker thread, after the commit.
+        await run_in_threadpool(staging_org.after_parent_change, staging_parent)
+    return out
+
+
+def _add_bindings(
+    session: Session,
+    body: BindingsIn,
+    actor: AdminUser,
+    principal: Principal,
+) -> tuple[list[BindingOut], UUID | None]:
+    """`add_bindings`'s body, over the route's async session (`run_sync`): the rows, and the org whose staging
+    admins the commit may change (an org-scope binding), else None."""
+    actor = adopt_user(session, actor)
     scope = access.resolve_scope(session, body.scope.type, body.scope.id)
     out: list[BindingOut] = []
     for entry in body.principals:
@@ -256,46 +256,57 @@ def add_bindings(
             scope=scope.wire,
         ))
     session.commit()
-    if scope.type == access.SCOPE_ORG:
-        staging_org.after_parent_change(scope.org_id)
-    return out
+    return out, scope.org_id if scope.type == access.SCOPE_ORG else None
 
 
 @router.delete("/bindings/{binding_id}", status_code=204)
 @feature("projects", "edit", tenancy=Tenancy.CALLER_PLANE)
-def delete_binding(
+async def delete_binding(
+    db: DbDep,
     binding_id: UUID,
-    actor: AdminUser = Depends(require_user),
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> Response:
     """Remove one binding. 409 when it is the org's last direct Org Owner."""
+    org_id, affected, actor_id = await db.run_sync(_delete_binding, binding_id, caller.actor, caller.principal)
+    if org_id is not None:
+        # Opens its own sessions and pushes on the node bus: a worker thread, after the commit.
+        await run_in_threadpool(staging_org.after_parent_change, org_id)
+    # A removal narrows: the same post-commit revokes a membership removal owes (`routes/users.py`).
+    await after_narrowing(db, affected, actor_id)
+    return Response(status_code=204)
+
+
+def _delete_binding(
+    session: Session,
+    binding_id: UUID,
+    actor: AdminUser,
+    principal: Principal,
+) -> tuple[UUID | None, list[UUID], UUID]:
+    """`delete_binding`'s body up to its commit, over the route's async session (`run_sync`): the binding's org
+    (a direct org-scope one), the users it narrowed, and the actor's id — for the owed post-commit work."""
+    actor = adopt_user(session, actor)
     # A direct org-scope binding is what a staging org copies (`app/staging_org.py`); read before it goes.
     org_id = session.scalar(select(RoleBinding.scope_org_id).where(
         RoleBinding.id == binding_id, RoleBinding.user_id.is_not(None),
     ))
     affected = access.remove_binding(session, actor, principal, binding_id)
     session.commit()
-    if org_id is not None:
-        staging_org.after_parent_change(org_id)
-    # A removal narrows: the same post-commit revokes a membership removal owes (`routes/users.py`).
-    revoke_direct_grants_current_epoch(session, affected)
-    if revoke_orphaned_project_roles(session, affected, actor_id=actor.id):
-        session.commit()
-    return Response(status_code=204)
+    return org_id, list(affected), actor.id
 
 
 @router.get("/principals", response_model=list[PickerEntry])
 @feature("projects", "edit", tenancy=Tenancy.CALLER_PLANE)
+@on_session
 def list_principals(
+    session: Session,
     scope: str,
     q: str = "",
     principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
 ) -> list[PickerEntry]:
     """The Add dialog's picker: the users and groups of the scope's org a caller who may manage it can
     bind — id and name only (+ email, member count), never the `users:view` directory. Everyone is
-    offered to an Org Owner/Admin only."""
+    offered to an Org Owner/Admin only; the bypass group never is, nor a legacy role-named seed
+    while it is empty (`access_admin.BYPASS_GROUP_NAME`, `access_admin.LEGACY_ROLE_GROUP_IDS`)."""
     resolved = _scope(session, scope)
     if not access.may_manage_any(principal, resolved):
         raise HTTPException(status_code=403, detail="forbidden")
@@ -318,7 +329,12 @@ def list_principals(
     group_query = (
         select(Group.id, Group.name, counts.c.n)
         .outerjoin(counts, counts.c.group_id == Group.id)
-        .where(Group.org_id == resolved.org_id, Group.name.ilike(needle, escape="\\"))
+        .where(
+            Group.org_id == resolved.org_id, Group.name.ilike(needle, escape="\\"),
+            # Never offered: the reserved bypass group, nor a legacy role-named seed while it is empty.
+            func.lower(Group.name) != BYPASS_GROUP_NAME.lower(),
+            or_(Group.id.not_in(LEGACY_ROLE_GROUP_IDS), counts.c.n > 0),
+        )
         .order_by(Group.name).limit(_PICKER_LIMIT)
     )
     if not principal.is_org_admin:
@@ -332,11 +348,8 @@ def list_principals(
 
 @router.get("/reaches/{user_id}")
 @feature("projects", "view", tenancy=Tenancy.CALLER_PLANE)
-def get_reaches(
-    user_id: UUID,
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
-) -> dict:
+@on_session
+def get_reaches(session: Session, user_id: UUID, principal: Principal = Depends(current_principal)) -> dict:
     """What `user_id` reaches, grouped org → project, plus accounts. Self, or an Org Admin."""
     _self_or_org_admin(principal, user_id)
     return access.reaches(session, _target_user(session, user_id).id)
@@ -344,11 +357,8 @@ def get_reaches(
 
 @router.post("/check")
 @feature("projects", "view", tenancy=Tenancy.CALLER_PLANE)
-def check_access(
-    body: CheckIn,
-    principal: Principal = Depends(current_principal),
-    session: Session = Depends(get_session),
-) -> dict:
+@on_session
+def check_access(session: Session, body: CheckIn, principal: Principal = Depends(current_principal)) -> dict:
     """Check access: may `user_id` do `action` to `resource` — the chain that allows it, or the nearest
     missing link. Self, or an Org Admin. `access.explain` is the one home."""
     _self_or_org_admin(principal, body.user_id)

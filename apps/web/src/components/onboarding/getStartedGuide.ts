@@ -15,14 +15,14 @@ import {
 } from '../../lib/onboarding'
 import type { GuideAnswer } from './guide'
 
-/* THE NEW-USER GUIDE. A new user cannot tell which page is MANDATORY: without a connected GitHub credential
- * their runners cannot push. Minimum words: a segmented meter plus rows of a glyph and a 2–4 word label that
+/* THE NEW-USER GUIDE. A new user cannot tell which page is MANDATORY: without an AI account no task runs.
+ * Minimum words: a segmented meter plus rows of a glyph and a 2–4 word label that
  * is itself the link to the step's page (drawn by `setupChecklist/SetupChecklist.tsx` inside `OnboardingWidget.tsx`).
- * IT LINKS, IT DOES NOT DO — each step's work has one home (`/profile` Git and Settings tabs, the
- * new-task form); re-hosting any would drift. A MAP, never a workshop.
+ * IT LINKS, IT DOES NOT DO — each step's work has one home (the Accounts page, `/profile`'s Settings tab,
+ * the new-task form); re-hosting any would drift. A MAP, never a workshop.
  * The ✕ HIDES it, stored in `admin.preferences` (cross-device — see `lib/onboarding.ts`), and the sidebar's
  * Setup button shows it again; it ends for good on completion — after a done state (and the celebration) for
- * the rest of the load when this mount watched it finish. It never lies about progress: GitHub reads `git_credential_id`, first-task asks
+ * the rest of the load when this mount watched it finish. It never lies about progress: an AI account reads the roster, first-task asks
  * the server — and once the server has said yes, that answer is recorded and the probe ends.
  * Per-step reasoning: `lib/onboarding.ts`.
  * `enabled` is the widget's: false for a viewer the company guide is for (who never gets this one), and
@@ -123,8 +123,6 @@ export function useGetStartedGuide(enabled: boolean): GuideAnswer {
     switch (step.id) {
       case 'connect_account':
         return (accountsQuery.data?.length ?? 0) > 0
-      case 'connect_github':
-        return Boolean(admin.git_credential_id)
       case 'create_first_task':
         return hasOwnTask
       case 'choose_theme':
@@ -132,8 +130,8 @@ export function useGetStartedGuide(enabled: boolean): GuideAnswer {
     }
   }
 
-  /* Arrived finished: nothing. Finished while watched: the done state. `steps` is never empty (Git and theme
-     rows are ungated). */
+  /* Arrived finished: nothing. Finished while watched: the done state. `steps` is never empty (the theme row is
+     ungated). */
   if (steps.every(isDone)) {
     if (!sawUnfinished.current) return { pending: false, guide: null }
   } else if ((!wantsOwnTaskProbe || ownTaskQuery.isSuccess) && (!wantsAccounts || accountsQuery.isSuccess)) {

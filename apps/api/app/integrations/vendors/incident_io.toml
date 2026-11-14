@@ -1,0 +1,46 @@
+# incident.io. Facts confirmed at the vendor's own docs: API keys (Settings > API keys, Bearer) and the identity
+# endpoint any key may call https://docs.incident.io/api-reference . Probed 2026-11-03: GET /v1/identity with a bad
+# key answers 401 authentication_error.
+slug = "incident_io"
+label = "incident.io"
+category = "dev_tools"
+vendor_docs_url = "https://docs.incident.io/api-reference"
+summary = "Read and update incidents, follow-ups and on-call schedules in incident.io."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "incident.io dashboard > Settings > API keys > Add new: name it Jaah, tick only the permissions agents need (for example View data, Create incidents, Edit incidents), select Create, then copy the key - incident.io shows it once" },
+]
+
+[test]
+method = "GET"
+path = "https://api.incident.io/v1/identity"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+identity = [["identity", "name"]]
+identity_phrase = "with key"
+
+[docs]
+agent_uses = [
+  "Read an incident's summary, timeline, severity and status to help investigate it",
+  "List follow-ups and actions from past incidents and turn them into Jaah tasks",
+  "Post an update or change an incident's status, if the key allows editing incidents",
+  "See who is on call from a schedule before paging a person",
+]
+prerequisites = [
+  "An incident.io account with the Owner or Admin role, or a role allowed to manage API keys",
+]
+limitations = [
+  "An API key acts as the organization, not as a person: updates show as made by the API key",
+  "The key can only do what the permissions ticked at creation allow; add permissions by creating a new key",
+  "incident.io rate-limits API keys (about 1,200 requests a minute)",
+]
+troubleshooting = [
+  { symptom = "Test says incident.io rejected the API key (401)", fix = "The key was deleted or mistyped. Create a new key in Settings > API keys and select Replace" },
+  { symptom = "Agents get 403 on an action", fix = "The key lacks that permission (for example Edit incidents). Create a key with it ticked and replace this one" },
+  { symptom = "Private incidents are missing", fix = "Private incidents need the key's private-incident permission. Create a key that includes it" },
+]
+faq = [
+  { q = "What does the Test show", a = "The key's own name in incident.io, from the identity endpoint, which every valid key may call" },
+  { q = "Can I use a user API key", a = "Yes, where your incident.io plan offers them: it acts with that user's own permissions" },
+]

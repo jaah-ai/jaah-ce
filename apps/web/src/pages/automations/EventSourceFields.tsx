@@ -1,6 +1,6 @@
-import { type ReactNode, useEffect, useRef, useState } from 'react'
+import { createContext, type ReactNode, useContext, useEffect, useRef, useState } from 'react'
 import { Link as RouterLink } from 'react-router-dom'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Link from '@mui/material/Link'
@@ -8,80 +8,76 @@ import Stack from '@mui/material/Stack'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import { apiDetail, ApiError } from '../../api'
-import type { useConfirm } from '../../components/ConfirmDialog'
+import { danger, type useConfirm } from '../../components/ConfirmDialog'
 import { useSubmit } from '../../hooks/useSubmit'
 import Banner from '../../ui/Banner'
+import FormBox from '../../ui/FormBox'
+import { CopyButton } from '../../ui/CopyButton'
 import { CopyableValue } from '../../ui/CopyableValue'
 import CredentialSelect from '../../ui/CredentialSelect'
 import { credentialMark } from '../../ui/credentialMarks'
 import { DetailSection } from '../../ui/detail/DetailPage'
 import { Mono } from '../../ui/DetailFields'
-import FormTextField from '../../ui/FormTextField'
+import FormField from '../../ui/FormField'
+import FormTextField, { type FormOption } from '../../ui/FormTextField'
+import type { Explain, HelpProp } from '../../ui/explain'
+import { HelpLabel } from '../../ui/HelpLabel'
+import { KeyValue, KeyValueList } from '../../ui/KeyValueList'
 import { fieldTapTargetSx, monoSx, tapTargetSx } from '../../ui/listStyles'
+import SavedNote from '../../ui/SavedNote'
 import SettingCheckbox from '../../ui/SettingCheckbox'
 import { loadCredentialOptions } from '../credentials/api'
 import { API_KEYS_URL } from '../settings/apiKeys/api'
 import { EMAIL_ADDRESSES_URL, getOrgEmail, ORG_EMAIL_KEY, type OrgEmail } from '../settings/email/api'
-import NewAddressDialog from '../settings/email/NewAddressDialog'
-import { githubEventLabel, HTTP_SOURCE_KINDS } from '../triggers/vocabulary'
+import { capitalize } from '../../lib/humanize'
+import { SEVERITIES } from '../../lib/productionQa'
+import { isRecord } from '../../lib/records'
+import { SIGNUP_ACCOUNT_TYPE_LABELS, SIGNUP_PROVIDER_LABELS } from '../../lib/signupLabels'
+import { splitList, strOrNull } from '../../lib/strings'
+import { wholeNumber } from '../../lib/wholeNumber'
+import type { Forge } from '../../types'
+import { githubEventLabel, gitlabEventLabel, HTTP_SOURCE_KINDS } from '../triggers/vocabulary'
+import { str } from './vocabulary'
 import SignatureCheckDialog from './SignatureCheck'
 import {
   connectedGithubRepos,
   revealAutomationSecret,
   rotateAutomationSecret,
   runAutomation,
+  setAutomationSecret,
   testRenderAutomation,
   type Automation,
   type EventWhen,
 } from './api'
 import { CodeBlock } from '../../ui/CodeBlock'
 import RichTextRenderer from '../../components/richtext/RichTextRenderer'
+import { FONT_WEIGHT, RADIUS, SIZE, grid } from '../../theme'
 
 /* An event Automation's When — the source's settings, its preflight, limits and auto-pause (lifted from the
  * retired trigger editor), plus the Setup (where a sender posts, the one-time secret) and Test panels.
  *
  * THE DRAFT IS STRINGS: every number field holds what was typed, and `eventWhenOf` turns the draft into the wire
  * `when` or refuses with a sentence — a cleared number never reaches the server as `NaN`/`null` by accident.
- * The source kind is picked by the editor's When control; this form only draws that kind's fields. */
-
-/** Each kind's template namespaces (`app/trigger_template.py`): a pasted sample whose top-level keys all
- *  sit inside these is sent as-is; anything else is wrapped in the kind's own namespace. */
-const SAMPLE_NAMESPACES: Record<string, { wrap: string; keys: readonly string[] }> = {
-  webhook: { wrap: 'body', keys: ['body', 'headers', 'query', 'item'] },
-  github: { wrap: 'body', keys: ['body', 'headers', 'query', 'item'] },
-  gmail: { wrap: 'email', keys: ['email', 'item'] },
-  slack: { wrap: 'slack', keys: ['slack', 'item'] },
-  user_registered: { wrap: 'user', keys: ['user', 'item'] },
-}
-
-const SAMPLE_PLACEHOLDER: Record<string, string> = {
-  webhook: '{"issue": {"title": "Login broken"}}',
-  github: '{"action": "opened", "issue": {"title": "Login broken"}}',
-  gmail: 'Paste {"from": "…", "subject": "…", "body": "…"}',
-  slack: 'Paste {"text": "…", "user": "…", "channel": "…", "permalink": "…"}',
-  user_registered: 'Paste {"email": "…", "name": "…", "org_name": "…", "provider": "…"}',
-}
-
-const PLACEHOLDERS: Record<string, string> = {
-  webhook: '{{body.…}}, {{headers.…}}, {{query.…}}',
-  github: '{{body.…}}, {{headers.…}}, {{query.…}}',
-  gmail: '{{email.from}}, {{email.subject}}, {{email.body}}',
-  slack: '{{slack.text}}, {{slack.user}}, {{slack.channel}}, {{slack.permalink}}',
-  user_registered: '{{user.email}}, {{user.name}}, {{user.org_name}}, {{user.provider}}, {{user.url}}',
-}
-
-/** The hint under a body template, per source kind. */
-export const EVENT_TEMPLATE_HINT: Record<string, string> = Object.fromEntries(
-  Object.entries(PLACEHOLDERS).map(([kind, names]) => [kind, `Placeholders: ${names}; with a preflight, {{item.id}}, {{item.…}}.`]),
-)
+ * The source kind is picked by the editor's When control; this form only draws that kind's fields. Everything one
+ * kind owns — its config read and written, its template namespaces, its fields — is its `SOURCE_KINDS` entry. */
 
 export const PREFLIGHT_LABELS: Record<string, string> = { none: 'None', script: 'Script', model: 'Model' }
 
-/** A `user_registered` source's enumerated values, in the words the form and the review show them with. */
-export const USER_PROVIDER_LABELS: Record<string, string> = { google: 'Google', github: 'GitHub', microsoft: 'Microsoft', email: 'Email' }
-export const USER_ACCOUNT_TYPE_LABELS: Record<string, string> = { individual: 'Individual', organization: 'Organization' }
+/** A `user_registered` source's remaining enumerated values (provider and account type: `lib/signupLabels`). */
 export const USER_SCOPE_LABELS: Record<string, string> = { org: 'Your members', platform: 'Sign-ups on Jaah' }
 export const USER_MOMENT_LABELS: Record<string, string> = { applied: 'Application submitted', approved: 'Organization approved' }
+
+export const SEVERITY_LABELS: Record<string, string> = {
+  debug: 'Debug', info: 'Info', warning: 'Warning', error: 'Error', critical: 'Critical',
+}
+/** An `incident` source's `types`; none ticked is every type. */
+export const INCIDENT_TYPE_LABELS: Record<string, string> = {
+  monitor: 'Monitor alert', regression: 'Regression', lane_slowdown: 'Merge-lane slowdown',
+}
+const QUIET_START = '22:00'
+const QUIET_END = '08:00'
+const HH_MM = /^([01]\d|2[0-3]):[0-5]\d$/
+const localTimeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone
 
 /** A webhook source's `auth`. Only `api_key` is offered: `hmac`/`bearer` are legacy secrets a saved source keeps until
  *  its owner switches it, and the server refuses a switch to either. */
@@ -90,6 +86,37 @@ const isLegacyWebhookAuth = (auth: string) => auth === 'hmac' || auth === 'beare
 /** A saved webhook source's `auth` (`trigger_secrets.webhook_auth`): one saved before `auth` existed is HMAC-signed.
  *  Empty for any other kind. */
 const savedWebhookAuth = (when: EventWhen) => (when.source_kind === 'webhook' ? str(when.source_config?.auth) || 'hmac' : '')
+
+/** A webhook's `shape` (`app/trigger_config.py`): `event` files a task; `incident` only records the generic incident
+ *  JSON under the target project's Incidents. */
+export const WEBHOOK_SHAPE_LABELS: Record<string, string> = { event: 'Any JSON', incident: 'Incident' }
+/** The keys an incident-shaped body carries. */
+const INCIDENT_KEYS = 'fingerprint, title, severity, environment, count, release, commit, stack_frames, action'
+
+/** The monitor sources (`app/triggers.py::MONITOR_SOURCE_KINDS`): each only records incidents. */
+export const MONITOR_SOURCE_KINDS: ReadonlySet<string> = new Set(['sentry', 'datadog', 'pagerduty', 'cloudwatch'])
+/** Monitors whose vendor mints the signing secret, pasted here (`app/triggers.py::VENDOR_SECRET_KINDS`). */
+const VENDOR_SECRET_LABELS: Record<string, string> = { sentry: 'Sentry Client Secret', pagerduty: 'PagerDuty signing secret' }
+/** The Datadog webhook payload to paste (`app/production_qa/adapters/datadog.py` reads exactly these keys). */
+export const DATADOG_PAYLOAD = `{
+  "id": "$ID",
+  "aggreg_key": "$AGGREG_KEY",
+  "transition": "$ALERT_TRANSITION",
+  "priority": "$ALERT_PRIORITY",
+  "title": "$EVENT_TITLE",
+  "date": "$DATE",
+  "link": "$LINK",
+  "tags": "$TAGS",
+  "alert_id": "$ALERT_ID",
+  "scope": "$ALERT_SCOPE",
+  "hostname": "$HOSTNAME"
+}`
+/** The PagerDuty event types the adapter reads. */
+const PAGERDUTY_EVENTS = ['incident.triggered', 'incident.resolved', 'incident.reopened']
+
+/** A source that only records incidents, filing no task: a monitor, or a webhook shaped as an incident. */
+export const recordsOnly = (draft: EventDraft) =>
+  MONITOR_SOURCE_KINDS.has(draft.sourceKind) || (draft.sourceKind === 'webhook' && draft.webhookShape === 'incident')
 
 /** A GitHub source's "Any repository", in the draft. Never a valid `owner/repo`, so it cannot collide with one; sent
  *  as `""`, which the server keeps as any. An untouched blank (`''`) is sent as null instead, which a create fills
@@ -100,48 +127,125 @@ export const ANY_REPOSITORY = '*'
 const MIN_TIMEOUT = 5
 const MAX_TIMEOUT = 165
 
-export type EventDraft = {
-  sourceKind: string
-  webhookAuth: string
-  /** The saved webhook source's `auth`; '' for a new one. A legacy value keeps the Authentication choice drawn. */
-  webhookSavedAuth: string
-  githubEvents: string
-  githubActions: string
-  githubRepository: string
-  /** Where an Email source receives (`GMAIL_SYSTEM`, `address:<id>`, `connection:<id>`); '' = not picked. */
-  gmailInbox: string
-  gmailTo: string
-  gmailFrom: string
-  gmailSubject: string
-  slackChannels: string
-  userScope: string
-  userMoment: string
-  userProviders: string
-  userAccountTypes: string
-  userDomains: string
-  preflightKind: string
-  preflightScriptPath: string
-  preflightPrompt: string
-  preflightCredentialId: string | null
-  preflightTimeout: string
-  concurrencyCap: string
-  queueDepth: string
-  rateLimit: string
-  budget: string
-  autoPauseFailuresOn: boolean
-  autoPauseFailures: string
-  autoPauseIdleOn: boolean
-  autoPauseIdleDays: string
+/* ── Every field's explanation (`ui/explain.ts`): the hover on its label, a pop-up where there is more to say. A
+ *    one-line explanation used once sits on its field. ── */
+export const DOCS_HOW = 'using-jaah/automations/how-automations-work'
+export const DOCS_REFERENCE = 'console-reference/automation/automations'
+const PREFLIGHT_HELP: Explain = {
+  tip: 'Decides whether to file, or splits one event into items.',
+  more: 'It runs before each event files and answers run or skip, or returns items, each filed as its own task. It '
+    + 'may also rewrite the State document. A failed preflight counts toward Auto-pause.',
+  docs: DOCS_REFERENCE,
 }
+const PREFLIGHT_CHOICE_HELP: Record<string, string> = {
+  none: 'Every event files as it arrives.',
+  script: 'Runs a script from the project’s repository on a node.',
+  model: 'Asks a model with your prompt and Anthropic key.',
+}
+const SCRIPT_PATH_HELP: Explain = {
+  tip: 'The repository script that judges each event.',
+  more: 'It runs on an online node the project runs on, in a throwaway clone of the integration branch made with '
+    + 'the owner’s git login. It reads the event and the state as JSON and prints its answer as JSON.',
+}
+const CONCURRENCY_HELP: Explain = {
+  tip: 'Most open tasks per target; further events wait queued.',
+  more: 'While a target already has this many open tasks from this automation, the next event waits as Queued and '
+    + 'files when one closes.',
+  docs: DOCS_HOW,
+}
+const QUEUE_DEPTH_HELP: Explain = {
+  tip: 'How many events may wait; later ones are skipped.',
+  docs: DOCS_HOW,
+}
+const BUDGET_HELP: Explain = {
+  tip: 'Cost cap per task; over it flags, never stops.',
+  more: 'A filed task that costs more marks the automation Degraded with the task named. Blank: no budget.',
+}
+const AUTO_PAUSE_FAILURES_HELP: Explain = {
+  tip: 'Stops it after this many failed runs in a row.',
+  more: 'Failed preflights, template renders and filings count, and so does a filed task that fails. It shows as '
+    + 'Failing; Owners and Admins are told, and Resume starts it again.',
+  docs: DOCS_HOW,
+}
+const WEBHOOK_SHAPE_CHOICE_HELP: Record<string, string> = {
+  event: 'Each call files a task per target.',
+  incident: 'Records an incident in the target project; files no task.',
+}
+const WEBHOOK_AUTH_CHOICE_HELP: Record<string, string> = {
+  api_key: 'Callers send an API key that may create tasks.',
+  hmac: 'Legacy: callers sign the body with the stored secret.',
+  bearer: 'Legacy: callers send the stored secret as a token.',
+}
+const SNS_TOPICS_HELP: Explain = {
+  tip: 'Only alarms from these SNS topics are recorded.',
+  more: 'Topic ARNs, comma-separated. A message from any other topic is refused.',
+}
+const GITHUB_EVENTS_HELP: Explain = {
+  tip: 'GitHub event types that run it, comma-separated.',
+  more: 'Each name is a GitHub webhook event, such as issues or pull_request. Tick the same events on the GitHub webhook.',
+  docs: DOCS_REFERENCE,
+}
+const GITHUB_REPOSITORY_HELP = 'Only deliveries from this repository run it.'
+const RECEIVES_AT_HELP: Explain = {
+  tip: 'The address or mailbox whose incoming mail runs it.',
+  more: 'One of your organization’s Jaah addresses or a service-account Gmail mailbox. The system mail domain needs a '
+    + 'To, From or Subject rule.',
+  docs: 'administration/security-and-audit/gmail',
+}
+const USER_SCOPE_CHOICE_HELP: Record<string, string> = {
+  org: 'Each new member of this organization.',
+  platform: 'Anyone signing up to Jaah; operators only.',
+}
+const USER_MOMENT_CHOICE_HELP: Record<string, string> = {
+  applied: 'Runs when someone submits a sign-up application.',
+  approved: 'Runs when their organization is approved.',
+}
+const USER_PROVIDER_HELP: Record<string, string> = {
+  google: 'Counts sign-ups through a Google account.',
+  github: 'Counts sign-ups through a GitHub account.',
+  microsoft: 'Counts sign-ups through a Microsoft account.',
+  email: 'Counts email sign-ups and members an admin creates.',
+}
+const USER_ACCOUNT_TYPE_HELP: Record<string, string> = {
+  individual: 'Counts sign-ups for a personal account.',
+  organization: 'Counts sign-ups made for an organization.',
+}
+const INCIDENT_TYPE_HELP: Record<string, string> = {
+  monitor: 'Counts alerts raised by a connected monitor.',
+  regression: 'Counts errors that rose after a release.',
+  lane_slowdown: 'Counts the merge lane running slower than usual.',
+}
+const VENDOR_SECRET_HELP = 'Checks each delivery’s signature; paste it from the vendor.'
+const SAMPLE_PAYLOAD_HELP: Explain = {
+  tip: 'An example event to try the templates on.',
+  more: 'Test shows the Title and Body it would file, without filing. Run now with this sample files it for real.',
+  docs: DOCS_REFERENCE,
+}
+/** A ticked-boxes row's heading: what ticking narrows to, and that none ticked takes everyone. */
+const narrowsTo = (what: string) => `Runs only for these ${what}; none ticked: any.`
+/** A labels record as select options, each with its own help when given. */
+const optionsOf = (labels: Record<string, string>, help?: Record<string, string>): FormOption[] =>
+  Object.entries(labels).map(([value, label]) => ({ value, label, ...(help ? { help: help[value] } : {}) }))
 
-export function newEventDraft(sourceKind: string): EventDraft {
+/** A new source's draft, whose shape is `EventDraft`. */
+export function newEventDraft(sourceKind: string) {
   return {
     sourceKind,
     webhookAuth: 'api_key',
+    /** The saved webhook source's `auth`; '' for a new one. A legacy value keeps the Authentication choice drawn. */
     webhookSavedAuth: '',
+    /** `event` | `incident` (`WEBHOOK_SHAPE_LABELS`). */
+    webhookShape: 'event',
     githubEvents: '',
     githubActions: '',
     githubRepository: '',
+    sentryEnvironments: '',
+    /** A saved monitor source's `metrics` (Sentry, Datadog, CloudWatch), never edited here: sent back as it was read. */
+    monitorMetrics: null as Record<string, unknown> | null,
+    /** A CloudWatch source's SNS topic ARNs, comma-separated. */
+    cloudwatchTopicArns: '',
+    cloudwatchSeverity: 'error',
+    /** Where an Email source receives (`GMAIL_SYSTEM`, `address:<id>`, `connection:<id>`); '' = not picked. */
     gmailInbox: '',
     gmailTo: '',
     gmailFrom: '',
@@ -152,10 +256,18 @@ export function newEventDraft(sourceKind: string): EventDraft {
     userProviders: '',
     userAccountTypes: '',
     userDomains: '',
+    incidentSeverity: 'error',
+    incidentTypes: '',
+    /** Blank sends null: production only (a deploy failure: every environment). */
+    incidentEnvironments: '',
+    quietOn: false,
+    quietStart: QUIET_START,
+    quietEnd: QUIET_END,
+    quietTz: localTimeZone(),
     preflightKind: 'none',
     preflightScriptPath: '',
     preflightPrompt: '',
-    preflightCredentialId: null,
+    preflightCredentialId: null as string | null,
     preflightTimeout: '120',
     concurrencyCap: '1',
     queueDepth: '10',
@@ -167,15 +279,13 @@ export function newEventDraft(sourceKind: string): EventDraft {
     autoPauseIdleDays: '7',
   }
 }
+export type EventDraft = ReturnType<typeof newEventDraft>
 
-const str = (value: unknown): string => (typeof value === 'string' ? value : '')
 const list = (value: unknown): string => (Array.isArray(value) ? value.filter(v => typeof v === 'string').join(', ') : '')
-const splitList = (raw: string): string[] => raw.split(',').map(v => v.trim()).filter(Boolean)
-const orNull = (raw: string): string | null => (raw.trim() === '' ? null : raw.trim())
 
 /* The server names the refused field by its wire key ("when: rate_limit_per_hour: must be …",
  * "action.params.body: …"). The page says it with the field's own label instead — no internal code reaches
- * the user. */
+ * the user. A refusal written as a whole sentence ("Add a description or pick a template.") is said as is. */
 const FIELD_LABELS: Record<string, string> = {
   name: 'Name',
   description: 'Description',
@@ -200,57 +310,34 @@ const FIELD_LABELS: Record<string, string> = {
 export function readableError(err: unknown, fallback: string): string {
   const detail = apiDetail(err, fallback).replace(/^when: /, '')
   const match = /^([a-z_.]+): ([\s\S]+)$/.exec(detail)
+  if (match && /^[A-Z].*\.$/.test(match[2])) return match[2]
   const label = match ? FIELD_LABELS[match[1]] : undefined
   return match && label ? `${label}: ${match[2]}` : detail
-}
-
-export function eventDraftOf(when: EventWhen): EventDraft {
-  const config = when.source_config ?? {}
-  // A webhook saved before `auth` existed is HMAC-signed; any other kind turned into a webhook here is a new one.
-  const savedAuth = savedWebhookAuth(when)
-  return {
-    sourceKind: when.source_kind,
-    webhookAuth: savedAuth || 'api_key',
-    webhookSavedAuth: savedAuth,
-    githubEvents: list(config.events),
-    githubActions: list(config.actions),
-    // A saved source with no repository listens to any.
-    githubRepository: str(config.repository) || ANY_REPOSITORY,
-    gmailInbox: when.source_kind === 'gmail' ? inboxChoiceOf(config) : '',
-    gmailTo: str(config.to),
-    gmailFrom: str(config.from),
-    gmailSubject: str(config.subject),
-    slackChannels: list(config.channel_ids),
-    userScope: str(config.scope) || 'org',
-    userMoment: str(config.moment) || 'applied',
-    userProviders: list(config.providers),
-    userAccountTypes: list(config.account_types),
-    userDomains: list(config.email_domains),
-    preflightKind: when.preflight_kind,
-    preflightScriptPath: when.preflight_script_path ?? '',
-    preflightPrompt: when.preflight_prompt ?? '',
-    preflightCredentialId: when.preflight_credential_id,
-    preflightTimeout: String(when.preflight_timeout_seconds),
-    concurrencyCap: String(when.concurrency_cap),
-    queueDepth: String(when.queue_depth),
-    rateLimit: String(when.rate_limit_per_hour),
-    budget: when.budget_usd === null ? '' : String(when.budget_usd),
-    autoPauseFailuresOn: when.auto_pause_failures !== null,
-    autoPauseFailures: String(when.auto_pause_failures ?? 5),
-    autoPauseIdleOn: when.auto_pause_idle_days !== null,
-    autoPauseIdleDays: String(when.auto_pause_idle_days ?? 7),
-  }
 }
 
 /** An Email source's "Receives at" values: the deployment's own mail domain (operator org only), one of the org's
  *  hosted addresses, or one of its service-account mailboxes. */
 export const GMAIL_SYSTEM = 'system'
-/** How the server reads a From rule (`trigger_intake.from_rule_matches`). */
-export const FROM_RULE_HINT = 'An address matches only itself; a domain (@acme.com) also matches its subdomains; other text matches anywhere.'
+/** How the server reads a From rule (`trigger_intake.from_rule_matches`): the field's pop-up. */
+const FROM_RULE_HELP: Explain = {
+  tip: 'Runs only on mail from this sender or domain.',
+  more: 'An address matches only itself; a domain (@acme.com) also matches its subdomains; other text matches anywhere.',
+}
 const ADDRESS_PREFIX = 'address:'
 const CONNECTION_PREFIX = 'connection:'
 /** "Receives at"'s last option: opens New address and selects what it makes; never a stored value. */
 const NEW_ADDRESS = 'new-address'
+/** The nested create's pick (`hooks/useNestedCreate.ts`): the New address page's id fills "Receives at". */
+export const ADDRESS_PICK = 'address_id'
+
+/** Opens the New address page for "Receives at" (a nested create): the automation editor provides it, since it owns
+ *  the draft that page comes back to. Absent, no "New address…" is offered. */
+export const NewAddressContext = createContext<(() => void) | null>(null)
+
+/** The draft with a just-made hosted address picked as "Receives at". */
+export function withAddress(draft: EventDraft, addressId: string): EventDraft {
+  return { ...draft, gmailInbox: `${ADDRESS_PREFIX}${addressId}` }
+}
 
 /** A saved Email source's `inbox`/`address_id` as the select's value; a source saved before either existed is the
  *  system inbox (the server's default). */
@@ -267,25 +354,236 @@ function inboxConfigOf(choice: string): { inbox: string; address_id: string | nu
   return { inbox: GMAIL_SYSTEM, address_id: null }
 }
 
-/** The kind's `source_config`, in the shape `app/trigger_config.py` validates. */
-function sourceConfigOf(draft: EventDraft): Record<string, unknown> {
-  switch (draft.sourceKind) {
-    case 'webhook':
-      return { auth: draft.webhookAuth }
-    case 'github':
+/* ── ONE entry per source kind ─────────────────────────────────────────────────────────────────────── */
+
+/** The draft fields that hold text. */
+type TextKey = { [K in keyof EventDraft]: EventDraft[K] extends string ? K : never }[keyof EventDraft]
+/** One labelled field: a text box, or a select when `options` is given. */
+type FieldSpec = {
+  key: TextKey
+  label: string
+  testId: string
+  help: HelpProp
+  required?: boolean
+  placeholder?: string
+  hint?: string
+  type?: 'time'
+  options?: FormOption[]
+}
+/** What a kind's bespoke fields draw with: the form's props, one field's edit, a `FieldSpec`'s field, a ticked-boxes row. */
+type Kit = {
+  draft: EventDraft
+  disabled: boolean
+  creating: boolean
+  operator: boolean
+  projectId: number | null
+  orgId: string
+  operatorOrg: boolean
+  automationId: string | null
+  edit: <K extends keyof EventDraft>(key: K, value: EventDraft[K]) => void
+  field: (spec: FieldSpec) => ReactNode
+  toggles: (key: TextKey, labels: Record<string, string>, testId: string, help: Record<string, string>) => ReactNode
+}
+/** A kind's template namespaces (`app/trigger_template.py`): a pasted sample whose top-level keys all sit inside
+ *  `keys` is sent as-is; anything else is wrapped in `wrap`. `names` are the body hint's placeholders. */
+type Template = { wrap: string; keys: readonly string[]; names: string; sample: string }
+type SourceKind = {
+  template?: Template
+  /** The saved `source_config` as this kind's draft fields; every other field keeps `newEventDraft`'s. */
+  parse?: (config: Record<string, unknown>) => Partial<EventDraft>
+  /** The kind's `source_config`, in the shape `app/trigger_config.py` validates; none: `{}`. */
+  wire?: (draft: EventDraft) => Record<string, unknown>
+  /** The sentence that stops a save, beyond the shared number checks. */
+  check?: (draft: EventDraft) => string | null
+  /** Its fields: plain ones as descriptors, the rest drawn by `render` after them. */
+  fields?: FieldSpec[]
+  render?: (kit: Kit) => ReactNode
+}
+
+const httpTemplate = (sample: string): Template => ({
+  wrap: 'body', keys: ['body', 'headers', 'query', 'item'], names: '{{body.…}}, {{headers.…}}, {{query.…}}', sample,
+})
+const WEBHOOK_TEMPLATE = httpTemplate('{"issue": {"title": "Login broken"}}')
+/** A monitor's saved `metrics`, and the config that sends them back as they were read. */
+const parseMetrics = (config: Record<string, unknown>) => ({ monitorMetrics: isRecord(config.metrics) ? config.metrics : null })
+const metricsOf = (draft: EventDraft) => (draft.monitorMetrics ? { metrics: draft.monitorMetrics } : {})
+
+/** `incident`, `deploy_failed` and `health_breach`: only `incident` (`typed`) narrows by incident type. */
+function incidentKind(typed: boolean): SourceKind {
+  return {
+    template: {
+      wrap: 'incident',
+      keys: ['incident', 'suspects', 'deployment', 'item'],
+      names: '{{incident.brief}}, {{incident.title}}, {{incident.severity}}, {{incident.url}}, {{deployment.run_url}}',
+      sample: 'Paste {"incident": {"title": "…", "severity": "…", "environment": "…"}}',
+    },
+    parse: config => {
+      const quiet: Record<string, unknown> = isRecord(config.quiet_hours) ? config.quiet_hours : {}
       return {
-        events: splitList(draft.githubEvents),
-        actions: splitList(draft.githubActions),
-        repository: draft.githubRepository === ANY_REPOSITORY ? '' : orNull(draft.githubRepository),
+        incidentSeverity: str(config.min_severity) || 'error',
+        incidentTypes: typed ? list(config.types) : '',
+        incidentEnvironments: list(config.environments),
+        quietOn: isRecord(config.quiet_hours),
+        quietStart: str(quiet.start) || QUIET_START,
+        quietEnd: str(quiet.end) || QUIET_END,
+        quietTz: str(quiet.tz) || localTimeZone(),
       }
-    case 'gmail':
+    },
+    wire: draft => {
+      const environments = splitList(draft.incidentEnvironments)
       return {
-        to: orNull(draft.gmailTo), from: orNull(draft.gmailFrom), subject: orNull(draft.gmailSubject),
-        ...inboxConfigOf(draft.gmailInbox),
+        min_severity: draft.incidentSeverity,
+        types: typed ? splitList(draft.incidentTypes) : [],
+        environments: environments.length > 0 ? environments : null,
+        quiet_hours: draft.quietOn ? { start: draft.quietStart.trim(), end: draft.quietEnd.trim(), tz: draft.quietTz.trim() } : null,
       }
-    case 'slack':
-      return { channel_ids: splitList(draft.slackChannels) }
-    case 'user_registered': {
+    },
+    check: draft => {
+      if (!draft.quietOn) return null
+      if (!HH_MM.test(draft.quietStart.trim())) return 'Quiet hours start must be HH:MM.'
+      if (!HH_MM.test(draft.quietEnd.trim())) return 'Quiet hours end must be HH:MM.'
+      return draft.quietTz.trim() === '' ? 'Quiet hours need a time zone.' : null
+    },
+    render: ({ draft, edit, field, toggles, disabled }) => (
+      <>
+        <Banner severity="info" testId="automation-incident-target">Files in the incident’s project: pick exactly one project as the Target.</Banner>
+        {field({ key: 'incidentSeverity', label: 'Minimum severity', testId: 'automation-incident-severity', options: optionsOf(SEVERITY_LABELS),
+          help: 'Incidents below this severity are ignored.' })}
+        {typed && (
+          <>
+            <SubHeading help={narrowsTo('incident types')}>Types</SubHeading>
+            {toggles('incidentTypes', INCIDENT_TYPE_LABELS, 'automation-incident-type', INCIDENT_TYPE_HELP)}
+          </>
+        )}
+        {field({
+          key: 'incidentEnvironments', label: 'Environments', testId: 'automation-incident-environments', placeholder: 'production',
+          help: draft.sourceKind === 'deploy_failed'
+            ? 'Runs only for these environments, comma-separated; blank: all.'
+            : 'Runs only for these environments, comma-separated; blank: production.',
+        })}
+        <SettingCheckbox name="quiet_hours" label="Quiet hours" help="Holds tasks in a daily window; they file after it." checked={draft.quietOn}
+          disabled={disabled} onChange={on => edit('quietOn', on)} testId="automation-quiet-hours-on" />
+        {draft.quietOn && (
+          <FieldGrid>
+            {field({ key: 'quietStart', label: 'Start', testId: 'automation-quiet-start', type: 'time', help: 'From this time each day, new tasks are held.' })}
+            {field({ key: 'quietEnd', label: 'End', testId: 'automation-quiet-end', type: 'time', help: 'Held tasks file at this time each day.' })}
+            {field({ key: 'quietTz', label: 'Time zone', testId: 'automation-quiet-tz', placeholder: 'Europe/London', help: 'Start and End are local times in this zone.' })}
+          </FieldGrid>
+        )}
+      </>
+    ),
+  }
+}
+
+const SOURCE_KINDS: Partial<Record<string, SourceKind>> = {
+  webhook: {
+    template: WEBHOOK_TEMPLATE,
+    // A webhook saved before `auth` existed is HMAC-signed.
+    parse: config => {
+      const auth = str(config.auth) || 'hmac'
+      return { webhookAuth: auth, webhookSavedAuth: auth, webhookShape: config.shape === 'incident' ? 'incident' : 'event' }
+    },
+    // `shape` is sent only for an incident: an event webhook keeps the plain `{auth}` it always sent.
+    wire: draft => ({ auth: draft.webhookAuth, ...(draft.webhookShape === 'incident' ? { shape: 'incident' } : {}) }),
+    render: ({ draft, field }) => (
+      <>
+        {field({
+          key: 'webhookShape', label: 'Payload', testId: 'automation-webhook-shape', help: 'Whether each call files a task or records an incident.',
+          options: optionsOf(WEBHOOK_SHAPE_LABELS, WEBHOOK_SHAPE_CHOICE_HELP),
+          hint: draft.webhookShape === 'incident' ? `Keys: ${INCIDENT_KEYS}.` : undefined,
+        })}
+        {/* An API key is the only scheme: the choice is drawn only for a legacy secret, to switch it. */}
+        {isLegacyWebhookAuth(draft.webhookSavedAuth) && (
+          <>
+            <Banner severity="warning" testId="automation-webhook-legacy">Legacy secret. Switch to an API key.</Banner>
+            {field({
+              key: 'webhookAuth', label: 'Authentication', testId: 'automation-webhook-auth', help: 'How a caller proves the call is genuine.',
+              options: [draft.webhookSavedAuth, 'api_key'].map(value => ({ value, label: WEBHOOK_AUTH_LABELS[value], help: WEBHOOK_AUTH_CHOICE_HELP[value] })),
+              hint: draft.webhookAuth === 'api_key' ? 'Saving drops the secret.' : undefined,
+            })}
+          </>
+        )}
+      </>
+    ),
+  },
+  github: {
+    template: httpTemplate('{"action": "opened", "issue": {"title": "Login broken"}}'),
+    // A saved source with no repository listens to any.
+    parse: config => ({ githubEvents: list(config.events), githubActions: list(config.actions), githubRepository: str(config.repository) || ANY_REPOSITORY }),
+    wire: draft => ({
+      events: splitList(draft.githubEvents),
+      actions: splitList(draft.githubActions),
+      repository: draft.githubRepository === ANY_REPOSITORY ? '' : strOrNull(draft.githubRepository),
+    }),
+    fields: [
+      { key: 'githubEvents', label: 'Events', testId: 'automation-github-events', required: true, placeholder: 'issues, pull_request', help: GITHUB_EVENTS_HELP },
+      { key: 'githubActions', label: 'Actions', testId: 'automation-github-actions', placeholder: 'opened, labeled',
+        help: 'Narrows events to these actions; empty takes every action.' },
+    ],
+    // Keyed so a Target move between no project and a project remounts it: the select then defaults afresh.
+    render: ({ draft, edit, projectId, disabled, creating }) => (
+      <GithubRepositorySelect key={projectId === null ? 'free' : 'connected'} projectId={projectId} value={draft.githubRepository}
+        onChange={v => edit('githubRepository', v)} disabled={disabled} creating={creating} />
+    ),
+  },
+  sentry: {
+    template: httpTemplate('{"action": "created", "data": {"issue": {"title": "TypeError"}}}'),
+    parse: config => ({ sentryEnvironments: list(config.environments), ...parseMetrics(config) }),
+    wire: draft => ({ environments: splitList(draft.sentryEnvironments), ...metricsOf(draft) }),
+    fields: [{ key: 'sentryEnvironments', label: 'Environments', testId: 'automation-sentry-environments', placeholder: 'production',
+      help: 'Records only these environments, comma-separated; blank: all.' }],
+  },
+  datadog: { parse: parseMetrics, wire: metricsOf },
+  pagerduty: { parse: parseMetrics },
+  cloudwatch: {
+    parse: config => ({ cloudwatchTopicArns: list(config.topic_arns), cloudwatchSeverity: str(config.severity) || 'error', ...parseMetrics(config) }),
+    wire: draft => ({ topic_arns: splitList(draft.cloudwatchTopicArns), severity: draft.cloudwatchSeverity, ...metricsOf(draft) }),
+    fields: [
+      { key: 'cloudwatchTopicArns', label: 'SNS topics', testId: 'automation-cloudwatch-topics', required: true,
+        placeholder: 'arn:aws:sns:us-east-1:<account>:alarms', help: SNS_TOPICS_HELP },
+      { key: 'cloudwatchSeverity', label: 'Severity', testId: 'automation-cloudwatch-severity',
+        options: SEVERITIES.map(value => ({ value, label: capitalize(value) })), help: 'Severity every alarm is recorded with; CloudWatch sends none.' },
+    ],
+  },
+  gmail: {
+    template: { wrap: 'email', keys: ['email', 'item'], names: '{{email.from}}, {{email.subject}}, {{email.body}}',
+      sample: 'Paste {"from": "…", "subject": "…", "body": "…"}' },
+    parse: config => ({ gmailInbox: inboxChoiceOf(config), gmailTo: str(config.to), gmailFrom: str(config.from), gmailSubject: str(config.subject) }),
+    wire: draft => ({
+      to: strOrNull(draft.gmailTo), from: strOrNull(draft.gmailFrom), subject: strOrNull(draft.gmailSubject),
+      ...inboxConfigOf(draft.gmailInbox),
+    }),
+    check: draft => {
+      if (draft.gmailInbox === '') return 'Pick where it receives.'
+      const anyRule = [draft.gmailTo, draft.gmailFrom, draft.gmailSubject].some(v => v.trim() !== '')
+      return draft.gmailInbox === GMAIL_SYSTEM && !anyRule ? 'The system mail domain needs a To, From or Subject.' : null
+    },
+    render: ({ draft, edit, field, disabled, orgId, operatorOrg, automationId }) => (
+      <>
+        <GmailInboxSelect orgId={orgId} operatorOrg={operatorOrg} automationId={automationId} value={draft.gmailInbox}
+          onChange={v => edit('gmailInbox', v)} disabled={disabled} />
+        {field({ key: 'gmailTo', label: 'To contains', testId: 'automation-gmail-to', help: 'Runs only on mail whose To contains this text.' })}
+        {field({ key: 'gmailFrom', label: 'From', testId: 'automation-gmail-from', help: FROM_RULE_HELP })}
+        {field({ key: 'gmailSubject', label: 'Subject contains', testId: 'automation-gmail-subject', help: 'Runs only on mail whose subject contains this text.' })}
+      </>
+    ),
+  },
+  slack: {
+    template: { wrap: 'slack', keys: ['slack', 'item'], names: '{{slack.text}}, {{slack.user}}, {{slack.channel}}, {{slack.permalink}}',
+      sample: 'Paste {"text": "…", "user": "…", "channel": "…", "permalink": "…"}' },
+    parse: config => ({ slackChannels: list(config.channel_ids) }),
+    wire: draft => ({ channel_ids: splitList(draft.slackChannels) }),
+    fields: [{ key: 'slackChannels', label: 'Channel IDs', testId: 'automation-slack-channels', required: true, placeholder: 'C0123ABCD',
+      help: 'Mentions of Jaah in these channels run it; comma-separated.' }],
+  },
+  user_registered: {
+    template: { wrap: 'user', keys: ['user', 'item'], names: '{{user.email}}, {{user.name}}, {{user.org_name}}, {{user.provider}}, {{user.url}}',
+      sample: 'Paste {"email": "…", "name": "…", "org_name": "…", "provider": "…"}' },
+    parse: config => ({
+      userScope: str(config.scope) || 'org', userMoment: str(config.moment) || 'applied', userProviders: list(config.providers),
+      userAccountTypes: list(config.account_types), userDomains: list(config.email_domains),
+    }),
+    wire: draft => {
       // Moment and account type are a platform sign-up's; the server refuses them on an org scope.
       const platform = draft.userScope === 'platform'
       return {
@@ -295,35 +593,82 @@ function sourceConfigOf(draft: EventDraft): Record<string, unknown> {
         account_types: platform ? splitList(draft.userAccountTypes) : [],
         email_domains: splitList(draft.userDomains),
       }
-    }
-    default:
-      return {}
+    },
+    render: ({ draft, field, toggles, operator }) => {
+      const platform = draft.userScope === 'platform'
+      return (
+        <>
+          {field({ key: 'userScope', label: 'Who', testId: 'automation-user-scope', help: 'Whose sign-ups run it.', options: [
+            { value: 'org', label: USER_SCOPE_LABELS.org, help: USER_SCOPE_CHOICE_HELP.org },
+            ...(operator || platform ? [{ value: 'platform', label: USER_SCOPE_LABELS.platform, help: USER_SCOPE_CHOICE_HELP.platform }] : []),
+          ] })}
+          {platform && field({ key: 'userMoment', label: 'Fires on', testId: 'automation-user-moment', help: 'Which step of a platform sign-up runs it.',
+            options: optionsOf(USER_MOMENT_LABELS, USER_MOMENT_CHOICE_HELP) })}
+          <SubHeading help={narrowsTo('sign-in methods')}>Sign-in providers</SubHeading>
+          {toggles('userProviders', SIGNUP_PROVIDER_LABELS, 'automation-user-provider', USER_PROVIDER_HELP)}
+          {platform && (
+            <>
+              <SubHeading help={narrowsTo('account types')}>Account type</SubHeading>
+              {toggles('userAccountTypes', SIGNUP_ACCOUNT_TYPE_LABELS, 'automation-user-account', USER_ACCOUNT_TYPE_HELP)}
+            </>
+          )}
+          {field({ key: 'userDomains', label: 'Email domains', testId: 'automation-user-domains', placeholder: 'example.com',
+            help: 'Runs only for emails at these exact domains; empty: any.' })}
+        </>
+      )
+    },
+  },
+  incident: incidentKind(true),
+  deploy_failed: incidentKind(false),
+  health_breach: incidentKind(false),
+}
+
+/** A kind's template namespaces; a kind without its own reads as a webhook's. */
+const templateOf = (kind: string) => SOURCE_KINDS[kind]?.template ?? WEBHOOK_TEMPLATE
+
+/** The hint under a body template, per source kind. */
+export const EVENT_TEMPLATE_HINT: Record<string, string> = Object.fromEntries(
+  Object.entries(SOURCE_KINDS).flatMap(([kind, spec]) =>
+    spec?.template ? [[kind, `Placeholders: ${spec.template.names}; with a preflight, {{item.id}}, {{item.…}}.`]] : []),
+)
+
+export function eventDraftOf(when: EventWhen): EventDraft {
+  return {
+    ...newEventDraft(when.source_kind),
+    ...SOURCE_KINDS[when.source_kind]?.parse?.(when.source_config ?? {}),
+    preflightKind: when.preflight_kind,
+    preflightScriptPath: when.preflight_script_path ?? '',
+    preflightPrompt: when.preflight_prompt ?? '',
+    preflightCredentialId: when.preflight_credential_id,
+    preflightTimeout: String(when.preflight_timeout_seconds),
+    concurrencyCap: String(when.concurrency_cap),
+    queueDepth: String(when.queue_depth),
+    rateLimit: String(when.rate_limit_per_hour),
+    budget: when.budget_usd === null ? '' : String(when.budget_usd),
+    autoPauseFailuresOn: when.auto_pause_failures !== null,
+    autoPauseFailures: String(when.auto_pause_failures ?? 5),
+    autoPauseIdleOn: when.auto_pause_idle_days !== null,
+    autoPauseIdleDays: String(when.auto_pause_idle_days ?? 7),
   }
 }
 
 /** A whole number from a typed field, or the sentence that says why not. */
-function wholeNumber(raw: string, label: string): number | string {
-  const value = Number(raw.trim())
-  if (raw.trim() === '' || !Number.isInteger(value)) return `${label} must be a whole number.`
-  return value
-}
+const whole = (raw: string, label: string): number | string => wholeNumber(raw) ?? `${label} must be a whole number.`
 
 /** The draft as the wire `when` (`automation_service.EVENT_FIELDS`), or the first sentence that stops it. */
 export function eventWhenOf(draft: EventDraft): ({ kind: 'event' } & Record<string, unknown>) | string {
   const numbers = {
-    preflight_timeout_seconds: wholeNumber(draft.preflightTimeout, 'Preflight timeout'),
-    concurrency_cap: wholeNumber(draft.concurrencyCap, 'Concurrency cap'),
-    queue_depth: wholeNumber(draft.queueDepth, 'Queue depth'),
-    rate_limit_per_hour: wholeNumber(draft.rateLimit, 'Rate limit'),
-    auto_pause_failures: draft.autoPauseFailuresOn ? wholeNumber(draft.autoPauseFailures, 'Failures before pause') : null,
-    auto_pause_idle_days: draft.autoPauseIdleOn ? wholeNumber(draft.autoPauseIdleDays, 'Idle days before pause') : null,
+    preflight_timeout_seconds: whole(draft.preflightTimeout, 'Preflight timeout'),
+    concurrency_cap: whole(draft.concurrencyCap, 'Concurrency cap'),
+    queue_depth: whole(draft.queueDepth, 'Queue depth'),
+    rate_limit_per_hour: whole(draft.rateLimit, 'Rate limit'),
+    auto_pause_failures: draft.autoPauseFailuresOn ? whole(draft.autoPauseFailures, 'Failures before pause') : null,
+    auto_pause_idle_days: draft.autoPauseIdleOn ? whole(draft.autoPauseIdleDays, 'Idle days before pause') : null,
   }
   for (const value of Object.values(numbers)) if (typeof value === 'string') return value
-  if (draft.sourceKind === 'gmail') {
-    if (draft.gmailInbox === '') return 'Pick where it receives.'
-    const anyRule = [draft.gmailTo, draft.gmailFrom, draft.gmailSubject].some(v => v.trim() !== '')
-    if (draft.gmailInbox === GMAIL_SYSTEM && !anyRule) return 'The system mail domain needs a To, From or Subject.'
-  }
+  const kind = SOURCE_KINDS[draft.sourceKind]
+  const refused = kind?.check?.(draft)
+  if (refused) return refused
   let budget: number | null = null
   if (draft.budget.trim() !== '') {
     budget = Number(draft.budget.trim())
@@ -332,10 +677,10 @@ export function eventWhenOf(draft: EventDraft): ({ kind: 'event' } & Record<stri
   return {
     kind: 'event',
     source_kind: draft.sourceKind,
-    source_config: sourceConfigOf(draft),
+    source_config: kind?.wire?.(draft) ?? {},
     preflight_kind: draft.preflightKind,
-    preflight_script_path: orNull(draft.preflightScriptPath),
-    preflight_prompt: orNull(draft.preflightPrompt),
+    preflight_script_path: strOrNull(draft.preflightScriptPath),
+    preflight_prompt: strOrNull(draft.preflightPrompt),
     preflight_credential_id: draft.preflightCredentialId,
     ...numbers,
     budget_usd: budget,
@@ -345,10 +690,10 @@ export function eventWhenOf(draft: EventDraft): ({ kind: 'event' } & Record<stri
 /** The pasted sample as the event the template reads. Throws on invalid JSON. */
 function sampleEvent(kind: string, raw: string): Record<string, unknown> {
   const parsed: unknown = JSON.parse(raw)
-  const spaces = SAMPLE_NAMESPACES[kind] ?? SAMPLE_NAMESPACES.webhook
-  if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+  const spaces = templateOf(kind)
+  if (isRecord(parsed)) {
     const keys = Object.keys(parsed)
-    if (keys.length > 0 && keys.every(key => spaces.keys.includes(key))) return parsed as Record<string, unknown>
+    if (keys.length > 0 && keys.every(key => spaces.keys.includes(key))) return parsed
   }
   return { [spaces.wrap]: parsed }
 }
@@ -364,15 +709,7 @@ const fetchAnthropicKeys = (query: string, signal: AbortSignal) =>
 /* ── The When's fields ─────────────────────────────────────────────────────────────────────────────── */
 
 export default function EventSourceFields({
-  draft,
-  onChange,
-  disabled,
-  creating,
-  operator = false,
-  projectId = null,
-  orgId = '',
-  operatorOrg = false,
-  automationId = null,
+  draft, onChange, disabled, creating, operator = false, projectId = null, orgId = '', operatorOrg = false, automationId = null,
 }: {
   draft: EventDraft
   onChange: (next: EventDraft) => void
@@ -390,27 +727,90 @@ export default function EventSourceFields({
   /** The saved automation's id: the address its own trigger holds stays offered. */
   automationId?: string | null
 }) {
-  const edit = <K extends keyof EventDraft>(key: K, value: EventDraft[K]) => onChange({ ...draft, [key]: value })
+  const edit = fieldEditor(draft, onChange)
+  const field = ({ key, ...props }: FieldSpec) => (
+    <FormTextField key={key} {...props} value={draft[key]} disabled={disabled} onChange={v => edit(key, v)} />
+  )
+  // One box per value, kept in the draft's comma-joined list; the boxes share one wrapping row, and a row
+  // with nothing ticked is an any-of over everyone — said once under it, since bare boxes cannot say so.
+  const toggles: Kit['toggles'] = (key, labels, testId, help) => {
+    const picked = splitList(draft[key])
+    return (
+      <Box>
+        <Box sx={{ display: 'flex', flexWrap: 'wrap', columnGap: 2 }}>
+          {Object.entries(labels).map(([value, label]) => (
+            <SettingCheckbox
+              key={value}
+              name={`${testId}-${value}`}
+              label={label}
+              help={help[value]}
+              checked={picked.includes(value)}
+              disabled={disabled}
+              onChange={on => edit(key, (on ? [...picked, value] : picked.filter(v => v !== value)).join(', '))}
+              testId={`${testId}-${value}`}
+            />
+          ))}
+        </Box>
+      </Box>
+    )
+  }
+  const kind = SOURCE_KINDS[draft.sourceKind]
   return (
     <>
-      <SourceConfigFields draft={draft} edit={edit} disabled={disabled} creating={creating} operator={operator} projectId={projectId}
-        orgId={orgId} operatorOrg={operatorOrg} automationId={automationId} />
+      {recordsOnly(draft) && (
+        <Banner severity="info" testId="automation-records-only">Records incidents in the target project. Files no task.</Banner>
+      )}
+      {kind?.fields?.map(field)}
+      {kind?.render?.({ draft, edit, field, toggles, disabled, creating, operator, projectId, orgId, operatorOrg, automationId })}
+    </>
+  )
+}
 
-      <SubHeading>Preflight</SubHeading>
+/** One field's change as the whole next draft, which both halves of the event form hand their fields. */
+function fieldEditor(draft: EventDraft, onChange: (next: EventDraft) => void) {
+  return <K extends keyof EventDraft>(key: K, value: EventDraft[K]) => onChange({ ...draft, [key]: value })
+}
+
+/** The Limits row's number fields. */
+const LIMIT_FIELDS: { key: TextKey; label: string; help: HelpProp; testId: string; htmlInput: { min: number; max?: number; step: string } }[] = [
+  { key: 'concurrencyCap', label: 'Concurrency cap', help: CONCURRENCY_HELP, testId: 'automation-concurrency', htmlInput: { min: 1, max: 20, step: '1' } },
+  { key: 'queueDepth', label: 'Queue depth', help: QUEUE_DEPTH_HELP, testId: 'automation-queue-depth', htmlInput: { min: 0, max: 100, step: '1' } },
+  { key: 'rateLimit', label: 'Rate limit per hour', help: 'Most filings per hour; events past it are skipped.', testId: 'automation-rate-limit',
+    htmlInput: { min: 1, max: 1000, step: '1' } },
+  { key: 'budget', label: 'Budget (USD)', help: BUDGET_HELP, testId: 'automation-budget', htmlInput: { min: 0, step: '0.01' } },
+]
+/** Auto-pause's switched numbers: a box turns each on, and its number shows only while on. */
+const AUTO_PAUSE_FIELDS = [
+  { name: 'auto_pause_failures', label: 'Pause after consecutive failures', help: AUTO_PAUSE_FAILURES_HELP, on: 'autoPauseFailuresOn',
+    value: 'autoPauseFailures', testId: 'automation-auto-pause-failures' },
+  { name: 'auto_pause_idle_days', label: 'Pause after idle days', help: 'Stops it after this many days without a successful run.', on: 'autoPauseIdleOn',
+    value: 'autoPauseIdleDays', testId: 'automation-auto-pause-idle' },
+] as const
+
+/** An event's Settings-tab half: Preflight, Limits and Auto-pause. A new automation keeps `newEventDraft`'s values. */
+export function EventExtrasFields({ draft, onChange, disabled }: {
+  draft: EventDraft
+  onChange: (next: EventDraft) => void
+  disabled: boolean
+}) {
+  const edit = fieldEditor(draft, onChange)
+  return (
+    <>
       <FormTextField
         label="Preflight"
-        help="May split one event into several items."
+        help={PREFLIGHT_HELP}
         value={draft.preflightKind}
         disabled={disabled}
         testId="automation-preflight-kind"
         onChange={v => edit('preflightKind', v)}
-        options={Object.entries(PREFLIGHT_LABELS).map(([value, label]) => ({ value, label }))}
+        options={optionsOf(PREFLIGHT_LABELS, PREFLIGHT_CHOICE_HELP)}
       />
       {draft.preflightKind === 'script' && (
         <FormTextField
           label="Script path"
+          help={SCRIPT_PATH_HELP}
           required
-          hint="Repo-relative, e.g. scripts/triage.py"
+          placeholder="scripts/triage.py"
           value={draft.preflightScriptPath}
           disabled={disabled}
           onChange={v => edit('preflightScriptPath', v)}
@@ -422,6 +822,7 @@ export default function EventSourceFields({
         <>
           <FormTextField
             label="Preflight prompt"
+            help="Instructions the model follows to judge each event."
             required
             value={draft.preflightPrompt}
             disabled={disabled}
@@ -430,24 +831,24 @@ export default function EventSourceFields({
             onChange={v => edit('preflightPrompt', v)}
             testId="automation-preflight-prompt"
           />
-          <CredentialSelect
-            id="automation-preflight-credential"
-            label="Anthropic API key"
-            value={draft.preflightCredentialId}
-            onChange={next => edit('preflightCredentialId', next)}
-            fetchOptions={fetchAnthropicKeys}
-            disabled={disabled}
-            helperText="Blank uses the platform key, if one is set."
-            fullWidth
-            size="small"
-            testId="automation-preflight-credential"
-          />
+          <FormField label="Anthropic API key" help="The Anthropic key the preflight model is billed to.">
+            <CredentialSelect
+              id="automation-preflight-credential"
+              value={draft.preflightCredentialId}
+              onChange={next => edit('preflightCredentialId', next)}
+              fetchOptions={fetchAnthropicKeys}
+              disabled={disabled}
+              fullWidth
+              size="small"
+              testId="automation-preflight-credential"
+            />
+          </FormField>
         </>
       )}
       {draft.preflightKind !== 'none' && (
         <FormTextField
           label="Timeout (seconds)"
-          hint={`${MIN_TIMEOUT}–${MAX_TIMEOUT}.`}
+          help={`The preflight fails after this many seconds (${MIN_TIMEOUT}–${MAX_TIMEOUT}).`}
           type="number"
           value={draft.preflightTimeout}
           disabled={disabled}
@@ -459,203 +860,37 @@ export default function EventSourceFields({
 
       <SubHeading>Limits</SubHeading>
       <FieldGrid>
-        <FormTextField label="Concurrency cap" type="number" value={draft.concurrencyCap} disabled={disabled}
-          slotProps={{ htmlInput: { min: 1, max: 20, step: '1' } }}
-          testId="automation-concurrency" onChange={v => edit('concurrencyCap', v)} />
-        <FormTextField label="Queue depth" type="number" value={draft.queueDepth} disabled={disabled}
-          slotProps={{ htmlInput: { min: 0, max: 100, step: '1' } }}
-          testId="automation-queue-depth" onChange={v => edit('queueDepth', v)} />
-        <FormTextField label="Rate limit per hour" type="number" value={draft.rateLimit} disabled={disabled}
-          slotProps={{ htmlInput: { min: 1, max: 1000, step: '1' } }} testId="automation-rate-limit" onChange={v => edit('rateLimit', v)} />
-        <FormTextField label="Budget (USD)" type="number" value={draft.budget} disabled={disabled}
-          slotProps={{ htmlInput: { min: 0, step: '0.01' } }} testId="automation-budget" onChange={v => edit('budget', v)}
-          help="Advisory: a Task over budget is flagged, never stopped." />
+        {LIMIT_FIELDS.map(({ key, htmlInput, ...props }) => (
+          <FormTextField key={key} {...props} type="number" value={draft[key]} disabled={disabled} slotProps={{ htmlInput }}
+            onChange={v => edit(key, v)} />
+        ))}
       </FieldGrid>
 
       <SubHeading>Auto-pause</SubHeading>
-      <ToggledNumber
-        name="auto_pause_failures"
-        label="Pause after consecutive failures"
-        on={draft.autoPauseFailuresOn}
-        value={draft.autoPauseFailures}
-        disabled={disabled}
-        testId="automation-auto-pause-failures"
-        onToggle={on => edit('autoPauseFailuresOn', on)}
-        onChange={value => edit('autoPauseFailures', value)}
-      />
-      <ToggledNumber
-        name="auto_pause_idle_days"
-        label="Pause after idle days"
-        on={draft.autoPauseIdleOn}
-        value={draft.autoPauseIdleDays}
-        disabled={disabled}
-        testId="automation-auto-pause-idle"
-        onToggle={on => edit('autoPauseIdleOn', on)}
-        onChange={value => edit('autoPauseIdleDays', value)}
-      />
+      {AUTO_PAUSE_FIELDS.map(({ name, label, help, on, value, testId }) => (
+        <Box key={name} sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+          <Box sx={{ flex: `1 1 ${grid(37)}` }}>
+            <SettingCheckbox name={name} label={label} help={help} checked={draft[on]} disabled={disabled} onChange={next => edit(on, next)}
+              testId={`${testId}-on`} />
+          </Box>
+          {draft[on] && (
+            <Box sx={{ flex: `0 1 ${grid(21)}` }}>
+              <TextField
+                type="number"
+                size="small"
+                fullWidth
+                value={draft[value]}
+                disabled={disabled}
+                onChange={e => edit(value, e.target.value)}
+                sx={fieldTapTargetSx}
+                slotProps={{ htmlInput: { 'data-testid': testId, min: 1, 'aria-label': label } }}
+              />
+            </Box>
+          )}
+        </Box>
+      ))}
     </>
   )
-}
-
-function SourceConfigFields({
-  draft,
-  edit,
-  disabled,
-  creating,
-  operator,
-  projectId,
-  orgId,
-  operatorOrg,
-  automationId,
-}: {
-  draft: EventDraft
-  edit: <K extends keyof EventDraft>(key: K, value: EventDraft[K]) => void
-  disabled: boolean
-  creating: boolean
-  operator: boolean
-  projectId: number | null
-  orgId: string
-  operatorOrg: boolean
-  automationId: string | null
-}) {
-  const text = (key: keyof EventDraft, label: string, testId: string, props: { hint?: string; required?: boolean; placeholder?: string } = {}) => (
-    <FormTextField
-      label={label}
-      {...props}
-      value={draft[key] as string}
-      disabled={disabled}
-      onChange={v => edit(key, v as EventDraft[typeof key])}
-      testId={testId}
-    />
-  )
-  switch (draft.sourceKind) {
-    case 'webhook':
-      // An API key is the only scheme: the choice is drawn only for a legacy secret, to switch it.
-      if (!isLegacyWebhookAuth(draft.webhookSavedAuth)) return null
-      return (
-        <>
-          <Banner severity="warning" testId="automation-webhook-legacy">Legacy secret. Switch to an API key.</Banner>
-          <FormTextField
-            label="Authentication"
-            value={draft.webhookAuth}
-            disabled={disabled}
-            testId="automation-webhook-auth"
-            onChange={v => edit('webhookAuth', v)}
-            options={[draft.webhookSavedAuth, 'api_key'].map(value => ({ value, label: WEBHOOK_AUTH_LABELS[value] }))}
-            hint={draft.webhookAuth === 'api_key' ? 'Saving drops the secret.' : undefined}
-          />
-        </>
-      )
-    case 'github':
-      return (
-        <>
-          {text('githubEvents', 'Events', 'automation-github-events', { required: true, placeholder: 'issues, pull_request', hint: 'Comma-separated.' })}
-          {text('githubActions', 'Actions', 'automation-github-actions', { placeholder: 'opened, labeled', hint: 'Comma-separated. Empty: every action.' })}
-          {projectId === null
-            ? (
-              <FormTextField
-                label="Repository"
-                placeholder="owner/repo"
-                hint={creating ? 'Empty: the project’s primary repository.' : 'Empty: any repository.'}
-                value={draft.githubRepository === ANY_REPOSITORY ? '' : draft.githubRepository}
-                disabled={disabled}
-                onChange={v => edit('githubRepository', v.trim() === '' && !creating ? ANY_REPOSITORY : v)}
-                testId="automation-github-repository"
-              />
-            )
-            : (
-              <GithubRepositorySelect
-                projectId={projectId}
-                value={draft.githubRepository}
-                onChange={v => edit('githubRepository', v)}
-                disabled={disabled}
-                creating={creating}
-              />
-            )}
-        </>
-      )
-    case 'gmail': {
-      // An address or a mailbox of the org's own takes every message there; the shared system domain needs a rule.
-      const hint = draft.gmailInbox !== '' && draft.gmailInbox !== GMAIL_SYSTEM ? 'Optional.' : undefined
-      return (
-        <>
-          <GmailInboxSelect orgId={orgId} operatorOrg={operatorOrg} automationId={automationId} value={draft.gmailInbox}
-            onChange={v => edit('gmailInbox', v)} disabled={disabled} />
-          {text('gmailTo', 'To contains', 'automation-gmail-to', { hint })}
-          {text('gmailFrom', 'From', 'automation-gmail-from', { hint: [hint, FROM_RULE_HINT].filter(Boolean).join(' ') })}
-          {text('gmailSubject', 'Subject contains', 'automation-gmail-subject', { hint })}
-        </>
-      )
-    }
-    case 'slack':
-      return text('slackChannels', 'Channel IDs', 'automation-slack-channels', {
-        required: true,
-        placeholder: 'C0123ABCD',
-        hint: 'Comma-separated.',
-      })
-    case 'user_registered': {
-      const platform = draft.userScope === 'platform'
-      // One box per value, kept in the draft's comma-joined list; the boxes share one wrapping row, and a row
-      // with nothing ticked is an any-of over everyone — said once under it, since bare boxes cannot say so.
-      const toggles = (key: 'userProviders' | 'userAccountTypes', choices: [string, string][], testId: string) => {
-        const picked = splitList(draft[key])
-        return (
-          <Box>
-            <Box sx={{ display: 'flex', flexWrap: 'wrap', columnGap: 2 }}>
-              {choices.map(([value, label]) => (
-                <SettingCheckbox
-                  key={value}
-                  name={`${testId}-${value}`}
-                  label={label}
-                  checked={picked.includes(value)}
-                  disabled={disabled}
-                  onChange={on => edit(key, (on ? [...picked, value] : picked.filter(v => v !== value)).join(', '))}
-                  testId={`${testId}-${value}`}
-                />
-              ))}
-            </Box>
-            <Typography variant="caption" sx={{ color: 'text.secondary' }}>None ticked: any.</Typography>
-          </Box>
-        )
-      }
-      return (
-        <>
-          <FormTextField
-            label="Who"
-            value={draft.userScope}
-            disabled={disabled}
-            testId="automation-user-scope"
-            onChange={v => edit('userScope', v)}
-            options={[
-              { value: 'org', label: USER_SCOPE_LABELS.org },
-              ...(operator || platform ? [{ value: 'platform', label: USER_SCOPE_LABELS.platform }] : []),
-            ]}
-          />
-          {platform && (
-            <FormTextField
-              label="Fires on"
-              value={draft.userMoment}
-              disabled={disabled}
-              testId="automation-user-moment"
-              onChange={v => edit('userMoment', v)}
-              options={Object.entries(USER_MOMENT_LABELS).map(([value, label]) => ({ value, label }))}
-            />
-          )}
-          <SubHeading>Sign-in providers</SubHeading>
-          {toggles('userProviders', Object.entries(USER_PROVIDER_LABELS), 'automation-user-provider')}
-          {platform && (
-            <>
-              <SubHeading>Account type</SubHeading>
-              {toggles('userAccountTypes', Object.entries(USER_ACCOUNT_TYPE_LABELS), 'automation-user-account')}
-            </>
-          )}
-          {text('userDomains', 'Email domains', 'automation-user-domains', { placeholder: 'example.com', hint: 'Exact domains, comma-separated. Empty: any.' })}
-        </>
-      )
-    }
-    default:
-      return null
-  }
 }
 
 /** "Receives at"'s options for one org: the system domain (operator org, or a source already saved on it); each
@@ -679,8 +914,9 @@ export function inboxOptions(email: OrgEmail, operatorOrg: boolean, automationId
 }
 
 /** An Email source's required "Receives at", read from the automation's org. Where the org can make a hosted address
- *  (on the plan, on a deployment that receives mail), "New address…" makes one here and selects it, so the editor is
- *  never left for Settings. A tenant org with nothing to receive at and nothing to make gets the way to Settings. */
+ *  (on the plan, on a deployment that receives mail), "New address…" opens the New address page, which comes back
+ *  to the editor with its input kept and the new address picked (`NewAddressContext`). A tenant org with nothing to
+ *  receive at and nothing to make gets the way to Settings. */
 function GmailInboxSelect({ orgId, operatorOrg, automationId, value, onChange, disabled }: {
   orgId: string
   operatorOrg: boolean
@@ -689,12 +925,10 @@ function GmailInboxSelect({ orgId, operatorOrg, automationId, value, onChange, d
   onChange: (value: string) => void
   disabled: boolean
 }) {
-  const queryClient = useQueryClient()
-  const [creating, setCreating] = useState(false)
-  const key = [...ORG_EMAIL_KEY, orgId]
-  const email = useQuery({ queryKey: key, queryFn: () => getOrgEmail(orgId), enabled: orgId !== '' })
+  const openNewAddress = useContext(NewAddressContext)
+  const email = useQuery({ queryKey: [...ORG_EMAIL_KEY, orgId], queryFn: () => getOrgEmail(orgId), enabled: orgId !== '' })
   const options = email.data ? inboxOptions(email.data, operatorOrg, automationId, value) : []
-  const canCreate = !!email.data && email.data.on_plan && email.data.mail_domain !== ''
+  const canCreate = openNewAddress !== null && !!email.data && email.data.on_plan && email.data.mail_domain !== ''
   const known = value === '' || !email.data || options.some(option => option.value === value)
   if (email.data && options.length === 0 && !canCreate) {
     return (
@@ -704,49 +938,44 @@ function GmailInboxSelect({ orgId, operatorOrg, automationId, value, onChange, d
     )
   }
   return (
-    <>
-      <FormTextField
-        label="Receives at"
-        required
-        value={value}
-        disabled={disabled || email.isLoading}
-        testId="automation-gmail-inbox"
-        onChange={choice => (choice === NEW_ADDRESS ? setCreating(true) : onChange(choice))}
-        error={email.isError ? apiDetail(email.error, 'Couldn’t load the addresses.') : undefined}
-        options={[
-          ...options,
-          ...(known ? [] : [{ value, label: 'Removed' }]),
-          ...(canCreate ? [{ value: NEW_ADDRESS, label: 'New address…' }] : []),
-        ]}
-      >
-        {/* Nothing picked yet: a native select would show its first option as if chosen, and picking "New address…"
-            when it is the only one would fire no change. */}
-        {value === '' && <option value="" disabled>Choose…</option>}
-      </FormTextField>
-      {creating && (
-        <NewAddressDialog orgId={orgId} onClose={() => setCreating(false)} onCreated={row => {
-          setCreating(false)
-          // In the list before it is selected, so the select never reads it as Removed.
-          queryClient.setQueryData<OrgEmail>(key, old => (old ? { ...old, addresses: [...old.addresses, row] } : old))
-          void queryClient.invalidateQueries({ queryKey: ORG_EMAIL_KEY })
-          onChange(`${ADDRESS_PREFIX}${row.id}`)
-        }} />
-      )}
-    </>
+    <FormTextField
+      label="Receives at"
+      help={RECEIVES_AT_HELP}
+      required
+      value={value}
+      disabled={disabled || email.isLoading}
+      testId="automation-gmail-inbox"
+      onChange={choice => (choice === NEW_ADDRESS ? openNewAddress?.() : onChange(choice))}
+      error={email.isError ? apiDetail(email.error, 'Couldn’t load the addresses.') : undefined}
+      options={[
+        ...options,
+        ...(known ? [] : [{ value, label: 'Removed' }]),
+        ...(canCreate ? [{ value: NEW_ADDRESS, label: 'New address…' }] : []),
+      ]}
+    >
+      {/* Nothing picked yet: a native select would show its first option as if chosen, and picking "New address…"
+          when it is the only one would fire no change. */}
+      {value === '' && <option value="" disabled>Choose…</option>}
+    </FormTextField>
   )
 }
 
 /** A GitHub source's Repository: one of the project's connected repos (D9), or any. A new source starts on the
  *  primary, and again whenever the Target moves to a project that does not connect the picked repo. A stored value
- *  the project no longer connects stays listed, marked, so a reopen never silently changes it. */
+ *  the project no longer connects stays listed, marked, so a reopen never silently changes it. With no project
+ *  there is nothing to list: free text, where blank means any repository (on create, the project's primary). */
 function GithubRepositorySelect({ projectId, value, onChange, disabled, creating }: {
-  projectId: number
+  projectId: number | null
   value: string
   onChange: (value: string) => void
   disabled: boolean
   creating: boolean
 }) {
-  const repos = useQuery({ queryKey: ['automation-github-repos', projectId], queryFn: () => connectedGithubRepos(projectId) })
+  const repos = useQuery({
+    queryKey: ['automation-github-repos', projectId],
+    queryFn: () => connectedGithubRepos(projectId!),
+    enabled: projectId !== null,
+  })
   const connected = repos.data ?? []
   const picked = value.trim()
   // Matched case-insensitively, as intake matches a delivery; the select shows the connected spelling.
@@ -761,9 +990,23 @@ function GithubRepositorySelect({ projectId, value, onChange, disabled, creating
     if (picked === ANY_REPOSITORY && !first) return
     if (!repos.data.some(repo => repo.name.toLowerCase() === picked.toLowerCase())) onChange(repos.data[0]?.name ?? ANY_REPOSITORY)
   }, [creating, repos.data, projectId, picked, onChange])
+  if (projectId === null) {
+    return (
+      <FormTextField
+        label="Repository"
+        placeholder="owner/repo"
+        help={creating ? 'Only this repository runs it; empty: the project’s primary.' : 'Only this repository runs it; empty: any repository.'}
+        value={value === ANY_REPOSITORY ? '' : value}
+        disabled={disabled}
+        onChange={v => onChange(v.trim() === '' && !creating ? ANY_REPOSITORY : v)}
+        testId="automation-github-repository"
+      />
+    )
+  }
   return (
     <FormTextField
       label="Repository"
+      help={GITHUB_REPOSITORY_HELP}
       value={match ?? (picked === '' ? ANY_REPOSITORY : picked)}
       disabled={disabled || repos.isPending}
       testId="automation-github-repository"
@@ -779,60 +1022,18 @@ function GithubRepositorySelect({ projectId, value, onChange, disabled, creating
   )
 }
 
-function ToggledNumber({
-  name,
-  label,
-  on,
-  value,
-  disabled,
-  testId,
-  onToggle,
-  onChange,
-}: {
-  name: string
-  label: string
-  on: boolean
-  value: string
-  disabled: boolean
-  testId: string
-  onToggle: (on: boolean) => void
-  onChange: (value: string) => void
-}) {
-  return (
-    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
-      <Box sx={{ flex: '1 1 14rem' }}>
-        <SettingCheckbox name={name} label={label} checked={on} disabled={disabled} onChange={onToggle} testId={`${testId}-on`} />
-      </Box>
-      {on && (
-        <Box sx={{ flex: '0 1 8rem' }}>
-          <TextField
-            type="number"
-            size="small"
-            fullWidth
-            value={value}
-            disabled={disabled}
-            onChange={e => onChange(e.target.value)}
-            sx={fieldTapTargetSx}
-            slotProps={{ htmlInput: { 'data-testid': testId, min: 1, 'aria-label': label } }}
-          />
-        </Box>
-      )}
-    </Box>
-  )
-}
-
 function FieldGrid({ children }: { children: ReactNode }) {
   return (
-    <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: 'repeat(auto-fit, minmax(11rem, 1fr))' }}>
+    <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: `repeat(auto-fit, minmax(${grid(29)}, 1fr))` }}>
       {children}
     </Box>
   )
 }
 
-function SubHeading({ children }: { children: ReactNode }) {
+function SubHeading({ children, help }: { children: string; help?: string }) {
   return (
-    <Typography variant="body2" component="h3" sx={{ fontWeight: 600, pt: 0.5 }}>
-      {children}
+    <Typography variant="body2" component="h3" sx={{ fontWeight: FONT_WEIGHT.semibold, pt: 0.5 }}>
+      <HelpLabel label={children} help={help} />
     </Typography>
   )
 }
@@ -851,6 +1052,8 @@ export function EventSetupSection({
   confirm: ReturnType<typeof useConfirm>[0]
 }) {
   const { busy, formError: error, run: submit } = useSubmit()
+  const pasted = useSubmit()
+  const [clientSecret, setClientSecret] = useState('')
   const [checking, setChecking] = useState(false)
   const when = automation.when
   if (when.kind !== 'event' || !HTTP_SOURCE_KINDS.has(when.source_kind)) return null
@@ -858,9 +1061,11 @@ export function EventSetupSection({
   const bearer = auth === 'bearer'
   // An API-key webhook holds no secret: nothing to reveal, rotate or check.
   const apiKey = auth === 'api_key'
+  // Sentry and PagerDuty sign with their own secret, pasted below: rotating would overwrite it.
+  const vendorSecretLabel = VENDOR_SECRET_LABELS[when.source_kind] ?? null
   const revealed = { ...automation, when: { ...when, secret_state: 'revealed' } }
-  // HMAC-signed sources only: a bearer sender sends the secret itself, so there is no signature to check.
-  const check = bearer || apiKey ? null : (
+  // Jaah's own HMAC scheme only: a bearer or Datadog sender sends the secret itself, and a monitor signs its own way.
+  const check = bearer || apiKey || MONITOR_SOURCE_KINDS.has(when.source_kind) ? null : (
     <Button variant="outlined" onClick={() => setChecking(true)} sx={tapTargetSx} data-testid="automation-check-signature">
       Check signature
     </Button>
@@ -879,123 +1084,302 @@ export function EventSetupSection({
   })
 
   const rotate = async () => {
-    const ok = await confirm({
+    const ok = await confirm(danger('Rotate secret', {
       title: 'Rotate secret',
       identity: automation.name,
       message: 'The old secret stops working at once. Update every sender with the new one.',
-      confirmLabel: 'Rotate secret',
-      destructive: true,
-    })
+    }))
     if (ok) await run(() => rotateAutomationSecret(automation.id), 'Couldn’t rotate the secret.')
   }
+
+  const saveClientSecret = () => pasted.run('Couldn’t save the secret.', async () => {
+    await setAutomationSecret(automation.id, clientSecret.trim())
+    setClientSecret('')
+    onAutomation(revealed)
+  })
 
   return (
     <DetailSection title="Endpoint" testId="automation-section-setup">
       {when.source_kind === 'github' && when.ingress_url ? (
-        <GithubSetup when={when} url={when.ingress_url} />
+        <ForgeSetup
+          forge="github"
+          events={Array.isArray(when.source_config.events) ? (when.source_config.events as string[]) : []}
+          repository={typeof when.source_config.repository === 'string' ? when.source_config.repository : ''}
+          url={when.ingress_url}
+        />
+      ) : isVendorKind(when.source_kind) && when.ingress_url ? (
+        <VendorSetup kind={when.source_kind} url={when.ingress_url} />
       ) : when.ingress_url ? (
         <CopyableValue value={when.ingress_url} copyLabel="Copy URL" sx={{ overflowWrap: 'anywhere' }} />
       ) : (
-        <Typography variant="body2">
-          No public hooks address — this automation can’t receive requests yet.
-        </Typography>
+        <Banner severity="warning" testId="automation-no-ingress">No public address.</Banner>
       )}
       {when.source_kind === 'webhook' && (
-        <Typography variant="body2" sx={{ color: 'text.secondary', overflowWrap: 'anywhere' }} data-testid="automation-auth-hint">
-          {apiKey ? (
-            <>
-              Send <Mono>Authorization: Bearer &lt;API key&gt;</Mono> — a key with Tasks: create.{' '}
-              <Link component={RouterLink} to={API_KEYS_URL}>API keys</Link>
-            </>
-          ) : bearer ? (
-            <>Send <Mono>Authorization: Bearer &lt;secret&gt;</Mono>.</>
-          ) : (
-            <>Sign each request: <Mono>X-Jaah-Signature-256: sha256=&lt;hex&gt;</Mono>, the HMAC-SHA256 of the raw body keyed with the secret.</>
-          )}
-        </Typography>
+        <Box data-testid="automation-auth-hint" sx={{ overflowWrap: 'anywhere' }}>
+          <KeyValueList labelWidth={grid(24)}>
+            <KeyValue label={<HelpLabel label="Header" help={apiKey ? 'A key with Tasks: create.' : bearer ? undefined : 'HMAC-SHA256 of the raw body, keyed with the secret.'} />}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+                <CopyableValue
+                  value={apiKey ? 'Authorization: Bearer <API key>' : bearer ? 'Authorization: Bearer <secret>' : 'X-Jaah-Signature-256: sha256=<hex>'}
+                  copyLabel="Copy"
+                />
+                {apiKey && <Link component={RouterLink} to={API_KEYS_URL} variant="body2">API keys</Link>}
+              </Box>
+            </KeyValue>
+          </KeyValueList>
+        </Box>
       )}
       {error && <Banner severity="error">{error}</Banner>}
-      {apiKey ? null : when.secret_state === 'revealed' ? (
+      {!apiKey && (when.secret_state === 'owed' || (when.secret_state === 'revealed' && !vendorSecretLabel)) && (
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
-          <Typography variant="body2">Secret hidden — rotate to get a new one</Typography>
-          <Button variant="outlined" disabled={busy} onClick={() => void rotate()} sx={tapTargetSx} data-testid="automation-rotate-secret">
-            Rotate secret
-          </Button>
+          {when.secret_state === 'revealed' ? (
+            <Button variant="outlined" disabled={busy} onClick={() => void rotate()} sx={tapTargetSx} data-testid="automation-rotate-secret">
+              Rotate secret
+            </Button>
+          ) : (
+            <Button variant="outlined" disabled={busy} sx={tapTargetSx} data-testid="automation-reveal-secret"
+              onClick={() => void run(() => revealAutomationSecret(automation.id), 'Couldn’t reveal the secret.')}>
+              Reveal secret (one time)
+            </Button>
+          )}
           {check}
         </Box>
-      ) : when.secret_state === 'owed' ? (
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
-          <Button
-            variant="outlined"
-            disabled={busy}
-            onClick={() => void run(() => revealAutomationSecret(automation.id), 'Couldn’t reveal the secret.')}
-            sx={tapTargetSx}
-            data-testid="automation-reveal-secret"
-          >
-            Reveal secret (one time)
+      )}
+      {vendorSecretLabel && (
+        <FormBox onSubmit={saveClientSecret}
+          sx={{ display: 'flex', alignItems: 'flex-start', gap: 1.5, flexWrap: 'wrap' }}>
+          <Box sx={{ flex: `1 1 ${grid(42.5)}`, minWidth: 0 }}>
+            <FormTextField
+              label={vendorSecretLabel}
+              help={VENDOR_SECRET_HELP}
+              type="password"
+              autoComplete="new-password"
+              value={clientSecret}
+              onChange={v => { setClientSecret(v); pasted.clearSaved() }}
+              disabled={pasted.busy}
+              testId="automation-vendor-secret"
+            />
+          </Box>
+          <Button type="submit" variant="outlined" disabled={pasted.busy || clientSecret.trim() === ''} sx={tapTargetSx}
+            data-testid="automation-vendor-secret-save">
+            Save
           </Button>
-          {check}
-        </Box>
-      ) : null}
+          <SavedNote show={pasted.saved} sx={{ alignSelf: 'center' }} />
+        </FormBox>
+      )}
+      {pasted.formError && <Banner severity="error">{pasted.formError}</Banner>}
       {/* Mounted only while open: closing drops every typed field. */}
       {checking && <SignatureCheckDialog onClose={() => setChecking(false)} />}
     </DetailSection>
   )
 }
 
-/* The repo-webhook form GitHub shows, field by field, in its own order: what to paste into each box and which
- * events to tick. The secret is the one revealed below — never shown here. */
-function GithubSetup({ when, url }: { when: EventWhen; url: string }) {
-  const events = Array.isArray(when.source_config.events) ? (when.source_config.events as string[]) : []
-  const repository = typeof when.source_config.repository === 'string' ? when.source_config.repository : ''
-  const where = repository ? <Mono>{repository}</Mono> : 'the repository'
+const AZURE_DEVOPS_EVENT_LABELS: Record<string, string> = {
+  'git.push': 'Code pushed',
+  'ms.vss-pipelines.run-state-changed-event': 'Run state changed',
+  'ms.vss-pipelines.stage-state-changed-event': 'Run stage state changed',
+  'ms.azure-devops-release.deployment-completed-event': 'Release deployment completed',
+}
+
+const BITBUCKET_TRIGGER_LABELS: Record<string, string> = {
+  'repo:push': 'Push',
+  'repo:commit_status_created': 'Build status created',
+  'repo:commit_status_updated': 'Build status updated',
+}
+
+/** An Azure DevOps `organization/project/repo` as people read it: a stored repo URL keeps `My%20Project`. */
+export function azureRepositoryLabel(repository: string): string {
+  try {
+    return decodeURIComponent(repository)
+  } catch {
+    return repository
+  }
+}
+
+/* Each forge's own webhook form, field by field in its own order: what to paste into each box and which events to
+ * tick. `secretPending` is the secret row's text while the caller does not hold the secret. */
+const FORGE_SETUPS: Record<Forge, {
+  testId: string
+  repositoryLabel: string
+  repository?: (repository: string) => string
+  urlLabel: string
+  fixedRows?: { label: string; value: string }[]
+  secretLabel: string
+  secretPending: (secret: string | null | undefined) => string
+  eventsLabel: string
+  eventsHelp: string
+  eventsTestId: (testId: string) => string
+  eventLabel: (event: string) => string
+  copyEvent?: boolean
+}> = {
+  /* GitHub's repo-webhook form. The secret: `null` when it was shown at creation, else revealed once below. Also the
+   * Production QA tab's Connect releases answer (`ProductionQaConnectDeploys.tsx`). */
+  github: {
+    testId: 'automation-github-setup',
+    repositoryLabel: 'Repository',
+    urlLabel: 'Payload URL',
+    fixedRows: [{ label: 'Content type', value: 'application/json' }],
+    secretLabel: 'Secret',
+    secretPending: secret => (secret === null ? 'Shown once, when created' : 'Below'),
+    eventsLabel: 'Events',
+    eventsHelp: 'Let me select individual events',
+    eventsTestId: () => 'automation-github-events-to-tick',
+    eventLabel: githubEventLabel,
+    copyEvent: true,
+  },
+  /* GitLab's Add webhook form (Settings › Webhooks): the URL, the Secret token (sent back in `X-Gitlab-Token`), and
+   * the Trigger boxes to tick. */
+  gitlab: {
+    testId: 'automation-gitlab-setup',
+    repositoryLabel: 'Project',
+    urlLabel: 'URL',
+    secretLabel: 'Secret token',
+    secretPending: secret => (secret === null ? 'Shown once, when created' : 'Below'),
+    eventsLabel: 'Trigger',
+    eventsHelp: 'Tick only these',
+    eventsTestId: testId => `${testId}-events`,
+    eventLabel: gitlabEventLabel,
+  },
+  /* Azure DevOps service hooks (Web Hooks consumer), one subscription per event: Azure DevOps does not sign, so the
+   * secret is the basic-auth password (`app/production_qa/azure_devops.py`). */
+  azure_devops: {
+    testId: 'automation-azure-devops-setup',
+    repositoryLabel: 'Repository',
+    repository: azureRepositoryLabel,
+    urlLabel: 'URL',
+    fixedRows: [{ label: 'Username', value: 'jaah' }],
+    secretLabel: 'Password',
+    secretPending: () => 'Shown once, when created',
+    eventsLabel: 'Events',
+    eventsHelp: 'One subscription each',
+    eventsTestId: testId => `${testId}-events`,
+    eventLabel: event => AZURE_DEVOPS_EVENT_LABELS[event] ?? event,
+  },
+  /* Bitbucket Cloud's Add webhook form (Repository settings › Webhooks): its triggers are the push and the two
+   * build-status events deploy ingestion reads (`app/production_qa/bitbucket.py`). */
+  bitbucket: {
+    testId: 'automation-bitbucket-setup',
+    repositoryLabel: 'Repository',
+    urlLabel: 'URL',
+    secretLabel: 'Secret',
+    secretPending: () => 'Shown once, when created',
+    eventsLabel: 'Triggers',
+    eventsHelp: 'Choose from a full list of triggers',
+    eventsTestId: testId => `${testId}-triggers`,
+    eventLabel: event => BITBUCKET_TRIGGER_LABELS[event] ?? event,
+  },
+}
+
+/* The secret: `secret` when the caller holds it, else the forge's pending text. An unknown `forge` reads as GitHub. */
+export function ForgeSetup({ forge, events, repository, url, secret, testId }: {
+  forge: Forge
+  events: string[]
+  repository: string
+  url: string
+  secret?: string | null
+  testId?: string
+}) {
+  const spec = FORGE_SETUPS[forge] ?? FORGE_SETUPS.github
+  const id = testId ?? spec.testId
   return (
-    <Stack spacing={1.5} data-testid="automation-github-setup">
-      <Typography variant="body2">
-        In GitHub, open {where} → Settings → Webhooks → Add webhook, and fill it in:
-      </Typography>
-      <SetupRow label="Payload URL">
+    <KeyValueList labelWidth={grid(24)} testId={id}>
+      {repository && <KeyValue label={spec.repositoryLabel}><Mono>{spec.repository?.(repository) ?? repository}</Mono></KeyValue>}
+      <KeyValue label={spec.urlLabel}>
         <CopyableValue value={url} copyLabel="Copy URL" sx={{ overflowWrap: 'anywhere' }} />
-      </SetupRow>
-      <SetupRow label="Content type">
-        <CopyableValue value="application/json" copyLabel="Copy" />
-      </SetupRow>
-      <SetupRow label="Secret">
-        <Typography variant="body2">This automation’s secret (below).</Typography>
-      </SetupRow>
-      <SetupRow label="Events">
-        <Typography variant="body2" sx={{ mb: 0.5 }}>
-          Choose “Let me select individual events” and tick:
-        </Typography>
-        <Box component="ul" sx={{ m: 0, pl: 2.5 }} data-testid="automation-github-events-to-tick">
-          {events.map(event => (
-            <Box component="li" key={event} sx={{ py: 0.25 }}>
-              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
-                <Typography variant="body2" sx={{ fontWeight: 500 }}>{githubEventLabel(event)}</Typography>
-                <CopyableValue value={event} copyLabel="Copy" />
+      </KeyValue>
+      {spec.fixedRows?.map(row => (
+        <KeyValue key={row.label} label={row.label}>
+          <CopyableValue value={row.value} copyLabel="Copy" />
+        </KeyValue>
+      ))}
+      <KeyValue label={spec.secretLabel}>
+        {secret
+          ? <CopyableValue value={secret} copyLabel="Copy secret" testId={`${id}-secret`} sx={{ overflowWrap: 'anywhere' }} />
+          : <Typography variant="body2">{spec.secretPending(secret)}</Typography>}
+      </KeyValue>
+      <KeyValue label={<HelpLabel label={spec.eventsLabel} help={spec.eventsHelp} />}>
+        <Box component="ul" sx={{ m: 0, pl: 2.5 }} data-testid={spec.eventsTestId(id)}>
+          {events.map(event => {
+            const label = <Typography variant="body2" sx={{ fontWeight: FONT_WEIGHT.medium }}>{spec.eventLabel(event)}</Typography>
+            return (
+              <Box component="li" key={event}>
+                {spec.copyEvent
+                  ? <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>{label}<CopyableValue value={event} copyLabel="Copy" /></Box>
+                  : label}
               </Box>
-            </Box>
-          ))}
+            )
+          })}
         </Box>
-      </SetupRow>
-    </Stack>
+      </KeyValue>
+    </KeyValueList>
   )
 }
 
-function SetupRow({ label, children }: { label: string; children: ReactNode }) {
+/* ONE panel per monitor vendor: where the URL goes in the vendor's own form (`urlLabel`), its other rows, and the
+ * hint naming the vendor's screen. The vendor mints the signing secret where the hint says to paste it here. */
+type VendorKind = 'sentry' | 'datadog' | 'pagerduty' | 'cloudwatch'
+const VENDOR_SETUP: Record<VendorKind, { urlLabel: string; rows?: ReactNode; hint?: string }> = {
+  // Sentry's Custom Integration form; its Client Secret is the signing secret.
+  sentry: {
+    urlLabel: 'Webhook URL',
+    hint: 'In Sentry: Settings → Custom Integrations → Webhook URL = this URL; turn on Alert Rule Action and the Issue '
+      + 'webhook; paste its Client Secret here.',
+  },
+  // Datadog's Webhooks integration: the custom header carries the secret (Datadog does not sign), and the payload
+  // is what the adapter reads.
+  datadog: {
+    urlLabel: 'URL',
+    rows: (
+      <>
+        <KeyValue label={<HelpLabel label="Custom headers" help="Keep the secret in a hidden custom variable." />}>
+          <CopyableValue value='{"X-Jaah-Token": "<secret>"}' copyLabel="Copy" />
+        </KeyValue>
+        <KeyValue label="Payload">
+          <Stack spacing={0.5} sx={{ alignItems: 'flex-start' }}>
+            <CodeBlock testId="automation-datadog-payload" bordered>{DATADOG_PAYLOAD}</CodeBlock>
+            <CopyButton text={() => DATADOG_PAYLOAD} label="Copy payload" testId="automation-datadog-payload-copy" />
+          </Stack>
+        </KeyValue>
+      </>
+    ),
+  },
+  // PagerDuty's Generic Webhook (v3) subscription: the event types the adapter reads.
+  pagerduty: {
+    urlLabel: 'Webhook URL',
+    rows: (
+      <KeyValue label="Event subscription">
+        <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+          {PAGERDUTY_EVENTS.map(event => <CopyableValue key={event} value={event} copyLabel="Copy" />)}
+        </Box>
+      </KeyValue>
+    ),
+    hint: 'In PagerDuty: Integrations → Generic Webhooks (v3) → New Webhook; paste its signing secret here.',
+  },
+  // An HTTPS subscription to the SNS topic the alarms publish to: AWS signs every message, Jaah confirms the
+  // subscription itself.
+  cloudwatch: {
+    urlLabel: 'Endpoint',
+    rows: <KeyValue label="Protocol"><Mono>HTTPS</Mono></KeyValue>,
+    hint: "In SNS: the alarms' topic → Create subscription. Jaah confirms it while active.",
+  },
+}
+
+function isVendorKind(kind: string): kind is VendorKind {
+  return kind in VENDOR_SETUP
+}
+
+function VendorSetup({ kind, url }: { kind: VendorKind; url: string }) {
+  const { urlLabel, rows, hint } = VENDOR_SETUP[kind]
   return (
-    <Box
-      sx={{
-        display: 'grid',
-        gridTemplateColumns: { xs: '1fr', sm: '9rem 1fr' },
-        columnGap: 2,
-        rowGap: 0.5,
-        alignItems: 'baseline',
-      }}
-    >
-      <Typography variant="body2" sx={{ color: 'text.secondary', fontWeight: 500 }}>{label}</Typography>
-      <Box sx={{ minWidth: 0 }}>{children}</Box>
-    </Box>
+    <Stack spacing={1.5} data-testid={`automation-${kind}-setup`}>
+      <KeyValueList labelWidth={grid(24)}>
+        <KeyValue label={urlLabel}>
+          <CopyableValue value={url} copyLabel="Copy URL" sx={{ overflowWrap: 'anywhere' }} />
+        </KeyValue>
+        {rows}
+      </KeyValueList>
+      {hint && <Typography variant="body2" sx={{ color: 'text.secondary' }}>{hint}</Typography>}
+    </Stack>
   )
 }
 
@@ -1036,43 +1420,36 @@ export function EventTestPanel({
     }
   }
 
-  const runTest = async () => {
+  /** Hands the parsed sample to `call` while `mode` runs; a failure goes to `refused`. */
+  const fire = async (mode: 'test' | 'run', call: (event: Record<string, unknown>) => Promise<void>, refused: (err: unknown) => void) => {
     const event = parsedSample()
     if (event === null) return
-    setRunning('test')
+    setRunning(mode)
     try {
-      setResult(await testRenderAutomation(automation.id, event, { prompt_template: bodyTemplate, title_template: titleTemplate }))
+      await call(event)
     } catch (err) {
-      setResult(null)
-      setError(readableError(err, 'Couldn’t render the template.'))
+      refused(err)
     } finally {
       setRunning(null)
     }
   }
-
-  const runNow = async () => {
-    const event = parsedSample()
-    if (event === null) return
-    setRunning('run')
-    try {
-      const fired = await runAutomation(automation.id, event)
-      onRan(fired.detail)
-    } catch (err) {
-      setError(apiDetail(err, 'Couldn’t run the automation.'))
-    } finally {
-      setRunning(null)
-    }
-  }
+  const runTest = () => fire('test',
+    async event => setResult(await testRenderAutomation(automation.id, event, { prompt_template: bodyTemplate, title_template: titleTemplate })),
+    err => { setResult(null); setError(readableError(err, 'Couldn’t render the template.')) })
+  const runNow = () => fire('run',
+    async event => onRan((await runAutomation(automation.id, event)).detail),
+    err => setError(apiDetail(err, 'Couldn’t run the automation.')))
 
   return (
-    <Stack spacing={1.5} sx={{ maxWidth: '40rem' }}>
+    <Stack spacing={1.5} sx={{ maxWidth: SIZE.measure }}>
       <FormTextField
         label="Sample payload"
+        help={SAMPLE_PAYLOAD_HELP}
         error={jsonError || undefined}
         value={sample}
         multiline
         minRows={4}
-        placeholder={SAMPLE_PLACEHOLDER[kind] ?? SAMPLE_PLACEHOLDER.webhook}
+        placeholder={templateOf(kind).sample}
         onChange={setSample}
         sx={{ '& textarea': monoSx }}
         testId="automation-test-sample"
@@ -1112,7 +1489,7 @@ export function EventTestPanel({
             <Box
               data-testid="automation-test-body"
               sx={{
-                border: '1px solid', borderColor: 'divider', borderRadius: 2, bgcolor: 'background.paper', p: '0.75rem',
+                border: '1px solid', borderColor: 'divider', borderRadius: RADIUS.md, bgcolor: 'background.paper', p: 2,
                 overflowWrap: 'anywhere',
                 '& > .rte-content': { p: 0 },
                 '& .ProseMirror > :first-child': { mt: 0 },

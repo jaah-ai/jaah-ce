@@ -15,11 +15,19 @@ is no chmod (ACLs inherit) — so no socket widening and no readability pass.
 On macOS it is `ai.jaah.runner`'s loop (the bundle's `jaah-runner-launch`), as the hidden user
 `_jaah`: the Linux contract unchanged (a `tmux-<uid>` socket widened for the daemon's group, the
 `server-access` grant, the readability pass), with a holder BSD `sleep` accepts (`holder_command`).
+
+On Linux with `jaah-fleet-tmux.socket` active (`session_user.fleet_isolated`) the loop instead keeps the socket
+systemd passed it and runs the server ON it (`converge_activated`): the socket is the daemon's, so no
+runner pane can reach the server; the grant, options and holder session come from the root-owned
+`fleet-tmux.conf`, since this loop cannot connect either. It also retires the pre-isolation shared server
+once its runners are gone.
 """
 from __future__ import annotations
 
 import os
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -353,25 +361,11 @@ def recycle_stale_server(session: str, env: dict | None = None) -> bool:
         return False
     env = dict(os.environ if env is None else env)
     socket = own_socket(env)
-    shown = _tmux(socket, "display-message", "-p", "-t", f"={session}", "#{pid}", env=env)
-    pid = (shown.stdout or "").strip()
-    if shown.returncode != 0 or not pid.isdigit():
+    pid = _idle_server_pid(socket, session, env)
+    if pid is None:
         return False
     theirs = host_platform.mount_namespace(pid)
     if theirs is None or mine == theirs:
-        return False
-    panes = _tmux(socket, "list-panes", "-a", "-F", "#{pane_pid} #{window_name}", env=env)
-    clients = _tmux(socket, "list-clients", env=env)
-    if panes.returncode != 0 or clients.returncode != 0 or (clients.stdout or "").strip():
-        return False
-    holders = set()
-    for line in (panes.stdout or "").splitlines():
-        pane_pid, _, window = line.partition(" ")  # tmux prints a tab as `_`
-        if window != HOLDER_WINDOW:
-            return False
-        holders.add(pane_pid)
-    children = host_platform.child_pids(pid)
-    if children is None or children - holders:
         return False
     # A launch landing between these reads and the kill loses its pane: a seconds-wide, one-off window.
     killed = _tmux(socket, "kill-server", env=env)
@@ -380,6 +374,30 @@ def recycle_stale_server(session: str, env: dict | None = None) -> bool:
     print(f"fleet_tmux_server: recycled the tmux server (pid {pid}) on {socket}: it ran in an older mount "
           f"namespace than this unit and held no session")
     return True
+
+
+def _idle_server_pid(socket: str, session: str, env: dict) -> str | None:
+    """The pid of SOCKET's server when it holds nothing but the holder — no window but the holder, no
+    attached client, no server child but the holder's pane (a `run-shell -b` job is a child, not a window)
+    — else None, also when anything is unreadable."""
+    shown = _tmux(socket, "display-message", "-p", "-t", f"={session}", "#{pid}", env=env)
+    pid = (shown.stdout or "").strip()
+    if shown.returncode != 0 or not pid.isdigit():
+        return None
+    panes = _tmux(socket, "list-panes", "-a", "-F", "#{pane_pid} #{window_name}", env=env)
+    clients = _tmux(socket, "list-clients", env=env)
+    if panes.returncode != 0 or clients.returncode != 0 or (clients.stdout or "").strip():
+        return None
+    holders = set()
+    for line in (panes.stdout or "").splitlines():
+        pane_pid, _, window = line.partition(" ")  # tmux prints a tab as `_`
+        if window != HOLDER_WINDOW:
+            return None
+        holders.add(pane_pid)
+    children = host_platform.child_pids(pid)
+    if children is None or children - holders:
+        return None
+    return pid
 
 
 # Run through the server by `_server_can_symlink`: create and remove a symlink in a fresh temp dir. Prints
@@ -524,12 +542,142 @@ def _recycle_stale_windows_server(session: str, env: dict | None) -> bool:
     return True
 
 
+# ── The isolated fleet server: socket activation (Linux) ───────────────────────────────────────────────
+# systemd's first passed descriptor (`SD_LISTEN_FDS_START`).
+LISTEN_FD = 3
+# The server's whole configuration: the daemon's grant, options, the holder session. Root-owned in the
+# package, beside this file — a runner can neither edit it nor plant another (`-f` also keeps the server off
+# `~/.tmux.conf`, which is the runner's to write).
+FLEET_TMUX_CONF = str(_HERE / "fleet-tmux.conf")
+# The variable `fleet-tmux.conf` reads for the session name (tmux expands `$NAME` from its own environment).
+FLEET_SESSION_ENV = "JAAH_FLEET_SESSION"
+_ACTIVATED_SERVER_UP_S = 10.0
+
+
+def activated_fd(env: dict | None = None) -> int | None:
+    """The listening socket systemd passed this process, or None — the `sd_listen_fds` contract: exactly one
+    descriptor (`LISTEN_FDS=1`), `LISTEN_PID` naming this process, and a socket on `LISTEN_FD`."""
+    source = os.environ if env is None else env
+    if source.get("LISTEN_FDS") != "1" or source.get("LISTEN_PID") != str(os.getpid()):
+        return None
+    try:
+        return LISTEN_FD if stat.S_ISSOCK(os.fstat(LISTEN_FD).st_mode) else None
+    except OSError:
+        return None
+
+
+def _socket_holders(inode: int) -> set[int]:
+    """Pids other than this one holding socket INODE open. Only this uid's processes are readable, and no
+    other process but systemd (root) can hold it: tmux opens it close-on-exec, so no pane inherits it."""
+    return host_platform.socket_holders(inode)
+
+
+# Moves the passed descriptor onto `LISTEN_FD` (systemd already put it there; a caller's own may not be), then
+# names this pid — tmux's once the shell execs it — as the one `sd_listen_fds` honours it in. bash, not sh:
+# dash takes no descriptor above 9.
+_ACTIVATED_SERVER_SH = ('fd=$1; shift; [ "$fd" = 3 ] || eval "exec 3<&$fd $fd<&-"; '
+                        'LISTEN_PID=$$; export LISTEN_PID; exec "$@"')
+
+
+def _is_tmux(pid: int) -> bool:
+    """Is PID running tmux (its argv[0]), as opposed to a shell that has not exec'd it yet?"""
+    return (host_platform.cmdline_args(pid) or [b""])[0].startswith(b"tmux")
+
+
+def _activated_server_argv(socket: str, fd: int) -> list[str]:
+    """The server on descriptor FD. `-D` (foreground, this loop's child) is what makes tmux adopt it: a forking
+    start reads the descriptor in a pid `LISTEN_PID` does not name, and binds its own. `-S` names the activated
+    path, so a tmux that ignored the descriptor fails to bind in root's directory instead of serving on
+    another socket.
+
+    A server reads its configuration only when its FIRST client arrives, and refuses a non-owner who arrives
+    before the grant (`access not allowed`, exit 0) without reading it. This loop cannot connect, so the
+    unit's `ExecStartPost=` connects as root (always admitted) — which is why a dead server ends this loop
+    rather than being restarted by it (`_converge_activated_forever`)."""
+    return ["/bin/bash", "-c", _ACTIVATED_SERVER_SH, "bash", str(fd),
+            "tmux", "-u", "-S", socket, "-f", FLEET_TMUX_CONF, "-D"]
+
+
+def converge_activated(session: str, fd: int, env: dict | None = None, *, announce: bool = True) -> int:
+    """Keep a fleet server running on FD, the socket systemd bound for the daemon. Returns an exit code.
+
+    A live holder of the socket — the server this loop or a previous one started (`KillMode=process` keeps
+    it across a restart) — is left alone. Otherwise one is started on it with `fleet-tmux.conf`, which
+    grants the daemon, sets the options and opens the holder session."""
+    env = dict(os.environ if env is None else env)
+    if session_user.switch_needed():
+        print(f"fleet_tmux_server: REFUSING to start the fleet server for {session!r} — this process is "
+              f"euid {os.geteuid()}, not {session_user.session_user()!r}.", file=sys.stderr)
+        return 1
+    inode = os.fstat(fd).st_ino
+    running = _socket_holders(inode)
+    if running:
+        if announce:
+            print(f"fleet_tmux_server: the fleet server (pid {min(running)}) is already running on the "
+                  f"activated socket")
+        return 0
+    socket = session_user.isolated_socket(env)
+    child_env = {k: v for k, v in env.items() if not k.startswith("LISTEN_") and k != "TMUX"}
+    child_env.update({"LISTEN_FDS": "1", FLEET_SESSION_ENV: session,
+                      environment.DAEMON_USER_ENV: session_user.daemon_user()})
+    try:
+        child = subprocess.Popen(_activated_server_argv(socket, fd), env=child_env, pass_fds=(fd,),
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        print(f"fleet_tmux_server: could not start the fleet server on {socket}: {exc}", file=sys.stderr)
+        return 1
+    deadline = time.monotonic() + _ACTIVATED_SERVER_UP_S
+    while time.monotonic() < deadline:
+        if child.poll() is not None:
+            print(f"fleet_tmux_server: the fleet server on {socket} exited at once (rc={child.returncode})",
+                  file=sys.stderr)
+            return 1
+        # Held by tmux itself, not the launcher shell before its exec: across the exec `/proc/<pid>/fd` is briefly
+        # unreadable, so a converge that read it then would see no holder and start a second server.
+        if child.pid in _socket_holders(inode) and _is_tmux(child.pid):
+            print(f"fleet_tmux_server: started the fleet server (pid {child.pid}) for session {session!r} "
+                  f"on {socket}, the daemon's socket — no runner pane can reach it")
+            return 0
+        time.sleep(0.1)
+    print(f"fleet_tmux_server: the fleet server on {socket} did not take the socket within "
+          f"{_ACTIVATED_SERVER_UP_S:.0f}s", file=sys.stderr)
+    return 1
+
+
+def retire_shared_server(session: str, env: dict | None = None) -> bool:
+    """Kill the pre-isolation shared server (this uid's `tmux-<uid>` socket) once it holds nothing but the
+    holder. Returns True when it killed it. Its runners keep running until they end; the daemon manages
+    them meanwhile (`session_user.manage_sockets`). A busy server is retried next tick."""
+    env = dict(os.environ if env is None else env)
+    socket = own_socket(env)
+    if not os.path.exists(socket):
+        return False
+    pid = _idle_server_pid(socket, session, env)
+    if pid is None:
+        return False
+    if _tmux(socket, "kill-server", env=env).returncode != 0:
+        return False
+    print(f"fleet_tmux_server: retired the shared tmux server (pid {pid}) on {socket}: its runners are gone "
+          f"and the fleet server runs on the daemon's socket now")
+    return True
+
+
 def converge_forever(session: str, interval: float = CONVERGE_INTERVAL_S) -> int:
     """`seed` once loudly, then re-converge every INTERVAL seconds, forever — the `--loop` ExecStart.
 
     The first seed's verdict is the unit's start verdict; after that a failed pass never exits the loop
     (`Restart=always` backstops a dead process). The readability pass rides the same tick — the only
-    place it can succeed (`_converge_shared_readability`)."""
+    place it can succeed (`_converge_shared_readability`). Given the fleet socket by systemd, the seed is
+    `converge_activated` instead."""
+    fd = activated_fd() if host_platform.is_linux() else None
+    if fd is not None and session_user.isolation_available():
+        return _converge_activated_forever(session, fd, interval)
+    if fd is not None:
+        # The daemon decides by the same test (`session_user.fleet_isolated`), so it stays on the shared socket.
+        print("fleet_tmux_server: systemd passed the fleet socket, but this host cannot isolate the fleet server "
+              "(a tmux without socket activation, or Yama ptrace_scope 0) — serving on the shared socket",
+              file=sys.stderr)
     rc = seed(session)
     if rc != 0:
         return rc
@@ -543,6 +691,70 @@ def converge_forever(session: str, interval: float = CONVERGE_INTERVAL_S) -> int
         except Exception as exc:  # noqa: BLE001 — the loop IS the recovery mechanism; log and re-tick
             print(f"fleet_tmux_server: converge pass failed ({exc}); retrying in {interval}s",
                   file=sys.stderr)
+
+
+# How often the activated loop looks for its server: a dead one leaves the daemon's calls queued on the socket
+# systemd holds, so it is noticed in seconds, not on the 30s converge tick.
+_ACTIVATED_WATCH_S = 5.0
+
+
+def _converge_activated_forever(session: str, fd: int, interval: float) -> int:
+    """`converge_forever` on the activated socket: the readability pass and the shared server's retirement
+    each INTERVAL. A server that no longer holds the socket ENDS the loop (exit 1): `Restart=` starts the unit
+    again, and with it the root `ExecStartPost=` the next server needs for its configuration
+    (`_activated_server_argv`). One that let go of the socket but lives on (SIGUSR1 has tmux re-take it, and
+    it closes the one systemd passed) is ended first: its panes would otherwise run on unreachable."""
+    rc = converge_activated(session, fd)
+    if rc != 0:
+        return rc
+    _converge_shared_readability()
+    inode = os.fstat(fd).st_ino
+    server = min(_socket_holders(inode) or {0})
+    since = time.monotonic()
+    while True:
+        time.sleep(min(interval, _ACTIVATED_WATCH_S))
+        holders = _socket_holders(inode)
+        if not holders:
+            if server and _is_tmux(server):
+                print(f"fleet_tmux_server: the fleet server (pid {server}) let go of the socket — ending it",
+                      file=sys.stderr)
+                try:
+                    os.kill(server, signal.SIGTERM)
+                except OSError:
+                    pass
+            print("fleet_tmux_server: the fleet server is gone — exiting so systemd restarts this unit and "
+                  "the next server is configured", file=sys.stderr)
+            return 1
+        server = min(holders)
+        if time.monotonic() - since < interval:
+            continue
+        since = time.monotonic()
+        try:
+            retire_shared_server(session)
+            _converge_shared_readability()
+        except Exception as exc:  # noqa: BLE001 — the loop IS the recovery mechanism; log and re-tick
+            print(f"fleet_tmux_server: converge pass failed ({exc}); retrying in {interval}s",
+                  file=sys.stderr)
+
+
+# The isolated server's first client, run as root by the unit's `ExecStartPost=` (`_activated_server_argv`).
+_FIRST_CLIENT_TIMEOUT_S = 30
+
+
+def first_client(env: dict | None = None) -> int:
+    """Connect to the isolated fleet socket once, as root, so the server reads its configuration. A no-op (0)
+    where the loop does not isolate (`session_user.isolation_available`): nothing accepts there, and the unit
+    would wait out the timeout. Never fails the unit: a server left unconfigured is the loop's to report."""
+    socket = session_user.isolated_socket(env)
+    if not session_user.isolation_available() or not os.path.exists(socket):
+        return 0
+    try:
+        subprocess.run(["tmux", "-N", "-S", socket, "start-server"], stdin=subprocess.DEVNULL,
+                       capture_output=True, timeout=_FIRST_CLIENT_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"fleet_tmux_server: the first client on {socket} failed ({exc}) — the server may be unconfigured",
+              file=sys.stderr)
+    return 0
 
 
 # Line-buffer stdout before anything prints: under systemd stdout is a pipe (block-buffered), the loop
@@ -562,6 +774,8 @@ def _line_buffer_stdout() -> None:
 def main(argv: list[str] | None = None) -> int:
     _line_buffer_stdout()
     args = list(sys.argv[1:] if argv is None else argv)
+    if args == ["--first-client"]:
+        return first_client()
     loop = "--loop" in args
     if loop:
         args.remove("--loop")

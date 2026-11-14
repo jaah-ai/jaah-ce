@@ -4,13 +4,15 @@ import Button from '@mui/material/Button'
 import Checkbox from '@mui/material/Checkbox'
 import FormControlLabel from '@mui/material/FormControlLabel'
 import Typography from '@mui/material/Typography'
-import { apiDetail } from '../../../api'
+import EmptyState from '../../../ui/EmptyState'
 import { useApiRead } from '../../../hooks/useApiRead'
+import { useSubmit } from '../../../hooks/useSubmit'
 import { withMember } from '../../../lib/sets'
 import Banner from '../../../ui/Banner'
 import LoadingState from '../../../ui/LoadingState'
 import { chooseMigration, getMigrationCandidates } from './api'
 import { NoteList } from './ResultStep'
+import { FONT_WEIGHT } from '../../../theme'
 
 /* The Migrate step (AC-4.7): every eligible credential still on KMS, Select all + one box each, and the
  * ineligible ones listed apart with the server's reason. Move sends the choice to the waiting setup
@@ -24,7 +26,7 @@ export default function MigrateStep({
   rotation = false,
 }: {
   frozen: boolean
-  onChosen: () => void
+  onChosen: () => void | Promise<void>
   /** A rotation's Migrate: the credentials go onto the new key. */
   rotation?: boolean
 }): JSX.Element {
@@ -33,8 +35,7 @@ export default function MigrateStep({
   const { data: candidates, error: loadError } = useApiRead(
     ['nodevault-migration-candidates'], getMigrationCandidates, 'Couldn’t load your credentials. Reload the page.',
   )
-  const [error, setError] = useState('')
-  const [busy, setBusy] = useState(false)
+  const { busy, formError: error, run } = useSubmit()
 
   if (loadError) return <Banner severity="error">{loadError}</Banner>
   if (!candidates) return <LoadingState />
@@ -44,18 +45,12 @@ export default function MigrateStep({
   const allSelected = movable.length > 0 && selected.size === movable.length
   const someSelected = selected.size > 0 && !allSelected
 
-  async function submit(skip: boolean) {
-    setBusy(true)
-    setError('')
-    try {
-      // "All" lets the server record every ineligible credential as skipped with its reason (AC-4.8).
-      await chooseMigration(skip ? { skip: true } : allSelected ? { all: true } : { credential_ids: [...selected] })
-      onChosen()
-    } catch (err) {
-      setError(apiDetail(err, 'Couldn’t start the move. Try again.'))
-      setBusy(false)
-    }
-  }
+  const submit = (skip: boolean) => run('Couldn’t start the move. Try again.', async () => {
+    // "All" lets the server record every ineligible credential as skipped with its reason (AC-4.8).
+    await chooseMigration(skip ? { skip: true } : allSelected ? { all: true } : { credential_ids: [...selected] })
+    // Awaited: the step stays busy until the parent's refetch unmounts it, so a second press cannot re-post.
+    await onChosen()
+  })
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }} data-testid="nodevault-migrate-step">
@@ -70,7 +65,7 @@ export default function MigrateStep({
       {frozen && <Banner severity="warning">NodeVault isn’t included in your plan. You can only skip.</Banner>}
 
       {movable.length === 0 ? (
-        <Typography variant="body2">No credentials to move.</Typography>
+        <EmptyState inline title="No credentials to move." />
       ) : (
         <Box>
           <FormControlLabel
@@ -82,7 +77,7 @@ export default function MigrateStep({
                 onChange={e => setSelected(e.target.checked ? new Set(movable.map(m => m.id)) : new Set())}
               />
             }
-            label={<Typography variant="body2" sx={{ fontWeight: 600 }}>Select all ({movable.length})</Typography>}
+            label={<Typography variant="body2" sx={{ fontWeight: FONT_WEIGHT.semibold }}>Select all ({movable.length})</Typography>}
           />
           <Box component="ul" sx={{ listStyle: 'none', m: 0, p: 0, pl: 3 }} data-testid="nodevault-eligible">
             {movable.map(c => (

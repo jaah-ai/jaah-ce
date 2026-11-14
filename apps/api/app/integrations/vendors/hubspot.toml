@@ -1,0 +1,77 @@
+slug = "hubspot"
+label = "HubSpot"
+category = "crm"
+credential_type = "hubspot"
+vendor_docs_url = "https://developers.hubspot.com/docs/api-reference/auth-oauth-v3/guide"
+summary = "Read and update HubSpot contacts, companies, deals and tickets, with a sign-in or a private app token."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://app.hubspot.com/oauth/authorize"
+token_url = "https://api.hubspot.com/oauth/v3/token"
+# HubSpot documents no PKCE; the client pair travels in the form body.
+pkce = false
+scopes = [
+  { name = "oauth", label = "Sign in to HubSpot and keep the connection: HubSpot requires it on every app" },
+  { name = "crm.objects.contacts.read", label = "Read contacts" },
+  { name = "crm.objects.contacts.write", label = "Create and update contacts" },
+  { name = "crm.objects.companies.read", label = "Read companies" },
+  { name = "crm.objects.companies.write", label = "Create and update companies" },
+  { name = "crm.objects.deals.read", label = "Read deals" },
+  { name = "crm.objects.deals.write", label = "Create and update deals" },
+  { name = "tickets", label = "Read and update tickets" },
+]
+jaah_app = true
+
+[auth.oauth.registration]
+console_url = "https://developers.hubspot.com/"
+steps = [
+  "Sign in to a HubSpot developer account that Jaah owns (create one from Create a developer account on the developer site if there is none)",
+  "Open Development, select Create app (HubSpot's developer platform; legacy public apps can no longer be created), name it Jaah and choose OAuth as its authentication",
+  "On the app's Auth settings add the redirect URIs below and the scopes below as required scopes",
+  "Set the app's distribution to Marketplace (unlisted is enough), so portals other than the developer account can install it",
+  "Copy the Client ID and Client secret from the Auth settings",
+]
+review = "Not required to connect: an unlisted app installs in any portal, and HubSpot shows the person an unverified-app warning they accept once; listing it on the HubSpot Marketplace needs HubSpot's app review"
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "access_token", label = "Access token", kind = "secret", required = true, help = "In HubSpot, select the settings gear, then Integrations > Private Apps (in newer accounts this lives under Development > Legacy apps), select Create a private app, name it Jaah, tick the scopes agents need on the Scopes tab (for example crm.objects.contacts.read and crm.objects.deals.write), select Create app, then on the Auth tab select Show token and copy it" },
+]
+
+[test]
+# A Connect row's Test (its access token as Bearer); a pasted private app token keeps the type's own Test.
+path = "https://api.hubapi.com/account-info/v3/details"
+identity = [["portalId"]]
+identity_phrase = "- portal"
+
+[docs]
+agent_uses = [
+  "Look up, create and update contacts, companies, deals and tickets through the CRM API",
+  "Search records with the CRM search endpoint, for example every deal in a pipeline stage",
+  "Log notes, calls and tasks against a record so the history stays in HubSpot",
+  "Read pipelines, owners and properties to fill fields the way your portal expects",
+]
+prerequisites = [
+  "A HubSpot account where you are a Super Admin, or may install apps (Connect) or create private apps (a token)",
+  "Knowing which objects agents should touch, so you can tick only those scopes",
+]
+limitations = [
+  "Connect signs in as you and reaches the portal you pick at consent; agents act with your HubSpot permissions. A private app token acts as the app instead",
+  "The token reaches only the scopes you ticked on the private app; adding a scope later needs no new token, but agents see the change only after you save the app",
+  "HubSpot limits private apps to a per-account request rate (for example 100 requests per 10 seconds on Professional), shared by everything using that app",
+  "A private app belongs to one HubSpot account; connect a separate secret for each portal, including a sandbox",
+]
+troubleshooting = [
+  { symptom = "The HubSpot window warns that the app is not verified", fix = "Jaah's app is unlisted on the HubSpot Marketplace. Type I accept the risk if HubSpot asks, then select Connect app" },
+  { symptom = "Test says HubSpot rejected the access token", fix = "The token was rotated or the private app was deleted. In HubSpot open the app's Auth tab, copy the current token, and select Replace on the secret" },
+  { symptom = "Test passes but an agent gets 403 MISSING_SCOPES", fix = "The private app lacks the scope that call needs. Open the app's Scopes tab in HubSpot, tick the missing scope (the error names it), and select Commit changes; the token stays the same" },
+  { symptom = "Agents hit 429 TOO_MANY_REQUESTS", fix = "The account's private-app rate limit is spent. Ask the agent to batch reads with the batch endpoints, or give heavy jobs their own private app" },
+]
+faq = [
+  { q = "Should I connect or paste a private app token", a = "Connect is quicker and renews itself. Use a private app token when agents should act as an app rather than as you" },
+  { q = "Which portal does Test name", a = "Test shows the portal ID the token belongs to, so you can tell a sandbox from production at a glance" },
+  { q = "Does rotating the token in HubSpot break running tasks", a = "Yes, once the old token expires. Rotate in HubSpot, then select Replace on the secret straight away; new calls use the new token" },
+]

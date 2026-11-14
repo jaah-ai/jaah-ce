@@ -10,13 +10,16 @@ redacts; refusals name keys, never values).
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import logging
 import os
 import threading
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlencode
 
 from sqlalchemy import event
@@ -134,16 +137,29 @@ _MIN_FETCH_INTERVAL_SECONDS = 5.0
 _fetched_at = 0.0
 _replaced: int | None = None
 
+# An AWSPENDING value Postgres refused, kept as a keyed digest (never the value; the key is this process's own) so
+# a pending version a failed rotation left behind is adopted once, not on every refusal. `_pending_generation` is
+# the generation adopted from AWSPENDING, so its refusal can be recognised.
+_DIGEST_KEY = os.urandom(32)
+_pending_generation: int | None = None
+_refused_pending: bytes | None = None
+
+
+def _digest(username: str, password: str) -> bytes:
+    return hmac.new(_DIGEST_KEY, f"{username}\0{password}".encode("utf-8"), hashlib.sha256).digest()
+
 
 def reset_cache() -> None:
     """Test seam only — the cache is process-local and is never cleared in production."""
-    global _cached, _generation, _failure, _fetched_at, _replaced
+    global _cached, _generation, _failure, _fetched_at, _replaced, _pending_generation, _refused_pending
     with _lock:
         _cached = None
         _generation = 0
         _failure = None
         _fetched_at = 0.0
         _replaced = None
+        _pending_generation = None
+        _refused_pending = None
 
 
 def secret_arn() -> str:
@@ -283,11 +299,13 @@ def resolve(*, replacing: int | None = None) -> _Credential:
         raise RuntimeError(f"{SECRET_ARN_VAR} is set, but this edition reads no credential from Secrets Manager")
     from app.aws import secretsmanager
 
-    global _cached, _generation, _failure, _fetched_at, _replaced
+    global _cached, _generation, _failure, _fetched_at, _replaced, _pending_generation, _refused_pending
     with _lock:
         cached = _cached
         if cached is not None and (replacing is None or cached.generation > replacing):
             return cached
+        if cached is not None and replacing is not None and replacing == _pending_generation:
+            _refused_pending = _digest(cached.username, cached.password)
         if (
             cached is not None
             and _replaced == replacing
@@ -310,9 +328,25 @@ def resolve(*, replacing: int | None = None) -> _Credential:
             raise
         _failure = None
         _fetched_at = time.monotonic()
+        adopted_pending = False
         unchanged = cached is not None and hmac.compare_digest(
             cached.username.encode("utf-8"), username.encode("utf-8")
         ) and hmac.compare_digest(cached.password.encode("utf-8"), password.encode("utf-8"))
+        if unchanged and replacing is not None and cached is not None:
+            # Mid-rotation: Postgres already holds the new password while AWSCURRENT still names the old one
+            # (AWS promotes the new version only after its test step). That value is staged as AWSPENDING.
+            pending = _pending(secretsmanager)
+            if pending is not None and _refused_pending is not None and hmac.compare_digest(
+                _digest(*pending), _refused_pending
+            ):
+                pending = None  # refused once already: a failed rotation's leftover, not this one's
+            if pending is not None and not (
+                hmac.compare_digest(cached.username.encode("utf-8"), pending[0].encode("utf-8"))
+                and hmac.compare_digest(cached.password.encode("utf-8"), pending[1].encode("utf-8"))
+            ):
+                username, password = pending
+                unchanged = False
+                adopted_pending = True
         if unchanged:
             # An identical re-read does not advance the generation: a generation identifies a credential, not a
             # fetch. Otherwise every refusal in a storm would look like a new question.
@@ -320,11 +354,26 @@ def resolve(*, replacing: int | None = None) -> _Credential:
             return cached
         _generation += 1
         _cached = _Credential(username=username, password=password, generation=_generation)
+        _pending_generation = _generation if adopted_pending else None
         _replaced = None
         _log.info(
             "database credential resolved from %s (generation %s)", SECRET_ARN_VAR, _generation
         )
         return _cached
+
+
+def _pending(secretsmanager) -> tuple[str, str] | None:  # type: ignore[no-untyped-def]
+    """The secret's AWSPENDING username and password, or None when there is none to try.
+
+    Outside a rotation AWS answers `ResourceNotFoundException`; that, and any other failure, means "no
+    alternative" — the caller then lets Postgres's refusal propagate. Only the error's class is logged.
+    """
+    try:
+        return _parse(secretsmanager.get_secret_value(secret_arn(), version_stage=secretsmanager.PENDING_STAGE))
+    except Exception as error:  # noqa: BLE001 — no pending version is the ordinary answer
+        _log.info("no usable %s version of the database secret (%s)",
+                  secretsmanager.PENDING_STAGE, type(error).__name__)
+        return None
 
 
 def is_auth_failure(exc: BaseException) -> bool:
@@ -468,21 +517,42 @@ def _connect(dialect, connection_record, cargs, cparams):  # type: ignore[no-unt
     if credential is None:
         return None
     cparams.update(parameters)
+    return _dial_twice(lambda: dialect.connect(*cargs, **cparams), cparams, credential)
+
+
+def _dial_twice(dial: Callable[[], Any], parameters: dict, credential: _Credential) -> Any:
+    """`dial()` once, then exactly once more with the credential `_replacement` names, rewritten into
+    `parameters` in place (the dialer reads it). The retry's own failure propagates from here, so it is
+    scrubbed too."""
     try:
-        return dialect.connect(*cargs, **cparams)
+        return dial()
     except Exception as exc:
-        # The retry's own failure propagates from here, so it is scrubbed too.
         fresh = _replacement(credential, exc)
-        cparams["user"] = fresh.username
-        cparams["password"] = fresh.password
+        parameters.update(user=fresh.username, password=fresh.password)
         try:
-            connection = dialect.connect(*cargs, **cparams)
+            connection = dial()
         except Exception as retried:
             _scrub(retried)
             raise
-        _log.info(
-            "database credential re-resolved after a refusal (generation %s)", fresh.generation
-        )
+        _log.info("database credential re-resolved after a refusal (generation %s)", fresh.generation)
+        return connection
+
+
+async def _dial_twice_async(
+    dial: Callable[[], Awaitable[Any]], parameters: dict, credential: _Credential,
+) -> Any:
+    """`_dial_twice` for an awaitable dialer."""
+    try:
+        return await dial()
+    except Exception as exc:
+        fresh = _replacement(credential, exc)
+        parameters.update(user=fresh.username, password=fresh.password)
+        try:
+            connection = await dial()
+        except Exception as retried:
+            _scrub(retried)
+            raise
+        _log.info("database credential re-resolved after a refusal (generation %s)", fresh.generation)
         return connection
 
 
@@ -497,20 +567,9 @@ def psycopg_connect(**options: object):  # type: ignore[no-untyped-def]
     parameters, credential = _attempt(libpq_parameters() if configured() else {})
     if credential is None:
         return psycopg.connect(raw_dsn(), **options)  # type: ignore[arg-type]
-    try:
-        return psycopg.connect(**parameters, **options)  # type: ignore[arg-type]
-    except Exception as exc:
-        fresh = _replacement(credential, exc)
-        parameters |= {"user": fresh.username, "password": fresh.password}
-        try:
-            connection = psycopg.connect(**parameters, **options)  # type: ignore[arg-type]
-        except Exception as retried:
-            _scrub(retried)
-            raise
-        _log.info(
-            "database credential re-resolved after a refusal (generation %s)", fresh.generation
-        )
-        return connection
+    return _dial_twice(
+        lambda: psycopg.connect(**parameters, **options), parameters, credential,  # type: ignore[arg-type]
+    )
 
 
 async def psycopg_connect_async(**options: object):  # type: ignore[no-untyped-def]
@@ -524,20 +583,9 @@ async def psycopg_connect_async(**options: object):  # type: ignore[no-untyped-d
     parameters, credential = _attempt(libpq_parameters() if configured() else {})
     if credential is None:
         return await psycopg.AsyncConnection.connect(raw_dsn(), **options)  # type: ignore[arg-type]
-    try:
-        return await psycopg.AsyncConnection.connect(**parameters, **options)  # type: ignore[arg-type]
-    except Exception as exc:
-        fresh = _replacement(credential, exc)
-        parameters |= {"user": fresh.username, "password": fresh.password}
-        try:
-            connection = await psycopg.AsyncConnection.connect(**parameters, **options)  # type: ignore[arg-type]
-        except Exception as retried:
-            _scrub(retried)
-            raise
-        _log.info(
-            "database credential re-resolved after a refusal (generation %s)", fresh.generation
-        )
-        return connection
+    return await _dial_twice_async(
+        lambda: psycopg.AsyncConnection.connect(**parameters, **options), parameters, credential,  # type: ignore[arg-type]
+    )
 
 
 _installed = False

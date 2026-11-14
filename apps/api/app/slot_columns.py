@@ -80,10 +80,9 @@ OCCUPANCY = frozenset(
     {
         "state",
         "state_since",
-        # The owner columns: `ck_worktrees_state_ownership` makes them and `state` one fact, so moving an
+        # The owner column: `ck_worktrees_state_ownership` makes it and `state` one fact, so moving the
         # owner without the state is rejected by the database.
         "task_id",
-        "owner_user_id",
         "generation",
         "launch_claimed_generation",
         "dispatch_id",
@@ -126,9 +125,9 @@ JOINED: frozenset[str] = frozenset()
 # must never name one.
 DB_OWNED = frozenset({"id", "created_at", "updated_at"})
 
-# ── DECLARATION — written by the declare-a-slot INSERT (`slot_allocation.converge`'s `_add_row`) and by the ──
+# ── DECLARATION — written by the declare-a-slot INSERT (`slot_allocation.add_dynamic`'s `_add_row`) and by the ──
 # clone-owner reassignment UPDATE (`routes/pool_slots._clone_owner_statement`), which names only this
-# column. Not `DB_OWNED`: the converge stamps it (`slot_allocation._declarer`). Not `MUTATED`: the
+# column. Not `DB_OWNED`: the declare stamps it (`slot_allocation._declarer`). Not `MUTATED`: the
 # reassignment names it alone, which would break that family's SET equality. Every INSERT names a
 # human; rows still attributed to the system actor are repaired by the reassignment UPDATE (see
 # `fleet_observe.slot_update_statement`).
@@ -141,10 +140,9 @@ SESSION_RUN = frozenset({"session_since"})
 
 
 # ── ALLOCATION — written only by `app/slot_allocation.py` ──────────────────────────────────
-# A slot's kind and the order to destroy it: the assignment model's decisions, never sensed, never an
-# occupancy edge. Two statements (`_retire_statement`, `_kind_statement`), each naming one member — a subset
-# rule like `OCCUPANCY`'s, whose union equals the family. The declare INSERT sets `kind` too; INSERTs are not
-# statement families.
+# A slot's kind and the order to destroy it: allocation decisions, never sensed, never an occupancy edge. One
+# UPDATE statement (`_retire_statement`) names `retiring_at`; `kind` is set only by the declare INSERT (INSERTs are
+# not statement families) and stays a member so no other family may write it.
 ALLOCATION = frozenset({"kind", "retiring_at"})
 
 # ── DESTROY_ACK — the node's refusal of a `destroy_slot`, written only by that verb's ack handler ─────────
@@ -155,7 +153,7 @@ DESTROY_ACK = frozenset({"destroy_error"})
 
 # ── ORG — the tenancy column, written at INSERT and by no UPDATE of ours ─────────────────────────────
 # Written on row creation by `app/slot_allocation.py::converge` and the write seam's
-# `before_flush` stamp; `lease`/`claim_for_user` only compare it. A slot never changes tenant. Not
+# `before_flush` stamp; `lease` only compares it. A slot never changes tenant. Not
 # `DB_OWNED` (no default). Reclassify it if an UPDATE ever assigns it. Named `ORG`, not `TENANCY`, to
 # avoid colliding with `app.tenancy.manifest.TENANCY`.
 ORG = frozenset({"org_id"})

@@ -1,7 +1,6 @@
 import Typography from '@mui/material/Typography'
 import type { JSX } from 'react'
-import { NO_VALUE } from '../lib/relativeTime'
-import { formatSpanBetween } from '../lib/spanTime'
+import { formatSpanBetween, NO_VALUE } from '../lib/relativeTime'
 import { formatZoned } from '../lib/zonedTime'
 import { DetailField } from './detail/DetailPage'
 

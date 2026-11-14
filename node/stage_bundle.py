@@ -39,7 +39,10 @@ _DOCTRINE = {"doctrine/agents/": "doctrine/agents/",
              "doctrine/context-architecture.md": "docs/policies/context-architecture.md",
              # Not doctrine, but placed the same way: the package-manager seam the daemon loads by path
              # (`pkgmgr_loader.py`), at its fleet path. The tree ships it under `toolchain/`.
-             "toolchain/pkgmgr.py": "infra/jaah/pkgmgr.py"}
+             "toolchain/pkgmgr.py": "infra/jaah/pkgmgr.py",
+             # The fleet-harness settings canonical the daemon derives each account's managed settings from
+             # (`plugin_repair.MANAGED_SETTINGS_PATH`), at its fleet path. The tree ships it under `toolchain/`.
+             "toolchain/settings.json": "infra/host/fleet-harness/settings.json"}
 
 # `<dest>/bin/<name>` -> the `module:function` it runs, argv after the name passed through. The fleet node's twins
 # are the package's and its provisioner's renders; the macOS package ships the same set.
@@ -88,7 +91,8 @@ def stage(source: Path, dest: Path, python: str) -> None:
             out = dest / rel
             out.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, out)
-    for published, path in [*_tree_files(source, "doctrine"), *_tree_files(source, "toolchain/pkgmgr.py")]:
+    for published, path in [*_tree_files(source, "doctrine"), *_tree_files(source, "toolchain/pkgmgr.py"),
+                            *_tree_files(source, "toolchain/settings.json")]:
         prefix = next((p for p in _DOCTRINE if published.startswith(p)), None)
         if prefix is None:
             continue

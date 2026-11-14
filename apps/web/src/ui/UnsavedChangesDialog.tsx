@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import type { JSX, ReactNode } from 'react'
 import Button from '@mui/material/Button'
 import DialogContentText from '@mui/material/DialogContentText'
 import { FormDialog } from './FormDialog'
@@ -56,4 +56,12 @@ export default function UnsavedChangesDialog({
       </DialogContentText>
     </FormDialog>
   )
+}
+
+/** The dialog wired to a `hooks/useLeaveGuard` result; `message` names the page's subject. */
+export function LeaveGuardDialog({ leave, message }: {
+  leave: { open: boolean; saving: boolean; onChoose: (choice: UnsavedChoice) => unknown }
+  message: ReactNode
+}): JSX.Element {
+  return <UnsavedChangesDialog open={leave.open} saving={leave.saving} onChoose={choice => void leave.onChoose(choice)} message={message} />
 }

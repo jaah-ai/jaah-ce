@@ -30,6 +30,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app import node_host_metrics
+from app.db import excluded_of
 from app.models.agent_sessions import JaahSession
 from app.models.nodes import NodeSessionUsage, TaskSessionUsagePeak
 from app.models.tasks import Task
@@ -104,16 +105,17 @@ def upsert_statement(node_uuid: UUID, org_id: UUID, entries: Iterable[Any]):
             reported.c.rss_kb, reported.c.procs, reported.c.pid, func.now(),
         ).where(reported.c.task_id.in_(_tasks_on(node_uuid))),
     )
+    excluded = excluded_of(NodeSessionUsage.__table__)
     return insert.on_conflict_do_update(
         index_elements=[
             NodeSessionUsage.node_id, NodeSessionUsage.task_id, NodeSessionUsage.session_id,
             NodeSessionUsage.bucket_at,
         ],
         set_={
-            "cpu_pct": insert.excluded.cpu_pct,
-            "rss_kb": insert.excluded.rss_kb,
-            "procs": insert.excluded.procs,
-            "pid": insert.excluded.pid,
+            "cpu_pct": excluded.cpu_pct,
+            "rss_kb": excluded.rss_kb,
+            "procs": excluded.procs,
+            "pid": excluded.pid,
             "updated_at": func.now(),
         },
     )
@@ -135,12 +137,13 @@ def peaks_statement(node_uuid: UUID, org_id: UUID, entries: Iterable[Any]):
             reported.c.rss_kb, reported.c.cpu_pct, reported.c.cpu_seconds,
         ).where(reported.c.task_id.in_(_tasks_on(node_uuid))),
     )
+    excluded = excluded_of(TaskSessionUsagePeak.__table__)
     return insert.on_conflict_do_update(
         index_elements=[TaskSessionUsagePeak.task_id, TaskSessionUsagePeak.node_id, TaskSessionUsagePeak.session_id],
         set_={
-            "peak_rss_kb": func.greatest(TaskSessionUsagePeak.peak_rss_kb, insert.excluded.peak_rss_kb),
-            "peak_cpu_pct": func.greatest(TaskSessionUsagePeak.peak_cpu_pct, insert.excluded.peak_cpu_pct),
-            "cpu_seconds": func.greatest(TaskSessionUsagePeak.cpu_seconds, insert.excluded.cpu_seconds),
+            "peak_rss_kb": func.greatest(TaskSessionUsagePeak.peak_rss_kb, excluded.peak_rss_kb),
+            "peak_cpu_pct": func.greatest(TaskSessionUsagePeak.peak_cpu_pct, excluded.peak_cpu_pct),
+            "cpu_seconds": func.greatest(TaskSessionUsagePeak.cpu_seconds, excluded.cpu_seconds),
             "last_seen_at": func.now(),
         },
     )
@@ -161,7 +164,7 @@ def prune_statement(node_uuid: UUID):
     ingest path, as `node_host_metrics.prune_statement`. The peaks are never pruned."""
     return delete(NodeSessionUsage).where(
         NodeSessionUsage.node_id == node_uuid,
-        NodeSessionUsage.bucket_at < node_host_metrics._db_now_minus(node_host_metrics.RETENTION_SECONDS),
+        NodeSessionUsage.bucket_at < node_host_metrics.db_now_minus(node_host_metrics.RETENTION_SECONDS),
     )
 
 
@@ -212,7 +215,7 @@ def live_sessions(session: Session, node_uuids: Iterable[UUID]) -> list[LiveSess
         )
         .where(
             NodeSessionUsage.node_id.in_(wanted),
-            NodeSessionUsage.bucket_at >= node_host_metrics._db_now_minus(LIVE_BOUND_SECONDS),
+            NodeSessionUsage.bucket_at >= node_host_metrics.db_now_minus(LIVE_BOUND_SECONDS),
         )
         .distinct(NodeSessionUsage.node_id, NodeSessionUsage.task_id, NodeSessionUsage.session_id)
         .order_by(
@@ -274,7 +277,7 @@ def task_sessions(session: Session, task_id: int, task_org_id: UUID, *, hours: f
         .where(
             NodeSessionUsage.task_id == task_id,
             NodeSessionUsage.org_id == task_org_id,
-            NodeSessionUsage.bucket_at >= node_host_metrics._db_now_minus(hours * 60.0 * 60.0),
+            NodeSessionUsage.bucket_at >= node_host_metrics.db_now_minus(hours * 60.0 * 60.0),
         )
         .group_by(NodeSessionUsage.node_id, NodeSessionUsage.session_id, bucket)
         .order_by(bucket)

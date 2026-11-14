@@ -16,7 +16,6 @@ from app.events import emit_console_event
 from app.models.projects import Project
 from app.models.task_extras import ATTACHMENT_KIND_FILE, TaskAttachment
 from app.models.tasks import Task
-from app.persona_registry import SHAPE_TOP_LEVEL, TASK_CREATION_LICENCES
 from app.short_title import authored_title, sanitize_title
 from app.task_ancestry import executor_user_id
 from app.task_artifacts import uploaded_clause, visible_artifact_clause
@@ -26,6 +25,7 @@ from app import task_source
 from app.task_title import _rederive_children
 from app.user_activity import record_task_note
 from app.routes.tasks.policy import (
+    PERSONA_ADVISOR,
     PERSONA_EPIC,
     PERSONA_PROTOTYPER,
     TOP_LEVEL_DEPTHS,
@@ -37,6 +37,7 @@ from app.routes.tasks.policy import (
 )
 from app.routes.tasks.create import _create_analysis_children, _snapshot_body_version, new_top_level_task
 from app.routes.tasks.dispatch import _start, _start_epic
+from app.pipeline import gate as pipeline_gate
 from app.routes.tasks.delete import delete_task_core
 
 log = logging.getLogger(__name__)
@@ -127,33 +128,33 @@ def _record_top_level_collapse(
     emit_console_event(
         session, entity="task", id=caller.id, action="agent_filing_deduped",
         record_transition=False,
+        commit=True,
     )
-    session.commit()
 
 
 def file_agent_top_level_task(
     caller: Task, proposal: dict[str, Any], session: Session
 ) -> dict[str, Any]:
     """File ONE standalone top-level Task in the CALLER'S OWN project — a Nodes-project caller's in its org's oldest own
-    project, always a draft (`node_targets.follow_up_project_id`) — (`SHAPE_TOP_LEVEL`, or
-    `SHAPE_DRAFT_TOP_LEVEL`, which never starts), left `draft` unless the proposal asked for it to be STARTED. Returns `{id, created, project_id, state, persona, title}`.
+    project, always a draft (`node_targets.follow_up_project_id`) — (`SHAPE_TOP_LEVEL`), left `draft` unless the proposal
+    asked for it to be STARTED. Returns `{id, created, project_id, state, persona, title}`.
 
     The project comes only from the caller's row: a caller-named project would be authority a runner
     grants itself. The persona comes from the proposal's `depth` (`_top_level_persona_or_422`): a sketch
-    (`prototyper`), a task (`coder`, or a named licence-free persona), or an epic, built with its analysis
-    children through the operator path's own recipe. None of them holds a dispatching licence except the epic's
-    `plan` child, whose chain terminates (a `coder` holds only `INERT_SHAPES`), keeping the work graph a finite
-    fan (`SHAPE_PRODUCES_PERSONAS`).
-    `guided` stores `autonomous = false`; omitted, the row is unattended.
+    (`prototyper`), a task (`coder`, or a named `TOP_LEVEL_TASK_PERSONAS` member), or an epic, built with its
+    analysis children through the operator path's own recipe.
+    `guided` stores `autonomous = false`; omitted, the row is unattended. `requested` (implied for an `advisor`) files it
+    under `console`, a person's ask, instead of `agent` (`task_source.requested_source`).
 
     Idempotent on a required `dedup_key`: a re-file writes no row and records the collapse on the caller.
     Atomicity comes from `uq_tasks_open_dedup_key` plus the probe (no epic to lock).
 
     `draft` by default via `new_top_level_task`; `ready` only on `start` (owner decision): a chat files
-    proposals, and a started row spends a pool slot. The would-not-start 500 applies only to the start
-    branch.
+    proposals, and a started row spends a pool slot. A `start` from a chain a machine started is a 403
+    before anything is written (`require_human_started`), never a silent draft, so the model knows its ask
+    was refused and can file the draft instead. The would-not-start 500 applies only to the start branch.
 
-    Refuses: a non-live filer (404) and a key held by a row this shape will not collapse onto (409,
+    Refuses: a machine-started `start` (403), a non-live filer (404) and a key held by a row this shape will not collapse onto (409,
     `_dedup_key_held_409`)."""
     dedup_key = proposal["dedup_key"]
     project_id = caller.project_id
@@ -174,6 +175,12 @@ def file_agent_top_level_task(
         if _proposed_artifact_ids(proposal):
             raise HTTPException(status_code=422, detail=node_targets.NO_FOLLOW_UP_ATTACHMENTS)
         project = session.get(Project, project_id)
+    starting = bool(proposal.get("start")) and not redirected
+    if starting:
+        # Deferred: `routes/agent/auth.py` reaches back into this module (`live_agent_caller`).
+        from app.routes.agent.auth import require_human_started
+
+        require_human_started(session, caller, what="starting a task you file")
     # An unnamed `task` takes the landing project's default (`project_default_persona`).
     persona = named_persona or project_default_persona(
         project.default_persona if project is not None else None, TOP_LEVEL_TASK_PERSONAS,
@@ -208,12 +215,18 @@ def file_agent_top_level_task(
             caller.id, len(proposal["title"]), sanitize_title(proposal["title"])[:120], title[:120],
         )
     executor_id = executor_user_id(session, caller.id)
+    requested = bool(proposal.get("requested")) or caller.persona == PERSONA_ADVISOR
     row = new_top_level_task(
         project_id=project_id,
-        source=task_source.AGENT,
+        # Who wanted it: a person-requested filing reads as theirs on the board; the activity log still names the filer.
+        source=task_source.requested_source(requested),
         title=title,
-        # Verbatim: the operator and the next runner both read it.
-        body=proposal["body"],
+        # Verbatim, except that a runner's own find (a Jaah suggestion, `task_source.is_suggested`) opens by naming the
+        # task it came from (an operator decision): the operator deciding Accept/Discard and the next runner read it.
+        body=(
+            proposal["body"] if requested
+            else task_source.with_suggested_from(proposal["body"], caller.id, link=not redirected)
+        ),
         persona=persona,
         # `.get`: absent means unattended, today's behaviour and the console's own default.
         autonomous=not bool(proposal.get("guided")),
@@ -223,8 +236,7 @@ def file_agent_top_level_task(
         # And the caller's own ADDRESSEE, one hop, as every pipeline child inherits its epic's.
         assigned_to_id=caller.assigned_to_id,
     )
-    # The dedup authority. No `<!-- sysdedup:KEY -->` body marker: that is the system path's shim for an old
-    # body parser, never read on a visible `coder` row.
+    # The dedup authority.
     row.dedup_key = dedup_key
     # The filer, on the row, where authorization can read it: the caller's `edit_filed`/`delete_filed`
     # shapes reach exactly these drafts. See `Task.created_by_task_id`.
@@ -294,13 +306,23 @@ def file_agent_top_level_task(
         },
     )
     # `.get`, defaulting to no start: an unasked start must never spend a slot, and older callers file drafts.
-    # A filer licensed only for drafts (`SHAPE_DRAFT_TOP_LEVEL`) never starts: its `start` is ignored.
-    if not bool(proposal.get("start")) or redirected or not _may_start_filing(caller):
+    if not starting:
         # Nothing else commits on this path (`_start` would have), so commit the insert, event and note here.
         session.commit()
         return {
             "id": row_id, "created": True, "project_id": project_id, "state": DRAFT, "persona": persona,
             "title": title,
+        }
+    filed = session.get(Task, row_id)
+    decision = pipeline_gate.start_decision(session, project, filed, None, filed.started_by_id) \
+        if filed is not None and project is not None else None
+    if decision is not None and not decision.open:
+        # The pipeline's Start step waits (approvals): a draft with its executor's press recorded, started when the
+        # gate opens; the console's 202 body rides along so the filer reads "waiting", not an error.
+        session.commit()
+        return {
+            "id": row_id, "created": True, "project_id": project_id, "state": DRAFT, "persona": persona,
+            "title": title, "waiting": decision.waiting_body(),
         }
     if persona == PERSONA_EPIC:
         # An epic starts through the operator's own epic door (`draft -> active`; its children dispatch off the
@@ -318,18 +340,9 @@ def file_agent_top_level_task(
         # Unreachable for a fresh `draft`, asserted: a requested start that did not land would report success
         # and run nothing. `_start` commits only on success, so everything rolls back.
         session.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=f"task {row_id} was created but would not start",
-        )
+        raise HTTPException(status_code=500, detail=f"task {row_id} was created but would not start")
     return {"id": row_id, "created": True, "project_id": project_id, "state": READY, "persona": persona,
             "title": title}
-
-
-def _may_start_filing(caller: Task) -> bool:
-    """Whether the caller's licence lets its filing start (`SHAPE_TOP_LEVEL`), not only draft it."""
-    licence = TASK_CREATION_LICENCES.get(caller.persona)
-    return licence is not None and SHAPE_TOP_LEVEL in licence.shapes
 
 
 def _proposed_artifact_ids(proposal: dict[str, Any]) -> list[int]:
@@ -390,19 +403,7 @@ def _attach_caller_artifacts(
     if not fresh:
         return []
     copies = [
-        TaskAttachment(
-            task_id=target.id,
-            kind=ATTACHMENT_KIND_FILE,
-            filename=row.filename,
-            content_type=row.content_type,
-            size_bytes=row.size_bytes,
-            s3_key=row.s3_key,
-            s3_bucket=row.s3_bucket,
-            uploaded_at=row.uploaded_at,
-            etag=row.etag,
-            uploaded_by_id=row.uploaded_by_id,
-            source_task_id=caller.id,
-        )
+        TaskAttachment.copy_of(row, task_id=target.id, kind=ATTACHMENT_KIND_FILE, source_task_id=caller.id)
         for row in fresh
     ]
     session.add_all(copies)
@@ -512,8 +513,7 @@ def edit_agent_filed_draft(
 
     A collapse writes nothing, so without this a correction would need a new filing per fix. Exactly
     `title` and `body`, plus optional `attachments` ADDED from the caller's own artifacts
-    (`_attach_caller_artifacts`): not state, persona (`SHAPE_PRODUCES_PERSONAS` maps this shape to
-    nothing), `dedup_key`, or scope.
+    (`_attach_caller_artifacts`): not state, persona, `dedup_key`, or scope.
 
     The title is sanitized like the filing's, the body stored verbatim; a changed body is snapshotted
     first (`_snapshot_body_version`, source `agent_filed_edit`). The note goes on the caller."""
@@ -535,9 +535,14 @@ def edit_agent_filed_draft(
         if target.persona == PERSONA_EPIC:
             # The children wear `[<persona>] <epic title>` (`derived_child_title`); re-stamp them in step.
             _rederive_children(session, target, old_title, title)
-    if proposal["body"] != target.body:
+    body = proposal["body"]
+    if task_source.is_suggested(target.source, target.created_by_task_id):
+        # A suggestion keeps naming its source task through the filer's rewrite (`file_agent_top_level_task`); linked
+        # only where the filing was (a node task's follow-up lands outside the caller's project).
+        body = task_source.with_suggested_from(body, caller.id, link=target.project_id == caller.project_id)
+    if body != target.body:
         _snapshot_body_version(target, "agent_filed_edit", session)
-        target.body = proposal["body"]
+        target.body = body
         changed.append("body")
     # Added, never replaced: an omitted list leaves the draft's attachments as they are.
     attached_ids = _attach_caller_artifacts(caller, target, attachment_sources, session)
@@ -588,23 +593,3 @@ def delete_agent_filed_draft(caller: Task, filed_task_id: int, session: Session)
     )
     delete_task_core(target, session)
     return {"id": filed_task_id, "deleted": True}
-
-
-# ── The system-task body marker ────────────────────────────────────────────────────────────────────
-# A convention about what a Task BODY carries, not about any one route, so it lives here. Two modules
-# stamp and match it, and a format string copied into one can silently stop matching the other.
-def sysdedup_marker(dedup_key: str) -> str:
-    """The hidden HTML-comment marker stamped in a system Task's body to carry its `dedup_key`. Invisible
-    in rendered markdown; the finer per-source dedup discriminator matches on it, so distinct sources keep
-    separate open rows instead of collapsing on the coarse (persona, project) key."""
-    return f"<!-- sysdedup:{dedup_key} -->"
-
-
-def body_with_dedup_marker(body_text: str, dedup_key: Optional[str]) -> str:
-    """Append the `dedup_key` marker to a system-task body, idempotently; unchanged when no key is given."""
-    if not dedup_key:
-        return body_text
-    marker = sysdedup_marker(dedup_key)
-    if marker in body_text:
-        return body_text
-    return f"{body_text}\n{marker}"

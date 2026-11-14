@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import unicodedata
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Optional
 
 # The single home of "never ask Slack to unfurl a link", read by `app/slack_egress.py` and `app/alert_relay.py`
 # (the operator webhook is often Slack-shaped; other receivers ignore the fields). Every link we post points at
@@ -19,6 +19,11 @@ from typing import Any, Callable, Mapping
 # Applied to `chat.postMessage` only: `chat.update` documents neither argument. Read-only so a stray write
 # cannot flip every egress leg at once.
 NO_UNFURL: Mapping[str, bool] = MappingProxyType({"unfurl_links": False, "unfurl_media": False})
+
+# The options a question offers, on the card and in the flat-text fallback alike: Slack allows 25 elements
+# per `actions` block and 10 options per `checkboxes`. One home (`slack_blocks` renders it, `alert_relay`
+# caps to it) so the two can never offer different choices.
+OPTIONS_MAX_COUNT = 10
 
 # Ours: the done card is one scannable line; matches `_HEADER_MAX`.
 _DONE_TITLE_MAX = 150
@@ -30,6 +35,11 @@ _ELLIPSIS = "…"
 _BLANK_GLYPHS = frozenset(
     "\u2800\u3164\u115f\u1160\u17b4\u17b5\uffa0\u180e\u200b\u2060\ufeff"
 )
+
+
+def plural(n: int, one: str, many: Optional[str] = None) -> str:
+    """`n` with its noun: `one` for exactly one, else `many` or `one` + "s" (`plural(2, "delivery", "deliveries")`)."""
+    return f"{n} {one if n == 1 else (many or one + 's')}"
 
 
 def _has_glyph(text: str) -> bool:

@@ -2,13 +2,13 @@ import { useCallback, useEffect, useRef } from 'react'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { get } from '../api'
 import { useEventStream } from './useEventStream'
-import { useLiveRefetch } from './useLiveRefetch'
+import { STREAM_DOWN_POLL_MS, useLiveRefetch } from './useLiveRefetch'
 import { useUrlFilters } from './useUrlFilters'
 
 /* THE CONSOLE'S ONE NUMBERED, SERVER-PAGED LIST: page / per / sort / dir in the URL, one page read
  * per render, the server's `Page[T]` envelope (`apps/api/app/list_page.py`). `ui/ListPager` draws the footer,
- * `ui/feed/FeedList`'s `columns`/`sort`/`onSort` the sortable header. Offset lists that predate it (sessions,
- * credentials, the audit tabs) keep `usePagedLogFilters`.
+ * `ui/feed/FeedList`'s `columns`/`sort`/`onSort` the sortable header. The log tabs' search/range filters are
+ * `usePagedLogFilters`'s (local state), serialized into `resetKey` here.
  * READ-THROUGH (`useUrlFilters`): no second copy of the state, a pasteable link, `replace` so paging does not
  * flood history. Defaults are DROPPED from the URL, so a page at rest carries a clean link. */
 
@@ -39,7 +39,13 @@ function readPer(raw: string | null): number {
  *  serialization of the filters). Values outside vocabulary (bad per, sort not in `sorts`) read as default.
  *  No `sorts` = a list with no sortable column: `sort` always reads null. */
 export function useListPage(opts: { prefix?: string; sorts?: readonly string[]; resetKey?: string } = {}):
-  ListPageState & { setPage(n: number): void; setPer(n: number): void; toggleSort(key: string, firstDir?: SortDir): void } {
+  ListPageState & {
+    setPage(n: number): void
+    setPer(n: number): void
+    toggleSort(key: string, firstDir?: SortDir): void
+    /** One column and direction outright, or `null` for the server's order (a three-state heading's way back). */
+    setSort(key: string | null, dir?: SortDir): void
+  } {
   const { prefix = '', sorts, resetKey } = opts
   const [params, setFilters] = useUrlFilters()
   const keys = { page: `${prefix}page`, per: `${prefix}per`, sort: `${prefix}sort`, dir: `${prefix}dir` }
@@ -81,15 +87,18 @@ export function useListPage(opts: { prefix?: string; sorts?: readonly string[]; 
     setFilters({ [keys.per]: n === PER_DEFAULT ? '' : String(n), [keys.page]: '' })
   }, [keys.per, keys.page, setFilters])
 
-  /* A new column opens at `firstDir` (a date or a count reads best newest/biggest first); the same column flips.
-     Either way the order changed, so page N of the old order means nothing: page one. 'asc' is the default
-     direction and is dropped like every other default. */
-  const toggleSort = useCallback((key: string, firstDir: SortDir = 'asc') => {
-    const next: SortDir = key === sort ? (dir === 'asc' ? 'desc' : 'asc') : firstDir
-    setFilters({ [keys.sort]: key, [keys.dir]: next === 'desc' ? 'desc' : '', [keys.page]: '' })
-  }, [sort, dir, keys.sort, keys.dir, keys.page, setFilters])
+  /* Any order change means page N of the old order means nothing: page one. 'asc' is the default direction and
+     is dropped like every other default; `null` is the server's own order. */
+  const setSort = useCallback((key: string | null, next: SortDir = 'asc') => {
+    setFilters({ [keys.sort]: key ?? '', [keys.dir]: key && next === 'desc' ? 'desc' : '', [keys.page]: '' })
+  }, [keys.sort, keys.dir, keys.page, setFilters])
 
-  return { page, per, sort, dir, setPage, setPer, toggleSort }
+  /* A new column opens at `firstDir` (a date or a count reads best newest/biggest first); the same column flips. */
+  const toggleSort = useCallback((key: string, firstDir: SortDir = 'asc') => {
+    setSort(key, key === sort ? (dir === 'asc' ? 'desc' : 'asc') : firstDir)
+  }, [sort, dir, setSort])
+
+  return { page, per, sort, dir, setPage, setPer, toggleSort, setSort }
 }
 
 /** Appends page/per/sort/dir to `params` (always page & per; sort/dir only when sort set). */
@@ -103,7 +112,6 @@ export function setPageParams(params: URLSearchParams, state: ListPageState): UR
   return params
 }
 
-const POLL_MS = 30_000
 /* One shared empty array, so a caller's `useMemo` over `rows` is not re-run by every loading render. */
 const EMPTY: never[] = []
 
@@ -135,7 +143,7 @@ export function useListPageQuery<T>(opts: {
     enabled,
     /* A page turn, sort or filter swaps the rows when the new page lands, never through a skeleton. */
     placeholderData: keepPreviousData,
-    refetchInterval: live && stream.state === 'down' ? POLL_MS : false,
+    refetchInterval: live && stream.state === 'down' ? STREAM_DOWN_POLL_MS : false,
     ...(retry === undefined ? null : { retry }),
   })
   /* `cancelRefetch: false`: under a steady event stream a read longer than the throttle gap must finish, or

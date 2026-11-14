@@ -4,9 +4,7 @@ import Divider from '@mui/material/Divider'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
 import { del, get } from '../api'
-import { useConfirm } from './ConfirmDialog'
-import { shortDate } from '../lib/billing'
-import { absoluteTime } from '../lib/relativeTime'
+import { danger, useConfirm } from './ConfirmDialog'
 import type { TrustedDevice } from '../types'
 import { useApiRead } from '../hooks/useApiRead'
 import { useRowActions } from '../hooks/useBusyIds'
@@ -16,6 +14,7 @@ import LoadingState from '../ui/LoadingState'
 import { ROW_ACTION_SX } from '../ui/listStyles'
 import { StatusChip } from '../ui/StatusChip'
 import RelativeTime from '../ui/RelativeTime'
+import { FONT_WEIGHT } from '../theme'
 
 /* The signed-in user's trusted browsers (`/profile` → Security): each skips the second factor until it
  * expires. A browser is trusted only from the MFA pages' "Trust this device" box; here it can only be
@@ -48,12 +47,7 @@ export default function TrustedDevices() {
     })
 
   async function handleRevokeAll() {
-    const ok = await confirm({
-      title: 'Revoke all devices',
-      message: 'Every browser asks for a code again. Other sessions sign out.',
-      confirmLabel: 'Revoke all',
-      destructive: true,
-    })
+    const ok = await confirm(danger('Revoke all', { title: 'Revoke all devices', message: 'Every browser asks for a code again. Other sessions sign out.' }))
     if (ok) await revoke('all', 'Failed to revoke devices')
   }
 
@@ -77,7 +71,7 @@ export default function TrustedDevices() {
             >
               <Box sx={{ flex: '1 1 auto', minWidth: 0 }}>
                 <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', columnGap: 1, rowGap: 0.5 }}>
-                  <Typography variant="body2" sx={{ fontWeight: 500, overflowWrap: 'break-word' }}>
+                  <Typography variant="body2" sx={{ fontWeight: FONT_WEIGHT.medium, overflowWrap: 'break-word' }}>
                     {d.label}
                   </Typography>
                   {d.current && <StatusChip label="This device" tone="info" />}
@@ -86,13 +80,13 @@ export default function TrustedDevices() {
                 <Typography
                   variant="caption"
                   component="p"
-                  sx={{ color: 'text.secondary', display: 'flex', flexWrap: 'wrap', columnGap: 0.75 }}
+                  sx={{ color: 'text.secondary', display: 'flex', flexWrap: 'wrap', columnGap: 0.5 }}
                 >
-                  <span title={absoluteTime(d.created_at)}>Trusted {shortDate(d.created_at)}</span>
+                  <RelativeTime iso={d.created_at} absolute="date" prefix="Trusted" />
                   <span aria-hidden>·</span>
                   {d.last_used_at ? <RelativeTime iso={d.last_used_at} prefix="Last used" /> : <span>Not used yet</span>}
                   <span aria-hidden>·</span>
-                  <span title={absoluteTime(d.expires_at)}>Expires {shortDate(d.expires_at)}</span>
+                  <RelativeTime iso={d.expires_at} absolute="date" prefix="Expires" />
                 </Typography>
               </Box>
               <Button

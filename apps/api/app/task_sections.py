@@ -1,10 +1,9 @@
 """The board's state sections — Stopped / In progress / Draft / Done — and the stop record that says why a row stopped.
 
 A VIEW over `Task.state`, never a state of its own: `app/task_lifecycle.py` keeps its seven states and its
-transition table untouched. The one thing a state cannot say is "Waiting on customer" — a pause reason
-(D-waiting) — so it lives in the STOP RECORD (`tasks.stop_reason`/`stop_note`/`stopped_by_id`/
-`stopped_at`), written by `routes/tasks/transitions.py::_stop_task_core` and the record-only `wait-on-customer` path,
-and cleared by the database the moment the row leaves for a working or finished state
+transition table untouched. What a state cannot say — WHO paused a row, a person or the system — lives in the
+STOP RECORD (`tasks.stop_reason`/`stopped_by_id`/`stopped_at`), written by
+`routes/tasks/transitions.py::_stop_task_core` and the system pauses, and cleared by the database the moment the row leaves for a working or finished state
 (`trg_tasks_clear_stop_record` below), so every state writer — roll-up, force-start, the agent and
 portfolio routes — clears it without being edited.
 
@@ -36,6 +35,7 @@ from typing import TYPE_CHECKING, Any, Literal, Optional
 
 from sqlalchemy import Text, and_, case, cast, exists, func, literal, or_, select
 
+from app.triggers import TRACKER_SOURCE_KINDS
 from app.task_lifecycle import (
     ACTIVE,
     AWAITING_RESPONSE,
@@ -54,12 +54,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from sqlalchemy.orm import Session
 
 Section = Literal["stopped", "in_progress", "draft", "done"]
-StopKind = Literal["question", "failed", "paused", "balance", "jaah_unavailable", "waiting_on_customer"]
+StopKind = Literal["question", "failed", "paused", "balance", "jaah_unavailable"]
 
 # Display order of the sections, and of the rows inside Stopped and In progress (D6-state).
 SECTIONS: tuple[Section, ...] = ("stopped", "in_progress", "draft", "done")
 STOP_KIND_ORDER: tuple[StopKind, ...] = (
-    "question", "failed", "paused", "balance", "jaah_unavailable", "waiting_on_customer",
+    "question", "failed", "paused", "balance", "jaah_unavailable",
 )
 # The stop kind a HIDDEN row is placed in Done for rather than Stopped (`place`).
 HIDDEN_DONE_KIND: StopKind = "failed"
@@ -67,22 +67,22 @@ HIDDEN_DONE_KIND: StopKind = "failed"
 IN_PROGRESS_ORDER: tuple[str, ...] = (ACTIVE, AWAITING_RESPONSE, READY)
 
 # ── The stop record ───────────────────────────────────────────────────────────────────────────────────
-# `operator` is a person's Stop; `waiting_on_customer` the pause reason. NULL is "no record" — an idle
+# `operator` is a person's Stop. NULL is "no record" — an idle
 # kill, an epic-cascade stop, or a row that never stopped. `balance` and `jaah_unavailable` (spelled in
 # `task_lifecycle`, whose `BALANCE_RESUME` guards on them) are the SYSTEM's pauses of work on the Jaah account
 # (`app/jaah_routing/pause.py`): the balance reached the floor, or the platform Bedrock account
 # broke. No person acts, so they alone may carry no `stopped_by_id`, and they alone are ever resumed
 # automatically — an operator Stop writes `operator` and is never resumed (AS4).
 STOP_REASON_OPERATOR = "operator"
-STOP_REASON_WAITING = "waiting_on_customer"
 SYSTEM_STOP_REASONS: tuple[str, ...] = (STOP_REASON_BALANCE, STOP_REASON_JAAH_UNAVAILABLE)
 assert frozenset(SYSTEM_STOP_REASONS) == BALANCE_RESUME.stop_reasons
-STOP_REASONS: tuple[str, ...] = (STOP_REASON_OPERATOR, STOP_REASON_WAITING, *SYSTEM_STOP_REASONS)
-STOP_NOTE_MAX = 2000
+# A tracker's stop (`app/trackers/intake.py`): the issue was unassigned, or its start label removed, in that tracker.
+TRACKER_STOP_REASON = "stopped from {tracker}"
+TRACKER_STOP_REASONS: tuple[str, ...] = tuple(TRACKER_STOP_REASON.format(tracker=t) for t in TRACKER_SOURCE_KINDS)
+STOP_REASONS: tuple[str, ...] = (STOP_REASON_OPERATOR, *SYSTEM_STOP_REASONS, *TRACKER_STOP_REASONS)
 
 TASK_STOP_REASON_CHECK = "ck_tasks_stop_reason"
 TASK_STOP_RECORD_CHECK = "ck_tasks_stop_record_complete"
-TASK_STOP_NOTE_CHECK = "ck_tasks_stop_note"
 TASK_STOPPED_BY_FK = "fk_tasks_stopped_by_id"
 
 TASK_STOP_REASON_CHECK_SQL = (
@@ -93,10 +93,6 @@ TASK_STOP_RECORD_CHECK_SQL = (
     "(stop_reason IS NULL) = (stopped_at IS NULL) AND (stopped_by_id IS NULL OR stop_reason IS NOT NULL) "
     "AND (stopped_by_id IS NOT NULL OR stop_reason IS NULL OR stop_reason IN ("
     + ", ".join(f"'{r}'" for r in SYSTEM_STOP_REASONS) + "))"
-)
-# A note belongs to a wait only, and is bounded.
-TASK_STOP_NOTE_CHECK_SQL = (
-    f"stop_note IS NULL OR (stop_reason = '{STOP_REASON_WAITING}' AND char_length(stop_note) <= {STOP_NOTE_MAX})"
 )
 
 # ── The clearing trigger ──────────────────────────────────────────────────────────────────────────────
@@ -112,7 +108,6 @@ BEGIN
     IF NEW.state IS DISTINCT FROM OLD.state
        AND NEW.state IN ({", ".join(f"'{s}'" for s in CLEARING_STATES)}) THEN
         NEW.stop_reason := NULL;
-        NEW.stop_note := NULL;
         NEW.stopped_by_id := NULL;
         NEW.stopped_at := NULL;
     END IF;
@@ -138,8 +133,6 @@ def stop_kind_of(state: str, stop_reason: Optional[str], delivering: bool = Fals
         return None
     if state == AWAITING_RESPONSE and delivering:
         return None
-    if stop_reason == STOP_REASON_WAITING and state in (DRAFT, PAUSED, SYSTEM_FAILED):
-        return "waiting_on_customer"
     if state == PAUSED and stop_reason == STOP_REASON_BALANCE:
         return "balance"
     if state == PAUSED and stop_reason == STOP_REASON_JAAH_UNAVAILABLE:
@@ -246,10 +239,8 @@ def answer_delivering_keys(task_ids: Optional[Iterable[int]] = None):
         is_deliver,
         key.is_not(None),
         *narrowed,
-        or_(
-            SlotIntent.outcome.is_(None),
-            SlotIntent.outcome.notin_(fleet_verdicts.SLOT_INTENT_RETIRING_OUTCOMES),
-        ),
+        # The drain's own pending test, whose index guard makes this an index read of the few live rows.
+        fleet_verdicts.still_pending(),
         key.not_in(asking),
     )
     waiting = select(cast(TaskQuestion.task_id, Text)).join(Task, Task.id == TaskQuestion.task_id).where(
@@ -318,8 +309,12 @@ def _default_child_alias() -> Any:
     return aliased(Task)
 
 
+#: Children that never place their parent: a coder's blind review children are advisory (`app/blind_review.py`).
+_ADVISORY_CHILD_PERSONAS = ("reviewer", "security_reviewer", "tester")
+
+
 def _live_children_of(t: Any, c: Any):
-    return and_(c.parent_task_id == t.id, c.archived_at.is_(None))
+    return and_(c.parent_task_id == t.id, c.archived_at.is_(None), c.persona.not_in(_ADVISORY_CHILD_PERSONAS))
 
 
 def section_sql(task_alias: Any, child_alias_factory: Callable[[], Any] = _default_child_alias):
@@ -357,12 +352,41 @@ def stop_kind_rank_sql(task_alias: Any, child_alias_factory: Callable[[], Any] =
     return func.coalesce(_row_kind_rank(t), child_rank)
 
 
+def section_of_stop_rank_sql(state: Any, hidden: Any, stop_rank: Any):
+    """`section_sql`'s placement over a row's `state`, `hidden` and an already-computed `stop_kind_rank_sql`
+    value, so a query projecting the rank once per row does not read the children again for the section
+    (`task_tree.count_rows`). The same CASE arm for arm: `_row_stopped` and the child EXISTS hold exactly when
+    the placed rank is non-NULL (`_row_kind_rank` ranks the same `_kind_predicate`s, over the same
+    `_live_children_of`), and `_hidden_done` is its comparison verbatim. `stop_rank` may be anything for a
+    `done` row: done wins first."""
+    return case(
+        (state == DONE, literal("done")),
+        (and_(hidden.is_(True), stop_rank == STOP_KIND_ORDER.index(HIDDEN_DONE_KIND)), literal("done")),
+        (stop_rank.is_not(None), literal("stopped")),
+        (state == DRAFT, literal("draft")),
+        else_=literal("in_progress"),
+    )
+
+
 def in_progress_rank_sql(task_alias: Any):
     """The In progress section's first ordering term: running → delivering an answer → queued."""
     return case(
         *((task_alias.state == state, i) for i, state in enumerate(IN_PROGRESS_ORDER)),
         else_=len(IN_PROGRESS_ORDER),
     )
+
+
+def suggested_sql(task_alias: Any):
+    """`task_source.is_suggested` over `task_alias`, in SQL: a runner's own filing from another task. Its drafts rank
+    after the plain drafts (`board_rank_sql`, `draft_rank_sql`), so "Suggested by Jaah" pages as one block."""
+    from app import task_source
+
+    return and_(task_alias.source == task_source.AGENT, task_alias.created_by_task_id.is_not(None))
+
+
+def draft_rank_sql(task_alias: Any):
+    """The Draft section's first ordering term: plain drafts (0), then Jaah's suggestions (1)."""
+    return case((suggested_sql(task_alias), 1), else_=0)
 
 
 def board_rank_sql(task_alias: Any, child_alias_factory: Callable[[], Any] = _default_child_alias):
@@ -377,12 +401,44 @@ def board_rank_sql(task_alias: Any, child_alias_factory: Callable[[], Any] = _de
     )
     in_progress_base = len(STOP_KIND_ORDER)
     draft_rank = in_progress_base + len(IN_PROGRESS_ORDER) + 1
-    working = case((t.state == DRAFT, draft_rank), else_=in_progress_base + in_progress_rank_sql(t))
+    # Draft, then Jaah's suggestions (`draft_rank_sql`), then Done.
+    done_rank = draft_rank + 2
+    working = case((t.state == DRAFT, draft_rank + draft_rank_sql(t)), else_=in_progress_base + in_progress_rank_sql(t))
     stop_rank = func.coalesce(_row_kind_rank(t), child_rank)
     hidden_done = and_(t.hidden.is_(True), stop_rank == STOP_KIND_ORDER.index(HIDDEN_DONE_KIND))
     return case(
-        (t.state == DONE, draft_rank + 1), (hidden_done, draft_rank + 1), else_=func.coalesce(stop_rank, working),
+        (t.state == DONE, done_rank), (hidden_done, done_rank), else_=func.coalesce(stop_rank, working),
     )
+
+
+# ── The same three expressions over `Task` itself, built once ──────────────────────────────────────────
+# Each is a constant over `Task` (model columns and literal vocabularies: no bind, no clock, no request), and
+# building one is tens of milliseconds of Python on the GIL per board read — measured 45 of `GET
+# /api/tasks/counts`' 61 ms on an empty board — which a page's parallel reads then queue behind. Built once
+# per process, as `_task_row_stopped` is; a statement may hold one twice (ORDER BY and its keyset WHERE), as
+# it already held one built per call.
+@functools.cache
+def task_section_sql():
+    """`section_sql(Task)`."""
+    from app.models.tasks import Task
+
+    return section_sql(Task)
+
+
+@functools.cache
+def task_stop_kind_rank_sql():
+    """`stop_kind_rank_sql(Task)`."""
+    from app.models.tasks import Task
+
+    return stop_kind_rank_sql(Task)
+
+
+@functools.cache
+def task_board_rank_sql():
+    """`board_rank_sql(Task)`."""
+    from app.models.tasks import Task
+
+    return board_rank_sql(Task)
 
 
 # ── Stage rank: an epic's children in pipeline order, from the dependency edges ───────────────────────
@@ -454,7 +510,8 @@ def stopping_children(session: "Session", parent_ids: Sequence[int]) -> Mapping[
     if not parent_ids:
         return {}
     stopped = session.scalars(
-        select(Task).where(Task.parent_task_id.in_(parent_ids), Task.archived_at.is_(None), _task_row_stopped())
+        select(Task).where(Task.parent_task_id.in_(parent_ids), Task.archived_at.is_(None),
+                           Task.persona.not_in(_ADVISORY_CHILD_PERSONAS), _task_row_stopped())
     ).all()
     if not stopped:
         return {}

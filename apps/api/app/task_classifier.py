@@ -20,6 +20,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.clock import capped_doubling
 from app.llm_client import classify_timeout, first_text, summary_llm
 from app.models.task_extras import Tag, TagGroup
 from app.models.tasks import Task
@@ -40,7 +41,7 @@ def budget_for_attempt(attempt: int) -> int:
 
     `attempt <= 1` (the manual Re-tag button) gets the base budget, so a press does not bill the
     ceiling for the median task."""
-    return min(_MAX_TOKENS * 2 ** max(0, attempt - 1), _MAX_TOKENS_CEILING)
+    return capped_doubling(attempt - 1, _MAX_TOKENS, _MAX_TOKENS_CEILING)
 
 _CLASSIFY_PROMPT = (
     "Classify ONE task into EVERY tag group listed below.\n\n"

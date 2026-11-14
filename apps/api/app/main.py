@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 # FIRST, before the imports it measures: the boot's `api.exec` phase (the shell's exec, entrypoint.sh's
-# worker guard, uvicorn's own import) ends here and `app.import` starts (`app/boot_phases.py`).
+# worker guard, Granian's own import) ends here and `app.import` starts (`app/boot_phases.py`).
 from app import boot_phases
 
 boot_phases.done("api.exec")
@@ -25,6 +25,8 @@ if edition_features.enabled("sso"):
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app.edge_viewer import EdgeViewerMiddleware
+from app.server_timing import ServerTimingMiddleware
 from app.auth import (
     SecurityHeadersMiddleware,
     SessionAuthMiddleware,
@@ -33,7 +35,7 @@ from app.auth import (
 )
 from app.authz.catalog import Tenancy
 from app.authz.declarations import always
-from app.authz.enforce import HintedDenial, OtherOrgDenial
+from app.authz.enforce import OtherOrgDenial
 from app.authz.guard import authz_guard
 from app.node_targets import SystemProjectTaskRefused
 from app.config import get_settings
@@ -44,141 +46,35 @@ from app.credential_keys import (
     resolve_previous_key_providers,
     resolve_secret_key_provider,
 )
-from app.dev_bypass import assert_agent_auth_posture
+from app.dev_bypass import assert_agent_auth_posture, is_fixture_env
 from app.events import start_listener, stop_listener
 from app import cp_peers, ce_bootstrap, ce_caps, node_bus, worker_guard
 from app.node_bus import registry as node_bus_registry
 from app.ratelimit import SharedRateLimiter
-from app.routes import accounts as accounts_routes
-from app.routes.agent import accounts_worktrees as agent_accounts_worktrees_routes
-from app.routes.agent import pool_tick as agent_pool_tick_routes
-from app.routes.agent import slot_intents as agent_slot_intents_routes
-from app.routes.agent import fleet_observe as agent_fleet_observe_routes
-from app.routes.agent import node_config as agent_node_config_routes
-from app.routes.agent import releases as agent_releases_routes
-from app.routes.agent import task_reads as agent_task_reads_routes
-from app.routes.agent import runner_liveness as agent_runner_liveness_routes
-from app.routes.agent import task_terminal as agent_task_terminal_routes
-from app.routes.agent import agent_filing as agent_filing_routes
-from app.routes.agent import task_secrets as agent_task_secrets_routes
-from app.routes import agent_apt as agent_apt_routes
-from app.routes import agent_dist as agent_dist_routes
-from app.routes import agent_rpm as agent_rpm_routes
-from app.routes import agent_bootstrap as agent_bootstrap_routes
-from app.routes import agent_nodevault as agent_nodevault_routes
-from app.routes import agent_project_settings as agent_project_settings_routes
-from app.routes import agent_crons as agent_crons_routes
-from app.routes import agent_triggers as agent_triggers_routes
-from app.routes import agent_peer_tasks as agent_peer_tasks_routes
-from app.routes import agent_sdk as agent_sdk_routes
-from app.routes import agent_sessions as agent_session_routes
-from app.routes import attachments as attachments_routes
-from app.routes import audit as audit_routes
-from app.routes import auth as auth_routes
-from app.routes import commands as commands_routes
-from app.routes import automations as automations_routes
-from app.routes import crons as crons_routes
-from app.routes import triggers as triggers_routes
 from app import console_direct
-from app.routes import cp_peer as cp_peer_routes
-from app.routes import ce_limits as ce_limits_routes
-from app.routes import org_setup as org_setup_routes
-from app.routes import assignments as assignments_routes
-from app.routes import console as console_routes
-from app.routes import console_runtime as console_runtime_routes
-from app.routes import forge_connect as forge_connect_routes
-from app.routes import git_connect as git_connect_routes
-from app.routes import mfa as mfa_routes
-from app.routes import password_reset as password_reset_routes
-from app.routes import git_connections as git_connections_routes
-from app.routes import budgets as budgets_routes
-from app.routes import ip_allowlist as ip_allowlist_routes
-from app.routes import org_retention as org_retention_routes
-from app.routes import api_keys as api_keys_routes
-from app.routes import groups as groups_routes
-from app.routes import health as health_routes
-from app.routes import jira as jira_routes
-from app.routes.credentials import (
-    bulk as credential_bulk_routes,
-    connect as credential_connect_routes,
-    connection_test as credential_test_routes,
-    project_pool as credential_pool_routes,
-    reads as credential_reads_routes,
-    tree as credential_tree_routes,
-    writes as credential_writes_routes,
-)
-from app.routes import nodevault as nodevault_routes
 from app.routes import node_bus as node_bus_routes
-from app.routes.nodes import (
-    delete as nodes_delete,
-    health as nodes_health,
-    intents as nodes_intents,
-    journal as nodes_journal,
-    lifecycle as nodes_lifecycle,
-    metrics as nodes_metrics,
-    reads as nodes_reads,
-    register as nodes_register,
-    update as nodes_update,
-)
-from app.routes import task_comments as task_comments_routes
-from app.routes import task_queue as task_queue_routes
-from app.routes import orgs as orgs_routes
-from app.routes import access as access_routes
-from app.routes import access_requests as access_request_routes
-from app.routes import inbox as inbox_routes
-from app.routes import personas as personas_routes
-from app.routes import pool_slots as pool_slots_routes
-from app.routes import portfolio as portfolio_routes
-from app.routes import project_env as project_env_routes
-from app.routes import projects as projects_routes
-from app.routes import public as public_routes
-from app.routes import ce_setup as ce_setup_routes
-from app.routes import ce_storage as ce_storage_routes
-from app.routes import port_grid as port_grid_routes
-from app.routes import sessions as sessions_routes
-from app.routes import task_session_events as task_session_events_routes
-from app.routes import settings as settings_routes
-from app.routes import stream as stream_routes
-from app.routes import tags as tags_routes
-from app.routes import agents as agents_routes
-from app.routes import acp_registry as acp_registry_routes
-from app.routes import task_control_messages as task_control_messages_routes
-from app.routes import task_page as task_page_routes
-from app.routes import task_ratings as task_ratings_routes
-from app.routes.tasks import (
-    activity as tasks_activity_routes,
-    answers as tasks_answers_routes,
-    create as tasks_create_routes,
-    delete as tasks_delete_routes,
-    dependencies as tasks_dependencies_routes,
-    dispatch as tasks_dispatch_routes,
-    listing as tasks_listing_routes,
-    read as tasks_read_routes,
-    title as tasks_title_routes,
-    transitions as tasks_transitions_routes,
-    update as tasks_update_routes,
-)
-from app.routes import telemetry as telemetry_routes
-from app.routes import tenancy_exclusions as tenancy_exclusions_routes
-from app.routes import workflows as workflows_routes
-from app.routes import features as features_routes
-from app.routes import playbooks as playbooks_routes
-from app.routes import task_templates as task_templates_routes
 from app.durable import runtime as durable_runtime
 from app.tenancy.exclusion_log import start_exclusion_flusher, stop_exclusion_flusher
 from app.task_notify import start_task_notifier, stop_task_notifier
 from app.cpu_profile import start_cpu_profiler, stop_cpu_profiler
-from app import db, pool_watch, route_inventory
+from app import db_async, gc_watch, loop_debug, loop_watch, offload, pool_watch, route_inventory
 from app.login_funnel import SessionRefreshMiddleware
+from app.idempotency import IdempotencyMiddleware
 from app.stale_tab_guard import StaleTabGuardMiddleware
 from app import api_keys
 from app import ip_allowlist  # registers the IP allowlist's funnel hooks; its refusal's handler is below
+from app.conditional_get import ConditionalGetMiddleware
 from app.user_activity import UserActivityMiddleware
+from app.proxy_headers import ProxyHeadersMiddleware
+from app import ingress_surface
+from app.ingress_surface import IngressSurfaceMiddleware
+from app.machine_access_log import MachineAccessLogMiddleware
+from app.body_cap import BodyCapMiddleware
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Run this API process's actors: the LISTEN cockpit_events connection, the tenancy exclusion flusher, the CPU profiler (app/cpu_profile.py) and the pool watch (app/pool_watch.py), plus the cloud edition's own
+    """Run this API process's actors: the LISTEN cockpit_events connection, the tenancy exclusion flusher, the CPU profiler (app/cpu_profile.py), the pool watch (app/pool_watch.py) and the loop watch (app/loop_watch.py), plus the cloud edition's own
     workers (`app/routers_cloud.py::WORKERS`).
     The startup cron projection is not one of them: the durable lifespan wrap asks the `cron-projection` queue
     for a pass once DBOS has launched (`app/durable/runtime.py::_durable_lifespan`).
@@ -191,15 +87,26 @@ async def _lifespan(app: FastAPI):
 
     Node sockets close first on the way out: `registry.close_all` sends 4504 ("redial now",
     `app/routes/node_bus.py::_WS_HANDOFF`) so the fleet dials the overlapping successor at once instead of
-    backing off. Under uvicorn, SIGTERM already closes WebSockets with 1012 before lifespan shutdown
-    (`apps/api/entrypoint.sh`), so nodes must treat both as "redial now"; the sweep covers non-uvicorn hosts.
+    backing off. The sweep is the announcement, whatever the server itself does to open sockets on SIGTERM.
 
-    The opening direct-console check only warns; it refuses nothing."""
+    The opening direct-console check only warns; it refuses nothing.
+
+    First of all, the serving process's own checks: every import is done, so a C extension that switched the GIL
+    back on refuses the boot here (`app/worker_guard.py::assert_gil_off`), so does a thread that would inherit
+    its creator's tenancy scope (`assert_threads_start_clean`), and dev logs slow loop callbacks
+    (`app/loop_debug.py`)."""
+    worker_guard.assert_gil_off()
+    worker_guard.assert_threads_start_clean()
+    loop_debug.configure()
     console_direct.warn_if_tailnet_suffix_is_unusable()
     # First, and not an actor: pins this loop as the one threadpool callers push node-bus work onto
     # (`app/node_bus.py::run_on_serving_loop`, `app/node_send_intent.py`), and the one a forwarded
     # command for a peer-held socket runs on. Must precede anything that could serve a request.
     node_bus.capture_serving_loop()
+    # The async pool (`app/db_async.py`) belongs to this loop: built here, before anything serves or samples it.
+    await db_async.start()
+    # Error tracking, OFF until the operator sets a DSN; read once here, so a change applies on restart.
+    await _start_error_tracking()
     # Then the peer row, then the store that reads it — in that order, before the first dial (docstring).
     await cp_peers.start(app)
     node_bus_registry.attach_store(node_bus.SharedSocketStore())
@@ -212,11 +119,17 @@ async def _lifespan(app: FastAPI):
     await start_exclusion_flusher(app)
     await start_cpu_profiler(app)
     await pool_watch.start_pool_watch(app)
+    await loop_watch.start_loop_watch(app)
+    # Last before serving: the startup heap is complete, so freeze it and set the thresholds (`app/gc_watch.py::tune`).
+    # Not in the fixture env: a test suite enters this lifespan once per client, and each freeze would pin its heap.
+    if not is_fixture_env():
+        gc_watch.tune()
     try:
         yield
     finally:
         # First: this is the handoff's announcement (see the docstring).
         await node_bus_registry.close_all(node_bus_routes._WS_HANDOFF, "control plane handing off")
+        await loop_watch.stop_loop_watch(app)
         await pool_watch.stop_pool_watch(app)
         await stop_cpu_profiler(app)
         await stop_exclusion_flusher(app)
@@ -230,6 +143,17 @@ async def _lifespan(app: FastAPI):
         await cp_peers.stop(app)
         # Last, mirroring the capture: past this line `send_intent` reads "no loop" as a drop.
         node_bus.release_serving_loop()
+        await db_async.stop()
+        offload.shutdown()
+
+
+async def _start_error_tracking() -> None:
+    """`app/error_tracking.py::start`, off the event loop: it reads an operator setting on a sync session."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from app import error_tracking
+
+    await run_in_threadpool(error_tracking.start)
 
 
 # The app's own log level: INFO by default, `LOG_LEVEL` to override.
@@ -254,12 +178,6 @@ async def _nodevault_sealed(request: Request, exc: NodeVaultSealed) -> JSONRespo
     detail = "NodeVault credential — not available to Jaah"
     consumer = getattr(exc, "consumer", None)
     return JSONResponse(status_code=409, content={"detail": f"{consumer}: {detail}" if consumer else detail})
-
-
-async def _hinted_denial(request: Request, exc: HintedDenial) -> JSONResponse:
-    """A guard refusal that carries the access-request hint: `{detail, request: {scope, role}}`
-    (`app/access_requests.py::request_hint`). Every other denial keeps FastAPI's own `{detail}` body."""
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail, "request": exc.request})
 
 
 async def _other_org_denial(request: Request, exc: OtherOrgDenial) -> JSONResponse:
@@ -307,7 +225,7 @@ class _AppFormatter(logging.Formatter):
 def _configure_app_logging() -> None:
     """Give the ROOT logger a handler and a level, so this app's own `log.info` actually reaches the logs.
 
-    Uvicorn configures only its own loggers, so without this every module logger falls to `lastResort`
+    Granian configures only its own loggers, so without this every module logger falls to `lastResort`
     and drops everything below WARNING. An explicit handler rather than `basicConfig`, which is a silent
     no-op when a handler exists; the level is set unconditionally. `httpx`'s WARNING pin (set before this)
     is per-logger and survives the root going to INFO. Idempotent: never stacks a second handler."""
@@ -347,11 +265,137 @@ def _register_not_in_ce(app: FastAPI) -> None:
             app.add_api_route(route, _not_in_ce, methods=_ALL_METHODS, include_in_schema=False)
 
 
+#: Every edition's routers (`route_inventory.include_all` specs), in precedence order; the cloud's follow
+#: (`routers_cloud.ROUTERS`).
+ROUTERS: tuple[str, ...] = (
+    # The `/api/agent/*` routers, in this order and before every other `/api/agent` router: static task paths
+    # (`/tasks/by-id`) must match before any `/tasks/{task_id}`.
+    "routes.agent.accounts_worktrees", "routes.agent.pool_tick", "routes.agent.slot_intents",
+    "routes.agent.fleet_observe", "routes.agent.node_config", "routes.agent.releases", "routes.agent.task_reads",
+    "routes.agent.runner_liveness", "routes.agent.task_terminal", "routes.agent.agent_filing",
+    "routes.agent.task_secrets", "routes.agents", "routes.acp_registry", "routes.agent_marketplace",
+    # The agent session endpoints: their own `/api/agent/sessions` router, same `_check_token` door.
+    "routes.agent_sessions",
+    # The apt channel: re-serves the signed apt repo to a node without AWS credentials; its own auth
+    # (apt cannot send a custom header).
+    "routes.agent_apt",
+    # The dist channel: the macOS/Windows installers from the same bucket, header-token only.
+    "routes.agent_dist",
+    # The rpm channel: the Amazon Linux dnf repo from the same bucket, the apt channel's Basic auth.
+    "routes.agent_rpm", "routes.agent_nodevault",
+    # The project-settings channel: the only agent-plane governance write; its module docstring holds why
+    # it is safe (the operator's writer under the launcher's authority).
+    "routes.agent_project_settings",
+    # The cron channel: a runner's Runner cron in its own project, run as the chain's executor through the
+    # console's own writers (`SHAPE_CRON`).
+    "routes.agent_crons",
+    # The outcome scan's toolbox calls (`app/outcome_ledger/scan.py`); the ledger is kept in every edition.
+    "routes.agent_outcome_scan",
+    # The deploy probe run's toolbox calls (`app/production_qa/probes.py`); Production QA ships in every edition.
+    "routes.agent_deploy_probe",
+    # The release executor's toolbox calls and jaah-forge's release-PR question (`app/releases/runs.py`).
+    "routes.agent_release",
+    # The node gate driver's results (`app/pipeline_gates/results.py`), for the lane and the release executor.
+    "routes.agent_pipeline_gates",
+    # Its twin for event-driven triggers (`SHAPE_TRIGGER`); the secret never reaches the agent.
+    "routes.agent_triggers",
+    # The peer-task channel: a runner reads other tasks of its own project under its launcher's view.
+    "routes.agent_peer_tasks",
+    # The org-wide channels, as the launcher (`routes/agent/auth.py::launcher_principal`): the task board and the
+    # org reads + notify. Before the SDK router, whose `/tasks/{task_id}/notify` would catch `/tasks/org/notify`.
+    "routes.agent_task_board", "routes.agent_credentials", "routes.agent_automations", "routes.agent_org",
+    # The runner-pin write, as the launcher (an operator); its module docstring holds the one loop-guard exception.
+    "routes.agent_gha_runner_pin",
+    "routes.agent_sdk",
+    # The bootstrap channel: same `_check_token` door, but off the `/api/agent` plane because
+    # `/api/node-bootstrap` is the one machine path the public ALB allows
+    # (`app/node_bootstrap.py::BOOTSTRAP_PATH`).
+    "routes.agent_bootstrap", "routes.auth", "routes.mfa", "routes.password_reset",
+    # A second router: the permission catalog is served at `/api/permissions`, outside `/api/auth`.
+    "routes.auth:catalog_router",
+    # The built-in role catalog, read-only (app/routes/access.py).
+    "routes.access",
+    # The bell's feed (`/api/inbox*`).
+    "routes.inbox", "routes.notification_channels", "routes.trackers", "routes.project_trackers", "routes.webhooks", "routes.budgets", "routes.ip_allowlist", "routes.org_retention", "routes.api_keys",
+    "routes.public", "routes.public:well_known_router",
+    # The community edition's first run and attachment volume; each answers 404 in the cloud.
+    "routes.ce_setup", "routes.ce_storage", "routes.settings",
+    # The persona catalogue: a read-only projection (app/routes/personas.py).
+    "routes.personas", "routes.portfolio", "routes.production_qa", "routes.production_qa:deploys_router", "routes.releases", "routes.pipeline_guardrails", "routes.pipeline_templates", "routes.pipeline_board", "routes.outcome_links", "routes.review_findings",
+    # The slot-row write surface on portfolio_routes' `/api/worktrees` paths; different methods.
+    "routes.pool_slots", "routes.projects",
+    # The nodes a task pin may name for a project: `/api/projects/{project_id}/runnable-nodes`, a distinct path.
+    "routes.project_nodes",
+    # The project Environment tab's routes: distinct `/{id}/env-vars...` sub-paths, no order hazard.
+    "routes.project_env",
+    "routes.commands",
+    # The node routes (`app/routes/nodes/`), one router per module, in this fixed order. Rule: a literal-path
+    # GET (`/api/nodes/intents`, `/api/nodes/page`) is included before any `/api/nodes/{node_id}` GET, or the
+    # param route would claim it — `intents` first, and `reads` declares `/page` above `/{node_id}`.
+    "routes.nodes.intents", "routes.nodes.reads", "routes.nodes.health", "routes.nodes.journal",
+    "routes.nodes.metrics", "routes.nodes.register", "routes.nodes.lifecycle", "routes.nodes.update",
+    "routes.nodes.delete", "routes.nodes.restart",
+    # Orgs, the tenancy axis. Distinct paths, no order hazard.
+    "routes.orgs", "routes.org_setup", "routes.ce_limits", "routes.task_comments",
+    # The dispatch forecast (`GET /api/tasks/{task_id}/dispatch-forecast`).
+    "routes.task_queue", "routes.accounts",
+    # The credentials package, one router per module. Literal-path GETs (`/api/credentials/seal-key`,
+    # `/types`, `/owners`, `/nodevault-state`) are declared in `reads` before `/{credential_id}`, and `reads`
+    # is included first: a literal path registered after the `{credential_id}` route would 422 as a bad UUID.
+    # Before the reads: their `/api/credentials/{credential_id}` would swallow `/api/credentials/tree`.
+    "routes.credentials.tree", "routes.credentials.reads", "routes.credentials.writes", "routes.credentials.bulk",
+    "routes.credentials.project_pool", "routes.credentials.mcp_links", "routes.credentials.connection_test",
+    "routes.credentials.connect",
+    # The integration catalog's gallery, logos and one-click Connect start (its callback is the connect router's).
+    # Custom connectors: before the catalog router, so `/api/integrations/custom/...` is never read as a vendor slug.
+    "routes.integrations_custom", "routes.integrations", "routes.nodevault",
+    # Connect GitHub on `/api/git-connect`: its callback is a browser page reached by redirect
+    # from github.com, not part of the credentials CRUD surface.
+    "routes.git_connect",
+    # Git Access per forge root (`/api/users/{id}/git-connections`), self-service.
+    "routes.git_connections", "routes.health", "routes.attachments",
+    # Its agent-token half (the runner's report upload); same module to avoid an import cycle with routes/agent/task_reads.py.
+    "routes.attachments:agent_router", "routes.sessions", "routes.task_session_events", "routes.audit",
+    # Audit > Client errors: what flagged console sessions report (`app/client_events.py`).
+    "routes.client_events",
+    # The org boundary's exclusion log, beside the other operator audit surfaces it reads like.
+    "routes.tenancy_exclusions", "routes.stream", "routes.read_relay", "routes.console",
+    # The console's chat view and live control of a slot's ACP run.
+    "routes.console_runtime",
+    # The peer surface: what one control-plane task presents to another, under `/api/agent/`
+    # so the session middleware, the public ALB deny and nginx treat it as machine surface already.
+    "routes.cp_peer", "routes.node_bus", "routes.tags", "routes.automations", "routes.crons", "routes.triggers",
+    # The Task rating pair on `/api/tasks`. Declared before `tasks_routes`: they cannot shadow each other,
+    # but narrower static paths first keeps it so.
+    "routes.task_ratings",
+    # The task page's read-only Routing panel (`GET /api/tasks/{id}/routing`).
+    "routes.routing", "routes.routing:preview_router", "routes.task_control_messages",
+    # The detail page's cold load, composed from the routes above and below (`app/routes/task_page.py`).
+    "routes.task_page",
+    # The `app/routes/tasks/` package, one router per domain module, all on `/api/tasks`. Order rule: every
+    # router declaring a literal `GET /api/tasks/<word>` path (`listing`: `/models`, `/sources`, `/tag-counts`,
+    # `/creators`, `/tree`, `/counts`, `/personas`) precedes the one declaring `GET /api/tasks/{task_id}`
+    # (`read`) — the `int` param does not fall through, so a literal registered after it is a 422. The
+    # pre-tasks includes above stay ahead of all of these.
+    "routes.tasks.create", "routes.tasks.update", "routes.tasks.title", "routes.tasks.delete", "routes.tasks.listing",
+    "routes.tasks.read", "routes.tasks.dispatch", "routes.tasks.answers", "routes.tasks.question_drafts", "routes.tasks.transitions",
+    "routes.tasks.dependencies", "routes.tasks.activity", "routes.telemetry",
+    # The durable-workflow read surface; `cron_tick` is deliberately absent (app/workflow_registry.py).
+    "routes.workflows", "routes.features",
+    # The Playbooks sandbox (isolated: nothing that runs a task reads it — app/routes/playbooks.py).
+    "routes.playbooks",
+    # Task templates: the gallery, the manage list and the editor (app/routes/task_templates.py).
+    "routes.task_templates",
+)
+
+
 def create_app() -> FastAPI:
-    # Fail fast if started with more than one uvicorn worker: a peer address names ONE process to the other
+    # Fail fast if started with more than one Granian worker: a peer address names ONE process to the other
     # control-plane tasks (`app/cp_peers.py`), and the LISTEN fan-out is per process
     # (worker_guard.py). Scale is more tasks, never more workers.
     worker_guard.assert_single_api_worker()
+    # On ECS the public ALBs dial this process directly: never start there with the ingress guard inert.
+    ingress_surface.assert_configured_on_ecs()
 
     # httpx logs every request URL at INFO, and `str(httpx.URL)` renders `user:pass@` userinfo in plaintext;
     # presigned S3 URLs also carry their signature and session token in the query. Pinned to WARNING so a
@@ -405,22 +449,45 @@ def create_app() -> FastAPI:
         dependencies=[Depends(authz_guard)],
     )
 
+    # Innermost: it fingerprints the handler's own 200 body for the node rosters (`app/conditional_get.py`).
+    app.add_middleware(ConditionalGetMiddleware)
     app.add_middleware(UserActivityMiddleware)
     # Inside `SessionAuthMiddleware`: a request it refuses never reaches the sliding re-mint.
     app.add_middleware(SessionRefreshMiddleware)
+    # Inside the stale-tab guard and outside the re-mint and the activity trail (pinned, `app/idempotency.py`): a
+    # refused request never claims a key, and a replayed write re-mints nothing and records no second row.
+    app.add_middleware(IdempotencyMiddleware)
     # Between the two (pinned, `app/stale_tab_guard.py`): after the session is resolved, and its `org_switched`
     # refusal never reaches the re-mint.
     app.add_middleware(StaleTabGuardMiddleware)
     app.add_middleware(SessionAuthMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
+    # Outermost but the edge-viewer rewrite and the CE peer gate: its clock covers every layer this process spends on
+    # a request (`app/server_timing.py`).
+    app.add_middleware(ServerTimingMiddleware)
+    # Outside every layer that reads the client address: through the CloudFront edge the client becomes the
+    # viewer, and the edge's origin secret is stripped (`app/edge_viewer.py`).
+    app.add_middleware(EdgeViewerMiddleware)
     if edition.IS_CE:
         # Outermost: a caller off this machine is refused before any other layer runs (`app/ce_local_peers.py`).
         from app.ce_local_peers import LocalPeersOnlyMiddleware
 
         app.add_middleware(LocalPeersOnlyMiddleware)
+    # nginx's body ceiling, where no nginx fronts the API (`app/body_cap.py`); inside the access line, so a 413 is logged.
+    app.add_middleware(BodyCapMiddleware)
+    # Directly inside the guard: nginx's access line for the token-only surface, which the node-token alarm counts,
+    # wherever no nginx fronts the API (`app/machine_access_log.py`).
+    app.add_middleware(MachineAccessLogMiddleware)
+    # Directly inside the proxy-header rewrite: it decides on the ORIGINAL TCP peer that layer keeps, before any other
+    # layer or handler runs; inert until `JAAH_INGRESS_INTERNAL_CIDRS` is set (`app/ingress_surface.py`).
+    app.add_middleware(IngressSurfaceMiddleware)
+    # OUTERMOST, the CE peer gate included: the client's real address behind nginx (`app/proxy_headers.py`), so
+    # every layer below and every per-client limit (`app/routes/public.py::check_rate_limit`) keys on the caller,
+    # never on nginx's loopback hop. Outside the CE gate too, which therefore sees the same rewritten peer it saw
+    # when the server itself did this rewrite.
+    app.add_middleware(ProxyHeadersMiddleware)
     app.add_exception_handler(WrappingKeyUnavailable, _wrapping_key_unavailable)
     app.add_exception_handler(NodeVaultSealed, _nodevault_sealed)
-    app.add_exception_handler(HintedDenial, _hinted_denial)
     app.add_exception_handler(OtherOrgDenial, _other_org_denial)
     app.add_exception_handler(ip_allowlist.IpNotAllowed, _ip_not_allowed)
     app.add_exception_handler(api_keys.ApiKeyNotAllowed, _api_key_not_allowed)
@@ -432,169 +499,7 @@ def create_app() -> FastAPI:
         limit=int(os.environ.get("PUBLIC_RATE_LIMIT", "600")), bucket="public"
     )
 
-    # The `/api/agent/*` routers, in this order and before every other `/api/agent` router: static task paths
-    # (`/tasks/by-id`, `/tasks/needs-attention`, `/tasks/system/open`) must match before any `/tasks/{task_id}`.
-    app.include_router(agent_accounts_worktrees_routes.router)
-    app.include_router(agent_pool_tick_routes.router)
-    app.include_router(agent_slot_intents_routes.router)
-    app.include_router(agent_fleet_observe_routes.router)
-    app.include_router(agent_node_config_routes.router)
-    app.include_router(agent_releases_routes.router)
-    app.include_router(agent_task_reads_routes.router)
-    app.include_router(agent_runner_liveness_routes.router)
-    app.include_router(agent_task_terminal_routes.router)
-    app.include_router(agent_filing_routes.router)
-    app.include_router(agent_task_secrets_routes.router)
-    app.include_router(agents_routes.router)
-    app.include_router(acp_registry_routes.router)
-    # The agent session endpoints: their own `/api/agent/sessions` router, same `_check_token` door.
-    app.include_router(agent_session_routes.router)
-    # The apt channel: re-serves the signed apt repo to a node without AWS credentials; its own auth
-    # (apt cannot send a custom header).
-    app.include_router(agent_apt_routes.router)
-    # The dist channel: the macOS/Windows installers from the same bucket, header-token only.
-    app.include_router(agent_dist_routes.router)
-    # The rpm channel: the Amazon Linux dnf repo from the same bucket, the apt channel's Basic auth.
-    app.include_router(agent_rpm_routes.router)
-    app.include_router(agent_nodevault_routes.router)
-    # The project-settings channel: the only agent-plane governance write; its module docstring holds why
-    # it is safe (the operator's writer under the launcher's authority).
-    app.include_router(agent_project_settings_routes.router)
-    # The cron channel: a runner's Runner cron in its own project, run as the chain's executor through the
-    # console's own writers (`SHAPE_CRON`).
-    app.include_router(agent_crons_routes.router)
-    # Its twin for event-driven triggers (`SHAPE_TRIGGER`); the secret never reaches the agent.
-    app.include_router(agent_triggers_routes.router)
-    # The peer-task channel: a runner reads other tasks of its own project under its launcher's view.
-    app.include_router(agent_peer_tasks_routes.router)
-    app.include_router(agent_sdk_routes.router)
-    # The bootstrap channel: same `_check_token` door, but off the `/api/agent` plane because
-    # `/api/node-bootstrap` is the one machine path the public ALB allows
-    # (`app/node_bootstrap.py::BOOTSTRAP_PATH`).
-    app.include_router(agent_bootstrap_routes.router)
-    app.include_router(auth_routes.router)
-    app.include_router(mfa_routes.router)
-    app.include_router(password_reset_routes.router)
-    # A second router: the permission catalog is served at `/api/permissions`, outside `/api/auth`.
-    app.include_router(auth_routes.catalog_router)
-    # The built-in role catalog, read-only (app/routes/access.py).
-    app.include_router(access_routes.router)
-    # Access requests (`/api/access/requests*`) and the bell's feed (`/api/inbox*`), access-model C7.
-    app.include_router(access_request_routes.router)
-    app.include_router(inbox_routes.router)
-    app.include_router(groups_routes.router)
-    app.include_router(budgets_routes.router)
-    app.include_router(ip_allowlist_routes.router)
-    app.include_router(org_retention_routes.router)
-    app.include_router(api_keys_routes.router)
-    app.include_router(public_routes.router)
-    # The community edition's first run and attachment volume; each answers 404 in the cloud.
-    app.include_router(ce_setup_routes.router)
-    app.include_router(ce_storage_routes.router)
-    app.include_router(settings_routes.router)
-    app.include_router(port_grid_routes.router)
-    # The persona catalogue: a read-only projection (app/routes/personas.py).
-    app.include_router(personas_routes.router)
-    app.include_router(portfolio_routes.router)
-    # The slot-row write surface on portfolio_routes' `/api/worktrees` paths; different methods.
-    app.include_router(pool_slots_routes.router)
-    app.include_router(projects_routes.router)
-    # Assignments: `/api/nodes/{node_id}/projects` + `/api/projects/{project_id}/nodes`, distinct paths.
-    app.include_router(assignments_routes.router)
-    # The project Environment tab's routes: distinct `/{id}/env-vars...` sub-paths, no order hazard.
-    app.include_router(project_env_routes.router)
-    # The task form's project-scoped Jira reads: distinct `/{id}/jira/...` sub-paths, no order hazard.
-    app.include_router(jira_routes.router)
-    app.include_router(commands_routes.router)
-    # The node routes (`app/routes/nodes/`), one router per module, in this fixed order. Rule: a literal-path
-    # GET (`/api/nodes/intents`, `/api/nodes/page`) is included before any `/api/nodes/{node_id}` GET, or the
-    # param route would claim it — `intents` first, and `reads` declares `/page` above `/{node_id}`.
-    app.include_router(nodes_intents.router)
-    app.include_router(nodes_reads.router)
-    app.include_router(nodes_health.router)
-    app.include_router(nodes_journal.router)
-    app.include_router(nodes_metrics.router)
-    app.include_router(nodes_register.router)
-    app.include_router(nodes_lifecycle.router)
-    app.include_router(nodes_update.router)
-    app.include_router(nodes_delete.router)
-    # Orgs, the tenancy axis. Distinct paths, no order hazard.
-    app.include_router(orgs_routes.router)
-    app.include_router(org_setup_routes.router)
-    app.include_router(ce_limits_routes.router)
-    app.include_router(task_comments_routes.router)
-    # The dispatch forecast (`GET /api/tasks/{task_id}/dispatch-forecast`).
-    app.include_router(task_queue_routes.router)
-    app.include_router(accounts_routes.router)
-    # The credentials package, one router per module. Literal-path GETs (`/api/credentials/seal-key`,
-    # `/types`, `/owners`, `/nodevault-state`) are declared in `reads` before `/{credential_id}`, and `reads`
-    # is included first: a literal path registered after the `{credential_id}` route would 422 as a bad UUID.
-    # Before the reads: their `/api/credentials/{credential_id}` would swallow `/api/credentials/tree`.
-    app.include_router(credential_tree_routes.router)
-    app.include_router(credential_reads_routes.router)
-    app.include_router(credential_writes_routes.router)
-    app.include_router(credential_bulk_routes.router)
-    app.include_router(credential_pool_routes.router)
-    app.include_router(credential_test_routes.router)
-    app.include_router(credential_connect_routes.router)
-    app.include_router(nodevault_routes.router)
-    # Connect GitHub on `/api/git-connect`: its callback is a browser page reached by redirect
-    # from github.com, not part of the credentials CRUD surface.
-    app.include_router(git_connect_routes.router)
-    app.include_router(forge_connect_routes.router)
-    # Git Access per forge root (`/api/users/{id}/git-connections`), self-service.
-    app.include_router(git_connections_routes.router)
-    app.include_router(health_routes.router)
-    app.include_router(attachments_routes.router)
-    # Its agent-token half (the runner's report upload); same module to avoid an import cycle with routes/agent/task_reads.py.
-    app.include_router(attachments_routes.agent_router)
-    app.include_router(sessions_routes.router)
-    app.include_router(task_session_events_routes.router)
-    app.include_router(audit_routes.router)
-    # The org boundary's exclusion log, beside the other operator audit surfaces it reads like.
-    app.include_router(tenancy_exclusions_routes.router)
-    app.include_router(stream_routes.router)
-    app.include_router(console_routes.router)
-    # The console's chat view and live control of a slot's ACP run.
-    app.include_router(console_runtime_routes.router)
-    # The peer surface: what one control-plane task presents to another, under `/api/agent/`
-    # so the session middleware, the public ALB deny and nginx treat it as machine surface already.
-    app.include_router(cp_peer_routes.router)
-    app.include_router(node_bus_routes.router)
-    app.include_router(tags_routes.router)
-    app.include_router(automations_routes.router)
-    app.include_router(crons_routes.router)
-    app.include_router(triggers_routes.router)
-    # The Task rating pair on `/api/tasks`. Declared before `tasks_routes`: they cannot shadow each other,
-    # but narrower static paths first keeps it so.
-    app.include_router(task_ratings_routes.router)
-    app.include_router(task_control_messages_routes.router)
-    # The detail page's cold load, composed from the routes above and below (`app/routes/task_page.py`).
-    app.include_router(task_page_routes.router)
-    # The `app/routes/tasks/` package, one router per domain module, all on `/api/tasks`. Order rule: every
-    # router declaring a literal `GET /api/tasks/<word>` path (`listing`: `/models`, `/sources`, `/tag-counts`,
-    # `/creators`, `/tree`, `/counts`, `/personas`) precedes the one declaring `GET /api/tasks/{task_id}`
-    # (`read`) — the `int` param does not fall through, so a literal registered after it is a 422. The
-    # pre-tasks includes above stay ahead of all of these.
-    app.include_router(tasks_create_routes.router)
-    app.include_router(tasks_update_routes.router)
-    app.include_router(tasks_title_routes.router)
-    app.include_router(tasks_delete_routes.router)
-    app.include_router(tasks_listing_routes.router)
-    app.include_router(tasks_read_routes.router)
-    app.include_router(tasks_dispatch_routes.router)
-    app.include_router(tasks_answers_routes.router)
-    app.include_router(tasks_transitions_routes.router)
-    app.include_router(tasks_dependencies_routes.router)
-    app.include_router(tasks_activity_routes.router)
-    app.include_router(telemetry_routes.router)
-    # The durable-workflow read surface; `cron_tick` is deliberately absent (app/workflow_registry.py).
-    app.include_router(workflows_routes.router)
-    app.include_router(features_routes.router)
-    # The Playbooks sandbox (isolated: nothing that runs a task reads it — app/routes/playbooks.py).
-    app.include_router(playbooks_routes.router)
-    # Task templates: the gallery, the manage list and the editor (app/routes/task_templates.py).
-    app.include_router(task_templates_routes.router)
+    route_inventory.include_all(app, ROUTERS)
     if not edition.IS_CE:
         from app import routers_cloud
 
@@ -605,7 +510,7 @@ def create_app() -> FastAPI:
     # so even a no-I/O probe cannot get a thread. The ALB kills the task after 3 missed 5s/2s probes.
     # Necessary but not sufficient: the global `authz_guard` must also decide on the event loop
     # (`app/authz/enforce.py::_decides_without_io`). Not served from nginx: this is the service's only liveness
-    # signal, and it must reach Python to notice a wedged uvicorn.
+    # signal, and it must reach Python to notice a wedged server.
     # The one thing it does report: a pool `pool_watch.unhealthy()` — wedged (every connection out and none
     # returned, for longer than any burst) or starved (full while checkouts keep timing out) — is a wedged
     # task, answered 503 so ECS replaces it — a memory read, never a checkout, so the probe itself can never
@@ -621,9 +526,11 @@ def create_app() -> FastAPI:
     if edition.IS_CE:
         _register_not_in_ce(app)
 
-    # Last, over every route: a sync endpoint's route connection is back in the pool before its response is
-    # validated on another thread (`app/db.py::release_after_endpoint`).
-    db.release_after_endpoint(dependant for _route, dependant in route_inventory.dispatched_dependants(app))
+    # Last, over every route: an endpoint's `DbDep` connection is back before its dependencies are torn down
+    # (`app/db_async.py::release_after_async_endpoint`).
+    db_async.release_after_async_endpoint(
+        dependant for _route, dependant in route_inventory.dispatched_dependants(app)
+    )
     return app
 
 

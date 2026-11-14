@@ -2,11 +2,11 @@ import Box from '@mui/material/Box'
 import Drawer from '@mui/material/Drawer'
 import IconButton from '@mui/material/IconButton'
 import Typography from '@mui/material/Typography'
-import { alpha, type Theme } from '@mui/material/styles'
+import { type Theme } from '@mui/material/styles'
 import { useMemo, useState, type JSX, type ReactNode } from 'react'
 import { FORM_BAR_STUCK_ATTR, useStuck } from './FormActionBar'
 import { CloseIcon } from './icons'
-import { paperGround } from '../theme'
+import { FONT_WEIGHT, paperGround } from '../theme'
 
 /* The console's ONE right-anchored detail drawer: Escape/backdrop close via MUI's Modal, full-width at
  * `xs`. `testId` is the structural handle suites address the paper by; `width` is the `sm` width, or a
@@ -66,12 +66,12 @@ export default function SideDrawer({
       {title !== undefined && (
         <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1, mb: 1 }}>
           <Box sx={{ flex: '1 1 auto', minWidth: 0 }}>
-            <Typography variant="subtitle1" component="h3" sx={{ fontWeight: 600, overflowWrap: 'anywhere' }}>
+            <Typography variant="subtitle1" component="h3" sx={{ fontWeight: FONT_WEIGHT.semibold, overflowWrap: 'anywhere' }}>
               {title}
             </Typography>
             {subtitle && <Box sx={{ mt: 0.5 }}>{subtitle}</Box>}
           </Box>
-          <IconButton onClick={onClose} aria-label={closeLabel} title={closeLabel} color="inherit" data-testid={`${testId}-close`}>
+          <IconButton onClick={onClose} aria-label={closeLabel} color="inherit" data-testid={`${testId}-close`}>
             <CloseIcon />
           </IconButton>
         </Box>
@@ -96,19 +96,16 @@ export default function SideDrawer({
               py: 1.5,
               position: 'sticky',
               bottom: 0,
-              /* Above the body's positioned descendants (an outlined field's floating label is `z-index: 1`),
-                 or they paint over the foot as it scrolls past them. */
-              zIndex: 2,
+              /* Level with the body's positioned descendants (an outlined field's floating label is `z-index: 1`) and
+                 after them in the tree, so the foot paints over them as they scroll past it. */
+              zIndex: 1,
               // The drawer paper's own ground (`theme.ts`'s `paperGround`): plain paper reads darker in dark.
               bgcolor: paperGround(theme),
               borderTop: '1px solid',
               borderColor: 'divider',
-              /* Content continues beneath: the same edge as a stuck `FormActionBar`, deeper on dark paper, where
-                 that one barely shows. */
-              [`&[${FORM_BAR_STUCK_ATTR}]`]: {
-                boxShadow: `0 -6px 8px -6px ${alpha(theme.palette.common.black, 0.35)}`,
-                ...theme.applyStyles('dark', { boxShadow: `0 -8px 12px -6px ${alpha(theme.palette.common.black, 0.8)}` }),
-              },
+              /* Content continues beneath: the same edge as a stuck `FormActionBar`, a hairline that darkens (legible
+                 on both schemes, where a shadow barely showed on dark paper). */
+              [`&[${FORM_BAR_STUCK_ATTR}]`]: { borderColor: 'text.disabled' },
             })}
           >
             {footer}

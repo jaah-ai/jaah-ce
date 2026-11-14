@@ -188,8 +188,8 @@ def slot_released(session: Any, worktree_id: UUID) -> None:
 def carried_project_ids(conn: Any, node: str) -> dict[int, str]:
     """`{project id: name}` for the projects node `node` (its uuid) runs a carried-over slot of. A moved project
     is not in the node's org, so without this `fleet_observe.resolve_project_ids` would skip the carried slot
-    and its runner would read as lost. Keyed by id: names are unique per org only, so two carried projects can
-    share one; the name is for an older daemon that reports a slot by name."""
+    and its runner would read as lost. The name is display only: the pool tick's `known_slots` label
+    (`routes/agent/pool_tick.py::build_known_slots`), which the node's org can no longer read by join."""
     rows = conn.execute(text("""
         SELECT p.id, p.name FROM org_transfer_carryovers c
         JOIN worktrees w ON w.id = c.worktree_id JOIN projects p ON p.id = w.project_id
@@ -203,7 +203,7 @@ def _erase_slot(session: Any, worktree_id: UUID, task_id: int) -> None:
     node deregistered) has nothing left to erase."""
     # Deferred: `slot_destroy` imports `slot_state`, whose `release` calls `close`.
     from app import slot_destroy  # noqa: PLC0415
-    from app.node_clone import clone_for_slot_path, resolve_clone  # noqa: PLC0415
+    from app.node_clone import clone_for_slot_path, legacy_clone  # noqa: PLC0415
 
     # The slot, its project and its node in one statement: the project is in the new org and the slot and node
     # in the old one, so no scope sees all three.
@@ -215,7 +215,7 @@ def _erase_slot(session: Any, worktree_id: UUID, task_id: int) -> None:
     if slot is None:
         log.info("carry-over of task %s: slot %s is already gone — nothing to erase", task_id, worktree_id)
         return
-    clone = clone_for_slot_path(slot.jaah_home, slot.path, slot.number) or resolve_clone(
+    clone = clone_for_slot_path(slot.jaah_home, slot.path, slot.number) or legacy_clone(
         slot.jaah_home, slot.project_id
     )
     if not clone:

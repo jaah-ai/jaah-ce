@@ -23,7 +23,6 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.models.node_groups import NodeProject
 from app.models.orgs import Org
 from app.models.projects import Project
 from app.models.tasks import Task
@@ -94,20 +93,10 @@ def ensure_nodes_project(session: Session, org_id: UUID) -> Project:
 
 
 def prepare(session: Session, org_id: UUID, node_id: UUID) -> int:
-    """Make `node_id` able to run a node task, and answer the project id to file it in: the org's Nodes project,
-    explicitly assigned to the node with no static slot (each task gets a dynamic folder slot at dispatch).
-    Takes `slot_allocation.lock_pair` first, as every writer of a pair's assignment does. Flushes, never
-    commits."""
-    # Imported here: `app/db.py` imports this module for its flush listener, before the dispatch modules load.
-    from app import slot_allocation
-
+    """Answer the project id a node task of `node_id` is filed in: the org's Nodes project, made on first use. It
+    runs on every node of the org (the All group, `app/placement_groups.py`), so nothing is written per node;
+    each task gets a dynamic folder slot at dispatch. Flushes, never commits."""
     project = ensure_nodes_project(session, org_id)
-    slot_allocation.lock_pair(session, node_id, project.id)
-    session.execute(
-        pg_insert(NodeProject)
-        .values(node_id=node_id, project_id=project.id, org_id=org_id, static_slots=0)
-        .on_conflict_do_nothing(index_elements=["node_id", "project_id"])
-    )
     session.flush()
     return project.id
 

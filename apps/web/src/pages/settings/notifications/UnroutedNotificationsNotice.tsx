@@ -3,9 +3,10 @@ import { Link as RouterLink } from 'react-router-dom'
 import Link from '@mui/material/Link'
 import { useQuery } from '@tanstack/react-query'
 import { get } from '../../../api'
-import { useAuth } from '../../../auth'
+import { useOwnOrgId } from '../../../hooks/useOwnOrgId'
 import { isEnabled } from '../../../lib/editionFeatures'
 import { readString, writeString } from '../../../lib/safeStorage'
+import { countOf } from '../../../lib/humanize'
 import Banner from '../../../ui/Banner'
 import RelativeTime from '../../../ui/RelativeTime'
 
@@ -48,7 +49,7 @@ function newestMark(data: Unrouted): string {
 }
 
 export default function UnroutedNotificationsNotice(): JSX.Element | null {
-  const ownOrg = useAuth().admin?.org?.id
+  const ownOrg = useOwnOrgId()
   const { data } = useQuery({
     queryKey: [UNROUTED_NOTIFICATIONS_URL],
     queryFn: () => get<Unrouted>(UNROUTED_NOTIFICATIONS_URL),
@@ -67,7 +68,7 @@ export default function UnroutedNotificationsNotice(): JSX.Element | null {
   const named = orgs.some(o => o.id !== ownOrg) ? orgs.map(o => o.name) : []
   return (
     <Banner severity="warning" testId="settings-unrouted-notifications" onDismiss={dismiss}>
-      {data.count} task notification{data.count === 1 ? '' : 's'} in the last {data.window_days} days reached no one
+      {countOf(data.count, 'task notification')} in the last {data.window_days} days reached no one
       {named.length > 0 && <> in <strong data-testid="settings-unrouted-orgs">{orgsText(named)}</strong></>}:
       no recipient or channel is set up.
       {data.last_at && <> Latest <RelativeTime iso={data.last_at} />

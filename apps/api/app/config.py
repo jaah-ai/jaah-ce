@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 from app.jaah_env import env_flag_enabled
+from app.log_on_change import WarnOnce
 
 #: `Settings.live_public_base_url` when the environment sets none.
 LIVE_PUBLIC_BASE_URL = "https://live.jaah.ai"
@@ -25,7 +26,6 @@ class Settings:
     # UI's ingress: main yes, dev no — admins only). Not public, a self-hosted Ubuntu one-liner joins the tailnet
     # and fetches from the address nodes dial (`routes/nodes/register.py::_joins_tailnet_first`). Unset = public.
     console_public: bool
-    public_rate_limit: int
     tz: str
     # No GitHub token here: git access is a `credentials` row resolved per task
     # (`app/git_access.py`). Deliberately no env fallback — one would reinstate a shared fleet identity.
@@ -99,6 +99,16 @@ class Settings:
     # terraform sets it from `var.apple_team_id`. Empty (or not 10 of `[A-Z0-9]`, warned) = unconfigured: the
     # profile route answers 404 naming `JAAH_APPLE_TEAM_ID`.
     apple_team_id: str
+    # ── Jira Forge app (app/trackers/forge_fit.py) ──
+    # The app's id (`ari:cloud:ecosystem::app/<uuid>`, its manifest's `app.id`): the audience every Forge Invocation
+    # Token must name. Empty = no Forge app here: every Forge invocation is refused. Not a secret.
+    jira_forge_app_id: str
+    # The Forge environment this control plane serves (the FIT's `app.environment.id`): its app's production
+    # environment, so a token from the app's other environments is refused here. Empty = any environment of the app.
+    jira_forge_environment_id: str
+    # The app's installation link for this environment (the developer console's Distribution page), shown beside a
+    # Forge connection's claim code. Empty = the console shows none.
+    jira_forge_install_url: str
 
 
 _APPLE_TEAM_ID = re.compile(r"[A-Z0-9]{10}")
@@ -131,11 +141,10 @@ def _http_url(name: str, raw: str) -> str:
 
 @dataclass(frozen=True)
 class DbPoolSizes:
+    #: The one async pool per task (`app/db_async.py`): every request, identity read and background job.
     pool_size: int
     max_overflow: int
     dbos_pool_size: int | None  # None = DBOS's own default
-    identity_pool_size: int
-    background_pool_size: int
 
 
 def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
@@ -150,29 +159,42 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
 
 
 def db_pool_sizes() -> DbPoolSizes:
-    """The per-task DB connection ceiling: `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` for the request engine
-    (`app/db.py::_pool_kwargs`), `DB_IDENTITY_POOL_SIZE` and `DB_BACKGROUND_POOL_SIZE` for its two side engines
-    (`app/db.py`'s identity and background lanes), and `DBOS_POOL_SIZE` for DBOS's system-database engine
-    (`app/durable/runtime.py`). Set per environment by the deployment because the
-    control plane autoscales and each environment's RDS class bounds tasks x pool. Unset — the local stack —
-    keeps 20 + 20, 5, 10 and DBOS's default. A pool size of 0 means UNBOUNDED to SQLAlchemy, hence minimum 1.
-    Not cached: read once per engine at import, and tests set the environment per case."""
+    """The per-task DB connection ceiling: `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` for the one async pool
+    (`app/db_async.py`) and `DBOS_POOL_SIZE` for DBOS's system-database engine (`app/durable/runtime.py`). Set per
+    environment by the deployment (the ECS module's DB environment), because the control plane autoscales and each
+    environment's RDS class bounds tasks x pool (the deployment's connection-budget test counts them).
+
+    A pool sized 0 is DISABLED (`app/db_async.py::DisabledPoolError`), never defaulted. Unset — the local stack —
+    keeps 20 + 20 and DBOS's default. Not cached: read once per engine, and tests set the environment per case."""
     dbos = _env_int("DBOS_POOL_SIZE", 0)
     return DbPoolSizes(
-        pool_size=_env_int("DB_POOL_SIZE", 20, minimum=1),
+        pool_size=_env_int("DB_POOL_SIZE", 20),
         max_overflow=_env_int("DB_MAX_OVERFLOW", 20),
         dbos_pool_size=dbos or None,
-        identity_pool_size=_env_int("DB_IDENTITY_POOL_SIZE", 5, minimum=1),
-        background_pool_size=_env_int("DB_BACKGROUND_POOL_SIZE", 10, minimum=1),
     )
 
 
+#: Every pooled DB connection's maximum age (`pool_recycle`): older, it is closed at its next checkout and a fresh
+#: one opened. A busy pool reuses each connection forever, so `idle_session_timeout` never reaps it, and a Postgres
+#: backend's private memory (relcache, cached plans) only grows: ~300 such backends swapped prod RDS (8 GB) by 3.6 GB.
+DB_POOL_RECYCLE_SECONDS = 1800
+
+
+#: Connections of the one async pool that request sessions never take (`app/db_async.py::RequestAdmission`): a
+#: burst of requests queues on its admission gate, and background work (cron ticks, lease-drain, DBOS steps) still
+#: checks out. Not a pool size: the pool stays `db_pool_sizes()`.
+REQUEST_ADMISSION_RESERVE = 4
+
+
+#: `API_THREAD_LIMIT`'s default: the request threadpool's size.
+DEFAULT_API_THREAD_LIMIT = 200
+
+
 def request_thread_limit() -> int:
-    """The request threadpool's size (`app/pool_watch.py::apply_thread_limit`): `API_THREAD_LIMIT`, or the app
-    pool's capacity (`pool_size + max_overflow`), so no more sync handlers run at once than there are
-    connections for them. Not cached: read once at lifespan start, and tests set the environment per case."""
-    sizes = db_pool_sizes()
-    return _env_int("API_THREAD_LIMIT", sizes.pool_size + sizes.max_overflow, minimum=1)
+    """The request threadpool's size (`app/pool_watch.py::apply_thread_limit`): `API_THREAD_LIMIT`, default
+    `DEFAULT_API_THREAD_LIMIT`. Not the pool's capacity: every route is async on the loop (`app/db_async.py`); these
+    threads run sync dependencies and `run_in_threadpool` work, and a thread never stands for a connection. Not cached: read once at lifespan start, and tests set the environment."""
+    return _env_int("API_THREAD_LIMIT", DEFAULT_API_THREAD_LIMIT, minimum=1)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -192,7 +214,6 @@ def get_settings() -> Settings:
         database_url=db_credentials.database_url(),
         frontend_url=os.environ.get("FRONTEND_URL", "http://localhost:3020"),
         console_public=_env_bool("CONSOLE_PUBLIC", True),
-        public_rate_limit=int(os.environ.get("PUBLIC_RATE_LIMIT", "600")),
         tz=os.environ.get("TZ", "America/New_York"),
         aws_region=os.environ.get("AWS_REGION", "").strip(),
         session_transcript_bucket=os.environ.get("SESSION_TRANSCRIPT_BUCKET", "").strip(),
@@ -220,7 +241,18 @@ def get_settings() -> Settings:
             "LIVE_PUBLIC_BASE_URL", os.environ.get("LIVE_PUBLIC_BASE_URL", "").strip() or LIVE_PUBLIC_BASE_URL
         ).rstrip("/"),
         apple_team_id=_apple_team_id(os.environ.get("JAAH_APPLE_TEAM_ID", "").strip()),
+        jira_forge_app_id=os.environ.get("JIRA_FORGE_APP_ID", "").strip(),
+        jira_forge_environment_id=os.environ.get("JIRA_FORGE_ENVIRONMENT_ID", "").strip(),
+        jira_forge_install_url=_http_url(
+            "JIRA_FORGE_INSTALL_URL", os.environ.get("JIRA_FORGE_INSTALL_URL", "").strip()
+        ),
     )
+
+
+def console_url(path: str = "") -> str:
+    """`path` on the console's own origin (`FRONTEND_URL`, trailing slash dropped), never the request's: a Connect
+    callback must be byte-identical on `/start` and the exchange. The one spelling of that origin."""
+    return f"{get_settings().frontend_url.rstrip('/')}{path}"
 
 
 # ── Session transcripts: the off-until-configured read ──
@@ -229,14 +261,8 @@ def get_settings() -> Settings:
 # credentials come from `app/aws/container_credentials.py`, signing from `app/aws/presign.py` (query
 # string signing; `app/credentials/sigv4.py` is the header signer, for credential rows).
 log = logging.getLogger("app.config")
-
-_transcript_warned = False
-
-
-def reset_session_transcript_warning() -> None:
-    """Test seam only — the warn-once latch is process-local and is never reset in production."""
-    global _transcript_warned
-    _transcript_warned = False
+# The three off-until-configured reads below share it; tests `.reset()` it.
+unconfigured = WarnOnce(log)
 
 
 def session_transcript_config() -> tuple[str, str] | None:
@@ -256,19 +282,13 @@ def session_transcript_config() -> tuple[str, str] | None:
     if region and bucket:
         return region, bucket
 
-    global _transcript_warned
     message = (
         "session transcript storage is UNCONFIGURED — transcripts will not be stored or served "
         "(AWS_REGION=%s, SESSION_TRANSCRIPT_BUCKET=%s). Both are required. They are set by the "
         "deployment's task definition; for a local stack put them in the root .env. Clearing "
         "SESSION_TRANSCRIPT_BUCKET is also the deliberate kill switch for this feature."
     )
-    args = ("set" if region else "empty", "set" if bucket else "empty")
-    if _transcript_warned:
-        log.debug(message, *args)
-    else:
-        _transcript_warned = True
-        log.warning(message, *args)
+    unconfigured.say("transcript", message, "set" if region else "empty", "set" if bucket else "empty")
     return None
 
 
@@ -285,9 +305,6 @@ class SessionAnalyticsConfig:
     database: str
     table: str
     output_location: str
-
-
-_analytics_warned = False
 
 
 def session_analytics_settings() -> tuple[tuple[str, bool], ...]:
@@ -314,12 +331,6 @@ SESSION_ANALYTICS_FORMATS = {
 }
 
 
-def reset_session_analytics_warning() -> None:
-    """Test seam only — the warn-once latch is process-local and is never reset in production."""
-    global _analytics_warned
-    _analytics_warned = False
-
-
 def session_analytics_config() -> SessionAnalyticsConfig | None:
     """Return the analytics coordinates when the read layer is configured, else ``None``.
 
@@ -337,7 +348,6 @@ def session_analytics_config() -> SessionAnalyticsConfig | None:
     if all(is_set for _, is_set in session_analytics_settings()):
         return config
 
-    global _analytics_warned
     message = (
         "session-efficiency analytics is UNCONFIGURED — Audit > Sessions > Efficiency will "
         "report itself unavailable (AWS_REGION=%s, SESSION_ANALYTICS_WORKGROUP=%s, "
@@ -346,26 +356,14 @@ def session_analytics_config() -> SessionAnalyticsConfig | None:
         "from its session-analytics resources; clearing them is also the deliberate kill switch for "
         "this feature."
     )
-    args = tuple("set" if is_set else "empty" for _, is_set in session_analytics_settings())
-    if _analytics_warned:
-        log.debug(message, *args)
-    else:
-        _analytics_warned = True
-        log.warning(message, *args)
+    unconfigured.say(
+        "analytics", message, *("set" if is_set else "empty" for _, is_set in session_analytics_settings())
+    )
     return None
 
 
 # ── Node journals: the third off-until-configured read ──
 # Consulted per node shipment, so it warns once and then logs at debug, as the two above.
-_node_log_group_warned = False
-
-
-def reset_node_log_group_warning() -> None:
-    """Test seam only — the warn-once latch is process-local and is never reset in production."""
-    global _node_log_group_warned
-    _node_log_group_warned = False
-
-
 def node_log_group() -> str | None:
     """The CloudWatch Logs group node journals ship into, or ``None`` when shipping is unconfigured.
 
@@ -383,16 +381,10 @@ def node_log_group() -> str | None:
     if value and GROUP_PATTERN.fullmatch(value):
         return value
 
-    global _node_log_group_warned
     message = (
         "node log shipping is UNCONFIGURED — node journals will be refused with 503 (NODE_LOG_GROUP=%s). "
         "It is set by the deployment's task definition to "
         "/jaah/<env>/nodes; clearing it is also the deliberate kill switch for this feature."
     )
-    state = "not a log group name" if value else "empty"
-    if _node_log_group_warned:
-        log.debug(message, state)
-    else:
-        _node_log_group_warned = True
-        log.warning(message, state)
+    unconfigured.say("node_log_group", message, "not a log group name" if value else "empty")
     return None

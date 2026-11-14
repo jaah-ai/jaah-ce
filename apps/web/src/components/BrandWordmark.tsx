@@ -1,5 +1,6 @@
 import { useId } from 'react'
 import SvgIcon from '@mui/material/SvgIcon'
+import { MarkGradient } from './BrandMark'
 
 type BrandWordmarkProps = {
   /** Rendered height in px; the width follows the 386×230 grid. Below ~32px a tile drops under 3px and
@@ -44,13 +45,7 @@ export default function BrandWordmark({ height, className }: BrandWordmarkProps)
       titleAccess="Jaah"
       sx={{ width, height, fontSize: height, display: 'block', flexShrink: 0, fill: 'none' }}
     >
-      <defs>
-        <linearGradient id={grad} x1="0" y1="0" x2="386" y2="230" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stopColor="var(--sk-mark-0, #38bdf8)" />
-          <stop offset="0.55" stopColor="var(--sk-mark-1, #3b82f6)" />
-          <stop offset="1" stopColor="var(--sk-mark-2, #a855f7)" />
-        </linearGradient>
-      </defs>
+      <defs><MarkGradient id={grad} x2={386} y2={230} /></defs>
       {CELLS.map(([x, y]) => tile(x, y, `url(#${grad})`))}
       {tile(LIT[0], LIT[1], 'var(--sk-mark-core, #e0f2fe)')}
     </SvgIcon>

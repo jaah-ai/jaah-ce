@@ -10,14 +10,15 @@
  */
 import { useState, type JSX } from 'react'
 import { useLocation, useParams } from 'react-router-dom'
+import { grid } from '../../theme'
 import { useQuery } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
+import EmptyState from '../../ui/EmptyState'
 import Breadcrumb from '../../components/Breadcrumb'
 import { TabPanel, Tabs, type TabDef } from '../../components/Tabs'
 import { useUrlTab } from '../../hooks/useUrlTab'
-import { NO_VALUE } from '../../lib/relativeTime'
-import { formatSpanBetween } from '../../lib/spanTime'
+import { formatSpanBetween, NO_VALUE } from '../../lib/relativeTime'
 import { formatZoned } from '../../lib/zonedTime'
 import { AUDIT_TAB_PATHS, AUDIT_WORKFLOW_TAB_PATHS } from '../../routeGroups'
 import Banner from '../../ui/Banner'
@@ -37,7 +38,7 @@ function Payload({ label, value }: { label: string; value: string | null }): JSX
     <Box>
       <Typography variant="caption" sx={{ color: 'text.secondary' }}>{label}</Typography>
       {/* `maxHeight` so an unbounded traceback leaves the other payloads reachable. */}
-      <CodeBlock maxHeight={220} sx={{ mt: 0.25 }} testId={`workflow-run-${label.toLowerCase()}`}>{value}</CodeBlock>
+      <CodeBlock maxHeight={grid(36.5)} testId={`workflow-run-${label.toLowerCase()}`}>{value}</CodeBlock>
     </Box>
   )
 }
@@ -140,9 +141,7 @@ export default function WorkflowRunPage(): JSX.Element {
           <DetailSection title="Payloads">
             {/* All three can be absent at once; say so once rather than look like a failed load. */}
             {!run.input && !run.output && !run.error && (
-              <Typography variant="body2" sx={{ color: 'text.secondary', py: 0.5 }} data-testid="workflow-run-no-payloads">
-                No payloads recorded.
-              </Typography>
+              <Box sx={{ py: 0.5 }}><EmptyState inline title="No payloads recorded." /></Box>
             )}
             <Payload label="Input" value={run.input} />
             <Payload label="Output" value={run.output} />

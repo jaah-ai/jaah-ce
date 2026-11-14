@@ -146,7 +146,7 @@ def _disable_ipv6(interface: str) -> None:
         # no v6 stack at all is fine.
         if Path("/proc/sys/net/ipv6").exists():
             raise RuntimeError(
-                f"this node has IPv6 but {knob} is missing — refusing to bring up {interface}")
+                f"this node has IPv6 but {knob} is missing — refusing to bring up {interface}") from None
         log.info("no v6 stack on this node — nothing to disable on %s", interface)
 
 

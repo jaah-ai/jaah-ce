@@ -9,12 +9,11 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from app.auth import require_user
 from app.authz.declarations import feature
-from app.authz.principal import Principal, creates_org_rows, current_principal
+from app.authz.principal import AsyncCaller, Principal, creates_org_rows, current_caller
 from app.authz.visibility import visible_project_clause
-from app.db import get_session
-from app.entity_shape import get_or_404, UuidRefOut, optional_uuid
+from app.db_async import on_session
+from app.entity_shape import UuidRefOut, get_or_404, optional_uuid, or_404, from_row
 from app.identities import display_name
 from app.credentials.registry import type_label
 from app.models.credentials import (
@@ -89,10 +88,7 @@ class ProjectCredentialIn(BaseModel):
 
 
 def _credential_ref_out(row: Credential) -> CredentialRefOut:
-    return CredentialRefOut(
-        id=row.id, name=row.name, type=row.type, type_label=type_label(row.type),
-        personal=row.owner_id is not None,
-    )
+    return from_row(CredentialRefOut, row, type_label=type_label(row.type), personal=row.owner_id is not None)
 
 
 def _pool_project_or_404(session: Session, principal: Principal | None, project_id: int) -> Project:
@@ -149,39 +145,35 @@ def _pool_credential_or_404(
 # `projects:edit` on THIS project: a Maintainer there, or an Org Owner/Admin. Which credential they may
 # attach is the handler's (`_require_pool_manager`).
 @feature("projects", "edit", object_type="project", object_params=("project_id",))
+@on_session
 def attach_project_credential(
+    session: Session,
     project_id: int,
     response: Response,
     raw_body: Any = Body(default=None),
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> ProjectCredentialOut:
     """Attach a credential to a project's pool. 201 on a new attachment, 200 when already attached."""
     body = _parsed_body(raw_body, ProjectCredentialIn, frozenset({"credential_id"}))
-    project = _pool_project_or_404(session, principal, project_id)
-    row = _pool_credential_or_404(session, principal, body.credential_id)
-    _require_pool_manager(principal, row, attaching=True)
+    project = _pool_project_or_404(session, caller.principal, project_id)
+    row = _pool_credential_or_404(session, caller.principal, body.credential_id)
+    _require_pool_manager(caller.principal, row, attaching=True)
     if row.system:
         # A system row is the control plane's own (0325): a pool would hand it to every task there.
-        raise HTTPException(
-            status_code=422, detail="a system credential cannot be attached to a project"
-        )
+        raise HTTPException(status_code=422, detail="a system credential cannot be attached to a project")
     if session.scalar(select(Account.id).where(Account.credential_id == row.id)) is not None:
         # An account's own API key is never a pool member: no roster serves it (`task_roster_select`),
         # so the attachment would promise a use that never happens.
-        raise HTTPException(
-            status_code=422, detail="an account's own API key cannot be attached to a project"
-        )
+        raise HTTPException(status_code=422, detail="an account's own API key cannot be attached to a project")
     attached = _pool_link(session, project.id, row.id) is not None
     if not attached:
         # Its org is the project's, stamped by the write seam (`tenancy/manifest.py`, same-org refused).
-        link = ProjectCredential(project_id=project.id, credential_id=row.id, created_by_id=user.id)
+        link = ProjectCredential(project_id=project.id, credential_id=row.id, created_by_id=caller.actor.id)
         with _scrubbed_write(session, "attach"):
             session.add(link)
             session.flush()
             _audit(
-                session, user, "credential_attached",
+                session, caller.actor, "credential_attached",
                 f"Attached credential {row.name} to project {project.name}", row,
             )
             session.commit()
@@ -192,28 +184,24 @@ def attach_project_credential(
 
 @router.delete("/api/projects/{project_id}/credentials/{credential_id}", status_code=204)
 @feature("projects", "edit", object_type="project", object_params=("project_id",))
+@on_session
 def detach_project_credential(
+    session: Session,
     project_id: int,
     credential_id: UUID,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> Response:
     """Detach a credential from a project's pool. 404 when it is not attached there."""
-    project = _pool_project_or_404(session, principal, project_id)
-    row = _pool_credential_or_404(session, principal, credential_id)
-    _require_pool_manager(principal, row, attaching=False)
+    project = _pool_project_or_404(session, caller.principal, project_id)
+    row = _pool_credential_or_404(session, caller.principal, credential_id)
+    _require_pool_manager(caller.principal, row, attaching=False)
     if row.home_project_id == project.id:
-        raise HTTPException(
-            status_code=409, detail="this is the credential's home project; change its home instead"
-        )
-    link = _pool_link(session, project.id, row.id)
-    if link is None:
-        raise HTTPException(status_code=404, detail="that credential is not attached to this project")
+        raise HTTPException(status_code=409, detail="this is the credential's home project; change its home instead")
+    link = or_404(_pool_link(session, project.id, row.id), detail="that credential is not attached to this project")
     with _scrubbed_write(session, "detach"):
         session.delete(link)
         _audit(
-            session, user, "credential_detached",
+            session, caller.actor, "credential_detached",
             f"Detached credential {row.name} from project {project.name}", row,
         )
         session.commit()
@@ -222,15 +210,15 @@ def detach_project_credential(
 
 @router.get("/api/credentials/{credential_id}/access", response_model=CredentialAccessOut)
 @feature("credentials", "view", own_credential=True)
+@on_session
 def get_credential_access(
+    session: Session,
     credential_id: UUID,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CredentialAccessOut:
     """The credential's owner (personal), its home project and the projects it is attached to — never its
     config."""
-    row = _scoped_row_or_404(session, principal, credential_id, _VIEW_KEY)
+    row = _scoped_row_or_404(session, caller.principal, credential_id, _VIEW_KEY)
     owner = None
     if row.owner_id is not None:
         owner_user = session.scalar(select(AdminUser).where(AdminUser.id == row.owner_id))
@@ -241,7 +229,7 @@ def get_credential_access(
         select(Project.id, Project.name)
         .where(
             or_(Project.id.in_(attached), Project.id == row.home_project_id),
-            visible_project_clause(principal),
+            visible_project_clause(caller.principal),
         )
         .order_by(Project.name.asc(), Project.id.asc())
     ).all()

@@ -9,16 +9,15 @@ import { TabPanel, Tabs, type TabDef } from '../../components/Tabs'
 import { useApiRead } from '../../hooks/useApiRead'
 import { useUrlTab } from '../../hooks/useUrlTab'
 import { AUDIT_TAB_PATHS, AUDIT_WORKFLOW_TAB_PATHS } from '../../routeGroups'
-import { DBOS_STATUS_HELP, DBOS_STATUS_TONE } from '../../lib/dbosStatus'
+import { DBOS_STATUS_HELP, dbosStatus } from '../../lib/dbosStatus'
 import { relativeAge } from '../../lib/relativeTime'
 import { formatZoned } from '../../lib/zonedTime'
 import Banner from '../../ui/Banner'
+import HelpLabel from '../../ui/HelpLabel'
+import DetailPage from '../../ui/detail/DetailPage'
+import DetailStatus from '../../ui/detail/DetailStatus'
 import { KeyValue, KeyValueList } from '../../ui/KeyValueList'
-import LoadFailedState from '../../ui/LoadFailedState'
-import MissingRecordState from '../../ui/MissingRecordState'
 import { monoSx } from '../../ui/listStyles'
-import LoadingState from '../../ui/LoadingState'
-import PageHeader from '../../ui/PageHeader'
 import SectionCard from '../../ui/SectionCard'
 import { StatusChip } from '../../ui/StatusChip'
 import WorkflowRunsTab from './WorkflowRunsTab'
@@ -82,36 +81,24 @@ export default function WorkflowDetailPage() {
     'Failed to load this workflow',
   )
 
-  if (loading) return <LoadingState rows={4} />
-
-  if (detail === MISSING) {
+  if (loading || detail === null || detail === MISSING) {
     return (
-      <MissingRecordState
-        breadcrumb={<Trail current={name} />}
-        heading="Unknown workflow"
-        title={`No workflow is registered as “${name}”`}
-        headerTestId="workflow-detail-header"
-        backTo={WORKFLOWS_TAB}
-        backLabel="Back to workflows"
+      <DetailStatus
+        trail={<Trail current={name} />} loading={loading} notFound={detail === MISSING && `No workflow is registered as “${name}”`}
+        error={error} failedTitle="Workflow unavailable" onRetry={() => void load()}
       />
     )
   }
 
-  if (detail === null) {
-    return <LoadFailedState title="Workflow unavailable" error={error} onRetry={() => void load()} />
-  }
-
   return (
-    <Box>
-      <PageHeader
-        breadcrumb={
-          <Trail current={detail.label} />
-        }
-        title={detail.label}
-        subtitle={detail.description}
-        testId="workflow-detail-header"
-      />
-
+    <DetailPage
+      breadcrumb={
+        <Trail current={detail.label} />
+      }
+      title={detail.label}
+      subtitle={detail.description}
+      headerTestId="workflow-detail-header"
+    >
       {error && <Banner severity="error">{error}</Banner>}
       {!detail.engine_available && (
         <Banner severity="warning" testId="workflow-detail-engine-unavailable">
@@ -137,7 +124,7 @@ export default function WorkflowDetailPage() {
           </SectionCard>
         </Box>
       </TabPanel>
-    </Box>
+    </DetailPage>
   )
 }
 
@@ -149,11 +136,11 @@ function Facts({ detail }: { detail: WorkflowDetail }) {
 
   return (
     <KeyValueList testId="workflow-detail-facts">
-      <KeyValue label="Started by">
+      <KeyValue label={<HelpLabel label="Started by" help="The trigger that queues each run." />}>
         <Typography variant="body2">{detail.trigger}</Typography>
       </KeyValue>
 
-      <KeyValue label="Queue">
+      <KeyValue label={<HelpLabel label="Queue" help="Runs wait in this engine queue; direct runs start immediately." />}>
         <StatusChip
           label={detail.queue ?? 'direct'}
           tone={detail.queue ? 'info' : 'neutral'}
@@ -176,7 +163,7 @@ function Facts({ detail }: { detail: WorkflowDetail }) {
                   <StatusChip
                     key={entry.status}
                     label={`${entry.status} ${entry.count}`}
-                    tone={DBOS_STATUS_TONE[entry.status] ?? 'neutral'}
+                    tone={dbosStatus(entry.status).tone}
                     title={DBOS_STATUS_HELP[entry.status]}
                     data-status={entry.status}
                   />
@@ -197,11 +184,11 @@ function Facts({ detail }: { detail: WorkflowDetail }) {
         ) : detail.last_run_at === null ? (
           <Typography variant="body2" sx={{ color: 'text.secondary' }}>{NEVER_RAN}</Typography>
         ) : (
-          <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
+          <Stack direction="row" spacing={0.5} sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
             {detail.last_status && (
               <StatusChip
                 label={detail.last_status}
-                tone={DBOS_STATUS_TONE[detail.last_status] ?? 'neutral'}
+                tone={dbosStatus(detail.last_status).tone}
                 title={DBOS_STATUS_HELP[detail.last_status]}
                 data-status={detail.last_status}
               />

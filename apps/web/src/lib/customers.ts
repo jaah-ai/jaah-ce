@@ -5,11 +5,13 @@
 
 import { del, get, patch, post } from '../api'
 import { setPageParams, type ListPageState, type Page } from '../hooks/useListPage'
+import type { ConfirmOptions } from '../components/ConfirmDialog'
 import type { DeliveryStatus } from '../pages/settings/emailDelivery/api'
 import type { Tone } from '../ui/StatusChip'
+import type { Presentation } from '../ui/statusTone'
 
 /** A customer page's tabs (`pages/customers/customerTabs.ts` holds their labels and the retired addresses). */
-export type CustomerTab = 'overview' | 'access' | 'products' | 'billing' | 'overrides' | 'settings' | 'security' | 'history'
+export type CustomerTab = 'overview' | 'access' | 'products' | 'billing' | 'easy-mode' | 'overrides' | 'settings' | 'security' | 'history'
 
 export const DEFAULT_CUSTOMER_TAB: CustomerTab = 'overview'
 
@@ -29,7 +31,7 @@ export function customerUrl(id: string, target: CustomerTarget = { tab: DEFAULT_
 export type CustomerStatus = 'signup' | 'pending' | 'enabled' | 'disabled' | 'rejected' | 'deleted'
 /** How far the sign-up got: the step it is on, `submitted` awaiting approval, `approved` done. */
 export type CustomerStage = 'verify_email' | 'password' | 'profile' | 'plan' | 'billing_details' | 'card' | 'submitted' | 'approved'
-export type CustomerBillingState = 'past_due' | 'paying' | 'comped' | 'included' | 'none'
+export type CustomerBillingState = 'past_due' | 'paying' | 'trial' | 'comped' | 'included' | 'none'
 
 /** An email-only sign-up's own facts (`kind: 'email_signup'` rows only). */
 export type SignupFacts = {
@@ -82,6 +84,8 @@ export type Customers = Page<CustomerRow> & {
   connected: boolean
   livemode: boolean | null
   mrr_total: { amount: number; currency: string }[] | null
+  /** `mrr_total` once every running free trial bills; null as `mrr_total` is. */
+  mrr_after_trial_total?: { amount: number; currency: string }[] | null
   /** Under `status=signup` only: the unfinished sign-ups; `verified` = verified, no org yet. */
   signups?: { total: number; unverified: number; verified: number } | null
 }
@@ -107,6 +111,15 @@ export function getCustomers(filters: CustomerFilters, page: ListPageState): Pro
   return get<Customers>(`/api/customers?${params.toString()}`)
 }
 
+/** `/customers/signups/:id`: an email sign-up's own page (it has no org, so no customer page). */
+export const signupUrl = (id: string): string => `/customers/signups/${encodeURIComponent(id)}`
+
+export const customerSignupRowKey = (id: string) => ['customer-signup-row', id] as const
+
+/** One email sign-up row by id, wherever it falls in the roster; 404 once it is used or gone. */
+export const getCustomerSignupRow = (id: string) =>
+  get<CustomerRow>(`/api/customers/signups/${encodeURIComponent(id)}`)
+
 /** Mails an email sign-up a fresh code; 404 once the row is used, 429 `resend_cooldown` inside the wait. */
 export const resendSignupCode = (id: string) =>
   post<{ email: string; resend_after: number }>(`/api/operator/signups/${encodeURIComponent(id)}/resend`)
@@ -117,6 +130,15 @@ export const verifySignupEmail = (id: string) =>
 
 /** Deletes an email sign-up with no org yet; 409 once it has a draft (delete that customer instead). */
 export const deleteSignup = (id: string) => del(`/api/operator/signups/${encodeURIComponent(id)}`)
+
+/** The delete confirm, the list's and the sign-up page's. */
+export const deleteSignupConfirm = (row: CustomerRow): ConfirmOptions => ({
+  title: 'Delete sign-up',
+  identity: row.name,
+  message: `Delete the sign-up of ${row.name}? Its code stops working; the address can sign up again.`,
+  confirmLabel: 'Delete',
+  destructive: true,
+})
 
 /** A pending customer's sign-up answers and plan, as the operator edits them on Overview
  *  (`routes/customer_roster.py::SignupOut`). */
@@ -145,14 +167,16 @@ export const getCustomerSignup = (orgId: string) =>
 export const editCustomerSignup = (orgId: string, edit: CustomerSignupEdit) =>
   patch<CustomerSignup>(`/api/customers/${encodeURIComponent(orgId)}/signup`, edit)
 
-export const STATUS_CHIP: Record<CustomerStatus, { label: string; tone: Tone }> = {
-  signup: { label: 'Sign-up', tone: 'info' },
-  pending: { label: 'Pending', tone: 'warning' },
-  enabled: { label: 'Enabled', tone: 'success' },
-  disabled: { label: 'Disabled', tone: 'neutral' },
-  rejected: { label: 'Rejected', tone: 'error' },
+/* The glyph is the row's disc (`CustomersPage.tsx`): the status as a mark, so a phone row has a state at a glance and a tap
+   that opens the facts the narrow bands drop (`notes`). */
+export const STATUS_CHIP: Record<CustomerStatus, Presentation> = {
+  signup: { label: 'Sign-up', tone: 'info', glyph: '◌' },
+  pending: { label: 'Pending', tone: 'warning', glyph: '?' },
+  enabled: { label: 'Enabled', tone: 'success', glyph: '●' },
+  disabled: { label: 'Disabled', tone: 'neutral', glyph: '○' },
+  rejected: { label: 'Rejected', tone: 'error', glyph: '✕' },
   /* Listed only under `status=deleted`; the unfiltered roster omits it. */
-  deleted: { label: 'Deleted', tone: 'error' },
+  deleted: { label: 'Deleted', tone: 'error', glyph: '✕' },
 }
 
 export const STAGE_LABEL: Record<CustomerStage, string> = {
@@ -169,6 +193,7 @@ export const STAGE_LABEL: Record<CustomerStage, string> = {
 export const BILLING_CHIP: Record<CustomerBillingState, { label: string; tone: Tone }> = {
   past_due: { label: 'Past due', tone: 'error' },
   paying: { label: 'Paying', tone: 'success' },
+  trial: { label: 'Trial', tone: 'info' },
   comped: { label: 'Comped', tone: 'info' },
   included: { label: 'Included', tone: 'info' },
   none: { label: 'None', tone: 'neutral' },

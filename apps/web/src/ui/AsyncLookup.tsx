@@ -6,18 +6,21 @@ import Box from '@mui/material/Box'
 import CircularProgress from '@mui/material/CircularProgress'
 import TextField from '@mui/material/TextField'
 import { useAsyncOptions } from '../hooks/useAsyncOptions'
+import HelpLabel, { ExplainMoreButton } from './HelpLabel'
+import { toExplain, type HelpProp } from './explain'
 import { ELLIPSIS_SX, fieldTapTargetSx } from './listStyles'
 import { NO_AUTOFILL_INPUT } from './noAutofill'
+import { FONT_SIZE, FONT_WEIGHT, SIZE, grid } from '../theme'
+import Tip from './Tip'
 
 /* The console's ONE server-backed lookup: type, the server answers, take a row.
  *
- * vs `ui/FilterRow`'s `FilterSelect` (a static vocabulary → native `<select>`);
- * `components/tasks/TaskTags.tsx` stays separate (multi-select over a catalogue fetched once).
+ * vs `ui/FilterRow`'s `FilterSelect` (a static vocabulary → native `<select>`).
  *
  * Owns the box: the echo-vs-typed distinction and an Enter that never submits the surrounding form. The option
  * list (one in-flight request, superseded responses DISCARDED, honest loading and error lines) is
  * `hooks/useAsyncOptions`. Everything the two lookups share — that list, the popper's width, the rows, the
- * field — is `useLookupField` + `renderLookupInput` below, also `ui/AsyncMultiLookup`'s (several values, as chips).
+ * field — is `useLookupField` (over `renderLookupInput`) below, also `ui/AsyncMultiLookup`'s (several values, as chips).
  */
 
 /** One offerable row. `hint` is the disambiguator (a project, a status, a kind); `key` is identity. */
@@ -30,6 +33,9 @@ export type LookupOption = {
    *  Optional; absent renders the row unchanged. Never carries a fact: the slot is `aria-hidden`, so
    *  anything the operator must know belongs in label or hint. */
   icon?: ReactNode
+  /** A NOTICE row, not a choice: drawn at full strength and never pickable — `error` for a source that failed while
+   *  the others answered, `muted` for a plain line under it (`components/trackers/IssuePicker.tsx`). */
+  tone?: 'error' | 'muted'
 }
 
 export interface AsyncLookupProps {
@@ -68,40 +74,60 @@ export interface AsyncLookupProps {
   /** Each row as two lines, the hint under the label at full width: for a hint that must stay readable on
    *  a phone (a person's email), where the side-by-side row caps it at 40%. */
   stacked?: boolean
+  /** Each row's label WRAPS to as many lines as it needs instead of ellipsising: for a label that must be read in
+   *  full at phone width (an issue title). */
+  wrap?: boolean
   /** Draw no clear ✕: for a required choice no caller can unset (`ui/OrgSelect`), where the ✕ offers an act that
    *  does nothing. */
   disableClearable?: boolean
+  /** Focus the box on mount, its list still CLOSED (the page's first paint is not covered) and the held label
+   *  selected, so typing searches. A click, a keystroke or ↓ opens it as usual; once the box has blurred, focus
+   *  opens it again (`openOnFocus`). */
+  autoFocus?: boolean
+  /** The label's explanation (`ui/HelpLabel`): a hover on the label, and the input's `aria-description`. */
+  help?: HelpProp
+  /** `ui/FormField`'s cloned contract: its `htmlInput` (the `aria-description` it injects) reaches the input. */
+  slotProps?: { htmlInput?: Record<string, unknown> }
 }
+
+/** What both lookups hand `useLookupField`: every prop but the value's own. */
+export type LookupFieldProps = Omit<AsyncLookupProps, 'value' | 'onChange' | 'placeholder' | 'disableClearable' | 'slotProps'>
 
 /* The debounce's numbers, re-exported from their home (`hooks/useAsyncOptions`) for the boxes that key on them. */
 export { QUERY_DEBOUNCE_MS, QUERY_MAX_WAIT_MS } from '../hooks/useAsyncOptions'
 
 /* A suggestion row: label left, hint dim on the right edge. On the INNER box, not the `<li>`: MUI's
-   `.MuiAutocomplete-listbox .MuiAutocomplete-option` outranks a one-class `sx` (measured in `TaskTags`, which
-   shares it). */
+   `.MuiAutocomplete-listbox .MuiAutocomplete-option` outranks a one-class `sx` (measured). */
 export const OPTION_ROW_SX = {
   display: 'flex',
   width: '100%',
   minWidth: 0,
   alignItems: 'baseline',
   justifyContent: 'space-between',
-  gap: '0.75rem',
+  gap: 2,
 } as const
 
 /* The label is the row: the hint is capped at 40%, and the
    label ellipsises with the full string on the row's `title`. */
-const OPTION_LABEL_SX = { ...ELLIPSIS_SX, flex: '1 1 auto', fontSize: '0.8125rem', color: 'text.primary' } as const
+const OPTION_LABEL_SX = { ...ELLIPSIS_SX, flex: '1 1 auto', fontSize: FONT_SIZE.md, color: 'text.primary' } as const
 const OPTION_HINT_SX = {
   ...ELLIPSIS_SX,
   flex: '0 1 auto',
   maxWidth: '40%',
-  fontSize: '0.75rem',
+  fontSize: FONT_SIZE.sm,
   color: 'text.secondary',
 } as const
 
 /* `stacked`: label over hint, each ellipsising at the row's full width. */
 const STACKED_ROW_SX = { display: 'flex', flexDirection: 'column', width: '100%', minWidth: 0 } as const
 const STACKED_HINT_SX = { ...OPTION_HINT_SX, maxWidth: '100%' } as const
+/* `wrap`: the label breaks onto as many lines as it needs (a long word too), never ellipsised. */
+const WRAP_LABEL_SX = { flex: '1 1 auto', minWidth: 0, fontSize: FONT_SIZE.md, color: 'text.primary', whiteSpace: 'normal', overflowWrap: 'anywhere' } as const
+/* A notice row keeps full strength: MUI dims a disabled option to 0.38 (`.MuiAutocomplete-listbox
+   .MuiAutocomplete-option[aria-disabled]`), which a sentence the operator must read cannot afford. */
+/* `wrap`: the hint (a short word: the tracker) keeps its full width; the label is what wraps. */
+const WRAP_HINT_SX = { ...OPTION_HINT_SX, flex: '0 0 auto', maxWidth: 'none' } as const
+const NOTICE_LI_SX = { '&&&[aria-disabled="true"]': { opacity: 1 } } as const
 
 /* The icon slot: a FIXED square so glyphs form a column; `flexShrink: 0` so the label gives way;
    `alignSelf: 'center'` (an svg has no useful baseline). `aria-hidden` here, since the slot is decorative
@@ -119,8 +145,7 @@ export function optionText(option: LookupOption): string {
   return option.hint ? `${option.label} · ${option.hint}` : option.label
 }
 
-/** The typed run, emboldened inside its label; plain when the server matched on an unrendered field. Also
- *  `TaskTags`'s, where the hit may be on the unrendered NAME. */
+/** The typed run, emboldened inside its label; plain when the server matched on an unrendered field. */
 export function highlight(text: string, query: string): ReactNode {
   const needle = query.trim().toLowerCase()
   if (!needle) return text
@@ -129,7 +154,7 @@ export function highlight(text: string, query: string): ReactNode {
   return (
     <>
       {text.slice(0, at)}
-      <Box component="strong" sx={{ fontWeight: 700 }}>
+      <Box component="strong" sx={{ fontWeight: FONT_WEIGHT.bold }}>
         {text.slice(at, at + needle.length)}
       </Box>
       {text.slice(at + needle.length)}
@@ -141,8 +166,8 @@ export function highlight(text: string, query: string): ReactNode {
 function lookupPopperStyle(anchorWidth: number | undefined) {
   return {
     width: 'max-content',
-    minWidth: anchorWidth === undefined ? undefined : `${anchorWidth}px`,
-    maxWidth: 'min(34rem, calc(100vw - 2rem))',
+    minWidth: anchorWidth,
+    maxWidth: `min(${grid(90.5)}, calc(100vw - ${grid(5.5)}))`,
   } as const
 }
 
@@ -153,54 +178,58 @@ function renderLookupOption(
   option: LookupOption,
   inputValue: string,
   stacked: boolean,
+  wrap: boolean,
 ): JSX.Element {
   const { key: _muiKey, ...rest } = props
   const full = optionText(option)
+  const notice = option.tone !== undefined
+  const labelSx = notice
+    ? { ...WRAP_LABEL_SX, color: option.tone === 'error' ? 'error.main' : 'text.secondary' }
+    : wrap ? WRAP_LABEL_SX : OPTION_LABEL_SX
   return (
     /* `title` shows the whole string; `aria-label` because the highlight splits the label into
        children that accessible-name computation joins with spaces ("Al pha"). */
-    <Box component="li" key={option.key} {...rest} title={full} aria-label={full}>
+    <Tip key={option.key} title={full}><Box component="li" {...rest} aria-label={full} sx={notice ? NOTICE_LI_SX : undefined}>
       <Box sx={stacked ? STACKED_ROW_SX : OPTION_ROW_SX}>
         {option.icon && (
           <Box component="span" aria-hidden="true" sx={OPTION_ICON_SX}>
             {option.icon}
           </Box>
         )}
-        <Box component="span" sx={OPTION_LABEL_SX}>
-          {highlight(option.label, inputValue)}
+        <Box component="span" sx={labelSx}>
+          {notice ? option.label : highlight(option.label, inputValue)}
         </Box>
         {option.hint && (
-          <Box component="span" sx={stacked ? STACKED_HINT_SX : OPTION_HINT_SX}>
+          <Box component="span" sx={stacked ? STACKED_HINT_SX : wrap ? WRAP_HINT_SX : OPTION_HINT_SX}>
             {stacked ? highlight(option.hint, inputValue) : option.hint}
           </Box>
         )}
       </Box>
-    </Box>
+    </Box></Tip>
   )
 }
 
-/** The state and the `<Autocomplete>` props both lookups share: the option list, the field's measured width
- *  for the popper, the rows, and the Enter guard. `query`/`typed` are the caller's reading of its box (the
- *  single-valued one tells an echo from typing; the many-valued one has only typing). */
-export function useLookupField({
-  id, testId, fetchOptions, query, typed, minChars, fetchOnFocus, noOptionsText, disabled, fullWidth, size, stacked,
-}: Pick<AsyncLookupProps, 'id' | 'testId' | 'fetchOptions'> & {
-  query: string
-  typed: boolean
-  minChars: number
-  fetchOnFocus: boolean
-  noOptionsText: string
-  disabled: boolean
-  fullWidth: boolean
-  size: 'small' | 'medium'
-  stacked: boolean
-}) {
+/** The state, the `<Autocomplete>` props and the `renderInput` both lookups share: the prop defaults, the option
+ *  list, the field's measured width for the popper, the rows, the mount focus and the Enter guard. `query`/`typed`
+ *  are the caller's reading of its box (the single-valued one tells an echo from typing; the many-valued one
+ *  has only typing). */
+export function useLookupField(
+  {
+    id, testId, fetchOptions, label, ariaLabel, help, autoFocus, required, error, helperText, margin, disabled = false,
+    minChars = 1, noOptionsText = 'No matches', fetchOnFocus = false, fullWidth = true, size = 'small', stacked = false,
+    wrap = false,
+  }: LookupFieldProps,
+  query: string,
+  typed: boolean,
+) {
+  /* The mount focus (`autoFocus`) is not a request for the list; the first blur ends it. */
+  const [mountFocus, setMountFocus] = useState(Boolean(autoFocus))
   /* The field's own width, so the popup can be at least as wide (see the popper block for why it is
      measured). */
   const rootRef = useRef<HTMLDivElement | null>(null)
   const [anchorWidth, setAnchorWidth] = useState<number | undefined>(undefined)
 
-  const { shown, busy, emptyText, failed, scheduleQuery, requestFirstPage } = useAsyncOptions<LookupOption>({
+  const { shown, busy, emptyText, failed, scheduleQuery, requestFirstPage, settle } = useAsyncOptions<LookupOption>({
     fetchOptions, query, typed, minChars, fetchOnFocus, noOptionsText,
   })
 
@@ -220,7 +249,8 @@ export function useLookupField({
     ),
     /* The first match is pre-highlighted: type three letters, press Enter. */
     autoHighlight: true,
-    openOnFocus: true,
+    openOnFocus: !mountFocus,
+    onBlur: () => setMountFocus(false),
     /* The popup may be WIDER than the field: at a narrow field's width the 40%-capped hint made
        rows like `jaah-github-…` / `GitHub OAuth App…` indistinguishable.
        On the POPPER, not the Paper: a wider paper overflows a field-width popper that popper.js never
@@ -232,7 +262,7 @@ export function useLookupField({
     ref: rootRef,
     isOptionEqualToValue: (a: LookupOption, b: LookupOption) => a.key === b.key,
     getOptionLabel: (option: LookupOption) => option.label,
-    getOptionDisabled: (option: LookupOption) => Boolean(option.disabled),
+    getOptionDisabled: (option: LookupOption) => Boolean(option.disabled) || option.tone !== undefined,
     /* No client filter (the many-valued twin's `filterSelectedOptions` runs first, removing the picked ones):
        the server may match fields this row does not render, and re-filtering on the label would drop those
        hits. */
@@ -241,28 +271,41 @@ export function useLookupField({
        would submit the surrounding `<form>` (`TaskDependencies` records the trap). Enter is swallowed
        unconditionally; MUI's selection still runs (it reads `defaultMuiPrevented`, never set here). */
     onKeyDown: (event: KeyboardEvent<HTMLDivElement>) => {
-      if (event.key === 'Enter') event.preventDefault()
+      // Only the text box's Enter: a chip's ✕ (a button inside the same root) keeps its own Enter.
+      if (event.key === 'Enter' && event.target instanceof HTMLInputElement) event.preventDefault()
     },
     renderOption: (props: HTMLAttributes<HTMLLIElement> & { key: Key }, option: LookupOption, state: AutocompleteRenderOptionState) =>
-      renderLookupOption(props, option, state.inputValue, stacked),
+      renderLookupOption(props, option, state.inputValue, stacked, wrap),
   }
-  return { busy, scheduleQuery, requestFirstPage, autocompleteProps }
+  const renderInput = (
+    params: AutocompleteRenderInputParams,
+    own: Pick<Parameters<typeof renderLookupInput>[1], 'placeholder' | 'shrink' | 'title' | 'htmlInput'>,
+  ) => renderLookupInput(params, { busy, margin, label, required, error, helperText, ariaLabel, autoFocus, help, ...own })
+  return { scheduleQuery, requestFirstPage, settle, mountFocus, autocompleteProps, renderInput }
 }
 
 /** Both lookups' `renderInput`: the field copy, the spinner and the autofill-proof input. What differs —
- *  `required`, when the label is pinned up (`shrink`), a held value's hover `title` — the caller decides. */
+ *  `required`, when the label is pinned up (`shrink`), a held value's hover `title`, the label's hover (`help`,
+ *  `ui/HelpLabel`), `autoFocus` — the caller decides. */
 export function renderLookupInput(
   params: AutocompleteRenderInputParams,
-  { busy, shrink, ariaLabel, title, ...field }: Pick<AsyncLookupProps, 'margin' | 'label' | 'placeholder' | 'required' | 'error' | 'helperText' | 'ariaLabel'> & {
+  { busy, shrink, ariaLabel, title, label, help, htmlInput, ...field }: Pick<AsyncLookupProps, 'margin' | 'label' | 'placeholder' | 'required' | 'error' | 'helperText' | 'ariaLabel'> & {
     busy: boolean
+    /** A wrapper's extra input props (`ui/FormField`'s `aria-description`); MUI's and the lookup's own win. */
+    htmlInput?: Record<string, unknown>
     shrink: boolean
     title?: string
+    help?: HelpProp
+    autoFocus?: boolean
   },
 ): JSX.Element {
+  const tip = label ? toExplain(help)?.tip : undefined
   return (
+    <>
     <TextField
       {...params}
       {...field}
+      label={tip && label ? <HelpLabel label={label} help={help} /> : label}
       sx={fieldTapTargetSx}
       slotProps={{
         ...params.slotProps,
@@ -272,38 +315,24 @@ export function renderLookupInput(
           /* The spinner rides BEFORE MUI's ✕ and ▾, so they never jump sideways. */
           endAdornment: (
             <>
-              {busy && <CircularProgress size={16} thickness={5} data-testid="async-lookup-busy" />}
+              {busy && <CircularProgress size={SIZE.iconSm} thickness={5} data-testid="async-lookup-busy" />}
               {params.slotProps.input.endAdornment}
             </>
           ),
         },
-        htmlInput: { ...params.slotProps.htmlInput, ...NO_AUTOFILL_INPUT, 'aria-label': ariaLabel, title },
+        htmlInput: {
+          ...htmlInput, ...params.slotProps.htmlInput, ...NO_AUTOFILL_INPUT, 'aria-label': ariaLabel, title,
+          ...(tip ? { 'aria-description': tip } : {}),
+        },
       }}
     />
+    {label && <ExplainMoreButton label={label} help={help} />}
+    </>
   )
 }
 
 export function AsyncLookup({
-  id,
-  value,
-  onChange,
-  fetchOptions,
-  label,
-  placeholder,
-  ariaLabel,
-  disabled = false,
-  minChars = 1,
-  noOptionsText = 'No matches',
-  fetchOnFocus = false,
-  testId,
-  required,
-  error,
-  helperText,
-  fullWidth = true,
-  size = 'small',
-  margin,
-  stacked = false,
-  disableClearable = false,
+  value, onChange, placeholder, disableClearable = false, slotProps, ...field
 }: AsyncLookupProps): JSX.Element {
   const [inputValue, setInputValue] = useState('')
   /* Whether the box holds a query or an ECHO: MUI writes the picked label back (reason `reset`), which must
@@ -311,18 +340,24 @@ export function AsyncLookup({
      re-offers the first page). */
   const [typed, setTyped] = useState(false)
 
-  const { busy, scheduleQuery, requestFirstPage, autocompleteProps } = useLookupField({
-    id, testId, fetchOptions, query: typed ? inputValue.trim() : '', typed, minChars, fetchOnFocus, noOptionsText,
-    disabled, fullWidth, size, stacked,
-  })
+  const { scheduleQuery, requestFirstPage, mountFocus, autocompleteProps, renderInput } =
+    useLookupField(field, typed ? inputValue.trim() : '', typed)
 
   /* The box never shows a value the caller no longer holds. MUI writes the picked label itself and its reset
      effect bails when `value` did not change between renders (`focused && !valueChange`), so a set-and-revert
-     in ONE batch (`TaskEditForm`'s From Jira flow on a fast failure) left the label over `null`. Mirrored
+     in ONE batch (`components/trackers/IssuePicker`'s flow on a fast failure) left the label over `null`. Mirrored
      here only while nothing is TYPED. */
   useEffect(() => {
     if (!typed) setInputValue(value === null ? '' : value.label)
   }, [typed, value])
+
+  /* The mount focus selects the held label once it is in the box, so the first keystroke searches afresh
+     rather than appending to it. */
+  useEffect(() => {
+    if (!mountFocus || typed || inputValue === '') return
+    const input = document.getElementById(field.id)
+    if (input instanceof HTMLInputElement && input === document.activeElement) input.select()
+  }, [mountFocus, typed, inputValue, field.id])
 
   return (
     <Autocomplete<LookupOption, false, boolean, false>
@@ -350,8 +385,9 @@ export function AsyncLookup({
       }}
       /* The empty-query fetch rides focus, not the debounce (a single event). */
       onFocus={requestFirstPage}
-      renderInput={params => renderLookupInput(params, {
-        busy, margin, label, required, error, helperText, placeholder, ariaLabel,
+      renderInput={params => renderInput(params, {
+        placeholder,
+        htmlInput: slotProps?.htmlInput,
         /* An invisible placeholder is none: MUI hides it while the floating label rests on the input, so
            a real empty answer ("Not connected") showed a blank box until focused (`ui/CredentialSelect`'s
            point 3). `shrink` is pinned only when a placeholder is given — or a value is held: the box's text

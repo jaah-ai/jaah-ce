@@ -3,24 +3,26 @@
 The single home for that answer: the node's git askpass, the pool clone and the docs reader all resolve
 here. There is no deployment-wide git credential; do not reintroduce one under any name. The PERSON is
 chosen by this rule, in order, and the credential is that person's connection for the repo's forge root
-(`forges.RepoRef.root`; `models.UserGitConnection`, falling back to the pre-0291 pointer only for its own
-root):
+(`forges.RepoRef.root`; `models.UserGitConnection` — of several, the one whose account reaches the repo's
+owner, else the root's default):
 1. a human started it (`task_ancestry.starter_user_id`) -> that person's connection, else refuse;
-2. no starter and a cron filed it (`created_by_cron_id`) -> that row's own non-system creator;
-3. anything else (system alarm, creator-less fan-out) -> refuse.
-Branch 2 is gated on the cron marker, never on "a creator exists". A runner-filed task takes branch 1: a
+2. no starter and a schedule, trigger or automation filed it -> the project's "Run jobs as" person
+   (`project_forge_person`), never the row's creator: nobody's `created_by_id` decides whose login automated work
+   spends;
+3. anything else (system alarm, system-filed fan-out) -> refuse.
+Branch 2 is gated on the machine marker, never on "a creator exists". A runner-filed task takes branch 1: a
 top-level filing is stamped `started_by_id` = its chain's executor (`task_ancestry.executor_user_id`), and a
 pipeline child walks to its epic's starter. The GitHub App and the GitHub OAuth App are one operator-plane row
 each with no org; `git_connect_app` picks which one new grants come from (`app_config`), and a stored
 token of either kind keeps working.
-Pointers are re-authorized on every read; refresh is locked and durable (`app/durable/git_token.py`).
+Selections are re-authorized on every read; refresh is locked and durable (`app/durable/git_token.py`).
 Nothing here logs a token.
 """
 from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from functools import partial
 from typing import Literal, NamedTuple, Optional
 from uuid import UUID
@@ -29,7 +31,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import forge_oauth, forges, git_probe, github_oauth
-from app.clock import as_utc
+from app.clock import as_utc, utcnow
 from app.operator_settings import reads as settings_reads
 from app.authz.principal import principal_for_user
 from app.authz.visibility import git_identity_select
@@ -39,6 +41,7 @@ from app.credentials.testers import AZURE_DEVOPS_KINDS, BITBUCKET_KINDS
 from app.forges import FORGE_LABELS, RepoRef
 from app.models.credentials import Credential, UserGitConnection
 from app.models.identity import AdminUser
+from app.models.orgs import Org
 from app.models.projects import Project, ProjectRepo
 from app.models.tasks import Task
 from app.models.worktrees import Worktree
@@ -139,19 +142,22 @@ def credential_root(credential: Credential) -> Optional[str]:
     return forges.credential_root(credential.type, base_url if isinstance(base_url, str) else None)
 
 
-def _profile_path(forge: str) -> str:
+def profile_path(forge: str) -> str:
     return f"Profile > Git > {FORGE_LABELS[forge]}"
 
 
-def _own_non_system_creator(session: Session, task: Task) -> Optional[UUID]:
-    """`task.created_by_id` when it names a real (non-system) person, else None.
+#: The provenance columns marking a row a schedule, trigger or automation filed (`git_person_for_task` branch 2).
+_AUTOMATED_ORIGIN_COLUMNS = ("created_by_cron_id", "created_by_trigger_id", "created_by_automation_id")
 
-    Reads this one row, not the chain (`task_ancestry.creator_user_id`): a cron marker is a fact about one row, so
-    its owner is read off the same row."""
-    if task.created_by_id is None:
+
+def automated_run_as(session: Session, task: Task) -> Optional[UUID]:
+    """The "Run jobs as" person of an automation-filed `task`'s project (`project_forge_person`), or None when a
+    person filed it or its project is gone. Reads this one row's marker, not the chain: a marker is a fact about
+    one row."""
+    if not any(getattr(task, column) is not None for column in _AUTOMATED_ORIGIN_COLUMNS):
         return None
-    user = session.get(AdminUser, task.created_by_id)
-    return user.id if user is not None and not user.is_system else None
+    project = session.scalars(select(Project).where(Project.id == task.project_id)).first()
+    return project_forge_person(session, project) if project is not None else None
 
 
 def git_person_for_task(session: Session, task: Task) -> Optional[UUID]:
@@ -163,14 +169,98 @@ def git_person_for_task(session: Session, task: Task) -> Optional[UUID]:
     starter_id = starter_user_id(session, task.id)
     if starter_id is not None:
         return starter_id
-    if task.created_by_cron_id is not None:
-        # This row's own creator, never an ancestor's: walking up could spend the token of a person who
-        # never configured this cron.
-        owner_id = _own_non_system_creator(session, task)
-        if owner_id is not None:
-            log.debug("git-access: task=%s is cron-filed, using its cron's owner %s", task.id, owner_id)
-            return owner_id
+    run_as_id = automated_run_as(session, task)
+    if run_as_id is not None:
+        log.debug("git-access: task=%s is automation-filed, using its project's Run jobs as %s", task.id, run_as_id)
+    return run_as_id
+
+
+#: The live tasks `live_runner_person` looks through, newest first.
+_LIVE_RUNNER_TASKS = 20
+
+
+def live_runner_person(session: Session, project_id: int, *, exclude_persona: str) -> Optional[UUID]:
+    """The git person of the newest live (`active`/`awaiting_response`) task of the project whose persona is not
+    `exclude_persona` (the caller's own system persona), or None when no live task names one."""
+    tasks = session.scalars(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.persona.is_distinct_from(exclude_persona),
+            Task.state.in_(("active", "awaiting_response")),
+        ).order_by(Task.id.desc()).limit(_LIVE_RUNNER_TASKS)
+    ).all()
+    for task in tasks:
+        person = git_person_for_task(session, task)
+        if person is not None:
+            return person
     return None
+
+
+def usable_job_person(session: Session, user_id: Optional[UUID], org_id: UUID) -> bool:
+    """Whether `user_id` can be a "Run jobs as" person of org `org_id`: a real, enabled member of that org."""
+    return user_id is not None and session.scalar(select(AdminUser.id).where(
+        AdminUser.id == user_id, AdminUser.is_system.is_(False), AdminUser.org_id == org_id,
+        AdminUser.disabled_at.is_(None),
+    )) is not None
+
+
+def explicit_job_people(session: Session, project: Project, *, run_as_id: Optional[UUID] = None) -> list[UUID]:
+    """The usable people named for `project`'s background jobs, in order: `run_as_id` (an automation's own "Run
+    as"), the project's "Run jobs as" (`projects.run_jobs_as_id`), the org's (`orgs.run_jobs_as_id`)."""
+    picks = (run_as_id, project.run_jobs_as_id, session.scalar(select(Org.run_jobs_as_id).where(Org.id == project.org_id)))
+    return list(dict.fromkeys(p for p in picks if p is not None and usable_job_person(session, p, project.org_id)))
+
+
+def has_forge_login(session: Session, user_id: UUID, project: Project) -> bool:
+    """Whether `user_id` holds a live git connection (its credential not marked for a reconnect) on `project`'s forge
+    root (`forges.RepoRef.root`); any live git connection when the project names no usable repository URL, since
+    there is no root to match."""
+    query = (
+        select(UserGitConnection.user_id)
+        .join(Credential, Credential.id == UserGitConnection.credential_id)
+        .where(UserGitConnection.user_id == user_id, Credential.needs_reconnect_at.is_(None))
+    )
+    try:
+        query = query.where(UserGitConnection.root == forges.repo_ref(project).root)
+    except forges.ForgeUrlError:
+        pass
+    return session.scalar(query.limit(1)) is not None
+
+
+def project_forge_person(session: Session, project: Project, *, run_as_id: Optional[UUID] = None) -> Optional[UUID]:
+    """THE "Run as" rule: whose forge login and coding-agent account a project's background work uses — the merge
+    lane's PRs no runner reports, the outcome scan's reads, benchmark reviews, memory graduations and every
+    automation's tasks. Candidates in order: `explicit_job_people`, then the org's live Owners/Admins by email. The
+    first holding a git login on the project's forge root (`has_forge_login`) wins: a pick without one is skipped,
+    since a task started as them cannot push. Nobody holds one: the first candidate anyway, so the work still starts
+    and its refusal names who must connect. A departed or disabled pick is never a candidate. None only when nothing
+    is picked and the org has no live Owner/Admin."""
+    from app.access import owners_and_admins
+
+    explicit = explicit_job_people(session, project, run_as_id=run_as_id)
+    for person_id in explicit:
+        if has_forge_login(session, person_id, project):
+            return person_id
+    admins = [p.id for p in owners_and_admins(session, project.org_id)] if project.org_id is not None else []
+    for person_id in admins:
+        if person_id not in explicit and has_forge_login(session, person_id, project):
+            return person_id
+    candidates = explicit + admins
+    return candidates[0] if candidates else None
+
+
+def requested_job_person(session: Session, project: Project, requester_id: Optional[UUID]) -> Optional[UUID]:
+    """Whom a control-plane run of `project` that `requester_id` asked for (None: the system) starts as: the requester
+    when they are a usable job person holding a git login on the project's forge (`has_forge_login`), else the
+    project's "Run as" person (`project_forge_person`). A hidden run filed with no starter clones as nobody (branch 3
+    of the module rule), so every such run is stamped with this person."""
+    if (
+        requester_id is not None
+        and usable_job_person(session, requester_id, project.org_id)
+        and has_forge_login(session, requester_id, project)
+    ):
+        return requester_id
+    return project_forge_person(session, project)
 
 
 def project_repo(project: Optional[Project], *, retry: str) -> RepoRef:
@@ -238,48 +328,81 @@ def project_repo_ref(row: ProjectRepo, *, retry: str = _RETRY_TASK) -> RepoRef:
     except forges.ForgeUrlError as exc:
         raise GitAccessError(
             f"Repository '{row.name}' of this project has no usable URL ({exc.problem}), so there is no forge "
-            f"to authenticate to. Fix it in the project's Repositories table, {retry}."
+            f"to authenticate to. Fix it on the project's Repository line, {retry}."
         ) from None
 
 
+def root_connections(session: Session, user: AdminUser, root: str) -> list[UserGitConnection]:
+    """`user`'s connections on `root`, the default first, then oldest first."""
+    return list(session.scalars(
+        select(UserGitConnection)
+        .where(UserGitConnection.user_id == user.id, UserGitConnection.root == root)
+        .order_by(UserGitConnection.is_default.desc(), UserGitConnection.created_at, UserGitConnection.id)
+    ).all())
+
+
+def owner_match(path: str, owners: list[str]) -> int:
+    """How long the longest of `owners` that owns `path` (`o/r`, `g/sub/r`, `org/project/r`) is; 0 for none."""
+    lowered = path.lower()
+    return max((len(o) for o in owners if o and lowered.startswith(o.lower() + "/")), default=0)
+
+
+def _reach(session: Session, connections: list[UserGitConnection], path: str) -> list[int]:
+    """Per connection, how specifically it reaches `path`'s owner (`owner_match`) through its recorded owners
+    or its own forge account."""
+    accounts = {
+        row.id: (row.config or {}).get("account")
+        for row in session.scalars(
+            select(Credential).where(Credential.id.in_([c.credential_id for c in connections]))
+        ).all()
+    }
+    reach = []
+    for connection in connections:
+        account = accounts.get(connection.credential_id)
+        reach.append(owner_match(path, [*(connection.owners or []), *([account] if isinstance(account, str) else [])]))
+    return reach
+
+
+def pick_connection(
+    session: Session, connections: list[UserGitConnection], path: str
+) -> UserGitConnection:
+    """Of one root's `connections` (default first, `root_connections`), the one for a repository at `path`:
+    the account whose recorded owners or own forge account owns it — the most specific owner wins, a tie
+    goes to the earlier row — else the default. A path-less ask (a whole root) is the default's."""
+    if len(connections) == 1 or not path:
+        return connections[0]
+    reach = _reach(session, connections, path)
+    return connections[reach.index(max(reach))]
+
+
+def owner_known(session: Session, connections: list[UserGitConnection], path: str) -> bool:
+    """Whether any of one root's `connections` is recorded as reaching `path`'s owner (`pick_connection` matched
+    rather than fell back to the default)."""
+    return max(_reach(session, connections, path), default=0) > 0
+
+
 def selected_credential_id(session: Session, user: AdminUser, repo: RepoRef) -> Optional[UUID]:
-    """Which credential `user` selected for `repo.root`: their connection row for that root, else the
-    pre-0291 pointer ONLY when its credential authenticates that same root (the overlap read rule).
-    Refuses a pointer at a non-git credential by type, as it always has. None: nothing."""
-    connection = session.scalars(
-        select(UserGitConnection).where(
-            UserGitConnection.user_id == user.id, UserGitConnection.root == repo.root
-        )
-    ).first()
-    if connection is not None:
-        return connection.credential_id
-    if user.git_credential_id is None:
-        return None
-    pointed = session.scalars(select(Credential).where(Credential.id == user.git_credential_id)).first()
-    if pointed is None:
-        return None
-    if pointed.type not in GIT_CREDENTIAL_TYPES:
-        # The pre-0291 pointer was only ever used for GitHub work, so a non-git pointer is that root's
-        # refusal by type (as it always was) and simply no selection for every other root.
-        if repo.root == "github.com":
-            _require_git_type(pointed, who=user.email or str(user.id), forge=repo.forge)
-        return None
-    return pointed.id if credential_root(pointed) == repo.root else None
+    """Which credential `user` selected for `repo`: of their connections on its root, the one for its owner
+    (`pick_connection`). None: nothing connected there."""
+    connections = root_connections(session, user, repo.root)
+    return pick_connection(session, connections, repo.path).credential_id if connections else None
 
 
 def resolve_for_user(
-    session: Session, user_id: UUID, repo: RepoRef, *, retry: str = _RETRY_TASK
+    session: Session, user_id: UUID, repo: RepoRef, *, retry: str = _RETRY_TASK,
+    credential_id: Optional[UUID] = None,
 ) -> Credential:
     """The credential `user_id` connected for `repo`'s forge root, re-checked against their current grants.
 
     The selection is read (`selected_credential_id`), then the row re-authorized, so a revoked or foreign
     row stops resolving while the selection still names it; a credential for another root is never
-    returned, and a grant its forge reported revoked (`grant_dead_at`) is `GitAccessNeedsReconnect`.
+    returned, and a row marked as needing a reconnect (`grant_dead`) is `GitAccessNeedsReconnect`.
     Every refusal names the forge, the root, the person and where to fix it; `retry` closes each with an
-    action this caller can take.
+    action this caller can take. `credential_id` names one of the person's connections on the root instead
+    of selecting one (Profile > Git lists each account's own state).
     """
     label = FORGE_LABELS[repo.forge]
-    where = _profile_path(repo.forge)
+    where = profile_path(repo.forge)
     user = session.get(AdminUser, user_id)
     if user is None:
         raise GitAccessError(
@@ -288,7 +411,8 @@ def resolve_for_user(
         )
     who = user.email or str(user.id)
 
-    credential_id = selected_credential_id(session, user, repo)
+    if credential_id is None:
+        credential_id = selected_credential_id(session, user, repo)
     if credential_id is None:
         raise GitAccessError(
             f"{who} has not connected a {label} account for {repo.root}. Open {where} and connect one "
@@ -308,7 +432,7 @@ def resolve_for_user(
             f"authenticates {credential_root(credential)} instead. Open {where} and connect "
             f"{repo.root}, {retry}."
         )
-    if (credential.config or {}).get("grant_dead_at"):
+    if grant_dead(credential):
         raise GitAccessNeedsReconnect(
             f"{who}'s {label} connection for {repo.root} (credential '{credential.name}') was revoked at "
             f"{label}, so it needs reconnecting. Open {where} and reconnect or paste a new token, {retry}."
@@ -316,14 +440,36 @@ def resolve_for_user(
     return credential
 
 
+def grant_dead(credential: Credential) -> bool:
+    """Whether a git credential needs reconnecting: its `needs_reconnect_at` column, set when its forge reported
+    the token revoked (`git_probe.mark_revoked`) and cleared by any newly entered token (`Credential.config`). The
+    one reader of that fact for every forge."""
+    return credential.needs_reconnect_at is not None
+
+
+#: Where a person reconnects or adds their own git login: the console's Profile › Git.
+PROFILE_GIT_URL = "/profile?tab=git-accounts"
+
+
+def revoked_hold_fix_url(session: Session, task: Task, wait_reason: str, viewer_id: UUID) -> Optional[str]:
+    """Profile › Git when `wait_reason` is `task`'s revoked-login hold (`revoked_holds`) and `viewer_id` holds that
+    login (`git_person_for_task`), else None: the fix is that person's alone, so nobody else is sent to their own
+    Profile, where nothing is revoked. One task's reads: the detail route only."""
+    if revoked_holds(session, [task]).get(task.id) != wait_reason:
+        return None
+    return PROFILE_GIT_URL if git_person_for_task(session, task) == viewer_id else None
+
+
 def revoked_holds(session: Session, tasks) -> dict[int, str]:
     """`{task id: wait reason}` for those of `tasks` whose git credential its forge reported revoked
-    (`grant_dead_at`, `git_probe.mark_revoked`). Such a task is not dispatched — its runner would only be refused
+    (`grant_dead`, `git_probe.mark_revoked`). Such a task is not dispatched — its runner would only be refused
     the token (410) and park on the question — so the project's work waits on one sentence instead; reconnecting
     clears the mark (`routes/credentials/writes.py`, `routes/git_connections.py`) and lifts the hold. Derived,
     never stored. The repo is read once per project and the credential once per person and root; any other
     resolution problem is not this hold's (the runner's own refusal names it). A merge-lane run is never held
-    here, as the dispatcher never holds one (`routes/fleet.py::fleet_allocation`)."""
+    here, as the dispatcher never holds one (`routes/fleet.py::fleet_allocation`), nor a task on a Jaah-made
+    repository, whose login is the console's GitHub App's, never a person's (`jaah_repos.runner_app_repo`)."""
+    from app import jaah_repos
     from app.merge_lane_state import is_lane_persona
 
     tasks = [task for task in tasks if not is_lane_persona(task.persona)]
@@ -337,10 +483,14 @@ def revoked_holds(session: Session, tasks) -> dict[int, str]:
         # that task (its runner's own refusal names the problem) instead of breaking either.
         try:
             if task.project_id not in repos:
+                project = session.get(Project, task.project_id)
                 try:
-                    repos[task.project_id] = project_repo(session.get(Project, task.project_id), retry=_RETRY_TASK)
+                    found = project_repo(project, retry=_RETRY_TASK)
                 except GitAccessError:
-                    repos[task.project_id] = None
+                    found = None
+                if found is not None and jaah_repos.runner_app_repo(session, project, found) is not None:
+                    found = None
+                repos[task.project_id] = found
             repo = repos[task.project_id]
             person_id = git_person_for_task(session, task) if repo is not None else None
             if repo is None or person_id is None:
@@ -356,34 +506,26 @@ def revoked_holds(session: Session, tasks) -> dict[int, str]:
 
 
 def _any_grant_dead(session: Session, org_ids: set) -> bool:
-    """Whether any git credential in `org_ids` carries `grant_dead_at` — `revoked_holds`' one-query short-circuit,
-    so the usual pass (nothing revoked) costs this read alone. `config` is sealed at rest (`Credential`'s
-    docstring), so the mark cannot be filtered in SQL: the org's git rows are read once and their tier 1 opened
-    here (no KMS call). A row that will not open counts as possibly dead, so the full resolution decides."""
-    rows = session.scalars(
-        select(Credential).where(Credential.org_id.in_(org_ids), Credential.type.in_(GIT_CREDENTIAL_TYPES))
-    )
-    for credential in rows:
-        try:
-            if (credential.config or {}).get("grant_dead_at"):
-                return True
-        except Exception:
-            return True
-    return False
+    """Whether any git credential in `org_ids` needs reconnecting (`grant_dead`) — `revoked_holds`' one-query
+    short-circuit, so the usual pass (nothing revoked) costs this read alone. A column, so filtered in SQL and
+    nothing sealed is opened."""
+    return session.scalar(
+        select(Credential.id).where(
+            Credential.org_id.in_(org_ids), Credential.type.in_(GIT_CREDENTIAL_TYPES),
+            Credential.needs_reconnect_at.is_not(None),
+        ).limit(1)
+    ) is not None
 
 
 def _grant_dead(session: Session, user_id: UUID, repo: RepoRef) -> bool:
-    """Whether the credential `user_id` selected for `repo.root` carries `grant_dead_at` — the same row
+    """Whether the credential `user_id` selected for `repo.root` needs reconnecting (`grant_dead`) — the same row
     `resolve_for_user` would refuse with `GitAccessNeedsReconnect`."""
     user = session.get(AdminUser, user_id)
-    try:
-        credential_id = selected_credential_id(session, user, repo) if user is not None else None
-    except GitAccessError:
-        return False
+    credential_id = selected_credential_id(session, user, repo) if user is not None else None
     credential = session.get(Credential, credential_id) if credential_id is not None else None
     return bool(
         credential is not None and credential_root(credential) == repo.root
-        and (credential.config or {}).get("grant_dead_at")
+        and grant_dead(credential)
     )
 
 
@@ -391,26 +533,24 @@ def _readable_credential(
     session: Session, user: AdminUser, credential_id: UUID
 ) -> Optional[Credential]:
     """`credential_id`, but only if `user` may push as it right now (`authz.git_identity_select`, the same
-    rule the Git Access dropdown offers); otherwise None."""
-    principal = principal_for_user(session, user)
-    # Only the pre-0291 pointer is grandfathered as an org selection: a connection row naming an org
-    # credential was checked against the org role at write time, and stops resolving once that role goes.
+    rule the Git Access dropdown offers); otherwise None. The retiring pointer is read only as that rule's
+    grandfather (`current_id`), never as a selection."""
     current_id = credential_id if credential_id == user.git_credential_id else None
-    stmt = git_identity_select(principal, current_id=current_id)
+    stmt = git_identity_select(principal_for_user(session, user), current_id=current_id)
     return session.scalars(stmt.where(Credential.id == credential_id)).first()
 
 
 def _require_git_type(credential: Credential, *, who: str, forge: str) -> None:
     """Refuse a credential that cannot authenticate a git remote.
 
-    Separate from the dropdown filter: the pointer is a plain FK an API caller can set to any id.
+    Separate from the dropdown filter: `resolve_for_user`'s `credential_id` is any id its caller names.
     """
     if credential.type not in GIT_CREDENTIAL_TYPES:
         label = FORGE_LABELS[forge]
         raise GitAccessError(
             f"{who}'s Git Access names credential '{credential.name}', which is a "
             f"{type_label(credential.type)} credential and cannot authenticate a git remote. Pick a "
-            f"{label} credential instead under {_profile_path(forge)}."
+            f"{label} credential instead under {profile_path(forge)}."
         )
 
 
@@ -425,14 +565,14 @@ def git_login_for(session: Session, credential: Credential, repo: RepoRef) -> Gi
     if credential_root(credential) != repo.root or credential.type != repo.forge:
         raise GitAccessError(
             f"Credential '{credential.name}' does not authenticate {repo.root}, so it is not sent there. "
-            f"Choose a {FORGE_LABELS[repo.forge]} credential under {_profile_path(repo.forge)}."
+            f"Choose a {FORGE_LABELS[repo.forge]} credential under {profile_path(repo.forge)}."
         )
     config = credential.config or {}
     if rest_username_problem(credential.type, config) is not None:
         raise GitAccessError(
             f"Credential '{credential.name}' is a {FORGE_LABELS[repo.forge]} API token with no Atlassian "
             f"account email, which the {FORGE_LABELS[repo.forge]} API requires beside it. Open "
-            f"{_profile_path(repo.forge)} and paste the token again with its account email, then try again."
+            f"{profile_path(repo.forge)} and paste the token again with its account email, then try again."
         )
     token = token_for(session, credential)
     if git_probe.claim_check(credential.id):
@@ -445,7 +585,7 @@ def git_login_for(session: Session, credential: Credential, repo: RepoRef) -> Gi
             label = FORGE_LABELS[repo.forge]
             raise GitAccessNeedsReconnect(
                 f"{label} reports that the token in credential '{credential.name}' for {repo.root} has "
-                f"been revoked. Open {_profile_path(repo.forge)} and reconnect or paste a new token, "
+                f"been revoked. Open {profile_path(repo.forge)} and reconnect or paste a new token, "
                 "then try again."
             )
     return _login(credential, token)
@@ -474,8 +614,9 @@ def resolve_for_worktree_clone(
     session: Session, node_id: UUID, project_id: int, repo: Optional[RepoRef] = None
 ) -> Credential:
     """The credential a pool clone of `project_id` on `node_id` authenticates with: the connection, for
-    that project's forge root — or `repo`'s, one of its connected repositories — of the operator
-    who declared that project's slots on that node.
+    that project's forge root — or `repo`'s, one of its connected repositories — of the person
+    who declared that project's slots on that node (a dynamic slot is declared as its task's starter,
+    `slot_allocation._declarer`).
 
     The earliest human declarer wins (`created_at`, then `id` for ties), which is stable as slots are
     added but not under deletion of the earliest slot. System-actor declarers are skipped. It refuses
@@ -486,18 +627,8 @@ def resolve_for_worktree_clone(
     if repo is None:
         project = session.scalars(select(Project).where(Project.id == project_id)).first()
         repo = project_repo(project, retry=retry)
-    row = session.execute(
-        select(Worktree.created_by_id)
-        .join(AdminUser, AdminUser.id == Worktree.created_by_id)
-        .where(
-            Worktree.node_id == node_id,
-            Worktree.project_id == project_id,
-            AdminUser.is_system.is_(False),
-        )
-        .order_by(Worktree.created_at.asc(), Worktree.id.asc())
-        .limit(1)
-    ).first()
-    if row is None:
+    declarer_id = clone_owner_id(session, node_id, project_id)
+    if declarer_id is None:
         label = FORGE_LABELS[repo.forge]
         outsider = _declarer_outside_org(session, node_id, project_id)
         if outsider is not None:
@@ -507,15 +638,29 @@ def resolve_for_worktree_clone(
                 f"This project's slots on this node were declared by {outsider}, who is not a member of this "
                 f"organization, so its clone cannot use their {label} account. Open one of its slots on the "
                 f"Worktrees page, choose Change clone owner, and pick a member who has connected {label} for "
-                f"{repo.root} under {_profile_path(repo.forge)}."
+                f"{repo.root} under {profile_path(repo.forge)}."
             )
         raise GitAccessError(
-            "No person declared any worktree slot for this project on this node, so its clone has no "
-            f"{label} account to authenticate as. Declare a slot from the node's page in the console, or "
-            "check that the node group which declared them still names a real operator, and make sure "
-            f"that person has connected {label} for {repo.root} under {_profile_path(repo.forge)}."
+            f"No one who can read {repo.root} started a task on this node yet. "
+            f"Ask the task's starter to connect {label} under {profile_path(repo.forge)}."
         )
-    return resolve_for_user(session, row[0], repo, retry=retry)
+    return resolve_for_user(session, declarer_id, repo, retry=retry)
+
+
+def clone_owner_id(session: Session, node_id: UUID, project_id: int) -> Optional[UUID]:
+    """The person a (node, project) pair's slots authenticate as: the earliest human declarer of its slots
+    (`resolve_for_worktree_clone`; changed by `routes/pool_slots.py::set_clone_owner`). None: nobody."""
+    return session.scalar(
+        select(Worktree.created_by_id)
+        .join(AdminUser, AdminUser.id == Worktree.created_by_id)
+        .where(
+            Worktree.node_id == node_id,
+            Worktree.project_id == project_id,
+            AdminUser.is_system.is_(False),
+        )
+        .order_by(Worktree.created_at.asc(), Worktree.id.asc())
+        .limit(1)
+    )
 
 
 def _declarer_outside_org(session: Session, node_id: UUID, project_id: int) -> Optional[str]:
@@ -526,7 +671,7 @@ def _declarer_outside_org(session: Session, node_id: UUID, project_id: int) -> O
     who they are is read fleet-wide. One email out, for the refusal that names them; None when nobody but the
     system declared."""
     # Deferred: `app.db` installs ORM listeners at import time; route modules import this one.
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.tenancy import seam
 
     declarers = list(dict.fromkeys(session.scalars(
@@ -536,7 +681,7 @@ def _declarer_outside_org(session: Session, node_id: UUID, project_id: int) -> O
     )))
     if not declarers:
         return None
-    with seam.detached(), seam.operator_scope(), SessionLocal() as fleet:
+    with seam.detached(), seam.operator_scope(), BridgedSession() as fleet:
         people = dict(fleet.execute(
             select(AdminUser.id, AdminUser.email).where(AdminUser.id.in_(declarers), AdminUser.is_system.is_(False))
         ).tuples().all())
@@ -620,7 +765,7 @@ def app_config(*, kind: Optional[str] = None, open_client_secret: bool = True) -
     opening the secret: `client_secret` is then blank and must not be sent anywhere.
     """
     # Deferred: `app.db` installs ORM listeners at import time; route modules import this one.
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.tenancy import seam
 
     if kind is None:
@@ -630,7 +775,7 @@ def app_config(*, kind: Optional[str] = None, open_client_secret: bool = True) -
                 settings_reads.get_str(APP_KNOBS[other][0]).strip():
             chosen = other
         kind = chosen
-    with seam.detached(), seam.operator_scope(), SessionLocal() as session:
+    with seam.detached(), seam.operator_scope(), BridgedSession() as session:
         credential = _designated_app(session, kind)
         # Read out as plain strings before the session closes (see `AppConfig`). The client secret is a
         # sealed field, opened through the one seam (`credential_crypto.open_secret`) because it is
@@ -723,7 +868,7 @@ def forge_app_config(forge: str, *, open_client_secret: bool = True) -> forge_oa
 
     `open_client_secret=False` answers only "is it usable" (the Git Access page) without opening the
     secret; the returned `client_secret` is then blank and must not be sent anywhere."""
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.tenancy import seam
 
     spec = forge_oauth.FORGE_OAUTH[forge]
@@ -733,7 +878,7 @@ def forge_app_config(forge: str, *, open_client_secret: bool = True) -> forge_oa
     raw = settings_reads.get_str(spec.app_setting).strip()
     if not raw:
         raise GitAccessError(not_configured_sentence(forge))
-    with seam.detached(), seam.operator_scope(), SessionLocal() as session:
+    with seam.detached(), seam.operator_scope(), BridgedSession() as session:
         credential = _credential_by_setting(session, raw, setting="App credential", section=spec.settings_section)
         if credential.org_id not in OPERATOR_PLANE_ORG_IDS:
             log.warning(
@@ -926,6 +1071,27 @@ def token_for(session: Session, credential: Credential) -> str:
     return _stored_token(refreshed)
 
 
+def renew_if_expiring(session: Session, credential: Credential) -> None:
+    """Renew `credential`'s forge grant in place when it is expiring and renewable (`token_for`), else
+    nothing: for a reader about to hand the whole row out (the runner's `credential.get`), which must not
+    serve a token the control plane would have renewed on a git use. A row that needs no renewal is never
+    opened here, so a NodeVault field the control plane cannot open stays untouched. Raises what `token_for`
+    raises."""
+    if _needs_refresh(credential):
+        token_for(session, credential)
+        # Ends the row lock `token_for` keeps when a concurrent caller had already renewed it.
+        session.commit()
+
+
+def is_connect_grant(credential: Credential) -> bool:
+    """Whether `credential` is a grant a forge Connect minted, which the control plane renews (`token_for`): its
+    refresh token is the control plane's alone, since a forge's refresh token is single-use."""
+    return (
+        credential.type in REFRESHABLE_TYPES
+        and credential_root(credential) == forge_oauth.FORGE_OAUTH[credential.type].root
+    )
+
+
 def readable_token(credential: Credential) -> Optional[str]:
     """The row's stored token as it stands (no renewal), or None when it holds none or it
     cannot be opened: for a writer about to replace it (`git_connections.connect_github`). Never log it."""
@@ -943,9 +1109,7 @@ def _needs_refresh(credential: Credential) -> bool:
     `token_expires_at` reads as not expiring. The refresh token is only tested for presence (a sealed
     marker is truthy), never opened: the rotation reads it (`durable/git_token.py`).
     """
-    if credential.type not in REFRESHABLE_TYPES:
-        return False
-    if credential_root(credential) != forge_oauth.FORGE_OAUTH[credential.type].root:
+    if not is_connect_grant(credential):
         # A self-managed GitLab row: no Connect minted it (D4), so no rotation may spend its token.
         return False
     if not credential.config.get("refresh_token"):
@@ -953,7 +1117,7 @@ def _needs_refresh(credential: Credential) -> bool:
     expires_at = _parsed_expiry(credential.config.get("token_expires_at"))
     if expires_at is None:
         return False
-    return datetime.now(timezone.utc) + _REFRESH_MARGIN >= expires_at
+    return utcnow() + _REFRESH_MARGIN >= expires_at
 
 
 def _parsed_expiry(raw: object) -> Optional[datetime]:

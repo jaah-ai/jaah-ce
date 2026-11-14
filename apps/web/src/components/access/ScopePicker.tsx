@@ -1,18 +1,20 @@
 import { useEffect, useMemo, useState, type JSX } from 'react'
 import Autocomplete from '@mui/material/Autocomplete'
 import Box from '@mui/material/Box'
-import MenuItem from '@mui/material/MenuItem'
 import Stack from '@mui/material/Stack'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
-import { get } from '../../api'
 import { useApiRead } from '../../hooks/useApiRead'
+import { listAccounts } from '../../pages/credentials/api'
 import { listProjects } from '../../hooks/useRosters'
 import { useAuth } from '../../auth'
 import { getOrgsByIds, useOrgSearch } from '../../lib/orgs'
-import type { Account } from '../../types'
-import type { ScopeType } from './api'
+import { SCOPE_TYPES, SCOPE_TYPE_LABELS, type ScopeType } from './api'
 import { NO_AUTOFILL_INPUT } from '../../ui/noAutofill'
+import { fieldTapTargetSx } from '../../ui/listStyles'
+import HelpLabel from '../../ui/HelpLabel'
+import FormField from '../../ui/FormField'
+import SelectField from '../../ui/SelectField'
 
 // Pick one scope (org / project / account) by name: a type select, then a searchable list of
 // that type's rows. The rows are the reader's own lists (`GET /api/projects`, `/accounts`;
@@ -21,6 +23,9 @@ import { NO_AUTOFILL_INPUT } from '../../ui/noAutofill'
 // THE ORG ROSTER IS PAGED, so an operator's orgs are never listed whole: narrowed to one org, that
 // org is read by id; unnarrowed, `useScopeOptions` carries no org rows and the picker SEARCHES the server
 // as the operator types.
+
+/** The scope list's explanation: its hover and its input's description. */
+const SCOPE_TIP = 'The grant applies here and to everything inside it.'
 
 export type ScopeOption = {
   type: ScopeType
@@ -32,13 +37,7 @@ export type ScopeOption = {
   orgId?: string
 }
 
-export const SCOPE_TYPE_LABELS: Record<ScopeType, string> = {
-  org: 'Organization',
-  project: 'Project',
-  account: 'Account',
-}
-
-const SCOPE_TYPES: ScopeType[] = ['org', 'project', 'account']
+export { SCOPE_TYPE_LABELS }
 
 /** Every scope the reader may name, narrowed to `orgId` where a row's org is known. One read per type; a
  *  failed read costs only that type (a reader without `accounts:view` still picks projects). An operator's
@@ -53,7 +52,7 @@ export function useScopeOptions(orgId?: string | null): { options: ScopeOption[]
     const [orgs, projects, accounts] = await Promise.all([
       isOperator ? soft(orgId ? getOrgsByIds([orgId]) : Promise.resolve([])) : Promise.resolve(null),
       soft(listProjects()),
-      soft(get<Account[]>('/api/accounts')),
+      soft(listAccounts()),
     ])
     return { orgs, projects, accounts }
   }, 'Could not load the scopes.')
@@ -85,15 +84,23 @@ export function ScopePicker({
   value,
   onChange,
   types = SCOPE_TYPES,
+  label,
+  noOptionsText,
   idPrefix,
+  disabled = false,
 }: {
   options: ScopeOption[]
   loading: boolean
   value: ScopeOption | null
   onChange: (next: ScopeOption | null) => void
-  /** Which scope types are offered. */
-  types?: ScopeType[]
+  /** Which scope types are offered. Exactly one: no Type select, the list's label names it. */
+  types?: readonly ScopeType[]
+  /** The list's label; the type's name by default. A repeated row numbers it (`Project 2`). */
+  label?: string
+  /** The empty list's line; by default the reader can see none of this type. */
+  noOptionsText?: string
   idPrefix: string
+  disabled?: boolean
 }): JSX.Element {
   const { admin } = useAuth()
   const [type, setType] = useState<ScopeType>(value?.type ?? types[0])
@@ -116,23 +123,28 @@ export function ScopePicker({
 
   return (
     <Stack spacing={2} direction={{ xs: 'column', sm: 'row' }}>
-      <TextField
-        select
-        id={`${idPrefix}-scope-type`}
-        label="Type"
-        value={type}
-        onChange={e => {
-          setType(e.target.value as ScopeType)
-          onChange(null)
-        }}
-        sx={{ minWidth: { sm: 160 } }}
-      >
-        {types.map(t => <MenuItem key={t} value={t}>{SCOPE_TYPE_LABELS[t]}</MenuItem>)}
-      </TextField>
+      {/* `width: auto` beside the scope list: the form row's `fullWidth` would crowd it out. */}
+      {types.length > 1 && (
+        <FormField label="Type" help="Narrows the next list to scopes of this kind.">
+          <SelectField
+            id={`${idPrefix}-scope-type`}
+            value={type}
+            onChange={v => {
+              setType(v as ScopeType)
+              onChange(null)
+            }}
+            sx={{ minWidth: { sm: 160 }, width: { sm: 'auto' } }}
+            disabled={disabled}
+            options={types.map(t => ({ value: t, label: SCOPE_TYPE_LABELS[t] }))}
+          />
+        </FormField>
+      )}
       <Autocomplete
         id={`${idPrefix}-scope`}
+        size="small"
         sx={{ flex: 1, minWidth: 0 }}
         options={ofType}
+        disabled={disabled}
         value={value && value.type === type ? value : null}
         onChange={(_, next) => onChange(next)}
         onInputChange={(_, next, reason) => {
@@ -144,7 +156,7 @@ export function ScopePicker({
         isOptionEqualToValue={(a, b) => a.type === b.type && a.id === b.id}
         getOptionLabel={o => o.name}
         getOptionKey={o => `${o.type}:${o.id}`}
-        noOptionsText={busy ? 'Loading…' : orgSearch.isError && searching ? 'Could not search the organizations' : `No ${SCOPE_TYPE_LABELS[type].toLowerCase()}s you can see`}
+        noOptionsText={busy ? 'Loading…' : orgSearch.isError && searching ? 'Could not search the organizations' : noOptionsText ?? `No ${SCOPE_TYPE_LABELS[type].toLowerCase()}s you can see`}
         renderOption={({ key, ...props }, o) => (
           <Box component="li" key={key} {...props}>
             <Box sx={{ minWidth: 0 }}>
@@ -157,7 +169,7 @@ export function ScopePicker({
             </Box>
           </Box>
         )}
-        renderInput={params => <TextField {...params} label={SCOPE_TYPE_LABELS[type]} slotProps={{ ...params.slotProps, htmlInput: { ...params.slotProps.htmlInput, ...NO_AUTOFILL_INPUT } }} />}
+        renderInput={params => <TextField {...params} label={<HelpLabel label={label ?? SCOPE_TYPE_LABELS[type]} help={SCOPE_TIP} />} sx={fieldTapTargetSx} slotProps={{ ...params.slotProps, htmlInput: { ...params.slotProps.htmlInput, ...NO_AUTOFILL_INPUT, 'aria-description': SCOPE_TIP } }} />}
       />
     </Stack>
   )

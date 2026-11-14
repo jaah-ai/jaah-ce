@@ -1,4 +1,5 @@
 import Box from '@mui/material/Box'
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, RADIUS, SIZE } from '../theme'
 
 /* THE CONSOLE'S ONE DISCLOSURE GLYPH: a caret, `▸` folded and `▾` open. Not `+`/`−`: beside an
    Add `+` a row's `+` read as "add", not "expand". The box's fixed width keeps the two carets (whose advance
@@ -16,13 +17,13 @@ const TOGGLE_GLYPH_SX = {
   display: 'inline-flex',
   alignItems: 'center',
   justifyContent: 'center',
-  width: 20,
-  height: 20,
+  width: SIZE.iconMd,
+  height: SIZE.iconMd,
   border: 0,
-  borderRadius: 0,
-  fontSize: '0.875rem',
-  fontWeight: 600,
-  lineHeight: 1,
+  borderRadius: RADIUS.none,
+  fontSize: FONT_SIZE.base,
+  fontWeight: FONT_WEIGHT.semibold,
+  lineHeight: LINE_HEIGHT.tight,
   color: 'text.secondary',
 } as const
 

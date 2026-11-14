@@ -1,22 +1,13 @@
 // Thin fetch wrapper: same-origin JSON, session cookie, typed errors.
 
 import { AUTH_EXPIRED_EVENT, clearAuthSnapshot } from './authStore'
-import { noticeActAsUnavailable, withHeldRowOrg } from './lib/actAs'
-import { noticeOrgSwitched, sessionHeaders } from './lib/activeOrg'
-import { createExternalStore, useExternalStore } from './lib/externalStore'
+import { noticeActAsUnavailable } from './lib/actAs'
+import { reportClientEvent } from './lib/clientTelemetry'
+import { ApiError, KEY_REUSED, NoAnswerError, NO_ANSWER, OUTCOME_UNKNOWN, UNKNOWN_OUTCOME_CODES } from './net/errors'
+import { send } from './net/send'
 
-export class ApiError extends Error {
-  status: number
-  detail: unknown
-  body: unknown
-
-  constructor(status: number, detail: unknown, body: unknown = null) {
-    super(typeof detail === 'string' ? detail : `HTTP ${status}`)
-    this.status = status
-    this.detail = detail
-    this.body = body
-  }
-}
+export { ApiError, NoAnswerError, NO_ANSWER, OUTCOME_UNKNOWN } from './net/errors'
+export { send } from './net/send'
 
 /** The record is not there to read: a 404, or a 422 for an id the route could not parse (shown as not found). */
 export const isNotFound = (err: unknown): boolean =>
@@ -25,53 +16,27 @@ export const isNotFound = (err: unknown): boolean =>
 /** A detail read's `retry`: a missing record is an answer, never retried; anything else twice more. */
 export const retryUnlessNotFound = (count: number, err: unknown): boolean => !isNotFound(err) && count < 2
 
-/* ── THE REWRITER SEAM (Live Cast viewer) ─────────────────────────────────────────────────────────────
-   The console's own task list and task detail are mounted again on the public live host (`src/live/`), where
-   every `/api/...` path they ask for has to land on `/api/public/live/{org}/{slug}/...`, be answered locally
-   with an empty value, or not be sent at all — and carry no cookie. ONE seam does
-   that for every request this module makes (`api`, `getText`, `getPage`, `apiFetch`) and for every URL the
-   browser fetches by itself (`apiHref`: an `<img src>`, an `<iframe src>`, a download link, the event
-   stream). The console installs none, so `fetch` is called exactly as before and every href is unchanged. */
-export type ApiRewriter = {
-  /** Send what `path` names, as this host must: the console's `fetch(path, init)` call, rewritten. */
-  fetch(path: string, init: RequestInit): Promise<Response>
-  /** A URL the browser fetches by itself (no headers), rewritten; '' when it must not be fetched at all. */
-  href(path: string): string
+/** One row picked off a list read, for a record with no single-row route: no match is a 404, so an edit page reads
+ *  it as not-found. */
+export async function pickFrom<T>(list: () => Promise<T[]>, match: (row: T) => boolean, missing: string): Promise<T> {
+  const row = (await list()).find(match)
+  if (!row) throw new ApiError(404, missing)
+  return row
 }
 
-let rewriter: ApiRewriter | null = null
-const rewriterVersion = createExternalStore(0)
-
-/** Install the live host's rewriter, or `null` for the console. Installing re-renders every `useApiRewriterVersion`
- *  reader, so an href or a stream path rendered before it is rewritten under it. */
-export function setApiRewriter(next: ApiRewriter | null): void {
-  rewriter = next
-  rewriterVersion.set(rewriterVersion.get() + 1)
-}
-
-/** A URL the browser fetches by itself: unchanged in the console. */
-export const apiHref = (path: string): string => (rewriter ? rewriter.href(path) : path)
-
-/** Re-render when the rewriter changes (a component holding an `apiHref` or an open stream path). */
-export function useApiRewriterVersion(): number {
-  return useExternalStore(rewriterVersion)
-}
-
-/** `fetch` with the console's session headers — or, on the live host, through its rewriter. Exported for the one
- *  caller that reads a body none of the helpers below can (`components/richtext/attachmentResolver`'s blob). A write
- *  below another org's row a page holds goes as that org (`lib/actAs.ts::useActAsRows`). */
-export function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
-  if (rewriter) return rewriter.fetch(path, init)
-  return fetch(path, { ...init, headers: sessionHeaders(withHeldRowOrg(path, init), init.method) })
-}
+/* THE REWRITER SEAM (Live Cast viewer) lives with the choke point that applies it (`net/send.ts`). */
+export { setApiRewriter, useApiRewriterVersion, type ApiRewriter } from './net/send'
 
 /** A JSON helper's refusal (`api`, `getPage`): the side effects every refusal carries — an expired session, the IP
- *  allowlist, an org switch, Act as gone — then the `ApiError` the caller catches. */
-function refuse(resp: Response, body: { detail?: unknown } | null): never {
+ *  allowlist, Act as gone (an org switch never reaches here: `net/send.ts` holds it) — then the `ApiError` the caller catches. */
+export function refuse(resp: Response, body: { detail?: unknown } | null): never {
+  // One key is minted per call (`net/send.ts`), so a key the server saw with another body is a bug in the choke point.
+  if (resp.status === 422 && body?.detail === KEY_REUSED) {
+    reportClientEvent('uncaught_error', { message: KEY_REUSED, detail: { status: resp.status } })
+  }
   signalAuthExpired(resp.status, body?.detail)
   signalIpNotAllowed(resp.status, body)
   signalTermsRequired(resp.status, body)
-  noticeOrgSwitched(resp.status, body)
   noticeActAsUnavailable(resp.status, body)
   throw new ApiError(resp.status, body?.detail ?? null, body)
 }
@@ -88,11 +53,28 @@ export async function api<T>(
     ...opts,
     headers: jsonHeader ? { 'Content-Type': 'application/json', ...(opts.headers ?? {}) } : opts.headers,
   }
-  const resp = await apiFetch(path, init)
+  const resp = await send(path, init)
   if (resp.status === 204) return undefined as T
-  const body = await resp.json().catch(() => null)
-  if (!resp.ok) refuse(resp, body)
-  return body as T
+  return (await readJson(resp, path)) as T
+}
+
+/** A JSON helper's body. A refusal's is read leniently (`refuse` wants only its detail). A 2xx body that cannot be
+ *  read THROWS: a connection cut mid-download, or something other than JSON, used to come back as a successful
+ *  `null` that the caller then dereferenced (a whole-console crash on a network that drops connections). Only a
+ *  2xx that says it has no body (`Content-Length: 0`) is `null`. */
+export async function readJson(resp: Response, path: string): Promise<unknown> {
+  if (!resp.ok) refuse(resp, await readJsonOrNull(resp) as { detail?: unknown } | null)
+  try {
+    return await resp.json()
+  } catch (err) {
+    if (resp.headers?.get('content-length') === '0') return null
+    throw new Error(`The answer to ${path} arrived incomplete`, { cause: err })
+  }
+}
+
+/** A body read leniently: its JSON, or `null` when there is none (a refusal's, a status-only answer). */
+export async function readJsonOrNull(resp: Response): Promise<unknown> {
+  return resp.json().catch(() => null)
 }
 
 /* The expired-session side effect, hoisted out of `api` so `getText` below shares it rather than
@@ -165,26 +147,33 @@ export const IDLE_LOGIN_PATH = '/login?reason=idle'
    guess who sent it. An earlier draft of this pair DID infer from it, and this helper's hardcoded null
    would then have made every ordinary 404 from a real API route claim it never reached the API. */
 export async function getText(path: string, opts: RequestInit = {}): Promise<string> {
-  const resp = await apiFetch(path, { credentials: 'same-origin', ...opts })
+  return (await readOk(path, opts)).text()
+}
+
+/** A GET whose response body is BYTES (an attachment's, a template asset's): `getText`'s rule, read as a `Blob`. */
+export async function getBlob(path: string, opts: RequestInit = {}): Promise<Blob> {
+  return (await readOk(path, opts)).blob()
+}
+
+/** The checked response behind the non-JSON reads: same credentials, a refusal's side effects, the same `ApiError`. */
+async function readOk(path: string, opts: RequestInit): Promise<Response> {
+  const resp = await send(path, { credentials: 'same-origin', ...opts })
   if (!resp.ok) {
     await noticeRefusal(resp)
     throw new ApiError(resp.status, null, null)
   }
-  return resp.text()
+  return resp
 }
 
-/** A non-JSON read's refusal side effects (expired session, IP allowlist, org switch), shared by `getText` and
+/** A non-JSON read's refusal side effects (expired session, IP allowlist, Act as gone), shared by `getText` and
  *  the Artifacts tab's report-frame probe so every read of the bytes logs out alike. A refusal's body is the
  *  API's JSON, not the bytes the caller wanted: read for its `detail` and `code` only; a 403 may not be JSON. */
 export async function noticeRefusal(resp: Response): Promise<void> {
-  const refusal = [401, 403, 409].includes(resp.status) ? await resp.json().catch(() => null) : null
+  const refusal = [401, 403, 409].includes(resp.status) ? await readJsonOrNull(resp) as { detail?: unknown } | null : null
   signalAuthExpired(resp.status, refusal?.detail)
   signalIpNotAllowed(resp.status, refusal)
   signalTermsRequired(resp.status, refusal)
-  if (resp.status === 409) {
-    noticeOrgSwitched(resp.status, refusal)
-    noticeActAsUnavailable(resp.status, refusal)
-  }
+  if (resp.status === 409) noticeActAsUnavailable(resp.status, refusal)
 }
 
 /* ONE FastAPI validation failure, as `RequestValidationError` serializes it. `loc` is the path to the
@@ -307,6 +296,11 @@ function statusSentence(status: number): string {
  *
  *  Always a plain string, because that is what every one of its call sites renders. */
 export function apiDetail(err: unknown, fallback: string): string {
+  // The choke point's own two answers (`net/errors.ts`): one sentence each, wherever the request started.
+  if (err instanceof NoAnswerError) return because(fallback, NO_ANSWER)
+  if (err instanceof ApiError && typeof err.detail === 'string' && UNKNOWN_OUTCOME_CODES.has(err.detail)) {
+    return because(fallback, OUTCOME_UNKNOWN)
+  }
   if (err instanceof ApiError) {
     if (typeof err.detail === 'string' && err.detail) return err.detail
     // An object detail that carries its own sentence beside its facts (a hosted machine's 409, `routes/nodes/delete.py`).
@@ -341,6 +335,14 @@ export function apiDetail(err: unknown, fallback: string): string {
   return fallback
 }
 
+/** The in-app path an object refusal carries beside its sentence (`fix_url`: where to fix what it names, e.g.
+ *  `project_intake.refused_not_set_up`), or null. Only a path inside this console is returned. */
+export function apiFixUrl(err: unknown): string | null {
+  if (!(err instanceof ApiError)) return null
+  const url = (err.detail as { fix_url?: unknown } | null)?.fix_url
+  return typeof url === 'string' && url.startsWith('/') && !url.startsWith('//') && !url.includes('\\') ? url : null
+}
+
 /* `opts` exists for ONE reason and it is `signal`: `ui/AsyncLookup` aborts a keystroke the operator has
    already typed past, and every one of its fetchers is a GET. Optional and spread into `fetch`, so every
    existing caller — and every test that mocks this function with one parameter — is unaffected. */
@@ -349,12 +351,23 @@ export const get = <T,>(path: string, opts?: RequestInit) => api<T>(path, opts)
 /** An org-scoped route (`/api/orgs/{org_id}/<tail>`), the id encoded once, here. */
 export const orgPath = (orgId: string, tail: string) => `/api/orgs/${encodeURIComponent(orgId)}/${tail}`
 
+/** `path` plus a query string, keys in insertion order. `undefined`, `null`, `''`, `false` and `[]` are ABSENT (an
+    empty `?owner_id=` is a 422); an array repeats its key once per item; nothing left answers `path` itself. */
+export function withQuery(path: string, params: Record<string, string | number | boolean | readonly string[] | null | undefined>): string {
+  const query = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (typeof value === 'object' && value !== null) for (const item of value) query.append(key, item)
+    else if (value !== undefined && value !== null && value !== '' && value !== false) query.append(key, String(value))
+  }
+  const qs = query.toString()
+  return qs ? `${path}?${qs}` : path
+}
+
 /* A keyset-paged GET: the body plus the `X-Next-Cursor` header (`GET /api/tasks`), `null` on the last page.
    Same credentials, 401 handling and `ApiError` as `api`. */
 export async function getPage<T>(path: string, opts: RequestInit = {}): Promise<{ data: T; next: string | null }> {
-  const resp = await apiFetch(path, { credentials: 'same-origin', ...opts })
-  const body = await resp.json().catch(() => null)
-  if (!resp.ok) refuse(resp, body)
+  const resp = await send(path, { credentials: 'same-origin', ...opts })
+  const body = await readJson(resp, path)
   return { data: body as T, next: resp.headers.get('X-Next-Cursor') }
 }
 export const post = <T,>(path: string, body?: unknown, headers?: HeadersInit) =>
@@ -393,37 +406,5 @@ export const postUploadTicket = (
   ticket: { filename: string; content_type: string; size_bytes: number; visibility?: 'public' | 'internal' },
 ) => api<UploadTicket>(path, { method: 'POST', body: JSON.stringify(ticket) })
 
-/* THE RAW PUT, and the one request in this app that must NOT go through `api` above. Every one of that
-   helper's three invariants is wrong here:
-     • it parses every body through `resp.json()` — S3 answers XML, or nothing at all;
-     • it sends `credentials: 'same-origin'` — this URL is cross-origin, and a cookie on it is at best
-       ignored;
-     • it sets `Content-Type: application/json` — and a presigned request here signs `host` plus, on an
-       upload PUT, `content-length` (the API's S3 presigner: `SIGNED_HEADERS = "host"` and
-       `SIGNABLE_CONTENT_LENGTH`, which is the only thing that bounds a query-string presign at all),
-       with `content-type` named in `FORBIDDEN_HEADERS` and `reject_forbidden_headers` enforcing that on
-       every presigned request the control plane and the node make. An unsigned header is at best
-       outside the signature and at worst refused; either way the browser should not be the one uploader
-       that ignores the rule.
-   Hence no headers OF OURS, deliberately: this call sends the method and the bytes, and the one header
-   that does travel is the `Content-Length` the browser computes from the Blob itself. That one is
-   load-bearing rather than incidental — the upload signature covers it, so it has to be the real byte
-   count, which is exactly why it is NOT ours to set: script may not touch a forbidden header name in
-   fetch (also why it needs no CORS grant). Do not "helpfully" add any other — and note that the BODY
-   can add one behind your back, which is why the parameter is a type-less `Blob` rather than a `File`
-   (see `lib/uploadTaskAttachment`).
-   Throws an `ApiError` rather than a bare `Error` so both call sites read its reason through
-   `apiDetail`, exactly as they read every other refusal — and the reason is OURS to write, because an
-   S3 error body is XML that `apiDetail` cannot read and no operator should be shown. */
-export async function putToStorage(url: string, body: Blob): Promise<void> {
-  let resp: Response
-  try {
-    resp = await fetch(url, { method: 'PUT', body })
-  } catch {
-    // Status 0: there was no HTTP response to carry one — DNS, the proxy, a dropped connection.
-    throw new ApiError(0, 'the upload could not reach the storage service')
-  }
-  if (!resp.ok) {
-    throw new ApiError(resp.status, `the storage service refused the upload (HTTP ${resp.status})`)
-  }
-}
+/* THE RAW PUT to the presigned URL: `net/storage.ts`, the one request `api` above must not carry. */
+export { putToStorage } from './net/storage'

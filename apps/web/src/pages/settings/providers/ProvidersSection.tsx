@@ -3,26 +3,32 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Divider from '@mui/material/Divider'
-import Link from '@mui/material/Link'
 import Stack from '@mui/material/Stack'
-import Switch from '@mui/material/Switch'
 import TableBody from '@mui/material/TableBody'
 import TableCell from '@mui/material/TableCell'
 import TableHead from '@mui/material/TableHead'
 import TableRow from '@mui/material/TableRow'
 import Typography from '@mui/material/Typography'
-import useMediaQuery from '@mui/material/useMediaQuery'
-import { alpha, type Theme } from '@mui/material/styles'
 import { apiDetail, get, put } from '../../../api'
 import { useAgentProviders } from '../../../hooks/useAgentProviders'
+import { useBusyIds } from '../../../hooks/useBusyIds'
 import { isEnabled } from '../../../lib/editionFeatures'
+import { countOf } from '../../../lib/humanize'
+import { prefersReducedMotion } from '../../../lib/motion'
+import { AUTH_KIND_LABEL } from '../../../lib/authKindLabel'
 import { capabilitiesOf } from '../../../lib/providerCatalogue'
 import type { AccountAuthKind, ProviderChoice } from '../../../types'
 import Banner from '../../../ui/Banner'
 import DataTable from '../../../ui/DataTable'
 import EmptyState from '../../../ui/EmptyState'
+import type { Explain } from '../../../ui/explain'
+import HelpLabel, { ExplainMoreButton } from '../../../ui/HelpLabel'
+import { KeyValue, KeyValueList } from '../../../ui/KeyValueList'
 import LoadingState from '../../../ui/LoadingState'
-import { PHONE_QUERY } from '../../../ui/listStyles'
+import { usePhone } from '../../../hooks/usePhone'
+import LinkButton from '../../../ui/LinkButton'
+import SettingCheckbox from '../../../ui/SettingCheckbox'
+import { FONT_WEIGHT, RADIUS, grid, tint } from '../../../theme'
 
 /* Settings > Providers — a summary of every catalogue row, then one section per row: its capability groups, gaps
  * and runtime modes, and the per provider/auth-kind runtime switch (operator only). Every fact is the listing's
@@ -53,11 +59,20 @@ type AcpRuntimeOut = { switches: AcpRuntimeSwitch[] }
 export const ACP_RUNTIME_PATH = '/api/settings/acp-runtime'
 const ACP_RUNTIME_QUERY_KEY = ['acp-runtime']
 
-const AUTH_LABEL: Record<string, string> = { oauth: 'Subscription', api_key: 'API key', jaah_account: 'Jaah account' }
+// The runtime switch also names the node's own Jaah account, which is no account `auth_kind`.
+const AUTH_LABEL: Record<string, string> = { ...AUTH_KIND_LABEL, jaah_account: 'Jaah account' }
 
 const ABSENT = '—'
 const TERMINAL_ONLY = 'Terminal only'
 const ACP_ONLY = 'ACP only'
+/** The runtime switch's explanation (`app/acp_runtime.py`: resolved per dispatch, fixed per attempt). */
+const RUNTIME_HELP: Explain = {
+  tip: 'On: new runs use the ACP host; off: terminal CLI.',
+  more: 'The ACP host (jaah-acp-host) drives the agent over its protocol and streams its activity; Terminal runs the CLI ' +
+    'in a terminal, viewed as a TUI. A change applies from the next dispatch, never to a running attempt. A node with ' +
+    'no ACP launch for this pair still runs the terminal.',
+}
+
 /** What a session runs on, by its pair's runtime: the switch's two states, and the console view each offers. */
 const RUNTIME_WORD = { acp: 'ACP host', terminal: 'Terminal' } as const
 const VIEW_WORD = { acp: 'Agent activity', terminal: 'TUI' } as const
@@ -200,23 +215,20 @@ export default function ProvidersSection(): JSX.Element {
     refetchOnWindowFocus: false,
   })
   const switches = new Map((runtime.data?.switches ?? []).map(sw => [sw.key, sw]))
-  const [busy, setBusy] = useState<string | null>(null)
+  const [busy, withBusy] = useBusyIds()
   const [error, setError] = useState('')
   // The Shared gaps fold, held here so a card's "N shared gaps" jump can unfold it: a folded block may hide the gap.
   const [sharedAll, setSharedAll] = useState(false)
 
-  async function flip(pair: string, on: boolean) {
-    setBusy(pair)
+  const flip = (pair: string, on: boolean) => withBusy(pair, async () => {
     setError('')
     try {
       const data = await put<AcpRuntimeOut>(ACP_RUNTIME_PATH, { switches: { [pair]: on } })
       queryClient.setQueryData(ACP_RUNTIME_QUERY_KEY, data)
     } catch (err) {
       setError(`Not saved: ${apiDetail(err, 'the server refused the switch.')}`)
-    } finally {
-      setBusy(null)
     }
-  }
+  })
 
   if (!settled) return <LoadingState />
   if (rows.length === 0) return <EmptyState title="Providers did not load." />
@@ -270,7 +282,7 @@ const litTimers = new WeakMap<HTMLElement, number>()
 function jumpTo(anchor: string) {
   const target = document.getElementById(anchor)
   if (!target) return
-  const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  const still = prefersReducedMotion()
   target.scrollIntoView({ block: 'start', behavior: still ? 'auto' : 'smooth' })
   target.focus({ preventScroll: true })
   target.setAttribute('data-jumped', 'true')
@@ -286,22 +298,22 @@ function JumpLink({ anchor, label, onJump, children }: {
   children: ReactNode
 }): JSX.Element {
   return (
-    <Link component="button" type="button" variant="body2" aria-label={label} onClick={() => { onJump?.(); jumpTo(anchor) }}
+    <LinkButton variant="body2" aria-label={label} onClick={() => { onJump?.(); jumpTo(anchor) }}
       sx={{ textAlign: 'left', verticalAlign: 'baseline' }}>
       {children}
-    </Link>
+    </LinkButton>
   )
 }
 
 /** Where a jump lands: focusable without joining the tab order, outlined only for the keyboard. */
 const JUMP_TARGET_SX = {
-  scrollMarginTop: 8,
-  borderRadius: 1,
+  scrollMarginTop: grid(1),
+  borderRadius: RADIUS.sm,
   transition: 'background-color 600ms',
-  '&:focus-visible': { outline: 2, outlineColor: 'primary.main', outlineOffset: 4 },
+  '&:focus-visible': { outline: 2, outlineColor: 'primary.main', outlineOffset: grid(0.5) },
   '&:focus:not(:focus-visible)': { outline: 'none' },
   // Settings' search-jump tint (`settings/KnobSection`), so a landing reads the same anywhere on the page.
-  '&[data-jumped]': { bgcolor: (theme: Theme) => alpha(theme.palette.warning.main, 0.18) },
+  '&[data-jumped]': { bgcolor: tint('warning', 0.18) },
 } as const
 
 /** " · "-joined words that break only between items, never inside one ("rate-limit reset"): a whole cell kept on one
@@ -329,7 +341,7 @@ function Off({ children }: { children: ReactNode }): JSX.Element {
 /** The provider × runtime/questions/usage/views/gaps table; on a phone, where six columns do not fit, a jump list
  *  that keeps each provider's runtime. */
 function Summary({ laned }: { laned: { row: ProviderChoice; lanes: Lane[]; gaps: Gap[] | undefined }[] }): JSX.Element {
-  const phone = useMediaQuery(PHONE_QUERY)
+  const phone = usePhone()
   if (phone) {
     return (
       <Box component="nav" aria-label="Providers" data-testid="providers-summary"
@@ -384,7 +396,7 @@ function Summary({ laned }: { laned: { row: ProviderChoice; lanes: Lane[]; gaps:
  *  ("2 gaps"): there it has no column header to name it. */
 function GapCount({ row, gaps, phone = false }: { row: ProviderChoice; gaps: Gap[] | undefined; phone?: boolean }): JSX.Element {
   if (gaps === undefined) return <>{ABSENT}</>
-  const words = `${gaps.length} ${gaps.length === 1 ? 'gap' : 'gaps'}`
+  const words = countOf(gaps.length, 'gap')
   if (gaps.length === 0) return <Off>{phone ? 'no gaps' : 'none'}</Off>
   return <JumpLink anchor={gapsAnchorOf(row.value)} label={`${row.label}: ${words}`}>{phone ? words : gaps.length}</JumpLink>
 }
@@ -400,11 +412,11 @@ function SharedGaps({ gaps, all, setAll }: { gaps: SharedGap[]; all: boolean; se
   return (
     <Box component="section" id={SHARED_ANCHOR} tabIndex={-1} aria-labelledby={`${SHARED_ANCHOR}-name`}
       data-testid={SHARED_ANCHOR} sx={JUMP_TARGET_SX}>
-      <Typography id={`${SHARED_ANCHOR}-name`} variant="subtitle1" component="h3" sx={{ fontWeight: 600, mb: 1 }}>Shared gaps</Typography>
-      <Box component="ul" sx={{ m: 0, pl: 2.25, typography: 'body2', '& li + li': { mt: 0.75 } }}>
+      <Typography id={`${SHARED_ANCHOR}-name`} variant="subtitle1" component="h3" sx={{ fontWeight: FONT_WEIGHT.semibold, mb: 1 }}>Shared gaps</Typography>
+      <Box component="ul" sx={{ m: 0, pl: 2, typography: 'body2', '& li + li': { mt: 0.5 } }}>
         {shown.map(gap => (
           <li key={gap.id}>
-            <Box component="span" sx={{ fontWeight: 600 }}>{gap.capability}</Box>
+            <Box component="span" sx={{ fontWeight: FONT_WEIGHT.semibold }}>{gap.capability}</Box>
             {' — '}
             {gap.consequence}
             <Box component="span" sx={{ display: 'block', color: 'text.secondary' }}>{gap.providers.join(' · ')}</Box>
@@ -441,7 +453,7 @@ function ProviderBlock({ row, lanes, gaps, sharedIds, onSharedJump, busy, onFlip
   gaps: Gap[] | undefined
   sharedIds: Set<string>
   onSharedJump: () => void
-  busy: string | null
+  busy: ReadonlySet<string>
   onFlip: (pair: string, on: boolean) => void
 }): JSX.Element {
   const caps = capabilitiesOf(row)
@@ -462,54 +474,38 @@ function ProviderBlock({ row, lanes, gaps, sharedIds, onSharedJump, busy, onFlip
       data-testid={`provider-${row.value}`}
       sx={{ minWidth: 0, ...JUMP_TARGET_SX }}
     >
-      <Typography id={`provider-${row.value}-name`} variant="subtitle1" component="h3" sx={{ fontWeight: 600, mb: 1 }}>{row.label}</Typography>
-      <Box
-        component="dl"
-        sx={{
-          m: 0,
-          display: 'grid',
-          gridTemplateColumns: { xs: 'minmax(0, 1fr)', sm: '7.5rem minmax(0, 1fr)' },
-          columnGap: 2,
-          rowGap: { xs: 0.25, sm: 0.75 },
-          '& dt': { color: 'text.secondary', typography: 'body2', mt: { xs: 0.75, sm: 0 } },
-          '& dd': { m: 0, typography: 'body2', overflowWrap: 'anywhere', minWidth: 0 },
-        }}
-      >
-        <Fact term="Runtime"><RuntimeLines provider={row} lanes={lanes} busy={busy} onFlip={onFlip} /></Fact>
-        <Fact term="Modes"><Modes row={row} /></Fact>
-        <Fact term="Sessions">
+      <Typography id={`provider-${row.value}-name`} variant="subtitle1" component="h3" sx={{ fontWeight: FONT_WEIGHT.semibold, mb: 1 }}>{row.label}</Typography>
+      <KeyValueList labelWidth={grid(20)}>
+        <KeyValue label="Runtime"><RuntimeLines provider={row} lanes={lanes} busy={busy} onFlip={onFlip} /></KeyValue>
+        <KeyValue label="Modes"><Modes row={row} /></KeyValue>
+        <KeyValue label="Sessions">
           <Presence items={sessions && [
             ['assigned ID', sessions.assign_id], ['listing', sessions.list], ['closing', sessions.close],
             ['extra dirs', sessions.additional_dirs], [sessions.resume === 'load' ? 'loading' : 'resuming', sessions.resume !== 'none'],
           ]} />
-        </Fact>
-        <Fact term="Turns"><Presence items={turns && [['steering', turns.steer], ['interrupting', turns.interrupt]]} /></Fact>
-        <Fact term="Requests">
+        </KeyValue>
+        <KeyValue label="Turns"><Presence items={turns && [['steering', turns.steer], ['interrupting', turns.interrupt]]} /></KeyValue>
+        <KeyValue label="Requests">
           <Presence items={requests && [
             ['approvals', requests.approval],
             [questions ? `questions (${questions})` : 'questions', Boolean(questions)],
           ]} />
-        </Fact>
-        <Fact term="Usage">
+        </KeyValue>
+        <KeyValue label="Usage">
           <Presence items={usage && [['tokens', usage.tokens], ['cost', usage.cost], ['rate-limit reset', usage.rate_limit_reset]]} />
-        </Fact>
-        <Fact term="Views">
+        </KeyValue>
+        <KeyValue label="Views">
           <span data-testid={`provider-${row.value}-views`}>{viewsOf(row, lanes)}</span>
           {consoleReason && <Box component="span" sx={{ display: 'block', color: 'text.secondary' }}>{consoleReason}</Box>}
-        </Fact>
-        <Fact term="Gaps" anchor={gapsAnchorOf(row.value)}><Gaps provider={row.value} gaps={gaps} sharedIds={sharedIds} onSharedJump={onSharedJump} /></Fact>
-      </Box>
+        </KeyValue>
+        <KeyValue label="Gaps">
+          {/* The value is the jump target (the summary's Gaps count lands here), so the Gaps value lights. */}
+          <Box id={gapsAnchorOf(row.value)} tabIndex={-1} sx={JUMP_TARGET_SX}>
+            <Gaps provider={row.value} gaps={gaps} sharedIds={sharedIds} onSharedJump={onSharedJump} />
+          </Box>
+        </KeyValue>
+      </KeyValueList>
     </Box>
-  )
-}
-
-/** A term and its value; `anchor` makes the value a jump target. */
-function Fact({ term, anchor, children }: { term: string; anchor?: string; children: ReactNode }): JSX.Element {
-  return (
-    <>
-      <dt>{term}</dt>
-      {anchor ? <Box component="dd" id={anchor} tabIndex={-1} sx={JUMP_TARGET_SX}>{children}</Box> : <dd>{children}</dd>}
-    </>
   )
 }
 
@@ -522,7 +518,7 @@ function Reveal({ open, onClick, children, controls }: { open: boolean; onClick:
       aria-expanded={open}
       aria-controls={controls}
       onClick={onClick}
-      sx={{ p: 0, minWidth: 0, verticalAlign: 'baseline', typography: 'body2', fontWeight: 600, textTransform: 'none' }}
+      sx={{ p: 0, minWidth: 0, verticalAlign: 'baseline', typography: 'body2', fontWeight: FONT_WEIGHT.semibold, textTransform: 'none' }}
     >
       {children}
     </Button>
@@ -579,7 +575,7 @@ function Gaps({ provider, gaps, sharedIds, onSharedJump }: {
       {shared.length > 0 && (
         <Box data-testid={`provider-${provider}-shared-gaps`}>
           <JumpLink anchor={SHARED_ANCHOR} onJump={onSharedJump}>
-            <Box component="span" sx={{ fontWeight: 600 }}>{shared.length} shared {shared.length === 1 ? 'gap' : 'gaps'}</Box>
+            <Box component="span" sx={{ fontWeight: FONT_WEIGHT.semibold }}>{countOf(shared.length, 'shared gap')}</Box>
           </JumpLink>
           : {shared.map(gap => gap.capability).join(' · ')}
         </Box>
@@ -597,10 +593,10 @@ function GapGroup({ id, noun, gaps }: { id: string; noun: string; gaps: Gap[] })
         {gaps.length} {gaps.length === 1 ? noun : `${noun}s`}
       </Reveal>
       {!open && <Box component="span" data-testid={`${id}-names`}>: {gaps.map(gap => gap.capability).join(' · ')}</Box>}
-      <Box component="ul" id={`${id}-list`} hidden={!open} sx={{ m: 0, mt: 0.5, pl: 2.25 }}>
+      <Box component="ul" id={`${id}-list`} hidden={!open} sx={{ m: 0, mt: 0.5, pl: 2 }}>
         {gaps.map(gap => (
           <li key={gap.key}>
-            <Box component="span" sx={{ fontWeight: 600 }}>{gap.capability}</Box>
+            <Box component="span" sx={{ fontWeight: FONT_WEIGHT.semibold }}>{gap.capability}</Box>
             <GapConsequence gap={gap} />
           </li>
         ))}
@@ -620,7 +616,7 @@ function GapConsequence({ gap }: { gap: Gap }): JSX.Element | null {
 function RuntimeLines({ provider, lanes, busy, onFlip }: {
   provider: ProviderChoice
   lanes: Lane[]
-  busy: string | null
+  busy: ReadonlySet<string>
   onFlip: (pair: string, on: boolean) => void
 }): JSX.Element {
   const first = lanes[0]
@@ -636,16 +632,21 @@ function RuntimeLines({ provider, lanes, busy, onFlip }: {
         if (!lane.served) return <Box key={lane.kind} data-testid={`runtime-${pair}`}>{lane.label}: {ABSENT}</Box>
         return (
           <Box key={lane.kind} data-testid={`runtime-${pair}`} sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', columnGap: 1 }}>
-            <span>{lane.label}</span>
-            <Switch
-              size="small"
+            <span><HelpLabel label={lane.label} help={RUNTIME_HELP} /></span>
+            <SettingCheckbox
+              dense
+              name={pair}
+              label={`${provider.label} ${lane.label} ACP runtime`}
+              help={RUNTIME_HELP}
               checked={lane.served.on}
-              disabled={busy !== null}
-              onChange={e => onFlip(pair, e.target.checked)}
-              slotProps={{ input: { 'aria-label': `${provider.label} ${lane.label} ACP runtime` } }}
+              disabled={busy.size > 0}
+              onChange={on => onFlip(pair, on)}
+              labelHidden
+              testId={`runtime-switch-${pair}`}
             />
+            <ExplainMoreButton label={`${provider.label} ${lane.label} runtime`} help={RUNTIME_HELP} />
             <Box component="span" sx={{ color: 'text.secondary' }}>
-              {busy === pair ? 'Saving…' : RUNTIME_WORD[lane.served.on ? 'acp' : 'terminal']}
+              {busy.has(pair) ? 'Saving…' : RUNTIME_WORD[lane.served.on ? 'acp' : 'terminal']}
             </Box>
           </Box>
         )
@@ -657,7 +658,7 @@ function RuntimeLines({ provider, lanes, busy, onFlip }: {
 function FixedLine({ testId, label, lane }: { testId: string; label: string; lane: Lane }): JSX.Element {
   return (
     <Box data-testid={testId}>
-      {label}: <Box component="span" sx={{ fontWeight: 600 }}>{lane.only}</Box>
+      {label}: <Box component="span" sx={{ fontWeight: FONT_WEIGHT.semibold }}>{lane.only}</Box>
       {lane.reason && <Box component="span" sx={{ color: 'text.secondary' }}> — {lane.reason}</Box>}
     </Box>
   )

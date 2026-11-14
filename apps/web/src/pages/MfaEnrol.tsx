@@ -10,6 +10,7 @@ import { ApiError, apiDetail, post } from '../api'
 import Banner from '../ui/Banner'
 import { CopyButton } from '../ui/CopyButton'
 import { monoSx as sharedMonoSx } from '../ui/listStyles'
+import { FONT_SIZE, grid, RADIUS } from '../theme'
 import { EntryCard, EntryHeading, EntryLoading, EntrySubmit, submitSx } from './authEntry'
 import {
   MfaExpired,
@@ -29,7 +30,6 @@ type EnrolConfirm = { recovery_codes: string[]; user: Admin }
 
 /* Four modules of quiet zone (the QR spec's minimum) inside the white square. */
 const QUIET = 4
-const QR_PX = 180
 
 /* Drawn as one SVG path from the module matrix: no innerHTML, no data URL. Black on white in both themes —
  * scanners expect dark-on-light. */
@@ -54,7 +54,7 @@ function QrCode({ value }: { value: string }) {
       aria-label="QR code for your authenticator app"
       viewBox={`0 0 ${size} ${size}`}
       shapeRendering="crispEdges"
-      sx={{ display: 'block', mx: 'auto', width: QR_PX, height: QR_PX, borderRadius: 1 }}
+      sx={{ display: 'block', mx: 'auto', width: grid(30), height: grid(30), borderRadius: RADIUS.sm }}
     >
       <rect width={size} height={size} fill={theme.palette.common.white} />
       <path d={d} fill={theme.palette.common.black} />
@@ -126,10 +126,10 @@ export default function MfaEnrol() {
             gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
             gap: 1,
             textAlign: 'center',
-            fontSize: '0.875rem',
+            fontSize: FONT_SIZE.base,
             border: 1,
             borderColor: 'divider',
-            borderRadius: 1,
+            borderRadius: RADIUS.sm,
             bgcolor: 'action.hover',
           })}
         >
@@ -167,7 +167,7 @@ export default function MfaEnrol() {
           component="code"
           data-testid="mfa-secret"
           // `balance`: a narrow card breaks the key into even halves, not seven groups and a straggler.
-          sx={t => ({ ...monoSx(t), display: 'block', fontSize: '0.875rem', textWrap: 'balance', wordBreak: 'break-word' })}
+          sx={t => ({ ...monoSx(t), display: 'block', fontSize: FONT_SIZE.base, textWrap: 'balance', wordBreak: 'break-word' })}
         >
           {factor.secret.match(/.{1,4}/g)?.join(' ')}
         </Box>

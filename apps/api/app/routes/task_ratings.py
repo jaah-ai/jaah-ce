@@ -17,9 +17,9 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app import actors
-from app.auth import require_user
+from app.auth import adopt_user, require_user
 from app.authz.declarations import feature
-from app.db import get_session
+from app.db_async import on_session
 from app.events import emit_console_event
 from app.models.identity import AdminUser
 from app.models.tasks import Task, TaskRating
@@ -105,14 +105,12 @@ def _is_ratable(task: Task) -> bool:
 
 @router.get("/{task_id}/rating", response_model=TaskRatingOut)
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
-def get_task_rating(
-    task_id: int,
-    user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-) -> TaskRatingOut:
+@on_session
+def get_task_rating(session: Session, task_id: int, user: AdminUser = Depends(require_user)) -> TaskRatingOut:
     """This Task's rating: the aggregate, the calling user's own vote, and who voted what.
 
     No state guard (see the module docstring)."""
+    user = adopt_user(session, user)
     get_task_or_404(task_id, session)
     return _rating_out(session, task_id, user.id)
 
@@ -120,11 +118,12 @@ def get_task_rating(
 @router.put("/{task_id}/rating", response_model=TaskRatingOut)
 # `tasks:view`, not `tasks:edit`, deliberately (see the module docstring).
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
+@on_session
 def rate_task(
+    session: Session,
     task_id: int,
     payload: TaskRatingIn,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> TaskRatingOut:
     """Record the calling user's vote on this Task, replacing their previous one if they had one.
 
@@ -138,6 +137,7 @@ def rate_task(
     `record_transition=False` is mandatory: True would persist a same-state `task:rated`
     `ActivityEvent` that the activity view shows as a lifecycle transition. False still reaches live
     SSE subscribers."""
+    user = adopt_user(session, user)
     task = get_task_or_404(task_id, session)
     # The two 409s are reported apart: "not finished" is a wait, "not rateable" is permanent.
     if not _is_ratable(task):

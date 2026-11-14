@@ -8,9 +8,10 @@ import { forgetSubjectAttachments, uploadTaskAttachment } from '../../lib/upload
 import { useMaxFileBytes } from '../../lib/maxFileBytes'
 import type { Attachment } from '../../types'
 import { Banner } from '../../ui/Banner'
+import { SIZE } from '../../theme'
 import { PaperclipIcon } from '../../ui/icons'
 import { PHONE } from '../../ui/listStyles'
-import { AXIS_TRACK_GROUND } from './axisTrackLook'
+import { SEGMENT_TRACK_GROUND } from '../../ui/SegmentedControl'
 import { attachmentContentUrl, FileChip, overCapMessage, QUIET_ATTACH_SX, useAttachmentViewer, viewerItem } from './TaskAttachmentsField'
 
 /* Max files one answer may carry — a MIRROR of `_MAX_ANSWER_ATTACHMENTS` in `apps/api/app/routes/tasks/answers.py`
@@ -34,15 +35,12 @@ export default function AnswerAttachments({
   onChange,
   onBusyChange,
   disabled,
-  roundLabel,
 }: {
   taskId: number
   files: Attachment[]
   onChange: (next: Attachment[]) => void
   onBusyChange: (busy: boolean) => void
   disabled: boolean
-  /** E.g. `round 3`, for the button's accessible name (see `AnswerControl`'s `roundLabel`). */
-  roundLabel?: string
 }): JSX.Element {
   const maxFileBytes = useMaxFileBytes()
   const [busy, setBusy] = useState(false)
@@ -112,10 +110,9 @@ export default function AnswerAttachments({
         variant="outlined"
         color="inherit"
         data-testid="gate-attach"
-        aria-label={roundLabel ? `Attach files to the answer for ${roundLabel}` : 'Attach files to the answer'}
+        aria-label="Attach files to the answer"
         disabled={disabled || busy || files.length >= MAX_ANSWER_ATTACHMENTS}
         onClick={() => inputRef.current?.click()}
-        title="Attach files"
         /* On a phone the paperclip alone: the word pushed Attach onto a line of its own under the
            answer's buttons. The accessible name is `aria-label` either way; 44px is the touch floor.
            QUIET: beside a disabled Submit, `inherit`'s outline made Attach the loudest control there.
@@ -124,20 +121,20 @@ export default function AnswerAttachments({
            so the hover still shows (see `COMPACT_ATTACH_SX`). */
         sx={{
           ...QUIET_ATTACH_SX,
-          '&:not(.Mui-disabled):not(:hover)': { '--variant-outlinedBg': AXIS_TRACK_GROUND },
+          '&:not(.Mui-disabled):not(:hover)': { '--variant-outlinedBg': SEGMENT_TRACK_GROUND },
           whiteSpace: 'nowrap',
           flexShrink: 0,
-          [PHONE]: { minHeight: 44, minWidth: 44, px: 1 },
+          [PHONE]: { minHeight: SIZE.tapTarget, minWidth: SIZE.tapTarget, px: 1 },
         }}
       >
         {/* A PAPERCLIP, NOT AN ARROW: `⬆` read as "upload/send", and alone on the phone it named nothing.
             The mark is `ui/icons.tsx`'s, shared with the task form's Attach. */}
-        <PaperclipIcon size="1.1em" testId="gate-attach-icon" sx={{ mr: 0.5, [PHONE]: { mr: 0 } }} />
+        <PaperclipIcon size={SIZE.iconXs} testId="gate-attach-icon" sx={{ mr: 0.5, [PHONE]: { mr: 0 } }} />
         <Box component="span" data-testid="gate-attach-word" sx={{ [PHONE]: { display: 'none' } }}>Attach</Box>
       </Button>
       {busy && (
         <Box role="status" aria-label="Uploading files" sx={{ display: 'inline-flex', alignItems: 'center', alignSelf: 'center', flexShrink: 0 }}>
-          <CircularProgress size={14} thickness={5} />
+          <CircularProgress size={SIZE.iconXs} />
         </Box>
       )}
       {files.map(a => (
@@ -160,7 +157,7 @@ export default function AnswerAttachments({
         type="file"
         multiple
         ref={inputRef}
-        aria-label={roundLabel ? `Files for ${roundLabel}` : 'Files for the answer'}
+        aria-label="Files for the answer"
         disabled={disabled || busy}
         onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
           const picked = Array.from(e.target.files ?? [])

@@ -56,7 +56,6 @@ Accepted limits:
 from __future__ import annotations
 
 import getpass
-import importlib.util
 import json
 import logging
 import os
@@ -71,6 +70,7 @@ from typing import Any, Callable, Iterable, Optional
 
 import env_helpers
 import host_platform
+import path_module
 import session_user
 
 log = logging.getLogger("jaahd.slot_residue")
@@ -87,11 +87,7 @@ _TASK_TMP = re.compile(r"task-([0-9]+)-[A-Za-z0-9._-]+", re.ASCII)
 _SLOT_STACK = re.compile(r"p([0-9]+)(?:-([0-9]+))?", re.ASCII)
 
 # `break_cause.munge` — PATH-LOADED, as in `session_sweep`: `hooks/` has no `__init__.py`.
-_BREAK_CAUSE_SPEC = importlib.util.spec_from_file_location(
-    "break_cause", Path(__file__).resolve().parent / "hooks" / "break_cause.py"
-)
-_break_cause = importlib.util.module_from_spec(_BREAK_CAUSE_SPEC)
-_BREAK_CAUSE_SPEC.loader.exec_module(_break_cause)
+_break_cause = path_module.load(Path(__file__).resolve().parent / "hooks" / "break_cause.py", "break_cause")
 
 
 def remove_tree(path: str) -> str:
@@ -99,7 +95,7 @@ def remove_tree(path: str) -> str:
     if session_user.switch_needed():
         return session_user.remove_tree_as_session_user(path)
     try:
-        shutil.rmtree(path) if os.path.isdir(path) and not os.path.islink(path) else os.unlink(path)
+        env_helpers.remove_path(path)
     except FileNotFoundError:
         pass
     except OSError as exc:
@@ -509,9 +505,7 @@ _CONTAINER_FIELD = ("{{.Image}}/{{range .Mounts}}{{.Name}},{{end}}/"
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess:
     """One command as the session user where the uid split applies, else in-process (`remove_tree`'s rule)."""
-    if session_user.switch_needed():
-        return session_user.run_as_session_user(argv)
-    return subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
+    return session_user.run_as_session_user_or_here(argv, timeout=300)
 
 
 def _account(result: dict[str, Any], what: str, reply: dict) -> None:

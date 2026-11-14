@@ -1,26 +1,30 @@
 import { type FormEvent, type JSX, useEffect, useMemo, useRef, useState } from 'react'
-import { Link as RouterLink, useLocation, useNavigate, useParams } from 'react-router-dom'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useLocation, useNavigate, useParams } from 'react-router-dom'
+import { useQueryClient } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Typography from '@mui/material/Typography'
-import { apiDetail, isNotFound, retryUnlessNotFound } from '../../api'
+import { apiDetail } from '../../api'
 import Breadcrumb from '../../components/Breadcrumb'
 import { TabPanel, Tabs, type TabDef } from '../../components/Tabs'
 import TaskSpecFields, { MODEL_INHERIT, PROVIDER_ANY, type TaskSpec } from '../../components/tasks/TaskSpecFields'
 import { paintableImageUrl, releasePaintedUrl } from '../../components/richtext/attachmentResolver'
 import { DEFAULT_PERSONA } from '../../components/tasks/taskPersona'
+import { useBaselineDirty } from '../../hooks/useBaselineDirty'
+import { useEditRecord } from '../../hooks/useEditRecord'
+import { useSubmit } from '../../hooks/useSubmit'
 import { useUrlTab } from '../../hooks/useUrlTab'
 import { formatBytes } from '../../lib/formatBytes'
 import { TEMPLATE_PATHS } from '../../routeGroups'
 import Banner from '../../ui/Banner'
 import { DetailPage, DetailSection } from '../../ui/detail/DetailPage'
-import DetailStatus from '../../ui/detail/DetailStatus'
-import FormActionBar from '../../ui/FormActionBar'
+import { EditStatus } from '../../ui/detail/DetailStatus'
+import CancelSaveBar from '../../ui/CancelSaveBar'
+import { EntityNameField } from '../../ui/EntityNameFields'
 import { FormTextField } from '../../ui/FormTextField'
 import { SettingCheckbox } from '../../ui/SettingCheckbox'
-import SubmitButton from '../../ui/SubmitButton'
 import { PHONE, tapTargetSx } from '../../ui/listStyles'
+import type { Explain } from '../../ui/explain'
 import {
   BODY_IMAGE,
   CARD_IMAGE,
@@ -42,9 +46,10 @@ import {
   uploadTemplateAsset,
 } from './api'
 import { useTemplateDelete, useTemplateEditing } from './access'
+import { grid, RADIUS, SIZE } from '../../theme'
 
 /* THE TEMPLATE EDITOR — `/templates/:id`, and `/templates/new` (`mode="create"`, the same page with a blank draft that
- * Save POSTs), on `PlaybookEditPage`'s pattern: seeded ONCE from the fetched row (`base`), and Save sends only the
+ * Save POSTs), on `PlaybookEditPage`'s pattern: seeded ONCE from the fetched row (`useBaselineDirty`), and Save sends only the
  * fields that differ (`PATCH`). TWO TABS, ONE FORM, the tab in the URL (`useUrlTab`):
  *  * Task — the task the template starts: Title, then `TaskSpecFields` under its `template` context, the very field
  *    components `TaskEditForm` renders (Description with rich text and pasted images, Depth, Involvement, Persona,
@@ -60,6 +65,15 @@ type TemplateTab = 'task' | 'library'
 /** The Library tab's own fields; the task half lives in the `TaskSpec` `TaskSpecFields` edits. */
 type Library = Pick<TemplateFields, 'name' | 'summary' | 'purpose' | 'title' | 'featured' | 'published'>
 
+/** The Description's placeholder help (`TemplateInputFields`: Start asks for each). */
+const INPUT_HINT = '{{input: Label}} asks for a value on Start; {{input?: Label}} is optional.'
+const ORIGIN_HELP: Explain = {
+  tip: 'Which library owns it; fixed once created.',
+  more: 'Global templates are the Official library, shown to every org and edited by the operator alone. Org '
+    + "templates belong to your organization and need the Templates (org) plan feature. A template's library "
+    + 'cannot change after it is created; Duplicate copies an Official one into your org.',
+  docs: 'using-jaah/templates/how-templates-work',
+}
 const CARD_ACCEPT = CARD_IMAGE_TYPES.join(',')
 const CARD_CAP_LABEL = `${MAX_CARD_IMAGE_BYTES / (1024 * 1024)} MiB`
 
@@ -73,10 +87,10 @@ function specOf(t: Pick<TemplateDetail, 'persona' | 'body' | 'model' | 'autonomo
     agent_id: null,
     pinned_node_id: null,
     autonomous: t.autonomous,
-    project_memory: null,
     priority: 0,
     playbook_id: null,
     transition_mode: 'auto',
+    max_running: null,
     assignee_id: null,
     attachment_ids: [],
     feature_id: null,
@@ -134,19 +148,12 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
   const editing = useTemplateEditing()
   const [askDelete, deleteDialog] = useTemplateDelete()
 
-  const query = useQuery({
-    queryKey: templateKey(id),
-    queryFn: () => getTemplate(id),
-    enabled: !creating,
-    retry: retryUnlessNotFound,
-  })
-  const row = creating ? null : query.data ?? null
+  const [row, setRow] = useState<TemplateDetail | null>(null)
   const readOnly = !creating && row !== null && !row.editable
 
-  // Seeded once per template: a background refetch must never overwrite the edit in progress.
+  // Seeded once per template, from the row as it loaded.
   const [lib, setLib] = useState<Library | null>(null)
   const [spec, setSpec] = useState<TaskSpec | null>(null)
-  const [base, setBase] = useState<string | null>(null)
   const [stagedFiles, setStagedFiles] = useState<File[]>([])
   const [origin, setOrigin] = useState<TemplateOrigin>(editing.global ? 'global' : 'org')
   // The card: a picked file to upload, or the stored one removed.
@@ -155,8 +162,8 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
   const [cardRemoved, setCardRemoved] = useState(false)
   const [cardError, setCardError] = useState(carried?.cardError ?? '')
   const [nameError, setNameError] = useState('')
-  const [formError, setFormError] = useState(carried?.saveError ?? '')
-  const [saving, setSaving] = useState(false)
+  // A create's carried refusal (`CreateCarry`) is on the first paint.
+  const { busy: saving, formError, run } = useSubmit(undefined, carried?.saveError ?? '')
   const cardInput = useRef<HTMLInputElement>(null)
 
   const tabs: readonly TabDef<TemplateTab>[] = [
@@ -170,15 +177,17 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
     const s = specOf(from)
     setLib(l)
     setSpec(s)
-    setBase(JSON.stringify(fieldsOf(l, s)))
   }
 
+  const { loading, notFound, loadError } = useEditRecord(
+    creating ? null : id, getTemplate, from => { setRow(from); seed(from) },
+    { loadFallback: 'Could not load this template.', fixedLoadError: true },
+  )
+
   useEffect(() => {
-    if (base !== null) return
-    if (creating) seed(BLANK)
-    else if (row) seed(row)
-    // seeded once per template, by design (above)
-  }, [creating, row, base])
+    if (creating && lib === null) seed(BLANK)
+    // seeded once, by design (above)
+  }, [creating, lib])
 
   useEffect(() => () => {
     if (cardPreview) releasePaintedUrl(cardPreview)
@@ -187,18 +196,14 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
   const resolveStoredSrc = useMemo(() => (row ? templateAssetResolver(row.id, row.assets) : undefined), [row])
 
   const fields = lib && spec ? fieldsOf(lib, spec) : null
-  const json = fields ? JSON.stringify(fields) : ''
-  const dirty = base !== null && (json !== base || stagedFiles.length > 0 || cardFile !== null || cardRemoved)
+  const { base, dirty } = useBaselineDirty(fields ? JSON.stringify(fields) : null, { extra: stagedFiles.length > 0 || cardFile !== null || cardRemoved })
 
-  const notFound = isNotFound(query.error)
   const trailRoot = { label: 'Templates', to: TEMPLATE_PATHS.manage }
-  if (notFound || !lib || !spec || !fields || (!creating && !row)) {
+  if (loading || notFound || loadError || !lib || !spec || !fields || (!creating && !row)) {
     return (
-      <DetailStatus
+      <EditStatus
         trail={<Breadcrumb items={[trailRoot, { label: 'Template' }]} />}
-        loading={!query.isError}
-        notFound={notFound && 'Template not found'}
-        error="Could not load this template."
+        loading={loading} notFound={notFound} loadError={loadError} notFoundTitle="Template not found"
       />
     )
   }
@@ -272,17 +277,8 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
       return
     }
     setNameError('')
-    setFormError('')
     setCardError('')
-    setSaving(true)
-    try {
-      if (creating) await saveCreate(fields)
-      else await saveEdit(fields)
-    } catch (err) {
-      setFormError(apiDetail(err, 'Could not save the template.'))
-    } finally {
-      setSaving(false)
-    }
+    await run('Could not save the template.', () => (creating ? saveCreate(fields) : saveEdit(fields)))
   }
 
   /* A create: POST, then the staged images and the card against the new row. Once the row exists a later failure
@@ -337,6 +333,7 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
     // Read back what the server stored (renamed images, the card) and seed from it.
     const fresh = await getTemplate(id).catch(() => saved)
     queryClient.setQueryData(templateKey(id), fresh)
+    setRow(fresh)
     seed(fresh)
     setCardError(cardFailed)
   }
@@ -376,7 +373,7 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
             <FormTextField
               id="template-title"
               label="Title"
-              help="The task's title when it starts."
+              help="Becomes the title of every task this template starts."
               value={lib.title}
               onChange={v => patchLib({ title: v })}
               testId="template-edit-title"
@@ -392,6 +389,7 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
               stagedFiles={stagedFiles}
               onStagedFilesChange={setStagedFiles}
               resolveStoredSrc={resolveStoredSrc}
+              templateHint={readOnly ? undefined : INPUT_HINT}
               readOnly={readOnly}
               disabled={saving}
             />
@@ -399,19 +397,18 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
         </TabPanel>
 
         <TabPanel id="library" current={tab} idPrefix="template">
-          <DetailSection title="Library">
+          <DetailSection title="Library" help="How it shows in the gallery and who can start it.">
             <Box
               sx={{
                 display: 'grid',
                 gap: 1.5,
-                gridTemplateColumns: 'repeat(auto-fill, minmax(15rem, 1fr))',
+                gridTemplateColumns: `repeat(auto-fill, minmax(${grid(40)}, 1fr))`,
                 [PHONE]: { gridTemplateColumns: '1fr' },
               }}
             >
-              <FormTextField
+              <EntityNameField
                 id="template-name"
-                label="Name"
-                required
+                maxLength={MAX_NAME}
                 error={nameError || undefined}
                 value={lib.name}
                 autoFocus={creating && tab === 'library'}
@@ -420,7 +417,8 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
                   patchLib({ name: v })
                 }}
                 testId="template-edit-name"
-                slotProps={{ htmlInput: { readOnly, maxLength: MAX_NAME } }}
+                help="Shown in the gallery; weighs most in search."
+                slotProps={{ htmlInput: { readOnly } }}
               />
               <FormTextField
                 id="template-purpose"
@@ -429,6 +427,7 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
                 value={lib.purpose}
                 onChange={v => patchLib({ purpose: v })}
                 testId="template-edit-purpose"
+                help="The gallery group this template is filed under."
                 options={PURPOSES.map(p => ({ value: p.value, label: p.label }))}
                 slotProps={{ htmlInput: { readOnly } }}
               />
@@ -439,8 +438,11 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
                 value={lib.published ? 'published' : 'draft'}
                 onChange={v => patchLib({ published: v === 'published' })}
                 testId="template-edit-status"
-                help="Published templates show in the gallery."
-                options={[{ value: 'draft', label: 'Draft' }, { value: 'published', label: 'Published' }]}
+                help="Draft hides it from the gallery and blocks Start."
+                options={[
+                  { value: 'draft', label: 'Draft', help: 'Hidden from the gallery; nobody can start it.' },
+                  { value: 'published', label: 'Published', help: 'In the gallery; members can start it.' },
+                ]}
                 slotProps={{ htmlInput: { readOnly } }}
               />
               {creating && editing.global && editing.org && (
@@ -451,15 +453,18 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
                   value={origin}
                   onChange={v => setOrigin(v as TemplateOrigin)}
                   testId="template-edit-origin"
-                  help="Global reaches every org; Org only yours."
-                  options={[{ value: 'global', label: 'Global' }, { value: 'org', label: 'Org' }]}
+                  help={ORIGIN_HELP}
+                  options={[
+                    { value: 'global', label: 'Global', help: 'Official library; every org sees it.' },
+                    { value: 'org', label: 'Org', help: "Your org's library; only your org sees it." },
+                  ]}
                 />
               )}
               <Box sx={{ gridColumn: '1 / -1' }}>
                 <FormTextField
                   id="template-summary"
                   label="Summary"
-                  help="One line on the gallery card."
+                  help="One line in the gallery; also searched."
                   value={lib.summary}
                   onChange={v => patchLib({ summary: v })}
                   testId="template-edit-summary"
@@ -471,7 +476,7 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
                   name="template-featured"
                   testId="template-edit-featured"
                   label="Featured"
-                  help="Shown first in the gallery."
+                  help="Marks it ★ in Manage; does not reorder the gallery."
                   checked={lib.featured}
                   disabled={readOnly || saving}
                   onChange={featured => patchLib({ featured })}
@@ -480,14 +485,14 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
             </Box>
           </DetailSection>
 
-          <DetailSection title="Image">
-            <Box sx={{ display: 'grid', gap: 1, maxWidth: '24rem', minWidth: 0 }} data-testid="template-card-image">
-              {/* The gallery card's own frame: 16:9, covered, so the preview is what the card will show. */}
+          <DetailSection title="Image" help="Thumbnail in the gallery; none shows a placeholder.">
+            <Box sx={{ display: 'grid', gap: 1, maxWidth: SIZE.measureNarrow, minWidth: 0 }} data-testid="template-card-image">
+              {/* The gallery thumbnail's frame: 16:9, covered, so the preview is what the gallery will show. */}
               <Box
                 sx={{
                   aspectRatio: '16 / 9',
                   width: '100%',
-                  borderRadius: 2,
+                  borderRadius: RADIUS.md,
                   border: '1px solid',
                   borderColor: 'divider',
                   bgcolor: 'action.hover',
@@ -507,7 +512,7 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
                   />
                 ) : (
                   <Typography variant="body2" sx={{ color: 'text.secondary' }} data-testid="template-card-placeholder">
-                    No image: the card shows its purpose placeholder.
+                    No image: the gallery shows its purpose placeholder.
                   </Typography>
                 )}
               </Box>
@@ -547,16 +552,8 @@ function TemplateEditor({ mode, id }: { mode?: 'create'; id: string }): JSX.Elem
           </DetailSection>
         </TabPanel>
 
-        <FormActionBar testId="template-form-actions" stretchTestIds={['template-edit-save']}>
-          <Button component={RouterLink} to={TEMPLATE_PATHS.manage} color="inherit" data-testid="template-edit-cancel" sx={tapTargetSx}>
-            {readOnly ? 'Back' : 'Cancel'}
-          </Button>
-          {!readOnly && (
-            <SubmitButton testId="template-edit-save" busy={saving} disabled={saving || !dirty}>
-              {creating ? 'Create' : 'Save'}
-            </SubmitButton>
-          )}
-        </FormActionBar>
+        <CancelSaveBar testId="template-form-actions" saveTestId="template-edit-save" cancelTo={TEMPLATE_PATHS.manage}
+          creating={creating} busy={saving} disabled={!dirty} readOnly={readOnly} />
       </Box>
       {deleteDialog}
     </DetailPage>

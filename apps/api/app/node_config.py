@@ -12,13 +12,13 @@ from __future__ import annotations
 import logging
 import re
 import time
-from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from app.clock import parse_utc
 from app.models.nodes import Node
 from app.models.orgs import OrgConsentHash
 from app.node_identity import node_matches, warn_unregistered_node
@@ -50,18 +50,6 @@ CONSENT_UPDATED_AT_SNAPSHOT_KEY = "remote_settings_consent_updated_at"
 # The daemon's own `plugin_repair._CONSENT_HASH_RE`. Validated on the way in: a malformed value seeded
 # into every new node would be a silent fleet-wide wedge.
 _CONSENT_HASH_RE = re.compile(r"\A[0-9a-f]{64}\Z")
-
-
-def parse_iso8601(value: Any) -> Optional[datetime]:
-    """Parse an ISO-8601 timestamp (trailing `Z` allowed); missing or malformed yields None, never raises,
-    so a bad `reported_at` degrades to "unknown when" rather than dropping the snapshot."""
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        log.warning("node-config: dropping malformed config reported_at %r", value)
-        return None
 
 
 def org_consent_hash(session, org_id: Optional[UUID]) -> str:
@@ -211,7 +199,10 @@ def apply_config_snapshot(
         return False
     if microvm is not None:
         config = {**config, MICROVM_SNAPSHOT_KEY: microvm}
-    reported_at = parse_iso8601(reported_at_raw)
+    # A missing or malformed stamp degrades to "unknown when" rather than dropping the snapshot.
+    reported_at = parse_utc(reported_at_raw)
+    if reported_at is None and reported_at_raw:
+        log.warning("node-config: dropping malformed config reported_at %r", reported_at_raw)
 
     # `node_id` is the name the daemon posted; select the uuid too so the UPDATE keys on the primary key.
     prev = session.execute(

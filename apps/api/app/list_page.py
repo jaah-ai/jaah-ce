@@ -47,6 +47,13 @@ class Page(BaseModel, Generic[T]):
     per: int = Field(description="The page size, as asked.")
 
 
+class Counted(BaseModel, Generic[T]):
+    """Every matching row's count plus the rows asked for, by offset and limit (`Page` is the paged-by-number twin)."""
+
+    total: int
+    items: list[T]
+
+
 @dataclass(frozen=True)
 class PageQuery:
     page: int
@@ -78,9 +85,16 @@ def page_query(sorts: Sequence[str]) -> Callable[..., PageQuery]:
 
 
 def like_pattern(q: str) -> str:
-    """A case-insensitive substring pattern for `ilike(..., escape="\\\\")`: LIKE's wildcards in what the
-    person typed are literal characters, so a pasted `50%_off` matches itself."""
+    """A case-insensitive substring pattern for `ilike()`: LIKE's wildcards in what the person typed are
+    literal characters, so a pasted `50%_off` matches itself. Escaped with `\\`, Postgres's default ESCAPE, so
+    `escape="\\\\"` is optional; leaving it out keeps the bare `ILIKE` a trigram index serves."""
     return "%" + q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def count(session: Session, stmt: Select[Any]) -> int:
+    """How many rows the filtered `stmt` matches, over every page: the one count a roster, a tab badge or an
+    offset-addressed console list reads. Any ORDER BY is dropped first; a count has no order."""
+    return session.scalar(select(func.count()).select_from(stmt.order_by(None).subquery())) or 0
 
 
 def sql_page(
@@ -95,7 +109,7 @@ def sql_page(
     """The page's rows and the filtered total. `stmt` is the filtered select (no ORDER BY, no LIMIT);
     `sorts` maps each sort key to its column expression, `default` is the ORDER BY without `?sort=`, and
     `tie` a unique column closing every ordering. A sort column's NULLs sit last in either direction."""
-    total = session.scalar(select(func.count()).select_from(stmt.order_by(None).subquery())) or 0
+    total = count(session, stmt)
     if query.sort is None:
         order = [*default, tie]
     else:

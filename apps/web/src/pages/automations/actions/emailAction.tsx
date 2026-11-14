@@ -3,8 +3,11 @@ import Box from '@mui/material/Box'
 import Link from '@mui/material/Link'
 import { Link as RouterLink } from 'react-router-dom'
 import { FormTextField } from '../../../ui/FormTextField'
+import type { Explain } from '../../../ui/explain'
 import { EMAIL_SETTINGS_URL, getOrgEmail, ORG_EMAIL_KEY } from '../../settings/email/api'
-import type { ActionContext, ActionEntry, ActionFormProps, ActionReviewRow } from './registry'
+import { str } from '../vocabulary'
+import type { ActionContext, ActionEntry, ActionFormProps } from './registry'
+import { FONT_SIZE } from '../../../theme'
 
 /* SEND EMAIL: one message from the org's connected Gmail each time the automation runs. Every rule is
  * the server's (`app/automation_email.py`): placeholders, recipient parsing, the connection check. This entry is the
@@ -14,8 +17,6 @@ export type EmailActionValue = { connection_id: string | null; to: string; cc: s
 
 /** The fields every run fills (`automation_email.OWN_FIELDS`). */
 const OWN_PLACEHOLDERS = '{{automation.name}}, {{fired_at}}, {{org.name}}'
-
-const str = (value: unknown): string => (typeof value === 'string' ? value : '')
 
 export function emailValueOf(params: Record<string, unknown>): EmailActionValue {
   return {
@@ -34,10 +35,16 @@ function eventAddressed(recipients: string, context: ActionContext): string | un
     : undefined
 }
 
-function placeholderHint(context: ActionContext): string {
+/** The Body's explanation: the placeholders it may quote are the pop-up. */
+function bodyHelp(context: ActionContext): Explain {
   const own = `Placeholders: ${OWN_PLACEHOLDERS}.`
-  return context.templateHint ? `${own} ${context.templateHint}` : own
+  return { tip: 'The email text; placeholders fill in at each run.', more: context.templateHint ? `${own} ${context.templateHint}` : own }
 }
+
+const FROM_HELP = 'The connected Gmail mailbox each email is sent from.'
+const TO_HELP = 'Who receives it: addresses, comma-separated; placeholders allowed.'
+const SUBJECT_HELP = 'The subject line; placeholders fill in at each run.'
+const CC_HELP = 'Who is copied: addresses, comma-separated; placeholders allowed.'
 
 function EmailActionForm({ value, onChange, context }: ActionFormProps<EmailActionValue>) {
   const orgId = context.orgId
@@ -49,20 +56,21 @@ function EmailActionForm({ value, onChange, context }: ActionFormProps<EmailActi
   const connections = query.data?.connections ?? []
   const errors = context.errors ?? {}
   const set = (patch: Partial<EmailActionValue>) => onChange({ ...value, ...patch })
-  const hint = placeholderHint(context)
+  const body = bodyHelp(context)
   const noConnection = query.isSuccess && connections.length === 0
   const stored = value.connection_id !== null && !connections.some(c => c.id === value.connection_id)
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
       {noConnection ? (
-        <Box data-testid="automation-email-no-connection" sx={{ color: 'text.secondary', fontSize: '0.875rem' }}>
+        <Box data-testid="automation-email-no-connection" sx={{ color: 'text.secondary', fontSize: FONT_SIZE.base }}>
           No Gmail connected.{' '}
           <Link component={RouterLink} to={EMAIL_SETTINGS_URL}>Connect Gmail</Link>
         </Box>
       ) : (
         <FormTextField
           label="From"
+          help={FROM_HELP}
           id="automation-email-from"
           testId="automation-email-from"
           value={value.connection_id ?? ''}
@@ -83,6 +91,7 @@ function EmailActionForm({ value, onChange, context }: ActionFormProps<EmailActi
       )}
       <FormTextField
         label="To"
+        help={TO_HELP}
         id="automation-email-to"
         testId="automation-email-to"
         required
@@ -90,23 +99,13 @@ function EmailActionForm({ value, onChange, context }: ActionFormProps<EmailActi
         onChange={to => set({ to })}
         disabled={context.disabled}
         error={errors.to}
-        hint={eventAddressed(value.to, context) ?? 'Separate addresses with commas.'}
+        hint={eventAddressed(value.to, context)}
         placeholder="ops@example.com"
         fullWidth
       />
       <FormTextField
-        label="Cc"
-        id="automation-email-cc"
-        testId="automation-email-cc"
-        value={value.cc}
-        onChange={cc => set({ cc })}
-        disabled={context.disabled}
-        error={errors.cc}
-        hint={eventAddressed(value.cc, context)}
-        fullWidth
-      />
-      <FormTextField
         label="Subject"
+        help={SUBJECT_HELP}
         id="automation-email-subject"
         testId="automation-email-subject"
         required
@@ -128,23 +127,35 @@ function EmailActionForm({ value, onChange, context }: ActionFormProps<EmailActi
         onChange={body => set({ body })}
         disabled={context.disabled}
         error={errors.body}
-        hint={hint}
+        help={body}
         fullWidth
       />
     </Box>
   )
 }
 
-function reviewRows(value: EmailActionValue): ActionReviewRow[] {
-  const rows: ActionReviewRow[] = [{ label: 'To', value: value.to }]
-  if (value.cc.trim()) rows.push({ label: 'Cc', value: value.cc })
-  rows.push({ label: 'Subject', value: value.subject }, { label: 'Body', value: value.body })
-  return rows
+/** The Settings tab's half: Cc. */
+function EmailActionExtras({ value, onChange, context }: ActionFormProps<EmailActionValue>) {
+  return (
+    <FormTextField
+      label="Cc"
+      help={CC_HELP}
+      id="automation-email-cc"
+      testId="automation-email-cc"
+      value={value.cc}
+      onChange={cc => onChange({ ...value, cc })}
+      disabled={context.disabled}
+      error={context.errors?.cc}
+      hint={eventAddressed(value.cc, context)}
+      fullWidth
+    />
+  )
 }
 
 export const emailAction: ActionEntry<EmailActionValue> = {
   type: 'email.send',
   Form: EmailActionForm,
+  Extras: EmailActionExtras,
   initial: () => ({ connection_id: null, to: '', cc: '', subject: '', body: '' }),
   fromParams: params => emailValueOf(params),
   toParams: value => ({ ...value }),
@@ -153,5 +164,4 @@ export const emailAction: ActionEntry<EmailActionValue> = {
     return to ? `${label ?? 'Send email'} · ${to}` : (label ?? 'Send email')
   },
   brief: params => str(params.to) || 'Send email',
-  reviewRows,
 }

@@ -1,11 +1,13 @@
-import { useId, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import { useSubmit } from '../../hooks/useSubmit'
 import { formatBytes } from '../../lib/formatBytes'
+import { FONT_SIZE } from '../../theme'
 import Banner from '../../ui/Banner'
+import FormTextField from '../../ui/FormTextField'
+import type { Explain } from '../../ui/explain'
 import { putTriggerState } from './api'
 
 /* The preflight's state document (R10): a JSON object the preflight reads each run and may replace. The
@@ -14,6 +16,13 @@ import { putTriggerState } from './api'
 
 /** `routes/triggers.py::MAX_STATE_BYTES`. */
 const MAX_STATE_BYTES = 65536
+
+const STATE_HELP: Explain = {
+  tip: 'JSON the preflight reads, and may replace, on each event.',
+  more: 'A preflight gets this object with every event and can return a new one, such as a cursor or what it has seen. '
+    + 'Edit it to reset or seed that memory. At most 64 KB.',
+  docs: 'console-reference/automation/automations',
+}
 
 function seedOf(document: Record<string, unknown>): string {
   return JSON.stringify(document, null, 2)
@@ -79,16 +88,15 @@ export default function StateDocumentEditor({
   document: Record<string, unknown>
   onSaved: (document: Record<string, unknown>) => void
 }) {
-  const sizeId = useId()
   const seed = seedOf(document)
   const [text, setText] = useState(seed)
   const { busy: saving, formError: error, setFormError: setError, run } = useSubmit()
   const parsed = useMemo(() => parse(text), [text])
   const tooBig = parsed.ok && parsed.bytes > MAX_STATE_BYTES
   const unsafe = parsed.ok && parsed.unsafe
-  const errorId = useId()
   const dirty = text !== seed
   const empty = parsed.ok && Object.keys(parsed.value).length === 0
+  const size = parsed.ok ? `${formatBytes(parsed.bytes)} of 64 KB` : undefined
 
   async function save() {
     if (!parsed.ok || tooBig || unsafe) return
@@ -106,34 +114,23 @@ export default function StateDocumentEditor({
           The state document is empty.
         </Typography>
       )}
-      <TextField
+      {/* The helper slot under the field is its state: the parse error, else the size (red when over the cap). */}
+      <FormTextField
         label="State document"
+        help={STATE_HELP}
         multiline
         minRows={4}
         maxRows={24}
         value={text}
-        onChange={e => setText(e.target.value)}
-        error={!parsed.ok || tooBig}
+        onChange={setText}
+        error={!parsed.ok ? parsed.error : tooBig ? size : undefined}
+        hint={size}
         slotProps={{
-          htmlInput: { spellCheck: false, 'aria-describedby': parsed.ok ? sizeId : errorId },
+          htmlInput: { spellCheck: false },
+          formHelperText: { 'data-testid': parsed.ok ? 'trigger-state-size' : 'trigger-state-error', sx: { overflowWrap: 'anywhere' } } as object,
         }}
-        sx={{ '& textarea': { fontFamily: theme => theme.typography.mono.fontFamily, fontSize: '0.8125rem' } }}
+        sx={{ '& textarea': { fontFamily: theme => theme.typography.mono.fontFamily, fontSize: FONT_SIZE.md } }}
       />
-      {!parsed.ok && (
-        <Typography id={errorId} variant="body2" color="error" data-testid="trigger-state-error" sx={{ overflowWrap: 'anywhere' }}>
-          {parsed.error}
-        </Typography>
-      )}
-      {parsed.ok && (
-        <Typography
-          id={sizeId}
-          variant="caption"
-          data-testid="trigger-state-size"
-          sx={{ color: tooBig ? 'error.main' : 'text.secondary' }}
-        >
-          {formatBytes(parsed.bytes)} of 64 KB
-        </Typography>
-      )}
       {unsafe && (
         <Banner severity="warning">
           This document holds whole numbers too large for a browser to keep exactly, so saving it here would change

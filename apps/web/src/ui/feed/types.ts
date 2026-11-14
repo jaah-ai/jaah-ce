@@ -39,6 +39,9 @@ export type FeedIndicator = {
   /** An arc on the disc's perimeter, a rollup costing no column. `pct` (0-100) is the route's rounding,
    *  never re-derived, so the arc and `data-pct` are one number. */
   ring?: { pct: number } | null
+  /** Draws a pulsing halo in the disc's tone: something about this row awaits the viewer (a finished task they
+   *  have not opened). A static ring under reduced motion. The route puts it in words too (`label`/`ariaLabel`). */
+  attention?: boolean
 }
 
 /* A fixed-width trailing column, reserved on every row (see `./geometry`). */
@@ -81,14 +84,15 @@ export type FeedSlot = {
  *  `FeedRowSpec.ariaLabel`. */
 export type FeedMarker = {
   key: string
-  glyph: string
+  /** A character, or an icon drawn in `currentColor` where a character reads too small (a built-in's lock). */
+  glyph: ReactNode
   label: string
   /** The hover sentence. */
   title?: string
   data?: Record<string, string | number | boolean | undefined>
   testId?: string
   /** Drawn right after the name, inside the title cell, rather than as a column at that cell's far end: a mark ON
-   *  the name (a built-in's 🔒), not a fact read down a column. Absent = the column. */
+   *  the name (a built-in's lock), not a fact read down a column. Absent = the column. */
   hug?: boolean
   /** Colours the glyph (and `word`) in this tone, for a mark that must be noticed (a bumped priority).
    *  Absent = `text.disabled`, a quiet mark. Colour is never the only signal: the glyph and `label` still say it. */
@@ -105,6 +109,9 @@ export type FeedDisclosure = {
   onToggle: () => void
   /** This list's word for its children ("Expand subtasks"). */
   label?: string
+  /** Draw the control on the rail, where a disc would sit, and keep its width in the row as a spacer: a row with
+   *  no disc (a mark-less folder) then starts in the column its siblings' discs do. */
+  onRail?: boolean
 }
 
 /** A fact about a row in words: a reason, a note, an error. NEVER A SECOND LINE: a one-row item stays one
@@ -121,7 +128,8 @@ export type FeedNote = {
 /* The feed's half of a drag. A pointer drag, not HTML5 DnD (`components/LayoutDesigner.tsx`'s header:
  * jsdom cannot drive DnD). The feed owns no drag state: it reports `onLift` and draws the route's
  * verdict. `hooks/usePointerDrag.ts` resolves the destination from the element under the pointer via
- * `dropKey`. List-specific rules live with the route (e.g. `lib/nameTreeMove.ts`). */
+ * `dropKey`. List-specific rules live with the route (e.g.
+ * `pages/credentials/CredentialTreeView.tsx::dropProps`). */
 export type FeedDrag = {
   /** The row is a drag source: pointer-down on its body reports here. The route owns threshold,
    *  destination and release. Absent = cannot be picked up. */
@@ -150,6 +158,10 @@ export type FeedRowSpec = {
   depth?: number
   /** Absent = an empty disc slot: a row that is a place, not a record with a state (a tree container). */
   indicator?: FeedIndicator
+  /** A bulk-pick tick that takes the disc's place, costing no width: hidden at rest, it replaces the disc while the
+   *  pointer is on the disc (a hover-capable pointer), while the control holds keyboard focus, and while the control
+   *  carries `data-revealed="true"` (the route's word: ticked). Give the control `className="feed-pick"`. */
+  pick?: ReactNode
   /** Absent on a row that can have no children; a childless row that could have them passes `'spacer'`
    *  so titles align. */
   disclosure?: FeedDisclosure | 'spacer'
@@ -170,8 +182,9 @@ export type FeedRowSpec = {
    *  — Running, created by ada"). Supplying it silences the state disc and markers (`aria-hidden`) so the
    *  state is not heard twice; slots are always announced. */
   ariaLabel?: string
-  /** Router path. Absent = unnavigable (title renders as text). */
-  href?: string
+  /** Router path to the row's editor, or `null` for a row that is no record (the title renders as text). Required, so
+   *  every row builder decides; a `null` needs its file's reason in the editor gate's ROWS. */
+  href: string | null
   /** A small control hugging the title's text, OUTSIDE the link (a button inside an `<a>` is invalid).
    *  Revealed on row hover and keyboard focus (`:focus-visible`, so a mouse click does not pin it); never drawn on a hover-less (touch) device, so it must have
    *  a second home (e.g. the ⋯ menu). The title yields width to it, never the reverse. */
@@ -181,8 +194,17 @@ export type FeedRowSpec = {
   titleAside?: ReactNode
   /** The mono identifier left of the title, inside the link. Gated at `FEED_NO_ID`, or at `gate` (which should
    *  include that band) where the list's own width drops it too. `align` defaults to `right` (numeric ids line up
-   *  by their last digit); a free-text lead takes `left`, so short and truncated values start at one edge. */
-  lead?: { text: string; width?: number; title?: string; gate?: SlotGate; align?: 'left' | 'right' }
+   *  by their last digit); a free-text lead takes `left`, so short and truncated values start at one edge.
+   *  `copy`: a click puts `value()` on the clipboard and flashes the outcome (`FeedList`'s `FeedLead`); `what`
+   *  names it in the label and tooltip ("link to task 42"). */
+  lead?: {
+    text: string
+    width?: number
+    title?: string
+    gate?: SlotGate
+    align?: 'left' | 'right'
+    copy?: { what: string; value: () => string }
+  }
   markers?: FeedMarker[]
   /** The trailing cluster, ordered by gate strength. */
   slots?: FeedSlot[]
@@ -194,7 +216,7 @@ export type FeedRowSpec = {
   /** A write is in flight; the row's controls go busy. */
   busy?: boolean
   /** Pressing the row body. Only for a destination the row already advertises another way, or the very toggle
-   *  its checkbox disc already offers (a pick list, `components/AssignmentList.tsx`); never any other verb that
+   *  its checkbox disc already offers (a pick list); never any other verb that
    *  changes anything. Keyboard-reachable (tab stop, Enter, Space). */
   onRowClick?: () => void
   /** What that press does. Required with `onRowClick`; not `ariaLabel`, which names the record. */
@@ -218,6 +240,10 @@ export type FeedRowSpec = {
   /** Present but not currently meaningful (offline node, superseded intent): reduced strength; controls
    *  keep full strength. */
   muted?: boolean
+  /** The title in the secondary grey: a CLASS of record that should recede beside the rest (a machine-filed task,
+   *  `lib/taskOrigin.ts`). Unlike `muted`, the row's state and controls keep full strength; never the only signal
+   *  (the row names it). */
+  quiet?: boolean
   /** `data-*` for the route's tests and oracles. `testid` is ignored: the handle is always `feed-row`. */
   data?: Record<string, string | number | boolean | undefined>
   /** Children, already built; rendered at `depth + 1` when open. */
@@ -264,3 +290,7 @@ export type FeedColumn = {
   /** The direction a first press sorts in; a date or a count reads best `'desc'`. Default `'asc'`. */
   firstDir?: SortDir
 }
+
+/** `FeedList`'s header row: the title's column, each slot's, and an optional list-wide control (an order menu)
+ *  heading the ⋯ column, drawn only where rows carry a ⋯. */
+export type FeedColumns = { title: FeedColumn; slots?: FeedColumn[]; actions?: ReactNode }

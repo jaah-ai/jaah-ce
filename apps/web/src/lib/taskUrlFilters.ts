@@ -15,8 +15,8 @@ import { KNOWN_TASK_STATES } from '../generated/taskTransitions'
  * counts (`components/tasks/TaskToolbar.tsx`). Anything that only changes how rows are drawn is not here.
  */
 export type TaskUrlFilters = {
-  /** Free text, matched SERVER-SIDE as `?q=` (one case-insensitive phrase against title OR body, plus
-   *  task id / issue number when numeric) — so it finds rows outside the lazy window. Stored verbatim;
+  /** Free text, matched SERVER-SIDE as `?q=` (every word, case-insensitive and in any order, against
+   *  title, description and outcome, plus task id when numeric) — so it finds rows outside the lazy window. Stored verbatim;
    *  whitespace-only is blank everywhere (the server strips it), so `?q=+++` never sits over a `0` badge. */
   q: string
   /** The one ADDITIVE tick (hidden system rows + archived); still badged, since it changes which rows
@@ -28,22 +28,36 @@ export type TaskUrlFilters = {
    *  back does not blank what was typed. */
   dateFrom: string
   dateTo: string
-  /** Creator ids; EMPTY means every creator. Several picks are a UNION (repeatable `created_by_id=`). */
+  /** Assignee ids; EMPTY means every assignee. Several picks are a UNION (repeatable `assigned_to_id=`). */
+  assigneeIds: string[]
+  /** Creator ids (`GET /api/tasks/creators`, whose "System" id also matches rows with no recorded creator); EMPTY
+   *  means every creator. A UNION, like assignees (repeatable `creator=`). */
   creatorIds: string[]
-  /** Origin codes (`GET /api/tasks/sources`); EMPTY means every source. A UNION, like creators (repeatable `source=`). */
+  /** Origin codes (`GET /api/tasks/sources`); EMPTY means every source. A UNION, like assignees (repeatable `source=`). */
   sources: string[]
   /** One task state (`?state=` on `GET /api/tasks`), `''` for every state — so a bulk verb can
    *  reach exactly one project's drafts. A state the lifecycle does not name reads as `''`. */
   state: string
+  /** One persona slug (`?persona=` on `GET /api/tasks`), `''` for every persona. Single-valued: the API takes
+   *  one. Labelled by `components/tasks/personaRegistry.ts::personaLabel`, never shown as the slug. */
+  persona: string
+  /** An EXACT window over last activity, as ISO instants WITH an offset (`''` unset), sent verbatim as
+   *  `updated_after`/`updated_before` (both inclusive). What the command center's count links carry; while
+   *  either is set it overrides the Period choice (`lib/taskDateRange.ts::instantWindowBounds`). An inverted
+   *  pair reads as unset, like an inverted `Exact dates` pair. */
+  windowAfter: string
+  windowBefore: string
 }
 
 /* One frozen empty array for every read with no picks: the page keys fetch effects on this value and
    re-reads on every query-string change (e.g. the `?task=` strip), so a fresh `[]` would refetch for
    nothing. */
-const NO_CREATORS: string[] = []
-Object.freeze(NO_CREATORS)
+const NO_ASSIGNEES: string[] = []
+Object.freeze(NO_ASSIGNEES)
 const NO_SOURCES: string[] = []
 Object.freeze(NO_SOURCES)
+const NO_CREATORS: string[] = []
+Object.freeze(NO_CREATORS)
 
 /* Param names must not collide with `lib/taskDeepLink.ts`'s `task`/`project`, which are stripped on
    arrival and would erase a same-named filter. Constants shared by reader and writer: the writer DELETES
@@ -53,11 +67,26 @@ const HIDDEN_PARAM = 'hidden'
 const PERIOD_PARAM = 'period'
 const FROM_PARAM = 'from'
 const TO_PARAM = 'to'
-const CREATOR_PARAM = 'creator'
+const ASSIGNEE_PARAM = 'assignee'
 const SOURCE_PARAM = 'source'
+const CREATOR_PARAM = 'creator'
 const STATE_PARAM = 'state'
+const PERSONA_PARAM = 'persona'
+const AFTER_PARAM = 'after'
+const BEFORE_PARAM = 'before'
 
-const OWNED_PARAMS = [Q_PARAM, HIDDEN_PARAM, PERIOD_PARAM, FROM_PARAM, TO_PARAM, CREATOR_PARAM, SOURCE_PARAM, STATE_PARAM]
+/** Every param this module owns: the board's row filters (`lib/taskFilterStorage.ts` remembers them per scope). */
+export const OWNED_PARAMS = [
+  Q_PARAM, HIDDEN_PARAM, PERIOD_PARAM, FROM_PARAM, TO_PARAM, ASSIGNEE_PARAM, CREATOR_PARAM, SOURCE_PARAM,
+  STATE_PARAM, PERSONA_PARAM, AFTER_PARAM, BEFORE_PARAM,
+]
+
+/* A persona slug as the registry spells them (`apps/api/app/persona_registry.py`); anything else is no filter. */
+const PERSONA_SLUG = /^[a-z][a-z0-9_-]{0,63}$/
+
+/* An ISO-8601 instant that names its offset: an offset-less one would mean the viewer's zone here and UTC on
+   the server. Seconds and fractions optional. */
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:?\d{2})$/
 
 /* Strictly `1`; anything else is off (the wider board). */
 const HIDDEN_ON = '1'
@@ -71,19 +100,44 @@ export function readTaskUrlFilters(searchParams: URLSearchParams): TaskUrlFilter
     const raw = searchParams.get(key)
     return raw !== null && isDateInput(raw) ? raw : ''
   }
+  const assigneeIds = uniqueNonEmpty(searchParams.getAll(ASSIGNEE_PARAM))
   const creatorIds = uniqueNonEmpty(searchParams.getAll(CREATOR_PARAM))
   const sources = uniqueNonEmpty(searchParams.getAll(SOURCE_PARAM))
   const state = searchParams.get(STATE_PARAM) ?? ''
+  const persona = searchParams.get(PERSONA_PARAM) ?? ''
+  let windowAfter = readInstant(searchParams.get(AFTER_PARAM))
+  let windowBefore = readInstant(searchParams.get(BEFORE_PARAM))
+  if (windowAfter !== '' && windowBefore !== '' && Date.parse(windowAfter) > Date.parse(windowBefore)) {
+    windowAfter = ''
+    windowBefore = ''
+  }
   return {
     q: searchParams.get(Q_PARAM) ?? '',
     showHidden: searchParams.get(HIDDEN_PARAM) === HIDDEN_ON,
     dateRange: isTaskDateRangeId(period) ? period : DEFAULT_TASK_DATE_RANGE,
     dateFrom: dateInput(FROM_PARAM),
     dateTo: dateInput(TO_PARAM),
+    assigneeIds: assigneeIds.length === 0 ? NO_ASSIGNEES : assigneeIds,
     creatorIds: creatorIds.length === 0 ? NO_CREATORS : creatorIds,
     sources: sources.length === 0 ? NO_SOURCES : sources,
     state: isTaskStateFilter(state) ? state : '',
+    persona: PERSONA_SLUG.test(persona) ? persona : '',
+    windowAfter,
+    windowBefore,
   }
+}
+
+/* A hand-typed `+01:00` arrives as ` 01:00` (`+` is a space in a query string), so that one spelling is
+   repaired; anything else that is not an offset-bearing instant is no bound. */
+function readInstant(raw: string | null): string {
+  if (raw === null) return ''
+  const value = raw.replace(/ (\d{2}:?\d{2})$/, '+$1')
+  return isIsoInstant(value) ? value : ''
+}
+
+/** Whether `value` is an ISO-8601 instant with an offset that names a real moment. */
+export function isIsoInstant(value: string): boolean {
+  return ISO_INSTANT.test(value) && !Number.isNaN(Date.parse(value))
 }
 
 /**
@@ -108,9 +162,13 @@ export function writeTaskUrlFilters(
   }
   if (filters.dateFrom !== '' && isDateInput(filters.dateFrom)) params.set(FROM_PARAM, filters.dateFrom)
   if (filters.dateTo !== '' && isDateInput(filters.dateTo)) params.set(TO_PARAM, filters.dateTo)
+  for (const id of uniqueNonEmpty(filters.assigneeIds)) params.append(ASSIGNEE_PARAM, id)
   for (const id of uniqueNonEmpty(filters.creatorIds)) params.append(CREATOR_PARAM, id)
   for (const source of uniqueNonEmpty(filters.sources)) params.append(SOURCE_PARAM, source)
   if (isTaskStateFilter(filters.state)) params.set(STATE_PARAM, filters.state)
+  if (PERSONA_SLUG.test(filters.persona)) params.set(PERSONA_PARAM, filters.persona)
+  if (isIsoInstant(filters.windowAfter)) params.set(AFTER_PARAM, filters.windowAfter)
+  if (isIsoInstant(filters.windowBefore)) params.set(BEFORE_PARAM, filters.windowBefore)
   return params
 }
 
@@ -137,9 +195,13 @@ export function hasTaskUrlFilters(filters: TaskUrlFilters): boolean {
     filters.dateRange !== DEFAULT_TASK_DATE_RANGE ||
     filters.dateFrom !== '' ||
     filters.dateTo !== '' ||
+    filters.assigneeIds.length > 0 ||
     filters.creatorIds.length > 0 ||
     filters.sources.length > 0 ||
-    filters.state !== ''
+    filters.state !== '' ||
+    filters.persona !== '' ||
+    filters.windowAfter !== '' ||
+    filters.windowBefore !== ''
   )
 }
 

@@ -1,0 +1,58 @@
+# Wiz. Facts confirmed at the vendor's own documentation (win.wiz.io, the API reference behind sign-in): service
+# accounts of type Custom Integration (GraphQL API), a client-credentials token from the tenant's Authentication URL
+# with audience wiz-api, and the tenant's API Endpoint URL shown under Tenant Info. Public setup steps mirrored at
+# https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/wiz-audit-logs-source-setup .
+# Probed 2026-11-03: a bad client pair answers 401 at https://auth.app.wiz.io/oauth/token; an unauthenticated
+# GraphQL call answers 401 UNAUTHORIZED.
+slug = "wiz"
+label = "Wiz"
+category = "dev_tools"
+vendor_docs_url = "https://win.wiz.io/reference/prerequisites"
+summary = "Read Wiz issues, vulnerabilities and cloud inventory with a service account."
+
+[[auth]]
+kind = "service_account"
+fields = [
+  { key = "client_id", label = "Client ID", kind = "text", required = true, help = "Wiz > Settings > Access Management > Service Accounts > Add Service Account: name it Jaah, Type Custom Integration (GraphQL API), choose the API scopes (read:issues, read:vulnerabilities, read:resources for read-only use), select Add, then copy the Client ID" },
+  { key = "client_secret", label = "Client secret", kind = "secret", required = true, help = "Shown once, beside the Client ID when you create the service account: copy it before closing, or rotate the secret on the service account" },
+  { key = "api_endpoint", label = "API endpoint", kind = "url", required = true, placeholder = "https://api.us17.app.wiz.io", help = "Wiz > your profile icon > Tenant Info > General > API Endpoint URL, without the trailing /graphql (for example https://api.us17.app.wiz.io)" },
+]
+
+[test]
+method = "POST"
+path = "{api_endpoint}/graphql"
+body = '{"query":"{ __typename }"}'
+content_type = "application/json"
+host_suffixes = ["app.wiz.io"]
+accept = ""
+[test.token]
+url = "https://auth.app.wiz.io/oauth/token"
+client_id_field = "client_id"
+client_secret_field = "client_secret"
+audience = "wiz-api"
+
+[docs]
+agent_uses = [
+  "List open Wiz issues for a project or cloud account and summarize the critical ones",
+  "Look up the vulnerabilities on a container image, VM or package a task is about",
+  "Find which cloud resources an alert refers to, and their owners and tags",
+  "Check whether a fix removed an issue after a deploy",
+]
+prerequisites = [
+  "A Wiz tenant on the commercial cloud (app.wiz.io) and a Wiz role that may create service accounts (Global Admin, or a project admin for project-scoped accounts)",
+]
+limitations = [
+  "Read-only by design: give the service account only read scopes unless agents must resolve issues",
+  "A project-scoped service account sees only its projects' resources",
+  "Wiz for Government (wiz.us) tenants use a different sign-in host and are not supported by this connection yet",
+  "Wiz rate-limits API calls per service account; very large inventory queries must be paginated",
+]
+troubleshooting = [
+  { symptom = "Test says Wiz rejected the client ID and client secret (401)", fix = "The secret was rotated or mistyped, or the service account was deleted. Rotate the secret on the service account and select Replace on both values" },
+  { symptom = "Test says Wiz cannot be reached at that address", fix = "API endpoint is not your tenant's: copy it again from Tenant Info > General > API Endpoint URL, without /graphql" },
+  { symptom = "Test passes but agents get an authorization error on a query", fix = "The service account lacks that scope (for example read:vulnerabilities). Edit its scopes in Service Accounts" },
+]
+faq = [
+  { q = "What does the Test do", a = "It exchanges the client ID and secret for a token at Wiz's sign-in service, then sends the smallest possible GraphQL query to your tenant. No data is read" },
+  { q = "Which scopes should the service account have", a = "read:issues, read:vulnerabilities and read:resources cover investigation. Add write scopes only if agents should change issues" },
+]

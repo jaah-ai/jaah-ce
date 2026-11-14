@@ -1,0 +1,19 @@
+# The integration catalog's categories: the closed enum every vendor spec's `category` names, in the order
+# readers see them, each with its one label. This file is their single home: the catalog loader and
+# the integration docs generator both read it. Adding a category is one line here.
+[categories]
+dev_tools = "Developer tools"
+payments = "Payments and commerce"
+messaging = "Messaging and email"
+crm = "CRM and sales"
+productivity = "Productivity"
+data = "Data and analytics"
+search = "Search and scraping"
+ai_media = "AI and media"
+cloud = "Cloud providers"
+support = "Customer support"
+marketing = "Marketing, SEO and social"
+hr_other = "HR and other"
+cms = "Content management"
+mcp = "MCP servers"
+custom = "Custom"

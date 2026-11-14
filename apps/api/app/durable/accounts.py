@@ -24,7 +24,6 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone
 from collections.abc import Iterable
 from typing import Any
 
@@ -34,7 +33,8 @@ from fastapi import HTTPException
 from sqlalchemy import text
 
 from app import agent_providers
-from app.db import SessionLocal
+from app.clock import epoch_ms_or_none, utc_iso_or_none
+from app.db import BridgedSession
 from app.entity_shape import optional_uuid
 from app.login_seal_wire import is_wire_key, is_wire_sealed
 from app.tenancy import exclusion_log, seam
@@ -222,7 +222,7 @@ def dispatch(node_id: str, command_type: str, args: dict[str, Any]) -> dict[str,
         # An identity read, hence `identity_scope()` not `bind_from`: `bus_key` asks which socket a wire
         # value addresses and falls back to the raw value for an unregistered node, which `bind_from`
         # would refuse. The fail-closed decision is `commands.py::_dispatch`'s. One call wide on purpose.
-        with SessionLocal() as session:
+        with BridgedSession() as session:
             with seam.identity_scope():
                 bus_target = bus_key(session, node_id)
 
@@ -261,7 +261,7 @@ def ensure_row(
     step arguments are replayed, and a stale permission snapshot must not be; `principal_for_user`
     rebuilds it. `provider` (which agent CLI) is defaulted so a step recorded by an older release replays
     as Claude; `personal` (the account is the creator's own, G2) is last and defaulted to the org's
-    default for the same reason."""
+    default for the same reason. `born_shared` is unread, kept in position for the same contract."""
     from app.authz.principal import principal_for_user
     from app.models.identity import AdminUser
     from app.models.nodes import Node
@@ -269,7 +269,7 @@ def ensure_row(
     from app.routes.commands import _ensure_account_row
 
     # Attributed for `dispatch`'s reason.
-    with exclusion_log.caller("durable:accounts.ensure_row"), SessionLocal() as session:
+    with exclusion_log.caller("durable:accounts.ensure_row"), BridgedSession() as session:
         # The account belongs to the node's org; this DBOS thread has nothing bound. The wire `node_id`
         # is resolved under `identity_scope()` (as in `dispatch`), then `bind_from` binds its org.
         with seam.identity_scope():
@@ -310,9 +310,6 @@ def ensure_row(
             _ensure_account_row(
                 session, slug, result, enabled=enabled, node_id=node_id, principal=principal,
                 provider=provider,
-                # The CP's own record of asking for a shared mint, from persisted inputs; defaulted for
-                # replay.
-                born_shared=born_shared,
                 personal=personal,
             )
 
@@ -328,7 +325,7 @@ def lift_auth_rejection(slug: str, node_id: str) -> None:
     from app.node_identity import node_id_or_none
 
     try:
-        with exclusion_log.caller("durable:accounts.lift_auth_rejection"), SessionLocal() as session:
+        with exclusion_log.caller("durable:accounts.lift_auth_rejection"), BridgedSession() as session:
             with seam.identity_scope():
                 resolved_node = node_id_or_none(session, node_id)
             if resolved_node is None:
@@ -371,7 +368,7 @@ def drop_abandoned_row(slug: str, node_id: str) -> bool:
 
     if another_login_is_live():
         return False
-    with exclusion_log.caller("durable:accounts.drop_abandoned_row"), SessionLocal() as session:
+    with exclusion_log.caller("durable:accounts.drop_abandoned_row"), BridgedSession() as session:
         with seam.identity_scope():
             resolved_node = node_id_or_none(session, node_id)
         if resolved_node is None:
@@ -398,8 +395,7 @@ def drop_abandoned_row(slug: str, node_id: str) -> bool:
                 return False
             account_id = row.id
             session.delete(row)
-            emit_console_event(session, entity="account", id=account_id, action="deleted")
-            session.commit()
+            emit_console_event(session, entity="account", id=account_id, action="deleted", commit=True)
     log.info("abandoned sign-in %r on node %r: dropped its never-signed-in account row", slug, node_id)
     return True
 
@@ -461,11 +457,12 @@ def authenticate_account(
     restart. An Add-Account sign-in that ends without finishing then drops the roster row its first phase
     wrote (`drop_abandoned_row`), so a timed-out or failed sign-in leaves no never-signed-in account behind.
     Appended after every existing step, so an in-flight login recorded by an older release still replays."""
+    # `born_shared` is unused: still accepted, in position, because a login recorded before it stopped
+    # being sent replays with its recorded arguments.
     verdict: dict[str, Any] = {"ok": False}
     try:
         verdict = _authenticate(
-            slug, node_id, reauth, with_code, creator_user_id, new_account, provider, born_shared, peer_key,
-            personal,
+            slug, node_id, reauth, with_code, creator_user_id, new_account, provider, peer_key, personal,
         )
     finally:
         # Also on a raise, which ends a login as surely as a failed verdict. Not gated on `new_account`: the
@@ -482,7 +479,7 @@ def authenticate_account(
 def _authenticate(
     slug: str, node_id: str, reauth: bool, with_code: bool = True,
     creator_user_id: str | None = None, new_account: bool = True,
-    provider: str = agent_providers.DEFAULT_PROVIDER, born_shared: bool = False,
+    provider: str = agent_providers.DEFAULT_PROVIDER,
     peer_key: str | None = None, personal: bool = False,
 ) -> dict[str, Any]:
     """The login itself, run inside `authenticate_account`'s workflow.
@@ -494,11 +491,9 @@ def _authenticate(
         (`_declared_completion`). Kept in position so an older release's recorded inputs still replay.
       * `creator_user_id`: who the account may belong to (`authz.stamp_owner_on_create`); absent
         means the org's.
-      * `new_account` (True): create vs enrol, passed in (`routes/commands.py::_account_slug_is_new`)
-        because a replay after `ensure_row` would read it wrong.
+      * `new_account` (True): create vs enrol (`routes/commands.py::_account_slug_is_new`). Unread: the
+        node chooses the store and the roster row answers for an enrolment.
       * `provider`: which agent CLI; decides the node flag and the row's `provider`.
-      * `born_shared` (False): whether an old `jaahd` is told to mint on its share (the route's decision,
-        `routes/commands.py::enqueue_command`), passed in so a replay cannot drift.
       * `peer_key`: the wizard's per-login public key, required; the node seals the authorize
         URL to it and the code comes back sealed to the node's key. The `None` default only keeps the
         parameter in position for the recorded-input contract: a login without one is refused
@@ -516,14 +511,8 @@ def _authenticate(
         return {"ok": False, "error": "login_seal_required"}
     # The node seals the authorize URL to this key and mints its own for the code (`seal_key`).
     start_args: dict[str, Any] = {"slug": slug, "peer_key": peer_key}
-    # A creation sends `shared: true` to a node reporting a mounted share; enrolment and re-auth send nothing
-    # (the node reads the roster). Never `shared: false`: the node's override is one-way. The share flag
-    # is injected here because the workflow dispatches the start verb (`routes/commands.py::
-    # enqueue_command` is the argument's home); `new_account` keeps a retried creation from becoming an
-    # enrolment.
-    if not reauth and new_account and born_shared:
-        start_args["shared"] = True
-    # `reauth`/`new_account` still decide everything else; they no longer select a store.
+    # Nothing here names a store: the node mints on its share when one is mounted and reads an existing
+    # account's answer off the roster.
     if not agent_providers.implied_on_wire(provider):
         # Omitted for Claude: absence means `DEFAULT_PROVIDER` on both sides, keeping the payload
         # byte-identical for older daemons.
@@ -598,8 +587,9 @@ def _authenticate(
             # Ungated by `new_account`: an enrolment's insert loses to `ON CONFLICT DO NOTHING`. No
             # store is passed: phase 2 names none, and the insert only wins when phase 1 wrote no row,
             # where fail-closed `shared = false` is honest.
+            # The `False` fills `ensure_row`'s unread `born_shared` position.
             ensure_row(slug, reply.get("result") or {}, node_id, True, creator_user_id, provider,
-                       born_shared, personal)
+                       False, personal)
         lift_auth_rejection(slug, node_id)
         return {"ok": True, "config_dir": _login_config_dir(reply)}
     finally:
@@ -696,7 +686,7 @@ def _stored_auth_projection(workflow_id: str | None) -> dict[str, Any]:
             "report it"
         )
     schema = dbos_system_schema(engine)
-    with SessionLocal() as session:
+    with BridgedSession() as session:
         row = session.execute(
             text(
                 f'SELECT "value", "serialization" FROM "{schema}"."{_DBOS_EVENTS_TABLE}" '
@@ -741,9 +731,9 @@ def _node_payload(reply: dict[str, Any]) -> dict[str, Any]:
 def _login_config_dir(reply: dict[str, Any]) -> str | None:
     """`config_dir` out of a phase reply, via the existing single-home reader. A login reply carries no
     `oauth_url` to read (the link travels as `sealed_url`, read by `_sealed_login`)."""
-    from app.routes.commands import _config_dir_from_reply
+    from app.routes.commands import _reply_str
 
-    return _config_dir_from_reply((reply or {}).get("result"))
+    return _reply_str((reply or {}).get("result"), "config_dir")
 
 
 def _sealed_login(reply: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -930,7 +920,7 @@ def cancel_login(node_id: str, slug: str) -> bool:
 def start_login(
     command_type: str, node_id: str, slug: str, with_code: bool = True,
     creator_user_id: str | None = None, new_account: bool = True,
-    provider: str = agent_providers.DEFAULT_PROVIDER, born_shared: bool = False,
+    provider: str = agent_providers.DEFAULT_PROVIDER,
     peer_key: str | None = None, personal: bool = False,
 ) -> tuple[str, dict]:
     """Phase 1: start the workflow and answer with the (sealed) authorization URL.
@@ -939,12 +929,13 @@ def start_login(
     (`_ensure_account_row` reads `securestorage_dir`). `creator_user_id` (a string: a persisted input),
     `new_account`, `provider` and `peer_key` are relayed from the route, never re-decided, and defaulted
     like the workflow's parameters; `with_code` is kept in position for the recorded-input contract and
-    ignored (the declared mode decides)."""
+    ignored (the declared mode decides). The `False` handed to the workflow fills its unread
+    `born_shared` position."""
     workflow_id = login_workflow_id(node_id, slug, int(time.time() * 1000))
     with SetWorkflowID(workflow_id):
         DBOS.start_workflow(
             authenticate_account, slug, node_id, command_type == "account_reauth", with_code,
-            creator_user_id, new_account, provider, born_shared, peer_key, personal,
+            creator_user_id, new_account, provider, False, peer_key, personal,
         )
     published = _await_auth_event(workflow_id)
     if not isinstance(published, dict) or not published.get("sealed_url"):
@@ -1144,15 +1135,8 @@ def provisioning_records() -> list[dict[str, Any]]:
                 "user_code": user_code,
                 "status": state,
                 "error": error,
-                "started_at": _iso(workflow.created_at),
+                "started_at": utc_iso_or_none(epoch_ms_or_none(workflow.created_at or None)),
                 "node_id": node_id,
             }
         )
     return out
-
-
-def _iso(epoch_ms: int | None) -> str | None:
-    """DBOS records times as epoch milliseconds; `ProvisioningOut.started_at` is an ISO string."""
-    if not epoch_ms:
-        return None
-    return datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc).isoformat()

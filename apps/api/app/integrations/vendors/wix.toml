@@ -1,0 +1,57 @@
+slug = "wix"
+label = "Wix"
+category = "cms"
+vendor_docs_url = "https://dev.wix.com/docs/go-headless/authentication/admin/generate-an-api-key.md"
+summary = "Wix sites: agents manage site content, the CMS, stores and bookings through the Wix REST APIs."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "Sign in as the account owner or a co-owner and open the API Keys Manager (manage.wix.com/account/api-keys). Select Generate API Key, name it Jaah, choose the sites it may reach, tick the permissions agents need - including Site List read so Jaah can test it - and select Generate Key. Copy the key - Wix shows it once" },
+  { key = "account_id", label = "Account ID", kind = "text", required = true, help = "Shown on the right of the API Keys Manager page (manage.wix.com/account/api-keys), under Account ID" },
+]
+
+[test]
+method = "POST"
+path = "https://www.wixapis.com/site-list/v2/sites/query"
+body = '{"query":{"cursorPaging":{"limit":1}}}'
+auth = { field = "api_key", header = "Authorization" }
+field_headers = { "wix-account-id" = "account_id" }
+list_field = "sites"
+
+[docs]
+agent_uses = [
+  "List the sites in your Wix account and find their site IDs",
+  "Read and update collections in the Wix CMS (data collections)",
+  "Manage store products, inventory and orders on Wix Stores sites",
+  "Read and update blog posts, bookings and contacts, depending on the permissions the key carries",
+]
+prerequisites = [
+  "A Wix account where you are the owner or a co-owner: only they can create API keys",
+  "Decide which sites and permissions the key should carry; each key lists them when it is created",
+]
+limitations = [
+  "Site-level calls need the site's ID in a wix-site-id header instead of the account ID: agents find it with the site list or from the dashboard address (the part after /dashboard/)",
+  "A key reaches only the sites and permissions chosen when it was created",
+  "Headless (Wix Headless) projects are not listed by the default site query; agents must ask for them explicitly",
+]
+
+[[docs.troubleshooting]]
+symptom = "Test says Wix rejected the API key (401 or 403)"
+fix = "The key was mistyped or deleted, Account ID belongs to a different account, or the key lacks the Site List read permission. Check the Account ID on the API Keys Manager page, open the key there and tick Site List read, then test again"
+
+[[docs.troubleshooting]]
+symptom = "Generate API Key is missing from the API Keys Manager"
+fix = "Only the account owner and co-owners can create keys. Ask the owner to create it, or to make you a co-owner in Settings > Roles and Permissions"
+
+[[docs.troubleshooting]]
+symptom = "The test passes, but an agent gets 403 on a site"
+fix = "The key was not given access to that site or to the API the agent called. Open the key in the API Keys Manager and add the site and the permission, or generate a new key"
+
+[[docs.faq]]
+q = "Is this the same as a Wix app from the App Market?"
+a = "No. An API key gives agents direct access to your own account's sites. Apps published on the Wix App Market use a different sign-in that is not part of this integration"
+
+[[docs.faq]]
+q = "How do I revoke the key in Wix?"
+a = "Open the API Keys Manager and delete the Jaah key. Agents lose access on their next call"

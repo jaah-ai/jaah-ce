@@ -1,0 +1,41 @@
+# Stripe, over the hand-written `stripe` type (adopted, AS3: its fields and Test are unchanged). Facts confirmed at
+# the vendor's own docs: API keys, restricted keys and publishable keys https://docs.stripe.com/keys ; restricted
+# keys https://docs.stripe.com/keys/restricted-api-keys
+slug = "stripe"
+label = "Stripe"
+category = "payments"
+credential_type = "stripe"
+vendor_docs_url = "https://docs.stripe.com/keys"
+summary = "Read and manage Stripe customers, payments, subscriptions and products."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "secret_key", label = "Secret or restricted key", kind = "secret", required = true, placeholder = "rk_live_...", help = "Stripe Dashboard > Developers > API keys > Create restricted key: name it Jaah, give Read (or Write) on only the resources agents need, select Create key, then copy it. A test-mode key (rk_test_ or sk_test_) is safest for development" },
+  { key = "publishable_key", label = "Publishable key", kind = "text", required = true, placeholder = "pk_live_...", help = "Stripe Dashboard > Developers > API keys > Standard keys > Publishable key, from the same mode (live or test) as the secret key" },
+]
+
+[docs]
+agent_uses = [
+  "Look up a customer, their payments, invoices and subscriptions to answer a support question",
+  "Create products, prices and payment links when building a checkout",
+  "Read failed payments and disputes to investigate a billing issue",
+  "Use test-mode keys to build and test a payment flow end to end",
+]
+prerequisites = [
+  "A Stripe account and the Administrator or Developer role to create API keys",
+]
+limitations = [
+  "A restricted key does exactly what its permissions allow; agents get a permission error elsewhere",
+  "Live and test mode keys reach separate data: a test key never touches real payments",
+  "Stripe rate-limits API calls (about 100 a second in live mode, 25 in test mode)",
+]
+troubleshooting = [
+  { symptom = "Test says Stripe rejected the key (401)", fix = "The key was rolled, deleted or mistyped. Create a new restricted key and select Replace" },
+  { symptom = "Test passes but agents get a permission error", fix = "The restricted key lacks that resource. Edit its permissions in Developers > API keys" },
+  { symptom = "Agents cannot find a payment you can see in the Dashboard", fix = "The key is from the other mode. Live payments need a live key, test ones a test key" },
+]
+faq = [
+  { q = "Secret key or restricted key", a = "A restricted key: it limits agents to what they need, and you can revoke it without affecting your app" },
+  { q = "Why the publishable key", a = "Agents building a checkout need it in client-side code. It is public by design" },
+]

@@ -1,0 +1,53 @@
+# Snowflake: a programmatic access token on the SQL API; the Test runs `SELECT 1`.
+slug = "snowflake"
+label = "Snowflake"
+category = "data"
+vendor_docs_url = "https://docs.snowflake.com/en/developer-guide/sql-api/authenticating"
+summary = "Let agents run SQL against your Snowflake account through its SQL API."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "account", label = "Account identifier", kind = "text", required = true, placeholder = "myorg-myaccount", help = "In Snowsight, select your name (bottom left) > Connect a tool to Snowflake > Account/Server URL tab: copy the Account Identifier, written orgname-accountname (a hyphen, not a dot; write any underscore in the account name as a hyphen)" },
+  { key = "token", label = "Programmatic access token", kind = "secret", required = true, help = "In Snowsight, open Governance & security > Users & roles, select the agents' user > Programmatic access tokens > Generate new token; choose the role agents should use and an expiry, then copy the token (it is shown once)" },
+  { key = "warehouse", label = "Warehouse", kind = "text", required = false, placeholder = "COMPUTE_WH", help = "The warehouse agents run queries on (Snowsight > Compute > Warehouses); blank uses the user's default warehouse" },
+  { key = "role", label = "Role", kind = "text", required = false, placeholder = "ANALYST", help = "The role to run queries as; blank uses the token's role" },
+]
+
+[test]
+method = "POST"
+path = "https://{account}.snowflakecomputing.com/api/v2/statements"
+body = '{"statement": "SELECT 1", "timeout": 10}'
+auth = { field = "token", header = "Authorization", prefix = "Bearer" }
+headers = { "X-Snowflake-Authorization-Token-Type" = "PROGRAMMATIC_ACCESS_TOKEN" }
+list_field = "data"
+
+[docs]
+agent_uses = [
+  "Run read-only SQL to answer questions about your data, for example revenue by month or the newest sign-ups",
+  "Inspect databases, schemas, tables and column types before writing a migration or a dbt model",
+  "Check that a pipeline loaded today's rows, and report the counts in the task",
+  "Run the SQL an agent wrote for a report and attach the result",
+]
+prerequisites = [
+  "A Snowflake user that may create a programmatic access token. Snowflake requires the user to be covered by a network policy before it issues one, unless an admin has relaxed that rule for the user.",
+  "A role for agents, granted USAGE on the warehouse and SELECT on what they should read. Grant no more: the token can do whatever that role can.",
+  "Your account identifier in the orgname-accountname form. The older locator form with a region (xy12345.us-east-1) does not fit this field.",
+]
+limitations = [
+  "Jaah tests with `SELECT 1`. It proves the token and account are right, not that the role can read a given table.",
+  "Only programmatic access tokens are supported here. Key-pair (JWT) and OAuth sign-in to Snowflake are not.",
+  "A programmatic access token expires (15 days by default, at most a year, as the admin set). Rotate it before then.",
+  "Queries run on a warehouse and use its credits. Give agents a small warehouse with auto-suspend.",
+]
+troubleshooting = [
+  { symptom = "Test says Snowflake rejected the programmatic access token (401)", fix = "Generate a new token: it may have expired or been revoked. Check that the user is covered by a network policy that allows Jaah's address, which Snowflake requires before it accepts a token" },
+  { symptom = "Test says the account identifier must be a single name", fix = "Use the orgname-accountname form from Connect a tool to Snowflake, with a hyphen. Do not paste the whole URL or the locator with a region" },
+  { symptom = "Test says Snowflake returned HTTP 422", fix = "Snowflake could not run SELECT 1, most often because the user has no default warehouse. Set one with ALTER USER USER_NAME SET DEFAULT_WAREHOUSE = WAREHOUSE_NAME and grant the token's role USAGE on it" },
+  { symptom = "Test passes but a query fails with 'No active warehouse selected'", fix = "Fill in Warehouse, or set a default warehouse on the user with ALTER USER USER_NAME SET DEFAULT_WAREHOUSE = WAREHOUSE_NAME" },
+  { symptom = "A query fails with 'does not exist or not authorized'", fix = "Grant the token's role USAGE on the database and schema and SELECT on the table, then try again" },
+]
+faq = [
+  { q = "Can agents change data?", a = "Only if the token's role may. Use a role with SELECT grants only to keep agents read-only" },
+  { q = "Which Snowflake regions and clouds work?", a = "All of them. The account identifier already says where the account lives" },
+]

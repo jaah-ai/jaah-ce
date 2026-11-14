@@ -1,0 +1,50 @@
+# WooCommerce REST API v3: the consumer key and secret as HTTP Basic over https, at the store's own address (a tenant
+# URL, dialled only at a vetted public address).
+slug = "woocommerce"
+label = "WooCommerce"
+category = "payments"
+vendor_docs_url = "https://woocommerce.github.io/woocommerce-rest-api-docs/#authentication"
+summary = "Read and update a WooCommerce store's orders, products, customers and coupons."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "store_url", label = "Store URL", kind = "url", required = true, placeholder = "https://shop.example.com", help = "Your WordPress site's https address, the one customers visit, without /wp-admin. If WordPress lives in a folder, include it, such as https://example.com/shop" },
+  { key = "consumer_key", label = "Consumer key", kind = "secret", required = true, help = "In WordPress, open WooCommerce > Settings > Advanced > REST API and select Add key. Enter Jaah as the description, pick an administrator or shop manager as the user, set Permissions to Read (or Read/Write if agents must change orders or products) and select Generate API key. Copy the Consumer key, which starts with ck_" },
+  { key = "consumer_secret", label = "Consumer secret", kind = "secret", required = true, help = "Shown on the same screen as the consumer key, right after Generate API key, and starts with cs_. WooCommerce shows it only once: if you lost it, revoke the key and generate a new one" },
+]
+
+# The store's currency: a tiny read-only object any key whose user manages the store may read.
+[test]
+method = "GET"
+path = "{store_url}/wp-json/wc/v3/data/currencies/current"
+auth = { basic = ["consumer_key", "consumer_secret"] }
+identity = [["code"]]
+identity_phrase = "- store currency"
+
+[docs]
+agent_uses = [
+  "Look up an order, its items, customer and shipping state when a support task names an order number",
+  "List products that are out of stock or missing prices, images or categories, and report them",
+  "Change an order's status, add an order note, or update a product's stock or price (needs a Read/Write key)",
+  "Pull orders and refunds for a date range to build a sales or tax report",
+]
+prerequisites = [
+  "A WordPress site with WooCommerce 3.5 or later, served over https and reachable from the internet",
+  "A WordPress administrator who can open WooCommerce > Settings > Advanced > REST API",
+  "Permalinks set to anything but Plain (Settings > Permalinks): the REST API does not answer with Plain permalinks",
+]
+limitations = [
+  "Agents act as the WordPress user the key was created for: they can do only what that user can, and the key stops working if the user is deleted",
+  "A Read key cannot change anything; agents get 401 on every write",
+  "Hosts that cache or firewall /wp-json (some security plugins do) can block agents even when Test passes",
+]
+troubleshooting = [
+  { symptom = "Test says WooCommerce rejected the consumer secret (401)", fix = "The key was revoked, its user was deleted or lost the manage WooCommerce right, or the pair was mistyped. Generate a new key in WooCommerce > Settings > Advanced > REST API and select Replace" },
+  { symptom = "Test fails with 401 and the key is right", fix = "The host strips the Authorization header before WordPress sees it (common with FastCGI). Ask the host to pass it through, or add SetEnvIf Authorization \"(.*)\" HTTP_AUTHORIZATION=$1 to the site's .htaccess" },
+  { symptom = "Test fails with 404 or says WooCommerce answered, but not with an API response", fix = "Permalinks are set to Plain, or Store URL is not the site root. Choose Post name in Settings > Permalinks and check Store URL has no /wp-admin" },
+]
+faq = [
+  { q = "Read or Read/Write", a = "Read when agents only report or answer questions; Read/Write when tasks must change orders, products or coupons" },
+  { q = "Does Test change anything in my store", a = "No. It reads the store's currency and nothing else" },
+]

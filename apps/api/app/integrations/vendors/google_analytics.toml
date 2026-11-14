@@ -1,0 +1,65 @@
+# Google Analytics (GA4) through the Analytics Admin and Data APIs. OAuth only: Google offers no API key for
+# private analytics data. Confirmed 2026-11-03 at the vendor_docs_url page (accountSummaries.list, scopes).
+slug = "google_analytics"
+label = "Google Analytics"
+category = "marketing"
+vendor_docs_url = "https://developers.google.com/analytics/devguides/config/admin/v1/rest/v1beta/accountSummaries/list"
+summary = "Read Google Analytics 4 properties, traffic and conversion reports."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+authorize_extra = { access_type = "offline", prompt = "consent" }
+scopes = [
+  { name = "https://www.googleapis.com/auth/analytics.readonly", label = "Read your Analytics accounts, properties and reports, so agents can answer traffic and conversion questions. Read only: agents cannot change settings" },
+]
+jaah_app = true
+[auth.oauth.registration]
+console_url = "https://console.cloud.google.com/auth/clients"
+steps = [
+  "One Google Cloud OAuth client can serve every Jaah Google integration. If the Jaah Google Search Console app is already registered, reuse its project and client: add the scope below under Google Auth Platform > Data access, skip to the redirect URI step, and pick the same oauth_app secret in this vendor's knob",
+  "In the Google Cloud console project picker, select or create the project named jaah-integrations",
+  "Open APIs & Services > Library, search for Google Analytics Admin API and select Enable, then do the same for Google Analytics Data API",
+  "Open Google Auth Platform > Branding. Set App name to Jaah, the user support email to the shared support mailbox, Application home page to the public homepage of the company that runs this Jaah (its https address), Privacy policy and Terms of service to that company's privacy policy and terms pages, and add its domain under Authorized domains. Select Save",
+  "Open Google Auth Platform > Audience. Choose External, then select Publish app so the app is In production rather than Testing (Testing refresh tokens expire after 7 days)",
+  "Open Google Auth Platform > Data access, select Add or remove scopes, tick .../auth/analytics.readonly and select Update, then Save",
+  "Open Google Auth Platform > Clients, select Create client, choose Application type Web application and name it Jaah. This client is the OAuth app: the redirect URIs (a later step) go under its Authorized redirect URIs, then select Create",
+]
+review = "Google verification: analytics.readonly is listed under Data access; if Google marks it sensitive, submit the app in Google Auth Platform > Verification Center. Until verified, members see an unverified-app warning and the app is capped at 100 users"
+
+[test]
+method = "GET"
+path = "https://analyticsadmin.googleapis.com/v1beta/accountSummaries?pageSize=1"
+identity = [["accountSummaries", 0, "displayName"]]
+identity_phrase = "with account"
+
+[docs]
+revoke_at = "your Google Account > Security > Your connections to third-party apps & services (myaccount.google.com/connections)"
+agent_uses = [
+  "List the Analytics accounts and GA4 properties the connected Google account can see",
+  "Run Data API reports: sessions, users, page views, events and conversions by date, page, source or country",
+  "Compare a period against the previous one to check whether a release or a campaign moved traffic",
+  "Read realtime reports to confirm a new page or event is firing after a deploy",
+]
+prerequisites = [
+  "A Google account with at least Viewer access to the Google Analytics 4 property agents should read (Admin > Property access management in Google Analytics)",
+  "A GA4 property. Universal Analytics properties stopped processing data in 2024 and are not supported by these APIs",
+]
+limitations = [
+  "Read only: agents cannot create properties, edit data streams, change conversions or manage users",
+  "Reports follow Google's Data API quotas per property (tokens per hour and per day); a busy agent can hit them and must wait",
+  "Data is subject to Google's own processing delay: standard reports can lag by up to a day, realtime covers the last 30 minutes",
+]
+troubleshooting = [
+  { symptom = "Test says Google Analytics rejected the access token (401)", fix = "The grant was revoked at myaccount.google.com > Security > Third-party apps, or the password changed. Select Reconnect and approve again" },
+  { symptom = "Test says Connected to Google Analytics - credentials accepted, with no account named", fix = "The connected Google account has no Analytics access. In Google Analytics open Admin > Account access management and add that account as a Viewer, then test again" },
+  { symptom = "An agent gets 403 PERMISSION_DENIED on one property", fix = "The account can see other properties but not this one. Add it under Admin > Property access management for that property" },
+  { symptom = "Google shows This app isn't verified during Connect", fix = "This Jaah's Google app is still in verification. Select Advanced > Go to Jaah to continue, or connect with your own OAuth app" },
+]
+faq = [
+  { q = "Which Google account should I connect", a = "One that can read the properties agents need. A shared analytics account is better than a personal one, because the connection stops working if that person leaves" },
+  { q = "Can agents see personal data about visitors", a = "No. The Data API returns aggregated reports only; Google Analytics does not expose individual visitors through it" },
+  { q = "Does this connection also cover Search Console", a = "No. Google Search Console is its own integration with its own scope; connect it separately" },
+]

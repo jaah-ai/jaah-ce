@@ -1,4 +1,4 @@
-// The Task page's navigation inputs: what `location.state` and `?persona=&project_id=` hand a create.
+// The Task page's navigation inputs: what `location.state`, `?persona=&project_id=` and `?ticket=` hand a create.
 import { useState } from 'react'
 import { useLocation, useSearchParams } from 'react-router-dom'
 import { readTaskPrefillParams } from '../../components/tasks/taskPrefill'
@@ -6,6 +6,13 @@ import { duplicateSourceId, type NewTaskNavState } from '../../lib/taskDuplicate
 import { isUuidShaped } from '../../lib/uuidShape'
 
 export type TaskDetailNavState = ReturnType<typeof useTaskDetailNavState>
+
+/** `?ticket=<id>`: the ticket page's Create task (`TaskCreateView` seeds from the ticket and links the create
+ *  back to it). Digits only; anything else is no ticket, the ordinary blank form. */
+export function readTicketSeedParam(params: URLSearchParams): number | null {
+  const raw = params.get('ticket')
+  return raw !== null && /^\d+$/.test(raw) && Number(raw) > 0 ? Number(raw) : null
+}
 
 /** A project id as navigation state may carry one: a positive integer. `location.state` is untrusted. */
 function isProjectIdShaped(value: unknown): value is number {
@@ -30,8 +37,8 @@ export function useTaskDetailNavState(isCreate: boolean, isChat: boolean) {
   const rawBoardProject: unknown = navState?.boardProjectId
   const boardProjectId: number | null = isProjectIdShaped(rawBoardProject) ? rawBoardProject : null
   /* …and the board's FEATURE scope (`navState.boardFeatureId`, `Tasks.tsx`'s ⤢): the create files there when the
-     tree confirms it is active and in the resolved project (the seed effect below). Shape-checked
-     (`isUuidShaped`); anything else is "No feature". */
+     tree confirms it is in the resolved project (the seed effect below). Shape-checked (`isUuidShaped`); anything
+     else files in the project alone. */
   const rawFeatureScope: unknown = navState?.boardFeatureId
   /* …and the composer's own "Change" pick (`navState.filingTarget`), which outranks both: ⤢ must file where the
      row said it would. Shape-checked; the seeds below re-check it against the projects, grants and tree. */

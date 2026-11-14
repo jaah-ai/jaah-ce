@@ -1,7 +1,8 @@
 """One-click unsubscribe from non-essential system mail (RFC 8058; PRD R6).
 
 An optional email (a notification event: a mention, a merge-lane notice, a budget warning... — never an essential
-type, `email_templates.TemplateType.essential`) names its recipient and event as an `UnsubscribeTarget`. Its link is
+type, `email_templates.TemplateType.essential`) names its recipient, channel and event as an `UnsubscribeTarget`. Its
+link is
 `{HOOKS_PUBLIC_BASE_URL}/api/public/email/unsubscribe/<token>`: the token is the target signed with the operator's
 keyring (`email_unsubscribe_credential_id` -> an `email_unsubscribe_secret` credential: `current_secret`, and
 `previous_secret` so links already sent survive a rotation), salted, with no expiry. The message carries it three ways
@@ -9,8 +10,10 @@ from one URL: `List-Unsubscribe` + `List-Unsubscribe-Post: List-Unsubscribe=One-
 footer link (`email_templates._layout`).
 
 The public route (`routes/public.py`) shows a confirm page on GET — a link scanner never unsubscribes anyone — and on
-POST turns Email off for that event alone (`preferences.NotificationEventPreference.email`), with no sign-in; the
-switch shows on Profile > Alerts. A blank hooks URL or keyring sends optional mail with neither headers nor link,
+POST turns that event off on that Email channel alone (its settings, `notification_catalog`), with no sign-in; the
+switch shows on Profile > Alerts. A version-2 token names the channel (`{u, c, e, v: 2}`); a version-1 one, sent
+before channels, names only the membership: it turns the event off on the account-email channel, else on every Email
+channel of that membership. A blank hooks URL or keyring sends optional mail with neither headers nor link,
 never a dead one; on a deployed environment that is a fault (`problem`).
 """
 from __future__ import annotations
@@ -32,7 +35,9 @@ log = logging.getLogger("app.email_unsubscribe")
 SETTING_KEY = "email_unsubscribe_credential_id"
 CREDENTIAL_TYPE = "email_unsubscribe_secret"
 _SALT = "email-unsubscribe"
-_VERSION = 1
+_VERSION = 2
+#: Tokens signed before channels existed: `{u, e, v: 1}`, still honoured.
+_LEGACY_VERSION = 1
 PATH = "/api/public/email/unsubscribe"
 #: RFC 8058's one body a one-click POST carries.
 ONE_CLICK_BODY = "List-Unsubscribe=One-Click"
@@ -43,10 +48,12 @@ KEY_MIN = 32
 
 @dataclass(frozen=True)
 class UnsubscribeTarget:
-    """Whose preference one click turns off (`user_id`) and for which notification event (`event`)."""
+    """Whose channel one click turns off (`user_id`, `channel_id`) and for which notification event (`event`).
+    `channel_id` None: a version-1 token, or a message with no channel row."""
 
     user_id: UUID
     event: str
+    channel_id: Optional[UUID] = None
 
 
 # The opened keyring per designation, for `_KEYRING_TTL_S`: opening the credential decrypts it and lands a
@@ -102,7 +109,11 @@ def token_for(target: UnsubscribeTarget) -> Optional[str]:
     keys = _keyring()
     if not keys:
         return None
-    return _serializer(keys).dumps({"u": str(target.user_id), "e": target.event, "v": _VERSION})
+    if target.channel_id is None:
+        return _serializer(keys).dumps({"u": str(target.user_id), "e": target.event, "v": _LEGACY_VERSION})
+    return _serializer(keys).dumps(
+        {"u": str(target.user_id), "c": str(target.channel_id), "e": target.event, "v": _VERSION}
+    )
 
 
 def verify(token: str) -> Optional[UnsubscribeTarget]:
@@ -114,13 +125,21 @@ def verify(token: str) -> Optional[UnsubscribeTarget]:
         payload = _serializer(keys).loads(token)
     except BadSignature:
         return None
-    if not isinstance(payload, dict) or payload.get("v") != _VERSION or not isinstance(payload.get("e"), str):
+    if not isinstance(payload, dict) or not isinstance(payload.get("e"), str):
         return None
     user_id = optional_uuid(payload.get("u"))
-    return UnsubscribeTarget(user_id=user_id, event=payload["e"]) if user_id is not None else None
+    if user_id is None:
+        return None
+    if payload.get("v") == _LEGACY_VERSION:
+        return UnsubscribeTarget(user_id=user_id, event=payload["e"])
+    channel_id = optional_uuid(payload.get("c"))
+    if payload.get("v") != _VERSION or channel_id is None:
+        return None
+    return UnsubscribeTarget(user_id=user_id, event=payload["e"], channel_id=channel_id)
 
 
-def _base_url() -> str:
+def public_base_url() -> str:
+    """The hooks edge's origin, where the public mail-link pages are served; blank on a stack without one."""
     from app.config import get_settings
 
     return get_settings().hooks_public_base_url.rstrip("/")
@@ -129,11 +148,11 @@ def _base_url() -> str:
 def url_for(target: Optional[UnsubscribeTarget]) -> Optional[str]:
     """The one-click link for `target`, or None: no target (essential mail), an event nobody may turn off (a page),
     no hooks edge or no signing key. None sends the message without headers or footer link."""
-    from app.preferences import NOTIFICATION_EVENTS
+    from app import notification_catalog
 
-    if target is None or target.event not in NOTIFICATION_EVENTS:
+    if target is None or notification_catalog.event_for(target.event) not in notification_catalog.EVENTS:
         return None
-    base = _base_url()
+    base = public_base_url()
     if not base:
         return None
     token = token_for(target)
@@ -154,7 +173,7 @@ def problem() -> Optional[str]:
 
     if not os.environ.get(system_mail.DOMAIN_VARIABLE, "").strip():
         return None
-    if not _base_url():
+    if not public_base_url():
         return "HOOKS_PUBLIC_BASE_URL is blank, so notifications go out without an unsubscribe link"
     if not _keyring():
         return (
@@ -165,27 +184,40 @@ def problem() -> Optional[str]:
 
 
 def unsubscribe(target: UnsubscribeTarget) -> None:
-    """Turn Email off for `target.event` on `target.user_id`'s membership, and commit. Idempotent; a membership that
-    is gone is nothing to do. Under `seam.identity_scope()`: the public route binds no org."""
-    from app.db import SessionLocal
+    """Turn `target.event` off on the Email channel the token names (a version-1 token: the account-email channel,
+    else every Email channel of the membership), and commit. Idempotent; a membership or channel that is gone is
+    nothing to do. Under `seam.identity_scope()`: the public route binds no org."""
+    from app import notification_catalog, notification_channels
+    from app.db import BridgedSession
     from app.models.identity import AdminUser
-    from app.preferences import UserPreferences, preferences_to_store
     from app.tenancy import seam
 
-    with seam.identity_scope(), SessionLocal() as session:
-        user = session.get(AdminUser, target.user_id, with_for_update=True)
+    event = notification_catalog.event_for(target.event)
+    if event is None:
+        return
+    with seam.identity_scope(), BridgedSession() as session:
+        user = session.get(AdminUser, target.user_id)
         if user is None:
             return
-        prefs = UserPreferences.from_stored(user.preferences)
-        events = prefs.notifications.events
-        current = events.get(target.event)
-        if current is None or not current.email:
+        emails = notification_channels.channels_of(session, user, notification_channels.EMAIL)
+        if target.channel_id is not None:
+            chosen = [row for row in emails if row.id == target.channel_id]
+        else:
+            chosen = [row for row in emails if row.account_email] or emails
+        changed = False
+        for row in chosen:
+            settings = row.settings if isinstance(row.settings, dict) else {}
+            if (settings.get("events") or {}).get(event) == notification_catalog.OFF:
+                continue
+            row.settings = {
+                "groups": dict(settings.get("groups") or {}),
+                "events": {**(settings.get("events") or {}), event: notification_catalog.OFF},
+            }
+            changed = True
+        if not changed:
             return
-        events = {**events, target.event: current.model_copy(update={"email": False})}
-        prefs = prefs.model_copy(update={"notifications": prefs.notifications.model_copy(update={"events": events})})
-        user.preferences = preferences_to_store(prefs, user.preferences)
         session.commit()
-    log.info("email unsubscribe: user %s turned Email off for %s", target.user_id, target.event)
+    log.info("email unsubscribe: user %s turned %s off on %d Email channel(s)", target.user_id, event, len(chosen))
 
 
 # ── The pages the public route answers with ─────────────────────────────────────────────────────────────────
@@ -205,10 +237,10 @@ _PAGE_STYLE = (
 )
 
 
-def _profile_alerts_url() -> str:
-    from app.config import get_settings
+def profile_alerts_url() -> str:
+    from app.config import console_url
 
-    return f"{get_settings().frontend_url.rstrip('/')}/profile?tab=notifications"
+    return console_url("/profile?tab=notifications")
 
 
 def page(kind: str, nonce: str) -> str:
@@ -216,10 +248,8 @@ def page(kind: str, nonce: str) -> str:
     verify), as a whole HTML document."""
     import html
 
-    from app import email_templates as t
-
     esc = html.escape
-    alerts = f'<a href="{esc(_profile_alerts_url(), quote=True)}">Profile &gt; Alerts</a>'
+    alerts = f'<a href="{esc(profile_alerts_url(), quote=True)}">Profile &gt; Alerts</a>'
     if kind == "confirm":
         title = "Unsubscribe"
         body = (
@@ -243,6 +273,18 @@ def page(kind: str, nonce: str) -> str:
             "<p>It may be incomplete. Copy the whole link from the email, or change what Jaah emails you "
             f"in {alerts}.</p>"
         )
+    return page_document(title, body, nonce)
+
+
+def page_document(title: str, body: str, nonce: str) -> str:
+    """One public mail-link page — `title` (text) and `body` (HTML the caller escaped) in the mail's own card — as a
+    whole HTML document, served with `page_headers(nonce)`. The emailed confirm-address link answers with it too
+    (`app/notification_emails.py`)."""
+    import html
+
+    from app import email_templates as t
+
+    esc = html.escape
     style = _PAGE_STYLE.format(
         paper=t._PAPER, font=t._FONT, ink=t._INK, accent=t._ACCENT, rule=t._RULE, muted=t._MUTED,
     )

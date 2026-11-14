@@ -15,7 +15,7 @@ export default function FeatureIcon({
   inline = false,
 }: {
   icon: string | null | undefined
-  size?: number
+  size?: number | string
   testId?: string
   inline?: boolean
 }) {
@@ -35,7 +35,7 @@ export default function FeatureIcon({
         height: size,
         display: inline ? 'inline-block' : 'block',
         flex: '0 0 auto',
-        ...(inline && { verticalAlign: 'middle', mr: '0.4em', position: 'relative', top: '-0.06em' }),
+        ...(inline && { verticalAlign: 'middle', mr: 0.5 }),
         color: featureIconColour(colour, 'light'),
         ...theme.applyStyles('dark', { color: featureIconColour(colour, 'dark') }),
       })}

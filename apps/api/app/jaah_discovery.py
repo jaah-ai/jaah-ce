@@ -20,15 +20,15 @@ import asyncio
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app import node_presence
-from app.clock import as_utc
-from app.db import SessionLocal
+from app.clock import as_utc, utcnow
+from app.db import BridgedSession
 from app.events import emit_console_event
 from app.models.nodes import Node
 from app.node_identity import ids_by_wire_value, node_org
@@ -118,7 +118,7 @@ def status_and_last_seen(
     if persisted is None:
         return "unknown", None
     seen = as_utc(persisted)
-    if ((now or datetime.now(timezone.utc)) - seen).total_seconds() < RECONNECT_GRACE_SECONDS:
+    if ((now or utcnow()) - seen).total_seconds() < RECONNECT_GRACE_SECONDS:
         return "online", persisted.isoformat()
     return "offline", persisted.isoformat()
 
@@ -138,7 +138,7 @@ def _sync_roster(node_id: str) -> bool:
     # machine keys, not tenant choices. `detached()` so a future org-bound caller does not make
     # `operator_scope()` raise inside a heartbeat.
     with seam.detached(), seam.operator_scope():
-        session = SessionLocal()
+        session = BridgedSession()
         try:
             # The wire resolver: a machine key, and a name-only lookup would report every node
             # as unregistered.
@@ -148,7 +148,7 @@ def _sync_roster(node_id: str) -> bool:
                     update(Node)
                     # Keyed on the resolved id so a uuid-spelled key matches its row.
                     .where(Node.id == registered[node_id])
-                    .values(last_seen=datetime.now(timezone.utc))
+                    .values(last_seen=utcnow())
                 )
             node_presence.touch(session, node_id)
             session.commit()
@@ -286,12 +286,12 @@ def _notify_node_change(node_id: str) -> None:
     context binds no org and an unbound read would resolve no node. Blocking: async callers go through
     `_notify_node_change_off_loop`."""
     with seam.detached(), seam.operator_scope():
-        session = SessionLocal()
+        session = BridgedSession()
         try:
             emit_console_event(
                 session, entity="node", id=0, action="upserted", org_id=node_org(session, node_id),
+                commit=True,
             )
-            session.commit()
         except Exception:
             session.rollback()
             raise

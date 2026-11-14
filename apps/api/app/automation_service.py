@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID
 
@@ -46,11 +46,11 @@ from app.automations import (
     STATUS_PAUSED,
     TARGET_KINDS,
     TARGET_MODES,
-    TARGET_NODES,
     TARGET_PROJECTS,
     WHEN_EVENT,
     WHEN_SCHEDULE,
 )
+from app.clock import utcnow
 from app.cron_schedule import CronScheduleError, describe_schedule_short
 from app.crons import (
     RUN_OUTCOME_ACTED,
@@ -59,14 +59,19 @@ from app.crons import (
     RUN_OUTCOME_NOOP,
     RUN_OUTCOME_SKIPPED,
     SKIP_ALREADY_RUNNING,
+    SKIP_CREDENTIAL_ROTATING,
+    SKIP_PREVIOUS_TASK_OPEN,
 )
-from app.entity_shape import add_with_org_slug, float_or_none, get_or_404, new_uuid7
+from app.entity_shape import (
+    add_with_org_slug, commit_row, float_or_none, get_or_404, new_uuid7, optional_uuid, refused_as,
+)
 from app.models.automations import Automation, AutomationRunTarget, Cron, CronRun, TaskTrigger, TriggerDelivery
 from app.triggers import (
     DEDUPED,
     DISPATCHED,
     FAILED,
     FILTERED,
+    HELD,
     QUEUED,
     RATE_CAPPED,
     SKIPPED,
@@ -102,7 +107,18 @@ LAST_RUN_OUTCOMES: tuple[str, ...] = (
 # A delivery state that already came to nothing (`triggers.py`'s logged non-dispatch outcomes) reads `skipped`.
 _SKIPPED_DELIVERY_STATES = (SKIPPED, FILTERED, DEDUPED, RATE_CAPPED, UNMATCHED)
 # A delivery not yet settled — the transient states plus a queued one waiting its turn — reads `pending`.
-_PENDING_DELIVERY_STATES = TRANSIENT_STATES + (QUEUED,)
+_PENDING_DELIVERY_STATES = TRANSIENT_STATES + (QUEUED, HELD)
+# A problem run (`problem_streak`): a schedule's error, missed occurrence, or a skip that means it could not run
+# (the always-recorded skips: run lock held, previous task open, credential rotating); a delivery that failed or hit
+# its hourly cap. A stopped delivery (`SKIPPED`: paused, no targets, a refused signature) is not one: it ends a streak.
+_PROBLEM_SKIP_REASONS = (SKIP_ALREADY_RUNNING, SKIP_PREVIOUS_TASK_OPEN, SKIP_CREDENTIAL_ROTATING)
+_PROBLEM_DELIVERY_STATES = (FAILED, RATE_CAPPED)
+# Read straight through, neither a problem nor a run that ends a streak: a delivery passed over by design (it did not
+# match, or repeated one) or not yet settled, and a schedule's skip by design (below its minimum period, disabled).
+_READ_THROUGH_DELIVERY_STATES = (FILTERED, DEDUPED, UNMATCHED) + _PENDING_DELIVERY_STATES
+# The newest rows a streak reads, so a list load costs the same however long a history is; past it the wire says
+# `more`. Raised to the threshold where an operator set that higher.
+_STREAK_WINDOW = 500
 
 
 # ── The parent's values, derived from a child (the backfill's mapping; revision 0417 mirrors it in SQL) ───────
@@ -315,12 +331,18 @@ def sync_cron(session: Session, cron: Cron, spec: Optional[ParentSpec] = None) -
     return _apply(session, cron, _merged(existing, derived), None)
 
 
-def sync_trigger(session: Session, trigger: TaskTrigger, spec: Optional[ParentSpec] = None) -> Automation:
-    """The event child's parent, created or brought in step. Flushes, never commits."""
+def sync_trigger(session: Session, trigger: TaskTrigger, spec: Optional[ParentSpec] = None) -> Optional[Automation]:
+    """The event child's parent, created or brought in step. Flushes, never commits. A record-only trigger (every
+    monitor adapter, a `record_only` github trigger — `app/production_qa/recorder.py::records_only`) adopts none:
+    derived from the trigger, its parent would file a task per recorded event (architecture A-2). None then."""
+    from app.production_qa.recorder import records_only
+
     if spec is not None:
         return _apply(session, trigger, _spec_values(spec, WHEN_EVENT), spec)
-    derived = values_from_trigger(trigger)
     existing = _automation(session, trigger.automation_id)
+    if existing is None and records_only(trigger):
+        return None
+    derived = values_from_trigger(trigger)
     return _apply(session, trigger,
                   _merged(existing, derived, single_project=True) if existing is not None else derived, None)
 
@@ -489,9 +511,89 @@ def is_stuck(
     return cause == STUCK_CAUSE or (status == STATUS_PAUSED and stuck_run(session, child, run) is not None)
 
 
+OWNER_OUTSIDE_ORG_CAUSE = "Owner no longer in this org"
+OWNER_OUTSIDE_ORG_REASON = (
+    "Its owner is no longer a member of this organization, so every run is refused. Take ownership to run it again."
+)
+
+
+def has_foreign_owner(session: Session, automation: Optional[Automation], child: Cron | TaskTrigger) -> bool:
+    """Is the automation owned from another org — the owner every firing refuses (`automation_fire.owner_outside_org`)?
+    A system automation has no owner to refuse, and a record-only trigger (Connect deploys, a monitor) settles before
+    any owner is asked (`trigger_intake._record`). The owner is read as a caller (`seam.identity_scope`): under a
+    tenant's bind an owner elsewhere reads missing, which is exactly the case to name."""
+    from app.automation_fire import owner_outside_org
+    from app.models.identity import AdminUser
+    from app.production_qa.recorder import records_only
+    from app.tenancy import seam
+
+    if automation is None or automation.is_system or automation.created_by_id is None:
+        return False
+    if isinstance(child, TaskTrigger) and records_only(child):
+        return False
+    with seam.identity_scope():
+        owner = session.execute(
+            select(AdminUser.org_id, AdminUser.is_system).where(AdminUser.id == automation.created_by_id)
+        ).first()
+    return owner is not None and not owner.is_system and owner_outside_org(owner.org_id, automation.org_id)
+
+
+def actor_outside_org(actor: "AdminUser", org_id: UUID) -> bool:
+    """Would an automation `actor` owns be refused in `org_id`? The owner stored is the PERSON (`act_as.person`):
+    an operator acting as the org is served as its Owner seat, but the row it writes names the operator, whose
+    own org is not this one — so acting-as is no membership here."""
+    from app.act_as import person
+    from app.automation_fire import owner_outside_org
+
+    return owner_outside_org(person(actor).org_id, org_id)
+
+
+def take_ownership(session: Session, automation: Automation, *, actor: "AdminUser") -> None:
+    """Re-own an automation owned from another org as `actor`, a member of its org, so its firings run again. The
+    system stop that owner earned is cleared with it (a human pause stays). 409 when the caller is outside the org
+    too, or the owner is already a member. Commits."""
+    from app.actors import stamp_actor
+    from app.automation_fire import REASON_OWNER_OTHER_ORG
+    from app.trigger_health import clear_failure
+    from app.trigger_intake import LEGACY_REASONS_TRIGGER_OWNER_OTHER_ORG, REASON_TRIGGER_OWNER_OTHER_ORG
+    from app.user_activity import record_write
+
+    if actor_outside_org(actor, automation.org_id):
+        raise HTTPException(status_code=409, detail=switch_org_detail(session, automation.org_id, "take ownership"))
+    child = child_of(session, automation)
+    if not has_foreign_owner(session, automation, child):
+        raise HTTPException(status_code=409, detail="its owner is already a member of this organization")
+    locked = session.scalar(select(type(child)).where(type(child).id == child.id).with_for_update())
+    # The prior owner is in no request field and the write erases it: recorded here, as `_retire` records its name.
+    record_write(
+        session, actor, "automation_update", f"Took ownership of automation {automation.name}",
+        data={"automation_id": str(automation.id),
+              "changed": {"owner_id": {"from": str(automation.created_by_id), "to": str(actor.id)}}},
+    )
+    for row in (automation, locked):
+        row.created_by_id = actor.id
+        stamp_actor(row, actor)
+    # Either stop the owner earned: the intake's at a filing, the fire engine's at a target.
+    if isinstance(locked, TaskTrigger) and locked.failed_reason in (REASON_TRIGGER_OWNER_OTHER_ORG,
+                                                                    REASON_OWNER_OTHER_ORG,
+                                                                    *LEGACY_REASONS_TRIGGER_OWNER_OTHER_ORG):
+        clear_failure(locked)
+    session.commit()
+
+
+def switch_org_detail(session: Session, org_id: UUID, verb: str) -> str:
+    """The refusal a caller acting from another org gets where what they would own could never run there. Only an
+    operator reaches another org's rows, and the operator plane reads every org's name."""
+    from app.models.orgs import Org
+
+    name = session.scalar(select(Org.name).where(Org.id == org_id))
+    return (f"Switch to {name or 'its organization'} to {verb}: an automation runs as its owner, and an owner "
+            f"outside {name or 'that organization'} cannot file its tasks.")
+
+
 def status_of(
     session: Session, automation: Automation, child: Cron | TaskTrigger, now: datetime, run: Optional[Any],
-    errored: Optional[str] = None,
+    errored: Optional[str] = None, foreign_owner: Optional[bool] = None,
 ) -> tuple[str, Optional[str], Optional[str]]:
     """`paused`, else `failing` (an event the system stopped, a schedule whose newest recorded run errored, or a
     newest run with an errored target), else `active` — with the sentence saying why (§6.3) and, when failing,
@@ -500,6 +602,11 @@ def status_of(
     by `out` for the outcome word too); an event child's branch reads the target ledger instead and ignores both."""
     if is_paused(child):
         return STATUS_PAUSED, None, None
+    if foreign_owner is None:
+        foreign_owner = has_foreign_owner(session, automation, child)
+    if foreign_owner:
+        # Broken before it fires: every firing would refuse its owner (`automation_fire.owner_outside_org`).
+        return STATUS_FAILING, OWNER_OUTSIDE_ORG_REASON, OWNER_OUTSIDE_ORG_CAUSE
     if isinstance(child, TaskTrigger):
         if child.failed_at is not None:
             return (STATUS_FAILING, f"Stopped {_ago(child.failed_at, now)}: {child.failed_reason or 'failed'}",
@@ -522,7 +629,7 @@ def status_of(
         return (STATUS_FAILING,
                 f"Stuck: the run {_ago(stuck.fired_at, now)} {stuck.detail}; every run since was skipped",
                 STUCK_CAUSE)
-    if run.outcome == RUN_OUTCOME_ERROR:
+    if run.outcome == RUN_OUTCOME_ERROR and not _succeeded_since(child, run):
         return (STATUS_FAILING, f"Last run failed {_ago(run.fired_at, now)}: {run.detail or 'error'}",
                 failure_cause(run.detail))
     if errored:
@@ -557,6 +664,8 @@ def _last_run_outcome(
     if isinstance(child, Cron):
         if _fired_after_gap(child, run):
             return None
+        if _succeeded_since(child, run):
+            return LAST_RUN_OUTCOME_RAN
         if run.outcome == RUN_OUTCOME_ERROR or errored:
             return LAST_RUN_OUTCOME_ERROR
         if run.outcome == RUN_OUTCOME_ACTED:
@@ -574,6 +683,15 @@ def _last_run_outcome(
     if run.state in _PENDING_DELIVERY_STATES:
         return LAST_RUN_OUTCOME_PENDING
     return LAST_RUN_OUTCOME_RAN
+
+
+def _succeeded_since(child: Cron | TaskTrigger, run: Any) -> bool:
+    """Has a firing finished `acted`/`noop` after the newest row's errored one was written? Its retention mode may
+    keep no row of a success (`crons.should_record`: `none` keeps errors only), so without this one transient error
+    would read as failing until the next error. Measured from the error row's write (its uuid7), not its scheduled
+    instant: an earlier firing that finished late must not hide it. `last_succeeded_at` is stamped by a success only."""
+    return (isinstance(child, Cron) and run.outcome == RUN_OUTCOME_ERROR and child.last_succeeded_at is not None
+            and child.last_succeeded_at.timestamp() * 1000 > _uuid7_ms(run.id))
 
 
 def _fired_after_gap(child: Cron, run: Any) -> bool:
@@ -619,6 +737,50 @@ def _missed_gap(session: Session, child: Cron | TaskTrigger, run: Optional[Any])
     written = max(_uuid7_ms(row.id) for row in rows)
     batch = [row for row in rows if written - _uuid7_ms(row.id) < _BACKFILL_BATCH_MS]
     return {"count": len(batch), "more": any(row.detail for row in batch)}
+
+
+def _problem_streak(session: Session, child: Cron | TaskTrigger) -> Optional[dict[str, Any]]:
+    """The newest problem runs in a row (`_PROBLEM_*`) as `{count, more}` once `count` reaches the org's alert
+    threshold (`automation_alerts.threshold`; an event, which has no cadence, the hourly-or-slower knob), else None —
+    and None while paused. Read-through rows (`_READ_THROUGH_DELIVERY_STATES`, a schedule's skip by design) are
+    skipped over; any other run, or a success whose row retention dropped (`last_succeeded_at`, written after the
+    row), ends the streak. Reads the newest `_STREAK_WINDOW` rows: `more` when every one of them was in the streak."""
+    from app.automation_alerts import SLOW_RUNS_KEY, threshold
+    from app.operator_settings import reads
+
+    if is_paused(child):
+        return None
+    if isinstance(child, Cron):
+        limit = threshold(child)
+        window = max(limit, _STREAK_WINDOW)
+        since = child.last_succeeded_at.timestamp() * 1000 if child.last_succeeded_at is not None else None
+        rows = session.execute(
+            select(CronRun.id, CronRun.outcome, CronRun.skip_reason).where(CronRun.cron_id == child.id)
+            .order_by(CronRun.fired_at.desc(), CronRun.id.desc()).limit(window)
+        ).all()
+        problems: list[bool] = []
+        for row in rows:
+            if since is not None and _uuid7_ms(row.id) <= since:
+                problems.append(False)  # a success was written after it
+                break
+            if row.outcome == RUN_OUTCOME_SKIPPED and row.skip_reason not in _PROBLEM_SKIP_REASONS:
+                continue  # a skip by design
+            problems.append(row.outcome in (RUN_OUTCOME_ERROR, RUN_OUTCOME_MISSED, RUN_OUTCOME_SKIPPED))
+        scanned = len(rows)
+    else:
+        limit = reads.get_int(SLOW_RUNS_KEY)
+        window = max(limit, _STREAK_WINDOW)
+        states = session.scalars(
+            select(TriggerDelivery.state)
+            .where(TriggerDelivery.trigger_id == child.id, TriggerDelivery.parent_delivery_id.is_(None))
+            .order_by(TriggerDelivery.received_at.desc(), TriggerDelivery.id.desc()).limit(window)
+        ).all()
+        problems = [state in _PROBLEM_DELIVERY_STATES for state in states if state not in _READ_THROUGH_DELIVERY_STATES]
+        scanned = len(states)
+    count = next((i for i, problem in enumerate(problems) if not problem), len(problems))
+    if count < limit:
+        return None
+    return {"count": count, "more": count == len(problems) and scanned == window}
 
 
 def _dispatched_outcome(session: Session, delivery_id: int) -> str:
@@ -766,17 +928,19 @@ def out(session: Session, automation: Automation, *, now: Optional[datetime] = N
     from app.actors import actor_names
     from app.entity_shape import iso_or_none
 
-    now = now or datetime.now(timezone.utc)
+    now = now or utcnow()
     child = child_of(session, automation)
     run = newest_run(session, child)
     errored = errored_target_of(session, child, run)
-    status, reason, cause = status_of(session, automation, child, now, run, errored)
+    foreign_owner = has_foreign_owner(session, automation, child)
+    status, reason, cause = status_of(session, automation, child, now, run, errored, foreign_owner)
     last_run, next_run = _runs_times(session, child, now)
-    names = actor_names(session, [automation.created_by_id, automation.updated_by_id])
     action_params = (
         automation_actions.task_params(automation.action_params)
         if automation.action_type == ACTION_TASK else dict(automation.action_params or {})
     )
+    run_as_id = optional_uuid(action_params.get("run_as_id"))
+    names = actor_names(session, [automation.created_by_id, automation.updated_by_id, run_as_id])
     return {
         "id": str(automation.id),
         "name": automation.name,
@@ -784,6 +948,8 @@ def out(session: Session, automation: Automation, *, now: Optional[datetime] = N
         "description": automation.description,
         "org_id": str(automation.org_id),
         "owner": {"id": str(automation.created_by_id), "name": names.get(automation.created_by_id)},
+        # The Task action's own "Run as" (`action.params.run_as_id`) with its name; null: the project/org default.
+        "run_as": None if run_as_id is None else {"id": str(run_as_id), "name": names.get(run_as_id)},
         "is_system": automation.is_system,
         "when": _when_out(child, now),
         "target": (
@@ -796,9 +962,11 @@ def out(session: Session, automation: Automation, *, now: Optional[datetime] = N
         "status_reason": reason,
         "status_cause": cause,
         "stuck": is_stuck(session, child, run, status, cause),
+        "foreign_owner": foreign_owner,
         "last_run_at": iso_or_none(last_run),
         "last_run_outcome": _last_run_outcome(session, child, run, errored),
         "last_run_missed": _missed_gap(session, child, run),
+        "problem_streak": _problem_streak(session, child),
         "last_acted_at": iso_or_none(_last_acted_at(session, child)),
         "next_run_at": iso_or_none(next_run),
         "legacy": {"kind": "cron" if isinstance(child, Cron) else "trigger", "id": str(child.id)},
@@ -825,10 +993,8 @@ def target_rule(raw: Any) -> Optional[TargetRule]:
         raise HTTPException(status_code=422, detail=f"target.mode: must be one of {', '.join(TARGET_MODES)}")
     if not isinstance(ids, list):
         raise HTTPException(status_code=422, detail="target.ids: must be a list")
-    try:
+    with refused_as(422, ValueError, chain=True, prefix="target.ids: "):
         normalized = target_resolver.normalize_ids(kind, ids)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=f"target.ids: {exc}") from exc
     if mode == MODE_ALL and normalized:
         raise HTTPException(status_code=422, detail="target.ids: All takes no ids — use All except to leave some out")
     return TargetRule(kind=kind, mode=mode, ids=tuple(normalized))
@@ -913,6 +1079,23 @@ def legacy_cron_params(rule: TargetRule, params: dict[str, Any]) -> dict[str, An
 UNTARGETED_TRIGGER_BODY = "(this automation sends an email; it files no Task)"
 #: The `prompt_template` an event child of a Task action filed from a template carries: NOT NULL, never rendered.
 TEMPLATE_TRIGGER_BODY = "(this automation files its Task from a template)"
+#: The `prompt_template` of a record-only event (`app/production_qa/recorder.py::records_only`) created with no action:
+#: NOT NULL, never rendered — the trigger records into its one project and files nothing.
+RECORD_ONLY_TRIGGER_BODY = "(this automation records incidents; it files no Task)"
+
+
+def _record_only_action(when: dict[str, Any], raw_target: Any, action: Any) -> Any:
+    """A record-only When (Sentry, an incident-shaped webhook, a record-only GitHub source) files nothing, so its
+    create needs no action: one is supplied, inert, that only carries the child's NOT NULL columns. Its Target is the
+    ONE project the incidents are recorded in (the child's `project_id`). Any other When: `action` as sent."""
+    from app.production_qa.recorder import source_records_only
+
+    if when.get("kind") != WHEN_EVENT or not source_records_only(when.get("source_kind"), when.get("source_config")):
+        return action
+    rule = target_rule(raw_target)
+    if rule is None or rule.kind != TARGET_PROJECTS or rule.mode != MODE_SPECIFIC or len(rule.ids) != 1:
+        raise HTTPException(status_code=422, detail="target: pick the one project incidents are recorded in")
+    return action or {"type": ACTION_TASK, "params": {"persona": "coder", "body": RECORD_ONLY_TRIGGER_BODY}}
 
 
 def legacy_trigger_fields(session: Session, org_id: UUID, rule: Optional[TargetRule], params: dict[str, Any]) -> dict[str, Any]:
@@ -1004,6 +1187,33 @@ def _validated_action(
     return descriptor, rule, params
 
 
+def _incident_target_or_refuse(source_kind: Optional[str], rule: Optional[TargetRule]) -> None:
+    """An automation on a CP-raised incident kind files into the incident's own project
+    (`app/production_qa/events.py`): its Target is exactly that one project — never a fan-out."""
+    from app.triggers import INCIDENT_SOURCE_KINDS
+
+    if source_kind not in INCIDENT_SOURCE_KINDS:
+        return
+    if rule is None or rule.kind != TARGET_PROJECTS or rule.mode != MODE_SPECIFIC or len(rule.ids) != 1:
+        raise HTTPException(
+            status_code=422,
+            detail="target: an incident automation files in the incident's own project — pick exactly one project",
+        )
+
+
+def _production_qa_source_or_refuse(
+    session: Session, principal: "Principal", source_kind: Optional[str], stored_kind: Optional[str] = None,
+) -> None:
+    """A When on a Production QA source kind (`triggers.PRODUCTION_QA_SOURCE_KINDS`: monitors, incidents, deploy
+    recorders) is chosen only while the tenant's plan has Production QA (`plan_terms.require_tenant_switch`, 403); one
+    already stored keeps its kind through an edit."""
+    from app import plan_terms
+    from app.triggers import PRODUCTION_QA_SOURCE_KINDS
+
+    if source_kind in PRODUCTION_QA_SOURCE_KINDS and source_kind != stored_kind:
+        plan_terms.require_tenant_switch(session, principal, plan_terms.PRODUCTION_QA)
+
+
 def _cron_activity(descriptor: automation_actions.ActionDescriptor, rule, params: dict[str, Any]) -> tuple[str, Any]:
     from app import cron_activities
 
@@ -1038,13 +1248,11 @@ def _cron_create_body(name: str, description: str, org_id: UUID, when: dict[str,
     activity_type, _activity = _cron_activity(descriptor, rule, params)
     activity_params = _carried_params(descriptor, rule, params)
     fields = {key: when[key] for key in SCHEDULE_FIELDS if key in when}
-    try:
+    with refused_as(422, ValueError, chain=True, prefix="when: "):
         return CronCreate(
             org_id=org_id, name=name, description=description, activity_type=activity_type,
             activity_params=activity_params, enabled=enabled, **fields,
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=f"when: {exc}") from exc
 
 
 def _trigger_create_body(session: Session, org_id: UUID, name: str, description: str, when: dict[str, Any], rule,
@@ -1052,24 +1260,24 @@ def _trigger_create_body(session: Session, org_id: UUID, name: str, description:
     from app.routes.triggers import TriggerCreate
 
     fields = {key: when[key] for key in EVENT_FIELDS if key in when}
-    try:
+    with refused_as(422, ValueError, chain=True, prefix="when: "):
         return TriggerCreate(name=name, description=description, **legacy_trigger_fields(session, org_id, rule, params),
                              **fields)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=f"when: {exc}") from exc
 
 
 def create(
     session: Session, *, org_id: UUID, body: dict[str, Any], actor: "AdminUser", principal: "Principal",
-    background: Any,
+    background: Any, created_by_task_id: Optional[int] = None,
 ) -> Saved:
-    """One new automation and its When child, in one transaction (the child writer commits)."""
+    """One new automation and its When child, in one transaction (the child writer commits). `created_by_task_id`
+    is the agent surface's provenance (`routes/agent_automations.py`), stamped on the child and so the parent."""
     when = body.get("when") or {}
     when_kind = when.get("kind")
     if when_kind not in (WHEN_SCHEDULE, WHEN_EVENT):
         raise HTTPException(status_code=422, detail=f"when.kind: must be {WHEN_SCHEDULE!r} or {WHEN_EVENT!r}")
+    action = _record_only_action(when, body.get("target"), body.get("action"))
     descriptor, rule, params = _validated_action(
-        session, org_id=org_id, when_kind=when_kind, raw_target=body.get("target"), action=body.get("action") or {},
+        session, org_id=org_id, when_kind=when_kind, raw_target=body.get("target"), action=action or {},
         actor=actor, principal=principal,
     )
     if not descriptor.creatable:
@@ -1077,6 +1285,9 @@ def create(
             status_code=422,
             detail=f"action.type: {descriptor.label} cannot be created again; it is offered only where it already runs",
         )
+    if when_kind == WHEN_EVENT:
+        _production_qa_source_or_refuse(session, principal, when.get("source_kind"))
+        _incident_target_or_refuse(when.get("source_kind"), rule)
     name, description = body["name"], body.get("description", "")
     paused = bool(body.get("paused", False))
     spec = _spec(descriptor, rule, params)
@@ -1088,23 +1299,24 @@ def create(
         cron_org = org_for(is_system=activity.is_system, author_org=org_id)
         cron_body = _cron_create_body(name, description, org_id, when, descriptor, rule, params, enabled=not paused)
         detail = write_cron_create(session, cron_body, actor, background, descriptor=activity, org_id=cron_org,
-                                   automation=spec)
+                                   automation=spec, created_by_task_id=created_by_task_id)
         automation_id = session.scalar(select(Cron.automation_id).where(Cron.id == detail.id))
         return Saved(automation=_automation(session, automation_id))
     from app.routes.triggers import write_trigger_create
 
     trigger, secret = write_trigger_create(
         session, _trigger_create_body(session, org_id, name, description, when, rule, params), actor, automation=spec,
-        paused=paused)
+        paused=paused, created_by_task_id=created_by_task_id)
     return Saved(automation=_automation(session, trigger.automation_id), secret=secret)
 
 
 def update(
     session: Session, automation: Automation, *, body: dict[str, Any], actor: "AdminUser", principal: "Principal",
-    background: Any,
+    background: Any, created_by_task_id: Optional[int] = None,
 ) -> Saved:
     """Patch one automation. Sent keys only; the merged automation is validated whole. Changing the When kind
-    swaps the child in one transaction (a new event child answers its secret once)."""
+    swaps the child in one transaction (a new event child answers its secret once). `created_by_task_id`, as on
+    `create`: an agent edit that moves the When to an event leaves the secret's one reveal owed to a person."""
     child = child_of(session, automation)
     for key in ("name", "description"):
         if key in body and body[key] is None:
@@ -1139,10 +1351,25 @@ def update(
         None if automation.target_kind is None
         else {"kind": automation.target_kind, "mode": automation.target_mode, "ids": list(automation.target_ids)}
     )
+    if when is not None and new_kind == WHEN_EVENT:
+        # Moving to (or staying on) a record-only When: the same one-project Target as a create, and an action that
+        # takes it — a stored action of another type (an email takes no Target) is swapped for the inert one.
+        stored_source = child if isinstance(child, TaskTrigger) else None
+        effective = {
+            "kind": new_kind,
+            "source_kind": when.get("source_kind", stored_source.source_kind if stored_source else None),
+            "source_config": when.get("source_config", stored_source.source_config if stored_source else None),
+        }
+        action = _record_only_action(effective, raw_target, action if action.get("type") == ACTION_TASK else None)
     descriptor, rule, params = _validated_action(
         session, org_id=automation.org_id, when_kind=new_kind, raw_target=raw_target, action=action, actor=actor,
         principal=principal, stored=automation,
     )
+    if new_kind == WHEN_EVENT:
+        _production_qa_source_or_refuse(session, principal, (when or {}).get("source_kind"),
+                                        child.source_kind if isinstance(child, TaskTrigger) else None)
+        _incident_target_or_refuse(
+            (when or {}).get("source_kind") or (child.source_kind if isinstance(child, TaskTrigger) else None), rule)
     name = body.get("name", automation.name)
     description = body.get("description", automation.description)
     spec = _spec(descriptor, rule, params, automation_id=automation.id, actor=actor)
@@ -1170,7 +1397,7 @@ def update(
             _trigger, secret = write_trigger_create(
                 session, _trigger_create_body(session, automation.org_id, name, description, when, rule, params), actor,
                 automation=spec,
-                paused=bool(body.get("paused", is_paused(child))),
+                paused=bool(body.get("paused", is_paused(child))), created_by_task_id=created_by_task_id,
             )
             # The retired schedule's engine entry goes on the next reconcile, as a cron delete's does.
             _reconcile_later(background)
@@ -1196,10 +1423,8 @@ def update(
         if "paused" in body:
             patch["enabled"] = not bool(body["paused"])
         locked = session.scalar(select(Cron).where(Cron.id == child.id).with_for_update())
-        try:
+        with refused_as(422, ValueError, chain=True, prefix="when: "):
             cron_patch = CronUpdate(**patch)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=f"when: {exc}") from exc
         write_cron_update(session, locked, cron_patch, actor, background, automation=spec)
         sync_cron(session, locked, spec)
     else:
@@ -1211,17 +1436,14 @@ def update(
             if key in body:
                 patch[key] = body[key]
         locked = session.scalar(select(TaskTrigger).where(TaskTrigger.id == child.id).with_for_update())
-        try:
+        with refused_as(422, ValueError, chain=True, prefix="when: "):
             trigger_patch = TriggerUpdate(**patch)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=f"when: {exc}") from exc
         write_trigger_update(session, locked, trigger_patch, actor, automation=spec)
         sync_trigger(session, locked, spec)
         if "paused" in body and bool(body["paused"]) != is_paused(locked):
             (write_pause(session, locked, actor, "") if body["paused"] else write_resume(session, locked, actor))
     _stamp(session, automation, actor)
-    session.commit()
-    session.refresh(automation)
+    commit_row(session, automation)
     return Saved(automation=automation, secret=secret)
 
 

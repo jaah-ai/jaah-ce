@@ -1,14 +1,17 @@
 import { MAX_PROXY_BYTES, PREVIEW_SUFFIX_TYPES } from '../../generated/inlinePreviewTypes'
-import { TEXT_PREVIEW_MAX_BYTES } from './artifactKinds'
+import { TEXT_PREVIEW_MAX_BYTES, mediaPreviewMode } from './artifactKinds'
 
 /** How the full-screen viewer (`AttachmentViewer`) renders a human's attachment. */
-export type AttachmentPreviewMode = 'image' | 'pdf' | 'text'
+export type AttachmentPreviewMode = 'image' | 'pdf' | 'text' | 'audio' | 'video'
 
 /** The viewer's renderer for a file, or `null` when it only downloads. Decided by the NAME, as the server decides
  *  what `?preview=1` serves (`PREVIEW_SUFFIX_TYPES`, generated). Text past `TEXT_PREVIEW_MAX_BYTES` is not decoded
  *  into a string. A PDF past `MAX_PROXY_BYTES` would be a presigned S3 URL in a FRAME, which the console's
  *  `frame-src` refuses (the Artifacts tab's same rule, `artifactKinds.ts`); an image is fine there (`img-src`). */
 export function attachmentPreviewMode(filename: string, sizeBytes: number): AttachmentPreviewMode | null {
+  // Audio and video stream from storage at any size (`mediaPreviewMode`).
+  const media = mediaPreviewMode(filename)
+  if (media) return media
   const dot = filename.lastIndexOf('.')
   const served = dot > 0 ? PREVIEW_SUFFIX_TYPES[filename.slice(dot).toLowerCase()] : undefined
   if (served === undefined) return null

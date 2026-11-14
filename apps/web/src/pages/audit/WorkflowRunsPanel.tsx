@@ -44,7 +44,7 @@ export default function WorkflowRunsPanel() {
       {ticks.length > 0 && (
         <Box sx={{ mb: 1 }}>
           <Banner severity="warning" testId="pending-cron-ticks">
-            <Stack spacing={0.25}>
+            <Stack spacing={0}>
               <span>Pending cron ticks</span>
               {ticks.map(tick => (
                 <span key={tick.workflow_id} data-testid="pending-cron-tick">

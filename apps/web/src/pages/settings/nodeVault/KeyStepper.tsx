@@ -2,17 +2,18 @@ import { useCallback, useEffect, useRef, useState, type JSX, type ReactNode } fr
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import LinearProgress from '@mui/material/LinearProgress'
-import Link from '@mui/material/Link'
 import Step from '@mui/material/Step'
 import StepLabel from '@mui/material/StepLabel'
 import Stepper from '@mui/material/Stepper'
 import Typography from '@mui/material/Typography'
-import useMediaQuery from '@mui/material/useMediaQuery'
 import { apiDetail } from '../../../api'
-import { useConfirm } from '../../../components/ConfirmDialog'
+import { danger, useConfirm } from '../../../components/ConfirmDialog'
+import { useSubmit } from '../../../hooks/useSubmit'
 import BusyButton from '../../../ui/BusyButton'
 import Banner from '../../../ui/Banner'
-import { PHONE_QUERY } from '../../../ui/listStyles'
+import { usePhone } from '../../../hooks/usePhone'
+import LinkButton from '../../../ui/LinkButton'
+import { countOf } from '../../../lib/humanize'
 import { shortHash, type NodeVaultKey } from '../../../lib/nodeVaultKeys'
 import { abandonOperation, keyRecipients, type NodeVaultOperation, type NodeVaultStatus } from './api'
 import BackupStep from './BackupStep'
@@ -23,6 +24,7 @@ import MigrateStep from './MigrateStep'
 import NodeGrantList from './NodeGrantList'
 import ResultStep from './ResultStep'
 import { KEY_CHANGED, onlineHolders, runningOperationId, submitRotation } from './rotate'
+import { FONT_WEIGHT } from '../../../theme'
 
 /* The two key steppers — setup and rotation — share one implementation; `kind` picks the step list and copy.
  * Setup (AC-4.1–4.8): 1 Explanation → 2 Key → 3 Backup → 4 Distribute → 5 Migrate → 6 Result.
@@ -82,7 +84,7 @@ function RekeyProgress({ status, op }: { status: NodeVaultStatus; op: NodeVaultO
       )}
       {failed > 0 && (
         <Typography variant="body2" sx={{ color: 'error.main' }}>
-          {failed === 1 ? '1 credential couldn’t be rekeyed.' : `${failed} credentials couldn’t be rekeyed.`} The result says what to do.
+          {`${countOf(failed, 'credential')} couldn’t be rekeyed.`} The result says what to do.
         </Typography>
       )}
     </Box>
@@ -111,7 +113,7 @@ export default function KeyStepper({
 }): JSX.Element {
   const rotation = kind === 'rotation'
   const steps: readonly StepName[] = rotation ? ROTATION_STEPS : STEPS
-  const phone = useMediaQuery(PHONE_QUERY)
+  const phone = usePhone()
   const [confirm, confirmDialog] = useConfirm()
   const op = status.operation?.kind === kind ? status.operation : null
   const currentHash = status.current_key?.hash ?? null
@@ -121,10 +123,9 @@ export default function KeyStepper({
   const [key, setKey] = useState<NodeVaultKey | null>(null)
   const [source, setSource] = useState<KeySource>('generate')
   const [backupReady, setBackupReady] = useState(false)
-  const [sending, setSending] = useState(false)
   // The operation the CP accepted, until a refetch shows it: never back to a fresh Key step.
   const [sent, setSent] = useState(false)
-  const [error, setError] = useState('')
+  const { busy: sending, formError: error, setFormError: setError, run } = useSubmit()
   // AC-6.6: the rotation's send was refused because another operation runs.
   const [elsewhere, setElsewhere] = useState(false)
   const keyRef = useRef<NodeVaultKey | null>(null)
@@ -187,12 +188,10 @@ export default function KeyStepper({
     setLocalStep(from === 'upload' ? 'Distribute' : 'Backup')
   }
 
-  async function send() {
+  function send() {
     if (!key || (rotation && !currentHash)) return
-    setSending(true)
-    setError('')
-    setElsewhere(false)
-    try {
+    void run('Couldn’t send the key. Try again.', async () => {
+      setElsewhere(false)
       const id = rotation
         ? await submitRotation({ key, orgId, source, currentHash: currentHash as string })
         : await submitSetup({ key, orgId, source, nodes: status.nodes })
@@ -202,18 +201,18 @@ export default function KeyStepper({
       setSent(true)
       if (rotation) onStarted?.(id)
       await onRefresh()
-    } catch (err) {
-      if (rotation && runningOperationId(err)) {
-        // Another operation owns the org now: this key will never be sent.
-        dropKey()
-        setElsewhere(true)
-      }
-      const known = rotation ? KEY_CHANGED : NODES_KEPT_CHANGING
-      setError(err instanceof Error && err.message === known ? known : apiDetail(err, 'Couldn’t send the key. Try again.'))
-      void onRefresh()
-    } finally {
-      setSending(false)
-    }
+    }, {
+      mapError: (err, fallback) => {
+        if (rotation && runningOperationId(err)) {
+          // Another operation owns the org now: this key will never be sent.
+          dropKey()
+          setElsewhere(true)
+        }
+        const known = rotation ? KEY_CHANGED : NODES_KEPT_CHANGING
+        void onRefresh()
+        return err instanceof Error && err.message === known ? known : apiDetail(err, fallback)
+      },
+    })
   }
 
   function cancel() {
@@ -223,17 +222,14 @@ export default function KeyStepper({
 
   async function abandon() {
     if (!op) return
-    const ok = await confirm({
+    if (!await confirm(danger('Abandon', {
       title: rotation ? 'Abandon rotation?' : 'Abandon setup?',
       message: rotation
         ? 'The new key is removed from every node that received it. Your current key stays in use.'
         : op.step === 'migrating'
           ? 'Credentials not moved yet stay as they are. The key stays in use.'
           : 'The new key is removed from every node that received it. Nothing has been sealed with it yet.',
-      confirmLabel: 'Abandon',
-      destructive: true,
-    })
-    if (!ok) return
+    }))) return
     setError('')
     try {
       await abandonOperation(op.id)
@@ -377,7 +373,7 @@ export default function KeyStepper({
       data-step={step}
       sx={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}
     >
-      {rotation && <Typography variant="body2" sx={{ fontWeight: 600 }}>Rotate key</Typography>}
+      {rotation && <Typography variant="body2" sx={{ fontWeight: FONT_WEIGHT.semibold }}>Rotate key</Typography>}
       {phone ? (
         <Typography variant="body2" sx={{ color: 'text.secondary' }} data-testid="nodevault-step-count">
           Step {stepIndex + 1} of {steps.length}: {step}
@@ -393,7 +389,7 @@ export default function KeyStepper({
           ))}
         </Stepper>
       )}
-      <Typography id={rotation ? 'nodevault-rotation-title' : 'nodevault-step-title'} component="h3" variant="subtitle1" sx={{ fontWeight: 600 }}>{heading}</Typography>
+      <Typography id={rotation ? 'nodevault-rotation-title' : 'nodevault-step-title'} component="h3" variant="subtitle1" sx={{ fontWeight: FONT_WEIGHT.semibold }}>{heading}</Typography>
       {body}
       {error && (
         <Banner severity="error" testId={`nodevault-${kind}-error`}>
@@ -401,9 +397,9 @@ export default function KeyStepper({
           {elsewhere && (
             <>
               {' '}
-              <Link component="button" type="button" variant="body2" onClick={cancel} sx={{ verticalAlign: 'baseline' }}>
+              <LinkButton variant="body2" onClick={cancel} sx={{ verticalAlign: 'baseline' }}>
                 Show it
-              </Link>
+              </LinkButton>
             </>
           )}
         </Banner>

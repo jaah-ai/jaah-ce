@@ -25,14 +25,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import act_as, ip_allowlist
-from app.actors import actor_names, stamp_actor
+from app.actors import actor_names, set_request_actor, stamp_actor
 from app.auth import require_user
 from app.clock import utcnow
 from app.authz.catalog import Tenancy
 from app.authz.declarations import always, org_admin, session_only
-from app.authz.principal import Principal, current_principal
-from app.db import get_session
-from app.entity_shape import administered_org_or_404, flush_or_409
+from app.authz.principal import AsyncCaller, Principal, current_caller, current_principal
+from app.db_async import on_session
+from app.entity_shape import administered_org_or_404, flush_or_409, refused_as, from_row
 from app.models.identity import AdminUser
 from app.models.orgs import OrgIpRange
 
@@ -82,7 +82,7 @@ def _host(request: Request) -> Optional[str]:
 def _out(session: Session, org_id: UUID, request: Request) -> IpRangesOut:
     rows = ip_allowlist.stored_ranges(session, org_id)
     ids = {row.updated_by_id for row in rows if row.updated_by_id is not None}
-    # Staff reads "Jaah support" to both sides; the operator still finds who in the email on hover.
+    # Staff reads `WITHHELD_ACTOR` to both sides; the operator still finds who in the email on hover.
     names = actor_names(session, ids, withhold_staff=True)
     # Seam-filtered like the names: a tenant reader gets no address for an operator-side changer.
     emails = dict(
@@ -90,8 +90,10 @@ def _out(session: Session, org_id: UUID, request: Request) -> IpRangesOut:
     ) if ids else {}
     return IpRangesOut(
         ranges=[
-            IpRangeOut(id=row.id, cidr=str(row.cidr), label=row.label, updated_at=row.updated_at,
-                       updated_by=names.get(row.updated_by_id), updated_by_email=emails.get(row.updated_by_id))
+            from_row(
+                IpRangeOut, row, cidr=str(row.cidr), updated_by=names.get(row.updated_by_id),
+                updated_by_email=emails.get(row.updated_by_id),
+            )
             for row in rows
         ],
         your_ip=_host(request),
@@ -107,10 +109,8 @@ def _parsed(body: IpRangesIn) -> list[tuple[ip_allowlist.Network, str]]:
     parsed: list[tuple[ip_allowlist.Network, str]] = []
     seen: set[ip_allowlist.Network] = set()
     for item in body.ranges:
-        try:
+        with refused_as(422, ValueError):
             network = ip_allowlist.parse_range(item.cidr)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from None
         if network in seen:
             raise HTTPException(status_code=422, detail=f"{network} is in the list twice. Remove one and save again.")
         seen.add(network)
@@ -120,11 +120,12 @@ def _parsed(body: IpRangesIn) -> list[tuple[ip_allowlist.Network, str]]:
 
 @router.get("/api/orgs/{org_id}/ip-ranges", response_model=IpRangesOut)
 @org_admin(Tenancy.CALLER_PLANE)
+@on_session
 def get_ip_ranges(
+    session: Session,
     org_id: str,
     request: Request,
     principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
 ) -> IpRangesOut:
     """The org's allowlist, in the order entered, and the caller's own address."""
     org = _org(session, org_id, principal)
@@ -133,20 +134,21 @@ def get_ip_ranges(
 
 @router.put("/api/orgs/{org_id}/ip-ranges", response_model=IpRangesOut)
 @org_admin(Tenancy.CALLER_PLANE)
+@on_session
 def put_ip_ranges(
+    session: Session,
     org_id: str,
     body: IpRangesIn,
     request: Request,
-    actor: AdminUser = Depends(require_user),
-    principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> IpRangesOut:
     """Replace the org's allowlist. Empty turns it off. Refused (422) when it is not empty and leaves out the
     caller's own address, unless the caller is an operator."""
-    org = _org(session, org_id, principal)
+    set_request_actor(session, caller.actor.id)
+    org = _org(session, org_id, caller.principal)
     parsed = _parsed(body)
     host = _host(request)
-    if parsed and not ip_allowlist.exempt(act_as.person(actor)) and not ip_allowlist.allowed(
+    if parsed and not ip_allowlist.exempt(act_as.person(caller.actor)) and not ip_allowlist.allowed(
         (network for network, _ in parsed), host
     ):
         raise HTTPException(
@@ -163,12 +165,12 @@ def put_ip_ranges(
         row = existing.get(network)
         if row is None:
             row = OrgIpRange(org_id=org.id, cidr=str(network), label=label)
-            stamp_actor(row, actor, created=True)
+            stamp_actor(row, caller.actor, created=True)
             session.add(row)
         elif row.label != label:
             row.label = label
             row.updated_at = utcnow()
-            stamp_actor(row, actor)
+            stamp_actor(row, caller.actor)
     flush_or_409(
         session, "Someone else saved this list just now. Reload it and save again.",
         constraints=frozenset({"uq_org_ip_ranges_org_id_cidr"}),
@@ -177,13 +179,11 @@ def put_ip_ranges(
     ip_allowlist.invalidate(org.id)
     return _out(session, org.id, request)
 
-
 @router.get("/api/auth/me/ip-allowlist", response_model=IpAllowlistStatusOut)
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def my_ip_allowlist(
-    actor: AdminUser = Depends(require_user), session: Session = Depends(get_session)
-) -> IpAllowlistStatusOut:
+@on_session
+def my_ip_allowlist(session: Session, actor: AdminUser = Depends(require_user)) -> IpAllowlistStatusOut:
     """Whether the caller's org restricts the networks they may sign in from. The ranges stay the admins'."""
     person = act_as.person(actor)
     return IpAllowlistStatusOut(

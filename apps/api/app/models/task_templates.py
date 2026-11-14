@@ -7,7 +7,7 @@ template stores what a task create stores (title, body, persona, autonomous, mod
 are derived from them as the task form derives them (`app/routes/task_templates.py::depth_of`).
 
 Start counts live in per-day counter tables, one per template table, so "Most popular" never reads `tasks`
-across orgs: the global counter carries no `org_id` at all. Revision 202610281500 is the DDL.
+across orgs: the global counter carries no `org_id` at all. `migrations/versions/202611130100_baseline.py` is the DDL.
 """
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import Base, EntityMixin, OrgScoped, _in_check, org_unique, timestamp_column
+from app.models.base import Base, EntityMixin, OrgScoped, UuidPkMixin, _in_check, org_unique, timestamp_column
 
 #: The purpose groups, in gallery order (PRD §9), each with its label. The order IS the sort order.
 PURPOSES: dict[str, str] = {
@@ -116,7 +116,7 @@ class OrgTaskTemplate(EntityMixin, OrgScoped, _TemplateColumns, Base):
     )
 
 
-class TaskTemplateAsset(Base):
+class TaskTemplateAsset(UuidPkMixin, Base):
     """An uploaded image of a GLOBAL template: its card image or one pasted into its body (`filename` is the
     body's `attachment:<filename>` token). An org template's images are `task_attachments` rows on
     `org_template_id` instead. The bytes are S3's, shared by key with every task started from the template."""
@@ -124,7 +124,6 @@ class TaskTemplateAsset(Base):
     __tablename__ = "task_template_assets"
     __table_args__ = (_in_check("kind", ASSET_KINDS, "ck_task_template_assets_kind"),)
 
-    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, server_default=text("uuidv7()"))
     template_id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("task_templates.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -140,7 +139,7 @@ class TaskTemplateAsset(Base):
     )
 
 
-class TaskTemplateFavorite(OrgScoped, Base):
+class TaskTemplateFavorite(UuidPkMixin, OrgScoped, Base):
     """One member's star on one template, global or their org's. Exactly one of the two ids; deleting the
     template takes the star with it."""
 
@@ -158,7 +157,6 @@ class TaskTemplateFavorite(OrgScoped, Base):
         ),
     )
 
-    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, server_default=text("uuidv7()"))
     user_id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("admin_users.id", ondelete="CASCADE"), nullable=False
     )
@@ -185,7 +183,7 @@ class TaskTemplateStartDay(Base):
     starts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
 
 
-class OrgTaskTemplateStartDay(OrgScoped, Base):
+class OrgTaskTemplateStartDay(UuidPkMixin, OrgScoped, Base):
     """`TaskTemplateStartDay` for an org's own template. An `id` of its own, as every `Stored` row's composite
     target (`org_unique`); the bump's upsert targets the unique pair."""
 
@@ -195,7 +193,6 @@ class OrgTaskTemplateStartDay(OrgScoped, Base):
         UniqueConstraint("org_template_id", "day", name="uq_org_task_template_start_days_template_day"),
     )
 
-    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, server_default=text("uuidv7()"))
     org_template_id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("org_task_templates.id", ondelete="CASCADE"), nullable=False
     )

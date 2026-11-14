@@ -1,8 +1,8 @@
-import { lazy } from 'react'
+import { lazyRetry } from './lib/lazyRetry'
 import { Route } from 'react-router-dom'
 import { REMOVED_CONSOLE_ROUTES } from './lib/editionFeatures'
 
-const NotInEdition = lazy(() => import('./pages/ce/NotInEdition'))
+const NotInEdition = lazyRetry(() => import('./pages/ce/NotInEdition'))
 
 /* A feature this edition leaves out answers its console paths with the upsell, never "Page not found"
  * (`pages/ce/NotInEdition.tsx`; the paths are the edition map's `console_routes`). None in the cloud. A function, as

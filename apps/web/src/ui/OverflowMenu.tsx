@@ -1,4 +1,4 @@
-import { useId, useState, type MouseEvent } from 'react'
+import { useId, useState, type MouseEvent, type ReactNode } from 'react'
 import Box from '@mui/material/Box'
 import Button, { type ButtonProps } from '@mui/material/Button'
 import IconButton from '@mui/material/IconButton'
@@ -9,6 +9,8 @@ import type { SxProps, Theme } from '@mui/material/styles'
 import { CompactVerbLabel, compactVerbProps } from './CompactVerb'
 import { MoreHorizIcon } from './icons'
 import { PHONE } from './listStyles'
+import { SIZE, grid } from '../theme'
+import Tip from './Tip'
 
 // The disabled verb's fade — MUI's own disabled opacity, applied to the label and glyph, not the item.
 const DIM_SX = { opacity: (t: Theme) => t.palette.action.disabledOpacity }
@@ -22,8 +24,10 @@ export type OverflowItem = {
   ariaLabel: string
   testId?: string
   danger?: boolean
+  /** The one in force (a sort order): MUI's selected face. */
+  selected?: boolean
   /* A verb the row offers but cannot perform (e.g. deleting the last superadmin): rendered disabled with
-     its reason announced, never a pressable no-op. */
+     its reason announced, never a pressable no-op. Still reachable by arrow key (`disabledItemsFocusable`). */
   disabled?: boolean
   /** Why it is disabled, in words: a visible line under the label, and appended to the accessible name. Required
    *  when `disabled`. */
@@ -31,8 +35,9 @@ export type OverflowItem = {
 } & (
   // `href`: an external URL as a real anchor in a new tab (middle-click, copy link keep working).
   // `to`: an in-app route via `RouterLink`, same tab. `download` for a file whose server sets no
-  // `Content-Disposition`.
-  | { href: string; download?: boolean; to?: never; onClick?: never }
+  // `Content-Disposition`. `onFollow`: an anchor's own click handler, which may take a plain click over
+  // (`net/href.tsx::apiDownloadProps` saves a download through the choke point).
+  | { href: string; download?: boolean; onFollow?: (e: MouseEvent<HTMLElement>) => void; to?: never; onClick?: never }
   | { href?: never; to: string; onClick?: never }
   | { href?: never; to?: never; onClick: () => void }
 )
@@ -47,6 +52,7 @@ export function OverflowMenu({
   size,
   sx,
   button,
+  glyph,
 }: {
   items: OverflowItem[]
   busy?: boolean
@@ -57,6 +63,8 @@ export function OverflowMenu({
   sx?: SxProps<Theme>
   /** `compact`: a tab strip's verb, a wordless ＋ on a phone (`ui/CompactVerb`). */
   button?: { label: string; variant?: ButtonProps['variant']; compact?: boolean }
+  /** Another wordless trigger than ⋯ (`ui/SortMenu`'s ⇅): its mark, and the tooltip describing it. */
+  glyph?: { icon: ReactNode; tooltip: string }
 }): JSX.Element | null {
   const [anchor, setAnchor] = useState<HTMLElement | null>(null)
   const menuId = useId()
@@ -80,20 +88,31 @@ export function OverflowMenu({
       ) : button ? (
         <Button variant={button.variant} {...trigger}>{button.label}</Button>
       ) : (
-        <IconButton aria-label={ariaLabel} {...trigger}>
-          <MoreHorizIcon />
-        </IconButton>
+        <Tip title={glyph?.tooltip}><IconButton aria-label={ariaLabel} {...trigger}>
+          {glyph?.icon ?? <MoreHorizIcon />}
+        </IconButton></Tip>
       )}
-      <Menu id={menuId} anchorEl={anchor} open={Boolean(anchor)} onClose={() => setAnchor(null)}>
+      {/* `disabledItemsFocusable`: MUI's arrow keys skip a disabled item by default, which would put its reason out of
+          a keyboard or screen-reader user's reach. Focusable, it is still `aria-disabled` and its click is a no-op. */}
+      <Menu
+        id={menuId}
+        anchorEl={anchor}
+        open={Boolean(anchor)}
+        onClose={() => setAnchor(null)}
+        slotProps={{ list: { disabledItemsFocusable: true } }}
+      >
         {items.map((item) => {
+          /* A reason that only repeats the label (an info item whose value fits uncapped) is not printed twice: the
+             label alone stays, at the reason's full contrast. */
+          const repeats = Boolean(item.disabled) && item.disabledReason === item.label
+          const reason = item.disabled && item.disabledReason && !repeats ? item.disabledReason : undefined
           // Shared by every arm. `key` stays out: React warns on a key through a spread.
           const common = {
             'data-testid': item.testId,
             // The reason rides the accessible name.
-            'aria-label': item.disabled && item.disabledReason
-              ? `${item.ariaLabel} — ${item.disabledReason}`
-              : item.ariaLabel,
+            'aria-label': reason ? `${item.ariaLabel} — ${reason}` : item.ariaLabel,
             title: item.disabled ? item.disabledReason : undefined,
+            selected: item.selected,
             disabled: busy || Boolean(item.disabled),
             onClick: () => {
               setAnchor(null)
@@ -101,27 +120,27 @@ export function OverflowMenu({
             },
             /* 44px target at phone width. A disabled item dims its VERB only (`DIM_SX`): MUI's own opacity
                fades the whole item, reason included, and the reason is the line that must stay readable. */
-            sx: [{ [PHONE]: { minHeight: 44 }, '&.Mui-disabled': { opacity: 1 } }, item.danger ? { color: 'error.main' } : {}],
+            sx: [{ [PHONE]: { minHeight: SIZE.tapTarget }, '&.Mui-disabled': { opacity: 1 } }, item.danger ? { color: 'error.main' } : {}],
           }
-          const dim = busy || Boolean(item.disabled)
+          const dim = busy || (Boolean(item.disabled) && !repeats)
           const body = (
             <>
               {item.icon && (
-                <Box component="span" aria-hidden="true" sx={[{ width: 18, textAlign: 'center', mr: 1 }, dim && DIM_SX]}>
+                <Box component="span" aria-hidden="true" sx={[{ width: grid(3), textAlign: 'center', mr: 1 }, dim && DIM_SX]}>
                   {item.icon}
                 </Box>
               )}
               {/* A disabled item prints its reason under the label: MUI's disabled item takes no pointer
                   events, so a `title` tooltip never shows. */}
-              {item.disabled && item.disabledReason ? (
+              {reason ? (
                 <Box component="span" sx={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
                   <Box component="span" sx={DIM_SX}>{item.label}</Box>
                   <Box
                     component="span"
                     data-testid="overflow-item-reason"
-                    sx={{ typography: 'caption', color: 'text.secondary', whiteSpace: 'normal', maxWidth: 240 }}
+                    sx={{ typography: 'caption', color: 'text.secondary', whiteSpace: 'normal', maxWidth: grid(40) }}
                   >
-                    {item.disabledReason}
+                    {reason}
                   </Box>
                 </Box>
               ) : <Box component="span" sx={dim ? DIM_SX : undefined}>{item.label}</Box>}
@@ -138,6 +157,10 @@ export function OverflowMenu({
               target="_blank"
               rel="noreferrer"
               {...common}
+              onClick={(e: MouseEvent<HTMLElement>) => {
+                common.onClick()
+                item.onFollow?.(e)
+              }}
             >
               {body}
             </MenuItem>

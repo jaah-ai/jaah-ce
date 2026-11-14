@@ -1,6 +1,7 @@
 import type { JSX, ReactNode } from 'react'
 import Box from '@mui/material/Box'
 import type { SxProps, Theme } from '@mui/material/styles'
+import { grid } from '../theme'
 
 /* Horizontal field-grouping row. Wrapping is content-driven: each cell's `flex-basis` (set at the call
  * site, in rem) decides how many share a line, not a media query, so a growing label makes a cell taller
@@ -8,7 +9,7 @@ import type { SxProps, Theme } from '@mui/material/styles'
 export function FieldRow({
   children,
   align = 'start',
-  columnGap = '1rem',
+  columnGap = grid(2.5),
   rowGap,
   testId,
   sx,

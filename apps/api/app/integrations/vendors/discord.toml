@@ -1,0 +1,44 @@
+slug = "discord"
+label = "Discord"
+category = "messaging"
+vendor_docs_url = "https://docs.discord.com/developers/reference#authentication"
+summary = "Post messages, read channels and run a bot in your Discord servers."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "bot_token", label = "Bot token", kind = "secret", required = true, help = "Discord Developer Portal (discord.com/developers/applications) > your application > Bot > Reset Token, then Copy. Discord shows the token only once, so paste it straight into Jaah" },
+]
+
+[test]
+method = "GET"
+path = "https://discord.com/api/v10/users/@me"
+auth = { field = "bot_token", header = "Authorization", prefix = "Bot" }
+identity = [["username"]]
+
+[docs]
+agent_uses = [
+  "Post a message or an embed to a channel, for example a build or deploy result",
+  "Read recent messages in a channel to summarise a discussion or pick up a bug report",
+  "Create threads and reply in them",
+  "List the servers, channels and roles the bot can see",
+]
+prerequisites = [
+  "A Discord application with a bot user, created in the Discord Developer Portal (Applications > New Application, then the Bot page)",
+  "The bot invited to each server it should reach: Developer Portal > your application > OAuth2 > URL Generator, tick the bot scope and the permissions it needs (for example Send Messages and Read Message History), open the generated URL and pick the server",
+  "Manage Server permission on that server, which Discord requires to add a bot",
+]
+limitations = [
+  "Jaah connects a bot, not your own Discord user: agents act as the bot and see only the servers and channels it was invited to",
+  "Reading message text needs the Message Content intent, switched on under Developer Portal > your application > Bot > Privileged Gateway Intents",
+  "Discord rate-limits each bot per route; a burst of posts from many tasks may be slowed down",
+]
+troubleshooting = [
+  { symptom = "Test says Discord rejected the bot token (401)", fix = "The token was reset or copied incompletely. In the Developer Portal open Bot > Reset Token, copy the new token and select Replace on the secret" },
+  { symptom = "The agent gets Missing Access (403) when posting", fix = "The bot is not in that server or lacks permission in that channel. Re-invite it with the OAuth2 URL Generator, or give its role Send Messages in the channel's Permissions" },
+  { symptom = "Messages the agent reads have empty text", fix = "Turn on the Message Content intent under Bot > Privileged Gateway Intents in the Developer Portal" },
+]
+faq = [
+  { q = "Can I use a webhook URL instead of a bot?", a = "Not as a Discord secret. A webhook only posts to one channel; store its URL as a generic secret if that is all you need" },
+  { q = "Does the bot need to stay online?", a = "No. Agents call Discord's REST API with the token when they need it; nothing runs between tasks" },
+]

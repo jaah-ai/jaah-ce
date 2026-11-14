@@ -15,6 +15,7 @@ import { DIVIDER_PX, clampPaneWidth, isRatio, paneWidthFromDividerX } from './sp
 import { TEMPLATE_PATHS, normalizePathname } from '../routeGroups'
 import { MAIN_MIN_PX } from './consoleDock'
 import { REMOVED_CONSOLE_ROUTES } from './editionFeatures'
+import { SCOPE_PARAM } from './taskScope'
 
 /**
  * EVERY EDITOR, AND THE LIST A COLD LOAD SHOWS BESIDE IT — the single home of both facts. Opened in-app,
@@ -24,23 +25,37 @@ import { REMOVED_CONSOLE_ROUTES } from './editionFeatures'
  * (`/workflows/:name`). A create page (`/tasks/new`, `/projects/new`, …) is matched by its editor's `:id`
  * pattern, so New opens in the pane too. A `list` may name the detail's own params (`:projectId`): a cold
  * load fills them from the detail's address, so a child record sits beside its parent page. A `list` may
- * carry its tab as a query (`/products?tab=plans`); the cold background takes it as its search.
+ * carry its tab as a query (`/products?tab=kind-plan`); the cold background takes it as its search. `except` names the
+ * addresses the pattern also matches that are no editor (a sibling list tab). `carry` names the editor's own query
+ * params a cold list keeps: a task's `?scope=` is the board it sits beside, so a reload keeps that board.
  */
-export const LIST_DETAIL_ROUTES: readonly { detail: string; list: string }[] = [
-  { detail: '/tasks/:id', list: '/tasks' },
+export const LIST_DETAIL_ROUTES: readonly {
+  detail: string; list: string; except?: readonly string[]; carry?: readonly string[]
+}[] = [
+  { detail: '/tasks/:id', list: '/tasks', carry: [SCOPE_PARAM] },
   { detail: '/features/:id', list: '/tasks' },
   { detail: '/projects/:id', list: '/projects' },
   { detail: '/projects/:id/docs', list: '/projects' },
+  { detail: '/projects/:id/env/:varId', list: '/projects/:id?tab=environment' },
   { detail: '/nodes/:nodeId', list: '/nodes' },
-  { detail: '/nodes/groups/:groupId', list: '/nodes' },
+  { detail: '/nodes/groups/:groupId', list: '/nodes?tab=groups' },
+  { detail: '/nodes/node-groups/:groupId', list: '/nodes?tab=node-groups' },
   { detail: '/nodes/hosts/:hostName', list: '/nodes' },
+  { detail: '/nodes/nodelinks/:nodelinkId', list: '/networks?tab=nodelink' },
+  { detail: '/networks/connections/:connectionId', list: '/networks?tab=connections' },
   { detail: '/users/:id', list: '/users' },
   { detail: '/groups/:id', list: '/groups' },
-  { detail: '/credentials/:id', list: '/credentials' },
+  { detail: '/credentials/custom/:id', list: '/credentials' },
+  // `/credentials/custom` is no editor: it redirects to the New secret gallery's Custom category.
+  { detail: '/credentials/:id', list: '/credentials', except: ['/credentials/custom'] },
   { detail: '/accounts/:id', list: '/accounts' },
   { detail: '/accounts/login/:slug', list: '/accounts' },
+  // The sibling tabs of the Agents strip share the pattern's shape and are lists of their own.
+  { detail: '/agents/:id', list: '/agents', except: ['/agents/catalog', '/agents/registry'] },
   { detail: '/automations/:id', list: '/automations' },
   { detail: '/automations/:id/runs/:runId', list: '/automations' },
+  { detail: '/integrations/trackers/:id', list: '/integrations/trackers' },
+  { detail: '/integrations/webhooks/:id', list: '/integrations/webhooks' },
   { detail: '/playbooks/:id', list: '/playbooks' },
   { detail: '/templates/:id', list: TEMPLATE_PATHS.manage },
   { detail: '/support/tickets/:id', list: '/support' },
@@ -49,32 +64,86 @@ export const LIST_DETAIL_ROUTES: readonly { detail: string; list: string }[] = [
   { detail: '/workflows/personas/:persona', list: '/audit/personas' },
   { detail: '/workflows/runs/:runId', list: '/audit/workflows' },
   { detail: '/workflows/:name', list: '/audit/workflows/catalogue' },
+  { detail: '/deployments/:id', list: '/tasks' },
+  { detail: '/incidents/:id', list: '/incidents' },
+  { detail: '/sessions/:sessionId/pane-log', list: '/sessions' },
   { detail: '/compliance/repos/:projectId/cells/:ruleKey', list: '/compliance/repos/:projectId' },
-  { detail: '/compliance/rules/:ruleId', list: '/compliance?tab=packs' },
-  { detail: '/compliance/packs/:packId/rules/new', list: '/compliance?tab=packs' },
-  { detail: '/compliance/packs/:packId', list: '/compliance?tab=packs' },
-  { detail: '/products/plans/:key', list: '/products?tab=plans' },
+  { detail: '/compliance/rules/:ruleId', list: '/compliance/packs' },
+  { detail: '/compliance/packs/:packId/rules/new', list: '/compliance/packs' },
+  { detail: '/compliance/packs/:packId', list: '/compliance/packs' },
+  { detail: '/products/plans/:key', list: '/products?tab=kind-plan' },
+  { detail: '/customers/signups/:signupId', list: '/customers' },
+  { detail: '/customers/:id', list: '/customers' },
+  // A catalogue product's kind tab is read off the product: opened cold it lists Products' first tab until the page
+  // moves it to its kind's tab (`pages/products/CatalogueProductPage.tsx`).
+  { detail: '/products/catalogue/:id', list: '/products' },
   { detail: '/org/billing/subscription/change', list: '/org/billing' },
   { detail: '/org/billing/subscription', list: '/org/billing' },
   { detail: '/org/billing/jaah-ai', list: '/org/billing' },
   { detail: '/org/billing/hosting/:id', list: '/org/billing' },
-  { detail: '/org/billing/invoices/:id', list: '/org/billing' },
-  { detail: '/org/billing/methods/:id', list: '/org/billing' },
-  { detail: '/org/billing/details', list: '/org/billing' },
+  { detail: '/org/billing/invoices/:id', list: '/org/billing?tab=invoices' },
+  { detail: '/org/billing/methods/:id', list: '/org/billing?tab=methods' },
+  { detail: '/org/billing/budgets/:id', list: '/org/billing?tab=budgets' },
+  { detail: '/org/billing/details', list: '/org/billing?tab=details' },
+  // Settings records: each list is the Settings section that holds it; a tag sits beside its group's Tags tab.
+  { detail: '/settings/tags/:groupId/tags/:tagId', list: '/settings/tags/:groupId?tab=tags' },
+  { detail: '/settings/tags/:groupId', list: '/settings?area=tasks&section=tags' },
+  { detail: '/settings/pricing/:model', list: '/settings?area=accounts&section=pricing' },
+  { detail: '/settings/pipeline-templates/:id', list: '/settings?area=projects&section=pipeline-templates' },
+  { detail: '/settings/email-templates/:key', list: '/settings?area=integrations&section=email-templates' },
+  { detail: '/settings/api-keys/:keyId', list: '/settings?area=api-keys&section=api-keys' },
+  { detail: '/settings/email/service-accounts/new', list: '/settings?area=organizations&section=email' },
+  { detail: '/settings/email/addresses/new', list: '/settings?area=organizations&section=email&mail=addresses' },
+  { detail: '/settings/email/:connectionId', list: '/settings?area=organizations&section=email' },
 ]
 
-/** The list a cold load shows beside an editor's pathname; `null` for a page that is no editor. */
-export function listForDetail(pathname: string): string | null {
+/** Every list's own pathname (no params, no query): never an editor, whatever pattern it also matches. */
+const LIST_PATHS: ReadonlySet<string> = new Set(
+  LIST_DETAIL_ROUTES.map(({ list }) => list.split('?')[0]).filter(path => !path.includes(':')),
+)
+
+/** The list a cold load shows beside an editor's pathname (and, for a route that `carry`s params, its `search`);
+ *  `null` for a page that is no editor. */
+export function listForDetail(pathname: string, search = ''): string | null {
   // A path of a feature this edition leaves out is the full-page upsell (`pages/ce/NotInEdition.tsx`), no editor.
   if (REMOVED_CONSOLE_ROUTES.some(({ path }) => matchPath(path, pathname) !== null)) return null
+  // A list whose address an editor's pattern also matches (`/templates/manage` against `/templates/:id`) is no
+  // editor of itself.
+  if (LIST_PATHS.has(normalizePathname(pathname))) return null
   for (const route of LIST_DETAIL_ROUTES) {
+    if (route.except?.includes(normalizePathname(pathname))) continue
     const match = matchPath(route.detail, pathname)
-    // A list whose address its editor's pattern also matches (`/templates/manage` against `/templates/:id`) is no
-    // editor of itself.
-    if (match !== null && normalizePathname(pathname) === route.list) return null
-    if (match !== null) return route.list.includes(':') ? generatePath(route.list, match.params) : route.list
+    if (match === null) continue
+    return withCarried(filledList(route.list, match.params), route.carry, search)
   }
   return null
+}
+
+/** True when a cold list beside `pathname` keeps some of the editor's own params (`carry`). */
+export function listCarriesParams(pathname: string): boolean {
+  const route = LIST_DETAIL_ROUTES.find(r => matchPath(r.detail, pathname) !== null)
+  return (route?.carry?.length ?? 0) > 0
+}
+
+function filledList(list: string, params: Record<string, string | undefined>): string {
+  if (!list.includes(':')) return list
+  // The params fill the path alone: `generatePath` would read `:id?tab=` as an optional param.
+  const at = list.indexOf('?')
+  return at < 0 ? generatePath(list, params) : `${generatePath(list.slice(0, at), params)}${list.slice(at)}`
+}
+
+function withCarried(list: string, carry: readonly string[] | undefined, search: string): string {
+  if (!carry?.length || !search) return list
+  const from = new URLSearchParams(search)
+  const at = list.indexOf('?')
+  const kept = new URLSearchParams(at < 0 ? '' : list.slice(at + 1))
+  for (const name of carry) {
+    const value = from.get(name)
+    if (value !== null && value !== '') kept.set(name, value)
+  }
+  const query = kept.toString()
+  const path = at < 0 ? list : list.slice(0, at)
+  return query ? `${path}?${query}` : path
 }
 
 /**
@@ -99,8 +168,8 @@ export function safeReturnPath(search: string, origin: string, param = 'from'): 
 
 /** True when a row's link (`/tasks/41`, `/tasks/41?tab=x`) is the editor open in the pane (`openPath`, a
  *  normalized pathname, or `null` with nothing open). Compared by pathname, so a query never breaks it. */
-export function isOpenPath(openPath: string | null, href: string | undefined): boolean {
-  return openPath !== null && href !== undefined && normalizePathname(href.split(/[?#]/)[0]) === openPath
+export function isOpenPath(openPath: string | null, href: string | null | undefined): boolean {
+  return openPath !== null && href != null && normalizePathname(href.split(/[?#]/)[0]) === openPath
 }
 
 /** The editor pane's floor, in px: a detail page's tab strip on one line and its fields readable. 440

@@ -12,7 +12,7 @@ attempt is the full history the org page lists (`sends`). Neither row ever names
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Iterable, Literal, Optional
 from urllib.parse import quote
 from uuid import UUID
@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import onboarding_mail
+from app.clock import utcnow
 from app.login_oauth import frontend_origin
 from app.models.audit import ActivityEvent
 from app.models.identity import AdminUser
@@ -78,7 +79,7 @@ def send(session: Session, org: Org, actor: AdminUser) -> Outcome:
         },
         button_url=url,
     )
-    signup.welcome_sent_at = datetime.now(timezone.utc)
+    signup.welcome_sent_at = utcnow()
     signup.welcome_sent_by_id = actor.id
     signup.welcome_error = _ERROR.get(outcome)
     record_write(

@@ -13,7 +13,7 @@ recorded stopped, without waiting for the next deploy. A rollback to a release f
 recovers none of them (it recovers `local` only); the next forward deploy's first pass does. Replicas need no leader: every handoff is a claim in the
 system database.
 The org read seam is not on DBOS's engine, which reaches only operator-plane `durable_dbos_sys`; step
-reads go through `app.db.SessionLocal` (`test_tenancy_plane_sites.py`), binding from the step's own
+reads go through `app.db.BridgedSession` (`test_tenancy_plane_sites.py`), binding from the step's own
 argument so a recovered replay binds the same org.
 """
 from __future__ import annotations
@@ -21,18 +21,16 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import time
 from contextlib import asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Callable, Iterator, TypeVar
+from typing import Any, AsyncIterator, Callable, Iterator, Optional, TypeVar
 
 log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
 APP_NAME = "jaah"
-# The name rows carried before `APP_NAME`. Migration 202610291800 moved every row; a release still draining
-# during that deploy can write more under it; launch and retention adopt those (`cron_retention.adopt_retired_dbos_rows`).
-RETIRED_APP_NAME = "cto-cockpit-durable"
 SYSTEM_SCHEMA = "durable_dbos_sys"
 
 # Bump only to abandon in-flight workflows on purpose: this is the identity every executor recognises
@@ -68,16 +66,14 @@ VENDOR_QUEUE: dict[str, Any] = {
 #: across tasks. `VENDOR_QUEUE` carries it; `slack-echo`, `notify-outbox` and `cron-projection` name it.
 INTERACTIVE_POLL_SEC = VENDOR_QUEUE["polling_interval_sec"]
 
-#: How often an idle queue is polled, in seconds. Every registered queue is one engine thread per api task,
-#: waking this often to reload its config and try a dequeue — ~8% of the api's CPU at the engine's 1s default
-#: across a dozen mostly-empty queues; 10s, not 5s, halves those idle polls again, at
-#: up to ~10s before queued work starts. Work a person waits on polls at `INTERACTIVE_POLL_SEC` instead; this
-#: is for background work nobody waits on. A queue with a tighter bound names its own `POLL_SEC` (the durable
-#: `cloud_node` and `live_cast` modules, and the token-billing effect's).
-BACKGROUND_POLL_SEC = 10.0
+#: How often an idle queue is polled, in seconds: 30s, for background work nobody waits on. Every api task polls
+#: every registered queue (one engine thread each, waking to reload its config and try a dequeue), so the idle poll
+#: is a CPU cost multiplied by the task count. Work a person waits on polls at `INTERACTIVE_POLL_SEC`; a queue with a
+#: tighter bound names its own `POLL_SEC` (`cloud_node`, `cloud_change`, `hosted_app`, `live_cast`, token-billing).
+BACKGROUND_POLL_SEC = 30.0
 
 #: How long shutdown lets in-flight workflows finish and record their outcome before the engine is torn down.
-#: It runs after uvicorn's graceful window and the app's teardown, inside the api container's
+#: It runs after Granian's graceful window and the app's teardown, inside the api container's
 #: `stopTimeout` (set by the ECS Terraform module). A workflow still running past it stays PENDING
 #: until `recover_abandoned` sees the task stopped; `_InterruptedAtShutdown` keeps its failed outcome write out
 #: of the error log.
@@ -138,7 +134,7 @@ async def register_queues() -> None:
 @contextmanager
 def step_session(caller: str, *, gone: str | None = None, logger: logging.Logger = log) -> Iterator[Any]:
     """A step's attributed session: `exclusion_log.caller(caller)` (a DBOS worker has no request or cron to
-    name its reads) around a fresh `SessionLocal`, for the step to `seam.bind_from` on.
+    name its reads) around a fresh `BridgedSession`, for the step to `seam.bind_from` on.
 
     `bind_from` stays at the call site (or in `delegate_for_task`, the one shared site the tenancy scope census
     attributes for the steps that hand one task to a delegate). With `gone`, a `TenancyRowMissing` (the row was deleted while queued) is suppressed —
@@ -146,10 +142,11 @@ def step_session(caller: str, *, gone: str | None = None, logger: logging.Logger
     the `with`, the step's nothing-to-do return; without it, it propagates.
     """
     # Deferred: every durable module imports this one at DBOS registration time, before the app is wired.
-    from app.db import SessionLocal
+    from app.db import BridgedSession
+    from app import write_origin
     from app.tenancy import exclusion_log, seam
 
-    with exclusion_log.caller(caller), SessionLocal() as session:
+    with exclusion_log.caller(caller), write_origin.scope(f"durable:{caller}"), BridgedSession() as session:
         try:
             yield session
         except seam.TenancyRowMissing:
@@ -207,7 +204,7 @@ def engine_config(*, system_schema: str | None = None) -> dict[str, Any]:
 
     A function so a test can assert the wiring without a runtime or database connection.
     """
-    from app.config import db_pool_sizes
+    from app.config import DB_POOL_RECYCLE_SECONDS, db_pool_sizes
     from app.db import database_url
 
     return {
@@ -229,8 +226,11 @@ def engine_config(*, system_schema: str | None = None) -> dict[str, Any]:
         "enable_otlp": False,
         "log_level": "INFO",
         # The system-database engine's pool, per task: an ENVIRONMENT decision beside the app pool's (see
-        # `app/db.py::_pool_kwargs`). Unset -> None -> the library default (20).
+        # `app/config.py::db_pool_sizes`). Unset -> None -> the library default (20).
         "sys_db_pool_size": db_pool_sizes().dbos_pool_size,
+        # Merged over DBOS's own engine defaults (dbos 3.2.0 `configure_db_engine_parameters`), so only the age bound
+        # (`app/config.py::DB_POOL_RECYCLE_SECONDS`) changes; its pool size stays `sys_db_pool_size`'s.
+        "db_engine_kwargs": {"pool_recycle": DB_POOL_RECYCLE_SECONDS},
     }
 
 
@@ -340,36 +340,103 @@ class _InterruptedAtShutdown(logging.Filter):
 _INTERRUPTED_AT_SHUTDOWN = _InterruptedAtShutdown()
 
 
+#: How long `destroy_engine` waits for the notification listener to leave once its backend is ended. It normally
+#: leaves within half a second. The served shutdown's budget is short: it runs after Granian's graceful window and
+#: `SHUTDOWN_DRAIN_SEC`, inside the api container's `stopTimeout`. Tests (`strict`) wait longer.
+LISTENER_STOP_SEC = 2.0
+STRICT_LISTENER_STOP_SEC = 15.0
+
+
+def _stop_notification_listener(dbos: Any, budget_sec: float) -> None:
+    """End the engine's LISTEN thread on its OWN thread, so `DBOS.destroy` finds no connection to close.
+
+    dbos 3.2.0's destroy (`_cleanup_connections`) closes the listener's connection from the calling thread while
+    the listener is still inside psycopg's `notifies()` on it: with psycopg's C implementation that frees the
+    `PGconn` under the waiting thread, a use-after-free free-threaded CPython does not serialize. So: stop the
+    listener's loop, end its backend from another connection, and wait. Its wait then fails on its own thread, its
+    `finally` closes its own connection, and the loop exits. Raises when it cannot: the caller decides whether that
+    is fatal. The real fix is upstream — `_cleanup_connections` should stop its own listener thread.
+    """
+    from sqlalchemy import text
+
+    sys_db = dbos._sys_db_field
+    if sys_db is None or not getattr(sys_db, "use_listen_notify", False):
+        return
+    listener = next((t for t in dbos._background_threads
+                     if getattr(t, "_target", None) == sys_db.run_notification_listener), None)
+    if listener is None:
+        # A finished thread drops `_target`: none left alive without one means the listener already exited.
+        # (Conductor's websocket is a Thread subclass with no `_target` either.)
+        if not any(t.is_alive() and getattr(t, "_target", None) is None and t is not dbos.conductor_websocket
+                   for t in dbos._background_threads):
+            return
+        # A dbos upgrade renamed what this reads: say so, never silently leave the race in place.
+        raise RuntimeError("no DBOS notification listener thread found — re-check _stop_notification_listener")
+    sys_db._run_background_processes = False
+    ended: set[int] = set()
+    deadline = time.monotonic() + budget_sec
+    while listener.is_alive() and time.monotonic() < deadline:
+        # Read per pass (the listener may be between connections, then on a new one), and under the lock its own
+        # `_cleanup_connections` closes under, so this read never overlaps that close.
+        with sys_db._listener_thread_lock:
+            raw = getattr(sys_db.notification_conn, "dbapi_connection", None)
+            pid = None if raw is None or raw.closed else raw.info.backend_pid
+        if pid and pid not in ended:  # once each: a reused pid may be another process's backend
+            ended.add(pid)
+            with sys_db.engine.begin() as conn:
+                conn.execute(text("SET LOCAL statement_timeout = 5000"))
+                conn.execute(text("SELECT pg_terminate_backend(:pid)"), {"pid": pid})
+        listener.join(timeout=0.5)
+    if listener.is_alive():
+        raise RuntimeError(f"the DBOS notification listener did not stop within {budget_sec:g}s")
+
+
+def destroy_engine(*, strict: bool = False) -> None:
+    """Shut the launched engine down without dbos's listener race: the ONE way this codebase destroys an engine.
+
+    Stops dequeuing, gives in-flight workflows `SHUTDOWN_DRAIN_SEC` to record their outcome (destroy's own drain,
+    run here so the listener is stopped only after it: the stopped flag also stops the notifier, and a workflow
+    waiting on an event would otherwise wait out a polling interval), stops the notification listener on its own
+    thread (`_stop_notification_listener`), then destroys. A stop that fails still destroys; `strict` (tests)
+    then raises it and waits `STRICT_LISTENER_STOP_SEC` for the listener, the served shutdown logs it. No engine, or one never launched, is just destroyed.
+    """
+    global _dbos
+    from dbos import DBOS
+    from dbos import _dbos as dbos_module
+
+    engine = dbos_module._dbos_global_instance
+    failure: Exception | None = None
+    if engine is not None and engine._launched:
+        for event in engine.background_thread_stop_events:
+            event.set()
+        drain = time.monotonic() + SHUTDOWN_DRAIN_SEC
+        while engine._active_workflows_set.activeList() and time.monotonic() < drain:
+            time.sleep(0.1)
+        if active := engine._active_workflows_set.activeList():
+            log.info("durable engine shutdown: %d workflows still active after the drain: %s", len(active), active)
+        try:
+            _stop_notification_listener(engine, STRICT_LISTENER_STOP_SEC if strict else LISTENER_STOP_SEC)
+        except Exception as exc:  # destroy runs regardless: a leaked engine is worse than the race
+            failure = exc
+    DBOS.destroy()
+    _dbos = None
+    if failure is not None:
+        if strict:
+            raise failure
+        log.warning("durable engine shutdown: the notification listener was not stopped first (%s)", failure)
+
+
 async def _drain_and_destroy() -> None:
-    """Stop dequeuing, give in-flight workflows `SHUTDOWN_DRAIN_SEC` to record their outcome, then destroy.
+    """Stop dequeuing, give in-flight workflows `SHUTDOWN_DRAIN_SEC` to record their outcome, then destroy
+    (`destroy_engine`).
 
     On a worker thread because the drain blocks: an async workflow runs on the serving loop and must keep
     stepping through it, and `accounts.dispatch` hops a step back onto that loop.
     """
-    from dbos import DBOS
     from dbos._logger import dbos_logger
 
     dbos_logger.addFilter(_INTERRUPTED_AT_SHUTDOWN)
-    await asyncio.to_thread(DBOS.destroy, workflow_completion_timeout_sec=SHUTDOWN_DRAIN_SEC)
-
-
-# When the previous release may still be draining after a deploy: adopt what it wrote under the retired name
-# then, rather than at the next daily retention sweep.
-_ADOPT_AFTER_LAUNCH_SEC = (0.0, 60.0, 300.0, 900.0)
-
-
-async def _adopt_retired_rows_while_draining() -> None:
-    from app.cron_reconcile import launched_engine
-    from app.cron_retention import adopt_retired_dbos_rows
-
-    waited = 0.0
-    for at in _ADOPT_AFTER_LAUNCH_SEC:
-        await asyncio.sleep(at - waited)
-        waited = at
-        engine = launched_engine()
-        if engine is None:
-            return
-        await asyncio.to_thread(adopt_retired_dbos_rows, engine)
+    await asyncio.to_thread(destroy_engine)
 
 
 def _durable_lifespan(inner: Any) -> Any:
@@ -389,9 +456,8 @@ def _durable_lifespan(inner: Any) -> Any:
 
         # Lazy, like `DBOS`: every durable module imports this one.
         from app import boot_phases
-        from app.durable import cron_projection, task_title_queue
+        from app.durable import cron_projection, jaah_repo_prefix, task_title_queue
 
-        adoption: asyncio.Task[None] | None = None
         try:
             async with inner(app) as state:
                 boot_phases.done("app.startup")
@@ -400,16 +466,23 @@ def _durable_lifespan(inner: Any) -> Any:
                 await register_queues()
                 cron_projection.request_projection()
                 task_title_queue.request_filed_title_sweep()
-                adoption = asyncio.get_running_loop().create_task(_adopt_retired_rows_while_draining())
+                jaah_repo_prefix.request_startup_sweep()
                 boot_phases.done("dbos.launch")
                 boot_phases.ready()
                 yield state
         finally:
-            if adoption is not None:
-                adoption.cancel()
             await _drain_and_destroy()
 
     return lifespan
+
+
+def reraise_engine_control(exc: BaseException) -> None:
+    """The engine's own control flow (a cancel, a recovery conflict) is never a failed run: let it through. Only a
+    step whose retries ran out is a failure its workflow records."""
+    from dbos import error as dbos_error
+
+    if isinstance(exc, dbos_error.DBOSException) and not isinstance(exc, dbos_error.DBOSMaxStepRetriesExceeded):
+        raise exc
 
 
 def enqueue(
@@ -469,7 +542,7 @@ def migrate_system_schema() -> None:
     from dbos._serialization import DefaultSerializer
     from dbos._sys_db import SystemDatabase
 
-    from app.db import engine
+    from app.db import offline_engine as engine
 
     sys_db = SystemDatabase.create(
         system_database_url=engine.url.render_as_string(), engine_kwargs={}, engine=engine,
@@ -495,7 +568,7 @@ def cancel_unfinished(workflow_names: tuple[str, ...]) -> int:
     transaction."""
     from sqlalchemy import inspect
 
-    from app.db import engine
+    from app.db import offline_engine as engine
 
     if not workflow_names or not inspect(engine).has_table("workflow_status", schema=system_schema):
         return 0
@@ -507,12 +580,70 @@ def cancel_unfinished(workflow_names: tuple[str, ...]) -> int:
     return len(ids)
 
 
+#: The statuses of a run that ended: what `finished_runs` lists.
+FINISHED_STATUSES: tuple[str, ...] = ("SUCCESS", "ERROR", "MAX_RECOVERY_ATTEMPTS_EXCEEDED")
+
+
+def finished_runs(workflow_name: str, *, limit: int) -> list[Any]:
+    """The newest `limit` ended runs of `workflow_name`, newest first, with their outputs (the engine's
+    `WorkflowStatus`); empty where the engine's schema does not exist yet. Its own connection, as `cancel_unfinished`."""
+    from sqlalchemy import inspect
+
+    from app.db import offline_engine as engine
+
+    if not inspect(engine).has_table("workflow_status", schema=system_schema):
+        return []
+    return list(_client(system_schema).list_workflows(
+        name=workflow_name, status=list(FINISHED_STATUSES), sort_desc=True, limit=limit, load_input=False,
+        load_output=True))
+
+
+def latest_run(workflow_id_prefix: str) -> Optional[tuple[str, int]]:
+    """The newest run whose id starts with `workflow_id_prefix`: its status and when it last moved (epoch ms: its
+    newest step's end, else its own last update). None when there is none, or the engine's schema does not exist
+    yet. Its own connection, as `cancel_unfinished`."""
+    from sqlalchemy import inspect
+
+    from app.db import offline_engine as engine
+
+    if not inspect(engine).has_table("workflow_status", schema=system_schema):
+        return None
+    client = _client(system_schema)
+    runs = client.list_workflows(workflow_id_prefix=workflow_id_prefix, sort_desc=True, limit=1, load_input=False,
+                                 load_output=False)
+    if not runs:
+        return None
+    run = runs[0]
+    moved = [run.updated_at or run.created_at or 0]
+    moved += [step["completed_at_epoch_ms"] or step["started_at_epoch_ms"] or 0
+              for step in client.list_workflow_steps(run.workflow_id, load_output=False)]
+    return str(run.status), max(moved)
+
+
+def cancel_unfinished_runs(workflow_id_prefix: str) -> int:
+    """Cancel every enqueued or pending run whose id starts with `workflow_id_prefix`; how many. Its own connection,
+    outside any caller's transaction, as `cancel_unfinished`."""
+    from sqlalchemy import inspect
+
+    from app.db import offline_engine as engine
+
+    if not inspect(engine).has_table("workflow_status", schema=system_schema):
+        return 0
+    client = _client(system_schema)
+    ids = [status.workflow_id for status in client.list_workflows(
+        workflow_id_prefix=workflow_id_prefix, status=list(UNFINISHED_STATUSES), load_input=False, load_output=False)]
+    if ids:
+        client.cancel_workflows(ids)
+    return len(ids)
+
+
 @functools.cache
 def _client(schema: str) -> Any:
-    """One client per schema, over the app's own engine, so it opens no pool of its own."""
+    """One client per schema, over the app's offline engine (`app/db.py`: nothing pools on it in production), so
+    it opens no pool of its own. Its in-transaction enqueue runs on the caller's session."""
     from dbos import DBOSClient
 
-    from app.db import engine
+    from app.db import offline_engine as engine
 
     return DBOSClient(system_database_engine=engine, dbos_system_schema=schema, application_name=APP_NAME, lazy=True)
 

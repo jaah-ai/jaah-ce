@@ -14,8 +14,11 @@ to a terminal prompt nobody in a runner pane can answer.
 A value is never a secret here, so these names are safe to write into `launch.sh` and to log."""
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 import sys
+from typing import Callable, Sequence
 
 # `sys.platform`, not `host_platform`: this module is also imported where `apps/jaahd` is not on the path
 # (the node provisioning script's selftest), so the seam is imported only inside the Windows/macOS helpers.
@@ -85,7 +88,7 @@ def pinned_config(helper: str = GIT_CREDENTIAL_HELPER, *,
 
     `http.extraHeader` is the other file-borne credential git sends without a helper, cleared the same way.
     Transport keys that redirect the connection (`url.<x>.insteadOf`, `http.<url>.*`) are not this function's:
-    the daemon's own network git reads no runner-writable config (`git_mirror`), and the node's credential
+    the daemon's own network git reads no runner-writable global config (`NO_USER_CONFIG`), and the node's credential
     helper refuses to answer a runner's git whose non-system config sets one
     (`git_credential_helper.check_config_scopes`). Defence in depth,
     not a boundary: a process that sets its own `GIT_CONFIG_COUNT` replaces this silently. On Windows the
@@ -127,26 +130,19 @@ NO_USER_CONFIG: dict[str, str] = {"GIT_CONFIG_GLOBAL": "/dev/null"}
 # that `sh` keeps the quotes and splits `C:/Program Files` at its space, so every network op of the daemon's failed.
 # Empty: none of the daemon's other MSYS options matter to git.
 _DAEMON_GIT_MSYS: dict[str, str] = {"MSYS": ""} if _WINDOWS else {}
-# The environment pins a daemon-side network git call (a declared op, `clone_identity`) carries. Users: the mirror's
-# refresh/ls-remote/push (`git_mirror`) and an image source clone (`microvm_images._source`). `NO_USER_CONFIG`
-# alone: the mirror's local reads (`git_mirror`).
+# The environment pins a daemon-side network git call (a declared op, `clone_identity`) carries. Users: a slot's
+# clone and refresh (`slot_clone._network`), an image source clone (`microvm_images._source`) and a MicroVM
+# session's clone (`microvm_session._clone_from_forge`).
 DECLARED_OP: dict[str, str] = {**BROKER_ONLY, **NO_USER_CONFIG, **_DAEMON_GIT_MSYS}
 
 # Repo-local code pinned off for a daemon-side git call: a hook, fsmonitor, template or askpass program planted
 # in a tree a runner writes must never run under the daemon's credential declaration (`clone_identity`), as the
 # daemon. `core.askPass` empty: git runs it when the credential helper answers nothing (a refused destination),
 # and as a descendant of the declared op it would be served the login. Users, at the seams: `worktree_mechanics.core._run_git`,
-# `commands._native_run`'s callers (`worktree_ops`), `reconcile.context._fetch_base_blocking`, `git_mirror`,
-# `microvm_session._git`, `microvm_images._git`.
+# `commands._native_run`'s callers (`worktree_ops`), `microvm_session._git`, `microvm_images._git`.
 NO_REPO_CODE: tuple[str, ...] = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
                                  "-c", "init.templateDir=", "-c", "protocol.ext.allow=never",
                                  "-c", "core.askPass=")
-
-def tracking_refspec(branch: str) -> str:
-    """The refspec a `fetch origin <branch>` updated opportunistically, spelled out for a fetch from the project's
-    mirror (`git_mirror.local_fetch_args`), which names no remote."""
-    return f"+refs/heads/{branch}:refs/remotes/origin/{branch}"
-
 
 # Git reads author/committer from these above every config scope, so a commit names the task's launcher
 # rather than a shared clone's `user.*`.
@@ -162,6 +158,43 @@ def author_env(identity: "tuple[str, str] | None") -> dict[str, str]:
         return {}
     name, email = identity
     return {**{var: name for var in AUTHOR_NAME_VARS}, **{var: email for var in AUTHOR_EMAIL_VARS}}
+
+
+def gist(text: str, limit: int = 460) -> str:
+    """Git's output kept under the rail's 500-character report: its head AND its tail. The head is where a
+    credential refusal names the person and the fix; the tail is git's own `fatal:` line. A tail-only cut
+    reported the launcher as `h.ai`."""
+    if len(text) <= limit:
+        return text
+    tail = 150
+    return f"{text[:limit - tail - 3]} … {text[-tail:]}"
+
+
+def run_own_git(args: Sequence[str], *, cwd: "str | os.PathLike | None", timeout: float, error_cls: type[Exception],
+                redact: Callable[[str], str] | None = None, env: dict[str, str] | None = None, umask: int = -1,
+                where: str = "") -> str:
+    """`git <args>` run by the daemon on ITS OWN uid — `clone_identity.run_own`, so the op is registered under this
+    thread's declaration (or the broker serves it no project) — with the daemon's own git environment: repo-local
+    code off (`NO_REPO_CODE`), no terminal prompt, `env` on top of the process's. Returns its stdout; raises
+    `error_cls` on any failure (git absent, timed out, nonzero), its text `redact`ed (`redact_userinfo` unless
+    given) BEFORE `gist` cuts it — a cut inside `https://u:tok@` would hide the `@` from the pattern. `where`
+    names the tree in the message (" in the mirror 7.git"). The one daemon-own git runner; the session-user
+    one is `worktree_mechanics.core._run_git`."""
+    import clone_identity  # noqa: PLC0415 — see `_WINDOWS`
+
+    redact = redact or redact_userinfo
+    full_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", **(env or {})}
+    try:
+        done = clone_identity.run_own(["git", *NO_REPO_CODE, *args], cwd=cwd, text=True, timeout=timeout,
+                                      env=full_env, umask=umask)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        # A timeout's text is the whole argv, clone URL included: `redact` masks its userinfo, the host stays
+        # (`test_microvm_images` pins both halves).
+        raise error_cls(redact(f"git {args[0]}{where} failed: {exc}")) from None
+    if done.returncode != 0:
+        out = redact((done.stderr or done.stdout or "").strip())
+        raise error_cls(f"git {' '.join(args[:2])}{where} failed: {gist(out)}")
+    return done.stdout
 
 
 def redact_userinfo(text: str) -> str:

@@ -11,10 +11,10 @@ import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import IconButton from '@mui/material/IconButton'
-import InputBase from '@mui/material/InputBase'
 import Paper from '@mui/material/Paper'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
+import type { Theme } from '@mui/material/styles'
 /* The window buttons and their style are shared with the list/detail pane. */
 import { CloseButton, MaximizeButton, paneHeaderButtonSx as headerButtonSx } from './PaneWindowButtons'
 import ConsolePane, { DEFAULT_FONT_SIZE, type ConsolePaneHandle, type ConsoleStatus } from './ConsolePane'
@@ -22,6 +22,7 @@ import { clipboardFiles } from '../lib/clipboardFiles'
 import type { ConsolePresentation, ConsoleView } from '../lib/consoleDock'
 import LayoutDesigner, { SHIPPED_CELL_METRICS } from './LayoutDesigner'
 import FormDialog from '../ui/FormDialog'
+import HelpLabel from '../ui/HelpLabel'
 import { useFleetWindows } from '../hooks/useFleetWindows'
 import { useViewportIs } from '../hooks/useViewportWidth'
 import { layoutStorageKey, loadLayout, saveLayout } from '../lib/consoleLayoutStorage'
@@ -38,10 +39,14 @@ import {
 } from '../lib/consoleLayout'
 /* `SR_ONLY_SX` (ui/listStyles) is the single home for the sr-only shape; read its note before moving the
    announcer out of the (positioned) dock header. */
-import { PHONE, SR_ONLY_SX } from '../ui/listStyles'
+import { PHONE, SR_ONLY_SX, ELLIPSIS_SX } from '../ui/listStyles'
+import StatusDot from '../ui/StatusDot'
+import type { Tone } from '../ui/StatusChip'
+import { FONT_SIZE, FONT_WEIGHT, LETTER_SPACING, LINE_HEIGHT, RADIUS, SIZE, grid } from '../theme'
 import { directUrlOverrideKey, loadDirectUrlOverride, saveDirectUrlOverride } from '../lib/directConsole'
+import { countOf } from '../lib/humanize'
 import { useCanDriveWorktreeSession } from '../hooks/useWorktreeAccess'
-import { useCommitOnBlurEdit } from '../hooks/useCommitOnBlurEdit'
+import { useWindowDrag } from '../hooks/useWindowDrag'
 import {
   DIRECT_MODE_EXPLAINER,
   DIRECT_TOGGLE_VIEW,
@@ -49,22 +54,21 @@ import {
   loadDirectEnabled,
   saveDirectEnabled,
 } from '../lib/directToggle'
-import { saveSlotTitle, titleEditorSeed, type TitleNotice } from '../lib/slotTitle'
-import { useCopyFlash } from '../ui/useCopyFlash'
+import { CopyButton } from '../ui/CopyButton'
 import ChatView from './console/ChatView'
 import type { ConsoleRuntime } from './console/consoleRuntime'
+import Tip from '../ui/Tip'
 
 type Props = {
   // The display name; `projectId` addresses every console/worktree call.
   project: string
   projectId: number
   number: number
-  // Which node's slot (its uuid): (project, number) is unique only PER NODE. Also gates the Title editor (`canEditTitle`).
+  // Which node's slot (its uuid): (project, number) is unique only PER NODE.
   nodeId?: string
   kind?: 'clauded' | 'term'
   // The slot's Title (lib/worktree.ts's resolveTitle) — the same string as the Worktrees Title column
-  // (AC8.3); absent falls back to `project-number`. Read-only here: edits go to the CP
-  // (`lib/slotTitle.ts`) and return through this prop.
+  // (AC8.3); absent falls back to `project-number`. Read-only here.
   title?: string
   // May this principal drive THIS slot — the row's server-computed `may_edit` (`types.ts::Worktree.may_edit`,
   // single home `apps/api/app/authz/`). Needed besides the key predicate: pool admins SEE every slot but
@@ -75,10 +79,8 @@ type Props = {
   // passed to `<ConsolePane hadLiveSession>` (the single home for its use). Optional is fail-safe here.
   // A SNAPSHOT of what was clicked, deliberately not refreshed from the cache.
   hadLiveSession?: boolean
-  // Catalogue value for a NEW session's account provider; absent = Any. Passed to `<ConsolePane provider>`.
-  provider?: string
   // A MicroVM task's `vm:<vm_id>` (`lib/consoleDock.ts::ConsoleTarget`), passed to `<ConsolePane view>`. No slot
-  // behind it, so no saved layouts, designer, direct transport or Title rename.
+  // behind it, so no saved layouts, designer or direct transport.
   view?: string
   onClose: () => void
   // Prev/next session chevrons. The caller owns neighbor order; an absent handler disables that edge.
@@ -107,6 +109,8 @@ type ManualBox = { top: number; left: number; width: number; height: number }
  * real remote PTY and repaints the TUI.
  */
 const PANEL_REFIT_DEBOUNCE_MS = 120
+/** The direct-address field's explanation: blank dials the node's own address; the value stays in this browser. */
+const DIRECT_OVERRIDE_TIP = 'Dials this address instead of the node’s; this browser only.'
 
 const MIN_WIDTH = 320
 const MIN_HEIGHT = 200
@@ -151,8 +155,8 @@ const overlaySx = {
   position: 'fixed',
   inset: 0,
   bgcolor: 'rgba(0, 0, 0, 0.55)',
-  backdropFilter: 'blur(2px)',
-  zIndex: 60,
+  backdropFilter: `blur(${grid(0.5)})`,
+  zIndex: (t: Theme) => t.zIndex.mobileStepper,
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
@@ -164,19 +168,19 @@ const overlaySx = {
 
 const panelSx = {
   position: 'relative',
-  borderRadius: 2,
+  borderRadius: RADIUS.md,
   // Viewport minus the scrim padding; the window-resize handler re-fits.
-  width: 'calc(100vw - 3rem)',
-  height: 'calc(100vh - 3rem)',
+  width: `calc(100vw - ${grid(8)})`,
+  height: `calc(100vh - ${grid(8)})`,
   /* Never taller than the VISUAL viewport, so the soft keyboard cannot cover the cursor rows. On the base
      rule because the phone query keys on width and landscape phones never match it. Non-binding with no
      keyboard. The setter is the effect below and must move with this: a `var()` fallback fails silently. */
-  maxHeight: 'var(--console-vv-height, calc(100vh - 3rem))',
+  maxHeight: `var(--console-vv-height, calc(100vh - ${grid(8)}))`,
   display: 'flex',
   flexDirection: 'column',
   overflow: 'hidden',
   '@keyframes consolePanelIn': {
-    from: { opacity: 0, transform: 'translateY(8px) scale(0.98)' },
+    from: { opacity: 0, transform: `translateY(${grid(1)}) scale(0.98)` },
     to: { opacity: 1, transform: 'none' },
   },
   animation: 'consolePanelIn 180ms ease',
@@ -191,7 +195,7 @@ const panelSx = {
     width: '100vw !important',
     height: '100vh !important',
     margin: 0,
-    borderRadius: 0,
+    borderRadius: RADIUS.none,
     /* `100vh` above for engines without `dvh`/`visualViewport` (else an invalid `var()` collapses the
        panel to `height: auto`), then `dvh`, then the var. `dvh` ignores the soft keyboard, hence the var. */
     '@supports (height: 100dvh)': { height: 'var(--console-vv-height, 100dvh) !important' },
@@ -206,11 +210,11 @@ const dockedRootSx = { width: '100%', height: '100%', minWidth: 0, display: 'fle
 const floatingRootSx = {
   position: 'fixed',
   inset: 0,
-  zIndex: 60,
+  zIndex: (t: Theme) => t.zIndex.mobileStepper,
   pointerEvents: 'none',
 } as const
 
-const maximizedRootSx = { position: 'fixed', inset: 0, zIndex: 60, display: 'flex' } as const
+const maximizedRootSx = { position: 'fixed', inset: 0, zIndex: (t: Theme) => t.zIndex.mobileStepper, display: 'flex' } as const
 
 const PANEL_BODY_SX = {
   display: 'flex',
@@ -224,7 +228,7 @@ const dockedPanelSx = {
   ...PANEL_BODY_SX,
   width: '100%',
   height: '100%',
-  borderRadius: 0,
+  borderRadius: RADIUS.none,
 } as const
 
 /* Default box for a just-undocked, never-dragged console: `right`-anchored so it opens where the dock was.
@@ -233,11 +237,11 @@ const floatingPanelSx = {
   ...PANEL_BODY_SX,
   position: 'fixed',
   pointerEvents: 'auto',
-  top: '1.5rem',
-  right: '1.5rem',
-  width: 'min(760px, 46vw)',
-  height: 'calc(100dvh - 3rem)',
-  borderRadius: 2,
+  top: grid(4),
+  right: grid(4),
+  width: `min(${grid(126.5)}, 46vw)`,
+  height: `calc(100dvh - ${grid(8)})`,
+  borderRadius: RADIUS.md,
 } as const
 
 const maximizedPanelSx = {
@@ -246,7 +250,7 @@ const maximizedPanelSx = {
   inset: 0,
   width: '100%',
   height: '100%',
-  borderRadius: 0,
+  borderRadius: RADIUS.none,
   margin: 0,
 } as const
 
@@ -254,8 +258,8 @@ const headerSx = {
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'space-between',
-  px: '0.5rem',
-  py: '0.25rem',
+  px: 1,
+  py: 0.5,
   bgcolor: 'background.default',
   borderBottom: 1,
   borderColor: 'divider',
@@ -266,57 +270,45 @@ const headerSx = {
      ellipsise; `overflow: hidden` stops the row pushing the last control (✕ Close) off the viewport. */
   minWidth: 0,
   overflow: 'hidden',
-  [PHONE]: { px: '0.75rem', minHeight: 44, cursor: 'default' },
+  [PHONE]: { px: 2, minHeight: SIZE.tapTarget, cursor: 'default' },
 } as const
 
 /* Connection state as a DOT (the close reason is written into the terminal body). States differ by
    SILHOUETTE (WCAG 1.4.1): hollow ring / filled circle / filled square; colour is reinforcement only.
-   `border-box` keeps a constant 12px so the header never reflows. State rides `data-state` for specs. */
+   A fixed size so the header never reflows. State rides `data-state` for specs. */
+const STATUS_DOT: Record<ConsoleStatus['state'], { tone: Tone; hollow?: boolean }> = {
+  connecting: { tone: 'warning', hollow: true },
+  connected: { tone: 'success' },
+  closed: { tone: 'error' },
+}
 const statusDotSx = {
-  flexShrink: 0,
-  boxSizing: 'border-box',
-  width: 12,
-  height: 12,
-  ml: '0.5rem',
-  // Keeps the dot beside the title in a space-between header; resolves to 0 on a phone.
+  ml: 1,
+  // Keeps the dot beside the title in a space-between header; on a phone a gap from the nav chevron instead.
   mr: 'auto',
-  borderRadius: '50%',
-  border: '2px solid #6b7280',
-  bgcolor: 'transparent',
-  '&[data-state="connecting"]': { borderColor: '#f59e0b', bgcolor: 'transparent' },
-  '&[data-state="connected"]': { borderColor: '#22c55e', bgcolor: '#22c55e' },
-  // red-400 so the alarm state is not the faintest mark; the square contour is the real distinction.
-  '&[data-state="closed"]': { borderColor: 'transparent', bgcolor: '#f87171', borderRadius: '2px' },
-  [PHONE]: {
-    // Larger for arm's length; margins trimmed so the footprint stays 26px (6+14+6 = 8+10+8), leaving the
-    // title width unchanged.
-    width: 14,
-    height: 14,
-    ml: '0.375rem',
-    // The auto margin collapses here; keep a gap from the nav chevron.
-    mr: '0.375rem',
-  },
+  '&[data-state="closed"]': { borderRadius: RADIUS.none },
+  // Larger at arm's length.
+  [PHONE]: { mr: 1, width: SIZE.iconXs, height: SIZE.iconXs },
 } as const
 
 /* The one-way-console badge: a muted header LABEL, not a dismissible banner or a warning colour. */
 const readOnlyBadgeSx = {
   flexShrink: 0,
-  mr: '0.5rem',
-  px: '0.375rem',
-  py: '0.05rem',
+  mr: 1,
+  px: 1,
+  py: 0,
   border: 1,
   borderColor: 'divider',
-  borderRadius: 1,
-  fontSize: '0.6875rem',
-  fontWeight: 600,
-  letterSpacing: '0.03em',
+  borderRadius: RADIUS.sm,
+  fontSize: FONT_SIZE.xs,
+  fontWeight: FONT_WEIGHT.semibold,
+  letterSpacing: LETTER_SPACING.none,
   textTransform: 'uppercase',
   color: 'text.disabled',
   // Kept on phones too: it is the only explanation for a keyboard that does nothing.
   whiteSpace: 'nowrap',
 } as const
 
-export default function ConsoleTerminal({ project, projectId, number, nodeId, kind = 'clauded', title, mayEdit, hadLiveSession, provider, view, onClose, onPrev, onNext, hasPrev = false, hasNext = false, presentation = 'modal', onSetView, runtime, onChatTask }: Props) {
+export default function ConsoleTerminal({ project, projectId, number, nodeId, kind = 'clauded', title, mayEdit, hadLiveSession, view, onClose, onPrev, onNext, hasPrev = false, hasNext = false, presentation = 'modal', onSetView, runtime, onChatTask }: Props) {
   /* The presentation, unpacked once so rules do not drift. `isModal` is the full pre-dock behaviour
      (scrim, scroll lock, free window once dragged). */
   const isModal = presentation === 'modal'
@@ -327,40 +319,18 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
   const isMovable = isFloating || isModal
   // Always the browser overlay view (spec R1).
   const kindLabel = kind === 'term' ? 'Web Term' : 'Web Console'
-  /* Whether anything may go upstream (stdin, key bar, Title editor). Both halves of the server's rule:
+  /* Whether anything may go upstream (stdin, key bar). Both halves of the server's rule:
        · the key: `useCanDriveWorktreeSession`, NOT `useCanEditWorktrees` — the relay needs
          `worktrees:edit` alone (see `hooks/useWorktreeAccess.ts`);
        · the slot: `mayEdit` — pool admins may watch any slot read-only (`components/WorktreePool.tsx`
          keeps the button enabled) but not drive it.
      `mayEdit !== true` fails closed on an `undefined` from outside the type system. */
   const readOnly = !useCanDriveWorktreeSession() || mayEdit !== true
-  // The slot slug is the stable identity for aria-label and tooltip, independent of a renamable title.
+  // The slot slug is the stable identity for aria-label and tooltip, independent of the title.
   const slotLabel = `${project}-${number}`
-  // ── The header's Title editor (the same edit as the pool drawer's Title row). ──
-  // `savedTitle` bridges until the owner's refetch catches up, so the header does not snap back to the
-  // old title; retired once the prop agrees (as `components/WorktreePool.tsx` retires `pendingTitles`).
-  const [savedTitle, setSavedTitle] = useState<string | null>(null)
-  const [titleNotice, setTitleNotice] = useState<TitleNotice | null>(null)
-  useEffect(() => {
-    setSavedTitle((prev) => (prev === title ? null : prev))
-  }, [title])
   // `''` when unresolved, which falls back to the slug.
-  const resolvedTitle = savedTitle ?? title ?? ''
+  const resolvedTitle = title ?? ''
   const headerTitle = resolvedTitle || slotLabel
-  // Requires `nodeId`: the API resolves an omitted node to the CP's own, which would retitle the wrong
-  // slot. And requires drive rights: the title PUT is `worktrees:edit` only.
-  const canEditTitle = nodeId !== undefined && !readOnly && view === undefined
-  // The editing contract is `hooks/useCommitOnBlurEdit.ts`'s (shared with the pool drawer's Title row).
-  const { close: closeTitleEditor, ...titleEditor } = useCommitOnBlurEdit({
-    canEdit: canEditTitle,
-    onSave: (value) => void commitTitle(value),
-  })
-  // Header chevrons change slot WITHOUT a remount; reset per-slot state.
-  useEffect(() => {
-    setSavedTitle(null)
-    closeTitleEditor()
-    setTitleNotice(null)
-  }, [project, number, nodeId, closeTitleEditor])
   /* Where Restore returns to: per maximize gesture, kept in a ref (the panel never unmounts across the
      trip — components/ConsoleDock.tsx). A reload into `maximized` restores to `docked`, the default. */
   const restoreViewRef = useRef<ConsoleView>('docked')
@@ -377,8 +347,8 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
   // null = still on the CSS default (viewport-filling, centered); set on the first drag or resize.
   const [manual, setManual] = useState<ManualBox | null>(null)
   // Bumping this re-runs the pane's connect effect from scratch ("try now"; both paths retry on their own
-  // cadence — ConsolePane's RECONNECT_IDLE_DELAY_MS / DIRECT_RETRY_DELAY_MS). A FIRST attach, not a retry:
-  // no attach_only, so a click may create a session like re-opening would.
+  // cadence — ConsolePane's RECONNECT_IDLE_DELAY_MS / DIRECT_RETRY_DELAY_MS). It re-runs a first attach,
+  // still attach-only: a click never creates a session.
   const [reconnectNonce, setReconnectNonce] = useState(0)
 
   // ── Chat or Terminal ──
@@ -468,8 +438,6 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
   // One target always: key bar, paste, dot and re-fits go to the single <ConsolePane>. Routing within a
   // grid is tmux's (`mouse on`).
   const activePane = useCallback((): ConsolePaneHandle | null => paneRef.current, [])
-  // "Copy pane text": the write lands when the node's OSC 52 does, so the button flashes what it heard back.
-  const [paneCopyState, , flashPaneCopy] = useCopyFlash(2000)
 
   // ── The single live region ───────────────────────────────────────────
   // One polite region (WCAG 4.1.3). Multi-tile announcements are tile-labelled and rate-limited
@@ -552,7 +520,7 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
     setLayout(model)
     if (dropped.length > 0) {
       announceThrottled(
-        `Saved layout restored without ${dropped.length} closed window${dropped.length === 1 ? '' : 's'}.`,
+        `Saved layout restored without ${countOf(dropped.length, 'closed window')}.`,
       )
     }
   }, [pendingRestore, fleet.settled, fleet.loading, fleet.error, fleet.windows, isDesktopViewport,
@@ -651,18 +619,10 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
     }
   }, [isModal])
 
-  // Drag-to-move (header) and drag-to-resize (corner). Window-level listeners rather than
-  // setPointerCapture (jsdom lacks it). The teardown is stashed so an unmount mid-drag removes them.
-  const dragTeardownRef = useRef<(() => void) | null>(null)
-  useEffect(() => () => dragTeardownRef.current?.(), [])
-  // Did the pointer move? The drag ends with a `click` on the title, which must not open the Title editor.
-  const dragMovedRef = useRef(false)
-
+  // Drag-to-move (header) and drag-to-resize (corner).
+  const attachDrag = useWindowDrag()
   // setManual waits for the first pointermove so a plain header click keeps the CSS-default sizing.
   const startDrag = (e: React.PointerEvent) => {
-    // Cleared BEFORE the guards: a non-drag gesture (phone tap) must clear a stale `true`.
-    dragMovedRef.current = false
-    // `input` too: a pointerdown in the Title editor must place the caret, not drag.
     if (e.button !== 0 || (e.target as HTMLElement).closest('button, input') || !isMovable || !isDesktopViewport) return
     const rect = panelRef.current!.getBoundingClientRect()
     const base = manual ?? { top: rect.top, left: rect.left, width: rect.width, height: rect.height }
@@ -670,7 +630,6 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
     const startY = e.clientY
 
     const onMove = (ev: PointerEvent) => {
-      dragMovedRef.current = true
       const maxTop = window.innerHeight - 40
       const maxLeft = window.innerWidth - 40
       setManual((prev) => {
@@ -682,14 +641,7 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
         }
       })
     }
-    const onUp = () => {
-      window.removeEventListener('pointermove', onMove)
-      window.removeEventListener('pointerup', onUp)
-      dragTeardownRef.current = null
-    }
-    window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', onUp)
-    dragTeardownRef.current = onUp
+    attachDrag(onMove)
   }
 
   const startResize = (e: React.PointerEvent) => {
@@ -711,32 +663,7 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
         }
       })
     }
-    const onUp = () => {
-      window.removeEventListener('pointermove', onMove)
-      window.removeEventListener('pointerup', onUp)
-      dragTeardownRef.current = null
-    }
-    window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', onUp)
-    dragTeardownRef.current = onUp
-  }
-
-  // Open the header's Title editor, seeded like the Worktrees cell editor.
-  const startTitleEdit = () => {
-    if (!canEditTitle || dragMovedRef.current) return
-    titleEditor.open(titleEditorSeed(resolvedTitle))
-  }
-
-  // Request/addressing/outcomes are `lib/slotTitle.ts`'s. An empty value is an operator CLEAR, not a
-  // cancel (Escape cancels); the CP resolves the slot back to its task-composed Title or `free`.
-  const commitTitle = async (value: string) => {
-    if (nodeId === undefined) return
-    setTitleNotice(null)
-    if (value) setSavedTitle(value)
-    const saved = await saveSlotTitle({ project, projectId, number, nodeId }, value)
-    // `null` = the request never landed; drop the optimistic paint.
-    setSavedTitle(saved.title)
-    setTitleNotice(saved.notice)
+    attachDrag(onMove)
   }
 
   // Soft keyboard: bound the panel by the VISUAL viewport. `dvh`/`vh` ignore the keyboard, and iOS Safari
@@ -860,12 +787,10 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
   const noticeOwner = transportStatuses.find((s) => s.notice)
   const directNotice = noticeOwner?.notice ?? ''
 
-  // One notice bar. A Title-edit outcome outranks the standing transport reason while showing.
-  // `kind: 'error'`: the console is NOT connected and retrying; nothing carries the bytes meanwhile —
+  // One notice bar. `kind: 'error'`: the console is NOT connected and retrying; nothing carries the bytes meanwhile —
   // except `relayed`, where the relay carries them and the notice only explains why (`info`).
-  const notice: TitleNotice | null =
-    titleNotice
-    ?? (directNotice ? { text: directNotice, kind: noticeOwner?.transport === 'cp' ? 'info' : 'error' } : null)
+  const notice: { text: string; kind: 'error' | 'info' } | null =
+    directNotice ? { text: directNotice, kind: noticeOwner?.transport === 'cp' ? 'info' : 'error' } : null
 
   return (
     /* `data-testid="console-overlay"` is the specs' hook. `components/ConsoleDock.tsx` renders its own
@@ -896,95 +821,33 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
         >
           {/* Header shows the slot TITLE (the identity that distinguishes consoles); kind stays in the
               aria-label, and the tooltip carries title + slug since the title ellipsises. */}
-          {titleEditor.editing ? (
-            /* `flex: 1 1 auto`: Titles run 40-60 chars. `userSelect`/`touchAction` re-enabled (the header
-               disables them for drag). `InputBase` so the dense header row does not double in height. */
-            <InputBase
-              data-testid="console-title-input"
-              value={titleEditor.draft}
-              autoFocus
-              inputProps={{ 'aria-label': `Title for ${project} #${number}` }}
-              sx={(theme) => ({
-                flex: '1 1 auto',
-                minWidth: 0,
-                px: '0.35rem',
-                py: '0.1rem',
-                fontSize: '0.85rem',
-                fontFamily: theme.typography.mono.fontFamily,
-                bgcolor: 'action.hover',
-                border: 1,
-                borderColor: 'primary.main',
-                borderRadius: 1,
-                userSelect: 'text',
-                touchAction: 'auto',
-                '& .MuiInputBase-input': { p: 0 },
-              })}
-              onChange={(e) => titleEditor.setDraft(e.target.value)}
-              onKeyDown={(e) => {
-                // Keystrokes stop here; Escape must not also reach the pane behind.
-                e.stopPropagation()
-                titleEditor.onKeyDown(e)
-              }}
-              // Leaving the field COMMITS (as in the Worktrees cell); Escape is the sole cancel.
-              onBlur={titleEditor.onBlur}
-            />
-          ) : (
-            <Box
-              component="span"
-              data-testid="console-title"
-              data-editable={canEditTitle ? 'true' : undefined}
-              sx={(theme) => ({
-                fontSize: '0.85rem',
-                fontWeight: 600,
-                fontFamily: theme.typography.mono.fontFamily,
-                color: 'text.primary',
-                /* Click-to-rename (see canEditTitle): a text caret + hover underline, since the header is
-                   `cursor: move`; a focus ring for keyboard reach (role=button, tabindex 0). */
-                '&[data-editable="true"]': { cursor: 'text', borderRadius: 1 },
-                '&[data-editable="true"]:hover': { textDecoration: 'underline' },
-                '&[data-editable="true"]:focus-visible': {
-                  outline: '2px solid',
-                  outlineColor: 'primary.main',
-                  outlineOffset: '2px',
-                },
-                /* The title is the element that gives, at EVERY width: a docked panel can be 320px on a
-                   desktop, where no `[PHONE]` rule applies, and every control beside it is `flexShrink: 0`
-                   (else ✕ Close is pushed off). One line, ellipsised, full string on the tooltip. */
-                /* `block`, not `flex`: `text-overflow` does not apply to a flex container, whose text
-                   would be clipped with no ellipsis. */
-                display: 'block',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-                minWidth: 0,
-                flex: '1 1 auto',
-                [PHONE]: {
-                  // A control here, so it owes the 44px tap floor; it fits the header's existing
-                  // 44px min-height. `flex` for vertical centring.
-                  display: 'flex',
-                  alignItems: 'center',
-                  '&[data-editable="true"]': { minHeight: 44 },
-                },
-              })}
-              // Tooltip keeps Title + slug, and names the edit when offered (no room for a ✎ button).
-              title={`${resolvedTitle ? `${headerTitle} (${slotLabel})` : slotLabel}${canEditTitle ? ' — click to rename' : ''}`}
-              role={canEditTitle ? 'button' : undefined}
-              tabIndex={canEditTitle ? 0 : undefined}
-              onClick={startTitleEdit}
-              onKeyDown={(e) => {
-                if (!canEditTitle || (e.key !== 'Enter' && e.key !== ' ')) return
-                // Space would scroll the panel before opening the editor.
-                e.preventDefault()
-                startTitleEdit()
-              }}
-            >
-              {headerTitle}
-            </Box>
-          )}
-          <Box
+          <Tip title={resolvedTitle ? `${headerTitle} (${slotLabel})` : slotLabel}><Box
             component="span"
+            data-testid="console-title"
+            sx={(theme) => ({
+              fontSize: FONT_SIZE.md,
+              fontWeight: FONT_WEIGHT.semibold,
+              fontFamily: theme.typography.mono.fontFamily,
+              color: 'text.primary',
+              /* The title is the element that gives, at EVERY width: a docked panel can be 320px on a
+                 desktop, where no `[PHONE]` rule applies, and every control beside it is `flexShrink: 0`
+                 (else ✕ Close is pushed off). One line, ellipsised, full string on the tooltip. */
+              /* `block`, not `flex`: `text-overflow` does not apply to a flex container, whose text
+                 would be clipped with no ellipsis. */
+              display: 'block',
+              ...ELLIPSIS_SX,
+              flex: '1 1 auto',
+            })}
+            // Tooltip keeps Title + slug.
+          >
+            {headerTitle}
+          </Box></Tip>
+          <StatusDot
+            aria-hidden={false}
             data-testid="console-status-dot"
             data-state={headerStatus.state}
+            {...STATUS_DOT[headerStatus.state]}
+            size={grid(2)}
             sx={statusDotSx}
             role="img"
             aria-label={`Connection: ${headerStatus.label}`}
@@ -1022,7 +885,7 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
                 reports, not its state. */}
             {/* Four states (AC7.2), none by colour alone: name, tooltip (lib/directToggle.ts) and badge
                 glyph differ per state; `sx` colour is reinforcement. State rides `data-direct-state`. */}
-            <IconButton
+            <Tip title={directView.title}><IconButton
               type="button"
               role="switch"
               aria-checked={directEnabled}
@@ -1030,7 +893,6 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
               data-direct-state={directState}
               onClick={toggleDirect}
               aria-label={directView.label}
-              title={directView.title}
               sx={{
                 ...headerButtonSx,
                 position: 'relative',
@@ -1038,7 +900,7 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
                 display: 'inline-flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                gap: '0.05rem',
+                gap: 0,
                 // OFF: dimmer than neighbours — discoverable without demanding attention.
                 '&[data-direct-state="off"]': { color: 'text.disabled' },
                 // CONNECTING: the pulse is decoration only.
@@ -1068,21 +930,20 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
                   component="span"
                   data-testid="console-direct-badge"
                   aria-hidden="true"
-                  sx={{ fontSize: '0.6875rem', lineHeight: 1, fontWeight: 700 }}
+                  sx={{ fontSize: FONT_SIZE.xs, lineHeight: LINE_HEIGHT.tight, fontWeight: FONT_WEIGHT.bold }}
                 >
                   {directView.badge}
                 </Box>
               )}
-            </IconButton>
+            </IconButton></Tip>
             {isDesktopViewport && (
-              <IconButton
+              <Tip title="Direct connection settings"><IconButton
                 sx={headerButtonSx}
                 onClick={openDirectSettings}
                 aria-label="Direct connection settings"
-                title="Direct connection settings"
               >
                 ⚙
-              </IconButton>
+              </IconButton></Tip>
             )}
           </Box>
           )}
@@ -1097,21 +958,28 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
                 // Only bumps the nonce; the pane's connect effect owns the status reset.
                 onClick={() => setReconnectNonce((n) => n + 1)}
                 aria-label="Reconnect"
-                title="Reconnect"
               >
                 ↻
               </IconButton>
             )}
-            {/* The pane's whole history as plain text — the readable way back past an inline-redrawing CLI. */}
+            {/* The pane's whole history as plain text — the readable way back past an inline-redrawing CLI. The write
+                lands when the node's OSC 52 does, so the button flashes what it heard back. */}
             {headerStatus.state === 'connected' && !readOnly && !showChat && (
-              <IconButton
-                sx={headerButtonSx}
-                onClick={() => { activePane()?.copyPaneText(flashPaneCopy) }}
-                aria-label="Copy pane text"
-                title={paneCopyState === 'copied' ? 'Copied' : paneCopyState === 'failed' ? 'Copy failed' : 'Copy pane text'}
-              >
-                {paneCopyState === 'copied' ? '✓' : paneCopyState === 'failed' ? '!' : '⎘'}
-              </IconButton>
+              <CopyButton
+                variant="icon"
+                testId="console-copy-pane"
+                label="Copy pane text"
+                copiedLabel="Copied"
+                failedLabel="Copy failed"
+                flashMs={2000}
+                announce={false}
+                /* The header's rhythm and, as its neighbours, the theme's phone tap floor (the icon face drops it). */
+                sx={(theme) => ({
+                  minWidth: headerButtonSx.minWidth,
+                  [theme.breakpoints.down('sm')]: { minWidth: SIZE.tapTarget, minHeight: SIZE.tapTarget },
+                })}
+                text={{ run: (settle) => { activePane()?.copyPaneText(settle) } }}
+              />
             )}
             {(onPrev || onNext) && (
               <>
@@ -1120,7 +988,6 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
                   onClick={onPrev}
                   disabled={!onPrev || !hasPrev}
                   aria-label="Previous session"
-                  title="Previous session"
                 >
                   ‹
                 </IconButton>
@@ -1129,21 +996,19 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
                   onClick={onNext}
                   disabled={!onNext || !hasNext}
                   aria-label="Next session"
-                  title="Next session"
                 >
                   ›
                 </IconButton>
               </>
             )}
             {isDesktopViewport && !view && (
-              <IconButton
+              <Tip title="Console layout"><IconButton
                 sx={headerButtonSx}
                 onClick={openDesigner}
                 aria-label="Console layout"
-                title="Console layout"
               >
                 ▦
-              </IconButton>
+              </IconButton></Tip>
             )}
             {/* DOCK/UNDOCK and MAXIMIZE/RESTORE: only when something owns the view and above
                 `DOCK_MIN_VIEWPORT`. Each has `title` + `aria-label`, since a glyph alone cannot say what it does. */}
@@ -1151,14 +1016,13 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
               <>
                 {/* Hidden while maximized: Restore already returns to the dock. */}
                 {!isMaximized && (
-                  <IconButton
+                  <Tip title={isDocked ? 'Undock console' : 'Dock console to the right'}><IconButton
                     sx={headerButtonSx}
                     onClick={() => onSetView(isDocked ? 'floating' : 'docked')}
                     aria-label={isDocked ? 'Undock console' : 'Dock console to the right'}
-                    title={isDocked ? 'Undock console' : 'Dock console to the right'}
                   >
                     {isDocked ? '⧉' : '⇥'}
-                  </IconButton>
+                  </IconButton></Tip>
                 )}
                 <MaximizeButton
                   noun="console"
@@ -1181,8 +1045,8 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
             would scroll the in-terminal copy away. Non-dismissible: acknowledging does not clear a
             standing failure. `role="status"`; the reason is a plain string, never markup. */}
         {notice && (
-          /* A bar, not a toast (a timeout would take the explanation with it). `TitleNotice`'s `info` maps to
-             `warning` (lib/slotTitle.ts). `role="status"` overrides Alert's assertive `role="alert"`. */
+          /* A bar, not a toast (a timeout would take the explanation with it). An `info` notice maps to
+             `warning`. `role="status"` overrides Alert's assertive `role="alert"`. */
           <Alert
             data-testid="console-notice"
             data-kind={notice.kind}
@@ -1191,11 +1055,11 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
             icon={false}
             sx={{
               flexShrink: 0,
-              borderRadius: 0,
-              fontSize: '0.78rem',
-              lineHeight: 1.35,
-              py: '0.15rem',
-              '& .MuiAlert-message': { py: '0.25rem' },
+              borderRadius: RADIUS.none,
+              fontSize: FONT_SIZE.sm,
+              lineHeight: LINE_HEIGHT.snug,
+              py: 0,
+              '& .MuiAlert-message': { py: 0.5 },
             }}
           >
             {notice.text}
@@ -1222,9 +1086,6 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
             number={number}
             nodeId={nodeId}
             kind={kind}
-            // Not while editing the Title: a pane focuses itself on every (re)connect and would steal the
-            // caret mid-word, sending the rest into the live session.
-            autoFocus={!titleEditor.editing}
             // Absent for a plain console; present, the node builds the tmux window this PTY shows.
             layout={layoutSpec ?? undefined}
             fontSize={layout ? tileFontSize(countTiles(layout)) : undefined}
@@ -1235,7 +1096,6 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
             readOnly={readOnly}
             // Passed through unexamined; absent means "the caller did not say".
             hadLiveSession={hadLiveSession}
-            provider={provider}
             view={view}
             // The direct route cannot open a VM view; relay only.
             direct={directEnabled && !view}
@@ -1256,8 +1116,8 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
             display: 'flex',
             flexShrink: 0,
             gap: 0.5,
-            px: '0.5rem',
-            py: '0.2rem',
+            px: 1,
+            py: 0.5,
             bgcolor: 'background.default',
             borderTop: 1,
             borderColor: 'divider',
@@ -1275,19 +1135,18 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
               onPointerDown={(e) => e.preventDefault()}
               onClick={() => pressKey(key)}
               aria-label={key.ariaLabel}
-              title={key.ariaLabel}
               sx={(theme) => ({
                 flex: '0 0 auto',
-                minWidth: '2.5rem',
-                px: '0.5rem',
-                py: '0.35rem',
+                minWidth: grid(6.5),
+                px: 1,
+                py: 0.5,
                 fontFamily: theme.typography.mono.fontFamily,
-                fontSize: '0.8125rem',
-                lineHeight: 1,
+                fontSize: FONT_SIZE.md,
+                lineHeight: LINE_HEIGHT.tight,
                 borderColor: 'divider',
                 color: 'text.primary',
                 // Thumb-sized keys on a phone, where this bar is the only way to send Esc or arrows.
-                [PHONE]: { minWidth: 44, minHeight: 44, fontSize: '0.9375rem' },
+                [PHONE]: { minWidth: SIZE.tapTarget, minHeight: SIZE.tapTarget, fontSize: FONT_SIZE.base },
               })}
             >
               {key.label}
@@ -1304,17 +1163,17 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
             position: 'absolute',
             right: 0,
             bottom: 0,
-            width: 16,
-            height: 16,
+            width: SIZE.iconSm,
+            height: SIZE.iconSm,
             cursor: 'nwse-resize',
             touchAction: 'none',
             '&::after': {
               content: '""',
               position: 'absolute',
-              right: '3px',
-              bottom: '3px',
-              width: 8,
-              height: 8,
+              right: grid(0.5),
+              bottom: grid(0.5),
+              width: grid(1),
+              height: grid(1),
               borderRight: '2px solid',
               borderBottom: '2px solid',
               borderColor: 'text.disabled',
@@ -1336,18 +1195,18 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
           <Box data-testid="console-direct-note">
             <Typography variant="body2">Connect straight to the node</Typography>
             {/* The pre-toggle explainer (`DIRECT_MODE_EXPLAINER`); must describe the trade honestly. */}
-            <Typography variant="caption" component="p" sx={{ color: 'text.secondary', lineHeight: 1.4 }}>
+            <Typography variant="caption" component="p" sx={{ color: 'text.secondary', lineHeight: LINE_HEIGHT.snug }}>
               {DIRECT_MODE_EXPLAINER}
             </Typography>
           </Box>
           {/* Monospace, full width: a URL wrapped mid-host cannot be checked. */}
           <TextField
             data-testid="console-direct-url"
-            label="Direct address override"
+            label={<HelpLabel label="Direct address override" help={DIRECT_OVERRIDE_TIP} />}
             type="text"
             fullWidth
             slotProps={{
-              htmlInput: { inputMode: 'url', spellCheck: false },
+              htmlInput: { inputMode: 'url', spellCheck: false, 'aria-description': DIRECT_OVERRIDE_TIP },
             }}
             placeholder="wss://node.tailnet.example:7787/console/project/1/clauded"
             value={draftOverride}
@@ -1355,7 +1214,7 @@ export default function ConsoleTerminal({ project, projectId, number, nodeId, ki
             sx={(theme) => ({
               '& .MuiInputBase-input': {
                 fontFamily: theme.typography.mono.fontFamily,
-                fontSize: '0.78rem',
+                fontSize: FONT_SIZE.sm,
               },
             })}
           />

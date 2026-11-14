@@ -2,8 +2,9 @@
 #
 # Keys are `/etc/os-release` `ID` and `VERSION_ID`, compared as exact strings. A release not listed here is
 # warned about and tried (the bootstrap), never refused. Readers: the API's node label
-# (`apps/api/app/node_platform.py::distro_label`), the bootstrap renderer and the docs, which point here and
-# never restate the list.
+# (`apps/api/app/node_platform.py::distro_label`) and the bootstrap renderer. One reader restates it for tenants,
+# who cannot read this file: the reader docs' Add a node page, § What a Linux machine needs — change it with
+# this list.
 schema = 1
 
 # Machine names as `uname -m` prints them; the daemon normalises to the wire's x64/arm64

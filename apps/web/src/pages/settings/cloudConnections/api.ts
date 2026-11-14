@@ -1,11 +1,11 @@
 // The cloud-connection surface's ONE API client, shared by the Settings table, the Add-node wizard and the
 // node-group dialog so they cannot disagree about a URL (shape precedent: `settings/tags/api.ts`). Lives
-// under `settings/` though `components/addNode/AddNodeDialog.tsx` reads it: a module lives where the thing
-// it describes lives (`components/PortGridSection.tsx` states the rule). Record shapes live in
+// under `settings/` though `components/addNode/AddNodePage.tsx` reads it: a module lives where the thing
+// it describes lives. Record shapes live in
 // `src/types.ts`; this module owns the REQUEST shapes, since no create body is a record minus a field.
 
-import { del, get, post, put } from '../../../api'
-import { NETWORKS_TAB_PATHS } from '../../../routeGroups'
+import { del, get, post, put, withQuery } from '../../../api'
+import { connectionUrl, NETWORKS_TAB_PATHS } from '../../../routeGroups'
 import type {
   CloudConnectionCredentialOption,
   CloudConnectionOption,
@@ -55,7 +55,7 @@ export const updateCloudConnection = (id: string, body: CloudConnectionBody) =>
 
 export const deleteCloudConnection = (id: string) => del(`/api/cloud-connections/${id}`)
 
-/* ── Lookups the dialog's selects are fed from ────────────────────────────────────────────────────
+/* ── Lookups the form's selects are fed from ──────────────────────────────────────────────────────
    Regions are a static catalogue (no credential). Subnets and security groups are read from AWS under the
    chosen credential; an AWS refusal comes back 502 with AWS's own sentence as the detail, which the field
    shows verbatim (nothing here could say it better). */
@@ -96,15 +96,13 @@ export type LookupOption = { value: string; label: string }
 export function lookupConnectionField(
   field: string, provider: CloudProvider, credentialId: string, region = '', parents: Record<string, string> = {},
 ) {
-  const query = new URLSearchParams({ provider, credential_id: credentialId })
-  if (region) query.set('region', region)
-  for (const [name, value] of Object.entries(parents)) if (value) query.set(name, value)
-  return get<LookupOption[]>(`/api/cloud-connections/lookup/${encodeURIComponent(field)}?${query.toString()}`)
+  const set = Object.fromEntries(Object.entries(parents).filter(([, value]) => value))
+  return get<LookupOption[]>(withQuery(`/api/cloud-connections/lookup/${encodeURIComponent(field)}`, { provider, credential_id: credentialId, region, ...set }))
 }
 
-/** The region a connection opens on: the credential's own, else AWS's default. Spelled once for the
- *  dialog and the inline credential form (the registry's AWS `region` field defaults the same way). */
-export const DEFAULT_REGION = 'us-east-1'
+/** The region a connection opens on: the credential's own, else AWS's default (the registry's AWS `region`
+ *  field defaults the same way). */
+const DEFAULT_REGION = 'us-east-1'
 
 export function initialRegion(credential: CloudConnectionCredentialOption | undefined): string {
   return credential?.region || DEFAULT_REGION
@@ -134,3 +132,9 @@ export const PROVIDER_LABELS: Readonly<Record<CloudProvider, string>> = {
    surfaces: the prose path and the link that opens it. */
 export const CLOUD_CONNECTIONS_PATH = 'Networks > Connections'
 export const CLOUD_CONNECTIONS_URL = NETWORKS_TAB_PATHS.networks
+/** The Connections list itself (Networks' Connections tab): where a connection's page goes back to. */
+export const CONNECTIONS_LIST_URL = `${CLOUD_CONNECTIONS_URL}?tab=connections`
+/** The retired `?edit=<id>` deep link (`CloudConnectionsSection` redirects it to the connection's page). */
+export const EDIT_CONNECTION_PARAM = 'edit'
+/** That connection's page: a refused launch's way to its network settings. */
+export const connectionEditUrl = (id: string) => connectionUrl(id)

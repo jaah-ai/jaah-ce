@@ -33,7 +33,7 @@ from typing import Annotated, Any, Iterator, Literal, Optional, Union
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import Field, StringConstraints
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -45,9 +45,9 @@ from app.actors import stamp_actor
 from app.access import ORG_ADMIN, ORG_OWNER
 from app.authz.catalog import Tenancy
 from app.authz.declarations import always
-from app.authz.principal import Principal, current_principal
-from app.db import SessionLocal
-from app.entity_shape import constraint_name, get_or_404, iso_or_none
+from app.authz.principal import Principal, current_principal_async
+from app.db_async import on_session
+from app.entity_shape import StrictModel, constraint_name, get_or_404, iso_or_none, or_404
 from app.models.identity import AdminUser
 from app.models.tasks import BuiltInPlaybook, Playbook
 from app.playbook_built_ins import BUILT_INS
@@ -87,44 +87,40 @@ _TOKENS = 100
 _BODY_STAGES = MAX_STAGES * 4
 
 
-class _Shape(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-
-class ExpertPinned(_Shape):
+class ExpertPinned(StrictModel):
     kind: Literal["pinned"]
     expert: _Token
 
 
-class ExpertChosen(_Shape):
+class ExpertChosen(StrictModel):
     kind: Literal["chosen_at_start"]
     default: _Token
     allowed: Annotated[list[_Token], Field(max_length=_TOKENS)]
 
 
-class CreatedAtStart(_Shape):
+class CreatedAtStart(StrictModel):
     kind: Literal["at_start"]
 
 
-class CreatedBy(_Shape):
+class CreatedBy(StrictModel):
     kind: Literal["by"]
     stage: _Token
 
 
-class DependsNone(_Shape):
+class DependsNone(StrictModel):
     kind: Literal["none"]
 
 
-class DependsAllEarlier(_Shape):
+class DependsAllEarlier(StrictModel):
     kind: Literal["all_earlier"]
 
 
-class DependsStages(_Shape):
+class DependsStages(StrictModel):
     kind: Literal["stages"]
     keys: Annotated[list[_Token], Field(max_length=_TOKENS)]
 
 
-class StageIn(_Shape):
+class StageIn(StrictModel):
     key: _Token
     label: _Text
     expert: Annotated[Union[ExpertPinned, ExpertChosen], Field(discriminator="kind")]
@@ -142,7 +138,7 @@ class StageIn(_Shape):
     may_file: Optional[Annotated[list[_Token], Field(max_length=_TOKENS)]] = None
 
 
-class PlaybookIn(_Shape):
+class PlaybookIn(StrictModel):
     name: _Text
     description: _Text = ""
     entry: _Token
@@ -176,7 +172,7 @@ def _row_input(row: Union[Playbook, BuiltInPlaybook]) -> dict[str, Any]:
 
 
 def _stages_out(pb: dict[str, Any]) -> list[dict[str, Any]]:
-    return [{**stage, "derived": derived} for stage, derived in zip(pb["stages"], derive(pb))]
+    return [{**stage, "derived": derived} for stage, derived in zip(pb["stages"], derive(pb), strict=False)]
 
 
 def _out(
@@ -274,30 +270,30 @@ def _apply(row: Playbook, pb: dict[str, Any]) -> None:
 
 
 @contextmanager
-def _member_session(principal: Optional[Principal]) -> Iterator[tuple[Session, Any]]:
-    """A session bound to the caller's own org, and that org — 401 without a signed-in person. The guard
-    bound nothing (`ALWAYS`), so there is no decided scope for the region to conflict with."""
+def _member_session(session: Session, principal: Optional[Principal]) -> Iterator[tuple[Session, Any]]:
+    """The route's `session` bound to the caller's own org, and that org — 401 without a signed-in person. The
+    guard bound nothing (`ALWAYS`), so there is no decided scope for the region to conflict with."""
     if principal is None or principal.org_id is None:
         raise HTTPException(status_code=401, detail="unauthorized")
-    with seam.bound_to(principal.org_id), SessionLocal() as session:
+    with seam.bound_to(principal.org_id):
         if not playbook_engine.enabled(session, principal.org_id):
             raise HTTPException(status_code=403, detail=playbook_engine.OFF_DETAIL)
         yield session, principal.org_id
 
 
 @contextmanager
-def _reader_session(principal: Optional[Principal], *, fleet: bool) -> Iterator[tuple[Session, Any]]:
+def _reader_session(session: Session, principal: Optional[Principal], *, fleet: bool) -> Iterator[tuple[Session, Any]]:
     """`_member_session`, or — for an operator asking `fleet` — a fleet-wide session, so the read reaches
     every org's copies. Reads only: no mutation enters it. Yields the caller's own org either way."""
     if not (fleet and principal is not None and principal.is_operator):
-        with _member_session(principal) as pair:
+        with _member_session(session, principal) as pair:
             yield pair
         return
     # The same 401 `_member_session` answers: "own" is meaningless without an org of one's own.
     if principal.org_id is None:
         raise HTTPException(status_code=401, detail="unauthorized")
     # The operator's org filter narrows the fleet read; set only on an operator's GET.
-    with seam.operator_scope(), seam.request_org_filter_applied(), SessionLocal() as session:
+    with seam.operator_scope(), seam.request_org_filter_applied():
         yield session, principal.org_id
 
 
@@ -306,9 +302,9 @@ def _labelled(session: Session, rows: list[Playbook]) -> dict[Any, OrgRef]:
 
 
 @contextmanager
-def _editor_session(principal: Optional[Principal]) -> Iterator[tuple[Session, AdminUser]]:
+def _editor_session(session: Session, principal: Optional[Principal]) -> Iterator[tuple[Session, AdminUser]]:
     """`_member_session` for a mutation: 403 unless `_may_edit`, and the caller's own row to stamp."""
-    with _member_session(principal) as (session, _org_id):
+    with _member_session(session, principal) as (session, _org_id):
         if not _may_edit(principal):
             raise HTTPException(status_code=403, detail="forbidden")
         # A filtered read, not `session.get`: the seam's org predicate applies to it.
@@ -318,21 +314,23 @@ def _editor_session(principal: Optional[Principal]) -> Iterator[tuple[Session, A
         yield session, user
 
 
-def _signed_in(principal: Optional[Principal], *, operator_read: bool = False) -> None:
+def _signed_in(session: Session, principal: Optional[Principal], *, operator_read: bool = False) -> None:
     """401 without a signed-in person, 403 while their org's plan has Playbooks off (`_member_session`) —
     unless `operator_read` and the caller is an operator."""
     if principal is None:
         raise HTTPException(status_code=401, detail="unauthorized")
     if operator_read and principal.is_operator:
         return
-    with _member_session(principal):
+    with _member_session(session, principal):
         pass
 
 
 @router.get("")
 @always(Tenancy.ORG_SCOPED)
+@on_session
 def list_playbooks(
-    principal: Optional[Principal] = Depends(current_principal),
+    session: Session,
+    principal: Optional[Principal] = Depends(current_principal_async),
     all_orgs: bool = Query(
         False,
         description="An operator's ask for every org's copies (the console's Playbooks list); ignored for "
@@ -342,7 +340,7 @@ def list_playbooks(
     """The built-ins in seed order, then the caller org's copies by name — or, for an operator asking
     `all_orgs`, every org's copies by name, another org's read-only."""
     may_edit = _may_edit(principal)
-    with _reader_session(principal, fleet=all_orgs) as (session, org_id):
+    with _reader_session(session, principal, fleet=all_orgs) as (session, org_id):
         built_ins = sorted(
             session.scalars(select(BuiltInPlaybook)).all(),
             key=lambda row: _SEED_ORDER.get(row.id, len(_SEED_ORDER)),
@@ -365,9 +363,10 @@ def list_playbooks(
 
 @router.get("/vocabulary")
 @always(Tenancy.ORG_SCOPED)
-def vocabulary(principal: Optional[Principal] = Depends(current_principal)) -> dict[str, Any]:
+@on_session
+def vocabulary(session: Session, principal: Optional[Principal] = Depends(current_principal_async)) -> dict[str, Any]:
     """Every closed set with its human label, so the console renders no raw token."""
-    _signed_in(principal, operator_read=True)
+    _signed_in(session, principal, operator_read=True)
     return {
         "experts": [{"key": e.key, "label": e.label} for e in v.EXPERT_RECORDS],
         "deliverables": [
@@ -390,17 +389,20 @@ def vocabulary(principal: Optional[Principal] = Depends(current_principal)) -> d
 
 @router.post("/validate")
 @always(Tenancy.ORG_SCOPED)
+@on_session
 def validate_playbook(
-    body: PlaybookIn, principal: Optional[Principal] = Depends(current_principal)
+    session: Session,
+    body: PlaybookIn,
+    principal: Optional[Principal] = Depends(current_principal_async),
 ) -> dict[str, Any]:
     """The issues and derived facts of an unsaved playbook — always 200, never a 422 for an issue.
     Name uniqueness is checked on save only (an edit would otherwise collide with its own name)."""
-    _signed_in(principal)
+    _signed_in(session, principal)
     pb = _as_input(body)
     return {"issues": [issue.as_dict() for issue in validate(pb)], "stages": _stages_out(pb)}
 
 
-class PreviewIn(_Shape):
+class PreviewIn(StrictModel):
     playbook: PlaybookIn
     stage_key: _Token
     # A chosen-at-start stage's pick among its allowed experts; None = its default.
@@ -411,12 +413,15 @@ class PreviewIn(_Shape):
 
 @router.post("/preview-prompt")
 @always(Tenancy.ORG_SCOPED)
+@on_session
 def preview_prompt(
-    body: PreviewIn, principal: Optional[Principal] = Depends(current_principal)
+    session: Session,
+    body: PreviewIn,
+    principal: Optional[Principal] = Depends(current_principal_async),
 ) -> dict[str, Any]:
     """One stage's rendered dispatch prompt against the sample fixture (`app/playbook_prompt.py`), for an
     unsaved edit as readily as a saved one. An invalid playbook or an unrenderable stage is a 422."""
-    _signed_in(principal)
+    _signed_in(session, principal)
     pb = _as_input(body.playbook)
     issues = validate(pb)
     if has_errors(issues):
@@ -429,11 +434,14 @@ def preview_prompt(
 
 @router.get("/{playbook_id}")
 @always(Tenancy.ORG_SCOPED)
+@on_session
 def get_playbook(
-    playbook_id: UUID, principal: Optional[Principal] = Depends(current_principal)
+    session: Session,
+    playbook_id: UUID,
+    principal: Optional[Principal] = Depends(current_principal_async),
 ) -> dict[str, Any]:
     """A built-in, or the caller org's copy — or, for an operator, any org's copy, read-only."""
-    with _reader_session(principal, fleet=True) as (session, org_id):
+    with _reader_session(session, principal, fleet=True) as (session, org_id):
         row = _built_in(session, playbook_id) or session.scalars(
             select(Playbook).where(Playbook.id == playbook_id)
         ).one_or_none()
@@ -451,11 +459,13 @@ def get_playbook(
 
 @router.post("", status_code=201)
 @always(Tenancy.ORG_SCOPED)
+@on_session
 def create_playbook(
+    session: Session,
     body: PlaybookIn,
-    principal: Optional[Principal] = Depends(current_principal),
+    principal: Optional[Principal] = Depends(current_principal_async),
 ) -> dict[str, Any]:
-    with _editor_session(principal) as (session, user):
+    with _editor_session(session, principal) as (session, user):
         pb = _checked(session, user, body)
         row = Playbook(org_id=user.org_id)
         _apply(row, pb)
@@ -468,13 +478,15 @@ def create_playbook(
 
 @router.put("/{playbook_id}")
 @always(Tenancy.ORG_SCOPED)
+@on_session
 def update_playbook(
+    session: Session,
     playbook_id: UUID,
     body: PlaybookIn,
-    principal: Optional[Principal] = Depends(current_principal),
+    principal: Optional[Principal] = Depends(current_principal_async),
 ) -> dict[str, Any]:
     """A full replace; the stage order sent is the order stored."""
-    with _editor_session(principal) as (session, user):
+    with _editor_session(session, principal) as (session, user):
         row = _own_or_refuse(session, user, playbook_id)
         pb = _checked(session, user, body, except_id=row.id)
         _apply(row, pb)
@@ -498,14 +510,17 @@ def _copy_name(session: Session, org_id: Any, name: str) -> str:
 
 @router.post("/{playbook_id}/duplicate", status_code=201)
 @always(Tenancy.ORG_SCOPED)
+@on_session
 def duplicate_playbook(
-    playbook_id: UUID, principal: Optional[Principal] = Depends(current_principal)
+    session: Session,
+    playbook_id: UUID,
+    principal: Optional[Principal] = Depends(current_principal_async),
 ) -> dict[str, Any]:
     """A new, editable copy in the caller's org of a built-in or of one of the org's own copies."""
-    with _editor_session(principal) as (session, user):
-        source = _built_in(session, playbook_id) or _own(session, user.org_id, playbook_id)
-        if source is None:
-            raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
+    with _editor_session(session, principal) as (session, user):
+        source = _built_in(session, playbook_id) or or_404(
+            _own(session, user.org_id, playbook_id), detail=NOT_FOUND_DETAIL,
+        )
         pb, source_name = _row_input(source), source.name
         # A concurrent duplicate can take the same free name first; the caller named nothing, so pick the
         # next free one rather than answer "choose a different name".
@@ -529,12 +544,14 @@ def duplicate_playbook(
 
 @router.delete("/{playbook_id}", status_code=204)
 @always(Tenancy.ORG_SCOPED)
+@on_session
 def delete_playbook(
+    session: Session,
     playbook_id: UUID,
-    principal: Optional[Principal] = Depends(current_principal),
+    principal: Optional[Principal] = Depends(current_principal_async),
 ) -> Response:
     """A hard delete (D-DEL); a built-in is a 409."""
-    with _editor_session(principal) as (session, user):
+    with _editor_session(session, principal) as (session, user):
         session.delete(_own_or_refuse(session, user, playbook_id))
         session.commit()
     # Not `-> None`: FastAPI would derive a response model and assert on a bodiless 204.

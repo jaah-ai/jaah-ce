@@ -4,28 +4,36 @@ import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import DialogContentText from '@mui/material/DialogContentText'
 import Typography from '@mui/material/Typography'
-import { useNavigate } from 'react-router-dom'
 import { post } from '../../api'
 import { useAuth } from '../../auth'
-import { useAgentProviders } from '../../hooks/useAgentProviders'
+import { useLeaveGuard } from '../../hooks/useLeaveGuard'
 import { useSubmit } from '../../hooks/useSubmit'
 import { downloadText } from '../../lib/downloadText'
 import { isOrgAdminSeat } from '../../lib/orgAdmin'
-import type { Account } from '../../types'
+import type { Account, ProviderChoice } from '../../types'
 import FormDialog from '../../ui/FormDialog'
 import FormTextField from '../../ui/FormTextField'
 import { JsonFilePicker, useJsonFilePick } from '../../ui/JsonFilePicker'
 import { tapTargetSx } from '../../ui/listStyles'
-import { accountEditPath, accountLoginPath } from './accountModel'
+import { accountEditPath, accountLoginPath, ACCOUNTS_PATH } from './accountModel'
 import { ACCOUNTS_KEY, RESOURCES_KEY } from './api'
+import { FONT_SIZE } from '../../theme'
+import Tip from '../../ui/Tip'
+import Banner from '../../ui/Banner'
+import CancelSaveBar from '../../ui/CancelSaveBar'
+import FormBox from '../../ui/FormBox'
+import { LeaveGuardDialog } from '../../ui/UnsavedChangesDialog'
 
 /* Export / Import of one runner account between consoles (`POST /api/accounts/{id}/export`,
  * `POST /api/accounts/import`; the bundle's contract is `apps/api/app/account_transfer.py`). An API-key account's
  * key leaves sealed under a passphrase typed here and on the target; the key itself never reaches this page. An
- * OAuth account carries no login, so its import offers Log in. */
+ * OAuth account carries no login, so its import lands on Log in. */
 
 /** The server's floor (`account_transfer.MIN_PASSPHRASE_LENGTH`). */
 const MIN_PASSPHRASE = 12
+
+/** New account's choice between setting one up and importing a file: it unmounts the form, so it is leaving. */
+const VIA_KEYS = ['via'] as const
 
 /** The download's name: the account's slug, never anything from its key. */
 export function exportFileName(slug: string): string {
@@ -89,16 +97,18 @@ function ExportDialog({ apiKey, busy, error, onClose, onSubmit }: {
       submitTestId="account-export-submit"
       submitDisabled={apiKey && (short || repeat !== passphrase)}
     >
-      <DialogContentText sx={{ fontSize: '0.875rem' }}>
+      <DialogContentText sx={{ fontSize: FONT_SIZE.base }}>
         {apiKey ? 'The key is sealed with this passphrase. Import needs it.'
           : 'The record only: the login stays on its nodes. Log in again after import.'}
       </DialogContentText>
       {apiKey && (
         <>
           <FormTextField label="Passphrase" type="password" autoComplete="new-password" value={passphrase}
-            onChange={setPassphrase} hint={`${MIN_PASSPHRASE}+ characters`} testId="account-export-passphrase" autoFocus />
+            onChange={setPassphrase} hint={`${MIN_PASSPHRASE}+ characters`} testId="account-export-passphrase" autoFocus
+            help={{ tip: 'Seals the key in the file; import needs it.', docs: 'using-jaah/model-accounts/move-a-model-account-between-consoles' }} />
           <FormTextField label="Confirm passphrase" type="password" autoComplete="new-password" value={repeat}
-            onChange={setRepeat} error={mismatch ? 'Does not match' : undefined} testId="account-export-repeat" />
+            onChange={setRepeat} error={mismatch ? 'Does not match' : undefined} testId="account-export-repeat"
+            help="Catches a typo before the key is sealed." />
         </>
       )}
     </FormDialog>
@@ -108,40 +118,19 @@ function ExportDialog({ apiKey, busy, error, onClose, onSubmit }: {
 type ImportResult = { account: Account; needs_login: boolean }
 type Bundle = { auth_kind?: unknown; name?: unknown; provider?: unknown }
 
-/** "Import" on the Brains list header: pick an export file, type its passphrase, create the account here. */
-export function ImportAccountAction() {
-  const [open, setOpen] = useState(false)
-  return (
-    <>
-      <Button
-        type="button"
-        variant="outlined"
-        color="primary"
-        onClick={() => setOpen(true)}
-        aria-label="Import account"
-        title="Import an account exported from another console"
-        data-testid="account-import"
-        sx={[{ whiteSpace: 'nowrap' }, tapTargetSx]}
-      >
-        Import
-      </Button>
-      {open && <ImportDialog onClose={() => setOpen(false)} />}
-    </>
-  )
-}
-
-function ImportDialog({ onClose }: { onClose: () => void }) {
-  const navigate = useNavigate()
+/** New account's "Import a file" (`/accounts/new?via=import`): pick an export file, type its passphrase, create the
+ *  account here, then open it — its Log in when the bundle carried no login. */
+/* `providers`: the page's catalogue (its spinner holds until it settles), named on the bundle's summary line. */
+export function ImportAccountForm({ providers }: { providers: readonly ProviderChoice[] }) {
   const queryClient = useQueryClient()
   const { admin } = useAuth()
-  const providers = useAgentProviders()
   const [bundle, setBundle] = useState<Bundle | null>(null)
   const [passphrase, setPassphrase] = useState('')
-  const [imported, setImported] = useState<ImportResult | null>(null)
   const { busy, formError, setFormError, run } = useSubmit()
   const apiKey = bundle?.auth_kind === 'api_key'
   // `create_account`'s rule: only an administrator records a login-based account (a key-based one anyone may).
   const loginBlocked = bundle && !apiKey && !isOrgAdminSeat(admin) ? 'Only an admin can import a subscription' : undefined
+  const ready = !!bundle && !loginBlocked && (!apiKey || passphrase.length >= MIN_PASSPHRASE)
 
   const [fileName, pick] = useJsonFilePick({
     clear: () => { setFormError(''); setBundle(null) },
@@ -153,64 +142,47 @@ function ImportDialog({ onClose }: { onClose: () => void }) {
     fail: () => setFormError('Not a Jaah account export.'),
   })
 
-  if (imported) {
-    const { account } = imported
-    return (
-      <FormDialog
-        title="Imported"
-        submitLabel={imported.needs_login ? 'Log in' : 'Open'}
-        onSubmit={() => navigate(imported.needs_login ? accountLoginPath(account.slug, null, true) : accountEditPath(account.id))}
-        onClose={onClose}
-        cancelLabel="Close"
-        maxWidth="xs"
-        testId="account-import-done"
-        submitTestId="account-import-open"
-        submitAutoFocus
-      >
-        <DialogContentText sx={{ fontSize: '0.875rem', overflowWrap: 'anywhere' }}>
-          {account.name}
-          {imported.needs_login ? ' — log it in on a node to use it.' : ' — Auto-assign off.'}
-        </DialogContentText>
-      </FormDialog>
-    )
+  const importNow = async (): Promise<ImportResult | null> => {
+    if (!ready) return null
+    let result: ImportResult | null = null
+    await run('Import failed', async () => {
+      result = await post<ImportResult>('/api/accounts/import', { bundle, passphrase: apiKey ? passphrase : null })
+      void queryClient.invalidateQueries({ queryKey: ACCOUNTS_KEY })
+      void queryClient.invalidateQueries({ queryKey: RESOURCES_KEY })
+    })
+    return result
   }
+  const destination = ({ account, needs_login }: ImportResult) =>
+    needs_login ? accountLoginPath(account.slug, null, true) : accountEditPath(account.id)
+  // A picked file is work a stray click would lose; the dialog's Save is Import. `via` unmounts this form.
+  const guard = useLeaveGuard(!!fileName, async () => (await importNow()) !== null, VIA_KEYS)
 
   return (
-    <FormDialog
-      title="Import account"
-      submitLabel="Import"
-      busyLabel="Importing…"
-      busy={busy}
-      error={formError}
-      onSubmit={() => void run('Import failed', async () => {
-        setImported(await post<ImportResult>('/api/accounts/import', { bundle, passphrase: apiKey ? passphrase : null }))
-        void queryClient.invalidateQueries({ queryKey: ACCOUNTS_KEY })
-        void queryClient.invalidateQueries({ queryKey: RESOURCES_KEY })
-      })}
-      onClose={onClose}
-      modal
-      maxWidth="xs"
-      testId="account-import-dialog"
-      submitTestId="account-import-submit"
-      submitDisabled={!bundle || (apiKey && passphrase.length < MIN_PASSPHRASE)}
-      submitDisabledReason={loginBlocked}
-    >
+    <FormBox onSubmit={async () => {
+      const result = await importNow()
+      if (result) guard.leaveNow(destination(result), { replace: true })
+    }} sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }} data-testid="account-import-form">
+      {formError && <Banner severity="error">{formError}</Banner>}
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, minWidth: 0 }}>
         <JsonFilePicker label={fileName ? 'Change file' : 'Choose file'} testId="account-import-file" onPick={pick} />
         {fileName && (
-          <Typography variant="body2" noWrap title={fileName} sx={{ minWidth: 0 }}>{fileName}</Typography>
+          <Tip title={fileName}><Typography variant="body2" noWrap sx={{ minWidth: 0 }}>{fileName}</Typography></Tip>
         )}
       </Box>
       {bundle && typeof bundle.name === 'string' && (
-        <DialogContentText sx={{ fontSize: '0.875rem', overflowWrap: 'anywhere' }}>
-          {bundle.name} · {providers.rows.find(p => p.value === bundle.provider)?.label ?? String(bundle.provider ?? '')}
+        <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+          {bundle.name} · {providers.find(p => p.value === bundle.provider)?.label ?? String(bundle.provider ?? '')}
           {' · '}{apiKey ? 'API key' : 'Subscription'}
-        </DialogContentText>
+        </Typography>
       )}
       {apiKey && (
         <FormTextField label="Passphrase" type="password" autoComplete="off" value={passphrase}
-          onChange={setPassphrase} testId="account-import-passphrase" autoFocus />
+          onChange={setPassphrase} testId="account-import-passphrase" autoFocus
+          help="Opens the sealed key; must match the export’s." />
       )}
-    </FormDialog>
+      <CancelSaveBar testId="account-import-actions" saveTestId="account-import-submit" cancelTo={ACCOUNTS_PATH}
+        creating saveLabel="Import" busy={busy} disabled={!ready} saveReason={loginBlocked} />
+      <LeaveGuardDialog leave={guard} message="This account has not been imported yet. Import it before leaving?" />
+    </FormBox>
   )
 }

@@ -1,0 +1,40 @@
+# Miro: hosted MCP server. Facts confirmed at https://developers.miro.com/docs/miro-mcp and the server's own OAuth metadata (mcp.miro.com/.well-known/oauth-protected-resource; Dynamic Client Registration at /register).
+slug = "miro"
+label = "Miro"
+category = "mcp"
+vendor_docs_url = "https://developers.miro.com/docs/miro-mcp"
+summary = "Read Miro boards and turn them into plans, or draw diagrams onto boards, through Miro's MCP server."
+
+[[auth]]
+kind = "mcp"
+
+[mcp]
+url = "https://mcp.miro.com/"
+url_editable = false
+transport = "streamable_http"
+auth = "oauth_dcr"
+
+[docs]
+agent_uses = [
+  "Read a board's sticky notes, frames and comments and turn them into tasks or a spec",
+  "Draw a diagram (flowchart, architecture, sequence) onto a board from a task's description",
+  "Summarize a workshop board into a document",
+]
+prerequisites = [
+  "A Miro account with access to the boards agents should use",
+  "On a company plan, a Miro company admin must turn MCP on for the organization: Admin settings > Apps and integrations > MCP > Enable MCP",
+]
+limitations = [
+  "Agents reach only the boards the signed-in user can open",
+  "Agents act as the signed-in user and need edit rights on a board to draw on it",
+]
+troubleshooting = [
+  { symptom = "Test says Miro rejected the token (401)", fix = "The grant expired or was revoked, or a company admin turned MCP off. Select Reconnect, and ask the admin if it fails again" },
+  { symptom = "Agents cannot find a board", fix = "The signed-in user cannot open it. Ask the board owner to share it with that user" },
+  { symptom = "The secret shows Needs reconnect", fix = "Miro ended the grant (a password change, a revoked connection or a long idle period). Select Reconnect on the secret and sign in to Miro again" },
+  { symptom = "New tasks on the project have no Miro tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with, and an agent marked Not supported on that tab cannot load MCP servers" },
+]
+faq = [
+  { q = "Does Jaah need an app registered at Miro", a = "No. Jaah registers itself with Miro's sign-in server the first time anyone connects, and every later connection reuses that registration" },
+  { q = "What does Test do", a = "It opens an MCP session with Miro's server and lists its tools, then closes the session. It reads and changes nothing in your Miro account" },
+]

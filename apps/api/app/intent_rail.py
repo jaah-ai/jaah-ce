@@ -9,7 +9,6 @@ budget carried across a re-mint, loss-tolerant push. Left to the caller: which r
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from typing import Any, Callable, Iterable, Optional, Sequence
 
 from sqlalchemy import case, or_, update
@@ -30,14 +29,6 @@ def settle(session, commit: bool) -> None:
         session.commit()
     else:
         session.flush()
-
-
-def iso(value: Any) -> Optional[str]:
-    """One DB timestamp as the wire spells it. `None` stays `None` (an absent staleness token is
-    meaningful)."""
-    if value is None:
-        return None
-    return value.isoformat() if isinstance(value, datetime) else str(value)
 
 
 def still_pending(model, retiring: Sequence[str]):

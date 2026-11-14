@@ -80,9 +80,9 @@ import agent_providers
 from . import antigravity_acp_auth, antigravity_keyring, antigravity_transcript
 from .antigravity import AntigravityLoginAdapter
 from .base import (ACP_CHAIN_EVENTS, ACP_HARNESS_EVENTS, CLAUDE_ONLY_MATCHERS, TASK_ARGV_FLAG, AcpLaunch,
-                   AcpLaunchContext, AdapterDefaults, ComposerTui, LifecycleChains, QuitSignature, TokenCounts,
-                   TurnError, adapter_env, control_mcp_server, hardened_python, harness_dispatch, harness_entries,
-                   tool_path, write_rendered_hooks)
+                   AcpLaunchContext, AgentAdapter, ComposerTui, LifecycleChains, QuitSignature, TokenCounts,
+                   TurnError, adapter_env, hardened_python, harness_dispatch, harness_entries,
+                   remote_mcp_servers, tool_path, write_rendered_hooks)
 from .base import acp_hook_files as base_acp_hook_files
 
 log = logging.getLogger(__name__)
@@ -111,11 +111,8 @@ _API_KEY_PROVIDER = "gemini"
 _ONBOARDING_JSON = os.path.join(".gemini", "antigravity-cli", "cache", "onboarding.json")
 _ONBOARDING_DONE = {"consumerOnboardingComplete": True, "onboardingComplete": True}
 
-# The variables naming this dispatch's own hook file; the bridge reads them. One fact each, the neutral
-# dispatcher's (`hook_bridge_core.py::HOOKS_FILE_ENV`) and agy's one-release alias (`LEGACY_HOOKS_FILE_ENV`),
-# which an older bridge still reads.
-DISPATCH_HOOKS_FILE_ENV = "JAAH_HOOKS_FILE"
-HOOKS_FILE_ENV = "JAAH_AGY_HOOKS"
+# The variable naming this dispatch's own hook file; the bridge reads it (`hook_bridge_core.py::HOOKS_FILE_ENV`).
+HOOKS_FILE_ENV = "JAAH_HOOKS_FILE"
 # The runner charter file the bridge hands over at agy's `SessionStart` (its `CHARTER_FILE_ENV`).
 CHARTER_FILE_ENV = "JAAH_CHARTER_FILE"
 
@@ -204,15 +201,14 @@ _HARNESS_MATCHERS: dict[str, str | None] = {
     "AskUserQuestion": "ask_question",
     # `mcp_<server>_<tool>`, one underscore (the binary's own `mcp_chrome_devtools_…`), so not
     # `base.CONTROL_TOOL_MATCHERS`: the bridge unwraps a `call_mcp_tool` call to the same name and respells it
-    # for the settle guard (`claude_tool_name`). `task_settle` is the pre-rename name (`agent_vocabulary.ALIASES`).
+    # for the settle guard (`claude_tool_name`).
     "mcp__plugin_jaah_control__task_complete": "mcp_control_task_complete",
-    "mcp__plugin_jaah_control__task_settle": "mcp_control_task_settle",
     **CLAUDE_ONLY_MATCHERS,
 }
 
 def _hooks_file_env(path: str) -> dict[str, str]:
-    """The hook file's path under every name a bridge reads: the neutral one, then agy's alias."""
-    return {DISPATCH_HOOKS_FILE_ENV: path, HOOKS_FILE_ENV: path}
+    """The hook file's path under the name the bridge reads."""
+    return {HOOKS_FILE_ENV: path}
 
 
 def bridge_path() -> str:
@@ -237,9 +233,8 @@ dispatch_hooks = functools.partial(harness_dispatch, vendor=agent_providers.ANTI
                                    chain_events=ACP_CHAIN_EVENTS, events=_HARNESS_EVENTS, matchers=_HARNESS_MATCHERS)
 
 
-def acp_hook_files(chains: LifecycleChains) -> tuple[dict, dict]:
-    """An ACP run's two hook files (`base.acp_hook_files`): the engine's and the host's own."""
-    return base_acp_hook_files(chains, vendor=agent_providers.ANTIGRAVITY.value, dispatch=dispatch_hooks)
+# An ACP run's two hook files (`base.acp_hook_files`): the engine's and the host's own.
+acp_hook_files = functools.partial(base_acp_hook_files, vendor=agent_providers.ANTIGRAVITY.value, dispatch=dispatch_hooks)
 
 
 # The account `hooks.json`'s per-event budgets, in seconds. FIXED, never summed per dispatch: every runner
@@ -259,7 +254,7 @@ _HOOK_NAME_PREFIX = "jaah-fleet-"
 def _account_hook_spec() -> dict:
     """The account `hooks.json`'s handlers: one per agy event the bridge serves, each running the bridge.
 
-    NOTHING PER-DISPATCH: the bridge reads each dispatch's own entries through `$JAAH_AGY_HOOKS`, so two
+    NOTHING PER-DISPATCH: the bridge reads each dispatch's own entries through `$JAAH_HOOKS_FILE`, so two
     runners on one account share this file safely. Tool events are GROUPED (matcher + hooks), `""` = every
     tool — the bridge does the matching; every other event is a flat list (`_GROUPED_EVENTS`). Only `command`
     handlers: one entry of a type agy does not take (`http`) makes it skip the whole file."""
@@ -318,7 +313,7 @@ def _write_account_hooks(path: str) -> str:
     return session_user.replace_file_as_session_user(path, content)
 
 
-class AntigravityAdapter(AdapterDefaults):
+class AntigravityAdapter(AgentAdapter):
     """The `agy` CLI. Stateless — the registry holds one instance."""
 
     provider = agent_providers.ANTIGRAVITY.value
@@ -350,7 +345,7 @@ class AntigravityAdapter(AdapterDefaults):
     ) -> list[str]:
         """agy's whole `exec` block for a dispatch's `launch.sh`.
 
-        1. `export JAAH_AGY_HOOKS=<this dispatch's hook file>` (`settings_flag`, composed by
+        1. `export JAAH_HOOKS_FILE=<this dispatch's hook file>` (`settings_flag`, composed by
            `render_hooks`, NOT re-quoted): the account's `hooks.json` dispatches through it.
         2. The session-start commands, once, before agy exists (agy has no SessionStart event); a
            failure there is logged by the bridge and never stops the launch.
@@ -508,7 +503,7 @@ class AntigravityAdapter(AdapterDefaults):
         (`antigravity_acp_auth.seed_oauth_sign_in`), which the guest's config share cannot take."""
         from fleet_launch import guard_chains, shq  # in-function: see the module header
 
-        from .agent_layer import jaah_mcp_command
+        from .agent_layer import control_server
 
         guest = ctx.guest and bool(ctx.api_key_account)
         if not (ctx.config_dir and (guest or os.path.isdir(ctx.config_dir))):
@@ -517,7 +512,7 @@ class AntigravityAdapter(AdapterDefaults):
             return None
         env = {**self.env(config_dir=ctx.config_dir, worktree=ctx.worktree),
                _GEMINI_HOME_ENV: os.path.join(ctx.config_dir, ".gemini")}
-        delimiter = f"JAAH_AGY_HOOKS_{secrets.token_hex(8)}"
+        delimiter = f"JAAH_HOOKS_{secrets.token_hex(8)}"
         refuse = "{ printf 'agy-acp-server: %s - refusing to launch\\n' "
         exports = " ".join(f'{name}="$agy_hooks"' for name in _hooks_file_env(""))
         engine_hooks, host_hooks = acp_hook_files(guard_chains(ctx.worktree, guard=ctx.guard))
@@ -538,8 +533,11 @@ class AntigravityAdapter(AdapterDefaults):
             *((f"{_bridge_command('--session-start')} </dev/null || true",) if engine_hooks["session_start"] else ()),
             f"exec {' '.join(shq(a) for a in ACP_ARGV)}",
         ])
-        command, *args = jaah_mcp_command()
-        control = control_mcp_server(command, args, {})
+        control = control_server()
+        # The project's linked remote MCP servers ride this session's `session/new`, never the account's
+        # `mcp_config.json` every session of the account reads; eager like the control server, so their tools are
+        # the model's own rather than behind `call_mcp_tool`.
+        servers = (control, *remote_mcp_servers(ctx.mcp_connections, guest=ctx.guest))
         worktree, config_dir, project, api_key_account = ctx.worktree, ctx.config_dir, ctx.project, ctx.api_key_account
 
         def prepare() -> None:
@@ -554,8 +552,8 @@ class AntigravityAdapter(AdapterDefaults):
         return AcpLaunch(
             argv=("bash", "-c", script, "agy-acp"),
             env=env,
-            session_meta={"antigravity": {_EAGER_MCP_META: [control["name"]]}},
-            mcp_servers=(control,),
+            session_meta={"antigravity": {_EAGER_MCP_META: [server["name"] for server in servers]}},
+            mcp_servers=servers,
             prepare=None if guest else prepare,
             authenticate={**ACP_KEY_SIGN_IN, "account": ctx.api_key_account} if ctx.api_key_account else None,
             host_hooks=host_hooks,
@@ -593,7 +591,7 @@ class AntigravityAdapter(AdapterDefaults):
         return flag
 
     # ── Session identity + ingest: ONE-LINE delegations (Architecture §5.1), late-bound so the module stays the
-    # answer; `session_binding` is `AdapterDefaults`' (`antigravity_transcript.SESSION_BINDING` pins it equal) ──
+    # answer; `session_binding` is `AgentAdapter`'s default (`antigravity_transcript.SESSION_BINDING` pins it equal) ──
 
     def discover_session_id(self, *, config_dir: str, worktree: str, since: float) -> str | None:
         return antigravity_transcript.discover_session_id(config_dir=config_dir, worktree=worktree, since=since)

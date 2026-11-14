@@ -1,34 +1,35 @@
 """Task creation: the create route, its spec validation, playbook plans, epic children and body versions."""
 from __future__ import annotations
 
-import re
+import logging
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, NamedTuple, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app import actors, agent_providers, model_catalog, node_targets, provider_auth_policy
-from app.auth import require_user
+from app.auth import adopt_user, require_user
 from app.authz.catalog import permission_key
 from app.authz.declarations import feature
-from app.authz.object_access import can_access, named_user_reaches_project
+from app.authz.object_access import can_access, named_user_or_422
 from app.authz.principal import Principal, current_principal
 from app.authz.visibility import PROJECTS_VIEW_KEY, ObjectAccess, has_project_key, readable_account_select
-from app.db import get_session
-from app.entity_shape import SYSTEM_ACTOR_ID
+from app.db_async import defer_off_loop, on_session
+from app.entity_shape import refused_as
 from app.events import emit_console_event
-from app.features import FEATURE_SHIPPED
 from app.models.credentials import Account
 from app.models.identity import AdminUser
 from app.models.projects import Feature, Project
-from app.models.tasks import Task, TaskBodyVersion, TaskDependency
-from app.persona_registry import CREATABLE_PERSONAS
+from app.models.tasks import MAX_RUNNING_CEILING, Task, TaskBodyVersion
+from app.persona_registry import CREATABLE_PERSONAS, SERVER_FILED_PERSONAS
 from app import agent_resolution, placement_grants, playbook_engine, task_templates
+from app import agent_router
+from app.agent_router import pins
 from app.models.task_templates import OrgTaskTemplate
 from app.task_template_assets import copy_template_assets
 from app.task_lifecycle import DRAFT, READY
@@ -42,6 +43,7 @@ from app.routes.tasks.policy import (
     DEFAULT_TRANSITION_MODE,
     INTERVIEWING_CHILD_PERSONAS,
     PERSONA_ADVISOR,
+    PERSONA_APP_WIZARD,
     PERSONA_ARCHITECTURE,
     PERSONA_BUSINESS_ANALYSIS,
     PERSONA_CODER,
@@ -53,54 +55,17 @@ from app.routes.tasks.policy import (
     _PRIORITY_ABS_MAX,
     _advisor_chat_cap_or_409,
     create_autonomous_for_persona,
+    epic_child_autonomous,
 )
 from app.routes.tasks.task_wire import TaskOut, _authored_draft_ids, _may_edit_ids, _task_out
-from app.routes.tasks.dependencies import _would_create_cycle
+from app.routes.tasks.dependencies import stage_edge
+from app.routes.tasks import tracker_pick
+from app.trackers import project_links
+from app.routes.tasks.tracker_pick import TrackerIssuePick
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
-
-
-# The trackers `external_task_system` may name; wire strings, every write-path check builds from it.
-EXTERNAL_TASK_SYSTEMS = ("jira",)
-# SECURITY boundary: the issue key is later interpolated into a Jira REST path AND a JQL string (JQL has
-# no parameterized form), so the strict check must sit at the WRITE boundary.
-_EXTERNAL_TASK_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-[0-9]+$")
-
-
-def _external_issue_or_422(
-    system: Optional[str], issue_id: Optional[str]
-) -> tuple[Optional[str], Optional[str]]:
-    """Normalise + validate the external-issue PAIR, returning the `(system, id)` to STORE. Blank collapses
-    to null (an emptied field CLEARS the link); each half is checked; both-set or both-null, never exactly
-    one (models/tasks.py:Task.external_task_system). Every failure is a 422."""
-    system = system.strip() or None if system is not None else None
-    issue_id = issue_id.strip() or None if issue_id is not None else None
-    if system is not None and system not in EXTERNAL_TASK_SYSTEMS:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"external_task_system must be one of {', '.join(EXTERNAL_TASK_SYSTEMS)} "
-                f"(got {system!r})"
-            ),
-        )
-    if issue_id is not None and not _EXTERNAL_TASK_ID_RE.match(issue_id):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"external_task_id must be a tracker issue key like 'OAM-123' "
-                f"(got {issue_id!r})"
-            ),
-        )
-    if (system is None) != (issue_id is None):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "external_task_system and external_task_id must be set together or both left empty "
-                f"(got system={system!r}, id={issue_id!r})"
-            ),
-        )
-    return system, issue_id
-
 
 def _model_pin_or_refuse(
     value: Optional[str], principal: Principal | None
@@ -120,10 +85,8 @@ def _model_pin_or_refuse(
         if is_tenant_org(principal.org_id):
             raise HTTPException(status_code=403, detail=administrator_changes("Task models"))
         raise HTTPException(status_code=403, detail="only a superadmin may set a task's model")
-    try:
+    with refused_as(422, ValueError, chain=True, prefix="model: "):
         return model_catalog.validate_model(value) or None
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=f"model: {exc}") from exc
 
 
 def _provider_pin_or_refuse(value: Optional[str]) -> Optional[str]:
@@ -234,7 +197,7 @@ def _pinned_node_or_refuse(
         raise HTTPException(
             status_code=422,
             detail=(
-                "pinned_node_id names no node this project runs on — assign the node to the project "
+                "pinned_node_id names no node this project runs on — add the node to one of the project's node groups "
                 "first, or pick Any"
             ),
         )
@@ -244,44 +207,21 @@ def _pinned_node_or_refuse(
 def _validated_assignee(
     session: Session, value: UUID, *, project_id: int, actor: AdminUser
 ) -> UUID:
-    """`assigned_to_id`, refused unless it names a real, non-system user who can ALREADY reach the task's
-    PROJECT; shared by `create_task` and `update_task` so the two doors onto one column cannot drift.
+    """`assigned_to_id`, through `authz.named_user_or_422`; shared by `create_task` and `update_task` so the two
+    doors onto one column cannot drift.
 
     The assignee is the addressee (`task_notify.announce_assignment` DMs them the title), and any
     `tasks:edit` holder can edit the task, so unchecked it would route content to an arbitrary account.
     The candidate set is exactly what `list_project_members` offers: a direct or group grant on the
-    project, or an operator-plane superadmin.
-
-    The reach probe lives once in `authz.named_user_reaches_project` (including the tenant-actor
-    superadmin flag-drop); the 422 sentence stays with each door, as in
-    `routes/projects.py::_validated_project_role`.
-
-    The system actor is refused ahead of the probe (non-loginable, but superadmin-shaped). 422 naming
-    the field, never the account: echoing the email would be a uuid→address oracle. By id first: its row
-    sits in org zero (revision 0406), which a tenant caller's scope does not read."""
-    user = session.get(AdminUser, value)
-    if user is None and value != SYSTEM_ACTOR_ID:
-        raise HTTPException(
-            status_code=422,
-            detail=f"assigned_to_id does not name a known user (id={value})",
-        )
-    if value == SYSTEM_ACTOR_ID or user.is_system:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "assigned_to_id may not be the system actor: it is non-loginable, so nothing assigned "
-                "to it would ever be read"
-            ),
-        )
-    if not named_user_reaches_project(session, user, project_id, actor=actor):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "assigned_to_id names a user with no access to this project — a task can only be "
-                "assigned to someone who can already reach it. Grant them access to the project first"
-            ),
-        )
-    return value
+    project, or an operator-plane superadmin."""
+    return named_user_or_422(
+        session, value, project_id=project_id, actor=actor, field="assigned_to_id",
+        system_refusal="it is non-loginable, so nothing assigned to it would ever be read",
+        reach_refusal=(
+            "a task can only be assigned to someone who can already reach it. Grant them access to the "
+            "project first"
+        ),
+    )
 
 
 class TaskCreateSpec(BaseModel):
@@ -302,6 +242,9 @@ class TaskCreateSpec(BaseModel):
     autonomous: Optional[bool] = None
     # Opts out of the periodic agentic-maturity/compliance sweep. No hidden default.
     sweep_opt_out: Optional[bool] = None
+    # Tell the recipients when it ships, and mark it unseen for them (`models.Task.notify_when_done`). Absent/null
+    # takes the filing default (`app/task_done_notice.py::default_for`); an explicit value wins.
+    notify_when_done: Optional[bool] = None
     # Project memory On/Off (`models.Task.project_memory`); absent/null is Default, resolved at dispatch by
     # `project_memory.switch.effective_memory` — never prefilled here, so the row follows the setting as it
     # stands when it runs.
@@ -356,7 +299,9 @@ def validate_task_spec(spec: TaskCreateSpec, principal: Principal | None) -> Tas
             ),
         )
     # Validated like `update_task`'s conversion path; omitted resolves in `create_task` (`_default_persona`).
-    if spec.persona is not None and spec.persona not in CREATABLE_PERSONAS:
+    # A control-plane filing (`ServerTaskCreate`) may also name a `SERVER_FILED_PERSONAS` one; no request can.
+    server_filed = SERVER_FILED_PERSONAS if isinstance(spec, ServerTaskCreate) else ()
+    if spec.persona is not None and spec.persona not in CREATABLE_PERSONAS + server_filed:
         raise HTTPException(
             status_code=422,
             detail=f"persona must be one of {', '.join(CREATABLE_PERSONAS)} (got {spec.persona!r})",
@@ -377,11 +322,17 @@ class TaskCreate(TaskCreateSpec):
     # The project this row is filed in, authorized `tasks:create` there. Required unless `feature_id` is
     # given (then the feature's project; both given and disagreeing is a 422).
     project_id: Optional[int] = None
-    # The feature this row is filed in; absent is "No feature". A shipped feature is refused. See
+    # The feature this row is filed in; absent files it in the project itself. A deleted feature is refused. See
     # `_create_feature_or_refuse`.
     feature_id: Optional[UUID] = None
-    # The external issue this Task is created FROM. A PAIR, validated together by `_external_issue_or_422`;
-    # no hidden default.
+    # The epic throttle (`models.Task.max_running`), 1..`MAX_RUNNING_CEILING` (422 otherwise); absent/null = no limit.
+    # An epic's only: a non-null value on any other persona is a 422 (`create_task`).
+    max_running: Optional[int] = Field(default=None, ge=1, le=MAX_RUNNING_CEILING)
+    # The issue this Task is linked to (`routes/tasks/tracker_pick.py`): read from its tracker before the create,
+    # linked in its commit. `_picked` is that read, set by `with_tracker_pick`, never by the request.
+    tracker_issue: Optional[TrackerIssuePick] = None
+    _picked: Any = PrivateAttr(default=None)
+    # The old external pair: accepted and ignored (`tracker_issue` is the one way to link an issue).
     external_task_system: Optional[str] = None
     external_task_id: Optional[str] = None
     # Auto-save: the editor writing a ticket still being typed, not a Save. Lands the row `unsaved`
@@ -397,12 +348,31 @@ class TaskCreate(TaskCreateSpec):
     # is Any. Stamps `bound_provider` from the account. Not on `TaskCreateSpec`, like the node pin. Ignored on an
     # `epic`, which never dispatches.
     account_id: Optional[UUID] = None
+    # The answer to the router's recommendation the form showed (`POST /api/routing/preview`): the Config taken
+    # with "Use this" (recorded `accepted` when it is the router's own pick), or null for the person's own runner
+    # (`overridden` when they pinned another). Absent: no recommendation was shown, nothing is recorded.
+    routing_accepted_config: Optional[dict[str, Any]] = None
     # The template this task is started from (Start or Customize, `app/task_templates.py`): resolved visible and
     # published for the project's org, else 422. It fills every work field the request left out (title, body,
     # persona, autonomous, model); a field sent wins. Not on `TaskCreateSpec`: an automation resolves its template
     # at fire time. With it, `body` may be omitted.
     template_id: Optional[UUID] = None
+    # Start's answers to the template's input placeholders (`task_templates.inputs_of`), by label. Read only when the
+    # body comes from the template; a sent body (Customize) is the starter's own text.
+    template_inputs: dict[str, str] = {}
     body: str = ""
+
+
+class ServerTaskCreate(TaskCreate):
+    """A create the control plane makes itself, as the person whose action asked for it (`app/jaah_repo_replace.py`):
+    the console's own checks, plus a `SERVER_FILED_PERSONAS` persona. Never a route's body type, so no request
+    names one of those."""
+
+    # An epic's child recipe in place of `_EPIC_ANALYSIS_CHILDREN` (only `APP_WIZARD_CHILDREN` today); None is the
+    # default recipe. Ignored on any other persona and with a playbook. Not stored: the children are built at create,
+    # so it must never ride an `unsaved` draft, whose children `_finalize_unsaved_draft` builds later on the default.
+    epic_children: Optional[tuple[str, ...]] = None
+
 
 
 class TaskUpdate(BaseModel):
@@ -414,6 +384,8 @@ class TaskUpdate(BaseModel):
     is_plannable: Optional[bool] = None
     autonomous: Optional[bool] = None
     sweep_opt_out: Optional[bool] = None
+    # The done notice (`TaskCreateSpec.notify_when_done`); explicit null is 422.
+    notify_when_done: Optional[bool] = None
     # Project memory On/Off; explicit null returns the row to Default (see `TaskCreate.project_memory`).
     project_memory: Optional[bool] = None
     # Model pin: top of `dispatch_compose.compose._resolve_model`'s precedence. SUPERADMIN-ONLY (no feature key
@@ -431,6 +403,9 @@ class TaskUpdate(BaseModel):
     agent_id: Optional[UUID] = None
     # Validated against `TRANSITION_MODES` (422); read off the PARENT epic at dispatch, inert elsewhere.
     transition_mode: Optional[str] = None
+    # The epic throttle, 1..`MAX_RUNNING_CEILING` (422 otherwise); null = no limit; an epic's only (422 elsewhere).
+    # Lowering it below the running count preempts the excess at once (`transitions.throttle_epic_children`).
+    max_running: Optional[int] = Field(default=None, ge=1, le=MAX_RUNNING_CEILING)
     # Epic ⇄ runner-persona conversion, TO `CREATABLE_PERSONAS` from any persona (system ones included).
     # Resending the CURRENT persona is a no-op; a change is allowed in ANY state on a TOP-LEVEL row only
     # and RECONCILES the children, else 400.
@@ -441,16 +416,21 @@ class TaskUpdate(BaseModel):
     # WHOLE SUBTREE, as children are born with the epic's value. Ignored on an auto-save. Explicit null is
     # 422, a change on a child 400, a resend of the current value a no-op. See `_apply_hidden`.
     hidden: Optional[bool] = None
+    # The task's language (`app/task_language.py`): a code, on a TOP-LEVEL row, written over its WHOLE SUBTREE and
+    # pinned against re-detection. Null or a non-code is 422, a change on a child 400. See `_apply_language`.
+    language: Optional[str] = None
     # Move the task AND ITS WHOLE SUBTREE to another project (`project_id` is copied at creation, never
     # derived; a split subtree breaks dispatch, fan-out, sweeps and authz). Resending the CURRENT value is a
     # silent no-op; a change is authorized against the TARGET project and refused while any subtree row is
     # live. Top-level rows only. See `_apply_project_move`.
     project_id: Optional[int] = None
     # File the task AND ITS WHOLE SUBTREE into a feature of its own project, or of the `project_id` in the
-    # same request; explicit null is "No feature". Top-level rows only. See `_apply_feature_filing`.
+    # same request; explicit null files it in the project itself. Top-level rows only. See `_apply_feature_filing`.
     feature_id: Optional[UUID] = None
-    # Explicit null CLEARS its half. The pair rule is judged on the row's RESULTING state, so a partial
-    # edit cannot leave a row half-linked (`update_task`, `_external_issue_or_422`).
+    # The picked issue (`routes/tasks/tracker_pick.py`): absent leaves the link, null clears it. `_picked` is its
+    # read, set by `with_tracker_pick`. The old external pair is accepted and ignored.
+    tracker_issue: Optional[TrackerIssuePick] = None
+    _picked: Any = PrivateAttr(default=None)
     external_task_system: Optional[str] = None
     external_task_id: Optional[str] = None
     # The addressee, re-pointable in every state, `done` included (an administrative fact, not a dispatch
@@ -464,6 +444,8 @@ class TaskUpdate(BaseModel):
     # row (which would bury both under near-identical rows). Staleness propagation is not silenced (see
     # `update_task`). False is also what finalizes an `unsaved` row (`_finalize_unsaved_draft`).
     autosave: bool = False
+    # As `TaskCreate.routing_accepted_config`: not a task field, popped before the walk.
+    routing_accepted_config: Optional[dict[str, Any]] = None
     # Pick (a uuid) or drop (explicit null) the playbook, as `TaskCreate.playbook_id`. Only before Save
     # (`unsaved`): a saved row's playbook is fixed, 400. See `_apply_playbook`.
     playbook_id: Optional[UUID] = None
@@ -528,13 +510,24 @@ def _close_autosave_body_version(task_id: int, session: Session) -> None:
 
 
 # ── CRUD routes ────────────────────────────────────────────────────────────────────────────────────
+def _pick_project(session: Session, kwargs: dict[str, Any]) -> Optional[int]:
+    """The project a create's picked issue must be linked to: the request's, or its feature's."""
+    body = kwargs["body"]
+    project_id = body.project_id
+    if project_id is None and body.feature_id is not None:
+        project_id = session.scalar(select(Feature.project_id).where(Feature.id == body.feature_id))
+    return tracker_pick.may_pick(kwargs["principal"], project_id, "create")
+
+
 @router.post("", response_model=TaskOut, status_code=201)
 @feature("tasks", "create")
+@tracker_pick.with_tracker_pick(_pick_project)
+@on_session(deferring=True)
 def create_task(
+    session: Session,
     body: TaskCreate,
     _user: AdminUser = Depends(require_user),
     principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
 ) -> TaskOut:
     """Create a top-level `draft` work item — an EPIC with its auto-initialized analysis children, or a
     single top-level task carrying one operator runner persona.
@@ -543,15 +536,12 @@ def create_task(
     `task_dependencies`; `persona='coder'` creates one directly dispatchable row with no children.
     An absent `persona` is the project's, else the org's, New-task default (`_default_persona`), anything outside
     `CREATABLE_PERSONAS` is a 422, and the title is the authored `title` when given, else derived from the body."""
-    # A feature, when named, decides the project (a task in a feature is in its project), so it is resolved
-    # first; the project's own authorization below then applies unchanged.
+    _user = adopt_user(session, _user)
     feature_row = _create_feature_or_refuse(body, session, principal)
     project_id = body.project_id
     if feature_row is not None:
         if project_id is not None and project_id != feature_row.project_id:
-            raise HTTPException(
-                status_code=422, detail=f"feature {feature_row.id} is in another project",
-            )
+            raise HTTPException(status_code=422, detail=f"feature {feature_row.id} is in another project")
         project_id = feature_row.project_id
     if project_id is None:
         raise HTTPException(status_code=422, detail="project_id is required")
@@ -588,10 +578,8 @@ def create_task(
     model_pin, provider_pin = validate_task_spec(body, principal)
     if template_model is not None:
         # The template's own pin, chosen by its editor: validated, never re-authorized against the starter.
-        try:
+        with refused_as(422, ValueError, chain=True, prefix="model: "):
             model_pin = model_catalog.validate_model(template_model) or None
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=f"model: {exc}") from exc
     # The SDK half of the picker; the built-in half is `provider_pin`.
     if body.agent_id is not None and (provider_pin or body.account_id is not None):
         raise HTTPException(status_code=422, detail=_AGENT_OR_PROVIDER)
@@ -620,6 +608,8 @@ def create_task(
         else body.persona or _default_persona(project)
     )
     body = body.model_copy(update={"persona": persona})
+    if body.max_running is not None and persona != PERSONA_EPIC:
+        raise HTTPException(status_code=422, detail="max_running applies to an epic only")
 
     # An advisor chat also demands `worktrees:edit` on the same project. A chat's deliverable is a console
     # the operator types into, and `worktrees:edit` decides whether it is two-way
@@ -647,9 +637,6 @@ def create_task(
         persona=body.persona,
     )
 
-    # Validated through the edit path's helper, so a bad pair is a clean 422 before any write; builders
-    # re-derive the normalized values.
-    _external_issue_or_422(body.external_task_system, body.external_task_id)
     # The submitted assignee, against the derived project (the subject the picker listed). `_user`, not
     # `principal`: the probe narrows on the actor, and the principal may be the agent identity (None).
     if body.assigned_to_id is not None:
@@ -669,14 +656,63 @@ def create_task(
     # The epic is the one special case; every other creatable persona is one top-level row. Branching on
     # `epic` (not on a standalone list) means a newly creatable persona cannot silently become an epic.
     if persona == PERSONA_EPIC:
-        return _create_epic_with_children(
+        created = _create_epic_with_children(
             body, title, session, principal, model_pin, project_id, playbook_plan=playbook_plan, template=template,
+            children=_server_epic_children(body),
         )
-    return _create_coder_task(
-        body, title, session, principal, persona, model_pin, project_id,
-        provider=provider_pin, agent_id=agent_pick, playbook_plan=playbook_plan, pinned_node_id=node_pin,
-        account_id=account_pick.id if account_pick is not None else None, template=template,
-    )
+    else:
+        created = _create_coder_task(
+            body, title, session, principal, persona, model_pin, project_id,
+            provider=provider_pin, agent_id=agent_pick, playbook_plan=playbook_plan, pinned_node_id=node_pin,
+            account_id=account_pick.id if account_pick is not None else None, template=template,
+        )
+    return _start_on_create(session, project, created, _user, principal, unsaved=bool(body.unsaved))
+
+
+def start_on_save(session: Session, task_id: int, user: AdminUser, principal: Principal | None) -> None:
+    """`_start_on_create` for an auto-saved draft its first explicit Save finalizes (`routes/tasks/update.py`)."""
+    task = session.scalar(select(Task).where(Task.id == task_id))
+    project = session.scalar(select(Project).where(Project.id == task.project_id)) if task is not None else None
+    if task is None or project is None or task.state != DRAFT:
+        return
+    from app.pipeline import gate as pipeline_gate  # noqa: PLC0415
+    from app.routes.tasks.dispatch import start_one  # noqa: PLC0415 — dispatch imports this module
+
+    if not pipeline_gate.starts_on_create(session, project):
+        return
+    try:
+        start_one(session, task_id, None, user, principal, out=False)
+    except Exception as exc:  # noqa: BLE001 — the save has committed; a failed start leaves the draft
+        session.rollback()
+        log.info("save: task %s not started on save (%s)", task_id, getattr(exc, "detail", exc))
+
+
+def _start_on_create(session: Session, project: Project, created: TaskOut, user: AdminUser,
+                     principal: Principal | None, *, unsaved: bool) -> TaskOut:
+    """"By itself" on the step out of the first stage starts a new idea on create (`app/pipeline/gate.py`), through
+    the console's own Start; an auto-saved draft is not an idea yet. A Start refused here (no one to push as, a
+    pending org) leaves the draft as created: the create stands."""
+    from app.pipeline import gate as pipeline_gate  # noqa: PLC0415
+    from app.routes.tasks.dispatch import start_one  # noqa: PLC0415 — dispatch imports this module
+
+    if unsaved or not pipeline_gate.starts_on_create(session, project):
+        return created
+    try:
+        started = start_one(session, created.id, None, user, principal)
+    except Exception as exc:  # noqa: BLE001 — the create has committed; a failed start leaves the draft
+        session.rollback()
+        log.info("create: task %s not started on create (%s)", created.id, getattr(exc, "detail", exc))
+        return created
+    return started if isinstance(started, TaskOut) else created
+
+
+def _server_epic_children(body: TaskCreate) -> Optional[tuple[str, ...]]:
+    """A control-plane filing's epic recipe (`ServerTaskCreate.epic_children`); None for any request body."""
+    if not isinstance(body, ServerTaskCreate) or body.epic_children is None:
+        return None
+    if body.unsaved:
+        raise HTTPException(status_code=422, detail="an epic with its own child recipe is filed saved")
+    return body.epic_children
 
 
 def _apply_template(body: TaskCreate, template: task_templates.AnyTemplate) -> tuple[TaskCreate, Optional[str]]:
@@ -684,8 +720,14 @@ def _apply_template(body: TaskCreate, template: task_templates.AnyTemplate) -> t
     when the request sent none or the same one — that pin is the template editor's choice, not the starter's, so
     `create_task` applies it without `_model_pin_or_refuse`'s bar. None when the request's own pin stands."""
     sent = body.model_dump(exclude_unset=True)
+    sent.pop("template_inputs", None)
     if not (body.body or "").strip():
-        sent["body"] = template.body
+        if any(len(value) > task_templates.MAX_INPUT_CHARS for value in body.template_inputs.values()):
+            raise HTTPException(
+                status_code=422, detail=f"template_inputs: a value is over {task_templates.MAX_INPUT_CHARS} characters"
+            )
+        with refused_as(422, task_templates.MissingInputs, chain=True, prefix="template_inputs: "):
+            sent["body"] = task_templates.fill_inputs(template.body, body.template_inputs)
     if not (body.title or "").strip():
         sent["title"] = template.title
     if body.persona is None:
@@ -761,10 +803,8 @@ def _playbook_plan_or_422(
     Simple: the row runs stage 0 — `persona`, when a creatable non-epic one, overrides its expert, and
     `model`, when pinned, overrides its tier (the stage's tier is the stage default at dispatch,
     `dispatch_compose.compose.compose`, so nothing writes it into the pin)."""
-    try:
+    with refused_as(422, playbook_engine.PlaybookNotRunnable, chain=True):
         snap = playbook_engine.load(session, project.org_id, playbook_id)
-    except playbook_engine.PlaybookNotRunnable as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _plan_from_snapshot(snap, persona, model)
 
 
@@ -780,12 +820,10 @@ def _plan_from_snapshot(snap: dict[str, Any], persona: Optional[str], model: Opt
             status_code=422,
             detail=f"persona must be one of {', '.join(CREATABLE_PERSONAS)} (got {override!r})",
         )
-    try:
+    with refused_as(422, playbook_engine.PlaybookNotRunnable, chain=True):
         expert = playbook_engine.expert_for_persona(override) if override is not None else None
         stage = playbook_engine.resolve_stage(snap, 0, expert=expert)
         playbook_engine.check_alone(stage)
-    except playbook_engine.PlaybookNotRunnable as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _PlaybookPlan(snapshot=snap, persona=stage["persona"], model=model, stage=stage)
 
 
@@ -796,19 +834,16 @@ def _create_feature_or_refuse(
 
     Visibility is the feature's own (`tasks:view` on its project); the create key (`tasks:create`) is then
     asked of that project by `create_task`'s ordinary gate, so a feature adds no second rule. "Does not
-    exist" and "not yours" are one 422. A shipped feature is closed for filing (400, the filing door's
-    sentence)."""
+    exist", "not yours" and "deleted" are one 422."""
     if body.feature_id is None:
         return None
-    # `FOR SHARE`: a concurrent ship or delete waits for this create to commit, so the row cannot land in a
-    # feature shipped or deleted between this check and the insert.
+    # `FOR SHARE`: a concurrent delete waits for this create to commit, so the row cannot land in a feature
+    # deleted between this check and the insert.
     feature_row = session.get(Feature, body.feature_id, with_for_update={"read": True})
-    if feature_row is None or not can_access(
+    if feature_row is None or feature_row.deleted_at is not None or not can_access(
         session, principal, "feature", body.feature_id, mode=ObjectAccess.READ
     ):
         raise HTTPException(status_code=422, detail=f"feature {body.feature_id} not found")
-    if feature_row.status == FEATURE_SHIPPED:
-        raise HTTPException(status_code=400, detail=_FEATURE_SHIPPED_DETAIL)
     return feature_row
 
 
@@ -820,9 +855,18 @@ _EPIC_ANALYSIS_CHILDREN: tuple[str, ...] = (
     PERSONA_ARCHITECTURE,
     PERSONA_PLAN,
 )
+# A new web app's epic (`app/project_onboarding.py`): the App Wizard's business interview in place of the business
+# analyst, then the same design and plan. Server-only: no request body can name a recipe (`ServerTaskCreate`).
+APP_WIZARD_CHILDREN: tuple[str, ...] = (
+    PERSONA_APP_WIZARD,
+    PERSONA_ARCHITECTURE,
+    PERSONA_PLAN,
+)
 
 
-def _create_epic_children(epic: Task, session: Session) -> list[Task]:
+def _create_epic_children(
+    epic: Task, session: Session, *, children: Optional[tuple[str, ...]] = None,
+) -> list[Task]:
     """An epic's children at Save: a playbook container's start stages, else the analysis recipe.
 
     Every child is the EPIC's: `created_by_id` is copied from the epic, never taken from whoever's request
@@ -831,7 +875,7 @@ def _create_epic_children(epic: Task, session: Session) -> list[Task]:
     (`task_ancestry.starter_user_id`)."""
     if epic.playbook:
         return _create_playbook_start_children(epic, session)
-    return _create_analysis_children(epic, session)
+    return _create_analysis_children(epic, session, personas=children or _EPIC_ANALYSIS_CHILDREN)
 
 
 def _new_stage_child(
@@ -850,6 +894,7 @@ def _new_stage_child(
         parent_task_id=epic.id,
         source=task_source.source_for(epic, task_source.CONSOLE),
         hidden=epic.hidden,
+        language=epic.language,
         title=title,
         body=body,
         is_plannable=False,
@@ -863,19 +908,6 @@ def _new_stage_child(
         created_by_id=created_by_id,
         assigned_to_id=epic.assigned_to_id,
     )
-
-
-def _stage_edge(session: Session, row: Task, prereq: Task) -> None:
-    """`row` waits on `prereq`: a duplicate is a no-op, a cycle rolls the whole build back (422)."""
-    if session.get(TaskDependency, {"task_id": row.id, "depends_on_task_id": prereq.id}) is not None:
-        return
-    if _would_create_cycle(row.id, prereq.id, session):
-        session.rollback()
-        raise HTTPException(
-            status_code=422,
-            detail=f"playbook stage edge {row.id} -> {prereq.id} would create a cycle — nothing was filed",
-        )
-    session.add(TaskDependency(task_id=row.id, depends_on_task_id=prereq.id))
 
 
 def _wire_stage_edges(
@@ -903,7 +935,7 @@ def _wire_stage_edges(
         for row in rows_by_index[index]:
             for prereq in prereqs:
                 if prereq is not row:
-                    _stage_edge(session, row, prereq)
+                    stage_edge(session, row.id, prereq.id, "playbook stage edge")
     filed = set(new_indexes)
     for index, rows in rows_by_index.items():
         waits_on_new = filed & set(playbook_engine.dependency_indexes(snap, index))
@@ -914,7 +946,7 @@ def _wire_stage_edges(
                 continue
             for dep in waits_on_new:
                 for prereq in rows_by_index[dep]:
-                    _stage_edge(session, row, prereq)
+                    stage_edge(session, row.id, prereq.id, "playbook stage edge")
 
 
 def _create_playbook_start_children(epic: Task, session: Session) -> list[Task]:
@@ -958,7 +990,9 @@ def sync_epic_child_autonomous(session: Session, epic: Task) -> None:
         child.autonomous = epic.autonomous
 
 
-def _create_analysis_children(epic: Task, session: Session) -> list[Task]:
+def _create_analysis_children(
+    epic: Task, session: Session, *, personas: tuple[str, ...] = _EPIC_ANALYSIS_CHILDREN,
+) -> list[Task]:
     """Fan `epic` out into its three draft analysis children plus the fan-in dependency edges — the single
     home for the recipe, so `update_task`'s `coder → epic` conversion builds the identical shape.
 
@@ -967,7 +1001,7 @@ def _create_analysis_children(epic: Task, session: Session) -> list[Task]:
     `created_by_id` (`_create_epic_children`) and sits in the epic's project."""
     prior_child_ids: list[int] = []
     children: list[Task] = []
-    for persona in _EPIC_ANALYSIS_CHILDREN:
+    for persona in personas:
         child = Task(
             project_id=epic.project_id,
             # The epic's org, never the scope's: `fk_tasks_project_id_org` holds a task to its project's org.
@@ -987,10 +1021,12 @@ def _create_analysis_children(epic: Task, session: Session) -> list[Task]:
             state=DRAFT,
             persona=persona,
             priority=epic.priority,
+            # Every child carries its epic's language (`app/task_language.py`).
+            language=epic.language,
             # The switch this child will actually dispatch with (`_task_effective_autonomous`), stored so the
             # column never claims Full Auto on a child that inherits the epic's OFF; `sync_epic_child_autonomous`
             # keeps it true when the epic's switch moves.
-            autonomous=epic.autonomous if persona in INTERVIEWING_CHILD_PERSONAS else True,
+            autonomous=epic_child_autonomous(persona, epic.autonomous),
             # The epic's author, never the request's principal; PROVENANCE ONLY — a Task carries no grant row.
             created_by_id=epic.created_by_id,
             # The epic's own addressee, never the finalizing principal's (who may differ).
@@ -1001,17 +1037,7 @@ def _create_analysis_children(epic: Task, session: Session) -> list[Task]:
         # Fan in to every earlier child, so a later stage receives every earlier settled output; the cycle
         # guard is defensive.
         for prior_id in prior_child_ids:
-            if _would_create_cycle(child.id, prior_id, session):
-                raise HTTPException(
-                    status_code=500,
-                    detail=(
-                        f"epic child dependency {child.id} -> {prior_id} would create a cycle "
-                        "(unexpected for a fresh epic — aborting create)"
-                    ),
-                )
-            session.add(
-                TaskDependency(task_id=child.id, depends_on_task_id=prior_id)
-            )
+            stage_edge(session, child.id, prior_id, "epic child dependency", status=500)
         prior_child_ids.append(child.id)
         children.append(child)
     return children
@@ -1079,8 +1105,8 @@ def new_top_level_task(
         # The addressee defaults to the author here, so cron-filed rows get the same answer. A NULL creator stays
         # a NULL assignee. Explicit values arrive validated (`TaskCreate.assigned_to_id`).
         assigned_to_id=assigned_to_id if assigned_to_id is not None else created_by_id,
-        # Already resolved against `project_id` by the caller (`_create_feature_or_refuse`); None is
-        # "No feature".
+        # Already resolved against `project_id` by the caller (`_create_feature_or_refuse`); None files it in
+        # the project itself.
         feature_id=feature_id,
         pinned_node_id=pinned_node_id,
     )
@@ -1109,10 +1135,6 @@ def _create_coder_task(
     transition_mode = (
         body.transition_mode if body.transition_mode is not None else DEFAULT_TRANSITION_MODE
     )
-    # Already validated in `create_task`; called again for the NORMALISED pair (blank → null).
-    external_system, external_id = _external_issue_or_422(
-        body.external_task_system, body.external_task_id
-    )
     task = new_top_level_task(
         # The derived project, handed down so the FK-checked pair is the one authorized.
         project_id=project_id,
@@ -1124,8 +1146,6 @@ def _create_coder_task(
         autonomous=autonomous,
         sweep_opt_out=sweep_opt_out,
         transition_mode=transition_mode,
-        external_task_system=external_system,
-        external_task_id=external_id,
         # Already authorized and normalized by `create_task`; None inherits.
         model=model,
         # The editor's auto-save, straight off the request — `TaskCreate.unsaved` is the single home.
@@ -1143,13 +1163,22 @@ def _create_coder_task(
     task.bound_provider = provider
     task.agent_id = agent_id
     task.bound_account_id = account_id
+    # A person's choice of runner or model (`agent_router/pins.py`).
+    pins.stamp(task, pins.HUMAN)
     task.project_memory = body.project_memory
+    if body.notify_when_done is not None:
+        task.notify_when_done = body.notify_when_done
     # A one-stage playbook: this row IS its stage (`_PlaybookPlan`).
     if playbook_plan is not None:
         task.playbook = playbook_plan.snapshot
         task.playbook_stage = playbook_plan.stage
     session.add(task)
     session.flush()
+    tracker_pick.apply(session, task, body)
+    # The person's answer to the router's recommendation, if the form showed one (`agent_router.record_answer`).
+    if "routing_accepted_config" in body.model_fields_set:
+        agent_router.record_answer(session, task, session.scalars(select(Project).where(Project.id == task.project_id)).first(),
+                                   accepted=body.routing_accepted_config)
     _link_template(session, task, template, principal)
     # No object grant: the create gate required `tasks:create` here and `visible_task_clause` reads
     # `tasks:view` on the same scope. For an auto-save, notify but do not record: the author's board must
@@ -1157,16 +1186,16 @@ def _create_coder_task(
     # (`_finalize_unsaved_draft`).
     emit_console_event(
         session, entity="task", id=task.id, action="created", record_transition=not body.unsaved,
+        commit=True,
     )
-    session.commit()
     # After the commit: the workflow re-reads the row, and an early dequeue would find nothing and burn the
     # one enqueue. Never raises. Deferred import: the queue module pulls `dbos` and registers a workflow.
     from app.durable.task_title_queue import enqueue_title
 
     # Not while the author is typing; Save enqueues it (`_finalize_unsaved_draft`). Never over an authored title.
     if not body.unsaved and not (body.title or "").strip():
-        enqueue_title(task.id)
-    _announce_assignment_after_create(task, body, principal)
+        defer_off_loop(session, enqueue_title, task.id)
+    _announce_assignment_after_create(session, task, body, principal)
     # `child_count=0` explicitly (else null). `actor_names` explicitly rather than `session=session`, which
     # would also compute the counts above; without a map the author's name would render as an em-dash.
 
@@ -1176,6 +1205,8 @@ def _create_coder_task(
         task,
         child_count=0,
         done_child_count=0,
+        # The picked issue, if any (`tracker_pick.apply` above): with no session `_task_out` would not read it.
+        issue_map=project_links.task_issue_wire(session, [task.id]),
         actor_names=actors.actor_names(
             session, (task.created_by_id, task.updated_by_id, task.assigned_to_id), name_acting=True
         ),
@@ -1189,7 +1220,7 @@ def _create_coder_task(
 
 
 def _announce_assignment_after_create(
-    task: Task, body: TaskCreate, principal: Principal | None
+    session: Session, task: Task, body: TaskCreate, principal: Principal | None
 ) -> None:
     """The "assigned to you" notice a CREATE owes, after its commit — one home for the coder and epic arms.
 
@@ -1203,15 +1234,16 @@ def _announce_assignment_after_create(
         return
     from app import task_notify
 
-    task_notify.announce_assignment(
-        task.id, assignee_id=task.assigned_to_id, assigned_by_id=creator_id
+    defer_off_loop(
+        session, task_notify.announce_assignment,
+        task.id, assignee_id=task.assigned_to_id, assigned_by_id=creator_id,
     )
 
 
 def _create_epic_with_children(
     body: TaskCreate, title: str, session: Session, principal: Principal | None,
     model: Optional[str], project_id: int, *, playbook_plan: Optional[_PlaybookPlan] = None,
-    template: Optional[task_templates.AnyTemplate] = None,
+    template: Optional[task_templates.AnyTemplate] = None, children: Optional[tuple[str, ...]] = None,
 ) -> TaskOut:
     """Build an auto-initialized epic and its analysis children in ONE transaction, so a
     mid-build failure leaves NO partial epic:
@@ -1229,11 +1261,6 @@ def _create_epic_with_children(
     transition_mode = (
         body.transition_mode if body.transition_mode is not None else DEFAULT_TRANSITION_MODE
     )
-    # The external issue lands on the epic only: its children are stages of one issue, and copying the id
-    # down would multiply Jira done-comments. Already validated in `create_task`.
-    external_system, external_id = _external_issue_or_422(
-        body.external_task_system, body.external_task_id
-    )
     epic = Task(
         project_id=project_id,
         source=task_source.CONSOLE,
@@ -1250,12 +1277,13 @@ def _create_epic_with_children(
         sweep_opt_out=sweep_opt_out,
         # The epic's own; its children stay null and inherit it at dispatch (`switch.effective_memory`).
         project_memory=body.project_memory,
+        # Only the epic carries the notice (its stages never announce); None leaves the filing default.
+        **({"notify_when_done": body.notify_when_done} if body.notify_when_done is not None else {}),
         # Only the EPIC row takes it: dispatch reads the mode off the PARENT epic, so a child's is inert.
         transition_mode=transition_mode,
+        max_running=body.max_running,
         # Stored though an epic never dispatches, so the submitted value reads back; see `TaskCreate.model`.
         model=model,
-        external_task_system=external_system,
-        external_task_id=external_id,
         # The editor's auto-save — see `_create_coder_task`'s own pass-through and `TaskCreate.unsaved`.
         unsaved=body.unsaved,
         # PROVENANCE ONLY, like every other create path — see `Task.created_by_id`.
@@ -1270,8 +1298,13 @@ def _create_epic_with_children(
     # A complex playbook: the container keeps the snapshot its stage children are built from.
     if playbook_plan is not None:
         epic.playbook = playbook_plan.snapshot
+    # The epic's own model pin is a person's (`agent_router/pins.py`); an epic never dispatches, but its row says who.
+    pins.stamp(epic, pins.HUMAN)
     session.add(epic)
     session.flush()   # assign epic.id for the children's parent_task_id + the dependency edges
+    # The picked issue links the epic only: its children are stages of one issue, and linking each would post
+    # every stage's write-back to it.
+    tracker_pick.apply(session, epic, body)
     _link_template(session, epic, template, principal)
     # No object grant: every subtree row sits in the same project, read via `tasks:view` there.
 
@@ -1279,31 +1312,27 @@ def _create_epic_with_children(
     # Owner's ruling: the editor can switch between Complex and simple before Save, so no children are
     # fanned out per tick. `_finalize_unsaved_draft` builds them at Save through the same recipe;
     # `_apply_persona_conversion` holds the matching line for conversions while unsaved.
-    children = None if epic.unsaved else _create_epic_children(epic, session)
+    built = None if epic.unsaved else _create_epic_children(epic, session, children=children)
 
     # Notify-but-do-not-record for an auto-save — `_create_coder_task` carries the whole argument.
     emit_console_event(
         session, entity="task", id=epic.id, action="created", record_transition=not epic.unsaved,
+        commit=True,
     )
-    session.commit()
     # The epic alone: its children's titles derive from it, and the refinement re-stamps them. After commit,
     # deferred — see `_create_coder_task`.
     from app.durable.task_title_queue import enqueue_title
 
     # Withheld while unsaved or authored, for `_create_coder_task`'s reasons exactly.
     if not body.unsaved and not (body.title or "").strip():
-        enqueue_title(epic.id)
-    _announce_assignment_after_create(epic, body, principal)
+        defer_off_loop(session, enqueue_title, epic.id)
+    _announce_assignment_after_create(session, epic, body, principal)
     # `child_count=0` explicitly on the unsaved arm; `children=None` would trigger a counting query.
-    if children is None:
+    if built is None:
         return _task_out(
             epic, child_count=0, done_child_count=0, session=session, principal=principal,
         )
-    return _task_out(epic, children=children, session=session, principal=principal)
-
-
-# One sentence for "this feature is closed for filing", shared by the create and the filing doors.
-_FEATURE_SHIPPED_DETAIL = "feature is shipped — reopen it to file tasks"
+    return _task_out(epic, children=built, session=session, principal=principal)
 
 
 # ── Body-version history (item 6a) ────────────────────────────────────────────────────────────────
@@ -1319,16 +1348,22 @@ class TaskBodyVersionOut(BaseModel):
 
 @router.get("/{task_id}/body-versions", response_model=list[TaskBodyVersionOut])
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
+@on_session
 def list_body_versions(
+    session: Session,
     task_id: int,
     _user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> list[TaskBodyVersionOut]:
     """Timestamped prior descriptions for `task_id`, newest first."""
+    _user = adopt_user(session, _user)
     get_task_or_404(task_id, session)
-    rows = session.scalars(
-        select(TaskBodyVersion)
-        .where(TaskBodyVersion.task_id == task_id)
-        .order_by(TaskBodyVersion.id.desc())
-    ).all()
-    return [TaskBodyVersionOut.model_validate(row) for row in rows]
+    return body_versions(session, task_id)
+
+
+def body_versions(session: Session, task_id: int, *, since: Optional[datetime] = None,
+                  limit: Optional[int] = None) -> list[TaskBodyVersionOut]:
+    """`task_id`'s prior descriptions, newest first; `since`/`limit` narrow them (`routes/live_public.py`)."""
+    stmt = select(TaskBodyVersion).where(TaskBodyVersion.task_id == task_id).order_by(TaskBodyVersion.id.desc())
+    if since is not None:
+        stmt = stmt.where(TaskBodyVersion.created_at >= since)
+    return [TaskBodyVersionOut.model_validate(row) for row in session.scalars(stmt.limit(limit))]

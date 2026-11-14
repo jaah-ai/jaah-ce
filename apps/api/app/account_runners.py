@@ -22,7 +22,22 @@ from app import edition_features, fleet_verdicts, pool_state, slot_state
 from app.fleet_decide import UNACKED_REDISPATCH_DEADLINE_SECONDS, UNANSWERED_LEASE_MAX_WAIT_SECONDS
 from app.models.worktrees import Worktree
 
-__all__ = ["fleet_assigned_runner_counts"]
+__all__ = ["fleet_assigned_runner_counts", "launch_in_flight"]
+
+
+def launch_in_flight():
+    """Is a `task` hold's launch in flight? A boolean expression correlated to `Worktree`, on the database's clock:
+    `dispatched_at` younger than `UNACKED_REDISPATCH_DEADLINE_SECONDS` (not narrowed by `acked_at`), or the hold's
+    own `lease_slot` order still queued unanswered within `UNANSWERED_LEASE_MAX_WAIT_SECONDS`. NULL `dispatched_at`
+    fails the comparison, so it under-counts rather than inventing an allocation. Shared with the node task cap
+    (`launch_gates.TASKS`), which must charge a launch before its runner claims the task."""
+    return or_(
+        cast(func.extract("epoch", func.now() - Worktree.dispatched_at), Float)
+        < UNACKED_REDISPATCH_DEADLINE_SECONDS,
+        # The redispatch waits on the hold's own unanswered order, so its launch is still coming.
+        cast(func.extract("epoch", func.now() - fleet_verdicts.own_unanswered_lease_since()), Float)
+        < UNANSWERED_LEASE_MAX_WAIT_SECONDS,
+    )
 
 
 def fleet_assigned_runner_counts(session: Session) -> dict[UUID, int]:
@@ -48,15 +63,8 @@ def fleet_assigned_runner_counts(session: Session) -> dict[UUID, int]:
         Worktree.session_status != "",
         _observation_fresh,
     )
-    # Arm 2: launch in flight. NULL `dispatched_at` fails the comparison, so it under-counts rather
-    # than inventing an allocation.
-    _launch_in_flight = or_(
-        cast(func.extract("epoch", func.now() - Worktree.dispatched_at), Float)
-        < UNACKED_REDISPATCH_DEADLINE_SECONDS,
-        # The redispatch waits on the hold's own unanswered order, so its launch is still coming.
-        cast(func.extract("epoch", func.now() - fleet_verdicts.own_unanswered_lease_since()), Float)
-        < UNANSWERED_LEASE_MAX_WAIT_SECONDS,
-    )
+    # Arm 2: launch in flight.
+    _launch_in_flight = launch_in_flight()
     rows = session.execute(
         select(_slot_account, func.count())
         .where(

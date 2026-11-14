@@ -145,11 +145,16 @@ def _positions(stages: list[dict[str, Any]]) -> dict[str, int]:
     return positions
 
 
-def _named(stage: dict[str, Any], index: int) -> str:
-    """How a message names a stage: its label and key, or its position when it has neither."""
+def _named(stages: list[dict[str, Any]], index: int) -> str:
+    """How a message names a stage: its label (with its key only when another stage shares that label), else its
+    key, else its position."""
+    stage = stages[index]
     key = (stage.get("key") or "")[:40]
     label = (stage.get("label") or "").strip()[:MAX_LABEL]
-    if label and key:
+    if label and key and any(
+        i != index and (other.get("label") or "").strip()[:MAX_LABEL].casefold() == label.casefold()
+        for i, other in enumerate(stages)
+    ):
         return f'Stage "{label}" ({key})'
     if label or key:
         return f'Stage "{label or key}"'
@@ -179,7 +184,7 @@ def validate(pb: dict[str, Any]) -> list[Issue]:
     stages = _stages(pb)
     if len(stages) > MAX_STAGES:
         return issues  # already refused; walking an oversized list is cost for nothing
-    for index, stage in enumerate(stages):
+    for index, _stage in enumerate(stages):
         issues.extend(_stage_issues(pb, stages, index))
     issues.extend(_cycle_issues(stages))
     return issues
@@ -218,7 +223,7 @@ def _playbook_issues(pb: dict[str, Any]) -> Iterable[Issue]:
 def _stage_issues(pb: dict[str, Any], stages: list[dict[str, Any]], index: int) -> Iterable[Issue]:
     stage = stages[index]
     key = stage.get("key") or ""
-    who = _named(stage, index)
+    who = _named(stages, index)
     last = index == len(stages) - 1
 
     def issue(field: str, message: str, severity: str = ERROR) -> Issue:
@@ -423,7 +428,7 @@ def _created_issues(stages: list[dict[str, Any]], index: int, who: str, issue) -
         return
     creator_index = positions[creator_key]
     creator = stages[creator_index]
-    creator_name = _named(creator, creator_index)
+    creator_name = _named(stages, creator_index)
     if creator_index >= index:
         yield issue(
             "created",
@@ -490,7 +495,7 @@ def _cycle_issues(stages: list[dict[str, Any]]) -> list[Issue]:
                         stage = stages[member]
                         issues.append(Issue(
                             stage.get("key") or None, member, "depends_on", ERROR,
-                            f"{_named(stage, member)} is part of a waiting loop ({chain}): each stage waits "
+                            f"{_named(stages, member)} is part of a waiting loop ({chain}): each stage waits "
                             "for the next, so none can start. Remove one of these dependencies.",
                         ))
             elif state.get(target) is None:

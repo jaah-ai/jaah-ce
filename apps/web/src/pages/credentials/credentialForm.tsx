@@ -1,17 +1,22 @@
 import { useCallback, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import Link from '@mui/material/Link'
 import Typography from '@mui/material/Typography'
 import { get } from '../../api'
+import { listProjects } from '../../hooks/useRosters'
 import { actAsOnce } from '../../lib/actAs'
 import { credentialHomeLabel } from '../../lib/credentialRow'
 import { sealSecret } from '../../lib/credentialSeal'
 import type { OrgRef, Project } from '../../types'
 import FormTextField from '../../ui/FormTextField'
+import { urlShapeWarning } from '../../lib/urlShape'
+import { fmtTimestamp } from '../../lib/relativeTime'
 import { ShowHideAdornment } from '../../ui/ShowHideAdornment'
 import { getCredentialSealKey, type CredentialSealKey, type FieldSpec, type SealedSecretEnvelope } from './api'
+import Tip from '../../ui/Tip'
 
-// Registry-driven form pieces shared by `CredentialEditPage` and `AwsCredentialFields` (sealing: one envelope per
-// secret, the row's id in the AAD, plaintext never on the wire).
+// Registry-driven form pieces of `CredentialEditPage` (sealing: one envelope per secret, the row's id in the AAD,
+// plaintext never on the wire).
 
 /** The seal key, fetched once on first ask and held as a promise for the form's life. */
 export function useSealKey(): () => Promise<CredentialSealKey> {
@@ -20,14 +25,6 @@ export function useSealKey(): () => Promise<CredentialSealKey> {
     if (ref.current === null) ref.current = getCredentialSealKey()
     return ref.current
   }, [])
-}
-
-/** `errors` without `key` — the same object when it had none, so a state setter is a no-op. */
-export function withoutKey(errors: Record<string, string>, key: string): Record<string, string> {
-  if (!(key in errors)) return errors
-  const next = { ...errors }
-  delete next[key]
-  return next
 }
 
 /** A server 400 names the offending KEY first; re-home it under that field's label. */
@@ -66,7 +63,10 @@ export async function buildSealedConfig({ fields, values, credentialId, destinat
 }
 
 /** One registry field as an input. */
-export function RegistryFieldInput({ field, value, error, onChange, disabled, required, id, hint }: {
+const isIsoStamp = (value: string): boolean =>
+  /^\d{4}-\d{2}-\d{2}T/.test(value) && !Number.isNaN(new Date(value).getTime())
+
+export function RegistryFieldInput({ field, value, error, onChange, disabled, required, id, hint, placeholder, freeFormUrl }: {
   field: FieldSpec
   value: string
   error?: string
@@ -75,17 +75,36 @@ export function RegistryFieldInput({ field, value, error, onChange, disabled, re
   required?: boolean
   id: string
   hint?: string
+  /** Replaces the registry's example (a stored secret says it is kept). */
+  placeholder?: string
+  /** The type's `free_form_url`: a url field warns on an odd shape (`lib/urlShape.ts`), never refuses. */
+  freeFormUrl?: boolean
 }) {
   const isSecret = field.kind === 'secret'
   const [shown, setShown] = useState(false)
   /* Sentence case, as `NewPasswordFields`' "Show password". */
   const what = field.label.toLowerCase()
   const toggle = isSecret ? <ShowHideAdornment shown={shown} onToggle={() => setShown(s => !s)} what={what} /> : undefined
+  /* A stamp the system writes (`token_expires_at`, `grant_dead_at`: the registry's `*_at` keys) reads as a date,
+     like every other date in the console, never raw ISO; shown, not typed, so the stored value saves unchanged. */
+  /* Decided from the value the form LOADED (never per keystroke: `new Date('2')` parses), and only an ISO stamp.
+     Clear drops it to an empty, editable field, the one edit an operator makes to a stamp. */
+  const [stamp, setStamp] = useState(() => !isSecret && field.key.endsWith('_at') && isIsoStamp(value))
+  if (stamp && isIsoStamp(value)) {
+    return (
+      <FormTextField label={field.label} help={field.help ?? undefined} id={id} readOnly value={fmtTimestamp(value)} onChange={() => {}}
+        hint={disabled ? undefined : (
+          <Link component="button" type="button" onClick={() => { setStamp(false); onChange('') }} data-testid={`${id}-clear`}>Clear</Link>
+        )} />
+    )
+  }
   return (
     <FormTextField
       label={field.label}
-      hint={hint ?? field.help ?? undefined}
+      help={field.help ?? undefined}
+      hint={hint}
       error={error}
+      warning={freeFormUrl && field.kind === 'url' ? urlShapeWarning(value) : undefined}
       id={id}
       required={required}
       disabled={disabled}
@@ -94,7 +113,7 @@ export function RegistryFieldInput({ field, value, error, onChange, disabled, re
       type={isSecret && !shown ? 'password' : field.kind === 'email' ? 'email' : 'text'}
       autoComplete={isSecret ? 'new-password' : 'off'}
       value={value}
-      placeholder={field.placeholder ?? undefined}
+      placeholder={placeholder ?? field.placeholder ?? undefined}
       onChange={onChange}
       slotProps={{
         input: toggle ? { endAdornment: toggle } : undefined,
@@ -122,7 +141,7 @@ export function useHomeProjects(
   const headers = actAsOnce(actAs)
   const query = useQuery({
     queryKey: actAs ? ['projects', { actAs: actAs.id }] : ['projects'],
-    queryFn: () => get<Project[]>('/api/projects', headers ? { headers } : undefined),
+    queryFn: () => (headers ? get<Project[]>('/api/projects', { headers }) : listProjects()),
     enabled,
     retry: false,
   })
@@ -154,6 +173,7 @@ export function HomeProjectField({ orgLabel, projects, value, storedName, onChan
     <FormTextField
       label="Home"
       id="credential-home-project"
+      help="In a project, its tasks use it as if attached."
       value={value === null ? '' : String(value)}
       disabled={disabled}
       options={options}
@@ -168,8 +188,8 @@ export function CredentialHomeLine({ path }: { path: readonly string[] }) {
   const label = credentialHomeLabel(path)
   if (!label) return null
   return (
-    <Typography variant="body2" noWrap title={label} data-testid="credential-name-home" sx={{ color: 'text.secondary', mb: 1 }}>
+    <Tip title={label}><Typography variant="body2" noWrap data-testid="credential-name-home" sx={{ color: 'text.secondary', mb: 1 }}>
       {label}
-    </Typography>
+    </Typography></Tip>
   )
 }

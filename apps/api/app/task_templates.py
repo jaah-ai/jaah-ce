@@ -7,8 +7,10 @@ tables and their reasons: `app/models/task_templates.py`.
 """
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Optional, Union
+from typing import Mapping, Optional, Union
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -26,6 +28,46 @@ POPULAR_DAYS = 90
 UNAVAILABLE_DETAIL = "template_id: Template unavailable"
 
 AnyTemplate = Union[TaskTemplate, OrgTaskTemplate]
+
+#: An input placeholder in a template's body: `{{input: Label}}` (required) or `{{input?: Label}}` (optional). Start
+#: asks for each (`StartTemplateDialog.tsx`), an automation stores a value per label (`automation_actions.py`), and the
+#: value replaces every token of that label. Distinct from a trigger's `{{ns.path}}` (`trigger_template.py`): `input`
+#: is no trigger namespace, and a template's body is never rendered as a trigger template.
+INPUT_TOKEN = re.compile(r"\{\{\s*input(\?)?\s*:\s*([^{}\n]{1,80}?)\s*\}\}")
+#: What an optional input left blank reads as in the task's body.
+INPUT_NOT_GIVEN = "(not given)"
+MAX_INPUT_CHARS = 20_000
+
+
+@dataclass(frozen=True)
+class TemplateInput:
+    label: str
+    required: bool
+
+
+def inputs_of(body: str) -> list[TemplateInput]:
+    """The body's inputs in order of first use, one per label; a label that is required anywhere is required."""
+    found: dict[str, bool] = {}
+    for match in INPUT_TOKEN.finditer(body or ""):
+        label = " ".join(match.group(2).split())
+        found[label] = found.get(label, False) or match.group(1) is None
+    return [TemplateInput(label, required) for label, required in found.items()]
+
+
+class MissingInputs(ValueError):
+    def __init__(self, labels: list[str]) -> None:
+        super().__init__(f"needs a value for {', '.join(repr(label) for label in labels)}")
+        self.labels = labels
+
+
+def fill_inputs(body: str, values: Mapping[str, str]) -> str:
+    """`body` with every input token replaced by its value (stripped). Raises `MissingInputs` naming each required
+    input left blank; an optional one left blank reads `INPUT_NOT_GIVEN`."""
+    given = {" ".join(label.split()): (value or "").strip() for label, value in values.items()}
+    missing = [i.label for i in inputs_of(body) if i.required and not given.get(i.label)]
+    if missing:
+        raise MissingInputs(missing)
+    return INPUT_TOKEN.sub(lambda m: given.get(" ".join(m.group(2).split())) or INPUT_NOT_GIVEN, body)
 
 
 def origin_of(row: AnyTemplate) -> str:

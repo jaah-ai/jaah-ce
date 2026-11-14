@@ -1,0 +1,48 @@
+# Shopify Admin API: an Admin API access token sent as X-Shopify-Access-Token, on the store's own myshopify.com
+# subdomain (a tenant host, dialled only at a vetted public address).
+slug = "shopify"
+label = "Shopify"
+category = "payments"
+vendor_docs_url = "https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/generate-app-access-tokens-admin"
+summary = "Read and update a Shopify store's products, orders, customers and inventory through the Admin API."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "shop", label = "Store name", kind = "text", required = true, placeholder = "acme-store", help = "The first part of your store's admin address: for acme-store.myshopify.com it is acme-store. Find it in Shopify admin > Settings > Domains, on the line ending in .myshopify.com" },
+  { key = "access_token", label = "Admin API access token", kind = "secret", required = true, help = "In Shopify admin, open Settings > Apps > Develop apps (Legacy custom apps on stores that have them), select the app, open API credentials and reveal the Admin API access token, which starts with shpat_. Shopify shows it once: if it is lost, uninstall and reinstall the app to get a new one" },
+]
+
+# The shop's own record: one small object any Admin API token may read.
+[test]
+method = "GET"
+path = "https://{shop}.myshopify.com/admin/api/2026-10/shop.json"
+auth = { field = "access_token", header = "X-Shopify-Access-Token" }
+identity = [["shop", "name"]]
+
+[docs]
+agent_uses = [
+  "Look up an order, its fulfilment and refund state when a support task names an order number",
+  "Find products that are out of stock, unpublished or missing images and descriptions",
+  "Update product prices, inventory levels or tags when a task asks (needs the matching write scopes)",
+  "Export orders for a date range to build a sales or tax report",
+]
+prerequisites = [
+  "A Shopify store and a staff account with the Apps permission (the store owner has it)",
+  "An app on the store whose Admin API access token you can copy: a custom app created in the Shopify admin before 1 January 2026, or a token your developer issued for this store",
+  "The app's Admin API scopes set to what agents need, such as read_products, read_orders and write_inventory",
+]
+limitations = [
+  "Shopify stopped letting stores create new custom apps in the admin on 1 January 2026. Apps made in the Shopify Dev Dashboard issue tokens that expire after 24 hours, which this connection cannot renew yet: use a token from an existing custom app",
+  "The token can do only what its app's Admin API scopes allow; changing scopes means reinstalling the app and copying the new token",
+  "Shopify throttles the Admin API per store (a leaky bucket for REST, a cost budget for GraphQL); bulk work is slowed down, not refused",
+]
+troubleshooting = [
+  { symptom = "Test says Shopify rejected the admin API access token (401)", fix = "The token was revoked (the app was uninstalled or its token rotated) or belongs to another store. Reveal the token again in Settings > Apps > Develop apps and select Replace" },
+  { symptom = "Test says Shopify cannot be reached at that address", fix = "Store name must be only the myshopify.com name, such as acme-store, not your own domain and not the full address" },
+  { symptom = "An agent's call is refused with 403", fix = "The app lacks the scope for that call. Add it under the app's Configuration > Admin API scopes, reinstall the app and replace the token" },
+]
+faq = [
+  { q = "Can I use my store's own domain", a = "No. The Admin API answers only on the store's myshopify.com address, so enter that name" },
+  { q = "Does Test change anything in my store", a = "No. It reads the store's name and nothing else" },
+]

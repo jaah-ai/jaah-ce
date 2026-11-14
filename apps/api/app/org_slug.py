@@ -1,4 +1,4 @@
-"""An org's generated slug: a 5-7 character abbreviation of its name plus two random digits (`timesvr38`).
+"""An org's slug: its grammar (`ORG_SLUG_RE`), and the generated one — a 5-7 character abbreviation of its name plus two random digits (`timesvr38`).
 
 The abbreviation comes from the same LLM client as task titles (`app/llm_client.py::summary_llm`), with a
 short inline timeout because sign-up waits on it; any failure, an absent key, or a reply outside the shape
@@ -6,7 +6,7 @@ falls back to `_fallback_abbreviation`, so a slug is always produced.
 
 Used by the self-service sign-up (`app/signup.py`) and by the operator's Create dialog suggestion
 (`GET /api/orgs/slug-suggestion`). The result is lowercase letters and digits only, so it satisfies both
-the slug grammar (`app/routes/commands.py::_SLUG_RE`) and the tailnet tag grammar
+the slug grammar (`ORG_SLUG_RE`) and the tailnet tag grammar
 (`app/cloud_node_launch.py::tailnet_tags_for`). Uniqueness is checked here; a concurrent create taking the
 same slug is still `uq_orgs_slug`'s, answered by `app/org_create.py::create_org_row`.
 """
@@ -18,8 +18,9 @@ import secrets
 import string
 import unicodedata
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session
+
+from app.entity_shape import slug_taken
 
 # Bound locally so tests patch `app.org_slug._summary_llm`, as `session_summary` does.
 from app.llm_client import NO_THINKING_OPTIONS, summary_llm as _summary_llm, text_blocks
@@ -44,6 +45,23 @@ _PROMPT = (
     "NAME:\n{name}\n\nHANDLE:"
 )
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+#: An org slug: lowercase letters and digits only, at most 32. No separator, so `<slug>-` — the name prefix of every
+#: repository Jaah makes for the org (`app/jaah_repos.py::repo_prefix`) — can never be another org's prefix too
+#: (`acme-` would match `acme-corp-…`). Enforced at the org's write paths (`app/routes/orgs.py::_validated_slug`);
+#: a slug written under the older grammar is renamed once by `app/durable/jaah_repo_prefix.py`.
+ORG_SLUG_MAX = 32
+ORG_SLUG_RE = re.compile(rf"[a-z0-9]{{1,{ORG_SLUG_MAX}}}")
+ORG_SLUG_RULE = f"slug must be lowercase letters and digits only, max {ORG_SLUG_MAX} chars"
+
+
+def is_org_slug(value: str) -> bool:
+    return ORG_SLUG_RE.fullmatch(value or "") is not None
+
+
+def conforming(slug: str) -> str:
+    """`slug` under `ORG_SLUG_RE`: every other character dropped, cut to `ORG_SLUG_MAX`; "" when nothing is left."""
+    return _NON_ALNUM.sub("", (slug or "").lower())[:ORG_SLUG_MAX]
 _VOWELS = frozenset("aeiou")
 
 
@@ -111,10 +129,6 @@ def abbreviation(name: str) -> str:
     return fallback
 
 
-def _taken(session: Session, slug: str) -> bool:
-    return session.scalar(select(Org.id).where(Org.slug == slug)) is not None
-
-
 def unique_slug(session: Session, base: str) -> str:
     """`base` plus two random digits, the first free one in a random order over all 100. Should all 100 be
     taken, three digits, then the base re-rolled — the slug must be globally unique, and two digits only
@@ -122,15 +136,10 @@ def unique_slug(session: Session, base: str) -> str:
     suffixes = [f"{n:02d}" for n in range(100)]
     secrets.SystemRandom().shuffle(suffixes)
     for suffix in suffixes:
-        if not _taken(session, base + suffix):
+        if not slug_taken(session, Org, base + suffix):
             return base + suffix
     for _ in range(20):
         candidate = f"{base}{secrets.randbelow(1000):03d}"
-        if not _taken(session, candidate):
+        if not slug_taken(session, Org, candidate):
             return candidate
     return unique_slug(session, base[: ABBREV_MIN - 1] + _random_letters(ABBREV_MAX - ABBREV_MIN + 1))
-
-
-def generate_slug(session: Session, name: str) -> str:
-    """A free generated slug for an org called `name`."""
-    return unique_slug(session, abbreviation(name))

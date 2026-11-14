@@ -15,7 +15,7 @@ attachment in another region: moving data between regions is the operator's migr
 ENFORCED AT CREATION. An org that picked a region may not create a cloud connection or NodeLink storage in another
 one (`refuse_other_region`); a hosted machine Jaah launches for it goes through the operator's connection in its
 region (`hosting_provisioning._hosting_connection`). New transcripts and attachments go to its region's bucket
-(`bucket_for_org`); every row keeps the bucket it was written to, so an older object stays readable and the
+(`session_transcript_archive.org_bucket`); every row keeps the bucket it was written to, so an older object stays readable and the
 retention sweep deletes from the row's own bucket. An org that never picked is not fenced: NULL is not a promise.
 """
 from __future__ import annotations
@@ -30,6 +30,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import edition_features
+from app.notify_text import plural
 from app.operator_settings import reads as settings_reads
 from app.config import get_settings
 
@@ -178,12 +179,6 @@ def org_region(session: Session, org_id: Optional[UUID]) -> Optional[str]:
     return session.scalar(select(Org.data_region).where(Org.id == org_id))
 
 
-def bucket_for_org(session: Session, org_id: Optional[UUID]) -> str:
-    """The bucket new objects of `org_id` go to: its region's, else the configured bucket."""
-    chosen = org_region(session, org_id)
-    return bucket_for_region(chosen) if chosen else configured_bucket()
-
-
 def wrong_region(org_region_code: str) -> str:
     """The refusal for a resource created outside the org's region: what, and what to do."""
     return f"Your organization's data region is {label(org_region_code)}. Choose that region."
@@ -200,10 +195,6 @@ def refuse_other_region(session: Session, org_id: Optional[UUID], region: str) -
 
 
 # ── Changing the region ──────────────────────────────────────────────────────────────────────────────
-
-
-def _plural(n: int, one: str) -> str:
-    return f"{n} {one}" if n == 1 else f"{n} {one}s"
 
 
 def blockers(session: Session, org_id: UUID, target: Optional[str]) -> Optional[str]:
@@ -263,7 +254,7 @@ def blockers(session: Session, org_id: UUID, target: Optional[str]) -> Optional[
     if not found:
         return None
     where = "; ".join(
-        f"{label(region)}: {', '.join(_plural(n, what) for what, n in kinds.items())}"
+        f"{label(region)}: {', '.join(plural(n, what) for what, n in kinds.items())}"
         for region, kinds in sorted(found.items())
     )
     return f"Your organization has data in {where}. Delete it, or ask support to migrate it, then change the region."

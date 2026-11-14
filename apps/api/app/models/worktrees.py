@@ -1,4 +1,4 @@
-"""Worktree slots, their port grid and slot intents, and the co-located (vnode) hosts they run on."""
+"""Worktree slots, their slot intents, and the co-located (vnode) hosts they run on."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -23,44 +23,16 @@ from app.entity_shape import SYSTEM_ACTOR_ID
 from app.models.base import Base, EntityMixin, org_unique, OrgScoped, timestamp_column, UuidPkMixin
 
 
-class PortGridVar(EntityMixin, OrgScoped, Base):
-    """One tier-1 service var of the deterministic port grid: an env-var name and where its port space begins.
-
-    The single home for range starts; `app/port_grid.py` resolves, and the four grid scalars are operator
-    knobs. A row makes a var tier 1 (banded, drift-audited); without one it is tier 2 (auto-assigned
-    node-side), so deleting a row is always safe. `name` is resolved exact-match, so uniqueness is
-    identity; per org because it is written into each slot's `.env`. No `slug`: the var name is the handle.
-    """
-
-    __tablename__ = "port_grid_vars"
-    __table_args__ = (
-        org_unique(__tablename__),
-        # The fleet-wide unique still stands beside the per-org one until a later contraction drops it,
-        # so two orgs cannot yet both declare `API_PORT`.
-        UniqueConstraint("name", name="uq_port_grid_vars_name"),
-        UniqueConstraint("org_id", "name", name="uq_port_grid_vars_org_id_name"),
-    )
-
-    # NOT unique: one service spelled two ways (API_PORT and BACKEND_PORT) shares a start on purpose.
-    # `app/routes/port_grid.py` rejects values outside 1..65535; overlaps and host-daemon collisions
-    # are advisory warnings, not refusals (operator decision).
-    range_start: Mapped[int] = mapped_column(Integer, nullable=False)
-
-
 # ── Console cache tables (written by host agent, read by API) ──────────────
 
 
-# `worktrees.kind` (`ck_worktrees_kind`): how a numbered slot came to exist and what happens when it is freed.
-# `static` is held at the assignment's count and survives a release; `dynamic` is created on demand and
-# destroyed once freed (`app/slot_allocation.py` owns the rules). Slot 0, the main clone, is always
-# `static`.
+# `worktrees.kind` (`ck_worktrees_kind`): every slot is `dynamic`, created on demand and destroyed once freed
+# (`app/slot_allocation.py` owns the rules). `static` is retired (revision 202611141900 demoted every such row); the
+# value stays legal while an older release may still write it, and the free sweep retires such a row like any other.
 WORKTREE_KIND_STATIC = "static"
 
 
 WORKTREE_KIND_DYNAMIC = "dynamic"
-
-
-WORKTREE_KINDS: tuple[str, ...] = (WORKTREE_KIND_STATIC, WORKTREE_KIND_DYNAMIC)
 
 
 class Worktree(EntityMixin, OrgScoped, Base):
@@ -77,15 +49,15 @@ class Worktree(EntityMixin, OrgScoped, Base):
         UniqueConstraint("node_id", "project_id", "number", name="uq_worktrees_node_project_number"),
         # The vocabulary (`app/slot_state.py::STATES`) in DDL. Keep this constraint's text to the state
         # literals alone: `tests/test_slot_two_writers.py` parses it.
-        CheckConstraint("state IN ('free', 'task', 'user')", name="ck_worktrees_state"),
-        # The pairing: `free` => both owners NULL; `task` => `task_id` only; `user` => `owner_user_id`
-        # only. Both owners at once would let a dispatch and a human believe the same tree is theirs.
+        CheckConstraint("state IN ('free', 'task')", name="ck_worktrees_state"),
+        # The pairing: `free` => no `task_id`; `task` => a `task_id`.
         CheckConstraint(
-            "(state = 'free' AND task_id IS NULL AND owner_user_id IS NULL)"
-            " OR (state = 'task' AND task_id IS NOT NULL AND owner_user_id IS NULL)"
-            " OR (state = 'user' AND owner_user_id IS NOT NULL AND task_id IS NULL)",
+            "(state = 'free' AND task_id IS NULL) OR (state = 'task' AND task_id IS NOT NULL)",
             name="ck_worktrees_state_ownership",
         ),
+        # Slots are numbered from 1: `number = 0` was the shared clone an older control plane declared,
+        # and no release declares one.
+        CheckConstraint("number >= 1", name="ck_worktrees_number"),
         CheckConstraint("kind IN ('static', 'dynamic')", name="ck_worktrees_kind"),
         # No partial index on `state`: the remaining reads address a slot by the unique triple or by
         # `task_id`, and the pool is tens of rows per node. Do not add one back speculatively.
@@ -102,7 +74,7 @@ class Worktree(EntityMixin, OrgScoped, Base):
     number: Mapped[int] = mapped_column(Integer, nullable=False)
     path: Mapped[str] = mapped_column(Text, nullable=False)
     branch: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # Ownership is `state` + `task_id` + `owner_user_id` and nothing else: no `holder` column, and
+    # Ownership is `state` + `task_id` and nothing else: no `holder` column, and
     # `idle_hours` stays a read-time derivation (`app/slot_state.py::idle_hours_expr()`). Defended by
     # `tests/test_slot_two_writers.py`.
 
@@ -200,16 +172,10 @@ class Worktree(EntityMixin, OrgScoped, Base):
     # OCCUPANCY`): `app/slot_state.py`'s lifecycle statements are the sole writer, disjoint by
     # construction from the observation upsert and the operator-mutation statement.
 
-    # `free` | `task` (`task_id`) | `user` (`owner_user_id`). Occupancy, not liveness: ownership ends
+    # `free` | `task` (`task_id`). Occupancy, not liveness: ownership ends
     # only on a recorded decision (task terminal/deleted/reset, or `routes/pool_slots.py::release_slot`);
     # a dead runner is restarted in the same worktree. Edges: `app/slot_state.py::release`.
     state: Mapped[str] = mapped_column(Text, nullable=False, server_default="free")
-    # The human who owns this tree; invisible to dispatch and sweeps. SET NULL, and the pairing CHECK
-    # then invalidates the row rather than freeing it, so deleting the user cannot hand their tree to a
-    # dispatch. No index: tens of rows per node.
-    owner_user_id: Mapped[Optional[UUID]] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("admin_users.id", ondelete="SET NULL"), nullable=True
-    )
     # Fencing token: bumped by every lease and redispatch, carried out on the intent and back on the
     # ack, so a late ack from a superseded dispatch cannot resurrect itself.
     generation: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
@@ -235,10 +201,11 @@ class Worktree(EntityMixin, OrgScoped, Base):
     # When the current `state` began, written only by `app/slot_state.py`'s lifecycle edges. Not
     # `updated_at`, which the trigger advances on every ~5s observation.
     state_since: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
-    # `WORKTREE_KINDS`; the `ALLOCATION` family (`app/slot_columns.py`), written only by
-    # `app/slot_allocation.py`. A held static surplus is demoted to `dynamic` rather than destroyed (D12).
+    # `WORKTREE_KIND_STATIC` or `WORKTREE_KIND_DYNAMIC`; the `ALLOCATION` family (`app/slot_columns.py`), written only by
+    # `app/slot_allocation.py`'s declare. Defaults to `dynamic` since revision 202611141900, which demoted every static
+    # row (node groups).
     kind: Mapped[str] = mapped_column(
-        Text, nullable=False, default=WORKTREE_KIND_STATIC, server_default=WORKTREE_KIND_STATIC
+        Text, nullable=False, default=WORKTREE_KIND_DYNAMIC, server_default=WORKTREE_KIND_DYNAMIC
     )
     # Whether this slot is a git worktree (true) or an empty folder (false) — its project's `has_repo` AT
     # DECLARE (`slot_allocation._add_row`), never updated: a held slot keeps the kind its node built after
@@ -299,6 +266,13 @@ class SlotIntent(OrgScoped, Base):
             "ix_slot_intents_pane_writes_task", text("(payload ->> 'task_id')"), "created_at",
             postgresql_where=text("verb IN ('deliver_message', 'deliver_answer')"),
         ),
+        # A page's newest slot order per ready task (`dispatch_wait.slot_refusals`, every board read): `lease_slot`
+        # rows are kept and their payloads carry the prompt bundle (tens of KB, TOASTed), so without it every
+        # read detoasts the fleet's whole lease history to compare one key.
+        Index(
+            "ix_slot_intents_lease_slot_task", text("(payload ->> 'task_id')"), "created_at",
+            postgresql_where=text("verb = 'lease_slot'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -317,7 +291,7 @@ class SlotIntent(OrgScoped, Base):
     # ~5s observation.
     decided_on_observed_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
     preconditions: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
-    # The decisions the node receives (account dir, port band, branch/base, generation); not
+    # The decisions the node receives (account dir, branch/base, generation); not
     # `preconditions`, which the node may refuse on.
     payload: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
     reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -343,6 +317,10 @@ class SlotIntent(OrgScoped, Base):
 #: The converge states a vnode's row moves through. `provisioning`/`failed` admit an enrolment read,
 #: `deleting` is set by the tenant node's delete and ends when the host reports `destroyed`.
 VNODE_STATES = ("provisioning", "ready", "failed", "deleting")
+#: How a host houses a vnode (`virtual_nodes.housing`/`built_housing`).
+VNODE_HOUSINGS = ("host", "vm")
+#: How a vnode was placed (`virtual_nodes.origin`, `app/node_shape.py::origin_of`).
+VNODE_ORIGINS = ("cloud", "self_hosted", "co_locate", "hosting", "other")
 
 
 class VnodeHost(OrgScoped, Base):
@@ -398,6 +376,9 @@ class VnodeHost(OrgScoped, Base):
     # per `vnodes.POLL_STAMP_EVERY`). A pass blocked in one vnode's setup asks nothing, so a stale stamp beside a
     # live heartbeat is a stuck converge. NULL until the first poll.
     desired_polled_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
+    # What the host's helper says it can build (revision 202611100100, e.g. `["nodevm"]`: a node housed in a
+    # VM); NULL = it advertised nothing. Read by `app/node_shape.py::offered`.
+    capabilities: Mapped[Optional[list[str]]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = timestamp_column()
     created_by_id: Mapped[UUID] = mapped_column(
         ForeignKey("admin_users.id", ondelete="RESTRICT", name="fk_vnode_hosts_created_by_id"),
@@ -431,6 +412,17 @@ class VirtualNode(UuidPkMixin, OrgScoped, Base):
             name="ck_virtual_nodes_state",
         ),
         Index("ix_virtual_nodes_tenant_org_id", "tenant_org_id"),
+        CheckConstraint(
+            "housing IN (" + ", ".join(f"'{h}'" for h in VNODE_HOUSINGS) + ")", name="ck_virtual_nodes_housing"
+        ),
+        CheckConstraint(
+            "built_housing IS NULL OR built_housing IN (" + ", ".join(f"'{h}'" for h in VNODE_HOUSINGS) + ")",
+            name="ck_virtual_nodes_built_housing",
+        ),
+        CheckConstraint(
+            "origin IS NULL OR origin IN (" + ", ".join(f"'{o}'" for o in VNODE_ORIGINS) + ")",
+            name="ck_virtual_nodes_origin",
+        ),
     )
 
     host_node_id: Mapped[UUID] = mapped_column(
@@ -454,12 +446,6 @@ class VirtualNode(UuidPkMixin, OrgScoped, Base):
     state: Mapped[str] = mapped_column(Text, nullable=False)
     failure_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     tailnet_device_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # UNWRITTEN and unread: the host mounts the org's LIVE store (`vnodes.shared_config`). Dropped in a later
-    # release (additive while two releases overlap).
-    access_point_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    shared_efs_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    shared_efs_region: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    shared_efs_mount_ip: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # The operator's per-node caps (0358); NULL means the node's Shared tier, else the System setting
     # (`vnodes.effective_caps`).
     disk_cap_gb: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -469,6 +455,29 @@ class VirtualNode(UuidPkMixin, OrgScoped, Base):
     disk_used_kb: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     inodes_used: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     usage_measured_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
+    # The node's shape (revision 202611100100, `app/node_shape.py` the one writer): `housing` is how the host
+    # should house it (`host` = its own uids on the host kernel, `vm` = one VM), `built_housing` what the host
+    # reports it built (NULL = not yet; the console's shape reads this, never `housing`), `generation` bumped on
+    # every housing change, `pending_microvm` a VM → MicroVM switch waiting for the rebuilt node's first report.
+    housing: Mapped[str] = mapped_column(Text, nullable=False, default="host", server_default=text("'host'"))
+    built_housing: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    pending_microvm: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    # How it was placed (`node_shape.origin_of`): gates the Whole-node VM shape; NULL only before the backfill.
+    origin: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # A Whole-node VM's size; NULL = the default.
+    vm_vcpus: Mapped[Optional[int]] = mapped_column(SmallInteger, nullable=True)
+    vm_ram_mib: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    vm_disk_gib: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # The node VM's disk as its host last reported it (usage report); NULL until one. The disk's default once built.
+    vm_disk_built_gib: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Saved size changes so far (`node_vm_sizing.change`); the host resizes the VM for a count it has not applied.
+    vm_resize_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # Whether the node VM's seed (`seed.img`, which carries the node token) is still on its host, as the host last
+    # reported it (`vnodes.apply_report`); NULL until reported, and for a node not housed in a VM.
+    vm_seed_present: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     created_at: Mapped[datetime] = timestamp_column()
     updated_at: Mapped[datetime] = timestamp_column()
     created_by_id: Mapped[UUID] = mapped_column(

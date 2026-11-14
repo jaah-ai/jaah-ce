@@ -4,15 +4,18 @@
 // Money on the wire is integer micro-USD (1 USD = 1_000_000); markup is basis points (100 bps = 1%).
 // React-free.
 
-import { get, post, put } from '../api'
-import { moneyText, shortDate } from './billing'
-import { compactCount, groupedCount } from './humanize'
+import { get, post, put, withQuery } from '../api'
+import { moneyText } from './billing'
+import { viewerZone } from './zonedTime'
+import { compactCount, groupedCount, groupedCountOf } from './humanize'
 
 export type FloorState = 'ok' | 'low' | 'floor'
 
 export type LedgerKind =
   | 'signup_credit'
   | 'operator_credit'
+  | 'sponsored_credit'
+  | 'sponsored_expiry'
   | 'operator_debit'
   | 'topup'
   | 'auto_recharge'
@@ -117,11 +120,6 @@ export type JaahAdjustment = {
   request_id: string
 }
 
-/** `request_id`: minted once per dialog open, so a double-sent top-up charges once. A non-null `client_secret`
- *  means Stripe wants 3-D Secure (`components/billing/payFlow.ts::authenticate`). */
-export type TopupIn = { amount_micros: number; payment_method_id: string; request_id: string }
-export type TopupOut = { topup: JaahTopup; client_secret: string | null; wallet: JaahWallet }
-export type AutoRechargeIn = { enabled: boolean; threshold_micros: number; amount_micros: number }
 export type RefundIn = { amount_micros: number; request_id: string }
 /** `stopped`: why the rest was not refunded, when Stripe refused a later part of a multi-top-up refund. */
 export type RefundOut = { refunded_micros: number; stopped: string | null; wallet: JaahWallet }
@@ -141,9 +139,6 @@ export const getJaahWallet = () => get<JaahWallet>(ROOT)
 export const putLowThreshold = (low_threshold_micros: number) =>
   put<JaahWallet>(`${ROOT}/low-threshold`, { low_threshold_micros })
 export const putJaahMode = (mode: JaahMode) => put<JaahWallet>(`${ROOT}/mode`, { mode })
-/** 402 = declined (`detail` is Stripe's sentence); 422 refused; 404 unknown card; 409 billing not connected. */
-export const postTopup = (body: TopupIn) => post<TopupOut>(`${ROOT}/topups`, body)
-export const putAutoRecharge = (body: AutoRechargeIn) => put<JaahWallet>(`${ROOT}/auto-recharge`, body)
 /** 422 = refused, nothing debited; 409 = a refund already in progress. */
 export const postRefund = (body: RefundIn) => post<RefundOut>(`${ROOT}/refunds`, body)
 
@@ -234,6 +229,8 @@ export function bpsToPercentInput(bps: number): string {
 export const ENTRY_LABEL: Record<LedgerKind, string> = {
   signup_credit: 'Signup credit',
   operator_credit: 'Credit from Jaah',
+  sponsored_credit: 'Sponsored credit',
+  sponsored_expiry: 'Sponsored credit ended',
   operator_debit: 'Adjustment by Jaah',
   topup: 'Top-up',
   auto_recharge: 'Auto-recharge',
@@ -287,15 +284,6 @@ export function lastTopupFailure(topups: JaahTopup[]): JaahTopup | null {
 }
 
 const sentence = (text: string) => text.trim().replace(/[.\s]+$/, '')
-
-/** "Auto-recharge failed: <reason>. Paused until <date> — update your card or settings to retry now." Null
- *  when nothing failed. */
-export function autoRechargeFailureText(auto: AutoRecharge): string | null {
-  if (!auto.last_failure) return null
-  const failed = `Auto-recharge failed: ${sentence(auto.last_failure)}.`
-  if (!auto.paused_until) return failed
-  return `${failed} Paused until ${shortDate(auto.paused_until, undefined, true)} — update your card or settings to retry now.`
-}
 
 /** "Top-up of $25.00 failed: Your card was declined." */
 export function topupFailureText(topup: Pick<JaahTopup, 'amount_micros' | 'failure_reason'>): string {
@@ -369,11 +357,6 @@ export type UsageSource = { kind: 'tenant' } | { kind: 'operator'; orgId: string
 export type UsageRange = { from: string; to: string }
 
 const usageRoot = (source: UsageSource) => (source.kind === 'tenant' ? ROOT : orgPath(source.orgId))
-const zoneName = () => Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
-
-function query(params: Record<string, string | number>): string {
-  return new URLSearchParams(Object.entries(params).map(([k, v]) => [k, String(v)])).toString()
-}
 
 /** Every usage read sits under this key, so one `token_wallet` event refreshes them all. */
 export const usageKey = (source: UsageSource, ...rest: unknown[]) =>
@@ -381,13 +364,13 @@ export const usageKey = (source: UsageSource, ...rest: unknown[]) =>
 export const JAAH_TENANTS_USAGE_KEY = [JAAH_AI_QUERY, 'usage', 'tenants'] as const
 
 export const getJaahUsage = (source: UsageSource, range: UsageRange, group: UsageGroupBy) =>
-  get<JaahUsage>(`${usageRoot(source)}/usage?${query({ ...range, group, tz: zoneName() })}`)
+  get<JaahUsage>(withQuery(`${usageRoot(source)}/usage`, { ...range, group, tz: viewerZone() }))
 /** The page after `after` (the previous page's last row), newest first; null = the first page. */
 export type LedgerCursor = { before: string; before_id: string } | null
 export const getJaahUsageLedger = (source: UsageSource, range: UsageRange, after: LedgerCursor, limit: number) =>
-  get<UsageLedgerPage>(`${usageRoot(source)}/ledger?${query({ ...range, tz: zoneName(), limit, ...(after ?? {}) })}`)
+  get<UsageLedgerPage>(withQuery(`${usageRoot(source)}/ledger`, { ...range, tz: viewerZone(), limit, ...(after ?? {}) }))
 export const getJaahTenantsUsage = (range: UsageRange) =>
-  get<TenantsUsage>(`/api/billing/jaah-ai/orgs?${query(range)}`)
+  get<TenantsUsage>(withQuery('/api/billing/jaah-ai/orgs', range))
 
 /** `YYYY-MM-DD` as a local calendar day. */
 export function localDay(day: string): Date {
@@ -428,7 +411,7 @@ export function tokensText(tokens: number): string {
 }
 
 /** "1 call", "12 calls". */
-export const callsText = (calls: number) => `${groupedCount(calls)} ${calls === 1 ? 'call' : 'calls'}`
+export const callsText = (calls: number) => groupedCountOf(calls, 'call')
 
 export const GROUP_LABEL: Record<UsageGroupBy, string> = {
   task: 'Task',

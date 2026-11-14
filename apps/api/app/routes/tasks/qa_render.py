@@ -11,17 +11,16 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import edition_features
+from app import edition_features, notify_targets
 from app.entity_shape import from_row
 from app.identities import operator_label
 from app.models.audit import ActivityEvent
 from app.models.identity import AdminUser
 from app.models.merge_lane import MergeLaneRow
 from app.models.tasks import Task, TaskQuestion
-from app.question_plain import QuestionPlain, stored_plain
 from app.task_artifacts import visible_artifact_clause, visible_artifact_clause_joined
 from app.task_awaiting_response_parser import parse_response_options
-from app.task_lifecycle import AWAITING_RESPONSE
+from app.task_lifecycle import AWAITING_RESPONSE, READY
 
 
 # ── One offered option, in full ──────────────────────────────────────────────────────────────────────
@@ -115,9 +114,6 @@ class TaskQuestionOut(BaseModel):
     # `_task_questions_out` assigns it from list position; a single-row projection is passed its ordinal.
     round: int
     created_at: datetime
-    # The round reworded in plain terms, DISPLAY ONLY (`app/question_plain.py`): `plain.options[i]` rewords
-    # `option_details[i]`, and an answer still posts `options[i]`. Null until reworded, or when the blob is malformed.
-    plain: Optional[QuestionPlain]
 
 
 # Answer + operator comment as ONE line; single home so the delivery payload and the Q&A trail agree, and
@@ -231,7 +227,6 @@ def _task_question_out(
         option_details=option_details,
         resolved_by=resolved_by,
         round=round_index,
-        plain=stored_plain(row.plain),
     )
 
 
@@ -504,10 +499,12 @@ def _task_merge_lane_verdict(session: Session, task: Task) -> Optional[str]:
                     row, tree=None, tests=list(failure.get("tests") or []), excerpt=failure.get("excerpt") or ""))
     if row.state == merge_lane.QUEUED and (row.note or "").startswith("Conflicts with"):
         return f"PR #{row.pr_number} ({row.pr_url}): {row.note}"
+    if row.state == merge_lane.CLOSED and row.note == merge_lane.NOTE_SENT_BACK:
+        return f"PR #{row.pr_number} ({row.pr_url}): {merge_lane.sent_back_message(row)}"
     if row.state == merge_lane.CLOSED and row.note == merge_lane.NOTE_LANE_STOPPED:
         return (f"PR #{row.pr_number} ({row.pr_url}): the merge lane was stopped before it merged this PR. Bring "
                 "it up to date and deliver it again: if the lane is on (your instructions say so), report it with "
-                "`task_pr_queue`; otherwise run the full gate, merge it yourself and settle.")
+                "`pull_request_enqueue`; otherwise run the full gate, merge it yourself and settle.")
     return None
 
 
@@ -519,44 +516,76 @@ def _task_qa_trail(session: Session, task: Task) -> Optional[str]:
     Includes the options offered, not just `Q:`/`A:`. The one defanging caller: this reaches a runner,
     so agent-authored resolutions are stripped of delimiters (see `_task_qa_entries`), and every string
     this renderer adds — header, label, description, preview, and the question — enters defanged and
-    flattened (`_prompt_option_text`)."""
+    flattened (`_prompt_option_text`).
+
+    On a `ready` row it also lists, under their own heading, the rounds still `open` that an earlier runner
+    asked and an operator's Stop kept (`runner_terminations._QUESTIONS_KEPT_ANSWERABLE`): the claim retires
+    them (`runner_terminations.drop_kept_questions`), so this is where the next runner learns they were never
+    answered. Only `ready`: a live runner reading its own task must not see its own open round relabelled."""
     # (is_operator_authored, line): only `A:` lines are the human's words; only agent-authored lines may be
     # clipped to fit (`_fit_qa_trail`).
     lines: list[tuple[bool, str]] = []
-    for entry in _task_qa_entries(session, task, defang_for_prompt=True):
+    entries = _task_qa_entries(session, task, defang_for_prompt=True)
+    for entry in entries:
         if entry.status == "dismissed":
             # Dismissals are not in the prompt: this section is settled rulings a relaunched runner must not re-ask,
             # and a `Q:` without an `A:` is a shape it never has. Telling a runner "declined" is a separate change.
             continue
-        if entry.question:
-            header = _prompt_option_text(entry.header)
-            # Defanged and flattened like every agent-authored string: a question with a newline plus `A: <ruling>`
-            # would forge a human answer inside this trail, which a trusted restart line tells the runner is settled.
-            # `defang_fence_markers` does not cover `Q: `/`A: `. No option clamp: `_fit_qa_trail` bounds the line.
-            question = _flatten(_neutralize_batch_delimiters(entry.question))
-            lines.append(
-                (False, f"Q: [{header}] {question}" if header else f"Q: {question}"))
-        if entry.option_details:
-            lines.append((False, "   Options offered:"))
-            for position, option in enumerate(entry.option_details, start=1):
-                label = _prompt_option_text(option.label) or ""
-                # The suffix test runs on the raw label (defanged reads `(Recommended]`), so it is never said twice.
-                if option.recommended and not _label_marks_recommended(option.label):
-                    label = f"{label} (recommended)"
-                description = _prompt_option_text(option.description)
-                lines.append((
-                    False,
-                    f"     {position}. {label}" + (f" — {description}" if description else ""),
-                ))
-                # Folded to one line: a multi-line preview would sit at column 0 and forge the `Q:`/`A:` shape.
-                preview = _prompt_option_text(option.preview)
-                if preview:
-                    lines.append((False, f"        preview: {preview}"))
+        lines.extend(_trail_question_lines(entry.header, entry.question, entry.option_details))
         if entry.resolution:
             # Tagged by who wrote it: a clicked option is runner text a human selected, so clippable; only typed
             # text is exempt from `_QA_TRAIL_MAX_CHARS` (see `QAEntryOut.machine_authored`).
             lines.append((not entry.machine_authored, f"A: {entry.resolution}"))
+    if task.state == READY:
+        # A reopened round is already an entry above (`_clear_reopened_resolutions`), so it is not listed twice.
+        listed = {entry.question_id for entry in entries if entry.question_id is not None}
+        kept_open = [row for row in session.scalars(notify_targets.open_rounds(task.id)).all() if row.id not in listed]
+        if kept_open:
+            # The control plane's words, so never clipped (tagged as the operator's): cut, the `Q:` lines below
+            # would read as answered rounds missing their `A:`.
+            lines.append((True, _KEPT_OPEN_HEADING))
+            for row in kept_open:
+                lines.extend(_trail_question_lines(
+                    row.header, row.question, _question_option_details(row.options) or []))
     return _fit_qa_trail(lines)
+
+
+# Heads the still-open rounds `_task_qa_trail` lists on a `ready` row; nothing below it has an answer.
+_KEPT_OPEN_HEADING = (
+    "NOT ANSWERED — asked by an earlier runner before this task was stopped; nobody has answered them. "
+    "Ask again (AskUserQuestion) any you still need:"
+)
+
+
+def _trail_question_lines(
+    header: Optional[str], question: Optional[str], option_details: list[QuestionOptionOut],
+) -> list[tuple[bool, str]]:
+    """One round's `Q:` line and the options it offered, as `_task_qa_trail` tags them — all agent-authored."""
+    lines: list[tuple[bool, str]] = []
+    if question:
+        header_text = _prompt_option_text(header)
+        # Defanged and flattened like every agent-authored string: a question with a newline plus `A: <ruling>`
+        # would forge a human answer inside this trail, which a trusted restart line tells the runner is settled.
+        # `defang_fence_markers` does not cover `Q: `/`A: `. No option clamp: `_fit_qa_trail` bounds the line.
+        flat = _flatten(_neutralize_batch_delimiters(question))
+        lines.append((False, f"Q: [{header_text}] {flat}" if header_text else f"Q: {flat}"))
+    if option_details:
+        lines.append((False, "   Options offered:"))
+        for position, option in enumerate(option_details, start=1):
+            label = _prompt_option_text(option.label) or ""
+            # The suffix test runs on the raw label (defanged reads `(Recommended]`), so it is never said twice.
+            if option.recommended and not _label_marks_recommended(option.label):
+                label = f"{label} (recommended)"
+            description = _prompt_option_text(option.description)
+            lines.append((
+                False,
+                f"     {position}. {label}" + (f" — {description}" if description else ""),
+            ))
+            # Folded to one line: a multi-line preview would sit at column 0 and forge the `Q:`/`A:` shape.
+            preview = _prompt_option_text(option.preview)
+            if preview:
+                lines.append((False, f"        preview: {preview}"))
+    return lines
 
 
 def _share_budget(lengths: list[int], budget: int) -> list[int]:
@@ -721,7 +750,7 @@ def _neutralize_batch_delimiters(value: str) -> str:
     `_COMMENT_JOINER` is a phrase the table cannot express; an option could otherwise reproduce the
     operator's own labelled voice. So the label is rewritten, broadly (any dash, case, plural), since the
     reader is a language model. The Cc/Cf fold is part of the match: a zero-width space would slip past
-    and `_scrub_control_chars` would later reassemble the label, so folding here makes the output
+    and `live_runner.scrub_control_chars` would later reassemble the label, so folding here makes the output
     scrub-stable.
 
     It raises the cost, it does not draw a boundary: paraphrases and homoglyphs still pass. The price is

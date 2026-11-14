@@ -60,7 +60,7 @@ async def wind_down(session: Session, org: Org, actor: AdminUser, *, keep_node_r
          account, which the node delete does not sign for.
       4. Delete every remaining node — co-located and carried nodes before the host carrying them (a host's
          nodes may be another org's when the org is the operator plane) — through the console's own node delete
-         (`routes/nodes/delete.py::delete_node_row`, forced past its allocated/hosted refusals): holders ended, trees
+         (`routes/nodes/delete.py::delete_node_row`): holders ended, trees
          erased, a control-plane-launched instance terminated. A host's teardowns still pending go with it: the
          host that would finish them is the machine being removed. `keep_node_rows` is the soft delete's
          switch: the org's own nodes are torn down the same but their rows stay for Restore
@@ -83,7 +83,7 @@ async def wind_down(session: Session, org: Org, actor: AdminUser, *, keep_node_r
             await run_in_threadpool(_drop_pending_teardowns, session, node_id)
         keep_row = keep_node_rows and node_id in own
         out = await delete_node_row(
-            session, node_id, actor, reason=f"{ORG_DELETED_REASON} — end the runner", force=True, keep_row=keep_row,
+            session, node_id, actor, reason=f"{ORG_DELETED_REASON} — end the runner", keep_row=keep_row,
         )
         deleted.append(name)
         failures += [f"{name}: {failure}" for failure in out.node_erase_failures]

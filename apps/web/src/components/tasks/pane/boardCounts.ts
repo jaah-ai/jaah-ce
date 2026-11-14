@@ -8,11 +8,15 @@ import { boardFilterParams } from '../shared'
 export type PaneFilters = {
   showHidden: boolean
   bounds: DateRangeBounds
+  assigneeIds: string[]
+  /** Creator ids, EMPTY for every creator (`lib/taskUrlFilters.ts`). */
   creatorIds: string[]
   /** Source codes, EMPTY for every source (`lib/taskUrlFilters.ts`). */
   sources: string[]
   /** The State filter, `''` for every state (`lib/taskUrlFilters.ts`). Absent = every state. */
   state?: string
+  /** The Persona filter, `''` for every persona (`lib/taskUrlFilters.ts`). Absent = every persona. */
+  persona?: string
   focus: boolean
   q: string
   /** The user's muted nodes (`lib/taskMute.ts`): their rows leave every scope above them. Absent = none. */
@@ -21,15 +25,7 @@ export type PaneFilters = {
 
 /** `GET /api/tasks/counts` for the scope, under the list's own filters. */
 export function paneCountsUrl(scope: TaskScope, filters: PaneFilters): string {
-  const query = boardFilterParams(
-    scopeToListParams(scope, filters.muted),
-    filters.showHidden,
-    filters.bounds,
-    filters.creatorIds,
-    filters.focus,
-    filters.q,
-    filters.sources,
-    filters.state,
-  ).toString()
+  const { muted, ...filter } = filters
+  const query = boardFilterParams({ scopeFilter: scopeToListParams(scope, muted), ...filter }).toString()
   return `/api/tasks/counts${query ? `?${query}` : ''}`
 }

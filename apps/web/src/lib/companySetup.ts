@@ -1,4 +1,4 @@
-// The company-setup status's wire vocabulary and its one stored flag. The five steps every surface draws are
+// The company-setup status's wire vocabulary and its one stored flag. The steps every surface draws are
 // `lib/welcomeWizard.ts`'s; `components/onboarding/companySetupGuide.tsx` words them per viewer.
 // React-free. Completion and visibility are the SERVER's (`GET /api/org/setup`, `routes/org_setup.py`):
 // every step is derived from org state and org-wide, so nothing here decides whether a step is done or
@@ -16,10 +16,9 @@ export const COMPANY_SETUP_QUERY = 'company-setup'
 export const COMPANY_SETUP_DISMISSED_PREF = 'company_setup_dismissed'
 
 /** The step ids, spelled as `routes/org_setup.py`'s `OPERATOR_STEPS` and `SELF_SERVICE_STEPS`. The server
- *  sends the list and its order per org; `lib/welcomeWizard.ts` folds it into the five steps drawn. `add_compute` is an operator-created
+ *  sends the list and its order per org; `lib/welcomeWizard.ts` folds it into the steps drawn. `add_compute` is an operator-created
  *  org's; a self-service org's `compute` is the same destination, fed by the node its plan includes. */
 export type CompanySetupStepId =
-  | 'connect_github'
   | 'add_compute'
   | 'add_account'
   | 'add_project'
@@ -41,18 +40,17 @@ export type CompanySetupRequirement = 'tasks:create' | 'org_admin'
  *  The Billing rail row owns it and every page under it. Route constants are plain literals, never template
  *  strings: the docs coverage check reads them by value. */
 export const BILLING_PAGE = '/org/billing'
+/** Billing › Products' Buy card's hash (`pages/org/billing/ProductsPage.tsx`): a plan row's Change lands on it. */
+export const BUY_ANCHOR = 'buy'
 
 /** The subscription page (`pages/org/billing/SubscriptionPage.tsx`): the current plan, its limits, the catalogue. */
 export const SUBSCRIPTION_PAGE = '/org/billing/subscription'
 
-/** The change-plan wizard (`pages/org/billing/ChangePlanWizard.tsx`): `?plan=<key>` preselects a plan and starts at step 2. */
+/** The retired change-plan page's address: kept so an old bookmark redirects to Billing › Products, where plans are bought. */
 export const CHANGE_PLAN_PAGE = '/org/billing/subscription/change'
 
 /** Where "choose a plan" leads — the subscription page. */
 export const PLAN_PAGE = SUBSCRIPTION_PAGE
-
-/** The old plan page's address: bookmarks and old links hop to `SUBSCRIPTION_PAGE` (`App.tsx`). */
-export const LEGACY_PLAN_PAGE = '/org/plan'
 
 /** The Jaah AI page (`pages/org/billing/JaahAiPage.tsx`): balance, funding, usage. */
 export const JAAH_AI_PAGE = '/org/billing/jaah-ai'
@@ -77,6 +75,24 @@ export const METHOD_PAGE_PATTERN = '/org/billing/methods/:id'
 export function METHOD_PAGE(id: string): string {
   return `${BILLING_PAGE}/methods/${encodeURIComponent(id)}`
 }
+
+/** Add a payment method (`pages/org/billing/MethodNewPage.tsx`): Stripe's card form on a page of its own. */
+export const METHOD_NEW_PAGE = '/org/billing/methods/new'
+
+/** One budget's page (`pages/org/billing/BudgetEditPage.tsx`); `BUDGET_NEW_PAGE` is the same page creating one. */
+export const BUDGET_PAGE_PATTERN = '/org/billing/budgets/:id'
+
+export const BUDGET_NEW_PAGE = '/org/billing/budgets/new'
+
+export function BUDGET_PAGE(id: string): string {
+  return `${BILLING_PAGE}/budgets/${encodeURIComponent(id)}`
+}
+
+/** The Billing list's Budgets tab, where a budget page's trail and Cancel lead. */
+export const BUDGETS_TAB = '/org/billing?tab=budgets'
+
+/** The Billing list's Payment methods tab. */
+export const METHODS_TAB = '/org/billing?tab=methods'
 
 /** The org's billing details page (`pages/org/billing/BillingDetailsPage.tsx`). */
 export const BILLING_DETAILS_PAGE = '/org/billing/details'

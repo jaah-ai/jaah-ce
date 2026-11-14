@@ -6,7 +6,7 @@ the node has NO default: absent one, the verb needing it FAILS CLOSED. Restart =
 compose scoping, but an authored line can re-export it. Every branch is synchronous.
 
 SECURITY: NODE_TOKEN and protected-holder guards run upstream in `commands.py`. The authored lines run
-through `bash -lc` UNSANITISED, bounded by the three things `worktree_ops.check` gives `gate_cmd`:
+through `bash -lc` UNSANITISED, bounded by three things:
 provenance (the CP overwrites both from the project row; only a superadmin authors them), a curated
 env allowlist (`_STACK_ENV_KEYS` — `jaah-runner@.service` not listing `node.env` is the other leg), and
 a REFUSAL, never a downgrade to the daemon uid (root on a cloud node), when the session-user switch is
@@ -65,7 +65,7 @@ def _dc_step(run: Callable[..., dict], argv: list[str], cwd: str) -> dict:
 
     `jaahd` has no docker access (`session_user.py`, "Running one command as the session user"). Same
     `{exit_code, stdout, stderr}` either way; the delegated path is `session_user.run_capped`'s.
-    Switch needed but unavailable is a REFUSAL, as in `worktree_ops.check`."""
+    Switch needed but unavailable is a REFUSAL, never a run as the daemon uid."""
     from worktree_mechanics.core import SWITCH_UNAVAILABLE_RC
 
     if session_user.switch_needed():

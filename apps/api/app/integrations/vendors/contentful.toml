@@ -1,0 +1,56 @@
+slug = "contentful"
+label = "Contentful"
+category = "cms"
+vendor_docs_url = "https://www.contentful.com/developers/docs/references/authentication/"
+summary = "Headless CMS: agents read and manage content types, entries and assets through the Content Management API."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "access_token", label = "Personal access token", kind = "secret", required = true, help = "In Contentful, open the cog menu (Settings) > CMA tokens, select Create personal access token, name it Jaah, pick an expiry and select Generate. Copy the token (it starts with CFPAT-) - Contentful shows it once" },
+  { key = "space_id", label = "Space ID", kind = "text", required = false, help = "Optional: the space agents should work in by default. In Contentful open Settings > General settings; the Space ID is listed there" },
+]
+
+[test]
+method = "GET"
+path = "https://api.contentful.com/users/me"
+auth = { field = "access_token", header = "Authorization", prefix = "Bearer" }
+identity = [["email"], ["firstName"]]
+
+[docs]
+agent_uses = [
+  "Create, update and publish entries and assets through the Content Management API",
+  "Read and change content models (content types and their fields), for example to add a field a feature needs",
+  "Manage environments and locales, such as copying content between a sandbox and master",
+  "Audit content: find entries missing fields, broken references or untranslated locales",
+]
+prerequisites = [
+  "A Contentful account with access to the space or spaces agents should work in",
+  "A role in those spaces that allows the changes agents should make: a personal access token acts with all of your own permissions",
+]
+limitations = [
+  "A personal access token acts as you across every space and organization you can reach; Contentful offers no narrower scope for it, so connect a dedicated user when you want agents limited to one space",
+  "The token expires on the date you chose when creating it; create a new one and replace the secret before then",
+  "Spaces hosted in Contentful's EU data region are reached at api.eu.contentful.com, which this integration does not test against yet; the test checks the default region",
+  "The Content Delivery and Preview APIs use separate space-level API keys (Settings > API keys), which are not part of this integration",
+]
+
+[[docs.troubleshooting]]
+symptom = "Test says Contentful rejected the personal access token (401)"
+fix = "The token was mistyped, revoked or has expired. In Contentful open Settings > CMA tokens, check its status and expiry, create a new one if needed, and select Replace on the secret in Jaah"
+
+[[docs.troubleshooting]]
+symptom = "The test passes, but an agent gets 404 or 403 for a space"
+fix = "The token's user is not a member of that space or its role cannot do the change. In Contentful open the space's Settings > Users and give the user a suitable role, or check the Space ID in the agent's task"
+
+[[docs.troubleshooting]]
+symptom = "An agent's requests fail with 429 Too Many Requests"
+fix = "Contentful rate-limits the Content Management API per space (around 7 requests a second on most plans). Ask the agent to batch its changes or pause between them; nothing is wrong with the connection"
+
+[[docs.faq]]
+q = "Can I use a Content Delivery API key instead?"
+a = "No. Delivery and Preview keys only read published content of one space; this integration needs a personal access token for the Content Management API so agents can make changes"
+
+[[docs.faq]]
+q = "How do I revoke Jaah's access in Contentful?"
+a = "Open Settings > CMA tokens and select Revoke next to the token you created for Jaah. Agents lose access on their next call"

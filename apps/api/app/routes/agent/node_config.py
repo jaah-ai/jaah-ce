@@ -4,12 +4,13 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import Response
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
@@ -25,13 +26,14 @@ from app import (
 )
 # routes need one for a user who is NOT the caller (they carry no session cookie, only the node token).
 from app.authz.catalog import Tenancy
-from app.clock import as_utc
+from app.clock import as_utc, utcnow
+from app.request_body import read_capped
 from app.authz.declarations import infra
-from app.db import get_session
+from app.db_async import DbDep, on_session, release, run_blocking_in_session
 from app.events import emit_console_event
 from app.node_identity import names_by_id, node_id_or_none, node_matches, wire_node_id_or_404
 from app.models.nodes import Node
-from app.entity_shape import RefOut
+from app.entity_shape import RefOut, or_404
 from app.routes.agent.auth import _check_token, caller_node_id, caller_node_ref
 
 if edition_features.enabled("nodelink"):
@@ -61,10 +63,10 @@ class ConfigSnapshotOut(BaseModel):
 
 @router.post("/nodes/config-snapshot", response_model=ConfigSnapshotOut)
 @infra(Tenancy.ORG_SCOPED)
-def set_node_config_snapshot(
+async def set_node_config_snapshot(
     body: ConfigSnapshotIn,
+    db: DbDep,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> ConfigSnapshotOut:
     """Persist a node's config snapshot. The publish-on-change compare stays node-side. A node may report
     only its own (`caller_node_ref`): the snapshot can correct `nodes.jaah_home`.
@@ -72,6 +74,31 @@ def set_node_config_snapshot(
     The degradation contract lives in `app/node_config.py`: a bad `reported_at` degrades to NULL without
     dropping the snapshot; the change gate compares `config` only.
     """
+    changed, node_id, mounted = await db.run_sync(_set_node_config_snapshot, body=body, caller=caller)
+    if node_id is not None and mounted is not None:
+        # After the commit (it takes the store lock and commits); a NodeLink this node no longer reports
+        # mounted stops holding its delete. In a worker thread on a session of its own: finishing a delete calls
+        # the cloud provider and reads the operator plane. Best effort: the next snapshot retries it.
+        await run_blocking_in_session(_recheck_nodelink_deletes, node_id, mounted, body.node_id, route=db)
+    return ConfigSnapshotOut(changed=changed)
+
+
+def _recheck_nodelink_deletes(session: Session, node_id: UUID, mounted: set[str], reported_as: str) -> None:
+    try:
+        node = session.get(Node, node_id)
+        if node is not None:
+            nodelinks.recheck_deletes(session, node, mounted)
+    except Exception:  # noqa: BLE001 — never fail a snapshot over a pending delete
+        session.rollback()
+        log.warning("nodelinks: recheck after %s's snapshot failed", reported_as, exc_info=True)
+
+
+def _set_node_config_snapshot(
+    session: Session,
+    body: ConfigSnapshotIn,
+    caller: node_credentials.AgentCaller,
+) -> tuple[bool, Optional[UUID], Optional[set[str]]]:
+    """The snapshot, committed: `(changed, node id, mounted NodeLinks)` — the last two for the post-commit recheck."""
     caller_node_ref(session, caller, body.node_id)
     changed = node_config.apply_config_snapshot(
         session, body.node_id, body.config, body.reported_at, microvm=body.microvm
@@ -93,15 +120,7 @@ def set_node_config_snapshot(
             action="upserted",
         )
     session.commit()
-    if node is not None and mounted is not None:
-        # After the commit (it takes the store lock and commits); a NodeLink this node no longer reports
-        # mounted stops holding its delete. Best effort: the next snapshot retries it.
-        try:
-            nodelinks.recheck_deletes(session, node, mounted)
-        except Exception:  # noqa: BLE001 — never fail a snapshot over a pending delete
-            session.rollback()
-            log.warning("nodelinks: recheck after %s's snapshot failed", body.node_id, exc_info=True)
-    return ConfigSnapshotOut(changed=changed)
+    return changed, (node.id if node is not None else None), mounted
 
 
 # ── Node egress IPv4, for the headscale edge's allowlist ───────────────────────────────────────────
@@ -129,10 +148,11 @@ class NodeEgressIn(BaseModel):
 
 @router.post("/nodes/egress", status_code=204)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def set_node_egress(
+    session: Session,
     body: NodeEgressIn,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> Response:
     """Stamp the CALLING node's egress IPv4 and its report time (`app/headscale_allowlist.py` reads both).
 
@@ -187,28 +207,19 @@ class NodeLogsOut(BaseModel):
 async def _node_logs_body(
     request: Request, caller: node_credentials.AgentCaller = Depends(_check_token)
 ) -> NodeLogsIn:
-    """The body, bounded at `NODE_LOGS_MAX_BODY_BYTES` on its RAW bytes — the declared length first, then
-    the bytes actually read, so a chunked or lying sender is cut off before the whole body is buffered.
-    Async dependency, sync handler, as `routes/attachments.py::_artifact_ticket_body`. A node token only:
+    """The body, bounded at `NODE_LOGS_MAX_BODY_BYTES` on its RAW bytes (`app/request_body.py`), so a chunked
+    or lying sender is cut off before the whole body is buffered. Async dependency, sync handler, as `routes/attachments.py::_artifact_ticket_body`. A node token only:
     an arm that derives no node (CP loopback, dev bypass) has no journal, and is refused before a byte is
     buffered."""
     if caller.node_id is None:
         raise HTTPException(status_code=403, detail="node logs are accepted only on a node's own token")
-    oversize = HTTPException(
-        status_code=413, detail=f"a node-logs body must be at most {NODE_LOGS_MAX_BODY_BYTES} bytes"
-    )
-    declared = (request.headers.get("content-length") or "").strip()
-    if declared.isdigit() and int(declared) > NODE_LOGS_MAX_BODY_BYTES:
-        raise oversize
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > NODE_LOGS_MAX_BODY_BYTES:
-            raise oversize
-        chunks.append(chunk)
+    raw = await read_capped(request, NODE_LOGS_MAX_BODY_BYTES)
+    if raw is None:
+        raise HTTPException(
+            status_code=413, detail=f"a node-logs body must be at most {NODE_LOGS_MAX_BODY_BYTES} bytes"
+        )
     try:
-        return NodeLogsIn.model_validate_json(b"".join(chunks))
+        return NodeLogsIn.model_validate_json(raw)
     except ValidationError as exc:
         # A count, not `exc.errors()`, which would quote the journal back.
         raise HTTPException(
@@ -243,10 +254,10 @@ def _record_log_findings(session: Session, node_id: UUID, entries: list[NodeLogE
 
 @router.post("/node-logs", response_model=NodeLogsOut)
 @infra(Tenancy.ORG_SCOPED)
-def ship_node_logs(
+async def ship_node_logs(
+    db: DbDep,
     caller: node_credentials.AgentCaller = Depends(_check_token),
     body: NodeLogsIn = Depends(_node_logs_body),
-    session: Session = Depends(get_session),
 ) -> NodeLogsOut:
     """Write the CALLING node's journal entries to its stream (the node's id) in `NODE_LOG_GROUP`.
 
@@ -258,7 +269,16 @@ def ship_node_logs(
     from its old cursor.
     """
     if body.entries and caller.node_id is not None:
-        _record_log_findings(session, caller.node_id, body.entries)
+        await db.run_sync(_record_log_findings, caller.node_id, body.entries)
+    await release(db)
+    # The CloudWatch step (AWS calls, up to `NODE_LOGS_MAX_CALLS`) touches no DB: off the loop.
+    return await run_in_threadpool(_ship_node_logs, caller, body)
+
+
+def _ship_node_logs(
+    caller: node_credentials.AgentCaller,
+    body: NodeLogsIn,
+) -> NodeLogsOut:
     if not edition_features.enabled("node_log_archive"):
         raise HTTPException(status_code=503, detail=_NODE_LOGS_NOT_CONFIGURED)
     from app.aws import cloudwatch_logs
@@ -268,10 +288,8 @@ def ship_node_logs(
         raise HTTPException(status_code=503, detail=_NODE_LOGS_NOT_CONFIGURED)
     if not body.entries:
         return NodeLogsOut(cursor=body.cursor)
-    if caller.node_id is None:
-        raise HTTPException(status_code=404, detail="this credential has no node")
-    stream = str(caller.node_id)
-    now = datetime.now(timezone.utc)
+    stream = str(or_404(caller.node_id, detail="this credential has no node"))
+    now = utcnow()
     oldest, newest = now - NODE_LOGS_MAX_AGE, now + NODE_LOGS_MAX_FUTURE
     events = [
         _cloudwatch_event(entry) for entry in body.entries
@@ -331,10 +349,11 @@ class NodeModelCatalogsIn(BaseModel):
 
 @router.post("/nodes/model-catalogs", status_code=204)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def set_node_model_catalogs(
+    session: Session,
     body: NodeModelCatalogsIn,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> Response:
     """Merge the CALLING node's reported catalogs into `nodes.model_catalogs`, per provider, each stamped
     with the CP's clock. A provider the body omits keeps its last report (absence asserts nothing).
@@ -344,7 +363,7 @@ def set_node_model_catalogs(
     node_id = caller_node_id(session, caller, body.node_id or "")
     current = session.scalar(select(Node.model_catalogs).where(Node.id == node_id).with_for_update())
     merged = dict(current) if isinstance(current, dict) else {}
-    observed_at = datetime.now(timezone.utc).isoformat()
+    observed_at = utcnow().isoformat()
     for provider, models in body.catalogs.items():
         merged[provider] = {
             "observed_at": observed_at,
@@ -373,8 +392,7 @@ SELECT coalesce(json_agg(t ORDER BY t.node_id)::text, '[]') FROM (
          n.observed_at::text                                          AS observed_at,
          n.config_snapshot->>'version'                                AS generation,
          extract(epoch from (now() - n.config_reported_at))::float8   AS generation_reported_age,
-         (SELECT count(*) FROM worktrees w
-           WHERE w.node_id = n.id AND w.number > 0)::int               AS slots,
+         (SELECT count(*) FROM worktrees w WHERE w.node_id = n.id)::int AS slots,
          (SELECT count(*) FROM worktrees w WHERE w.node_id = n.id)::int AS worktree_rows,
          -- The config PAIR the CONFIG-DRIFT verdict compares: the roster's declaration of what this
          -- node's knobs should be, and what the node last reported. Shipped as whole objects and
@@ -417,9 +435,10 @@ class NodeLivenessRow(BaseModel):
 
 @router.get("/nodes/liveness", response_model=list[NodeLivenessRow])
 @infra(Tenancy.OPERATOR)
+@on_session
 def node_liveness(
+    session: Session,
     _: None = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> list[NodeLivenessRow]:
     """The fleet-wide liveness roster `apps/api/app/node_liveness.py` asserts against. Read-only: observing
     must not change fleet state.
@@ -441,11 +460,12 @@ class NodeIdentityOut(RefOut):
 
 @router.get("/nodes/identity", response_model=NodeIdentityOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def node_self_identity(
+    session: Session,
     node_id: str = Query(..., min_length=1,
                          description="the asking node's own uuid, as `/etc/jaah/node.env` holds it"),
     _: None = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> NodeIdentityOut:
     """The human handle for the uuid a node already holds. Read-only.
 
@@ -453,10 +473,11 @@ def node_self_identity(
     misprovisioned.
     """
     resolved = wire_node_id_or_404(session, node_id)
-    name = names_by_id(session, [resolved]).get(resolved)
-    if name is None:
-        # An unnamed row is as unresolved as an unknown uuid: a blank handle is useless.
-        raise HTTPException(status_code=404, detail=f"node {node_id!r} resolves to a row with no name")
+    # An unnamed row is as unresolved as an unknown uuid: a blank handle is useless.
+    name = or_404(
+        names_by_id(session, [resolved]).get(resolved),
+        detail=f"node {node_id!r} resolves to a row with no name",
+    )
     return NodeIdentityOut(id=str(resolved), name=name)
 
 
@@ -483,11 +504,12 @@ def _rotating_node(session: Session, caller: node_credentials.AgentCaller, prese
 
 @router.post("/token/rotate", response_model=TokenRotateOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def rotate_node_token(
+    session: Session,
     response: Response,
     x_agent_token: str = Header(default=""),
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> TokenRotateOut:
     """Mint the calling node's next credential as pending (`node_credentials.rotate`); the current one keeps
     working until `/token/rotate/confirm`. Presented the pending token instead, 409: that node already holds its
@@ -507,10 +529,11 @@ def rotate_node_token(
 
 @router.post("/token/rotate/confirm", status_code=204)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def confirm_node_token_rotation(
+    session: Session,
     x_agent_token: str = Header(default=""),
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> Response:
     """Presented the pending token: promote it, and the previous one stops resolving. Presented the current one
     with nothing pending: 204, so a confirm whose answer was lost can be repeated. Presented the current one while
@@ -518,8 +541,7 @@ def confirm_node_token_rotation(
     node, presented_as = _rotating_node(session, caller, x_agent_token)
     if presented_as == node_credentials.ROTATION_PRESENTED_PENDING:
         node_credentials.confirm_rotation(node)
-        emit_console_event(session, entity="node", id=str(node.id), action="upserted")
-        session.commit()
+        emit_console_event(session, entity="node", id=str(node.id), action="upserted", commit=True)
         log.info("node-auth: node %s confirmed its rotated credential; the previous one is revoked", node.id)
     elif node.pending_node_token_hash is not None:
         raise HTTPException(
@@ -531,10 +553,11 @@ def confirm_node_token_rotation(
 
 @router.post("/disk-reclaims", response_model=node_disk_events.DiskReclaimOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def post_disk_reclaim(
+    session: Session,
     body: node_disk_events.DiskReclaimIn,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> node_disk_events.DiskReclaimOut:
     """One reclaim the calling node ran, stored as a `reclaim` row of its disk history
     (`app/node_disk_events.py`). The node is the credential's own, never a claim; a replay of a `reclaim_id`

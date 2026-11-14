@@ -4,6 +4,7 @@ import { useLocation, useNavigate, type Location } from 'react-router-dom'
 import { useAuth } from '../auth'
 import { useListDetail } from '../components/ListDetail'
 import { getOrgsByIds, getOrgsBySlugs } from '../lib/orgs'
+import type { Org } from '../types'
 import {
   readScopeParam,
   refreshScope,
@@ -26,26 +27,28 @@ const sortedKey = (values: readonly string[]) => [...new Set(values)].sort()
 const scopeIdsKey = (ids: readonly string[]) => ['orgs', 'scope-ids', sortedKey(ids)] as const
 const scopeSlugsKey = (slugs: readonly string[]) => ['orgs', 'scope-slugs', sortedKey(slugs)] as const
 
-/** The orgs behind `ids`, named as the filter names them; `orgs` undefined until read. */
-export function useScopeOrgsByIds(ids: readonly string[], enabled: boolean) {
+/** The orgs `values` name, read by `read` and named as the filter names them; `orgs` undefined until read. */
+function useScopeOrgs(
+  queryKey: readonly unknown[], values: readonly string[], enabled: boolean,
+  read: (values: readonly string[], signal?: AbortSignal) => Promise<Org[]>,
+) {
   const query = useQuery({
-    queryKey: scopeIdsKey(ids),
-    queryFn: async ({ signal }) => scopeRoster(await getOrgsByIds(ids, signal)),
-    enabled: enabled && ids.length > 0,
+    queryKey,
+    queryFn: async ({ signal }) => scopeRoster(await read(values, signal)),
+    enabled: enabled && values.length > 0,
     staleTime: 60_000,
   })
   return { ...query, orgs: query.data }
 }
 
-/** The orgs a URL's `?orgs=` slugs name, named as the filter names them. */
+/** The orgs behind `ids` (the held scope). */
+export function useScopeOrgsByIds(ids: readonly string[], enabled: boolean) {
+  return useScopeOrgs(scopeIdsKey(ids), ids, enabled, getOrgsByIds)
+}
+
+/** The orgs a URL's `?orgs=` slugs name. */
 function useScopeOrgsBySlugs(slugs: readonly string[], enabled: boolean) {
-  const query = useQuery({
-    queryKey: scopeSlugsKey(slugs),
-    queryFn: async ({ signal }) => scopeRoster(await getOrgsBySlugs(slugs, signal)),
-    enabled: enabled && slugs.length > 0,
-    staleTime: 60_000,
-  })
-  return { ...query, orgs: query.data }
+  return useScopeOrgs(scopeSlugsKey(slugs), slugs, enabled, getOrgsBySlugs)
 }
 
 /** The address bar's location. Under the list/detail split the shell's `<Routes>` renders the BACKGROUND list

@@ -1,0 +1,63 @@
+slug = "workday"
+label = "Workday"
+category = "hr_other"
+vendor_docs_url = "https://community.workday.com/sites/default/files/file-hosting/restapi/index.html"
+summary = "Workday HCM: agents read workers, organizations and jobs through your tenant's REST API, as an integration user."
+
+[[auth]]
+kind = "service_account"
+fields = [
+  { key = "host", label = "Workday host", kind = "text", required = true, placeholder = "wd2-impl-services1.workday.com", help = "The host name of your tenant's REST endpoint. In Workday, run the View API Clients report: the Workday REST API Endpoint is shown at the top, for example https://wd2-impl-services1.workday.com/ccx/api/v1/acme - enter only the host part (wd2-impl-services1.workday.com)" },
+  { key = "tenant", label = "Tenant name", kind = "text", required = true, placeholder = "acme", help = "The last part of the same REST API Endpoint (acme in the example above); it is also the name after the host when you sign in to Workday" },
+  { key = "client_id", label = "Client ID", kind = "text", required = true, help = "In Workday, run the task Register API Client for Integrations: name the client Jaah, tick Non-Expiring Refresh Tokens, add the functional-area scopes agents need (for example Staffing and Organizations and Roles), and select OK. The Client ID is shown on the confirmation page and later in View API Clients" },
+  { key = "client_secret", label = "Client secret", kind = "secret", required = true, help = "Shown once, on the same confirmation page as the Client ID, right after you register the API client. If you lost it, open the client from View API Clients and choose API Client > Generate New Client Secret" },
+  { key = "refresh_token", label = "Refresh token", kind = "secret", required = true, help = "In View API Clients, open the API Clients for Integrations tab, select the Jaah client's related actions and choose API Client > Manage Refresh Tokens for Integrations. Pick the integration system user agents act as, tick Generate New Refresh Token, select OK and copy the token" },
+]
+
+[test]
+kind = "format"
+patterns = { host = "(?i)[a-z0-9-]+(\\.[a-z0-9-]+)*\\.(workday|myworkday)\\.com", tenant = "[A-Za-z0-9_]+" }
+public_host_field = "host"
+
+[docs]
+agent_uses = [
+  "Look up workers: names, positions, managers, locations and organizations",
+  "Read the organization structure, supervisory organizations and job profiles",
+  "Read time off balances and requests, where the integration user's security groups allow it",
+  "Answer questions about headcount and reporting lines, or prepare data for another system",
+]
+prerequisites = [
+  "A Workday administrator who can run the tasks Register API Client for Integrations and Create Integration System User",
+  "An integration system user (ISU) in a security group whose domain policies cover what agents should see - for example Worker Data: Public Worker Reports. After changing policies, run Activate Pending Security Policy Changes",
+  "Your tenant's REST API endpoint, from the View API Clients report",
+]
+limitations = [
+  "There is no one-click Connect Workday: Workday registers API clients inside each customer's own tenant (https://community.workday.com/sites/default/files/file-hosting/restapi/index.html), so an administrator registers the Jaah client in your tenant and pastes its values here",
+  "Test checks the format of each value and that the host is a public Workday address, but does not call Workday: minting an access token from the refresh token is the first real check, when an agent uses it",
+  "Agents get access tokens from your tenant's token endpoint (https://HOST/ccx/oauth2/TENANT/token) using the client ID, client secret and refresh token, and see only what the integration user's security groups allow",
+  "Implementation (sandbox) and production tenants have different hosts and clients; connect each one as its own secret",
+]
+
+[[docs.troubleshooting]]
+symptom = "Test says Workday host is not in the format Workday uses"
+fix = "Enter only the host name from the REST API Endpoint, such as wd2-impl-services1.workday.com - no https://, no /ccx/... path and no tenant name. Workday hosts end in workday.com or myworkday.com"
+
+[[docs.troubleshooting]]
+symptom = "An agent reports invalid_client or invalid_grant from the token endpoint"
+fix = "The client secret or refresh token does not belong to this client, or the refresh token was regenerated or revoked. In Workday, open the client from View API Clients, generate a new refresh token with Manage Refresh Tokens for Integrations, and select Replace on the secret"
+
+[[docs.troubleshooting]]
+symptom = "An agent's calls succeed but return no workers, or answer 403"
+fix = "The integration system user's security group lacks the domain policy for that data, or the API client lacks the functional-area scope. Add the policy (and run Activate Pending Security Policy Changes) or edit the API client's scopes, then ask the agent to try again"
+
+[[docs.faq]]
+q = "Why is there no Connect Workday button?"
+a = "Workday has no shared sign-in for outside apps: each company registers API clients inside its own tenant. Registering a client for integrations gives a refresh token that does not expire, which works like a key"
+
+[[docs.faq]]
+q = "Which user do agents act as?"
+a = "The integration system user you chose when generating the refresh token. Use a dedicated ISU for Jaah so its access can be reviewed and revoked on its own"
+
+[[docs.faq]]
+q = "How do I revoke Jaah's access in Workday?"
+a = "Open the Jaah client from View API Clients and choose API Client > Manage Refresh Tokens for Integrations to revoke the token, or deactivate the API client. Agents lose access when their current access token expires"

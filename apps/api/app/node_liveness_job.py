@@ -18,8 +18,8 @@ from typing import Optional
 
 from sqlalchemy import select
 
-from app import cron_alarms, edition_features, node_liveness, platform_release
-from app.db import SessionLocal
+from app import cron_alarms, edition_features, node_alerts, node_liveness, platform_release
+from app.db import BridgedSession
 from app.models.nodes import Node
 from app.routes.agent import (
     auth as agent_auth,
@@ -39,8 +39,9 @@ INTERVAL_SECONDS = 300.0
 TIMEOUT_SECONDS = 120.0
 
 
-def sweep_once(session_factory=SessionLocal) -> int:
-    """Read the roster, place generations, assert, deliver. Returns the sweep's exit code.
+def sweep_once(session_factory=BridgedSession) -> int:
+    """Read the roster, place generations, assert, deliver; then the tenant node alerts. Returns the sweep's exit
+    code.
 
     One session for the whole pass, so the roster read and the alarm writes see one control plane.
     `session_factory` is the test seam.
@@ -62,7 +63,7 @@ def sweep_once(session_factory=SessionLocal) -> int:
 
             # A lagging vnode makes its host the target (one package version per host) — `app/vnodes.py`.
             placed = vnodes.retarget_rollout(placed, vnodes.host_id_by_vnode_id(session))
-        return node_liveness.sweep(
+        rc = node_liveness.sweep(
             placed,
             create_task=seams.create_task,
             find_task=seams.find_task,
@@ -70,13 +71,17 @@ def sweep_once(session_factory=SessionLocal) -> int:
             recent_settled_task=seams.recent_settled_task,
             release_grace_active=node_liveness.release_desired_in_grace(published.updated_age),
         )
+        # The tenant's own node alerts, beside the operator's alarms and never in their way (`app/node_alerts.py`).
+        session.rollback()  # `record_alert` needs a session with no open work
+        node_alerts.sweep(session, placed)
+        return rc
 
 
 def _place_per_platform(
     rows: list[node_liveness.NodeRow], published: Optional[str], os_by_uuid: dict[str, str]
 ) -> list[node_liveness.NodeRow]:
-    """`node_liveness.place_generations`, but each row against what its platform can install
-    (`app/platform_release.py`): a Windows node is never STALE for a release with no Windows bundle."""
+    """Stamp every row's `placement` (`node_liveness.place_generation`), each against what its platform can
+    install (`app/platform_release.py`): a Windows node is never STALE for a release with no Windows bundle."""
     return [
         row._replace(placement=node_liveness.place_generation(
             row.generation, platform_release.for_os(os_by_uuid.get(row.node_uuid or ""), published).version
@@ -106,7 +111,7 @@ class _Seams:
 
         Round-trips through JSON so `parse_rows` stays the one parser ("a malformed answer is no reading,
         never an empty fleet")."""
-        rows = agent_node_config.node_liveness(_=None, session=self.session)
+        rows = agent_node_config.node_liveness.session_body(self.session)
         return node_liveness.parse_rows(
             json.dumps([row.model_dump() for row in rows], default=str)
         )
@@ -142,22 +147,21 @@ class _Seams:
             # Raised into the sweep's delivery guard, which prints the whole report as ALARM NOT DELIVERED.
             log.error("node-liveness: alarm %s NOT filed — %s", kwargs.get("dedup_key"), cron_alarms.unset_reason())
             raise RuntimeError(cron_alarms.unset_reason())
-        out = agent_task_reads.create_system_task(
+        out = agent_task_reads.create_system_task.session_body(
+            self.session,
             body=agent_task_reads.SystemTaskIn(**kwargs, project_id=project_id),
             x_agent_task_id=agent_auth.HOST_PRODUCER_CALLER,
-            _=None,
-            session=self.session,
         )
         return {"id": out.id, "created": out.created}
 
     def find_task(self, **kwargs) -> Optional[int]:
-        """`GET /api/agent/tasks/system/open` — the id of the row THIS dedup_key opened, or None."""
+        """The id of the row THIS dedup_key opened, or None."""
         project_id = self._project_id()
         if project_id is None:
             return None  # nothing can be open where nothing was filed
-        return agent_task_reads.find_open_system_task(
-            persona=kwargs["persona"], project_id=project_id, dedup_key=kwargs.get("dedup_key"),
-            _=None, session=self.session,
+        return agent_task_reads._find_open_system_task(
+            self.session, persona=kwargs["persona"], project="", project_id=project_id,
+            dedup_key=kwargs.get("dedup_key"),
         ).id
 
     def recent_settled_task(self, **kwargs) -> Optional[dict]:
@@ -178,11 +182,10 @@ class _Seams:
         )
 
     def resolve_task(self, task_id: int, outcome_summary: str = "resolved") -> dict:
-        """`POST /api/agent/tasks/system/{id}/resolve` — closes a cleared condition's Task."""
+        """Closes a cleared condition's Task."""
         out = agent_task_reads.resolve_system_task(
+            self.session,
             task_id=task_id,
             body=agent_task_reads.ResolveSystemTaskIn(outcome_summary=outcome_summary),
-            _=None,
-            session=self.session,
         )
         return {"resolved": out.resolved}

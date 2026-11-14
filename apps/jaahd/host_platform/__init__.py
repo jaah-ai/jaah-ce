@@ -27,6 +27,8 @@ The interface (every module answers all of it):
   owner_uid(pid)               the real uid a process runs as
   cmdline_args(pid)            a process's argv, as the kernel holds it
   mount_namespace(pid) / child_pids(pid)  a process's mount namespace and direct children (None = unreadable)
+  socket_holders(inode)        the other processes holding a socket open (Linux; the activated fleet socket)
+  ptrace_scope()               Yama's ptrace scope, 0 without Yama (Linux; runner isolation needs >= 1)
   lock(fh) / unlock(fh)        an advisory whole-file lock
   sample_metrics() -> dict     one instantaneous host sample (`host_metrics` windows it)
   service(name)                restart / is-active for a supervised daemon unit
@@ -162,6 +164,8 @@ owner_uid = _IMPL.owner_uid
 cmdline_args = _IMPL.cmdline_args
 mount_namespace = _IMPL.mount_namespace
 child_pids = _IMPL.child_pids
+socket_holders = _IMPL.socket_holders
+ptrace_scope = _IMPL.ptrace_scope
 stdin_tty = _IMPL.stdin_tty
 lock = _IMPL.lock
 unlock = _IMPL.unlock

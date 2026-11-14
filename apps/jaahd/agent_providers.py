@@ -116,8 +116,6 @@ class Usage:
 class Console:
     chat_view: bool
     terminal_view: bool
-    # True => the console switches one session between the two views.
-    toggle: bool
     # Why a view is missing, shown beside it; "" when nothing is.
     reason: str = ""
 
@@ -175,8 +173,9 @@ _QUOTA_USAGE = "quota"
 #: claude-agent-acp's dialect, so every Claude Code row's (Claude, DeepSeek). Its `errorKind` (the prompt
 #: error's `data`, the SDK's assistant `error`) maps as the StopFailure hook maps the same values
 #: (`hooks/runner-status.py::_ERROR_TYPE_CAUSES`); money and holds are `credit_exhausted`, not a window. The text
-#: pattern is Bedrock refusing the model to the account, exactly `hooks/break_cause.py::MODEL_REFUSED` (a test
-#: pins them). Its rate-limit report rides a `usage_update`'s `_meta["_claude/rateLimit"]` (the SDK's
+#: patterns are Bedrock refusing the model to the account, exactly `hooks/break_cause.py::MODEL_REFUSED`, and
+#: Anthropic refusing an unscoped key with no workspace, exactly `WORKSPACE_REQUIRED` (a test pins both). Its
+#: rate-limit report rides a `usage_update`'s `_meta["_claude/rateLimit"]` (the SDK's
 #: `rate_limit_info`: `resetsAt` epoch seconds, `rateLimitType`, `status`).
 _CLAUDE_CODE_ACP = AcpDialect(
     error_kind_meta="errorKind",
@@ -188,7 +187,10 @@ _CLAUDE_CODE_ACP = AcpDialect(
     error_text_patterns=((r"is not available for this account\. You can explore other available models|"
                           r"anthropic\.claude[\w.:-]* is not available for this account|"
                           r"You don't have access to the model with the specified model ID|"
-                          r"Model use case details have not been submitted", "model_refused"),),
+                          r"Model use case details have not been submitted", "model_refused"),
+                         (r"This API key is not scoped to a workspace|"
+                          r"anthropic-workspace-id header must be a valid workspace ID|"
+                          r"Workspace `[^`\n]*` not found", "auth_expired")),
     rate_limit_meta="_claude/rateLimit",
     usage_meta=_QUOTA_USAGE,
 )
@@ -233,11 +235,16 @@ class Capabilities:
     # JSON-RPC server ("app_server"), the credential file plus the Code Assist API ("code_assist"), or nothing on the
     # node because the credential broker holds the key ("broker_key"); "none" = no probe.
     health_probe: Literal["app_server", "code_assist", "broker_key", "none"] = "none"
-    # The control plane's own second anchor on an authorize URL a node scraped (`app/agent_providers.py::
-    # authorize_url_admits`), as `(prefix, exact)`: `exact` says the whole URL must EQUAL the prefix, otherwise it must
-    # start with it. It narrows host and path, not provenance. None = no opinion (a host that varies). The node never
+    # The browser's anchor on the authorize URL it unseals (served by `app/agent_providers.py::
+    # authorize_url_prefix`/`authorize_url_exact`), as `(prefix, exact)`: `exact` says the whole URL must EQUAL
+    # the prefix, otherwise it must start with it. It narrows host and path, not provenance. None = no opinion (a host that varies). The node never
     # reads it; its scrape pattern is the adapter's own copy.
     authorize_url_anchor: tuple[str, bool] | None = None
+    # True => a project's linked remote MCP servers reach this engine's sessions, one `mcp_<name>` stdio bridge
+    # each (`agents/base.py::remote_mcp_servers`; a legacy launch through the adapter's `legacy_mcp_config`), per
+    # session and never in the account's config; False => the launch adds none. A runtime of a True row that takes
+    # no per-session server is the row's own degradation.
+    supports_remote_mcp: bool = False
     # The row's own `degradations`, filled by `AgentProvider.__post_init__` (one home: the row's field).
     gaps: tuple[Degradation, ...] = ()
 
@@ -249,14 +256,8 @@ def _modes(native: tuple[Mode, ...]) -> Modes:
 
 #: The console's views: the TUI terminal everywhere, the chat view on an ACP session
 #: (`apps/web/src/components/console/ChatView.tsx`). A legacy session's own reason is the CP's
-#: (`app/routes/console_runtime.py`). No hand-off between the two fronts for these: their TUI has no
-#: `resume_exec_line` (`agents/base.py`), so the terminal cannot reopen the chat's session.
-_CHAT_AND_TERMINAL = Console(chat_view=True, terminal_view=True, toggle=False,
-                             reason="The terminal can't take over a live chat session yet.")
-#: Both views, and the toggle hands the one native session between `jaah-acp-host` and the TUI
-#: (`apps/api/app/routes/console_runtime.py`; node half `reconcile.enact_launch._launch_into_slot`'s `handoff`): a CLI with an ACP
-#: launch AND a TUI that resumes a session by id (`resume_exec_line`, asserted registry-wide by the adapter tests).
-_HANDOFF = Console(chat_view=True, terminal_view=True, toggle=True)
+#: (`app/routes/console_runtime.py`). A session stays on the front it opened on.
+_CHAT_AND_TERMINAL = Console(chat_view=True, terminal_view=True)
 
 
 @dataclass(frozen=True)
@@ -267,6 +268,8 @@ class AgentProvider:
     value: str
     # What the console shows.
     label: str
+    # The agent catalog's one-line description of this built-in (Customize > Agents > Catalog).
+    description: str
     # The executable name, as it is found on a node's PATH.
     binary: str
     # False = no quota to gate on, which is NOT a quota that could not be read — conflating them makes a
@@ -327,17 +330,14 @@ class AgentProvider:
     # The credential type an API-key account of this provider points at (`app/credentials/registry.py`);
     # "" when `"api_key"` is not in `auth_kinds`.
     api_key_credential_type: str
-    # How an API-key account is picked beside the OAuth ones: "spillover" (only once every OAuth account is
-    # out of quota -- a key beside a subscription), "peer" (a first-class pick like any other account -- a
-    # provider whose only kind is an API key), "" when this provider takes no API key.
-    api_key_lane: str
     # True => this CLI takes an API key from a settings helper (`apiKeyHelper`, dialing the credential broker
     # per request), never its environment (node side: the adapter's `api_key_env()` is ""). The only key route a
     # console tab (`apps/jaahd/clauded_wt.py`) launches, so an API-key account of a provider with False is never
     # picked for one (`routes/console.py::_console_account`); a pool runner exports the key instead.
     api_key_helper: bool
-    # True => each account carries its own concurrent-runner cap (`accounts.max_runners`), set by the
-    # operator; the only bound on spend for a provider with no quota to gate on.
+    # True => an API-key account of this provider may carry its own concurrent-runner cap
+    # (`accounts.max_runners`); the only bound on spend for a provider with no quota to gate on. A
+    # subscription account of any provider may carry one regardless.
     per_account_runner_cap: bool
     # What a new account's `accounts.auto_assign` defaults to when the create request names none: whether
     # the scheduler may pick it for a task that did not ask for it.
@@ -382,6 +382,7 @@ class AgentProvider:
 CLAUDE = AgentProvider(
     value="claude",
     label="Claude Code",
+    description="Anthropic's coding agent",
     binary="claude",
     companions=(),
     acp_binary="claude-agent-acp",
@@ -411,14 +412,12 @@ CLAUDE = AgentProvider(
     # Must stay empty: Claude Code is the baseline every other row is measured against.
     auth_kinds=("oauth", "api_key"),
     api_key_credential_type="anthropic_api_key",
-    api_key_lane="spillover",
     api_key_helper=True,
     per_account_runner_cap=False,
     auto_assign_default=True,
     foreign_model_ids="passthrough",
     capabilities=Capabilities(
         # A subscription session stays on the legacy runtime (operator decision A5); a key runs on ACP.
-        # Its key is checked by the Credentials page's own tester, so nothing is probed here.
         runtime=(("oauth", "legacy_only"), ("api_key", "acp")),
         sessions=Sessions(assign_id=True, resume="resume", list=True, close=True, additional_dirs=True,
                           start_context=True, list_command=("agents", "--json")),
@@ -428,9 +427,11 @@ CLAUDE = AgentProvider(
         auth=Auth(kinds=(), key_delivery="helper", key_in_env=False),
         account_layer="omc",
         project_memory_hooks=True,
+        supports_remote_mcp=True,
         usage=Usage(tokens=True, cost=True, rate_limit_reset=True, priced_by_time=False),
         vendor="anthropic",
-        api_key_probe_url=None,
+        # Probed at save, so a key that is refused or not scoped to a workspace never becomes a benched account.
+        api_key_probe_url="https://api.anthropic.com/v1/models?limit=1",
         model_id_prefixes=("claude", "fable", "opus", "sonnet", "haiku"),
         console=_CHAT_AND_TERMINAL,
         acp_dialect=_CLAUDE_CODE_ACP,
@@ -442,6 +443,7 @@ CLAUDE = AgentProvider(
 CODEX = AgentProvider(
     value="codex",
     label="OpenAI Codex",
+    description="OpenAI's coding agent",
     binary="codex",
     companions=(),
     acp_binary="codex-acp",
@@ -481,7 +483,6 @@ CODEX = AgentProvider(
     # quota is read, so the key is spent only once it runs out.
     auth_kinds=("oauth", "api_key"),
     api_key_credential_type="openai_api_key",
-    api_key_lane="spillover",
     api_key_helper=False,
     per_account_runner_cap=False,
     auto_assign_default=True,
@@ -500,11 +501,12 @@ CODEX = AgentProvider(
         account_layer="omx",
         # On the ACP runtime, through its run hook file (`agents/codex.py::_dispatch_hooks`).
         project_memory_hooks=True,
+        supports_remote_mcp=True,
         usage=Usage(tokens=True, cost=False, rate_limit_reset=True, priced_by_time=False),
         vendor="openai",
         api_key_probe_url="https://api.openai.com/v1/models",
         model_id_prefixes=("gpt-", "codex", "o3", "o4"),
-        console=_HANDOFF,
+        console=_CHAT_AND_TERMINAL,
         # A failed turn is `threadStatus` `systemError` then the CLI's own error text (`acp/events.py::_THREAD_FAILED`).
         # Its retries cover only 429s and 5xx, so a turn that ran out of them is an API error (the status it names is
         # read by the vendor classifier); `stream disconnected …` also prefixes a refused prompt, so it names none.
@@ -540,6 +542,7 @@ CODEX = AgentProvider(
 DEEPSEEK = AgentProvider(
     value="deepseek",
     label="DeepSeek",
+    description="Claude Code on DeepSeek",
     # Claude Code itself, pointed at DeepSeek's Anthropic-compatible endpoint by the node adapter, so the CLI's
     # own capabilities (hooks, `AskUserQuestion`) are Claude's. The fields below describe that adapter; an
     # API-key launch currently loses the plugin layer they rely on, published as rows 37-39 below.
@@ -578,8 +581,6 @@ DEEPSEEK = AgentProvider(
     subagent_roster="",
     auth_kinds=("api_key",),
     api_key_credential_type="deepseek_api_key",
-    # Its only kind is a key, so its accounts are ordinary picks rather than a spillover behind OAuth.
-    api_key_lane="peer",
     api_key_helper=True,
     # With no quota to gate on, the operator's per-account cap is what bounds spend.
     per_account_runner_cap=True,
@@ -602,6 +603,8 @@ DEEPSEEK = AgentProvider(
         auth=Auth(kinds=(), key_delivery="helper", key_in_env=False),
         account_layer="omc",
         project_memory_hooks=True,
+        # The Claude adapter's ACP launch, inherited (`agents/deepseek.py`).
+        supports_remote_mcp=True,
         usage=Usage(tokens=True, cost=True, rate_limit_reset=False, priced_by_time=True),
         vendor="deepseek",
         api_key_probe_url="https://api.deepseek.com/models",
@@ -688,6 +691,7 @@ DEEPSEEK = AgentProvider(
 ANTIGRAVITY = AgentProvider(
     value="antigravity",
     label="Google Antigravity",
+    description="Google's coding agent",
     binary="agy",
     companions=(),
     # The wrapper `runner_cli_pins.py agy-acp-install` puts on the runner's PATH (`agents/antigravity_runner.py`).
@@ -742,7 +746,6 @@ ANTIGRAVITY = AgentProvider(
     # the quota is read, so the key is spent only once it runs out.
     auth_kinds=("oauth", "api_key"),
     api_key_credential_type="gemini_api_key",
-    api_key_lane="spillover",
     api_key_helper=False,
     # Spend is gated by the quota reading, as on the other OAuth CLIs, so no per-account cap.
     per_account_runner_cap=False,
@@ -781,6 +784,10 @@ ANTIGRAVITY = AgentProvider(
         # ACP host (`acp/lifecycle.py`) or the bridge's derived slots on the terminal
         # (`agents/antigravity_runner.py::_HARNESS_EVENTS`).
         project_memory_hooks=True,
+        # On ACP the linked servers ride `session/new` `mcpServers`, named eager like the control server
+        # (`agents/antigravity_runner.py::acp_launch`). The terminal runtime takes none: `agy mcp add` writes the
+        # account-wide config every session of the account shares (`terminal-no-linked-mcp`).
+        supports_remote_mcp=True,
         # The server's only usage report is a `usage_update` of the context window (`used`/`size`): no token counts
         # and no cost (`no-spend-reading`).
         usage=Usage(tokens=False, cost=False, rate_limit_reset=False, priced_by_time=False),
@@ -863,6 +870,16 @@ ANTIGRAVITY = AgentProvider(
                 "static nodes, run on ACP."
             ),
         ),
+        Degradation(
+            key="terminal-no-linked-mcp",
+            harness=False,
+            capability="Linked MCP servers in the terminal",
+            consequence=(
+                "A session on the terminal runtime — a signed-in one while its ACP switch is off, or on a "
+                "MicroVM node — does not get the project's linked MCP servers: the CLI reads servers only from "
+                "the account's own config, which every project's runs share. ACP sessions get them."
+            ),
+        ),
         # Kept under the feasibility escape (architecture §6): agy-acp-server 1.4.1 sends no token counts or
         # cost (measured), and no agy
         # 1.2.11 transcript line carries them (`agents/antigravity_transcript.py`).
@@ -885,6 +902,7 @@ ANTIGRAVITY = AgentProvider(
 PI = AgentProvider(
     value="pi",
     label="Pi",
+    description="Minimal coding agent",
     # The ACP agent the host spawns (it spawns `pi` itself): what a node must attest before it takes a Pi run.
     binary="pi-acp",
     # The package's postinst installs `pi` with `|| true`, so a node can attest `pi-acp` and still lack it.
@@ -923,8 +941,6 @@ PI = AgentProvider(
     auth_kinds=("api_key",),
     # A9: Pi runs on the org's Anthropic API key, the credential type Claude's key accounts point at.
     api_key_credential_type="anthropic_api_key",
-    # Its only kind is a key, so its accounts are ordinary picks, as DeepSeek's are.
-    api_key_lane="peer",
     # The key comes from a helper command (Pi's `auth.json` `!command`), never the environment.
     api_key_helper=True,
     # With no quota to gate on, the operator's per-account cap is what bounds spend.
@@ -947,6 +963,9 @@ PI = AgentProvider(
         account_layer="none",
         # The tool rows run in the fleet extension through the dispatcher, the lifecycle rows in the ACP host.
         project_memory_hooks=True,
+        # Not through Pi's `mcp.json`, which the account's every run shares: the fleet extension registers the
+        # run's own servers with `pi.registerMcpServer` (`agents/pi_extension/jaah-harness.ts`).
+        supports_remote_mcp=True,
         # Through the fork in `packages/acp-forks/pi-acp/`: each `usage_update` carries pi's running cost, the
         # prompt result its turn's tokens per model in `_meta.quota` (`acp_dialect`), and a usage limit its reset.
         usage=Usage(tokens=True, cost=True, rate_limit_reset=True, priced_by_time=False),
@@ -957,7 +976,7 @@ PI = AgentProvider(
         # Its models are Claude's, so a Claude model id attributes to Claude.
         model_id_prefixes=(),
         # The chat view is every ACP session's; Pi draws no terminal UI, so no console session opens on it.
-        console=Console(chat_view=True, terminal_view=False, toggle=False,
+        console=Console(chat_view=True, terminal_view=False,
                         reason="Pi has no terminal UI: its runs show in the chat view."),
         health_probe="broker_key",
         # pi-acp runs no lifecycle hook, so the host runs them (`acp/lifecycle.py`); the tool and compaction events
@@ -1070,59 +1089,3 @@ def implied_on_wire(value: str) -> bool:
     `DEFAULT_PROVIDER` on both sides, so omitting it keeps the payload byte-identical for an older peer. A
     wire default, not a capability: the senders ask this, never compare against `DEFAULT_PROVIDER`."""
     return value == DEFAULT_PROVIDER
-
-
-# The config-snapshot key an upgraded daemon publishes, and the value that means "speaks the current names".
-NAMING_SNAPSHOT_KEY = "naming"
-CURRENT_NAMING = "jaah"
-# The key a node publishes to say it exports the `JAAH_*` runner variables. Every node now exports only those
-# (rename wave R1); a control plane of the previous release still reads it to choose them.
-ENV_NAMING_SNAPSHOT_KEY = "env_naming"
-CURRENT_ENV_NAMING = "jaah"
-# The agent verbs, renamed to industry terms — `(current, pre-rename)`, the verb table's
-# `agent_vocabulary.ALIASES` read from here. A verb `a.b_c` is also the MCP tool `a_b_c`, so one pair covers
-# both spellings. An upgraded daemon accepts both and publishes `vocabulary: industry`; for any other node
-# the control plane composes the pre-rename names (`dispatch_compose.placeholders.respell_vocabulary`), which every
-# node serves. Deleted with the aliases (D5).
-VOCABULARY_SPELLINGS: tuple[tuple[str, str], ...] = (
-    ("task.complete", "task.settle"),
-    ("input.request", "task.question"),
-    ("input.request_batch", "agent.ask"),
-    ("input.responses", "agent.answers"),
-    ("artifact.upload", "task.artifact"),
-    ("artifact.upload_begin", "task.artifact_ticket"),
-    ("artifact.upload_commit", "task.artifact_confirm"),
-    ("artifact.read", "task.read_artifact"),
-    ("notification.send", "agent.notify"),
-    ("credential.list", "task.credential_list"),
-    ("credential.get", "task.credential_get"),
-    ("task.get_context", "agent.task"),
-    ("task.create_follow_up", "task.follow_up"),
-    ("task.create_batch", "task.append_tasks"),
-    ("task.update", "task.edit_filed"),
-    ("task.delete", "task.delete_filed"),
-    ("pull_request.enqueue", "task.pr_queue"),
-    ("pull_request.observed", "task.pr_observed"),
-    ("schedule.create", "task.cron_create"),
-    ("schedule.update", "task.cron_update"),
-    ("schedule.delete", "task.cron_delete"),
-    ("trigger.create", "task.trigger_create"),
-    ("trigger.update", "task.trigger_update"),
-    ("trigger.delete", "task.trigger_delete"),
-    ("project.get", "task.project_get"),
-    ("project.update", "task.project_update"),
-    ("project.env_set", "task.project_env_write"),
-    ("project.env_delete", "task.project_env_delete"),
-    ("session.heartbeat", "task.heartbeat"),
-    ("session.start", "task.claim_active"),
-    ("session.error", "task.runner_break"),
-    ("session.close", "task.console_exit"),
-    ("session.resume", "task.console_resume"),
-    ("merge_queue.batch", "lane.batch"),
-    ("merge_queue.queue", "lane.queue"),
-    ("merge_queue.event", "lane.event"),
-    ("merge_queue.base_check", "lane.base_check"),
-)
-VOCABULARY_SNAPSHOT_KEY = "vocabulary"
-CURRENT_VOCABULARY = "industry"
-

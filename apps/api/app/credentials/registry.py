@@ -30,6 +30,9 @@ class FieldSpec:
     default: Optional[str] = None
     # Helper text under the input: an instruction, where `placeholder` is only ever an example.
     help: Optional[str] = None
+    # An optional field the form shows beside the required ones instead of folding it into Advanced: the system
+    # cannot be reached without it and it has no standard value (Generic API Key's URL; GitHub's is github.com).
+    outright: bool = False
 
 
 @dataclass(frozen=True)
@@ -45,7 +48,17 @@ class KeyTestSpec:
     `reject_names_vendor`: a 401/403 reads "{label} rejected the {key label} - check it." instead of the
     shared sentence. `bearer_when`: a config key that, when non-blank, marks the key as an OAuth access token,
     sent as `Authorization: Bearer` instead of `header_name` (a header the provider accepts for its own
-    tokens only).
+    tokens only). `connect_token_field`: a secret field holding a Connect grant's cached OAuth access token;
+    when `key_field` is blank and it is not, the Test sends it as `Authorization: Bearer`, or answers
+    `unsupported` without a request once its `expiry_date` has passed (the refresh path renews it).
+    `rejected_message`: the type's own 401/403 sentence, verbatim, where neither shared one fits. `basic_user_field`:
+    a required config field sent with the key as `Authorization: Basic` (user:key) in place of `header_name`.
+    `identity_fallback_field`: an ungated (`accept=None`) identity verdict - the first `identity` path holding a
+    string names it, else this required config field does (an unreadable 2xx is still an authenticated call; a
+    number is not a name). `list_verdict`: the `testers._LIST_VERDICTS` function that reads the gated list for
+    the green sentence where a bare "credentials accepted" would under-report (Headscale's own key expiry).
+    `vet_destination`: an operator-typed host is dialled only at the public addresses `http_bounded.vetted_addresses`
+    passes (the type's runtime client vets the same way, so the Test never reaches what the client refuses).
     """
 
     path: str
@@ -61,6 +74,12 @@ class KeyTestSpec:
     blank_key_reason: Optional[str] = None
     reject_names_vendor: bool = False
     bearer_when: Optional[str] = None
+    connect_token_field: Optional[str] = None
+    rejected_message: Optional[str] = None
+    basic_user_field: Optional[str] = None
+    identity_fallback_field: Optional[str] = None
+    list_verdict: Optional[str] = None
+    vet_destination: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,24 +128,43 @@ class CredentialTypeSpec:
     nodevault_reason: Optional[str] = None
     require_one_of: tuple[tuple[str, ...], ...] = ()
     allowed_hosts: tuple[str, ...] = ()
+    #: The url fields take any text: the save never refuses one for its shape (the console only warns), and a Test
+    #: still needs an http(s) URL. Exclusive with `require_https_base_url` and `allowed_hosts`.
+    free_form_url: bool = False
     #: The config key holding when this type's token expires (`credentials/health.py::expires_at` reads it):
     #: ISO-8601 or epoch milliseconds. None for a type that records no expiry.
     expiry_field: Optional[str] = None
 
 
-# Why a forge Connect app (`gitlab_app`, `bitbucket_app`, `azure_devops_app`) has no Test.
-_CONNECT_APP_UNTESTABLE = (
-    "An OAuth app's client pair can only be checked by a real consent - press Connect under "
-    "Profile > Git, which fails at once if the pair is wrong."
-)
+def _connect_app(slug: str, label: str, base_url: str, *, id_label: str, secret_label: str,
+                 connect_where: str = "under Profile > Git", extra: tuple[FieldSpec, ...] = ()) -> CredentialTypeSpec:
+    """A Jaah-owned OAuth app's client pair as one operator-plane row (`gitlab_app`, `bitbucket_app`,
+    `azure_devops_app`, `figma_app`): never a git remote's login, never NodeVault, and untestable - the only check
+    is a real consent, and pressing Connect (`connect_where`) is that check."""
+    return CredentialTypeSpec(
+        slug=slug,
+        label=label,
+        fields=(
+            FieldSpec("client_id", id_label, "text", True),
+            FieldSpec("client_secret", secret_label, "secret", True),
+            *extra,
+        ),
+        testable=False,
+        untestable_reason=(
+            f"An OAuth app's client pair can only be checked by a real consent - press Connect {connect_where}, "
+            "which fails at once if the pair is wrong."
+        ),
+        default_base_url=base_url,
+        nodevault_eligible=False,
+    )
 
 
-# When the forge answered a connection test with a revocation (`forges.revoked`, D-A14); set only by
-# `git_access` and cleared by a reconnect or a new token. Set, the connection reads "Needs reconnect" and
-# no task is given the token. `text`, so an operator can see it and clear it after fixing the grant.
+# A revocation mark an earlier release wrote into the config (`forges.revoked`, D-A14); nothing writes it now —
+# a revocation is the row's `needs_reconnect_at` (`git_probe.mark_revoked`). Still declared so a row carrying it
+# reads it as a plain field (an undeclared key would be classed a secret), and cleared by a reconnect or a new token.
 _GRANT_DEAD_AT = FieldSpec(
     "grant_dead_at", "Revoked at", "text", False,
-    "Set automatically when the forge reports this token revoked - blank means it is not known to be",
+    help="When an earlier release saw the forge report this token revoked. Blank means it is not known to be.",
 )
 
 # The forge account the token belongs to (the login, username or email the forge names), written by Connect,
@@ -135,11 +173,11 @@ _GRANT_DEAD_AT = FieldSpec(
 # `_GRANT_DEAD_AT`: an operator can see it.
 _ACCOUNT = FieldSpec(
     "account", "Account", "text", False,
-    "Set automatically when the token is connected or tested - the forge account it belongs to",
+    help="The forge account the token belongs to, set when it is connected or tested.",
 )
 
 
-# The three fields Connect fills on an OAuth-refreshed type (`heroku`, `zapier`, `oauth2_client`). The refresh
+# The three fields Connect fills on an OAuth-refreshed type (`heroku`, `zapier`, `figma`, `oauth2_client`). The refresh
 # token is optional: the row must be savable before Connect, since it holds the client the flow needs, and a
 # pasted token is still accepted. The other two are the CP's own token cache, written by `oauth2_tokens.py` after
 # a refresh. Declared because an undeclared key is treated as secret by `secret_keys()`, which would hide the
@@ -175,6 +213,13 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
             FieldSpec("project_key", "Project key", "text", False, "OAM"),
         ),
         testable=True,
+        # Not shape-gated: an unreadable 2xx still proves the credential worked (gating would change a shipped sentence).
+        key_test=KeyTestSpec(
+            path="/rest/api/3/myself", key_field="api_token", basic_user_field="email", accept=None,
+            identity=(("displayName",),), identity_fallback_field="email", vet_destination=True,
+        ),
+        # `jira_api` dials only a public https:// site, so a plaintext Base URL is refused at save and test too.
+        require_https_base_url=True,
     ),
     "n8n": CredentialTypeSpec(
         slug="n8n",
@@ -229,7 +274,7 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
         # Token introspection needs a client pair a private-app token lacks. `portalId` is a JSON number.
         key_test=KeyTestSpec(
             path="/account-info/v3/details", key_field="access_token", value_prefix="Bearer",
-            identity=(("portalId",),), identity_phrase="- portal",
+            identity=(("portalId",),), identity_phrase="- portal", reject_names_vendor=True,
         ),
     ),
     # `app_token` is the Socket Mode app-level token (`xapp-...`), separate from the bot token; neither can
@@ -249,6 +294,22 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
         testable=True,
         default_base_url="https://slack.com",
     ),
+    # One tenant org's installed Slack workspace (Add to Slack, `app/slack_workspaces.py`): the bot token the control
+    # plane posts there with, plus the install's facts. Always a SYSTEM row written by the connect and the re-seal job,
+    # never reaching a runner, and never the operator-plane `slack` app above.
+    "slack_workspace": CredentialTypeSpec(
+        slug="slack_workspace",
+        label="Slack workspace",
+        fields=(
+            FieldSpec("bot_token", "Bot token", "secret", True),
+            FieldSpec("team_id", "Workspace ID", "text", False),
+            FieldSpec("team_name", "Workspace", "text", False),
+            FieldSpec("app_id", "App ID", "text", False),
+            FieldSpec("bot_user_id", "Bot user ID", "text", False),
+        ),
+        testable=True,
+        default_base_url="https://slack.com",
+    ),
     # The bot the per-user Telegram notifications send as (`app/telegram_bot.py`): BotFather's token, which
     # Telegram takes in the URL path (`/bot<token>/<method>`), so the host is fixed and never an operator's.
     "telegram_bot": CredentialTypeSpec(
@@ -262,7 +323,7 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
     # `testers.py::_operator_host_field` keys on `kind == "url"` for the SSRF host pin, and a url field is not
     # "leave blank to keep", so redaction would lose the credential on a name-only PATCH.
 
-    # Both set `require_https_base_url` (jira/n8n do not): an org-wide source-control PAT warrants it. A new
+    # Both set `require_https_base_url` (n8n does not): an org-wide source-control PAT warrants it. A new
     # similarly broad type sets it too.
     # One type for a pasted PAT and a connected GitHub account, so no reader branches on spelling.
     # The OAuth fields are optional because a PAT has none; the OAuth App writes its `gho_` token into `token`
@@ -276,17 +337,16 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
         fields=(
             FieldSpec("token", "Personal access token", "secret", True),
             FieldSpec(
-                "base_url", "Base URL", "url", False,
-                "Leave blank for github.com - set only for GitHub Enterprise Server, "
-                "the instance root, not /api/v3 - must be https://",
+                "base_url", "Base URL", "url", False, "Blank for github.com",
+                help="Only for GitHub Enterprise Server: the instance root (not /api/v3), https://.",
             ),
             FieldSpec(
                 "refresh_token", "Refresh token", "secret", False,
-                "Set automatically by Connect GitHub - leave blank for a personal access token",
+                help="Set by Connect GitHub. Leave blank for a personal access token.",
             ),
             FieldSpec(
                 "token_expires_at", "Token expires at", "text", False,
-                "Set automatically by Connect GitHub - ISO-8601, blank means the token never expires",
+                help="Set by Connect GitHub. Blank means it never expires.",
             ),
             _GRANT_DEAD_AT,
             _ACCOUNT,
@@ -326,6 +386,11 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
             FieldSpec("client_id", "Client ID", "text", True, "Iv23li..."),
             FieldSpec("client_secret", "Client secret", "secret", True),
             FieldSpec("slug", "App slug", "text", True, "The name in the App's github.com/apps/<slug> URL"),
+            # Optional: with it the control plane signs the App's JWT and mints Easy Mode runners' one-repo
+            # installation tokens on the Jaah org (`app/easy_mode_runner_tokens.py`). It never leaves the control
+            # plane, which is also why the row is never a task's (`authz/visibility.py`).
+            FieldSpec("private_key", "Private key", "secret", False,
+                      help="The whole .pem file the App's General page generates. Needed for Easy Mode projects."),
         ),
         testable=True,
         default_base_url="https://github.com",
@@ -333,46 +398,49 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
         # Read only by the operator-tier knob `git_github_app_credential_id` (as `github_app`).
     ),
     # The three other forges' Connect apps, one operator-plane row each (`routes/forge_connect.py`,
-    # designated by `forge_oauth.FORGE_OAUTH[*].app_setting`); like `github_app`, none authenticates a git
-    # remote. Untestable: the only check is a real consent, and pressing Connect is that check.
-    "gitlab_app": CredentialTypeSpec(
-        slug="gitlab_app",
-        label="GitLab application (connect)",
-        fields=(
-            FieldSpec("client_id", "Application ID", "text", True),
-            FieldSpec("client_secret", "Secret", "secret", True),
-        ),
-        testable=False,
-        untestable_reason=_CONNECT_APP_UNTESTABLE,
-        default_base_url="https://gitlab.com",
-        nodevault_eligible=False,
+    # designated by `forge_oauth.FORGE_OAUTH[*].app_setting`).
+    "gitlab_app": _connect_app("gitlab_app", "GitLab application (connect)", "https://gitlab.com",
+                               id_label="Application ID", secret_label="Secret"),
+    "bitbucket_app": _connect_app("bitbucket_app", "Bitbucket OAuth consumer (connect)", "https://bitbucket.org",
+                                  id_label="Key", secret_label="Secret"),
+    "azure_devops_app": _connect_app(
+        "azure_devops_app", "Microsoft Entra app (sign-in and Azure DevOps connect)",
+        "https://login.microsoftonline.com", id_label="Application (client) ID", secret_label="Client secret",
+        extra=(FieldSpec(
+            "tenant", "Tenant", "text", False,
+            "Azure DevOps only: blank for any work or school account, or a tenant ID or domain",
+        ),),
     ),
-    "bitbucket_app": CredentialTypeSpec(
-        slug="bitbucket_app",
-        label="Bitbucket OAuth consumer (connect)",
+    # The deployment's own Figma OAuth app, designated by `figma_app_credential_id`
+    # (`oauth_providers.PROVIDERS["figma"]`): every `figma` credential's Connect authorizes against it.
+    "figma_app": _connect_app("figma_app", "Figma OAuth app (connect)", "https://www.figma.com",
+                              id_label="Client ID", secret_label="Client secret",
+                              connect_where="on a Figma credential"),
+    # A Jaah-owned OAuth app for one catalog vendor (`app/integrations/catalog.py`), named by that vendor's derived
+    # operator knob `oauth_app.<slug>` (`operator_settings/catalog_integrations.py`). One generic type for every
+    # catalog vendor; the hand-written `*_app` types above and below keep their own.
+    "oauth_app": CredentialTypeSpec(
+        slug="oauth_app",
+        label="OAuth app (catalog vendor)",
         fields=(
-            FieldSpec("client_id", "Key", "text", True),
-            FieldSpec("client_secret", "Secret", "secret", True),
-        ),
-        testable=False,
-        untestable_reason=_CONNECT_APP_UNTESTABLE,
-        default_base_url="https://bitbucket.org",
-        nodevault_eligible=False,
-    ),
-    "azure_devops_app": CredentialTypeSpec(
-        slug="azure_devops_app",
-        label="Microsoft Entra app (sign-in and Azure DevOps connect)",
-        fields=(
-            FieldSpec("client_id", "Application (client) ID", "text", True),
+            FieldSpec("client_id", "Client ID", "text", True),
             FieldSpec("client_secret", "Client secret", "secret", True),
-            FieldSpec(
-                "tenant", "Tenant", "text", False,
-                "Azure DevOps only: blank for any work or school account, or a tenant ID or domain",
-            ),
+            FieldSpec("provider", "Vendor", "text", False, help="The catalog vendor this app is registered with"),
+            FieldSpec("notes", "Notes", "text", False, help="Where the app is registered and who owns it"),
+            FieldSpec("token_auth", "Token endpoint auth", "text", False,
+                      help="client_secret_post (blank) or client_secret_basic - how the client authenticates"),
+            # The app's own webhook signing secret, for a vendor whose app posts signed events to Jaah (Linear's
+            # agent app: `trackers/linear.py`). One per app, never per workspace.
+            FieldSpec("webhook_secret", "Webhook signing secret", "secret", False,
+                      help="Only for an app that sends Jaah webhooks (Linear): the signing secret the vendor shows "
+                           "beside the app's webhook"),
         ),
         testable=False,
-        untestable_reason=_CONNECT_APP_UNTESTABLE,
-        default_base_url="https://login.microsoftonline.com",
+        untestable_reason=(
+            "An OAuth app's client pair can only be checked by a real consent - press Connect on the vendor, "
+            "which fails at once if the pair is wrong."
+        ),
+        default_base_url="https://oauth-app.invalid",
         nodevault_eligible=False,
     ),
     # The OAuth fields are optional because a PAT has none (Connect GitLab fills them). The
@@ -384,16 +452,16 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
         fields=(
             FieldSpec("token", "Personal access token", "secret", True),
             FieldSpec(
-                "base_url", "Base URL", "url", False,
-                "Leave blank for gitlab.com - the instance root, not /api/v4 - must be https://",
+                "base_url", "Base URL", "url", False, "Blank for gitlab.com",
+                help="Only for self-managed GitLab: the instance root (not /api/v4), https://.",
             ),
             FieldSpec(
                 "refresh_token", "Refresh token", "secret", False,
-                "Set automatically by Connect GitLab - leave blank for a personal access token",
+                help="Set by Connect GitLab. Leave blank for a personal access token.",
             ),
             FieldSpec(
                 "token_expires_at", "Token expires at", "text", False,
-                "Set automatically by Connect GitLab - ISO-8601, blank means the token never expires",
+                help="Set by Connect GitLab. Blank means it never expires.",
             ),
             _GRANT_DEAD_AT,
             _ACCOUNT,
@@ -425,11 +493,11 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
             FieldSpec("kind", "Token kind", "text", False, "api_token (a pasted API token) or oauth"),
             FieldSpec(
                 "refresh_token", "Refresh token", "secret", False,
-                "Set automatically by Connect Bitbucket - leave blank for an API token",
+                help="Set by Connect Bitbucket. Leave blank for an API token.",
             ),
             FieldSpec(
                 "token_expires_at", "Token expires at", "text", False,
-                "Set automatically by Connect Bitbucket - ISO-8601, blank means the token never expires",
+                help="Set by Connect Bitbucket. Blank means it never expires.",
             ),
             _GRANT_DEAD_AT,
             _ACCOUNT,
@@ -453,11 +521,11 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
             ),
             FieldSpec(
                 "refresh_token", "Refresh token", "secret", False,
-                "Set automatically by Connect Azure DevOps - leave blank for a personal access token",
+                help="Set by Connect Azure DevOps. Leave blank for a personal access token.",
             ),
             FieldSpec(
                 "token_expires_at", "Token expires at", "text", False,
-                "Set automatically by Connect Azure DevOps - ISO-8601, blank means the token never expires",
+                help="Set by Connect Azure DevOps. Blank means it never expires.",
             ),
             _GRANT_DEAD_AT,
             _ACCOUNT,
@@ -487,6 +555,41 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
         testable=True,
         default_base_url="https://sts.amazonaws.com",
         # Read only by cloud-node launch (`app/cloud_node_launch.py::AWS_CREDENTIAL_TYPE`).
+    ),
+    # The monitors the post-deploy regression check reads metrics from (`app/production_qa/metric_pulls.py`; a monitor
+    # trigger's `metrics.credential_id` names the row; CloudWatch signs with `aws`). Datadog is untestable: the read
+    # it needs is one query the row does not name. Sentry's Test is the organization list (docs.sentry.io/api/auth):
+    # any valid token may read it, a bad one answers 401; a JSON array, so not shape-gated.
+    "sentry": CredentialTypeSpec(
+        slug="sentry",
+        label="Sentry",
+        fields=(
+            FieldSpec("base_url", "Base URL", "url", True, default="https://sentry.io",
+                      help="Your self-hosted Sentry's address, or sentry.io"),
+            FieldSpec("org_slug", "Organization slug", "text", True, "acme"),
+            FieldSpec("auth_token", "Auth token", "secret", True,
+                      help="An internal integration's token with org:read and event:read"),
+        ),
+        testable=True,
+        require_https_base_url=True,
+        key_test=KeyTestSpec(
+            path="/api/0/organizations/", key_field="auth_token", value_prefix="Bearer", accept=None,
+            reject_names_vendor=True,
+        ),
+    ),
+    "datadog": CredentialTypeSpec(
+        slug="datadog",
+        label="Datadog",
+        fields=(
+            # The site, not a URL: the API host is `api.<site>`, from the fixed list Datadog serves
+            # (`metric_pulls.DATADOG_SITES`), so a row can never point the keys elsewhere.
+            FieldSpec("site", "Site", "text", True, "datadoghq.com", default="datadoghq.com"),
+            FieldSpec("api_key", "API key", "secret", True),
+            FieldSpec("app_key", "Application key", "secret", True),
+        ),
+        testable=False,
+        untestable_reason="Checked on the first post-deploy metric pull: a deploy's Metrics tab says why it failed.",
+        default_base_url="https://api.datadoghq.com",
     ),
     # A Microsoft Entra service principal (client-credentials grant) that signs Your Cloud on Azure
     # (`app/azure/auth.py`). Only the client secret authenticates; the three ids are how the operator recognises
@@ -542,6 +645,12 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
         testable=True,
         base_url_field="api_url",
         require_https_base_url=True,
+        key_test=KeyTestSpec(
+            path="/api/v1/apikey", key_field="api_key", value_prefix="Bearer", list_field="apiKeys",
+            list_verdict="headscale_key_expiry",
+            rejected_message="Headscale rejected the API key - check it has not expired or been revoked "
+                             "(`headscale apikeys list`).",
+        ),
         # Read only by cloud-node launch (`app/cloud_node_launch.py::HEADSCALE_CREDENTIAL_TYPE`: the operator-tier
         # knob `cloud_node_tailscale_credential_id`).
     ),
@@ -608,14 +717,19 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
         label="Anthropic API key",
         fields=(
             FieldSpec("api_key", "API key", "secret", True, "sk-ant-..."),
+            # An unscoped key must name its workspace on every request (`anthropic-workspace-id`), else Anthropic
+            # answers 400 "not scoped to a workspace". Non-secret; format checked by `account_auth.py`.
+            FieldSpec("workspace_id", "Workspace ID", "text", False, "wrkspc_..."),
         ),
         testable=True,
         default_base_url="https://api.anthropic.com",
         # Listing models authenticates and bills nothing, unlike a `POST /v1/messages` probe. `anthropic-version`
-        # is required by the API (without it the key is never considered): a pinned wire fact.
+        # is required by the API (without it the key is never considered): a pinned wire fact. The account
+        # save-time probe (`routes/accounts.py::_probe_api_key`) reads this same spec.
         key_test=KeyTestSpec(
             path="/v1/models?limit=1", key_field="api_key", header_name="x-api-key",
-            extra_headers=(("anthropic-version", "2023-06-01"),), list_field="data",
+            extra_headers=(("anthropic-version", "2023-06-01"),),
+            field_headers=(("anthropic-workspace-id", "workspace_id"),), list_field="data",
         ),
     ),
     # A DeepSeek runner account's key (`agent_providers.DEEPSEEK.api_key_credential_type`), created with the
@@ -671,7 +785,7 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
         default_base_url="https://api.stripe.com",
         require_https_base_url=True,
     ),
-    # Automation vendors, alphabetical: each is one entry (+ a pinned Connect provider for Heroku and Zapier), tested
+    # Automation vendors, alphabetical: each is one entry (+ a pinned Connect provider for Figma, Heroku and Zapier), tested
     # by its `key_test` alone. Fixed hosts except Make.
     "apify": CredentialTypeSpec(
         slug="apify",
@@ -686,6 +800,41 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
             path="/v2/users/me", key_field="api_token", value_prefix="Bearer",
             identity=(("data", "username"),), reject_names_vendor=True,
         ),
+    ),
+    # Either a pasted personal access token or a Connect through the deployment's own Figma app (`figma_app`,
+    # designated by the operator knob `figma_app_credential_id`), so the row holds no client. Test sends a pasted
+    # personal token as `X-Figma-Token`, else Connect's cached access token as `Authorization: Bearer` (an expired
+    # one is renewed before next use, never refreshed by a Test); a row with neither gets the blank-key sentence.
+    "figma": CredentialTypeSpec(
+        slug="figma",
+        expiry_field="expiry_date",
+        label="Figma",
+        fields=(
+            FieldSpec("api_token", "Personal access token", "secret", False, "figd_... or leave blank and press Connect"),
+            FieldSpec("scope", "Scopes", "text", False, help="Set by Connect - the scopes it asked Figma for"),
+            # Not `_CONNECT_TOKEN_FIELDS`: on the deployment's own app only Connect writes the tokens
+            # (`credential_wire._refuse_pasted_platform_grant`), so neither invites a paste.
+            FieldSpec("refresh_token", "Refresh token", "secret", False, "Filled by Connect"),
+            FieldSpec("access_token", "Access token", "secret", False, "Cached from the last refresh"),
+            FieldSpec("expiry_date", "Access token expiry", "text", False, "Milliseconds since the epoch"),
+            FieldSpec("account", "Account", "text", False, help="Set by Connect - the Figma account it belongs to"),
+        ),
+        testable=True,
+        default_base_url="https://api.figma.com",
+        require_https_base_url=True,
+        # `/v1/me` names the user.
+        key_test=KeyTestSpec(
+            path="/v1/me", key_field="api_token", header_name="X-Figma-Token",
+            connect_token_field="access_token",
+            identity=(("email",), ("handle",)),
+            blank_key_reason=(
+                "No personal access token or Connect grant on this credential - paste a token, or press Connect, "
+                "which fails at once if the app is not set up."
+            ),
+            reject_names_vendor=True,
+        ),
+        oauth_connect="figma",
+        nodevault_eligible=False,
     ),
     # A personal key authenticates only beside its user id (`x-auth-key`); an organization key needs none.
     "gumloop": CredentialTypeSpec(
@@ -863,6 +1012,41 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
         nodevault_eligible=False,
         nodevault_reason="Jaah's servers verify the links this key signs, so it can't use NodeVault",
     ),
+    # An org's connected Gmail mailbox (`app/tenant_gmail/`): SYSTEM rows the control plane alone sends and reads
+    # with, one per connected mailbox, which links it. Written by Connect with Google (the refresh token, on
+    # the operator's Google client named by `tenant_gmail_oauth_credential_id`) or by a service-account upload (the
+    # JSON key, domain-wide delegation naming the mailbox). Never a runner's: a system row is not usable by a task.
+    "gmail_oauth": CredentialTypeSpec(
+        slug="gmail_oauth",
+        label="Gmail (Google sign-in)",
+        fields=(
+            FieldSpec("refresh_token", "Refresh token", "secret", True, help="Filled by Connect with Google"),
+            FieldSpec("address", "Mailbox", "text", False, help="The address mail is sent from"),
+        ),
+        testable=False,
+        untestable_reason="Sending a message is the check: Settings › Organizations › Email shows the last failure.",
+        # Never dialled with the row's own host: the origin binds the seal (every type names one), so it never changes.
+        default_base_url="https://oauth2.googleapis.com",
+        nodevault_eligible=False,
+        nodevault_reason="Jaah's servers send and read mail with it, so it can't use NodeVault",
+    ),
+    "gmail_service_account": CredentialTypeSpec(
+        slug="gmail_service_account",
+        label="Gmail (service account)",
+        fields=(
+            # Not `key_json`: the runner transcript redactor binds `SERVICE_ACCOUNT_JSON` (`apps/jaahd/transcript_redact.py`).
+            FieldSpec(
+                "service_account_json", "Service-account key", "secret", True,
+                help="The JSON key file Google Cloud created",
+            ),
+            FieldSpec("address", "Mailbox", "text", False, help="The address the key acts as"),
+        ),
+        testable=False,
+        untestable_reason="Connecting proves the key against Google; Settings › Organizations › Email shows the last failure.",
+        default_base_url="https://oauth2.googleapis.com",
+        nodevault_eligible=False,
+        nodevault_reason="Jaah's servers send and read mail with it, so it can't use NodeVault",
+    ),
     # ── THE GENERIC TYPES ─────────────────────────────────────────────────────────────────────
     # Last in the dropdown so purpose-built types are met first. The two generic types below skip
     # `require_https_base_url` (operator decision): a generic row authorizes one host, and refusing plaintext
@@ -910,6 +1094,36 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
         oauth_connect="generic",
         nodevault_eligible=False,
     ),
+    # A remote MCP server (custom, or a catalog vendor's hosted one): its URL and transport, and how Jaah
+    # authenticates to it - a pasted bearer token, or Connect, which discovers the server's authorization server
+    # from `url` on every authorize, exchange and refresh (`app/mcp_oauth.py::grant_for`). No endpoint is stored:
+    # `url` is the one host field the secrets are sealed to, so the grant can only ever be spent where it points. A
+    # project reaches it only once linked (`project_mcp_links`, `app/mcp_links.py`); Test runs the MCP handshake
+    # (`credentials/testers.py::test_mcp_server`).
+    "mcp_server": CredentialTypeSpec(
+        slug="mcp_server",
+        expiry_field="expiry_date",
+        label="MCP server",
+        fields=(
+            FieldSpec("url", "Server URL", "url", True, "https://mcp.example.com/mcp",
+                      help="The server's MCP endpoint - must be https://"),
+            FieldSpec("transport", "Transport", "text", False, "streamable_http", default="streamable_http",
+                      help="streamable_http (current MCP servers) or sse (older ones)"),
+            FieldSpec("bearer_token", "Bearer token", "secret", False,
+                      help="For a server that takes an API key - leave blank to press Connect instead"),
+            # Blank: Connect registers Jaah with the server (RFC 7591) and keeps that client on the operator plane.
+            FieldSpec("client_id", "Client ID", "text", False,
+                      help="Your own OAuth client - leave blank and Connect registers Jaah"),
+            FieldSpec("client_secret", "Client secret", "secret", False, help="Your own client's secret, if it has one"),
+            FieldSpec("scope", "Scopes", "text", False, help="Space-separated - blank asks for the server's default"),
+            *_CONNECT_TOKEN_FIELDS,
+        ),
+        testable=True,
+        require_https_base_url=True,
+        oauth_connect="mcp",
+        # The control plane receives and refreshes a Connect grant (D7), and Test dials the server.
+        nodevault_eligible=False,
+    ),
     "generic_login": CredentialTypeSpec(
         slug="generic_login",
         label="Generic Login/Pwd",
@@ -919,7 +1133,14 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
             FieldSpec("base_url", "URL", "url", True, "https://example.com/login"),
             FieldSpec("login", "Login", "text", True),
             FieldSpec("password", "Password", "secret", True),
+            # A login behind a second factor: its TOTP seed, secret like the password, never in the description
+            # (descriptions are listed to every task that may see the row).
+            FieldSpec(
+                "totp_seed", "2FA seed", "secret", False,
+                help="The base32 TOTP seed shown when the account set up two-factor sign-in, if it uses one",
+            ),
         ),
+        free_form_url=True,
         # Untestable: a URL, login and password name no mechanism (form POST with CSRF, SSO, Basic?), and a
         # guessed one would red working credentials.
         testable=False,
@@ -937,11 +1158,11 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
         # sends the key alone (defaulting to `Bearer` would make `Authorization: <key>` inexpressible). The
         # prefix is a scheme word and the space is supplied (`_is_transmittable` rejects edge whitespace). Both
         # `text`: they authorize nothing and are the fields most likely to be wrong.
-        # Base URL is optional and has no default: a key used by an in-product consumer (reCAPTCHA, Gmail)
+        # The URL is optional and has no default: a key used by an in-product consumer (reCAPTCHA, Gmail)
         # names no host. Blank, Test refuses (`testers.py::test_generic_api_key`) and the secret seals under
         # `""` (`sealing_destination`); filling it later asks for the key again.
         fields=(
-            FieldSpec("base_url", "Base URL", "url", False, "https://api.example.com"),
+            FieldSpec("base_url", "URL", "url", False, "https://api.example.com", outright=True),
             FieldSpec("api_key", "API key", "secret", True),
             # Validated at write and test time from one home each: `testers.py::_header_name_clause` and
             # `::_value_prefix_clause`, dispatched by `write_time_problem` for `_validated_value`. Runners build
@@ -956,9 +1177,24 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
             ),
         ),
         # Testable with a weak claim: green means the host accepted the request, not that the key is valid
-        # (`testers.py::test_generic_api_key`).
+        # (`testers.py::test_generic_api_key`). Only an http(s) Base URL can be tested; any other still saves.
         testable=True,
+        free_form_url=True,
     ),
+}
+
+#: The generic types, LAST in dropdown order: the fallback a member meets after every vendor's own type
+#: (`integrations/catalog.py` keeps them last when it adds the catalog's derived types).
+GENERIC_FALLBACK_TYPES: tuple[str, ...] = ("generic_login", "generic_api_key")
+
+
+#: SYSTEM rows another page owns, `{type: where to remove it}`: the Secrets delete refuses them
+#: (`routes/credentials/writes.py::delete_credentials`) while their owner still points at them, because removing one
+#: there would leave the owner pointing at nothing - a Gmail mailbox is deleted with its credential by Disconnect.
+MANAGED_ELSEWHERE: dict[str, str] = {
+    "gmail_oauth": "Disconnect it in Settings › Organizations › Email.",
+    "gmail_service_account": "Disconnect it in Settings › Organizations › Email.",
+    "slack_workspace": "Disconnect it in Settings › Organizations › Slack.",
 }
 
 
@@ -966,8 +1202,9 @@ CREDENTIAL_TYPES: dict[str, CredentialTypeSpec] = {
 #: feature neither lists nor accepts the type (`routes/credentials/credential_wire.py::in_edition`). Data only: this
 #: module imports nothing of the app (the node's redactor loads it by path).
 TYPE_FEATURES: dict[str, str] = {
-    "slack": "slack", "telegram_bot": "telegram", "headscale": "tailnet", "stripe": "billing",
-    "email_unsubscribe_secret": "system_mail",
+    "slack": "slack", "slack_workspace": "slack", "telegram_bot": "telegram", "headscale": "tailnet",
+    "stripe": "billing", "email_unsubscribe_secret": "system_mail", "gmail_oauth": "tenant_mail",
+    "gmail_service_account": "tenant_mail",
 }
 
 
@@ -982,10 +1219,21 @@ def field_keys(slug: str) -> tuple[str, ...]:
 
     Schema only, never a row's content, so it is safe to serve to runners, which need a field name for
     `routes/agent_project_settings.py::AgentEnvVarWriteIn.credential_field` without pulling secrets via
-    `task.credential_get`. An unknown slug declares nothing (`()`), the safe direction.
+    `credential.get`. An unknown slug declares nothing (`()`), the safe direction.
     """
     spec = CREDENTIAL_TYPES.get(slug)
     return tuple(field.key for field in spec.fields) if spec is not None else ()
+
+
+#: The config key a custom connector's connection names its connector by (`integrations/custom.py`).
+CUSTOM_CONNECTOR_ID_KEY = "custom_connector_id"
+
+#: Undeclared config keys a type's row may carry that are NOT secret: a link the server writes, never a form field
+#: (so no form shows or edits it; a Secrets PATCH keeps it, `credential_wire.py::_merged_config`).
+_LINK_KEYS: dict[str, frozenset[str]] = {
+    slug: frozenset({CUSTOM_CONNECTOR_ID_KEY})
+    for slug in ("generic_api_key", "generic_login", "oauth2_client", "mcp_server")
+}
 
 
 def secret_keys(slug: str, config: Optional[Mapping[str, Any]] = None) -> frozenset[str]:
@@ -1002,7 +1250,7 @@ def secret_keys(slug: str, config: Optional[Mapping[str, Any]] = None) -> frozen
     declared = {field.key for field in spec.fields}
     return frozenset(
         [field.key for field in spec.fields if field.kind == "secret"]
-        + [key for key in (config or ()) if key not in declared]
+        + [key for key in (config or ()) if key not in declared and key not in _LINK_KEYS.get(slug, ())]
     )
 
 

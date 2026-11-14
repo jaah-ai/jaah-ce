@@ -2,24 +2,25 @@ import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'rea
 import { Link as RouterLink, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import FormControlLabel from '@mui/material/FormControlLabel'
 import MuiLink from '@mui/material/Link'
 import Stack from '@mui/material/Stack'
-import Switch from '@mui/material/Switch'
 import Typography from '@mui/material/Typography'
-import { ApiError, apiDetail, get, post, put } from '../../api'
+import { ApiError, get, post, put } from '../../api'
 import { currentOrgId, useAuth } from '../../auth'
 import { useActAsRows } from '../../lib/actAs'
 import { customerUrl } from '../../lib/customers'
 import { PLAN_PAGE } from '../../lib/companySetup'
 import { isOrgAdminSeat } from '../../lib/orgAdmin'
 import { useDirectoryTabs } from '../../lib/directoryTabs'
+import { countOf } from '../../lib/humanize'
 import AccessTab from '../../components/access/AccessTab'
 import Breadcrumb from '../../components/Breadcrumb'
 import { useChangeOrgAction } from '../../components/ChangeOrgDialog'
 import { TabPanel, Tabs, type TabDef } from '../../components/Tabs'
 import { useAgentProviders } from '../../hooks/useAgentProviders'
-import { useApiRead } from '../../hooks/useApiRead'
+import { useQuery } from '@tanstack/react-query'
+import { useEditRecord } from '../../hooks/useEditRecord'
+import { useLeaveGuard } from '../../hooks/useLeaveGuard'
 import { useEventStream } from '../../hooks/useEventStream'
 import { useSubmit } from '../../hooks/useSubmit'
 import { useUrlTab } from '../../hooks/useUrlTab'
@@ -27,44 +28,53 @@ import { isAuthRejected } from '../../lib/quota'
 import { createSealKeyPair, exportPeerKey, seal, unseal } from '../../lib/loginSeal'
 import { shortNode } from '../../lib/nodeName'
 import { safeHref } from '../../lib/safeHref'
-import { PROVISION_POLL_MS } from '../../lib/provisionPoll'
+import { PROVISION_POLL_MS } from '../../lib/pollIntervals'
 import type {
   Account, AccountAuthKind, ClaudeAccount, ClaudeResources, Command, ProviderChoice, ProvisioningRecord,
-  SettingsPayload,
 } from '../../types'
 /* Provider facts imported from `types.ts` (each points to `apps/jaahd/agent_providers.py`), never
 spelled as literals here. */
 import { PASTE_CODE } from '../../types'
+import { AUTH_KIND_LABEL } from '../../lib/authKindLabel'
 import { defaultProviderOf, hiddenProviders, isDefaultProvider } from '../../lib/providerCatalogue'
 import AdvancedSection from '../../ui/AdvancedSection'
 import AuthorizeLink from '../../ui/AuthorizeLink'
+import { ChoiceField, type Choice } from '../../ui/ChoiceField'
 import Banner from '../../ui/Banner'
 /* The device-auth code's copy affordance, the same primitive `ui/AuthorizeLink` uses for the URL. */
-import CopyableValue from '../../ui/CopyableValue'
+import { CopyableValue } from '../../ui/CopyableValue'
 import { DetailCell, DetailField, DetailPage } from '../../ui/detail/DetailPage'
+import DetailStatus from '../../ui/detail/DetailStatus'
+import { FactsGrid } from '../../ui/FactsGrid'
 import EmptyState from '../../ui/EmptyState'
-import NotFoundState from '../../ui/NotFoundState'
-import { ResourceRefusal } from '../NoAccess'
 import FieldRow from '../../ui/FieldRow'
+import FormBox from '../../ui/FormBox'
 import FormActionBar from '../../ui/FormActionBar'
+import { EntityNameField } from '../../ui/EntityNameFields'
 import FormTextField from '../../ui/FormTextField'
-import InfoTip from '../../ui/InfoTip'
-import { PHONE, tapTargetSx } from '../../ui/listStyles'
+import type { Explain, HelpProp } from '../../ui/explain'
+import HelpLabel from '../../ui/HelpLabel'
+import { FONT_WEIGHT, LETTER_SPACING, LINE_HEIGHT, grid } from '../../theme'
+import { tapTargetSx } from '../../ui/listStyles'
 import { ActingForNotice, useOtherOrg } from '../../ui/OrgIndicator'
 import LoadingState from '../../ui/LoadingState'
 import MetaRow, { MetaActors } from '../../ui/MetaRow'
 import SectionCard from '../../ui/SectionCard'
 import SettingCheckbox from '../../ui/SettingCheckbox'
 import SubmitButton from '../../ui/SubmitButton'
+import EnableToggle from '../../ui/EnableToggle'
+import { LeaveGuardDialog } from '../../ui/UnsavedChangesDialog'
 import {
-  accountEditPath, ACCOUNTS_PATH, AUTO_ASSIGN_HINT, dropPendingDispatch, fetchNodeChoices, holdPendingDispatch,
-  isApiKeyOnly, MAX_RUNNERS_HINT, nonBaaSurfaceFor, MAX_RUNNERS_INVALID, type NodeChoice,
-  parseMaxRunners, pendingDispatchFailure, slugOf, takePendingDispatch, dispatchBody, useCanLogIn,
+  accountEditPath, ACCOUNTS_PATH, applyPendingDispatch, AUTO_ASSIGN_HINT, dropPendingDispatch, fetchNodeChoices, holdPendingDispatch,
+  MAX_RUNNERS_HINT, MAX_RUNNERS_TIP, AUTO_ASSIGN_TIP, MAX_RUNNERS_HINT_API_KEY, takesRunnerCap, nonBaaSurfaceFor, MAX_RUNNERS_INVALID, type NodeChoice,
+  parseMaxRunners, SIGN_IN_NEEDS_PROJECT, slugOf, useCanAddAccount, useCanLogIn, useCanSignInNewAccount,
   hasInlineCode, withInlineCode,
 } from './accountModel'
-import { setAccountEnabled } from './api'
-import { useExportAccountAction } from './AccountTransfer'
-import OtherOrgGate from '../../components/OtherOrgGate'
+import { getResources, listAccounts, setAccountEnabled } from './api'
+import { fetchSettings, SETTINGS_QUERY_KEY } from '../settings/KnobSection'
+import { ImportAccountForm, useExportAccountAction } from './AccountTransfer'
+import OwnershipRadios from './OwnershipRadios'
+import OwnerMemberLookup, { type OwnerMember } from './OwnerMemberLookup'
 import NonBaaWarning from '../../components/NonBaaWarning'
 import AccountCapLine from '../ce/AccountCapLine'
 import { isEnabled } from '../../lib/editionFeatures'
@@ -90,13 +100,8 @@ import { type CapRefusal, capRefusal, useCeLimits } from '../../lib/communityEdi
  *   · every login verb is `system:create` (`accountModel.ts::LOGIN_PERMISSION`).
  */
 
-/* The page's column: three short fields share a row at desktop width, one per row at the phone (`STACK_SX`). */
-const PAGE_MEASURE_SX = { maxWidth: '48rem' } as const
-/* A row's short fields one per line at the phone. Provider · Authentication are the exception: narrow enough to share
-   a 448px line (`PAIR_BASIS`), wrapping only below it. */
-const STACK_SX = { [PHONE]: { flexBasis: '100%' } } as const
-const PAIR_BASIS = '10rem'
-const ROW_GAP = '0.75rem'
+/* The page's column. */
+const PAGE_MEASURE_SX = { maxWidth: grid(128) } as const
 
 /* The ways the sealed handoff dead-ends on this page, said once. All end in "Start again": the
  * next Start mints a new key pair and the control plane cancels the old attempt. `SEAL_LOST` is keyed by
@@ -328,34 +333,53 @@ export const AWAIT_RETRY_LIMIT = 6
 const AWAIT_RETRY_MAX_GAP_MS = 30_000
 
 /* ── Hover copy: one line each, a fact rather than a definition ── */
-const PROVIDER_HELP = 'Fixed once created.'
+const ACCOUNTS_DOCS = 'using-jaah/model-accounts/how-model-accounts-work'
+const AUTH_KIND_HELP: Explain = { tip: 'Sets sign-in, billing and quota; fixed once created.', docs: ACCOUNTS_DOCS }
 const AUTH_HELP: Record<AccountAuthKind, string> = {
-  oauth: 'A person signs in to a subscription on a node; the account reports its plan quota.',
-  api_key: 'A key held in the credential broker. No login, no node, no quota — billed per token.',
+  oauth: 'A person signs in per node; reports the plan quota.',
+  api_key: 'Stored key: any node, no quota, billed per token.',
 }
-const API_KEY_NEW_HELP = 'Stored in the credential broker, sent once and never shown again.'
+const PROVIDER_HELP = 'Which agent runs this account’s tasks; fixed once created.'
+const API_KEY_NEW_HELP = 'Held by the credential broker; never shown again.'
 /* An edit's key field is empty on every open (never read back); the placeholder says what blank means. */
 const API_KEY_KEEP_PLACEHOLDER = 'Stored — leave blank to keep'
 const API_KEY_ABSENT_PLACEHOLDER = 'No key stored'
-const FIXED_HELP = 'Fixed once created.'
+/* An Anthropic key not scoped to a workspace needs one named on every request. A UX mirror of the one home,
+`apps/jaahd/account_auth.py::is_valid_workspace_id`, which the API enforces; it rides a header, so no whitespace. */
+const WORKSPACE_ID_RE = /^wrkspc_[A-Za-z0-9]+$/
+const WORKSPACE_ID_HELP = 'Sent with every request by a key without a workspace.'
+const WORKSPACE_ID_INVALID = 'Starts with wrkspc_, then letters and digits.'
+const workspaceIdValid = (v: string) => !v.trim() || WORKSPACE_ID_RE.test(v.trim())
+const SLUG_HELP = 'Picked by Jaah; names the sign-in’s folder on each node.'
+/* An enrolment on the node its link names. */
+const ENROL_NODE_HELP = 'This node gets its own sign-in for the account.'
 /* "Add to node" from the Models page: an enrolment that picks its node among those the account is not on. */
-const ADD_NODE_HELP = 'Nodes this account is not on yet. The session stays on that node.'
+const ADD_NODE_HELP: Explain = {
+  tip: 'Adds a sign-in on this node; it stays there.',
+  more: 'Only nodes the account is not on yet are listed.',
+}
+/* The '' node option: no `node_id`, the API places the login (`default_dispatch_node`). */
+const AUTO_NODE_HELP = 'Jaah places the sign-in on the default node.'
 
 /* The node hover: where the login runs. A `node_pinned` provider keeps its credential on that node, and a
  * provider whose CLI must be attested lists only nodes reporting it (`addLoginNodes`). */
-function addNodeHelp(provider: ProviderChoice | null): string {
-  const where = provider?.node_pinned
-    ? 'The credential stays on this node; another node needs its own login.'
+function addNodeHelp(provider: ProviderChoice | null): HelpProp {
+  const tip = provider?.node_pinned
+    ? 'Credential stays on this node; other nodes need own sign-in.'
     : 'The login runs on this node.'
-  return provider?.needs_attested_binary ? `${where} Only nodes reporting \`${provider.binary}\` are listed.` : where
+  return provider?.needs_attested_binary ? { tip, more: `Only nodes reporting \`${provider.binary}\` are listed.` } : tip
 }
-const REAUTH_NODE_HELP = 'Sessions are per node and do not transfer.'
+const REAUTH_NODE_HELP = 'Signs in again on this node; sessions don’t transfer.'
 /* The two reasons the node list offers nothing to choose, as the disabled option's hover. */
-const NODES_UNREAD_HELP =
-  'The node list did not load (reading it needs the Nodes permission), so the node is chosen automatically '
-  + 'and the account is pinned there. Reload to choose.'
-const NODES_EMPTY_HELP =
-  'No node is visible to you, so the node is chosen automatically and the account is pinned there.'
+const NODES_UNREAD_HELP: Explain = {
+  tip: 'Node list unavailable; Jaah chooses the node and pins it.',
+  more: 'The node list did not load (reading it needs the Nodes permission), so the node is chosen automatically '
+    + 'and the account is pinned there. Reload to choose.',
+}
+const NODES_EMPTY_HELP: Explain = {
+  tip: 'No visible node; Jaah chooses one and pins the account.',
+  more: 'No node is visible to you, so the node is chosen automatically and the account is pinned there.',
+}
 
 /* ── Which node a login lands on ──
  * `addLoginNodes`: the nodes a NEW account's login may run on — the whole fleet, less nodes whose OS cannot run
@@ -422,35 +446,18 @@ function binaryAttestationWarning(nodes: NodeChoice[], nodeId: string, provider:
     + `this login. ${remedy}`
 }
 
-/* The fleet limit a blank cap falls back to (`max_runners_per_account`), for the placeholder. Best-effort:
- * `GET /api/settings` is `system:view`; without it the placeholder names no number. */
-function useFleetRunnerLimit(): number | null {
+/* The org default a subscription account's blank cap falls back to (`max_runners_per_account`), for the
+ * placeholder. Best-effort: `GET /api/settings` is `system:view`; without it the placeholder names no number. */
+function useOrgRunnerLimit(): number | null {
   // The error is dropped: the placeholder names no number.
-  const { data } = useApiRead(['account-edit-runner-limit'], () => get<SettingsPayload>('/api/settings').then(payload => {
-    const value = payload?.settings?.find(k => k.key === 'max_runners_per_account')?.value
-    return typeof value === 'number' ? value : null
-  }), '')
-  return data
+  const { data } = useQuery({ queryKey: SETTINGS_QUERY_KEY, queryFn: fetchSettings })
+  const value = data?.settings?.find(k => k.key === 'max_runners_per_account')?.value
+  return typeof value === 'number' ? value : null
 }
 
 /* ══ The rows ══════════════════════════════════════════════════════════════════════════════════════
  * Each a `FormTextField` (label + hover help + the one error slot) around a native select or a text field.
  * Native selects: on a phone the platform's own picker, and the suite reads `.value`. */
-
-/* An existing account's slug: shown, never editable (a rename would move a live credential dir). A new
- * account has none to show: the server draws it (`apps/api/app/account_slug.py`). */
-function SlugField({ value }: { value: string }) {
-  return (
-    <FormTextField
-      label="Slug"
-      id="account-slug"
-      value={value}
-      onChange={() => {}}
-      disabled
-      slotProps={{ htmlInput: { spellCheck: false, autoCapitalize: 'none' } }}
-    />
-  )
-}
 
 /* The account's label (`accounts.name`). Optional on an add (blank shows the slug); an edit cannot blank it. */
 function NameField({ value, onChange, disabled, required }: {
@@ -461,10 +468,10 @@ function NameField({ value, onChange, disabled, required }: {
 }) {
   const blank = !!required && value.trim() === ''
   return (
-    <FormTextField
-      label="Name"
+    <EntityNameField
+      help={required ? 'Shown wherever the account appears.' : 'Shown wherever the account appears. Blank: the slug.'}
       error={blank ? 'Required' : undefined}
-      required={required}
+      required={!!required}
       id="account-name"
       value={value}
       disabled={disabled}
@@ -486,16 +493,17 @@ function DescriptionField({ value, onChange, disabled, readOnly }: {
 }) {
   if (readOnly) {
     return (
-      <Box component="dl" sx={{ m: 0 }}>
+      <FactsGrid line>
         <DetailField label="Description" testId="account-description-readonly">
           {withInlineCode(value || '—')}
         </DetailField>
-      </Box>
+      </FactsGrid>
     )
   }
   return (
     <FormTextField
       label="Description"
+      help="Shown on the Agents list; backticked text renders as code."
       id="account-description"
       value={value}
       disabled={disabled}
@@ -536,16 +544,15 @@ function ProviderField({ value, onChange, providers, disabled, locked, fallbackL
 
 /* Why New account offers fewer providers than the catalogue lists: the org's provider grid (the plan
 term `providers`) leaves out every auth kind they have — the API's `allowed_auth_kinds`. One muted line, the count
-and the way out (`PlanRemedy`); the names, each with the auth kinds it has, in the tip. */
+and the way out (`PlanRemedy`); the names, each with the auth kinds it has, on the count's hover. */
 function HiddenProvidersNote({ providers }: { providers: ProviderChoice[] }) {
   const hidden = hiddenProviders(providers)
   if (hidden.length === 0) return null
-  const labels = hidden.map(row => `${row.label} (${row.auth_kinds.map(kind => AUTH_LABEL[kind]).join(' or ')})`)
+  const labels = hidden.map(row => `${row.label} (${row.auth_kinds.map(kind => AUTH_KIND_LABEL[kind]).join(' or ')})`)
   const names = labels.length < 2 ? labels.join('') : `${labels.slice(0, -1).join(', ')} and ${labels.at(-1)}`
   return (
     <Typography variant="body2" data-testid="hidden-providers" sx={{ color: 'text.secondary' }}>
-      {hidden.length} more {hidden.length > 1 ? 'providers' : 'provider'}
-      <InfoTip label="Which providers" title={names} testId="hidden-providers-names" />
+      <HelpLabel label={`${hidden.length} more ${hidden.length > 1 ? 'providers' : 'provider'}`} help={names} />
       {' '}{hidden.length > 1 ? 'are' : 'is'} {isEnabled('billing') ? 'not on your plan' : 'off'}. <PlanRemedy />
     </Typography>
   )
@@ -556,37 +563,20 @@ Billing; anyone else, whom to ask (`lib/planSwitches::NotOnPlan` words it the sa
 function PlanRemedy() {
   const { admin } = useAuth()
   // No plan on one machine: its one user turns providers on in Settings.
-  if (!isEnabled('billing')) return <MuiLink component={RouterLink} to="/settings?area=providers" sx={{ fontWeight: 600 }}>Turn on in Providers</MuiLink>
+  if (!isEnabled('billing')) return <MuiLink component={RouterLink} to="/settings?area=providers" sx={{ fontWeight: FONT_WEIGHT.semibold }}>Turn on in Providers</MuiLink>
   const orgId = admin?.is_operator === true ? currentOrgId(admin) : null
   if (orgId) {
-    return <MuiLink component={RouterLink} to={customerUrl(orgId, { tab: 'overrides', query: { overrides: 'providers' } })} sx={{ fontWeight: 600 }}>Turn on in Overrides</MuiLink>
+    return <MuiLink component={RouterLink} to={customerUrl(orgId, { tab: 'overrides', query: { overrides: 'providers' } })} sx={{ fontWeight: FONT_WEIGHT.semibold }}>Turn on in Overrides</MuiLink>
   }
   return isOrgAdminSeat(admin)
-    ? <MuiLink component={RouterLink} to={PLAN_PAGE} sx={{ fontWeight: 600 }}>Change plan</MuiLink>
+    ? <MuiLink component={RouterLink} to={PLAN_PAGE} sx={{ fontWeight: FONT_WEIGHT.semibold }}>Change plan</MuiLink>
     : <>Ask an admin to change the plan.</>
 }
 
 /* Who owns a new account (G2): the org, or the creating admin alone. Offered to an org admin only. */
 type Ownership = 'org' | 'personal'
-
-function OwnershipField({ value, onChange, disabled }: {
-  value: Ownership
-  onChange: (value: Ownership) => void
-  disabled?: boolean
-}) {
-  return (
-    <FormTextField
-      label="Owner"
-      id="account-ownership"
-      value={value}
-      disabled={disabled}
-      onChange={v => onChange(v === 'personal' ? 'personal' : 'org')}
-      options={[{ value: 'org', label: 'Organization' }, { value: 'personal', label: 'Personal' }]}
-    />
-  )
-}
-
-const AUTH_LABEL: Record<AccountAuthKind, string> = { oauth: 'Subscription', api_key: 'API key' }
+// Drawn in `OWNERSHIP_OPTIONS` order (Personal first); `org` stays the default value.
+const ACCOUNT_OWNERS: readonly Ownership[] = ['personal', 'org']
 
 function AuthKindField({ value, onChange, kinds, disabled }: {
   value: AccountAuthKind
@@ -599,13 +589,13 @@ function AuthKindField({ value, onChange, kinds, disabled }: {
   return (
     <FormTextField
       label="Authentication"
-      help={AUTH_HELP[value]}
+      help={AUTH_KIND_HELP}
       id="account-auth-kind"
       value={value}
       disabled={disabled || options.length < 2}
       /* Fail closed on an unrecognised value: a new kind without an arm here lands on 'oauth'. */
       onChange={v => onChange?.(v === 'api_key' ? 'api_key' : 'oauth')}
-      options={options.map(k => ({ value: k, label: AUTH_LABEL[k] }))}
+      options={options.map(k => ({ value: k, label: AUTH_KIND_LABEL[k], help: AUTH_HELP[k] }))}
     />
   )
 }
@@ -619,10 +609,10 @@ function NodeField({ value, onChange, nodes, disabled, help, allowUnpinned, empt
   onChange: (v: string) => void
   nodes: NodeChoice[]
   disabled?: boolean
-  help: string
+  help: HelpProp
   allowUnpinned?: boolean
   /** The hover when `nodes` is empty. */
-  emptyHelp?: string
+  emptyHelp?: HelpProp
 }) {
   const empty = nodes.length === 0
   return (
@@ -633,16 +623,15 @@ function NodeField({ value, onChange, nodes, disabled, help, allowUnpinned, empt
       value={empty ? '' : value}
       onChange={onChange}
       disabled={disabled || empty}
-      select
-    >
-      {(allowUnpinned || empty) && <option value="">Chosen automatically</option>}
-      {nodes.map(n => (
-        // Short name only when unambiguous (two domains can shorten to one host name).
-        <option key={n.node_id} value={n.node_id}>
-          {nodes.filter(o => shortNode(o.name) === shortNode(n.name)).length > 1 ? n.name : shortNode(n.name)}
-        </option>
-      ))}
-    </FormTextField>
+      options={[
+        ...(allowUnpinned || empty ? [{ value: '', label: 'Chosen automatically', help: AUTO_NODE_HELP }] : []),
+        ...nodes.map(n => ({
+          value: n.node_id,
+          // Short name only when unambiguous (two domains can shorten to one host name).
+          label: nodes.filter(o => shortNode(o.name) === shortNode(n.name)).length > 1 ? n.name : shortNode(n.name),
+        })),
+      ]}
+    />
   )
 }
 
@@ -672,29 +661,51 @@ function ApiKeyField({ value, onChange, disabled, label, placeholder, required }
   )
 }
 
-function MaxRunnersField({ value, onChange, disabled }: {
+function WorkspaceIdField({ value, onChange, disabled }: {
+  value: string
+  onChange: (v: string) => void
+  disabled?: boolean
+}) {
+  return (
+    <FormTextField
+      label="Workspace ID"
+      help={WORKSPACE_ID_HELP}
+      error={workspaceIdValid(value) ? undefined : WORKSPACE_ID_INVALID}
+      id="account-workspace-id"
+      value={value}
+      placeholder="wrkspc_…"
+      disabled={disabled}
+      onChange={onChange}
+    />
+  )
+}
+
+function MaxRunnersField({ value, onChange, disabled, apiKey }: {
   value: string
   onChange: (value: string) => void
   disabled?: boolean
+  /** An API-key account: a blank cap means no limit, not the org default. */
+  apiKey: boolean
 }) {
-  const fleetLimit = useFleetRunnerLimit()
+  const orgLimit = useOrgRunnerLimit()
   const invalid = parseMaxRunners(value) === undefined
+  const placeholder = apiKey ? 'No limit' : orgLimit != null ? `Org default: ${orgLimit}` : 'Org default'
   return (
     <FormTextField
       label="Max runners"
-      help={MAX_RUNNERS_HINT}
+      help={{ tip: MAX_RUNNERS_TIP, more: apiKey ? MAX_RUNNERS_HINT_API_KEY : MAX_RUNNERS_HINT, docs: ACCOUNTS_DOCS }}
       error={invalid ? MAX_RUNNERS_INVALID : undefined}
       id="account-max-runners"
       value={value}
       disabled={disabled}
       onChange={onChange}
-      placeholder={fleetLimit != null ? `Fleet limit: ${fleetLimit}` : 'Fleet limit'}
+      placeholder={placeholder}
       slotProps={{ htmlInput: { inputMode: 'numeric' } }}
     />
   )
 }
 
-/* What this provider cannot do compared with the baseline CLI, as ONE line whose ⓘ holds the itemized list
+/* What this provider cannot do compared with the baseline CLI, as ONE line whose hover holds the list
  * (`capability` — `consequence`, verbatim from the catalogue). Nothing for the baseline (no degradations). */
 function ProviderLimitations({ provider }: { provider: ProviderChoice | null }) {
   if (!provider?.degradations.length) return null
@@ -702,18 +713,11 @@ function ProviderLimitations({ provider }: { provider: ProviderChoice | null }) 
   return (
     <Box data-testid="provider-limitations" sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
       <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-        {n} {n === 1 ? 'limitation' : 'limitations'} vs Claude Code
+        <HelpLabel
+          label={`${countOf(n, 'limitation')} vs Claude Code`}
+          help={provider.degradations.map(d => `${d.capability} — ${d.consequence}`).join('; ')}
+        />
       </Typography>
-      <InfoTip
-        label={`What a runner cannot do on ${provider.label}`}
-        title={(
-          <Box component="ul" sx={{ m: 0, pl: 2 }}>
-            {provider.degradations.map(d => (
-              <li key={d.key} data-testid="provider-degradation"><strong>{d.capability}</strong> — {d.consequence}</li>
-            ))}
-          </Box>
-        )}
-      />
     </Box>
   )
 }
@@ -724,29 +728,29 @@ function nonBaselineRow(providerRow: ProviderChoice | null): ProviderChoice | nu
 }
 
 /* Auto-assign + Max runners (`maxRunners` null = no per-account cap), then the provider's limitations. */
-function DispatchFields({ dispatch, autoAssign, onAutoAssign, maxRunners, onMaxRunners, locked, providerRow, limitations = true }: {
+function DispatchFields({ dispatch, autoAssign, onAutoAssign, maxRunners, onMaxRunners, apiKey, locked, providerRow, limitations = true }: {
   dispatch: boolean; autoAssign: boolean; onAutoAssign: (value: boolean) => void; maxRunners: string | null
-  onMaxRunners: (value: string) => void; locked: boolean; providerRow: ProviderChoice | null
+  onMaxRunners: (value: string) => void; apiKey: boolean; locked: boolean; providerRow: ProviderChoice | null
   /** Off where the caller shows the provider's limitations itself (New account, outside Advanced). */
   limitations?: boolean
 }) {
   return (
     <>
       {dispatch && (
-        <FieldRow rowGap={ROW_GAP} align="center">
+        <FieldRow rowGap={grid(2)} align="center">
           <DetailCell>
             <SettingCheckbox
               name="account-auto-assign"
               label="Auto-assign"
-              help={AUTO_ASSIGN_HINT}
+              help={{ tip: AUTO_ASSIGN_TIP, more: AUTO_ASSIGN_HINT, docs: ACCOUNTS_DOCS }}
               checked={autoAssign}
               disabled={locked}
               onChange={onAutoAssign}
             />
           </DetailCell>
           {maxRunners !== null && (
-            <DetailCell basis="8rem" max="12rem">
-              <MaxRunnersField value={maxRunners} onChange={onMaxRunners} disabled={locked} />
+            <DetailCell basis={grid(21)} max={grid(32)}>
+              <MaxRunnersField value={maxRunners} onChange={onMaxRunners} disabled={locked} apiKey={apiKey} />
             </DetailCell>
           )}
         </FieldRow>
@@ -757,12 +761,18 @@ function DispatchFields({ dispatch, autoAssign, onAutoAssign, maxRunners, onMaxR
 }
 
 /* The kinds the catalogue offers for `provider`, narrowed to what the ORG allows (`allowed_auth_kinds`,
- * absent = all) and to what this SEAT may create: an API-key account is a `POST /api/accounts` (org admin); a
- * subscription is a login (`system:create`). An unread catalogue row is the baseline's pair. */
-function offeredKinds(provider: ProviderChoice | null, isOrgAdmin: boolean, canLogIn: boolean): AccountAuthKind[] {
+ * absent = all), when this SEAT may add an account at all (`useCanAddAccount`): a key is a `POST /api/accounts`,
+ * a subscription a login (`useCanSignInNewAccount`: it needs a node), each personal for a non-administrator.
+ * An unread catalogue row is the baseline's pair. */
+function offeredKinds(provider: ProviderChoice | null, canAdd: boolean, canSignIn: boolean): AccountAuthKind[] {
+  if (!canAdd) return []
+  return allowedKinds(provider).filter(k => k === 'api_key' || canSignIn)
+}
+
+function allowedKinds(provider: ProviderChoice | null): AccountAuthKind[] {
   const kinds = provider?.auth_kinds?.length ? provider.auth_kinds : (['oauth', 'api_key'] as AccountAuthKind[])
   const allowed = provider?.allowed_auth_kinds ?? kinds
-  return kinds.filter(k => allowed.includes(k) && (k === 'api_key' ? isOrgAdmin : canLogIn))
+  return kinds.filter(k => allowed.includes(k))
 }
 
 /* ══ The sign-in flow ═════════════════════════════════════════════════════════════════════════════
@@ -933,7 +943,7 @@ function useLoginFlow({ mode, slug: givenSlug, name, nodeId, providerValue, prov
 
     // The vanished-record fallback's probe: 'add' also requires enabled; 'reauth' presence alone.
     async function landedInResources(): Promise<boolean> {
-      const res = await get<ClaudeResources>('/api/resources').catch(() => null)
+      const res = await getResources().catch(() => null)
       if (!res) return false
       const landed = (a: ClaudeAccount) => (
         requirePresentOnNode
@@ -947,7 +957,7 @@ function useLoginFlow({ mode, slug: givenSlug, name, nodeId, providerValue, prov
     async function landedOnTargetNode(): Promise<boolean> {
       const targetNode = requirePresentOnNode || nodeId
       if (!targetNode) return false
-      const res = await get<ClaudeResources>('/api/resources').catch(() => null)
+      const res = await getResources().catch(() => null)
       if (!res) return false
       const acct = res.accounts.find(a => slugOf(a) === slug)
       const node = acct?.nodes?.find(n => n.node_id === targetNode)
@@ -1222,7 +1232,7 @@ function LoginProgress({ flow, doneLabel, autoClose }: { flow: LoginFlow; doneLa
   const showCodeForm = !flow.redirectMode
     && (flow.codeSent || (flow.awaitingCode && !!flow.oauthHref && !flow.sealError))
   return (
-    <Stack spacing={1.75} data-testid="account-sign-in">
+    <Stack spacing={1.5} data-testid="account-sign-in">
       {flow.oauthHref && !terminal && !flow.codeSent && <AuthorizeLink url={flow.oauthHref} label="Authenticate ↗" inline />}
 
       {!terminal && (flow.sealError || flow.offVendor || flow.catalogueLost) && (
@@ -1237,7 +1247,7 @@ function LoginProgress({ flow, doneLabel, autoClose }: { flow: LoginFlow; doneLa
       )}
 
       {flow.redirectMode && (
-        <Stack spacing={0.75}>
+        <Stack spacing={0.5}>
           {flow.deviceCode ? (
             <>
               <Typography variant="body2" sx={{ color: 'text.secondary' }}>
@@ -1248,8 +1258,8 @@ function LoginProgress({ flow, doneLabel, autoClose }: { flow: LoginFlow; doneLa
                 value={flow.deviceCode}
                 copyLabel="Copy code"
                 sx={{
-                  flex: '0 1 auto', pl: '0.5em', pr: '0.35em', py: '0.3em', fontSize: '1.75rem', fontWeight: 700,
-                  letterSpacing: '0.15em', lineHeight: 1.25,
+                  flex: '0 1 auto', pl: 2, pr: 1, py: 1, fontSize: t => t.typography.h5.fontSize, fontWeight: FONT_WEIGHT.bold,
+                  letterSpacing: LETTER_SPACING.caps, lineHeight: LINE_HEIGHT.snug,
                 }}
               />
               <Typography variant="caption" sx={{ color: 'text.secondary' }}>
@@ -1270,15 +1280,15 @@ function LoginProgress({ flow, doneLabel, autoClose }: { flow: LoginFlow; doneLa
       {/* `oauthHref` too: a code is sealed only to a record whose link this page has opened. */}
       {showCodeForm && (
         <Box component="form" id="account-auth-code-form" onSubmit={e => void flow.submitCode(e)}>
-          <Stack spacing={1.25}>
+          <Stack spacing={1}>
             {flow.codeError && <Banner severity="error">{flow.codeError}</Banner>}
             {/* Centred, with the button's `mt` matching the theme's dense field margin (8px top, 4px bottom),
                 so the button's middle meets the input's. */}
-            <FieldRow columnGap="0.5rem" rowGap={ROW_GAP} align="center">
-              <DetailCell basis="16rem" max="28rem">
+            <FieldRow columnGap={grid(1)} rowGap={grid(2)} align="center">
+              <DetailCell basis={grid(42.5)} max={grid(74.5)}>
                 <FormTextField
                   label="Authorization code"
-                  help="Authorize in the browser, then paste the code it shows."
+                  help="Finishes the sign-in; paste the code the browser shows."
                   id="account-auth-code"
                   autoFocus
                   value={flow.code}
@@ -1295,7 +1305,7 @@ function LoginProgress({ flow, doneLabel, autoClose }: { flow: LoginFlow; doneLa
                     variant="contained"
                     color="primary"
                     data-testid="account-login-close"
-                    sx={{ mt: '4px' }}
+                    sx={{ mt: 0.5 }}
                   >
                     Close
                   </Button>
@@ -1304,7 +1314,7 @@ function LoginProgress({ flow, doneLabel, autoClose }: { flow: LoginFlow; doneLa
                     busy={flow.codeSubmitting}
                     busyLabel="Confirming…"
                     disabled={!flow.code.trim()}
-                    sx={{ mt: '4px' }}
+                    sx={{ mt: 0.5 }}
                   >
                     Confirm
                   </SubmitButton>
@@ -1348,31 +1358,89 @@ function LoginActions({ flow }: { flow: LoginFlow }) {
   return <ActionBar cancelLabel={flow.terminal ? 'Close' : flow.redirectMode ? 'Back to accounts (keeps running)' : 'Cancel'} />
 }
 
-/* Apply a new login's held Auto-assign/cap/description once its row exists (`accountModel.ts::holdPendingDispatch`).
- * The roster applies it too, whichever sees the row first; taking it off the store first means once. */
+/* Apply a new login's held Auto-assign/cap/description once its row exists (`accountModel.tsx::applyPendingDispatch`). */
 async function flushPendingDispatch(): Promise<string> {
-  const rows = await get<Account[]>('/api/accounts').catch(() => null)
+  const rows = await listAccounts().catch(() => null)
   if (!rows) return ''
-  const records = Object.fromEntries(rows.map(row => [row.id, row]))
-  for (const { slug, row, wanted } of takePendingDispatch(records)) {
-    const body = dispatchBody(row, wanted)
-    if (!body) continue
-    try {
-      await put(`/api/accounts/${row.id}`, body)
-    } catch (err) {
-      return pendingDispatchFailure(row.name || slug, apiDetail(err, 'the write failed'))
-    }
-  }
-  return ''
+  return (await applyPendingDispatch(Object.fromEntries(rows.map(row => [row.id, row])))).failure
+}
+
+/* ── Shared by the three forms ────────────────────────────────────────────────────────────────────── */
+
+const FORM_SX = { display: 'flex', flexDirection: 'column', gap: 1.5 } as const
+
+/* An existing account's slug, provider and auth kind: shown in their rows, disabled (none has a change path). */
+function LockedIdentityRow({ slug, provider, kind, providers, fallbackLabel }: {
+  slug: string; provider: string; kind: AccountAuthKind; providers: ProviderChoice[]; fallbackLabel?: string
+}) {
+  return (
+    <FieldRow rowGap={grid(2)}>
+      <DetailCell basis={grid(29)}>
+        {/* Never editable: a rename would move a live credential dir. A new account has none to show: the server
+            draws it (`apps/api/app/account_slug.py`). */}
+        <FormTextField
+          label="Slug"
+          help={SLUG_HELP}
+          id="account-slug"
+          value={slug}
+          onChange={() => {}}
+          disabled
+          slotProps={{ htmlInput: { spellCheck: false, autoCapitalize: 'none' } }}
+        />
+      </DetailCell>
+      <DetailCell basis={grid(32)}>
+        <ProviderField value={provider} providers={providers} locked fallbackLabel={fallbackLabel} />
+      </DetailCell>
+      <DetailCell basis={grid(32)}>
+        <AuthKindField value={kind} kinds={[]} disabled />
+      </DetailCell>
+    </FieldRow>
+  )
+}
+
+/* An API-key account's key row and, for the default provider only (`workspaceId` non-null), its workspace row. */
+function ApiKeyRows({ apiKey, onApiKey, workspaceId, onWorkspaceId, disabled, required, placeholder, align }: {
+  apiKey: string; onApiKey: (v: string) => void; workspaceId: string | null; onWorkspaceId: (v: string) => void
+  disabled: boolean; required?: boolean; placeholder?: string; align?: 'center' | 'start'
+}) {
+  return (
+    <>
+      <FieldRow rowGap={grid(2)} align={align}>
+        <DetailCell basis={grid(48)} max={grid(85)}>
+          <ApiKeyField label="API key" value={apiKey} onChange={onApiKey} disabled={disabled} required={required} placeholder={placeholder} />
+        </DetailCell>
+      </FieldRow>
+      {workspaceId !== null && (
+        <FieldRow rowGap={grid(2)}>
+          <DetailCell basis={grid(48)} max={grid(85)}>
+            <WorkspaceIdField value={workspaceId} onChange={onWorkspaceId} disabled={disabled} />
+          </DetailCell>
+        </FieldRow>
+      )}
+    </>
+  )
+}
+
+/* Below the form once a login is polling: its progress, an optional error, and the actions. */
+function LoginTail({ flow, doneLabel, autoClose, error }: { flow: LoginFlow; doneLabel: string; autoClose: boolean; error?: string }) {
+  if (!flow.started || flow.phase !== 'polling') return null
+  return (
+    <>
+      <LoginProgress flow={flow} doneLabel={doneLabel} autoClose={autoClose} />
+      {error && <Banner severity="error">{error}</Banner>}
+      <LoginActions flow={flow} />
+    </>
+  )
 }
 
 /* ══ New account ═══════════════════════════════════════════════════════════════════════════════════ */
 
-function NewAccountForm({ nodes, providers, isOrgAdmin, canLogIn }: {
+function NewAccountForm({ nodes, providers, isOrgAdmin, canAdd, canSignIn }: {
   nodes: NodeChoice[] | null
   providers: ProviderChoice[]
   isOrgAdmin: boolean
-  canLogIn: boolean
+  canAdd: boolean
+  canSignIn: boolean
 }) {
   const navigate = useNavigate()
   /* `null` = untouched, following provider + auth kind ("Claude Code Subscription"), so a new account is never
@@ -1384,7 +1452,7 @@ function NewAccountForm({ nodes, providers, isOrgAdmin, canLogIn }: {
   /* Offered providers: those with at least one kind the org allows and this seat may create. An unread
   catalogue offers the baseline alone. A pick the org does not allow (the default, say) yields to the first
   offered one. */
-  const offeredProviders = providers.filter(p => offeredKinds(p, isOrgAdmin, canLogIn).length > 0)
+  const offeredProviders = providers.filter(p => offeredKinds(p, canAdd, canSignIn).length > 0)
   const providerValue = providers.length === 0 || offeredProviders.some(p => p.value === providerPick)
     ? providerPick
     : offeredProviders[0]?.value ?? providerPick
@@ -1392,22 +1460,28 @@ function NewAccountForm({ nodes, providers, isOrgAdmin, canLogIn }: {
   // Why nothing is offered: the org allows nothing, or this seat may create none of what it allows.
   const orgAllowsNone = !providers.some(p => (p.allowed_auth_kinds ?? p.auth_kinds).length > 0)
   const providerRow = providers.find(p => p.value === providerValue) ?? null
-  const kinds = offeredKinds(providerRow, isOrgAdmin, canLogIn)
-  const [kindPick, setKindPick] = useState<AccountAuthKind | null>(null)
+  const kinds = offeredKinds(providerRow, canAdd, canSignIn)
+  /* The org allows a subscription here, but this member reaches no node to sign it in on. */
+  const signInWithheld = canAdd && !canSignIn && allowedKinds(providerRow).includes('oauth')
+  /* `?auth=api_key` (Jaah AI's "Add an Anthropic API key") lands on the key form, where the provider offers it. */
+  const [params] = useSearchParams()
+  const [kindPick, setKindPick] = useState<AccountAuthKind | null>(() => params.get('auth') === 'api_key' ? 'api_key' : null)
   /* The pick if the provider offers it, else the catalogue's default (OAuth wherever allowed) when offered,
   else the provider's first (a key-only vendor lands on its key). */
   const defaultKind = providerRow?.default_auth_kind
   const kind: AccountAuthKind = kindPick && kinds.includes(kindPick)
     ? kindPick
     : defaultKind && kinds.includes(defaultKind) ? defaultKind : kinds[0] ?? 'oauth'
-  const name = nameEdit ?? `${providerRow?.label ?? 'Claude Code'} ${AUTH_LABEL[kind]}`
+  const name = nameEdit ?? `${providerRow?.label ?? 'Claude Code'} ${AUTH_KIND_LABEL[kind]}`
   const [apiKey, setApiKey] = useState('')
+  const [workspaceId, setWorkspaceId] = useState('')
+  const offersWorkspace = kind === 'api_key' && isDefaultProvider(providerValue)
   const [pickedNode, setPickedNode] = useState('')
   /* `null` = untouched, following the provider's default, so a change of provider re-seeds it. */
   const [autoAssignEdit, setAutoAssignEdit] = useState<boolean | null>(null)
   const autoAssign = autoAssignEdit ?? providerRow?.auto_assign_default ?? true
   const [maxRunners, setMaxRunners] = useState('')
-  const hasCap = !!providerRow?.per_account_runner_cap
+  const hasCap = takesRunnerCap(providerRow, kind)
   const parsedMaxRunners = hasCap ? parseMaxRunners(maxRunners) : null
   /* The settings a login cannot carry (`account_add` writes none: Auto-assign, cap, description) are a
   follow-up `PUT` — an org admin's write — so only that seat is offered them on a subscription add. */
@@ -1455,14 +1529,13 @@ function NewAccountForm({ nodes, providers, isOrgAdmin, canLogIn }: {
 
   const keyEntered = apiKey.trim().length > 0
   const canSubmit = parsedMaxRunners !== undefined && !locked && kinds.length > 0
-    && (kind === 'api_key' ? keyEntered : !addBlocked)
+    && (kind === 'api_key' ? keyEntered && (!offersWorkspace || workspaceIdValid(workspaceId)) : !addBlocked)
 
   const capHit = keyCapRefused ?? flow.capRefused
   /* The community edition's cap, already full: said before anything is typed, in the refusal an add would meet. */
   const capFull = useCeLimits().data?.accounts.refusal ?? null
 
-  async function submit(e: FormEvent) {
-    e.preventDefault()
+  async function submit() {
     if (!canSubmit) return
     if (kind === 'oauth') {
       /* Anything but what the row is born with (Auto-assign on, no cap) is written once the row exists, held
@@ -1486,6 +1559,7 @@ function NewAccountForm({ nodes, providers, isOrgAdmin, canLogIn }: {
       const body: Record<string, unknown> = { auth_kind: 'api_key', api_key: apiKey.trim(), auto_assign: autoAssign }
       if (name.trim()) body.name = name.trim()
       if (description.trim()) body.description = description.trim()
+      if (offersWorkspace && workspaceId.trim()) body.workspace_id = workspaceId.trim()
       if (providerValue && providerValue !== defaultProviderOf(providers)) body.provider = providerValue
       if (parsedMaxRunners != null) body.max_runners = parsedMaxRunners
       if (isOrgAdmin) body.ownership = ownership
@@ -1503,8 +1577,8 @@ function NewAccountForm({ nodes, providers, isOrgAdmin, canLogIn }: {
   }
 
   const nodeRow = (
-    <FieldRow rowGap={ROW_GAP}>
-      <DetailCell basis="16rem" max="26rem">
+    <FieldRow rowGap={grid(2)}>
+      <DetailCell basis={grid(42.5)} max={grid(69)}>
         <NodeField
           value={nodeId}
           onChange={setPickedNode}
@@ -1525,7 +1599,7 @@ function NewAccountForm({ nodes, providers, isOrgAdmin, canLogIn }: {
   if (capFull && !flow.started) return <AccountCapLine refusal={capFull} />
   return (
     <>
-      <Box component="form" onSubmit={e => void submit(e)} noValidate sx={{ display: 'flex', flexDirection: 'column', gap: 1.75 }}>
+      <FormBox onSubmit={submit} sx={FORM_SX}>
         {capHit ? <AccountCapLine refusal={capHit} />
           : (saveError || flow.submitError) && <Banner severity="error">{saveError || flow.submitError}</Banner>}
         {noneOffered && (
@@ -1533,8 +1607,9 @@ function NewAccountForm({ nodes, providers, isOrgAdmin, canLogIn }: {
             {orgAllowsNone ? <>{isEnabled('billing') ? 'No provider is on your plan.' : 'Every provider is off.'} <PlanRemedy /></> : 'You can’t add any allowed account. Ask an admin.'}
           </Banner>
         )}
-        <FieldRow rowGap={ROW_GAP} testId="account-identity-row">
-          <DetailCell basis={PAIR_BASIS}>
+        {/* Provider · Authentication: narrow enough to share one line, wrapping only below it. */}
+        <FieldRow rowGap={grid(2)} testId="account-identity-row">
+          <DetailCell basis={grid(26.5)}>
             <ProviderField
               value={providerValue}
               onChange={pickProvider}
@@ -1543,39 +1618,40 @@ function NewAccountForm({ nodes, providers, isOrgAdmin, canLogIn }: {
               fallbackLabel="Claude Code"
             />
           </DetailCell>
-          <DetailCell basis={PAIR_BASIS}>
+          <DetailCell basis={grid(26.5)}>
             <AuthKindField value={kind} onChange={setKindPick} kinds={kinds} disabled={locked} />
           </DetailCell>
         </FieldRow>
-        <FieldRow rowGap={ROW_GAP}>
-          <DetailCell basis="18rem" max="32rem">
+        <FieldRow rowGap={grid(2)}>
+          <DetailCell basis={grid(48)} max={grid(85)}>
             <NameField value={name} onChange={setName} disabled={nameLocked} />
           </DetailCell>
         </FieldRow>
         {!noneOffered && <HiddenProvidersNote providers={providers} />}
+        {signInWithheld && (
+          <Typography variant="body2" sx={{ color: 'text.secondary' }} data-testid="account-sign-in-needs-project">{SIGN_IN_NEEDS_PROJECT}</Typography>
+        )}
         <ProviderLimitations provider={nonBaselineRow(providerRow)} />
         <NonBaaWarning surface={nonBaaSurfaceFor(providerValue, kind)} />
-        {kind === 'api_key' ? (
-          <FieldRow rowGap={ROW_GAP}>
-            <DetailCell basis="18rem" max="32rem">
-              <ApiKeyField label="API key" value={apiKey} onChange={setApiKey} disabled={locked} required />
-            </DetailCell>
-          </FieldRow>
-        ) : !sharedNode && nodeRow}
+        {kind === 'api_key'
+          ? <ApiKeyRows apiKey={apiKey} onApiKey={setApiKey} workspaceId={offersWorkspace ? workspaceId : null} onWorkspaceId={setWorkspaceId} disabled={locked} required />
+          : !sharedNode && nodeRow}
         {/* A refusal may name a field folded in here (a name too long): open, so the operator can fix it. */}
         <AdvancedSection testId="account-advanced" forceOpen={!!(saveError || flow.submitError)}>
-          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.75, pt: 1 }}>
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, pt: 1 }}>
             {isOrgAdmin && (
-              <FieldRow rowGap={ROW_GAP}>
-                <DetailCell basis="11rem" sx={STACK_SX}>
-                  <OwnershipField value={ownership} onChange={setOwnership} disabled={nameLocked} />
-                </DetailCell>
-              </FieldRow>
+              <OwnershipRadios
+                labelId="account-ownership-label"
+                options={ACCOUNT_OWNERS}
+                value={ownership}
+                onChange={next => setOwnership(next === 'personal' ? 'personal' : 'org')}
+                disabled={nameLocked}
+              />
             )}
             {offersDispatch && <DescriptionField value={description} onChange={setDescription} disabled={locked} />}
             {kind === 'oauth' && sharedNode && nodeRow}
             <DispatchFields dispatch={offersDispatch} autoAssign={autoAssign} onAutoAssign={setAutoAssignEdit} maxRunners={hasCap ? maxRunners : null}
-              onMaxRunners={setMaxRunners} locked={locked} providerRow={providerRow} limitations={false} />
+              onMaxRunners={setMaxRunners} apiKey={kind === 'api_key'} locked={locked} providerRow={providerRow} limitations={false} />
           </Box>
         </AdvancedSection>
         {addBlocked && !flow.started && (
@@ -1586,29 +1662,21 @@ function NewAccountForm({ nodes, providers, isOrgAdmin, canLogIn }: {
             primary={<SubmitButton testId="account-form-submit" disabled={!canSubmit}>{kind === 'api_key' ? (saving ? 'Adding…' : 'Add') : (flow.startInFlight ? 'Starting…' : 'Authenticate ↗')}</SubmitButton>}
           />
         )}
-      </Box>
-      {flow.started && flow.phase === 'polling' && (
-        <>
-          <LoginProgress flow={flow} doneLabel="Account added and enabled." autoClose={dispatchSettled && !dispatchError} />
-          {dispatchError && <Banner severity="error">{dispatchError}</Banner>}
-          <LoginActions flow={flow} />
-        </>
-      )}
+      </FormBox>
+      <LoginTail flow={flow} doneLabel="Account added and enabled." autoClose={dispatchSettled && !dispatchError} error={dispatchError} />
     </>
   )
 }
 
 /* ══ Edit account ══════════════════════════════════════════════════════════════════════════════════
  * `PUT /api/accounts/{id}` carries only what was touched (`exclude_unset`): the record is re-read under the
- * form, so echoing a snapshot would undo another operator's write. Slug,
- * provider and kind are shown in their rows, disabled: none has a change path. */
+ * form, so echoing a snapshot would undo another operator's write. */
 
 function EditAccountForm({ record, providers, readOnly }: {
   record: Account
   providers: ProviderChoice[]
   readOnly: boolean
 }) {
-  const navigate = useNavigate()
   const isApiKey = record.auth_kind === 'api_key'
   const providerRow = providers.find(p => p.value === record.provider) ?? null
   /* `null` = untouched, mirroring the live record; only a change is sent. */
@@ -1617,81 +1685,111 @@ function EditAccountForm({ record, providers, readOnly }: {
   const [descriptionEdit, setDescriptionEdit] = useState<string | null>(null)
   const description = descriptionEdit ?? record.description
   const [apiKeyEdit, setApiKeyEdit] = useState('')
+  const offersWorkspace = isApiKey && isDefaultProvider(record.provider)
+  const [workspaceIdEdit, setWorkspaceIdEdit] = useState<string | null>(null)
+  const workspaceId = workspaceIdEdit ?? record.workspace_id ?? ''
   const [autoAssignEdit, setAutoAssignEdit] = useState<boolean | null>(null)
   const autoAssign = autoAssignEdit ?? record.auto_assign
-  const hasCap = !!providerRow?.per_account_runner_cap
+  const hasCap = takesRunnerCap(providerRow, record.auth_kind)
   /* `null` = untouched: mirrors the live record, and is not sent (another operator's cap change survives). */
   const [maxRunnersEdit, setMaxRunnersEdit] = useState<string | null>(null)
   const maxRunners = maxRunnersEdit ?? (record.max_runners != null ? String(record.max_runners) : '')
   const setMaxRunners = (v: string) => setMaxRunnersEdit(v)
   const parsedMaxRunners = hasCap ? parseMaxRunners(maxRunners) : null
+  /* The type and a personal account's owner; `null` = untouched. */
+  const { admin } = useAuth()
+  const savedOwnership: Ownership = record.ownership === 'personal' ? 'personal' : 'org'
+  const [ownershipEdit, setOwnershipEdit] = useState<Ownership | null>(null)
+  const ownership = ownershipEdit ?? savedOwnership
+  const [ownerEdit, setOwnerEdit] = useState<OwnerMember | null>(null)
+  const owner = ownerEdit ?? (record.owner_id ? { key: record.owner_id, label: record.owner ?? record.owner_id } : null)
   const { busy: saving, formError: saveError, run } = useSubmit()
   const locked = saving || readOnly
   const canSave = !locked && parsedMaxRunners !== undefined && name.trim() !== ''
+    && (!offersWorkspace || workspaceIdValid(workspaceId))
 
-  async function submit(e: FormEvent) {
-    e.preventDefault()
-    if (!canSave) return
-    await run('Failed to save the account', async () => {
-      const body: Record<string, unknown> = {}
-      if (nameEdit !== null && nameEdit.trim() !== record.name) body.name = nameEdit.trim()
-      // `''` clears it; `null` would be dropped server-side as "leave alone".
-      if (descriptionEdit !== null && descriptionEdit.trim() !== record.description) body.description = descriptionEdit.trim()
-      // Blank means unchanged; trimmed, since a pasted trailing newline authenticates nowhere.
-      const rotatedKey = apiKeyEdit.trim()
-      if (isApiKey && rotatedKey) body.api_key = rotatedKey
-      if (autoAssignEdit !== null) body.auto_assign = autoAssignEdit
-      // `null` clears the cap back to the fleet limit.
-      if (hasCap && maxRunnersEdit !== null && parsedMaxRunners !== (record.max_runners ?? null)) {
-        body.max_runners = parsedMaxRunners
-      }
+  /* What a Save sends: only what was touched and differs from the live record. Non-empty is "dirty", which the leave
+     gate asks about. */
+  function changes(): Record<string, unknown> {
+    const body: Record<string, unknown> = {}
+    if (nameEdit !== null && nameEdit.trim() !== record.name) body.name = nameEdit.trim()
+    // `''` clears it; `null` would be dropped server-side as "leave alone".
+    if (descriptionEdit !== null && descriptionEdit.trim() !== record.description) body.description = descriptionEdit.trim()
+    // Blank means unchanged; trimmed, since a pasted trailing newline authenticates nowhere.
+    const rotatedKey = apiKeyEdit.trim()
+    if (isApiKey && rotatedKey) body.api_key = rotatedKey
+    // `''` clears it.
+    if (offersWorkspace && workspaceIdEdit !== null && workspaceIdEdit.trim() !== (record.workspace_id ?? '')) {
+      body.workspace_id = workspaceIdEdit.trim()
+    }
+    if (autoAssignEdit !== null && autoAssignEdit !== record.auto_assign) body.auto_assign = autoAssignEdit
+    if (ownership !== savedOwnership) body.ownership = ownership
+    if (ownership === 'personal' && owner !== null && owner.key !== (record.owner_id ?? null)) {
+      body.ownership = ownership
+      body.owner_user_id = owner.key
+    }
+    // `null` clears the cap back to the org default (a subscription) or no limit (an API key).
+    if (hasCap && maxRunnersEdit !== null && parsedMaxRunners !== (record.max_runners ?? null)) {
+      body.max_runners = parsedMaxRunners
+    }
+    return body
+  }
+  const dirty = !readOnly && Object.keys(changes()).length > 0
+
+  /* The form's Save, and the leave dialog's: true once the write landed (or there was nothing to write). */
+  async function save(): Promise<boolean> {
+    if (!canSave) return false
+    const landed = await run('Failed to save the account', async () => {
+      const body = changes()
       // Nothing touched: nothing to write.
       if (Object.keys(body).length) await put(`/api/accounts/${record.id}`, body)
       setApiKeyEdit('')
-      navigate(ACCOUNTS_PATH)
     })
+    return landed !== null
+  }
+
+  // Leaving with unsaved edits asks first (`hooks/useLeaveGuard`).
+  const guard = useLeaveGuard(dirty, save)
+
+  async function submit() {
+    if (await save()) guard.leaveNow(ACCOUNTS_PATH)
   }
 
   return (
-    <Box component="form" onSubmit={e => void submit(e)} noValidate sx={{ display: 'flex', flexDirection: 'column', gap: 1.75 }}>
+    <FormBox onSubmit={submit} sx={FORM_SX}>
       {saveError && <Banner severity="error">{saveError}</Banner>}
       {readOnly && <Banner severity="info">Read-only — only an administrator can change an account.</Banner>}
-      <FieldRow rowGap={ROW_GAP}>
-        <DetailCell basis="14rem" max="24rem">
+      <FieldRow rowGap={grid(2)}>
+        <DetailCell basis={grid(37)} max={grid(64)}>
           <NameField value={name} onChange={setNameEdit} disabled={locked} required />
         </DetailCell>
       </FieldRow>
-      <FieldRow rowGap={ROW_GAP}>
-        <DetailCell basis="18rem" max="40rem">
+      <FieldRow rowGap={grid(2)}>
+        <DetailCell basis={grid(48)} max={grid(106.5)}>
           <DescriptionField value={description} onChange={setDescriptionEdit} disabled={locked} readOnly={readOnly} />
         </DetailCell>
       </FieldRow>
-      <FieldRow rowGap={ROW_GAP}>
-        <DetailCell basis="11rem">
-          <SlugField value={record.slug} />
-        </DetailCell>
-        <DetailCell basis="12rem">
-          <ProviderField value={record.provider} providers={providers} locked />
-        </DetailCell>
-        <DetailCell basis="12rem">
-          <AuthKindField value={isApiKey ? 'api_key' : 'oauth'} kinds={[]} disabled />
-        </DetailCell>
-      </FieldRow>
-      {isApiKey && (
-        <FieldRow rowGap={ROW_GAP} align="center">
-          <DetailCell basis="18rem" max="32rem">
-            <ApiKeyField
-              label="API key"
-              value={apiKeyEdit}
-              onChange={setApiKeyEdit}
+      {!readOnly && (
+        <FieldRow rowGap={grid(2)}>
+          <DetailCell basis={grid(48)} max={grid(106.5)}>
+            <OwnershipRadios
+              labelId="account-ownership-label"
+              options={ACCOUNT_OWNERS}
+              value={ownership}
+              onChange={next => setOwnershipEdit(next === 'personal' ? 'personal' : 'org')}
               disabled={locked}
-              placeholder={record.api_key_set ? API_KEY_KEEP_PLACEHOLDER : API_KEY_ABSENT_PLACEHOLDER}
+              personalOwner={<OwnerMemberLookup value={owner} onChange={setOwnerEdit} selfId={admin?.id} disabled={locked} />}
             />
           </DetailCell>
         </FieldRow>
       )}
+      <LockedIdentityRow slug={record.slug} provider={record.provider} kind={isApiKey ? 'api_key' : 'oauth'} providers={providers} />
+      {isApiKey && (
+        <ApiKeyRows apiKey={apiKeyEdit} onApiKey={setApiKeyEdit} workspaceId={offersWorkspace ? workspaceId : null} onWorkspaceId={setWorkspaceIdEdit}
+          disabled={locked} placeholder={record.api_key_set ? API_KEY_KEEP_PLACEHOLDER : API_KEY_ABSENT_PLACEHOLDER} align="center" />
+      )}
       <DispatchFields dispatch autoAssign={autoAssign} onAutoAssign={setAutoAssignEdit} maxRunners={hasCap ? maxRunners : null}
-        onMaxRunners={setMaxRunners} locked={locked} providerRow={providerRow} />
+        onMaxRunners={setMaxRunners} apiKey={isApiKey} locked={locked} providerRow={providerRow} />
       {/* Who touched this record (names only: `Account` carries no timestamps). Neither known: a row of two
       em-dashes says nothing, so there is no row. */}
       {(record.created_by || record.updated_by) && (
@@ -1700,7 +1798,8 @@ function EditAccountForm({ record, providers, readOnly }: {
         </MetaRow>
       )}
       <ActionBar primary={readOnly ? undefined : <SubmitButton testId="account-form-submit" busy={saving} disabled={!canSave}>Save</SubmitButton>} />
-    </Box>
+      <LeaveGuardDialog leave={guard} message="This account has changes that have not been saved. Save them before leaving?" />
+    </FormBox>
   )
 }
 
@@ -1764,40 +1863,21 @@ function LoginAccountForm({ slug, enrol, nodeParam, account, record, nodes, prov
 
   return (
     <>
-      <Box
-        component="form"
-        onSubmit={e => { e.preventDefault(); if (!locked) void flow.begin() }}
-        noValidate
-        sx={{ display: 'flex', flexDirection: 'column', gap: 1.75 }}
-      >
+      <FormBox onSubmit={() => { if (!locked) void flow.begin() }} sx={FORM_SX}>
         {flow.submitError && <Banner severity="error">{flow.submitError}</Banner>}
-        <FieldRow rowGap={ROW_GAP}>
-          <DetailCell basis="11rem">
-            <SlugField value={slug} />
-          </DetailCell>
-          <DetailCell basis="12rem">
-            <ProviderField
-              value={providerValue}
-              providers={providers}
-              locked
-              /* Only the default's name is known without the catalogue; any other stored value shows as itself. */
-              fallbackLabel={isDefaultProvider(providerValue) ? 'Claude Code' : undefined}
-            />
-          </DetailCell>
-          <DetailCell basis="12rem">
-            <AuthKindField value="oauth" kinds={[]} disabled />
-          </DetailCell>
-        </FieldRow>
+        {/* Only the default's name is known without the catalogue; any other stored value shows as itself. */}
+        <LockedIdentityRow slug={slug} provider={providerValue} kind="oauth" providers={providers}
+          fallbackLabel={isDefaultProvider(providerValue) ? 'Claude Code' : undefined} />
         <NonBaaWarning surface={nonBaaSurfaceFor(providerValue, 'oauth')} />
-        <FieldRow rowGap={ROW_GAP}>
-          <DetailCell basis="16rem" max="26rem">
+        <FieldRow rowGap={grid(2)}>
+          <DetailCell basis={grid(42.5)} max={grid(69)}>
             <NodeField
               value={nodeId}
               onChange={v => { setNodeTouched(true); setPickedNode(v) }}
               nodes={enrol && !pickEnrol ? enrolNodes : nodeChoices}
               disabled={locked || (enrol && !pickEnrol)}
               allowUnpinned={!enrol}
-              help={pickEnrol ? ADD_NODE_HELP : enrol ? FIXED_HELP : REAUTH_NODE_HELP}
+              help={pickEnrol ? ADD_NODE_HELP : enrol ? ENROL_NODE_HELP : REAUTH_NODE_HELP}
               emptyHelp={nodes === null ? NODES_UNREAD_HELP : NODES_EMPTY_HELP}
             />
           </DetailCell>
@@ -1808,17 +1888,8 @@ function LoginAccountForm({ slug, enrol, nodeParam, account, record, nodes, prov
             primary={<SubmitButton testId="account-form-submit" disabled={locked || (enrol && !nodeId)}>{flow.startInFlight ? 'Starting…' : 'Authenticate ↗'}</SubmitButton>}
           />
         )}
-      </Box>
-      {flow.started && flow.phase === 'polling' && (
-        <>
-          <LoginProgress
-            flow={flow}
-            doneLabel={enrol ? 'Signed in on this node.' : 'Re-login complete — credentials refreshed.'}
-            autoClose={doneWithLogin}
-          />
-          <LoginActions flow={flow} />
-        </>
-      )}
+      </FormBox>
+      <LoginTail flow={flow} doneLabel={enrol ? 'Signed in on this node.' : 'Re-login complete — credentials refreshed.'} autoClose={doneWithLogin} />
     </>
   )
 }
@@ -1831,65 +1902,33 @@ type PageData = {
   nodes: NodeChoice[] | null
 }
 
-/* THE ACCOUNT'S ENABLED SWITCH on its tab strip: on a phone the roster row has no toggle (its ⋯ does),
-   so the page an account opens to reaches the state in one tap. The roster's write (`setAccountEnabled`); flips at
-   once and rolls back with the server's reason on a refusal. An org admin's control, as the roster's toggle. */
-function AccountEnabledSwitch({ record, onChange }: { record: Account; onChange: (enabled: boolean) => void }) {
-  const { busy, formError: error, run } = useSubmit()
-
-  function toggle(next: boolean) {
-    const before = record.enabled
-    onChange(next)
-    return run('Failed to update the account', () => setAccountEnabled(record.id, next), {
-      mapError: (err, fallback) => {
-        onChange(before)
-        return apiDetail(err, fallback)
-      },
-    })
-  }
-
-  return (
-    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}>
-      <FormControlLabel
-        label="Enabled"
-        sx={[{ m: 0, whiteSpace: 'nowrap' }, tapTargetSx]}
-        control={(
-          <Switch
-            size="small"
-            checked={record.enabled}
-            disabled={busy}
-            onChange={event => void toggle(event.target.checked)}
-            slotProps={{ input: { 'data-testid': 'account-enabled' } as object }}
-          />
-        )}
-      />
-      {error && (
-        /* One clipped line, the whole reason on hover: a long refusal must not stretch the tab strip. */
-        <Typography
-          variant="caption"
-          color="error"
-          role="alert"
-          title={error}
-          data-testid="account-enabled-error"
-          sx={{ maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-        >
-          {error}
-        </Typography>
-      )}
-    </Box>
-  )
+async function loadPageData(): Promise<PageData> {
+  const [resources, records, nodes] = await Promise.all([
+    getResources().catch(() => null),
+    listAccounts().catch(() => null),
+    fetchNodeChoices(),
+  ])
+  return { resources, records, nodes }
 }
 
 type AccountTab = 'details' | 'access'
 const ACCOUNT_TABS: readonly TabDef<AccountTab>[] = [{ id: 'details', label: 'Details' }, { id: 'access', label: 'Access' }]
 
+/** New account's two doors: the form here, or a file exported from another console (`AccountTransfer.tsx`). */
+const VIA_CHOICES: readonly Choice<'new' | 'import'>[] = [
+  { value: 'new', label: 'Set up here', help: null, testId: 'account-new-via-new' },
+  { value: 'import', label: 'Import a file', help: 'An account exported from another console', testId: 'account-new-via-import' },
+]
+
 export default function AccountEditPage() {
   const { id, slug: loginSlug } = useParams()
   const location = useLocation()
-  const [params] = useSearchParams()
+  const [params, setParams] = useSearchParams()
   const { admin } = useAuth()
   const isOrgAdmin = isOrgAdminSeat(admin)
   const canLogIn = useCanLogIn()
+  const canAdd = useCanAddAccount()
+  const canSignIn = useCanSignInNewAccount()
   const catalogue = useAgentProviders()
   // The operator's "Change org…": an existing account only, gated inside the hook.
   const changeOrg = useChangeOrgAction('account')
@@ -1900,25 +1939,22 @@ export default function AccountEditPage() {
   const [accountTab, selectAccountTab] = useUrlTab(ACCOUNT_TABS, 'details')
   const nodeParam = params.get('node') ?? ''
 
+  /* Every mode reads the same three lists (each part falls back to null on its own), keyed by the route's id and
+     login slug, so a new one re-reads. The form stays on the last answer until the next lands (`!data` only). */
   const [data, setData] = useState<PageData | null>(null)
-  useEffect(() => {
-    let active = true
-    Promise.all([
-      get<ClaudeResources>('/api/resources').catch(() => null),
-      get<Account[]>('/api/accounts').catch(() => null),
-      fetchNodeChoices(),
-    ]).then(([resources, records, nodes]) => {
-      if (active) setData({ resources, records, nodes })
-    })
-    return () => { active = false }
-  }, [id, loginSlug])
+  useEditRecord(
+    `${id ?? ''}|${loginSlug ?? ''}`,
+    loadPageData,
+    setData,
+    { loadFallback: 'The account list did not load. Reload to try again.' },
+  )
   /* Another operator's write lands under the open form (an `account` event re-reads the records): an
   untouched control mirrors the live row, and nothing untouched is sent back (`EditAccountForm`). */
   const { lastEvent } = useEventStream('/api/stream', ['account'])
   useEffect(() => {
     if (!lastEvent) return
     let active = true
-    get<Account[]>('/api/accounts').then(
+    listAccounts().then(
       records => { if (active) setData(prev => (prev ? { ...prev, records } : prev)) },
       () => { /* keep what the form shows */ },
     )
@@ -1929,7 +1965,7 @@ export default function AccountEditPage() {
     : mode === 'login' ? data?.records?.find(r => r.slug === loginSlug) : undefined
   const account = mode === 'login' ? data?.resources?.accounts.find(a => slugOf(a) === loginSlug) : undefined
   /* Another org's account, for an operator: edited on that org's behalf. Every write below it — Save,
-     the enabled switch, Export — goes as its org for the one request (`lib/actAs.ts::useActAsRows`), the Access tab's
+     the enabled toggle, Export — goes as its org for the one request (`lib/actAs.ts::useActAsRows`), the Access tab's
      grants too (`actAsOnce`), and `ActingForNotice` says so. Change org… stays the operator's own verb. */
   const otherOrg = useOtherOrg(mode === 'edit' ? record?.org : null)
   useActAsRows(mode === 'edit' && record ? [{ path: `/api/accounts/${record.id}`, org: otherOrg }] : [])
@@ -1942,11 +1978,21 @@ export default function AccountEditPage() {
   })
   // Export is an administrator's act: the bundle carries the key (`require_account_writer`).
   const exportAction = useExportAccountAction(mode === 'edit' && isOrgAdmin ? record : undefined)
-  const enabledSwitch = mode === 'edit' && record && isOrgAdmin
-    ? <AccountEnabledSwitch record={record} onChange={setRecordEnabled} />
+  /* On the tab strip: a phone's roster row has no toggle (its ⋯ does), so the account's page reaches it in one tap. */
+  const [enabledError, setEnabledError] = useState('')
+  const enabledToggle = mode === 'edit' && record && isOrgAdmin
+    ? (
+      <EnableToggle
+        enabled={record.enabled}
+        write={next => setAccountEnabled(record.id, next)}
+        onToggled={next => { setEnabledError(''); setRecordEnabled(next) }}
+        onError={setEnabledError}
+        failMessage={next => `Failed to ${next ? 'enable' : 'disable'} the account`}
+      />
+    )
     : null
 
-  const agentsTab = useDirectoryTabs().find(t => t.id === 'agents')
+  const agentsTab = useDirectoryTabs().find(t => t.id === 'accounts')
   const title = mode === 'new' ? 'New account'
     : mode === 'edit' ? record?.name || record?.slug || 'Account'
     : enrol && !nodeParam ? `Add ${record?.name || loginSlug} to a node`
@@ -1957,83 +2003,84 @@ export default function AccountEditPage() {
   /* Rooted at the Directory tab the strip shows (Agents), as People and Secrets' editors are. Its first sub-tab is
      this roster under the same name, so one crumb names both levels and links to the roster itself. */
   const crumbs = (
-    <Breadcrumb items={[{ label: agentsTab?.label ?? 'Agents', to: ACCOUNTS_PATH }, { label: title }]} />
+    <Breadcrumb items={[{ label: agentsTab?.label ?? 'AI Accounts', to: ACCOUNTS_PATH }, { label: title }]} />
   )
 
+  /* Before the record (every mode reads the same lists): loading, the list that did not load, or a missing row —
+     under the trail alone (`ui/detail/DetailStatus`), as the other edit pages. */
+  if (!data || !catalogue.settled) return <DetailStatus trail={crumbs} loading />
+  if (mode === 'edit' && data.records === null) {
+    return <DetailStatus trail={crumbs} error="The account list did not load. Reload to try again." />
+  }
+  if (mode === 'edit' && !record) {
+    return <DetailStatus trail={crumbs} notFound="Account not found" locate={{ objectType: 'account', objectId: id }} />
+  }
+
   /* The record's tabs sit on the page, outside any card. Each panel carries its own card, as `GroupEditPage`'s do. */
-  const tabbed = mode === 'edit' && !!data && catalogue.settled && data.records !== null && !!record
+  const tabbed = mode === 'edit'
   let body: ReactNode
-  if (!data || !catalogue.settled) {
-    body = <LoadingState />
-  } else if (mode === 'new') {
-    body = !canLogIn && !isOrgAdmin
+  if (mode === 'new') {
+    /* Import a file is offered where the roster's Import is (`canLogIn`); the import route decides who may. */
+    const via = canLogIn && params.get('via') === 'import' ? 'import' : 'new'
+    body = !canAdd
       ? <EmptyState title="Not allowed" />
       : (
-        <NewAccountForm
-          nodes={data.nodes}
-          /* The catalogue minus a key-only vendor this seat cannot create a key for (`offeredKinds` filters). */
-          providers={catalogue.rows.filter(p => !isApiKeyOnly(p) || isOrgAdmin)}
-          isOrgAdmin={isOrgAdmin}
-          canLogIn={canLogIn}
-        />
-      )
-  } else if (mode === 'edit') {
-    body = data.records === null
-      ? <Banner severity="error">The account list did not load. Reload to try again.</Banner>
-      : !record
-        ? (
-          <NotFoundState
-            fallback={
-              <ResourceRefusal
-                fallback={
-                  <OtherOrgGate
-                    objectType="account"
-                    objectId={id}
-                    fallback={<EmptyState title="Account not found" />}
-                  />
-                }
-              />
-            }
-          />
-        )
-        : (
-          <>
-            <ActingForNotice org={otherOrg} testId="account-acting-for" />
-            {/* "Change org…" is a record verb, so it sits on the record's tab strip. `compactActions` +
-                `overflowMenu`: the verb stays on the tabs' row while both fit (a 390px phone) and wraps under them only
-                when they do not (an empty compact slot takes no room). */}
-            <Tabs
-              tabs={ACCOUNT_TABS}
-              tab={accountTab}
-              onSelect={selectAccountTab}
-              label="Account sections"
-              idPrefix="account"
-              actions={(enabledSwitch || exportAction.button || changeOrgButton) && (
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                  {enabledSwitch}{exportAction.button}{changeOrgButton}
-                </Box>
-              )}
-              compactActions
-              overflowMenu
-              sticky="default"
+        <Box sx={FORM_SX}>
+          {canLogIn && (
+            <ChoiceField label="Add by" row value={via} options={VIA_CHOICES} testId="account-new-via"
+              onChange={next => setParams(next === 'import' ? { via: 'import' } : {}, { replace: true })} />
+          )}
+          {via === 'import' ? <ImportAccountForm providers={catalogue.rows} /> : (
+            <NewAccountForm
+              nodes={data.nodes}
+              providers={catalogue.rows}
+              isOrgAdmin={isOrgAdmin}
+              canAdd={canAdd}
+              canSignIn={canSignIn}
             />
-            <TabPanel id="details" current={accountTab} idPrefix="account">
-              <Box sx={{ mt: 1 }}>
-                <SectionCard>
-                  <EditAccountForm key={record.id} record={record} providers={catalogue.rows} readOnly={!isOrgAdmin} />
-                </SectionCard>
-              </Box>
-            </TabPanel>
-            {/* Mounted only with its tab: it fetches. */}
-            <TabPanel id="access" current={accountTab} idPrefix="account">
-              <Box sx={{ mt: 1 }}>
-                <SectionCard>
-                  {accountTab === 'access' && <AccessTab scope={{ type: 'account', id: record.id }} otherOrg={otherOrg} />}
-                </SectionCard>
-              </Box>
-            </TabPanel>
-          </>
-        )
+          )}
+        </Box>
+      )
+  } else if (mode === 'edit' && record) {
+    body = (
+      <>
+        <ActingForNotice org={otherOrg} testId="account-acting-for" />
+        {enabledError && <Banner severity="error" testId="account-enabled-error">{enabledError}</Banner>}
+        {/* "Change org…" is a record verb, so it sits on the record's tab strip. `compactActions` +
+            `overflowMenu`: the verb stays on the tabs' row while both fit (a 390px phone) and wraps under them only
+            when they do not (an empty compact slot takes no room). */}
+        <Tabs
+          tabs={ACCOUNT_TABS}
+          tab={accountTab}
+          onSelect={selectAccountTab}
+          label="Account sections"
+          idPrefix="account"
+          actions={(enabledToggle || exportAction.button || changeOrgButton) && (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              {enabledToggle}{exportAction.button}{changeOrgButton}
+            </Box>
+          )}
+          compactActions
+          overflowMenu
+          sticky="default"
+        />
+        <TabPanel id="details" current={accountTab} idPrefix="account">
+          <Box sx={{ mt: 1 }}>
+            <SectionCard>
+              <EditAccountForm key={record.id} record={record} providers={catalogue.rows} readOnly={!isOrgAdmin} />
+            </SectionCard>
+          </Box>
+        </TabPanel>
+        {/* Mounted only with its tab: it fetches. */}
+        <TabPanel id="access" current={accountTab} idPrefix="account">
+          <Box sx={{ mt: 1 }}>
+            <SectionCard>
+              {accountTab === 'access' && <AccessTab scope={{ type: 'account', id: record.id }} otherOrg={otherOrg} />}
+            </SectionCard>
+          </Box>
+        </TabPanel>
+      </>
+    )
   } else {
     body = !canLogIn
       ? <EmptyState title="Not allowed" />

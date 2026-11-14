@@ -26,9 +26,10 @@ def exists(user: str) -> bool:
         return False
 
 
-def group_exists(name: str, gid: int) -> bool:
-    """By NAME or by GID — either one already present means `groupadd` would refuse."""
-    for lookup, key in ((grp.getgrnam, name), (grp.getgrgid, gid)):
+def group_exists(name: str, gid: int | None = None) -> bool:
+    """By NAME or, when `gid` is given, by GID too — either one already present means `groupadd` would refuse."""
+    lookups = [(grp.getgrnam, name)] + ([(grp.getgrgid, gid)] if gid is not None else [])
+    for lookup, key in lookups:
         try:
             lookup(key)
             return True

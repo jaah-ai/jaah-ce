@@ -1,10 +1,17 @@
 /* Standard base64 (RFC 4648 §4, `+`/`/`, padded) over raw bytes — the one wire spelling every seal
- * shares (`loginSeal.ts`, `credentialSeal.ts`, and the test-only `test/sealedSecrets.ts`). `btoa`/`atob`
- * take and give latin-1 strings, so bytes map one char each; nothing here is UTF-8 aware. */
+ * shares (`loginSeal.ts`, `credentialSeal.ts`, and the test-only `test/sealedSecrets.ts`) and a relayed
+ * write's body rides in (`net/relay.ts`). `btoa`/`atob` take and give latin-1 strings, so bytes map one
+ * char each; nothing here is UTF-8 aware. Do not re-add a local copy. */
+
+/* Bytes per `String.fromCharCode.apply` call: well under any engine's argument cap, few enough calls that a
+ * 1 MiB relay body (`net/relay.ts`) does not build its string one char at a time. */
+const CHUNK = 32 * 1024
 
 export function bytesToBase64(bytes: Uint8Array): string {
   let binary = ''
-  for (const b of bytes) binary += String.fromCharCode(b)
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as unknown as number[])
+  }
   return btoa(binary)
 }
 

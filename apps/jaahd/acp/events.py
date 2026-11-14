@@ -106,10 +106,13 @@ except Exception:  # noqa: BLE001 — import-guarded by contract
 
 try:  # the node's one vendor-error classifier (`AcpDialect.vendor_error_text`); missing, no record is refined
     from hooks.break_cause import UNKNOWN as _UNKNOWN_CAUSE, classify_vendor_error as _classify_vendor_error
-    from hooks.break_cause import vendor_message as _vendor_message
+    from hooks.break_cause import vendor_message as _vendor_message, workspace_detail as _workspace_detail
+    from hooks.break_cause import WORKSPACE_REQUIRED as _WORKSPACE_REQUIRED
 except Exception:  # noqa: BLE001 — import-guarded by contract
+    _WORKSPACE_REQUIRED = None  # type: ignore[assignment]  # then no text pattern is held back as record-only
     _classify_vendor_error = None  # type: ignore[assignment]  # the guarded fallback `vendor_cause` checks for
     _vendor_message = None  # type: ignore[assignment]  # an error then keeps the engine's whole text
+    _workspace_detail = None  # type: ignore[assignment]  # an unscoped key's error then reads as the engine's
 
 # A CLI's own update nag, which an engine streams as agent text (measured: an adapter writing its startup notice
 # "New version available: v1.4.0 (installed v1.0.2). Run: `npm i -g <its package>`"): never the
@@ -207,9 +210,13 @@ def _local_retry_at(text: str, now: float) -> str | None:
         if m.group("date"):
             day = _dt.datetime.strptime(f"{m.group('date')} {m.group('year')}", "%b %d %Y").date()
             return iso_ms(_dt.datetime.combine(day, clock).timestamp())
-        at = _dt.datetime.combine(_dt.datetime.fromtimestamp(now).date(), clock).timestamp()
-        # A bare time already past was written yesterday (read just after midnight): it is tomorrow's.
-        return iso_ms(at if at > now else at + 86400)
+        today = _dt.datetime.fromtimestamp(now).date()
+        at = _dt.datetime.combine(today, clock).timestamp()
+        if at <= now:
+            # A bare time already past was written yesterday (read just after midnight): it is tomorrow's — the
+            # next local calendar day, not +24h, so a DST change overnight keeps the wall-clock time.
+            at = _dt.datetime.combine(today + _dt.timedelta(days=1), clock).timestamp()
+        return iso_ms(at)
     except (ValueError, OverflowError, OSError):
         return None
 
@@ -237,7 +244,9 @@ def classify_error(code: int | None, message: str, data: object = None, now: flo
     if explicit.get("error_class") in ERROR_CLASSES:
         return explicit["error_class"], _norm_resets_at(explicit.get("resets_at"))
     text = _error_text(message, data)
-    kind = _CAUSE_CLASSES.get(_kind_cause(data, dialect)) or None
+    # The dialect's own error wording before its kind: an unscoped key's 400 is the agent's `invalid_request` (an
+    # `api` kind), but the account cannot run, so it reads as `auth` like its cause (`error_cause` orders them so).
+    kind = _CAUSE_CLASSES.get(text_cause(text, dialect)) or _CAUSE_CLASSES.get(_kind_cause(data, dialect)) or None
     if kind:
         return kind, _resets_at_from(text, data) if kind == "usage_limit" else None
     if code == 429 or _USAGE_RE.search(text):
@@ -623,7 +632,11 @@ class Normaliser:
     def _vendor_said(self, message: str) -> str:
         """An engine's error as the vendor's own sentence (`break_cause.vendor_message`) when the dialect says its
         error text IS the vendor's record (`vendor_error_text`), else unchanged: what Agent activity shows and the
-        break's detail carries. Never applied to a message the host writes itself."""
+        break's detail carries. Never applied to a message the host writes itself. An unscoped API key's
+        refusal reads as the fix first, the vendor's sentence after it (`break_cause.workspace_detail`), whatever the
+        dialect."""
+        if _workspace_detail is not None and (actionable := _workspace_detail(message)):
+            return actionable
         if not self._dialect.vendor_error_text or _vendor_message is None:
             return message
         return _vendor_message(message)
@@ -637,7 +650,14 @@ class Normaliser:
         # Never refined by the vendor classifier: agent text is the model's to write, and an account verdict is
         # read only off an engine's own error record (`error_cause`).
         cause = text_cause(self.turn_text, self._dialect, at_start=True)
-        return "" if cause in _RECORD_ONLY_CAUSES else cause
+        if cause in _RECORD_ONLY_CAUSES:
+            return ""
+        # An unscoped key's sentence is record-only by PATTERN, not cause: `auth_expired` stays readable off text for
+        # an engine that writes its refused key as a message (a dialect's own text pattern), but people quote the
+        # workspace sentence (`break_cause.WORKSPACE_REQUIRED`).
+        if _WORKSPACE_REQUIRED is not None and _WORKSPACE_REQUIRED.match(self.turn_text):
+            return ""
+        return cause
 
     def _vendor_meta(self, update: dict) -> None:
         """A turn the agent reports failed in its own `_meta` namespace (`_THREAD_FAILED`) opens `_failure`."""

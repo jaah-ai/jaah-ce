@@ -102,7 +102,6 @@ const BASE = '/api/playbooks'
 const one = (id: string) => `${BASE}/${encodeURIComponent(id)}`
 
 export const PLAYBOOKS_KEY = ['playbooks'] as const
-export const playbookKey = (id: string) => ['playbooks', 'one', id] as const
 export const VOCABULARY_KEY = ['playbooks', 'vocabulary'] as const
 
 export const listPlaybooks = () => get<{ playbooks: PlaybookOut[] }>(BASE).then(r => r.playbooks)

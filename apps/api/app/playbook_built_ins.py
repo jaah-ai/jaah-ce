@@ -67,7 +67,7 @@ def _pinned(expert: str) -> dict[str, Any]:
 TASK = BuiltIn(
     id="019a0000-0000-7000-8000-00000000b001",
     name="Task",
-    description="One expert does one piece of work. Engineer by default; pick another when you start it.",
+    description="One expert does one piece of work. Coder by default; pick another when you start it.",
     entry="new_task",
     full_auto_default=True,
     default_seniority="senior",

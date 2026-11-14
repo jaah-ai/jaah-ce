@@ -5,9 +5,10 @@ import Button from '@mui/material/Button'
 import ButtonBase from '@mui/material/ButtonBase'
 import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
-import Tooltip from '@mui/material/Tooltip'
+import Tip from '../../ui/Tip'
 import { nanoid } from 'nanoid'
-import { apiDetail, apiHref, del, get, useApiRewriterVersion } from '../../api'
+import { apiDetail, del, get, useApiRewriterVersion } from '../../api'
+import { ApiImg } from '../../net/href'
 import { useApiRead } from '../../hooks/useApiRead'
 import { cachedRead, CATALOGUE_STALE_MS, forgetCachedRead } from '../../lib/cachedRead'
 import { useSubmit } from '../../hooks/useSubmit'
@@ -21,10 +22,11 @@ import { DownloadGlyph } from '../../ui/DownloadGlyph'
 import type { Attachment } from '../../types'
 import { Banner } from '../../ui/Banner'
 import { PaperclipIcon } from '../../ui/icons'
-import { PHONE } from '../../ui/listStyles'
-import { AXIS_TRACK_GROUND, AXIS_TRACK_RADIUS } from './axisTrackLook'
+import { PHONE, phoneHitAreaSx } from '../../ui/listStyles'
+import { SEGMENT_TRACK_GROUND } from '../../ui/SegmentedControl'
 import { attachmentPreviewMode } from './attachmentPreview'
-import AttachmentViewer, { type ViewerItem } from './AttachmentViewer'
+import AttachmentViewer, { downloadLinkProps, type ViewerItem } from './AttachmentViewer'
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, RADIUS, SIZE, grid } from '../../theme'
 
 /* ── Attachments as one wrapping form row: an Attach button and one chip per file ──
  * Sits in `TaskEditForm`'s settings row; no heading, helper paragraph, empty-state sentence or card.
@@ -48,13 +50,12 @@ function isAttachmentList(data: unknown): data is Attachment[] {
     && typeof (a as Attachment).size_bytes === 'number')
 }
 
-/* The bytes of an uploaded attachment, for a plain anchor. No `?download=1`: unlike
-`artifact_content`, `user_task_attachment_content` (`app/routes/attachments.py`) always answers
-`Content-Disposition: attachment`. A same-origin `<a href download>` (as in `TaskArtifacts.tsx`): the
-cookie rides the navigation and the browser handles transfer and Save. The route is `tasks:view`, so
+/* The API path of an uploaded attachment's bytes, for a download link (`downloadLinkProps`, saved through
+`net/href.tsx::apiDownload`). No `?download=1`: unlike `artifact_content`, `user_task_attachment_content`
+(`app/routes/attachments.py`) always answers `Content-Disposition: attachment`. The route is `tasks:view`, so
 the download is not gated on `!readOnly`; every write affordance stays gated. */
 export function attachmentContentUrl(subject: CommentSubject, attachmentId: number): string {
-  return apiHref(`${subjectBase(subject)}/attachments/${attachmentId}/content`)
+  return `${subjectBase(subject)}/attachments/${attachmentId}/content`
 }
 
 /** An uploaded file as `AttachmentViewer` shows it, or `null` when it only downloads (`attachmentPreviewMode`). */
@@ -67,7 +68,7 @@ export function viewerItem(subject: CommentSubject, a: Attachment): ViewerItem |
     size: a.size_bytes,
     mode,
     previewPath: `${subjectBase(subject)}/attachments/${a.id}/content?preview=1`,
-    downloadHref: attachmentContentUrl(subject, a.id),
+    downloadPath: attachmentContentUrl(subject, a.id),
   }
 }
 
@@ -76,7 +77,7 @@ export function useAttachmentViewer(items: ViewerItem[]) {
   const [openId, setOpenId] = useState<number | null>(null)
   const previewFor = (id: number): ChipPreview | undefined => {
     const item = items.find(i => i.id === id)
-    return item && { mode: item.mode, src: apiHref(item.previewPath), open: () => setOpenId(id) }
+    return item && { mode: item.mode, src: item.previewPath, open: () => setOpenId(id) }
   }
   const viewer = <AttachmentViewer items={items} openId={openId} onOpenIdChange={setOpenId} />
   return { previewFor, viewer }
@@ -105,9 +106,12 @@ const ROW_SX = {
   display: 'flex',
   flexWrap: 'wrap',
   alignItems: 'center',
-  columnGap: '0.5rem',
-  rowGap: '0.375rem',
+  columnGap: 1,
+  rowGap: 1,
   minWidth: 0,
+  // A 30px chip's 44px hit areas overhang it 7px above and below (3px left and right): a 15px row gap and a 9px
+  // column gap keep neighbouring squares apart.
+  [PHONE]: { rowGap: 2.5, columnGap: 1.5 },
 } as const
 
 /* The full-size Attach: `color="inherit"`, the form's own text colour (an accessory beside other controls wears
@@ -115,13 +119,13 @@ const ROW_SX = {
 const ATTACH_SX = {
   whiteSpace: 'nowrap',
   flexShrink: 0,
-  [PHONE]: { minHeight: 44 },
+  [PHONE]: { minHeight: SIZE.tapTarget },
 } as const
 
-/** An accessory Attach's quiet outline (MUI `ToggleButton`'s divider border, `action.active` glyph): `inherit`'s
+/** An accessory Attach's quiet outline (`ToggleButton`'s divider border and `text.secondary` glyph, theme.ts): `inherit`'s
  *  currentColor outline made it the loudest control on its line. The answer form's Attach wears it too
  *  (`AnswerAttachments`). */
-export const QUIET_ATTACH_SX = { color: 'action.active', borderColor: 'divider' } as const
+export const QUIET_ATTACH_SX = { color: 'text.secondary', borderColor: 'divider' } as const
 
 /* Compact, the paperclip sits among the axes' pills, so it takes their whole look: the quiet outline plus the
 track's round shape and recessed ground, not a rounded square beside fully round groups. The ground goes
@@ -129,48 +133,53 @@ through MUI's `--variant-outlinedBg`, never `backgroundColor`: the outlined Butt
 only changes it, so a plain background would freeze the hover. */
 const COMPACT_ATTACH_SX = {
   ...ATTACH_SX,
-  minWidth: 44,
+  minWidth: SIZE.tapTarget,
   ...QUIET_ATTACH_SX,
-  borderRadius: AXIS_TRACK_RADIUS,
-  '--variant-outlinedBg': AXIS_TRACK_GROUND,
+  borderRadius: RADIUS.round,
+  '--variant-outlinedBg': SEGMENT_TRACK_GROUND,
 } as const
 
 /** The widest a chip grows to fit its name (~50 characters); its cell's floor reads it too (`TaskSpecFields`). */
-export const ATTACHMENT_CHIP_MAX = '20rem'
+export const ATTACHMENT_CHIP_MAX = grid(53)
 
 /* The chip's width contract, two rules read together:
 · `maxWidth: min(ATTACHMENT_CHIP_MAX, 100%)` — a name shows whole up to ~50 characters, and `min(…, 100%)` for the
 ~200px form column at 481-490px.
 · `flexShrink: 0` — wrap but never shrink, or MUI's ellipsizing label turns every chip into a stub.
-Height goes to 30px at ≤480px (an increase): the × is the only control, and a 24px chip gives it an
-~11px hit box. Not 44px, which would be taller than the chip. */
+Height goes to 30px at ≤480px (an increase) so the × and download marks read as touchable; their 44px hit areas
+are invisible squares around them (`phoneHitAreaSx`), not a 44px chip, which would make the row a column of pills. */
 const CHIP_SX = {
   maxWidth: `min(${ATTACHMENT_CHIP_MAX}, 100%)`,
   minWidth: 0,
   flexShrink: 0,
-  [PHONE]: { height: 30 },
+  [PHONE]: { height: grid(5) },
 } as const
 
 /* The origin of a group of chips ("from task N"), and the files' region, each a row member of its own rather than
 part of a chip: the settings row gives this field as little as 96px, where a chip has no room for a filename AND its
 origin. As a flex item it sits inline when the row is wide and on its own line under its chips when it is narrow. */
-const ORIGIN_SX = { fontSize: '0.75rem', color: 'text.secondary', whiteSpace: 'nowrap', flexShrink: 0 } as const
+const ORIGIN_SX = { fontSize: FONT_SIZE.sm, color: 'text.secondary', whiteSpace: 'nowrap', flexShrink: 0 } as const
 
+/* The × and download marks: 30px boxes at ≤480px, each wearing `phoneHitAreaSx` for the 44px floor (hence
+`position: 'relative'`). Across neighbouring chips the squares do not meet: each overhangs its chip by 3px into the
+9px column gap. */
 const REMOVE_SX = {
+  position: 'relative',
   px: 0.5,
-  lineHeight: 1,
-  fontSize: '1rem',
+  lineHeight: LINE_HEIGHT.tight,
+  fontSize: FONT_SIZE.lg,
   cursor: 'pointer',
   color: 'text.secondary',
   '&:hover': { color: 'error.main' },
   '&[aria-disabled="true"]': { cursor: 'default', opacity: 0.5, '&:hover': { color: 'text.secondary' } },
-  [PHONE]: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minWidth: 30, minHeight: 30 },
+  [PHONE]: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minWidth: grid(5), minHeight: grid(5) },
 } as const
 
 /* The download anchor's box, not a copy of `REMOVE_SX`: hover goes to `primary.main` (the × uses
 `error.main`), and no disabled branch — a read is untouched by `locked` and `readOnly`. The ≤480px box
 matches the ×'s 30px. `textDecoration: 'none'` because it is an `<a>`. */
 const DOWNLOAD_SX = {
+  position: 'relative',
   px: 0.5,
   cursor: 'pointer',
   color: 'text.secondary',
@@ -178,26 +187,31 @@ const DOWNLOAD_SX = {
   display: 'inline-flex',
   alignItems: 'center',
   '&:hover': { color: 'primary.main' },
-  [PHONE]: { justifyContent: 'center', minWidth: 30, minHeight: 30 },
+  [PHONE]: { justifyContent: 'center', minWidth: grid(5), minHeight: grid(5) },
 } as const
 
 /** What a chip needs to open its file in the viewer; an image also draws a thumbnail from `src`. */
+/** `src`: the preview's API path (`ApiImg`). */
 export type ChipPreview = { mode: ViewerItem['mode']; src: string; open: () => void }
 
 /* An image's chip is a THUMBNAIL: a small rectangle of the picture itself (Slack's look), 40px tall so a row of
 them stays one compact line beside the 24px chips. The × sits on its corner, a badge, so the thumbnail keeps its
-whole face; 24px at ≤480px, where it is the only touch target for removing. Download lives in the viewer. */
+whole face. At ≤480px it is a 24px badge inside a 44px hit area (`phoneHitAreaSx`). The badge stays OUT on the
+corner so the square takes as little of the picture (the preview) as it can — a 28px corner — and overhangs the
+thumbnail 16px up and right instead. The phone margins pay for that overhang: 12px right (+ the 9px column gap
+clears the next chip's 3px), 9px top (+ the 15px row gap clears a chip line's 7px). Download lives in the viewer. */
 const THUMB_SX = {
   position: 'relative',
   flexShrink: 0,
-  width: 56,
-  height: 40,
+  width: grid(9),
+  height: grid(6.5),
+  [PHONE]: { mt: 1.5, mr: 2 },
 } as const
 
 const THUMB_FACE_SX = {
   width: '100%',
   height: '100%',
-  borderRadius: 1,
+  borderRadius: RADIUS.sm,
   overflow: 'hidden',
   border: '1px solid',
   borderColor: 'divider',
@@ -208,16 +222,16 @@ const THUMB_FACE_SX = {
 
 const THUMB_REMOVE_SX = {
   position: 'absolute',
-  top: -6,
-  right: -6,
-  width: 18,
-  height: 18,
-  borderRadius: '50%',
+  top: grid(-1),
+  right: grid(-1),
+  width: grid(3),
+  height: grid(3),
+  borderRadius: RADIUS.round,
   display: 'inline-flex',
   alignItems: 'center',
   justifyContent: 'center',
-  fontSize: '0.875rem',
-  lineHeight: 1,
+  fontSize: FONT_SIZE.base,
+  lineHeight: LINE_HEIGHT.tight,
   cursor: 'pointer',
   color: 'text.secondary',
   backgroundColor: 'background.paper',
@@ -225,7 +239,7 @@ const THUMB_REMOVE_SX = {
   borderColor: 'divider',
   '&:hover': { color: 'error.main' },
   '&[aria-disabled="true"]': { cursor: 'default', opacity: 0.5, '&:hover': { color: 'text.secondary' } },
-  [PHONE]: { width: 24, height: 24 },
+  [PHONE]: { width: grid(4), height: grid(4) },
 } as const
 
 /* A previewable chip's name opens the viewer: a real button inside the label, so the chip root stays the
@@ -236,7 +250,7 @@ const NAME_BUTTON_SX = {
   overflow: 'hidden',
   textOverflow: 'ellipsis',
   '&:hover': { textDecoration: 'underline' },
-  '&:focus-visible': { outline: '2px solid', outlineColor: 'primary.main', outlineOffset: 1, borderRadius: 0.5 },
+  '&:focus-visible': { outline: '2px solid', outlineColor: 'primary.main', outlineOffset: 1, borderRadius: RADIUS.sm },
 } as const
 
 /* One file, staged or uploaded — they look identical, except only an uploaded chip has bytes to
@@ -280,7 +294,7 @@ export function FileChip({
   const origin = sourceTaskId == null ? null : `from task ${sourceTaskId}`
   // Size in the tooltip, not the label; the full name rides along because the label ellipsizes.
   const tooltip = [name, origin, formatBytes(size), regionLabel ? `Region: ${regionLabel}` : null].filter(Boolean).join(' · ')
-  const removeControl = (sx: object) => (
+  const removeControl = (sx: typeof REMOVE_SX | typeof THUMB_REMOVE_SX) => (
     <Box
       component="span"
       role="button"
@@ -295,7 +309,7 @@ export function FileChip({
         e.stopPropagation() // the chip root carries MUI's own key handling; this press is the ×'s
         remove()
       }}
-      sx={sx}
+      sx={[sx, phoneHitAreaSx]}
     >
       ×
     </Box>
@@ -303,16 +317,16 @@ export function FileChip({
   if (preview?.mode === 'image' && !thumbFailed) {
     return (
       <Box sx={THUMB_SX} role="group" data-testid={testId} data-internal={internal ? 'true' : undefined}>
-        <Tooltip title={internal ? `Internal · ${tooltip}` : tooltip}>
+        <Tip describeChild={false} title={internal ? `Internal · ${tooltip}` : tooltip}>
           <ButtonBase
             aria-label={`Preview ${name}`}
             onClick={preview.open}
             data-testid={`${testId}-thumb`}
             sx={{ ...THUMB_FACE_SX, ...(internal ? { borderColor: 'warning.main' } : {}) }}
           >
-            <img src={preview.src} alt="" loading="lazy" onError={() => setThumbFailed(true)} />
+            <ApiImg src={preview.src} alt="" loading="lazy" onError={() => setThumbFailed(true)} />
           </ButtonBase>
-        </Tooltip>
+        </Tip>
         {removable && removeControl(THUMB_REMOVE_SX)}
       </Box>
     )
@@ -325,7 +339,7 @@ export function FileChip({
   return (
     // The chip's ONE tooltip: its download and × controls are named by `aria-label` only — a native `title`
     // on either would pop the browser's tooltip on top of this one.
-    <Tooltip title={tooltip}>
+    <Tip describeChild={false} title={tooltip}>
       <Chip
         size="small"
         variant="outlined"
@@ -335,7 +349,7 @@ export function FileChip({
         data-internal={internal ? 'true' : undefined}
         label={internal ? (
           <>
-            <Box component="span" sx={{ color: 'warning.dark', fontWeight: 600, mr: 0.5 }}>Internal</Box>
+            <Box component="span" sx={{ color: 'warning.dark', fontWeight: FONT_WEIGHT.semibold, mr: 0.5 }}>Internal</Box>
             {shownName}
           </>
         ) : shownName}
@@ -346,24 +360,21 @@ export function FileChip({
           href === undefined ? undefined : (
             <Box
               component="a"
-              href={href}
-              // The Save dialog's name; the route's `Content-Disposition` reads the same stored `filename`.
-              download={name}
+              // The route's `Content-Disposition` reads the same stored `filename` as the Save dialog's name.
+              {...downloadLinkProps(href, name)}
               data-testid={`${testId}-download`}
-              // Named by file, so four chips are not four identical buttons.
-              aria-label={`Download ${name}`}
               // `stopPropagation`, not `preventDefault`: the navigation must happen.
               onClick={e => e.stopPropagation()}
-              sx={DOWNLOAD_SX}
+              sx={[DOWNLOAD_SX, phoneHitAreaSx]}
             >
-              <DownloadGlyph size={13} />
+              <DownloadGlyph size={SIZE.iconXs} />
             </Box>
           )
         }
         onDelete={removable ? remove : undefined}
         deleteIcon={removeControl(REMOVE_SX)}
       />
-    </Tooltip>
+    </Tip>
   )
 }
 
@@ -403,7 +414,7 @@ export default function TaskAttachmentsField({
   testId?: string
 }): JSX.Element {
   const maxFileBytes = useMaxFileBytes()
-  // Its hrefs are rewritten on the live host (`apiHref`): re-render when the rewriter is installed.
+  // Its hrefs are rewritten on the live host (`net/href.tsx`): re-render when the rewriter is installed.
   useApiRewriterVersion()
   // `null` = create mode (no id yet). Primitive deps below, so a fresh `subject` literal per render is fine.
   const subject: CommentSubject | null = subjectProp ?? (taskId === null ? null : { kind: 'task', id: taskId })
@@ -539,7 +550,7 @@ export default function TaskAttachmentsField({
   const message = actionError || loadError
 
   return (
-    <Box data-testid={testId} sx={{ display: 'flex', flexDirection: 'column', gap: '0.375rem', minWidth: 0 }}>
+    <Box data-testid={testId} sx={{ display: 'flex', flexDirection: 'column', gap: 1, minWidth: 0 }}>
       <Box sx={ROW_SX}>
         {/* Not mounted read-only (the API refuses the upload); `disabled` for the temporary `locked`. */}
         {!readOnly && (
@@ -556,7 +567,7 @@ export default function TaskAttachmentsField({
             sx={compact ? COMPACT_ATTACH_SX : ATTACH_SX}
           >
             {/* The answer form's paperclip, not `⬆`: one mark for Attach wherever it appears. */}
-            <PaperclipIcon size="1.1em" testId={`${testId}-attach-icon`} sx={compact ? undefined : { mr: 0.5 }} />
+            <PaperclipIcon size={SIZE.iconXs} testId={`${testId}-attach-icon`} sx={compact ? undefined : { mr: 0.5 }} />
             {!compact && 'Attach'}
           </Button>
         )}
@@ -569,7 +580,7 @@ export default function TaskAttachmentsField({
             data-testid={`${testId}-busy`}
             sx={{ display: 'inline-flex', alignItems: 'center', flexShrink: 0 }}
           >
-            <CircularProgress size={14} thickness={5} />
+            <CircularProgress size={SIZE.iconXs} sx={{ '& .MuiCircularProgress-circle': { strokeWidth: 5 } }} />
           </Box>
         )}
 

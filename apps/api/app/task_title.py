@@ -19,25 +19,27 @@ placeholder (`refine_title(authored=)`), and its fallback is that title cut to t
 "Re-generate title" (`regenerated_title`) is the forced path: same model and prompt, no placeholder guard,
 and the caller writes the result as a rename (`routes/tasks/title.py`).
 
-Epic children titled `[<persona>] <old epic title>` are re-derived with it. Dispatch can beat this, so
-`app/slot_retitle.py` relabels slot and tmux window afterwards (best effort); a prompt's `Title:` line
-is not chased. No connection is held across the vendor call (pool ceiling; see `app/task_retag.py`).
+Epic children titled `[<persona>] <old epic title>` are re-derived with it. Dispatch can beat this; a
+running task's prompt keeps the title it was dispatched with. No connection is held across the vendor
+call (pool ceiling; see `app/task_retag.py`).
 """
 from __future__ import annotations
 
 import logging
 import time
+from typing import NamedTuple
 
 from sqlalchemy import select, update
 
-from app import attachment_storage, slot_retitle
-from app.db import SessionLocal
+from app import attachment_storage
+from app.db import BridgedSession
 from app.events import emit_console_event
 from app.llm_client import IMAGE_TYPES, sniffed_image_type, summary_timeout
 from app.models.task_extras import ATTACHMENT_KIND_FILE, TaskAttachment
 from app.models.tasks import Task
-from app.session_summary import title_from_description, title_needs_images
+from app.session_summary import TitledDescription, title_needs_images, titled_description
 from app.short_title import short_title
+from app.task_language import DEFAULT_LANGUAGE
 from app.task_lifecycle import DRAFT
 from app.tenancy import seam
 
@@ -93,14 +95,16 @@ def derived_child_title(persona: str, parent_title: str) -> str:
 
 
 def refine_title(task_id: int, authored: str | None = None) -> bool:
-    """Replace `task_id`'s placeholder title with the LLM-derived one. True when a title was written.
+    """Replace `task_id`'s placeholder title with the LLM-derived one, and stamp the description's language
+    (`app/task_language.py`) on it and its subtree. True when either was written.
 
     `authored` is a filer's own title: the row is refined while it still carries exactly that, from the title
-    and body together, falling back to the title cut to the cap (`short_title(prose=False)`).
+    and body together, falling back to the title cut to the cap (`short_title(prose=False)`). A reply naming no
+    language stamps `DEFAULT_LANGUAGE`; a language a person picked (`language_pinned`) is never touched.
 
     Idempotent: every early return is "nothing to do". Raises only on a database failure (the caller's
-    retry); vendor failures come back as the deterministic fallback, i.e. no change."""
-    with SessionLocal() as session:
+    retry); vendor failures come back as the deterministic fallback, i.e. no title change."""
+    with BridgedSession() as session:
         task = session.get(Task, task_id)
         if task is None:
             # Deleted between the create and this run. Not an error: there is no title to fix.
@@ -116,18 +120,22 @@ def refine_title(task_id: int, authored: str | None = None) -> bool:
         session.rollback()
 
         generated = _generated_title(body, image_rows, authored)
-        if not generated or generated == old_title:
-            # Fallback, empty reply, or the same title: the row already says this.
-            return False
+        language = generated.language or DEFAULT_LANGUAGE
 
         locked = session.get(Task, task_id, with_for_update=True)
         if locked is None:
             return False
         # Re-checked under the lock against the snapshot, so a rename during the call wins.
-        if locked.title != old_title:
+        retitle = bool(generated.title) and generated.title != old_title and locked.title == old_title
+        # Detected once: a later refinement (a filer's title edit) never re-detects over it; only "Re-generate
+        # title" does (`routes/tasks/title.py`).
+        relanguaged = locked.language is None and stamp_language(session, locked, language)
+        if not retitle and not relanguaged:
+            # Fallback, empty reply, or the same title and language: the row already says this.
             return False
-        _retitle(session, task_id, generated)
-        rederived = _rederive_children(session, locked, old_title, generated)
+        if retitle:
+            _retitle(session, task_id, generated.title)
+            _rederive_children(session, locked, old_title, generated.title)
         # No durable ActivityEvent: a title changes no `state`, and a same-state `task:*` row would read
         # as a transition (`_epic_time_metrics`). The notify still refreshes an open board.
         emit_console_event(
@@ -135,24 +143,28 @@ def refine_title(task_id: int, authored: str | None = None) -> bool:
         )
         # Which task, never the body (the provider and model are `title_from_description`'s line). No actor
         # on a DBOS thread; correlate with the `task:created` ActivityEvent.
-        log.info("title: task %s retitled", task_id)
+        log.info("title: task %s retitled=%s language=%s", task_id, retitle, language)
         session.commit()
-        # After the commit and best effort: `retitle_task_slot` commits its own re-stamp and never
-        # raises, so a dead node cannot cost a retry. Children too, since each holds its own slot.
-        for retitled_id in (task_id, *rederived):
-            slot_retitle.retitle_task_slot(session, retitled_id)
         return True
 
 
-def regenerated_title(task_id: int) -> str | None:
-    """The title the model gives `task_id`'s current body now, whatever the row carries — or None when it
-    gives nothing new (deleted row, empty body, vendor failure, or the same title). Writes nothing.
+class RegeneratedTitle(NamedTuple):
+    """`regenerated_title`'s answer: a new title (None when the model gave nothing new) and the language it named."""
+
+    title: str | None
+    language: str | None
+
+
+def regenerated_title(task_id: int) -> RegeneratedTitle | None:
+    """The title the model gives `task_id`'s current body now, whatever the row carries, with the language it
+    names — or None when the row is gone. Writes nothing; `title` is None when it gives nothing new (empty
+    body, vendor failure, or the same title).
 
     The forced path behind "Re-generate title" (`routes/tasks/title.py`): the placeholder guard is skipped
     because a person asked, and the caller writes the result as their own rename. The fallback is the row's
     current title, so a vendor failure reads as "no change", never as the placeholder over a chosen title.
     No connection is held across the vendor call, as in `refine_title`."""
-    with SessionLocal() as session:
+    with BridgedSession() as session:
         task = session.get(Task, task_id)
         if task is None:
             return None
@@ -161,12 +173,27 @@ def regenerated_title(task_id: int) -> str | None:
         image_rows = _image_rows(session, task_id)
         session.rollback()
     generated = _generated_title(body, image_rows, None, fallback=current)
-    return generated if generated and generated != current else None
+    title = generated.title if generated.title and generated.title != current else None
+    return RegeneratedTitle(title, generated.language)
+
+
+def stamp_language(session, task: Task, language: str) -> bool:
+    """Write a detected `language` on `task` and its whole subtree, unless a person picked one
+    (`language_pinned`) or it already says so. True when written. The clock is pinned, as in `_retitle`."""
+    if task.language_pinned or task.language == language:
+        return False
+    from app.routes.tasks.task_wire import _subtree_task_ids  # deferred: the routes package imports this module
+
+    session.execute(
+        update(Task).where(Task.id.in_(_subtree_task_ids(task.id, session)))
+        .values(language=language, updated_at=Task.updated_at)
+    )
+    return True
 
 
 def _generated_title(
     body: str, image_rows: list[tuple[str, str | None]], authored: str | None, *, fallback: str | None = None
-) -> str:
+) -> TitledDescription:
     """One call to the title model: from `body`, or from a filer's `authored` title and the body together.
 
     `fallback` is what a vendor failure returns: by default the deterministic derivation (`refine_title`'s
@@ -175,8 +202,8 @@ def _generated_title(
     # Not fetched for a description that names its own subject: the model would not be sent them.
     images = _fetch_images(image_rows) if body.strip() and title_needs_images(description) else []
     if authored is None:
-        return title_from_description(body, fallback=fallback, images=images)
-    return title_from_description(description, fallback=short_title(authored, prose=False), images=images)
+        return titled_description(body, fallback=fallback, images=images)
+    return titled_description(description, fallback=short_title(authored, prose=False), images=images)
 
 
 def _image_rows(session, task_id: int) -> list[tuple[str, str | None]]:
@@ -237,23 +264,19 @@ def _retitle(session, task_id: int, title: str) -> None:
     )
 
 
-def _rederive_children(session, parent: Task, old_title: str, new_title: str) -> list[int]:
-    """Re-stamp every direct child still carrying `[<persona>] <old parent title>`. Returns their ids.
+def _rederive_children(session, parent: Task, old_title: str, new_title: str) -> None:
+    """Re-stamp every direct child still carrying `[<persona>] <old parent title>`.
 
-    The return feeds the slot relabel, so the guard has one spelling. Archived children are kept
-    evidence and skipped. Ordered by id for deterministic lock order. No event per child: the parent's
+    Archived children are kept evidence and skipped. Ordered by id for deterministic lock order. No event per child: the parent's
     notify already reloads boards and child pages."""
     children = session.scalars(
         select(Task)
         .where(Task.parent_task_id == parent.id, Task.archived_at.is_(None))
         .order_by(Task.id)
     ).all()
-    rederived: list[int] = []
     for child in children:
         if child.title == derived_child_title(child.persona, old_title):
             _retitle(session, child.id, derived_child_title(child.persona, new_title))
-            rederived.append(child.id)
-    return rederived
 
 
 def filed_titles_owed() -> list[tuple[int, str]]:
@@ -262,7 +285,7 @@ def filed_titles_owed() -> list[tuple[int, str]]:
     Untouched is `updated_at = created_at` (one insert stamps both; `_retitle` pins the clock): an operator's
     rename or a filer's amend moves it, so a title somebody chose since is never swept. Fleet-wide by subject;
     only ids and titles leave, and each refinement binds its own task's org."""
-    with seam.operator_scope(), SessionLocal() as session:
+    with seam.operator_scope(), BridgedSession() as session:
         rows = session.execute(
             select(Task.id, Task.title).where(
                 Task.state == DRAFT,

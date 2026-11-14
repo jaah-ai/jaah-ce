@@ -6,13 +6,13 @@ the control plane's container filesystem dies with each deploy — and not on `t
 fact about what the sweep told the operator, not about the task.
 
 The needs-attention stamp has two writers (this sweep and `app/task_notify.py`), hence `claim`; see
-`StampStore`. The store is injected so the DB-free `apps/api/test_*.py` suites use `MemoryStampStore`;
+`StampStore`. The store is injected so the DB-free `apps/api/test_*.py` suites use `tests/memory_stamp_store.py`;
 the DB path is covered by the API test suite.
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Iterable, Protocol
 
 log = logging.getLogger("cockpit-scheduler")
@@ -64,49 +64,6 @@ class StampStore(Protocol):
         snapshot's own time."""
 
 
-class MemoryStampStore:
-    """A dict. For tests, and for a caller that deliberately wants no durability."""
-
-    def __init__(self) -> None:
-        self.keys: set[str] = set()
-        self.stamped_at: dict[str, datetime] = {}
-
-    def seen(self, key: str) -> bool:
-        return key in self.keys
-
-    def seen_many(self, keys: Iterable[str]) -> set[str]:
-        return set(keys) & self.keys
-
-    def mark(self, key: str) -> None:
-        self.stamped_at.setdefault(key, datetime.now(timezone.utc))
-        self.keys.add(key)
-
-    def claim(self, key: str) -> bool:
-        if key in self.keys:
-            return False
-        self.mark(key)
-        return True
-
-    def release(self, key: str) -> None:
-        self.keys.discard(key)
-        self.stamped_at.pop(key, None)
-
-    def retain(
-        self, family: str, keys: Iterable[str], *, stamped_before: datetime | None = None
-    ) -> None:
-        prefix = f"{KEY_PREFIX}{family}:"
-        keep = set(keys)
-
-        def dropped(key: str) -> bool:
-            if not key.startswith(prefix) or key in keep:
-                return False
-            at = self.stamped_at.get(key)
-            return stamped_before is None or at is None or at < stamped_before
-
-        for key in [k for k in self.keys if dropped(k)]:
-            self.release(key)
-
-
 class DbStampStore:
     """`system_state`-backed, best effort, failing toward a duplicate alert rather than a silent one.
 
@@ -121,9 +78,9 @@ class DbStampStore:
 
     def _sessions(self):
         if self._session_factory is None:
-            from app.db import SessionLocal
+            from app.db import BridgedSession
 
-            self._session_factory = SessionLocal
+            self._session_factory = BridgedSession
         return self._session_factory
 
     def seen(self, key: str) -> bool:

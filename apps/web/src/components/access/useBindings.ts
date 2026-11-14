@@ -1,5 +1,6 @@
-import { useEffect, useState, type ReactNode } from 'react'
-import { apiDetail } from '../../api'
+import type { ReactNode } from 'react'
+import { useApiRead } from '../../hooks/useApiRead'
+import { useSubmit } from '../../hooks/useSubmit'
 import { useConfirm } from '../ConfirmDialog'
 import { removeBinding, searchPrincipals, type AccessScope } from './api'
 
@@ -7,17 +8,12 @@ import { removeBinding, searchPrincipals, type AccessScope } from './api'
    403, or anything else, → read-only): the same gate the Add dialog's picker sits behind. `null` (no scope
    known yet) is read-only. */
 export function useCanManage(scope: AccessScope | null): boolean {
-  const [canManage, setCanManage] = useState(false)
   const type = scope?.type
   const id = scope?.id
-  useEffect(() => {
-    setCanManage(false)
-    if (type === undefined || id === undefined) return
-    let live = true
-    searchPrincipals({ type, id }, '').then(() => { if (live) setCanManage(true) }, () => {})
-    return () => { live = false }
-  }, [type, id])
-  return canManage
+  // Only this key's own success counts: a held previous answer (`loading`) or a failed probe (`error`) reads false.
+  const probe = useApiRead(['access-can-manage', type, id], () => searchPrincipals({ type: type!, id: id! }, '').then(() => true), '',
+    { enabled: type !== undefined && id !== undefined })
+  return probe.data === true && !probe.loading && !probe.error
 }
 
 /* The Remove flow a bindings list runs: confirm (the caller words `message`), delete, re-read on success;
@@ -28,19 +24,18 @@ export function useRemoveBinding(reload: () => Promise<void>, headers?: HeadersI
   clearError: () => void
   confirmDialog: ReactNode
 } {
-  const [error, setError] = useState('')
+  const { formError: error, setFormError, run } = useSubmit()
   const [confirm, confirmDialog] = useConfirm()
   async function remove(bindingId: string, message: string) {
     const ok = await confirm({ title: 'Remove access', message, confirmLabel: 'Remove', destructive: true })
     if (!ok) return
-    setError('')
-    try {
+    let removed = false
+    await run('Could not remove access.', async () => {
       await (headers ? removeBinding(bindingId, headers) : removeBinding(bindingId))
-    } catch (err) {
-      setError(apiDetail(err, 'Could not remove access.'))
-      return
-    }
-    await reload()
+      removed = true
+    })
+    // After the write, not inside it: a failed re-read must not read as "could not remove".
+    if (removed) await reload()
   }
-  return { remove, error, clearError: () => setError(''), confirmDialog }
+  return { remove, error, clearError: () => setFormError(''), confirmDialog }
 }

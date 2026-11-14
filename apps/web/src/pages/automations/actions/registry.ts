@@ -1,4 +1,4 @@
-import type { ComponentType, ReactNode } from 'react'
+import type { ComponentType } from 'react'
 import type { TargetKind, TargetRule } from '../../../ui/TargetSelector'
 import type { ActionType, Automation } from '../api'
 
@@ -18,7 +18,9 @@ export type ActionContext = {
   /** The live target rule (null when the type takes none). */
   target: TargetRule | null
   whenKind: 'schedule' | 'event'
-  /** An event source's template placeholders, shown with the body; undefined on a schedule. */
+  /** An event automation's source kind (`incident`, `webhook`, …); undefined on a schedule. */
+  eventKind?: string
+  /** An event source's template placeholders (hover help on the template fields); undefined on a schedule. */
   templateHint?: string
   /** The server's descriptor for this type, when the catalogue offers it. */
   descriptor: ActionType | undefined
@@ -30,6 +32,10 @@ export type ActionContext = {
   onStagedFilesChange: (files: File[]) => void
   /** The save's refusal for a params field, keyed by wire name. */
   errors?: Record<string, string>
+  /** Form state the wire cannot carry, shared by the entry's `Form` and `Extras` (two tabs, one draft): the editor
+   *  holds it, and forgets it on a reseed or a type change. Null until the entry first sets it. */
+  uiState?: unknown
+  onUiStateChange?: (next: unknown) => void
 }
 
 export type ActionFormProps<V = unknown> = {
@@ -40,25 +46,26 @@ export type ActionFormProps<V = unknown> = {
 
 export type ActionEntry<V = unknown> = {
   type: string
+  /** The essentials: what the New-automation wizard asks and the edit page's Setup tab shows. */
   Form: ComponentType<ActionFormProps<V>>
+  /** Everything else, over the same value: the edit page's Settings tab only. A new automation keeps `initial`'s
+   *  defaults for these. Absent: the type has nothing beyond its essentials. */
+  Extras?: ComponentType<ActionFormProps<V>>
   /** A new automation's value for this type. */
   initial: (context: ActionContext) => V
   /** The wire params a stored automation carries, as this form's value. */
   fromParams: (params: Record<string, unknown>, context: ActionContext) => V
   /** This form's value as the wire `action.params`, for the When the automation is saved with. */
   toParams: (value: V, context: ActionContext) => Record<string, unknown>
+  /** What stops this value being saved, in a person's words ("Add a description or pick a template."), or null.
+   *  The wizard holds Next on What with it, beside the form. Absent: the server is the only check. */
+  blocker?: (value: V) => string | null
   /** One line for a list or a heading ("Task · Coder"); `label` is the server's word for the type, if known. */
   summary: (params: Record<string, unknown>, label?: string) => string
   /** The list column's shorter word ("Coder"), where the summary's lead adds nothing a column needs. Absent: the
    *  summary. */
   brief?: (params: Record<string, unknown>, label?: string) => string
-  /** The New-automation wizard's Review rows for this value, readable (names, not ids). Absent: the shell lists
-   *  the wire params, one row each (`AutomationReview.tsx`). */
-  reviewRows?: (value: V, context: ActionContext) => ActionReviewRow[]
 }
-
-/** One read-only line of an action's settings on the wizard's Review step. */
-export type ActionReviewRow = { label: string; value: ReactNode }
 
 const entries = new Map<string, ActionEntry<never>>()
 let fallback: ActionEntry<never> | null = null
@@ -66,11 +73,6 @@ let fallback: ActionEntry<never> | null = null
 /** Register (or replace) one action type's entry. */
 export function registerAction<V>(entry: ActionEntry<V>): void {
   entries.set(entry.type, entry as unknown as ActionEntry<never>)
-}
-
-/** Forget one entry (tests). */
-export function unregisterAction(type: string): void {
-  entries.delete(type)
 }
 
 /** The entry every system function shares (its params are read-only): used when a type has no entry of its own

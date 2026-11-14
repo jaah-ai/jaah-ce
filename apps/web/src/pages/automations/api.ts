@@ -2,7 +2,7 @@
 // One Automation is When -> Target -> Action over a schedule (cron) or event (trigger) child; nothing is
 // recomputed here: status, its reason, the schedule sentence and next run are the server's.
 
-import { del, get, patch, post, postForm } from '../../api'
+import { del, get, patch, post, postForm, put, withQuery } from '../../api'
 import { RUNS_PAGE_SIZE } from '../../hooks/usePagedList'
 import type { TargetDangling, TargetId, TargetKind, TargetRule } from '../../ui/TargetSelector'
 import type { ParamsSchema } from '../cron/api'
@@ -59,6 +59,8 @@ export type Automation = {
   description: string
   org_id: string
   owner: ActorRef
+  /** The Task action's "Run as" (`action.params.run_as_id`) and its name; null: the project's, else the org's. */
+  run_as?: ActorRef | null
   is_system: boolean
   when: When
   target: TargetRule | null
@@ -72,6 +74,8 @@ export type Automation = {
   status_cause: string | null
   /** A schedule whose firing outlived its timeout and still holds the run lock: offers Release. */
   stuck: boolean
+  /** Owned from another org, so every run is refused (`automation_service.has_foreign_owner`): offers Take ownership. */
+  foreign_owner: boolean
   last_run_at: string | null
   /** The newest recorded run's outcome in the list's one vocabulary (`automation_service.LAST_RUN_OUTCOMES`:
    *  `filed` | `ran` | `noop` | `skipped` | `missed` | `error` | `pending`); null with no run on record. */
@@ -79,12 +83,14 @@ export type Automation = {
   /** The newest gap of `missed` occurrences (a restart's backfill) as one fact: `count` rows, `more` when the
    *  backfill capped it. Null unless the newest recorded run is `missed`. */
   last_run_missed: { count: number; more: boolean } | null
+  /** The newest skipped or failed runs in a row once they reach the org's alert threshold: `count` runs, `more` when
+   *  the server stopped counting. Null below the threshold and while paused (`automation_service._problem_streak`). */
+  problem_streak: { count: number; more: boolean } | null
   /** A schedule's newest recorded `acted` run: when it last did work, however many noops since. Null for an event
    *  and where no `acted` row survives. */
   last_acted_at: string | null
   next_run_at: string | null
-  /** The cron or trigger row this automation sits over (old `/crons/:id`, `/triggers/:id` links, the state
-   *  document's route). */
+  /** The cron or trigger row this automation sits over (the state document's route). */
   legacy: { kind: 'cron' | 'trigger'; id: string }
   created_by_task_id: number | null
   created_at: string | null
@@ -99,7 +105,8 @@ export type AutomationInput = {
   org_id: string
   when: Record<string, unknown> & { kind: 'schedule' | 'event' }
   target: TargetRule | null
-  action: { type: string; params: Record<string, unknown> }
+  /** Left out only on a record-only create: the server supplies an inert one (`automation_service._record_only_action`). */
+  action?: { type: string; params: Record<string, unknown> }
   paused?: boolean
 }
 
@@ -173,13 +180,8 @@ const one = (id: string) => `${BASE}/${encodeURIComponent(id)}`
 
 /** The list's react-query key (`AutomationList.tsx`); the list re-reads on every visit. */
 export const AUTOMATIONS_KEY = ['automations'] as const
-export function listAutomations(filters: { when_kind?: string; status?: string } = {}) {
-  const query = new URLSearchParams()
-  if (filters.when_kind) query.set('when_kind', filters.when_kind)
-  if (filters.status) query.set('status', filters.status)
-  const qs = query.toString()
-  return get<{ items: Automation[]; total: number }>(qs ? `${BASE}?${qs}` : BASE)
-}
+export const listAutomations = (filters: { when_kind?: string; status?: string } = {}) =>
+  get<{ items: Automation[]; total: number }>(withQuery(BASE, { when_kind: filters.when_kind, status: filters.status }))
 export const getAutomation = (id: string) => get<Automation>(one(id))
 export const createAutomation = (input: AutomationInput) => post<AutomationSaved>(BASE, input)
 export const updateAutomation = (id: string, input: Partial<AutomationInput>) => patch<AutomationSaved>(one(id), input)
@@ -187,6 +189,8 @@ export const deleteAutomation = (id: string) => del(one(id))
 export const pauseAutomation = (id: string, reason = '') => post<Automation>(`${one(id)}/pause`, { reason })
 export const resumeAutomation = (id: string) => post<Automation>(`${one(id)}/resume`)
 /** End a stuck schedule's held run so the next tick runs; its run history stays. */
+/** Re-own an automation owned from another org as the calling member, so it runs again. */
+export const takeAutomationOwnership = (id: string) => post<Automation>(`${one(id)}/take-ownership`)
 export const releaseAutomation = (id: string) => post<Automation & { released: boolean }>(`${one(id)}/release`)
 export const runAutomation = (id: string, sample?: Record<string, unknown>) =>
   post<{ fired: boolean; detail: string; delivery_id?: number }>(`${one(id)}/run`, sample ? { sample } : undefined)
@@ -197,12 +201,7 @@ export const RUNS_REREAD_MS = [2500, 8000]
 export type RunsFilter = { status?: string; q?: string }
 export const listAutomationRuns = (
   id: string, offset = 0, limit = RUNS_PAGE_SIZE, targetsLimit = 50, filter: RunsFilter = {},
-) => {
-  const query = new URLSearchParams({ limit: String(limit), offset: String(offset), targets_limit: String(targetsLimit) })
-  if (filter.status) query.set('status', filter.status)
-  if (filter.q) query.set('q', filter.q)
-  return get<AutomationRunsPage>(`${one(id)}/runs?${query.toString()}`)
-}
+) => get<AutomationRunsPage>(withQuery(`${one(id)}/runs`, { limit, offset, targets_limit: targetsLimit, status: filter.status, q: filter.q }))
 /** One run by its `id` (the list item's), in the list item's shape — a pasted run URL's load. */
 export const getAutomationRun = (automationId: string, runId: string, targetsLimit?: number) =>
   get<AutomationRun>(
@@ -223,8 +222,6 @@ export const previewTarget = (orgId: string, target: TargetRule, automationId?: 
     target,
     ...(automationId ? { automation_id: automationId } : {}),
   })
-export const automationByLegacy = (kind: 'cron' | 'trigger', legacyId: string) =>
-  get<{ id: string }>(`${BASE}/by-legacy/${kind}/${encodeURIComponent(legacyId)}`)
 
 export function uploadAutomationAttachment(id: string, file: File) {
   const form = new FormData()
@@ -237,6 +234,8 @@ export const deleteAutomationAttachment = (id: string, attachmentId: number) =>
 // Event-only: today's trigger behaviour on the automation's event child.
 export const revealAutomationSecret = (id: string) => post<{ secret: string }>(`${one(id)}/reveal-secret`)
 export const rotateAutomationSecret = (id: string) => post<{ secret: string }>(`${one(id)}/rotate-secret`)
+/** A Sentry source's own signing secret (its integration's Client Secret), pasted in: Sentry mints it, not Jaah. */
+export const setAutomationSecret = (id: string, secret: string) => put<void>(`${one(id)}/secret`, { secret })
 export const testRenderAutomation = (
   id: string,
   sample: Record<string, unknown>,

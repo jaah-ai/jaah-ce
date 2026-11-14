@@ -9,7 +9,8 @@ resolution, so an object created after a binding is reached by it on the next re
 - an org binding of an org role (Owner/Admin) → every key, org-wide (`org_keys`), and `org_role`;
 - an org binding of a project role → that role's keys, org-wide (`org_keys`);
 - a project binding → the role's keys on that project, which is also where its features and tasks live;
-- an account binding, of ANY role → `accounts:view` on that account (may dispatch on it; D5/D10).
+- an account binding, of ANY role → `accounts:view` on that account (may dispatch on it; D5/D10) — an org
+  account or a personal one alike: an Org Owner/Admin shares either with users and groups.
 Org isolation is not decided here: every read below runs under the request's bound org
 (`app/tenancy/seam.py`), which is what keeps an org-wide key inside its own org.
 
@@ -25,7 +26,7 @@ from typing import Iterable
 from uuid import UUID
 
 from fastapi import HTTPException
-from sqlalchemy import or_, select, text
+from sqlalchemy import bindparam, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -81,11 +82,14 @@ class Expansion:
     scope_permissions: frozenset[tuple[str, int | UUID, str]]
     org_role: str | None
     valid_until: datetime | None
+    member_keys: frozenset[str] = frozenset()
+    """Keys every live member of a tenant org holds whatever their bindings (`access_catalog.MEMBER_KEYS`):
+    floor only, never org-wide and never a triple. Set by `authz/principal.py::effective_access`."""
 
     @property
     def permissions(self) -> frozenset[str]:
         """The route-level floor: every key held anywhere, derived so it cannot disagree."""
-        return self.org_keys | {key for _type, _id, key in self.scope_permissions}
+        return self.org_keys | self.member_keys | {key for _type, _id, key in self.scope_permissions}
 
 
 def _scope_of(row) -> tuple[str | None, UUID | int | None]:
@@ -104,20 +108,20 @@ def _scope_of(row) -> tuple[str | None, UUID | int | None]:
 #: The one read of `role_bindings` an authorization decision makes. RAW SQL, deliberately: it runs while
 #: the principal is being RESOLVED, inside `seam.identity_scope()` (whose open set, `IDENTITY_CLASSES`,
 #: `role_bindings` is not in — and `app/tenancy/seam.py` is frozen for this change), and from in-process
-#: callers already bound to an org or the operator plane. Keyed on the user, with the seam's own predicate
+#: callers already bound to an org or the operator plane. Keyed on the users asked for, with the seam's own predicate
 #: RESTATED (`rb.org_id` is the user's org), so it reads exactly the rows an org-bound ORM read would.
 #: Registered in `test_tenancy_bypass_sites.py`'s arm C.
 _EFFECTIVE_BINDINGS_SQL = text(
     """
-    WITH me AS (SELECT id, org_id FROM admin_users WHERE id = :user_id)
-    SELECT rb.id, r.slug, rb.scope_org_id, rb.project_id, rb.account_id,
+    WITH me AS (SELECT id, org_id FROM admin_users WHERE id IN :user_ids)
+    SELECT me.id AS user_id, rb.id, r.slug, rb.scope_org_id, rb.project_id, rb.account_id,
            rb.expires_at, NULL::uuid AS via_group_id
       FROM role_bindings rb
       JOIN roles r ON r.id = rb.role_id
       JOIN me ON rb.user_id = me.id AND rb.org_id = me.org_id
      WHERE CAST(:include_expired AS boolean) OR rb.expires_at IS NULL OR rb.expires_at > :now
     UNION ALL
-    SELECT DISTINCT rb.id, r.slug, rb.scope_org_id, rb.project_id, rb.account_id,
+    SELECT DISTINCT me.id AS user_id, rb.id, r.slug, rb.scope_org_id, rb.project_id, rb.account_id,
            rb.expires_at, m.group_id AS via_group_id
       FROM role_bindings rb
       JOIN roles r ON r.id = rb.role_id
@@ -125,7 +129,7 @@ _EFFECTIVE_BINDINGS_SQL = text(
       JOIN me ON m.user_id = me.id AND rb.org_id = me.org_id
      WHERE CAST(:include_expired AS boolean) OR rb.expires_at IS NULL OR rb.expires_at > :now
     """
-)
+).bindparams(bindparam("user_ids", expanding=True))
 
 
 def effective_bindings(
@@ -137,21 +141,37 @@ def effective_bindings(
     `expires_at <= now` confers nothing (AC-2.5); a binding with no expiry never expires.
     `include_expired=True` keeps the expired rows too — ONLY for `explain`, which reports them as
     `expired` and never as a path; no authorization decision may pass it."""
+    key = UUID(str(user_id))
+    return effective_bindings_many(session, [key], now=now, include_expired=include_expired)[key]
+
+
+def effective_bindings_many(
+    session: Session, user_ids: Iterable[UUID], *, now: datetime, include_expired: bool = False
+) -> dict[UUID, tuple[EffectiveBinding, ...]]:
+    """`effective_bindings` for several users in the same one statement, keyed by user (every id asked for is a
+    key; one with no live binding maps to `()`)."""
+    # UUIDs, not their spellings: the rows come back keyed by `uuid.UUID`.
+    wanted = list(dict.fromkeys(UUID(str(user_id)) for user_id in user_ids))
+    by_user: dict[UUID, list[EffectiveBinding]] = {user_id: [] for user_id in wanted}
+    if not wanted:
+        return {}
     rows = session.execute(
-        _EFFECTIVE_BINDINGS_SQL, {"user_id": user_id, "now": now, "include_expired": include_expired}
+        _EFFECTIVE_BINDINGS_SQL, {"user_ids": wanted, "now": now, "include_expired": include_expired}
     ).all()
-    out = []
     for row in rows:
         scope_type, scope_id = _scope_of(row)
         if scope_type is None:
             continue
-        out.append(
+        by_user.setdefault(row.user_id, []).append(
             EffectiveBinding(
                 binding_id=row.id, role_slug=row.slug, via_group_id=row.via_group_id,
                 scope_type=scope_type, scope_id=scope_id, expires_at=row.expires_at,
             )
         )
-    return tuple(sorted(out, key=lambda b: (str(b.binding_id), str(b.via_group_id))))
+    return {
+        user_id: tuple(sorted(found, key=lambda b: (str(b.binding_id), str(b.via_group_id))))
+        for user_id, found in by_user.items()
+    }
 
 
 def expand(bindings: Iterable[EffectiveBinding], *, vocabulary: frozenset[str]) -> Expansion:
@@ -215,10 +235,12 @@ EVERYONE_DETAIL = "Only an Org Owner or Org Admin can grant a role to Everyone."
 OWNER_TO_GROUP_DETAIL = "Org Owner is held by a person, never by a group."
 ORG_SCOPE_EXPIRY_DETAIL = "An organization-wide role never expires."
 PAST_EXPIRY_DETAIL = "The expiry must be in the future."
-PERSONAL_ACCOUNT_DETAIL = "A personal account stays its owner's; it cannot be shared through a role."
 OTHER_ORG_DETAIL = "The person or group must belong to the scope's organization."
 LAST_OWNER_DETAIL = "An organization must keep at least one owner. Make someone else an owner first."
 OWNER_SUBJECT_DETAIL = "Only an owner of your organization can change another owner."
+#: A project role below one the principal already holds through the org: under union semantics it confers
+#: nothing, and would read as a downgrade the access model does not have (no deny).
+INHERITED_DETAIL = "{name} already has {role} through {org}."
 
 
 @dataclass(frozen=True)
@@ -274,7 +296,7 @@ def resolve_scope(session: Session, scope_type: str, raw_id: object) -> Scope:
         else:
             raise ValueError(scope_type)
     except (TypeError, ValueError):
-        raise _not_found("scope")
+        raise _not_found("scope") from None
     if scope_type == SCOPE_ORG:
         bound = current_scope()
         if bound is not OPERATOR and bound != scope_id:
@@ -299,7 +321,7 @@ def resolve_holder(session: Session, kind: str, raw_id: object) -> Holder:
     try:
         holder_id = raw_id if isinstance(raw_id, UUID) else UUID(str(raw_id))
     except (TypeError, ValueError):
-        raise _not_found(kind if kind in ("user", "group") else "principal")
+        raise _not_found(kind if kind in ("user", "group") else "principal") from None
     if kind == "user":
         user = _one(session, AdminUser, holder_id)
         if user is None or user.is_system:
@@ -437,6 +459,25 @@ def _binding_query(holder: Holder, role_id: UUID, scope: Scope):
     )
 
 
+def _strongest_org_role(session: Session, holder: Holder, org_id: UUID):
+    """The highest-ranked role `holder` holds live at org scope — bound to it, or (a user) to a group it is
+    in — or None. What a project of that org inherits for it."""
+    now = _now()
+    if holder.kind == "user":
+        groups = select(UserGroupMembership.group_id).where(UserGroupMembership.user_id == holder.id)
+        whose = or_(RoleBinding.user_id == holder.id, RoleBinding.group_id.in_(groups))
+    else:
+        whose = RoleBinding.group_id == holder.id
+    role_ids = session.scalars(
+        select(RoleBinding.role_id).where(
+            RoleBinding.org_id == org_id, RoleBinding.scope_org_id == org_id, whose,
+            or_(RoleBinding.expires_at.is_(None), RoleBinding.expires_at > now),
+        )
+    ).all()
+    roles = [ROLES_BY_ID[rid] for rid in role_ids if rid in ROLES_BY_ID]
+    return max(roles, key=lambda r: r.rank, default=None)
+
+
 def add_binding(
     session: Session,
     actor: AdminUser,
@@ -452,7 +493,9 @@ def add_binding(
 
     Refuses, before any write: an unknown role or one the scope cannot carry (422); a caller `may_manage`
     refuses (403); a binding to Everyone by anyone below Org Admin (403); an org-scope expiry, a past one,
-    a personal account, an Org Owner grant to a group, a principal of another org (422). The caller
+    an Org Owner grant to a group, a principal of another org (422); a project role
+    BELOW the principal's strongest org-scope role, unless that exact row exists (409 `INHERITED_DETAIL`) — access is a union, so it would
+    confer nothing; an equal or higher one is accepted (the higher one is the effective role). The caller
     commits; `record_write` stages the audit row in the same transaction. A LAPSED row on the unique
     key is renewed (to `expires_at`) and reported `created=True`, since it conferred nothing."""
     from app.actors import stamp_actor
@@ -475,10 +518,17 @@ def add_binding(
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         if expires_at <= _now():
             raise HTTPException(status_code=422, detail=PAST_EXPIRY_DETAIL)
-    if scope.personal:
-        raise HTTPException(status_code=422, detail=PERSONAL_ACCOUNT_DETAIL)
     if principal.org_id != scope.org_id:
         raise HTTPException(status_code=422, detail=OTHER_ORG_DETAIL)
+    if scope.type == SCOPE_PROJECT:
+        inherited = _strongest_org_role(session, principal, scope.org_id)
+        # An exact row already held keeps its idempotent re-add/renew answer below; only a NEW lower one is refused.
+        if inherited is not None and role.rank < inherited.rank \
+                and session.scalar(_binding_query(principal, role.id, scope)) is None:
+            org = _one(session, Org, scope.org_id)
+            raise HTTPException(status_code=409, detail=INHERITED_DETAIL.format(
+                name=principal.name, role=inherited.name, org=org.name if org is not None else "the organization",
+            ))
 
     existing = session.scalar(_binding_query(principal, role.id, scope))
     if existing is not None:
@@ -601,7 +651,8 @@ def members(session: Session, scope: Scope, *, actor_principal=None, expand_grou
     each group as one row with no members and no `last_active_at` — never the org roster by the back door.
     `status` is `expired` for a lapsed binding, which confers nothing."""
     now = _now()
-    ancestors = _ancestors(session, scope)
+    # A personal account: only its own bindings reach it (`authz.visible_account_clause`), so no org row is listed.
+    ancestors = [scope] if scope.personal else _ancestors(session, scope)
     arms = [getattr(RoleBinding, SCOPE_COLUMNS[s.type]) == s.id for s in ancestors]
     rows = session.scalars(
         select(RoleBinding).where(or_(*arms), RoleBinding.org_id == scope.org_id)
@@ -799,21 +850,18 @@ def explain(session: Session, user: AdminUser, resource: Scope, feature: str, ac
             "message": f"{user_label} belongs to another organization.",
         }
         return answer
-    if resource.personal:
-        # A personal account is its owner's alone — no role reaches it, an Org Owner/Admin's included
-        # (`authz.visible_account_clause`, the enforcement).
-        if resource.owner_id == user.id:
-            answer.update(allowed=True, chain=[user_node, {"kind": "owner", "id": str(user.id), "name": user_label}, resource_node])
-        else:
-            answer["missing"] = {
-                "reason": "personal", "scope": resource.wire,
-                "message": f"{resource.name} is a personal account: only its owner may use it.",
-            }
+    if resource.personal and resource.owner_id == user.id:
+        answer.update(allowed=True, chain=[user_node, {"kind": "owner", "id": str(user.id), "name": user_label}, resource_node])
         return answer
-    answer["allowed"] = (
-        principal.has_org(key) if resource.type == SCOPE_ORG
-        else principal.has_on_scope(resource.type, resource.id, key)
-    )
+    if resource.personal:
+        # Someone else's personal account: only a binding on the account itself reaches it, never an org-wide
+        # role (`authz.visible_account_clause`, the enforcement).
+        answer["allowed"] = resource.id in principal.scopes_with(SCOPE_ACCOUNT, key)
+    else:
+        answer["allowed"] = (
+            principal.has_org(key) if resource.type == SCOPE_ORG
+            else principal.has_on_scope(resource.type, resource.id, key)
+        )
 
     every = effective_bindings(session, user.id, now=now, include_expired=True)
     names = _names(session, every)
@@ -836,6 +884,8 @@ def explain(session: Session, user: AdminUser, resource: Scope, feature: str, ac
 
     live, expired, reaching = [], [], []
     for b in every:
+        if resource.personal and (b.scope_type, b.scope_id) != (resource.type, resource.id):
+            continue
         expansion = expand((b,), vocabulary=vocabulary)
         is_expired = b.expires_at is not None and b.expires_at <= now
         if _confers(expansion, resource, key):
@@ -862,6 +912,11 @@ def explain(session: Session, user: AdminUser, resource: Scope, feature: str, ac
                 "reason": "role",
                 "scope": _binding_out(nearest, names, now)["scope"],
                 "message": f"{' and '.join(held)} does not include: {label}",
+            }
+        elif resource.personal:
+            answer["missing"] = {
+                "reason": "personal", "scope": resource.wire,
+                "message": f"{resource.name} is a personal account, not shared with {user_label}.",
             }
         else:
             answer["missing"] = {"reason": "binding", "scope": resource.wire, "message": _missing_message(resource)}
@@ -1031,13 +1086,7 @@ def bind_org_owner(session: Session, user: AdminUser) -> RoleBinding:
     owner_id = session.scalar(select(OrgSignup.owner_id).where(OrgSignup.org_id == user.org_id))
     if owner_id is None or owner_id != user.id:
         raise RuntimeError("bind_org_owner: the user is not the sign-up owner of their org")
-    row, _created = add_binding(
-        session, system_actor(user.org_id), _SystemPrincipal(),  # type: ignore[arg-type]
-        principal=Holder("user", user.id, display_name(user), user.org_id),
-        role_slug=OWNER_ROLE,
-        scope=resolve_scope(session, SCOPE_ORG, user.org_id),
-    )
-    return row
+    return _bind_as_system(session, user, OWNER_ROLE)
 
 
 def bind_staging_role(session: Session, user: AdminUser, role_slug: str) -> RoleBinding:
@@ -1050,6 +1099,12 @@ def bind_staging_role(session: Session, user: AdminUser, role_slug: str) -> Role
     parent = session.scalar(select(Org.parent_org_id).where(Org.id == user.org_id))
     if parent is None or role_slug not in (OWNER_ROLE, "org_admin"):
         raise RuntimeError("bind_staging_role: an Owner or Admin of a staging org only")
+    return _bind_as_system(session, user, role_slug)
+
+
+def _bind_as_system(session: Session, user: AdminUser, role_slug: str) -> RoleBinding:
+    """`bind_org_owner`'s and `bind_staging_role`'s write, reached only through their guards: `user` bound to
+    `role_slug` at their own org's scope, as the system."""
     row, _created = add_binding(
         session, system_actor(user.org_id), _SystemPrincipal(),  # type: ignore[arg-type]
         principal=Holder("user", user.id, display_name(user), user.org_id),

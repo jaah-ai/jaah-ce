@@ -1,4 +1,4 @@
-"""The write seam: one `before_flush` listener on `SessionLocal` that stamps `org_id`, refuses a
+"""The write seam: one `before_flush` listener on `BridgedSession` that stamps `org_id`, refuses a
 cross-org write, and counts writes it had no org to stamp (a listener, so a forgotten route fails closed).
 
   * Org bound: NULL `org_id` is stamped, a different org refused. `Derived` rows check the parent's
@@ -15,6 +15,7 @@ only: `app/tenancy/keys.py` (whose unkeyed references this seam does not hold ei
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 from uuid import UUID
 
@@ -72,7 +73,7 @@ def _derivations() -> dict[type, Any]:
 def stamp_org(session: Session, _flush_context: Any, _instances: Any) -> None:
     """`before_flush` listener: stamp, refuse, or count every tenant-owned instance in this flush.
 
-    Registered on `SessionLocal` after the actor stamp (`app/db.py`); order between the two does not
+    Registered on `BridgedSession` after the actor stamp (`app/db.py`); order between the two does not
     matter. `session.is_modified` filters `session.dirty`, which includes unchanged objects.
 
     The `Stored`-then-`Derived` pass order buys nothing; the parent-org guard is what matters.
@@ -186,7 +187,7 @@ def _apply(
         # An explicit `org_id` with nothing bound and no contradicting parent is left alone and not
         # counted (the operator plane writes other orgs' rows; B28's create surfaces take this arm).
         # Below the parent walk on purpose, so an explicit value cannot skip the parent check. Explicit
-        # writers (`routes/agent/task_reads.py::create_system_task`, `runner_breaks.py::record`, `routes/crons.py`)
+        # writers (`routes/agent/task_reads.py::create_system_task`, `routes/crons.py`)
         # are safe: the refusal fires only on NULL, and their classes are `Stored`.
         if current is not None:
             return
@@ -417,7 +418,8 @@ def _count_unbound(
         )
     except Exception as exc:  # noqa: BLE001 - a counter must never break a write; see above
         global _DROPPED
-        _DROPPED += 1
+        with _DROPPED_LOCK:
+            _DROPPED += 1
         if _remember(f"count-unbound:{type(exc).__name__}"):
             log.exception(
                 "tenancy write seam: the unbound-write counter raised; its counts are lost "
@@ -431,13 +433,15 @@ _LOGGED_FAILURES: set[str] = set()
 
 #: Unbound stamps this listener could not record. Read through `dropped()`; see `_count_unbound`.
 _DROPPED = 0
+# Writes on many request threads at once: without a GIL a bare `+=` loses counts.
+_DROPPED_LOCK = threading.Lock()
 
 
 def dropped() -> int:
     """How many unbound stamps this process failed to record.
 
-    Non-zero means `tenancy_exclusions` is only a lower bound. Not locked: a lost increment under a
-    race is cheaper than a second lock inside a flush."""
+    Non-zero means `tenancy_exclusions` is only a lower bound. The increment is locked (`_DROPPED_LOCK`: with no GIL
+    a bare `+=` loses counts); this read is a single load and needs none."""
     return _DROPPED
 
 
@@ -457,4 +461,5 @@ def reset_failure_log() -> None:
     (`tests/test_tenancy_write_seam.py`)."""
     global _DROPPED
     _LOGGED_FAILURES.clear()
-    _DROPPED = 0
+    with _DROPPED_LOCK:
+        _DROPPED = 0

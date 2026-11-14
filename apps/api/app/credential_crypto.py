@@ -386,6 +386,20 @@ def unseal(value: Any, *, aad: bytes, label: str) -> Any:
     return json.loads(plaintext)
 
 
+class RowEnvelope:
+    """A v1 envelope bound to one row of one store: AAD `<prefix><row id>`, so a value moved to another row or
+    another store fails to open. `prefix` is fixed per store forever — a changed byte orphans every sealed row."""
+
+    def __init__(self, prefix: bytes, label: str) -> None:
+        self.prefix, self.label = prefix, label
+
+    def seal(self, row_id: UUID, value: dict[str, Any]) -> dict[str, Any]:
+        return seal(value, aad=self.prefix + str(row_id).encode())
+
+    def open(self, stored: Any, row_id: UUID) -> Any:
+        return unseal(stored, aad=self.prefix + str(row_id).encode(), label=self.label)
+
+
 # ── The sealed-secret marker ─────────────────────────────────────────────────────────────────────────
 
 

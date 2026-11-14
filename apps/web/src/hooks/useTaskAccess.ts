@@ -9,7 +9,7 @@ import type { PipelineTask } from '../types'
  * grant on its PROJECT plus the `tasks:*` keys held there, for every task in it.
  * Keys (each asked PER ROW on the row's project: `tasks:edit` on B authorizes nothing on A):
  *   · `tasks:edit` — every mutation route but `DELETE`/`POST /api/tasks`: `PUT`/`PATCH /api/tasks/{id}`,
- *     `/start`, `/force-start`, `/answer`, `/answer-question`, `/ignore-question`, `/revise-question`,
+ *     `/start`, `/force-start`, `/answer`, `/answer-question`, `/input-requests/answers`, `/ignore-question`, `/revise-question`,
  *     `/reset`, `/stop`, `/complete`, `/dependencies`, and the three attachment writes, all
  *     `@feature("tasks", "edit", object_type="task", object_params=("task_id",))`.
  *   · `tasks:delete` — `DELETE /api/tasks/{id}` alone.

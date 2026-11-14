@@ -2,17 +2,17 @@ import { useEffect, useMemo, useState } from 'react'
 import type { JSX, ReactNode } from 'react'
 import Autocomplete, { createFilterOptions } from '@mui/material/Autocomplete'
 import Box from '@mui/material/Box'
-import CircularProgress from '@mui/material/CircularProgress'
-import TextField from '@mui/material/TextField'
+import Link from '@mui/material/Link'
+import { Link as RouterLink } from 'react-router-dom'
 import { get } from '../api'
 import { useAuth } from '../auth'
 import { actingAs, readAsOnce } from '../lib/actAs'
 import type { OrgRef } from '../types'
-import { highlight, OPTION_ROW_SX } from './AsyncLookup'
-import HelpLabel from './HelpLabel'
-import { ELLIPSIS_SX, fieldTapTargetSx } from './listStyles'
-import { NO_AUTOFILL_INPUT } from './noAutofill'
-import { paperGround } from '../theme'
+import { highlight, OPTION_ROW_SX, renderLookupInput } from './AsyncLookup'
+import type { HelpProp } from './explain'
+import { ELLIPSIS_SX } from './listStyles'
+import { FONT_SIZE, FONT_WEIGHT, grid, paperGround } from '../theme'
+import Tip from './Tip'
 
 /* The Repo URL field: type or paste any URL, or pick one of the repositories the signed-in person's own git
  * connections reach (`GET /api/git-repos`, every connected forge and every org/workspace in it), grouped by
@@ -26,6 +26,24 @@ import { paperGround } from '../theme'
  *
  * `org`: another org's project (an operator's) — the list, and each repository's state, are that org's
  * connections', read as it (`lib/actAs.ts::readAsOnce`). */
+
+/** Profile > Git, where the viewer's own Git connections are connected and reconnected. */
+export const PROFILE_GIT_PATH = '/profile?tab=git-accounts'
+const PROFILE_GIT_NAME = 'Profile > Git'
+
+/** A failed read's own sentence, its "Profile > Git" a link to that page. Not for another org's list (named, or the tab's
+ *  act-as org): the viewer's own Profile > Git would reconnect them, not that org. */
+function failedDetail(detail: string, linked: boolean): ReactNode {
+  const at = linked ? detail.indexOf(PROFILE_GIT_NAME) : -1
+  if (at < 0) return detail
+  return (
+    <>
+      {detail.slice(0, at)}
+      <Link component={RouterLink} to={PROFILE_GIT_PATH}>{PROFILE_GIT_NAME}</Link>
+      {detail.slice(at + PROFILE_GIT_NAME.length)}
+    </>
+  )
+}
 
 export type GitRepo = {
   url: string
@@ -89,7 +107,7 @@ export function loadRepoState(url: string, org: OrgRef | null = null): Promise<R
     .catch(() => ({ default_branch: null, empty: null }))
 }
 
-/** Test seam: forget the shared read. */
+/** Forget the shared read: a Git connection just landed (`components/projects/RepoGitConnect`), and tests. */
 export function resetRepoLookupCache(): void {
   cached = null
 }
@@ -124,8 +142,8 @@ export function unlistedForge(url: string, data: GitRepos | null, forges?: reado
 
 const matchRepo = createFilterOptions<GitRepo>({ stringify: repo => `${repo.owner}/${repo.name} ${repo.url}` })
 
-const GROUP_LABEL_SX = { ...ELLIPSIS_SX, flex: '1 1 auto', fontSize: '0.8125rem', color: 'text.primary' } as const
-const GROUP_HINT_SX = { ...ELLIPSIS_SX, flex: '0 1 auto', fontSize: '0.75rem', color: 'text.secondary' } as const
+const GROUP_LABEL_SX = { ...ELLIPSIS_SX, flex: '1 1 auto', fontSize: FONT_SIZE.md, color: 'text.primary' } as const
+const GROUP_HINT_SX = { ...ELLIPSIS_SX, flex: '0 1 auto', fontSize: FONT_SIZE.sm, color: 'text.secondary' } as const
 
 export default function RepoUrlLookup({
   id,
@@ -147,8 +165,8 @@ export default function RepoUrlLookup({
 }: {
   id: string
   label: string
-  /** A few words shown on hovering the label (`ui/HelpLabel`), as `ui/FormField` does. */
-  help?: string
+  /** The label's explanation (`ui/HelpLabel`), as `ui/FormField` does. */
+  help?: HelpProp
   value: string
   onChange: (url: string) => void
   /** Also called when a listed repository is picked (after `onChange`), for the fields it implies. */
@@ -224,7 +242,7 @@ export default function RepoUrlLookup({
   ) : failed ? (
     <>
       <Box component="span" sx={{ display: 'block' }} data-testid={`${id}-unread`}>
-        Couldn't read your {failed.forge_label} repos{failed.detail ? `: ${failed.detail}` : '.'}
+        Couldn't read your {failed.forge_label} repos{failed.detail ? <>: {failedDetail(failed.detail, !org && !actingAs())}</> : '.'}
       </Box>
       {hint}
     </>
@@ -282,8 +300,9 @@ export default function RepoUrlLookup({
         onBlur?.(value)
       }}
       onKeyDown={event => {
-        // Enter picks a highlighted row or keeps the typed URL; it never submits the surrounding form.
-        if (event.key === 'Enter') event.preventDefault()
+        /* Enter picks a highlighted row or keeps the typed URL; it never submits the surrounding form. Only the
+           text box's Enter: the label's explain button (inside the same root) keeps its own. */
+        if (event.key === 'Enter' && event.target instanceof HTMLInputElement) event.preventDefault()
       }}
       renderGroup={params => {
         const [owner, root] = params.group.split('\u0000')
@@ -291,11 +310,11 @@ export default function RepoUrlLookup({
           <li key={params.key}>
             <Box
               sx={{
-                ...OPTION_ROW_SX, position: 'sticky', top: '-8px', zIndex: 1, px: 2, py: 0.75,
-                bgcolor: paperGround, borderBottom: 1, borderColor: 'divider', fontWeight: 600,
+                ...OPTION_ROW_SX, position: 'sticky', top: grid(-1.5), zIndex: 1, px: 2, py: 0.5,
+                bgcolor: paperGround, borderBottom: 1, borderColor: 'divider', fontWeight: FONT_WEIGHT.semibold,
               }}
             >
-              <Box component="span" sx={{ ...GROUP_LABEL_SX, fontWeight: 600 }}>{owner}</Box>
+              <Box component="span" sx={{ ...GROUP_LABEL_SX, fontWeight: FONT_WEIGHT.semibold }}>{owner}</Box>
               {root && <Box component="span" sx={GROUP_HINT_SX}>{root}</Box>}
             </Box>
             <Box component="ul" sx={{ p: 0 }}>{params.children}</Box>
@@ -305,44 +324,25 @@ export default function RepoUrlLookup({
       renderOption={(props, option, state) => {
         const { key: _muiKey, ...rest } = props
         return (
-          <Box component="li" key={option.url} {...rest} title={option.url} aria-label={`${option.owner}/${option.name}`}>
-            <Box component="span" sx={{ ...ELLIPSIS_SX, pl: 1, fontSize: '0.8125rem' }}>
+          <Tip key={option.url} title={option.url}><Box component="li" {...rest} aria-label={`${option.owner}/${option.name}`}>
+            <Box component="span" sx={{ ...ELLIPSIS_SX, pl: 1, fontSize: FONT_SIZE.md }}>
               {highlight(option.name, state.inputValue)}
             </Box>
-          </Box>
+          </Box></Tip>
         )
       }}
-      slotProps={{ listbox: { sx: { maxHeight: '22rem' } } }}
-      renderInput={params => (
-        <TextField
-          {...params}
-          sx={fieldTapTargetSx}
-          label={help ? <HelpLabel label={label} help={help} /> : label}
-          required={need && requiredMark}
-          error={Boolean(error)}
-          helperText={error || shownHint}
-          placeholder={repos.length > 0 ? 'Search or paste a URL' : placeholder}
-          slotProps={{
-            ...params.slotProps,
-            inputLabel: { shrink: true },
-            input: {
-              ...params.slotProps.input,
-              endAdornment: (
-                <>
-                  {loading && focused && <CircularProgress size={16} thickness={5} data-testid={`${id}-busy`} />}
-                  {params.slotProps.input.endAdornment}
-                </>
-              ),
-            },
-            htmlInput: {
-              ...params.slotProps.htmlInput,
-              ...NO_AUTOFILL_INPUT,
-              ...(help ? { 'aria-description': help } : {}),
-              ...(need && !requiredMark ? { required: true } : {}),
-            },
-          }}
-        />
-      )}
+      slotProps={{ listbox: { sx: { maxHeight: grid(58.5) } } }}
+      renderInput={params => renderLookupInput(params, {
+        busy: loading && focused,
+        shrink: true,
+        label,
+        help,
+        required: need && requiredMark,
+        error: Boolean(error),
+        helperText: error || shownHint,
+        placeholder: repos.length > 0 ? 'Search or paste a URL' : placeholder,
+        htmlInput: need && !requiredMark ? { required: true } : undefined,
+      })}
     />
   )
 }

@@ -1,0 +1,40 @@
+slug = "attention"
+label = "Attention"
+category = "crm"
+vendor_docs_url = "https://docs.attention.com/api-authentication"
+summary = "Read Attention's recorded sales conversations, transcripts, scorecards and team data."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "Sign in at app.attention.tech, open Settings > API Keys, select Create API key, name it Jaah, choose organization level so agents can read every team's calls, and copy the key from the API Key Created window (it is shown once)" },
+]
+
+[test]
+path = "https://api.attention.tech/v2/users"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+list_field = "data"
+
+[docs]
+agent_uses = [
+  "List recorded conversations and read their transcripts, summaries and extracted fields",
+  "Read scorecards and their results to review call quality",
+  "Read users and teams to know who ran a call",
+  "Pull call insights into a CRM update or a weekly summary",
+]
+prerequisites = [
+  "An Attention account where you can create API keys (an organization-level key needs an admin)",
+]
+limitations = [
+  "A user-level key reaches only that user's conversations; an organization-level key reaches every team's",
+  "Attention rate-limits each key; ask your Attention account manager for a higher limit",
+  "Transcripts can hold personal data from your calls; connect only for tasks that need them",
+]
+troubleshooting = [
+  { symptom = "Test says Attention rejected the API key (401)", fix = "The key was deleted or mistyped. Create a new one under Settings > API Keys and select Replace on the secret" },
+  { symptom = "Test says Attention rejected the API key (403)", fix = "A user-level key may not list the organization's users. Create an organization-level key (an admin can) and replace the secret" },
+  { symptom = "An agent finds no conversations", fix = "The key belongs to a user who recorded none. Use an organization-level key, or a key of the user whose calls agents should read" },
+]
+faq = [
+  { q = "How do I rotate the key", a = "Create a new key in Attention, select Replace on the secret, check that Test passes, then delete the old key in Attention" },
+]

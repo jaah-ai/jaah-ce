@@ -1,8 +1,8 @@
 import type { JSX, ReactNode } from 'react'
 import Stack from '@mui/material/Stack'
-import TextField from '@mui/material/TextField'
-import { fieldTapTargetSx, tapTargetSx } from './listStyles'
-import { NO_AUTOFILL_INPUT } from './noAutofill'
+import { fieldTapTargetSx } from './listStyles'
+import SearchBox from './SearchBox'
+import SelectField from './SelectField'
 
 /* ONE wrapping row of controls, handed to `ui/FilterBar` as a SINGLE child: the bar stacks each child
    full-width below `sm`, which put six controls on six lines at 390px (measured 695px of chrome vs a 529px
@@ -45,13 +45,12 @@ export function vocabularyOptions(
   return names.map(value => ({ value, label: label(value) }))
 }
 
-/* The console's ONE filter dropdown: MUI `TextField select`, `native` (a real `<select>`). Native because
-   the vocabulary has no icons, no multi-select and no async load — the Material answer for that, the
-   phone's own picker, and what the suite drives with `userEvent.selectOptions`.
+/* The console's ONE filter dropdown: `ui/SelectField` (a native `<select>`) with the "no filter" option first.
    `ariaLabel` is a SEPARATE, frozen accessible name specs query by, applied to the `select` itself.
    `disabled`/`errorText` do not widen the vocabulary: a caller with fetched options must have them before
    mapping (the Credentials strip fetches once at mount); they render the never-arrived roster honestly.
-   Additive and default-absent, so existing call sites are unchanged (N13: not forked). */
+   The phone tap floor is `SelectField`'s (`fieldTapTargetSx`): a single native select has no MUI `height`
+   rule to collide with, so the 23px value keeps 27px of content inside the 44px floor and never ellipsises. */
 export function FilterSelect({
   label,
   ariaLabel,
@@ -88,63 +87,41 @@ export function FilterSelect({
   errorText?: string
 }): JSX.Element {
   return (
-    <TextField
-      select
+    <SelectField
       label={label}
+      ariaLabel={ariaLabel}
       value={value}
-      onChange={e => onChange(e.target.value)}
+      onChange={onChange}
       disabled={disabled}
       error={Boolean(errorText)}
       helperText={errorText}
-      slotProps={{
-        select: { native: true },
-        // Pinned open: an outlined select with value '' would otherwise overlap label and placeholder.
-        inputLabel: { shrink: true },
-        htmlInput: ariaLabel ? { 'aria-label': ariaLabel } : {},
-      }}
-      /* `m: 0` cancels the theme's `margin: 'dense'` (chrome height above the first row, AC5). */
-      /* The floor goes on the `input` slot too: for a `native` select the tap target is the `<select>`
-         (40px inside a 44px root). Spelled as PADDING, not `minHeight`: forcing `border-box` for a
-         `minHeight` collapsed the 23px content to 6px and rendered the value as three dots (caught only
-         by looking). 23px content + 21px padding = 44px. */
-      sx={theme => ({
-        minWidth,
-        maxWidth,
-        ...(grow && { flex: `1 1 ${minWidth}px` }),
-        m: 0,
-        '& .MuiInputBase-root': tapTargetSx(theme),
-        '& .MuiInputBase-input': { pt: { xs: '10.5px', sm: '8.5px' }, pb: { xs: '10.5px', sm: '8.5px' } },
-      })}
-    >
-      <option value="">{allLabel}</option>
-      {options.map(o => (
-        <option key={o.value} value={o.value}>{o.label}</option>
-      ))}
-    </TextField>
+      options={[{ value: '', label: allLabel }, ...options]}
+      sx={{ minWidth, maxWidth, ...(grow && { flexGrow: 1, flexShrink: 1, flexBasis: minWidth }) }}
+    />
   )
 }
 
-/* THE ONE CLIENT-SIDE LIST SEARCH: an undebounced "Search" field that grows from its `minWidth` basis
-   (190px by default). A server search is `ui/SearchBox` (debounced) — keep the two apart. */
-export function FilterSearch({ value, onChange, ariaLabel, placeholder, minWidth = 190 }: {
+/* THE CLIENT-SIDE LIST SEARCH: `ui/SearchBox` (the console's one search box) under a "Search" label, committing
+   every keystroke (the list filters in the browser), growing from its `minWidth` basis (190px by default). */
+export function FilterSearch({ value, onChange, ariaLabel, placeholder, minWidth = 190, grow = 1 }: {
   value: string
   onChange: (next: string) => void
   ariaLabel: string
   placeholder: string
   /** The flex basis and floor; a strip packing many controls onto one line lowers it. */
   minWidth?: number
+  /** Its share of the row's spare width against the strip's other growing controls (each 1). */
+  grow?: number
 }): JSX.Element {
   return (
-    <TextField
+    <SearchBox
       label="Search"
       value={value}
-      onChange={e => onChange(e.target.value)}
+      onChange={onChange}
+      delayMs={0}
       placeholder={placeholder}
-      slotProps={{
-        inputLabel: { shrink: true },
-        htmlInput: { ...NO_AUTOFILL_INPUT, 'aria-label': ariaLabel },
-      }}
-      sx={[{ flex: `1 1 ${minWidth}px`, minWidth, m: 0 }, fieldTapTargetSx]}
+      ariaLabel={ariaLabel}
+      sx={[{ flexGrow: grow, flexShrink: 1, flexBasis: minWidth, minWidth, m: 0 }, fieldTapTargetSx]}
     />
   )
 }

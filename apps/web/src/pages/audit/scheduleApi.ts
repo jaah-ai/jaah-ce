@@ -2,17 +2,19 @@
  * The ROW TYPE IS SHARED with `pages/cron/api.ts`, not copied (`FleetCronRun`).
  */
 
-import { get } from '../../api'
+import { get, withQuery } from '../../api'
 import { RUNS_PAGE_SIZE } from '../../hooks/usePagedList'
 import { RUNS_MAX_LIMIT, type CronRun } from '../cron/api'
 
 /** ONE FIRING, ACROSS EVERY SCHEDULE — `routes/crons.py`'s ledger row with the cron's identity on it.
  *
  *  DERIVED FROM `CronRun` (documented in `pages/cron/api.ts`, the only place),
- *  PLUS `cron_id` (the address and filter value) and `cron_name` (what an operator reads). */
+ *  PLUS `cron_id` (the filter value), `cron_name` (what an operator reads) and `automation_id` (the link). */
 export type FleetCronRun = CronRun & {
   cron_id: string
   cron_name: string
+  /** The automation the cron is the schedule of (the name's link); null only for a row older than automations. */
+  automation_id: string | null
 }
 
 /** One KEYSET page of the ledger, newest first — `GET /api/crons/runs`.
@@ -49,9 +51,6 @@ export type ScheduleFilters = {
 }
 
 export function listFleetCronRuns(filters: ScheduleFilters = {}) {
-  const params = new URLSearchParams({ limit: String(RUNS_PAGE_SIZE) })
-  if (filters.cron) params.set('cron', filters.cron)
-  if (filters.outcome) params.set('outcome', filters.outcome)
-  if (filters.before) params.set('before', filters.before)
-  return get<FleetCronRunsPage>(`/api/crons/runs?${params}`)
+  const { cron, outcome, before } = filters
+  return get<FleetCronRunsPage>(withQuery('/api/crons/runs', { limit: RUNS_PAGE_SIZE, cron, outcome, before }))
 }

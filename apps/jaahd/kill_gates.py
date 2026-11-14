@@ -49,20 +49,8 @@ def _reachable_sockets() -> list[str]:
 def _window_id_on(socket: str, tmux_target: str, run_fn) -> str:
     """The stable `#{window_id}` of `tmux_target` on this socket, or "" when absent or unprobeable. Also
     the per-socket membership test: window ids are per-server."""
-    try:
-        probe = run_fn(
-            session_user.tmux_cmd(socket, "display-message", "-t", tmux_target, "-p", "#{window_id}"),
-            capture_output=True, text=True, timeout=10, env=env_helpers._tmux_safe_env(),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.warning(
-            "kill-gates: tmux window_id resolve for %s on socket %r failed (%s)",
-            tmux_target, socket, exc,
-        )
-        return ""
-    if getattr(probe, "returncode", 1) != 0:
-        return ""
-    return (getattr(probe, "stdout", "") or "").strip()
+    return session_user.tmux_out(socket, "display-message", "-t", tmux_target, "-p", "#{window_id}",
+                                 run=run_fn) or ""
 
 
 def _window_cwd_matches(socket: str, target: str, expect_cwd: str, run_fn) -> bool:
@@ -71,55 +59,57 @@ def _window_cwd_matches(socket: str, target: str, expect_cwd: str, run_fn) -> bo
     The kill's IDENTITY check. FAILS CLOSED: an unreadable pane list is not a match and the kill is
     refused. A persisted `session:index` goes stale when `renumber-windows` shifts the pack, so the same
     string can name a different live window; unproven identity must never be killed on an index."""
-    try:
-        probe = run_fn(
-            session_user.tmux_cmd(socket, "list-panes", "-t", target, "-F", "#{pane_current_path}"),
-            capture_output=True, text=True, timeout=10, env=env_helpers._tmux_safe_env(),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.warning(
-            "kill-gates: tmux pane-cwd probe for %s on socket %r failed (%s) — refusing the kill "
-            "(an unverifiable window is not a kill target)", target, socket, exc,
-        )
-        return False
-    if getattr(probe, "returncode", 1) != 0:
+    paths = session_user.tmux_out(socket, "list-panes", "-t", target, "-F", "#{pane_current_path}", run=run_fn)
+    if paths is None:
         return False
     # `host_platform.is_under`: the posix rule is the string prefix it always was; on Windows tmux answers
     # in MSYS spelling (`/c/ProgramData/...`) while the slot path is `C:\ProgramData\...`.
-    for path in (getattr(probe, "stdout", "") or "").splitlines():
+    for path in paths.splitlines():
         if host_platform.is_under(path.strip(), expect_cwd):
             return True
     return False
 
 
+def _window_in_tree(socket: str, expect_cwd: str, run_fn) -> str:
+    """The `#{window_id}` of THE one window on this socket with a pane at or under EXPECT_CWD, or "".
+
+    `kill_session`'s recovery when a stale `session:index` names another slot's window (`renumber-windows`
+    shifted the pack, typically under a `_clear_tree` whose own reap just closed windows): the slot's worktree
+    still names its window. The holder and console tabs (`|term`/`|web`, kept unreaped in the tree) are never
+    candidates, nor a window with any pane outside the tree. FAILS CLOSED: an unreadable listing, or two candidate
+    windows in the tree (the fence cannot tell them apart), is "" and nothing is killed."""
+    import worktree_ops  # noqa: PLC0415 — deferred: `worktree_ops` imports `commands`, which imports this module
+
+    listing = session_user.tmux_out(
+        socket, "list-panes", "-a", "-F", "#{window_id}\t#{window_name}\t#{pane_current_path}", run=run_fn)
+    if listing is None:
+        return ""
+    inside: set[str] = set()
+    outside: set[str] = set()
+    for line in listing.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) != 3 or not parts[0].strip():
+            continue
+        window_id, name, path = parts[0].strip(), parts[1], parts[2].strip()
+        if name == HOLDER_WINDOW or name.endswith(worktree_ops._NON_AGENT_WINDOW_SUFFIXES):
+            continue
+        (inside if host_platform.is_under(path, expect_cwd) else outside).add(window_id)
+    # Every pane of the window in the tree: a window that also holds a neighbour's pane is not this slot's.
+    found = inside - outside
+    return found.pop() if len(found) == 1 else ""
+
+
 def _window_holds_pane(socket: str, target: str, pane_pid: int, run_fn) -> bool:
     """Whether TARGET on this socket still holds the pane whose `#{pane_pid}` is PANE_PID. FAILS CLOSED, like
     `_window_cwd_matches`: a caller that named the pane wants exactly that pane's window and no other."""
-    try:
-        probe = run_fn(
-            session_user.tmux_cmd(socket, "list-panes", "-t", target, "-F", "#{pane_pid}"),
-            capture_output=True, text=True, timeout=10, env=env_helpers._tmux_safe_env(),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    if getattr(probe, "returncode", 1) != 0:
-        return False
-    return str(pane_pid) in {line.strip() for line in (getattr(probe, "stdout", "") or "").splitlines()}
+    pids = session_user.tmux_out(socket, "list-panes", "-t", target, "-F", "#{pane_pid}", run=run_fn)
+    return pids is not None and str(pane_pid) in {line.strip() for line in pids.splitlines()}
 
 
 def _window_name_on(socket: str, target: str, run_fn) -> str:
     """`#{window_name}` of TARGET on this socket, or "". Feeds only the holder refusal, so an unreadable
     name fails OPEN (not-the-holder): the kill proceeds and no-ops on a gone window."""
-    try:
-        probe = run_fn(
-            session_user.tmux_cmd(socket, "display-message", "-t", target, "-p", "#{window_name}"),
-            capture_output=True, text=True, timeout=10, env=env_helpers._tmux_safe_env(),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if getattr(probe, "returncode", 1) != 0:
-        return ""
-    return (getattr(probe, "stdout", "") or "").strip()
+    return session_user.tmux_out(socket, "display-message", "-t", target, "-p", "#{window_name}", run=run_fn) or ""
 
 
 def kill_session(tmux_target: str, *, expect_cwd: str = "", reason: str = "", socket: str | None = None,
@@ -170,28 +160,34 @@ def kill_session(tmux_target: str, *, expect_cwd: str = "", reason: str = "", so
             )
             continue
         if expect_cwd and not _window_cwd_matches(socket, target, expect_cwd, run_fn):
+            # A stale index must not leave the slot's own window running: find it by the worktree instead.
+            in_tree = _window_in_tree(socket, expect_cwd, run_fn)
+            if not in_tree:
+                log.warning(
+                    "kill-gates: refusing to kill %s (%r) on socket %r — no pane of it lives under %s, so "
+                    "the caller's tmux_target %r names a DIFFERENT window than the slot it wants to kill "
+                    "(a stale session:index renumbered onto a live neighbour), and no single window of that "
+                    "worktree was found instead%s",
+                    target, name, socket, expect_cwd, tmux_target, f" — {reason}" if reason else "",
+                )
+                continue
             log.warning(
-                "kill-gates: refusing to kill %s (%r) on socket %r — no pane of it lives under %s, so "
-                "the caller's tmux_target %r names a DIFFERENT window than the slot it wants to kill "
-                "(a stale session:index renumbered onto a live neighbour)%s",
-                target, name, socket, expect_cwd, tmux_target, f" — {reason}" if reason else "",
+                "kill-gates: %s (%r) on socket %r is not under %s — the caller's tmux_target %r is stale "
+                "(renumbered onto a neighbour); killing that worktree's own window %s instead",
+                target, name, socket, expect_cwd, tmux_target, in_tree,
             )
-            continue
+            target = in_tree
+            name = _window_name_on(socket, target, run_fn)
         if expect_pane_pid is not None and not _window_holds_pane(socket, target, expect_pane_pid, run_fn):
             log.warning(
                 "kill-gates: refusing to kill %s (%r) on socket %r — it no longer holds pane pid %s%s",
                 target, name, socket, expect_pane_pid, f" — {reason}" if reason else "",
             )
             continue
-        try:
-            proc = run_fn(
-                session_user.tmux_cmd(socket, "kill-window", "-t", target),
-                capture_output=True, text=True, timeout=10, env=env_helpers._tmux_safe_env(),
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            log.warning("kill-gates: tmux kill-window %s on socket %r failed: %s", target, socket, exc)
+        proc = session_user.tmux_run(socket, "kill-window", "-t", target, run=run_fn)
+        if proc is None:
             continue
-        if getattr(proc, "returncode", 1) == 0:
+        if proc.returncode == 0:
             # A confirmed kill is logged so the journal names why every window died.
             log.info(
                 "kill-gates: killed tmux window %s (%r) on socket %r for target %r%s",

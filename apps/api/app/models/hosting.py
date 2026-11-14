@@ -1,4 +1,4 @@
-"""Node hosting: hosting prices, allowed instance types, node hostings and their changes."""
+"""Node hosting: allowed instance types, node hostings and their changes."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -8,7 +8,6 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
-    Float,
     ForeignKey,
     Index,
     Integer,
@@ -29,46 +28,6 @@ from app.models.base import (
     timestamp_column,
     UuidPkMixin,
 )
-
-
-#: `rental_prices.kind`: a Dedicated host's instance type, its storage size, a Shared tier, Live Cast's price per
-#: project (one row, key `project`, `app/live_cast/billing.py`), or the Windows license on an instance type (key =
-#: the type; a Windows Dedicated host bills it beside the type).
-HOSTING_PRICE_KINDS = ("instance", "storage", "shared", "live_cast", "windows")
-
-
-class HostingPrice(EntityMixin, Base):
-    """One line of the operator's hosting price catalogue: an instance type, a storage size
-    (`key` = GB) or a Shared tier, at a monthly price, and the Stripe Product and licensed monthly Price it sells
-    through (`app/billing/hosting_prices.py`). `monthly_cents` is the price offered; once pushed it is copied from
-    the Price Stripe CREATED, and `unit_amount` mirrors that Price. An edit is a new Price (`version` + 1);
-    subscriptions move to it at their next period. `vcpu`/`ram_gb` are display facts of an instance row; `disk_gb` is a
-    Shared tier's disk, the cap every Shared node on the tier binds to (`vnodes.effective_caps`)."""
-
-    __tablename__ = "rental_prices"
-    __table_args__ = (
-        UniqueConstraint("kind", "key", name="uq_rental_prices_kind_key"),
-        CheckConstraint(
-            "kind IN (" + ", ".join(f"'{k}'" for k in HOSTING_PRICE_KINDS) + ")", name="ck_rental_prices_kind"
-        ),
-        CheckConstraint("monthly_cents >= 0", name="ck_rental_prices_monthly_cents"),
-    )
-
-    kind: Mapped[str] = mapped_column(Text, nullable=False)
-    key: Mapped[str] = mapped_column(Text, nullable=False)
-    monthly_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
-    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
-    vcpu: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    ram_gb: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    # Set on every Shared row (the API requires it, 0419 backfilled it); NULL on instance and storage rows.
-    disk_gb: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    stripe_product_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    stripe_price_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    unit_amount: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
-    stripe_account_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    livemode: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
 
 
 #: The clouds a row may name (`allowed_instance_types.provider`, `org_shared_stores.provider`): the database's copy of
@@ -180,17 +139,18 @@ class NodeHosting(EntityMixin, OrgScoped, Base):
         ForeignKey("nodes.id", ondelete="SET NULL", name="fk_node_rentals_node_id"), nullable=True
     )
     instance_price_id: Mapped[Optional[UUID]] = mapped_column(
-        ForeignKey("rental_prices.id", ondelete="RESTRICT", name="fk_node_rentals_instance_price_id"), nullable=True
+        ForeignKey("product_options.id", ondelete="RESTRICT", name="fk_node_rentals_instance_price_id"), nullable=True
     )
     storage_price_id: Mapped[Optional[UUID]] = mapped_column(
-        ForeignKey("rental_prices.id", ondelete="RESTRICT", name="fk_node_rentals_storage_price_id"), nullable=True
+        ForeignKey("product_options.id", ondelete="RESTRICT", name="fk_node_rentals_storage_price_id"), nullable=True
     )
     shared_price_id: Mapped[Optional[UUID]] = mapped_column(
-        ForeignKey("rental_prices.id", ondelete="RESTRICT", name="fk_node_rentals_shared_price_id"), nullable=True
+        ForeignKey("product_options.id", ondelete="RESTRICT", name="fk_node_rentals_shared_price_id"), nullable=True
     )
-    # A Windows Dedicated host's license row (kind `windows`, key = its type); NULL = Ubuntu (202610211300).
+    # The four product columns name the hosting products' options (`product_options`, revision 202611141800; option
+    # ids are the legacy catalogue row ids). A Windows Dedicated host's licence option (key = its type); NULL = Ubuntu.
     windows_price_id: Mapped[Optional[UUID]] = mapped_column(
-        ForeignKey("rental_prices.id", ondelete="RESTRICT", name="fk_node_rentals_windows_price_id"), nullable=True
+        ForeignKey("product_options.id", ondelete="RESTRICT", name="fk_node_rentals_windows_price_id"), nullable=True
     )
     instance_type: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     storage_gb: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -256,7 +216,7 @@ class HostingChange(UuidPkMixin, StampedMixin, OrgScoped, Base):
     to_instance_type: Mapped[str] = mapped_column(Text, nullable=False)
     from_storage_gb: Mapped[int] = mapped_column(Integer, nullable=False)
     to_storage_gb: Mapped[int] = mapped_column(Integer, nullable=False)
-    # `rental_prices.id`s (for `_price` and the reversal) and the Stripe Prices the swap moves.
+    # The hosting catalogue's option ids (for `_price` and the reversal) and the Stripe Prices the swap moves.
     from_price_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
     to_price_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
     from_stripe_price_ids: Mapped[list[str]] = mapped_column(

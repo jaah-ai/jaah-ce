@@ -7,4 +7,6 @@
 **/__pycache__
 apps/web
 apps/docs
+# Except the event catalog Dockerfile.api copies into ./shared (the webhooks catalog reads it).
+!apps/docs/reference-data/events.toml
 apps/site-widget

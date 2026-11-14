@@ -1,25 +1,29 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import MuiLink from '@mui/material/Link'
 import Stack from '@mui/material/Stack'
-import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
-import { ApiError, apiDetail, apiHref, get } from '../api'
+import { ApiError, get } from '../api'
+import { apiDownloadProps } from '../net/href'
 import { useCan } from '../auth'
-import { useNow } from '../hooks/useMinuteTick'
+import { useNow } from '../hooks/useNow'
+import { useStickToBottom } from '../hooks/useStickToBottom'
 import { type StalledAnswer, lastHandOver, pickedUp, stalledAnswer } from '../lib/answerPickup'
 import { clockTime } from '../lib/relativeTime'
 import type { PipelineTask } from '../types'
 import { DetailSection } from '../ui/detail/DetailPage'
-import { PHONE, PRE_WRAP_SX } from '../ui/listStyles'
+import SelectField from '../ui/SelectField'
+import { PHONE } from '../ui/listStyles'
+import { grid } from '../theme'
 import {
   type AgentEvent,
   type EventLog,
   EventRow,
   POLL_MS,
   eventsKey,
+  eventsPlaceholder,
   foldEvents,
   readEvents,
   retryUnlessUnavailable,
@@ -53,8 +57,6 @@ type SessionList = { items: SessionItem[] }
 
 /** Sessions list refresh while the task runs, so a new session appears without a reload. */
 const SESSIONS_POLL_MS = 10_000
-/** Within this many px of the bottom counts as "at the newest event" (as the console chat). */
-const STICK_PX = 48
 /** Events rendered at first; each "Show earlier" reveals this many more. */
 const WINDOW = 300
 
@@ -181,19 +183,13 @@ export default function TaskActivity({
   const actions = (
     <Stack direction="row" spacing={1.5} useFlexGap sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
       {sessions.length > 1 && (
-        <TextField
-          select
-          size="small"
+        <SelectField
           label="Session"
           value={sessionId}
-          onChange={e => setPicked(e.target.value)}
-          slotProps={{ select: { native: true } }}
-          sx={{ maxWidth: '100%' }}
-        >
-          {sessions.map(s => (
-            <option key={s.agent_session_id} value={s.agent_session_id}>{sessionLabel(s)}</option>
-          ))}
-        </TextField>
+          onChange={setPicked}
+          options={sessions.map(s => ({ value: s.agent_session_id, label: sessionLabel(s) }))}
+          sx={{ mt: 1, mb: 0.5, maxWidth: '100%' }}
+        />
       )}
       {/* DOWNLOAD SAYS WHY NOT: the bare link opened the endpoint's JSON refusal (409 no stream, 503 no
           storage) or a half-written file mid-run. A finished session with a stream gets the link; any other names
@@ -205,7 +201,7 @@ export default function TaskActivity({
         </Typography>
       ) : (
         <MuiLink
-          href={apiHref(`/api/tasks/${taskId}/sessions/${encodeURIComponent(sessionId)}/events.jsonl`)}
+          {...apiDownloadProps(`/api/tasks/${taskId}/sessions/${encodeURIComponent(sessionId)}/events.jsonl`)}
           rel="noopener"
           variant="body2"
           aria-label={`Download events for session ${sessionId}`}
@@ -224,18 +220,10 @@ export default function TaskActivity({
           <Typography variant="body2" sx={{ color: 'text.secondary' }}>Following live in the console chat.</Typography>
           {openInChat}
         </Stack>
-      ) : eventsQuery.isError ? (
-        <Typography variant="body2" role="alert" sx={[PRE_WRAP_SX, { color: 'error.main' }]}>
-          {apiDetail(eventsQuery.error, 'Events failed to load')}
-        </Typography>
-      ) : eventsQuery.isPending ? (
-        <Typography variant="body2" sx={{ color: 'text.secondary' }}>Loading…</Typography>
-      ) : events.length === 0 ? (
-        <Typography variant="body2" sx={{ color: 'text.secondary' }}>No events yet.</Typography>
-      ) : (
+      ) : (eventsPlaceholder(eventsQuery, events) ?? (
         // Keyed by session: a new session starts at its newest event with a fresh window.
         <EventList key={sessionId} events={events} fill={fill} />
-      )}
+      ))}
     </DetailSection>
   )
 }
@@ -246,65 +234,28 @@ function EventList({ events: log, fill }: { events: AgentEvent[]; fill: boolean 
   // Display rows: a tool call's and a turn's usage events fold into one row each, so the window counts rows.
   const events = useMemo(() => foldEvents(log), [log])
   const [shown, setShown] = useState(WINDOW)
-  const [away, setAway] = useState(false)
-  const scrollRef = useRef<HTMLDivElement | null>(null)
-  const stickRef = useRef(true)
-  // Distance from the bottom before revealing earlier events, so the reader's place holds.
-  const fromBottomRef = useRef<number | null>(null)
+  const follow = useStickToBottom<HTMLDivElement>([events])
   const seenRef = useRef(events.length)
 
-  /* New events: a follower is taken to them before paint; a reader scrolled back keeps the window's START, so the
-     rows under them never slide up as the oldest would drop off a fixed-length window. Keyed on the rows, not their
-     count: an event folding into a row already shown grows it without adding one. */
+  /* New events: a follower is taken to them (the hook, keyed on the rows: an event folding into a row already shown
+     grows it without adding one); a reader scrolled back keeps the window's START, so the rows under them never
+     slide up as the oldest would drop off a fixed-length window. */
   useLayoutEffect(() => {
     const grew = events.length - seenRef.current
     seenRef.current = events.length
-    const el = scrollRef.current
-    if (!el) return
-    if (stickRef.current) el.scrollTop = el.scrollHeight
-    else if (grew > 0) setShown(n => n + grew)
+    if (follow.box.current && !follow.stuck.current && grew > 0) setShown(n => n + grew)
   }, [events])
-
-  /* THE PANEL MOUNTS HIDDEN (the task page keeps every tab's panel mounted), so the first scroll-to-bottom ran on a
-     zero-height box and the tab opened on the oldest shown event. Re-follow whenever the box's size changes —
-     the tab shown, a rotated phone — while the reader has not scrolled back. */
-  useEffect(() => {
-    const el = scrollRef.current
-    if (!el || typeof ResizeObserver === 'undefined') return
-    const observer = new ResizeObserver(() => {
-      if (stickRef.current) el.scrollTop = el.scrollHeight
-    })
-    observer.observe(el)
-    return () => observer.disconnect()
-  }, [])
-
-  useLayoutEffect(() => {
-    const el = scrollRef.current
-    if (el && fromBottomRef.current !== null) el.scrollTop = el.scrollHeight - fromBottomRef.current
-    fromBottomRef.current = null
-  }, [shown])
 
   const hidden = Math.max(0, events.length - shown)
   const more = Math.min(WINDOW, hidden)
 
-  function jump() {
-    const el = scrollRef.current
-    if (el) el.scrollTop = el.scrollHeight
-    stickRef.current = true
-    setAway(false)
-  }
-
   return (
     <Box sx={{ position: 'relative', minWidth: 0, display: 'flex', flexDirection: 'column', ...(fill ? { flex: '1 1 auto', minHeight: 0 } : {}) }}>
       <Stack
-        ref={scrollRef}
-        spacing={0.75}
+        ref={follow.ref}
+        spacing={0.5}
         data-testid="task-activity"
-        onScroll={e => {
-          const el = e.currentTarget
-          stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < STICK_PX
-          setAway(!stickRef.current)
-        }}
+        onScroll={follow.onScroll}
         /* On a phone the page grows to its content and the shell scrolls, so a filling list would never be the scroller
            it follows in: there it is capped like the unfilled one. */
         sx={{
@@ -318,8 +269,7 @@ function EventList({ events: log, fill }: { events: AgentEvent[]; fill: boolean 
           <Button
             size="small"
             onClick={() => {
-              const el = scrollRef.current
-              if (el) fromBottomRef.current = el.scrollHeight - el.scrollTop
+              follow.keepPlace()
               setShown(n => n + WINDOW)
             }}
             sx={{ alignSelf: 'center' }}
@@ -329,13 +279,13 @@ function EventList({ events: log, fill }: { events: AgentEvent[]; fill: boolean 
         )}
         {events.slice(-shown).map(event => <EventRow key={event.seq} event={event} />)}
       </Stack>
-      {away && (
+      {follow.away && (
         <Button
           variant="contained"
           size="small"
           data-testid="task-activity-jump"
-          onClick={jump}
-          sx={{ position: 'absolute', bottom: 8, left: '50%', transform: 'translateX(-50%)' }}
+          onClick={follow.toBottom}
+          sx={{ position: 'absolute', bottom: grid(1), left: '50%', transform: 'translateX(-50%)' }}
         >
           Jump to latest
         </Button>

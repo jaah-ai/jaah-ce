@@ -23,6 +23,7 @@ from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+from app.entity_shape import PG_INT_MAX
 from app.forges import FORGES, repo_ref_or_none
 from app.pr_stats import (
     FORGE_UNKNOWN, PR_STATS_STATUSES, REASON_MALFORMED, STATUS_CAPTURED, STATUS_NOT_CAPTURED,
@@ -43,7 +44,6 @@ MAX_MESSAGE_BYTES = 4096
 # A path or a name is a line, not a document: anything past this is not a forge's answer.
 _TEXT_MAX = 4096
 _REASON_MAX = 500
-_INT_MAX = 2**31 - 1
 # A git object id: SHA-1 (40) or SHA-256 (64) hex; a forge may abbreviate, never below 7.
 _SHA = re.compile(r"[0-9a-f]{7,64}")
 
@@ -112,7 +112,7 @@ def normalize_pr_provenance(raw: Any) -> Optional[dict[str, Any]]:
         return None
     number = raw.get("pr_number")
     if number is not None:
-        if isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= _INT_MAX:
+        if isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= PG_INT_MAX:
             return None
         values["pr_number"] = number
     forge = raw.get("forge")

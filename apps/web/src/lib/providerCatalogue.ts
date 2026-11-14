@@ -1,5 +1,4 @@
 import type { ProviderCapabilities, ProviderChoice } from '../types'
-import { providerOn } from './providerGrid'
 
 /* ── QUESTIONS ABOUT THE PROVIDER CATALOGUE, ANSWERED FROM THE LISTING ──────────────────────────────────────
  * `GET /api/accounts/providers` is the web's one source of which providers exist, their order and what each can
@@ -40,12 +39,6 @@ export function capabilitiesOf(row: ProviderChoice): ProviderCapabilities {
  *  `''` before the listing lands — a writer then omits `provider` and the server applies its own default. */
 export function defaultProviderOf(rows: readonly ProviderChoice[]): string {
   return rows[0]?.value ?? ''
-}
-
-/** The rows the org's provider grid offers (`lib/providerGrid`: any cell of the row on). Presentation only: the
- *  API refuses an off provider on its own. */
-export function offeredOnPlan(rows: readonly ProviderChoice[], grid: Parameters<typeof providerOn>[0]): ProviderChoice[] {
-  return rows.filter(row => providerOn(grid, row.value))
 }
 
 /** The rows New account hides because the plan leaves out every auth kind they have: the API's `allowed_auth_kinds`

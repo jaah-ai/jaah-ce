@@ -41,13 +41,19 @@ import runner_env  # python_cmd(): the node's own interpreter, never a PATH look
 from acp.events import fold_inclusive_counts
 
 from .base import (
+    MODEL_SWITCH_BUSY,
+    MODEL_SWITCH_POLL_SECS,
+    MODEL_SWITCH_POLLS,
+    MODEL_SWITCH_RETRY,
+    MODEL_SWITCH_UNSUPPORTED,
+    MODEL_SWITCHED,
     ACP_HARNESS_EVENTS,
     CLAUDE_ONLY_MATCHERS,
     CONTROL_TOOL_MATCHERS,
     CONTROL_TOOL_NAMES,
     AcpLaunch,
     AcpLaunchContext,
-    AdapterDefaults,
+    AgentAdapter,
     ComposerTui,
     hub_root,
     json_object,
@@ -62,9 +68,8 @@ from .base import (
     WINDOWS_HOOK_SHELL_POWERSHELL,
     adapter_env,
     chain_hook_groups,
-    control_mcp_server,
+    remote_mcp_servers,
     count_int,
-    credential_file_present,
     hardened_python,
     harness_dispatch,
     host_hook_commands,
@@ -74,6 +79,7 @@ from .base import (
     tool_path,
     write_rendered_hooks,
 )
+from .codex_login import CodexLoginAdapter
 
 log = logging.getLogger("jaahd.agents.codex")
 
@@ -725,7 +731,122 @@ class IncompleteRolloutWalk(Exception):
     """
 
 
-class CodexAdapter(AdapterDefaults):
+# ── The in-place model switch (`CodexAdapter.model_switch`) ─────────────────────────────────────────────────
+# Measured codex-cli 0.163.0: `/model <id>` is NOT a command (it goes to the model as a prompt). `/model` + Enter opens
+# `Select Model and Effort`, rows `  N. <Display>   <blurb>` (the current one prefixed `›`, suffixed `(current)`); the
+# display name is the id upper-cased per hyphen segment (`GPT-5.5` ↔ `gpt-5.5`). The row's digit selects; then
+# `Select Reasoning Level for <Display>`, footer `enter default · s session · esc back` — `s` keeps the choice to this
+# session (`Enter` persists it to `config.toml`). Result: `• Model changed to <id> <effort> for this session only`.
+_MODEL_PICKER = "Select Model"
+_MODEL_ROW_RE = re.compile(r"^\s*(\u203a)?\s*(\d+)\.\s+(\S.*?)(\s+\(current\))?(?:\s{2,}|\s*$)")
+_MODEL_REASONING = "Select Reasoning Level"
+_MODEL_SESSION_KEY = "s"
+_MODEL_CHANGED = "Model changed to"
+
+
+def _rows_after_last(screen: str, marker: str) -> list[str] | None:
+    """The rows after the LAST row holding MARKER, None when none does — the live dialog, never a scrollback copy."""
+    lines = screen.splitlines()
+    at = next((i for i in range(len(lines) - 1, -1, -1) if marker in lines[i]), None)
+    return None if at is None else lines[at + 1:]
+
+
+def _model_rows(rows: list[str]) -> list[tuple[int, str, bool, bool]]:
+    """The model picker's rows as `(number, display, current, highlighted)`."""
+    out = []
+    for row in rows:
+        match = _MODEL_ROW_RE.match(row)
+        if match:
+            out.append((int(match.group(2)), match.group(3), bool(match.group(4)), bool(match.group(1))))
+    return out
+
+
+def _results(screen: str, result: str) -> int:
+    """How many times RESULT shows as a whole run (`gpt-5` never counts inside `gpt-5.5`), case-blind."""
+    return len(re.findall(re.escape(result) + r"(?!\S)", screen.lower()))
+
+
+# How many `Escape`s may close what the switch opened: the picker, else the reasoning step and then the picker.
+_MODEL_CLOSE_KEYS = 3
+
+
+def _close_model_dialogs(pane, sleep_fn) -> None:
+    """`Escape` until the composer is back, so a re-served switch is not stuck behind a dialog this one opened. Only
+    while one of the switch's own dialogs shows and the composer does not: an `Escape` at a working composer would
+    end the runner's turn."""
+    for _ in range(_MODEL_CLOSE_KEYS):
+        screen = pane.capture()
+        if _TUI.is_ready(screen) or (_MODEL_PICKER not in screen and _MODEL_REASONING not in screen):
+            return
+        if not pane.key("Escape"):
+            return
+        sleep_fn(MODEL_SWITCH_POLL_SECS)
+
+
+def switch_model_on(pane, model: str, *, config_dir: str, sleep_fn, saved=None) -> tuple[str, str]:
+    """`/model`, the target's row by its digit (arrows past 9), `s` at the reasoning step, verified by a NEW `Model
+    changed to <id>`. `(status, reason)` as `AgentAdapter.model_switch`; `config_dir` and `saved` are unread (the
+    `s` key keeps the account's `config.toml` untouched). Only into an idle composer (`_TUI.is_ready`): a busy one is
+    `busy` (an uncharged wait), with nothing typed. A model with no row is one this CLI cannot run: the picker is
+    closed and the switch refused. Every other exit once `/model` is submitted closes what it opened
+    (`_close_model_dialogs`)."""
+    del config_dir, saved
+    if not _TUI.is_ready(pane.capture()):
+        return MODEL_SWITCH_BUSY, "the composer is not idle"
+    if not pane.paste("/model"):
+        return MODEL_SWITCH_RETRY, "the /model command could not be typed"
+    sleep_fn(MODEL_SWITCH_POLL_SECS)
+    if not pane.key("Enter"):
+        return MODEL_SWITCH_RETRY, "the /model command was not submitted"
+    status, why = _pick_model(pane, model, sleep_fn)
+    if status != MODEL_SWITCHED:
+        _close_model_dialogs(pane, sleep_fn)
+    return status, why
+
+
+def _pick_model(pane, model: str, sleep_fn) -> tuple[str, str]:
+    """`switch_model_on` once `/model` is submitted: find the picker, choose the row, confirm session-only."""
+    rows = None
+    for _ in range(MODEL_SWITCH_POLLS):
+        rows = _rows_after_last(pane.capture(), _MODEL_PICKER)
+        if rows is not None:
+            break
+        sleep_fn(MODEL_SWITCH_POLL_SECS)
+    if rows is None:
+        return MODEL_SWITCH_RETRY, "the model picker did not open"
+    wanted = model.lower()
+    entries = _model_rows(rows)
+    target = next((e for e in entries if e[1].strip().lower().replace(" ", "-") == wanted), None)
+    if target is None:
+        return MODEL_SWITCH_UNSUPPORTED, "this CLI offers no such model"
+    number, _display, current, _highlighted = target
+    if current:
+        pane.key("Escape")
+        return MODEL_SWITCHED, ""
+    # A result line already on screen (an earlier switch) is the baseline; only a NEW one confirms. One missed
+    # (scrolled away) costs a retry, which then finds the target as the `(current)` row.
+    result = f"{_MODEL_CHANGED} {wanted}".lower()
+    seen_before = _results(pane.capture(), result)
+    if number <= 9:
+        sent = pane.key(str(number))
+    else:
+        at = next((e[0] for e in entries if e[3]), 1)
+        step = "Down" if number > at else "Up"
+        sent = all(pane.key(step) for _ in range(abs(number - at))) and pane.key("Enter")
+    if not sent:
+        return MODEL_SWITCH_RETRY, "the model row could not be chosen"
+    session_only_sent = False
+    for _ in range(MODEL_SWITCH_POLLS):
+        screen = pane.capture()
+        if _results(screen, result) > seen_before:
+            return MODEL_SWITCHED, ""
+        if not session_only_sent and _MODEL_REASONING in screen:
+            session_only_sent = pane.key(_MODEL_SESSION_KEY)
+        sleep_fn(MODEL_SWITCH_POLL_SECS)
+    return MODEL_SWITCH_RETRY, "the CLI did not confirm the switch"
+
+
+class CodexAdapter(AgentAdapter):
     """The `codex` CLI. Stateless — the registry holds one instance."""
 
     provider = agent_providers.CODEX.value
@@ -738,7 +859,7 @@ class CodexAdapter(AdapterDefaults):
     base_command = _BASE
 
     def base_argv(self, *, model: str) -> tuple[str, ...]:
-        """`AdapterDefaults.base_argv` plus `credential_store_args()`."""
+        """`AgentAdapter.base_argv` plus `credential_store_args()`."""
         return super().base_argv(model=model) + credential_store_args()
 
     #: PASTED into the live pane (architecture A6) — see `exec_line` for why it is not on the argv.
@@ -751,6 +872,13 @@ class CodexAdapter(AdapterDefaults):
     quit_sig = _QUIT
     #: `codex mcp add control <node interpreter> <absolute server.py>`, no scope flag — see `register_mcp`.
     mcp_binary = agent_providers.CODEX.binary
+    #: `credential_state` probes `auth.json` with an `lstat`, never reading it; a symlink is not a credential.
+    login_adapter = CodexLoginAdapter
+    stat_only = True
+
+    def model_switch(self):
+        """The `/model` picker (`switch_model_on`)."""
+        return switch_model_on
 
     def exec_line(
         self, *, sys_file: str, task_file: str, settings_flag: str,
@@ -795,14 +923,6 @@ class CodexAdapter(AdapterDefaults):
             charter,
             " ".join(p for p in (f"exec {exec_argv}", rc, quoted, settings_flag) if p),
         ]
-
-    def resume_exec_line(self, *, sys_file: str, settings_flag: str, model_args: tuple[str, ...],
-                         native_ref: str) -> list[str]:
-        """`exec_line` reopening rollout `native_ref`: the same charter install, then `codex <root flags> resume
-        <ref>` — the `resume` subcommand merges the root flags (model, sandbox, approvals) into the resumed session,
-        and takes no prompt, so the TUI opens on the conversation as the chat left it."""
-        return self.exec_line(sys_file=sys_file, task_file="", settings_flag=settings_flag, model_args=model_args,
-                              session_args=("resume", native_ref))
 
     def inherits_harness_hooks(self) -> bool:
         """False: the fleet's account hook layer is Claude-format, so the gate is composed into the chains
@@ -919,9 +1039,11 @@ class CodexAdapter(AdapterDefaults):
         }
         from . import agent_layer
 
-        command, *args = agent_layer.jaah_mcp_command()
         return AcpLaunch(argv=(ACP_BINARY,), env=env, session_meta={},
-                         mcp_servers=(control_mcp_server(command, args, {}),),
+                         # The project's linked remote MCP servers ride the ACP session's `mcpServers`, never
+                         # the account config's `mcp_servers.*` table every session of the account reads.
+                         mcp_servers=(agent_layer.control_server(),
+                                      *remote_mcp_servers(ctx.mcp_connections, guest=ctx.guest)),
                          prepare=lambda: self._acp_prepare(ctx, harness),
                          authenticate={**ACP_KEY_SIGN_IN, "account": ctx.api_key_account}
                          if ctx.guest and ctx.api_key_account else None)
@@ -1224,36 +1346,6 @@ class CodexAdapter(AdapterDefaults):
                 "candidate was attributed to this run — the remaining candidates were never read"
                 % (_META_CALL_BYTES, str(root)))
         return found
-
-    def credential_state(self, *, config_dir: str) -> str:
-        """One of `agent_config_dirs.CREDS_TOKEN` / `CREDS_NONE` / `CREDS_UNREADABLE` for this account.
-
-        Unreadable is never collapsed into none (a kill-safety gate would reap a live runner). Answered by
-        `credential_file_present` (an `lstat`) of `CodexLoginAdapter.credential_path` without reading it;
-        a symlink is not a credential. The `lstat` first is the unreadable leg alone: an untraversable
-        `config_dir` (`PermissionError`)."""
-        import agent_config_dirs
-
-        from .codex_login import MAX_CREDENTIAL_BYTES, CodexLoginAdapter
-
-        if not config_dir:
-            return agent_config_dirs.CREDS_NONE
-        path = CodexLoginAdapter().credential_path(config_dir=config_dir)
-        import runner_credentials  # noqa: PLC0415 — a daemon module, as `agent_config_dirs`
-
-        if runner_credentials.read_through_runner(path):
-            # A Windows NodeLink store: only the runner account sees it.
-            return runner_credentials.credential_state(
-                path, shape=runner_credentials.SHAPE_FILE, max_bytes=MAX_CREDENTIAL_BYTES)
-        try:
-            os.lstat(path)
-        except PermissionError:
-            return agent_config_dirs.CREDS_UNREADABLE
-        except OSError:
-            return agent_config_dirs.CREDS_NONE
-        if credential_file_present(path, max_bytes=MAX_CREDENTIAL_BYTES):
-            return agent_config_dirs.CREDS_TOKEN
-        return agent_config_dirs.CREDS_NONE
 
     def transcript(self, *, config_dir: str, worktree: str, session_id: str) -> str | None:
         """This session's rollout file, or None when it is not there (yet, or at all).

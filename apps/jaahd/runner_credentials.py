@@ -24,8 +24,6 @@ log = logging.getLogger(__name__)
 # A spool round trip doing no work of its own (as `accounts._DELEGATED_TIMEOUT`).
 _TIMEOUT = 30.0
 
-SHAPE_FILE = "file"
-
 # Runs AS THE RUNNER ACCOUNT: stdlib only; prints `token`/`none`/`unreadable` and NOTHING else — never the file's
 # contents. `O_NOFOLLOW` + `S_ISREG` + the size bound, as `agents.base.credential_file_present`. Windows has no
 # `O_NOFOLLOW`, so a link or reparse point is refused by `lstat` first; the race left is the runner's own, and

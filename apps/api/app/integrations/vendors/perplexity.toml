@@ -1,0 +1,39 @@
+slug = "perplexity"
+label = "Perplexity"
+category = "search"
+vendor_docs_url = "https://docs.perplexity.ai/docs/getting-started/quickstart"
+summary = "Grounded, cited web answers and web search results from Perplexity's Sonar and Search APIs."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, placeholder = "pplx-...", help = "Sign in to the Perplexity API console (console.perplexity.ai), open the API Keys page of your project and select Generate a new key. The key starts with pplx-" },
+]
+
+# Perplexity has no free read-only call: every request is billed, so the Test checks the key's shape only (AC3.2).
+[test]
+kind = "format"
+patterns = { api_key = "pplx-[A-Za-z0-9_-]{16,}" }
+
+[docs]
+agent_uses = [
+  "Ask the Sonar models a question and get an answer grounded in live web results, with citations",
+  "Run raw web searches through the Search API and read the ranked results",
+  "Research a topic in depth with the deep-research models and cite the sources found",
+]
+prerequisites = [
+  "A Perplexity API account at console.perplexity.ai with credit bought (API use is billed separately from a Perplexity Pro subscription)",
+]
+limitations = [
+  "Every Perplexity API call is billed, so the Test does not call Perplexity: it only checks that the key has the pplx- shape. The first real check is the agent's first request",
+  "New accounts start at usage tier 0, limited to about one request per second; buying more credit raises the tier",
+]
+troubleshooting = [
+  { symptom = "The Test says the API key is not in the format Perplexity uses", fix = "The value pasted is not a Perplexity API key, or it was cut short. Copy it again from console.perplexity.ai > API Keys; it starts with pplx-" },
+  { symptom = "The Test passes but agents get 401 Unauthorized", fix = "The key has the right shape but was revoked, or belongs to a project with no credit. Generate a new key in the API console and select Replace" },
+  { symptom = "Agents get 429 Too Many Requests", fix = "Your usage tier's rate limit was hit. Ask the agent to send fewer requests at once, or buy credit to reach a higher tier" },
+]
+faq = [
+  { q = "Why does the Test say Perplexity was not called", a = "Perplexity offers no free endpoint to check a key, and Jaah does not spend your credit on a test" },
+  { q = "Does my Perplexity Pro subscription include API access", a = "No. The API is billed separately from the console's own credit" },
+]

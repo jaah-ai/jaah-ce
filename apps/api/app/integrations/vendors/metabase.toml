@@ -1,0 +1,45 @@
+slug = "metabase"
+label = "Metabase"
+category = "data"
+vendor_docs_url = "https://www.metabase.com/docs/latest/people-and-groups/api-keys"
+summary = "Lets agents run saved questions and queries, read dashboards and collections, and manage content in Metabase."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "base_url", label = "Instance URL", kind = "url", required = true, placeholder = "https://yourcompany.metabaseapp.com", help = "The address you open Metabase at, such as https://yourcompany.metabaseapp.com for Metabase Cloud or your own server's https address" },
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "Metabase > grid icon (top right) > Admin > Settings > Authentication > API Keys > Manage > Create API Key; pick a group for it, then copy the key, which is shown only once" },
+]
+
+[test]
+method = "GET"
+path = "{base_url}/api/database"
+auth = { field = "api_key", header = "X-API-Key" }
+list_field = "data"
+
+[docs]
+agent_uses = [
+  "Run saved questions and ad-hoc native SQL or MBQL queries and read the results",
+  "List and read dashboards, collections and questions, and create or update them",
+  "Read database metadata: tables, fields and their types, to write correct queries",
+  "Trigger a database schema sync or a field-values rescan after a schema change",
+]
+prerequisites = [
+  "Metabase version 49 or later (Cloud or self-hosted), reachable over https",
+  "A Metabase admin, who creates the key: grid icon (top right) > Admin > Settings > Authentication > API Keys",
+  "A group for the key with the data and collection permissions agents should have. A key in the Administrators group can do everything",
+]
+limitations = [
+  "An API key acts with its group's permissions; agents cannot see databases or collections that group cannot",
+  "A Metabase server reachable only on a private network cannot be tested or used from Jaah",
+  "Metabase shows the key only once; if it is lost, regenerate it and replace it in Jaah",
+]
+troubleshooting = [
+  { symptom = "Test says Metabase rejected the API key (401)", fix = "The key is wrong or was regenerated. Create a new key in Admin > Settings > Authentication > API Keys, select Replace on the secret, and paste it" },
+  { symptom = "Test says Metabase returned HTTP 404", fix = "The Instance URL is not Metabase's root, or the version is older than 49, which has no API keys. Use the address you open Metabase at, with no path after it" },
+  { symptom = "The Test passes but agents see no databases", fix = "The key's group has no data permissions. In Admin > Permissions > Data, give the group View data and Create queries on the databases agents should use" },
+]
+faq = [
+  { q = "Can I use my user name and password instead?", a = "Jaah connects Metabase with an API key only: a key is not tied to a person, cannot sign in to the web app, and can be revoked on its own" },
+  { q = "Does it work with Metabase Cloud?", a = "Yes. Use your https://yourcompany.metabaseapp.com address as the Instance URL" },
+]

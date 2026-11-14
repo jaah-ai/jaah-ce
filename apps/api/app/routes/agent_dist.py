@@ -17,6 +17,7 @@ import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
+from starlette.concurrency import run_in_threadpool
 from app import node_credentials
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
@@ -62,7 +63,7 @@ def _dist_key(platform: str, filename: str, raw_path: str) -> str | None:
 
 @router.get(f"{DIST_PATH}/{{platform}}/{{filename}}", status_code=307)
 @infra(Tenancy.OPERATOR)
-def serve_dist_object(
+async def serve_dist_object(
     platform: str,
     filename: str,
     request: Request,
@@ -71,8 +72,8 @@ def serve_dist_object(
     caller: node_credentials.AgentCaller = Depends(_check_token),
 ) -> RedirectResponse:
     """Redirect one authenticated node to a short-lived presigned GET for one installer artifact."""
-    key = _dist_key(platform, filename, agent_apt._raw_path(request))
-    if key is None:
-        # Before any config read, so a hostile name gets the same 404 whether or not a channel exists.
-        raise HTTPException(status_code=404, detail="no such object")
-    return agent_apt.presigned_redirect(key, channel="dist", caller=caller)
+    # Off the loop, as `agent_apt.serve_apt_object`: the presign reads a setting and fetches AWS credentials.
+    return await run_in_threadpool(
+        agent_apt.serve_object, _dist_key(platform, filename, agent_apt._raw_path(request)), channel="dist",
+        caller=caller,
+    )

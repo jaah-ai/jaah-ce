@@ -43,6 +43,12 @@ PROJECT_ROLE_ORG_KEYS: frozenset[str] = frozenset(
     {"credentials:view", "credentials:create", "accounts:view", "accounts:create", "tags:view"}
 )
 
+#: Keys every live member of a tenant org holds, whatever their roles: anyone may bring their OWN AI account
+#: and see the accounts that are theirs. Floor only (`Principal.permissions`), never org-wide, so it reaches
+#: no org account and no colleague's personal one (`authz/visibility.py::visible_account_clause`); a
+#: non-administrator's account is always personal (`routes/accounts.py::_account_ownership`).
+MEMBER_KEYS: frozenset[str] = frozenset({"accounts:view", "accounts:create"})
+
 #: Keys that widen what a principal can reach beyond the resource they hold them on (placement, fleet
 #: config, credential material). Disjoint from `PROJECT_ROLE_ORG_KEYS` by invariant.
 WIDENING_KEYS: frozenset[str] = frozenset(
@@ -52,10 +58,6 @@ WIDENING_KEYS: frozenset[str] = frozenset(
      # the whole org, runs in every project, so that takes the key org-wide (`routes/agents.py`).
      "agents:edit"}
 )
-
-
-#: An access request's lifecycle (`access_requests.state`).
-REQUEST_STATES: tuple[str, ...] = ("pending", "approved", "denied", "withdrawn")
 
 
 def in_sql(column: str, values: tuple[str, ...]) -> str:

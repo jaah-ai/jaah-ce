@@ -1,29 +1,35 @@
 import type { JSX } from 'react'
+import { Link as RouterLink } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Card from '@mui/material/Card'
+import Link from '@mui/material/Link'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
 import { useCan } from '../../../auth'
-import type { ConfirmOptions } from '../../../components/ConfirmDialog'
+import { type ConfirmOptions, danger } from '../../../components/ConfirmDialog'
 import { useSubmit } from '../../../hooks/useSubmit'
+import { countOf } from '../../../lib/humanize'
 import Banner from '../../../ui/Banner'
 import StatusChip from '../../../ui/StatusChip'
 import { ABOVE_PHONE, PHONE, ROW_ACTION_SX, monoSx } from '../../../ui/listStyles'
+import { FONT_SIZE, FONT_WEIGHT, SIZE, grid } from '../../../theme'
 import type { Tag, TagGroup } from '../../../types'
-import { deleteTag, deleteTagGroup, reorderTags, tagGroupUsage, tagUsage, updateTagGroup } from './api'
+import {
+  deleteTag, deleteTagGroup, newTagUrl, reorderTags, tagGroupUrl, tagGroupUsage, tagUrl, tagUsage, updateTagGroup,
+} from './api'
 
 /* ONE GROUP, ONE CARD, WITH ITS OWN TAGS INSIDE IT — the requirement: "what does *By type* offer?" is
  * answered by being on screen, not by changing a filter on two flat rosters.
  *
  * The card owns every write scoped to ONE group (activation, deletes, tag reorder). The group reorder
- * (needs the whole list) and the dialogs (one at a time) are the panel's.
+ * (needs the whole list) is the panel's. Editing is a page: the group's name links to `TagGroupEditPage`,
+ * each tag's name to `TagEditPage`, and Add tag to the new-tag page.
  *
  * ── WHICH KEY EACH CONTROL ASKS ──
  * THREE SEPARATELY GRANTABLE KEYS, named after the WRITE (as `TagsSection.tsx`), checked against
  * `apps/api/app/routes/tags.py` — cited by symbol, never line:
- *   `tags:edit`   — Activate / Move to draft and group Edit (`update_tag_group`), a tag's Edit
- *                   (`update_tag`), the tag arrows (`reorder_tags`).
+ *   `tags:edit`   — Activate / Move to draft (`update_tag_group`), the tag arrows (`reorder_tags`).
  *   `tags:delete` — group Delete (`delete_tag_group`), a tag's Delete (`delete_tag`).
  *   `tags:create` — Add tag (`create_tag`).
  *
@@ -35,62 +41,72 @@ import { deleteTag, deleteTagGroup, reorderTags, tagGroupUsage, tagUsage, update
  * PRESENTATION ONLY (`components/RequireFeature.tsx`); `authz_guard` decides on every /api/tags route.
  */
 
-/** The delete confirmations quote a REAL count from the usage endpoint; this is only its grammar. */
-function taskCountPhrase(count: number): string {
-  return `${count} ${count === 1 ? 'task' : 'tasks'}`
+/* The confirmation's count is QUERIED, never guessed; a failed query says the number could not be read
+ * rather than becoming a silent zero. Shared with the record pages' Delete. */
+export async function confirmedCount(read: () => Promise<{ task_count: number }>): Promise<number | null> {
+  try {
+    return (await read()).task_count
+  } catch {
+    return null
+  }
+}
+
+/** The group delete's confirmation, from its queried task count (`null`: unread). */
+export function groupDeleteConfirm(group: TagGroup, count: number | null): ConfirmOptions {
+  const impact = count === null ? 'The task count could not be read, so this may also remove tag assignments from tasks.'
+    : count === 0 ? 'No task carries one of its tags, so nothing else changes.'
+      : `Its tags also come off ${countOf(count, 'task')}.`
+  return danger('Delete group', {
+    title: 'Delete tag group',
+    identity: `${group.name} · ${countOf(group.tags.length, 'tag')}`,
+    message: `This deletes the group and every tag in it. ${impact} This cannot be undone.`,
+  })
+}
+
+/** A tag delete's confirmation, from its queried task count (`null`: unread). */
+export function tagDeleteConfirm(group: TagGroup, tag: Tag, count: number | null): ConfirmOptions {
+  const impact = count === null ? 'The task count could not be read, so this may also remove the tag from tasks.'
+    : count === 0 ? 'No task carries it, so nothing else changes.'
+      : `It also comes off ${countOf(count, 'task')}.`
+  return danger('Delete tag', { title: 'Delete tag', identity: `${group.name} · ${tag.tag}`, message: `This deletes “${tag.name}”. ${impact} This cannot be undone.` })
 }
 
 /* Arrow buttons: 44px `minWidth` because the touch target is min(width, height); MUI's stock 64px would
  * triple a glyph button. */
-const ARROW_SX = [...ROW_ACTION_SX, { minWidth: 44, px: 0.5, fontSize: '0.875rem' }]
+const ARROW_SX = [...ROW_ACTION_SX, { minWidth: SIZE.tapTarget, px: 0.5, fontSize: FONT_SIZE.base }]
 
 /** The up/down pair a group and a tag share: disabled in flight (`locked`) or at an end of its list; the
  *  caller gates it on `tags:edit`. `subject` completes "Move <subject> up" (the group name, `tag <code>`). */
 function MoveArrows({ subject, locked, canUp, canDown, onMove }: {
-  subject: string
-  locked: boolean
-  canUp: boolean
-  canDown: boolean
-  onMove: (direction: -1 | 1) => void
+  subject: string; locked: boolean; canUp: boolean; canDown: boolean; onMove: (direction: -1 | 1) => void
 }): JSX.Element {
+  const arrow = (direction: -1 | 1, word: string, glyph: string, can: boolean) => (
+    <Button type="button" variant="text" disabled={locked || !can} onClick={() => onMove(direction)} aria-label={`Move ${subject} ${word}`} sx={ARROW_SX}>
+      <Box component="span" aria-hidden="true">{glyph}</Box>
+    </Button>
+  )
+  return <>{arrow(-1, 'up', '↑', canUp)}{arrow(1, 'down', '↓', canDown)}</>
+}
+
+/** A group's and a tag's Delete: `label` names what goes (`Delete <group>`, `Delete tag <code>`). */
+function DeleteButton({ label, locked, onClick }: { label: string; locked: boolean; onClick: () => void }): JSX.Element {
   return (
-    <>
-      <Button type="button" variant="text" disabled={locked || !canUp} onClick={() => onMove(-1)} aria-label={`Move ${subject} up`} sx={ARROW_SX}>
-        <Box component="span" aria-hidden="true">↑</Box>
-      </Button>
-      <Button type="button" variant="text" disabled={locked || !canDown} onClick={() => onMove(1)} aria-label={`Move ${subject} down`} sx={ARROW_SX}>
-        <Box component="span" aria-hidden="true">↓</Box>
-      </Button>
-    </>
+    <Button type="button" variant="outlined" color="error" disabled={locked} onClick={onClick} aria-label={label} sx={ROW_ACTION_SX}>
+      Delete
+    </Button>
   )
 }
+
+/* A wrapping row, vertically centred: the card's header, its name cluster and a tag row. */
+const WRAP_ROW_SX = { display: 'flex', flexWrap: 'wrap', alignItems: 'center' } as const
 
 /* The tag row: code, name, description, actions, and the wrap does the rest (≤480px: description, then
  * actions, each on its own line). Nothing is truncated — a shortened code names nothing. */
 const TAG_ROW_SX = {
-  display: 'flex',
-  flexWrap: 'wrap',
-  alignItems: 'center',
-  columnGap: 1,
-  rowGap: 0.5,
-  px: 1.5,
-  py: 0.75,
-  borderTop: '1px solid',
-  borderColor: 'divider',
+  ...WRAP_ROW_SX, columnGap: 1, rowGap: 0.5, px: 1.5, py: 0.5, borderTop: '1px solid', borderColor: 'divider',
 }
 
-export function TagGroupCard({
-  group,
-  canMoveUp,
-  canMoveDown,
-  panelBusy,
-  onMoveGroup,
-  onEditGroup,
-  onAddTag,
-  onEditTag,
-  onChanged,
-  confirm,
-}: {
+export function TagGroupCard({ group, canMoveUp, canMoveDown, panelBusy, onMoveGroup, onChanged, confirm }: {
   group: TagGroup
   canMoveUp: boolean
   canMoveDown: boolean
@@ -98,9 +114,6 @@ export function TagGroupCard({
   panelBusy: boolean
   /** Whole-list group reorder (needs every group's id). */
   onMoveGroup: (direction: -1 | 1) => Promise<void>
-  onEditGroup: () => void
-  onAddTag: () => void
-  onEditTag: (tag: Tag) => void
   /** Refetch the catalogue after a write this card made. */
   onChanged: () => Promise<void>
   confirm: (options: ConfirmOptions) => Promise<boolean>
@@ -119,8 +132,7 @@ export function TagGroupCard({
   const canDeleteTags = can('tags:delete')
   /* WHETHER THE ROW OF CONTROLS EXISTS AT ALL, header and tag row separately: an empty `Stack` still
      takes a line (`flex: '1 1 100%'` at phone width) or holds the name row open. */
-  const showGroupActions = canEditTags || canDeleteTags
-  const showTagActions = canEditTags || canDeleteTags
+  const showActions = canEditTags || canDeleteTags
 
   /** Every write: disable the card, run, refetch, show the server's sentence on failure. `fallback` only
    *  when no `detail` was sent. */
@@ -135,64 +147,25 @@ export function TagGroupCard({
     // Unreachable through the UI; the guard on the write itself does not depend on every control being
     // gated (as the panel's `moveGroup`). Same on the three below.
     if (!canEditTags) return
-    const next = isActive ? 'draft' : 'active'
     void run(
       isActive ? 'Failed to move the group to draft.' : 'Failed to activate the group.',
-      () => updateTagGroup(group.id, { state: next }),
+      () => updateTagGroup(group.id, { state: isActive ? 'draft' : 'active' }),
     )
   }
 
-  /* The confirmation's count is QUERIED, never guessed; a failed query says the number could not be read
-   * rather than becoming a silent zero. */
-  async function confirmedCount(read: () => Promise<{ task_count: number }>): Promise<number | null> {
-    try {
-      return (await read()).task_count
-    } catch {
-      return null
-    }
+  /* Both deletes: the confirmation quotes the count `usage` reads, then the write. */
+  async function deleteAfterConfirm(
+    usage: () => Promise<{ task_count: number }>, confirmOf: (count: number | null) => ConfirmOptions,
+    fallback: string, write: () => Promise<unknown>,
+  ) {
+    if (!canDeleteTags || locked) return
+    if (!(await confirm(confirmOf(await confirmedCount(usage))))) return
+    void run(fallback, write)
   }
-
-  async function handleDeleteGroup() {
-    if (!canDeleteTags) return
-    if (locked) return
-    const count = await confirmedCount(() => tagGroupUsage(group.id))
-    const impact =
-      count === null
-        ? 'The task count could not be read, so this may also remove tag assignments from tasks.'
-        : count === 0
-          ? 'No task carries one of its tags, so nothing else changes.'
-          : `Its tags also come off ${taskCountPhrase(count)}.`
-    const ok = await confirm({
-      title: 'Delete tag group',
-      identity: `${group.name} · ${tags.length} ${tags.length === 1 ? 'tag' : 'tags'}`,
-      message: `This deletes the group and every tag in it. ${impact} This cannot be undone.`,
-      confirmLabel: 'Delete group',
-      destructive: true,
-    })
-    if (!ok) return
-    void run('Failed to delete the tag group.', () => deleteTagGroup(group.id))
-  }
-
-  async function handleDeleteTag(tag: Tag) {
-    if (!canDeleteTags) return
-    if (locked) return
-    const count = await confirmedCount(() => tagUsage(tag.id))
-    const impact =
-      count === null
-        ? 'The task count could not be read, so this may also remove the tag from tasks.'
-        : count === 0
-          ? 'No task carries it, so nothing else changes.'
-          : `It also comes off ${taskCountPhrase(count)}.`
-    const ok = await confirm({
-      title: 'Delete tag',
-      identity: `${group.name} · ${tag.tag}`,
-      message: `This deletes “${tag.name}”. ${impact} This cannot be undone.`,
-      confirmLabel: 'Delete tag',
-      destructive: true,
-    })
-    if (!ok) return
-    void run('Failed to delete the tag.', () => deleteTag(tag.id))
-  }
+  const handleDeleteGroup = () => deleteAfterConfirm(
+    () => tagGroupUsage(group.id), count => groupDeleteConfirm(group, count), 'Failed to delete the tag group.', () => deleteTagGroup(group.id))
+  const handleDeleteTag = (tag: Tag) => deleteAfterConfirm(
+    () => tagUsage(tag.id), count => tagDeleteConfirm(group, tag, count), 'Failed to delete the tag.', () => deleteTag(tag.id))
 
   /* ONE ATOMIC WRITE: the complete list in one request. Two per-row PUTs, interrupted, would leave two rows
    * sharing a `position`. */
@@ -208,57 +181,28 @@ export function TagGroupCard({
 
   return (
     <Card variant="outlined" data-testid="tag-group-card" data-group-state={group.state}>
-      <Box
-        sx={{
-          display: 'flex',
-          flexWrap: 'wrap',
-          alignItems: 'center',
-          columnGap: 1.5,
-          rowGap: 1,
-          px: 1.5,
-          py: 1,
-          borderBottom: '1px solid',
-          borderColor: 'divider',
-        }}
-      >
-        <Box
-          sx={{
-            display: 'flex',
-            flexWrap: 'wrap',
-            alignItems: 'center',
-            columnGap: 1,
-            rowGap: 0.5,
-            flex: '1 1 12rem',
-            minWidth: 0,
-          }}
-        >
+      <Box sx={{ ...WRAP_ROW_SX, columnGap: 1.5, rowGap: 1, px: 1.5, py: 1, borderBottom: '1px solid', borderColor: 'divider' }}>
+        <Box sx={{ ...WRAP_ROW_SX, columnGap: 1, rowGap: 0.5, flex: `1 1 ${grid(32)}`, minWidth: 0 }}>
           <Typography
             variant="subtitle2"
             component="h3"
             /* `break-word`, never `anywhere`: wrap at spaces, split only an unbreakable token. */
-            sx={{ fontWeight: 600, minWidth: 0, overflowWrap: 'break-word' }}
+            sx={{ fontWeight: FONT_WEIGHT.semibold, minWidth: 0, overflowWrap: 'break-word' }}
           >
-            {group.name}
+            {/* The group's page: a real link, so Tab + Enter opens it like any other. */}
+            <Link component={RouterLink} to={tagGroupUrl(group.id)} underline="hover" color="inherit">
+              {group.name}
+            </Link>
           </Typography>
-          <StatusChip
-            label={group.state}
-            tone={isActive ? 'success' : 'warning'}
-            data-status={group.state}
-          />
+          <StatusChip label={group.state} tone={isActive ? 'success' : 'warning'} data-status={group.state} />
           <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-            {group.multi_select ? 'Several tags per task' : 'One tag per task'} ·{' '}
-            {tags.length} {tags.length === 1 ? 'tag' : 'tags'}
+            {group.multi_select ? 'Several tags per task' : 'One tag per task'} · {countOf(tags.length, 'tag')}
           </Typography>
         </Box>
 
         {/* THE WHOLE CLUSTER IS CONDITIONAL: an empty `Stack` would hold the name row open. */}
-        {showGroupActions && (
-          <Stack
-            direction="row"
-            spacing={0.5}
-            useFlexGap
-            sx={{ flexWrap: 'wrap', flex: '0 0 auto', alignItems: 'center' }}
-          >
+        {showActions && (
+          <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'wrap', flex: '0 0 auto', alignItems: 'center' }}>
             {/* THE ONE CLICK THAT TURNS THE FEATURE ON: `contained` while draft (both seeded groups ship
                 draft). EVERY `aria-label` ON THIS CARD CONTAINS ITS VISIBLE TEXT AS ONE UNBROKEN RUN
                 (WCAG 2.5.3), so the group name is appended, never spliced in. */}
@@ -275,35 +219,11 @@ export function TagGroupCard({
                 {isActive ? 'Move to draft' : 'Activate'}
               </Button>
             )}
-            {canEditTags && (
-              <Button
-                type="button"
-                variant="text"
-                disabled={locked}
-                onClick={onEditGroup}
-                aria-label={`Edit ${group.name}`}
-                sx={ROW_ACTION_SX}
-              >
-                Edit
-              </Button>
-            )}
             {/* Rendered = key held, so `canMoveUp`/`canMoveDown` are purely positional (see the header). */}
             {canEditTags && (
               <MoveArrows subject={group.name} locked={locked} canUp={canMoveUp} canDown={canMoveDown} onMove={d => void onMoveGroup(d)} />
             )}
-            {canDeleteTags && (
-              <Button
-                type="button"
-                variant="outlined"
-                color="error"
-                disabled={locked}
-                onClick={() => void handleDeleteGroup()}
-                aria-label={`Delete ${group.name}`}
-                sx={ROW_ACTION_SX}
-              >
-                Delete
-              </Button>
-            )}
+            {canDeleteTags && <DeleteButton label={`Delete ${group.name}`} locked={locked} onClick={() => void handleDeleteGroup()} />}
           </Stack>
         )}
       </Box>
@@ -345,21 +265,23 @@ export function TagGroupCard({
                 component="span"
                 /* A FLOOR, not a width, above the phone so codes and names align as columns; a longer
                    code still renders WHOLE. Dropped at phone width. */
-                sx={[monoSx, { fontSize: '0.8125rem', fontWeight: 600, flex: '0 0 auto', [ABOVE_PHONE]: { minWidth: '7rem' } }]}
+                sx={[monoSx, { fontSize: FONT_SIZE.md, fontWeight: FONT_WEIGHT.semibold, flex: '0 0 auto', [ABOVE_PHONE]: { minWidth: grid(18.5) } }]}
               >
                 {tag.tag}
               </Typography>
               <Typography
                 variant="body2"
-                sx={{ fontWeight: 500, flex: '0 1 auto', minWidth: 0, [ABOVE_PHONE]: { minWidth: '9rem' } }}
+                sx={{ fontWeight: FONT_WEIGHT.medium, flex: '0 1 auto', minWidth: 0, [ABOVE_PHONE]: { minWidth: grid(24) } }}
               >
-                {tag.name}
+                <Link component={RouterLink} to={tagUrl(group.id, tag.id)} underline="hover" color="inherit">
+                  {tag.name}
+                </Link>
               </Typography>
               <Typography
                 variant="body2"
                 sx={{
                   color: 'text.secondary',
-                  flex: '1 1 10rem',
+                  flex: `1 1 ${grid(26.5)}`,
                   minWidth: 0,
                   overflowWrap: 'break-word',
                   [PHONE]: { flex: '1 1 100%' },
@@ -368,43 +290,14 @@ export function TagGroupCard({
                 {tag.description}
               </Typography>
               {/* CONDITIONAL AS A CLUSTER: an empty Stack takes a full line at phone width. */}
-              {showTagActions && (
-                <Stack
-                  direction="row"
-                  spacing={0.5}
-                  useFlexGap
-                  sx={{ flexWrap: 'nowrap', flex: '0 0 auto', [PHONE]: { flex: '1 1 100%' } }}
-                >
-                  {canEditTags && (
-                    <Button
-                      type="button"
-                      variant="text"
-                      disabled={locked}
-                      onClick={() => onEditTag(tag)}
-                      aria-label={`Edit tag ${tag.tag}`}
-                      sx={ROW_ACTION_SX}
-                    >
-                      Edit
-                    </Button>
-                  )}
+              {showActions && (
+                <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'nowrap', flex: '0 0 auto', [PHONE]: { flex: '1 1 100%' } }}>
                   {/* Absent without the key, disabled at the ends — same split as the group arrows. */}
                   {canEditTags && (
                     <MoveArrows subject={`tag ${tag.tag}`} locked={locked} canUp={index > 0} canDown={index < tags.length - 1}
                       onMove={d => moveTag(index, d)} />
                   )}
-                  {canDeleteTags && (
-                    <Button
-                      type="button"
-                      variant="outlined"
-                      color="error"
-                      disabled={locked}
-                      onClick={() => void handleDeleteTag(tag)}
-                      aria-label={`Delete tag ${tag.tag}`}
-                      sx={ROW_ACTION_SX}
-                    >
-                      Delete
-                    </Button>
-                  )}
+                  {canDeleteTags && <DeleteButton label={`Delete tag ${tag.tag}`} locked={locked} onClick={() => void handleDeleteTag(tag)} />}
                 </Stack>
               )}
             </Box>
@@ -416,10 +309,10 @@ export function TagGroupCard({
       {canCreateTags && (
         <Box sx={{ px: 1.5, py: 1 }}>
           <Button
-            type="button"
             variant="outlined"
+            component={RouterLink}
+            to={newTagUrl(group.id)}
             disabled={locked}
-            onClick={onAddTag}
             aria-label={`Add tag to ${group.name}`}
             sx={ROW_ACTION_SX}
           >

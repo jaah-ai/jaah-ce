@@ -44,6 +44,11 @@ API_KEY_CREDENTIAL_TYPE = "anthropic_api_key"
 #: The key inside that credential's config holding the secret. One spelling for reader and writer.
 API_KEY_CONFIG_KEY = "api_key"
 
+#: The optional, non-secret key beside it naming the Anthropic workspace an UNSCOPED key must send on every
+#: request, and the check a value must pass to be written into that header (`wrkspc_` + alphanumerics).
+WORKSPACE_ID_CONFIG_KEY: str = _node.WORKSPACE_ID_CONFIG_KEY
+is_valid_workspace_id = _node.is_valid_workspace_id
+
 
 def is_api_key(auth_kind: Optional[str]) -> bool:
     """Whether this kind authenticates with an API key. Absent/unknown reads as OAuth — fail-safe: an
@@ -105,15 +110,6 @@ def account_slug_from_ref(ref: Optional[str]) -> str:
 
 #: The prefix a node-facing credential name carries when it asks for one account's API key.
 NODE_CREDENTIAL_PREFIX: str = _node.NODE_CREDENTIAL_PREFIX
-
-
-def node_credential_name(slug: Optional[str]) -> str:
-    """`account_api_key:<slug>` — the name a node asks its credential socket for. `""` when unresolvable.
-
-    Same refusals as `api_key_account_ref` (`_prefixed_slug`): the string lands in a query parameter on a
-    node-token route.
-    """
-    return _prefixed_slug(NODE_CREDENTIAL_PREFIX, slug)
 
 
 # The parser of that name and its slug grammar (32 characters, lowercase alphanumerics plus `-`/`_`, alphanumeric

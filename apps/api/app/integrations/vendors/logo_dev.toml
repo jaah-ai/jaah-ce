@@ -1,0 +1,40 @@
+slug = "logo_dev"
+label = "Logo.dev"
+category = "ai_media"
+vendor_docs_url = "https://www.logo.dev/docs/brand-search/introduction"
+summary = "Company logos by domain, and brand search by name, from Logo.dev."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "secret_key", label = "Secret key", kind = "secret", required = true, placeholder = "sk_...", help = "Sign in at logo.dev and open Dashboard > API keys (logo.dev/dashboard/api-keys); copy the Secret key, which starts with sk_" },
+  { key = "publishable_key", label = "Publishable key", kind = "text", required = false, placeholder = "pk_...", help = "On the same Dashboard > API keys page, copy the Publishable key (starts with pk_). Agents put it in img.logo.dev image URLs in the apps they build; it is safe to show in a browser" },
+]
+
+[test]
+method = "GET"
+path = "https://api.logo.dev/v2/search?q=logo.dev&limit=1"
+auth = { field = "secret_key", header = "Authorization", prefix = "Bearer" }
+list_field = "data"
+
+[docs]
+agent_uses = [
+  "Find a company's domain and logo by its name with Brand Search",
+  "Show company logos in an app by domain, using img.logo.dev image URLs with the publishable key",
+  "Look up brand details (name, colors, social links) for a domain",
+]
+prerequisites = [
+  "A Logo.dev account (the free Community plan includes both keys)",
+]
+limitations = [
+  "The free plan has a monthly request cap and requires a visible link to Logo.dev when used commercially",
+  "The Test runs one brand search, which counts as one request against your plan",
+]
+troubleshooting = [
+  { symptom = "The Test says Logo.dev rejected the secret key (401)", fix = "A publishable key (pk_) was pasted as the secret key, or the key was rotated. Copy the Secret key (sk_) from Dashboard > API keys and select Replace" },
+  { symptom = "Logos stop loading in a built app with 429 errors", fix = "The plan's monthly cap was reached. Check usage on the Logo.dev dashboard and upgrade, or wait for the next month" },
+  { symptom = "Logos load locally but not on the live site", fix = "The publishable key has domain restrictions that do not include the site. Add the site's domain to the key on Dashboard > API keys" },
+]
+faq = [
+  { q = "Why two keys", a = "The secret key calls Logo.dev's API from servers and must stay private; the publishable key only loads logo images and is meant to appear in web pages" },
+]

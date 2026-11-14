@@ -4,7 +4,8 @@ Stdlib, not botocore: `requirements.txt` ships into the runtime image. One helpe
 
 `host` is derived from `url` and `x-amz-date` is the `amz_date` argument, never a clock. The signed
 header set is frozen at `content-type;host;x-amz-date`, plus `x-amz-security-token` when the caller signs
-with temporary (STS) credentials, whose session token AWS refuses the request without. Any input that would
+with temporary (STS) credentials, whose session token AWS refuses the request without, plus any `x-amz-*`
+headers the caller passes as `amz_headers` (S3 refuses an unsigned `x-amz-*` header). Any input that would
 make the signed bytes differ from the sent bytes raises `ValueError` naming the parameter.
 
 Caller contract: send the returned mapping verbatim, add no `Host`, pass the same `payload` bytes, and
@@ -175,6 +176,25 @@ def host_header(url: str) -> str:
     return _host_header(_signing_url(url))
 
 
+# Names `amz_headers` may not carry: the signer derives them itself.
+_DERIVED_AMZ_HEADERS = frozenset({"x-amz-date", "x-amz-security-token"})
+_HEADER_NAME_CHARACTERS = frozenset(_LOWERCASE + _DIGITS + "-")
+
+
+def _amz_headers(amz_headers: dict[str, str] | None) -> dict[str, str]:
+    """The caller's extra `x-amz-*` headers, lowercased and checked: each is signed and sent verbatim."""
+    checked: dict[str, str] = {}
+    for name, value in (amz_headers or {}).items():
+        lowered = name.lower()
+        if not lowered.startswith("x-amz-") or not _HEADER_NAME_CHARACTERS.issuperset(lowered):
+            raise ValueError("amz_headers may name only x-amz-* headers")
+        if lowered in _DERIVED_AMZ_HEADERS or lowered in checked:
+            raise ValueError("amz_headers may not repeat a header the signer sets")
+        _reject_unsendable("amz_headers", value)
+        checked[lowered] = value
+    return checked
+
+
 def _canonical_uri(parts: SplitResult) -> str:
     """The canonical URI: the path, percent-encoded per AWS's `UriEncode` — `/` left alone.
 
@@ -207,13 +227,15 @@ def canonical_request(
     content_type: str,
     amz_date: str,
     session_token: str | None = None,
+    amz_headers: dict[str, str] | None = None,
 ) -> str:
     """Step 1: the canonical request — the exact document whose hash the signature commits to.
 
     Six lines in this order: method, canonical URI, canonical query string, the canonical-headers
     block (itself newline-terminated, hence the blank line the join produces), the signed-header
     list, and the payload hash. `session_token` (temporary credentials only) is signed as
-    `x-amz-security-token`; `None` signs exactly the three fixed headers.
+    `x-amz-security-token`; `None` signs exactly the three fixed headers. `amz_headers` adds `x-amz-*` headers to
+    the signed set, in sorted order.
     """
     _reject_unsendable("method", method)
     if method != method.upper():
@@ -226,21 +248,19 @@ def canonical_request(
     if not isinstance(payload, bytes):
         raise ValueError("payload must be the exact bytes the request will send")
     parts = _signing_url(url)
-    canonical_headers = (
-        f"content-type:{content_type}\n"
-        f"host:{_host_header(parts)}\n"
-        f"x-amz-date:{amz_date}\n"
-    )
+    signed = {"content-type": content_type, "host": _host_header(parts), "x-amz-date": amz_date,
+              **_amz_headers(amz_headers)}
     if session_token is not None:
         _reject_bad_session_token(session_token)
-        canonical_headers += f"x-amz-security-token:{session_token}\n"
+        signed["x-amz-security-token"] = session_token
+    canonical_headers = "".join(f"{name}:{signed[name]}\n" for name in sorted(signed))
     return "\n".join(
         (
             method,
             _canonical_uri(parts),
             _canonical_query_string(parts),
             canonical_headers,
-            _signed_header_list(session_token),
+            _signed_header_list(session_token, amz_headers),
             hashlib.sha256(payload).hexdigest(),
         )
     )
@@ -253,8 +273,9 @@ def _reject_bad_session_token(session_token: str) -> None:
         raise ValueError("session_token contains characters that cannot be sent in a request")
 
 
-def _signed_header_list(session_token: str | None) -> str:
-    return CANONICAL_SIGNED_HEADERS if session_token is None else SESSION_SIGNED_HEADERS
+def _signed_header_list(session_token: str | None, amz_headers: dict[str, str] | None = None) -> str:
+    names = (CANONICAL_SIGNED_HEADERS if session_token is None else SESSION_SIGNED_HEADERS).split(";")
+    return ";".join(sorted(names + list(_amz_headers(amz_headers))))
 
 
 def _credential_scope(*, amz_date: str, region: str, service: str) -> str:
@@ -265,15 +286,19 @@ def _credential_scope(*, amz_date: str, region: str, service: str) -> str:
     return f"{amz_date[:8]}/{region}/{service}/aws4_request"
 
 
+def assemble_string_to_sign(*, algorithm: str, amz_date: str, scope: str, request: str) -> str:
+    """The four-line string to sign every SigV4-family signer (`sigv4a` too) hashes: algorithm, timestamp,
+    credential scope, and the canonical request's hash."""
+    return "\n".join((algorithm, amz_date, scope, hashlib.sha256(request.encode("utf-8")).hexdigest()))
+
+
 def string_to_sign(*, request: str, amz_date: str, region: str, service: str) -> str:
     """Step 2: algorithm, timestamp, credential scope, and the canonical request's hash."""
-    return "\n".join(
-        (
-            ALGORITHM,
-            amz_date,
-            _credential_scope(amz_date=amz_date, region=region, service=service),
-            hashlib.sha256(request.encode("utf-8")).hexdigest(),
-        )
+    return assemble_string_to_sign(
+        algorithm=ALGORITHM,
+        amz_date=amz_date,
+        scope=_credential_scope(amz_date=amz_date, region=region, service=service),
+        request=request,
     )
 
 
@@ -306,19 +331,21 @@ def signed_headers(
     content_type: str,
     amz_date: str,
     session_token: str | None = None,
+    amz_headers: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Sign one request and return the COMPLETE header mapping to send with it.
 
     Steps 1-4 composed. See the module docstring for the caller contract. Any input this signer cannot
     sign faithfully raises `ValueError`. `session_token` is the temporary credentials' token, or `None`
-    for a long-lived key; set, it is signed and sent as `X-Amz-Security-Token`.
+    for a long-lived key; set, it is signed and sent as `X-Amz-Security-Token`. `amz_headers` (`x-amz-*` only)
+    are signed and returned in the mapping, lowercased.
     """
     _reject_outside(
         "access_key_id", access_key_id, _ACCESS_KEY_ID_CHARACTERS, "letters and digits"
     )
     request = canonical_request(
         method=method, url=url, payload=payload, content_type=content_type, amz_date=amz_date,
-        session_token=session_token,
+        session_token=session_token, amz_headers=amz_headers,
     )
     to_sign = string_to_sign(request=request, amz_date=amz_date, region=region, service=service)
     key = signing_key(
@@ -332,8 +359,9 @@ def signed_headers(
         "X-Amz-Date": amz_date,
         "Authorization": (
             f"{ALGORITHM} Credential={access_key_id}/{scope}, "
-            f"SignedHeaders={_signed_header_list(session_token)}, Signature={signature}"
+            f"SignedHeaders={_signed_header_list(session_token, amz_headers)}, Signature={signature}"
         ),
+        **_amz_headers(amz_headers),
     }
     if session_token is not None:
         headers["X-Amz-Security-Token"] = session_token

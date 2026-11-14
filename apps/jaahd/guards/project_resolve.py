@@ -1,13 +1,13 @@
 """Shared Cockpit-API project resolution for the access-level guard scripts (apps/jaahd/guards/).
 
 Single home for the name/clone-path resolution check-access-guard.py and install-access-guard.py share,
-via tools/control_plane_client.py — and for `git_hooks_dir`, the clone's hooks directory both resolve.
+via tools/control_plane_client.py — and for `git_hooks_dir` and `git_config_values`, the clone reads both make.
 An exact project-name match wins FIRST; only then is the argument treated as a literal clone path — a
 coincidentally-named git directory under cwd must never shadow the real, DB-declared clone.
 
-A matched project's clone path is COMPUTED for this node from the project's `id`
-(`control_plane_client.resolve_clone_root` → `<JAAH_HOME>/repos/<id>/main`); `""` when this node has no
-JAAH_HOME or the row carries no usable `id`.
+A matched project's clones are COMPUTED for this node from the project's `id`
+(`control_plane_client.resolve_slot_clones`: every primary-repository slot clone under `<JAAH_HOME>/repos/<id>/`,
+plus a legacy `main` anchor still on disk); `[]` when this node has no JAAH_HOME, no usable `id`, or no clone yet.
 
 JAAH_ENV_PATH overrides which `.env` supplies ADMIN_EMAIL/ADMIN_PASSWORD (test isolation);
 JAAH_API_URL (control_plane_client.api_base) overrides the API base URL.
@@ -24,6 +24,12 @@ HUB_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(HUB_ROOT / "tools"))
 import control_plane_client  # noqa: E402
 
+# The `remote.origin.pushurl` sentinel install-access-guard.py sets when push is disabled and
+# check-access-guard.py audits for. Never rename: live clones already carry this literal, and the
+# installer removes only a sentinel it recognizes, so a rename would leave those clones permanently
+# unpushable.
+DISABLED_PUSH_URL = "disabled://readonly-guard-see-docs-policies-repo-access-levels-md"
+
 
 def git_hooks_dir(clone: str) -> Path:
     """`git rev-parse --git-path hooks` for `clone`, as an absolute path; raises `CalledProcessError` when
@@ -37,6 +43,18 @@ def git_hooks_dir(clone: str) -> Path:
     return p if p.is_absolute() else Path(clone) / out
 
 
+def git_config_values(clone: str, key: str, *, local: bool = False) -> list[str] | None:
+    """Every value of `key` in `clone`'s git config (`--get-all`, one per line as git prints them), or None
+    when git cannot answer: the key is unset, or `clone` is no repository. `local` reads the clone's own config
+    file alone — the scope `access-guard-pre-push.py::read_config` reads, so an audit is never satisfied by
+    `~/.gitconfig` or `GIT_CONFIG_*`."""
+    result = subprocess.run(
+        ["git", "-C", clone, "config", *(["--local"] if local else []), "--get-all", key],
+        capture_output=True, text=True,
+    )
+    return result.stdout.splitlines() if result.returncode == 0 else None
+
+
 _ENV_PATH_OVERRIDE = os.environ.get("JAAH_ENV_PATH")
 ENV_PATH = Path(_ENV_PATH_OVERRIDE) if _ENV_PATH_OVERRIDE else control_plane_client.DEFAULT_ENV_PATH
 
@@ -45,19 +63,22 @@ def _is_git_clone(path: str) -> bool:
     return os.path.isdir(os.path.join(path, ".git")) or os.path.isfile(os.path.join(path, ".git"))
 
 
-def resolve_one(arg: str) -> tuple[str, str] | None:
-    """<name-or-path> -> (name, clone path), or None if it resolves to neither an exact console
-    project name nor a local git clone; the clone path is `""` for a project this node cannot place.
+def _project_clones(project: dict) -> list[str]:
+    return [os.path.expanduser(c) for c in control_plane_client.resolve_slot_clones(project.get("id"))]
+
+
+def resolve_one(arg: str) -> tuple[str, list[str]] | None:
+    """<name-or-path> -> (name, clone paths), or None if it resolves to neither an exact console
+    project name nor a local git clone; the list is empty for a project with no clone on this node.
     Raises control_plane_client.ControlPlaneApiError if the API is unreachable — callers must propagate
     that loudly, never as a silent 'not found'."""
     projects = control_plane_client.fetch_projects(env_path=ENV_PATH)
     for p in projects:
         if p.get("name") == arg:
-            clone = control_plane_client.resolve_clone_root(p.get("id"))
-            return arg, os.path.expanduser(clone) if clone else ""
+            return arg, _project_clones(p)
     if _is_git_clone(arg):
         name = os.path.basename(arg.rstrip("/")) or arg
-        return name, arg
+        return name, [arg]
     return None
 
 
@@ -72,6 +93,15 @@ def resolve_integration_branch(arg: str) -> str:
         if p.get("name") == arg:
             return str(p.get("integration_branch") or "")
     return ""
+
+
+def resolve_jaah_repo_prefix(arg: str) -> str | None:
+    """The project's `jaah_repo_prefix` (`<jaah org>/<org slug>-`, `""` when the control plane has none), or None
+    when `arg` names no Jaah project. Raises `ControlPlaneApiError`, as `resolve_integration_branch` does."""
+    for p in control_plane_client.fetch_projects(env_path=ENV_PATH):
+        if p.get("name") == arg:
+            return str(p.get("jaah_repo_prefix") or "")
+    return None
 
 
 class DeclaredGovernance(NamedTuple):
@@ -133,33 +163,28 @@ def _declared_governance(project: dict) -> DeclaredGovernance:
     return DeclaredGovernance(branch_prefix=prefix, push_enabled=push_enabled)
 
 
-def resolve_one_with_governance(arg: str) -> tuple[str, str, DeclaredGovernance | None] | None:
-    """`resolve_one` plus the project's DECLARED governance — (name, clone path, governance), where
+def resolve_one_with_governance(arg: str) -> tuple[str, list[str], DeclaredGovernance | None] | None:
+    """`resolve_one` plus the project's DECLARED governance — (name, clone paths, governance), where
     governance is None ONLY for a bare local clone the API knows nothing about (a caller must not
-    invent one). Same priority and per-node clone path as `resolve_one`."""
+    invent one). Same priority and per-node clones as `resolve_one`."""
     projects = control_plane_client.fetch_projects(env_path=ENV_PATH)
     for p in projects:
         if p.get("name") == arg:
-            clone = control_plane_client.resolve_clone_root(p.get("id"))
-            return arg, (os.path.expanduser(clone) if clone else ""), _declared_governance(p)
+            return arg, _project_clones(p), _declared_governance(p)
     if _is_git_clone(arg):
         name = os.path.basename(arg.rstrip("/")) or arg
-        return name, arg, None
+        return name, [arg], None
     return None
 
 
-def sweep_all() -> list[tuple[str, str, DeclaredGovernance]]:
-    """EVERY project in the console as (name, clone path, declared governance) triples — governance per
-    `_declared_governance`, the clone path computed for THIS node and possibly empty.
+def sweep_all() -> list[tuple[str, list[str], DeclaredGovernance]]:
+    """EVERY project in the console as (name, clone paths, declared governance) triples — governance per
+    `_declared_governance`, the clones this node holds (possibly none).
 
     Deliberately UNfiltered: filtering to restricted projects would hide a clone still carrying a
     restrictive marker after its restriction was lifted."""
     projects = control_plane_client.fetch_projects(env_path=ENV_PATH)
     return [
-        (
-            p.get("name", ""),
-            os.path.expanduser(control_plane_client.resolve_clone_root(p.get("id"))),
-            _declared_governance(p),
-        )
+        (p.get("name", ""), _project_clones(p), _declared_governance(p))
         for p in projects
     ]

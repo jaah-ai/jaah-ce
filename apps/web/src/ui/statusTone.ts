@@ -1,5 +1,9 @@
 import type { Tone } from './StatusChip'
 
+/** A vocabulary token as the console shows it: its word, its tone, and its state-mark glyph — one record per
+ *  vocabulary, never parallel label/tone/glyph maps. */
+export type Presentation = { label: string; tone: Tone; glyph: string }
+
 /* The one badge-token → tone map for the console: a page reads the tone, never the hue. Each entry
  * transcribes its `styles.css` hue onto the nearest MUI semantic:
  *   green → success   red → error   orange → warning   blue/purple → info   gray → neutral
@@ -54,7 +58,18 @@ export const TONE_COLOR: Record<Tone, string> = {
   error: 'error.main',
 }
 
+/** A status word → its tone through one map, with the console's one fallback: an unknown or absent word is `neutral`. */
+export function toneOf(map: Readonly<Partial<Record<string, Tone>>>, key: string | null | undefined, fallback: Tone = 'neutral'): Tone {
+  return (key != null && Object.hasOwn(map, key) && map[key]) || fallback
+}
+
+/** A status word → its presentation through one map, with the caller's one fallback: an unknown, absent or
+ *  inherited word reads as `fallback` (a newer vocabulary renders as itself in grey, never as a crash). */
+export function presentationOf(map: Readonly<Partial<Record<string, Presentation>>>, key: string | null | undefined, fallback: Presentation): Presentation {
+  return (key != null && Object.hasOwn(map, key) && map[key]) || fallback
+}
+
 /** A badge token → its tone, with the stylesheet's own "no rule matched" fallback made explicit. */
 export function toneFor(badgeToken: string | null | undefined): Tone {
-  return (badgeToken && STATUS_TONE[badgeToken]) || 'neutral'
+  return toneOf(STATUS_TONE, badgeToken)
 }

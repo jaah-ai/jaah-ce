@@ -1,0 +1,44 @@
+# Google Maps Platform: an API key. Every Maps call, a read included, is a billed SKU, so the Test is a format
+# check (architecture §3.2). Confirmed 2026-11-03 at the vendor_docs_url page (where keys are made).
+slug = "google_maps"
+label = "Google Maps Platform"
+category = "marketing"
+vendor_docs_url = "https://developers.google.com/maps/documentation/javascript/get-api-key"
+summary = "Geocode addresses, search places, and build maps and directions with your Maps API key."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, placeholder = "AIza...", help = "Google Cloud console > Google Maps Platform > Keys & Credentials > Create credentials > API key. Restrict it under API restrictions to the Maps APIs agents need (for example Geocoding API and Places API) before saving it here" },
+]
+
+[test]
+kind = "format"
+patterns = { api_key = "AIza[0-9A-Za-z_-]{35}" }
+
+[docs]
+agent_uses = [
+  "Geocode an address to coordinates, or reverse-geocode coordinates to an address",
+  "Search places by text or near a point, and read a place's details and opening hours",
+  "Compute routes, distances and travel times between addresses",
+  "Wire a Maps JavaScript or Static Maps key into an app's configuration while building it",
+]
+prerequisites = [
+  "A Google Cloud project with billing enabled. Google Maps Platform does not serve keys from a project without a billing account",
+  "Each Maps API agents call enabled in that project (Google Maps Platform > APIs & Services)",
+]
+limitations = [
+  "Jaah's Test checks only the key's shape and does not call Google, because every Maps request is billed. The first real check is an agent's first call",
+  "Every agent call is billed to your Google Cloud project at Google's per-SKU price. Set a budget alert and per-API quotas in the Cloud console",
+  "A key restricted to HTTP referrers (websites) is refused from servers. For agents, use a key restricted by API, or by IP address",
+]
+troubleshooting = [
+  { symptom = "Test says API key is not in the format Google Maps Platform uses", fix = "Google API keys start with AIza and are 39 characters. Copy the key again from Keys & Credentials > Show key, without spaces or quotes" },
+  { symptom = "An agent gets REQUEST_DENIED with This API project is not authorized to use this API", fix = "Enable that API (for example Places API) in the project, and add it to the key's API restrictions" },
+  { symptom = "An agent gets REQUEST_DENIED with You must enable Billing", fix = "Link a billing account to the project in Billing > Account management" },
+  { symptom = "An agent gets The provided API key is invalid although the format check passed", fix = "The key was deleted or belongs to another project. Create a new key and select Replace on the secret" },
+]
+faq = [
+  { q = "Why is the Test only a format check", a = "Google bills every Maps Platform request, including the cheapest read, so testing would cost money on every save. The format check catches typos; the first agent call proves the key" },
+  { q = "Can I reuse the key from my website", a = "Better not: a website key is usually restricted to HTTP referrers, which servers cannot send. Create a separate key for agents" },
+]

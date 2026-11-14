@@ -123,9 +123,9 @@ def stored_secret_envelope_exists(session: Session, field: str, envelope: dict) 
 
 
 def main() -> None:
-    from app.db import engine
+    from app.db import offline_engine
 
-    with engine.connect() as connection:
+    with offline_engine.connect() as connection:
         rotated, current = rotate_all(connection, commit=connection.commit)
         print(f"credential_reseal: moved {rotated} row(s) onto the current keys; {current} already current", flush=True)
         remaining = rows_on_previous_keys(connection)

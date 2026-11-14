@@ -1,4 +1,4 @@
-"""A slot's port and stack wiring in `.env` — the CP's band, tier-2 auto ports, stack and node identity."""
+"""A slot's port and stack wiring in `.env` — node-assigned ports, stack and node identity."""
 from __future__ import annotations
 
 import logging
@@ -6,7 +6,7 @@ import os
 import re
 import socket
 import threading
-from typing import Iterable
+from typing import Iterable, Mapping, Sequence
 
 import environment
 import host_platform
@@ -18,18 +18,17 @@ log = logging.getLogger("jaahd.worktree_mechanics.ports")
 # Pool-root reads use `environment.pool_root_raw()` (UNSTRIPPED): both readers normalise the value
 # themselves, and a `.strip()` on the way in would change what a whitespace-bearing value resolves to.
 
-# The deterministic port grid is NOT here: the CP ships each slot's band, `apply_port_band` writes it and
-# REFUSES an absent one ("write nothing" leaves every slot on the same `.env.example` port). Tier 2: a
-# declared `port_vars` entry with no range start gets a flat auto port from `apply_auto_ports` — the one
-# port decision the node makes. The grid's audit/`--fix` tool loads this module by
-# path for `_as_port`, `_env_embedded_ports` and the regexes (`tools/jaahd_module.py`) — no copy of them there.
+# The node picks every slot port: each declared `port_vars` entry gets a free host port from
+# `apply_auto_ports`, out of the CP's `auto_port_floor`/`auto_port_ceiling` range. The pool port audit loads
+# this module by path for `_as_port`, `_env_embedded_ports` and the regexes (`tools/jaahd_module.py`) — no
+# copy of them there.
 
 
-def _env_port(wt: str, var: str) -> str:
-    """Read VAR from a worktree's .env — first `^\\s*VAR=` line, trailing comment and quotes stripped.
-    "" if unset or unreadable."""
+def _env_port(wt: str, var: str, filename: str = ".env") -> str:
+    """Read VAR from a worktree's `.env` (or FILENAME, e.g. `.env.example`) — first `^\\s*VAR=` line,
+    trailing comment and quotes stripped. "" if unset or unreadable."""
     try:
-        text = env_file.env_text(os.path.join(wt, ".env"))
+        text = env_file.env_text(os.path.join(wt, filename))
     except OSError:
         return ""
     pat = re.compile(r"^\s*" + re.escape(var) + r"=")
@@ -55,8 +54,7 @@ def wt_ports_json(wt: str, port_vars: Iterable[str]) -> dict:
 # publishes KEY AND VALUE into a runner's environment out of the slot's secrets file, and `PASSPORT`,
 # `SUPPORT`, `EXPORT`, `REPORT`, `PORTAL`, `TRANSPORT` all contain `PORT` (`.endswith` is not enough
 # either), so a numeric PIN under such a name would clear both this and `wt_ports_json`'s digits filter.
-# Costs nothing: every name the grid seeds (`apps/api/app/port_grid.py`) is `*_PORT`. A hypothetical
-# `PORTFOO=` goes unpublished — a runner told one port fewer, the direction to be wrong in.
+# A hypothetical `PORTFOO=` goes unpublished — a runner told one port fewer, the direction to be wrong in.
 _PORT_VAR_TOKEN_RX = re.compile(r"(?:^|_)PORTS?(?:_|$)", re.IGNORECASE)
 
 
@@ -122,98 +120,9 @@ def has_stack(wt: str) -> bool:
     return False
 
 
-def apply_port_band(
-    wt: str, band: "dict[str, int] | None", *, port_vars: "list[str] | tuple[str, ...]" = (),
-    auto_ports: "tuple[int, int] | None" = None,
-) -> None:
-    """WRITE the CP-computed port band (`{VAR: port}` from `apps/api/app/fleet_decide.py::port_band`) into
-    a worktree's .env; nothing here derives a port.
-
-    FAIL-CLOSED and ALL-OR-NOTHING: an absent or malformed band raises `ResetRefused` before a single var
-    is written — writing nothing leaves the slot on the `.env.example` seed, identical in every slot.
-    `port_vars` alone tells "binds no host ports" from "the CP said nothing"; both arrive as an empty
-    mapping. A worktree with NO `.env` is the one non-refusing gap.
-
-    `auto_ports` is the tier-2 `(floor, ceiling)` off the pool tick's `grid` block, threaded here because
-    this tail call is the only entry into tier 2. None keeps the module defaults (a bus `claim`, a test)."""
-    if band is None:
-        raise core.ResetRefused(
-            "port-band-absent: the control plane sent no port band for this slot. The node deleted the "
-            "deterministic port grid (the CP computes it and ships it on the "
-            "pool-tick roster slot and in the lease intent payload) and will not fall back to the .env "
-            "seed, whose ports are identical in every slot"
-        )
-    if not isinstance(band, dict):
-        raise core.ResetRefused(
-            f"port-band-malformed: expected a {{VAR: port}} mapping from the CP, got "
-            f"{type(band).__name__} ({band!r})"
-        )
-    clean: dict[str, int] = {}
-    for var, port in band.items():
-        name = str(var or "").strip()
-        if not name:
-            raise core.ResetRefused(f"port-band-malformed: empty port-var name in the CP's band {band!r}")
-        # A band key is written as a `.env` KEY (see `_PORT_VAR_NAME_RX`); checked where it is acted on.
-        if not _port_var_name_ok(name):
-            raise core.ResetRefused(
-                f"port-band-malformed: {name!r} is not a usable port-var name — a band key is written as a "
-                f".env KEY, so it must be an env identifier (a name carrying a newline or an '=' would "
-                f"inject an arbitrary assignment) and must not be one of "
-                f"{sorted(_PORT_VAR_RESERVED_NAMES)} (which would SHADOW this node's own credential or "
-                f"identity with a port)"
-            )
-        # `bool` is an `int` in Python and `True` would band a slot onto port 1. Rejected, not coerced.
-        if isinstance(port, bool) or not isinstance(port, int):
-            raise core.ResetRefused(
-                f"port-band-malformed: {name}={port!r} is not an integer port — the CP decides ports and "
-                f"this module has no grid left to coerce or default one from"
-            )
-        if not 1 <= port <= 65535:
-            raise core.ResetRefused(f"port-band-malformed: {name}={port} is not a host port (1-65535)")
-        clean[name] = port
-    declared = [str(v).strip() for v in (port_vars or []) if str(v).strip()]
-    # Tier 2: a declared var the band misses is ASSIGNED a flat port, not refused ("no declared var keeps
-    # the shared seed", acted on). `port_vars` with no `port_block` is graded by
-    # the pool conformance check; refusing here too would re-block the case tier 2 exists for.
-    missing = [v for v in declared if v not in clean]
-    if not clean and not missing:
-        # No `port_vars`, no band: a repo that binds no host ports — a fact, not a silence.
-        return
-    env_path = os.path.join(wt, ".env")
-    if not os.path.isfile(env_path):
-        # LOUD but not a refusal: an absent `.env` is a REPO-contract fault the pool conformance check
-        # gates; refusing here would make the project's pool unmaterialisable on every node.
-        log.warning(
-            "apply_port_band: %s has no .env — the CP's band %s could not be written. The repo must ship "
-            "a .env.example for the slot to seed from; until it does, this stack falls back to its compose "
-            "defaults, which are the same in every slot",
-            wt, sorted(clean.items()),
-        )
-        return
-    env_file._ensure_eol_nl(env_path)
-    # Accumulated in the band's own order, written once (`_set_env_vars`).
-    assignments: dict[str, str] = {}
-    embedded: list[tuple[int, int]] = []
-    for var, port in clean.items():
-        old = _env_port(wt, var)
-        assignments[var] = str(port)
-        if old and old.isdigit() and old != str(port):
-            embedded.append((int(old), int(port)))
-    env_file._set_env_vars(env_path, assignments, embedded)
-    # Tier 2 runs LAST and reads the file back, so the ports just written are already avoided. `declared`
-    # (not `missing`) on purpose: "which var is tier 2" is defined in the function that acts on it. The
-    # range is forwarded, not re-derived — passing nothing would stop an operator's edit one hop short.
-    if auto_ports is None:
-        apply_auto_ports(wt, port_vars=declared, band=clean)
-    else:
-        floor, ceiling = auto_ports
-        apply_auto_ports(wt, port_vars=declared, band=clean, floor=floor, ceiling=ceiling)
-
-
-# ── The AUTO tier (tier 2): a declared port the port grid has no window for ────────────────────────────
-# ONE FLAT RANGE ABOVE EVERY GRID WINDOW (highest: CDP_BRIDGE_PORT's 18800-19799), so an auto port is
-# never mistaken for a banded one and is invisible to the CP's drift comparison by design. Collision
-# reporting (the pool port audit) still covers it.
+# ── Node-assigned ports: every declared `port_vars` var ──────────────────────────────────────────────
+# ONE FLAT RANGE shared by every project on the node; the CP may move it with `auto_port_floor` /
+# `auto_port_ceiling`. Collision reporting (the pool port audit) covers it.
 AUTO_PORT_FLOOR = 20800
 # Last port below the kernel's ephemeral floor (`net.ipv4.ip_local_port_range` = 32768-60999 here, also
 # docker's dynamic-publish source): a service bound inside it is a once-a-week EADDRINUSE. ~12k ports.
@@ -225,7 +134,7 @@ RESERVED_PORT_RANGES: tuple[tuple[int, int], ...] = ((32768, 33279),)
 
 
 def auto_port_range_from_grid(grid: object) -> "tuple[int, int]":
-    """`(floor, ceiling)` for the tier-2 walk from the CP's grid block (`auto_port_floor`/`auto_port_ceiling`),
+    """`(floor, ceiling)` for the auto-port walk from the CP's grid block (`auto_port_floor`/`auto_port_ceiling`),
     defaulting to the constants above. THE SINGLE HOME for that read: the allocator (`apply_auto_ports`)
     and the direct console's refusal (`console_direct.port_grid_conflict`) must never disagree, or a
     console bound inside the walked range crash-loops on EADDRINUSE.
@@ -251,7 +160,7 @@ def auto_port_range_from_grid(grid: object) -> "tuple[int, int]":
     ceiling = _knob("auto_port_ceiling", AUTO_PORT_CEILING)
     if floor > ceiling:
         log.warning(
-            "auto_port_range_from_grid: the control plane's tier-2 range is inverted (%d-%d) — falling "
+            "auto_port_range_from_grid: the control plane's auto-port range is inverted (%d-%d) — falling "
             "back WHOLE to this node's defaults (%d-%d) rather than allocating out of an empty interval",
             floor, ceiling, AUTO_PORT_FLOOR, AUTO_PORT_CEILING,
         )
@@ -265,9 +174,8 @@ _PORT_VAR_NAME_RX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # The charset stops INJECTION, not SHADOWING: a `port_vars` row named `NODE_TOKEN` writes `NODE_TOKEN=<port>`
 # into every slot's `.env`, and `./dc`'s compose-env-guard force-reads those keys into each stack — node auth
 # breaks from an edit to a table about ports. These three are what `/etc/jaah/node.env` defines
-# (`jaah_cli._write_node_env`). The CP's `port_grid.py::VAR_NAME_MUST_CONTAIN` already refuses them at
-# declaration, but a row that never passed that door (seeded, older build, restored backup) arrives here
-# unrefused. A REFUSAL, narrower than the CP's rule: a merely misdeclared name stays a one-slot warning.
+# (`jaah_cli._write_node_env`), so a declared port var naming one is a REFUSAL here, whatever the CP let
+# through; a merely misdeclared name stays a one-slot warning.
 _PORT_VAR_RESERVED_NAMES = frozenset({"NODE_ID", "NODE_NAME", "NODE_TOKEN"})
 
 
@@ -277,7 +185,7 @@ def _port_var_name_ok(name: str) -> bool:
 
 
 def _as_port(raw: str) -> "int | None":
-    """A `.env` value as a host port, or None — the ONLY way this tier turns text into a number.
+    """A `.env` value as a host port, or None — the ONLY way this module turns text into a number.
     `isdecimal`, never `isdigit`: `"²"` is isdigit-true and `int()`-UNSAFE, and a 5000-digit run trips
     CPython's 4300-digit cap; either would fail the lease of an INNOCENT slot, since the scan reads every
     sibling `.env`."""
@@ -359,9 +267,8 @@ def _sibling_env_paths(wt: str) -> list[str]:
       * this worktree's own project — its sibling slots and the main clone (`<repo dir>/*/.env`);
       * every project on the node (`<home>/repos/<project id>/<slot>/.env`).
 
-    CROSS-PROJECT IS NOT OPTIONAL. The auto range is ONE flat range shared by every project on the node —
-    unlike the grid, where each project's `port_block` makes disjointness structural — so a scan stopping
-    at the project boundary would hand two projects the same port. Which is why the pool root is DERIVED
+    CROSS-PROJECT IS NOT OPTIONAL. The auto range is ONE flat range shared by every project on the node,
+    so a scan stopping at the project boundary would hand two projects the same port. Which is why the pool root is DERIVED
     from `wt` when `$JAAH_HOME` is unset rather than skipping the wide pass: an env var missing from one
     daemon's environment must not silently narrow the scan to the one scope that cannot be correct.
 
@@ -426,14 +333,14 @@ def _pick_auto_port(taken: "set[int]", floor: int, ceiling: int) -> int:
     """The LOWEST port in `[floor, ceiling]` that is unspent, unreserved and bindable now. Lowest rather
     than random so a node's allocations stay compact and an operator reading two slots' `.env` files can
     see the pattern. Raises `ResetRefused` on exhaustion: silently leaving the var on its seed is the
-    shared-port failure this whole tier exists to prevent, so it fails the lease instead."""
+    shared-port failure this allocator exists to prevent, so it fails the lease instead."""
     for port in range(floor, ceiling + 1):
         if port in taken or _port_reserved(port):
             continue
         if _port_bindable(port):
             return port
     raise core.ResetRefused(
-        f"auto-port-exhausted: no free host port left in the tier-2 range {floor}-{ceiling} on this node "
+        f"auto-port-exhausted: no free host port left in the auto-port range {floor}-{ceiling} on this node "
         f"({len(taken)} already spent by this host's .env files). Either the range needs widening — it is "
         f"an OPERATOR KNOB now, `auto_port_floor`/`auto_port_ceiling` in the console's port-grid settings, "
         f"which this node falls back to worktree_mechanics.ports.AUTO_PORT_FLOOR/AUTO_PORT_CEILING for when the "
@@ -441,7 +348,7 @@ def _pick_auto_port(taken: "set[int]", floor: int, ceiling: int) -> int:
     )
 
 
-# Serializes tier-2 picks inside this daemon: `reconcile.execute.execute_intents` claims slots concurrently, and two
+# Serializes auto-port picks inside this daemon: `reconcile.execute.execute_intents` claims slots concurrently, and two
 # picks reading the sibling `.env` files before either writes would hand both slots the lowest free port.
 _AUTO_PORTS_LOCK = threading.Lock()
 
@@ -449,45 +356,50 @@ _AUTO_PORTS_LOCK = threading.Lock()
 def apply_auto_ports(
     wt: str,
     *,
-    port_vars: "list[str] | tuple[str, ...]" = (),
-    band: "dict[str, int] | None" = None,
+    port_vars: "Sequence[str]" = (),
+    preferred: "Mapping[str, int] | None" = None,
     floor: int = AUTO_PORT_FLOOR,
     ceiling: int = AUTO_PORT_CEILING,
 ) -> dict[str, int]:
     """`_apply_auto_ports` under `_AUTO_PORTS_LOCK`, so this daemon's concurrent claims cannot race a pick."""
     with _AUTO_PORTS_LOCK:
-        return _apply_auto_ports(wt, port_vars=port_vars, band=band, floor=floor, ceiling=ceiling)
+        return _apply_auto_ports(wt, port_vars=port_vars, preferred=preferred, floor=floor, ceiling=ceiling)
 
 
 def _apply_auto_ports(
     wt: str,
     *,
-    port_vars: "list[str] | tuple[str, ...]" = (),
-    band: "dict[str, int] | None" = None,
+    port_vars: "Sequence[str]" = (),
+    preferred: "Mapping[str, int] | None" = None,
     floor: int = AUTO_PORT_FLOOR,
     ceiling: int = AUTO_PORT_CEILING,
 ) -> dict[str, int]:
-    """Give every declared `port_vars` entry the CP's `band` does NOT name a flat host port, written into
-    this worktree's `.env`. Returns `{VAR: port}` for the tier-2 vars afterwards — assigned and kept alike.
+    """Give every declared `port_vars` entry a host port, written into this worktree's `.env`. Returns
+    `{VAR: port}` afterwards — assigned, preferred and kept alike.
 
-    IDEMPOTENT, WHICH IS NOT "KEEP WHATEVER IS THERE": a value is kept only when it is already an in-range
-    auto port nothing else on this host spends, because a re-lease must not move a port a warm stack is
-    bound to. Anything else is REassigned, and the case that matters is the `.env.example` SEED — present,
-    numeric, and identical in every slot, i.e. the cross-slot collision the port grid exists to prevent.
+    IDEMPOTENT, WHICH IS NOT "KEEP WHATEVER IS THERE": a present value is kept only when it is a port
+    >= 1024, outside RESERVED_PORT_RANGES, assigned by no sibling `.env`, not already claimed in this pass,
+    and different from the value the worktree's `.env.example` seeds for that var — because a re-lease must
+    not move a port a warm stack is bound to. Anything else is REassigned from `[floor, ceiling]`; the case
+    that matters is the `.env.example` SEED — present, numeric, and identical in every slot.
 
     COLLISION CHECKED TWICE, since each probe sees what the other cannot: every sibling `.env` on the node
     (a DOWN slot still owns its port) plus a live bind test (a listener no `.env` mentions). Best effort —
     this daemon's own picks are serialized (`apply_auto_ports`), but another process leasing on the same node
     can still pick one port, and the loser fails loudly at `up` time.
 
-    Called from `apply_port_band`, not from each mechanic, so tier 2 lands exactly where tier 1 does: every
-    create and every claim, from one place that cannot fall out of step with it."""
+    PREFERRED PORTS (`preferred`, a port Environment row's own port): used when it is >=1024, no sibling
+    slot's `.env` assigns it to a `*PORT*` key, no other key here assigns it, and it binds now; kept unprobed on a re-run
+    that finds it already written (a warm stack holds it). Otherwise the var takes the keep rule above, then the
+    auto pick.
+
+    Called on every create and every claim (`lifecycle.claim_mechanics`, `slot_repos`, the launch
+    enactment)."""
     declared = [str(v).strip() for v in (port_vars or []) if str(v).strip()]
-    banded = {str(v).strip() for v in (band or {})}
     # DEDUPED, ORDER IRRELEVANT (the loop sorts): `port_vars` is operator free text and CAN repeat a name.
     # Processed twice, the second pass reads back the value the first just wrote, finds it in `claimed`, and
     # reassigns — so the port flipped on EVERY lease, the exact churn idempotency exists to prevent.
-    autos = list(dict.fromkeys(v for v in declared if v not in banded))
+    autos = list(dict.fromkeys(declared))
     if not autos:
         return {}
     malformed = [v for v in autos if not _port_var_name_ok(v)]
@@ -497,35 +409,14 @@ def _apply_auto_ports(
             f"var becomes a KEY in this slot's .env — it must be an env identifier (a name carrying a "
             f"newline or an '=' would inject an arbitrary assignment) and must not be one of "
             f"{sorted(_PORT_VAR_RESERVED_NAMES)} (which would SHADOW this node's own credential or "
-            f"identity with a port). Fix the project's `port_vars` column"
-        )
-    if not banded:
-        # AMBIGUOUS AND WORTH SAYING SO. From here it is indistinguishable whether this project genuinely
-        # declares no grid-managed var or whether its `port_block` is unset — the node holds no grid to
-        # tell them apart. The second is a config fault with its own gate, named here so a human reading
-        # a node log has the next step rather than a mystery.
-        log.warning(
-            "apply_auto_ports: %s got NO grid band at all, so all of %s are being auto-assigned. Expected "
-            "for a project with no grid-managed var; otherwise its `port_block` is unset — run "
-            "the pool conformance check against the project",
-            wt, sorted(autos),
-        )
-    else:
-        # A MIXED band names the DEPLOY-SKEW case: if one of these vars does have a range start in a NEWER
-        # grid than the control plane is running, it is being auto-assigned instead of banded, and the CP's
-        # own drift check cannot see it (its copy is the stale one). The node holds no grid to decide this,
-        # so it reports rather than refuses — and the next lease after the CP catches up re-bands it.
-        log.info(
-            "apply_auto_ports: %s banded %s and is auto-assigning %s. If one of the latter should be on "
-            "the grid, this node's grid is ahead of the control plane's copy (policy §Ports, Known gap)",
-            wt, sorted(banded), sorted(autos),
+            f"identity with a port). Rename the project's Port variable in its Environment tab"
         )
     env_path = os.path.join(wt, ".env")
     if not os.path.isfile(env_path):
-        # Same asymmetry as `apply_port_band`'s: an absent `.env` is a REPO-contract fault
-        # (the pool conformance check gates it), never this node's, so it is loud and not a refusal.
+        # An absent `.env` is a REPO-contract fault (the pool conformance check gates it), never this
+        # node's, so it is loud and not a refusal.
         log.warning(
-            "apply_auto_ports: %s has no .env — the tier-2 vars %s could not be assigned a port and this "
+            "apply_auto_ports: %s has no .env — the port vars %s could not be assigned a port and this "
             "stack falls back to its compose defaults, which are the same in every slot",
             wt, sorted(autos),
         )
@@ -537,7 +428,13 @@ def _apply_auto_ports(
     # must not count). `avoid`: everything a new assignment dodges — that, plus every sibling's URL ports,
     # plus this file's own; erring wide is free. `claimed`: kept or assigned in THIS pass, so two vars
     # seeded to one value cannot both keep it.
+    prefer = {str(k).strip(): v for k, v in (preferred or {}).items()
+              if isinstance(v, int) and not isinstance(v, bool) and 1024 <= v <= 65535}
     sibling_assigned: set[int] = set()
+    # A preferred port usually sits outside the auto range (5173), so its sibling check reads every
+    # `*PORT*` key's value >=1024 in sibling SLOTS — not the main clone (its `.env` is the repo's seed), not
+    # URL ports, not other numbers; the bind probe catches a real listener. Consulted only for preferred vars.
+    sibling_any: set[int] = set()
     avoid: set[int] = set()
     for path in _sibling_env_paths(wt):
         try:
@@ -554,18 +451,24 @@ def _apply_auto_ports(
         # sibling's value only counts as an auto allocation when judged against the range it came from.
         sibling_assigned |= _env_assigned_ports(text, floor=floor, ceiling=ceiling)
         avoid |= _env_embedded_ports(text)
+        if prefer and os.path.basename(os.path.dirname(path)) != "main":
+            for line in text.splitlines():
+                m = env_file._ENV_KV_RX.match(line)
+                held = _as_port(env_file._clean_env_value(m.group(2))) if m and "PORT" in m.group(1).upper() else None
+                if held is not None and held >= 1024:
+                    sibling_any.add(held)
     avoid |= sibling_assigned
     try:
         own_text = env_file.env_text(env_path)
     except OSError as exc:
-        log.warning("apply_auto_ports: %s is unreadable (%s) — tier-2 vars left alone", env_path, exc)
+        log.warning("apply_auto_ports: %s is unreadable (%s) — port vars left alone", env_path, exc)
         return {}
     avoid |= _env_assigned_ports(own_text, floor=floor, ceiling=ceiling) | _env_embedded_ports(own_text)
 
     resolved: dict[str, int] = {}
     claimed: set[int] = set()
     # ACCUMULATED across the walk and written ONCE at the end (`_set_env_vars`): at
-    # `WORKTREE_ENV_MODE` the daemon's write is a delegated round trip, and a project with several tier-2
+    # `WORKTREE_ENV_MODE` the daemon's write is a delegated round trip, and a project with several port
     # vars would otherwise pay one per var on every claim. The reads inside the loop are unaffected —
     # each var reads only its OWN key, which no earlier iteration writes.
     assignments: dict[str, str] = {}
@@ -573,22 +476,34 @@ def _apply_auto_ports(
     for var in sorted(autos):     # sorted so a re-run assigns in the same order, not dict order
         current = _env_port(wt, var)
         was = _as_port(current)
-        if was is not None:
-            in_range = floor <= was <= ceiling and not _port_reserved(was)
-            if in_range and was not in sibling_assigned and was not in claimed:
+        want = prefer.get(var)
+        port: "int | None" = None
+        if (want is not None and want not in claimed and want not in sibling_any and not _port_reserved(want)
+                and not set(_env_keys_assigning(own_text, want)) - {var}):
+            if was == want:
+                resolved[var] = want
+                claimed.add(want)
+                continue
+            if _port_bindable(want):
+                port = want
+        if port is None and was is not None:
+            keepable = was >= 1024 and not _port_reserved(was)
+            seed = _as_port(_env_port(wt, var, ".env.example"))
+            if keepable and was != seed and was not in sibling_assigned and was not in claimed:
                 resolved[var] = was
                 claimed.add(was)
                 continue
-        elif current:
+        elif was is None and current:
             # A declared port var holding something that is not a port at all — a URL, a name, a comment.
             # It is still assigned (the project DECLARED it as a port), but the old value is deliberately
             # NOT logged: this shape is how a misdeclared `port_vars` entry (`DATABASE_URL`) would print a
             # credential into the node journal. Loud about the overwrite, silent about the value.
             log.warning(
-                "apply_auto_ports: %s %s held a NON-PORT value and is being overwritten with a tier-2 "
-                "port — if that var is not a host port, remove it from the project's `port_vars`", wt, var,
+                "apply_auto_ports: %s %s held a NON-PORT value and is being overwritten with a node-assigned "
+                "port — if that var is not a host port, remove that Port variable from the project's Environment tab", wt, var,
             )
-        port = _pick_auto_port(avoid | claimed, floor, ceiling)
+        if port is None:
+            port = _pick_auto_port(avoid | claimed, floor, ceiling)
         assignments[var] = str(port)
         if was is not None and was != port:
             # ONLY when this var is the sole owner of the old value. Two keys on one port (a seed copied
@@ -604,8 +519,9 @@ def _apply_auto_ports(
                     wt, var, was, port, sorted(owners), was, was,
                 )
         log.info(
-            "apply_auto_ports: %s %s=%d (tier 2 — no port-grid range start for this var%s)",
-            wt, var, port, "" if was is None else f", was {was}",
+            "apply_auto_ports: %s %s=%d (%s%s)", wt, var, port,
+            "its preferred port" if port == want else "node-assigned",
+            "" if was is None else f", was {was}",
         )
         resolved[var] = port
         claimed.add(port)
@@ -631,8 +547,7 @@ def stack_base(wt: str, repo: str) -> str:
 
 
 def apply_stack_identity(wt: str, repo: str, n: int | str) -> None:
-    """Write the deterministic COMPOSE_PROJECT_NAME = `<base>` for the main clone, else `<base>-N`, where
-    `<base>` is `stack_base`. No-op with no .env.
+    """Write the deterministic COMPOSE_PROJECT_NAME = `<base>-N`, where `<base>` is `stack_base`. No-op with no .env.
 
     NEVER THE DISPLAY NAME: a stack identity is a PLACEMENT fact naming containers, volumes and networks
     already on disk, so a rename of the operator-editable `projects.name` would ORPHAN a warm stack's —
@@ -645,8 +560,7 @@ def apply_stack_identity(wt: str, repo: str, n: int | str) -> None:
         return
     env_file._ensure_eol_nl(env_path)
     base = stack_base(wt, repo)
-    name = base if str(n) == "0" else f"{base}-{n}"
-    env_file._set_env_var(env_path, "COMPOSE_PROJECT_NAME", name)
+    env_file._set_env_var(env_path, "COMPOSE_PROJECT_NAME", f"{base}-{n}")
 
 
 def _default_node_id() -> str:
@@ -659,8 +573,8 @@ def _default_node_id() -> str:
 
 
 def apply_node_identity_env(wt: str, n: int | str, node_id: str | None = None) -> None:
-    """Assert-and-correct a POOL worktree's (N>=1) `NODE_ID` — which host this stack's `apps/api` reports
-    against. Slot 0 is never rewritten. `node_id` is INJECTED by the daemon.
+    """Assert-and-correct a pool worktree's `NODE_ID` — which host this stack's `apps/api` reports
+    against. `node_id` is INJECTED by the daemon.
 
     A CALLER-SUPPLIED `node_id` IS REQUIRED TO WRITE, because absent is strictly better than wrong. The
     value is not inert: a dispatch into a slot carrying the wrong node resumes under it, is refused by its
@@ -668,8 +582,6 @@ def apply_node_identity_env(wt: str, n: int | str, node_id: str | None = None) -
     `resolve_node_id()` degrades to `_default_node_id()`'s bare short hostname whenever the tailnet query
     is slow, so a value written from that is indistinguishable from a real answer and outlives the blip.
     Nothing reads this key for identity at runtime. Warn, do not fail."""
-    if str(n) == "0":
-        return
     env_path = os.path.join(wt, ".env")
     if not os.path.isfile(env_path):
         return

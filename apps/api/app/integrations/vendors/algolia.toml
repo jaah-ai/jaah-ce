@@ -1,0 +1,45 @@
+slug = "algolia"
+label = "Algolia"
+category = "search"
+vendor_docs_url = "https://www.algolia.com/doc/rest-api/search/"
+summary = "Search, index and configure your Algolia indices from agent sessions."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "app_id", label = "Application ID", kind = "text", required = true, placeholder = "ABCDE12345", help = "In the Algolia dashboard open Settings > API Keys (dashboard.algolia.com/account/api-keys); the Application ID is the first value at the top of the page" },
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "On the same Settings > API Keys page, copy the Write API Key, or under All API Keys select New API Key and grant it at least the listIndexes ACL plus the ACLs your agents need (search, addObject, editSettings). The Search-Only API Key cannot pass the Test" },
+]
+
+[test]
+method = "GET"
+path = "https://{app_id}.algolia.net/1/indexes?page=0&hitsPerPage=1"
+auth = { field = "api_key", header = "X-Algolia-API-Key" }
+field_headers = { "X-Algolia-Application-Id" = "app_id" }
+list_field = "items"
+
+[docs]
+agent_uses = [
+  "Search any index of your application, with filters, facets and ranking, to answer questions or check content",
+  "Add, update and delete records when a task changes the data behind your search",
+  "Read and change index settings (searchable attributes, ranking, synonyms, rules) and copy or clear an index",
+  "List the indices in the application to see what exists before changing anything",
+]
+prerequisites = [
+  "An Algolia account with at least one application (the free Build plan is enough)",
+  "Access to the application's Settings > API Keys page, which needs the Owner or an Admin role in Algolia's team settings to see the Write API Key",
+]
+limitations = [
+  "The Test lists the application's indices, so the key needs the listIndexes ACL: a Search-Only API Key is refused with 403",
+  "A secured API key (one your backend derives from another key) is not supported: connect the parent key instead",
+  "Algolia meters search and indexing operations, so heavy agent use counts against your plan's monthly records and requests",
+]
+troubleshooting = [
+  { symptom = "The Test says Algolia rejected the API key (403)", fix = "Either the Application ID and key belong to different applications, or the key lacks the listIndexes ACL. Copy both values again from the same Settings > API Keys page, or edit the key under All API Keys and add listIndexes" },
+  { symptom = "The Test says Algolia cannot be reached at that address", fix = "The Application ID is mistyped: it is 10 letters and digits, with no spaces and no https:// prefix. Copy it again from Settings > API Keys" },
+  { symptom = "Agents can search but writes fail with 403", fix = "The key is restricted to read ACLs or to some indices. Use the Write API Key, or edit the key's ACLs and Indices restriction under All API Keys" },
+]
+faq = [
+  { q = "Which Algolia key should I use", a = "The Write API Key works for everything. For least privilege, create a key under All API Keys with listIndexes, search and only the write ACLs your agents need, restricted to the indices they should touch" },
+  { q = "Can I use the Admin API Key", a = "Yes, but it can also manage other keys and delete any index. Prefer the Write API Key or a dedicated key" },
+]

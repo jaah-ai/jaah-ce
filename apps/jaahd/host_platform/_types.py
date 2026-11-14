@@ -1,6 +1,7 @@
 """The seam's value types and the pieces every implementation shares. Stdlib only, no side effects."""
 from __future__ import annotations
 
+import platform
 import subprocess
 from dataclasses import dataclass
 from typing import Callable, NamedTuple, Sequence
@@ -17,6 +18,11 @@ def normalise_arch(machine: str) -> str:
     """`x86_64`/`amd64`/`AMD64` → `x64`; `aarch64`/`arm64`/`ARM64` → `arm64`; else lower-cased as-is."""
     raw = (machine or "").strip().lower()
     return _ARCH_ALIASES.get(raw, raw)
+
+
+def machine() -> str:
+    """The raw `platform.machine()` spelling every OS reports alike; `normalise_arch` reads it."""
+    return platform.machine()
 
 
 @dataclass(frozen=True)

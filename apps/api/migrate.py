@@ -1,7 +1,7 @@
 """Local migration runner — ``python migrate.py [revision]`` → ``alembic upgrade``.
 
 Plain CLI the compose api service runs on boot
-(``python migrate.py && uvicorn …``). Defaults to ``head``; pass an explicit
+(``python migrate.py && ./entrypoint.sh …``). Defaults to ``head``; pass an explicit
 revision to target a specific one. Idempotent.
 """
 from __future__ import annotations
@@ -73,8 +73,8 @@ def alembic_config() -> Config:
     whole claim, and it is mechanically checkable without trusting this sentence — building a config
     means calling ``set_main_option``, so ``git grep -l set_main_option`` over the API test suite must find
     nothing. (Six of those seven files were themselves deleted by the first collapse, of 0001..0091 —
-    the revisions they walked no longer exist, and eight further collapses have since carried them
-    into ``202610251700_baseline``, the tree's base revision file. The file names below therefore resolve
+    the revisions they walked no longer exist, and the later collapses have since carried them
+    into ``202611130100_baseline``, the tree's base revision file. The file names below therefore resolve
     in git history, which is where the incident they record lives; the claim about ``set_main_option``
     is about the tests that remain and is still checkable.) Seven files in the API test suite each
     carried a byte-identical copy hardcoding the
@@ -107,7 +107,7 @@ def deploy_schema_note(cfg: Config) -> str:
     """The one line `upgrade()` prints before migrating — which of THREE cases this deploy is.
 
     The third case is why this is not just a pending-count. A database stamped BELOW a collapsed
-    baseline (`202610251700_baseline`) holds a revision this tree no longer contains, and walking `head` back to
+    baseline (`202611130100_baseline`) holds a revision this tree no longer contains, and walking `head` back to
     it raises — which an "on error, report nothing pending" helper turned into `already at head — this
     deploy changes no schema`, printed one line before alembic raised `Can't locate revision`. The log
     denied the exact failure the collapse introduces, at the one moment somebody is reading it.

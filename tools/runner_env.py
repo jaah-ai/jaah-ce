@@ -17,6 +17,7 @@ _daemon = jaahd_module.load("runner_env.py", "_jaahd_runner_env", siblings=True)
 
 task_id = _daemon.task_id
 runner_session_id = _daemon.runner_session_id
+caller_task_id = _daemon.caller_task_id
 docker_env = _daemon.docker_env
 LIB_ROOT_ENV = _daemon.LIB_ROOT_ENV
 DOCKER_HOST_ENV = _daemon.DOCKER_HOST_ENV

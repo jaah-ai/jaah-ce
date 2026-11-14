@@ -8,6 +8,8 @@ import { apiDetail, post } from '../../api'
 import { useAuth, useCanOnProject } from '../../auth'
 import { useTabOrg } from '../../lib/activeOrg'
 import { enterActAs, useActingAs } from '../../lib/actAs'
+import { loadLastCreateProject, saveLastCreateProject } from '../../lib/lastCreateProject'
+import { readMuted, withoutHiddenProjects } from '../../lib/taskMute'
 import {
   CHAT_LAUNCH_TITLE,
   INLINE_TASK_PREFIXES,
@@ -33,7 +35,6 @@ import { usePushIdentity } from './PushIdentityDialog'
 import {
   type CreatableProject, type CreateScopeFeature, actAsNeededFor, createRefusal, refusedInOrg, resolveCreateTarget,
 } from './shared'
-import { useFocusedProjectId } from '../../hooks/useFocusedProjectId'
 import { useTaskCreateDefaults, withProjectPersona } from './taskDefaults'
 import { ADVISOR_PERSONA, DEFAULT_PERSONA } from './taskPersona'
 import { TASK_INVOLVEMENTS, type TaskInvolvement, involvementForTask } from './TaskAxisControls'
@@ -46,8 +47,8 @@ export const EXPAND_LABEL = 'Open the full editor'
 export const EXPAND_TITLE = 'Open the full editor — or double-click the row'
 
 // The target is decided by `resolveCreateTarget` and NAMED on the row, which offers a picker to change it: the
-// board's feature scope files into that feature, a project (or its "Other") scope into that project with no
-// feature, All projects into the ladder's default project (the viewer's own org first) with no feature. The
+// board's feature scope files into that feature, a project scope into that project alone, All projects into the
+// ladder's default project (the viewer's own org first). The
 // pick (`pickedProjectId`) outranks the ladder. `null` = nothing creatable: the surface offers no row at all.
 export type InlineTaskCreateInput = {
   // `GET /api/projects`: seeing a project is not being able to file into it, so every rung is further
@@ -61,8 +62,7 @@ export type InlineTaskCreateInput = {
   // The project the board shows (`scopeProjectId`), the ladder's first rung; null for All projects.
   boardProjectId: number | null
   // The feature the board is scoped to (a rail feature node), filed into when the ladder lands in ITS
-  // project; elsewhere the row is filed with no feature, since the API refuses a mismatched pair.
-  // A SHIPPED one takes no new task: the row files to its project (`resolveCreateTarget`).
+  // project; elsewhere the row is filed in its project alone, since the API refuses a mismatched pair.
   feature?: CreateScopeFeature
   // The created task, already started. The host merges/refetches; the surface only clears itself.
   onCreated: (created: PipelineTask) => void
@@ -258,15 +258,20 @@ export function useInlineTaskCreate({
     (id: number) => canOnProject('tasks:create', id) && !systemIds.split(' ').includes(String(id)),
     [canOnProject, systemIds],
   )
-  const focusedProjectId = useFocusedProjectId()
-  // The org this tab is pinned to (`lib/activeOrg.ts`) — the operator's own unless acting — rung 3's preference.
+  // The org this tab is pinned to (`lib/activeOrg.ts`) — the operator's own unless acting — rung 2's preference.
   const ownOrgId = useTabOrg()
+  /* Under All projects, the last hand-filed task's project (`lib/lastCreateProject.ts`). Read every render, not held:
+     a filing in another tab or surface moves it while this board stays mounted. */
+  const lastProjectId = loadLastCreateProject(admin?.id ?? null)
+  /* This user's hidden projects are neither a default nor a picker row (`lib/taskMute.ts::withoutHiddenProjects`);
+     the board's own project stays, being where the operator chose to look. */
+  const visibleProjects = withoutHiddenProjects(projects, readMuted(admin?.preferences), [boardProjectId])
   const resolved = resolveCreateTarget(
-    { projects, boardProjectId, feature, focusedProjectId, ownOrgId, pickedProjectId }, canCreateIn)
+    { projects: visibleProjects, boardProjectId, feature, ownOrgId, pickedProjectId, lastProjectId }, canCreateIn)
   const { id: projectId, featureId } = resolved
   const targetProject = projects.find(p => p.id === projectId) ?? null
   if (targetRef) targetRef.current = projectId === null ? null : { projectId, featureId }
-  const pickerProjects = projects.filter(p => canCreateIn(p.id))
+  const pickerProjects = visibleProjects.filter(p => canCreateIn(p.id))
   /* A new target is a new ask: the last one's refusal (and a press held for its Act as) no longer applies. */
   const pickProject = (id: number) => {
     setError('')
@@ -330,13 +335,18 @@ export function useInlineTaskCreate({
       enterActAs(actAsOrg)
       return
     }
-    /* AN ACTING OPERATOR IS ASKED WHOM TO PUSH AS before the create, so Cancel files nothing; the answer rides the
-       start. Not acting, no await at all: the write starts in the same tick as the press. */
-    const pushAs = pushIdentity.acting && targetId !== null
-      ? await pushIdentity.ask({ projectId: targetId, title: trimmed })
-      : {}
-    if (!pushAs) return
+    /* THE START ASK COMES BEFORE THE CREATE (`usePushIdentity`), so Cancel files nothing; the answer rides the
+       start. An acting operator is asked whom to push as; anyone whose login can't see the repository, whether to
+       run without it. Not acting, the press awaits only that repository read. Busy from the press, so a second
+       press or ⤢ during the ask is refused. */
     setIntent(nextIntent)
+    const pushAs = targetId !== null
+      ? await pushIdentity.ask({ projectId: targetId, title: trimmed, epic: createBody.persona === 'epic' })
+      : {}
+    if (!pushAs) {
+      setIntent(null)
+      return
+    }
     let created: PipelineTask
     try {
       const filing = featureId !== null && targetId === projectId ? { feature_id: featureId } : {}
@@ -346,6 +356,7 @@ export function useInlineTaskCreate({
         body: trimmed,
         ...createBody,
       })
+      saveLastCreateProject(admin?.id ?? null, created.project_id)
     } catch (err) {
       setError(createRefusal(err, nextIntent === 'chat' ? 'Failed to create chat' : 'Failed to create task', project,
         admin?.is_operator === true))

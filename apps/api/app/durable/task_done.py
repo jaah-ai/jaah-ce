@@ -1,4 +1,4 @@
-"""The one workflow every finished Task runs: the Jira done comment, the auto re-tag, the epic fan-in, the
+"""The one workflow every finished Task runs: the auto re-tag, the epic fan-in, the
 support-ticket links and the compliance seal's start, on the durable engine (`app/durable/runtime.py`).
 No task notification step belongs here (Slack cards are `app/durable/task_notify_queue.py`'s);
 the support leg only hands the tickets' announcements to `app/durable/support_notify_queue.py`.
@@ -9,7 +9,8 @@ always has its run and a rolled-back one has none. The inline fan-in in
 `routes/tasks/epics.py` and `scan_active_epics_for_rollup` remain. `tasks.done_workflow_at` is stamped only by
 `mark_converged` and is the sole admission predicate (`unconverged_actions`). DBOS retries bound one
 workflow; the per-action and per-row attempt counters bound how many workflows a bad row costs.
-`external_comment` and `retag` run with `max_attempts=1`; the step order is fixed for DBOS replay.
+`retag` runs with `max_attempts=1`; the step order is fixed for DBOS replay, which is why the retired
+`external_comment` step stays, a no-op answering `RETIRED`. Dropped next release.
 """
 from __future__ import annotations
 
@@ -45,8 +46,9 @@ ALREADY = "already"      # this action's own marker said it had already run
 SKIPPED = "skipped"      # not applicable to this task at all
 DISABLED = "disabled"    # an operator knob is off — converges anyway (see `unconverged_actions`)
 EXHAUSTED = "exhausted"  # the per-task attempt counter is spent; given up on permanently
+RETIRED = "retired"      # the step is retired: a no-op kept for DBOS replay order — converges
 
-STATUSES = (DONE, ALREADY, SKIPPED, DISABLED, EXHAUSTED)
+STATUSES = (DONE, ALREADY, SKIPPED, DISABLED, EXHAUSTED, RETIRED)
 
 # A step that exhausted its DBOS retry ladder is recorded as `failed: <reason>` (the reason is the useful
 # half); `unconverged_actions` matches on this prefix.
@@ -63,20 +65,9 @@ _REASON_MAX = 300
 
 @DBOS.step(retries_allowed=True, max_attempts=1)
 def external_comment(task_id: int) -> str:
-    """Post the done comment on the Jira issue this task came from.
-
-    `max_attempts=1`: the per-task allowance is meant to span days, and the success marker is committed
-    after the network call, so a retry could post twice. The retry is a later offer of the row.
-
-    The org bind, the pool release before the delegate's Jira POST (15s budget) and the vanished-row
-    `"skipped"` (a `failed:` status would withhold convergence forever) are `runtime.delegate_for_task`'s."""
-    from app.task_external_comment import comment_on_done_task
-
-    return runtime.delegate_for_task(
-        "durable:task_done.external_comment", task_id,
-        gone=f"task-done: task {task_id} no longer exists — nothing to comment on", logger=log,
-        call=lambda org: comment_on_done_task(task_id, org=org), fallback="skipped",
-    )
+    """Retired: the tracker write-back (`app/trackers/writeback.py`) tells a linked issue. The step stays,
+    a no-op answering `RETIRED`, because DBOS replays steps in a fixed order. Dropped next release."""
+    return RETIRED
 
 
 @DBOS.step(retries_allowed=True, max_attempts=1)
@@ -84,7 +75,10 @@ def retag(task_id: int) -> str:
     """Classify the finished task into every active tag group, replacing its tags.
 
     The most expensive step (one ~20s billable classifier call); `task_retag` raises without spending an
-    attempt on a deployment-wide 409/503. `max_attempts=1` and the org bind follow `external_comment`."""
+    attempt on a deployment-wide 409/503. `max_attempts=1`: the per-task allowance is meant to span days,
+    so the retry is a later offer of the row. The org bind, the pool release before the classifier call and
+    the vanished-row `"skipped"` (a `failed:` status would withhold convergence forever) are
+    `runtime.delegate_for_task`'s."""
     from app.task_retag import retag_done_task
 
     return runtime.delegate_for_task(
@@ -105,12 +99,12 @@ def epic_fan_in(task_id: int) -> str:
     Lock order: the publisher takes the epic `FOR UPDATE` and the insert takes `FOR KEY SHARE` on the
     child, so never hold a child and reach for its epic. This step starts holding nothing.
     """
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.models.tasks import Task
     from app.routes.tasks.epics import _maybe_roll_up_parent
     from app.tenancy import seam
 
-    with SessionLocal() as session:
+    with BridgedSession() as session:
         # The org comes from the task via `bind_from`, not `operator_scope()` (which would let one task's
         # fan-in roll up every org's epics). A region, not `bind()`: a `ContextVar.set()` on a pool thread
         # dies with the thread.
@@ -133,7 +127,7 @@ def support_links(task_id: int) -> str:
     The task is the operator's and each link sits in its TICKET'S org, so the links are found fleet-wide
     by id alone (`support_access.links_for_task`), then each ticket is entered in its own org, on a fresh
     session, to stamp `done_at` on the links not yet stamped. `done_at` is this action's own marker
-    (like `external_done_comment_at` for Jira): a re-run finds nothing unstamped and answers `ALREADY`.
+    (like `auto_retagged_at` for `retag`): a re-run finds nothing unstamped and answers `ALREADY`.
     `SKIPPED` when nothing links the task. The announcement is not here: a step cannot start a workflow
     (DBOS refuses a child enqueue outside a workflow body), so `task_done` enqueues what
     `support_announcements` returns. `SKIPPED` too in an edition without the Help assistant."""
@@ -142,7 +136,7 @@ def support_links(task_id: int) -> str:
     from sqlalchemy import select
 
     from app import support_access
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.models.support import Ticket, TicketTaskLink
     from app.support_activity import now
     from app.tenancy import exclusion_log, seam
@@ -153,7 +147,7 @@ def support_links(task_id: int) -> str:
             return SKIPPED
         stamped = 0
         for ticket_id in dict.fromkeys(ticket_id for _link, ticket_id in links):
-            with SessionLocal() as session:
+            with BridgedSession() as session:
                 try:
                     with seam.bind_from(session, Ticket, ticket_id):
                         rows = session.scalars(
@@ -200,9 +194,9 @@ def unconverged_actions(results: dict[str, str]) -> list[str]:
 
     A pure seam so convergence is testable without DBOS. Only `failed: …` withholds: `done_workflow_at`
     is the admission predicate, so stamping over a failure would refuse every future offer. `EXHAUSTED`
-    does not withhold (permanently given up). `DISABLED` does not withhold either: the stamp is per row
-    and a knob per action, so withholding would suppress the other actions too. Nothing replays a
-    converged row when a knob returns.
+    does not withhold (permanently given up), nor does `RETIRED` (a no-op step). `DISABLED` does not
+    withhold either: the stamp is per row and a knob per action, so withholding would suppress the other
+    actions too. Nothing replays a converged row when a knob returns.
 
     `epic_fan_in` has no counter, so it re-runs on every offer while failing (as the rollup rescan does);
     the row counter (`max_attempts()`) keeps that finite.
@@ -229,19 +223,19 @@ def mark_converged(task_id: int, results: dict[str, str]) -> bool:
     """
     from sqlalchemy import func, update
 
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.models.tasks import Task
     from app.tenancy import exclusion_log, seam
 
     withheld = unconverged_actions(results)
-    # Attributed, as in `external_comment`; covers both arms, each with its own bind.
+    # Attributed, as in `support_links`; covers both arms, each with its own bind.
     with exclusion_log.caller("durable:task_done.mark_converged"):
         if withheld:
             # Cleared, not left alone: a failed step on a re-offered, stamped row must clear the stamp. The
             # attempt is charged in the same unguarded statement, bounding rows with no per-action counter.
             # The org is bound via `bind_from` (not `operator_scope()`); the read seam ignores DML, but it
             # keeps every durable site bound for anything this region calls.
-            with SessionLocal() as session:
+            with BridgedSession() as session:
                 try:
                     with seam.bind_from(session, Task, task_id) as org:
                         session.execute(
@@ -271,7 +265,7 @@ def mark_converged(task_id: int, results: dict[str, str]) -> bool:
             return False
         # The stamping arm binds separately: the arms are exclusive and each opens its own session, which
         # `bind_from` derives from.
-        with SessionLocal() as session:
+        with BridgedSession() as session:
             try:
                 with seam.bind_from(session, Task, task_id):
                     session.execute(
@@ -398,7 +392,7 @@ def workflow_id_for(task_id: int, attempt: int) -> str:
 
     Two constraints: a bare `task-done-<id>` would make a legitimate second run impossible (the id would
     collide with the finished run), and a per-call id (e.g. a clock) would let a re-emitted `done` admit a
-    second run beside one in flight, double-billing and double-commenting. `tasks.done_workflow_attempts`
+    second run beside one in flight, double-billing the classifier. `tasks.done_workflow_attempts`
     moves only when a run left something owed, so every `done` of one spell computes the same id, and a
     re-offer after a charge mints a fresh one. A pure function; this id is the exclusion (see
     `enqueue_in_transaction`).
@@ -438,7 +432,7 @@ def _admission(session: Any, task_id: int) -> Optional[int]:
     # The derived org's read stamps the writer's session (`seam.stamp_scope`), and a savepoint does not undo
     # `session.info`: put the stamp back, or the writer's next unit on this session would conflict with it.
     stamp = session.info.get(seam.SESSION_SCOPE_KEY, _UNSTAMPED)
-    # Attributed, as in `external_comment`; the region also covers the `max_attempts()` read.
+    # Attributed, as in `support_links`; the region also covers the `max_attempts()` read.
     with exclusion_log.caller("durable:task_done._admission"):
         try:
             with nullcontext() if deciding else seam.bind_from(session, Task, task_id):

@@ -18,11 +18,10 @@ import os
 from typing import Iterable, Optional
 from uuid import UUID
 
-from fastapi import HTTPException
 from sqlalchemy import false, select
 from sqlalchemy.orm import Session
 
-from app.entity_shape import optional_uuid
+from app.entity_shape import names_of, optional_uuid, or_404
 from app.models.nodes import Node
 from app.tenancy import seam
 from app.tenancy.ids import ORG_ZERO_ID
@@ -48,17 +47,14 @@ def wire_node_id_or_404(session: Session, value: Optional[str]) -> UUID:
     """`wire_node_id` for a route: an unresolvable value is a 404 whose message says what to do about it.
 
     Quotes the value sent, so a node.env still carrying a name is diagnosable from the response."""
-    resolved = wire_node_id(session, value)
-    if resolved is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"unknown node '{value}' — `NODE_ID` in /etc/jaah/node.env must be this node's uuid "
-                f"(a node NAME is not accepted on the agent plane). Re-enrol it with "
-                f"`jaah auth login <uuid> --with-token`."
-            ),
-        )
-    return resolved
+    return or_404(
+        wire_node_id(session, value),
+        detail=(
+            f"unknown node '{value}' — `NODE_ID` in /etc/jaah/node.env must be this node's uuid "
+            f"(a node NAME is not accepted on the agent plane). Re-enrol it with "
+            f"`jaah auth login <uuid> --with-token`."
+        ),
+    )
 
 
 def warn_name_on_the_wire(value: str) -> None:
@@ -108,10 +104,7 @@ def node_id_or_none(session: Session, value: Optional[str]) -> Optional[UUID]:
 def node_id_or_404(session: Session, value: Optional[str]) -> UUID:
     """`node_id_or_none`, but an unresolvable value is a 404 rather than a NULL reference, quoting the
     caller's own spelling."""
-    resolved = node_id_or_none(session, value)
-    if resolved is None:
-        raise HTTPException(status_code=404, detail=f"unknown node '{value}'")
-    return resolved
+    return or_404(node_id_or_none(session, value), detail=f"unknown node '{value}'")
 
 
 def node_matches(value: Optional[str]):
@@ -131,7 +124,7 @@ def node_org(session, value: Optional[str]):
 
     `nodes.org_id` is immutable (`app/tenancy/node_org.py`), so this is the org of everything the node
     touches (e.g. `app/port_grid.py::grid`). `None` is never widened to a default org. What a consumer
-    does with `None` is its own call (`port_grid.range_starts` vs `port_grid.scalars`); both fail closed.
+    does with `None` is its own call.
     One scalar read; callers hoist it to once per pass."""
     from sqlalchemy import select
 
@@ -173,12 +166,8 @@ def jaah_home_expr(column):
 def names_by_id(session: Session, ids: Iterable[Optional[UUID]]) -> dict[UUID, str]:
     """Resolve many node ids to their names in one query — the list-route shape.
 
-    Like `app/actors.py::actor_names`: NULLs dropped, unresolved ids omitted, no N+1."""
-    wanted = {node_id for node_id in ids if node_id is not None}
-    if not wanted:
-        return {}
-    rows = session.execute(select(Node.id, Node.name).where(Node.id.in_(wanted))).all()
-    return {node_id: name for node_id, name in rows}
+    Like `app/actors.py::actor_names`: NULLs dropped, unresolved ids omitted, no N+1 (`entity_shape.names_of`)."""
+    return names_of(session, Node, ids)
 
 
 def ids_by_wire_value(session: Session, values: Iterable[Optional[str]]) -> dict[str, UUID]:

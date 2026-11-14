@@ -37,7 +37,7 @@ from sqlalchemy.orm import Session
 from app import attachment_storage
 from app.activity_kinds import SECURITY_EVENT_KINDS
 from app.attachment_storage import Target
-from app.clock import jsonable
+from app.clock import jsonable, utcnow
 
 log = logging.getLogger("app.security_archive")
 
@@ -154,7 +154,7 @@ def export(
     are written the pass raises naming it, so the run records a failure an operator sees."""
     exported_days = exported_events = already = 0
     failed: list[str] = []
-    for day in days_due(now or datetime.now(timezone.utc)):
+    for day in days_due(now or utcnow()):
         key = day_key(day)
         try:
             if exists(where, key):

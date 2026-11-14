@@ -15,7 +15,7 @@ one entry changed — nothing else re-resolved.
 ## Bumping or dropping it
 
 - **pi bump:** regenerate the patch against the new tarball's `package.json` (`npm pack`, edit, `diff -u` with
-  `a/` and `b/` paths), regenerate the lock (`runner_cli_pins.py lock @earendil-works/pi-coding-agent`), and run
-  `test_runner_cli_pins_table.py`, which applies every patch to its pinned tarball.
+  `a/` and `b/` paths), regenerate the lock (`runner_cli_pins.py lock @earendil-works/pi-coding-agent`), re-record its fixture (`test_runner_cli_pins_table.py record @earendil-works/pi-coding-agent`), and run
+  `test_runner_cli_pins_table.py`, which applies every patch to the pinned tarball's recorded lines.
 - **Drop it** when an upstream release pins undici 8.12.2 or later: remove this directory, its `patches` line
   and its assertion in that test.

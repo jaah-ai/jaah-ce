@@ -1,0 +1,43 @@
+# Amplitude: hosted MCP server. Facts confirmed at https://amplitude.com/docs/amplitude-ai/amplitude-mcp and the server's own OAuth metadata (mcp.amplitude.com/.well-known/oauth-protected-resource; Dynamic Client Registration at /register).
+slug = "amplitude"
+label = "Amplitude"
+category = "mcp"
+vendor_docs_url = "https://amplitude.com/docs/amplitude-ai/amplitude-mcp"
+summary = "Query Amplitude charts, dashboards, cohorts and experiments through Amplitude's MCP server."
+
+[[auth]]
+kind = "mcp"
+fields = [
+  { key = "url", label = "Server URL", kind = "url", required = false, placeholder = "https://mcp.amplitude.com/mcp", help = "Leave blank for Amplitude's US data center. For an EU-hosted Amplitude organization enter https://mcp.eu.amplitude.com/mcp" },
+]
+
+[mcp]
+url = "https://mcp.amplitude.com/mcp"
+url_editable = true
+transport = "streamable_http"
+auth = "oauth_dcr"
+
+[docs]
+agent_uses = [
+  "Look up a chart or dashboard by name and read its current numbers into a report",
+  "Answer a product question (how many users did X last week) by querying events and user properties",
+  "List cohorts and experiments, and read an experiment's results before a release decision",
+]
+prerequisites = [
+  "An Amplitude Enterprise plan, or Plus with the MCP add-on (not on Free or Growth), and an account with access to the projects agents should query",
+  "Your Amplitude organization's region: US (the default) or EU",
+]
+limitations = [
+  "Agents see only the projects and data your Amplitude user can see; the server acts as you",
+  "Agents act on your Amplitude data through the tools Amplitude offers; check its documentation for the current list",
+]
+troubleshooting = [
+  { symptom = "Test says Amplitude rejected the token (401)", fix = "The sign-in expired or was revoked. Select Reconnect on the secret and sign in to Amplitude again" },
+  { symptom = "Sign-in succeeds but agents see no projects", fix = "Your organization is hosted in the EU. Edit the secret, set Server URL to https://mcp.eu.amplitude.com/mcp, then select Reconnect" },
+  { symptom = "The secret shows Needs reconnect", fix = "Amplitude ended the grant (a password change, a revoked connection or a long idle period). Select Reconnect on the secret and sign in to Amplitude again" },
+  { symptom = "New tasks on the project have no Amplitude tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with, and an agent marked Not supported on that tab cannot load MCP servers" },
+]
+faq = [
+  { q = "Does Jaah need an app registered at Amplitude", a = "No. Jaah registers itself with Amplitude's sign-in server the first time anyone connects, and every later connection reuses that registration" },
+  { q = "What does Test do", a = "It opens an MCP session with Amplitude's server and lists its tools, then closes the session. It reads and changes nothing in your Amplitude account" },
+]

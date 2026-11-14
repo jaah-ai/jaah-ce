@@ -20,16 +20,17 @@ from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy import case, exists, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
-from app import attachment_storage, comment_service, hipaa, node_credentials
+from app import attachment_storage, blind_review, comment_service, hipaa, keyset, node_credentials
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
 from app.authz.principal import Principal
 from app.authz.visibility import scoped_task_select
-from app.db import get_session
+from app.db_async import DbDep, on_session
 from app.entity_shape import from_row, get_or_404
 from app.models.identity import AdminUser
 from app.models.task_extras import ATTACHMENT_KIND_FILE, TaskAttachment
@@ -37,6 +38,8 @@ from app.models.tasks import Task, TaskDependency
 from app.task_manifest import DOCUMENT_KINDS
 from app.task_artifacts import (
     current_artifact_ids,
+    is_app_access,
+    not_app_access_clause,
     uploaded_clause,
     visible_artifact_clause,
     visible_artifact_clause_joined,
@@ -47,12 +50,7 @@ from app.task_artifacts import (
 # token_check`), the CP-side task/node binding backstop, and the launcher principal.
 from app.routes.agent.auth import _check_token_for_task, _task_or_404_for_node
 from app.routes.agent.task_secrets import _task_grant_principal
-from app.list_page import like_pattern
-from app.routes.tasks.listing import (
-    _LIKE_ESCAPE_CHAR,
-    _task_number_match,
-    _task_number_term,
-)
+from app.routes.tasks.listing import task_search_clause
 from app.routes.tasks.qa_render import QAEntryOut, _task_qa_entries
 from app.routes.tasks.task_wire import _latest_settled_output_note
 
@@ -159,7 +157,7 @@ class PeerArtifactDownloadOut(BaseModel):
 # ── the shared resolution ─────────────────────────────────────────────────────────────────────────────
 
 
-def _caller_and_launcher(
+def _task_and_grant_principal(
     session: Session, caller: node_credentials.AgentCaller, task_id: int
 ) -> tuple[Task, Principal]:
     """The caller's own task (node-bound) and its launcher's principal, or a refusal.
@@ -184,12 +182,22 @@ def _visible_peers(caller_task: Task, principal: Principal):
 
     The two row gates of `visible_task_clause` (an unsaved draft, a `hidden` row: their creator's alone)
     are re-applied because a SUPERADMIN principal skips them there — a runner never inherits the
-    superadmin bypass, as the credential roster's rule (`authz.task_roster_select`)."""
-    return scoped_task_select(principal).where(
+    superadmin bypass, as the credential roster's rule (`authz.task_roster_select`).
+
+    A blind review child never sees the coder task it reviews, that coder's epic, or a merge-lane run
+    (`blind_review.hidden_peer_ids`, `hides_merge_lane`): the same 404 as a task its launcher cannot view, so their
+    artifacts and search hits go with them."""
+    query = scoped_task_select(principal).where(
         Task.project_id == caller_task.project_id,
         or_(Task.unsaved.is_(False), Task.created_by_id == principal.user_id),
         or_(Task.hidden.is_(False), Task.created_by_id == principal.user_id),
     )
+    hidden = blind_review.hidden_peer_ids(object_session(caller_task), caller_task)
+    if hidden:
+        query = query.where(Task.id.not_in(hidden))
+    if blind_review.hides_merge_lane(caller_task):
+        query = query.where(Task.persona != "merge_lane")
+    return query
 
 
 def _peer_or_404(session: Session, caller_task: Task, principal: Principal, peer_task_id: int) -> Task:
@@ -206,6 +214,16 @@ def _peer_or_404(session: Session, caller_task: Task, principal: Principal, peer
     return peer
 
 
+def visible_peer_or_404(
+    session: Session, caller: node_credentials.AgentCaller, task_id: int, peer_task_id: int
+) -> Task:
+    """The peer task a runner may name, under exactly this module's scope (its own project, its launcher may view
+    it, blind-review hidden ids excluded), or the one 404. For a writer that names a peer: `task.wait`
+    (`routes/agent/task_terminal.py::_wait_task`)."""
+    task, principal = _task_and_grant_principal(session, caller, task_id)
+    return _peer_or_404(session, task, principal, peer_task_id)
+
+
 def _listed_artifact_clause():
     """The rows `_artifact_rows` lists, as one clause over `TaskAttachment` with `Task` in scope (joined, or
     correlated from an outer `select(Task)`): uploaded, and either the human's input or a document artifact
@@ -213,6 +231,7 @@ def _listed_artifact_clause():
     return (
         (TaskAttachment.task_id == Task.id)
         & uploaded_clause()
+        & not_app_access_clause()
         & (
             (TaskAttachment.kind == ATTACHMENT_KIND_FILE)
             | (
@@ -241,7 +260,8 @@ def _artifact_kinds_by_task(session: Session, task_ids: list[int]) -> dict[int, 
 
 def _artifact_rows(session: Session, peer: Task) -> list[PeerArtifactOut]:
     """The runner's document artifacts (Reset-hidden excluded, latest-wins flagged) then the human's inputs."""
-    documents = visible_document_artifacts(session, peer)
+    # The app-access report holds a password: never a runner's (`task_artifacts.app_access_clause`).
+    documents = [row for row in visible_document_artifacts(session, peer) if not is_app_access(row)]
     current_ids = current_artifact_ids(documents)
     inputs = session.scalars(
         select(TaskAttachment)
@@ -253,10 +273,8 @@ def _artifact_rows(session: Session, peer: Task) -> list[PeerArtifactOut]:
         .order_by(TaskAttachment.id)
     ).all()
     return [
-        PeerArtifactOut(
-            id=row.id, kind=row.kind, filename=row.filename, content_type=row.content_type,
-            size_bytes=row.size_bytes, created_at=row.created_at,
-            current=(row.id in current_ids) if row.kind != ATTACHMENT_KIND_FILE else None,
+        from_row(
+            PeerArtifactOut, row, current=(row.id in current_ids) if row.kind != ATTACHMENT_KIND_FILE else None,
         )
         for row in [*documents, *inputs]
     ]
@@ -266,10 +284,7 @@ def _comments(session: Session, peer: Task, launcher: AdminUser) -> list[PeerCom
     rows = comment_service.page(session, comment_service.Subject("task", peer.id), _COMMENTS_MAX)
     rendered = comment_service.render(session, rows, me=launcher, may_delete_any=False)
     return [
-        PeerCommentOut(
-            id=c.id, author_name=c.author_name, body=c.body, created_at=c.created_at, edited_at=c.edited_at,
-            image_count=len(c.images),
-        )
+        from_row(PeerCommentOut, c, image_count=len(c.images))
         for c in rendered
     ]
 
@@ -279,9 +294,11 @@ def _comments(session: Session, peer: Task, launcher: AdminUser) -> list[PeerCom
 
 @router.get("/api/agent/tasks/{task_id}/peer-tasks", response_model=PeerTaskListOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def list_peer_tasks(
+    session: Session,
     task_id: int,
-    q: Optional[str] = Query(None, max_length=200, description="title/body substring, or a task number"),
+    q: Optional[str] = Query(None, max_length=200, description="words in title, description or outcome, or a task number"),
     state: Optional[str] = Query(None, max_length=32),
     persona: Optional[str] = Query(None, max_length=64),
     has_artifacts: Optional[bool] = Query(None, description="true: only tasks carrying a listed artifact; "
@@ -290,7 +307,6 @@ def list_peer_tasks(
                                          description="only tasks carrying an artifact of this kind"),
     limit: int = Query(_LIST_DEFAULT, ge=1, le=_LIST_MAX),
     caller: node_credentials.AgentCaller = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> PeerTaskListOut:
     """Search the launcher-visible tasks of the caller's own project, newest first."""
     if artifact_kind and artifact_kind not in _LISTED_ARTIFACT_KINDS:
@@ -298,7 +314,7 @@ def list_peer_tasks(
             status_code=422,
             detail=f"artifact_kind {artifact_kind!r} is not one of {', '.join(_LISTED_ARTIFACT_KINDS)}",
         )
-    task, principal = _caller_and_launcher(session, caller, task_id)
+    task, principal = _task_and_grant_principal(session, caller, task_id)
     stmt = _visible_peers(task, principal)
     if state:
         stmt = stmt.where(Task.state == state)
@@ -310,41 +326,36 @@ def list_peer_tasks(
         carries = exists().where(_listed_artifact_clause())
         stmt = stmt.where(carries if has_artifacts else ~carries)
     if q is not None and q.strip():
-        # The board's own `q` semantics (`routes/tasks/listing.py::board_filtered_select`): literal substring on
-        # title or body, widened by the task number the term names.
-        pattern = like_pattern(q)
-        match = Task.title.ilike(pattern, escape=_LIKE_ESCAPE_CHAR) | Task.body.ilike(
-            pattern, escape=_LIKE_ESCAPE_CHAR
-        )
-        number = _task_number_term(q)
-        stmt = stmt.where(match if number is None else match | _task_number_match(number))
+        # The board's own `q` semantics: every word in title, description or outcome, widened by the task number.
+        match, number = task_search_clause(q)
+        stmt = stmt.where(match)
     else:
         number = None
     # The task the number names first, so newer tasks merely mentioning it cannot push it off the page.
     order = [Task.id.desc()] if number is None else [case((Task.id == number, 0), else_=1), Task.id.desc()]
-    fetched = session.scalars(stmt.order_by(*order).limit(limit + 1)).all()
-    rows = fetched[:limit]
+    rows, truncated = keyset.page(session, stmt.order_by(*order), limit)
     kinds = _artifact_kinds_by_task(session, [row.id for row in rows])
     return PeerTaskListOut(
         tasks=[
             from_row(PeerTaskSummaryOut, row, artifact_kinds=kinds.get(row.id, []))
             for row in rows
         ],
-        truncated=len(fetched) > limit,
+        truncated=truncated,
     )
 
 
 @router.get("/api/agent/tasks/{task_id}/peer-task", response_model=PeerTaskOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def read_peer_task(
+    session: Session,
     task_id: int,
     request: Request,
     peer_task_id: int = Query(..., ge=1),
     caller: node_credentials.AgentCaller = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> PeerTaskOut:
     """One peer task in full: row, settled output, recon map, Q&A trail, comments and artifact list."""
-    task, principal = _caller_and_launcher(session, caller, task_id)
+    task, principal = _task_and_grant_principal(session, caller, task_id)
     peer = _peer_or_404(session, task, principal, peer_task_id)
     # `_task_grant_principal` resolved this same row a moment ago; absent now only on a concurrent delete.
     launcher = session.scalars(select(AdminUser).where(AdminUser.id == principal.user_id)).first()
@@ -356,15 +367,13 @@ def read_peer_task(
         .order_by(TaskDependency.depends_on_task_id)
     ).all()
     log.info("peer tasks: task=%s read task=%s", task.id, peer.id)
-    out = PeerTaskOut(
-        id=peer.id, title=peer.title, body=peer.body, state=peer.state, persona=peer.persona,
-        parent_task_id=peer.parent_task_id, created_at=peer.created_at, updated_at=peer.updated_at,
+    out = from_row(
+        PeerTaskOut, peer,
         depends_on=list(depends_on),
         settled_output=_latest_settled_output_note(session, peer) or peer.outcome_summary,
         pr_url=peer.outcome_pr_url,
         no_pr_reason=peer.outcome_no_pr_reason,
         no_pr_evidence=peer.outcome_no_pr_evidence,
-        recon_map=peer.recon_map,
         # Defanged like the prompt's own Q&A trail: this reaches a model (`_task_qa_entries`).
         qa=_task_qa_entries(session, peer, defang_for_prompt=True),
         comments=_comments(session, peer, launcher),
@@ -379,22 +388,39 @@ def read_peer_task(
 
 @router.get("/api/agent/tasks/{task_id}/peer-task/artifact", response_model=PeerArtifactDownloadOut)
 @infra(Tenancy.ORG_SCOPED)
-def peer_task_artifact(
+async def peer_task_artifact(
     task_id: int,
     request: Request,
+    db: DbDep,
     peer_task_id: int = Query(..., ge=1),
     artifact_id: int = Query(..., ge=1),
     caller: node_credentials.AgentCaller = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> PeerArtifactDownloadOut:
     """One peer artifact's metadata and a presigned download URL. The row filter is the agent content
     route's (`routes/agent/task_reads.py::agent_task_attachment_content`): uploaded rows only, never a comment image,
     and the Reset watermark on every kind but the human's own input."""
-    task, principal = _caller_and_launcher(session, caller, task_id)
+    # Off the loop, and warms the credential cache `attachment_storage.target` reads below: a cache miss
+    # fetches from the container endpoint.
+    await run_in_threadpool(attachment_storage.target)
+    return await db.run_sync(
+        _peer_task_artifact, task_id=task_id, request=request, peer_task_id=peer_task_id, artifact_id=artifact_id, caller=caller,
+    )
+
+
+def _peer_task_artifact(
+    session: Session,
+    task_id: int,
+    request: Request,
+    peer_task_id: int,
+    artifact_id: int,
+    caller: node_credentials.AgentCaller,
+) -> PeerArtifactDownloadOut:
+    task, principal = _task_and_grant_principal(session, caller, task_id)
     peer = _peer_or_404(session, task, principal, peer_task_id)
     row = get_or_404(session, TaskAttachment, artifact_id, detail=f"artifact {artifact_id} not found on task {peer.id}", where=(
         TaskAttachment.task_id == peer.id,
         uploaded_clause(),
+        not_app_access_clause(),
         (TaskAttachment.kind == ATTACHMENT_KIND_FILE)
         | (
             TaskAttachment.kind.in_(DOCUMENT_KINDS)
@@ -409,9 +435,8 @@ def peer_task_artifact(
             detail="this control plane has no object storage configured to read artifact bytes from",
         )
     log.info("peer tasks: task=%s fetched artifact=%s of task=%s", task.id, row.id, peer.id)
-    out = PeerArtifactDownloadOut(
-        id=row.id, task_id=peer.id, kind=row.kind, filename=row.filename, content_type=row.content_type,
-        size_bytes=row.size_bytes,
+    out = from_row(
+        PeerArtifactDownloadOut, row, task_id=peer.id,
         download_url=attachment_storage.presign_download(
             where, row.s3_key, filename=row.filename, content_type=row.content_type or ""
         ),

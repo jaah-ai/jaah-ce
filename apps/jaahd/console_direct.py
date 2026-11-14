@@ -81,8 +81,8 @@ _ws_log.addFilter(_RedactDirectToken())
 # certify.
 DIRECT_CONSOLE_PORT_VAR = "JAAH_DIRECT_CONSOLE_PORT"
 
-# Not 8787, which sits in API_PORT's 8000-8999 grid window. A default, not an assertion: `port_grid_conflict`
-# re-checks it against the live, operator-editable grid at bind time.
+# Below the pool's default auto-port range. A default, not an assertion: `port_grid_conflict` re-checks it
+# against the org's live auto-port range at bind time.
 DEFAULT_DIRECT_CONSOLE_PORT = 7787
 
 
@@ -96,7 +96,7 @@ def resolve_direct_console_port() -> int:
     try:
         port = int(raw)
     except ValueError:
-        raise ValueError(f"{DIRECT_CONSOLE_PORT_VAR}={raw!r} is not an integer")
+        raise ValueError(f"{DIRECT_CONSOLE_PORT_VAR}={raw!r} is not an integer") from None
     if not 1 <= port <= 65535:
         raise ValueError(f"{DIRECT_CONSOLE_PORT_VAR}={port} is outside 1..65535")
     return port
@@ -110,7 +110,8 @@ _grid_unavailable_until: float = 0.0
 
 
 def _pool_grid() -> dict:
-    """The pool port grid's inputs from the control plane, cached for this process.
+    """The pool's port settings (`auto_port_floor`/`auto_port_ceiling`) from the control plane, cached for
+    this process.
 
     A CP unreachable at daemon start refuses the direct console — accepted, because a built-in fallback
     grid would be a second copy of the operator's table and a stale one squats a lease's port. A success is
@@ -140,35 +141,8 @@ def _pool_grid() -> dict:
     return grid
 
 
-def pool_grid_windows() -> List[Tuple[str, int, int]]:
-    """Every port window the pool port grid manages, as `(var, first, last_inclusive)`, read from the CP.
-
-    Fail-closed both ways: an unreachable CP raises (`_pool_grid`), and an unusable window raises rather
-    than being dropped (a dropped window is one this node would bind inside). No range starts at all is
-    legal — every port var is tier 2, which the tier-2 check covers."""
-    grid = _pool_grid()
-    starts = grid.get("range_start_by_var")
-    if not isinstance(starts, dict) or not starts:
-        return []
-    window = grid.get("window")
-    if isinstance(window, bool) or not isinstance(window, int) or window < 1:
-        raise RuntimeError(
-            "the control plane's pool grid has {} range starts but no usable window size ({!r}) — refusing "
-            "to bind against windows this node cannot compute".format(len(starts), window)
-        )
-    windows: List[Tuple[str, int, int]] = []
-    for var, start in starts.items():
-        if isinstance(start, bool) or not isinstance(start, int):
-            raise RuntimeError(
-                "the control plane's pool grid gives {!r} a non-integer range start ({!r}) — refusing to "
-                "bind against a window this node cannot compute".format(var, start)
-            )
-        windows.append((str(var), start, start + window - 1))
-    return sorted(windows, key=lambda w: w[1])
-
-
 def pool_auto_port_range() -> Tuple[int, int]:
-    """The pool's tier-2 range `(floor, ceiling)`, via the allocator's own read
+    """The pool's node-assigned port range `(floor, ceiling)`, via the allocator's own read
     (`worktree_mechanics.ports.auto_port_range_from_grid`), so the refusal and the allocator cannot disagree — a
     divergence would lose the console's port to a lease and crash-loop on EADDRINUSE."""
     return ports.auto_port_range_from_grid(_pool_grid())
@@ -178,21 +152,13 @@ def port_grid_conflict(port: int) -> Optional[str]:
     """The reason `port` may not host the direct listener, or None when it is disjoint from everything the
     worktree pool hands out.
 
-    Checked against the grid's windows (not current allocations, which go stale) and the tier-2 range
-    (allocated by live bind test, so a console that is merely down would lose its port and crash-loop on
-    EADDRINUSE). Raises when the grid is unreadable: None means "checked, and disjoint", never "could not
-    check"."""
-    for var, first, last in pool_grid_windows():
-        if first <= port <= last:
-            return (
-                f"port {port} is inside the pool port grid's {var} window ({first}-{last}) — the "
-                f"direct console port is a node-wide singleton and must be disjoint from every "
-                f"project's band (the grid is the console's port-grid settings, Settings)"
-            )
+    Checked against the node-assigned port range (allocated by live bind test, so a console that is merely
+    down would lose its port and crash-loop on EADDRINUSE). Raises when the range is unreadable: None means
+    "checked, and disjoint", never "could not check"."""
     floor, ceiling = pool_auto_port_range()
     if floor <= port <= ceiling:
         return (
-            f"port {port} is inside the worktree pool's tier-2 auto range ({floor}-{ceiling}) — a lease "
+            f"port {port} is inside the worktree pool's auto port range ({floor}-{ceiling}) — a lease "
             f"can allocate it to a project stack, and the direct console port is a node-wide singleton "
             f"(see worktree_mechanics.ports.apply_auto_ports)"
         )
@@ -259,25 +225,12 @@ def _clear_tailscale_self_cache() -> None:
 def _ask_tailscale_self() -> Optional[TailnetIdentity]:
     """One uncached `tailscale status --json`, reduced to this node's name and addresses. Never asked in the local
     edition, which joins no tailnet."""
-    if edition.IS_CE or not environment.tailscale_askable():
+    if edition.IS_CE:
         return None
-    try:
-        proc = subprocess.run(
-            environment.tailscale_command("status", "--json"),
-            capture_output=True, text=True, timeout=_TAILSCALE_STATUS_TIMEOUT,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.info("tailnet identity: tailscale status unavailable (%s)", exc)
+    status = environment.tailscale_json("status", "--json", timeout=_TAILSCALE_STATUS_TIMEOUT, who="tailnet identity")
+    if status is None:
         return None
-    if proc.returncode != 0:
-        log.info("tailnet identity: tailscale status failed (rc=%s)", proc.returncode)
-        return None
-    try:
-        status = json.loads(proc.stdout or "{}")
-        self_node = status.get("Self") or {}
-    except ValueError as exc:
-        log.warning("tailnet identity: tailscale status returned unparseable JSON (%s)", exc)
-        return None
+    self_node = status.get("Self") or {}
     # The trailing dot is how tailscaled reports a FQDN; it is not part of a URL host.
     dns_name = str(self_node.get("DNSName") or "").strip().rstrip(".")
     if not dns_name:
@@ -478,7 +431,7 @@ class DirectConsoleCert:
             raise CertUnavailable(
                 "cannot record a certificate-request attempt at {} ({}) — refusing to request without a "
                 "crash-loop throttle".format(self._attempt_path, exc)
-            )
+            ) from exc
 
     def request(self) -> None:
         """Ask tailscaled for a certificate, subject to both crash-loop guards.
@@ -515,7 +468,7 @@ class DirectConsoleCert:
             )
         except (OSError, subprocess.SubprocessError) as exc:
             self._record_attempt_outcome(_ATTEMPT_FAILED)
-            raise CertUnavailable("tailscale cert could not run ({})".format(exc))
+            raise CertUnavailable("tailscale cert could not run ({})".format(exc)) from exc
         if proc.returncode != 0:
             # The CLI's stderr is the actionable half ("HTTPS must be enabled in the admin console").
             self._record_attempt_outcome(_ATTEMPT_FAILED)
@@ -538,7 +491,7 @@ class DirectConsoleCert:
                 if self._explicit:
                     raise CertUnavailable(
                         "the configured cert/key pair at {} is unusable ({})".format(self._cert_path, exc)
-                    )
+                    ) from exc
                 log.warning("direct console: existing certificate at %s is unusable (%s) — re-requesting",
                             self._cert_path, exc)
         self.request()
@@ -546,7 +499,7 @@ class DirectConsoleCert:
             self._load()
         except (OSError, ssl.SSLError) as exc:
             raise CertUnavailable("the certificate just written to {} is unusable ({})".format(
-                self._cert_path, exc))
+                self._cert_path, exc)) from exc
 
     def renew_once(self) -> bool:
         """One renewal pass: request (tailscaled decides whether renewal is due via `--min-validity`, so no
@@ -598,13 +551,13 @@ class DirectGrant:
     """One CP authorization: this token may attach to this slot, as this admin session, until then.
 
     The raw `token` is kept (the CP's audit channel keys on it) but never logged (`fingerprint` is); the
-    store indexes by its SHA-256. `read_only`, `attach_only`, `config_dir` and `securestorage_dir` live on
+    store indexes by its SHA-256. `read_only`, `attach_only` and `config_dir` live on
     the grant, which arrived over the proof-authenticated bus, never on the browser-composed hello — so a
     token holder cannot flip a tier or point a session at another account's credentials. `attach_only` is
     ORed with the hello's (a CP requirement only narrows); the per-dial reconnect half rides the hello
-    because a grant lives up to 24h. `config_dir` is the CP-chosen account a create runs under;
-    `securestorage_dir` only relocates that same account's token lookup (`shared_storage`). Absent fields
-    parse as the narrow default."""
+    because a grant lives up to 24h. `config_dir` is the CP-chosen account a create runs under (the node
+    resolves its token store itself, `shared_storage.securestorage_dir`). Absent fields parse as the narrow
+    default."""
 
     token: str
     project: str
@@ -614,7 +567,6 @@ class DirectGrant:
     expires_at: float
     tmux_session: str = ""
     config_dir: Optional[str] = None
-    securestorage_dir: Optional[str] = None
     # Whose CLI a create opens, and an API-key account's slug standing in for `config_dir`; as the relay.
     provider: Optional[str] = None
     api_key_account: Optional[str] = None
@@ -738,7 +690,7 @@ class DirectGrantStore:
         kind = frame.get("kind")
         if kind != "clauded":
             return {"error": "unknown console kind"}
-        # `is None`, never `or ""`: slot 0 (the main clone) is falsy.
+        # `is None`, never `or ""`: a number 0 is falsy.
         project = "" if frame.get("project") is None else str(frame.get("project"))
         number = "" if frame.get("number") is None else str(frame.get("number"))
         if not project or not number:
@@ -787,12 +739,9 @@ class DirectGrantStore:
         # `console.py::_fleet_window_socket` resolves without checking the grant's slot — ungated, one slot's
         # holder would reach every runner on the host. `is True`, so a truthy value cannot widen it.
         view_allowed = frame.get("view_allowed") is True
-        # The relay's own readers. No `securestorage_dir` (older CP) is exactly a non-shared account.
+        # The relay's own readers. An older CP's `securestorage_dir` key is ignored: the node resolves the
+        # account's token store itself (`shared_storage.securestorage_dir`).
         config_dir = console_mod.console_config_dir(frame.get("config_dir"))
-        # And the store that account's token lives in when it is shared — same discipline, its own
-        # one-reading function. A CP too old to send it leaves `None`, which is exactly a non-shared
-        # account and makes the launch this grant authorizes byte-identical to before.
-        securestorage_dir = console_mod.console_securestorage_dir(frame.get("securestorage_dir"))
         # The same two readers the relay frame goes through, so both transports create the same tab.
         provider = console_mod.console_provider(frame.get("provider"))
         api_key_account = console_mod.console_api_key_account(frame.get("api_key_account"))
@@ -801,7 +750,7 @@ class DirectGrantStore:
         grant = DirectGrant(
             token=token, project=project, number=number, kind=kind,
             session_id=session_id, expires_at=expires_at, tmux_session=tmux_session,
-            config_dir=config_dir, securestorage_dir=securestorage_dir,
+            config_dir=config_dir,
             provider=provider, api_key_account=api_key_account, bedrock=bedrock, guard_project=guard_project,
             read_only=read_only, attach_only=attach_only,
             view_allowed=view_allowed,
@@ -1008,7 +957,7 @@ def parse_hello(raw: object) -> _Hello:
     try:
         hello = json.loads(raw)
     except ValueError as exc:
-        raise _HelloError(CLOSE_MALFORMED_HELLO, "the hello frame is not JSON ({})".format(exc))
+        raise _HelloError(CLOSE_MALFORMED_HELLO, "the hello frame is not JSON ({})".format(exc)) from exc
     if not isinstance(hello, dict):
         raise _HelloError(CLOSE_MALFORMED_HELLO, "the hello frame is not a JSON object")
     # `view` names one window of the shared `fleet` session instead of the slot's derived one.
@@ -1192,9 +1141,9 @@ class DirectConsoleListener:
             raw = await asyncio.wait_for(ws.recv(), timeout=HELLO_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             raise _HelloError(CLOSE_MALFORMED_HELLO, "no hello frame within {:.0f}s".format(
-                HELLO_TIMEOUT_SECONDS))
+                HELLO_TIMEOUT_SECONDS)) from None
         except Exception as exc:
-            raise _HelloError(CLOSE_MALFORMED_HELLO, "the socket ended before a hello ({})".format(exc))
+            raise _HelloError(CLOSE_MALFORMED_HELLO, "the socket ended before a hello ({})".format(exc)) from exc
         return parse_hello(raw)
 
     async def _serve_session(self, ws, key, grant: DirectGrant, hello: _Hello, peer: str) -> None:
@@ -1224,8 +1173,9 @@ class DirectConsoleListener:
 
         async def ack() -> None:
             """`{"ok":true}`, sent between resolving the session and attaching the viewer: once attached
-            the pump may write PTY bytes at once, and the ack must precede them."""
-            await ws.send(json.dumps({"ok": True}))
+            the pump may write PTY bytes at once, and the ack must precede them. `acks` advertises that this
+            daemon answers each keepalive (`console.KEEPALIVE_ACK`), which arms the pane's silence watchdog."""
+            await ws.send(json.dumps({"ok": True, "acks": True}))
 
         try:
             # The key gains the view member; `attach_direct_viewer` normalises "no view" to `""` exactly as
@@ -1244,11 +1194,10 @@ class DirectConsoleListener:
                 # The grant's own session claim; the browser-composed hello carries none.
                 session_name=grant.tmux_session or None,
                 before_attach=ack,
-                # The account, its shared credential store and the tier all come from the grant, never the
+                # The account and the tier both come from the grant, never the
                 # hello: with no CP in the data path, the minted `read_only` is the only thing between a view
                 # principal and a writable shell. `cols`/`rows` are discarded in `_resolve_session`.
                 config_dir=grant.config_dir,
-                securestorage_dir=grant.securestorage_dir,
                 provider=grant.provider, api_key_account=grant.api_key_account, bedrock=grant.bedrock,
                 **console_mod._guard_kw(grant.guard_project),
                 read_only=grant.read_only,

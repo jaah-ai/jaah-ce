@@ -16,7 +16,6 @@ import subprocess
 import uuid
 
 import cred_broker
-import env_helpers
 import kill_gates
 import runner_registry
 import session_user
@@ -32,18 +31,9 @@ def _pane_window(socket: str, pid: int, run) -> tuple[str, str] | None:
     """`(pane id, window name)` of the pane whose process is `pid` on one tmux server, or None. Filtered
     server-side to that one pane: the bus caps a shell-out's stdout, and a whole-server listing on a busy
     node could lose the very row asked for."""
-    try:
-        listed = run(
-            session_user.tmux_cmd(socket, "list-panes", "-a", "-f", f"#{{==:#{{pane_pid}},{pid}}}",
-                                  "-F", "#{pane_pid}\t#{pane_id}\t#{window_name}"),
-            capture_output=True, text=True, timeout=10, env=env_helpers._tmux_safe_env(),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.warning("bedrock-close: looking up pane %s on socket %r failed (%s)", pid, socket, exc)
-        return None
-    if getattr(listed, "returncode", 1) != 0:
-        return None
-    for line in (getattr(listed, "stdout", "") or "").splitlines():
+    listed = session_user.tmux_out(socket, "list-panes", "-a", "-f", f"#{{==:#{{pane_pid}},{pid}}}",
+                                   "-F", "#{pane_pid}\t#{pane_id}\t#{window_name}", run=run)
+    for line in (listed or "").splitlines():
         found, _, rest = line.partition("\t")
         pane, _, name = rest.partition("\t")
         if found.strip() == str(pid) and pane.startswith("%"):
@@ -79,15 +69,10 @@ def close_session(jaah_session_id: str, *, run=None) -> dict:
             if name == HOLDER_WINDOW:
                 log.warning("bedrock-close: pane %s resolved to the fleet holder window — not killing it", pid)
                 continue
-            try:
-                # The PANE, not its window: a human may have split a console tab, and their shell is no
-                # part of the Jaah session.
-                done = run(session_user.tmux_cmd(socket, "kill-pane", "-t", pane),
-                           capture_output=True, text=True, timeout=10, env=env_helpers._tmux_safe_env())
-            except (OSError, subprocess.SubprocessError) as exc:
-                log.warning("bedrock-close: killing pane %s on socket %r failed (%s)", pane, socket, exc)
-                continue
-            if getattr(done, "returncode", 1) == 0:
+            # The PANE, not its window: a human may have split a console tab, and their shell is no
+            # part of the Jaah session.
+            done = session_user.tmux_run(socket, "kill-pane", "-t", pane, run=run)
+            if done is not None and done.returncode == 0:
                 killed.append(pid)
                 runner_registry.forget(pid)
     # A pane that exited on its own between the registry read and the kill is closed, not a failure.

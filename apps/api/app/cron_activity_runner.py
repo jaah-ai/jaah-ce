@@ -148,4 +148,4 @@ def _descriptor() -> ActivityDescriptor:
     )
 
 
-RUNNER_ACTIVITY: ActivityDescriptor = register(_descriptor())
+register(_descriptor())

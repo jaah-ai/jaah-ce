@@ -6,9 +6,9 @@ absent). Absence from a payload means nothing, and the three completeness flags 
 
 The observation never creates a slot (`slot_allocation.converge` declares them from the assignments), so
 `slot_update_statement` is an UPDATE on the natural key and an unmatched slot is skipped with a
-warning. Nor does it destroy one: a `gone` or `unmaterialised` slot's row stands, and the node's
-convergence pass (`apps/jaahd/reconcile/orchestrate.py::_unmaterialised_candidates`) rebuilds it. A vanished tree
-with a hold raises an alert (`vanished_hold_statement`).
+warning. Nor does it destroy one: a `gone` or `unmaterialised` slot's row stands, and the slot's next lease
+clones it again (`apps/jaahd/worktree_mechanics/lifecycle.py::claim_mechanics`). A vanished tree
+with an unattended hold is logged as lost work (`vanished_hold_statement`); it is no notification (PRD R9).
 """
 
 # Deadlock is the one hazard this design adds (multi-row statements can lock in opposite orders):
@@ -25,7 +25,7 @@ import logging
 import math
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field, PrivateAttr, ValidationError, field_validator, model_validator
@@ -36,6 +36,7 @@ from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 
 from app import (
     alert_record,
+    blind_review,
     carryover,
     edition_features,
     fleet_verdicts,
@@ -46,14 +47,17 @@ from app import (
     node_tmp_inode_alarm,
     node_platform,
     project_identity,
+    slot_allocation,
     slot_columns,
     slot_state,
 )
-from app.db import SessionLocal
+from app.clock import utcnow
+from app.db import BridgedSession, excluded_of
+from app.entity_shape import pick
+from app.log_on_change import WarnOnce
 # The two rules ingest and upsert share (what makes a block a dated reading, how a date parses),
 # imported so there is one spelling. `account_fold` must never import from `app` at module level.
 from app.account_fold import QUOTA_PERCENT_KEYS, asserts_a_percentage, reading_observed_at
-from app.models.agent_sessions import FetchStamp
 from app.models.credentials import Account, AccountObservation
 from app.models.nodes import Node, NodeHostMetric, NodeSessionUsage, TaskSessionUsagePeak
 from app.models.notifications import Alert
@@ -216,8 +220,9 @@ class ObservedSlotRepos(BaseModel):
 class ObserveSlotIn(BaseModel):
     """One slot's observation. `state` carries the verdict the node's disk test reached."""
 
-    # `project_id` is the identity (C6); `project`, the display name, is what an older node sends alone, and
-    # `resolve_project_ids` then resolves it inside the node's own org.
+    # `project_id` is the identity (C6); `project` is the display name beside it, never resolved. A slot
+    # reported without an id (one the node knows only from disk, which its roster does not name) resolves to
+    # nothing and is skipped with a warning (`resolve_project_ids`).
     project: str
     project_id: Optional[int] = None
     number: int
@@ -334,30 +339,19 @@ class ObserveRunnerIn(BaseModel):
 _MAX_STAMP_SKEW_SECS = 120.0
 
 # One warning per (node_id, slug) per process, capped by entry count (the ids arrive before the
-# `is_registered_node` gate, so a `NODE_TOKEN` holder could grow the set). Key length is unbounded for
-# these older sets (follow-up; `_WARN_KEY_MAX` covers host metrics). Past the cap, `debug`.
+# `is_registered_node` gate, so a `NODE_TOKEN` holder could grow the set); past the cap, `debug`. A str
+# key is truncated to `WarnOnce.key_max` (the full id stays on the log line); a tuple key is kept whole.
 _UNDATABLE_WARN_CAP = 512
-_undatable_warned: set[tuple[str, str]] = set()
-
-
-def _reset_undatable_warnings() -> None:
-    """Test seam only — every dedupe set here is process-local and never cleared in production."""
-    _undatable_warned.clear()
-    _skewed_pass_warned.clear()
-    _implausible_metrics_warned.clear()
-
+_undatable_warned = WarnOnce(log, cap=_UNDATABLE_WARN_CAP)
 
 # One warning per node, capped like `_undatable_warned`.
-_skewed_pass_warned: set[str] = set()
+_skewed_pass_warned = WarnOnce(log, cap=_UNDATABLE_WARN_CAP)
 
 
 def _warn_skewed_pass(node_id: str, ahead_secs: float) -> None:
     """One line naming the node, how far ahead its clock is, and what was done."""
-    if node_id in _skewed_pass_warned or len(_skewed_pass_warned) >= _UNDATABLE_WARN_CAP:
-        log.debug("node %s posted an observation stamped %.0fs in the future; clamped", node_id, ahead_secs)
-        return
-    _skewed_pass_warned.add(node_id)
-    log.warning(
+    _skewed_pass_warned.say(
+        node_id,
         "node %s posted an observation stamped %.0fs in the FUTURE, beyond the %.0fs clock-skew allowance — "
         "clamping the pass stamp to this control plane's now(). Its readings will age from now instead of "
         "from its own clock; fix NTP on that host. Attestation is unaffected (it is CP-stamped).",
@@ -367,12 +361,8 @@ def _warn_skewed_pass(node_id: str, ahead_secs: float) -> None:
 
 def _warn_undatable_quota(node_id: str, slug: str, *, reason: str, action: str, raw: object) -> None:
     """One line naming the node, the slug, why the stamp is unusable and what was done about it."""
-    key = (node_id, slug)
-    if key in _undatable_warned or len(_undatable_warned) >= _UNDATABLE_WARN_CAP:
-        log.debug("undatable quota from node %r slug %r (%s -> %s): %r", node_id, slug, reason, action, raw)
-        return
-    _undatable_warned.add(key)
-    log.warning(
+    _undatable_warned.say(
+        (node_id, slug),
         "node %r sent a quota block for slug %r this control plane cannot date (%s, observedAt=%r) — %s. "
         "An undatable reading can never be aged out by the staleness bound, so it is refused rather than "
         "believed; the rest of the pass is unaffected.",
@@ -383,26 +373,17 @@ def _warn_undatable_quota(node_id: str, slug: str, *, reason: str, action: str, 
 # ── The ingest boundary for the host metrics block ─────────────────────────────────────────────────────
 
 # One warning per node, capped like the sets above; the ~5s cadence makes rate-limiting mandatory.
-_implausible_metrics_warned: set[str] = set()
+_implausible_metrics_warned = WarnOnce(log, cap=_UNDATABLE_WARN_CAP)
 
 # A separate budget: the set is keyed on `node_id` alone, so sharing it would let the trivial
 # optional-field narrowing warning permanently demote a later lost-block warning to `debug`.
-_optional_narrowed_warned: set[str] = set()
-
-# Key length bound: the cap counts entries, not bytes, and `node_id` is unbounded before the
-# registration gate. The full id stays on the log line.
-_WARN_KEY_MAX = 64
+_optional_narrowed_warned = WarnOnce(log, cap=_UNDATABLE_WARN_CAP)
 
 
-def _warn_implausible_host_metrics(node_id: str, problem: str, *, seen: Optional[set] = None) -> None:
+def _warn_implausible_host_metrics(node_id: str, problem: str, *, seen: Optional[WarnOnce] = None) -> None:
     """One line naming the node, what was implausible about its block, and that the pass itself survived."""
-    seen = _implausible_metrics_warned if seen is None else seen
-    key = node_id[:_WARN_KEY_MAX]
-    if key in seen or len(seen) >= _UNDATABLE_WARN_CAP:
-        log.debug("implausible host_metrics from node %r (%s); block dropped", node_id, problem)
-        return
-    seen.add(key)
-    log.warning(
+    (_implausible_metrics_warned if seen is None else seen).say(
+        node_id,
         "node %r sent a host_metrics block this control plane cannot believe (%s) — dropping the BLOCK "
         "only; every other family in the pass is applied normally. A metric is the least important thing "
         "on this payload and must never cost the node its worktree/runner/account rows. Check "
@@ -411,9 +392,10 @@ def _warn_implausible_host_metrics(node_id: str, problem: str, *, seen: Optional
     )
 
 
-class TopProcessIn(BaseModel):
+class TopProcess(BaseModel):
     """One of the host's busiest processes: its NAME (`/proc/<pid>/comm`), never argv (argv holds secrets),
-    its user, CPU in percent of one core and RSS. Cleaned before pydantic sees it (`_a_top_process_or_none`)."""
+    its user, CPU in percent of one core and RSS. Cleaned before pydantic sees it (`_a_top_process_or_none`); the
+    roster serves the same shape back (`routes/nodes/node_wire.py::NodeHostMetricsOut`)."""
 
     name: str
     user: str
@@ -493,7 +475,7 @@ class HostMetricsIn(BaseModel):
     psi_mem_pct: Optional[float] = None
     psi_io_pct: Optional[float] = None
     # Bounded lists, cleaned entry by entry before pydantic (`_LIST_KEYS`): a malformed entry costs only itself.
-    top_processes: Optional[list[TopProcessIn]] = None
+    top_processes: Optional[list[TopProcess]] = None
     sessions: Optional[list[SessionUsageIn]] = None
 
 
@@ -534,9 +516,9 @@ _SIGNAL_RANGES: dict[str, tuple[float, float]] = {
     "swap_total_kb": (0, _INT64_MAX), "swap_free_kb": (0, _INT64_MAX),
 }
 _SWAP_KEYS = ("swap_total_kb", "swap_free_kb")
-# The list caps (the daemon sends the union of top 5 by CPU and top 5 by RSS; at most 64 live sessions) and the
+# The list caps (the daemon sends the union of top 15 by CPU and top 15 by RSS; at most 64 live sessions) and the
 # string caps: a process name is `comm` (15 bytes on Linux; 32 leaves room), a user name likewise.
-_TOP_PROCESSES_MAX = 10
+_TOP_PROCESSES_MAX = 30
 _SESSIONS_MAX = 64
 _PROCESS_TEXT_MAX = 32
 _SESSION_ID_MAX = 128
@@ -649,7 +631,7 @@ def _clean_text(value: Any, cap: int) -> Optional[str]:
 
 
 def _a_top_process_or_none(item: Any, ceiling: float) -> Optional[dict]:
-    """One `top_processes` entry as `TopProcessIn` will accept it, or None when it is malformed. A nameless
+    """One `top_processes` entry as `TopProcess` will accept it, or None when it is malformed. A nameless
     process names nothing, so it is dropped; an empty user is kept."""
     if not isinstance(item, dict):
         return None
@@ -753,8 +735,13 @@ class PlatformIn(BaseModel):
     features: Optional[dict[str, bool]] = None
 
 
-#: The `launch.kind` vocabulary this CP believes (`fleet_verdicts`); a kind a newer node reports is dropped.
-_LAUNCH_KINDS = frozenset({fleet_verdicts.LAUNCH_KIND_AGENT, fleet_verdicts.LAUNCH_KIND_AGENT_ACP})
+#: The `launch_kinds` vocabulary this CP believes: every kind some CP predicate reads (`fleet_verdicts`' agent
+#: kinds for `agent_resolution.sdk_capable_nodes`, `slot_allocation.FOLDER_SLOT`, `blind_review.BLIND_CHECKOUT`
+#: for `blind_review.node_can_run`); a kind a newer node reports is dropped.
+_LAUNCH_KINDS = frozenset({
+    fleet_verdicts.LAUNCH_KIND_AGENT, fleet_verdicts.LAUNCH_KIND_AGENT_ACP,
+    fleet_verdicts.LAUNCH_KIND_AGENT_ACP_REGISTRY, slot_allocation.FOLDER_SLOT, blind_review.BLIND_CHECKOUT,
+})
 
 #: `systemd-detect-virt`'s vocabulary is open-ended (`kvm`, `amazon`, `vmware`, `docker`…), so it is bounded
 #: by shape rather than listed: one lowercase token, never display-hostile text.
@@ -899,10 +886,6 @@ class ObservationIn(BaseModel):
     worktrees: list[ObserveSlotIn] = Field(default_factory=list)
     runners: list[ObserveRunnerIn] = Field(default_factory=list)
     accounts: list[ObserveAccountIn] = Field(default_factory=list)
-    # Projects this pass `git fetch`ed — the write half of the fetch stamp. By id; the names are an older
-    # node's spelling, resolved inside its org (`resolve_project_ids`).
-    fetched_project_ids: list[int] = Field(default_factory=list)
-    fetched_projects: list[str] = Field(default_factory=list)
     # This node's CPU/RAM mean, the one optional top-level block (`app/node_host_metrics.py`).
     # Defaults to None for backward compatibility (nodes update independently) and because a node may
     # omit it. A pass without a block writes nothing for it: silence is not idleness.
@@ -1036,7 +1019,7 @@ class ObservationIn(BaseModel):
         reading looks fresh). No stamp and no percentage -> untouched. Unusable means missing, malformed,
         or beyond `_MAX_STAMP_SKEW_SECS` in the future. Never 422s the pass; a `model_validator` so the
         warning is rate-limited per (node_id, slug)."""
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         for account in self.accounts:
             block = account.quota
             if block is None:
@@ -1072,7 +1055,7 @@ class ObservationIn(BaseModel):
         A future stamp reads as permanently fresh. Clamped rather than 422 or nulled (`pool_state` reads
         NULL as "no complete enumeration"). Backward skew is not clamped: it only makes a reading look
         older, the safe direction (dispatch freshness reads the CP-stamped `attested_at`)."""
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         stamped = (
             self.observed_at
             if self.observed_at.tzinfo
@@ -1108,9 +1091,8 @@ class ObservationOut(BaseModel):
     # The `accounts` twin (slugs); the probe runs at 600s, the pass at ~5s.
     changed_accounts: list[str] = []
     # The unattended task-held subset of this pass's `gone` report (`{"project", "number", "task_id"}`),
-    # read inside the retryable transaction so the route alerts on it only after commit
-    # (`routes/agent/fleet_observe.py::fleet_observe_route` → `emit_vanished_hold_alerts`). The row survives,
-    # but the work in the tree is gone.
+    # read inside the retryable transaction so the route logs it only after commit
+    # (`routes/agent/fleet_observe.py::_post_commit_alerts`). The row survives, but the work in the tree is gone.
     vanished_task_holds: list[dict[str, Any]] = []
     # Task ids whose runner just disappeared (session true → not-true while task-held), visible only
     # inside the transaction. The route wakes `task-pipeline` after commit (`app/task_wake.py`), since a
@@ -1137,25 +1119,17 @@ class ObservationOut(BaseModel):
 # ── The ingest boundary for the project's identity ─────────────────────────────────────────────────────
 
 
-# A project as one pass reports it: its `projects.id` when the node sent one, else (an older node) its name.
-ProjectKey = Union[int, str]
-
-
-def project_key(slot: ObserveSlotIn) -> ProjectKey:
-    """The key `resolve_project_ids`' map holds this slot's project under: the id when sent, else the name."""
-    return slot.project_id if slot.project_id is not None else slot.project
+# A project as one pass reports it: its `projects.id`. A slot sent without one has no key and is skipped.
+ProjectKey = int
 
 
 def resolve_project_ids(session, payload: ObservationIn) -> dict[ProjectKey, int]:
-    """`{project key: projects.id}` for every distinct project this pass names — one resolution per pass.
+    """`{project_id: projects.id}` for every distinct project this pass names — one resolution per pass.
 
-    The identity boundary of the whole ingest: past here every key is `project_id`. A reported id
-    stands only for a project of the node's own org or one it runs a carried-over slot of
-    (`app/carryover.py`); an older node's bare name resolves inside the node's org
-    (`project_identity.legacy_project_id`, C6) — names are unique per org only — unless a carried-over slot's
-    project answers to it, which wins (the node's org may since have reused the name). Anything else (e.g. a
-    rename in flight, or an id of another org) is absent from the map and its rows are skipped, fail-closed and
-    self-healing; one warning per such key per pass."""
+    The identity boundary of the whole ingest: a reported id stands only for a project of the node's own org
+    or one it runs a carried-over slot of (`app/carryover.py`), and then maps to itself. Anything else (an id
+    of another org, a deleted project, a slot sent with no id) is absent from the map and its rows are
+    skipped, fail-closed and self-healing; one warning per such key per pass."""
     org_id = session.scalar(select(Node.org_id).where(Node.id == node_id_or_none(session, payload.node_id)))
     return _resolve_project_ids(session, payload, org_id)
 
@@ -1163,42 +1137,31 @@ def resolve_project_ids(session, payload: ObservationIn) -> dict[ProjectKey, int
 def _resolve_project_ids(session, payload: ObservationIn, org_id: Optional[UUID]) -> dict[ProjectKey, int]:
     """`resolve_project_ids` for a caller that has already read the node's org (`apply_observation`, off its
     stamp) — the same resolution without re-reading it."""
-    # No truthiness filter: `""` must resolve to nothing and get the warning, not skip silently.
-    keys: set[ProjectKey] = {project_key(slot) for slot in payload.worktrees}
-    keys |= set(payload.fetched_project_ids)
-    keys |= set(payload.fetched_projects)
-    resolved: dict[ProjectKey, int] = {}
-    # A carried-over slot's project moved out of this node's org (`app/carryover.py`): resolved by the carry-over.
-    carried = carryover.carried_project_ids(session, payload.node_id)
-    reported_ids = {key for key in keys if isinstance(key, int)}
+    # Every key as sent, with the display names reported beside it (for the warning only). `None` is a slot
+    # that sent no id: it must reach the warning, not skip silently.
+    names: dict[Optional[int], set[str]] = {}
+    for slot in payload.worktrees:
+        names.setdefault(slot.project_id, set()).add(slot.project)
+    reported_ids = {key for key in names if key is not None}
     own_ids = set(session.scalars(
         select(Project.id).where(Project.id.in_(reported_ids), Project.org_id == org_id)
     ).all()) if reported_ids and org_id is not None else set()
-    own_ids |= reported_ids & set(carried)
-    carried_by_name: dict[str, list[int]] = {}
-    for carried_id, carried_name in carried.items():
-        carried_by_name.setdefault(carried_name, []).append(carried_id)
-    for name in sorted(keys, key=str):
-        if isinstance(name, int):
-            project_id = name if name in own_ids else None
-        elif name in carried_by_name:
-            # The carry-over first: once its project leaves, the node's org may create a new project of the same
-            # name, and the older daemon's report of the carried slot must not land on it. Two carried projects
-            # of one name cannot be told apart by name: refused.
-            matches = carried_by_name[name]
-            project_id = matches[0] if len(matches) == 1 else None
-        else:
-            project_id = project_identity.legacy_project_id(session, name, org_id)
-        if project_id is None:
-            log.warning(
-                "fleet-observe: %s reported project %r, which no `projects` row answers to — every row "
-                "naming it is SKIPPED this pass (slot update, `gone` read, fetch stamp). "
-                "A rename in flight looks exactly like this and clears itself on the node's next roster; "
-                "anything else means the project was deleted while a node still holds its slots.",
-                payload.node_id, name,
-            )
+    # A carried-over slot's project moved out of this node's org (`app/carryover.py`): admitted by the carry-over.
+    own_ids |= reported_ids & set(carryover.carried_project_ids(session, payload.node_id))
+    resolved: dict[ProjectKey, int] = {}
+    for key in sorted(names, key=lambda k: (k is None, k or 0)):
+        if key is not None and key in own_ids:
+            resolved[key] = key
             continue
-        resolved[name] = project_id
+        named = ", ".join(repr(name) for name in sorted(names[key]))
+        label = f"{named} with no project_id" if key is None else f"{key} ({named})"
+        log.warning(
+            "fleet-observe: %s reported project %s, which resolves to no `projects` row of this node — every "
+            "row naming it is SKIPPED this pass (slot update, `gone` read). "
+            "A slot with no id is one its node's roster does not name and its known-slot row has no id for; "
+            "anything else means the project was deleted or moved while the node still holds its slots.",
+            payload.node_id, label,
+        )
     return resolved
 
 
@@ -1210,11 +1173,11 @@ def gone_slot_keys(payload: ObservationIn, project_ids: dict[ProjectKey, int]) -
 
     Feeds the vanished-hold read; the row stands. A target list,
     never a complement, so silence (or a slot declared after the tick's snapshot) acts on nothing. An
-    unresolved project name drops out."""
+    unresolved project id drops out."""
     return sorted(
-        (project_ids[project_key(slot)], slot.number)
+        (project_ids[slot.project_id], slot.number)
         for slot in payload.worktrees
-        if slot.state == SLOT_GONE and project_key(slot) in project_ids
+        if slot.state == SLOT_GONE and slot.project_id in project_ids
     )
 
 
@@ -1246,10 +1209,10 @@ def slot_update_rows(
     # One lookup for the payload, keyed on the node's own spelling.
     account_ids = node_clone.account_ids_for_dirs(session, [slot.account for slot in payload.worktrees])
     # The CP's clock: ages are subtracted only here, never from the node's own stamp.
-    received = datetime.now(timezone.utc)
+    received = utcnow()
     rows: list[dict[str, Any]] = []
     for slot in payload.worktrees:
-        if project_key(slot) not in project_ids:
+        if slot.project_id not in project_ids:
             continue
         if not slot.path:
             log.warning(
@@ -1263,44 +1226,22 @@ def slot_update_rows(
         rows.append(
             {
                 "node_id": node_uuid,
-                "project_id": project_ids[project_key(slot)],
-                "number": slot.number,
-                "path": slot.path,
-                "branch": slot.branch,
-                "dirty": slot.dirty,
-                "merged": slot.merged,
-                "ahead": slot.ahead,
-                "behind": slot.behind,
-                "head_sha": slot.head_sha,
-                "session": slot.session,
-                "session_id": slot.session_id,
-                "session_status": slot.session_status,
-                "session_started_at": slot.session_started_at,
-                "session_pid": slot.session_pid,
-                "session_proc_started_at": slot.session_proc_started_at,
+                "project_id": project_ids[slot.project_id],
+                **pick(
+                    slot, "number", "path", "branch", "dirty", "merged", "ahead", "behind", "head_sha", "session",
+                    "session_id", "session_status", "session_started_at", "session_pid", "session_proc_started_at",
+                    "console", "probes", "probed_config_dirs", "age_last_used_secs", "age_last_commit_secs",
+                    "age_index_mtime_secs", "tmux_window_id", "tmux_target", "window_name", "compose_project_name",
+                    "stack_present", "stack_up", "default_title", "host_env", "model",
+                ),
                 # Fails open: an unknown dir lands NULL rather than failing the whole pass.
                 # `resolve_auth_dir`'s fail-closed `""` is a dispatch rule; both polarities are deliberate.
                 "account_id": account_ids.get(slot.account),
-                "console": slot.console,
-                "probes": slot.probes,
-                "probed_config_dirs": slot.probed_config_dirs,
                 "observed_at": payload.observed_at,
-                "age_last_used_secs": slot.age_last_used_secs,
-                "age_last_commit_secs": slot.age_last_commit_secs,
-                "age_index_mtime_secs": slot.age_index_mtime_secs,
                 # The one sensed column the node ships as an age and the CP stores as a stamp on its own clock;
                 # None keeps the stored value (`slot_update_statement`).
                 "transcript_written_at": _transcript_stamp(received, slot.age_transcript_write_secs),
-                "tmux_window_id": slot.tmux_window_id,
-                "tmux_target": slot.tmux_target,
-                "window_name": slot.window_name,
-                "compose_project_name": slot.compose_project_name,
-                "stack_present": slot.stack_present,
-                "stack_up": slot.stack_up,
                 "ports": slot.ports_observed,
-                "default_title": slot.default_title,
-                "host_env": slot.host_env,
-                "model": slot.model,
                 "repos": slot.repos.model_dump() if slot.repos is not None else None,
                 # No `name` key: it is a MUTATED column, and this statement names none.
             }
@@ -1317,9 +1258,9 @@ def sighted_slot_keys(payload: ObservationIn, project_ids: dict[ProjectKey, int]
     writer. `slot.session is True` on the literal: `None` (unknown) and `False` must never count, since
     `mark_seen_live` only extends a hold's life."""
     return sorted(
-        (project_ids[project_key(slot)], slot.number)
+        (project_ids[slot.project_id], slot.number)
         for slot in payload.worktrees
-        if slot.session is True and project_key(slot) in project_ids
+        if slot.session is True and slot.project_id in project_ids
     )
 
 
@@ -1394,9 +1335,9 @@ def vanished_hold_statement(node_uuid: UUID, gone: list[tuple[int, int]]):
     """The slots the node reported `gone`, with their occupancy — a SELECT that replaced a DELETE.
 
     A sensor may not retract a human's declaration: the row stands and the
-    node rebuilds the slot (`apps/jaahd/reconcile/orchestrate.py::_unmaterialised_candidates`). A `task`-held slot
-    with no live session held unlanded work, so it earns an `alerts` row; one with a live session is a
-    log line. `ORDER BY … FOR UPDATE` on the full natural key (L1); the Python tuples and `tuple_()`
+    slot's next lease clones it again (`apps/jaahd/worktree_mechanics/lifecycle.py::claim_mechanics`). A `task`-held slot
+    with no live session held unlanded work, so it earns a warning naming it; one with a live session is an
+    info line. `ORDER BY … FOR UPDATE` on the full natural key (L1); the Python tuples and `tuple_()`
     columns must move together or `.in_()` matches nothing.
     """
     return (
@@ -1412,71 +1353,27 @@ def vanished_hold_statement(node_uuid: UUID, gone: list[tuple[int, int]]):
     )
 
 
-def _vanished_hold_alert_identity(entry: dict[str, Any]) -> str:
-    """The per-slot identity in the event's `issue` field (like `fleet_verdicts.reap_notify_identity`),
-    so `uq_alerts_dedup` does not collapse one pass's vanished holds into one alert per 300s window."""
-    return f"{entry['project']}-{entry['number']}"
-
-
-def build_vanished_hold_alert_event(node_id: str, entry: dict[str, Any]) -> dict[str, Any]:
-    """The `alert_record.record_alert` kwargs for one unattended `task`-held row whose tree a node just
-    reported gone — `fleet_verdicts.build_reap_notify_event`'s sibling. Kind `self-heal`.
-
-    The row survives but the alert is about the lost work, which rebuilding does not recover."""
-    identity = _vanished_hold_alert_identity(entry)
-    task_id = entry.get("task_id")
-    return {
-        "kind": "self-heal",
-        "issue": identity,
-        "node_id": node_id,
-        "task_id": task_id,
-        "reason": (
-            f"worktree slot {identity} was held for task {task_id} with no runner attached"
-            + f" when node {node_id} positively reported its tree gone — the declaration and the hold "
-            "survive and the slot will be rebuilt EMPTY, but any unlanded work that was in that tree is "
-            "gone and there is nothing left to inspect"
-        ),
-    }
-
-
-def emit_vanished_hold_alerts(node_id: str, vanished: list[dict[str, Any]]) -> int:
-    """One durable `alerts` row per unattended `task`-held slot whose tree a `gone` report just found
-    missing. Returns how many the store accepted. `fleet_verdicts.emit_reap_notifies`'s sibling.
-
-    A fresh session per alert (`record_alert` commits). Best effort, after the observation committed.
-    Dedup on the per-slot `issue` absorbs deadlock retries and a never-rebuildable slot re-reported
-    every pass, one per window."""
-    accepted = 0
-    for entry in vanished:
-        event = build_vanished_hold_alert_event(node_id, entry)
-        session = SessionLocal()
-        try:
-            outcome = alert_record.record_alert(session, **event)
-            accepted += 1
-            if outcome.relay_failed:
-                log.warning(
-                    "fleet-observe: the vanished-task-hold alert for slot %s was NOT delivered "
-                    "to any operator channel (relay failed; the dedup row was withdrawn so a retry is not "
-                    "suppressed)",
-                    event.get("issue"),
-                )
-        # `Exception`, not `BaseException`: the suite's alert boundary is a `BaseException`, and must
-        # not be swallowed (see `emit_reap_notifies`).
-        except Exception as exc:  # noqa: BLE001 — an alert must never break the pass it describes
-            log.warning(
-                "fleet-observe: could not record the vanished-task-hold alert for slot %s: %s "
-                "— the deletion itself already committed and is in the log line above it",
-                event.get("issue"), exc,
-            )
-        finally:
-            session.close()
-    return accepted
-
-
 # How far ahead of a Claude login's hard expiry the operator is told. The console's badge window
 # (`apps/web/src/pages/credentials/Accounts.tsx`, `LOGIN_EXPIRY_WARN_MS`) is the same three days.
 LOGIN_EXPIRY_WARN_SECONDS = 3 * 86_400
 LOGIN_EXPIRY_ALERT_KIND = "login-expiring"
+# The login has expired: its runners have stopped until someone re-logs in (`emit_login_expiry_alerts`).
+LOGIN_EXPIRED_ALERT_KIND = "login-expired"
+# Each login kind's word in its alert's `issue`: `<slug> login <verb> <when>`, the identity its dedup probes read.
+_LOGIN_ALERT_VERB = {LOGIN_EXPIRY_ALERT_KIND: "expires", LOGIN_EXPIRED_ALERT_KIND: "expired"}
+
+
+def _login_alert_reason(kind: str, slug: str, when: str, node_id: str) -> str:
+    """The alert's text for one login kind: what happened, and the one remedy (a re-login)."""
+    if kind == LOGIN_EXPIRED_ALERT_KIND:
+        return (
+            f"the Claude login for account {slug} expired {when} (seen on node {node_id}); its runners have "
+            "stopped. Re-login from Directory > AI Accounts"
+        )
+    return (
+        f"the Claude login for account {slug} expires {when} (seen on node {node_id}); "
+        "its runners stop then. No refresh extends it — re-login from Directory > AI Accounts"
+    )
 
 
 def _login_expiry(account: ObserveAccountIn) -> Optional[datetime]:
@@ -1514,21 +1411,33 @@ def emit_login_expiry_alerts(
     re-login moves the expiry, so the next one alerts afresh. Only a slug that is an ENABLED account of the
     node's own org is alerted: the body is node-supplied, so an invented slug must not reach the operator
     channels, and nothing runs on a disabled account. Best effort after the observation committed; never
-    raises."""
-    now = now or datetime.now(timezone.utc)
+    raises.
+
+    A login whose expiry has passed (within the last `LOGIN_EXPIRY_WARN_SECONDS`) raises ONE `login-expired`
+    instead, on the same rules: the transition to expired, once per expiry. An older expiry is history, not a
+    transition, so a fresh process never alerts an account that died long ago."""
+    now = now or utcnow()
     horizon = now + timedelta(seconds=LOGIN_EXPIRY_WARN_SECONDS)
+    expired_floor = now - timedelta(seconds=LOGIN_EXPIRY_WARN_SECONDS)
     for memo in (_LOGIN_EXPIRY_SETTLED, _LOGIN_EXPIRY_RETRY_AT):
         for key in [k for k, at in memo.items() if at <= now]:
             del memo[key]
-    due: dict[str, tuple[datetime, ObserveAccountIn]] = {}
+    # slug → (kind, expiry, the account, when its memo entry stops mattering).
+    due: dict[str, tuple[str, datetime, ObserveAccountIn, datetime]] = {}
     for account in accounts:
         expiry = _login_expiry(account)
-        if expiry is not None and account.enabled is not False and now < expiry <= horizon:
-            due[account.slug] = (expiry, account)
+        if expiry is None or account.enabled is False:
+            continue
+        if now < expiry <= horizon:
+            due[account.slug] = (LOGIN_EXPIRY_ALERT_KIND, expiry, account, expiry)
+        elif expired_floor < expiry <= now:
+            due[account.slug] = (
+                LOGIN_EXPIRED_ALERT_KIND, expiry, account, expiry + timedelta(seconds=LOGIN_EXPIRY_WARN_SECONDS),
+            )
     if not due:
-        return 0  # the steady state: no database touched
+        return 0  # no login near or just past its expiry: no database touched
     recorded = 0
-    session = SessionLocal()
+    session = BridgedSession()
     try:
         node_org = session.scalar(select(Node.org_id).where(Node.id == node_id_or_none(session, node_id)))
         if node_org is None:
@@ -1538,37 +1447,35 @@ def emit_login_expiry_alerts(
         )))
         session.rollback()  # `record_alert` needs a session with no open work
         for slug in sorted(known):
-            expiry, account = due[slug]
+            kind, expiry, account, settled_until = due[slug]
             when = expiry.strftime("%Y-%m-%d %H:%M UTC")
-            issue = f"{slug} login expires {when}"
+            verb = _LOGIN_ALERT_VERB[kind]
+            issue = f"{slug} login {verb} {when}"
             key = (node_org, issue)
             if key in _LOGIN_EXPIRY_SETTLED or key in _LOGIN_EXPIRY_RETRY_AT:
                 continue
             try:
                 # `repo = ''` leads `uq_alerts_dedup`, so this is an index probe. Org-scoped: slugs are per tenant.
                 seen = session.scalar(select(Alert.id).where(
-                    Alert.repo == "", Alert.issue == issue, Alert.kind == LOGIN_EXPIRY_ALERT_KIND,
+                    Alert.repo == "", Alert.issue == issue, Alert.kind == kind,
                     Alert.org_id == node_org,
                 ).limit(1))
                 session.rollback()
                 if seen is not None:
-                    _LOGIN_EXPIRY_SETTLED[key] = expiry
+                    _LOGIN_EXPIRY_SETTLED[key] = settled_until
                     continue
                 # The org's Owners and Admins hear of an account's expiry once per warning horizon, not once per expiry
                 # the node reports: the expiry is node-supplied, so a node could otherwise mint a fresh alert to
                 # them every minute it names. The operator channel keeps the per-expiry alert.
                 told_recently = session.scalar(select(Alert.id).where(
-                    Alert.repo == "", Alert.kind == LOGIN_EXPIRY_ALERT_KIND, Alert.org_id == node_org,
-                    Alert.issue.startswith(f"{slug} login expires ", autoescape=True),
+                    Alert.repo == "", Alert.kind == kind, Alert.org_id == node_org,
+                    Alert.issue.startswith(f"{slug} login {verb} ", autoescape=True),
                     Alert.created_at > now - timedelta(seconds=LOGIN_EXPIRY_WARN_SECONDS),
                 ).limit(1)) is not None
                 session.rollback()
                 outcome = alert_record.record_alert(
-                    session, kind=LOGIN_EXPIRY_ALERT_KIND, node_id=node_id, issue=issue,
-                    reason=(
-                        f"the Claude login for account {slug} expires {when} (seen on node {node_id}); "
-                        "its runners stop then. No refresh extends it — re-login from Directory > Agents > Agents"
-                    ),
+                    session, kind=kind, node_id=node_id, issue=issue,
+                    reason=_login_alert_reason(kind, slug, when, node_id),
                     # Not in `reason`: the relay redacts a bare domain there, so `a@x.com` would read
                     # `a@[link removed]`.
                     payload={"email": account.email} if account.email else None,
@@ -1577,14 +1484,14 @@ def emit_login_expiry_alerts(
                 if outcome.relay_failed:
                     _LOGIN_EXPIRY_RETRY_AT[key] = now + timedelta(seconds=alert_record.ALERT_WINDOW_SECONDS)
                     log.warning(
-                        "fleet-observe: the login-expiry alert for %s was NOT delivered to any operator "
-                        "channel (relay failed; retried once the alert window turns)", slug,
+                        "fleet-observe: the %s alert for %s was NOT delivered to any operator "
+                        "channel (relay failed; retried once the alert window turns)", kind, slug,
                     )
                     continue
-                _LOGIN_EXPIRY_SETTLED[key] = expiry
+                _LOGIN_EXPIRY_SETTLED[key] = settled_until
                 if not outcome.deduped:
                     recorded += 1
-            # `Exception`, not `BaseException` — as `emit_vanished_hold_alerts`.
+            # `Exception`, not `BaseException`: the suite's alert boundary is one, never swallowed.
             except Exception as exc:  # noqa: BLE001 — an alert must never break the observation
                 session.rollback()
                 log.warning("fleet-observe: could not record the login-expiry alert for %s: %s", slug, exc)
@@ -1639,10 +1546,10 @@ def session_since_stamp_statement(node_uuid: UUID, keys: list[tuple[int, int]]):
 
 
 def _node_org(node_uuid: UUID):
-    """This node's `org_id`, as a subquery, for the three Core upserts below.
+    """This node's `org_id`, as a subquery, for the two Core upserts below.
 
     `write_seam.stamp_org` only sees ORM instances, and these families land via `pg_insert` (see
-    `fleet_verdicts._persist_intents`); each is `Derived(parent=Node)`. A subquery, not a resolved value:
+    `fleet_verdicts._persist_kwargs`); each is `Derived(parent=Node)`. A subquery, not a resolved value:
     revision 0181's composite FK accepts only the parent's own org, so a read would be pure per-pass cost
     (R-5). It cannot be NULL (`nodes.org_id` is NOT NULL, node resolved first). On conflict it is
     COALESCEd, never overwritten: the org is immutable, and this repairs rows an older release left NULL."""
@@ -1682,32 +1589,34 @@ def runner_upsert_statement(session, node_uuid: UUID, payload: ObservationIn):
     if not rows:
         return None
     insert = pg_insert(Runner).values(rows)
+    excluded = excluded_of(Runner.__table__)
     return insert.on_conflict_do_update(
         constraint="uq_runners_node_pid",
         set_={
             **{
-                name: insert.excluded[name]
+                name: excluded[name]
                 for name in (
                     "cwd", "kind", "worktree_path", "branch", "status",
                     "proc_started_at", "account_id", "last_seen", "observed_at",
                 )
             },
             # COALESCEd rather than replaced, repairing only pre-contraction NULLs (`_node_org`).
-            "org_id": func.coalesce(Runner.org_id, insert.excluded.org_id),
+            "org_id": func.coalesce(Runner.org_id, excluded.org_id),
         },
     )
 
 
+def _stale_delete_statement(model, key_column, node_uuid: UUID, keep: list):
+    """Delete `node_uuid`'s `model` rows whose `key_column` is not in `keep` (all of them when `keep` is empty).
+    `ORDER BY … FOR UPDATE` on `(node_id, key)` in the subquery (L1)."""
+    inner = select(model.id).where(model.node_id == node_uuid).order_by(model.node_id, key_column).with_for_update()
+    if keep:
+        inner = inner.where(key_column.notin_(keep))
+    return delete(model).where(model.node_id == node_uuid, model.id.in_(inner))
+
+
 def runner_delete_statement(node_uuid: UUID, pids: list[int]):
-    inner = (
-        select(Runner.id)
-        .where(Runner.node_id == node_uuid)
-        .order_by(Runner.node_id, Runner.pid)
-        .with_for_update()
-    )
-    if pids:
-        inner = inner.where(Runner.pid.notin_(pids))
-    return delete(Runner).where(Runner.node_id == node_uuid, Runner.id.in_(inner))
+    return _stale_delete_statement(Runner, Runner.pid, node_uuid, pids)
 
 
 # `'{}'::jsonb` as a bound value: `::` collides with SQLAlchemy's bind-parameter parser.
@@ -1766,7 +1675,7 @@ def account_upsert_statement(session, node_uuid: UUID, payload: ObservationIn):
     if not rows:
         return None
     insert = pg_insert(AccountObservation).values(rows)
-    excluded = insert.excluded
+    excluded = excluded_of(AccountObservation.__table__)
     table = AccountObservation
     return insert.on_conflict_do_update(
         constraint="uq_account_observations_node_slug",
@@ -1795,55 +1704,7 @@ def account_upsert_statement(session, node_uuid: UUID, payload: ObservationIn):
 
 
 def account_delete_statement(node_uuid: UUID, slugs: list[str]):
-    inner = (
-        select(AccountObservation.id)
-        .where(AccountObservation.node_id == node_uuid)
-        .order_by(AccountObservation.node_id, AccountObservation.slug)
-        .with_for_update()
-    )
-    if slugs:
-        inner = inner.where(AccountObservation.slug.notin_(slugs))
-    return delete(AccountObservation).where(
-        AccountObservation.node_id == node_uuid, AccountObservation.id.in_(inner)
-    )
-
-
-def fetch_stamp_upsert_statement(
-    node_uuid: UUID, payload: ObservationIn, project_ids: dict[ProjectKey, int]
-):
-    """``INSERT … ON CONFLICT (node_id, project_id) DO UPDATE`` — when this node last fetched each base.
-
-    An unresolvable key is dropped (no key to write); the cost is one stale fetch age, which reads as
-    "fetch it". The `constraint=` target is the primary key, whose name survived migration 0104."""
-    rows = sorted(
-        (
-            {
-                "node_id": node_uuid,
-                # Named: a Core insert is invisible to the write seam (`_node_org`).
-                "org_id": _node_org(node_uuid),
-                "project_id": project_id,
-                "fetched_at": payload.observed_at,
-            }
-            # A set of ids: an id and its legacy name in one pass are one stamp.
-            for project_id in {
-                project_ids[key] for key in (*payload.fetched_project_ids, *payload.fetched_projects)
-                if key in project_ids
-            }
-        ),
-        key=lambda row: (row["node_id"], row["project_id"]),
-    )
-    if not rows:
-        return None
-    insert = pg_insert(FetchStamp).values(rows)
-    return insert.on_conflict_do_update(
-        constraint="pk_fetch_stamps",
-        set_={
-            "fetched_at": insert.excluded.fetched_at,
-            # COALESCEd (`_node_org`), and in the SET list because these rows are only ever updated after
-            # the first insert.
-            "org_id": func.coalesce(FetchStamp.org_id, insert.excluded.org_id),
-        },
-    )
+    return _stale_delete_statement(AccountObservation, AccountObservation.slug, node_uuid, slugs)
 
 
 def node_stamp_statement(node_uuid: UUID, payload: ObservationIn):
@@ -1978,7 +1839,7 @@ def _warn_undeclared_slots(
         log.warning(
             "fleet-observe: %s reported worktree %s#%s, which no declared slot answers to — SKIPPED, "
             "nothing was created. The observation senses slots, it never creates them: a slot exists "
-            "because the project is assigned to the node (its static slots, or a dynamic one a lease made). "
+            "because the project is assigned to the node (a dynamic one a lease made). "
             "Either assign the project to this node so the control plane owns it, or remove the directory "
             "from the node.",
             node_id, names.get(project_id, project_id), number,
@@ -2105,10 +1966,10 @@ def _root_grow(session, node_uuid: UUID, infra: Optional[dict[str, Any]], root_t
 def apply_observation(session, payload: ObservationIn) -> ObservationOut:
     """The whole pass, in one transaction. The caller commits (and retries per L4).
 
-    Statement order follows L2 — `nodes → worktrees → runners → account_observations` — then the leaf
-    `fetch_stamps`; `node_host_metrics` follows the `nodes` stamp. Every statement is `WHERE node_id =
-    :node_uuid`. Project names are resolved once, up front; `names` is the inverse for display. Three
-    builders take the session to batch-resolve `account_id`."""
+    Statement order follows L2 — `nodes → worktrees → runners → account_observations`;
+    `node_host_metrics` follows the `nodes` stamp. Every statement is `WHERE node_id = :node_uuid`. Project names
+    are resolved once, up front; `names` is the inverse for display. Three builders take the session to
+    batch-resolve `account_id`."""
     # `payload.node_id` is the node's name, for log lines only; statements key on `node_uuid`.
     node_id = payload.node_id
     # Registration gate and resolution are one lookup (R-5). An unregistered reporter is dropped whole,
@@ -2202,7 +2063,7 @@ def apply_observation(session, payload: ObservationIn) -> ObservationOut:
         if (row["project_id"], row["number"]) not in stored
     )
     changed = _changed_slots(rows, stored)
-    # Display only (logs, the vanished-hold alert, `changed_slots`): read back by id, never inverted from the
+    # Display only (logs, the vanished-hold warning, `changed_slots`): read back by id, never inverted from the
     # payload's names — and read only when something will be displayed. The steady pass (nothing undeclared,
     # changed or gone) displays nothing, so it skips the read.
     gone = gone_slot_keys(payload, project_ids)
@@ -2230,11 +2091,10 @@ def apply_observation(session, payload: ObservationIn) -> ObservationOut:
             )
         gone = []
     if gone:
-        # Under the pass's lock: the alert is about the occupancy this pass found.
+        # Under the pass's lock: the log line is about the occupancy this pass found.
         vanished_rows = session.execute(vanished_hold_statement(node_uuid, gone)).all()
-        # An unattended task-held slot held unlanded work, so a vanished tree earns a durable `alerts`
-        # row. Emitted post-commit by the route (`emit_vanished_hold_alerts`), since a deadlock retry
-        # could undo this pass.
+        # An unattended task-held slot held unlanded work, so a vanished tree earns a warning naming it.
+        # Logged post-commit by the route, since a deadlock retry could undo this pass.
         vanished_task_holds = [
             {
                 "project_id": project_id,
@@ -2274,10 +2134,6 @@ def apply_observation(session, payload: ObservationIn) -> ObservationOut:
         accounts_deleted = session.execute(
             account_delete_statement(node_uuid, sorted(a.slug for a in payload.accounts))
         ).rowcount or 0
-
-    fetch_statement = fetch_stamp_upsert_statement(node_uuid, payload, project_ids)
-    if fetch_statement is not None:
-        session.execute(fetch_statement)
 
     out = ObservationOut(
         # Always 0: the observation cannot delete a `worktrees` row; the shape is shared.

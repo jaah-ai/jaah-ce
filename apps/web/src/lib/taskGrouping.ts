@@ -11,7 +11,7 @@ export const GROUP_BY_NONE = ''
  *  every real group id is a server-minted UUID, so it cannot collide. */
 export const GROUP_BY_STATE = 'state'
 
-/** Section by feature (plus "Other"). Reserved word, as above. */
+/** Section by feature (plus one per project for tasks in the project itself). Reserved word, as above. */
 export const GROUP_BY_FEATURE = 'feature'
 
 /** Section by when each row last moved — the Activity Feed's recency buckets. Reserved word, as above. */
@@ -33,7 +33,7 @@ export function isProjectGroupBy(groupBy: string): boolean {
   return groupBy === GROUP_BY_PROJECT
 }
 
-/** Is the board sectioned by feature ("Other" last)? */
+/** Is the board sectioned by feature (the projects' own sections last)? */
 export function isFeatureGroupBy(groupBy: string): boolean {
   return groupBy === GROUP_BY_FEATURE
 }
@@ -56,19 +56,19 @@ export const GROUP_PARAM = 'group'
 const NONE_PARAM = 'none'
 const TAG_PREFIX = 'tag:'
 
-/** A raw `?group=` as a `groupBy`. TOTAL: absent or junk is the default; `tag:<id>` is that tag group (its
- *  existence is the catalog's to judge). */
-export function parseGroupParam(raw: string | null): string {
-  if (raw === null) return DEFAULT_GROUP_BY
+/** A raw `?group=` as a `groupBy`. TOTAL: absent or junk is the selection's default (`fallback`); `tag:<id>` is
+ *  that tag group (its existence is the catalog's to judge). */
+export function parseGroupParam(raw: string | null, fallback: string = DEFAULT_GROUP_BY): string {
+  if (raw === null) return fallback
   if (raw === NONE_PARAM) return GROUP_BY_NONE
   if (raw.startsWith(TAG_PREFIX) && raw.length > TAG_PREFIX.length) return raw.slice(TAG_PREFIX.length)
   if (raw !== GROUP_BY_NONE && BUILT_INS.has(raw)) return raw
-  return DEFAULT_GROUP_BY
+  return fallback
 }
 
-/** The `?group=` value for `groupBy`, or `null` for the default (the param is then left out). */
-export function groupParamValue(groupBy: string): string | null {
-  if (groupBy === DEFAULT_GROUP_BY) return null
+/** The `?group=` value for `groupBy`, or `null` for the selection's default (the param is then left out). */
+export function groupParamValue(groupBy: string, fallback: string = DEFAULT_GROUP_BY): string | null {
+  if (groupBy === fallback) return null
   if (groupBy === GROUP_BY_NONE) return NONE_PARAM
   return isTagGroupBy(groupBy) ? `${TAG_PREFIX}${groupBy}` : groupBy
 }
@@ -87,7 +87,7 @@ export function offeredGroupBys(
 ): GroupByOption[] {
   return [
     { value: GROUP_BY_STATE, label: 'State', hint: 'Stopped, In progress, Queued, Draft, Done.' },
-    { value: GROUP_BY_FEATURE, label: 'Feature', hint: 'One section per feature, plus one per project for tasks with none.' },
+    { value: GROUP_BY_FEATURE, label: 'Feature', hint: 'One section per feature, plus one per project for the rest.' },
     { value: GROUP_BY_RECENCY, label: 'Recency', hint: 'Running now, Last hour, Today, This week, Older.' },
     ...(spansProjects
       ? [{ value: GROUP_BY_PROJECT, label: 'Project', hint: 'One section per project.' }]
@@ -110,8 +110,9 @@ export function resolveGroupBy(
   groupBy: string,
   options: readonly GroupByOption[],
   catalogAnswered: boolean,
+  fallback: string = DEFAULT_GROUP_BY,
 ): string {
   if (options.some(option => option.value === groupBy)) return groupBy
   if (isTagGroupBy(groupBy) && !catalogAnswered) return groupBy
-  return DEFAULT_GROUP_BY
+  return options.some(option => option.value === fallback) ? fallback : DEFAULT_GROUP_BY
 }

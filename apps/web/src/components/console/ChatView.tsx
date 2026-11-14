@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
@@ -6,14 +6,19 @@ import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import { apiDetail, get } from '../../api'
 import { useCan } from '../../auth'
+import { useStickToBottom } from '../../hooks/useStickToBottom'
+import { useSubmit } from '../../hooks/useSubmit'
 import type { PipelineTask } from '../../types'
 import { PHONE, PRE_WRAP_SX } from '../../ui/listStyles'
-import GateForm, { type GateAnswer } from '../tasks/GateForm'
-import { postRoundAnswer } from '../tasks/roundAnswer'
+import { FONT_WEIGHT, RADIUS, SIZE, grid } from '../../theme'
+import GateForm from '../tasks/GateForm'
+import type { RoundSend } from '../tasks/GateSteps'
+import { postRoundAnswers, throwIfRoundsFailed } from '../tasks/roundAnswer'
 import {
   EventRow,
   POLL_MS,
   eventsKey,
+  eventsPlaceholder,
   foldEvents,
   obj,
   readEvents,
@@ -29,14 +34,12 @@ import { sendRuntimeControl, type ConsoleRuntime, type RuntimeControlType } from
  * names and paths render WHOLE and wrap here too. Every disabled control carries its reason as visible text
  * (the CP's own copy from the runtime route), wired to the control by `aria-describedby`. */
 
-const BUTTON_SX = { flexShrink: 0, [PHONE]: { minHeight: 44 } } as const
+const BUTTON_SX = { flexShrink: 0, [PHONE]: { minHeight: SIZE.tapTarget } } as const
 /** The task's open questions are re-read at this cadence; a new `user_input_request` lands within it. */
 const QUESTIONS_POLL_MS = 3_000
 /** The steer route's own cap on `text`; the counter shows only within `COUNTER_FROM` of it. */
 const MESSAGE_MAX = 16_000
 const COUNTER_FROM = MESSAGE_MAX - 1_000
-/** How close to the bottom still counts as "following" the stream (auto-scroll on new events). */
-const STICK_PX = 48
 
 const SENT_COPY = 'Sent — the agent reads it on its next turn.'
 /** A provider that cannot steer mid-turn: the host queues the message as its next prompt (`acp/host.py::_on_intent`). */
@@ -84,13 +87,13 @@ function OperatorPrompt({ text, omitted }: { text: string; omitted: boolean }) {
         alignSelf: 'flex-end',
         maxWidth: '85%',
         minWidth: 0,
-        px: 1.25,
-        py: 0.75,
-        borderRadius: 1.5,
+        px: 1,
+        py: 0.5,
+        borderRadius: RADIUS.md,
         bgcolor: 'action.selected',
       }}
     >
-      <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary' }}>You</Typography>
+      <Typography variant="caption" sx={{ fontWeight: FONT_WEIGHT.semibold, color: 'text.secondary' }}>You</Typography>
       <Typography variant="body2" sx={[PRE_WRAP_SX, omitted && { color: 'text.secondary', fontStyle: 'italic' }]}>
         {text}
       </Typography>
@@ -137,12 +140,7 @@ export default function ChatView({ projectId, number, nodeId, runtime }: Props) 
   const openQuestions = (task?.questions ?? []).filter(q => q.status === 'open')
 
   // ── Follow the stream: scroll to the newest event unless the reader scrolled back. ──
-  const scrollRef = useRef<HTMLDivElement | null>(null)
-  const stickRef = useRef(true)
-  useEffect(() => {
-    const el = scrollRef.current
-    if (el && stickRef.current) el.scrollTop = el.scrollHeight
-  }, [events.length, openQuestions.length])
+  const follow = useStickToBottom<HTMLDivElement>([events.length, openQuestions.length])
 
   // ── Composer ──
   const [text, setText] = useState('')
@@ -180,21 +178,15 @@ export default function ChatView({ projectId, number, nodeId, runtime }: Props) 
     if (await send('steer', { text }, queues ? QUEUED_COPY : SENT_COPY)) setText('')
   }
 
-  // ── Open questions: the task page's answer form, posting the same per-round route. ──
-  const [answering, setAnswering] = useState(false)
-  const [answerError, setAnswerError] = useState('')
-  async function answerQuestion(answer: GateAnswer, questionId?: number, comment?: string, attachmentIds?: number[]) {
-    if (questionId === undefined) return
-    setAnswering(true)
-    setAnswerError('')
-    try {
-      const updated = await postRoundAnswer(taskId, answer, questionId, comment, attachmentIds)
+  // ── Open questions: the task page's paged answer form, sending the whole round in one call. ──
+  const { busy: answering, formError: answerError, run: runAnswer } = useSubmit()
+  async function sendRounds(sends: RoundSend[]) {
+    await runAnswer('Failed to send answers', async () => {
+      const { task: updated, results } = await postRoundAnswers(taskId, sends)
       client.setQueryData(['console-chat-task', taskId], updated)
-    } catch (err) {
-      setAnswerError(apiDetail(err, 'Failed to post answer'))
-    } finally {
-      setAnswering(false)
-    }
+      // Refused rounds stay open with their drafts; their reasons are the form's error.
+      throwIfRoundsFailed(results)
+    })
   }
 
   const busy = sending !== null
@@ -210,12 +202,9 @@ export default function ChatView({ projectId, number, nodeId, runtime }: Props) 
       sx={{ flex: 1, minHeight: 0, minWidth: 0, display: 'flex', flexDirection: 'column', bgcolor: 'background.paper' }}
     >
       <Box
-        ref={scrollRef}
+        ref={follow.ref}
         data-testid="console-chat-events"
-        onScroll={e => {
-          const el = e.currentTarget
-          stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < STICK_PX
-        }}
+        onScroll={follow.onScroll}
         sx={{
           flex: '1 1 auto',
           minHeight: 0,
@@ -225,19 +214,11 @@ export default function ChatView({ projectId, number, nodeId, runtime }: Props) 
           py: 1,
           display: 'flex',
           flexDirection: 'column',
-          gap: 0.75,
+          gap: 0.5,
           [PHONE]: { px: 1 },
         }}
       >
-        {eventsQuery.isError ? (
-          <Typography variant="body2" role="alert" sx={[PRE_WRAP_SX, { color: 'error.main' }]}>
-            {apiDetail(eventsQuery.error, 'Events failed to load')}
-          </Typography>
-        ) : eventsQuery.isPending ? (
-          <Typography variant="body2" sx={{ color: 'text.secondary' }}>Loading…</Typography>
-        ) : events.length === 0 ? (
-          <Typography variant="body2" sx={{ color: 'text.secondary' }}>No events yet.</Typography>
-        ) : (
+        {eventsPlaceholder(eventsQuery, events) ?? (
           rows.map(event => {
             const prompt = operatorPrompt(event)
             return prompt !== null
@@ -255,11 +236,10 @@ export default function ChatView({ projectId, number, nodeId, runtime }: Props) 
               task={task}
               submitting={answering}
               error={answerError || undefined}
-              // Never reached: with open rounds and `onAnswerQuestion` wired, GateForm answers per round.
+              // Never reached: with open rounds and `onSendRounds` wired, GateForm sends the round in one call.
               onSubmit={() => {}}
-              onAnswerQuestion={answerQuestion}
+              onSendRounds={sendRounds}
               readOnly={readOnly}
-              hideTaskHeader
             />
           </Box>
         )}
@@ -272,7 +252,7 @@ export default function ChatView({ projectId, number, nodeId, runtime }: Props) 
           e.preventDefault()
           if (!controlReason && !busy) void onSend()
         }}
-        sx={{ flexShrink: 0, borderTop: 1, borderColor: 'divider', px: 1.5, py: 1, display: 'flex', flexDirection: 'column', gap: 0.75, [PHONE]: { px: 1 } }}
+        sx={{ flexShrink: 0, borderTop: 1, borderColor: 'divider', px: 1.5, py: 1, display: 'flex', flexDirection: 'column', gap: 0.5, [PHONE]: { px: 1 } }}
       >
         {controlReason && <Reason id={controlReasonId} testId="console-chat-control-reason">{controlReason}</Reason>}
         <TextField
@@ -311,7 +291,7 @@ export default function ChatView({ projectId, number, nodeId, runtime }: Props) 
           </Typography>
         )}
         <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'flex-start' }}>
-          <Box sx={{ minWidth: 0, flex: '1 1 10rem' }}>
+          <Box sx={{ minWidth: 0, flex: `1 1 ${grid(26.5)}` }}>
             <Button
               type="submit"
               variant="contained"
@@ -328,7 +308,7 @@ export default function ChatView({ projectId, number, nodeId, runtime }: Props) 
               <Reason id={sendReasonId} testId="console-chat-send-reason">{queueNote}</Reason>
             )}
           </Box>
-          <Box sx={{ minWidth: 0, flex: '1 1 10rem', textAlign: 'right', [PHONE]: { textAlign: 'left' } }}>
+          <Box sx={{ minWidth: 0, flex: `1 1 ${grid(26.5)}`, textAlign: 'right', [PHONE]: { textAlign: 'left' } }}>
             <Button
               type="button"
               variant="outlined"

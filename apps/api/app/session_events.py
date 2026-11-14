@@ -13,8 +13,10 @@ parser's figures for it are refused at the transcript and live-usage routes."""
 from __future__ import annotations
 
 import json
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Iterable, Iterator, Literal, Optional, get_args
 
@@ -25,7 +27,7 @@ from sqlalchemy.orm import Session
 
 from app import edition_features, http_bounded
 from app import session_transcripts as transcripts
-from app.clock import as_utc
+from app.clock import utc_iso_z, utcnow
 from app.entity_shape import MAX_NAME as MAX_MODEL_NAME, StrictModel
 from app.model_prices import REPORTED_CUMULATIVE_COST, canonical_model, empty_usage
 from app.task_metrics_ingest import MAX_TOKEN_COUNT
@@ -168,8 +170,7 @@ class AgentEvent(StrictModel):
         """The stored line: every envelope field present (null when absent), `ts` in UTC — so two engines'
         streams read back in one identical shape."""
         line = self.model_dump(mode="json")
-        stamp = as_utc(self.ts)
-        line["ts"] = stamp.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        line["ts"] = utc_iso_z(self.ts, timespec="milliseconds")
         return line
 
 
@@ -186,6 +187,8 @@ class Where:
     started_at: datetime
     #: The chunks are files on the community edition's volume, not S3 objects (`session_transcript_archive.on_volume`).
     on_volume: bool = False
+    #: The session's org: part of every sealed-chunk cache key (`_SealedChunks`), so no read crosses tenants.
+    org_id: Optional[int] = None
 
 
 def where_for(row: Any, *, pin: bool = False) -> Optional[Where]:
@@ -214,6 +217,7 @@ def where_for(row: Any, *, pin: bool = False) -> Optional[Where]:
         session_id=row.agent_session_id,
         started_at=row.started_at,
         on_volume=stored_bucket == LOCAL_BUCKET,
+        org_id=row.org_id,
     )
 
 
@@ -246,11 +250,11 @@ def _send(where: Where, method: str, chunk: int, body: Optional[bytes] = None) -
         region=where.region,
         service="s3",
         credentials=where.credentials,
-        amz_date=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+        amz_date=utcnow().strftime("%Y%m%dT%H%M%SZ"),
         expires_seconds=_PRESIGN_EXPIRES_SECONDS,
     )
     try:
-        with httpx.Client(timeout=_TIMEOUT, follow_redirects=False) as client:
+        with http_bounded.client(_TIMEOUT) as client:
             request = client.build_request(method, url, content=body)
             request.headers.pop("content-type", None)
             presign.reject_forbidden_headers(request.headers.keys())
@@ -285,15 +289,58 @@ def _send_volume(method: str, key: str, body: Optional[bytes]) -> tuple[int, byt
         raise EventStorageUnavailable(f"{type(exc).__name__} during a {method} of the event stream's volume") from None
 
 
-def _read_chunk(where: Where, chunk: int, *, stored: bool) -> list[dict[str, Any]]:
-    """One chunk's events, in seq order. Without `s3:ListBucket` S3 answers a missing key with 403, so 403 and 404
-    both mean absent: empty for a chunk past the high-water mark (`stored=False`), an error for one the row says
-    holds events — read as empty, an ingest would overwrite it and lose them."""
-    status, content = _send(where, "GET", chunk)
-    if status in (403, 404) and not stored:
-        return []
-    if status != 200:
-        raise EventStorageUnavailable(f"S3 answered {status} for an event chunk")
+class _SealedChunks:
+    """A bounded, thread-safe LRU of sealed chunks' raw bytes, so the 1s live poll and a cold open stop re-fetching
+    chunks that can never change.
+
+    A chunk is sealed once every seq it can hold is at or below `events_last_seq`: ingest is gapless
+    (`check_contiguous`) and deduplicated on `seq` (`append`), so a full chunk is never rewritten. A chunk is cached
+    only when its bytes prove that too — exactly its `CHUNK_EVENTS` seqs — so the open (newest) chunk is always
+    re-read. The key is the object's whole identity (org, store, region, bucket, key); it sits below the route's
+    authorization, which runs on every request before any read."""
+
+    def __init__(self, *, max_chunks: int, max_bytes: int) -> None:
+        self.max_chunks = max_chunks
+        self.max_bytes = max_bytes
+        self._entries: OrderedDict[tuple[Any, ...], bytes] = OrderedDict()
+        self._bytes = 0
+        self._lock = threading.Lock()
+
+    def get(self, key: tuple[Any, ...]) -> Optional[bytes]:
+        with self._lock:
+            content = self._entries.get(key)
+            if content is not None:
+                self._entries.move_to_end(key)
+            return content
+
+    def put(self, key: tuple[Any, ...], content: bytes) -> None:
+        if len(content) > self.max_bytes:
+            return
+        with self._lock:
+            previous = self._entries.pop(key, None)
+            if previous is not None:
+                self._bytes -= len(previous)
+            self._entries[key] = content
+            self._bytes += len(content)
+            while len(self._entries) > self.max_chunks or self._bytes > self.max_bytes:
+                _, evicted = self._entries.popitem(last=False)
+                self._bytes -= len(evicted)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._bytes = 0
+
+
+_SEALED = _SealedChunks(max_chunks=64, max_bytes=32 * 1024 * 1024)
+
+
+def _sealed(chunk: int, last_seq: int) -> bool:
+    """Every seq `chunk` can hold is at or below `last_seq`."""
+    return (chunk + 1) * CHUNK_EVENTS <= last_seq
+
+
+def _parse_chunk(content: bytes) -> list[dict[str, Any]]:
     events = []
     for line in content.decode("utf-8", errors="replace").splitlines():
         if line.strip():
@@ -304,6 +351,32 @@ def _read_chunk(where: Where, chunk: int, *, stored: bool) -> list[dict[str, Any
             if isinstance(event, dict) and isinstance(event.get("seq"), int):
                 events.append(event)
     return sorted(events, key=lambda event: event["seq"])
+
+
+def _read_chunk(where: Where, chunk: int, *, stored: bool, sealed: bool = False) -> list[dict[str, Any]]:
+    """One chunk's events, in seq order. Without `s3:ListBucket` S3 answers a missing key with 403, so 403 and 404
+    both mean absent: empty for a chunk past the high-water mark (`stored=False`), an error for one the row says
+    holds events — read as empty, an ingest would overwrite it and lose them. `sealed` (the caller's `_sealed`)
+    lets a full chunk be served from, and kept in, `_SEALED`."""
+    cache_key: Optional[tuple[Any, ...]] = None
+    if sealed:
+        cache_key = (
+            where.org_id, where.on_volume, where.region, where.bucket,
+            transcripts.events_chunk_key(session_id=where.session_id, started_at=where.started_at, chunk=chunk),
+        )
+        cached = _SEALED.get(cache_key)
+        if cached is not None:
+            return _parse_chunk(cached)
+    status, content = _send(where, "GET", chunk)
+    if status in (403, 404) and not stored:
+        return []
+    if status != 200:
+        raise EventStorageUnavailable(f"S3 answered {status} for an event chunk")
+    events = _parse_chunk(content)
+    first = chunk * CHUNK_EVENTS + 1
+    if cache_key is not None and [event["seq"] for event in events] == list(range(first, first + CHUNK_EVENTS)):
+        _SEALED.put(cache_key, content)
+    return events
 
 
 def _write_chunk(where: Where, chunk: int, events: list[dict[str, Any]]) -> None:
@@ -340,7 +413,7 @@ def read(where: Where, *, last_seq: Optional[int], after: int, limit: int = READ
     out: list[dict[str, Any]] = []
     budget = READ_BYTES_LIMIT
     for chunk in range(chunk_of(after + 1), chunk_of(last_seq) + 1):
-        for event in _read_chunk(where, chunk, stored=True):
+        for event in _read_chunk(where, chunk, stored=True, sealed=_sealed(chunk, last_seq)):
             if event["seq"] <= after:
                 continue
             budget -= len(json.dumps(event, separators=(",", ":"), ensure_ascii=False))
@@ -355,7 +428,7 @@ def iter_all(where: Where, *, last_seq: Optional[int]) -> Iterator[dict[str, Any
     if not last_seq:
         return
     for chunk in range(0, chunk_of(last_seq) + 1):
-        yield from _read_chunk(where, chunk, stored=True)
+        yield from _read_chunk(where, chunk, stored=True, sealed=_sealed(chunk, last_seq))
 
 
 # ── Usage ───────────────────────────────────────────────────────────────────────────────────────────

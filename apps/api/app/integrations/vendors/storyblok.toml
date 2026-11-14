@@ -1,0 +1,60 @@
+slug = "storyblok"
+label = "Storyblok"
+category = "cms"
+vendor_docs_url = "https://www.storyblok.com/docs/api/management/getting-started/authentication"
+summary = "Headless CMS: agents read and manage stories, components and assets through the Management API."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "access_token", label = "Personal access token", kind = "secret", required = true, help = "In Storyblok, open My account > Account settings > Personal access tokens and select Generate New Token. Name it Jaah, set an expiry, choose the spaces it may reach and its scopes, then generate and copy it - Storyblok shows it once" },
+  { key = "api_host", label = "API host (by region)", kind = "text", required = true, default = "mapi", placeholder = "mapi", help = "Type the host name for the region your spaces are hosted in: mapi for the EU (the default), api-us for the United States, api-ca for Canada, api-ap for Australia - exactly those letters, not the region name. A space's region is shown in its Settings > General" },
+]
+
+[test]
+method = "GET"
+path = "https://{api_host}.storyblok.com/v1/spaces/"
+auth = { field = "access_token", header = "Authorization" }
+list_field = "spaces"
+
+[docs]
+agent_uses = [
+  "Create, edit and publish stories, including their nested blocks and translations",
+  "Read and change component schemas, for example to add a field a new page section needs",
+  "Upload and organize assets in the asset library",
+  "Audit a space: find unpublished changes, empty fields or missing translations",
+]
+prerequisites = [
+  "A Storyblok account with access to the spaces agents should work in",
+  "The region your spaces are hosted in (EU, US, Canada or Australia)",
+]
+limitations = [
+  "One secret reaches one region; spaces in another region need their own secret with that region's API host",
+  "Spaces in Storyblok's China region are not supported",
+  "A personal access token acts as you, limited to the spaces and scopes chosen when it was created, and it stops working on its expiry date",
+  "The Content Delivery API's space tokens (preview and public) are separate and not part of this integration",
+]
+
+[[docs.troubleshooting]]
+symptom = "Test says Storyblok rejected the personal access token (401)"
+fix = "The token was mistyped, revoked or has expired, or it is a space preview token rather than a personal access token. Generate a new one under My account > Account settings > Personal access tokens and select Replace on the secret"
+
+[[docs.troubleshooting]]
+symptom = "The test passes but lists none of my spaces, or an agent gets 404 for a space"
+fix = "API host does not match the region the space is hosted in, or the token was limited to other spaces. Check the space's region in Settings > General and set API host to match (mapi, api-us, api-ca or api-ap), or generate a token that includes the space"
+
+[[docs.troubleshooting]]
+symptom = "Test says Storyblok cannot be reached at that address"
+fix = "API host holds something other than mapi, api-us, api-ca or api-ap - for example the region name EU or a full URL. Enter just the host name for your region"
+
+[[docs.troubleshooting]]
+symptom = "An agent's requests fail with 429 Too Many Requests"
+fix = "The Management API allows a limited number of requests per second depending on your plan. Ask the agent to batch changes or slow down; the connection itself is fine"
+
+[[docs.faq]]
+q = "Can I use a space's preview or public token?"
+a = "No. Those tokens only read content through the Content Delivery API. Agents need a personal access token for the Management API to make changes"
+
+[[docs.faq]]
+q = "How do I revoke the token in Storyblok?"
+a = "Open My account > Account settings > Personal access tokens and delete the Jaah token. Agents lose access on their next call"

@@ -152,18 +152,15 @@ def _strip_managed_marker(text: str) -> str:
     return "\n".join(line for i, line in enumerate(lines) if i not in drop)
 
 
-def _applicator_owned_names(
-    port_vars: "list[str] | tuple[str, ...]", band: "dict[str, int] | None",
-) -> "set[str]":
+def _applicator_owned_names(port_vars: "list[str] | tuple[str, ...]") -> "set[str]":
     """Every name an APPLICATOR writes after `apply_managed_env` returns, and therefore every name the
-    marker must NOT record — DERIVED from the same two inputs, never a maintained list.
+    marker must NOT record — DERIVED from the declared `port_vars`, never a maintained list.
 
-    `apply_port_band`, `apply_stack_identity` and `apply_node_identity_env` run afterwards; withdrawing
-    one of their names later would delete a line an applicator owns (a warm stack's tier-2 port, or a
-    banded line whose `localhost:<old>` rewrite would lose its old value). Not `captured`: a declared
-    tier-2 var blank or absent in `.env.example` is not captured and would slip into the marker."""
+    `apply_auto_ports`, `apply_stack_identity` and `apply_node_identity_env` run afterwards; withdrawing
+    one of their names later would delete a line an applicator owns (a warm stack's port). Not
+    `captured`: a declared port var blank or absent in `.env.example` is not captured and would slip into
+    the marker."""
     owned = {str(v).strip() for v in (port_vars or []) if str(v).strip()}
-    owned |= {str(v).strip() for v in (band or {}) if str(v).strip()}
     owned.add("NODE_ID")
     owned.add("COMPOSE_PROJECT_NAME")
     return owned
@@ -230,7 +227,7 @@ def _withdraw_managed_env(wt: str) -> None:
 
 def apply_managed_env(
     wt: str, env_vars: "dict | None", *, n: "int | str" = 1,
-    port_vars: "list[str] | tuple[str, ...]" = (), band: "dict[str, int] | None" = None,
+    port_vars: "list[str] | tuple[str, ...]" = (),
 ) -> None:
     """REBUILD a pool slot's `.env` from `.env.example` and lay the control plane's configured variables
     over it, preserving the values a bare re-copy would strand. `.env` is DERIVED on every claim.
@@ -242,25 +239,21 @@ def apply_managed_env(
       1. CAPTURE the values the rebuild would strand (the preserve set below).
       2. REBUILD: the file becomes `.env.example`, verbatim.
       3. OVERLAY `values`, then REMOVE every `omit` name (`_remove_env_keys`: removal, not blanking).
-      4. RE-INJECT the captured values LAST, so they beat a tab value (a tab value on a tier-2 port var
+      4. RE-INJECT the captured values LAST, so they beat a tab value (a tab value on a port var
          would otherwise move a port a warm stack is bound to — worktree-pool-policy.md §Ports).
       5. RECORD `# jaah-managed: NAME,…` — the names left holding a TAB value.
-    Runs before the applicators (`apply_port_band` etc.), so band ports, `COMPOSE_PROJECT_NAME` and
+    Runs before the applicators (`apply_auto_ports` etc.), so node-assigned ports, `COMPOSE_PROJECT_NAME` and
     `NODE_ID` still win. `NODE_TOKEN`/`NODE_NAME` are not re-derived, so names are held to
     `_port_var_name_ok` (the node is the last line).
 
-    Preserve set, DERIVED: declared `port_vars` the band does not name, plus `NODE_ID` (handed no id,
+    Preserve set, DERIVED: every declared `port_vars` entry, plus `NODE_ID` (handed no id,
     `apply_node_identity_env` leaves the key alone, so a rebuild would otherwise keep a blank seed).
     `DEV_NODE_ID`/`DEV_NODE_TOKEN` deliberately not preserved (re-run `./dc seed --dev`).
 
-    Every refusal leaves `.env` exactly as it was: slot 0 (the main clone, an operator's file); no
-    `.env.example`; no `.env` (the writer would create it `0664` under the umask); `values`/`omit` of
+    Every refusal leaves `.env` exactly as it was: no `.env.example`; no `.env` (the writer would create it `0664` under the umask); `values`/`omit` of
     the wrong type (unparseable is not an empty catalogue); an unreadable or over-cap current `.env`;
-    and a rebuilt text over the read cap (`_set_env_vars` would then refuse the band). Names logged,
+    and a rebuilt text over the read cap (`_set_env_vars` would then refuse the port write). Names logged,
     values never."""
-    if str(n) == "0":
-        # Slot 0 is the main clone — the operator's own `.env`. First, so it covers the withdrawal too.
-        return
     # `None` only, not `if not env_vars`: an emptied catalogue sends `{"values": {}, "omit": []}`, which
     # IS a rebuild with an empty overlay (a removed tab variable reverts to `.env.example`).
     if env_vars is None:
@@ -356,16 +349,14 @@ def apply_managed_env(
             "than rebuilding over values this pass could not capture", env_path, exc,
         )
         return
-    # DERIVED, and derived from the same two inputs `apply_port_band` derives its own tier-2 split from,
-    # so the two cannot drift: declared `port_vars` minus the names the CP's band covers.
+    # DERIVED from the same input `apply_auto_ports` walks, so the two cannot drift: every declared port var.
     declared = [str(v).strip() for v in (port_vars or []) if str(v).strip()]
-    banded = {str(v).strip() for v in (band or {})}
-    preserve = [v for v in dict.fromkeys(declared) if v not in banded]
+    preserve = list(dict.fromkeys(declared))
     preserve.append("NODE_ID")
     captured: dict[str, str] = {}
     for name in sorted(dict.fromkeys(preserve)):
         # EMPTY IS NOT CAPTURED. A blank here is the example's own seed surviving from a slot that has
-        # never been banded or never been given a node identity — re-injecting it would only write the
+        # never been assigned a port or never been given a node identity — re-injecting it would only write the
         # value the rebuild is about to lay down anyway, and for a port var it would look to
         # `apply_auto_ports` like a declared var holding a NON-PORT value and earn a spurious warning.
         current = _env_raw_value(current_text, name)
@@ -395,13 +386,13 @@ def apply_managed_env(
     text = env_file._apply_env_assignments(text, {k: captured[k] for k in sorted(captured)})
     # The marker, always the last line, MINUS every name an applicator writes afterwards (argued at
     # `_applicator_owned_names`). No names ⇒ no marker.
-    marker_keys = set(values) - _applicator_owned_names(port_vars, band)
+    marker_keys = set(values) - _applicator_owned_names(port_vars)
     if marker_keys:
         text = (text if text.endswith("\n") or not text else text + "\n") + _managed_marker_line(marker_keys)
     if len(text) >= env_file._MAX_ENV_BYTES:
-        # THE NEXT LINE IN `claim_mechanics` IS `apply_port_band`, and `_set_env_vars` WARNS AND RETURNS
+        # THE NEXT LINE IN `claim_mechanics` IS `apply_auto_ports`, and `_set_env_vars` WARNS AND RETURNS
         # on a file this size rather than raising. So writing this would not merely make an awkward
-        # `.env` — it would silently disarm the band, and `_set_env_vars`'s own docstring names that
+        # `.env` — it would silently disarm the port assignment, and `_set_env_vars`'s own docstring names that
         # outcome: "every slot claimed in this window binds the SAME host ports".
         log.warning(
             "apply_managed_env: %s would rebuild to %d bytes, at or past the %d-byte cap this module can "

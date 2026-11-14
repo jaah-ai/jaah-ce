@@ -16,7 +16,6 @@ fine and warns; each sentence names the mechanism that wins (for `DATABASE_URL` 
 """
 from __future__ import annotations
 
-import base64
 import json
 import re
 from typing import Any, Literal, NamedTuple, Optional
@@ -28,33 +27,37 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import jaah_repos
 from app.actors import stamp_actor
-from app.auth import require_user
 from app.authz.catalog import permission_key
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller
+from app.authz.object_access import require_project_key
 from app.authz.visibility import task_roster_select
-from app.authz.visibility import has_project_key
+from app.b64url import unb64url
 from app.credential_crypto import KEY_ENV as _CREDENTIAL_ENCRYPTION_KEY_VAR
 from app.credential_keys import LOCAL_KEY_ENV as _CREDENTIAL_LOCAL_PRIVATE_KEY_VAR
 from app.credentials.registry import type_label
-from app.db import get_session
+from app.db_async import on_session
 from app.db_credentials import URL_VAR as _DATABASE_URL_VAR
-from app.entity_shape import StrictModel, constraint_name, flush_or_409, get_or_404
+from app.entity_shape import StrictModel, constraint_name, flush_or_409, from_row, get_or_404
 from app.models.credentials import Credential
 from app.models.identity import AdminUser
 from app.models.projects import (
+    PORT_PREFERRED_MAX,
+    PORT_PREFERRED_MIN,
     PROJECT_ENV_VAR_NAME_RE,
     PROJECT_ENV_VAR_SOURCE_CREDENTIAL,
     PROJECT_ENV_VAR_SOURCE_LITERAL,
+    PROJECT_ENV_VAR_SOURCE_PORT,
     Project,
     ProjectEnvVar,
 )
-from app.port_grid import range_starts
 from app.project_identity import project_or_404
-from app.project_env import RowStatus, resolve_rows
+from app.project_env import RowStatus, port_specs, resolve_rows
 # `literal`/`description` are bound parameters, and psycopg's CHECK/NOT NULL text includes `Failing row
 # contains (…)` even under `hide_parameters=True` — R10 forbids that reaching a log, so every write spans it.
+from app import port_grid
 from app.routes.credentials.credential_wire import _scrubbed_write
 from app.user_activity import record_write
 
@@ -151,8 +154,8 @@ def _is_a_jwt(value: str) -> bool:
             if len(header) < 8 or len(parts[index + 1]) < 8 or len(parts[index + 2]) < 8:
                 continue
             try:
-                claims = json.loads(base64.urlsafe_b64decode(header + "=" * (-len(header) % 4)))
-            except ValueError:
+                claims = json.loads(unb64url(header))
+            except (ValueError, RecursionError):
                 continue
             if isinstance(claims, dict) and ("alg" in claims or "typ" in claims):
                 return True
@@ -182,13 +185,21 @@ def _refuse_an_unstorable_literal(body: "EnvVarWriteIn") -> None:
     must reach this (`test_every_write_verb_calls_the_secret_literal_guard`), including
     `routes/agent_project_settings.py::_operator_write_body`. The message names the credential arm as
     the way forward."""
-    if body.source == PROJECT_ENV_VAR_SOURCE_LITERAL:
+    if body.port_preferred is not None and body.source != PROJECT_ENV_VAR_SOURCE_PORT:
+        raise HTTPException(status_code=422, detail="only a Port variable takes a preferred port")
+    if body.source == PROJECT_ENV_VAR_SOURCE_PORT:
+        if body.literal is not None or body.credential_id is not None or body.credential_field is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="a Port variable takes no value: the node picks a free port for each slot",
+            )
+        if body.user_id is not None:
+            raise HTTPException(status_code=422, detail=_PORT_PROJECT_ONLY)
+    elif body.source == PROJECT_ENV_VAR_SOURCE_LITERAL:
         if body.literal is None:
             raise HTTPException(status_code=422, detail="source 'literal' requires a literal")
         if body.credential_id is not None or body.credential_field is not None:
-            raise HTTPException(
-                status_code=422, detail="source 'literal' takes no credential_id or credential_field"
-            )
+            raise HTTPException(status_code=422, detail="source 'literal' takes no credential_id or credential_field")
     else:
         if body.literal is not None:
             raise HTTPException(status_code=422, detail="source 'credential' takes no literal")
@@ -201,9 +212,7 @@ def _refuse_an_unstorable_literal(body: "EnvVarWriteIn") -> None:
     if literal is None:
         return
     if len(literal) > _LITERAL_MAX_LEN:
-        raise HTTPException(
-            status_code=422, detail=f"a literal must be at most {_LITERAL_MAX_LEN} characters"
-        )
+        raise HTTPException(status_code=422, detail=f"a literal must be at most {_LITERAL_MAX_LEN} characters")
     if not _is_one_line(literal):
         raise HTTPException(
             status_code=422,
@@ -226,6 +235,13 @@ def _refuse_an_unstorable_literal(body: "EnvVarWriteIn") -> None:
             "log before it was refused, so treat the value as exposed and rotate it."
         ),
     )
+
+
+#: Why a per-user Port variable, or a per-user override of one, is refused.
+_PORT_PROJECT_ONLY = (
+    "a Port variable is set for the whole project: the node gives every slot its own port, so there is "
+    "nothing for a personal override to change"
+)
 
 
 # ── The names that are written by something else, and what writes each ────────────────────────────────
@@ -264,21 +280,9 @@ _WARN_CREDENTIAL_LOCAL_PRIVATE_KEY = (
     f"(dc:42) so that a per-command override still works. So a value set here is NOT overwritten: it "
     f"takes effect and re-keys the wrapping of every stored secret, making each of them unopenable."
 )
-_WARN_PORT_BAND = (
-    "The port-band applicator (`apply_port_band`) assigns {name} from this project's grid band on every "
-    "claim, after this catalogue is applied, so a value set here is overwritten and never reaches the "
-    "stack."
-)
 _WARN_PORT_AUTO = (
-    "The tier-2 auto-port re-inject (`apply_auto_ports`) assigns {name} on every claim, after this "
+    "The node's port assignment (`apply_auto_ports`) assigns {name} on every claim, after this "
     "catalogue is applied, so a value set here is overwritten and never reaches the stack."
-)
-# A grid var this project does not declare is assigned by nothing, so the operator's value takes effect
-# unchecked against the grid — warned like `DATABASE_URL`, not like a banded port.
-_WARN_PORT_UNDECLARED = (
-    "{name} is a tier-1 grid var for this org, but this project does not declare it in `port_vars` — so "
-    "no applicator assigns it and a value set here is NOT overwritten. It takes effect, and nothing "
-    "checks it against the node's port grid, so it can collide with another slot on the same host."
 )
 
 #: The fixed half of the warned-name list, name → sentence. The port halves are per project.
@@ -295,24 +299,13 @@ _FIXED_WARNINGS: dict[str, str] = {
 
 
 def _warned_names(session: Session, project: Project) -> dict[str, str]:
-    """`{NAME: the sentence naming what wins instead}` for one project.
+    """`{NAME: the sentence naming what wins instead}` for one project. Never applied to a Port row itself
+    (`_serialize`): the node writing that name is the row's whole meaning.
 
-    The port half is read live per org via `range_starts` (not `SEED_RANGE_STARTS`; not `grid()`, which
-    can raise `GridUnavailable`). Tier 1 vs 2 is the band's complement, as
-    `worktree_mechanics.ports.apply_auto_ports`. On a collision the fixed sentence wins (e.g. `DATABASE_URL`
-    declared in `port_vars`)."""
-    grid = set(range_starts(session, project.org_id))
-    declared = list(project.port_vars or ())
-    # The band is `fleet_decide.port_band`'s: the declared `port_vars` when any, else the whole grid — so
-    # an undeclared grid var is banded by nothing.
-    banded = (grid & set(declared)) if declared else grid
-    warnings = {name: _WARN_PORT_BAND.format(name=name) for name in sorted(banded)}
-    for name in sorted(grid - banded):
-        warnings[name] = _WARN_PORT_UNDECLARED.format(name=name)
-    for name in declared:
-        if name in banded:
-            continue
-        warnings[name] = _WARN_PORT_AUTO.format(name=name)
+    The port half is the project's Port variables (`port_specs`): the node assigns each of them a port on every
+    claim (`worktree_mechanics.ports.apply_auto_ports`), so a plain row of the same name is overwritten. On a
+    collision the fixed sentence wins."""
+    warnings = {spec.name: _WARN_PORT_AUTO.format(name=spec.name) for spec in port_specs(session, project.id)}
     warnings.update(_FIXED_WARNINGS)
     return warnings
 
@@ -339,9 +332,11 @@ class EnvVarOut(BaseModel):
     name: str
     user_id: Optional[UUID] = None
     scope: Literal["project", "user"]
-    source: Literal["literal", "credential"]
+    source: Literal["literal", "credential", "port"]
     literal: Optional[str] = None
     credential: Optional[EnvVarCredentialOut] = None
+    # A Port row's preferred host port; None on a Port row = auto-assigned per slot.
+    port_preferred: Optional[int] = None
     status: str
     status_detail: Optional[str] = None
     winning: bool
@@ -360,10 +355,12 @@ class EnvVarWriteIn(StrictModel):
     # in `_refuse_an_unstorable_literal`.
     name: str
     user_id: Optional[UUID] = None
-    source: Literal["literal", "credential"]
+    source: Literal["literal", "credential", "port"]
     literal: Optional[str] = None
     credential_id: Optional[UUID] = None
     credential_field: Optional[str] = Field(default=None, max_length=256)
+    # `source='port'` only: the port the node tries first; None = auto-assigned per slot.
+    port_preferred: Optional[int] = Field(default=None, ge=PORT_PREFERRED_MIN, le=PORT_PREFERRED_MAX)
     description: str = Field(default="", max_length=1024)
 
     @field_validator("name")
@@ -421,14 +418,13 @@ def _authorize_tier(
     task's launcher or 403s.
     """
     if user_id is None:
-        if not has_project_key(principal, _EDIT_KEY, project_id):
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    f"{_EDIT_KEY} on this project is required to write a project-level environment "
-                    f"variable; any holder of {_VIEW_KEY} may set their own override instead"
-                ),
-            )
+        require_project_key(
+            principal, _EDIT_KEY, project_id,
+            detail=(
+                f"{_EDIT_KEY} on this project is required to write a project-level environment "
+                f"variable; any holder of {_VIEW_KEY} may set their own override instead"
+            ),
+        )
         return
     if user_id != actor.id:
         raise HTTPException(
@@ -474,9 +470,7 @@ def _usable_credential_or_422(
     Only the PROJECT's org's credentials: `project_env_vars.credential_id` is same-org keyed, so an
     operator naming its own org's credential on a tenant project gets this 422, not the key's 500."""
     if principal is None:
-        raise HTTPException(
-            status_code=403, detail="a credential reference needs a session principal to resolve under"
-        )
+        raise HTTPException(status_code=403, detail="a credential reference needs a session principal to resolve under")
     # Narrowed to columns: the entity would decrypt `config`, and before `_scrubbed_write` an
     # undecryptable row would raise an unscrubbed 500.
     usable = task_roster_select(principal, project.id).where(
@@ -503,7 +497,7 @@ def _flush_or_conflict(session: Session) -> None:
     (`flush_or_409`), its CHECKs a 422.
 
     Only the constraint name is matched, never the error text (hence the named constraints in
-    `migrations/versions/202610251700_baseline.py`). Only `IntegrityError` is handled; everything else (including
+    `migrations/versions/202611130100_baseline.py`). Only `IntegrityError` is handled; everything else (including
     NUL's `DataError`) is re-raised for `_scrubbed_write`."""
     try:
         flush_or_409(
@@ -566,18 +560,14 @@ def _serialize(
             type_label=type_label(held.type) if held is not None else None,
             field=row.credential_field or "",
         )
-    return EnvVarOut(
-        id=row.id,
-        name=row.name,
-        user_id=row.user_id,
+    return from_row(
+        EnvVarOut, row,
         scope="project" if row.user_id is None else "user",
-        source=row.source,  # type: ignore[arg-type]
-        literal=row.literal,
         credential=credential,
         status=status.status if status is not None else "unknown",
         status_detail=status.detail if status is not None else None,
         winning=bool(status.winning) if status is not None else False,
-        warning=warned.get(row.name),
+        warning=None if row.source == PROJECT_ENV_VAR_SOURCE_PORT else warned.get(row.name),
         description=row.description or "",
     )
 
@@ -640,7 +630,47 @@ def _activity_data(row: ProjectEnvVar, credential: Optional["_CredentialRef"]) -
     if row.source == PROJECT_ENV_VAR_SOURCE_CREDENTIAL:
         data["credential_name"] = credential.name if credential is not None else None
         data["credential_field"] = row.credential_field
+    if row.source == PROJECT_ENV_VAR_SOURCE_PORT:
+        data["port_preferred"] = row.port_preferred
     return data
+
+
+def _refuse_an_override_of_a_port(session: Session, project_id: int, name: str, user_id: Optional[UUID]) -> None:
+    """422 for a personal override named like one of the project's Port variables: the node writes that name
+    into every slot after the catalogue, so the override would never take effect."""
+    if user_id is None:
+        return
+    if any(spec.name == name for spec in port_specs(session, project_id)):
+        raise HTTPException(status_code=422, detail=_PORT_PROJECT_ONLY)
+
+
+#: Names the node owns in a slot's `.env` (`worktree_mechanics.ports._PORT_VAR_RESERVED_NAMES`, which refuses the
+#: whole claim on one) — and every name another applicator writes (`_FIXED_WARNINGS`): never a port.
+_NODE_OWNED_NAMES = frozenset({"NODE_ID", "NODE_NAME", "NODE_TOKEN"})
+
+
+def _refuse_an_unusable_port(
+    session: Session, project: Project, name: str, source: str, preferred: Optional[int]
+) -> None:
+    """422 for a Port variable the node cannot serve: a name something else writes, or a preferred port inside the
+    org's auto-assign range, which the node hands to other slots."""
+    if source != PROJECT_ENV_VAR_SOURCE_PORT:
+        return
+    if name.upper() in _NODE_OWNED_NAMES or name in _FIXED_WARNINGS:
+        raise HTTPException(
+            status_code=422, detail=f"{name} is set by Jaah on every slot, so it cannot be a Port variable",
+        )
+    if preferred is None:
+        return
+    floor, ceiling = (port_grid.scalars(project.org_id)[key] for key in ("auto_port_floor", "auto_port_ceiling"))
+    if floor <= preferred <= ceiling:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"port {preferred} is in the auto-assign range ({floor}-{ceiling}), which Jaah hands to other "
+                "slots; pick a port outside it, or let Jaah assign one"
+            ),
+        )
 
 
 def _changed_from(
@@ -649,7 +679,7 @@ def _changed_from(
     """What an UPDATE moved, for the audit row — shape 2, the before/after pair.
 
     Read off the row before the assignments, since nothing else holds the old values; this is the shape
-    `app/activity_kinds.py` claims for these sites. The credential is recorded as an id (joinable, no
+    `tests/test_activity_kinds.py` claims for these sites. The credential is recorded as an id (joinable, no
     extra read). Empty when nothing moved."""
     changed: dict = {}
     if before_name != row.name:
@@ -687,6 +717,8 @@ def create_env_var(
     so R2/D11 and R3 are unbypassable from either surface."""
     _authorize_tier(principal, actor, project.id, body.user_id)
     _refuse_an_unstorable_literal(body)
+    _refuse_an_override_of_a_port(session, project.id, body.name, body.user_id)
+    _refuse_an_unusable_port(session, project, body.name, body.source, body.port_preferred)
     credential = (
         _usable_credential_or_422(
             session, principal, project, body.credential_id, project_default=body.user_id is None
@@ -703,6 +735,7 @@ def create_env_var(
         literal=body.literal,
         credential_id=body.credential_id,
         credential_field=body.credential_field,
+        port_preferred=body.port_preferred,
         org_id=project.org_id,
     )
     stamp_actor(row, actor, created=True)
@@ -751,6 +784,8 @@ def update_env_var(
             ),
         )
     _refuse_an_unstorable_literal(body)
+    _refuse_an_override_of_a_port(session, project.id, body.name, row.user_id)
+    _refuse_an_unusable_port(session, project, body.name, body.source, body.port_preferred)
     credential = (
         _usable_credential_or_422(
             session, principal, project, body.credential_id, project_default=row.user_id is None
@@ -767,6 +802,7 @@ def update_env_var(
         row.literal = body.literal
         row.credential_id = body.credential_id
         row.credential_field = body.credential_field
+        row.port_preferred = body.port_preferred
         stamp_actor(row, actor)
         _flush_or_conflict(session)
         out = _rows_out(
@@ -820,28 +856,28 @@ def delete_env_var(
 
 @router.get("/{project_id}/env-vars", response_model=list[EnvVarOut])
 @feature("projects", "view", object_type="project", object_params=("project_id",))
+@on_session
 def list_project_env_vars(
+    session: Session,
     project_id: int,
-    actor: AdminUser = Depends(require_user),
-    _principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> list[EnvVarOut]:
     """The whole catalogue for this project, at both tiers.
 
     Every user's overrides (D20 relaxed visibility; authority stays in `_authorize_tier`). `winning` is
     resolved for the caller."""
     project = project_or_404(session, project_id, "no such project")
-    return _rows_out(session, project, _catalogue(session, project_id), actor.id)
+    return _rows_out(session, project, _catalogue(session, project_id), caller.actor.id)
 
 
 @router.get("/{project_id}/env-vars/preview", response_model=list[EnvVarOut])
 @feature("projects", "view", object_type="project", object_params=("project_id",))
+@on_session
 def preview_project_env_vars(
+    session: Session,
     project_id: int,
     user_id: Optional[UUID] = Query(default=None),
-    actor: AdminUser = Depends(require_user),
-    _principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> list[EnvVarOut]:
     """What this project's catalogue contributes to a slot resolved for `user_id` — the CP-managed set
     and nothing else.
@@ -851,7 +887,7 @@ def preview_project_env_vars(
     caller; any other id is admitted without a 404 (D20 already serves every override, and a 404 would
     probe the user id space)."""
     project = project_or_404(session, project_id, "no such project")
-    viewer_id = user_id if user_id is not None else actor.id
+    viewer_id = user_id if user_id is not None else caller.actor.id
     statuses = resolve_rows(session, project_id, viewer_id)
     rows = [
         row
@@ -867,50 +903,54 @@ def preview_project_env_vars(
 
 @router.post("/{project_id}/env-vars", response_model=EnvVarOut, status_code=201)
 @feature("projects", "view", object_type="project", object_params=("project_id",))
+@on_session
 def create_project_env_var(
+    session: Session,
     project_id: int,
     body: EnvVarWriteIn,
-    actor: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> EnvVarOut:
     """Declare a variable — a project default (needs `projects:edit`) or the caller's own override.
 
     The HTTP shell: lookup, 404, and the shared `create_env_var`."""
+    # Inline, so the write's delegation to `create_env_var` stays visible in this handler's own source
+    # (`tests/test_project_env_routes.py`'s guard census reads it off the AST).
     project = project_or_404(session, project_id, "no such project")
-    return create_env_var(session, project, body, actor, principal)
+    jaah_repos.refuse_member_edit(session, project_id, caller.actor, caller.principal)
+    return create_env_var(session, project, body, caller.actor, caller.principal)
 
 
 @router.put("/{project_id}/env-vars/{env_var_id}", response_model=EnvVarOut)
 @feature("projects", "view", object_type="project", object_params=("project_id",))
+@on_session
 def update_project_env_var(
+    session: Session,
     project_id: int,
     env_var_id: UUID,
     body: EnvVarWriteIn,
-    actor: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> EnvVarOut:
     """Edit a variable in place.
 
     The HTTP shell: lookups, 404s, and the shared `update_env_var`."""
+    # Inline, as the create's (its comment says why).
     project = project_or_404(session, project_id, "no such project")
-    row = get_or_404(session, ProjectEnvVar, env_var_id, detail=_NO_SUCH_ROW, where=(ProjectEnvVar.project_id == project_id,))
-    return update_env_var(session, project, row, body, actor, principal)
+    jaah_repos.refuse_member_edit(session, project_id, caller.actor, caller.principal)
+    row = get_or_404(session, ProjectEnvVar, env_var_id, detail=_NO_SUCH_ROW,
+                     where=(ProjectEnvVar.project_id == project_id,))
+    return update_env_var(session, project, row, body, caller.actor, caller.principal)
 
 
 @router.delete("/{project_id}/env-vars/{env_var_id}", status_code=204)
 @feature("projects", "view", object_type="project", object_params=("project_id",))
+@on_session
 def delete_project_env_var(
-    project_id: int,
-    env_var_id: UUID,
-    actor: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    session: Session, project_id: int, env_var_id: UUID, caller: AsyncCaller = Depends(current_caller),
 ) -> Response:
     """Remove a variable. Same authority as the write: a project default needs `projects:edit`, an
     override is its own user's. The HTTP shell over the shared `delete_env_var`; answers 204."""
     project = project_or_404(session, project_id, "no such project")
+    jaah_repos.refuse_member_edit(session, project_id, caller.actor, caller.principal)
     row = get_or_404(session, ProjectEnvVar, env_var_id, detail=_NO_SUCH_ROW, where=(ProjectEnvVar.project_id == project_id,))
-    delete_env_var(session, project, row, actor, principal)
+    delete_env_var(session, project, row, caller.actor, caller.principal)
     return Response(status_code=204)

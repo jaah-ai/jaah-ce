@@ -3,13 +3,14 @@
 // glyph pair, one button style, one naming rule ("<Verb> <noun>"), so the two panes read as one system.
 import IconButton from '@mui/material/IconButton'
 import { CloseIcon, MaximizeIcon, RestoreIcon } from '../ui/icons'
+import { FONT_SIZE, LINE_HEIGHT, RADIUS, SIZE } from '../theme'
 
 /** Every pane header button: the console's chevrons, ↻, ⚙, ▦, ⚡ and these two. */
 export const paneHeaderButtonSx = {
-  minWidth: '2rem',
-  fontSize: '1rem',
-  lineHeight: 1,
-  borderRadius: 1,
+  minWidth: SIZE.thumb,
+  fontSize: FONT_SIZE.lg,
+  lineHeight: LINE_HEIGHT.tight,
+  borderRadius: RADIUS.sm,
   color: 'text.secondary',
   '&:hover:not(:disabled)': { color: 'text.primary' },
   '&:disabled': { color: 'text.disabled' },
@@ -27,7 +28,7 @@ export function MaximizeButton({
 }) {
   const label = `${maximized ? 'Restore' : 'Maximize'} ${noun}`
   return (
-    <IconButton sx={paneHeaderButtonSx} onClick={onToggle} aria-label={label} title={label}>
+    <IconButton sx={paneHeaderButtonSx} onClick={onToggle} aria-label={label}>
       {maximized ? <RestoreIcon /> : <MaximizeIcon />}
     </IconButton>
   )
@@ -35,7 +36,7 @@ export function MaximizeButton({
 
 export function CloseButton({ noun, onClose }: { noun: string; onClose: () => void }) {
   return (
-    <IconButton sx={paneHeaderButtonSx} onClick={onClose} aria-label={`Close ${noun}`} title={`Close ${noun}`}>
+    <IconButton sx={paneHeaderButtonSx} onClick={onClose} aria-label={`Close ${noun}`}>
       <CloseIcon />
     </IconButton>
   )

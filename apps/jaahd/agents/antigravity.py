@@ -22,7 +22,7 @@ import agent_providers
 
 from . import antigravity_keyring
 from .antigravity_login_pty import STATUS_REJECTED
-from .base import LoginAdapterBase, credential_file_present
+from .base import SMALL_CREDENTIAL_MAX_BYTES, LoginAdapterBase, credential_file_present
 
 # The phishing anchor: Google's authorize endpoint, pinned through this CLI's public OAuth client id, the
 # same prefix the control plane holds (this provider's `Capabilities.authorize_url_anchor`). Not the `v2/auth`
@@ -30,11 +30,6 @@ from .base import LoginAdapterBase, credential_file_present
 _AUTH_URL_RE = re.compile(
     r"https://accounts\.google\.com/o/oauth2/auth\?access_type=offline&client_id="
     r"1071006060591-tmhssin2h21lcre235vtolojh4g403ep\.apps\.googleusercontent\.com&\S+")
-
-# The SHAPE of the one-time code the consent page shows (`antigravity.google/oauth-callback`), for grepping
-# logs and transcripts to prove no code landed there — never used to read one. Google's authorization-code
-# form: `4/0A` then ~70 URL-safe base64 characters (measured on one real code).
-AUTH_CODE_SHAPE_RE = re.compile(r"4/0A[0-9A-Za-z_-]{40,}")
 
 # The driver, run by the session user's interpreter. Beside this file in the package (root-owned, 0644).
 _DRIVER = str(Path(__file__).resolve().with_name("antigravity_login_pty.py"))
@@ -44,7 +39,7 @@ _TERM = "xterm-256color"
 
 # Read bound for `credential_present`: the token file is small; the bound stops a planted file from
 # making the daemon allocate at will (read one byte over).
-_MAX_CREDENTIAL_BYTES = 256 * 1024
+_MAX_CREDENTIAL_BYTES = SMALL_CREDENTIAL_MAX_BYTES
 
 
 class AntigravityLoginAdapter(LoginAdapterBase):

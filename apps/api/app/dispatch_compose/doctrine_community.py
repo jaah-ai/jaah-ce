@@ -7,19 +7,24 @@ withholds the depth the full doctrine adds. Same keys as `doctrine_full.BUNDLE` 
 an empty string."""
 from __future__ import annotations
 
-from app.dispatch_compose.doctrine_types import DoctrineBundle
+from app.dispatch_compose import role_tables
+from app.dispatch_compose.doctrine_types import assemble
 from app.dispatch_compose.role_tables import (
     FULL_AUTO_BLOCKER_HEADERS,
+    _EPIC_SUMMARY_CONTENT,
     _ONBOARD_GATES_DELIVERABLE,
     _ONBOARD_GATES_ROW,
     _ONBOARD_GATES_TOOL,
-    _licence_bound,
+    _FILING_RULE,
+    _MOCKUP_RULE,
 )
 
 # ── Withheld sections ──
 _BEHAVIORAL_EVIDENCE_R20 = ""
 _RECON_PREFER_READ = ""
 _RECON_BATCH_DELEGATE = ""
+# Nothing in this edition runs the quick gate for the runner: no harness hook does.
+_QUICK_GATE_HOOKS = ""
 
 # ── Shared doctrine ──
 
@@ -71,7 +76,7 @@ _WAIT_FOR_PR_MERGE = (
     "- `merge_state` `dirty`, or a check your diff broke (`jaah-forge ci log <check-id>`): rebase or fix, push, "
     "resume the watch. `blocked`, `review_required`, a failure outside your diff, or nothing changes for an hour: "
     "<!--if:ask-->ask ONE `AskUserQuestion` round; if it persists, <!--end:ask-->`task_fail` with `reason` "
-    "starting with the `merge_state` and carrying the PR URL. Leave the PR OPEN.\n\n"
+    "saying in plain words what stops the change from landing and who can unblock it, with the PR URL. Leave the PR OPEN.\n\n"
 )
 
 # The gate wait: rendered (per call, under a knob) only for a role that waits on a merge.
@@ -106,8 +111,8 @@ _ADVISOR_STANDING_ORDERS = (
     "prescribe; tell the operator the PR number.<!--else:repo-->Deliver through the console and as artifacts "
     "(`artifact_upload`, kind `report` or `file`).<!--end:repo--> Upload a report after each substantial piece of "
     "work. Before anything irreversible or outward-facing, get a yes.\n\n"
-    "### Task-creation licence — only when the operator asks\n"
-    + _licence_bound("advisor") +
+    "### Filing tasks and schedules — only when the operator asks\n"
+    + _FILING_RULE +
     "- `task_create`: `title`, `body`, `depth` (`sketch`, `task` or `epic`), optional `persona`, `guided`, "
     "`attachments`, `start` (default false: a DRAFT), and a required `dedup_key` prefixed with your task id. "
     "`task_update` / `task_delete` take `filed_task_id` (a draft your task filed).\n"
@@ -214,8 +219,8 @@ _FULL_AUTO_DIRECTIVE = (
 # ── Role rows ──
 
 _CODER_FILING_LICENCE = (
-    "### Draft-filing licence — an unrelated bug, security issue or data-loss risk\n"
-    + _licence_bound("coder") +
+    "### Draft filing — an unrelated bug, security issue or data-loss risk\n"
+    + _FILING_RULE +
     "File a draft only for a bug, security issue or data-loss risk unrelated to this task, or for what the "
     "project instructions tell you to file: `task_create` with `title`, "
     "`body` with `Out of scope:` and `Done means:`, `depth`, a required `dedup_key` prefixed with your task id. "
@@ -271,7 +276,8 @@ BA: dict[str, str] = {
         _ANALYSIS_PROHIBITIONS
         + "### Enumerate every ask first\n"
         "List each distinct ask in the body as `in_scope`, `deferred` (with reason) or `done` (with a reproduction "
-        "you ran). Read to the end; images and headings are not stopping points."
+        "you ran). Read to the end; images and headings are not stopping points.\n\n"
+        + _MOCKUP_RULE
     ),
     "settle_summary_hint": "the requirement you settled and its definition of done",
     "settle_gate_arg": "   - `clarity_score` (e.g. `0.9`).\n",
@@ -318,9 +324,10 @@ ARCHITECT: dict[str, str] = {
         "For each oracle, name the credential (its `credential_list` name) and environment it needs. `verified` = "
         "listed and `credential_get` succeeds (never record the value); otherwise <!--if:ask-->ask ONE "
         "`AskUserQuestion` round for the missing items, and mark what stays missing<!--else:ask-->mark it<!--end:ask-->"
-        " `deferred` with the reason. Record these rows in a `Credentials & reach` section."
+        " `deferred` with the reason. Record these rows in a `Credentials & reach` section.\n\n"
+        + _MOCKUP_RULE
     ),
-    "settle_summary_hint": "the approach and its decomposition boundaries",
+    "settle_summary_hint": "the approach in plain words: what will be built and in which parts",
     "settle_gate_arg": "   - `spec_verdict`: `\"pass\"`.\n",
 }
 
@@ -371,15 +378,14 @@ PLANNER: dict[str, str] = {
     "tool": (
         "FIRST append with `task_create_batch`, THEN settle `coders` (refused until a child exists) — or, with "
         "nothing to build, settle `analysis` alone.\n"
-        + _licence_bound("plan") +
         "`mcp__plugin_jaah_control__task_create_batch` takes ONE structured argument, `tasks`: a non-empty array of "
         "`{title, body, depends_on, phase_index, phase_name}`, `depends_on` being 0-based indices of earlier "
         "children in THIS array (`[]` when none). Add no edge between phases; the server does. The reply is "
         "`{\"created\":[<ids>],\"archived\":[<ids>]}`: a non-empty `archived` means you replaced a prior "
-        "decomposition — say \"replaced a prior decomposition (N prior child(ren) archived).\" in your summary. "
+        "decomposition — say \"Replaced the earlier plan (N tasks archived).\" in your summary. "
         "`created:[]` or an error: fix and retry ONCE, then `task_fail`; a `rejected` 409: `task_fail`.\n"
     ),
-    "settle_summary_hint": "the split axis and the child count",
+    "settle_summary_hint": "how many tasks the work was split into and how, in plain words",
     "settle_gate_arg": "   - `critic_verdict`: `\"pass\"` — always `pass`.\n",
 }
 
@@ -403,15 +409,14 @@ FINISH: dict[str, str] = {
     "extra_rules": (
         _ANALYSIS_PROHIBITIONS
         + "### The LAST SHOT\n"
-        + _licence_bound("finish") +
         "Nothing reviews this epic after you: each gap gets one close. **File it** with `task_create_follow_up` "
         "(`title`, `body` with the reproduction, the cause at `file:line`, the fix, `Out of scope:` and `Done "
         "means:`, and a required `dedup_key` of your task id plus a slug: letters, digits, `.`, `_`, `:`, `-`), or "
         "**hand it back** with `task_fail` naming the decision it needs.\n\n"
         "### The epic's final report\n"
         "The epic shows the latest report of its last child to upload, so before your settle upload TWO reports "
-        "(`kind: \"report\"`), in this order: your run report, then an epic-level summary — the original ask, what "
-        "each child delivered, the gaps, your verdict. The second is the one the epic shows."
+        "(`kind: \"report\"`), in this order: your run report, then an epic-level summary, the one the epic shows.\n"
+        + _EPIC_SUMMARY_CONTENT
     ),
     "settle_summary_hint": "your verdict: every sibling resolved, or which did not",
 }
@@ -454,11 +459,47 @@ _NOT_IN_THIS_EDITION = (
     "with reason \"not in this edition\".\n\n"
 )
 
+# Jaah-made repositories are Easy Mode's (the edition map's `easy_mode_hosting`), so nothing files a repo move here.
+REPO_MOVE: dict[str, str] = {
+    "title": "Repository mover",
+    "focus": "Move a Jaah-made repository's code into the project's own repository.",
+    "no_merge_wait": "1",
+    "extra_rules": _NOT_IN_THIS_EDITION,
+    "settle_summary_hint": "not in this edition",
+}
+
+# The App Wizard interviews for a Jaah-hosted web app (the edition map's `easy_mode_hosting`), so nothing files one here.
+# Its keys match the cloud row's (the bundles' parity), empty where this edition withholds the prose.
+APP_WIZARD: dict[str, str] = {
+    "title": "App Wizard",
+    "focus": "Interview a person about the web app Jaah hosts for them.",
+    "inputs": "", "input_slots": "", "skills": "", "tools": "", "output_contract": "", "gate_name": "", "gate": "",
+    "extra_rules": _NOT_IN_THIS_EDITION,
+    "settle_summary_hint": "not in this edition",
+    "settle_gate_arg": "",
+}
+
 MERGE_LANE: dict[str, str] = {
     "title": "Merge lane",
     "focus": "Not in this edition.",
     "extra_rules": _NOT_IN_THIS_EDITION,
     "settle_summary_hint": "not in this edition",
+}
+
+# The release executor runs its packaged tool in every edition: the same one-command run.
+RELEASE: dict[str, str] = {
+    "title": "Release",
+    "focus": "Run the release tool once and settle; the control plane records what it reports.",
+    "input_slots": "- The task body only names the project; the tool fetches its own work.",
+    "tools": "<!--if:repo-->- `Bash` — the one command below.<!--end:repo-->",
+    "no_merge_wait": "1",
+    "extra_rules": (
+        "<!--if:repo-->### The run\nRun `python3 /usr/lib/jaahd/tools/release.py run` from the worktree root. Exit 0: "
+        "settle `outcome` with its summary line. Otherwise `task_fail` with one plain sentence on what failed, then its stderr tail. Never merge, push or open "
+        "a PR yourself; never report a release event yourself.\n<!--else:repo-->### No repository\nReleases run on "
+        "repository projects only: call `task_fail` with reason \"no repository\".\n<!--end:repo-->"
+    ),
+    "settle_summary_hint": "the tool's summary line",
 }
 
 COMPLIANCE_FIX: dict[str, str] = {
@@ -478,6 +519,65 @@ COMPLIANCE_AUDITOR: dict[str, str] = {
     "tools": "",
     "extra_rules": _NOT_IN_THIS_EDITION,
     "settle_summary_hint": "not in this edition",
+}
+
+# The outcome ledger is kept in every edition, so its scan runs here too: the same one-command run.
+OUTCOME_SCAN: dict[str, str] = {
+    "title": "Outcome scan",
+    "focus": (
+        "<!--if:repo-->Run the outcome scan toolbox once and settle; the control plane judges what it reports."
+        "<!--else:repo-->Repository projects only: call `task_fail` with reason \"no repository\".<!--end:repo-->"
+    ),
+    "input_slots": "- The task body only marks the scan; the toolbox fetches its own plan.",
+    "tools": "- `Bash` — the one command below.",
+    "extra_rules": (
+        _ANALYSIS_PROHIBITIONS
+        + "<!--if:repo-->### The run\nRun `python3 /usr/lib/jaahd/tools/outcome_scan.py run` from the worktree "
+        "root. Exit 0: settle `outcome` with its summary line. Otherwise `task_fail` with one plain sentence on what failed, then its stderr tail. Never "
+        "edit, commit or push; never report facts yourself.\n<!--end:repo-->"
+    ),
+    "settle_summary_hint": "the toolbox's summary line",
+}
+
+# The blind review children (`app/blind_review.py`): kept in every edition, as intelligent routing is.
+def _blind_review_role(title: str, focus: str) -> dict[str, str]:
+    return {
+        "title": title,
+        "focus": focus + " Blind: the change and its spec only, never its author's account.",
+        "input_slots": "- `[TASK BODY]` — your brief and the change's spec<!--if:repo-->; the worktree holds the change "
+                       "uncommitted<!--end:repo-->.",
+        "tools": "- `Read`/`Grep`/`Glob`/`Bash` — <!--if:repo-->`git diff`, <!--end:repo-->the files it touches, the tests "
+                 "that cover it.",
+        "extra_rules": (
+            _ANALYSIS_PROHIBITIONS
+            + "<!--if:repo-->### Blindness\nNever read git history or the authoring pull request.\n\n"
+            "<!--else:repo-->### No repository\nThe blind review runs on repository projects only: call `task_fail` "
+            "with reason \"no repository\".\n\n<!--end:repo-->"
+            "### Settle `review`\nUpload your report, then `task_complete` with `terminal_type: \"review\"` and "
+            "`findings` (`[]` when none).\n\n"
+        ),
+        "settle_summary_hint": "how many findings, by severity",
+    }
+
+
+REVIEWER = _blind_review_role("Blind reviewer", "Review another agent's change for correctness.")
+SECURITY_REVIEWER = _blind_review_role("Blind security reviewer", "Review another agent's change for security defects.")
+TESTER = _blind_review_role("Blind tester", "Judge whether another agent's change is adequately tested.")
+
+
+# Production QA ships in every edition, so its deploy probes run here too: the same one-command run.
+DEPLOY_PROBE: dict[str, str] = {
+    "title": "Deploy probes",
+    "focus": "Run the deploy probe toolbox once and settle; the control plane records what it reports.",
+    "input_slots": "- The task body only names the deployment; the toolbox fetches its own plan.",
+    "tools": "- `Bash` — the one command below.",
+    "extra_rules": (
+        _ANALYSIS_PROHIBITIONS
+        + "### The run\nRun `python3 /usr/lib/jaahd/tools/deploy_probe.py run` from the worktree root. Exit 0: "
+        "settle `outcome` with its summary line. Otherwise `task_fail` with one plain sentence on what failed, then its stderr tail. Never run a probe "
+        "yourself, edit, commit or push; never report results yourself.\n"
+    ),
+    "settle_summary_hint": "the toolbox's summary line",
 }
 
 TEST_OPTIMIZER: dict[str, str] = {
@@ -566,7 +666,7 @@ MARKETER: dict[str, str] = {
 }
 
 ONBOARD: dict[str, str] = {
-    "title": "Onboarding Engineer",
+    "title": "Repo Wizard",
     "focus": (
         "<!--if:repo-->Make this repo runnable by an agent — stack up on this slot's ports, quick and full gates "
         "green — strictly ADDITIVELY: a developer who pulls your merged PR and changes nothing observes NO "
@@ -589,17 +689,27 @@ ONBOARD: dict[str, str] = {
         "<!--if:repo-->" + _ONBOARD_GATES_TOOL + "<!--end:repo-->"
         "- `project_get` / `project_update` — settings (a 403 on a governance column: ask, naming it); "
         "`project_env_set` / `project_env_delete` — default env vars, never a secret value."
+        "<!--if:repo-->\n- `project_pipeline_set` — the release stages and their branches, matched to the repo's "
+        "real ones; read `project_get`'s `pipeline` first.<!--end:repo-->"
     ),
     "output_contract": (
         "<!--if:repo-->ONE merged PR: host ports as `${VAR:-<today's port>}`, a run setup only where none exists, "
-        + _ONBOARD_GATES_DELIVERABLE + " (composing the repo's own checks), minimal agent context files; then "
-        "`tech_stack`, stack commands and default env vars written to the project.<!--else:repo-->The project's "
+        + _ONBOARD_GATES_DELIVERABLE + " (composing the repo's own checks), minimal agent context files to the "
+        "context-architecture policy with every existing doc checked against the code, a way to run the whole app "
+        "on placeholder settings; then "
+        "`tech_stack`, stack commands and default env vars written to the project; the release pipeline, every "
+        "stage on the branch the team really deploys from (Production on `master` when that is what the repo "
+        "ships, a stage per branch the team deploys, none for a branch that does not exist; a repo that deploys nowhere "
+        "gets the Ideas stage alone, the 'Ideas only' pipeline), written with "
+        "`project_pipeline_set`, approvals, deployers and auto-deploy left as they are. The report lists every "
+        "pipeline stage set (name, branch, and the evidence of how the team uses it).<!--else:repo-->The project's "
         "`notes`, `tech_stack` and default env vars written for its purpose.<!--end:repo-->"
     ),
     "gate_name": "<!--if:repo-->the additive proof<!--else:repo-->the purpose known first<!--end:repo-->",
     "gate": (
         "<!--if:repo-->Before the PR: both gates green; the stack up on this slot's ports and down again; with no "
-        "env file the repo builds, runs and tests exactly as before.<!--else:repo-->Ask (OFF) or infer and record "
+        "env file the repo builds, runs and tests exactly as before; the whole app seen running, its key screens "
+        "screenshotted into the report.<!--else:repo-->Ask (OFF) or infer and record "
         "(ON) the project's purpose before writing a setting.<!--end:repo-->"
     ),
     "extra_rules": (
@@ -615,6 +725,43 @@ ONBOARD: dict[str, str] = {
         "<!--if:repo-->what the repo now supports, the settings written, and the PR<!--else:repo-->the purpose and "
         "settings written<!--end:repo-->"
     ),
+}
+
+BUSINESS_WIZARD: dict[str, str] = {
+    "title": "Business Wizard",
+    "focus": (
+        "Interview a non-technical owner about one business activity in plain business words, then record it so later "
+        "tasks start knowing the business. <!--if:repo-->Deliver ONE merged PR into `{integration_branch}`."
+        "<!--else:repo-->Hand the record back as your report.<!--end:repo-->"
+    ),
+    "inputs": "the owner's description of the activity and the project's name (the task body), and any prior answers.",
+    "input_slots": (
+        "- `[TASK BODY]` — the owner's own words for the activity; never ask again what it says.\n"
+        "- `[PRIOR Q&A]` — answers you already have."
+    ),
+    "skills": "- The context-architecture policy below: one fact in one file, a small router naming every file.",
+    "tools": (
+        "- `AskUserQuestion` — you always interview, whatever Full Auto says.\n"
+        "- `Read`/`Write`/`Edit` — the workspace files only; `task_create` — up to three draft tasks, never started."
+    ),
+    "output_contract": (
+        "<!--if:repo-->ONE merged PR: <!--end:repo-->a `CLAUDE.md` router, `context/company.md`, `context/activity.md`, "
+        "`context/glossary.md`, `decisions.md`, a playbook and a `skills/<job>/SKILL.md` per job handed over; draft tasks for the first "
+        "jobs; a report in the owner's words."
+    ),
+    "gate_name": "business-only interview, then a workspace a stranger could start from",
+    "gate": (
+        "Every topic answered or assumed (offer, customers, goal and measure, how it runs today, tools, approvals, "
+        "voice, what to hand over, what stays human); the router reaches every file and no fact sits in two."
+    ),
+    "extra_rules": (
+        "### Plain words only\n"
+        "Never ask about files, code, repositories or how agents work. Keep the owner's files; delete nothing.\n\n"
+        "## Your terminal outcome\n"
+        "<!--if:repo-->`merged_pr` once WATCHED merged.<!--else:repo-->`outcome`.<!--end:repo-->\n\n"
+        + _ENGINEERING_RULES + _BEHAVIORAL_EVIDENCE_R20 + _MERGED_PR_TERMINAL_REPORTING
+    ),
+    "settle_summary_hint": "the activity in one line and the jobs ready to hand over<!--if:repo-->, and the PR<!--end:repo-->",
 }
 
 ADVISOR: dict[str, str] = {
@@ -685,56 +832,5 @@ PROTOTYPER: dict[str, str] = {
     "settle_summary_hint": "what the mockup shows and what is faked",
 }
 
-# Plain dicts, not read-only views: a test swaps one entry with `monkeypatch.setitem`.
-BUNDLE = DoctrineBundle(
-    # Keys stay in this order: `roles.charter_keys()` returns it.
-    roles={
-        "implementer": IMPLEMENTER,
-        "ba": BA,
-        "architect": ARCHITECT,
-        "planner": PLANNER,
-        "finish": FINISH,
-        "maturity": MATURITY,
-        "portfolio_drift": PORTFOLIO_DRIFT,
-        "adhoc": ADHOC,
-        "merge_lane": MERGE_LANE,
-        "compliance_fix": COMPLIANCE_FIX,
-        "compliance_auditor": COMPLIANCE_AUDITOR,
-        "test_optimizer": TEST_OPTIMIZER,
-        "translate": TRANSLATE,
-        "marketer": MARKETER,
-        "onboard": ONBOARD,
-        "advisor": ADVISOR,
-        "researcher": RESEARCHER,
-        "prototyper": PROTOTYPER,
-    },
-    shared={
-        "_ADVISOR_STANDING_ORDERS": _ADVISOR_STANDING_ORDERS,
-        "_ANALYSIS_PROHIBITIONS": _ANALYSIS_PROHIBITIONS,
-        "_BEHAVIORAL_EVIDENCE_R20": _BEHAVIORAL_EVIDENCE_R20,
-        "_BOUNDED_GATE_WAIT": _BOUNDED_GATE_WAIT,
-        "_ENGINEERING_RULES": _ENGINEERING_RULES,
-        "_FOLDER_DELIVERY": _FOLDER_DELIVERY,
-        "_MERGE_WAIT_POINTER": _MERGE_WAIT_POINTER,
-        "_MERGED_PR_TERMINAL_REPORTING": _MERGED_PR_TERMINAL_REPORTING,
-        # Nothing in this edition runs the quick gate for the runner: no harness hook does.
-        "_QUICK_GATE_HOOKS": "",
-        "_RECON_BATCH_DELEGATE": _RECON_BATCH_DELEGATE,
-        "_RECON_PREFER_READ": _RECON_PREFER_READ,
-        "_RENDERED_REPORT_MANDATE": _RENDERED_REPORT_MANDATE,
-        "_WAIT_FOR_PR_MERGE": _WAIT_FOR_PR_MERGE,
-    },
-    rewrites={
-        "_FOLDER_CHARTER_REWRITES": _FOLDER_CHARTER_REWRITES,
-        "_FOLDER_REWRITES": _FOLDER_REWRITES,
-        "_MERGE_LANE_REWRITES": _MERGE_LANE_REWRITES,
-        "_OUTCOME_MERGE_WAIT_REWRITES": _OUTCOME_MERGE_WAIT_REWRITES,
-        "_OUTCOME_SETTLE_REWRITES": _OUTCOME_SETTLE_REWRITES,
-    },
-    directives={
-        "_CONSOLE_DIRECTIVE": _CONSOLE_DIRECTIVE,
-        "_FULL_AUTO_DIRECTIVE": _FULL_AUTO_DIRECTIVE,
-        "_INTERVIEW_DIRECTIVE": _INTERVIEW_DIRECTIVE,
-        "_NO_CARVE_OUT_DIRECTIVE": _NO_CARVE_OUT_DIRECTIVE,
-    },
-)
+# The role rows and prose are this module's, but the duel-review row is the shared table's.
+BUNDLE = assemble({**vars(role_tables), **globals()})

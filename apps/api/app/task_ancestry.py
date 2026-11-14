@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.models.identity import AdminUser
 from app.models.tasks import Task
+from app.task_source import CONSOLE
 
 log = logging.getLogger("app.task_ancestry")
 
@@ -60,7 +61,7 @@ def task_and_ancestors(session: Session, task_id: Optional[int]):
     log.warning(
         "task-ancestry: gave up walking parents from task_id=%s after %s hops — no assignee found (the "
         "alert falls to the creator chain, then the pinned recipient), no owner found (an alert falls "
-        "to the pinned recipient), no epic found (a question is referred to nobody), no launcher found "
+        "to the pinned recipient), no launcher found "
         "(dispatch treats the task as unrestricted), and no starter found (git access is refused, or "
         "falls to the system credential for a machine-filed row)",
         task_id, MAX_OWNER_WALK_HOPS,
@@ -80,14 +81,21 @@ def launcher_user_id(session: Session, task_id: Optional[int]) -> Optional[UUID]
 
     A starter outside the task's own org is passed over for the creator: grants resolve inside the
     principal's org, so a cross-tenant Start would otherwise empty the roster and env of a tenant task, or
-    lend it another org's credentials."""
+    lend it another org's credentials.
+
+    A schedule, trigger or automation filed row with no usable starter runs as its project's "Run jobs as" person
+    (`git_access.automated_run_as`), never its creator; the creator chain is read there only when that names
+    nobody (an org with no live Owner/Admin), since None would leave the task unrestricted."""
+    from app import git_access
+
     starter = starter_user_id(session, task_id)
+    task = session.get(Task, task_id) if task_id is not None else None
     if starter is not None:
-        task = session.get(Task, task_id)
         user = session.get(AdminUser, starter)
         if task is None or user is None or user.org_id == task.org_id:
             return starter
-    return creator_user_id(session, task_id)
+    run_as = git_access.automated_run_as(session, task) if task is not None else None
+    return run_as if run_as is not None else creator_user_id(session, task_id)
 
 
 def creator_user_id(session: Session, task_id: Optional[int]) -> Optional[UUID]:
@@ -99,10 +107,14 @@ def creator_user_id(session: Session, task_id: Optional[int]) -> Optional[UUID]:
     deeper would make the walk exhaust to None).
 
     No last-resort human here: that pin would attribute every creator-less task to one human."""
+    return _nearest_human(session, task_id, "created_by_id")
+
+
+def _nearest_human(session: Session, task_id: Optional[int], attr: str) -> Optional[UUID]:
+    """The nearest ancestor's non-null, non-`is_system` user on column `attr`, or None."""
     for task in task_and_ancestors(session, task_id):
-        if task.created_by_id is None:
-            continue
-        user = session.get(AdminUser, task.created_by_id)
+        user_id = getattr(task, attr)
+        user = session.get(AdminUser, user_id) if user_id is not None else None
         if user is not None and not user.is_system:
             return user.id
     return None
@@ -117,7 +129,7 @@ def starter_user_id(session: Session, task_id: Optional[int]) -> Optional[UUID]:
     the column prevents. A `coder` child inherits from the epic one hop up; nesting deeper would refuse.
 
     `is_system` is excluded: the seeded actor holds no credential, so a chain naming only it reads as
-    machine-filed, which `git_access.py` refuses (except a cron-filed row, via its cron owner)."""
+    machine-filed, which `git_access.py` refuses (except an automation-filed row, via its project's Run jobs as)."""
     return first_human_starter(session, started_by_chain(session, task_id))
 
 
@@ -153,8 +165,8 @@ def executor_user_id(session: Session, task_id: Optional[int]) -> Optional[UUID]
 
     The starter wins because the person who ran the task is the one acting through it: an advisor one
     human created and another started files as the starter. A chain nobody started (a cron-fired task)
-    falls to its creator, the cron owner. None leaves the filed row unattributed, as a chain naming no
-    human always did."""
+    falls to its project's Run jobs as (`launcher_user_id`). None: the chain names no human, and the filed row is the
+    system actor's (`actors.stamp_dirty_task_actors` stamps it, so no task is ever unattributed)."""
     return launcher_user_id(session, task_id)
 
 
@@ -170,10 +182,47 @@ def assignee_user_id(session: Session, task_id: Optional[int]) -> Optional[UUID]
 
     No last-resort human here: the alert path (`notify_targets._task_owner`) decides who hears about a
     None, and it names nobody."""
+    return _nearest_human(session, task_id, "assigned_to_id") or creator_user_id(session, task_id)
+
+
+#: The provenance columns that mark a row a machine filed: a schedule, a trigger, an automation, an API key
+#: or another task's runner. `source` (`app/task_source.py`) is read beside them.
+_MACHINE_ORIGIN_COLUMNS = (
+    "created_by_cron_id", "created_by_trigger_id", "created_by_automation_id", "created_by_api_key_id",
+    "created_by_task_id",
+)
+
+
+def machine_origin(session: Session, task_id: Optional[int]) -> Optional[str]:
+    """Why this task's chain was started by a machine, or None when a person started it in the console.
+
+    The loop guard for the doors that make work run with nobody watching (a running task, a schedule, a
+    trigger, an automation): a task a schedule, trigger, automation or another agent filed may not open
+    one, so no chain of them can feed itself. Any row up the bounded walk counts, so an epic a cron filed
+    makes all its children machine-started. Conservative by design: a draft an agent filed stays
+    machine-started even after a person presses Start on it.
+
+    This is what keeps the work graph finite now that every persona may file every shape
+    (`persona_registry.TASK_CREATION_LICENCE`), replacing the old "no persona that a cron or trigger files
+    holds a cron or trigger licence" acyclicity: every unattended edge (a started filing, a schedule, a
+    trigger, a runnable system task) starts at a person, and anything downstream of a machine may only file
+    drafts, which wait on a person's Start. The pipeline's own fan-out (a plan's children, a finish follow-up)
+    is bounded by its endpoints' path checks, not by this.
+
+    Fails closed where the bounded walk ends with a parent still unread: an origin past the bound is unknown,
+    so it reads as a machine's. Accepted residuals: deleting the filing task nulls `created_by_task_id`, so a
+    row it filed loses that marker (its `source` stays); and a person's own API-key filing is not marked, since
+    tasks filed through the public API carry no machine column."""
+    read: set[int] = set()
+    last: Optional[Task] = None
     for task in task_and_ancestors(session, task_id):
-        if task.assigned_to_id is None:
-            continue
-        user = session.get(AdminUser, task.assigned_to_id)
-        if user is not None and not user.is_system:
-            return user.id
-    return creator_user_id(session, task_id)
+        read.add(task.id)
+        last = task
+        for column in _MACHINE_ORIGIN_COLUMNS:
+            if getattr(task, column, None) is not None:
+                return f"task {task.id} was filed by {column.removeprefix('created_by_').removesuffix('_id').replace('_', ' ')}"
+        if task.source != CONSOLE:
+            return f"task {task.id} came from {task.source!r}"
+    if last is not None and last.parent_task_id is not None and last.parent_task_id not in read:
+        return f"task {task_id}'s chain is deeper than the walk bound ({MAX_OWNER_WALK_HOPS} tasks)"
+    return None

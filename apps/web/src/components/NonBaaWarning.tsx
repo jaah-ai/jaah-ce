@@ -6,6 +6,7 @@ import { currentOrgId, useAuth } from '../auth'
 import { useSubmit } from '../hooks/useSubmit'
 import { isOrgAdminSeat } from '../lib/orgAdmin'
 import Banner from '../ui/Banner'
+import { SIZE } from '../theme'
 
 /* THE NON-BAA WARNING: in a HIPAA org, every surface whose vendor has no BAA on file says so at
  * the point of use. The warned set is the server's (`Admin.hipaa_warnings`, from `app/hipaa.py::SURFACES` minus
@@ -72,7 +73,7 @@ export function NonBaaWarning({ surface }: { surface: NonBaaSurface | null }): J
             disabled={busy}
             onClick={() => void acknowledge(orgId ?? '', surface)}
             data-testid="non-baa-acknowledge"
-            sx={{ ml: 1, minHeight: 32, verticalAlign: 'baseline' }}
+            sx={{ ml: 1, minHeight: SIZE.thumb, verticalAlign: 'baseline' }}
           >
             Acknowledge
           </Button>

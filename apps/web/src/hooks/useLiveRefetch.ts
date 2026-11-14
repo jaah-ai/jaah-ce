@@ -1,7 +1,8 @@
 import { createContext, useContext, useEffect, useRef } from 'react'
 import { useDebouncedCallback } from './useDebouncedCallback'
 import type { ConsoleEvent, UseEventStream } from './useEventStream'
-import { isPageHidden, useHiddenDeferral } from './useHiddenDeferral'
+import { isPollingPaused } from '../lib/pollGate'
+import { useHiddenDeferral } from './useHiddenDeferral'
 
 const LIVE_REFETCH_DEBOUNCE_MS = 150
 const LIVE_REFETCH_MAX_WAIT_MS = 1000
@@ -9,6 +10,9 @@ const LIVE_REFETCH_MAX_WAIT_MS = 1000
 // R9: while the stream is `down`, live events have stopped, so a live view polls REST at this rate until it recovers —
 // the board and the open task page alike. 30s matches Nodes.tsx, so the console polls at one rate.
 export const STREAM_DOWN_POLL_MS = 30_000
+/** A view that refreshes on stream events still re-reads this often while the stream is up: an event a writer never
+ *  sent, or a state that changes with time alone (a node read offline after its reconnect grace), heals here. */
+export const STREAM_SAFETY_POLL_MS = 5 * 60_000
 
 /* QUIET actions: frequent machinery signals that change one figure, not a row's state — a running task's
    `metered` usage arrives every few minutes per runner (`app/routes/agent_sessions.py::report_live_usage`), and
@@ -56,8 +60,9 @@ export function useEventsSinceSeen(
 // throttle: the first event refetches at once, later ones at most once per `minIntervalMs`. Both callbacks
 // are read at fire time (latest closure), so the interval is keyed on the stream state alone and never
 // re-armed by a render. `actions` narrows to those actions only, and is the one way to hear a QUIET action.
-// `match` narrows further by the event itself (e.g. its `id`), read at fire time. A HIDDEN TAB refetches nothing:
-// the refetch is deferred to its return (`useHiddenDeferral`) and the down-stream poll skips its ticks.
+// `match` narrows further by the event itself (e.g. its `id`), read at fire time. A PAUSED PAGE (`lib/pollGate.ts`:
+// hidden, idle or rate-limited) refetches nothing: the refetch is deferred to the resume (`useHiddenDeferral`) and the
+// down-stream poll skips its ticks.
 export function useLiveRefetch(
   stream: UseEventStream,
   refetch: () => void,
@@ -113,7 +118,7 @@ export function useLiveRefetch(
   useEffect(() => {
     if (streamState !== 'down' || pollMs === null) return
     const timer = setInterval(() => {
-      if (!isPageHidden() && !pausedRef.current) pollRef.current()
+      if (!isPollingPaused() && !pausedRef.current) pollRef.current()
     }, pollMs)
     return () => clearInterval(timer)
   }, [streamState, pollMs])

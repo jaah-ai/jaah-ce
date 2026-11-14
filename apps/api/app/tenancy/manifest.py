@@ -27,8 +27,11 @@ from app.models import (
     control_plane,
     credentials,
     governance,
+    hosted_apps,
     hosting,
+    jaah_repos,
     identity,
+    integrations,
     merge_lane,
     metering,
     node_groups,
@@ -37,12 +40,21 @@ from app.models import (
     notifications,
     operator_dashboard,
     orgs,
+    placement_groups,
+    production_qa,
+    products,
+    outcomes,
     projects,
+    releases,
+    review,
+    routing,
     support,
     tenant_email,
     task_extras,
     task_templates,
     tasks,
+    trackers,
+    webhooks,
     worktrees,
 )
 from app.models.base import Base
@@ -147,20 +159,27 @@ class Derived(Verdict):
                 f"these pairs (app/tenancy/manifest.py::Derived): {columns} vs "
                 f"{tuple(p.__name__ for p in parents)}"
             )
-        return tuple(zip(columns, parents))
+        return tuple(zip(columns, parents, strict=False))
 
 
 @dataclass(frozen=True)
 class Shared(Verdict):
-    """Genuinely shared across every org, by design rather than by omission.
+    """Genuinely shared across every org, by design rather than by omission."""
 
-    `legacy_org_id`: the table LEFT the tenant-owned set while the outgoing release still reads its
-    `org_id`, so the database keeps delivering that column — with its composite key and org-inherit
-    trigger, which fill it — until the contraction revision drops it. The model maps no `org_id` and the
-    seam filters nothing; the org-column censuses (`test_tenancy_org_column.py`,
-    `tests/test_tenancy_org_schema.py`) excuse exactly these tables, and nothing else."""
 
-    legacy_org_id: bool = False
+def _project(reason: str, *, on_delete: str, null_is_legitimate: bool) -> SameOrg:
+    """A `project_id` reference held to its row's org: the census's most common second reference."""
+    return SameOrg("project_id", projects.Project, on_delete, null_is_legitimate, reason)
+
+
+def _credential(reason: str, *, on_delete: str, null_is_legitimate: bool) -> SameOrg:
+    """A `credential_id` reference held to its row's org."""
+    return SameOrg("credential_id", credentials.Credential, on_delete, null_is_legitimate, reason)
+
+
+def _stage(reason: str, *, on_delete: str, null_is_legitimate: bool) -> SameOrg:
+    """A `stage_id` reference to a pipeline stage held to its row's org."""
+    return SameOrg("stage_id", releases.ReleaseStage, on_delete, null_is_legitimate, reason)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -188,10 +207,6 @@ TENANCY: dict[type[Base], Verdict] = {
         ),
     ),
     access.Group: Stored("A permission bundle is authored inside one org."),
-    worktrees.PortGridVar: Stored(
-        "Two columns (name, range_start) and no foreign key at all, so nothing to derive through. A var "
-        "name lands in every slot's .env, so it cannot be a shared catalogue."
-    ),
     orgs.AppSettings: Stored(
         "One row per org, carrying that org's branding — it stopped being the id=1 singleton when "
         "UNIQUE(org_id) landed. Stored rather than Derived because there is nothing above it to derive "
@@ -215,25 +230,19 @@ TENANCY: dict[type[Base], Verdict] = {
         "node_id, project_id and task_id are ALL nullable, so nothing derives. Transcript pointers — "
         "the highest-sensitivity row in the schema.",
         same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="SET NULL",
-                null_is_legitimate=True,
-                reason="A session runs a project of its own org; its node places only that org's work.",
+            _project(
+                "A session runs a project of its own org; its node places only that org's work.",
+                on_delete="SET NULL", null_is_legitimate=True,
             ),
         ),
     ),
     projects.Project: Stored(
         "The anchor: org sits directly above project.",
         same_org=(
-            SameOrg(
-                column="jira_credential_id",
-                parent=credentials.Credential,
-                on_delete="SET NULL",
-                null_is_legitimate=True,
-                reason="A project's Jira connection is its own org's credential.",
-            ),
+            SameOrg("pipeline_template_id", releases.PipelineTemplate, "RESTRICT", True,
+                    "The org pipeline template the project follows is its own org's; NULL when not linked."),
+            SameOrg("pipeline_template_version_id", releases.PipelineTemplateVersion, "RESTRICT", True,
+                    "The template version the project is on is its own org's; NULL when not linked."),
         ),
     ),
     orgs.OrgDomain: Stored(
@@ -248,13 +257,122 @@ TENANCY: dict[type[Base], Verdict] = {
         "An org's SIEM export destination, one per org. The org is its subject and there is no tenant-owned parent "
         "to derive through — org_domains' reason."
     ),
+    webhooks.OrgWebhookEndpoint: Stored(
+        "One of an org's outgoing webhook endpoints, made by its admin. The org is its subject and there is no "
+        "tenant-owned parent to derive through — org_siem_destinations' reason."
+    ),
+    webhooks.WebhookDelivery: Derived(
+        "One event owed to one webhook endpoint: that endpoint's tenant.",
+        parent=webhooks.OrgWebhookEndpoint,
+        fk_columns=("endpoint_id",),
+        on_delete="CASCADE",
+    ),
     orgs.ScimToken: Stored(
         "One of an org's SCIM bearer tokens. The org is its subject and there is no tenant-owned parent to derive "
         "through — org_domains' reason."
     ),
     tenant_email.GmailConnection: Stored(
         "A Gmail mailbox an org connected for its own mail. The org is its subject and there is no tenant-owned parent "
+        "to derive through — org_domains' reason.",
+        same_org=(
+            _credential(
+                "The credential row the mailbox is catalogued as is the org's own; NULL until linked.",
+                on_delete="SET NULL", null_is_legitimate=True,
+            ),
+        ),
+    ),
+    trackers.TrackerConnection: Stored(
+        "An org's connection to its own tracker workspace, made by its admin. The org is its subject and there is no "
+        "tenant-owned parent to derive through — gmail_connections' reason.",
+        same_org=(
+            _credential(
+                "The tracker token the connection acts with is the org's own credential; NULL for a Forge app.",
+                on_delete="SET NULL", null_is_legitimate=True,
+            ),
+            SameOrg(
+                column="trigger_id", parent=automations.TaskTrigger, on_delete="SET NULL", null_is_legitimate=True,
+                reason="The connection's events become its own org's trigger's deliveries; NULL once that is deleted.",
+            ),
+        ),
+    ),
+    trackers.TrackerMapping: Derived(
+        "A link of a tracker connection's container to a Jaah project: that connection's tenant. project_id names "
+        "the linked project, held to the same org below.",
+        parent=trackers.TrackerConnection,
+        fk_columns=("connection_id",),
+        on_delete="CASCADE",
+        same_org=(
+            _project("A connection's container is linked only to its own org's project.", on_delete="CASCADE",
+                     null_is_legitimate=False),
+        ),
+    ),
+    trackers.TrackerIssueLink: Derived(
+        "The tracker issue a task was started from: one row per task, so it is that task's tenant. connection_id "
+        "names the tracker_connections row that started it, held to the same org below.",
+        parent=tasks.Task,
+        fk_columns=("task_id",),
+        on_delete="CASCADE",
+        same_org=(
+            SameOrg(
+                column="connection_id", parent=trackers.TrackerConnection, on_delete="CASCADE",
+                null_is_legitimate=False,
+                reason="A task is started only by its own org's tracker connection.",
+            ),
+        ),
+    ),
+    trackers.TrackerWriteback: Derived(
+        "One thing posted back to a task's issue: that task's tenant.",
+        parent=tasks.Task,
+        fk_columns=("task_id",),
+        on_delete="CASCADE",
+    ),
+    hosted_apps.HostedApp: Stored(
+        "An Easy Mode app outlives its project: project_id goes NULL when the project is deleted and the row stays as "
+        "the deleted app's record, so nothing derives.",
+        same_org=(
+            _project(
+                "An app is its own org's project's; NULL once that project is deleted.",
+                on_delete="SET NULL", null_is_legitimate=True,
+            ),
+        ),
+    ),
+    hosted_apps.HostedAppUsage: Derived(
+        "A month's metered use belongs to the app it measures.",
+        parent=hosted_apps.HostedApp,
+        fk_columns=("app_id",),
+        on_delete="CASCADE",
+    ),
+    hosted_apps.HostedAppDomain: Derived(
+        "A custom domain belongs to the app it serves.",
+        parent=hosted_apps.HostedApp,
+        fk_columns=("hosted_app_id",),
+        on_delete="CASCADE",
+    ),
+    jaah_repos.JaahRepo: Stored(
+        "A Jaah-made repository outlives its project: project_id goes NULL when the project is deleted and the row "
+        "stays as the repo's record, so nothing derives.",
+        same_org=(
+            _project(
+                "A Jaah repo is its own org's project's; NULL once that project is deleted.",
+                on_delete="SET NULL", null_is_legitimate=True,
+            ),
+            SameOrg(
+                column="migration_task_id",
+                parent=tasks.Task,
+                on_delete="SET NULL",
+                null_is_legitimate=True,
+                reason="The task moving the project off this repo is the same org's; NULL until one runs.",
+            ),
+        ),
+    ),
+    integrations.CustomConnector: Stored(
+        "A custom connector an org defines for itself; the org is its subject and there is no tenant-owned parent "
         "to derive through — org_domains' reason."
+    ),
+    integrations.IntegrationVote: Shared(
+        "A person's vote for a Beta catalog vendor: one per identity, so a person in several orgs votes once, as "
+        "user_mfa_factors is per identity. The catalog it votes on is platform-wide, and only the per-vendor "
+        "count leaves the table (the operator's Settings list) besides the person's own voted mark.",
     ),
     tenant_email.TenantMailAddress: Stored(
         "A hosted address an org receives mail at. The org is its subject: it exists before any trigger names it, so "
@@ -296,19 +414,23 @@ TENANCY: dict[type[Base], Verdict] = {
             ),
         ),
     ),
-    billing.OrgPlanProduct: Stored(
-        "One line of an org's own product list, overriding its plan's. The org is its subject and there is "
-        "no tenant-owned parent to derive through (the list belongs to the org, not to a plan row) — "
-        "org_domains' reason."
+    products.OrgProduct: Stored(
+        "One product an org holds and where its money stands (the product engine's holding). The org is its "
+        "subject and its catalogue product is shared, so there is no tenant-owned parent to derive through — "
+        "node_rentals' reason."
     ),
-    billing.OrgComp: Stored(
-        "A product the operator gives an org for free, added to its product list. The org is its subject and "
-        "there is no tenant-owned parent to derive through — org_plan_products' reason."
+    products.ProductTrial: Stored(
+        "An org used its one trial of a product. The org is its subject and the product is shared, so there is "
+        "nothing tenant-owned to derive through — org_domains' reason."
+    ),
+    products.OrgProductSettings: Stored(
+        "One org's settings of one product (automatic top-up). The org is its subject and the product is shared, "
+        "so there is nothing tenant-owned to derive through — org_domains' reason."
     ),
     billing.PlanTermsSnapshot: Stored(
         "One org's plan terms as they stood before the plan engine's inheritance and rollover shipped. The org is "
         "its subject (org_id is the key) and there is no tenant-owned parent to derive through — org_domains' "
-        "reason. Read only by the operator's Plan terms check."
+        "reason. Read only by `billing.plans.ever_used`; the table awaits its drop."
     ),
     billing.CustomerEvent: Stored(
         "One thing that happened to an org, filed under that org. The org is its subject and the row outlives "
@@ -325,12 +447,9 @@ TENANCY: dict[type[Base], Verdict] = {
         "project_id is a SECOND REFERENCE into a tenant-owned table, not a derivation; its same-org key "
         "holds this row's org equal to its project's.",
         same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="NO ACTION",
-                null_is_legitimate=False,
-                reason="A task is its project's org's work; alarms file into the Alarm project's own org.",
+            _project(
+                "A task is its project's org's work; alarms file into the Alarm project's own org.",
+                on_delete="NO ACTION", null_is_legitimate=False,
             ),
         ),
     ),
@@ -338,7 +457,7 @@ TENANCY: dict[type[Base], Verdict] = {
     agent_sessions.Agent: Stored(
         "An org's registered SDK agent belongs to the org that registered it; a catalog connector is a row of "
         "org zero flagged is_catalog (the seam hides it from tenants, who read the catalog on a fleet session "
-        "of its own, `routes/agents.py::_catalog_rows`). Nothing above it to derive from."
+        "of its own, `agent_resolution.catalog_rows`). Nothing above it to derive from."
     ),
     agent_sessions.AgentEnablement: Stored(
         "One org's opt-in to one catalog connector: the org IS the row's subject. agent_id names a row of org "
@@ -356,13 +475,7 @@ TENANCY: dict[type[Base], Verdict] = {
         "A node of one org's portfolio graph. `project_id` is nullable (a team or model entity names none), so "
         "nothing derives; the project is a second reference.",
         same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="CASCADE",
-                null_is_legitimate=True,
-                reason="An entity names a project of its own portfolio.",
-            ),
+            _project("An entity names a project of its own portfolio.", on_delete="CASCADE", null_is_legitimate=True),
         ),
     ),
     governance.GovOrgSettings: Stored("One org's Portfolio Compliance settings; the org IS the row's subject."),
@@ -379,50 +492,29 @@ TENANCY: dict[type[Base], Verdict] = {
         "Materialised state, keyed per project for the matrix read. Stored so the twin's reads and its one writer "
         "filter on a single table; project_id is a second reference.",
         same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="CASCADE",
-                null_is_legitimate=False,
-                reason="A twin cell is materialised for a project of its own org.",
+            _project(
+                "A twin cell is materialised for a project of its own org.",
+                on_delete="CASCADE", null_is_legitimate=False,
             ),
         ),
     ),
     governance.GovTwinRepo: Stored(
         "A project's twin summary under one pack; gov_twin_cells' reason.",
         same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="CASCADE",
-                null_is_legitimate=False,
-                reason="A twin summary is of a project of its own org.",
-            ),
+            _project("A twin summary is of a project of its own org.", on_delete="CASCADE", null_is_legitimate=False),
         ),
     ),
     governance.GovException: Stored(
         "A waiver. `project_id` is NULL when a predicate scope is set, so no derivation is total.",
         same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="CASCADE",
-                null_is_legitimate=True,
-                reason="A waiver names a project of its own org.",
-            ),
+            _project("A waiver names a project of its own org.", on_delete="CASCADE", null_is_legitimate=True),
         ),
     ),
     governance.GovCampaign: Stored("A remediation campaign across one org's projects; the org IS its subject."),
     governance.GovRemediation: Stored(
         "One Fix on one project; Stored for gov_twin_cells' reason (the overlay read).",
         same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="CASCADE",
-                null_is_legitimate=False,
-                reason="A fix is filed on a project of its own org.",
-            ),
+            _project("A fix is filed on a project of its own org.", on_delete="CASCADE", null_is_legitimate=False),
         ),
     ),
     governance.GovPackProposal: Stored(
@@ -433,37 +525,240 @@ TENANCY: dict[type[Base], Verdict] = {
         "A runner PR queued for the lane. Stored so the lane's reads filter one table; project_id and both "
         "task references are second references, each read off the caller task's own project by the writer.",
         same_org=(
+            _project(
+                "A lane row is the reporting task's own project's.",
+                on_delete="CASCADE", null_is_legitimate=False,
+            ),
+        ),
+    ),
+    outcomes.TaskOutcome: Stored(
+        "task_id, project_id and agent_session_id are SET NULL (a deleted task's rows are kept, excluded), so no "
+        "derivation is total; the writer copies org_id off the dispatched task.",
+        same_org=(
             SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="CASCADE",
-                null_is_legitimate=False,
-                reason="A lane row is the reporting task's own project's.",
+                column="task_id", parent=tasks.Task, on_delete="SET NULL", null_is_legitimate=True,
+                reason="Provenance outlives a deleted task: SET NULL keeps the outcome's history.",
+            ),
+            _project(
+                "An outcome is its task's project's; SET NULL keeps it past the project's delete.",
+                on_delete="SET NULL", null_is_legitimate=True,
+            ),
+            SameOrg(
+                column="agent_session_id", parent=agent_sessions.AgentSession, on_delete="SET NULL",
+                null_is_legitimate=True,
+                reason="The dispatch's own session, of its own task; NULL until the launch announces itself.",
+            ),
+        ),
+    ),
+    outcomes.TaskOutcomeHead: Derived(
+        "A pushed head belongs to the dispatch it was pushed for.",
+        parent=outcomes.TaskOutcome,
+        fk_columns=("outcome_id",),
+        on_delete="CASCADE",
+        same_org=(
+            SameOrg(
+                column="task_id", parent=tasks.Task, on_delete="SET NULL", null_is_legitimate=True,
+                reason="The outcome's own task, SET NULL with it.",
+            ),
+        ),
+    ),
+    outcomes.OutcomeLink: Derived(
+        "Defect evidence belongs to the merged dispatch it judges; its actor columns are provenance.",
+        parent=outcomes.TaskOutcome,
+        fk_columns=("origin_outcome_id",),
+        on_delete="CASCADE",
+    ),
+    outcomes.BenchmarkDuel: Derived(
+        "A benchmark duel belongs to the sampled task it re-runs (`app/outcome_ledger/benchmark.py`); its shadow and "
+        "review tasks and its project are that task's own, each held same-org by its own key.",
+        parent=tasks.Task,
+        fk_columns=("origin_task_id",),
+        on_delete="CASCADE",
+        same_org=(
+            _project(
+                "The origin task's project, copied at sampling; SET NULL past the project's delete.",
+                on_delete="SET NULL", null_is_legitimate=True,
+            ),
+            SameOrg(
+                column="shadow_task_id", parent=tasks.Task, on_delete="SET NULL", null_is_legitimate=True,
+                reason="The hidden shadow the engine filed in the origin's project; NULL once it is deleted.",
+            ),
+            SameOrg(
+                column="review_task_id", parent=tasks.Task, on_delete="SET NULL", null_is_legitimate=True,
+                reason="The hidden duel_review task the engine filed in the origin's project; NULL until filed.",
+            ),
+        ),
+    ),
+    routing.RoutingDecision: Derived(
+        "A routing decision belongs to the dispatch of the task it was made for (`app/agent_router/decisions.py`); "
+        "its project_id is that task's project, held same-org by its own key.",
+        parent=tasks.Task,
+        fk_columns=("task_id",),
+        on_delete="CASCADE",
+        same_org=(
+            _project(
+                "The task's own project, copied at write; the task moves it with itself.",
+                on_delete="CASCADE", null_is_legitimate=False,
+            ),
+        ),
+    ),
+    review.ReviewFinding: Derived(
+        "A review finding belongs to the task whose change it is about (`app/review_findings.py`); the task that "
+        "detected it is held same-org by its own key.",
+        parent=tasks.Task,
+        fk_columns=("task_id",),
+        on_delete="CASCADE",
+        same_org=(
+            SameOrg(
+                column="detecting_task_id", parent=tasks.Task, on_delete="SET NULL", null_is_legitimate=True,
+                reason="A reviewing task of the authoring task's own org; NULL once it is deleted.",
             ),
         ),
     ),
     merge_lane.MergeLaneCertificate: Stored(
         "A green tree for one project's gate; merge_lane_rows' reason.",
         same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="CASCADE",
-                null_is_legitimate=False,
-                reason="A certificate is its project's org's.",
-            ),
+            _project("A certificate is its project's org's.", on_delete="CASCADE", null_is_legitimate=False),
         ),
     ),
     merge_lane.MergeLaneFlake: Stored(
         "A flaky test the lane saw on one project; merge_lane_rows' reason.",
         same_org=(
+            _project("A flake is its project's org's.", on_delete="CASCADE", null_is_legitimate=False),
+        ),
+    ),
+    # ── Production QA (revision 202611012000; rules: `app/production_qa/`) ─────────────────────────────────
+    production_qa.BranchPush: Stored(
+        "A push event on one project's deploy-watched repo; the deploy range ledger.",
+        same_org=(
+            _project(
+                "A push is recorded against the trigger's own project.",
+                on_delete="CASCADE", null_is_legitimate=False,
+            ),
+        ),
+    ),
+    production_qa.Deployment: Stored(
+        "One deploy run attempt of one project; the parent its children derive through.",
+        same_org=(
+            _project(
+                "A deploy is recorded against the trigger's own project.",
+                on_delete="CASCADE", null_is_legitimate=False,
+            ),
+        ),
+    ),
+    production_qa.Incident: Stored(
+        "One production problem of one project; the parent its children derive through.",
+        same_org=(
+            _project(
+                "An incident is recorded against the trigger's own project.",
+                on_delete="CASCADE", null_is_legitimate=False,
+            ),
+        ),
+    ),
+    production_qa.ProductionQaEdge: Stored(
+        "A ledger fact about one task. Stored so the applier reads one table in id order.",
+        same_org=(
             SameOrg(
-                column="project_id",
-                parent=projects.Project,
+                column="task_id",
+                parent=tasks.Task,
                 on_delete="CASCADE",
                 null_is_legitimate=False,
-                reason="A flake is its project's org's.",
+                reason="An edge is a fact about a task of the deploy's or incident's own project.",
             ),
+            SameOrg(
+                column="deployment_id",
+                parent=production_qa.Deployment,
+                on_delete="CASCADE",
+                null_is_legitimate=True,
+                reason="A deployed edge names a deploy of the task's own org; NULL on incident edges.",
+            ),
+            SameOrg(
+                column="incident_id",
+                parent=production_qa.Incident,
+                on_delete="CASCADE",
+                null_is_legitimate=True,
+                reason="An incident edge names an incident of the task's own org; NULL on deployed edges.",
+            ),
+        ),
+    ),
+    production_qa.MergeLaneStageTiming: Stored(
+        "How long one merge-lane gate stage took on one project.",
+        same_org=(
+            _project("A timing is its lane's project's.", on_delete="CASCADE", null_is_legitimate=False),
+        ),
+    ),
+    # ── Releases (revision 202611102100; rules: `app/releases/`) ─────────────────────────────────────────────
+    releases.ReleaseStage: Stored(
+        "One environment of one project; the parent its observed shas derive through.",
+        same_org=(
+            _project("A stage is its project's.", on_delete="CASCADE", null_is_legitimate=False),
+        ),
+    ),
+    releases.ReleaseFreeze: Stored(
+        "A deploy freeze of one project.",
+        same_org=(
+            _project("A freeze is its project's.", on_delete="CASCADE", null_is_legitimate=False),
+        ),
+    ),
+    releases.Release: Stored(
+        "One request to move a stage's head into the next; the parent its approvals and changes derive through. "
+        "Its stage, task and deployment references are second references, written off the project's own rows.",
+        same_org=(
+            _project("A release is its project's.", on_delete="CASCADE", null_is_legitimate=False),
+        ),
+    ),
+    releases.ReleaseJob: Stored(
+        "One executor job (survey, connect) of one project.",
+        same_org=(
+            _project("A job is its project's.", on_delete="CASCADE", null_is_legitimate=False),
+        ),
+    ),
+    releases.PipelineRevision: Stored(
+        "One save of a project's pipeline and freezes (`app/releases/history.py`).",
+        same_org=(
+            _project("A revision is its project's.", on_delete="CASCADE", null_is_legitimate=False),
+        ),
+    ),
+    releases.PipelineGuardrail: Stored(
+        "One org's setting for one built-in pipeline rule; nothing above it but the org, its subject."
+    ),
+    releases.PipelineTemplate: Stored(
+        "One org pipeline template; nothing above it but the org. published_version_id -> pipeline_template_versions "
+        "is one of its own versions.",
+        same_org=(
+            SameOrg("published_version_id", releases.PipelineTemplateVersion, "SET NULL", True,
+                    "A template's published version is one of its own; NULL until the first publish."),
+        ),
+    ),
+    # ── Pipeline gates (revision 202611131300; rules: `app/pipeline_gates/`) ─────────────────────────────────
+    releases.PipelineGate: Stored(
+        "One gate of a project's pipeline stage; the stage is its project's.",
+        same_org=(
+            _project("A gate is its project's.", on_delete="CASCADE", null_is_legitimate=False),
+            _stage("A gate sits on one of its project's stages.", on_delete="CASCADE", null_is_legitimate=False),
+        ),
+    ),
+    releases.GateRun: Stored(
+        "One run of a stage's gate list on one subject; the parent its results derive through.",
+        same_org=(
+            _project("A run is its project's.", on_delete="CASCADE", null_is_legitimate=False),
+            _stage("A run gated one of its project's stages; NULL once that stage is removed.", on_delete="SET NULL",
+                   null_is_legitimate=True),
+        ),
+    ),
+    releases.StageArrival: Stored(
+        "A change reaching one of a project's stages. Its release reference is a second reference, written off "
+        "the project's own release row.",
+        same_org=(
+            _project("An arrival is its project's.", on_delete="CASCADE", null_is_legitimate=False),
+            _stage("An arrival is on one of its project's stages.", on_delete="CASCADE", null_is_legitimate=False),
+        ),
+    ),
+    releases.ReleaseNotice: Stored(
+        "One release notice in one member's bell, written by `app/releases/notify.py` into the project's org. "
+        "user_id -> admin_users is that member's row in the same org (the writer resolves it by membership).",
+        same_org=(
+            _project("A notice is about its project.", on_delete="CASCADE", null_is_legitimate=False),
         ),
     ),
     # Billing mirrors (`app/billing/mirrors.py`): Stripe's state for ONE org's customer, written only by the
@@ -541,25 +836,20 @@ TENANCY: dict[type[Base], Verdict] = {
         fk_columns=("operation_id",),
         on_delete="CASCADE",
         same_org=(
-            SameOrg(
-                column="credential_id",
-                parent=credentials.Credential,
-                on_delete="CASCADE",
-                null_is_legitimate=False,
-                reason="An operation migrates its own org's credentials.",
+            _credential(
+                "An operation migrates its own org's credentials.",
+                on_delete="CASCADE", null_is_legitimate=False,
             ),
         ),
     ),
     audit.CommandAudit: Stored("node_id is nullable. Carries argv verbatim, so it must not read across orgs."),
+    audit.ClientEvent: Stored("user_id is nullable (SET NULL), so no derivation is total; the org is the reporter's."),
     credentials.Account: Stored(
         "node_id is nullable — NULL means fleet-wide today — so no derivation is total.",
         same_org=(
-            SameOrg(
-                column="credential_id",
-                parent=credentials.Credential,
-                on_delete="RESTRICT",
-                null_is_legitimate=True,
-                reason="An API-key account runs on its own org's credential.",
+            _credential(
+                "An API-key account runs on its own org's credential.",
+                on_delete="RESTRICT", null_is_legitimate=True,
             ),
         ),
     ),
@@ -606,11 +896,13 @@ TENANCY: dict[type[Base], Verdict] = {
     ),
     notifications.SlackInstallation: Stored(
         "An org's Slack workspace install, one per org. The org is its subject and there is no tenant-owned parent "
-        "to derive through — org_domains' reason."
-    ),
-    notifications.EmailMailbox: Stored(
-        "RETIRED: the old deployment Gmail mailbox's push cursor, org zero only; nothing reads or writes it "
-        "since inbound moved to SES, and no route serves the table to a tenant."
+        "to derive through — org_domains' reason.",
+        same_org=(
+            _credential(
+                "The credential row the workspace is catalogued as is the org's own; NULL until linked.",
+                on_delete="SET NULL", null_is_legitimate=True,
+            ),
+        ),
     ),
     notifications.InboundEmail: Stored(
         "A received message, one row per target its recipients resolved to (`app/ses_inbound.py`), written "
@@ -647,13 +939,7 @@ TENANCY: dict[type[Base], Verdict] = {
         "A trigger lives in its project's org, which the console route stamps from the project it names; "
         "its filings never leave that project.",
         same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="CASCADE",
-                null_is_legitimate=False,
-                reason="A trigger files into a project of its own org.",
-            ),
+            _project("A trigger files into a project of its own org.", on_delete="CASCADE", null_is_legitimate=False),
             SameOrg(
                 column="preflight_credential_id",
                 parent=credentials.Credential,
@@ -668,14 +954,15 @@ TENANCY: dict[type[Base], Verdict] = {
         "derive through — storing here is what keeps that derivation one hop rather than two. Landed "
         "after the specification's census was taken.",
         same_org=(
-            SameOrg(
-                column="credential_id",
-                parent=credentials.Credential,
-                on_delete="RESTRICT",
-                null_is_legitimate=False,
-                reason="A group launches with its own org's cloud credential.",
+            _credential(
+                "A group launches with its own org's cloud credential.",
+                on_delete="RESTRICT", null_is_legitimate=False,
             ),
         ),
+    ),
+    placement_groups.PlacementGroup: Stored(
+        "A node group is an org's own named set of its nodes, and the parent its two join tables derive "
+        "through — storing here keeps each of them one hop."
     ),
     support.Ticket: Stored(
         "A support ticket belongs to its REQUESTER'S org, and is the parent its links and reads derive "
@@ -722,12 +1009,9 @@ TENANCY: dict[type[Base], Verdict] = {
         on_delete="CASCADE",
         # All `null_is_legitimate=True`: `ck_role_bindings_one_scope` leaves two of three NULL on every row.
         same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="CASCADE",
-                null_is_legitimate=True,
-                reason="A project-scope binding must name a project in the principal's own org.",
+            _project(
+                "A project-scope binding must name a project in the principal's own org.",
+                on_delete="CASCADE", null_is_legitimate=True,
             ),
             SameOrg(
                 column="account_id",
@@ -745,32 +1029,6 @@ TENANCY: dict[type[Base], Verdict] = {
         fk_columns=("project_id", "group_id"),
         on_delete="CASCADE",
     ),
-    access.AccessRequest: Derived(
-        "A request belongs to the user who asked; requester_id is NOT NULL. Its scope columns are "
-        "role_bindings' and carry the same same-org keys, so a request can never name another org's "
-        "resource. decided_by_id is an actor reference and binding_id a provenance pointer into the "
-        "binding approval wrote; both are classified in the unkeyed-reference "
-        "register.",
-        parent=identity.AdminUser,
-        fk_columns=("requester_id",),
-        on_delete="CASCADE",
-        same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="CASCADE",
-                null_is_legitimate=True,
-                reason="A project-scope request must name a project in the principal's own org.",
-            ),
-            SameOrg(
-                column="account_id",
-                parent=credentials.Account,
-                on_delete="CASCADE",
-                null_is_legitimate=True,
-                reason="An account-scope request must name an account in the principal's own org.",
-            ),
-        ),
-    ),
     credentials.ProjectCredential: Derived(
         "An attachment belongs to the project it attaches to; project_id is NOT NULL. The credential is a "
         "second NOT NULL reference (credential_id) and must be the same org's — one tenant's secret attached to another "
@@ -779,12 +1037,23 @@ TENANCY: dict[type[Base], Verdict] = {
         fk_columns=("project_id",),
         on_delete="CASCADE",
         same_org=(
-            SameOrg(
-                column="credential_id",
-                parent=credentials.Credential,
-                on_delete="CASCADE",
-                null_is_legitimate=False,
-                reason="An attached credential must be the project's own org's.",
+            _credential(
+                "An attached credential must be the project's own org's.",
+                on_delete="CASCADE", null_is_legitimate=False,
+            ),
+        ),
+    ),
+    credentials.ProjectMcpLink: Derived(
+        "A project's explicit opt-in to an MCP connection; it belongs to the project it opts in, and project_id is "
+        "NOT NULL. The MCP connection is a second NOT NULL reference (credential_id) and must be the same org's — "
+        "ProjectCredential's reason.",
+        parent=projects.Project,
+        fk_columns=("project_id",),
+        on_delete="CASCADE",
+        same_org=(
+            _credential(
+                "An opted-in MCP connection must be the project's own org's.",
+                on_delete="CASCADE", null_is_legitimate=False,
             ),
         ),
     ),
@@ -805,8 +1074,8 @@ TENANCY: dict[type[Base], Verdict] = {
         on_delete="CASCADE",
     ),
     projects.Feature: Derived(
-        "A feature is a body of work inside one project. lead_id is caller-chosen rather than an actor "
-        "stamp, so it is keyed below; shipped_by_id is an actor stamp.",
+        "A feature is a folder of work inside one project. lead_id is caller-chosen rather than an actor "
+        "stamp, so it is keyed below; deleted_by_id is an actor stamp.",
         parent=projects.Project,
         fk_columns=("project_id",),
         on_delete="CASCADE",
@@ -829,12 +1098,9 @@ TENANCY: dict[type[Base], Verdict] = {
         fk_columns=("project_id",),
         on_delete="CASCADE",
         same_org=(
-            SameOrg(
-                column="credential_id",
-                parent=credentials.Credential,
-                on_delete="SET NULL",
-                null_is_legitimate=True,
-                reason="The resolver writes the DECRYPTED value to the env file, so the credential must be the project's own org's; SET NULL keeps the tombstone.",
+            _credential(
+                "The resolver writes the DECRYPTED value to the env file, so the credential must be the project's own org's; SET NULL keeps the tombstone.",
+                on_delete="SET NULL", null_is_legitimate=True,
             ),
         ),
     ),
@@ -842,6 +1108,110 @@ TENANCY: dict[type[Base], Verdict] = {
         "A runner is a process on one node.",
         parent=nodes.Node,
         fk_columns=("node_id",),
+        on_delete="CASCADE",
+    ),
+    releases.GateResult: Derived(
+        "One gate's result belongs to the run that recorded it.",
+        parent=releases.GateRun,
+        fk_columns=("run_id",),
+        on_delete="CASCADE",
+    ),
+    releases.StageHealth: Derived(
+        "A stage address's last probe belongs to that stage.",
+        parent=releases.ReleaseStage,
+        fk_columns=("stage_id",),
+        on_delete="CASCADE",
+    ),
+    releases.ReleaseApproval: Derived(
+        "One approval belongs to the release it approves. user_id -> admin_users is the approver, an actor "
+        "reference: an operator in org zero may approve, as they may author a tenant's row.",
+        parent=releases.Release,
+        fk_columns=("release_id",),
+        on_delete="CASCADE",
+    ),
+    releases.ReleaseChange: Derived(
+        "One change reference belongs to the release that carries it.",
+        parent=releases.Release,
+        fk_columns=("release_id",),
+        on_delete="CASCADE",
+    ),
+    releases.ReleaseContained: Derived(
+        "A sha observed on a stage's branch belongs to that stage. project_id -> projects is the stage's own "
+        "project, copied by the one writer off the stage; it is part of the primary key, not a second owner.",
+        parent=releases.ReleaseStage,
+        fk_columns=("stage_id",),
+        on_delete="CASCADE",
+    ),
+    releases.PipelineTemplateVersion: Derived(
+        "A published version belongs to its template. created_by_id -> admin_users is the publisher, an actor "
+        "reference.",
+        parent=releases.PipelineTemplate,
+        fk_columns=("template_id",),
+        on_delete="CASCADE",
+    ),
+    releases.ReleaseFreezeStage: Derived(
+        "A stage a freeze covers belongs to that freeze. stage_id -> release_stages is a same-project stage the "
+        "freeze names.",
+        parent=releases.ReleaseFreeze,
+        fk_columns=("freeze_id",),
+        on_delete="CASCADE",
+    ),
+    releases.PipelinePass: Derived(
+        "An item moved into a no-branch stage belongs to that stage. project_id -> projects is the stage's own "
+        "project, copied by the one writer off the stage; task_id -> tasks is the item, a same-project task; "
+        "created_by_id -> admin_users is the actor.",
+        parent=releases.ReleaseStage,
+        fk_columns=("stage_id",),
+        on_delete="CASCADE",
+    ),
+    releases.PipelineApproval: Derived(
+        "A press or approval of a step belongs to the stage the step leads into. project_id -> projects is the "
+        "stage's own project, copied by the one writer off the stage; task_id -> tasks is the item; user_id -> "
+        "admin_users is the actor.",
+        parent=releases.ReleaseStage,
+        fk_columns=("stage_id",),
+        on_delete="CASCADE",
+    ),
+    production_qa.DeploymentEnvironment: Derived(
+        "An environment a deploy reported belongs to that deploy.",
+        parent=production_qa.Deployment,
+        fk_columns=("deployment_id",),
+        on_delete="CASCADE",
+    ),
+    production_qa.DeploymentCommit: Derived(
+        "A commit in a deploy's range belongs to that deploy.",
+        parent=production_qa.Deployment,
+        fk_columns=("deployment_id",),
+        on_delete="CASCADE",
+    ),
+    production_qa.DeploymentPr: Derived(
+        "A PR in a deploy's range belongs to that deploy.",
+        parent=production_qa.Deployment,
+        fk_columns=("deployment_id",),
+        on_delete="CASCADE",
+    ),
+    production_qa.DeploymentMetric: Derived(
+        "A regression measurement belongs to its deploy.",
+        parent=production_qa.Deployment,
+        fk_columns=("deployment_id",),
+        on_delete="CASCADE",
+    ),
+    production_qa.IncidentEvent: Derived(
+        "A transition belongs to its incident.",
+        parent=production_qa.Incident,
+        fk_columns=("incident_id",),
+        on_delete="CASCADE",
+    ),
+    production_qa.IncidentSuspect: Derived(
+        "A suspect belongs to its incident.",
+        parent=production_qa.Incident,
+        fk_columns=("incident_id",),
+        on_delete="CASCADE",
+    ),
+    production_qa.IncidentTask: Derived(
+        "A task claim belongs to its incident.",
+        parent=production_qa.Incident,
+        fk_columns=("incident_id",),
         on_delete="CASCADE",
     ),
     tasks.TaskQuestion: Derived(
@@ -946,13 +1316,7 @@ TENANCY: dict[type[Base], Verdict] = {
         fk_columns=("scan_id",),
         on_delete="CASCADE",
         same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="CASCADE",
-                null_is_legitimate=False,
-                reason="A scan targets a project of the scanning org.",
-            ),
+            _project("A scan targets a project of the scanning org.", on_delete="CASCADE", null_is_legitimate=False),
         ),
     ),
     governance.GovCampaignItem: Derived(
@@ -961,18 +1325,27 @@ TENANCY: dict[type[Base], Verdict] = {
         fk_columns=("campaign_id",),
         on_delete="CASCADE",
         same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="CASCADE",
-                null_is_legitimate=False,
-                reason="A campaign fixes projects of its own org.",
-            ),
+            _project("A campaign fixes projects of its own org.", on_delete="CASCADE", null_is_legitimate=False),
         ),
     ),
     tasks.TaskRating: Derived(
         "A rating is a (task, user) pair — an AND, not an XOR: both columns are NOT NULL, both store "
         "org_id, and the two must AGREE on it.",
+        parent=(tasks.Task, identity.AdminUser),
+        fk_columns=("task_id", "user_id"),
+        on_delete="CASCADE",
+    ),
+    tasks.TaskDoneView: Derived(
+        "A seen mark is a (task, user) pair — task_ratings' AND: both columns are NOT NULL, both store "
+        "org_id, and the two must AGREE on it.",
+        parent=(tasks.Task, identity.AdminUser),
+        fk_columns=("task_id", "user_id"),
+        on_delete="CASCADE",
+    ),
+    tasks.TaskQuestionDraft: Derived(
+        "An unsent answer is a (task, user) pair — task_ratings' AND: both columns are NOT NULL, both store "
+        "org_id, and the two must AGREE on it. question_id is a second tenant-owned reference (task_questions "
+        "is itself Derived), classified in the unkeyed-reference register on the mention's comment_id terms.",
         parent=(tasks.Task, identity.AdminUser),
         fk_columns=("task_id", "user_id"),
         on_delete="CASCADE",
@@ -1071,6 +1444,14 @@ TENANCY: dict[type[Base], Verdict] = {
         fk_columns=("node_id",),
         on_delete="CASCADE",
     ),
+    notifications.NotificationChannel: Derived(
+        "One place a membership's alerts go: owned by that membership, so it is that membership's tenant. "
+        "The Slack and Telegram destinations it names are identifiers, not tenant rows; telegram_link_id and "
+        "email_id point at the PERSON's shared rows (telegram_links, notification_emails), never an org source.",
+        parent=identity.AdminUser,
+        fk_columns=("admin_user_id",),
+        on_delete="CASCADE",
+    ),
     credentials.UserGitConnection: Derived(
         "A git connection says which of a person's credentials their work uses on one forge root, so it "
         "is that person's tenant. credential_id is a second NOT NULL reference into credentials, which "
@@ -1080,12 +1461,9 @@ TENANCY: dict[type[Base], Verdict] = {
         fk_columns=("user_id",),
         on_delete="CASCADE",
         same_org=(
-            SameOrg(
-                column="credential_id",
-                parent=credentials.Credential,
-                on_delete="CASCADE",
-                null_is_legitimate=False,
-                reason="A connection must name a credential in its person's own org.",
+            _credential(
+                "A connection must name a credential in its person's own org.",
+                on_delete="CASCADE", null_is_legitimate=False,
             ),
         ),
     ),
@@ -1100,19 +1478,10 @@ TENANCY: dict[type[Base], Verdict] = {
         fk_columns=("account_id",),
         on_delete="CASCADE",
     ),
-    credentials.CredentialOAuthFlow: Derived(
-        "A credential OAuth flow is bound to one node by a NOT NULL node_id. It also carries a NOT NULL "
-        "user_id into admin_users, which stores org_id — a second reference needing a same-org key of its "
-        "own, and the one place a flow could otherwise bind one org's node to another org's user. Landed "
-        "after the specification's census was taken.",
-        parent=nodes.Node,
-        fk_columns=("node_id",),
-        on_delete="CASCADE",
-    ),
     agent_sessions.FetchStamp: Derived(
-        "A fetch stamp is a per-node fact; the node is the resource-side root and keeps this in step with its "
-        "siblings. Its NOT NULL project_id carries NO same-org key on purpose: a carried-over runner's node "
-        "(`app/carryover.py`) still fetches the project that moved away, as its slot still names it.",
+        "A fetch stamp is a per-node fact; the node is the resource-side root. Nothing reads or writes the table "
+        "(a later migration drops it); its NOT NULL project_id carries no same-org key, as when a carried-over "
+        "runner's node (`app/carryover.py`) stamped the project that moved away.",
         parent=nodes.Node,
         fk_columns=("node_id",),
         on_delete="CASCADE",
@@ -1149,13 +1518,7 @@ TENANCY: dict[type[Base], Verdict] = {
         fk_columns=("node_id",),
         on_delete="CASCADE",
         same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="CASCADE",
-                null_is_legitimate=False,
-                reason="A VM runs a project of its node's org.",
-            ),
+            _project("A VM runs a project of its node's org.", on_delete="CASCADE", null_is_legitimate=False),
         ),
     ),
     nodes.MicrovmIntent: Derived(
@@ -1211,13 +1574,7 @@ TENANCY: dict[type[Base], Verdict] = {
         fk_columns=("group_id",),
         on_delete="CASCADE",
         same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="CASCADE",
-                null_is_legitimate=False,
-                reason="A group is entitled to its own org's projects.",
-            ),
+            _project("A group is entitled to its own org's projects.", on_delete="CASCADE", null_is_legitimate=False),
         ),
     ),
     node_groups.NodeProject: Derived(
@@ -1228,39 +1585,47 @@ TENANCY: dict[type[Base], Verdict] = {
         fk_columns=("node_id",),
         on_delete="CASCADE",
         same_org=(
+            _project("A node is assigned to its own org's projects.", on_delete="CASCADE", null_is_legitimate=False),
+        ),
+    ),
+    placement_groups.PlacementGroupNode: Derived(
+        "A node's membership of a node group belongs to the group. Its NOT NULL node_id reaches nodes, which "
+        "stores org_id — a second reference needing a same-org key of its own, not a second derivation.",
+        parent=placement_groups.PlacementGroup,
+        fk_columns=("group_id",),
+        on_delete="CASCADE",
+        same_org=(
             SameOrg(
-                column="project_id",
-                parent=projects.Project,
+                column="node_id",
+                parent=nodes.Node,
                 on_delete="CASCADE",
                 null_is_legitimate=False,
-                reason="A node is assigned to its own org's projects.",
+                reason="A node group holds only nodes of its own org.",
             ),
+        ),
+    ),
+    placement_groups.ProjectPlacementGroup: Derived(
+        "A project's allocation to a node group belongs to the group; project_id is NOT NULL too, but the "
+        "group is the owning side, as for a node-group project line.",
+        parent=placement_groups.PlacementGroup,
+        fk_columns=("group_id",),
+        on_delete="CASCADE",
+        same_org=(
+            _project("A node group runs only its own org's projects.", on_delete="CASCADE", null_is_legitimate=False),
         ),
     ),
     node_groups.GhaRunnerPool: Derived(
         "A pool of self-hosted GitHub Actions runners belongs to the NODE that hosts them; node_id is "
         "NOT NULL and UNIQUE, so one node has at most one pool. Its NOT NULL project_id and "
-        "credential_id are SECOND references into tenant-owned tables, each needing a same-org key of "
-        "its own rather than a second derivation — the node is the owning side, and it is the only hop "
-        "that is total. Both carry same-org keys, holding the project and credential in the node's org.",
+        "credential_id are SECOND references into tenant-owned tables rather than a second derivation — "
+        "the node is the owning side, and it is the only hop that is total. project_id carries a same-org "
+        "key; credential_id does not, since the operator may lend their own personal credential to any "
+        "org's pool (the unkeyed register in test_tenancy_composite_keys.py).",
         parent=nodes.Node,
         fk_columns=("node_id",),
         on_delete="CASCADE",
         same_org=(
-            SameOrg(
-                column="project_id",
-                parent=projects.Project,
-                on_delete="RESTRICT",
-                null_is_legitimate=False,
-                reason="A pool serves a project of its node's org.",
-            ),
-            SameOrg(
-                column="credential_id",
-                parent=credentials.Credential,
-                on_delete="RESTRICT",
-                null_is_legitimate=False,
-                reason="A pool's runners register with its node's org's credential.",
-            ),
+            _project("A pool serves a project of its node's org.", on_delete="RESTRICT", null_is_legitimate=False),
         ),
     ),
     orgs.OrgSignup: Derived(
@@ -1323,7 +1688,7 @@ TENANCY: dict[type[Base], Verdict] = {
         "The marker that makes a node a Multi-Node Host belongs to that node; node_id is the primary key "
         "and NOT NULL, so the host is in its node's org: org zero for an operator host (every row the "
         "operator's, invisible to a tenant-bound read) or a tenant's own org for a tenant host "
-        "(routes/nodes/cloud.py::create_cloud_node / create_self_hosted_node).",
+        "(routes/nodes/cloud.py::launch_cloud_node_row / register_self_hosted_row, run by an Add-node order).",
         parent=nodes.Node,
         fk_columns=("node_id",),
         on_delete="RESTRICT",
@@ -1371,6 +1736,14 @@ TENANCY: dict[type[Base], Verdict] = {
         on_delete="CASCADE",
     ),
     # -- Tenant-shared by design ---------------------------------------------------------------------
+    hosted_apps.HostingCell: Shared(
+        "A database cell of the apps account (one Postgres instance), mirrored from its config: every org's apps"
+        " are placed in the same cells, so a cell belongs to no org and holds no tenant data."
+    ),
+    hosted_apps.HostedAppDomainMonth: Shared(
+        "A custom hostname that served an app in a metered month, keyed by environment and hostname for the apps "
+        "account's usage query: it names a hostname and an app slug, both public, and no org."
+    ),
     credentials.CredentialIdTombstone: Shared(
         "A deleted credential's id, kept so it is never minted again (its old envelopes would open under a"
         " re-created row). The id space is deployment-wide — a row carries no org and serves no reader."
@@ -1404,17 +1777,19 @@ TENANCY: dict[type[Base], Verdict] = {
         "A person's second factor: one per identity, so a person enrols once and every membership is "
         "challenged by and passes the same factor. An org's MFA policy is the org's "
         "(`Org.mfa_skip`); the factor that satisfies it is the person's, like the password.",
-        legacy_org_id=True,
     ),
     identity.UserRecoveryCode: Shared(
         "A person's recovery code, issued with and standing in for their one factor; per identity for the "
         "factor's reason.",
-        legacy_org_id=True,
     ),
     identity.UserTrustedDevice: Shared(
         "A browser the person proved their factor on: it skips the person's factor, so it is theirs, and a "
         "password change or an MFA reset forgets every one of them.",
-        legacy_org_id=True,
+    ),
+    identity.NotificationEmail: Shared(
+        "An email address a PERSON proved for notifications: one proof per person serves every org they act "
+        "in, as TelegramLink's chat does, and each membership's own Email channel decides whether that org "
+        "sends it anything. Read and written only for the caller's own identity or by the public verify link."
     ),
     identity.TelegramLink: Shared(
         "The Telegram chat a PERSON proved through the bot's deep link: one link per person serves "
@@ -1431,12 +1806,10 @@ TENANCY: dict[type[Base], Verdict] = {
         "A link that sets the person's password, which is identity-level (`identities.password_hash`): "
         "rate-limited and spent per identity. `user_id` is the membership whose eligibility the link is "
         "checked against; the door binds that membership's org before reading it.",
-        legacy_org_id=True,
     ),
     identity.LegalAcceptance: Shared(
         "The person accepting the Terms and Privacy Policy, append-only evidence about a person; read only to "
         "ask whether a person still owes it (`signup.terms_pending`), inside the owner's org.",
-        legacy_org_id=True,
     ),
     identity.UserIdentity: Shared(
         "The PERSON behind one or more memberships: an `admin_users` row is one membership in one "
@@ -1525,12 +1898,18 @@ TENANCY: dict[type[Base], Verdict] = {
         "One console session's rendezvous between the API and the console relay: the hashes of its two "
         "single-use leg tickets, the node the dial-back must come from, and the relay task that holds it. "
         "The authorization it stands for was decided in the console route that minted it; the viewer's "
-        "id and session epochs ride along only so the API's sweep can revoke an ended login."
+        "id and session epochs bind the browser leg's claim to that login and let the API's sweep revoke it once ended."
     ),
     control_plane.RateLimitHit: Shared(
         "One counted request for a rate-limit bucket and key (a login IP, a public route), kept so the "
         "limit holds fleet-wide rather than per process. The key is a request property, never an org's; "
-        "hour-old rows are pruned by the peer heartbeat."
+        "day-old rows are pruned by the peer heartbeat."
+    ),
+    control_plane.RequestIdempotency: Shared(
+        "One console write's idempotency key and the answer it got (`app/idempotency.py`), keyed by principal — "
+        "the session's `admin_id` — like `rate_limit_hits`. Read only by the same principal's next copy of that "
+        "write, after the route's own authz already answered the first; it carries no `org_id` and is pruned "
+        "after 24 hours by the `request-idempotency-prune` cron."
     ),
     identity.LoginFailure: Shared(
         "One counted refused sign-in for the lockout (`app/login_lockout.py`): an identifier's keyed hash, a "
@@ -1547,14 +1926,41 @@ TENANCY: dict[type[Base], Verdict] = {
         "The deployment's Stripe event log, deduplicated on Stripe's id. An event is about ONE account, not "
         "one org: its org is resolved when it is processed and lands on the mirror row, never here."
     ),
-    hosting.HostingPrice: Shared(
-        "The hosting price catalogue every org buys from (instance types, storage sizes, Shared tiers). A tenant "
-        "cannot add one, so a per-org copy would be N copies of one catalogue — billing_plans' reason."
+    billing.BillingStripeWrite: Shared(
+        "The deployment's log of every write it sent to Stripe (`app/billing/gateway.py`). A write is the "
+        "deployment's act on its own Stripe account; the customer's org is a copied pointer for the operator's "
+        "filter, and only the operator's Settings > Billing > Stripe log serves the table."
+    ),
+    billing.BillingReconcileRun: Shared(
+        "One read-only comparison of the deployment's Stripe account with what Jaah expects, across every "
+        "customer at once; only the operator's Settings > Billing > Reconcile serves it."
+    ),
+    billing.BillingReconcileDiff: Shared(
+        "One difference a deployment-wide reconcile run found (billing_reconcile_runs' reason); the customer's org "
+        "is a copied pointer, and only the operator's Reconcile screen serves the table."
+    ),
+    products.ProductKind: Shared(
+        "The product kinds the engine sells: a lookup every engine table references, the same for every org."
+    ),
+    products.Product: Shared(
+        "The product catalogue every org buys from, plus typed products an operator makes for one org: "
+        "customer_org_id is a copied pointer, never the tenancy column (a catalogue product has no org) — "
+        "billing_plans' reason."
+    ),
+    products.ProductOption: Shared(
+        "One priced choice of a catalogue product (an instance type, a storage size) — products' reason."
+    ),
+    products.ProductPrice: Shared(
+        "One price of a catalogue product or option — products' reason."
+    ),
+    products.ProductLine: Shared(
+        "What a plan includes, plus one org's override and comp lines in the same table: customer_org_id is a "
+        "copied pointer, never the tenancy column (a plan's line has no org) — billing_plans' reason."
     ),
     hosting.AllowedInstanceType: Shared(
         "The EC2 instance types the deployment allows (the cost control on every cloud launch and the menu its "
         "hosting products sell from). A tenant cannot add one, so a per-org copy would be N copies of one list — "
-        "rental_prices' reason."
+        "billing_plans' reason."
     ),
     billing.BillingPlan: Shared(
         "The plan catalogue every org chooses from (seeded `team`, `enterprise`). A tenant cannot add one, so "
@@ -1566,9 +1972,6 @@ TENANCY: dict[type[Base], Verdict] = {
         "would be N copies of one constant — built_in_playbooks' reason."
     ),
     governance.GovManagedPackRelease: Shared("One released version of a managed pack; gov_managed_packs' reason."),
-    billing.BillingPlanProduct: Shared(
-        "A product one catalogue plan bundles; a line of billing_plans, which is Shared — billing_plans' reason."
-    ),
     orgs.OrgTransferCarryover: Shared(
         "Operator machinery for a project move: one live runner's sanctioned tail on the "
         "org-A node it was running on when its task moved to org B. It is read by `routes/agent/auth.py::"
@@ -1606,12 +2009,9 @@ if edition_features.enabled("project_memory"):
             "derive through it, and a derived parent would put them two hops from orgs. org_id is copied off the "
             "project by the one writer (`app/project_memory/ingest.py`).",
             same_org=(
-                SameOrg(
-                    column="project_id",
-                    parent=projects.Project,
-                    on_delete="CASCADE",
-                    null_is_legitimate=False,
-                    reason="A unit is filed under a project of its own org.",
+                _project(
+                    "A unit is filed under a project of its own org.",
+                    on_delete="CASCADE", null_is_legitimate=False,
                 ),
             ),
         ),

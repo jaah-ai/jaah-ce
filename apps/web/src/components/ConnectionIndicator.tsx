@@ -3,26 +3,27 @@ import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
 import type { EventStreamState } from '../hooks/useEventStream'
 import type { ComponentHealth } from '../hooks/useHealth'
-import HoverCard from './HoverCard'
 import { VISUALLY_HIDDEN } from '../ui/visuallyHidden'
 import StatusDot from '../ui/StatusDot'
+import { FONT_SIZE, SIZE } from '../theme'
+import Tip from '../ui/Tip'
 
 // The console header badge: SSE state plus composite 'degraded' (amber); with `components` from
-// useHealth(), a per-component breakdown on hover.
+// useHealth(), a per-component breakdown on hover. It shows only when something is off: a healthy connection, and the
+// first connect on load, render nothing.
 export type IndicatorState = EventStreamState | 'degraded'
 
-const LABEL: Record<IndicatorState | 'connecting', string> = {
-  connecting: 'Connecting…',
-  connected: 'Live',
+/** The states that render: everything but a healthy connection and the first connect. */
+type OffState = Exclude<IndicatorState, 'connected'>
+
+const LABEL: Record<OffState, string> = {
   degraded: 'Degraded',
   reconnecting: 'Reconnecting…',
   down: 'Disconnected — polling',
 }
 
 // Palette tokens, not literals, so both colour schemes follow the theme (AC8).
-const STATE_COLOR: Record<IndicatorState | 'connecting', string> = {
-  connecting: 'text.secondary',
-  connected: 'success.main',
+const STATE_COLOR: Record<OffState, string> = {
   degraded: 'warning.main',
   reconnecting: 'warning.main',
   down: 'error.main',
@@ -30,8 +31,8 @@ const STATE_COLOR: Record<IndicatorState | 'connecting', string> = {
 
 
 /* "Reconnecting…" only once a drop outlasts this: the stream re-opens within a second or two on a deploy
- * or a network blip, and the badge flashed amber on every one. Until then the badge keeps what it last said; on a
- * first connect, which the stream also reports as `reconnecting`, it says "Connecting…" — never "Live" before it is.
+ * or a network blip, and the badge flashed amber on every one. Until then the badge keeps what it last said
+ * (nothing, when that was healthy); a first connect, which the stream also reports as `reconnecting`, shows nothing.
  * "Disconnected — polling" has its own, longer clock (`useEventStream`'s `DOWN_AFTER_MS`). */
 export const RECONNECT_GRACE_MS = 4000
 
@@ -65,7 +66,7 @@ function Breakdown({
   components,
   showDaemon,
 }: {
-  state: Shown
+  state: OffState
   components: ComponentHealth
   showDaemon: boolean
 }) {
@@ -77,17 +78,17 @@ function Breakdown({
   // row could only read "–". The Sidebar passes `is_operator`, stricter than the API's `is_tenant_org`;
   // this component only honours the verdict.
   if (showDaemon) rows.push(['jaahd', components.jaahd])
-  const rowSx = { display: 'flex', justifyContent: 'space-between', gap: 2, py: '1px' } as const
+  const rowSx = { display: 'flex', justifyContent: 'space-between', gap: 2, py: 0 } as const
   return (
-    <Box data-testid="health-breakdown" sx={{ display: 'flex', flexDirection: 'column', gap: '0.125rem', minWidth: 120 }}>
+    <Box data-testid="health-breakdown" sx={{ display: 'flex', flexDirection: 'column', gap: 0, minWidth: SIZE.fieldSm }}>
       <Box data-testid="hovercard-row" sx={rowSx}>
-        <Typography component="span" variant="body2" data-testid="hovercard-label" sx={{ color: 'text.secondary' }}>
+        <Typography component="span" variant="body2" data-testid="hovercard-label">
           {LABEL[state]}
         </Typography>
       </Box>
       {rows.map(([label, value]) => (
         <Box key={label} data-testid="hovercard-row" sx={rowSx}>
-          <Typography component="span" variant="body2" data-testid="hovercard-label" sx={{ color: 'text.secondary' }}>
+          <Typography component="span" variant="body2" data-testid="hovercard-label">
             {label}
           </Typography>
           <Typography component="span" variant="body2" data-testid="hovercard-value">
@@ -113,24 +114,26 @@ export default function ConnectionIndicator({
       Used in the Sidebar, including the 60px mobile bar. */
   compact?: boolean
 }) {
-  const shown = useGraced(state)
+  const graced = useGraced(state)
+  if (graced === 'connected' || graced === 'connecting') return null
+  const shown: OffState = graced
   const badge = (
     <Box
       component="span"
       data-testid="connection-indicator"
       // Under Emotion the class name is a hash, so tests read the state off `data-state`.
       data-state={shown}
-      // The hidden label leaves the dot unnamed; the title names it.
-      title={compact || !components ? `Connection: ${LABEL[shown]}` : undefined}
+      // The bare dot's name.
+      aria-label={compact ? `Connection: ${LABEL[shown]}` : undefined}
       sx={{
         display: 'inline-flex',
         alignItems: 'center',
-        gap: '0.375rem',
-        fontSize: '0.875rem',
+        gap: 1,
+        fontSize: FONT_SIZE.base,
         color: STATE_COLOR[shown],
       }}
     >
-      <StatusDot data-testid="connection-indicator-dot" color="currentColor" size="0.5rem" />
+      <StatusDot data-testid="connection-indicator-dot" color="currentColor" />
       {/* Wrapped (not a bare text node) so `compact` can hide it without hiding the dot. */}
       <Typography
         component="span"
@@ -145,10 +148,12 @@ export default function ConnectionIndicator({
     </Box>
   )
 
-  if (!components) return badge
   return (
-    <HoverCard content={<Breakdown state={shown} components={components} showDaemon={showDaemon} />}>
+    <Tip title={components
+      ? <Breakdown state={shown} components={components} showDaemon={showDaemon} />
+      : `Connection: ${LABEL[shown]}`}
+    >
       {badge}
-    </HoverCard>
+    </Tip>
   )
 }

@@ -5,9 +5,10 @@ import re
 import dataclasses
 import urllib.parse
 
-from ..model import Annotation, Check, ForgeError, Job, PolicyRefusal, PullRequest, Run, is_id
-from .base import (MAX_PR_COMMITS, PAGE_MAX, TRUNCATED, Adapter, capped, commit, diff_stats, every, is_ci_file,
-                   listed_item, provenance, take)
+from ..model import Annotation, Check, ForgeError, Job, PolicyRefusal, PullRequest, Run
+from .base import (MAX_MERGED_FILES, MAX_PAGES, MAX_PR_COMMITS, PAGE_MAX, TRUNCATED, Adapter, Started, capped, commit,
+                   diff_stats, every, is_ci_file, iso, listed_item, merged_item, newest_merged, parse_time, provenance,
+                   take)
 
 _STATE = {"opened": "open", "locked": "open", "merged": "merged", "closed": "closed"}
 _ROLLUP = {"success": "success", "failed": "failure", "canceled": "failure", "skipped": "none"}
@@ -20,12 +21,17 @@ _BLOCKED = {"draft_status", "discussions_not_resolved", "blocked_status", "not_o
 
 _CONCLUSION = {"success": "success", "failed": "failure", "canceled": "cancelled", "skipped": "skipped"}
 _RUNNING = {"running", "canceling"}
+# A commit status (`repository/commits/:sha/statuses`): `manual` waits on a person, so it is skipped as a job is.
+_COMMIT_STATUS = {"success": "success", "failed": "failure", "canceled": "failure", "skipped": "skipped",
+                  "manual": "skipped", "pending": "pending", "running": "pending", "created": "pending"}
 _MR_STATE = {"open": "opened", "closed": "all", "all": "all"}  # `closed` = closed + merged: filtered here
 # GitLab's draft flag IS a title prefix: dropping it is how an MR is marked ready.
 _DRAFT_PREFIX = re.compile(r"^\s*(?:draft:|\[draft\]|\(draft\)|draft\s+-|wip:)", re.IGNORECASE)
 # A job retried one by one: only a finished one can be (a running or queued job is already on its way).
 # A merge-request pipeline builds `refs/merge-requests/<iid>/head` (or `/merge`, `/train`), not a branch.
 _MR_REF = re.compile(r"refs/merge-requests/(\d+)/[a-z]+")
+# The pipeline variable `run dispatch` sets to the job a gate is judged on (`*` = the whole pipeline).
+GATE_VARIABLE = "JAAH_GATE"
 
 
 def outcome(status: "str | None") -> "tuple[str, str | None]":
@@ -79,28 +85,27 @@ def merge_state(status: str, checks: str) -> str:
 
 
 class GitLab(Adapter):
+    DESCRIPTION = "description"
+    PR_NAME = "GitLab MR"
+    NUMBER = "iid"
+    PRS = "merge_requests"
+    UPDATE = "PUT"
+    CLOSE = {"state_event": "close"}
+
     @property
-    def _project(self) -> str:
+    def _repo(self) -> str:
         return f"projects/{urllib.parse.quote(self.login.repo_path, safe='')}"
 
-    def _mr(self, iid) -> str:
-        return f"{self._project}/merge_requests/{iid}"
+    def _create_payload(self, title, body, head, base, draft):
+        return {"source_branch": head, "target_branch": base, "title": f"Draft: {title}" if draft else title,
+                "description": body, "squash": False}
 
-    def create(self, *, title, body, head, base, draft):
-        data = self.client.json("POST", f"{self._project}/merge_requests", json_body={
-            "source_branch": head, "target_branch": base, "title": f"Draft: {title}" if draft else title,
-            "description": body, "squash": False})
-        return self.view(int(data["iid"]))
-
-    def find(self, head):
-        rows = self.client.get(f"{self._project}/merge_requests", params={
+    def _find_rows(self, head):
+        return self.client.get(self._pr_path(), params={
             "source_branch": head, "state": "all", "order_by": "created_at", "sort": "desc", "per_page": 1})
-        if not rows:
-            raise ForgeError(f"no GitLab MR from branch '{head}'")
-        return int(rows[0]["iid"])
 
     def view(self, number):
-        mr = self.client.get(self._mr(number))
+        mr = self.client.get(self._pr_path(number))
         pipeline = mr.get("head_pipeline") or {}
         status = pipeline.get("status")
         checks = _ROLLUP.get(status, "pending") if status else "none"
@@ -119,7 +124,7 @@ class GitLab(Adapter):
         if pipeline_id is None:
             return []
         out: list[Check] = []
-        for job in self.client.get(f"{self._project}/pipelines/{pipeline_id}/jobs", params={"per_page": 100}):
+        for job in self.client.get(f"{self._repo}/pipelines/{pipeline_id}/jobs", params={"per_page": 100}):
             status = job.get("status")
             if status == "success":
                 state = "success"
@@ -136,9 +141,15 @@ class GitLab(Adapter):
                              not job.get("allow_failure")))
         return out
 
+    def checks_for_sha(self, sha):
+        # The latest status per name (no `all`): a retried job's earlier attempt no longer counts.
+        rows = every(self._pages(f"{self._repo}/repository/commits/{sha}/statuses", {}, PAGE_MAX))
+        return [Check(str(r["id"]), r.get("name") or "", _COMMIT_STATUS.get(r.get("status") or "", "pending"),
+                      r.get("target_url") or "") for r in rows]
+
     def _require_merge_commits(self) -> None:
         """A merge commit only: a fast-forward or semi-linear project would land the head without one."""
-        project = self.client.get(self._project)
+        project = self.client.get(self._repo)
         method = project.get("merge_method")
         if method != "merge":
             raise PolicyRefusal(f"this GitLab project merges by {method!r}, not with a merge commit — "
@@ -151,13 +162,13 @@ class GitLab(Adapter):
     def auto_merge(self, pr):
         self._require_merge_commits()
         # GitLab >= 17 reads `auto_merge`; older releases the deprecated `merge_when_pipeline_succeeds`.
-        self.client.json("PUT", f"{self._mr(pr.number)}/merge",
+        self.client.json("PUT", f"{self._pr_path(pr.number)}/merge",
                          json_body={"auto_merge": True, "merge_when_pipeline_succeeds": True, "squash": False})
         return self.view(pr.number)
 
     def disable_auto_merge(self, pr):
         # Cancels auto-merge on GitLab >= 17 too.
-        self.client.json("POST", f"{self._mr(pr.number)}/cancel_merge_when_pipeline_succeeds")
+        self.client.json("POST", f"{self._pr_path(pr.number)}/cancel_merge_when_pipeline_succeeds")
         return self.view(pr.number)
 
     def merge(self, pr):
@@ -165,40 +176,21 @@ class GitLab(Adapter):
         body = {"squash": False}
         if pr.extra.get("head_sha"):
             body["sha"] = pr.extra["head_sha"]  # refuse to merge a head that moved since the checks passed
-        self.client.json("PUT", f"{self._mr(pr.number)}/merge", json_body=body)
+        self.client.json("PUT", f"{self._pr_path(pr.number)}/merge", json_body=body)
         return self.view(pr.number)
 
-    def edit(self, number, *, title, body):
-        # Never `state_event` here: closing is the separate `close` method.
-        patch = {k: v for k, v in (("title", title), ("description", body)) if v is not None}
-        self.client.json("PUT", self._mr(number), json_body=patch)
-        return self.view(number)
-
     def comment(self, number, body):
-        data = self.client.json("POST", f"{self._mr(number)}/notes", json_body={"body": body})
+        data = self.client.json("POST", f"{self._pr_path(number)}/notes", json_body={"body": body})
         return {"number": number, "url": f"{self.login.web_url}/-/merge_requests/{number}#note_{data.get('id')}"}
 
     def ready(self, number):
-        title = self.client.get(self._mr(number)).get("title") or ""
+        title = self.client.get(self._pr_path(number)).get("title") or ""
         if _DRAFT_PREFIX.match(title):
             ready_title = title
             while _DRAFT_PREFIX.match(ready_title):  # GitLab reads `Draft: Draft: x` as a draft too
                 ready_title = _DRAFT_PREFIX.sub("", ready_title, count=1).lstrip()
-            self.client.json("PUT", self._mr(number), json_body={"title": ready_title})
+            return self._update(number, {"title": ready_title})
         return self.view(number)
-
-    def close(self, number):
-        self.client.json("PUT", self._mr(number), json_body={"state_event": "close"})
-        return self.view(number)
-
-    def _pages(self, path: str, params: dict, per_page: int):
-        page = 1
-        while True:
-            rows = self.client.get(path, params={**params, "per_page": per_page, "page": page}) or []
-            yield rows
-            if len(rows) < per_page:
-                return
-            page += 1
 
     def runs(self, workflow, branch, limit):
         # A project has ONE CI config, so its file (or no workflow) names every pipeline; anything else is a
@@ -208,14 +200,13 @@ class GitLab(Adapter):
             params["name"] = workflow
         if branch:
             params["ref"] = branch
-        return [_run(r) for r in take(self._pages(f"{self._project}/pipelines", params, min(limit, PAGE_MAX)), limit)]
+        return [_run(r) for r in take(self._pages(f"{self._repo}/pipelines", params, min(limit, PAGE_MAX)), limit)]
 
     def run(self, run_id):
-        if not is_id(run_id):
-            raise ForgeError(f"'{run_id}' is not a GitLab pipeline id")
-        head = _run(self.client.get(f"{self._project}/pipelines/{run_id}"))
+        self._id(run_id, "a GitLab pipeline id")
+        head = _run(self.client.get(f"{self._repo}/pipelines/{run_id}"))
         jobs, notes = [], []
-        for row in every(self._pages(f"{self._project}/pipelines/{run_id}/jobs", {}, PAGE_MAX)):
+        for row in every(self._pages(f"{self._repo}/pipelines/{run_id}/jobs", {}, PAGE_MAX)):
             name = row.get("name") or ""
             jobs.append(Job(str(row["id"]), name, *outcome(row.get("status"))))
             # GitLab has no annotation lines; its one warning is a job that failed but was allowed to.
@@ -225,29 +216,35 @@ class GitLab(Adapter):
         return head, jobs, notes
 
     def run_head(self, run_id):
-        if not is_id(run_id):
-            raise ForgeError(f"'{run_id}' is not a GitLab pipeline id")
-        row = self.client.get(f"{self._project}/pipelines/{run_id}")
+        self._id(run_id, "a GitLab pipeline id")
+        row = self.client.get(f"{self._repo}/pipelines/{run_id}")
         head = _run(row)
         found = _MR_REF.fullmatch(row.get("ref") or "")
         if found:
             # The MR's source branch — only when it lives in THIS project (a fork chose its own name).
-            mr = self.client.get(self._mr(found.group(1)))
+            mr = self.client.get(self._pr_path(found.group(1)))
             own = mr.get("source_project_id") == mr.get("target_project_id")
             head = dataclasses.replace(head, branch=(mr.get("source_branch") or "") if own else "")
         return head
 
     def rerun(self, run, failed_only):
-        if not is_id(run.id):
-            raise ForgeError(f"'{run.id}' is not a GitLab pipeline id")
+        self._id(run.id, "a GitLab pipeline id")
         if failed_only:
             # Retries the pipeline's failed and canceled jobs, in place.
-            self.client.json("POST", f"{self._project}/pipelines/{run.id}/retry")
+            self.client.json("POST", f"{self._repo}/pipelines/{run.id}/retry")
             return run.id
         # GitLab has no "re-run everything" in place (retrying finished jobs one by one would replay a played
         # manual job and ignore stage order): a fresh pipeline on the same branch, as a push would fire.
-        data = self.client.json("POST", f"{self._project}/pipeline", params={"ref": run.branch})
+        data = self.client.json("POST", f"{self._repo}/pipeline", params={"ref": run.branch})
         return str(data["id"])
+
+    def dispatch(self, workflow, ref, inputs):
+        # A project has ONE pipeline per ref: it starts whole, `JAAH_GATE` naming the job the gate is judged on
+        # (`*`: the whole pipeline), so a job's `rules:` may key on it. Inputs travel as pipeline variables.
+        given = {**inputs, GATE_VARIABLE: workflow}
+        variables = [{"key": k, "value": v, "variable_type": "env_var"} for k, v in given.items()]
+        data = self.client.json("POST", f"{self._repo}/pipeline", json_body={"ref": ref, "variables": variables})
+        return Started(str(data["id"]), data.get("web_url") or "", data.get("sha") or "")
 
     def prs(self, state, author, limit, head=None, base=None):
         params = {"state": _MR_STATE[state], "order_by": "created_at", "sort": "desc"}
@@ -259,7 +256,7 @@ class GitLab(Adapter):
             params["target_branch"] = base
         keep = (lambda mr: mr.get("state") not in ("opened", "locked")) if state == "closed" else None
         per_page = PAGE_MAX if keep else min(limit, PAGE_MAX)
-        rows = take(self._pages(f"{self._project}/merge_requests", params, per_page), limit, keep)
+        rows = take(self._pages(self._pr_path(), params, per_page), limit, keep)
         # A listed MR carries no head pipeline, so no checks or merge state: the row says only what the listing does.
         return [listed_item(number=int(mr["iid"]), title=mr.get("title") or "", head=mr.get("source_branch") or "",
                             base=mr.get("target_branch") or "", author=(mr.get("author") or {}).get("username") or "",
@@ -271,19 +268,16 @@ class GitLab(Adapter):
         # GitLab names no line counts: they are counted off each file's diff text. A diff GitLab withholds
         # (`too_large`, or `collapsed` with no text) has none — that file counts as a file only.
         # Counted as read, so no diff text outlives its page.
-        rows, more = capped(_diff_row(r) for page in self._pages(f"{self._mr(number)}/diffs", {}, PAGE_MAX)
-                            for r in page)
+        rows, more = capped(_diff_row(r) for r in self._rows(f"{self._pr_path(number)}/diffs", {}, PAGE_MAX))
         return diff_stats("gitlab", rows, TRUNCATED if more else None)
 
     def provenance(self, number):
-        mr = self.client.get(self._mr(number))
+        mr = self.client.get(self._pr_path(number))
         merged = mr.get("state") == "merged"
         # A merge commit, else the squash commit, else (a fast-forward merge) the head itself landed.
         merge_sha = mr.get("merge_commit_sha") or mr.get("squash_commit_sha") or mr.get("sha")
-        rows, more_commits = capped((r for page in self._pages(f"{self._mr(number)}/commits", {}, PAGE_MAX)
-                                     for r in page), MAX_PR_COMMITS)
-        paths, more_files = capped(_diff_path(r) for page in self._pages(f"{self._mr(number)}/diffs", {}, PAGE_MAX)
-                                   for r in page)
+        rows, more_commits = capped(self._rows(f"{self._pr_path(number)}/commits", {}, PAGE_MAX), MAX_PR_COMMITS)
+        paths, more_files = capped(_diff_path(r) for r in self._rows(f"{self._pr_path(number)}/diffs", {}, PAGE_MAX))
         # GitLab lists newest first; oldest first, as GitHub does. It names no account per commit.
         commits = [commit(r["id"], r.get("author_name") or "", None, r.get("message") or "") for r in reversed(rows)]
         # `changes_count` is a string, `"1000+"` past GitLab's own cap (MORE than 1000).
@@ -293,7 +287,44 @@ class GitLab(Adapter):
         return provenance("gitlab", number, merged=merged, merge_sha=merge_sha, commits=commits,
                           more_commits=more_commits, files=paths, more_files=more_files or short)
 
+    def merged_prs(self, since, limit):
+        # `updated_after` bounds the listing server-side (a merge is an update); `merged_at` decides.
+        params = {"state": "merged", "updated_after": iso(since), "order_by": "updated_at", "sort": "desc"}
+        rows = take(self._pages(self._pr_path(), params, PAGE_MAX), MAX_PAGES * PAGE_MAX)
+        return [merged_item(number=int(mr["iid"]), url=mr.get("web_url") or "", title=mr.get("title") or "",
+                            body=mr.get("description"), merged_at=when,
+                            files=[_diff_path(d) for d in self.client.get(
+                                f"{self._pr_path(mr['iid'])}/diffs", params={"per_page": MAX_MERGED_FILES})])
+                for when, mr in newest_merged(rows, lambda mr: parse_time(mr.get("merged_at")), since, limit)]
+
     def ci_log(self, check_id):
-        if not is_id(check_id):
-            raise ForgeError(f"'{check_id}' is not a GitLab job id")
-        return self.client.text(f"{self._project}/jobs/{check_id}/trace")
+        self._id(check_id, "a GitLab job id")
+        return self.client.text(f"{self._repo}/jobs/{check_id}/trace")
+
+    # A project's CI/CD variables: the repository level is environment scope `*`, `--env E` is scope `E`; a
+    # secret is a masked variable, so `kind` splits one listing by its `masked` flag.
+    VARIABLE_RIGHTS = "the Maintainer role on the project, through a token with the `api` scope"
+
+    def variables(self, kind, env):
+        scope, masked = env or "*", kind == "secret"
+        rows = every(self._pages(f"{self._repo}/variables", {}, PAGE_MAX))
+        return [{"name": r["key"], **({} if masked else {"value": r.get("value") or ""})}
+                for r in rows if r.get("environment_scope") == scope and bool(r.get("masked")) == masked]
+
+    def set_variable(self, kind, name, value, env):
+        scope, masked = env or "*", kind == "secret"
+        # `raw`: a value is stored as given, never expanded as `$VAR` references. `masked_and_hidden` (17.4+,
+        # create-only; older releases ignore it) keeps a secret out of the UI too.
+        return self._upsert_variable(
+            "PUT", f"{self._repo}/variables", name, {"value": value, "masked": masked, "raw": True},
+            {"key": name, "value": value, "environment_scope": scope, "masked": masked, "masked_and_hidden": masked,
+             "protected": False, "raw": True}, params={"filter[environment_scope]": scope})
+
+    def delete_variable(self, kind, name, env):
+        scope = {"filter[environment_scope]": env or "*"}
+        # Only one of this kind: `secret delete` never removes a plain variable of that name, nor the reverse.
+        row = self.client.get(f"{self._repo}/variables/{name}", params=scope)
+        if bool(row.get("masked")) != (kind == "secret"):
+            raise ForgeError(f"'{name}' in {self.login.repo_path} is not a {kind}")
+        self.client.json("DELETE", f"{self._repo}/variables/{name}", params=scope)
+        return {}

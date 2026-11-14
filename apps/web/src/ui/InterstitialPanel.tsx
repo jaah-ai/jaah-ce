@@ -2,6 +2,7 @@ import Box from '@mui/material/Box'
 import Paper from '@mui/material/Paper'
 import Typography from '@mui/material/Typography'
 import type { JSX, ReactNode } from 'react'
+import { FONT_WEIGHT, LINE_HEIGHT, grid } from '../theme'
 
 /* The console's ONE interstitial: a page that cannot show what was asked for and says why instead — no
  * access (`pages/NoAccess.tsx`), not on the plan (`lib/planSwitches.tsx`), held by another org
@@ -26,13 +27,13 @@ export function InterstitialPanel({
   children?: ReactNode
 }): JSX.Element {
   return (
-    <Box data-testid={testId} sx={{ display: 'flex', justifyContent: 'center', paddingTop: { xs: '1rem', sm: '4rem' } }}>
+    <Box data-testid={testId} sx={{ display: 'flex', justifyContent: 'center', paddingTop: { xs: 2.5, sm: 10.5 } }}>
       <Paper
         variant="outlined"
         sx={{
-          maxWidth: '32rem',
+          maxWidth: grid(85),
           width: '100%',
-          padding: { xs: '1.25rem', sm: '2rem' },
+          padding: { xs: 3, sm: 5 },
           display: 'flex',
           flexDirection: 'column',
           gap: 1.5,
@@ -42,7 +43,7 @@ export function InterstitialPanel({
           variant="h6"
           component="h1"
           data-testid={titleTestId}
-          sx={{ fontWeight: 600, lineHeight: 1.25, overflowWrap: 'anywhere' }}
+          sx={{ fontWeight: FONT_WEIGHT.semibold, lineHeight: LINE_HEIGHT.snug, overflowWrap: 'anywhere' }}
         >
           {title}
         </Typography>

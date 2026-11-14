@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { MutableRefObject } from 'react'
-import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import IconButton from '@mui/material/IconButton'
 import Typography from '@mui/material/Typography'
@@ -9,21 +8,35 @@ import { useApiRead } from '../../hooks/useApiRead'
 import { useEventStream } from '../../hooks/useEventStream'
 import { useLiveRefetch } from '../../hooks/useLiveRefetch'
 import { cachedRead, forgetCachedRead } from '../../lib/cachedRead'
+import { countOf } from '../../lib/humanize'
 import { touchesScope } from '../../lib/taskEventScope'
 import { takeTaskPageSeed } from '../../lib/taskPageSeed'
 import { AsyncLookup, type LookupOption } from '../../ui/AsyncLookup'
 import { Banner } from '../../ui/Banner'
 import { TaskLink } from '../../ui/DetailFields'
 import { DisabledReason } from '../../ui/DisabledReason'
+import type { Explain } from '../../ui/explain'
+import FormField from '../../ui/FormField'
+import HelpLabel, { ExplainMoreButton } from '../../ui/HelpLabel'
 import { useAwaitingApprovalReason } from '../../lib/orgLifecycle'
 import FeedList from '../../ui/feed/FeedList'
 import type { FeedRowSpec, OverflowItem } from '../../ui/feed/types'
 import { StatusChip } from '../../ui/StatusChip'
+import EmptyState from '../../ui/EmptyState'
 import type { PipelineTask, TaskDepRef, TaskDependencies as TaskDeps } from '../../types'
 import { can, CONTROLS, startBody } from './controls'
-import { type PushIdentity, usePushIdentity } from './PushIdentityDialog'
+import { usePushIdentity } from './PushIdentityDialog'
 import { displayTitle, stateLabel, statusForState, taskLabel } from './shared'
 import { HEADING_SX, PANEL_SX } from './TaskTags'
+import { SIZE, grid } from '../../theme'
+
+/* The panel heading's explanation (it names the setting in every state) and the lookup's own hover. */
+const DEPENDS_ON_HELP: Explain = {
+  tip: 'This task starts only after each listed task is done.',
+  more: 'Type a task number, title or link to add one; a number or link also finds a finished task. Re-run starts a listed task again.',
+  docs: 'console-reference/tasks/new-task',
+}
+const ADD_PREREQUISITE_HINT = 'Adds a task this one must wait for.'
 
 /* The two icon controls a row may carry. NO PHONE FLOOR OF THEIR OWN: `theme.ts` raises every
    `MuiIconButton` to 44x44 below `sm`, which in an ungated slot would silently set a 44px row height.
@@ -31,9 +44,6 @@ import { HEADING_SX, PANEL_SX } from './TaskTags'
    `&.Mui-disabled` IS NOT COSMETIC: MUI's `pointer-events: none` makes the `elementFromPoint`
    reachability oracles (mobile nav not covering an action) walk past a disabled control. */
 const ROW_ICON_SX = { '&.Mui-disabled': { pointerEvents: 'auto' } } as const
-
-// `ui/Banner`'s density, reproduced for the one direct Alert (see its call site).
-const ALERT_SX = { py: 0.25, px: 1, alignItems: 'center', '& .MuiAlert-message': { py: 0.5 } } as const
 
 // Cross-task dependency sub-UI for the task detail, in TWO halves on two surfaces:
 //   • `TaskDependsOn` — prerequisites ("blocked by"), inside `TaskEditForm`'s `<form>` (Task tab,
@@ -143,29 +153,28 @@ const DEPS_STALE_MS = 30_000
 // Re-run a stale dep through the `start` control with intent `'run'` (`run_requested: true` — see
 // `StartIntent` in controls.ts). Per-row, never cascaded. Shares one `busy`/`actionError` pair so one
 // in-flight write disables every control.
-// AN ACTING OPERATOR IS ASKED WHOM TO PUSH AS first (`PushIdentityDialog.tsx`); a dep ref carries no project, so
-// only then is the row read for it. Cancel posts nothing. The panel renders `pushDialog`.
+// THE START ASK COMES FIRST (`PushIdentityDialog.tsx::usePushIdentity`: whom an acting operator pushes as, whether a
+// starter who can't see the repository runs without it); a dep ref carries no project, so the row is read for it.
+// Cancel posts nothing. The panel renders `pushDialog`.
 function useRerun(reload: () => void) {
   const [busy, setBusy] = useState(false)
   const [actionError, setActionError] = useState('')
-  const { acting, ask, dialog: pushDialog } = usePushIdentity()
+  const { ask, dialog: pushDialog } = usePushIdentity()
 
   const rerun = useCallback(
     async (depId: number) => {
       setActionError('')
-      let pushAs: PushIdentity = {}
-      if (acting) {
-        let row: PipelineTask
-        try {
-          row = await get<PipelineTask>(`/api/tasks/${depId}`)
-        } catch (err) {
-          setActionError(apiDetail(err, 'Failed to re-run task'))
-          return
-        }
-        const answer = await ask({ projectId: row.project_id, title: row.title, assigneeId: row.assigned_to_id })
-        if (!answer) return
-        pushAs = answer
+      let row: PipelineTask
+      try {
+        row = await get<PipelineTask>(`/api/tasks/${depId}`)
+      } catch (err) {
+        setActionError(apiDetail(err, 'Failed to re-run task'))
+        return
       }
+      const pushAs = await ask({
+        projectId: row.project_id, title: row.title, assigneeId: row.assigned_to_id, epic: row.persona === 'epic',
+      })
+      if (!pushAs) return
       setBusy(true)
       try {
         await post(CONTROLS.start.path(depId), startBody('run', pushAs))
@@ -176,7 +185,7 @@ function useRerun(reload: () => void) {
         setBusy(false)
       }
     },
-    [reload, acting, ask],
+    [reload, ask],
   )
 
   return { busy, setBusy, actionError, setActionError, rerun, pushDialog }
@@ -262,9 +271,10 @@ function depRowSpec({
     /* NO `href`: inside `TaskEditForm`'s `<form>` following a link would discard what is typed. */
     /* `#<id>` beside the disc, not `task #<id>`: the list is headed by what the rows are, and a 96px lead
        pushed a short id far right of the disc while the title truncated. 44px holds `#12345`. */
-    lead: { text: `#${dep.id}`, width: 44, title: taskLabel(dep) },
+    lead: { text: `#${dep.id}`, width: SIZE.tapTarget, title: taskLabel(dep) },
     title: name,
     titleText: name,
+    href: null,
     /* THE WHOLE ROW IN ONE SENTENCE, which makes the disc and ✓ marker decorative (`ui/feed/types.ts`). */
     ariaLabel: [
       taskLabel(dep),
@@ -286,7 +296,7 @@ function depRowSpec({
     slots: [
       {
         key: 'flag',
-        width: 82,
+        width: grid(13.5),
         align: 'right',
         node: dep.stale_reason ? (
           // Keeps the `role="status"` semantics; `StatusChip` takes no `role` prop.
@@ -309,7 +319,7 @@ function depRowSpec({
       },
       {
         key: 'rerun',
-        width: 30,
+        width: grid(5),
         align: 'center',
         /* Gated off the phone row; the ⋯ item carries it. */
         gate: 'id',
@@ -319,7 +329,6 @@ function depRowSpec({
               // An untyped button inside TaskEditForm's `<form>` submits it.
               type="button"
               aria-label={rerunLabel}
-              title={rerunBlockedReason ?? 'Re-run'}
               disabled={busy || rerunBlockedReason !== undefined}
               onClick={() => onRerun(dep.id)}
               sx={ROW_ICON_SX}
@@ -331,7 +340,7 @@ function depRowSpec({
       },
       {
         key: 'remove',
-        width: 30,
+        width: grid(5),
         align: 'center',
         /* `compact` RATHER THAN A GATE: the ✕ is the edit this panel exists for; the ⋯ carries it too. */
         compact: true,
@@ -340,7 +349,6 @@ function depRowSpec({
             // An untyped button inside TaskEditForm's `<form>` submits it.
             type="button"
             aria-label={removeLabel}
-            title="Remove"
             disabled={busy}
             onClick={onRemove}
             sx={ROW_ICON_SX}
@@ -378,8 +386,8 @@ type DepPanelProps = {
 }
 
 // The read-only prerequisite list: bare `ul`/`li`, body2, one line per edge that wraps rather than truncates.
-const PLAIN_LIST_SX = { m: 0, p: 0, listStyle: 'none', display: 'flex', flexDirection: 'column', gap: '0.25rem' } as const
-const PLAIN_ROW_SX = { display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', columnGap: '0.5rem', typography: 'body2' } as const
+const PLAIN_LIST_SX = { m: 0, p: 0, listStyle: 'none', display: 'flex', flexDirection: 'column', gap: 0.5 } as const
+const PLAIN_ROW_SX = { display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', columnGap: 1, typography: 'body2' } as const
 
 /* ── STAGED PREREQUISITE EDITS ──
    Adds and removes are STAGED and written only when the host form's Save/Go runs, in BOTH modes: create
@@ -405,6 +413,21 @@ export type PrereqCommitHandle = {
 /* The candidate page: bounds ONE popup (the server matches per keystroke), far inside the route's
    clamp. */
 const CANDIDATE_LIMIT = 50
+
+/* THE TASK A TERM NAMES, mirrored from the server's `_task_number_term` / `_task_link_term`
+   (`apps/api/app/routes/tasks/listing.py` is the home): siblings are filtered here, so a number or a pasted
+   console link must name the same row on both sides. A link names that row alone; a named row is offered
+   even when done. */
+const NUMBER_TERM = /^(?:task\s*)?(?:#\s*)?([0-9]{1,9})$/i
+const LINK_TERM = /^(?:https?:\/\/)?(?:app|dev)\.jaah\.ai\/tasks\/([0-9]{1,9})\/?(?:[?#]\S*)?$/i
+
+function namedTask(term: string): { id: number; link: boolean } | null {
+  if (term.length > 512) return null
+  const link = LINK_TERM.exec(term)
+  if (link) return { id: Number(link[1]), link: true }
+  const number = term.length > 32 ? null : NUMBER_TERM.exec(term)
+  return number ? { id: Number(number[1]), link: false } : null
+}
 
 /** One frozen empty array: `setSiblings` on an identical reference is a React bail-out. */
 const NO_SIBLINGS: readonly PipelineTask[] = []
@@ -479,24 +502,12 @@ export function TaskDependsOn({
   }, [taskId, parentTaskId, declaredIds, draft])
 
   /* THE SIBLING SET, FETCHED ONCE PER PARENT: `?parent_id=` is the list route's unbounded branch (no `q`,
-     no `limit`), so per-keystroke refetches return the same rows. State, not a ref, so an arrival
-     re-renders the open popup. A FAILURE IS SILENT: the offer degrades to the top-level page, and
+     no `limit`), so per-keystroke refetches return the same rows. An arrival re-renders the open popup.
+     A FAILURE IS SILENT (its `error` is never read): the offer degrades to the top-level page, and
      `ui/AsyncLookup` owns the query's error line. */
-  const [siblings, setSiblings] = useState<readonly PipelineTask[]>(NO_SIBLINGS)
-  useEffect(() => {
-    if (parentTaskId === null) {
-      setSiblings(NO_SIBLINGS)
-      return
-    }
-    const controller = new AbortController()
-    get<PipelineTask[]>(`/api/tasks?parent_id=${parentTaskId}`, { signal: controller.signal })
-      .then(rows => {
-        if (controller.signal.aborted) return
-        setSiblings(Array.isArray(rows) ? rows : NO_SIBLINGS)
-      })
-      .catch(() => { /* see above — the offer degrades, it does not report */ })
-    return () => controller.abort()
-  }, [parentTaskId])
+  const siblingRead = useApiRead(['task-siblings', parentTaskId],
+    () => get<PipelineTask[]>(`/api/tasks?parent_id=${parentTaskId}`), 'Siblings failed to load.', { enabled: parentTaskId !== null })
+  const siblings: readonly PipelineTask[] = parentTaskId !== null && Array.isArray(siblingRead.data) ? siblingRead.data : NO_SIBLINGS
 
   /* Read from refs at request time, so a pick or sibling arrival mid-flight cannot change what the
      in-flight request filters. */
@@ -521,17 +532,21 @@ export function TaskDependsOn({
     )
     const excluded = excludedRef.current
     const needle = term.toLowerCase()
+    const named = namedTask(term)
     /* SIBLINGS FIRST, FOR CORRECTNESS: the top-level page alone can fill `CANDIDATE_LIMIT`, which would
        silently drop the sibling class for every query. */
     const rows: LookupOption[] = []
     for (const sibling of siblingsRef.current) {
-      if (sibling.state === 'done' || sibling.hidden || sibling.archived_at) continue
+      const isNamed = named !== null && sibling.id === named.id
+      if (sibling.hidden || sibling.archived_at) continue
+      if (sibling.state === 'done' && !isNamed) continue
       if (excluded.has(sibling.id)) continue
       const option = candidateOption(sibling)
       /* MATCHED ON THE VISIBLE LABEL, not the stored title: `displayTitle` rewrites `[architecture]` to
          "Design — …". The label carries the id too. A sibling findable only by its BODY is unreachable
-         (`TaskListOut` omits it). */
-      if (needle !== '' && !option.label.toLowerCase().includes(needle)) continue
+         (`TaskListOut` omits it). A link matches its own row only. */
+      const matches = named?.link ? isNamed : needle === '' || isNamed || option.label.toLowerCase().includes(needle)
+      if (!matches) continue
       offeredRef.current.set(sibling.id, candidateRow(sibling))
       rows.push(option)
     }
@@ -644,13 +659,14 @@ export function TaskDependsOn({
     <Box sx={PANEL_SX}>
       {pushDialog}
       <Typography variant="body2" sx={HEADING_SX}>
-        Depends on
+        <HelpLabel label="Depends on" help={DEPENDS_ON_HELP} />
       </Typography>
+      <ExplainMoreButton label="Depends on" help={DEPENDS_ON_HELP} />
 
       {/* NO blocked-by banner here — it lives in `TaskDependents`: this disclosure is collapsed by
           default and `waiting_on_kind` covers only an epic's children. */}
 
-      <Box sx={{ display: 'flex', flexDirection: 'column', gap: '0.375rem' }}>
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
         {/* No sub-label: the panel heading is the label. */}
         {/* READ-ONLY (another org's row): a plain list of links, not feed rows — no ✕, Re-run, ⋯ or row
             hover, since none of them can act. A link is safe here: there is no typed work to discard. The stale
@@ -714,34 +730,33 @@ export function TaskDependsOn({
             heading (indistinguishable from a failed load). */}
         {readOnly ? (
           nothingToShow && (
-            <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-              No prerequisites.
-            </Typography>
+            <EmptyState inline title="No prerequisites." />
           )
         ) : (
           /* THE LOOKUP IS ALWAYS THERE: focus offers the first page, typing filters server-side, a pick
              stages. `value={null}` makes it repeatable — `ui/AsyncLookup` empties its box for a
              null-valued caller (its own pinned contract), so no remount steals focus. */
-          <AsyncLookup
-            id="task-prerequisite-lookup"
-            testId="prerequisite-lookup"
-            value={null}
-            onChange={addPick}
-            fetchOptions={fetchCandidates}
-            disabled={busy}
-            /* LABELLED AND FULL-WIDTH: MUI pins the popper to the input's width, so a content-sized box
-               truncated every suggestion to `task ... [`. A label survives typing; a placeholder does
-               not. */
-            label="Add a prerequisite"
-            /* THE PLACEHOLDER NAMES THE NUMBER FIRST — operators come with a task number in hand. Both
-               match (`list_tasks`' `?q=`, `_task_number_term`). A DONE task is offered by neither
-               (`exclude_done=true`). */
-            placeholder="Type a task number or title…"
-            ariaLabel="Add a prerequisite task"
-            // The empty query IS the first page: a click shows what is available.
-            fetchOnFocus
-            noOptionsText="No matching task"
-          />
+          /* LABELLED AND FULL-WIDTH (`ui/FormField` injects both): MUI pins the popper to the input's width, so a
+             content-sized box truncated every suggestion to `task ... [`. A label survives typing; a placeholder
+             does not. */
+          <FormField label="Add a prerequisite" help={ADD_PREREQUISITE_HINT}>
+            <AsyncLookup
+              id="task-prerequisite-lookup"
+              testId="prerequisite-lookup"
+              value={null}
+              onChange={addPick}
+              fetchOptions={fetchCandidates}
+              disabled={busy}
+              /* THE PLACEHOLDER NAMES THE NUMBER FIRST — operators come with a task number or link in hand.
+                 All match (`list_tasks`' `?q=`, `_task_number_term`, `_task_link_term`). A DONE task is
+                 offered only when named by number or link (`exclude_done=true`'s exception). */
+              placeholder="Type a task number, link or title…"
+              ariaLabel="Add a prerequisite task"
+              // The empty query IS the first page: a click shows what is available.
+              fetchOnFocus
+              noOptionsText="No matching task"
+            />
+          </FormField>
         )}
         {actionError && <Banner severity="error">{actionError}</Banner>}
       </Box>
@@ -779,9 +794,8 @@ export function TaskDependents({ taskId, readOnly = false, canRerun = true }: De
       {/* ⛔ BLOCKED BY — the forward edge's warning, homed here because this is the always-visible
           dependency surface and already holds the counts. */}
       {totalUnmet > 0 && (
-        /* `Alert` DIRECTLY, not `ui/Banner`: MUI's Alert defaults to `role="alert"` (assertive) and a
-           `role="status"` wrapper does not demote it; Banner takes no `role` and is frozen. */
-        <Alert severity="warning" variant="outlined" role="status" data-testid="warning-banner" sx={ALERT_SX}>
+        /* `role="status"`: a standing fact, not an interruption. */
+        <Banner severity="warning" role="status">
           {/* Three shapes: all-visible, visible+hidden mix, all-hidden (the banner is the only signal). The facts only:
               the state chip already says the task waits. */}
           {unmetCount > 0 ? (
@@ -802,9 +816,9 @@ export function TaskDependents({ taskId, readOnly = false, canRerun = true }: De
               {hiddenUnmet > 0 && ` (+${hiddenUnmet} not visible to you)`}
             </>
           ) : (
-            <>⛔ Blocked by {hiddenUnmet} prerequisite{hiddenUnmet === 1 ? '' : 's'} not visible to you</>
+            <>⛔ Blocked by {countOf(hiddenUnmet, 'prerequisite')} not visible to you</>
           )}
-        </Alert>
+        </Banner>
       )}
 
       <Typography variant="body2" sx={HEADING_SX}>
@@ -828,14 +842,12 @@ export function TaskDependents({ taskId, readOnly = false, canRerun = true }: De
       )}
       {hiddenDependents > 0 && (
         <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-          + {hiddenDependents} dependent{hiddenDependents === 1 ? '' : 's'} not visible to you
+          + {countOf(hiddenDependents, 'dependent')} not visible to you
         </Typography>
       )}
       {/* No Add button implies "none" here, so the empty line is said to everyone. */}
       {nothingToShow && (
-        <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-          Nothing depends on this task.
-        </Typography>
+        <EmptyState inline title="Nothing depends on this task." />
       )}
       {actionError && <Banner severity="error">{actionError}</Banner>}
     </Box>

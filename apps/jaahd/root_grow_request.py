@@ -74,11 +74,7 @@ def record_observe_response(result: dict | None, *, clock: Callable[[], float] =
     if not enabled():
         return False
     target = marker()
-    try:
-        # `write_bytes(b"")`, not `touch()`: the marker must be EMPTY.
-        target.write_bytes(b"")
-    except OSError as exc:
-        log.warning("root-grow: could not create %s: %s", target, exc)
+    if not marker_request.write_empty(target, log, "root-grow"):
         return False
     _last_write = now
     log.info("root-grow: the control plane enlarged the root volume; asked for a grow (%s)", target)

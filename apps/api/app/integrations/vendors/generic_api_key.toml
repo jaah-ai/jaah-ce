@@ -1,0 +1,39 @@
+slug = "generic_api_key"
+label = "Generic API key"
+category = "custom"
+credential_type = "generic_api_key"
+vendor_docs_url = "https://datatracker.ietf.org/doc/html/rfc6750"
+summary = "Store one API key for any service, with the header and prefix it is sent under, when no card fits."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "base_url", label = "URL", kind = "url", required = false, outright = true, placeholder = "https://api.example.com", help = "The API's root address, for example https://api.example.com/v1. Leave it blank for a key that names no host, such as one a Jaah feature reads; the Test then has nothing to call" },
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "The key or token the service gave you, usually under its account, developer or API settings page. Paste the key alone, without a scheme word such as Bearer" },
+  { key = "header_name", label = "Header name", kind = "text", required = false, placeholder = "Authorization", help = "The HTTP header the API reads the key from, as its documentation names it (for example X-API-Key). Leave it blank to send the key in Authorization" },
+  { key = "value_prefix", label = "Value prefix", kind = "text", required = false, placeholder = "Bearer", help = "The word sent before the key, such as Bearer or Token. Leave it blank to send the key alone" },
+]
+
+[docs]
+agent_uses = [
+  "Call the API at the URL you saved, sending the key under the header and prefix you chose",
+  "Use the key in every task allowed to use the secret, without anyone pasting it into a prompt",
+]
+prerequisites = [
+  "A key or token from the service, and its documentation for how the key is sent (a header such as Authorization or X-API-Key, and any prefix such as Bearer)",
+  "When the whole organization reuses the same API: an Org Owner or Admin can define it once as a custom connector instead, under Secrets > Add secret > Custom category",
+]
+limitations = [
+  "Jaah does not know the API's endpoints: agents work from the API's own documentation, so link it in the task",
+  "The Test calls one GET request on the URL and passes on any answer that is not a refusal, so it proves the host answered, not that the key works on every endpoint",
+  "Without a URL there is nothing to test, and the key stays usable only where the secret is read directly",
+]
+troubleshooting = [
+  { symptom = "The Test says the host rejected the request (401 or 403)", fix = "Check the key, then the header name and value prefix against the API's documentation. Many APIs expect X-API-Key with no prefix, others Authorization with Bearer" },
+  { symptom = "Saving says the header name or value prefix is refused", fix = "Spell the header name as the API's documentation does, with no spaces or colon; Host, Content-Length and the other headers Jaah sets itself are refused. A prefix is one word, such as Bearer" },
+  { symptom = "The Test says URL is required before testing", fix = "Add the API's https address in URL, or leave the key untested when a Jaah feature reads it directly" },
+]
+faq = [
+  { q = "When should I use this card instead of a service's own card", a = "Only when the service has no card. A service's own card knows its address, how the key is sent and how to test it" },
+  { q = "What is the difference from a custom connector", a = "This secret is yours alone, defined as you save it. A custom connector is defined once by an Org Owner or Admin, and every member connects to it" },
+]

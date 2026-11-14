@@ -17,13 +17,15 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Optional
 from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import Text, case, cast, func, select, update
 from sqlalchemy.orm import Session
@@ -32,7 +34,7 @@ from app import agent_session_lifecycle as lifecycle
 from app import attachment_storage
 from app import session_transcript_archive as archive
 from app import session_transcripts as transcripts
-from app import edition_features, slot_state
+from app import edition_features, http_bounded, slot_state
 from app.agent_sessions import (
     END_REASON_RECONSTRUCTED,
     OWED_TRANSCRIPT_STATUSES,
@@ -51,10 +53,12 @@ from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
 from app.authz.principal import Principal
 from app.authz.visibility import visible_node_ref_clause
-from app.db import get_session
-from app.entity_shape import SYSTEM_ACTOR_ID, StrictModel
+from app.db_async import DbDep, on_session, run_blocking_in_session
+from app.entity_shape import SYSTEM_ACTOR_ID, StrictModel, or_404, refused_as
 from app.events import emit_console_event
 from app.model_prices import canonical_model
+from app.offload import run_cpu
+from app.request_body import read_capped
 from app.models.agent_sessions import AgentSession
 from app.models.credentials import Account
 from app.models.nodes import Node
@@ -73,7 +77,7 @@ from app.task_metrics_ingest import (
     fold_session_metrics,
     mark_live_capture_incomplete,
 )
-from app.clock import utcnow as _now
+from app.clock import as_utc, utcnow as _now
 
 log = logging.getLogger(__name__)
 
@@ -241,14 +245,8 @@ class TicketMemberIn(StrictModel):
     bytes: int = Field(ge=0, le=transcripts.MAX_MEMBER_BYTES)
 
 
-class TicketIn(StrictModel):
-    """A ticket request. A node-supplied key is refused at parse time.
-
-    The `mode="before"` validator runs on the raw input because Pydantic strips unknown fields first;
-    `reject_supplied_key` sits beside `extra="forbid"` so the message names the field."""
-
-    # Bounded, so one request cannot ask the CP to presign an arbitrary number of URLs.
-    members: list[TicketMemberIn] = Field(default_factory=list, max_length=transcripts.MEMBER_LIMIT)
+class _RefusesSuppliedKey(BaseModel):
+    """The raw-input key refusal `TicketIn` and `TranscriptReportIn` share (`TicketIn` says why)."""
 
     @model_validator(mode="before")
     @classmethod
@@ -256,6 +254,16 @@ class TicketIn(StrictModel):
         if isinstance(data, dict):
             transcripts.reject_supplied_key(data)
         return data
+
+
+class TicketIn(_RefusesSuppliedKey, StrictModel):
+    """A ticket request. A node-supplied key is refused at parse time.
+
+    The `mode="before"` validator runs on the raw input because Pydantic strips unknown fields first;
+    `reject_supplied_key` sits beside `extra="forbid"` so the message names the field."""
+
+    # Bounded, so one request cannot ask the CP to presign an arbitrary number of URLs.
+    members: list[TicketMemberIn] = Field(default_factory=list, max_length=transcripts.MEMBER_LIMIT)
 
 
 class TicketUrl(BaseModel):
@@ -283,7 +291,7 @@ class ReportMemberIn(StrictModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
-class TranscriptReportIn(CapturedUsageMixin):
+class TranscriptReportIn(_RefusesSuppliedKey, CapturedUsageMixin):
     """The upload outcome. Same raw-input key refusal as `TicketIn`: the manifest is built from this payload.
 
     Inherits `usage_by_model`/`explored_targets` from `app/task_metrics_ingest.py`, which owns their
@@ -309,13 +317,6 @@ class TranscriptReportIn(CapturedUsageMixin):
         if value is not None and len(json.dumps(value, default=str)) > 8192:
             raise ValueError("redaction report is larger than 8192 bytes")
         return value
-
-    @model_validator(mode="before")
-    @classmethod
-    def _no_node_supplied_key(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            transcripts.reject_supplied_key(data)
-        return data
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────────────────────────
@@ -382,16 +383,11 @@ def _work_items(
 
 
 def _row_or_404(session: Session, agent_session_id: str) -> AgentSession:
-    row = lifecycle.session_by_agent_id(session, agent_session_id)
-    if row is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"no session recorded for {agent_session_id!r} — report it on "
-                "`POST /api/agent/sessions/observed` first, which creates the row"
-            ),
-        )
-    return row
+    return or_404(
+        lifecycle.session_by_agent_id(session, agent_session_id),
+        detail=f"no session recorded for {agent_session_id!r} — report it on "
+                "`POST /api/agent/sessions/observed` first, which creates the row",
+    )
 
 
 # ── 1. The work list ──────────────────────────────────────────────────────────────────────────────
@@ -413,7 +409,7 @@ def _reclaim_expired_leases(session: Session) -> int:
     `gave_up` is decided from the incremented counter. Index-covered by `ix_sessions_transcript_sweep`."""
     attempts = AgentSession.transcript_attempts + 1
     exhausted = attempts >= transcripts.MAX_TRANSCRIPT_ATTEMPTS
-    deadline = datetime.now(timezone.utc) - transcripts.LEASE_TTL
+    deadline = _now() - transcripts.LEASE_TTL
     reclaimed = session.execute(
         update(AgentSession)
         .where(
@@ -458,10 +454,10 @@ def _reclaim_expired_leases(session: Session) -> int:
 # `agent_kind` and `runtime`).
 @router.get("/work", response_model=WorkOut, response_model_exclude_none=True)
 @infra(Tenancy.ORG_SCOPED)
-def session_work(
+async def session_work(
+    db: DbDep,
     node_id: str = Query(default=""),
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> WorkOut:
     """What this node still owes: transcripts to upload, and sessions to probe for aliveness.
 
@@ -470,13 +466,23 @@ def session_work(
     session served for upload would ship a partial transcript. An empty `awaiting_transcript` with
     `storage_available:false` is correct. The one write: fleet-wide lease reclaim first
     (`_reclaim_expired_leases`)."""
+    # Off the loop: a credential cache miss fetches from the container endpoint.
+    storage_available = await run_in_threadpool(archive.available)
+    return await db.run_sync(_session_work, node_id=node_id, caller=caller, storage_available=storage_available)
+
+
+def _session_work(
+    session: Session,
+    node_id: str,
+    caller: node_credentials.AgentCaller,
+    storage_available: bool,
+) -> WorkOut:
     # Derived from the credential, not the query string (`caller_node_id`).
     node = caller_node_id(session, caller, node_id)
     # Before the work queries, so a reclaimed lease is served this tick. Unconditional on storage: a
     # credential outage must not freeze lease expiry.
     _reclaim_expired_leases(session)
     homes = _node_homes(session, [node])
-    storage_available = archive.available()
 
     awaiting: list[WorkItem] = []
     if storage_available:
@@ -540,17 +546,18 @@ def _node_homes(session: Session, node_ids: list[UUID]) -> dict[UUID, str]:
 
 @router.post("/{agent_session_id}/end", status_code=204, response_model=None)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def end_session_route(
+    session: Session,
     agent_session_id: str,
     body: SessionEndIn,
     _: None = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> Response:
     """Record that a session ended. Idempotent: a repeat for an ended session is a no-op.
 
     The CP settles most endings itself; this covers a session restarting in place (`_KEEP_HOLD_REASONS`
     keeps the hold) and one the node's probe found dead. `end_reason` is validated against the full
-    domain (lifecycle outcomes plus every `runner_breaks` cause)."""
+    domain (lifecycle outcomes plus every `runner_causes` cause)."""
     if body.end_reason not in end_reasons():
         raise HTTPException(
             status_code=422,
@@ -561,7 +568,7 @@ def end_session_route(
         session,
         agent_session_id=agent_session_id,
         end_reason=body.end_reason,
-        ended_at=lifecycle.as_utc(body.ended_at),
+        ended_at=as_utc(body.ended_at),
     ):
         # Announced here because this route calls `end_session` directly (it must be able to fail the
         # request) rather than via `lifecycle.note_end`, which emits. Without it the page keeps the row as
@@ -575,19 +582,18 @@ def end_session_route(
 
 @router.post("/{agent_session_id}/pane-log", status_code=204, response_model=None)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def pane_log_route(
+    session: Session,
     agent_session_id: str,
     body: PaneLogIn,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> Response:
     """Store a dead run's pane-log tail, cleaned, redacted and capped (`pane_logs.store_form`). First answer wins:
     a repeat is a no-op, so a later run appending to the same file cannot overwrite the tail of this one."""
     row = _row_or_404(session, agent_session_id)
     if caller.node_id is not None and row.node_id != caller.node_id:
-        raise HTTPException(
-            status_code=403, detail="a node may only report the pane log of its own sessions"
-        )
+        raise HTTPException(status_code=403, detail="a node may only report the pane log of its own sessions")
     # `/work`'s own predicate, minus the window: a pane log is owed only by an ended run with no reason of its
     # own, so an early post cannot pre-empt a running session's real capture.
     if row.status != STATUS_ENDED or row.end_reason not in node_log_history.NODE_EXPLAINED_ENDS:
@@ -597,7 +603,7 @@ def pane_log_route(
             row.pane_log_tail, row.pane_log_redactions = pane_logs.store_form(body.tail)
             if row.pane_log_tail is None:
                 row.pane_log_redactions = None
-        row.pane_log_written_at = lifecycle.as_utc(body.written_at)
+        row.pane_log_written_at = as_utc(body.written_at)
         row.pane_log_captured_at = _now()
         row.updated_by_id = SYSTEM_ACTOR_ID
         session_changed(session)
@@ -609,11 +615,12 @@ def pane_log_route(
 
 @router.post("/{agent_session_id}/usage", status_code=204, response_model=None)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def report_live_usage(
+    session: Session,
     agent_session_id: str,
     body: LiveUsageIn,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> Response:
     """Fold a RUNNING session's usage so far into its task's `Task.metrics`, so the board's Tokens and
     Cost columns move within minutes instead of only when the session ends. The node posts every few
@@ -634,9 +641,7 @@ def report_live_usage(
     row = _row_or_404(session, agent_session_id)
     # A derived node may only meter its own sessions; the CP's own arms (`node_id is None`) are fleet-wide.
     if caller.node_id is not None and row.node_id != caller.node_id:
-        raise HTTPException(
-            status_code=403, detail="a node may only report usage for its own sessions"
-        )
+        raise HTTPException(status_code=403, detail="a node may only report usage for its own sessions")
     task_id = row.task_id
     # One usage source per attempt: an `acp` session is counted from its event stream (`ingest_events`), so a
     # vendor parser's figure for it is never folded.
@@ -714,23 +719,16 @@ _EVENTS_MAX_BODY_BYTES = session_events.MAX_BATCH_BYTES + 1024 * 1024
 
 
 async def _events_body(request: Request) -> EventsIn:
-    """The batch, bounded on its RAW bytes before it is parsed — the declared length first, then the bytes actually
-    read — as `routes/agent/node_config.py::_node_logs_body`. The 422 names fields, never quotes the input back."""
-    oversize = HTTPException(
-        status_code=413, detail=f"an event batch must be at most {_EVENTS_MAX_BODY_BYTES} bytes"
-    )
-    declared = (request.headers.get("content-length") or "").strip()
-    if declared.isdigit() and int(declared) > _EVENTS_MAX_BODY_BYTES:
-        raise oversize
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > _EVENTS_MAX_BODY_BYTES:
-            raise oversize
-        chunks.append(chunk)
+    """The batch, bounded on its RAW bytes before it is parsed (`app/request_body.py`). The 422 names fields, never
+    quotes the input back."""
+    raw = await read_capped(request, _EVENTS_MAX_BODY_BYTES)
+    if raw is None:
+        raise HTTPException(
+            status_code=413, detail=f"an event batch must be at most {_EVENTS_MAX_BODY_BYTES} bytes"
+        )
     try:
-        return EventsIn.model_validate_json(b"".join(chunks))
+        # Up to `_EVENTS_MAX_BODY_BYTES` of JSON: parsed and validated off the loop.
+        return await run_cpu(EventsIn.model_validate_json, raw)
     except ValidationError as exc:
         raise HTTPException(
             status_code=422, detail=exc.errors(include_url=False, include_input=False, include_context=False)
@@ -746,11 +744,11 @@ class EventsOut(BaseModel):
 
 @router.post("/{agent_session_id}/events", response_model=EventsOut)
 @infra(Tenancy.ORG_SCOPED)
-def ingest_events(
+async def ingest_events(
     agent_session_id: str,
+    db: DbDep,
     caller: node_credentials.AgentCaller = Depends(_check_token),
     body: EventsIn = Depends(_events_body),
-    session: Session = Depends(get_session),
 ) -> EventsOut:
     """Store a batch of an `acp` session's events, idempotent on `seq`, and fold its usage.
 
@@ -764,12 +762,39 @@ def ingest_events(
 
     LOCK ORDER as `report_live_usage`: the per-session ingest lock (advisory, `session_events.ingest_lock`),
     then the task row (the fold), then this session's row."""
+    # Off the loop: a credential cache miss fetches from the container endpoint; `where_for` then reads the cache.
+    await run_in_threadpool(archive.storage)
+    # The whole read-merge-write in a worker thread on a session of its own (`db_async.run_blocking_in_session`): its
+    # transaction-scoped ingest lock (`session_events.ingest_lock`) must stay held across the S3 round trip, which
+    # serialises this session's batches, so it never lives on an async connection across that wait.
+    return await run_blocking_in_session(_ingest_events_locked, agent_session_id, caller, body, route=db)
+
+
+def _ingest_events_locked(
+    session: Session, agent_session_id: str, caller: node_credentials.AgentCaller, body: EventsIn,
+) -> EventsOut:
+    batch = _ingest_events(session, agent_session_id=agent_session_id, caller=caller, body=body)
+    try:
+        stored = _store_events(batch, body)
+        return _finish_batch(session, batch, body, stored)
+    except HTTPException as exc:
+        if exc.status_code in _RECORDED_REFUSALS:
+            _record_refusal(session, batch.row.id, exc, body)
+        raise
+
+
+def _ingest_events(
+    session: Session,
+    agent_session_id: str,
+    caller: node_credentials.AgentCaller,
+    body: EventsIn,
+) -> "_Batch":
     row = _row_or_404(session, agent_session_id)
     if caller.node_id is not None and row.node_id != caller.node_id:
         raise HTTPException(status_code=403, detail="a node may only post events for its own sessions")
     row_id = row.id
     try:
-        return _store_batch(session, row, agent_session_id, body)
+        return _prepare_batch(session, row, agent_session_id, body)
     except HTTPException as exc:
         if exc.status_code in _RECORDED_REFUSALS:
             _record_refusal(session, row_id, exc, body)
@@ -811,9 +836,24 @@ def _record_refusal(session: Session, row_id: UUID, exc: HTTPException, body: Ev
         )
 
 
-def _store_batch(session: Session, row: AgentSession, agent_session_id: str, body: EventsIn) -> EventsOut:
-    """`ingest_events` past its ownership check: validate, store and fold one batch. Raises the 4xx refusals
-    `ingest_events` records on the row."""
+@dataclass(frozen=True)
+class _Batch:
+    """One batch validated under `ingest_lock` (`_prepare_batch`), for `_store_events` and `_finish_batch`."""
+
+    row: AgentSession
+    where: Any
+    # The row's committed high-water mark, read under the lock (plain, for `_store_events` off the loop).
+    stored_seq: Optional[int]
+    last_seq: int
+    closes: bool
+    uncounted: dict[int, dict[str, Any]]
+    # The session's running totals before this batch, read only when an uncounted usage item needs them.
+    start: Optional[session_events.UsageTotals]
+
+
+def _prepare_batch(session: Session, row: AgentSession, agent_session_id: str, body: EventsIn) -> _Batch:
+    """`ingest_events` past its ownership check: validate one batch under the ingest lock. Raises the 4xx
+    refusals `ingest_events` records on the row. `_store_events` then stores it, `_finish_batch` folds it."""
     if body.task_id is not None and row.task_id is not None and body.task_id != row.task_id:
         raise HTTPException(
             status_code=422, detail=f"the batch names task {body.task_id}; the session runs task {row.task_id}"
@@ -838,12 +878,10 @@ def _store_batch(session: Session, row: AgentSession, agent_session_id: str, bod
     session_events.ingest_lock(session, agent_session_id)
     # Re-read under the lock: a concurrent batch may have moved the high-water mark.
     session.refresh(row)
-    try:
+    with refused_as(409, session_events.SeqGap):
         last_seq = session_events.check_contiguous(
             (event.seq for event in body.events), last_seq=row.events_last_seq
         )
-    except session_events.SeqGap as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from None
     if last_seq > session_events.MAX_STREAM_EVENTS:
         raise HTTPException(
             status_code=413, detail=f"a session's stream holds at most {session_events.MAX_STREAM_EVENTS} events"
@@ -858,13 +896,25 @@ def _store_batch(session: Session, row: AgentSession, agent_session_id: str, bod
         # First wins, as `append` stores it.
         if event.seq > (row.events_last_seq or 0):
             uncounted.setdefault(event.seq, event.stored())
+    counts_usage = not closes and any(event["kind"] == "usage" for event in uncounted.values())
+    return _Batch(
+        row=row, where=where, stored_seq=row.events_last_seq, last_seq=last_seq, closes=closes, uncounted=uncounted,
+        start=_stream_totals(session, row) if counts_usage else None,
+    )
+
+
+def _store_events(
+    batch: _Batch, body: EventsIn,
+) -> tuple[list[dict[str, Any]], Optional[session_events.UsageTotals], Optional[Decimal]]:
+    """Store the batch and total its usage: object storage only, no database."""
+    where, uncounted = batch.where, batch.uncounted
     try:
-        added = session_events.append(where, body.events, last_seq=row.events_last_seq)
+        added = session_events.append(where, body.events, last_seq=batch.stored_seq)
         stored_total: Optional[Decimal] = None
-        if closes:
-            totals = session_events.usage_of(session_events.iter_all(where, last_seq=last_seq))
-        elif any(event["kind"] == "usage" for event in uncounted.values()):
-            start = _stream_totals(session, row)
+        if batch.closes:
+            totals = session_events.usage_of(session_events.iter_all(where, last_seq=batch.last_seq))
+        elif batch.start is not None:
+            start = batch.start
             stored_total = start.cumulative_cost_usd
             totals = session_events.usage_of((uncounted[seq] for seq in sorted(uncounted)), start)
         else:
@@ -873,6 +923,18 @@ def _store_batch(session: Session, row: AgentSession, agent_session_id: str, bod
         raise HTTPException(status_code=503, detail=f"{exc} — retry the batch") from None
     except transcripts.KeyRefused as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
+    return added, totals, stored_total
+
+
+def _finish_batch(
+    session: Session,
+    batch: _Batch,
+    body: EventsIn,
+    stored: tuple[list[dict[str, Any]], Optional[session_events.UsageTotals], Optional[Decimal]],
+) -> EventsOut:
+    """Fold the stored batch's usage and advance the row, in the transaction `_prepare_batch` locked."""
+    row, last_seq, closes = batch.row, batch.last_seq, batch.closes
+    added, totals, stored_total = stored
     native_ref = row.native_session_ref or next(
         (event.native_session_ref for event in body.events if event.native_session_ref), None
     )
@@ -959,10 +1021,11 @@ def _str_or_none(value: Optional[Decimal]) -> Optional[str]:
 
 @router.post("/observed", status_code=204, response_model=None)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def sessions_observed(
+    session: Session,
     body: ObservedIn,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> Response:
     """The node's own observed session ids; the CP creates a row for every one it does not hold.
 
@@ -972,7 +1035,7 @@ def sessions_observed(
     A created row is always `ended`/`reconstructed`/`pending` (reported only after the probe says it is
     not alive); `created_by_id` is the system actor. An id the CP already holds is left alone:
     `uq_sessions_agent_session_id` is global, so writing through the conflict would let a node claim a
-    row it does not own. The orphan count is read off the rows (`reconstructed_count`), not replied."""
+    row it does not own. The orphan count is read off the rows (`reconstructed_by_node`), not replied."""
     # No route-level cap: `ObservedIn.items` has `max_length`, validated before this runs.
     # Derived from the credential: this create path's node-supplied input decides which node the orphan
     # rows belong to, so `caller_node_id` refuses a body naming another node.
@@ -987,23 +1050,24 @@ def sessions_observed(
     # An ACP-hosted run's engine keeps its own transcript under its own id: the row it belongs to is the run's,
     # which records that id as its `native_session_ref` and uploads the run's transcript itself.
     engine_named = _engine_named_sessions(session, node, observed_ids)
+    # The node re-reports every session it still sees, so most ids already have a row naming a node, and
+    # `record_observed` would only read it and return False. One read here instead of a savepoint and a read per id.
+    recorded_ids = _already_recorded_sessions(
+        session, [sid for sid in observed_ids if sid not in live and sid not in engine_named]
+    )
     created = 0
+    skipped_live = skipped_engine = skipped_recorded = 0
     for item in body.items:
         if item.session_id in live:
-            log.info(
-                "sessions: ignoring observed %s — the control plane holds it as a LIVE session "
-                "(an open task's runner, or the holder of a pool slot), so it is not an orphan",
-                item.session_id,
-            )
+            skipped_live += 1
             continue
         if item.session_id in engine_named:
-            log.info(
-                "sessions: ignoring observed %s — it is an ACP-hosted run's engine session, recorded on that "
-                "run's own row, so it is not an orphan",
-                item.session_id,
-            )
+            skipped_engine += 1
             continue
-        # One savepoint per item (as `fleet_verdicts.record_intents`): `sessions` has other uniques/FKs, and
+        if item.session_id in recorded_ids:
+            skipped_recorded += 1
+            continue
+        # One savepoint per item (as `app/intent_rail.py::persist`): `sessions` has other uniques/FKs, and
         # one failing insert (a node retired mid-request) would otherwise discard the whole batch.
         try:
             with session.begin_nested():
@@ -1013,8 +1077,8 @@ def sessions_observed(
                     node_id=node,
                     worktree_ref=None,
                     cwd=item.worktree_path,
-                    started_at=lifecycle.as_utc(item.started_at),
-                    ended_at=lifecycle.as_utc(item.ended_at),
+                    started_at=as_utc(item.started_at),
+                    ended_at=as_utc(item.ended_at),
                 )
         except Exception:  # noqa: BLE001 — one refused row may not cost the other 199
             log.warning(
@@ -1032,6 +1096,12 @@ def sessions_observed(
             # The resolved uuid, never `body.node_id`: a CRLF surviving `uuid.UUID` could forge a log line.
             "sessions: %d session(s) observed on node %s had no record and were reconstructed",
             created, node,
+        )
+    if skipped_live or skipped_engine or skipped_recorded:
+        # One line per request, not one per id: a node re-reports the same ids every tick.
+        log.info(
+            "sessions: node %s observed %d live, %d ACP engine and %d already recorded session(s); none is an orphan",
+            node, skipped_live, skipped_engine, skipped_recorded,
         )
     return Response(status_code=204)
 
@@ -1080,6 +1150,21 @@ def _engine_named_sessions(session: Session, node: UUID, ids: list[str]) -> set[
     }
 
 
+def _already_recorded_sessions(session: Session, ids: list[str]) -> set[str]:
+    """Which of `ids` already have a row that names a node — the rows `record_observed` would leave alone.
+
+    A NULL-node row is not in the set: it goes through `record_observed`, whose upsert fills the node."""
+    if not ids:
+        return set()
+    return set(
+        session.execute(
+            select(AgentSession.agent_session_id).where(
+                AgentSession.agent_session_id.in_(ids), AgentSession.node_id.is_not(None)
+            )
+        ).scalars()
+    )
+
+
 def session_changed(session: Session) -> None:
     """Queue the live-refresh signal Audit > Sessions listens for, on the caller's transaction.
 
@@ -1090,26 +1175,14 @@ def session_changed(session: Session) -> None:
     )
 
 
-def reconstructed_count(session: Session, node_id: UUID, since: Optional[datetime] = None) -> int:
-    """How many of a node's session rows the CP had no record of until the node reported them.
-
-    A read over the rows rather than a counter, so it cannot drift, scoped by the page's window."""
-    statement = select(func.count()).select_from(AgentSession).where(
-        AgentSession.node_id == node_id,
-        AgentSession.end_reason == END_REASON_RECONSTRUCTED,
-    )
-    if since is not None:
-        statement = statement.where(AgentSession.started_at >= since)
-    return int(session.scalar(statement) or 0)
-
-
 def reconstructed_by_node(
     session: Session,
     since: Optional[datetime] = None,
     *,
     principal: "Principal | None" = None,
 ) -> list[tuple[Optional[UUID], int]]:
-    """The same count as `reconstructed_count`, for the whole fleet at once, grouped by node.
+    """How many session rows the CP had no record of until a node reported them, for the whole fleet at once,
+    grouped by node. A read over the rows rather than a counter, so it cannot drift.
 
     One round trip instead of one per node. A NULL node_id is kept: an unattributable reconstructed row
     is what the banner exists to admit.
@@ -1133,12 +1206,12 @@ def reconstructed_by_node(
 
 @router.post("/{agent_session_id}/upload-ticket", response_model=TicketOut)
 @infra(Tenancy.ORG_SCOPED)
-def upload_ticket(
+async def upload_ticket(
     agent_session_id: str,
     body: TicketIn,
     request: Request,
+    db: DbDep,
     _: None = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> TicketOut:
     """Take the lease and hand back one presigned PUT per member. Counts no attempt.
 
@@ -1150,10 +1223,20 @@ def upload_ticket(
 
     Keys are derived from the row's `started_at` and the allowlisted member name, so a retry overwrites
     the same objects. A name outside the allowlist is a 422."""
-    if not archive.available():
+    # Off the loop: a credential cache miss fetches from the container endpoint. It also warms that cache, so
+    # `archive.stored_at` below answers from it.
+    if not await run_in_threadpool(archive.available):
         # Before the row is read: nothing touches the row when the CP cannot pay.
         raise HTTPException(status_code=503, detail="transcript storage unavailable")
+    return await db.run_sync(_upload_ticket, agent_session_id=agent_session_id, body=body, request=request)
 
+
+def _upload_ticket(
+    session: Session,
+    agent_session_id: str,
+    body: TicketIn,
+    request: Request,
+) -> TicketOut:
     row = _row_or_404(session, agent_session_id)
     # The row's bucket, fixed now if this is its first object: `_complete_upload` writes the manifest
     # there, and the retention sweep and offboarding find an unfinished upload's members there.
@@ -1186,7 +1269,8 @@ def upload_ticket(
                 f"{transcripts.MAX_TRANSCRIPT_ATTEMPTS} upload attempts"
             ),
         )
-    try:
+    # 422 and the row does not move: a malformed ticket is the node's bug, not a failed upload.
+    with refused_as(422, transcripts.KeyRefused, chain=True):
         # No `reject_supplied_key` here: it runs on `TicketIn`'s raw input.
         for member in body.members:
             if member.bytes > transcripts.MAX_MEMBER_BYTES:
@@ -1196,12 +1280,9 @@ def upload_ticket(
                 )
         keyed = transcripts.member_keys(
             session_id=row.agent_session_id,
-            started_at=lifecycle.as_utc(row.started_at),
+            started_at=as_utc(row.started_at),
             names=[member.name for member in body.members],
         )
-    except transcripts.KeyRefused as exc:
-        # 422 and the row does not move: a malformed ticket is the node's bug, not a failed upload.
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     sizes = {member.name: member.bytes for member in body.members}
@@ -1283,11 +1364,11 @@ _UNLEASED_OUTCOMES = (TRANSCRIPT_FAILED, TRANSCRIPT_UNAVAILABLE, TRANSCRIPT_NOT_
 
 @router.post("/{agent_session_id}/transcript", status_code=204, response_model=None)
 @infra(Tenancy.ORG_SCOPED)
-def report_transcript(
+async def report_transcript(
     agent_session_id: str,
     body: TranscriptReportIn,
+    db: DbDep,
     _: None = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> Response:
     """What became of the upload. The report alone never flips the row to `uploaded`.
 
@@ -1307,6 +1388,26 @@ def report_transcript(
     `WORK_BATCH` forever. So `failed`/`unavailable` on a still-owed row is recorded under `_still_owed`,
     charged as the leased path would. An unleased `uploaded` is never accepted: only a ticket can have
     presigned the URLs."""
+    if body.status == TRANSCRIPT_UPLOADED:
+        # Off the loop, and warms the credential cache `_complete_upload`'s `archive.stored_at` reads.
+        await run_in_threadpool(archive.storage)
+    result = await db.run_sync(_report_transcript, agent_session_id=agent_session_id, body=body)
+    if isinstance(result, Response):
+        return result
+    # `_complete_upload` committed: no connection is held across the durable PUT and flip.
+    from app.durable.transcript_upload import finish_upload
+
+    # Never raises: the 204 is owed once the commit above landed (`finish_upload`).
+    outcome, detail = await run_in_threadpool(lambda: finish_upload(**result.finish))
+    await db.run_sync(_settle_upload, result, outcome, detail)
+    return Response(status_code=204)
+
+
+def _report_transcript(
+    session: Session,
+    agent_session_id: str,
+    body: TranscriptReportIn,
+) -> "Response | _PendingUpload":
     row = _row_or_404(session, agent_session_id)
     if body.status not in _REPORT_OUTCOMES:
         raise HTTPException(
@@ -1367,7 +1468,9 @@ def report_transcript(
         session.commit()
         return Response(status_code=204)
 
-    _complete_upload(session, row, body)
+    pending = _complete_upload(session, row, body)
+    if pending is not None:
+        return pending
     session.commit()
     return Response(status_code=204)
 
@@ -1546,8 +1649,20 @@ def _fail(
         session_changed(session)
 
 
-def _complete_upload(session: Session, row: AgentSession, body: TranscriptReportIn) -> None:
-    """Author the manifest, then hand the PUT and the flip to the durable workflow that pairs them.
+@dataclass(frozen=True)
+class _PendingUpload:
+    """A composed, committed upload whose durable PUT and flip (`finish_upload(**finish)`) run off the loop,
+    then `_settle_upload` records the outcome."""
+
+    row: AgentSession
+    session_id: str
+    fence: tuple[Any, ...]
+    finish: dict[str, Any]
+
+
+def _complete_upload(session: Session, row: AgentSession, body: TranscriptReportIn) -> Optional[_PendingUpload]:
+    """Author the manifest, then hand the PUT and the flip to the durable workflow that pairs them. None when
+    the report settled here (the caller commits); else the committed upload for the workflow.
 
     Nothing is ever flipped on a manifest that is not in the bucket; a failure lands `failed` with its
     reason. A node-side defect goes through `_fail` (charged), a CP-side failure through `_record_error`
@@ -1565,7 +1680,7 @@ def _complete_upload(session: Session, row: AgentSession, body: TranscriptReport
             f"({len(body.members)} member(s) named); a transcript with no session transcript in it "
             "is not a capture"
         ))
-        return
+        return None
 
     # The credential is discarded: this checks storage before composing, and `put_manifest` resolves a fresh
     # one, since a workflow argument is checkpointed into DBOS and a credential must never land there.
@@ -1574,9 +1689,9 @@ def _complete_upload(session: Session, row: AgentSession, body: TranscriptReport
     if where is None:
         # Credentials vanished between ticket and report: a CP-side outage, charged nothing.
         _record_error(session, row, "transcript storage became unavailable before the manifest was written")
-        return
+        return None
     region, bucket, _credentials = where
-    started_at = lifecycle.as_utc(row.started_at)
+    started_at = as_utc(row.started_at)
 
     try:
         members = [
@@ -1598,7 +1713,7 @@ def _complete_upload(session: Session, row: AgentSession, body: TranscriptReport
             project=lifecycle.project_name(session, row.project_id) or row.worktree_ref,
             task_id=row.task_id,
             started_at=started_at,
-            ended_at=lifecycle.as_utc(row.ended_at),
+            ended_at=as_utc(row.ended_at),
             end_reason=row.end_reason,
             redaction=body.redaction,
             members=members,
@@ -1609,7 +1724,7 @@ def _complete_upload(session: Session, row: AgentSession, body: TranscriptReport
         )
     except (transcripts.KeyRefused, KeyError, TypeError, ValueError) as exc:
         _record_error(session, row, f"the manifest could not be composed: {exc}")
-        return
+        return None
 
     # Commit before the network call: `_reclaim_expired_leases` has no `SKIP LOCKED` and rides a node's
     # `/work` request, so a row pinned across a slow PUT would stall that tick and every lease behind it.
@@ -1620,34 +1735,40 @@ def _complete_upload(session: Session, row: AgentSession, body: TranscriptReport
     session_id = row.agent_session_id
     # The lease this report settles is the workflow's identity, not `transcript_attempts` (which does not
     # move on a CP failure); see `transcript_upload.upload_workflow_id`.
-    attempt = lifecycle.as_utc(row.transcript_leased_at)
+    attempt = as_utc(row.transcript_leased_at)
     transcript_bytes = sum(member.bytes for member in body.members)
     session.commit()
 
+    # Every write after the workflow is fenced on this lease, not merely on `uploading` (`_still_leased_id`).
+    return _PendingUpload(
+        row=row, session_id=session_id, fence=_still_leased_id(row_id, attempt),
+        finish=dict(
+            row_id=str(row_id),
+            session_id=session_id,
+            attempt=attempt,
+            region=region,
+            bucket=bucket,
+            prefix=prefix,
+            key=key,
+            manifest_bytes=manifest_bytes,
+            transcript_bytes=transcript_bytes,
+        ),
+    )
+
+
+def _settle_upload(session: Session, pending: _PendingUpload, outcome: str, detail: Optional[str]) -> None:
+    """Record `finish_upload`'s outcome for `pending`, and commit."""
+    _record_upload_outcome(session, pending.row, pending.session_id, pending.fence, outcome, detail)
+    session.commit()
+
+
+def _record_upload_outcome(
+    session: Session, row: AgentSession, session_id: str, fence: tuple[Any, ...], outcome: str,
+    detail: Optional[str],
+) -> None:
     # Deferred: the durable module pulls `dbos` and registers a workflow by decorator side effect.
-    from app.durable.transcript_upload import (
-        CAPTURED,
-        FAILED,
-        FLIP_FAILED,
-        IN_FLIGHT,
-        finish_upload,
-    )
+    from app.durable.transcript_upload import CAPTURED, FAILED, FLIP_FAILED, IN_FLIGHT
 
-    # Every write below is fenced on this lease, not merely on `uploading` (`_still_leased_id`).
-    fence = _still_leased_id(row_id, attempt)
-
-    # Never raises: the 204 is owed once the commit above landed (`finish_upload`).
-    outcome, detail = finish_upload(
-        row_id=str(row_id),
-        session_id=session_id,
-        attempt=attempt,
-        region=region,
-        bucket=bucket,
-        prefix=prefix,
-        key=key,
-        manifest_bytes=manifest_bytes,
-        transcript_bytes=transcript_bytes,
-    )
     if outcome == FAILED:
         # Nothing reached the bucket: charged to nobody; offered again next tick. `_record_error` redacts.
         _record_error(session, row, detail or "writing manifest.json failed", fence=fence)
@@ -1726,7 +1847,7 @@ def put_object(
         amz_date=_now().strftime("%Y%m%dT%H%M%SZ"),
         expires_seconds=transcripts.LEASE_TTL_SECONDS,
     )
-    with httpx.Client(timeout=timeout) as client:
+    with http_bounded.client(timeout) as client:
         request = client.build_request("PUT", url, content=body)
         presign.reject_forbidden_headers(request.headers.keys())
         response = client.send(request)

@@ -1,9 +1,12 @@
 """Launches that failed on a node, counted per node — and the node a task stops being relaunched on.
 
-Two causes count, both carrying the node the launch ran on (`runner_terminations.record(node=...)`):
+Three causes count, each carrying the node the launch ran on (`runner_terminations.record(node=...)`):
 `launch_unannounced`, a launch acked and never claiming its task, charged by the drain
-(`routes/tasks/runner_settle.py::charge_unannounced_launch`); and `launch_failed`, a runner the node never sighted
-running after its ack, charged by the reclaim (`runner_settle.reclaim_active_task`). On a full-disk
+(`routes/tasks/runner_settle.py::charge_unannounced_launch`); `launch_failed`, a runner the node never sighted
+running after its ack, charged by the reclaim (`runner_settle.reclaim_active_task`); and `clone_failed`, a clone the
+node refused, which weighs `PER_NODE` alone and frees the task's never-cloned slot at once
+(`routes/agent/slot_intents.py::_leave_refusing_node`): a release task once held its slot on a node that refused the
+clone for three hours while the same login cloned on another node at once. On a full-disk
 host three launches in a row once hung before their first transcript write, and the drain kept relaunching into the
 same slot, rotating accounts that were never the problem; another time a retry went back to the node that had just
 failed it, four times on one host across three accounts.
@@ -53,15 +56,20 @@ from app.models.tasks import Task
 from app.node_identity import names_by_id
 from app.task_artifacts import visible_artifact_clause_joined
 from app.task_lifecycle import READY
+from app.pipeline_gates.full_gate import has_full_gate_sql
 
 #: Failed launches (unannounced or never sighted, any mix) of one task on one node before that node is left out
 #: for it. Two, not one: a single failed launch is the price a relaunch already accepts; two is the node.
 PER_NODE = 2
 
-#: The causes that count as a failed launch on the note's node.
+#: The causes that count as a failed launch on the note's node. A refused clone is one: its slot is freed at once
+#: (`routes/agent/slot_intents.py::_leave_refusing_node`), so the task is placed afresh, away from that node.
 LAUNCH_FAILURE_CAUSES: tuple[str, ...] = (
     runner_terminations.CAUSE_LAUNCH_UNANNOUNCED, runner_terminations.CAUSE_LAUNCH_FAILED,
+    runner_terminations.CAUSE_CLONE_FAILED,
 )
+#: The causes that weigh `PER_NODE` on their own: one is enough to leave the node out for the task.
+_WHOLE_NODE_CAUSES: tuple[str, ...] = (runner_terminations.CAUSE_NODE_FAULT, runner_terminations.CAUSE_CLONE_FAILED)
 
 #: How far back a failure counts. Long enough to span a task's whole retry run, short enough that a node
 #: whose disk was freed is offered the task again the next day.
@@ -110,7 +118,7 @@ def _failures(session: Session, task_ids: Optional[Iterable[int]] = None):
     node is left out for the task now — at `PER_NODE`."""
     task_key = ActivityEvent.data["id"].astext
     cause = ActivityEvent.data["cause"].astext
-    count = func.sum(case((cause == runner_terminations.CAUSE_NODE_FAULT, PER_NODE), else_=1))
+    count = func.sum(case((cause.in_(_WHOLE_NODE_CAUSES), PER_NODE), else_=1))
     stmt = (
         select(Task.id, _NODE_KEY.label("node"), count.label("n"), (count >= PER_NODE).label("skipping"))
         .select_from(ActivityEvent)
@@ -220,7 +228,7 @@ def _lane_fault_nodes(session: Session) -> dict[int, set[str]]:
 
 def lane_skipped_nodes(session: Session, project_id: int) -> list[tuple[str, datetime, Optional[str]]]:
     """`[(node name, until, reason)]`, soonest first: the nodes this project's lane runs are kept off after a
-    `node_fault`, when that ends — the latest fault plus `NODE_FAULT_WINDOW` (the Merge lane tab) —
+    `node_fault`, when that ends — the latest fault plus `NODE_FAULT_WINDOW` (Audit › Merge lanes) —
     and the latest fault's own reason (`runner_terminations.DETAIL_KEY`, None when it carried none). A node
     that no longer exists is left out."""
     rows: list[tuple[UUID, datetime]] = []
@@ -371,7 +379,7 @@ def excluded_node_ids(session: Session) -> ExcludedNodes:
     gated_lanes = session.scalars(
         select(Task.id).join(Project, Project.id == Task.project_id).where(
             Task.state == READY, Task.persona == merge_lane_state.LANE_PERSONA,
-            func.length(func.btrim(Project.gate_full_cmd, ' \t\r\n')) > 0)).all()
+            has_full_gate_sql(Project))).all()
     if gated_lanes:
         small = _too_small_for_lane(session)
         for task_id in gated_lanes:

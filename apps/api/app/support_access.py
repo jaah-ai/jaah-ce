@@ -161,10 +161,10 @@ def fleet_session() -> Iterator[Session]:
     `linked_task_states` (a task's state), `app/comment_mentions.py` (the ticket's mention roster, the
     names on its thread, and the reader's own ticket mentions), and the notification leg's two ids-only
     reads (`links_for_task`, `operator_recipients`)."""
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.tenancy import seam
 
-    with seam.detached(), seam.operator_scope(), SessionLocal() as session:
+    with seam.detached(), seam.operator_scope(), BridgedSession() as session:
         yield session
 
 

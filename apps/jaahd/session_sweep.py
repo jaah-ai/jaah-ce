@@ -20,7 +20,6 @@ import errno as errno_mod
 import gzip
 import hashlib
 import http.client
-import importlib.util
 import json
 import logging
 import os
@@ -37,8 +36,10 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import agent_providers
 import control_plane_api
 import env_helpers
+import file_io
 import host_platform
 from jaah_env import env_get
+import path_module
 from reconcile import accounts_probe
 import runner_registry
 import session_vendor
@@ -51,12 +52,7 @@ log = logging.getLogger("jaahd.session_sweep")
 # THE ONLY CORRECT MUNGE for a jaah path: the default CLI replaces every NON-ALPHANUMERIC byte with `-`,
 # so `/home/jaah/.jaah/repos/<id>/6` becomes `-home-jaah--jaah-repos-<id>-6` (note the
 # double hyphen). Never re-spell the rule.
-_HOOKS_DIR = Path(__file__).resolve().parent / "hooks"
-_BREAK_CAUSE_SPEC = importlib.util.spec_from_file_location(
-    "break_cause", _HOOKS_DIR / "break_cause.py"
-)
-break_cause = importlib.util.module_from_spec(_BREAK_CAUSE_SPEC)
-_BREAK_CAUSE_SPEC.loader.exec_module(break_cause)
+break_cause = path_module.load(Path(__file__).resolve().parent / "hooks" / "break_cause.py", "break_cause")
 
 # ── The wire vocabulary, RE-SPELLED because `apps/jaahd` imports nothing from `apps/api` ─────────
 # Mirrors the CP SSOT (`app/session_transcripts.py`, `app/aws/presign.py`); a divergence is a WIRE BREAK,
@@ -282,7 +278,7 @@ class _ExactlyNBytes:
 
     `http.client` reads a body until falsy and never consults `Content-Length`, and a runner-owned file
     can change size. GROWN: stop at the vetted length (S3 would only refuse at the end). SHRUNK: raise
-    at once rather than hold the connection (and an `_MAX_INFLIGHT` slot) until the timeout.
+    at once rather than hold the connection (and a `_CALL_WORKERS` thread) until the timeout.
 
     Also where `PUT_TIMEOUT` becomes a transfer DEADLINE (one `monotonic()` per chunk). Never buffers:
     one chunk at a time.
@@ -487,8 +483,8 @@ def slot_project_dirs(worktree_paths: Sequence[str]) -> Dict[str, str]:
     """`{munged project-dir name: the pool-slot path it came from}` — the OD2 fence, MUNGED FORWARD.
 
     NEVER UN-MUNGE: the transform is lossy, so a guess would attribute a session to another tree. Each of
-    this node's own slot paths is munged forward and matched exactly; anything else (the main clone, a
-    stray default-CLI run, other nodes' trees) is skipped.
+    this node's own slot paths is munged forward and matched exactly; anything else (a stray default-CLI
+    run, other nodes' trees) is skipped.
     """
     return {break_cause.project_name(path): path for path in worktree_paths if path}
 
@@ -669,54 +665,6 @@ class VendorLookupFailed(Exception):
     """
 
 
-#: How far a line's own `timestamp` may sit past a window edge and still count as inside it. The edges are the
-#: node's clock (`session_vendor.record` / `close_usage_window`), the stamps the CLI's: one clock on a static slot
-#: (the only place a hand-off runs today), a guest's own in a MicroVM, where kvm-clock or an NTP step leaves it a
-#: fraction of a second off. Kept below the gap that separates the two fronts' lines at either edge — the ceiling
-#: is stamped once the old front is dead, the floor at the new front's launch, after the old one closed and was
-#: killed — so the slack absorbs skew without counting another front's line twice.
-USAGE_WINDOW_SKEW_S = 2.0
-
-
-class _WindowedReader:
-    """`read_usage` folding only the spend stamped inside `[floor, ceiling)` (0.0 = that side open), each edge
-    widened by `USAGE_WINDOW_SKEW_S` — a row whose vendor transcript a console hand-off shares with another front.
-
-    A resumed row's transcript also holds the earlier front's turns (before its `usage_floor`), and a row that
-    handed its conversation on sees the next front's turns appended after its `usage_ceiling`; both are counted
-    on those fronts' own rows, so summing them here would count them twice. A spending line outside the window
-    reads as zero spend that still names its model (the model carries forward) and is counted in `dropped`,
-    which the fold's summary reports; a spending line with no parseable top-level `timestamp` raises, so the
-    fold marks the usage incomplete rather than counting it twice or dropping it silently. Every hand-off CLI's
-    transcript stamps each record with one.
-    """
-
-    def __init__(self, read_usage, floor: float, ceiling: float) -> None:
-        self._read_usage = read_usage
-        self._floor = floor - USAGE_WINDOW_SKEW_S if floor else 0.0
-        self._ceiling = ceiling + USAGE_WINDOW_SKEW_S if ceiling else 0.0
-        self.dropped = 0
-
-    def __call__(self, raw: bytes):
-        counts = self._read_usage(raw)
-        if counts is None or not any((counts.input, counts.output, counts.cache_read,
-                                      counts.cache_write_5m, counts.cache_write_1h)):
-            return counts
-        try:
-            record = json.loads(raw)
-        except ValueError:
-            record = None
-        stamp = record.get("timestamp") if isinstance(record, dict) else None
-        epoch = _parse_epoch(stamp) if isinstance(stamp, str) else None
-        if epoch is None:
-            raise ValueError("a spending line under a usage window carries no parseable timestamp")
-        if (self._floor and epoch < self._floor) or (self._ceiling and epoch >= self._ceiling):
-            from agents.base import TokenCounts  # noqa: PLC0415 — in-function, as `_vendor_transcript`
-            self.dropped += 1
-            return TokenCounts(model=counts.model)
-        return counts
-
-
 def _vendor_transcript(
     session_id: str, worktree_path: str, candidates: Sequence[str]
 ) -> Optional[Tuple[Path, str, object]]:
@@ -847,9 +795,7 @@ def _vendor_transcript(
     if not pinned:
         # `replace=` only for a pin proved dead above (see `pin_vendor_session`).
         session_vendor.pin_vendor_session(session_id, vendor_session, replace=replaced_dead_pin)
-    floor, ceiling = session_vendor.usage_floor(note), session_vendor.usage_ceiling(note)
-    return found, home, (_WindowedReader(adapter.read_usage, floor, ceiling) if floor or ceiling
-                         else adapter.read_usage)
+    return found, home, adapter.read_usage
 
 
 def vendor_transcript_path(session_id: str, worktree_path: str, config_dir: str) -> Optional[Path]:
@@ -1287,11 +1233,6 @@ class Analytics:
         return self._lines
 
     @property
-    def window_dropped(self) -> int:
-        """How many spending lines a hand-off's usage window (`_WindowedReader`) left to another front's row."""
-        return int(getattr(self._read_usage, "dropped", 0))
-
-    @property
     def reader_errors(self) -> int:
         """How many lines the per-vendor usage reader refused with a raise (always 0 for the default fold);
         `_feed_vendor` logs only the first."""
@@ -1447,7 +1388,7 @@ def prepare_member(
     except OSError as exc:
         # Errno and member name only: `str(OSError)` carries a path encoding `$JAAH_HOME` and the
         # account slug, and this reaches the operator's page.
-        raise MemberUnreadable("%s could not be read (errno %s)" % (name, exc.errno), exc.errno)
+        raise MemberUnreadable("%s could not be read (errno %s)" % (name, exc.errno), exc.errno) from exc
     return MemberPrep(
         name, source, gz_path, gz_path.stat().st_size, raw_size, digest.hexdigest(), counts
     )
@@ -2008,16 +1949,13 @@ def _upload_prepared(
         # `model=%r`: a runner-written name with a newline would forge a journal record. `models` keys are
         # clamped, and a dict's repr escapes them.
         "session_sweep: %s uploaded %d member(s) (%d subagent(s)) from %s — in=%s out=%s model=%r "
-        "models=%s%s%s",
+        "models=%s%s",
         session_id, len(prepared), subagent_count, config_dir, tokens_in, tokens_out, session_model,
         # Every model the session spent on.
         ",".join(sorted(usage_by_model)) or "-",
         # The refused-line count, only when non-zero (`_feed_vendor` logs just the first).
         ("" if not analytics.reader_errors
          else " unreadable_lines=%d/%d" % (analytics.reader_errors, analytics.lines)),
-        # Spending lines a hand-off's usage window left to the other front, only when non-zero.
-        ("" if not analytics.window_dropped
-         else " window_dropped=%d/%d" % (analytics.window_dropped, analytics.lines)),
     )
     return {
         "session_id": session_id,
@@ -2049,22 +1987,11 @@ def live_usage_path() -> Path:
 
 
 def _load_live_usage_state(path: Path) -> Dict[str, Dict[str, object]]:
-    """The throttle, or `{}`. Opened with `open_no_follow`: a symlink planted at the path is refused (read
-    as empty), never followed into a file the daemon can read and the runner cannot."""
-    try:
-        with open_no_follow(path) as handle:
-            raw = handle.read(1024 * 1024)
-    except FileNotFoundError:
-        return {}
-    except OSError as exc:
-        log.warning("session_sweep: the live-usage throttle %s is unreadable (%s) — treating it as empty",
-                    path, exc)
-        return {}
-    try:
-        state = json.loads(raw)
-    except ValueError:
-        log.warning("session_sweep: the live-usage throttle %s is corrupt — treating it as empty", path)
-        return {}
+    """The throttle, or `{}`. A bounded `file_io.read_json_or`: a symlink planted at the path is refused (read
+    as empty), never followed into a file the daemon can read and the runner cannot, and a file past 1 MiB
+    is empty too."""
+    state = file_io.read_json_or(path, {}, max_bytes=1024 * 1024, warn=lambda exc: log.warning(
+        "session_sweep: the live-usage throttle %s is unreadable (%s) — treating it as empty", path, exc))
     if not isinstance(state, dict):
         log.warning("session_sweep: the live-usage throttle %s is not an object — treating it as empty", path)
         return {}
@@ -2076,7 +2003,6 @@ def _save_live_usage_state(path: Path, state: Dict[str, Dict[str, object]]) -> N
     (or any predictable temp name) is replaced, never written through. An unwritable state dir is logged,
     never raised: the worst case is a post every tick whose files changed, which the fingerprint bounds."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
         env_helpers.atomic_write_json(path, state, mode=0o600, sort_keys=True)
     except OSError as exc:
         log.warning("session_sweep: could not persist the live-usage throttle to %s (%s)", path, exc)
@@ -2263,13 +2189,25 @@ def pane_log_tail(dispatch_ref: str, log_root: Optional[Path] = None) -> Tuple[O
     if newest is None:
         return None, None
     with open_no_follow(newest[1]) as handle:
-        size = os.fstat(handle.fileno()).st_size
-        handle.seek(max(0, size - PANE_LOG_TAIL_BYTES))
-        data = handle.read(PANE_LOG_TAIL_BYTES)
+        data = file_io.tail_bytes(handle, PANE_LOG_TAIL_BYTES)
     return data.decode("utf-8", errors="replace"), _iso(newest[0])
 
 
 # ── One tick ──────────────────────────────────────────────────────────────────────────────────────
+
+def is_idle(result: Dict[str, object]) -> bool:
+    """Whether a `sweep_once` result found nothing to do: the work list owed nothing and had nothing open, and
+    nothing ended. A skipped pass (no node id, no work list) is not idle: it learned nothing.
+
+    `observed` is not a signal: the reconcile leg re-reports every transcript inside the horizon on every pass,
+    so it is never zero on a node that has run a session. A session starting here is node activity instead,
+    which keeps this sweep at its fast interval while it runs (`poll_pace.recently_active`)."""
+    if "skipped" in result:
+        return False
+    return not (result.get("drained") or result.get("ended")
+                or result.get("live_usage") or result.get("pane_logs") or result.get("probes")
+                or result.get("vendor_probes"))
+
 
 def sweep_once(
     *,

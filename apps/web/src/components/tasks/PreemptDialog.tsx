@@ -10,6 +10,7 @@ import type { DispatchForecast } from '../../types'
 import FormDialog from '../../ui/FormDialog'
 import { tapTargetSx } from '../../ui/listStyles'
 import { DISPATCH_ROUTES } from './controls'
+import { FONT_SIZE, grid } from '../../theme'
 
 /* "No capacity — stop one to start this one". Opened by Start when
  * `GET /api/tasks/{id}/dispatch-forecast` says the task will not dispatch now — predicting, rather than
@@ -70,8 +71,8 @@ export default function PreemptDialog({
       onSubmit={() => onForceStart(stopId)}
       onClose={onCancel}
       testId="preempt-dialog"
-      paperSx={{ maxWidth: 420 }}
-      contentSx={{ gap: 1, fontSize: '0.875rem' }}
+      paperSx={{ maxWidth: grid(70) }}
+      contentSx={{ gap: 1, fontSize: FONT_SIZE.base }}
       secondaryAction={
         <Button type="button" onClick={onQueue} variant="outlined" color="inherit" sx={tapTargetSx}>
           Just queue it

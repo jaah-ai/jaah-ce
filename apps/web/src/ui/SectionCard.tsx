@@ -4,13 +4,16 @@ import CardContent from '@mui/material/CardContent'
 import Typography from '@mui/material/Typography'
 import { Children } from 'react'
 import type { JSX, ReactNode } from 'react'
+import HelpLabel, { ExplainMoreButton } from './HelpLabel'
+import type { HelpProp } from './explain'
+import { FONT_WEIGHT, grid } from '../theme'
 
-/* The body's (and title row's) padding, in theme spacing units (8px each); `dense` takes 1. */
+/* The body's (and title row's) padding, in theme spacing units (6px each); `dense` takes 1. */
 const BODY_PAD = 1.5
 
-/** Where a card's text starts from its outer edge — the body padding plus the 1px outline: what a line set
- *  beside a stack of cards (Settings' read-only note) is inset by, so it aligns with the cards' text. */
-export const SECTION_CARD_TEXT_INSET = `${BODY_PAD * 8 + 1}px`
+/** Where a card's text starts from its outer edge — the body padding (the 1px outline is below the grid): what a
+ *  line set beside a stack of cards (Settings' read-only note) is inset by, so it aligns with the cards' text. */
+export const SECTION_CARD_TEXT_INSET = grid(BODY_PAD)
 
 /* The console's one panel. `outlined`, never elevated: stacked elevated panels read as noise (AC4e).
  * No `CardHeader`: its padding and `h5` title are taller than this header, a measured criterion (AC5).
@@ -20,16 +23,15 @@ export const SECTION_CARD_TEXT_INSET = `${BODY_PAD * 8 + 1}px`
  * `minWidth: 0` keeps the scroll container's shrink: as a flex or grid item the card never widens to a wide child. */
 export function SectionCard({
   title,
-  tip,
+  help,
   actions,
   children,
   dense,
   testId,
 }: {
   title?: ReactNode
-  /** An ⓘ (`ui/InfoTip`) qualifying the title, right after it — outside the heading, so the heading's
-   *  accessible name stays the title alone. Shown only with a `title`. */
-  tip?: ReactNode
+  /** The title's explanation, a hover on it (`ui/HelpLabel`). Needs a string `title`. */
+  help?: HelpProp
   /** A control cluster on the title row (an edit button, a filter, a count). */
   actions?: ReactNode
   /** Empty (omitted, `null`, `false`), the card is its title row alone: one line for a section with nothing to list. */
@@ -49,19 +51,18 @@ export function SectionCard({
             justifyContent: 'space-between',
             gap: 1,
             px: dense ? 1 : BODY_PAD,
-            py: 0.75,
+            py: 0.5,
             // No body, no divider: it would double the card's own bottom border.
             borderBottom: hasBody ? 1 : 0,
             borderColor: 'divider',
           }}
         >
           {title && (
-            /* The tip's 44px phone tap box is pulled back to the glyph, or it sets the title row's height. */
-            <Box sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.5, minWidth: 0, '& > span': { my: { xs: '-12px', sm: 0 } } }}>
-              <Typography variant="subtitle2" component="h2" sx={{ fontWeight: 600, minWidth: 0 }}>
-                {title}
+            <Box sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.5, minWidth: 0, position: 'relative' }}>
+              <Typography variant="subtitle2" component="h2" sx={{ fontWeight: FONT_WEIGHT.semibold, minWidth: 0 }}>
+                {help && typeof title === 'string' ? <HelpLabel label={title} help={help} /> : title}
               </Typography>
-              {tip && <Box component="span" sx={{ display: 'inline-flex', mx: { xs: '-12px', sm: 0 } }}>{tip}</Box>}
+              {typeof title === 'string' && <ExplainMoreButton label={title} help={help} />}
             </Box>
           )}
           {actions && <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>{actions}</Box>}

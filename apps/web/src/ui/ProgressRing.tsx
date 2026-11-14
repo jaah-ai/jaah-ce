@@ -1,6 +1,7 @@
 import Box from '@mui/material/Box'
 import type { SxProps, Theme } from '@mui/material/styles'
 import { useId, type JSX } from 'react'
+import Tip from './Tip'
 
 /* THE ONE PROGRESS RING: a track and an arc drawn clockwise from twelve o'clock. The arc's extent rides
  * the dash OFFSET (one computed number), which `e2e/tasks-feed.spec.ts` reads to check an epic's arc
@@ -24,7 +25,7 @@ export function progressPct(progress: { done: number; total: number }): number {
 
 export type ProgressRingVariant = keyof typeof VARIANTS
 
-/** `aria-hidden`: the words beside the ring ("N of M") carry the reading; `title` is the mouse hint. */
+/** `aria-hidden`: the words beside the ring ("N of M") carry the reading; `title` is its `ui/Tip`. */
 export function ProgressRing({ pct, variant, size, testId, title, sx }: {
   /** 0–100; clamped for drawing, echoed raw on `data-pct`. */
   pct: number
@@ -42,7 +43,7 @@ export function ProgressRing({ pct, variant, size, testId, title, sx }: {
   const frac = Math.min(1, Math.max(0, pct / 100))
   const gradient = variant === 'gradient'
   return (
-    <Box
+    <Tip title={title}><Box
       component="svg"
       viewBox={`0 0 ${box} ${box}`}
       aria-hidden="true"
@@ -54,13 +55,12 @@ export function ProgressRing({ pct, variant, size, testId, title, sx }: {
         ...(Array.isArray(sx) ? sx : [sx]),
       ]}
     >
-      {title && <title>{title}</title>}
       {gradient && (
         <defs>
           <linearGradient id={gradientId} x1="0" y1="0" x2={box} y2={box} gradientUnits="userSpaceOnUse">
-            <stop offset="0" stopColor="#38bdf8" />
-            <stop offset="0.55" stopColor="#3b82f6" />
-            <stop offset="1" stopColor="#a855f7" />
+            <stop offset="0" stopColor="var(--mui-palette-primary-light)" />
+            <stop offset="0.55" stopColor="var(--mui-palette-primary-main)" />
+            <stop offset="1" stopColor="var(--mui-palette-info-main)" />
           </linearGradient>
         </defs>
       )}
@@ -85,6 +85,6 @@ export function ProgressRing({ pct, variant, size, testId, title, sx }: {
           '@media (prefers-reduced-motion: reduce)': { transition: 'none' },
         } : undefined}
       />
-    </Box>
+    </Box></Tip>
   )
 }

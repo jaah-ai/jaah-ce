@@ -1,0 +1,40 @@
+slug = "fireworks_ai"
+label = "Fireworks AI"
+category = "ai_media"
+vendor_docs_url = "https://docs.fireworks.ai/api-reference/introduction"
+summary = "Fast inference on open models (Llama, Qwen, DeepSeek, image models) through Fireworks AI's API."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, placeholder = "fw_...", help = "In the Fireworks AI app open Settings > Users > API keys (app.fireworks.ai/settings/users/api-keys) and select Create API key; copy it at once, it is shown only once" },
+]
+
+[test]
+method = "GET"
+path = "https://api.fireworks.ai/inference/v1/models"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+list_field = "data"
+
+[docs]
+agent_uses = [
+  "Call open chat, code and vision models through Fireworks' OpenAI-compatible API",
+  "Generate images with the hosted image models",
+  "Create embeddings and rerank results for search features",
+  "Use your own fine-tuned or deployed models in the account",
+]
+prerequisites = [
+  "A Fireworks AI account; add a payment method or credits to lift the free rate limit",
+]
+limitations = [
+  "Without a payment method or credits Fireworks limits the account to about 10 requests per minute",
+  "Inference is billed per token or per image by Fireworks; the Test only lists the models and spends nothing",
+]
+troubleshooting = [
+  { symptom = "The Test says Fireworks AI rejected the API key (401)", fix = "The key was deleted or mistyped. Create a new one under Settings > Users > API keys and select Replace" },
+  { symptom = "Agents get 429 Too Many Requests", fix = "The account has no payment method or credits, or hit its spend limit. Add billing details in the Fireworks app, or raise the monthly spend limit" },
+  { symptom = "Agents get 404 for a model", fix = "The model id is wrong or the model is not served serverlessly. Use the id shown on the model's page, for example `accounts/fireworks/models/<name>`" },
+]
+faq = [
+  { q = "Can an agent use the OpenAI SDK with this key", a = "Yes. Point the SDK's base URL at https://api.fireworks.ai/inference/v1 and pass the key" },
+]

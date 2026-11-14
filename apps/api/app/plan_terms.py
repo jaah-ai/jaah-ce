@@ -36,16 +36,18 @@ off (no upsell: an off-plan feature renders nothing). Never an org setting: what
   verification queue that batch-tests and merges runner PRs; off on every plan; `merge_lane_enabled` is its reader).
 * MicroVM — `orgs.microvm_allowed_override`, else `billing_plans.microvm_allowed` (whether the org may mark a node
   MicroVM; ON on every plan by default; read only by `app/microvm_mode.py`).
+* Whole-node VM — `orgs.node_vm_allowed_override`, else `billing_plans.node_vm_allowed` (whether the org may run a
+  node housed in one VM; OFF on every plan by default; read only by `app/node_shape.py`).
 * playbooks — `orgs.playbooks_enabled_override`, else `billing_plans.playbooks_enabled` (the playbook engine; off on
-  every plan; replaces the retired org knob `playbooks_enabled`; `playbooks_enabled` is its reader).
+  every plan; replaces the retired org knob `playbooks_enabled`; read through `switch_on`).
 * org templates — `orgs.org_templates_enabled_override`, else `billing_plans.org_templates_enabled` (whether the org may
   author its own task templates, `app/routes/task_templates.py`; off on every plan; off hides the org's templates from
-  the gallery and from Start without deleting them; `org_templates_enabled` is its reader).
+  the gallery and from Start without deleting them; read through `switches_on`).
 * node types — `orgs.<os>_nodes_allowed_override`, else `billing_plans.<os>_nodes_allowed`, one switch per `nodes.os`
   (`NODE_OS_SWITCHES`: whether the org may register a NEW self-hosted node of that OS, or a NEW Windows cloud or
   Dedicated hosting node; Ubuntu ON, macOS and Windows OFF by default; nodes the org already has keep running, and an
-  Ubuntu cloud, hosting or node-group node is not gated; read by `app/routes/nodes/cloud.py` and
-  `app/routes/node_orders.py` through `node_os_allowed`).
+  Ubuntu cloud, hosting or node-group node is not gated; read by `app/routes/node_orders.py` through
+  `app/routes/nodes/cloud.py::refuse_node_os_off_plan`).
 * project memory — `orgs.project_memory_enabled_override`, else `billing_plans.project_memory_enabled` (whether the
   org's runners, crons and console use project memory at all; read only by `app/project_memory/switch.py`, which puts
   it after the kill switch and before every other memory setting). ON on every plan that existed when it shipped,
@@ -70,13 +72,46 @@ off (no upsell: an off-plan feature renders nothing). Never an org setting: what
 * tenant email — `orgs.tenant_email_allowed_override`, else `billing_plans.tenant_email_allowed`: whether the org may
   connect its own Gmail and send through it (`app/tenant_gmail/`), and hold hosted trigger addresses. ON on every plan
   (revision 202610240100). Off keeps connections and their history; sending and connecting refuse.
+* intelligent routing — `orgs.intelligent_routing_override`, else `billing_plans.intelligent_routing`: whether the
+  org's projects may run the agent router in Recommend or Auto (`app/agent_router/modes.py`) and its Admin may set the
+  org's maximum mode and routing policy (`routes/orgs.py`), and whether a tenant reads a task's routing decisions
+  (`routes/routing.py`) and the scoreboard. OFF on every plan; Shadow records are written without it.
+  `intelligent_routing` is its reader.
+* production QA — `orgs.production_qa_override`, else `billing_plans.production_qa`: whether Production QA may act
+  (file tasks and reverts, run probes) in the org's opted-in projects (`app/production_qa/gate.py`), and whether a tenant
+  sees Production QA at all — Deployments, Incidents, a project's Production QA tab, a task's incident and lane stages
+  (`routes/production_qa.py`). OFF on every plan (revision 202611012000); measurement is recorded whatever it says.
+* Easy Mode caps — `orgs.<term>_override`, else the plan's `billing_plans.<term>` (NULL, or in `inherits`, =
+  `(default)`'s), else `(default)`'s, else the term's constant (`EASY_MODE_TERMS`): apps per org, back-end requests and
+  egress a month, database per app, Lambda reserved concurrency, and the sponsorship's end date (none = no end).
+  `easy_mode_terms` is their one reader.
+* agent performance — `orgs.agent_performance_override`, else `billing_plans.agent_performance`: whether a tenant reads
+  and acts on the outcome ledger — Command center › Performance, Compare and Leaderboard, its outcome tiles, the CSV
+  export, a task's Outcome panel and its defect links, the outcome-scan settings (`routes/outcomes.py`,
+  `routes/outcome_links.py`, `exec_dashboard`). OFF on every plan (revision 202611021400); the ledger is recorded
+  whatever it says.
+* webhooks — `orgs.webhooks_enabled_override`, else `billing_plans.webhooks_enabled`: whether an org admin may manage
+  outgoing webhook endpoints (`routes/webhooks.py`) and whether the `webhooks` cron delivers to them
+  (`app/webhooks/`). ON on every plan (revision 202611110110).
+* custom pipelines — `orgs.pipeline_custom_enabled_override`, else `billing_plans.pipeline_custom_enabled`: whether the
+  org's projects may leave the two basic pipelines for a custom one edited in the Pipeline tab
+  (`app/releases/basics.py`). ON on `business` only, so Business Trial and Enterprise by inclusion (revision
+  202611140800); losing it keeps a custom pipeline running, read-only.
+* node groups — `orgs.placement_groups_allowed_override`, else `billing_plans.placement_groups_allowed`: whether an org
+  admin may create node groups and allocate projects to them (`app/placement_groups.py`). ON on `business` only, so
+  Business Trial and Enterprise by inclusion (revision 202611141900); losing it keeps every group, and a project may
+  still go back to All or a group be deleted.
+* benchmark mode — `orgs.benchmark_mode_override`, else `billing_plans.benchmark_mode`: whether the outcome ledger may
+  sample the org's opted-in projects' coder tasks into shadow duels on another configuration
+  (`app/outcome_ledger/benchmark.py`). OFF on every plan (revision 202611020500); measurement is recorded whatever it
+  says.
 * then plan — `orgs.then_plan_key_override` while `orgs.then_plan_overridden` (NULL then = none), else
   `billing_plans.then_plan_key`: the plan an org moves to once its end passes (`app/plan_rollover.py`); none = the
   org's service ends as before.
 * quotas — requests per minute, task storage, org storage and max file size: `orgs.limit_<kind>`, else the plan's
   `billing_plans.limit_<kind>`, else `(default)`'s, else a constant (`app/org_quotas.py` resolves them).
-* static slots — `orgs.static_slots_override`, else `billing_plans.static_slots` (how many static worktrees a
-  project may hold on one node; 0 = none; read only by `app/static_slots_policy.py`).
+* survival window — `orgs.outcome_survival_days_override`, else `billing_plans.outcome_survival_days` (days after
+  merge a build's outcome becomes `survived`; 1–365, default `DEFAULT_OUTCOME_SURVIVAL_DAYS`).
 * agent range — `orgs.min_agents_override` / `orgs.max_agents_override` (0 = no upper bound), else the plan's
   `min_agents` (NULL = 1) / `max_agents` (NULL = no upper bound): what a per-agent purchase of the org's own plan
   may buy (`app/org_plans.py::bounds`). On a per-agent plan the agents bought are the Agents cap; on any other the
@@ -90,8 +125,8 @@ off (no upsell: an off-plan feature renders nothing). Never an org setting: what
   switch, it never follows `includes_plan_key`: an included plan's grid does not flow to the including plan. A cell
   is ON only while stored, so one a later build or the registry adds reads OFF everywhere until an operator stores it
   (`providers_of`).
-* products — the org's `org_plan_products` rows (the WHOLE list; empty is valid) while
-  `orgs.products_overridden`, else the plan's `billing_plan_products`.
+* products — the org's override lines in `product_lines` (the WHOLE list; empty is valid) while
+  `orgs.products_overridden`, else the plan's (`plan_lines`, `org_lines`).
 
 A STAGING ORG (`app/staging_org.py`, D-F7) has no terms of its own: every read here resolves it through its parent
 first (`terms_org`), so it shares the parent's plan row AND the parent's overrides, and loses a term the moment the
@@ -110,8 +145,8 @@ import functools
 import logging
 from collections import Counter
 from dataclasses import dataclass, field as dataclass_field
-from datetime import datetime, timedelta
-from typing import Callable, Final, Generic, Literal, Mapping, Optional, Sequence, TypeVar
+from datetime import date, datetime, timedelta
+from typing import Any, Callable, Final, Generic, Literal, Mapping, Optional, Sequence, TypeVar
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -119,12 +154,16 @@ from sqlalchemy import and_, case, delete, exists, func, select, update
 from sqlalchemy.orm import Session, aliased, object_session
 from sqlalchemy.sql.elements import ColumnElement
 
-from app import node_platform, provider_auth_policy
+from app import edition_features, node_platform, provider_auth_policy
 from app.operator_settings import reads as settings_reads
 from app.actors import stamp_actor
 from app.entity_shape import iso_or_none
-from app.models.billing import BillingPlan, BillingPlanProduct, OrgBundledProduct, OrgPlanProduct
-from app.models.hosting import HostingPrice
+from app.models.billing import BillingPlan, OrgBundledProduct
+from app.models.products import LINE_AUDIENCES
+from app.models.products import (
+    KIND_DEDICATED_NODE, KIND_JAAH_AI_CREDIT, KIND_LIVE_CAST, KIND_SHARED_NODE, NODE_KINDS, TERM_LINE_KINDS, Product,
+    ProductLine as EngineLine, ProductOption,
+)
 from app.models.identity import AdminUser
 from app.models.orgs import ORG_ACTIVE, Org
 from app.tenancy.ids import is_tenant_org
@@ -138,12 +177,13 @@ Cell = provider_auth_policy.Cell
 #: Who set a term: the plan, an operator's override, or (runner slots of a per-agent plan) the agents bought or the
 #: trial's lifted cap (`trial_agents_of`).
 Source = Literal["plan", "override", "purchase", "trial"]
-ProductKind = Literal["shared_node", "dedicated_node", "jaah_ai_credit", "live_cast"]
-#: Live Cast's one price row in the catalogue (`rental_prices` kind/key): the price per project a month.
+#: Live Cast's one price in the catalogue (`CatalogueEntry` kind/key): the price per project a month.
 LIVE_CAST_PRICE: Final = ("live_cast", "project")
 #: THE agent cap of a per-agent plan's trial when the plan sets neither Max agents nor a trial agent ceiling
 #: (`trial_agents_of`).
 TRIAL_AGENT_CEILING_DEFAULT: Final = 10
+#: The survival window when no plan row is found (`outcome_survival_days_of`); the column's own default.
+DEFAULT_OUTCOME_SURVIVAL_DAYS: Final = 14
 #: The most a Live Cast line's backfill N may be: it bounds what one publish spends on evaluation.
 MAX_BACKFILL: Final = 1000
 #: The Operator Settings knob a new Live Cast line's backfill N starts at (Products › Live Cast).
@@ -163,7 +203,11 @@ INHERITABLE: Final[Mapping[str, tuple[str, ...]]] = {
         "task_attachment_mb", "attachment_file_mb", "org_attachment_gb", "agent_requests_per_minute",
     )},
     "cron_min_period_seconds": ("cron_min_period_seconds",),
-    "static_slots": ("static_slots",),
+    "outcome_survival_days": ("outcome_survival_days",),
+    **{name: (name,) for name in (
+        "easy_mode_apps", "easy_mode_requests_month", "easy_mode_egress_gb_month", "easy_mode_db_mb",
+        "easy_mode_concurrency", "easy_mode_emails_month", "easy_mode_domains_per_app", "easy_mode_sponsor_end",
+    )},
     "duration_days": ("duration_days",),
     "then_plan_key": ("then_plan_key",),
     "products": (),
@@ -191,6 +235,7 @@ SWITCHES: Final[tuple[SwitchSpec, ...]] = (
     SwitchSpec("nodelink_allowed", "NodeLink"),
     SwitchSpec("merge_lane_enabled", "Merge lane"),
     SwitchSpec("microvm_allowed", "MicroVM nodes", True),
+    SwitchSpec("node_vm_allowed", "Whole-node VM nodes"),
     SwitchSpec("playbooks_enabled", "Playbooks"),
     SwitchSpec("org_templates_enabled", "Templates (org)"),
     SwitchSpec("ubuntu_nodes_allowed", "Ubuntu nodes", True),
@@ -218,6 +263,24 @@ SWITCHES: Final[tuple[SwitchSpec, ...]] = (
     SwitchSpec("azure_cloud_allowed", "Your Cloud: Azure"),
     # An org's own Gmail and hosted trigger addresses, one "tenant email" term (ON).
     SwitchSpec("tenant_email_allowed", "Tenant email", True),
+    # The agent router's Recommend and Auto modes (`app/agent_router/`), OFF.
+    SwitchSpec("intelligent_routing", "Intelligent routing"),
+    # Production QA — its pages (`routes/production_qa.py`) and behaviour (`app/production_qa/gate.py`): OFF on every
+    # plan, org and project at release.
+    SwitchSpec("production_qa", "Production QA"),
+    # The outcome ledger's shadow duels (`app/outcome_ledger/benchmark.py`): OFF on every plan; an operator's org override
+    # turns it on.
+    SwitchSpec("benchmark_mode", "Benchmark mode"),
+    # The outcome ledger's tenant surfaces (`routes/outcomes.py`, `routes/outcome_links.py`): OFF on every plan.
+    SwitchSpec("agent_performance", "Agent performance"),
+    # Outgoing webhooks (`app/webhooks/`): ON on every plan.
+    SwitchSpec("webhooks_enabled", "Webhooks", True),
+    # Custom pipelines (`app/releases/basics.py`): ON on Business only (Business Trial and Enterprise by inclusion).
+    SwitchSpec("pipeline_custom_enabled", "Custom pipelines"),
+    # Custom domains on Easy Mode apps (`app/hosted_apps/domains.py`): OFF on every plan; adding one needs it.
+    SwitchSpec("custom_domains_allowed", "Custom domains"),
+    # Node groups (`app/placement_groups.py`): ON on Business only (Business Trial and Enterprise by inclusion).
+    SwitchSpec("placement_groups_allowed", "Node groups"),
 )
 SWITCH_BY_NAME: Final[Mapping[str, SwitchSpec]] = {spec.name: spec for spec in SWITCHES}
 
@@ -236,6 +299,72 @@ SLACK: Final = "slack_enabled"
 JAAH_AI: Final = "jaah_ai_enabled"
 #: An org's own Gmail connections and hosted trigger addresses (`app/tenant_gmail/`).
 TENANT_EMAIL: Final = "tenant_email_allowed"
+#: The agent router's Recommend and Auto modes (`app/agent_router/modes.py`).
+INTELLIGENT_ROUTING: Final = "intelligent_routing"
+#: Production QA's behaviour — filing tasks and reverts, running probes (`app/production_qa/gate.py`); measurement
+#: ignores it.
+PRODUCTION_QA: Final = "production_qa"
+#: Benchmark mode — sampling opted-in projects' coder tasks into shadow duels on another configuration
+#: (`app/outcome_ledger/benchmark.py`); measurement ignores it.
+BENCHMARK_MODE: Final = "benchmark_mode"
+#: Agent performance — a tenant's reads and writes of the outcome ledger (`routes/outcomes.py`,
+#: `routes/outcome_links.py`); the ledger ignores it.
+AGENT_PERFORMANCE: Final = "agent_performance"
+#: Custom pipelines — the Pipeline tab's full editor (`app/releases/basics.py`); every plan has the two basics.
+PIPELINE_CUSTOM: Final = "pipeline_custom_enabled"
+#: Node groups: creating them and allocating projects to them (`app/placement_groups.py`).
+PLACEMENT_GROUPS: Final = "placement_groups_allowed"
+#: Custom domains — adding one to an Easy Mode app (`app/hosted_apps/domains.py`); reads, removal and Make main ignore
+#: it.
+CUSTOM_DOMAINS: Final = "custom_domains_allowed"
+#: Outgoing webhooks — an org admin's endpoints and their deliveries (`app/webhooks/`, `routes/webhooks.py`).
+WEBHOOKS: Final = "webhooks_enabled"
+
+
+@dataclass(frozen=True)
+class EasyModeTermSpec:
+    """One Easy Mode cap: `billing_plans.<name>`, `orgs.<name>_override`, the `INHERITABLE` field and the plans and
+    org-plan APIs' key alike; `attr` its `EasyModeTerms` attribute, `label` how the org's history names it, `default`
+    the value with nothing stored anywhere, `maximum` the most a plan or an override may set (whole numbers from 1)."""
+
+    name: str
+    attr: str
+    label: str
+    default: Optional[int]
+    maximum: Optional[int] = None
+
+
+#: THE EASY MODE CAPS, in display order (the web plan form's `EASY_MODE_KEYS` is its twin).
+#: `easy_mode_sponsor_end` is a date (None = the sponsorship has no end); the rest are whole numbers.
+EASY_MODE_TERMS: Final[tuple[EasyModeTermSpec, ...]] = (
+    EasyModeTermSpec("easy_mode_apps", "apps", "Easy Mode apps", 2, 1_000),
+    EasyModeTermSpec("easy_mode_requests_month", "requests_month", "Easy Mode requests / month", 100_000, 1_000_000_000),
+    EasyModeTermSpec("easy_mode_egress_gb_month", "egress_gb_month", "Easy Mode egress GB / month", 10, 100_000),
+    EasyModeTermSpec("easy_mode_db_mb", "db_mb", "Easy Mode database MB per app", 500, 1_000_000),
+    EasyModeTermSpec("easy_mode_concurrency", "concurrency", "Easy Mode concurrency", 2, 1_000),
+    #: Per app: the most emails the control plane relays for it in a calendar month (`app/hosted_apps/mail.py`).
+    EasyModeTermSpec("easy_mode_emails_month", "emails_month", "Easy Mode emails / month per app", 1_000, 1_000_000),
+    #: Per app: the most custom domains it may have connected, a root/www twin counted (`app/hosted_apps/domains.py`).
+    EasyModeTermSpec("easy_mode_domains_per_app", "domains_per_app", "Custom domains per app", 2, 100),
+    EasyModeTermSpec("easy_mode_sponsor_end", "sponsor_end", "Easy Mode sponsorship end", None),
+)
+EASY_MODE_TERM_BY_NAME: Final[Mapping[str, EasyModeTermSpec]] = {spec.name: spec for spec in EASY_MODE_TERMS}
+EASY_MODE_SPONSOR_END: Final = "easy_mode_sponsor_end"
+
+
+@dataclass(frozen=True)
+class EasyModeTerms:
+    """An org's Easy Mode caps as they govern it (`easy_mode_terms`)."""
+
+    apps: int
+    requests_month: int
+    egress_gb_month: int
+    db_mb: int
+    concurrency: int
+    emails_month: int
+    domains_per_app: int
+    #: None = the sponsorship has no end.
+    sponsor_end: Optional[date]
 #: Audit > Activity (`routes/audit.py`) and Audit > Sessions with its transcripts (`routes/sessions.py`).
 AUDIT: Final = "audit_enabled"
 SESSION_TRANSCRIPTS: Final = "session_transcripts_enabled"
@@ -258,13 +387,14 @@ CLOUD_SWITCHES: Final[Mapping[str, str]] = {
 #: (`routes/auth.py`) and the operator org roster's `plan_switches` (`routes/orgs.py`), which narrows the operator's
 #: act-as picker on a plan-gated page to the orgs that have the feature.
 CONSOLE_SWITCHES: Final = (
-    "playbooks_enabled", ORG_TEMPLATES, "microvm_allowed",
+    "playbooks_enabled", ORG_TEMPLATES, "microvm_allowed", "node_vm_allowed",
     *NODE_OS_SWITCHES.values(), "project_memory_enabled",
     # Slack and the eight enterprise switches: the console shows each feature's controls or its upgrade
     # notice; every door refuses on its own (`require_switch`).
     "slack_enabled", "sso_enabled", "scim_enabled", "siem_export_enabled", "data_residency_enabled", "ip_allowlist_enabled", "org_retention_enabled", "staging_org_enabled", "budgets_enabled",
     "jaah_ai_enabled", "audit_enabled", "session_transcripts_enabled",
-    *CLOUD_SWITCHES.values(), TENANT_EMAIL,
+    *CLOUD_SWITCHES.values(), TENANT_EMAIL, INTELLIGENT_ROUTING, PRODUCTION_QA, BENCHMARK_MODE,
+    AGENT_PERFORMANCE, WEBHOOKS, PIPELINE_CUSTOM, PLACEMENT_GROUPS,
 )
 #: The terms an operator-plane org may override (`routes/billing_org_plan.py::put_org_plan`): these switches and the provider grid
 #: (`PROVIDERS`). Hosting, NodeLink, Slack, Jaah
@@ -302,7 +432,8 @@ OVERRIDE_CHANGED: Final = "org_plan_override_changed"
 #: The numeric plan limits beyond the caps, as `(label, orgs column)`: one override each (NULL = the plan's).
 _LIMIT_OVERRIDES: Final = (
     ("Min agents", "min_agents_override"), ("Max agents", "max_agents_override"),
-    ("Static slots", "static_slots_override"),
+    ("Survival window", "outcome_survival_days_override"),
+    *((spec.label, f"{spec.name}_override") for spec in EASY_MODE_TERMS),
 )
 THEN_PLAN: Final = "Then plan"
 
@@ -334,36 +465,45 @@ class Term(Generic[T]):
         return self.source == "override"
 
 
+def audience_reaches(audience: Optional[str], audience_at: Optional[datetime], plan_started_at: datetime) -> bool:
+    """Whether an org on the plan since `plan_started_at` receives a plan line of `audience` (`product_lines`)."""
+    if audience in (None, "all") or audience_at is None:
+        return True
+    before = _as_utc(plan_started_at) < _as_utc(audience_at)
+    return before if audience == "existing" else not before
+
+
 @dataclass(frozen=True)
 class ProductLine:
-    """One bundled product line: a plan's (`billing_plan_products`) or an org's override (`org_plan_products`).
-    `id` is None for an unsaved draft."""
+    """One bundled product line: a plan's or an org's override, read from the product engine's `product_lines`
+    (`plan_lines`, `org_lines`). `id` is None for an unsaved draft."""
 
     id: Optional[UUID]
-    kind: ProductKind
+    #: One of `app/models/products.py::TERM_LINE_KINDS`.
+    kind: str
     quantity: int
     tier_key: Optional[str] = None
     instance_type: Optional[str] = None
     storage_gb: Optional[int] = None
     credit_cents: Optional[int] = None
     backfill_tasks: Optional[int] = None
+    #: A plan's node line only (`product_lines.audience`): `all`, or the orgs on the plan before `audience_at`
+    #: (`existing`) or from it (`new`).
+    audience: str = "all"
+    audience_at: Optional[datetime] = None
+
+    def reaches(self, plan_started_at: datetime) -> bool:
+        """Whether an org on the plan since `plan_started_at` receives this line."""
+        return audience_reaches(self.audience, self.audience_at, plan_started_at)
 
     def fingerprint(self) -> Optional[str]:
         """The configuration a node line makes (`org_bundled_products.fingerprint`); None for Jaah AI credit and
         Live Cast, which make no node."""
-        if self.kind == "shared_node":
+        if self.kind == KIND_SHARED_NODE:
             return f"shared_node:{self.tier_key}"
-        if self.kind == "dedicated_node":
+        if self.kind == KIND_DEDICATED_NODE:
             return f"dedicated_node:{self.instance_type}:{self.storage_gb}"
         return None
-
-    @classmethod
-    def of(cls, row: BillingPlanProduct | OrgPlanProduct) -> "ProductLine":
-        return cls(
-            id=row.id, kind=row.kind, quantity=row.quantity, tier_key=row.tier_key,  # type: ignore[arg-type]
-            instance_type=row.instance_type, storage_gb=row.storage_gb, credit_cents=row.credit_cents,
-            backfill_tasks=row.backfill_tasks,
-        )
 
 
 @dataclass(frozen=True)
@@ -451,8 +591,8 @@ def _defaults_for(
 def _sized_by(
     org: Org, plan: Optional[BillingPlan], defaults_row: Optional[BillingPlan],
 ) -> tuple[Optional[BillingPlan], Optional[BillingPlan]]:
-    """The plan row and `(default)` row `org`'s caps, agent range and static slots read: none for an operator-plane
-    org (`is_tenant_org`) — it has no plan, so those stay unlimited / 1 / 0 whatever `(default)` holds, as before
+    """The plan row and `(default)` row `org`'s caps and agent range read: none for an operator-plane
+    org (`is_tenant_org`) — it has no plan, so those stay unlimited / 1 whatever `(default)` holds, as before
     `(default)` existed (its quotas still read `(default)`, `app/org_quotas.py`) — else `plan` and `_defaults_for`'s."""
     if not is_tenant_org(org.id):
         return None, None
@@ -485,9 +625,27 @@ def lapse_plan_key(session: Session, lapsing: Optional[str] = None) -> str:
     return DEFAULTS_KEY
 
 
+#: Where `_plan_by_key` keeps the plan rows it read, per session, by key.
+_PLANS_INFO: Final = "plan_terms.plans"
+
+
+def _plan_by_key(session: Session, key: str) -> Optional[BillingPlan]:
+    """`key`'s row, read once per session while it stays in it under that key (`session.info`, as `defaults`): a
+    page of projects resolves the same few plan chains once per org, and each read is a round trip. A miss is
+    not remembered, so a row added later in the session is found."""
+    memo: dict[str, BillingPlan] = session.info.setdefault(_PLANS_INFO, {})
+    row = memo.get(key)
+    if row is not None and row in session and row.key == key:
+        return row
+    row = session.scalars(select(BillingPlan).where(BillingPlan.key == key)).one_or_none()
+    if row is not None:
+        memo[key] = row
+    return row
+
+
 def plan_row(session: Session, plan_key: str) -> Optional[BillingPlan]:
     """`plan_key`'s row, active or retired; `(default)` when no row has that key (never fail-open)."""
-    row = session.scalars(select(BillingPlan).where(BillingPlan.key == plan_key)).one_or_none()
+    row = _plan_by_key(session, plan_key)
     return row if row is not None else defaults(session)
 
 
@@ -498,20 +656,171 @@ def plan_name(session: Session, key: Optional[str]) -> Optional[str]:
     return session.scalar(select(BillingPlan.name).where(BillingPlan.key == key)) or key
 
 
+#: The product engine's hosting option dimensions (`app/products/kinds_impl/hosting.py`) → this line's column.
+_NODE_KEYS: Final = {"tier": "tier_key", "instance_type": "instance_type", "storage": "storage_gb"}
+
+
+def _lines_of(session: Session, *where: ColumnElement[bool]) -> tuple[ProductLine, ...]:
+    """The engine's `product_lines` matching `where`, in order, as this module's lines: the kinds a line here names
+    (a custom or other catalogue product's line is the engine's alone, `app/products/inclusion.py`)."""
+    return tuple(line for _, line in _read_lines(session, *where))
+
+
+def _read_lines(
+    session: Session, *where: ColumnElement[bool], fresh: bool = False,
+) -> list[tuple[EngineLine, ProductLine]]:
+    """`_lines_of`'s rows, each beside the engine line it was read from. Each kind's columns come from where the
+    engine keeps them: a node's from its options' keys, credit's from the line's amount, Live Cast's backfill from its
+    config (the catalogue's default when unset, as the line mirror writes it)."""
+    rows = session.execute(
+        select(EngineLine, Product.kind).join(Product, Product.id == EngineLine.product_id)
+        .where(Product.kind.in_(TERM_LINE_KINDS), *where)
+        .order_by(EngineLine.sort_order, EngineLine.created_at, EngineLine.id)
+        .execution_options(populate_existing=fresh)
+    ).tuples().all()
+    option_ids = {UUID(str(v)) for line, _ in rows for v in (line.options or {}).values() if _is_uuid(v)}
+    keys = dict(session.execute(
+        select(ProductOption.id, ProductOption.key).where(ProductOption.id.in_(option_ids))
+    ).tuples().all()) if option_ids else {}
+    out: list[tuple[EngineLine, ProductLine]] = []
+    for line, kind in rows:
+        columns: dict[str, Any] = {}
+        for dimension, value in (line.options or {}).items():
+            column = _NODE_KEYS.get(dimension)
+            key = keys.get(UUID(str(value))) if column and _is_uuid(value) else None
+            if column and key is not None:
+                # A deleted catalogue row's option keeps its key renamed aside (`<key>~<id>`).
+                key = key.split("~", 1)[0]
+                columns[column] = int(key) if column == "storage_gb" and key.isdigit() else key
+        if kind == KIND_JAAH_AI_CREDIT:
+            columns["credit_cents"] = int(line.amount or 0)
+        if kind == KIND_LIVE_CAST:
+            backfill = (line.config or {}).get("backfill_tasks")
+            columns["backfill_tasks"] = int(backfill) if backfill else settings_reads.get_int(LIVE_CAST_BACKFILL_KNOB)
+        out.append((line, ProductLine(
+            id=line.id, kind=kind, quantity=line.quantity, audience=line.audience or "all",
+            audience_at=line.audience_at, **columns,
+        )))
+    return out
+
+
+@dataclass(frozen=True)
+class Comp:
+    """An operator's comp as its copies, its end and its credit are decided from: the product engine's comp line
+    (`product_lines` owner `comp`, `row`) read as this module's line (`line`: its kind, quantity and configuration).
+    `end_mode` is the engine's (`never`, `date`, `plan_end`); `name` the label its copies take (`describe`, as the
+    line mirror names the legacy row, credit keeping the line's own)."""
+
+    row: EngineLine
+    line: ProductLine
+    name: str
+
+    @property
+    def id(self) -> UUID:
+        return self.row.id
+
+    @property
+    def org_id(self) -> UUID:
+        assert self.row.customer_org_id is not None  # a comp line names its org (`ck_product_lines_holder`)
+        return self.row.customer_org_id
+
+    @property
+    def kind(self) -> str:
+        return self.line.kind
+
+    @property
+    def quantity(self) -> int:
+        return self.line.quantity
+
+    @property
+    def tier_key(self) -> Optional[str]:
+        return self.line.tier_key
+
+    @property
+    def instance_type(self) -> Optional[str]:
+        return self.line.instance_type
+
+    @property
+    def storage_gb(self) -> Optional[int]:
+        return self.line.storage_gb
+
+    @property
+    def credit_cents(self) -> Optional[int]:
+        return self.line.credit_cents
+
+    @property
+    def backfill_tasks(self) -> Optional[int]:
+        return self.line.backfill_tasks
+
+    @property
+    def end_mode(self) -> str:
+        return self.row.end_mode or "never"
+
+    @property
+    def ends_at(self) -> Optional[datetime]:
+        return self.row.ends_at
+
+    @property
+    def ended_at(self) -> Optional[datetime]:
+        return self.row.ended_at
+
+    @property
+    def origin(self) -> Optional[str]:
+        return self.row.origin
+
+    @property
+    def created_at(self) -> datetime:
+        return self.row.created_at
+
+    def fingerprint(self) -> Optional[str]:
+        return self.line.fingerprint()
+
+
+def comps_by_org(
+    session: Session, org_ids: Any, *where: ColumnElement[bool], lock: bool = False,
+) -> dict[UUID, list[Comp]]:
+    """The comps of many orgs matching `where`, ended ones included, in their order; an org with none is absent.
+    `lock` reads the comp lines under their row locks, fresh from the database."""
+    wanted = set(org_ids)
+    if not wanted:
+        return {}
+    clauses = (EngineLine.owner == "comp", EngineLine.customer_org_id.in_(wanted), *where)
+    if lock:
+        session.execute(select(EngineLine.id).where(*clauses).with_for_update())
+    rows = _read_lines(session, *clauses, fresh=lock)
+    names = _price_names(session) if rows else {}
+    out: dict[UUID, list[Comp]] = {}
+    for row, line in rows:
+        label = describe(line, session, names=names)
+        name = (row.name or label) if line.kind == "jaah_ai_credit" else label
+        out.setdefault(row.customer_org_id, []).append(Comp(row, line, name))  # type: ignore[arg-type]
+    return out
+
+
+def comps_of(session: Session, org_id: UUID, *where: ColumnElement[bool], lock: bool = False) -> list[Comp]:
+    """`comps_by_org` of one org."""
+    return comps_by_org(session, {org_id}, *where, lock=lock).get(org_id, [])
+
+
+def comp(session: Session, org_id: UUID, comp_id: UUID, *, lock: bool = False) -> Optional[Comp]:
+    """The org's comp `comp_id`, ended or not; None when it has none by that id."""
+    return next(iter(comps_of(session, org_id, EngineLine.id == comp_id, lock=lock)), None)
+
+
+def _is_uuid(value: object) -> bool:
+    try:
+        UUID(str(value))
+    except ValueError:
+        return False
+    return True
+
+
 def plan_lines(session: Session, plan: BillingPlan) -> tuple[ProductLine, ...]:
-    rows = session.scalars(
-        select(BillingPlanProduct).where(BillingPlanProduct.plan_id == plan.id)
-        .order_by(BillingPlanProduct.sort_order, BillingPlanProduct.created_at, BillingPlanProduct.id)
-    ).all()
-    return tuple(ProductLine.of(r) for r in rows)
+    return _lines_of(session, EngineLine.owner == "plan", EngineLine.plan_id == plan.id)
 
 
 def org_lines(session: Session, org_id: UUID) -> tuple[ProductLine, ...]:
-    rows = session.scalars(
-        select(OrgPlanProduct).where(OrgPlanProduct.org_id == org_id)
-        .order_by(OrgPlanProduct.sort_order, OrgPlanProduct.created_at, OrgPlanProduct.id)
-    ).all()
-    return tuple(ProductLine.of(r) for r in rows)
+    return _lines_of(session, EngineLine.owner == "org_override", EngineLine.customer_org_id == org_id)
 
 
 # ── Effective terms ──────────────────────────────────────────────────────────────────────────────────
@@ -535,8 +844,8 @@ def caps_of(
     plan the agents bought (`orgs.agents_bought`, source `purchase`); while a trial of a per-agent plan is live they
     are lifted to `trial_agents_of` (source `trial`, never below the agents bought). Their one override is Max agents
     (`orgs.max_agents_override`, source `override` when it is what governs: with no agents bought, or pinned below
-    them) — migration 202610221300 folded the old `limit_runner_slots` into it; that column and
-    `limit_active_worktrees` are retired. Every other cap has a column of its own (`COLUMN_CAP_KINDS`)."""
+    them) — migration 202610221300 folded the old `limit_runner_slots` column into it. Every other cap has a column
+    of its own (`COLUMN_CAP_KINDS`)."""
     plan, dflt = _sized_by(org, plan, defaults_row)
     out: dict[str, Term[Optional[int]]] = {}
     for kind in CAP_KINDS:
@@ -576,6 +885,11 @@ def trial_live(org: Org, plan: Optional[BillingPlan], defaults_row: Optional[Bil
     until = org.agents_trial_until
     if until is None or _as_utc(until) <= _now():
         return False
+    return per_agent(org, plan, defaults_row)
+
+
+def per_agent(org: Org, plan: Optional[BillingPlan], defaults_row: Optional[BillingPlan] = None) -> bool:
+    """`org`'s plan (`plan`, its row) is priced per agent."""
     plan, dflt = _sized_by(org, plan, defaults_row)
     return plan is not None and bool(field(plan, dflt, "price", "per_agent"))
 
@@ -612,9 +926,13 @@ def max_agents_of(
     return Term(_unlimited(own), "override", planned) if own is not None else Term(planned, "plan", planned)
 
 
-def static_slots_of(org: Org, plan: Optional[BillingPlan], defaults_row: Optional[BillingPlan] = None) -> Term[int]:
-    planned: int = field(*_sized_by(org, plan, defaults_row), "static_slots") or 0  # type: ignore[assignment]
-    own = org.static_slots_override
+def outcome_survival_days_of(
+    org: Org, plan: Optional[BillingPlan], defaults_row: Optional[BillingPlan] = None,
+) -> Term[int]:
+    """Days after merge a build's outcome becomes `survived`; `DEFAULT_OUTCOME_SURVIVAL_DAYS` when no plan row says."""
+    stored = field(*_sized_by(org, plan, defaults_row), "outcome_survival_days")
+    planned: int = DEFAULT_OUTCOME_SURVIVAL_DAYS if stored is None else stored  # type: ignore[assignment]
+    own = org.outcome_survival_days_override
     return Term(own, "override", planned) if own is not None else Term(planned, "plan", planned)
 
 
@@ -705,8 +1023,7 @@ def plan_chain(session: Session, plan: Optional[BillingPlan]) -> tuple[BillingPl
         chain.append(current)
         seen.add(current.key)
         key = current.includes_plan_key
-        current = session.scalars(select(BillingPlan).where(BillingPlan.key == key)).one_or_none() \
-            if key is not None else None
+        current = _plan_by_key(session, key) if key is not None else None
     return tuple(chain)
 
 
@@ -716,22 +1033,42 @@ def _default_switch(defaults_row: Optional[BillingPlan], name: str) -> bool:
     return SWITCH_BY_NAME[name].default if value is None else bool(value)
 
 
+def plan_switch(
+    chain: Sequence[BillingPlan], name: str, defaults_row: Optional[BillingPlan],
+) -> tuple[bool, Optional[str]]:
+    """What the plan alone says for switch `name`, no org override: ON when the plan or any plan it includes has it
+    ON (`chain`, `plan_chain`'s; the second value names the first including plan that does), else `(default)`'s
+    value when the plan's own is NULL, else off. An empty `chain` reads `(default)`'s value."""
+    if not chain:
+        return _default_switch(defaults_row, name), None
+    donor = next((plan for plan in chain if getattr(plan, name)), None)
+    if donor is not None:
+        return True, (donor.key if donor is not chain[0] else None)
+    return getattr(chain[0], name) is None and _default_switch(defaults_row, name), None
+
+
+def plan_features(session: Session, plan: BillingPlan) -> list[str]:
+    """The `SWITCHES` labels `plan` turns ON for an org with no override, in `SWITCHES` order."""
+    chain, dflt = plan_chain(session, plan), defaults(session)
+    return [spec.label for spec in SWITCHES if plan_switch(chain, spec.name, dflt)[0]]
+
+
+def plan_caps(plan: BillingPlan, defaults_row: Optional[BillingPlan]) -> dict[str, Optional[int]]:
+    """`plan`'s five caps for an org with no override, purchase or trial, keyed by their console label in
+    `CAP_KINDS` order (None = unlimited): Agents is the plan's Max agents, as `caps_of` reads it."""
+    out: dict[str, Optional[int]] = {}
+    for kind in CAP_KINDS:
+        raw: Optional[int] = field(plan, defaults_row, "max_agents" if kind == "runner_slots" else kind)  # type: ignore[assignment]
+        out[_CAP_LABELS[kind]] = raw if kind == "runner_slots" else _unlimited(raw, kind)
+    return out
+
+
 def _switch(org: Org, chain: Sequence[BillingPlan], name: str, defaults_row: Optional[BillingPlan]) -> Term[bool]:
     """One plan switch: `orgs.<name>_override`, else ON when the plan or any plan it includes has it ON (`chain`,
     `plan_chain`'s; `inherited_from` names the first including plan that does), else `(default)`'s value when the
     plan's own is NULL, else off. With no plan — an operator-plane org has none for this (`routes/orgs.py` refuses
     its plan) — `(default)`'s value."""
-    inherited: Optional[str] = None
-    if chain and is_tenant_org(org.id):
-        donor = next((plan for plan in chain if getattr(plan, name)), None)
-        if donor is not None:
-            planned = True
-            if donor is not chain[0]:
-                inherited = donor.key
-        else:
-            planned = getattr(chain[0], name) is None and _default_switch(defaults_row, name)
-    else:
-        planned = _default_switch(defaults_row, name)
+    planned, inherited = plan_switch(chain if is_tenant_org(org.id) else (), name, defaults_row)
     own = getattr(org, f"{name}_override")
     if own is not None:
         return Term(own, "override", planned, inherited)
@@ -757,7 +1094,11 @@ def effective(session: Session, org: Org, now: Optional[datetime] = None) -> Pla
     dflt = defaults(session)
     ends = ends_of(org, plan, dflt)
     lines_row = field_row(plan, dflt, "products")
-    planned_lines = plan_lines(session, lines_row) if lines_row is not None else ()
+    # A line limited to the plan's existing or new customers is this org's only when it is in that audience.
+    planned_lines = tuple(
+        line for line in (plan_lines(session, lines_row) if lines_row is not None else ())
+        if line.reaches(org.plan_started_at)
+    )
     products = (
         Term(org_lines(session, org.id), "override", planned_lines) if org.products_overridden
         else Term(planned_lines, "plan", planned_lines)
@@ -821,9 +1162,9 @@ def merge_lane_enabled(session: Session, org: Org) -> bool:
     return _org_switch(session, org, "merge_lane_enabled")
 
 
-def microvm_allowed(session: Session, org: Org) -> bool:
-    """`effective(...).microvm_allowed.value` without reading the products."""
-    return microvm_allowed_term(session, org).value
+def intelligent_routing(session: Session, org: Org) -> bool:
+    """`effective(...).intelligent_routing.value` without reading the products."""
+    return _org_switch(session, org, INTELLIGENT_ROUTING)
 
 
 def microvm_allowed_term(session: Session, org: Org, plan: Optional[BillingPlan] = None) -> Term[bool]:
@@ -834,14 +1175,11 @@ def microvm_allowed_term(session: Session, org: Org, plan: Optional[BillingPlan]
     return _switch(parent, chain, "microvm_allowed", defaults(session))
 
 
-def playbooks_enabled(session: Session, org: Org) -> bool:
-    """`effective(...).playbooks_enabled.value` without reading the products."""
-    return _org_switch(session, org, "playbooks_enabled")
-
-
-def org_templates_enabled(session: Session, org: Org) -> bool:
-    """`effective(...).org_templates_enabled.value` without reading the products."""
-    return _org_switch(session, org, ORG_TEMPLATES)
+def node_vm_allowed_term(session: Session, org: Org, plan: Optional[BillingPlan] = None) -> Term[bool]:
+    """`effective(...).node_vm_allowed` without reading the products — `microvm_allowed_term`'s twin."""
+    parent = terms_org(session, org)
+    chain = org_chain(session, parent, plan if parent is org else None)
+    return _switch(parent, chain, "node_vm_allowed", defaults(session))
 
 
 def github_runners_allowed(session: Session, org_id: Optional[UUID]) -> bool:
@@ -901,10 +1239,65 @@ def require_tenant_switch(session: Session, principal: Optional[object], name: s
         require_switch(session, org_id, name)
 
 
-def static_slots(session: Session, org: Org) -> int:
-    """The org's static slots (`static_slots_of`; 0 = none); 0 when no plan row is found and none is overridden."""
+def tenant_switch_required(name: str) -> Callable[..., Any]:
+    """A route dependency — `dependencies=[Depends(tenant_switch_required(NAME))]` on a route or a router — that
+    answers `require_tenant_switch` for the request's principal (a tenant whose plan leaves switch `name` out is
+    refused 403; the operator and a caller with no principal, an agent token, pass), read on the route's own
+    session, its read returned before the next dependency runs (a router dependency resolves ahead of the
+    caller's identity reads, and a coroutine never holds two connections — `app/db_async.py`)."""
+    from fastapi import Depends
+
+    from app import db_async
+    from app.authz.principal import current_principal_async
+
+    # `Depends(get_db)` as a default, not the `DbDep` annotation: under this module's postponed annotations FastAPI
+    # resolves a hint against module globals, where the function-local `db_async` is not.
+    async def check(db: Any = Depends(db_async.get_db), principal: object = Depends(current_principal_async)) -> None:
+        try:
+            await db.run_sync(require_tenant_switch, principal, name)
+        finally:
+            await db_async.release(db)
+
+    return check
+
+
+def outcome_survival_days(session: Session, org: Org) -> int:
+    """The org's survival window in days (`outcome_survival_days_of`)."""
     org = terms_org(session, org)
-    return static_slots_of(org, plan_row(session, org.plan_key)).value
+    return outcome_survival_days_of(org, plan_row(session, org.plan_key)).value
+
+
+def easy_mode_terms_of(
+    org: Org, plan: Optional[BillingPlan], defaults_row: Optional[BillingPlan] = None,
+) -> dict[str, Term[Any]]:
+    """Every Easy Mode cap of `org` (already `terms_org`'s) on `plan`, by `EasyModeTermSpec.name`: its override, else
+    the plan's own (`(default)`'s while the plan inherits it), else `(default)`'s, else the constant. An operator-plane
+    org has no plan: the constants under its overrides."""
+    plan, dflt = _sized_by(org, plan, defaults_row)
+    if dflt is None and plan is not None and (session := object_session(org)) is not None:
+        dflt = defaults(session)  # a plan's own NULL still falls to `(default)`, inherited or not
+    out: dict[str, Term[Any]] = {}
+    for spec in EASY_MODE_TERMS:
+        stored = field(plan, dflt, spec.name)
+        if stored is None and dflt is not None:
+            stored = getattr(dflt, spec.name)
+        planned = spec.default if stored is None else stored
+        own = getattr(org, f"{spec.name}_override")
+        out[spec.name] = Term(own, "override", planned) if own is not None else Term(planned, "plan", planned)
+    return out
+
+
+def easy_mode_terms(session: Session, org_id: UUID) -> EasyModeTerms:
+    """THE ONE READER of an org's Easy Mode caps: override → plan → `(default)` → constant (`easy_mode_terms_of`). A
+    staging org's are its parent's; an id naming no org reads the constants."""
+    org = session.get(Org, org_id)
+    if org is None:
+        values: dict[str, Any] = {spec.attr: spec.default for spec in EASY_MODE_TERMS}
+    else:
+        org = terms_org(session, org)
+        terms = easy_mode_terms_of(org, plan_row(session, org.plan_key), defaults(session))
+        values = {spec.attr: terms[spec.name].value for spec in EASY_MODE_TERMS}
+    return EasyModeTerms(**values)
 
 
 # Built once: a clause is immutable, and building it proxies every `BillingPlan` column twice (the alias and the
@@ -951,6 +1344,11 @@ def was_text(what: str, was: object) -> str:
     return str(was)[:10] if what == "End date" else str(was)
 
 
+def _said(value: object) -> object:
+    """An override as the org's history records it: a date as its ISO day (JSON), anything else as it is."""
+    return value.isoformat() if isinstance(value, date) else value
+
+
 def _overrides(session: Session, org: Org) -> list[tuple[str, object, Callable[[], None]]]:
     """Every override the org holds, as `(label, value, clear)` — the value as `_record_cleared` records it, and what
     clears it. The one list both the move's preview (`cleared_overrides`) and the move (`clear_overrides`) read."""
@@ -969,7 +1367,8 @@ def _overrides(session: Session, org: Org) -> list[tuple[str, object, Callable[[
     ]
     if org.plan_end_overridden:
         out.append(("End date", iso_or_none(org.plan_end_override), clear_end))
-    out.extend((label, getattr(org, attr), unset(attr)) for label, attr in _LIMIT_OVERRIDES if getattr(org, attr) is not None)
+    out.extend((label, _said(getattr(org, attr)), unset(attr)) for label, attr in _LIMIT_OVERRIDES
+               if getattr(org, attr) is not None)
     if org.then_plan_overridden:
         out.append((THEN_PLAN, plan_name(session, org.then_plan_key_override) or "none", clear_then_plan))
     out.extend((spec.label, getattr(org, f"{spec.name}_override"), unset(f"{spec.name}_override")) for spec in SWITCHES
@@ -1004,7 +1403,7 @@ def _record_cleared(session: Session, org: Org, actor: Optional[AdminUser], what
 
 
 def clear_overrides(session: Session, org: Org, actor: Optional[AdminUser]) -> None:
-    """Clear every override the org holds (caps, end, agent range, static slots, then plan, every switch, providers, products —
+    """Clear every override the org holds (caps, end, agent range, then plan, every switch, providers, products —
     DA-4), one history row per value."""
     for what, was, clear in _overrides(session, org):
         clear()
@@ -1102,11 +1501,29 @@ def bundle_diff(session: Session, org: Org, terms: PlanTerms) -> BundleDiff:
     return diff
 
 
+#: One sellable catalogue entry a line names: `(kind, key, name, disk_gb, active)` — a hosting option read as its
+#: catalogue row (kind `shared`, `instance`, `storage` or `windows`, and its key), or Live Cast's price
+#: (`LIVE_CAST_PRICE`). The billing edition's kinds register their readers of the product engine's catalogue
+#: (`app/products/kinds_impl/`); the community edition sells nothing, so every line reads its bare key.
+CatalogueEntry = tuple[str, str, str, Optional[int], bool]
+_CATALOGUE: dict[str, Callable[[Session], Sequence[CatalogueEntry]]] = {}
+
+
+def register_catalogue(name: str, read: Callable[[Session], Sequence[CatalogueEntry]]) -> None:
+    _CATALOGUE[name] = read
+
+
+def _catalogue(session: Session) -> list[CatalogueEntry]:
+    if not _CATALOGUE:
+        _engine_loaded()
+    return [entry for read in _CATALOGUE.values() for entry in read(session)]
+
+
 def _price_names(session: Session) -> dict[tuple[str, str], str]:
     """Each catalogue row's name as a product line shows it: a Shared tier carries its disk ("Tier S · 20 GB")."""
     return {
-        (r.kind, r.key): f"{r.name} · {r.disk_gb} GB" if r.kind == "shared" and r.disk_gb else r.name
-        for r in session.scalars(select(HostingPrice)).all()
+        (kind, key): f"{name} · {disk_gb} GB" if kind == "shared" and disk_gb else name
+        for kind, key, name, disk_gb, _ in _catalogue(session)
     }
 
 
@@ -1119,11 +1536,11 @@ def describe(line: ProductLine, session: Session, *, names: Optional[dict[tuple[
     node (8 vCPU, 32 GB) · 20 GB"), "Dedicated node · t3.large · 100 GB", "Jaah AI · $5/month",
     "Live Cast · 3 projects · Backfill 100" (its quantity is the projects, so it takes no "N ×").
     `names` is a prefetched `_price_names` for a caller labelling many lines."""
-    if line.kind == "live_cast":
+    if line.kind == KIND_LIVE_CAST:
         projects = "1 project" if line.quantity == 1 else f"{line.quantity} projects"
         return f"Live Cast · {projects} · Backfill {line.backfill_tasks}"
     names = _price_names(session) if names is None else names
-    if line.kind == "shared_node":
+    if line.kind == KIND_SHARED_NODE:
         tier = names.get(("shared", line.tier_key or ""), line.tier_key) or ""
         # A tier the operator named for its kind ("Shared (8 vCPU, 32 GB) · 20 GB") already says Shared: its word
         # becomes the kind's ("Shared node (8 vCPU, 32 GB) · 20 GB"), never "Shared node · Shared (…)".
@@ -1134,7 +1551,7 @@ def describe(line: ProductLine, session: Session, *, names: Optional[dict[tuple[
         if named and rest[:5].lower() == " node" and not rest[5:6].isalnum():
             rest = rest[5:]
         label = f"Shared node{rest}" if named else f"Shared node · {tier}" if tier else "Shared node"
-    elif line.kind == "dedicated_node":
+    elif line.kind == KIND_DEDICATED_NODE:
         size = names.get(("instance", line.instance_type or ""), line.instance_type)
         label = f"Dedicated node · {size} · {line.storage_gb} GB"
     else:
@@ -1145,11 +1562,11 @@ def describe(line: ProductLine, session: Session, *, names: Optional[dict[tuple[
 def describe_fingerprint(fingerprint: str, session: Session, names: dict[tuple[str, str], str]) -> str:
     """A fingerprint's label without a count (the dry-run's rows carry the count apart)."""
     kind, _, rest = fingerprint.partition(":")
-    if kind == "shared_node":
-        return describe(ProductLine(None, "shared_node", 1, tier_key=rest), session, names=names)
+    if kind == KIND_SHARED_NODE:
+        return describe(ProductLine(None, KIND_SHARED_NODE, 1, tier_key=rest), session, names=names)
     instance_type, _, gb = rest.rpartition(":")
     return describe(
-        ProductLine(None, "dedicated_node", 1, instance_type=instance_type, storage_gb=int(gb) if gb.isdigit() else None),
+        ProductLine(None, KIND_DEDICATED_NODE, 1, instance_type=instance_type, storage_gb=int(gb) if gb.isdigit() else None),
         session, names=names,
     )
 
@@ -1161,30 +1578,46 @@ class ProductError(ValueError):
 LIVE_CAST_NOT_OFFERED: Final = "Live Cast isn't offered. Set its price in Products › Live Cast."
 
 
+def _audience(line: ProductLine) -> dict[str, Any]:
+    """A node line's audience as kept: `all` has no moment; a limited line keeps the moment it was added, or takes
+    now when it is new (the save that adds it)."""
+    if line.audience not in LINE_AUDIENCES:
+        raise ProductError(f"Unknown audience {line.audience!r}.")
+    if line.audience == "all":
+        return {}
+    now = _now()
+    if line.audience_at is not None and _as_utc(line.audience_at) > now:
+        raise ProductError("A product's start can't be in the future.")
+    return {"audience": line.audience, "audience_at": line.audience_at or now}
+
+
 def validate_lines(session: Session, lines: Sequence[ProductLine]) -> list[ProductLine]:
     """`lines` normalized to their kind's fields, each checked against the ACTIVE hosting catalogue (NC-2)."""
-    active = {(r.kind, r.key) for r in session.scalars(select(HostingPrice).where(HostingPrice.active)).all()}
+    active = {(kind, key) for kind, key, _, _, on in _catalogue(session) if on}
     out: list[ProductLine] = []
     for line in lines:
         if line.quantity < 1:
             raise ProductError("A product's quantity is at least 1.")
-        if line.kind == "shared_node":
+        if line.audience != "all" and line.kind not in NODE_KINDS:
+            raise ProductError("Only a node goes to existing or new customers alone.")
+        if line.kind == KIND_SHARED_NODE:
             if not line.tier_key or ("shared", line.tier_key) not in active:
                 raise ProductError(f"No Shared tier {line.tier_key!r} is offered. Pick one from the catalogue.")
-            out.append(ProductLine(None, "shared_node", line.quantity, tier_key=line.tier_key))
-        elif line.kind == "dedicated_node":
+            out.append(ProductLine(None, KIND_SHARED_NODE, line.quantity, tier_key=line.tier_key, **_audience(line)))
+        elif line.kind == KIND_DEDICATED_NODE:
             if not line.instance_type or ("instance", line.instance_type) not in active:
                 raise ProductError(f"No machine size {line.instance_type!r} is offered. Pick one from the catalogue.")
             if line.storage_gb is None or ("storage", str(line.storage_gb)) not in active:
                 raise ProductError(f"No {line.storage_gb} GB storage is offered. Pick one from the catalogue.")
             out.append(ProductLine(
-                None, "dedicated_node", line.quantity, instance_type=line.instance_type, storage_gb=line.storage_gb,
+                None, KIND_DEDICATED_NODE, line.quantity, instance_type=line.instance_type, storage_gb=line.storage_gb,
+                **_audience(line),
             ))
-        elif line.kind == "jaah_ai_credit":
+        elif line.kind == KIND_JAAH_AI_CREDIT:
             if line.credit_cents is None or line.credit_cents < 0:
                 raise ProductError("Jaah AI credit needs an amount of 0 or more.")
-            out.append(ProductLine(None, "jaah_ai_credit", line.quantity, credit_cents=line.credit_cents))
-        elif line.kind == "live_cast":
+            out.append(ProductLine(None, KIND_JAAH_AI_CREDIT, line.quantity, credit_cents=line.credit_cents))
+        elif line.kind == KIND_LIVE_CAST:
             if LIVE_CAST_PRICE not in active:
                 raise ProductError(LIVE_CAST_NOT_OFFERED)
             # A line sent without its N takes the catalogue's default, as the editors pre-fill it.
@@ -1193,45 +1626,65 @@ def validate_lines(session: Session, lines: Sequence[ProductLine]) -> list[Produ
                 backfill = settings_reads.get_int(LIVE_CAST_BACKFILL_KNOB)
             if not 1 <= backfill <= MAX_BACKFILL:
                 raise ProductError(f"Live Cast's backfill is a whole number from 1 to {MAX_BACKFILL}.")
-            out.append(ProductLine(None, "live_cast", line.quantity, backfill_tasks=backfill))
+            out.append(ProductLine(None, KIND_LIVE_CAST, line.quantity, backfill_tasks=backfill))
         else:
             raise ProductError(f"Unknown product {line.kind!r}.")
     return out
 
 
-def _line_columns(line: ProductLine, sort_order: int, label: str) -> dict[str, object]:
-    return {
-        "name": label, "kind": line.kind, "quantity": line.quantity, "tier_key": line.tier_key,
-        "instance_type": line.instance_type, "storage_gb": line.storage_gb, "credit_cents": line.credit_cents,
-        "backfill_tasks": line.backfill_tasks, "sort_order": sort_order,
-    }
+#: The product engine's writer of these lines (the billing edition registers it, `app/products/compat.py`; the
+#: community edition has none): `(session, owner, plan_id, org_id, lines, actor)` makes `lines` the owner's lines of
+#: these kinds in `product_lines` — kept by sameness, every other kind's line left as it is, a new override starting
+#: with its plan's other lines; `lines` None ends every line of the owner — and copies them to the legacy line rows
+#: the previous release reads.
+EngineWriter = Callable[
+    [Session, str, Optional[UUID], Optional[UUID], Optional[Sequence[ProductLine]], Optional[AdminUser]], None]
+_ENGINE_WRITER: list[EngineWriter] = []
+
+
+def register_engine_lines(write: EngineWriter) -> None:
+    _ENGINE_WRITER[:] = [write]
+
+
+def _engine_loaded() -> bool:
+    """The billing edition's product engine imported (its kinds register their writer and catalogue readers on
+    import): True when the edition sells (`billing`), False when it does not."""
+    if not edition_features.enabled("billing"):
+        return False
+    from app.products import compat  # noqa: PLC0415 — billing edition only (it imports this module)
+
+    compat._loaded()  # pyright: ignore[reportPrivateUsage]
+    return True
+
+
+def _write(session: Session, owner: str, *, plan_id: Optional[UUID] = None, org_id: Optional[UUID] = None,
+           lines: Sequence[ProductLine], actor: Optional[AdminUser]) -> None:
+    if not _engine_loaded() or not _ENGINE_WRITER:
+        raise HTTPException(status_code=409, detail="Products aren't sold in this edition.")
+    _ENGINE_WRITER[0](session, owner, plan_id, org_id, lines, actor)
+    session.flush()
 
 
 def replace_plan_lines(session: Session, plan: BillingPlan, lines: Sequence[ProductLine], actor: AdminUser) -> None:
-    """Replace `plan`'s whole product list with already-validated `lines`."""
-    names = _price_names(session)
-    session.execute(delete(BillingPlanProduct).where(BillingPlanProduct.plan_id == plan.id))
-    for index, line in enumerate(lines):
-        row = BillingPlanProduct(plan_id=plan.id, **_line_columns(line, index, describe(line, session, names=names)))
-        stamp_actor(row, actor, created=True)
-        session.add(row)
-    session.flush()
+    """Replace `plan`'s lines of these kinds with already-validated `lines`, each with its audience."""
+    _write(session, "plan", plan_id=plan.id, lines=lines, actor=actor)
 
 
 def clear_products(session: Session, org: Org) -> None:
     """Drop the org's products override: it follows its plan's list again."""
-    session.execute(delete(OrgPlanProduct).where(OrgPlanProduct.org_id == org.id))
+    if _engine_loaded() and _ENGINE_WRITER:
+        # Every override line goes, whatever its kind: the plan's list is the org's again.
+        _ENGINE_WRITER[0](session, "org_override", None, org.id, None, None)
+    else:
+        session.execute(delete(EngineLine).where(EngineLine.owner == "org_override", EngineLine.customer_org_id == org.id))
     org.products_overridden = False
+    session.flush()
 
 
 def replace_org_lines(session: Session, org: Org, lines: Sequence[ProductLine], actor: AdminUser) -> None:
-    """Make already-validated `lines` the org's whole products override (`products_overridden`)."""
-    names = _price_names(session)
-    session.execute(delete(OrgPlanProduct).where(OrgPlanProduct.org_id == org.id))
-    for index, line in enumerate(lines):
-        row = OrgPlanProduct(org_id=org.id, **_line_columns(line, index, describe(line, session, names=names)))
-        stamp_actor(row, actor, created=True)
-        session.add(row)
+    """Make already-validated `lines` the org's products override of these kinds (`products_overridden`); a new
+    override starts with its plan's lines of every other kind."""
+    _write(session, "org_override", org_id=org.id, lines=lines, actor=actor)
     org.products_overridden = True
     session.flush()
 

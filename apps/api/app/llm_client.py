@@ -55,9 +55,8 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DEEPSEEK = "deepseek"
 ANTHROPIC = "anthropic"
 PROVIDERS: tuple[str, ...] = (DEEPSEEK, ANTHROPIC)
-#: DeepSeek's flash id as its pricing page serves it; `deepseek-v4-flash` is a legacy name
-#: (api-docs.deepseek.com/quick_start/pricing). The CLI's tier aliases add a `[1m]` context suffix to the
-#: same ids (`model_catalog._CONTEXT_SUFFIX_RE`).
+#: DeepSeek's flash id as its pricing page serves it (api-docs.deepseek.com/quick_start/pricing). The CLI's
+#: tier aliases add a `[1m]` context suffix to the same ids (`model_catalog._CONTEXT_SUFFIX_RE`).
 DEEPSEEK_FLASH = "deepseek-flash"
 #: Each provider's default model for the support agent.
 SUPPORT_DEFAULT_MODELS = {DEEPSEEK: DEEPSEEK_FLASH, ANTHROPIC: "claude-haiku-4-5-20251001"}
@@ -225,7 +224,7 @@ def _credential_source(knob: str, *, env_fallback: bool) -> Optional[tuple[str, 
     from sqlalchemy import select
 
     from app.operator_settings import reads as settings_reads
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.entity_shape import optional_uuid
     from app.models.credentials import Credential
     from app.tenancy import seam
@@ -238,7 +237,7 @@ def _credential_source(knob: str, *, env_fallback: bool) -> Optional[tuple[str, 
     if credential_id is None:
         log.warning("%s unavailable: %r is not a credential id", knob, raw)
         return None
-    with seam.detached(), seam.operator_scope(), SessionLocal() as fleet:
+    with seam.detached(), seam.operator_scope(), BridgedSession() as fleet:
         row = fleet.scalars(
             select(Credential).where(
                 Credential.id == credential_id,
@@ -315,16 +314,9 @@ def support_llm(*, timeout: float) -> Optional[SupportLLM]:
 _MODEL_TIERS = {model: tier for tiers in SUPPORT_TIER_MODELS.values() for tier, model in tiers.items()}
 
 
-#: The legacy DeepSeek flash id, folded like the current one while a stored knob or env still names it.
-LEGACY_DEEPSEEK_FLASH = "deepseek-v4-flash"
-
-
 def provider_model(provider: str, configured: str) -> str:
     """`configured` on `provider`: another provider's tier model becomes `provider`'s model of the same tier;
-    `provider`'s own model or any other id stays as written. The legacy flash id folds too, so a deployed
-    env that still names it calls the current id."""
-    if configured == LEGACY_DEEPSEEK_FLASH:
-        return DEEPSEEK_FLASH if provider == DEEPSEEK else SUPPORT_TIER_MODELS[provider]["low"]
+    `provider`'s own model or any other id stays as written."""
     if configured in SUPPORT_TIER_MODELS[provider].values():
         return configured
     tier = _MODEL_TIERS.get(configured)

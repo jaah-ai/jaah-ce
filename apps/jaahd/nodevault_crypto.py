@@ -1,6 +1,9 @@
 """NodeVault's cryptographic constructions, node side: pure functions, no I/O.
 
-The single Python home of every construction the NodeVault architecture pins. The browser
+The single Python home of every construction the NodeVault architecture pins, on the node's side of each: the
+daemon OPENS a tier-2 secret envelope (the AAD arrives with it from the control plane) and never seals one;
+sealing and the AAD spelling are `apps/api/app/credential_crypto.py`'s, mirrored for the vectors by
+`tests/nodevault_sealing.py`. The browser
 mirrors them (its key module, a sibling task of the same epic); the two are held byte-compatible by the shared vector
 file `tests/fixtures/nodevault_vectors.json`, which `tests/test_nodevault_crypto.py` opens here.
 
@@ -37,7 +40,6 @@ from pathlib import Path
 from functools import cache
 from types import SimpleNamespace
 from typing import Any, Mapping
-from uuid import UUID
 
 RSA_BITS = 4096
 RSA_PUBLIC_EXPONENT = 65537
@@ -50,8 +52,6 @@ NIK_KEY_ID_PREFIX = "nik:"
 KEY_BLOB_VERSION = 1
 SECRET_ENVELOPE_VERSION = 2
 
-# Mirror of `credential_crypto._TIER2_AAD_PREFIX`; the key-blob prefix is NodeVault's own (§2).
-TIER2_AAD_PREFIX = b"credentials.secret|v2|"
 KEY_BLOB_AAD_PREFIX = b"nodevault.key|v1|"
 
 # Bounds, so a hostile blob is refused before any arithmetic: a 4096-bit OAEP block is 512 bytes; a
@@ -195,10 +195,6 @@ def key_hash(key: Any) -> str:
     return hashlib.sha256(public_spki_der(key)).hexdigest()
 
 
-def nv_key_id(hash_hex: str) -> str:
-    return NV_KEY_ID_PREFIX + _check_hash(hash_hex)
-
-
 def nik_key_id(fingerprint: str) -> str:
     return NIK_KEY_ID_PREFIX + _check_hash(fingerprint)
 
@@ -325,35 +321,6 @@ def unwrap_key_blob(blob: Any, *, unwrapping_key: Any, org_id: Any, key_hash_hex
     if not hmac.compare_digest(key_hash(nvk), expected):
         raise NodeVaultCryptoError(ERR_HASH_MISMATCH, "the unwrapped key is not the declared one")
     return nvk
-
-
-# ── Secret envelope (v2 tier 2 under an NVK) ──────────────────────────────────────────────────────────
-
-def tier2_aad(credential_id: UUID | str, field: str, destination: str) -> bytes:
-    """`credentials.secret|v2|<id>|<field>|<destination>` — mirror of `credential_crypto.tier2_aad`."""
-    try:
-        cid = str(UUID(str(credential_id).strip().lower())).encode()
-    except ValueError:
-        raise NodeVaultCryptoError(ERR_MALFORMED, "credential id") from None
-    if not isinstance(field, str) or not field or "|" in field:
-        raise NodeVaultCryptoError(ERR_MALFORMED, "field")
-    if not isinstance(destination, str):
-        raise NodeVaultCryptoError(ERR_MALFORMED, "destination")
-    try:
-        dest = destination.encode("utf-8")
-    except UnicodeEncodeError:
-        raise NodeVaultCryptoError(ERR_MALFORMED, "destination") from None
-    return TIER2_AAD_PREFIX + cid + b"|" + field.encode() + b"|" + dest
-
-
-def seal_secret(value: str, *, aad: bytes, public_key: Any) -> dict:
-    """`value` as a v2 envelope under the NVK `public_key` — the browser's and the CP's job; here for
-    the vectors and the tests that pin interop."""
-    data_key = os.urandom(DATA_KEY_BYTES)
-    nonce = os.urandom(NONCE_BYTES)
-    ct = _lib().AESGCM(data_key).encrypt(nonce, value.encode("utf-8"), aad)
-    return {"v": SECRET_ENVELOPE_VERSION, "k": nv_key_id(key_hash(public_key)), "alg": WRAP_ALGORITHM,
-            "ek": _enc(_wrap(data_key, public_key)), "n": _enc(nonce), "ct": _enc(ct)}
 
 
 def _secret_parts(envelope: Any, nvk: Any) -> tuple[bytes, bytes, bytes, bytes]:

@@ -1,0 +1,46 @@
+# Fireflies.ai. Facts confirmed at the vendor's own docs: API key and bearer auth
+# https://docs.fireflies.ai/fundamentals/authorization ; the user query https://docs.fireflies.ai/graphql-api/query/user ;
+# error envelope https://docs.fireflies.ai/fundamentals/errors (a bad key is answered HTTP 500 with code auth_failed).
+slug = "fireflies"
+label = "Fireflies"
+category = "productivity"
+vendor_docs_url = "https://docs.fireflies.ai/fundamentals/authorization"
+summary = "Read meeting transcripts, summaries and action items recorded by Fireflies."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "app.fireflies.ai > Integrations > Fireflies API (or Settings > Developer settings) > copy the API key" },
+]
+
+[test]
+method = "POST"
+path = "https://api.fireflies.ai/graphql"
+body = '{"query":"{ user { user_id email name } }"}'
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+identity = [["data", "user", "email"], ["data", "user", "name"]]
+rejected_when = { path = ["errors", 0, "code"], values = ["auth_failed"] }
+
+[docs]
+agent_uses = [
+  "Find a meeting by title, date or participant and read its transcript",
+  "Read a meeting's summary, keywords and action items to turn them into tasks or follow-ups",
+  "Answer questions about what was decided in a recorded meeting",
+]
+prerequisites = [
+  "A Fireflies account. API access is on every plan, with a lower daily request limit on Free and Pro",
+  "The meetings agents should read recorded by Fireflies, or shared with the account whose key you use",
+]
+limitations = [
+  "A Fireflies API key carries the full access of its user and cannot be limited to read-only; agents in Jaah only read",
+  "Agents see the meetings the key's user can see: their own, and those shared with them or their team",
+  "Free and Pro plans allow 50 API requests a day; Business and Enterprise allow more",
+]
+troubleshooting = [
+  { symptom = "Test says Fireflies rejected the API key (auth_failed)", fix = "Fireflies answers a wrong or revoked key with an auth_failed error. Copy the key again from Integrations > Fireflies API and select Replace on the secret" },
+  { symptom = "Agents cannot find a meeting", fix = "The meeting was not recorded by Fireflies or is not shared with the key's user. Share it with that user in Fireflies, or use the key of a user who attended" },
+  { symptom = "Agents report too_many_requests", fix = "The plan's daily API limit was reached. Wait for the next day or upgrade the Fireflies plan" },
+]
+faq = [
+  { q = "Can agents join or record meetings", a = "No. Jaah only reads what Fireflies already recorded" },
+]

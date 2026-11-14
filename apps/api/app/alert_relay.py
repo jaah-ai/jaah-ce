@@ -20,13 +20,15 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from typing import Any
 from uuid import UUID
 
-from app import edition_features, http_bounded, notify_text
+from app import edition_features, http_bounded, notification_catalog, notify_text
 from app.config import get_settings
 # Imported so the shared request fact cannot drift (`app/slack_egress.py` sends it too). The egress function
 # itself is not shared (see that module).
+from app.log_on_change import WarnOnce
 from app.notify_text import NO_UNFURL
 
 # The community edition has no Slack: `relay_alert` returns before a Slack recipient's leg, the only reader of
@@ -38,8 +40,8 @@ if edition_features.enabled("slack"):
 log = logging.getLogger("app.alert_relay")
 
 # The single home of the kind contract, `assigned` included. Validated at `AlertIn`
-# (pydantic's `kind: str` accepts `""`); an unknown kind is a 422. Order is the Profile > Notifications
-# panel's order (`preferences.NOTIFICATION_EVENTS`). `assigned` is produced in-process only; over HTTP a
+# (pydantic's `kind: str` accepts `""`); an unknown kind is a 422. Which notification event each kind is, and
+# whether it is one at all, is `app/notification_catalog.py`'s (`event_for`). `assigned` is produced in-process only; over HTTP a
 # node can never name a task or an assigner (`AlertIn._strip_task_id`). `login-expiring` (a Claude login
 # about to pass its hard refresh-token lifetime) is its own kind, not a `self-heal`: nothing heals it
 # — only an operator's re-login does — and an operator mutes it apart. Producer:
@@ -47,27 +49,34 @@ log = logging.getLogger("app.alert_relay")
 # stopped its runner and CI dispatch until usage drops under warn) is its own kind, so an operator can mute it
 # apart; producer `node_disk_events.after_commit`. `node-tmp-inodes` (a node's /tmp inode use crossed 90%, so
 # `mktemp` is about to fail there) likewise; producer `node_tmp_inode_alarm.after_commit`. `alarm` is a page
-# (`PAGE_KINDS`). `agent-message` is an SDK agent's informational post to its task's channel
-# (`task_notify.announce_agent_message`).
+# (`PAGE_KINDS`). `agent-message` and `self-heal` are no longer notifications (`notification_catalog.REMOVED_KINDS`)
+# and nothing in-process raises them; they stay accepted so an older node posting `self-heal` gets its 2xx, and
+# `record_alert` drops them (nothing recorded, nothing sent). `login-expired` (that login's expiry passed; producer
+# `fleet_observe.emit_login_expiry_alerts`), `node-offline` and `runner-crashing` (a node stopped reporting in, or
+# its runners keep failing to start or dying; producer `node_alerts.sweep`) are each one alert per episode.
 ALERT_KINDS = (
     "done", "blocked", "error", "failed", "self-heal", "login-expiring", "node-disk-paused", "node-tmp-inodes",
-    "alarm", "agent-message", "assigned",
+    "alarm", "agent-message", "assigned", "login-expired", "node-offline", "runner-crashing",
 )
 
 # The pages: a CloudWatch alarm changing state, relayed by `app/alarm_relay.py` to the env channel and every
-# superadmin's Slack DM. In-process only (`AlertIn` refuses them, so no node can page the operators) and not a
-# subscribable event (`preferences.NOTIFICATION_EVENTS` leaves them out), so no recipient can mute one.
+# superadmin's Slack DM. In-process only (`AlertIn` refuses them, so no node can page the operators) and outside
+# the notification catalog (`app/notification_catalog.py`), so no recipient can mute one.
 PAGE_KINDS = ("alarm",)
 
 # The node-level kinds: no task, so no recipient chain. Their in-process producers also tell the node org's Owners
-# and Admins (`alert_record.record_alert(tell_org_admins=True)`), and only those may subscribe to them
-# (`preferences.ORG_ADMIN_EVENTS`).
-NODE_KINDS = ("login-expiring", "node-disk-paused", "node-tmp-inodes")
+# and Admins (`alert_record.record_alert(tell_org_admins=True)`), and only those may subscribe to them (their
+# events are admin-only in `app/notification_catalog.py`).
+NODE_KINDS = (
+    "login-expiring", "login-expired", "node-disk-paused", "node-tmp-inodes", "node-offline", "runner-crashing",
+)
 
-# Kinds only the control plane raises: the pages, `node-disk-paused` and `node-tmp-inodes` (CP decisions,
-# so a node posting one is either forging it or squatting its dedup identity), and `agent-message` (its rate
-# cap and its author are the CP's `notify` route's). `AlertIn` refuses them.
-CP_ONLY_KINDS = PAGE_KINDS + ("node-disk-paused", "node-tmp-inodes", "agent-message")
+# Kinds only the control plane raises: the pages, `node-disk-paused`, `node-tmp-inodes`, `login-expired`,
+# `node-offline` and `runner-crashing` (CP decisions, so a node posting one is either forging it or squatting its
+# dedup identity), and `agent-message` (a CP-only kind no producer raises any more). `AlertIn` refuses them.
+CP_ONLY_KINDS = PAGE_KINDS + (
+    "node-disk-paused", "node-tmp-inodes", "agent-message", "login-expired", "node-offline", "runner-crashing",
+)
 
 
 class AlertRelayError(RuntimeError):
@@ -98,16 +107,23 @@ _NON_TLD_EXTENSIONS = frozenset({
 })
 
 
-def _sanitize_reason(reason: str) -> str:
+def _neutralize_links(text: str, *, keep_bare: Callable[[str], bool]) -> str:
+    """Every `_URL_LIKE_RE` match replaced by `[link removed]`, except a bare `word.tld` that `keep_bare` admits —
+    the one pass behind `_sanitize_reason` and `_redact_explicit_urls`."""
     def _redact(match: re.Match) -> str:
         bare = match.group("bare")
-        if bare is not None:
-            tld = bare.rsplit(".", 1)[-1].split("/", 1)[0].lower()
-            if tld in _NON_TLD_EXTENSIONS:
-                return bare
-        return "[link removed]"
+        return bare if bare is not None and keep_bare(bare) else "[link removed]"
 
-    return _URL_LIKE_RE.sub(_redact, reason)
+    return _URL_LIKE_RE.sub(_redact, text)
+
+
+def _is_source_file(bare: str) -> bool:
+    """`reconcile.py`, `config.yaml`: a dotted token whose "TLD" is a file extension, not a domain."""
+    return bare.rsplit(".", 1)[-1].split("/", 1)[0].lower() in _NON_TLD_EXTENSIONS
+
+
+def _sanitize_reason(reason: str) -> str:
+    return _neutralize_links(reason, keep_bare=_is_source_file)
 
 
 def inert_mrkdwn(text: str, *, limit: int | None = None) -> str:
@@ -155,7 +171,7 @@ def _console_link(url: str) -> str | None:
     """A link to this deployment's own console, admitted by matching its configured origin, or `None`.
 
     Not `_validate_notify_url`: that is a github allowlist for untrusted `event["url"]`, while a card url
-    is composed from our `FRONTEND_URL` (`task_external_comment._console_task_url`); the allowlist would
+    is composed from our `FRONTEND_URL` (`trackers.writeback.task_url`); the allowlist would
     reject every one and leave brief mode with no link.
 
     Still validated: `FRONTEND_URL` is operator-set, so only a url matching its origin (scheme plus host,
@@ -203,11 +219,18 @@ _STATUS_WORDS = {
     "failed": "Failed",
     "self-heal": "Self-heal",
     "login-expiring": "Re-login soon",
+    "login-expired": "Login expired",
+    "node-offline": "Node offline",
+    "runner-crashing": "Runner keeps crashing",
     "node-disk-paused": "Disk full, paused",
     "node-tmp-inodes": "/tmp inodes high",
     "assigned": "Assigned to you",
-    # Follows the agent's name (`payload["actor"]`): "Acme Bot posted".
+    # Follows the agent's name (`payload["actor"]`): "Acme Bot posted". `agent-message` names rows written before
+    # it stopped being a notification.
     "agent-message": "Posted",
+    # Not an alert kind: an agent's message to named members (`routes/agent_org.py::notify_org`), which never
+    # crosses `AlertIn`; also headed by the agent's name.
+    "message": "Posted",
     # Not alert kinds: `comment_notify` / `comment_reactions` events, which never cross `AlertIn`.
     "mention": "Mentioned you",
     "reaction": "Reacted",
@@ -252,10 +275,7 @@ def _redact_explicit_urls(text: str) -> str:
     Residual: a node cannot write a name (the key is stripped at the HTTP boundary), but any `projects:edit`
     grantee can rename a project to a bare `evil.to/phish`. Bounded: 40 characters, no markup, and
     nothing on either card (`verbatim`). The pattern is ASCII-only, as with `_sanitize_reason`."""
-    def _redact(match: re.Match) -> str:
-        return match.group(0) if match.group("bare") is not None else "[link removed]"
-
-    return _URL_LIKE_RE.sub(_redact, text)
+    return _neutralize_links(text, keep_bare=lambda _bare: True)
 
 
 def _escape_mrkdwn(text: str) -> str:
@@ -345,12 +365,48 @@ def _task_line(event: dict[str, Any], link: str | None, *, inert: Any, inert_nam
     return notify_text.build_task_line(**parts, url=link, inert=inert, inert_name=inert_name, actor=_actor(event))
 
 
+#: Kinds whose `reason` is a complete one-line sentence naming its subject: the deploy notices
+#: (`app/releases/notify.py`), read off the catalog's `deploys` group, and the producer kinds aliased to them (a task
+#: step's approval notices, `app/pipeline/notices.py`), so theirs is made inert the same way.
+_DEPLOY_EVENTS = frozenset(event.key for event in notification_catalog.GROUPS_BY_KEY["deploys"].events)
+_REASON_IS_HEADLINE: frozenset[str] = _DEPLOY_EVENTS | frozenset(
+    kind for kind, event in notification_catalog.EVENT_ALIASES.items() if event in _DEPLOY_EVENTS
+)
+
+
+#: Kinds whose `reason` leads with its own headline line, the message after it: the node alerts
+#: (`app/node_alerts.py`), which name a node, not a task, so neither `task_parts` nor the kind word can headline
+#: them. Both are `CP_ONLY_KINDS`, so the text is the control plane's own; the node's name in it is tenant-typed, so
+#: the headline is rendered inert as a name (`_redact_explicit_urls`/`_escape_mrkdwn`: `ip-10-0-0-1.ec2.internal`
+#: must stay readable, as a project name does). Their `payload["console_url"]` (the node's page) is the link every leg
+#: offers (`_console_card_link`, `email_notify.console_url`).
+_REASON_LEADS = frozenset({"node-offline", "runner-crashing"})
+_NODE_LINK_LABEL = "Open node"
+
+
+def _leading_reason(event: dict[str, Any]) -> tuple[str, str] | None:
+    """`(headline, message)` off a `_REASON_LEADS` event's `reason`, plain and un-inerted, or `None`."""
+    if event.get("kind") not in _REASON_LEADS or not event.get("reason"):
+        return None
+    head, _, rest = str(event["reason"]).partition("\n")
+    return " ".join(head.split()), rest.strip()
+
+
+def _deploy_mrkdwn(event: dict[str, Any]) -> dict[str, Any]:
+    """A deploy notice for a Slack leg: its reason (typed task titles) escaped, so a `<` cannot swallow the link
+    after it nor a `<!channel>` ping. `format_message` stays plain for email and Telegram."""
+    if not event.get("reason"):
+        return event
+    return {**event, "reason": inert_mrkdwn(str(event["reason"]))}
+
+
 def format_message(event: dict[str, Any]) -> str:
     """Human-readable one-liner for the operator channel. Never includes a token, a config value, or the
     self-reported `node_id`. `reason`/`url` are untrusted: `url` is dropped unless it is a genuine
     `https://github.com/...` link, and every URL-shaped substring in `reason` is neutralized.
 
-    Two headline shapes: `{project}|{id} {title}: {status}` for a task alert, `{owner/repo}: {status}`
+    Four headline shapes: `{project}|{id} {title}: {status}` for a task alert, a deploy notice's own one-line
+    `reason` (`_REASON_IS_HEADLINE`), a node alert's first `reason` line (`_REASON_LEADS`), `{owner/repo}: {status}`
     otherwise. No `[jaah]` prefix (Slack stamps the app name). Plain text throughout, since this also
     goes to the generic webhook; Slack legs re-render with `task_headline_mrkdwn`.
 
@@ -364,7 +420,14 @@ def format_message(event: dict[str, Any]) -> str:
         lines = [inert_mrkdwn(line) for line in (head, *detail.split("\n"))]
         return "\n".join([*lines, *([url] if url else [])])
     headline = task_headline(event)
-    if headline is None:
+    leading = _leading_reason(event) if headline is None else None
+    if leading is not None:
+        head, detail = _redact_explicit_urls(leading[0]), leading[1]
+    elif headline is None and event.get("kind") in _REASON_IS_HEADLINE and event.get("reason"):
+        # A deploy notice's sentence is its whole fact ("Live: <title>"): it is the headline, and so the email's
+        # subject, rather than a kind word every such email would share.
+        head, detail = _sanitize_reason(" ".join(str(event["reason"]).split())), ""
+    elif headline is None:
         target = target_label(event)
         status = _status_word(event.get("kind"))
         head = f"{target}: {status}" if target else status
@@ -398,8 +461,10 @@ def format_message(event: dict[str, Any]) -> str:
 # withdraws its `alerts` row, so this and one warning are the only evidence.
 _counter_lock = threading.Lock()
 _counters = {"alerts_relayed_total": 0, "alerts_relay_failed_total": 0}
-# One warning per process; the rest are `debug`.
-_warned: set[str] = set()
+# One warning per process; the rest are `debug`. `_warned` is the key set other modules' tests read.
+_once = WarnOnce(log)
+_warned = _once.seen
+_warn_once = _once.say
 
 
 def counters() -> dict[str, int]:
@@ -417,15 +482,7 @@ def reset_counters() -> None:
     with _counter_lock:
         for key in _counters:
             _counters[key] = 0
-    _warned.clear()
-
-
-def _warn_once(key: str, message: str, *args: Any) -> None:
-    if key in _warned:
-        log.debug(message, *args)
-        return
-    _warned.add(key)
-    log.warning(message, *args)
+    _once.reset()
 
 
 def _urlopen(req: urllib.request.Request, *, timeout: float):
@@ -487,16 +544,6 @@ _SLACK_RETRY_AFTER_CAP_SECONDS = 5.0
 # `Task.awaiting_response_body`. These caps sit far below Slack's 40_000: the suffix annotates the alert.
 _SLACK_OPTION_MAX_CHARS = 200
 _SLACK_OPTIONS_TOTAL_MAX_CHARS = 1_000
-_SLACK_OPTIONS_MAX_COUNT = 10
-# A divergence would make the card and flat fallback offer different choices. `raise`, not `assert`
-# (`python -O` strips asserts).
-# The community edition has no card to disagree with.
-if edition_features.enabled("slack"):
-    if slack_blocks._MAX_BUTTONS != _SLACK_OPTIONS_MAX_COUNT:
-        raise RuntimeError(
-            f"slack_blocks._MAX_BUTTONS ({slack_blocks._MAX_BUTTONS}) != _SLACK_OPTIONS_MAX_COUNT "
-            f"({_SLACK_OPTIONS_MAX_COUNT}) — the card and the flat-text fallback would disagree"
-        )
 # Slack's `text` limit, enforced in `_slack_chat_post` on the finished `message + suffix`.
 _SLACK_TEXT_MAX_CHARS = 40_000
 # Visible, so a truncated message is not answered as if whole.
@@ -657,7 +704,7 @@ _SLACK_CARD_TYPE_HINT = "Type your answer in the box above, then Submit answer."
 
 def _capped_options(options: Any) -> tuple[list[str], bool]:
     """The options as they will ship, plus whether anything was dropped or shortened: at most
-    `_SLACK_OPTIONS_MAX_COUNT`, each at most `_SLACK_OPTION_MAX_CHARS`, `_SLACK_OPTIONS_TOTAL_MAX_CHARS`
+    `notify_text.OPTIONS_MAX_COUNT`, each at most `_SLACK_OPTION_MAX_CHARS`, `_SLACK_OPTIONS_TOTAL_MAX_CHARS`
     across all (each bound covers a different blow-up).
 
     Capping runs before `_sanitize_reason` so the sanitizer sees what crosses the wire (a later cut could
@@ -666,7 +713,7 @@ def _capped_options(options: Any) -> tuple[list[str], bool]:
     used = 0
     truncated = False
     for index, option in enumerate(options):
-        if index >= _SLACK_OPTIONS_MAX_COUNT or used >= _SLACK_OPTIONS_TOTAL_MAX_CHARS:
+        if index >= notify_text.OPTIONS_MAX_COUNT or used >= _SLACK_OPTIONS_TOTAL_MAX_CHARS:
             truncated = True
             break
         text = str(option)
@@ -766,7 +813,14 @@ def _brief_text(event: dict[str, Any], target: Any) -> str:
     honoured, just not advertised.
     """
     brief = dict(event)
-    brief.pop("reason", None)
+    if event.get("kind") in _REASON_IS_HEADLINE:
+        # A deploy notice's reason is its headline (`format_message`), not content brief declines.
+        brief = _deploy_mrkdwn(brief)
+    elif (leading := _leading_reason(event)) is not None:
+        # A node alert's first line is its headline (`_REASON_LEADS`): brief keeps it and drops the message.
+        brief["reason"] = _escape_mrkdwn(leading[0])
+    else:
+        brief.pop("reason", None)
     # The question also rides in `payload["question_body"]`; drop it on the copy's own payload copy
     # (`_done_card`/`_question_card` read the original). Belt and braces, so a brief message cannot carry
     # content even if the composition below is rearranged.
@@ -774,12 +828,8 @@ def _brief_text(event: dict[str, Any], target: Any) -> str:
         brief["payload"] = {
             key: value for key, value in brief["payload"].items() if key != "question_body"
         }
-    # Whichever card this target carries (at most one); the assignment card carries `task_id`/`url` too.
-    card = (
-        getattr(target, "question", None)
-        or getattr(target, "done", None)
-        or getattr(target, "assigned", None)
-    )
+    # The assignment card carries `task_id`/`url` too.
+    card = _target_card(target)
     task_id = getattr(card, "task_id", None) if card is not None else None
     # Only when the headline has no identifier: a producer `issue` already gives `owner/repo#123`.
     # `isinstance` because the card is duck-typed: a hand-built `task_id` string could forge a second link
@@ -851,6 +901,16 @@ def _card_org(event: dict[str, Any]) -> str | None:
     return org if isinstance(org, str) else None
 
 
+def _target_card(target: Any) -> Any:
+    """Whichever card this target carries (at most one: `question`, `done` or `assigned`, in that order), or
+    `None`. `getattr` throughout: the target is duck-typed (see `_question_card`)."""
+    return (
+        getattr(target, "question", None)
+        or getattr(target, "done", None)
+        or getattr(target, "assigned", None)
+    )
+
+
 def _console_card_link(target: Any, event: dict[str, Any] | None = None) -> str | None:
     """The console url off whichever card this target carries, through both guards, or `None`.
 
@@ -860,13 +920,8 @@ def _console_card_link(target: Any, event: dict[str, Any] | None = None) -> str 
     and `|` hands the writer the label. `urlsplit` encodes nothing, so `<`, `>`, `|` and `Cf` bidi
     overrides survive the origin check inside a path.
 
-    `getattr` throughout: the target is duck-typed (see `_question_card`); at most one card is present.
     A refusal by either guard degrades to no link, never raw text."""
-    card = (
-        getattr(target, "question", None)
-        or getattr(target, "done", None)
-        or getattr(target, "assigned", None)
-    )
+    card = _target_card(target)
     url = getattr(card, "url", None) if card is not None else None
     if not url and event is not None:
         # No card, so the producer's own console URL (a mention, the needs-attention backstop). In-process
@@ -887,6 +942,10 @@ def _slack_flat_text(event: dict[str, Any], target: Any) -> str | None:
     # Accepted residual: the task id comes from the payload and the url from the card; both are built
     # off the same Task row by trusted in-process code. A second producer of either would need a cross-check.
     headline = task_headline_mrkdwn(event, link=_console_card_link(target, event))
+    if headline is None and event.get("kind") in _REASON_IS_HEADLINE:
+        return format_message(_deploy_mrkdwn(event))
+    if headline is None and (leading := _leading_reason(event)) is not None:
+        return _node_lines(leading, _console_card_link(target, event))
     if headline is None:
         return _support_line(event, target)
     parts = [headline]
@@ -901,6 +960,17 @@ def _slack_flat_text(event: dict[str, Any], target: Any) -> str | None:
         if safe_url:
             parts.append(safe_url)
     return "\n".join(parts)
+
+
+def _node_lines(leading: tuple[str, str], link: str | None) -> str:
+    """A node alert's Slack text (`_REASON_LEADS`): the headline in bold, the message, then the node's page. Each
+    line inerted on its own (`inert_mrkdwn` flattens), so the node's name cannot ping or forge a link; a refused
+    link degrades to none."""
+    head, rest = leading
+    lines = [f"*{_escape_mrkdwn(head)}*", *(inert_mrkdwn(line) for line in rest.split("\n") if line.strip())]
+    if link is not None:
+        lines.append(f"<{link}|{_NODE_LINK_LABEL}>")
+    return "\n".join(lines)
 
 
 def _support_line(event: dict[str, Any], target: Any) -> str | None:
@@ -922,7 +992,7 @@ def _done_card(event: dict[str, Any], target: Any) -> list[dict[str, Any]] | Non
     recipient; `None` for every other alert.
 
     `target.done` is populated only for a parentless Task's `done`, and `target.assigned` only by
-    `resolve_slack_target(assigned=True)`; they are mutually exclusive by `alert_record`'s `kind`
+    `resolve_slack_targets(assigned=True)`; they are mutually exclusive by `alert_record`'s `kind`
     derivation, and `done` is asked first.
 
     `getattr` because the target is duck-typed (see `_question_card`). `inert_mrkdwn` is injected:
@@ -985,28 +1055,30 @@ def _alarm_fields(event: dict[str, Any]) -> dict[str, str] | None:
 def _alarm_lines(event: dict[str, Any]) -> tuple[str, str, str | None] | None:
     """`(headline, detail, console url)` for an `alarm` event, plain text, or `None`.
 
-    Headline: `<STATE> — <description>` (the name when the alarm has no description). Detail: the name and
-    what it moved from (`resolved` for an `OK`), then CloudWatch's reason."""
+    Headline: `<STATE> — <description>` (the name when the alarm has no description); an `OK` is
+    `RESOLVED — <name>`, never the description, which states the failure. Detail: the name and what it moved
+    from, then CloudWatch's reason."""
     alarm = _alarm_fields(event)
     if alarm is None:
         return None
     state = alarm["state"].upper()
     name = notify_text._clip(alarm["name"], _ALARM_NAME_MAX)
-    headline = f"{state} — {alarm['description'] or name}"
     previous = alarm["previous_state"].upper()
+    moved = f"was {previous}" if previous else ""
     if state == "OK":
-        moved = f"resolved (was {previous})" if previous else "resolved"
+        headline = f"RESOLVED — {name}"
+        detail = moved
     else:
-        moved = f"was {previous}" if previous else ""
-    detail = " · ".join(part for part in (name, moved) if part)
-    if alarm["reason"]:
-        detail = f"{detail}\n{notify_text._clip(alarm['reason'], _ALARM_REASON_MAX)}"
+        headline = f"{state} — {alarm['description'] or name}"
+        detail = " · ".join(part for part in (name, moved) if part)
+    reason = notify_text._clip(alarm["reason"], _ALARM_REASON_MAX) if alarm["reason"] else ""
+    detail = "\n".join(part for part in (detail, reason) if part)
     return headline, detail, notify_text.link_url(alarm["console_url"]) if alarm["console_url"] else None
 
 
 def _alarm_card(event: dict[str, Any]) -> list[dict[str, Any]] | None:
     """The Block Kit page for an `alarm` event, or `None` for every other alert: a plain-text header
-    (`<STATE> — <description>`), then one `mrkdwn` section with the detail and the console link."""
+    (`_alarm_lines`' headline), then one `mrkdwn` section with the detail and the console link."""
     lines = _alarm_lines(event)
     if lines is None:
         return None

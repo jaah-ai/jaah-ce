@@ -4,13 +4,14 @@ import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Stack from '@mui/material/Stack'
 import { useTheme } from '@mui/material/styles'
-import { FilterRow, FilterSelect, withUnmatched } from '../../ui/FilterRow'
+import { FilterRow, withUnmatched } from '../../ui/FilterRow'
 import { usePagedList } from '../../hooks/usePagedList'
+import { usePhone } from '../../hooks/usePhone'
+import { grid, SIZE } from '../../theme'
 import { useUrlFilters } from '../../hooks/useUrlFilters'
 import { countOf } from '../../lib/humanize'
-import { DBOS_STATUSES, DBOS_STATUS_GLYPH, DBOS_STATUS_HELP, DBOS_STATUS_TONE, isInFlight } from '../../lib/dbosStatus'
-import { compactAge, NO_VALUE } from '../../lib/relativeTime'
-import { formatSpanBetween } from '../../lib/spanTime'
+import { DBOS_STATUSES, DBOS_STATUS_HELP, dbosStatus } from '../../lib/dbosStatus'
+import { compactAge, formatSpanBetween, NO_VALUE } from '../../lib/relativeTime'
 import { formatZoned } from '../../lib/zonedTime'
 import Banner from '../../ui/Banner'
 import EmptyState from '../../ui/EmptyState'
@@ -22,6 +23,7 @@ import FilterBar from '../../ui/FilterBar'
 import { FEED_NO_META, fieldTapTargetSx, RUNS_NO_WORKFLOW, tapTargetSx, WORKFLOW_RUNS_CONTAINER_SX } from '../../ui/listStyles'
 import PagedList from '../../ui/PagedList'
 import SearchBox from '../../ui/SearchBox'
+import { SelectFilters } from '../../ui/SelectFilters'
 import { listWorkflowRuns, type WorkflowRun, type WorkflowType } from './api'
 import {
   ENGINE_DOWN_RUNS,
@@ -41,13 +43,10 @@ import { TaskLink } from '../../ui/DetailFields'
  * A run's reading is the row title (a node, coloured by `kind`); `recovered ×N` is a marker, not a gated
  * slot, so narrow screens still show it. The pager caps a read at 50 rows. */
 
-/* Row mark from the run's status (`lib/dbosStatus.ts`); » in flight, `?` for an unknown status shown as
- * itself. */
+/* Row mark from the run's status (`lib/dbosStatus.ts`). */
 function statusMark(run: WorkflowRun): FeedIndicator {
   return {
-    tone: DBOS_STATUS_TONE[run.status] ?? 'neutral',
-    glyph: DBOS_STATUS_GLYPH[run.status] ?? (isInFlight(run.status) ? '»' : '?'),
-    label: run.status,
+    ...dbosStatus(run.status),
     title: DBOS_STATUS_HELP[run.status],
     // State oracle for tests.
     data: { status: run.status },
@@ -97,6 +96,7 @@ export default function WorkflowRunsTab({
   onRead?: () => void
 }) {
   const theme = useTheme()
+  const phone = usePhone()
   const [searchParams, setFilters] = useUrlFilters()
 
   /* Filters derived from the URL. A pinned name beats `?workflow=`, so a stray key cannot widen the page. */
@@ -240,7 +240,7 @@ export default function WorkflowRunsTab({
         },
         {
           key: 'duration',
-          width: 60,
+          width: grid(10),
           gate: 'id',
           align: 'right',
           mono: true,
@@ -262,7 +262,7 @@ export default function WorkflowRunsTab({
         {
           /* A real anchor (middle-click, copy link). `vocabulary.ts::taskIdOf` gates when it is offered. */
           key: 'task',
-          width: 48,
+          width: grid(8),
           align: 'right',
           node: taskId === null ? null : (
             /* Verb as the accessible name; `#id` as ink (48px slot). */
@@ -300,25 +300,16 @@ export default function WorkflowRunsTab({
       <FilterBar>
         <FilterRow>
           {/* `FilterRow` hands `ui/FilterBar` one wrapping child so controls pack at phone width. */}
-          {showWorkflow && (
-            <FilterSelect
-              label="Workflow"
-              ariaLabel="Filter by workflow"
-              value={nameFilter}
-              onChange={next => setFilters({ workflow: next })}
-              allLabel="All workflows"
-              options={typeOptions}
-              minWidth={190}
-            />
-          )}
-          <FilterSelect
-            label="Status"
-            ariaLabel="Filter by status"
-            value={statusFilter}
-            onChange={next => setFilters({ status: next })}
-            allLabel="Any status"
-            options={statusOptions}
-            minWidth={190}
+          <SelectFilters
+            narrowings={[
+              { key: 'workflow' as const, label: 'Workflow', ariaLabel: 'Filter by workflow', allLabel: 'All workflows', options: typeOptions, testId: 'workflow-runs-filter-workflow', minWidth: SIZE.fieldMd },
+              { key: 'status' as const, label: 'Status', ariaLabel: 'Filter by status', allLabel: 'Any status', options: statusOptions, testId: 'workflow-runs-filter-status', minWidth: SIZE.fieldMd },
+            ].filter(n => showWorkflow || n.key !== 'workflow')}
+            values={{ workflow: nameFilter, status: statusFilter }}
+            onChange={(key, value) => setFilters({ [key]: value })}
+            onClear={keys => setFilters(Object.fromEntries(keys.map(k => [k, ''])))}
+            phone={phone}
+            menuName="Filter runs"
           />
           {/* "Starts with": the server match is a prefix (strings single-homed in `vocabulary.ts`). */}
           <SearchBox
@@ -329,7 +320,7 @@ export default function WorkflowRunsTab({
             onChange={next => setFilters({ q: next.trim() })}
             placeholder={SEARCH_PLACEHOLDER}
             /* `m: 0` cancels the dense margin; `fieldTapTargetSx` is the 44px floor on the native input. */
-            sx={[{ m: 0, minWidth: 240, flex: '1 1 260px' }, fieldTapTargetSx]}
+            sx={[{ m: 0, minWidth: grid(40), flex: `1 1 ${grid(43)}` }, fieldTapTargetSx]}
           />
         </FilterRow>
       </FilterBar>

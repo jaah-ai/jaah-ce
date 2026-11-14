@@ -15,6 +15,7 @@ from typing import Optional
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+from app.clock import utcnow
 from app.triggers import (
     DEDUPED,
     DISPATCHED,
@@ -77,7 +78,7 @@ def apply_outcome(trigger, outcome: str, *, reason: Optional[str] = None, now: O
     counters alone — so an invalid signature can never pause a trigger (A6)."""
     if outcome in SUCCESS_OUTCOMES:
         trigger.consecutive_failures = 0
-        trigger.last_success_at = now or datetime.now(timezone.utc)
+        trigger.last_success_at = now or utcnow()
     elif outcome in FAILURE_OUTCOMES:
         trigger.consecutive_failures = (trigger.consecutive_failures or 0) + 1
         trigger.last_failure_reason = reason
@@ -99,7 +100,7 @@ def mark_failed(
     trigger keeps its first reason. `idle`: the days rule's stop, which the owner alone hears about."""
     if trigger.failed_at is not None:
         return
-    trigger.failed_at = now or datetime.now(timezone.utc)
+    trigger.failed_at = now or utcnow()
     trigger.failed_reason = reason
     on_failed(session, trigger, reason, idle=idle)
 
@@ -116,10 +117,15 @@ def auto_pause_if_due(session: Session, trigger, *, now: Optional[datetime] = No
 def clear_stops(trigger, *, now: Optional[datetime] = None) -> None:
     """Resume (a human action): clears both stops and the streak, so a fresh delivery files (AC-12.2), and
     restarts the idle rule's clock (`resumed_at`)."""
-    trigger.resumed_at = now or datetime.now(timezone.utc)
+    trigger.resumed_at = now or utcnow()
     trigger.paused_at = None
     trigger.paused_by_id = None
     trigger.paused_reason = None
+    clear_failure(trigger)
+
+
+def clear_failure(trigger) -> None:
+    """Clear the system stop and the streak only, keeping a human pause: what a repaired cause owes."""
     trigger.failed_at = None
     trigger.failed_reason = None
     trigger.consecutive_failures = 0
@@ -245,7 +251,7 @@ def fold_budget(session: Session, trigger, *, now: Optional[datetime] = None) ->
         breach_cost = _cost(session, trigger.budget_breach_task_id)
         if breach_cost is not None and breach_cost <= budget:
             _clear_breach(trigger)
-    cutoff = (now or datetime.now(timezone.utc)) - BUDGET_LOOKBACK
+    cutoff = (now or utcnow()) - BUDGET_LOOKBACK
     rows = session.execute(
         _filed(trigger)
         .where(or_(Task.state == ACTIVE, Task.updated_at >= cutoff))

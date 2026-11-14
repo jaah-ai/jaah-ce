@@ -4,7 +4,9 @@
 import { apiDetail, put } from '../api'
 import { actAsOnce } from './actAs'
 import type { OrgRef } from '../types'
-import type { TitleNotice } from './slotTitle'
+
+// A landed reassignment's note (`info`), or a refusal or warning (`error`).
+export type OwnerNotice = { text: string; kind: 'error' | 'info' }
 
 type CloneOwnerReply = {
   node_id: string
@@ -14,7 +16,7 @@ type CloneOwnerReply = {
   git_access_warning?: string | null
 }
 
-// `nodeId` (the node uuid) is required (as `SlotRef.nodeId`): an omitted `node_id` defaults to the CP's own node.
+// `nodeId` (the node uuid) is required: an omitted `node_id` defaults to the CP's own node.
 // `projectId` addresses the call; `project` only words the notice. `otherOrg`: the slot's org when it is not the
 // operator's own — the write goes as that org for this one request (`actAsOnce`), since an operator's
 // write naming another org's project is refused (`authz/enforce.py::OtherOrgDenial`).
@@ -24,7 +26,7 @@ export type CloneRef = { project: string; projectId: number; nodeId: string; nod
 // GitHub yet).
 export async function saveCloneOwner(
   clone: CloneRef, userId: string,
-): Promise<{ ok: boolean; notice: TitleNotice }> {
+): Promise<{ ok: boolean; notice: OwnerNotice }> {
   const label = `${clone.project} on ${clone.nodeLabel}`
   try {
     const reply = await put<CloneOwnerReply>(
@@ -40,7 +42,7 @@ export async function saveCloneOwner(
       ok: true,
       notice: {
         kind: 'info',
-        text: `${label} now clones as ${reply.owner_email}. Run Sync.`,
+        text: `${label} now clones as ${reply.owner_email}.`,
       },
     }
   } catch (err) {

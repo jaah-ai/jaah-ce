@@ -1,0 +1,41 @@
+# Azure Cloud API, over the hand-written `azure` type (adopted, AS3: its fields and Test - an ARM token, then the
+# subscription read - are unchanged). Facts confirmed at the vendor's own docs: service principals and client secrets
+# https://learn.microsoft.com/en-us/entra/identity-platform/howto-create-service-principal-portal
+slug = "azure"
+label = "Azure"
+category = "cloud"
+credential_type = "azure"
+vendor_docs_url = "https://learn.microsoft.com/en-us/entra/identity-platform/howto-create-service-principal-portal"
+summary = "Manage Azure resources in one subscription with a Microsoft Entra service principal."
+
+[[auth]]
+kind = "service_account"
+fields = [
+  { key = "tenant_id", label = "Tenant ID", kind = "text", required = true, placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", help = "Azure portal > Microsoft Entra ID > Overview > Tenant ID, or a domain such as acme.onmicrosoft.com" },
+  { key = "client_id", label = "Client ID", kind = "text", required = true, placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", help = "Microsoft Entra ID > App registrations > New registration (name it Jaah), then the app's Overview > Application (client) ID" },
+  { key = "client_secret", label = "Client secret", kind = "secret", required = true, help = "The app's Certificates & secrets > Client secrets > New client secret: copy the Value column (not the Secret ID) - Azure shows it once" },
+  { key = "subscription_id", label = "Subscription ID", kind = "text", required = true, placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", help = "Azure portal > Subscriptions > the subscription > Overview > Subscription ID. Then Access control (IAM) > Add role assignment: give the app the role agents need, such as Reader or Contributor" },
+]
+
+[docs]
+agent_uses = [
+  "Inspect resources, resource groups and deployments in the subscription",
+  "Read logs and metrics to investigate an incident",
+  "Create or change resources with the Azure CLI or an SDK, if the role you assigned allows it",
+]
+prerequisites = [
+  "An Azure subscription, and permission to register an app in Microsoft Entra ID and assign it a role on the subscription (Owner or User Access Administrator)",
+]
+limitations = [
+  "Azure has no sign-in button for apps like Jaah: you connect with a service principal's client secret",
+  "Agents get exactly the role you assign on the subscription. Reader keeps them read-only",
+  "Client secrets expire (6 to 24 months is typical). Add a new secret before the old one expires and select Replace",
+]
+troubleshooting = [
+  { symptom = "Test says Azure refused the credentials: AADSTS7000215 Invalid client secret provided", fix = "You copied the Secret ID, or the secret expired. Create a new client secret, copy its Value, and select Replace" },
+  { symptom = "Test says the app cannot read the subscription", fix = "The app has no role on that subscription. Add one under Subscriptions > Access control (IAM) > Add role assignment" },
+  { symptom = "Test says AADSTS700016 application not found in the directory", fix = "The client ID and tenant ID do not belong together. Copy both from the same app registration's Overview" },
+]
+faq = [
+  { q = "Can one secret reach several subscriptions", a = "The Test checks the subscription you enter. The app can hold roles on others too, and agents can reach them with the same secret" },
+]

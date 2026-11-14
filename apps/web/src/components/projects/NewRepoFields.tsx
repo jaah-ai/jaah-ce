@@ -3,15 +3,18 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link as RouterLink } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Link from '@mui/material/Link'
+import ExternalLink from '../../ui/ExternalLink'
 import Typography from '@mui/material/Typography'
 import { DetailCell } from '../../ui/detail/DetailPage'
 import FieldRow from '../../ui/FieldRow'
 import FormTextField from '../../ui/FormTextField'
+import { NEW_REPO_NOTES_STACKED, NEW_REPO_ROW_CONTAINER } from '../../ui/listStyles'
+import { grid } from '../../theme'
 import { get } from '../../api'
 import { useAuth } from '../../auth'
 import { actingAs, readAsOnce } from '../../lib/actAs'
 import type { OrgRef } from '../../types'
-import { type GitRepoSource } from '../../ui/RepoUrlLookup'
+import { type GitRepoSource, PROFILE_GIT_PATH } from '../../ui/RepoUrlLookup'
 import { REPO_OWNERS_KEY } from './githubOAuthPopup'
 import { newRepoNameError, type NewRepoDraft, type RepoRowError } from './projectForm'
 
@@ -121,9 +124,9 @@ function InstallLink({ owner, onInstall }: { owner: RepoOwner; onInstall: () => 
   return (
     <>
       {' '}
-      <Link href={owner.installUrl} target="_blank" rel="noopener noreferrer" onClick={onInstall}>
+      <ExternalLink href={owner.installUrl} onClick={onInstall}>
         Install the App on {owner.owner}
-      </Link>
+      </ExternalLink>
     </>
   )
 }
@@ -199,8 +202,6 @@ function useRepoOwners(enabled = true, org: OrgRef | null = null): { data: GitRe
   return { data: query.data ?? null, failed: query.isError, markStale }
 }
 
-const NOTES_CONTAINER = 'new-repo-row'
-
 const ownerValue = (o: { root: string; owner: string }) => `${o.root}/${o.owner}`
 
 export default function NewRepoFields({ draft, onChange, idBase, error, org = null }: {
@@ -242,7 +243,7 @@ export default function NewRepoFields({ draft, onChange, idBase, error, org = nu
           ) : (
             <>
               No forge connection lists an owner to create in. Connect one in{' '}
-              <Link component={RouterLink} to="/profile?tab=git-accounts">Profile &gt; Git</Link>.
+              <Link component={RouterLink} to={PROFILE_GIT_PATH}>Profile &gt; Git</Link>.
             </>
           )}
         </Typography>
@@ -264,15 +265,19 @@ export default function NewRepoFields({ draft, onChange, idBase, error, org = nu
   }
   /* The notes span both cells, under the row, not as the Owner field's hint: in the list pane the Owner cell is
   narrow, and a note there wrapped to five lines. They stay the Owner select's description. Once the
-  row is too narrow for both cells (2 × 14rem + the 1rem gap) it stacks, and the notes move up under Owner by
+  row is too narrow for both cells (2 × `grid(37)` + the gap) it stacks, and the notes move up under Owner by
   flex `order`, so they never read as notes about the name. */
   return (
-    <FieldRow align="start" rowGap="0.75rem" sx={{ containerType: 'inline-size', containerName: NOTES_CONTAINER }}>
-      <DetailCell basis="14rem" max="22rem">
+    <FieldRow align="start" rowGap={2} sx={{ containerType: 'inline-size', containerName: NEW_REPO_ROW_CONTAINER }}>
+      <DetailCell basis={grid(37)} max={grid(58.5)}>
         <FormTextField
           id={`${idBase}-owner`}
           label="Owner"
-          help="The account, organization, group, workspace or project it is created in."
+          help={{
+            tip: 'Where the new repository is created.',
+            more: "An account, organization, group, workspace or project your Git accounts reach. One Jaah can't create in is disabled and says why.",
+            docs: 'console-reference/directory/projects',
+          }}
           value={picked}
           onChange={v => {
             const o = owners.find(x => ownerValue(x) === v)
@@ -291,7 +296,7 @@ export default function NewRepoFields({ draft, onChange, idBase, error, org = nu
           <option value="">{data === null ? 'Loading…' : 'Pick an owner'}</option>
         </FormTextField>
       </DetailCell>
-      <DetailCell basis="14rem" max="22rem" sx={{ order: 2 }}>
+      <DetailCell basis={grid(37)} max={grid(58.5)} sx={{ order: 2 }}>
         <FormTextField
           id={`${idBase}-name`}
           label="Repository name"
@@ -303,16 +308,16 @@ export default function NewRepoFields({ draft, onChange, idBase, error, org = nu
       </DetailCell>
       {handoff && draft.oauth_connect && (
         <Typography variant="body2" data-testid="project-new-repo-oauth"
-          sx={{ flex: '1 1 100%', order: 4, color: 'text.secondary', mx: '14px' }}>
-          Create opens GitHub to approve once, then makes it with your own access.
+          sx={{ flex: '1 1 100%', order: 4, color: 'text.secondary', mx: 2 }}>
+          GitHub opens to approve once, then Jaah makes it with your own access.
         </Typography>
       )}
       {handoff && !draft.oauth_connect && (
         <Typography variant="body2" data-testid="project-new-repo-handoff"
-          sx={{ flex: '1 1 100%', order: 4, color: 'text.secondary', mx: '14px' }}>
+          sx={{ flex: '1 1 100%', order: 4, color: 'text.secondary', mx: 2 }}>
           The GitHub App may not create repositories in {draft.owner}.{' '}
-          <Link href={handoff} target="_blank" rel="noopener noreferrer">Create it on GitHub</Link>, empty, then
-          Create adds main and develop.
+          <ExternalLink href={handoff}>Create it on GitHub</ExternalLink>, empty; Jaah then
+          adds main and develop.
         </Typography>
       )}
       {notes && (
@@ -321,8 +326,8 @@ export default function NewRepoFields({ draft, onChange, idBase, error, org = nu
           variant="body2"
           component="div"
           sx={{
-            flex: '1 1 100%', order: 3, color: 'text.secondary', mx: '14px', mt: '-0.25rem',
-            [`@container ${NOTES_CONTAINER} (width < 29rem)`]: { order: 1 },
+            flex: '1 1 100%', order: 3, color: 'text.secondary', mx: 2, mt: -0.5,
+            [NEW_REPO_NOTES_STACKED]: { order: 1 },
           }}
         >
           {notes}

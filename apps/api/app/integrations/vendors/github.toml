@@ -1,0 +1,58 @@
+# GitHub API, over the hand-written `github` type and provider (adopted, AS3: nothing of either changes; Connect is
+# the forges' shared engine with its hooks, `forge_oauth.on_grant`). Facts confirmed at the vendor's own docs:
+# OAuth apps https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps ; personal
+# access tokens https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
+slug = "github"
+label = "GitHub"
+category = "dev_tools"
+credential_type = "github"
+vendor_docs_url = "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens"
+summary = "Read and write repositories, issues, pull requests and Actions on GitHub."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+# The registered provider's endpoints and scope, in its order (the conflict guard compares the endpoints).
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url = "https://github.com/login/oauth/access_token"
+scopes = [
+  { name = "repo", label = "Read and push code, open pull requests and manage issues in the repositories you can reach" },
+  { name = "workflow", label = "Update GitHub Actions workflow files when a change touches them" },
+  { name = "read:org", label = "See your organizations and teams, to find their repositories" },
+  { name = "read:user", label = "Read your profile, so the connection shows whose it is" },
+  { name = "user:email", label = "Read your email address, to attribute commits correctly" },
+]
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "token", label = "Personal access token", kind = "secret", required = true, placeholder = "github_pat_... or ghp_...", help = "GitHub > your avatar > Settings > Developer settings > Personal access tokens > Fine-grained tokens > Generate new token: name it Jaah, choose the resource owner and repositories, grant Contents, Issues, Pull requests and Metadata (read and write as needed), then Generate token and copy it - GitHub shows it once" },
+  { key = "base_url", label = "Base URL", kind = "url", required = false, help = "Leave blank for GitHub in the cloud. For GitHub Enterprise Server, your instance's https root (not /api/v3)" },
+]
+
+[docs]
+agent_uses = [
+  "Clone, branch, commit and push code, and open pull requests for a task",
+  "Read and comment on issues and pull request reviews",
+  "Check GitHub Actions runs and read their logs when a build fails",
+  "Search code across your organization's repositories",
+]
+prerequisites = [
+  "A GitHub account with access to the repositories agents should work in",
+  "For an organization that restricts OAuth apps or fine-grained tokens, an organization owner must approve Jaah or the token (Organization settings > Third-party access)",
+]
+limitations = [
+  "Agents act as the connected account: commits, comments and pull requests are attributed to it",
+  "A fine-grained token reaches only the repositories and permissions chosen for it; a sign-in reaches every repository the account can",
+  "GitHub limits authenticated API calls to 5,000 an hour per user",
+  "A token for GitHub Enterprise Server needs Base URL set to that server",
+]
+troubleshooting = [
+  { symptom = "Test says GitHub rejected the token (401)", fix = "The token expired, was revoked, or was mistyped. Generate a new one and select Replace, or Reconnect a sign-in" },
+  { symptom = "Agents get 404 for a repository you can see", fix = "A fine-grained token was not given that repository, or the organization has not approved the token. Edit the token, or ask an owner to approve it" },
+  { symptom = "Push fails with a workflow permission error", fix = "The change touches .github/workflows and the token lacks Workflows write (or the sign-in lacks the workflow scope). Add it and try again" },
+]
+faq = [
+  { q = "Sign-in or personal access token", a = "Sign in for the quickest setup. Use a fine-grained token to limit agents to some repositories and permissions" },
+  { q = "Is this the same as the GitHub connection for a project's repository", a = "It is the same kind of secret. A project's repository access can use it, or a separate one with narrower access" },
+]

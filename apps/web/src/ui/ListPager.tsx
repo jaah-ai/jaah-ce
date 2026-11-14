@@ -1,22 +1,24 @@
 import Box from '@mui/material/Box'
-import NativeSelect from '@mui/material/NativeSelect'
+import Button from '@mui/material/Button'
 import Typography from '@mui/material/Typography'
-import type { Theme } from '@mui/material/styles'
 import { useCallback, useId, type JSX, type SetStateAction } from 'react'
 import { PER_OPTIONS } from '../hooks/useListPage'
 import { groupedCount } from '../lib/humanize'
 import { usePageClamp } from '../hooks/usePageClamp'
-import { PHONE } from './listStyles'
-import { Pager } from './Pager'
+import { PHONE, ELLIPSIS_SX, tapTargetSx } from './listStyles'
+import { FONT_SIZE } from '../theme'
+import SelectField from './SelectField'
 
 /* THE FOOTER OF A `hooks/useListPage` LIST: where the reader is ("1–50 of 1,234"), the console's one
- * `Pager`, and how many rows a page holds. Each part shows only when it can say something: nothing at all before
+ * "Previous / Page X of N / Next", and how many rows a page holds. Each part shows only when it can say something: nothing at all before
  * the first total (no "of 0" posing as a count) or on an empty set (the list's own empty state speaks); no Prev/
- * Next on a single page; no size choice when every size shows the whole set (≤ 25). A footer with only its readout
+ * Next on a single page; no size choice when every size shows the whole set (≤ 25) or the page size is fixed (no
+ * `onPer`). A footer with only its readout
  * left (one page, no size choice) is not drawn at any width: "1–1 of 1" under one row repeats what it shows.
  * THREE COLUMNS ON A DESKTOP — readout left, pager centred on the list, size right, the outer two `1fr` so the
  * pager stays centred whatever the readout's width. TWO ROWS AT `PHONE`: readout and size share the first line,
- * the pager takes the second whole — one line of all three is ~425px against a 390px phone's 358px. */
+ * the pager takes the second whole — one line of all three is ~425px against a 390px phone's 358px.
+ * A KEYSET list (a cursor has no "page 4 of N") is `ui/PagedList`'s "Load more" instead. */
 
 const FOOTER_SX = {
   display: 'grid',
@@ -29,7 +31,7 @@ const FOOTER_SX = {
   [PHONE]: {
     gridTemplateColumns: '1fr auto',
     gridTemplateAreas: '"readout per" "pager pager"',
-    rowGap: 0.25,
+    rowGap: 0,
   },
 } as const
 
@@ -38,34 +40,25 @@ const READOUT_SX = {
   gridArea: 'readout',
   color: 'text.secondary',
   fontVariantNumeric: 'tabular-nums',
-  whiteSpace: 'nowrap',
-  overflow: 'hidden',
-  textOverflow: 'ellipsis',
-  minWidth: 0,
+  ...ELLIPSIS_SX,
 } as const
 
-/* `Pager` brings its own `mt: 1`; in the grid the row gap owns spacing. */
-const PAGER_SX = { gridArea: 'pager', mt: 0, minWidth: 0 } as const
+const PAGER_SX = {
+  gridArea: 'pager', minWidth: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 1, flexWrap: 'wrap',
+} as const
 
 const PER_SX = {
   gridArea: 'per',
   justifySelf: 'end',
   display: 'flex',
   alignItems: 'center',
-  gap: 0.75,
+  gap: 0.5,
   color: 'text.secondary',
 } as const
 
-/* A quiet underline-less select sized to its digits; the 44px floor applies below MUI `sm` (a finger, not a
-   width — `ui/listStyles.ts`'s `fieldTapTargetSx` reasoning), on the native control itself. */
-const selectSx = (theme: Theme) => ({
-  fontSize: '0.8125rem',
-  fontVariantNumeric: 'tabular-nums',
-  '& .MuiNativeSelect-select': { py: 0.5, pl: 0.75, minHeight: 0 },
-  [theme.breakpoints.down('sm')]: {
-    '& .MuiNativeSelect-select': { minHeight: theme.custom?.tapTargetPx ?? 44, boxSizing: 'border-box' },
-  },
-})
+/* The console's dense select sized to its digits, in the footer's small type; `SelectField` keeps the 44px floor on
+   the phone. */
+const SELECT_SX = { '& .MuiInputBase-root': { fontSize: FONT_SIZE.md, fontVariantNumeric: 'tabular-nums' } } as const
 
 export function ListPager({
   page,
@@ -75,16 +68,23 @@ export function ListPager({
   onPer,
   testId,
   aside,
+  noun,
+  nextDisabled = false,
 }: {
   page: number
   per: number
   /** The filtered set's size; null while the first page is in flight. */
   total: number | null
   onPage: (page: number) => void
-  onPer: (per: number) => void
+  /** Absent: a fixed page size, no size choice. */
+  onPer?: (per: number) => void
   testId?: string
   /** Rows drawn beside the set but not in its `total` (e.g. "1 preparing"), said after the count. */
   aside?: string
+  /** What is paged ("sessions"): names the buttons "Next page of sessions", unambiguous out of context. */
+  noun?: string
+  /** Next off before the last page: the endpoint's reach ends (an offset ceiling) where the set does not. */
+  nextDisabled?: boolean
 }): JSX.Element | null {
   const selectId = useId()
   /* `usePageClamp`'s snap-back, fed a page setter; before the first total it is fed a set that always reaches
@@ -101,7 +101,8 @@ export function ListPager({
   const first = Math.min((page - 1) * per + 1, total)
   const last = Math.min(page * per, total)
   // Dropped only when it says nothing a row does not: an aside is counted nowhere else.
-  if (totalPages <= 1 && total <= PER_OPTIONS[0] && !aside) return null
+  const perChoice = !!onPer && total > PER_OPTIONS[0]
+  if (totalPages <= 1 && !perChoice && !aside) return null
 
   return (
     <Box data-testid={testId} sx={FOOTER_SX}>
@@ -109,29 +110,35 @@ export function ListPager({
         {readout ?? `${groupedCount(first)}–${groupedCount(last)} of ${groupedCount(total)}${aside ? ` · ${aside}` : ''}`}
       </Typography>
       {totalPages > 1 && (
-        <Pager
-          page={page}
-          totalPages={totalPages}
-          onPrevious={() => onPage(page - 1)}
-          onNext={() => onPage(page + 1)}
-          testId={testId && `${testId}-pager`}
-          sx={PAGER_SX}
-        />
+        /* Both buttons carry `tapTargetSx`: a plain text `Button` (~31px) is not covered by `theme.ts`'s 44px
+           phone floor, and the accessor keeps the number single-homed in `theme.custom.tapTargetPx`. */
+        <Box data-testid={testId && `${testId}-pager`} sx={PAGER_SX}>
+          <Button type="button" variant="text" disabled={page <= 1} onClick={() => onPage(page - 1)} sx={tapTargetSx}
+            aria-label={noun ? `Previous page of ${noun}` : undefined}>
+            Previous
+          </Button>
+          <Typography variant="body2" sx={{ color: 'text.secondary', textAlign: 'center' }}>
+            Page {page} of {totalPages}
+          </Typography>
+          <Button type="button" variant="text" disabled={nextDisabled || page >= totalPages} onClick={() => onPage(page + 1)}
+            sx={tapTargetSx} aria-label={noun ? `Next page of ${noun}` : undefined}>
+            Next
+          </Button>
+        </Box>
       )}
-      {total > PER_OPTIONS[0] && (
+      {perChoice && (
         <Box data-testid={testId && `${testId}-per`} sx={PER_SX}>
           <Typography component="label" htmlFor={selectId} variant="body2" sx={{ color: 'inherit', whiteSpace: 'nowrap' }}>
             Per page
           </Typography>
-          <NativeSelect
+          <SelectField
             id={selectId}
-            value={per}
-            onChange={(event) => onPer(Number(event.target.value))}
-            disableUnderline
-            sx={selectSx}
-          >
-            {PER_OPTIONS.map((n) => <option key={n} value={n}>{n}</option>)}
-          </NativeSelect>
+            dense
+            value={String(per)}
+            onChange={(next) => onPer?.(Number(next))}
+            options={PER_OPTIONS.map((n) => ({ value: String(n), label: String(n) }))}
+            sx={SELECT_SX}
+          />
         </Box>
       )}
     </Box>

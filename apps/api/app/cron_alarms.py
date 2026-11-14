@@ -18,6 +18,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from app.log_on_change import ChangeLog
 # Stdlib-only at import (its suite pins that); the one home for the alarm Task's persona.
 from app.node_liveness import ALARM_TASK_PERSONA
 
@@ -25,6 +26,10 @@ log = logging.getLogger("cockpit-cron")
 
 #: The operator knob naming the project every control-plane alarm files into (`app/operator_settings/`).
 ALARM_PROJECT_KNOB = "alarm_project_id"
+
+# Per dedup key, the Task id last announced open: callers re-raise every tick while the condition holds,
+# so "is open as Task" warns once per Task, and `resolve_alarm` forgets the key so a re-open warns again.
+_announced = ChangeLog()
 
 # One key per condition. The per-cron key is load-bearing: the `(project, persona)` dedup would collapse
 # every wedged cron onto one row, and `adhoc` without a key is a 422.
@@ -40,6 +45,8 @@ TOKEN_BILLING_KEY_PREFIX = "token-billing-"
 #: The SOC 2 evidence collectors' alarms (`app/compliance_evidence/collectors.py`): one per collector, a drift or
 #: an error. Minted only there.
 COMPLIANCE_EVIDENCE_KEY_PREFIX = "compliance-evidence:"
+#: The outcome scan's alarms (`app/outcome_ledger/scan.py`): one per project, a stale scan or no git person.
+OUTCOME_SCAN_KEY_PREFIX = "outcome-scan-alarm:"
 
 
 def skip_dedup_key(cron_id: UUID | str) -> str:
@@ -56,6 +63,7 @@ def _own_key(dedup_key: str) -> bool:
         or dedup_key.startswith(BEDROCK_KEY_PREFIX)
         or dedup_key.startswith(TOKEN_BILLING_KEY_PREFIX)
         or dedup_key.startswith(COMPLIANCE_EVIDENCE_KEY_PREFIX)
+        or dedup_key.startswith(OUTCOME_SCAN_KEY_PREFIX)
         or dedup_key == RECONCILE_FAILED_KEY
     )
 
@@ -102,7 +110,8 @@ def raise_alarm(
             # ERROR, not the delivery warning below: nothing reaches /tasks until an operator sets it.
             log.error("cron: alarm %s NOT filed — %s: %s", dedup_key, unset_reason(), title)
             return None
-        out = agent_task_reads.create_system_task(
+        out = agent_task_reads.create_system_task.session_body(
+            session,
             body=agent_task_reads.SystemTaskIn(
                 persona=ALARM_TASK_PERSONA,
                 project_id=project_id,
@@ -114,13 +123,13 @@ def raise_alarm(
             ),
             # Required producer declaration: no Task behind this call, and an omission is a 422.
             x_agent_task_id=agent_auth.HOST_PRODUCER_CALLER,
-            _=None,
-            session=session,
         )
     except Exception as exc:  # noqa: BLE001 — best-effort by contract (module docstring)
         log.warning("cron: could not raise the %s alarm: %s", dedup_key, exc)
         return None
-    log.warning("cron: alarm %s is open as Task %s — see /tasks", dedup_key, out.id)
+    (log.warning if _announced.changed(dedup_key, out.id) else log.debug)(
+        "cron: alarm %s is open as Task %s — see /tasks", dedup_key, out.id
+    )
     return out.id
 
 
@@ -137,17 +146,15 @@ def resolve_alarm(session: Session, *, dedup_key: str, summary: str) -> bool:
             # `raise_alarm` already said so at ERROR; nothing can be open where nothing was filed.
             log.debug("cron: not resolving the %s alarm — %s", dedup_key, unset_reason())
             return False
-        found = agent_task_reads.find_open_system_task(
-            persona=ALARM_TASK_PERSONA, project_id=project_id, dedup_key=dedup_key,
-            _=None, session=session,
+        found = agent_task_reads._find_open_system_task(
+            session, persona=ALARM_TASK_PERSONA, project="", project_id=project_id, dedup_key=dedup_key,
         )
         if found.id is None:
             return False
         out = agent_task_reads.resolve_system_task(
+            session,
             task_id=found.id,
             body=agent_task_reads.ResolveSystemTaskIn(outcome_summary=summary[:280]),
-            _=None,
-            session=session,
         )
     except Exception as exc:  # noqa: BLE001 — best-effort by contract
         # A 404 (the Task already gone) is the ordinary quiet case; anything else warns.
@@ -157,5 +164,26 @@ def resolve_alarm(session: Session, *, dedup_key: str, summary: str) -> bool:
         )
         return False
     if out.resolved:
+        _announced.forget(dedup_key)
         log.info("cron: alarm %s resolved (Task %s) — the condition is clear", dedup_key, found.id)
     return out.resolved
+
+
+def raise_or_resolve(
+    key: str, raised: Optional[tuple[str, str]], *, resolved: str, log_tag: str,
+) -> None:
+    """Raise (`raised` = title, body) or resolve the operator alarm `key` on a fleet session of its own — the
+    one body behind every best-effort out-of-cron raiser (`token_billing/alerts.raise_alarm_or_retry` raises so its outbox retries). Best-effort: a failure logs as `"<log_tag> <key> failed"`."""
+    # Deferred: keeps the ORM and the tenancy seam out of a DB-free importer's graph.
+    from app.db import BridgedSession
+    from app.tenancy import seam
+
+    try:
+        with seam.detached(), seam.operator_scope(), BridgedSession() as alarms:
+            if raised is None:
+                resolve_alarm(alarms, dedup_key=key, summary=resolved)
+            else:
+                raise_alarm(alarms, dedup_key=key, title=raised[0], body=raised[1][:4000])
+            alarms.commit()
+    except Exception as exc:  # noqa: BLE001 — an alarm that fails must not fail its caller
+        log.warning("%s %s failed: %s", log_tag, key, exc)

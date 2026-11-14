@@ -24,18 +24,12 @@ function scrollPane(pane: HTMLElement, el: HTMLElement, block: Block): void {
   else if (below > 0) pane.scrollTop += Math.min(top, below)
 }
 
-/** Brings `el` into view by scrolling only its nearest scrolling ancestor (the pane). `scrollIntoView` scrolls
+/** Brings `el` into view by scrolling only its nearest scrolling ancestor (the pane) — `scrollIntoView` scrolls
  * every ancestor, `overflow: hidden` ones included, so a card near a pane's end slid the whole app shell and left a
- * blank band. With no scrolling ancestor (a phone, where the document scrolls) it falls back to `scrollIntoView`. */
-export function scrollWithinPane(el: HTMLElement, block: Block): void {
-  const pane = scrollingAncestor(el)
-  if (pane) scrollPane(pane, el, block)
-  else el.scrollIntoView?.({ block })
-}
-
-/** `scrollWithinPane`, then held there for up to `ms` while the pane's other cards load and push `el` down —
- * a deep link fires before they draw. The reader scrolling, clicking or typing ends the hold at once. Returns the
- * stop, for an effect's cleanup. */
+ * blank band — then holds it there for up to `ms` while the pane's other cards load and push `el` down (a deep
+ * link fires before they draw). With no scrolling ancestor (a phone, where the document scrolls) it falls back to
+ * `scrollIntoView`. The reader scrolling, clicking or typing ends the hold at once. Returns the stop, for an
+ * effect's cleanup. */
 export function keepInPane(el: HTMLElement, block: Block, ms = 3000): () => void {
   const pane = scrollingAncestor(el)
   if (!pane) {

@@ -13,7 +13,7 @@ runner B's log, read B's operator intents, nor collect B's answers.
     forwarded to the CP by ONE forwarder thread from a persisted cursor (idempotent on seq CP-side).
   * `runtime.control_wait` / `runtime.request_wait` — long polls PARKED ON THE LOOP (the broker's wait
     lane), resolved by `enqueue_control` / `resolve_request`, which reconcile calls when the CP sends an
-    operator's steer/interrupt/answer/close. A decided request is kept `DECIDED_GRACE_S` after delivery.
+    operator's steer/interrupt/answer/close/set_model. A decided request is kept `DECIDED_GRACE_S` after delivery.
   * `runtime.request_open` / `runtime.request_cancel` — the host opens a user-input request, and withdraws
     it when the agent does.
   * `runtime.account_key` — the key of the runner's leased API-key account, once per session, for a launch that
@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Callable
 
 import agent_vocabulary
+import file_io
 from acp.session_store import (O_BINARY, O_CLOEXEC, O_NOFOLLOW, SessionStore, private_dir, read_json,
                                valid_session_id, write_json_private, write_text_private)
 
@@ -48,7 +49,7 @@ log = logging.getLogger("jaahd.acp.runtime")
 MAX_WAIT_S = 50.0
 INTENT_RETENTION_S = 24 * 3600
 MAX_EVENTS_PER_BATCH = 512
-INTENT_TYPES = ("steer", "interrupt", "answer", "close")
+INTENT_TYPES = ("steer", "interrupt", "answer", "close", "set_model")
 # One serialized event, stamped. Below the socket's 256 KiB request line with room for the envelope: the
 # host splits a longer item into chunks of the same item_id, each of which fits.
 MAX_EVENT_BYTES = 192 * 1024
@@ -160,9 +161,7 @@ def _last_seq(path: Path) -> int:
     except OSError:
         return 0
     with os.fdopen(fd, "rb") as fh:
-        size = fh.seek(0, os.SEEK_END)
-        fh.seek(max(0, size - _SEQ_TAIL_BYTES))
-        tail = fh.read()
+        tail = file_io.tail_bytes(fh, _SEQ_TAIL_BYTES)
     best = 0
     for line in tail.split(b"\n"):
         try:

@@ -1,0 +1,52 @@
+slug = "looker"
+label = "Looker"
+category = "data"
+vendor_docs_url = "https://cloud.google.com/looker/docs/api-auth"
+summary = "Lets agents run Looks and explores, read dashboards and LookML models, and manage content through the Looker API."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "base_url", label = "Instance URL", kind = "url", required = true, placeholder = "https://yourcompany.cloud.looker.com", help = "The address you open Looker at, such as https://yourcompany.cloud.looker.com. A customer-hosted instance whose API runs on port 19999 takes that port: https://looker.yourcompany.com:19999" },
+  { key = "client_id", label = "Client ID", kind = "text", required = true, help = "Looker (original): Admin > Users > the API user > Edit > Edit Keys > New API Key. Looker (Google Cloud core): an admin turns on API key management on Admin > Users, then the user opens their Account page > API keys > Request new API key. Copy the Client ID" },
+  { key = "client_secret", label = "Client secret", kind = "secret", required = true, help = "Shown beside the Client ID on the same Edit User API Keys page; select Reveal to copy it" },
+]
+
+[test]
+method = "GET"
+path = "{base_url}/api/4.0/user"
+identity = [["display_name"], ["email"]]
+[test.token]
+url = "{base_url}/api/4.0/login"
+client_id_field = "client_id"
+client_secret_field = "client_secret"
+grant_type = ""
+prefix = "token"
+
+[docs]
+agent_uses = [
+  "Run a Look, an explore query or inline SQL through SQL Runner, and read the results as JSON or CSV",
+  "List and read dashboards, Looks and folders, and create or update them",
+  "Read LookML projects and models, and validate LookML on a development branch",
+  "Schedule deliveries and check the state of existing schedules",
+]
+prerequisites = [
+  "A Looker (Google Cloud core) or Looker (original) instance, and its address",
+  "A Looker admin who creates the API keys: on Looker (original), Admin > Users > choose a user (a dedicated service user is best) > Edit > Edit Keys > New API Key; on Looker (Google Cloud core), the admin enables API keys on Admin > Users and the user requests them on their Account page",
+  "A role on that user that allows what agents should do; the API acts with exactly the user's permissions",
+  "For a customer-hosted instance, the API port (19999 by default) reachable from the internet",
+]
+limitations = [
+  "The API acts as the user the keys belong to; agents cannot see content that user cannot see",
+  "Looker issues an API session token that lasts one hour; Jaah's Test logs in fresh each time, and agents log in with the stored keys when they start",
+  "A Looker instance reachable only on a private network cannot be tested or used from Jaah",
+]
+troubleshooting = [
+  { symptom = "Test says Looker rejected the client ID and client secret (404)", fix = "Looker answers a wrong key pair with 404 Not found on purpose, and so does a login sent to the wrong address. Copy the Client ID again from the user's API keys, reveal and copy the Client secret, and check the user is not disabled. If the keys are right, the API is on another host or port: ask your Looker admin for the API Host URL under Admin > Platform > API, and use it as the Instance URL (a customer-hosted instance usually adds :19999)" },
+  { symptom = "Test says Looker cannot be reached at that address", fix = "Check the Instance URL is the address you open Looker at, starts with https://, and for a customer-hosted instance includes the API port (:19999). Instances on a private network are not reachable from Jaah" },
+  { symptom = "Test says Looker rejected the access token it issued (403)", fix = "The keys are valid but Looker refused the session they opened. Check on Admin > Users that the user is not disabled or locked, and that its role is not empty" },
+]
+faq = [
+  { q = "Should I use my own API keys?", a = "A dedicated service user is better: its role limits what agents can do, and its keys keep working when people change roles or leave" },
+  { q = "Does this connect to Looker Studio?", a = "No. Looker Studio (formerly Data Studio) is a different product with no API keys; this connects to Looker instances" },
+]

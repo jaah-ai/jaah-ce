@@ -2,11 +2,13 @@ import { Link as RouterLink } from 'react-router-dom'
 import Link from '@mui/material/Link'
 import { compactAge, NO_VALUE } from '../../lib/relativeTime'
 import { formatZoned } from '../../lib/zonedTime'
+import { FONT_WEIGHT, grid } from '../../theme'
 import { TaskLink } from '../../ui/DetailFields'
 import { AGE_SLOT } from '../../ui/feed/geometry'
 import type { FeedNote, FeedRowSpec, FeedSlot, OverflowItem } from '../../ui/feed/types'
+import { AUDIT_TAB_PATHS } from '../../routeGroups'
 import type { CronRun } from './api'
-import { OUTCOME_EXPLANATION, OUTCOME_GLYPH, OUTCOME_TONE, STILL_RUNNING, readRun, readSpans, skipClause } from './vocabulary'
+import { OUTCOME, OUTCOME_EXPLANATION, STILL_RUNNING, readRun, readSpans, skipClause } from './vocabulary'
 
 /* ONE FIRING AS A FEED ROW — Audit > Schedule's fleet-wide ledger.
  * NOT ONE WORD OF THE VOCABULARY IS DECIDED HERE: `./vocabulary.ts` (`readRun`, `readSpans`, `OUTCOME_*`)
@@ -18,7 +20,7 @@ import { OUTCOME_EXPLANATION, OUTCOME_GLYPH, OUTCOME_TONE, STILL_RUNNING, readRu
 
 /* THE CRON'S LINK CARRIES NO TAP FLOOR: a 44px minimum on an inline word would outgrow its row
  * (`ui/feed/geometry.ts`); the row is the large target. */
-const CRON_LINK_SX = { color: 'inherit', fontWeight: 600 } as const
+const CRON_LINK_SX = { color: 'inherit', fontWeight: FONT_WEIGHT.semibold } as const
 
 export function cronRunRow(run: CronRun, {
   zone,
@@ -30,8 +32,9 @@ export function cronRunRow(run: CronRun, {
   zone: string
   /** `cron-run` → `cron-run-fired`, `cron-run-task-link`, … */
   testIdPrefix: string
-  /** A fleet-wide ledger: the firing's cron, linked ahead of the sentence (two crons can share one). */
-  cron?: { id: string; name: string }
+  /** A fleet-wide ledger: the firing's cron, named ahead of the sentence (two crons can share one) and linked
+   *  to its automation. */
+  cron?: { automationId: string | null; name: string }
   lead?: FeedSlot[]
 }): FeedRowSpec {
   const reading = readRun(run)
@@ -60,8 +63,8 @@ export function cronRunRow(run: CronRun, {
   return {
     key: run.id,
     indicator: {
-      tone: OUTCOME_TONE[run.outcome] ?? 'neutral',
-      glyph: OUTCOME_GLYPH[run.outcome] ?? '?',
+      tone: OUTCOME[run.outcome]?.tone ?? 'neutral',
+      glyph: OUTCOME[run.outcome]?.glyph ?? '?',
       label: run.outcome,
       title: run.skip_reason
         ? `${run.outcome} — ${skipClause(run.skip_reason)}`
@@ -72,14 +75,17 @@ export function cronRunRow(run: CronRun, {
     title: cron
       ? (
         <>
-          <Link component={RouterLink} to={`/crons/${cron.id}`} underline="hover" sx={CRON_LINK_SX} data-testid={`${testIdPrefix}-cron-link`}>
-            {cron.name}
-          </Link>
+          {cron.automationId ? (
+            <Link component={RouterLink} to={`${AUDIT_TAB_PATHS.automations}/${cron.automationId}`} underline="hover" sx={CRON_LINK_SX} data-testid={`${testIdPrefix}-cron-link`}>
+              {cron.name}
+            </Link>
+          ) : cron.name}
           {` — ${reading.sentence}`}
         </>
       )
       : reading.sentence,
     titleText: cron ? `${cron.name} — ${reading.sentence}` : reading.sentence,
+    href: null,
     /* Two lines at every width: a skipped firing's sentence ("… the previous firing had not returned yet …") was
        cut mid-word on one line at phone width. */
     titleLines: 2,
@@ -92,7 +98,7 @@ export function cronRunRow(run: CronRun, {
       ...lead,
       {
         key: 'duration',
-        width: 62,
+        width: grid(10),
         gate: 'id',
         align: 'right',
         mono: true,
@@ -105,7 +111,7 @@ export function cronRunRow(run: CronRun, {
         /* A real anchor (middle-click, copy link) to the task's own page; `FeedList` ignores row presses
            inside an `<a>`. The verb is the name, `#id` the ink. */
         key: 'task',
-        width: 58,
+        width: grid(9.5),
         gate: 'id',
         align: 'right',
         testId: `${testIdPrefix}-task`,

@@ -1,7 +1,6 @@
 """Row visibility as SQL: the `visible_*_clause` predicates, `OBJECT_SPECS` and `scoped_*_select`."""
 from __future__ import annotations
 
-import functools
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
@@ -10,7 +9,7 @@ from uuid import UUID
 from sqlalchemy import Select, and_, false, literal, or_, select, true
 from sqlalchemy.orm import Session, aliased
 
-from app.entity_shape import optional_uuid
+from app.entity_shape import SYSTEM_ACTOR_ID, optional_uuid
 from app.models.agent_sessions import AgentSession
 from app.models.credentials import Account, Credential, ProjectCredential
 from app.models.identity import AdminUser
@@ -114,7 +113,8 @@ def has_project_key(principal: Principal | None, key: str, project_id: int | Non
     it; "the scope this row lives in" asks `has_scope_key` with `ObjectSpec.key_scope_type`.
 
     Current callers (all genuinely mean a project): `routes/project_env.py::_authorize_tier`,
-    `routes/agent_project_settings.py::_require_the_launchers_project_key`, and in `routes/tasks/` the
+    `routes/agent_project_settings.py::_require_the_launchers_project_key`,
+    `routes/hosted_apps.py::_readable_app` (an app's custom domains, read on its project), and in `routes/tasks/` the
     advisor/chat `worktrees:edit` gates and `tasks:edit` on a cross-project move's destination, and
     `governance/guard_escalation.py::answer_for` (`compliance:edit` to grant a waiver from a guard question).
     `app/slack_inbound.py` uses `key_scope_satisfied` instead."""
@@ -129,6 +129,27 @@ def unhidden_task_clause():
     return or_(Task.hidden.is_(False), Task.state == AWAITING_RESPONSE)
 
 
+def board_draft_clause(principal: Principal | None, *, include_hidden: bool):
+    """Which `draft` rows a LISTING shows `principal` — the board, its counts and its search, never a read by id
+    (a draft's link still opens for every `tasks:view` holder). A draft is listed to its creator and its assignee;
+    one no person created (the system actor, `actors.stamp_dirty_task_actors`, or NULL once its person is deleted) to
+    everyone, as before; every draft to an Org Owner/Admin or a superadmin once Show hidden is on
+    (`include_hidden`). The agent principal
+    (`None`, the public viewer's statements included) is unrestricted. A board row is top-level, so an epic's
+    draft steps follow their epic."""
+    if principal is None:
+        return true()
+    if include_hidden and (principal.is_org_admin or principal.is_superadmin):
+        return true()
+    return or_(
+        Task.state != DRAFT,
+        Task.created_by_id.is_(None),
+        Task.created_by_id == SYSTEM_ACTOR_ID,
+        Task.created_by_id == principal.user_id,
+        Task.assigned_to_id == principal.user_id,
+    )
+
+
 def visible_task_clause(principal: Principal | None):
     """A boolean clause selecting the tasks `principal` may see. Correlates to the enclosing `select(Task)`.
 
@@ -140,7 +161,8 @@ def visible_task_clause(principal: Principal | None):
     * unsaved-draft gate — seen only by its author and a superadmin (`models/tasks.py::Task.unsaved`);
     * scope arm — `tasks:view` on the task's project; every holder sees every task there;
     * hidden gate — a `hidden` row only by its creator, a superadmin and an operator acting as the org (else
-      `?include_hidden=true` would leak runner-break bodies), unless it has an open question (`_hidden_gate`)."""
+      `?include_hidden=true` would leak runner-break bodies), unless it has an open question (`_hidden_gate`);
+      a release executor run is readable too (`_release_run_clause`)."""
     if principal is None or principal.is_superadmin:
         return true()
     return and_(
@@ -149,7 +171,7 @@ def visible_task_clause(principal: Principal | None):
         or_(Task.unsaved.is_(False), Task.created_by_id == principal.user_id),
         # A bare `IN` over the principal's resolved triples; its `tasks` predicate anchors the outer FROM.
         scope_key_clause(principal, "project", TASK_SCOPE_ARM_KEY, Task.project_id),
-        _hidden_gate(principal),
+        or_(_hidden_gate(principal), _release_run_clause()),
     )
 
 
@@ -176,6 +198,17 @@ def _lane_run_clause():
     return Task.persona == merge_lane_state.LANE_PERSONA
 
 
+def _release_run_clause():
+    """A release executor run (`app/releases/executor.py`): hidden only to keep it off the board, so READABLE by
+    every `tasks:view` holder on its project — a release links its run, whoever pressed it — as a merge-lane run is.
+    Not writable beyond the hidden gate: the release's own controls (cancel, retry) act on it. Its session only runs
+    the packaged release tool, and its fail reason is redacted where stored (`routes/agent/task_terminal.py`)."""
+    # Local: keeps the release package's import chain out of this module's.
+    from app.releases import executor  # noqa: PLC0415
+
+    return Task.persona == executor.PERSONA
+
+
 def editable_task_clause(principal: Principal | None):
     """A boolean clause selecting the tasks `principal` may mutate. Correlates to the enclosing
     `select(Task)`.
@@ -186,7 +219,7 @@ def editable_task_clause(principal: Principal | None):
     a flag, so the write rule can never acquire the read key by omission.
 
     Both write keys because `delete_task` declares `tasks:delete`. The key lives in the clause because bare
-    embeddings (the console, `pool_slots.set_slot_title`) have no declaring route. No named-role arm (the
+    embeddings (the console, `pool_slots.release_slot`) have no declaring route. No named-role arm (the
     scope arm subsumes it). Hidden/unsaved gates as
     for reads: a row you may not read is not one you may write."""
     if principal is None or principal.is_superadmin:
@@ -202,13 +235,6 @@ def editable_task_clause(principal: Principal | None):
     )
 
 
-# `authored_draft_task_clause`'s child alias, built once: a fresh `aliased(Task)` proxies every `Task` column, a few
-# ms on each board read. Shared safely: the EXISTS correlates `Task` explicitly, never `child`.
-@functools.cache
-def _draft_child() -> Any:
-    return aliased(Task)
-
-
 def authored_draft_task_clause(principal: Principal | None):
     """A boolean clause selecting the top-level `draft` tasks `principal` authored — for when
     `AUTHOR_DRAFT_KEY` stands in for a task-write route's declared key. Correlates to the enclosing
@@ -222,7 +248,9 @@ def authored_draft_task_clause(principal: Principal | None):
     if principal is None or principal.is_superadmin:
         # Unreachable from `_enforce`; gives in-process callers the uniform allow-all answer.
         return true()
-    child = _draft_child()
+    # A fresh alias per call, never a process-wide one: a shared alias compiled malformed SQL on its first
+    # concurrent uses on the free-threaded build (a cross join, or the probe reading the wrong alias).
+    child = aliased(Task)
     return and_(
         Task.created_by_id == principal.user_id,
         Task.state == DRAFT,
@@ -316,10 +344,10 @@ def sees_all_nodes(principal: Principal | None) -> bool:
 
 def visible_account_clause(principal: Principal | None):
     """A boolean clause selecting the credential accounts `principal` may DISPATCH on (D5/D10, E2): its
-    own personal account, an account-scope binding, or — with org-wide `accounts:view` — any ORG account
-    (`owner_id IS NULL`). Someone else's personal account is never in it, an Org Owner/Admin or a
-    superadmin included: personal stays personal. Correlates to the enclosing `select(Account)`; a roster
-    read is `readable_account_clause`."""
+    own personal account, an account-scope binding (on an org account or a personal one an Org Owner/Admin
+    shared), or — with org-wide `accounts:view` — any ORG account (`owner_id IS NULL`). An org-wide role never
+    reaches someone else's personal account, an Org Owner/Admin's or a superadmin's included: only a binding on
+    that account does. Correlates to the enclosing `select(Account)`; a roster read is `readable_account_clause`."""
     if principal is None:
         return true()
     arms = [Account.owner_id == principal.user_id]
@@ -327,8 +355,8 @@ def visible_account_clause(principal: Principal | None):
         arms.append(Account.owner_id.is_(None))
     bound = sorted(principal.scopes_with("account", ACCOUNTS_VIEW_KEY), key=str)
     if bound:
-        # A binding shares an ORG account; it never reaches a colleague's personal one.
-        arms.append(and_(Account.id.in_(bound), Account.owner_id.is_(None)))
+        # A binding shares the account it names, org or personal alike.
+        arms.append(Account.id.in_(bound))
     return or_(*arms)
 
 
@@ -343,6 +371,19 @@ def readable_account_clause(principal: Principal | None):
     if NODE_SPEC.unscoped_read_key is not None:
         return dispatchable
     return dispatchable & (Account.node_id.is_(None) | node_reach_clause(principal, Account.node_id))
+
+
+def account_roster_clause(principal: Principal | None):
+    """What the Accounts page lists and opens: `readable_account_clause`, plus — for an Org Owner/Admin — every
+    member's personal account of the bound org, so the admin can share it, change its type or its owner. Seeing it
+    is all this confers: dispatch stays `visible_account_clause`, which no org-wide role widens to a colleague's
+    personal account."""
+    readable = readable_account_clause(principal)
+    # A tenant's Owner/Admin, or an operator acting as the tenant; never the operator on its own plane.
+    if principal is not None and principal.is_org_admin and (principal.acting or not principal.is_operator):
+        # Its own org's only: an operator's lifted org filter (`routes/portfolio.py`) reaches no other org's.
+        return readable | and_(Account.owner_id.is_not(None), Account.org_id == principal.org_id)
+    return readable
 
 
 def _pool_of(project_ids):
@@ -458,13 +499,14 @@ _CONTROL_PLANE_SECRET_KNOBS: tuple[str, ...] = (
 def _not_a_control_plane_secret():
     """Not a credential the control plane itself acts with: any SYSTEM row (0325), any `github_app` or
     `github_install_app` row (the GitHub OAuth App's or GitHub App's client secret, which Connect GitHub and
-    GitHub sign-in spend and is never a task's; an older row may still hold a GitHub App's
-    private key) and the rows `_CONTROL_PLANE_SECRET_KNOBS` name."""
+    GitHub sign-in spend and is never a task's, and the GitHub App's private key, which mints Easy Mode runners'
+    tokens: `app/easy_mode_runner_tokens.py`), any row of the retired `github_app_key` type and the rows
+    `_CONTROL_PLANE_SECRET_KNOBS` name."""
     from app.operator_settings import reads as settings_reads
 
     ids = [parsed for key in _CONTROL_PLANE_SECRET_KNOBS
            if (parsed := optional_uuid(settings_reads.get_str(key).strip())) is not None]
-    clause = and_(Credential.type.not_in(("github_app", "github_install_app")), Credential.system.is_(False))
+    clause = and_(Credential.type.not_in(("github_app", "github_install_app", "github_app_key")), Credential.system.is_(False))
     return and_(clause, Credential.id.not_in(ids)) if ids else clause
 
 
@@ -690,17 +732,17 @@ def worktree_editable_clause(principal: Principal | None):
     Use only inside `select(Worktree)` or a `select_from(Worktree)`; otherwise every EXISTS goes
     true whenever the subject holds any hold or grant anywhere.
 
-    Two derived arms: my own `user` hold (`_worktree_owner_arm`) and the task's write decision
-    (`_console_task_clause`) with the liveness hold (`_worktree_task_arm`). Not widened by
+    One derived arm: the task's write decision (`_console_task_clause`) with the liveness hold
+    (`_worktree_task_arm`). Not widened by
     `WIDE_WORKTREE_KEYS` and not node-scoped. Editable ⊆ visible is not structural: a caller probing
     this clause must also conjoin the read clause (`console._console_slot_editable`,
-    `pool_slots.set_slot_title`)."""
+    `pool_slots.release_slot`)."""
     if principal is None or principal.is_superadmin:
         return true()
     # The write task clause, never the read one: driving a console is the strongest write here, and a
     # read grant must never become an edit right. The slot stays project-scoped
     # (delivery, not access).
-    return or_(_worktree_owner_arm(principal), _worktree_task_arm(principal, _console_task_clause))
+    return _worktree_task_arm(principal, _console_task_clause)
 
 
 def _console_task_clause(principal: Principal | None):
@@ -718,29 +760,12 @@ def _console_task_clause(principal: Principal | None):
     )
 
 
-def _worktree_owner_arm(principal: Principal):
-    """The user-hold arm of the worktree clauses: true when `principal` currently holds this slot —
-    `state = 'user'` and `owner_user_id` is theirs.
-
-    Ownership of the hold is the whole claim; no grant or key reaches it. `ck_worktrees_state_ownership`
-    makes `owner_user_id` NULL for `free`/`task` rows. An EXISTS correlated to `Worktree`, not a bare
-    predicate, so it is as unsafe-to-call-bare as the task arm
-    (`test_the_bare_worktree_clauses_compile_to_a_cross_join`)."""
-    return (
-        select(literal(1))
-        .where(Worktree.state == slot_state.USER, Worktree.owner_user_id == principal.user_id)
-        .correlate(Worktree)
-        .exists()
-    )
-
-
 def _worktree_task_arm(principal: Principal | None, task_clause):
     """The task arm of both worktree clauses: the slot's task satisfies `task_clause` and the slot is
     actually held. Correlates to `Worktree`.
 
     One builder for `_console_task_clause` (keyboard) and `visible_task_clause` (eyes), so the liveness half
-    has one copy. The hold is the liveness proof: `worktrees.task_id` is stale after a reap. A `user`-held
-    row never matches (its `task_id` is NULL)."""
+    has one copy. The hold is the liveness proof: `worktrees.task_id` is stale after a reap."""
     return (
         select(literal(1))
         # The plain `Task` entity, never `aliased(Task)`: the task clauses correlate to `Task`, so an
@@ -775,6 +800,20 @@ def _worktree_pool_rule(principal: Principal | None):
     if wide_projects:
         arms.append(Worktree.project_id.in_(wide_projects))
     return or_(*arms)
+
+
+def worktree_may_edit(session: Session, principal: Principal | None, *where: Any) -> bool | None:
+    """May `principal` DRIVE the one slot `where` names (send input, open a read-write console, release, run a
+    worktree verb)? True = yes, False = visible but read-only, None = not visible (deny). THE probe every route
+    asks through, so no caller re-spells the hazard: both clauses correlate to an enclosing
+    `select_from(Worktree)` (a bare `select(clause)` cross-joins and silently allows all), and editable is
+    conjoined with `visible_worktree_clause`, since editable ⊆ visible is not structural. A miss reads as a
+    falsy answer, never a 403, so the caller's 404 is no id-space oracle."""
+    return session.scalar(
+        select(worktree_editable_clause(principal).label("may_edit"))
+        .select_from(Worktree)
+        .where(*where, visible_worktree_clause(principal))
+    )
 
 
 def visible_worktree_clause(principal: Principal | None):
@@ -898,9 +937,9 @@ def _member_personal_clause(principal: Principal):
 def git_identity_select(principal: Principal, *, current_id: UUID | None = None) -> Select:
     """The credentials `principal` may push AS (Profile > Git) — a USE of the secret, so the use
     rule's shape: their own; an ORG credential (`owner_id IS NULL`) under an org role; and the org
-    credential already selected (`current_id`), so a selection made before this rule keeps resolving.
-    Never someone else's personal credential. One home for `git_access._readable_credential` and
-    `routes/auth.py::git_credential_scope`; no superadmin arm."""
+    credential grandfathered by the retiring pre-0291 pointer (`current_id`, `AdminUser.git_credential_id`),
+    so a selection made before this rule keeps resolving. Never someone else's personal credential. One
+    home for `git_access._readable_credential` and `routes/auth.py::git_credential_scope`; no superadmin arm."""
     arms = [Credential.owner_id == principal.user_id]
     if principal.org_role is not None:
         arms.append(Credential.owner_id.is_(None))
@@ -924,6 +963,14 @@ def readable_account_select(principal: Principal | None) -> Select:
     Built from `readable_account_clause`, which is also what `can_access` answers on, so the SSE relay
     cannot announce an account this drops."""
     return select(Account).where(readable_account_clause(principal))
+
+
+def account_roster_select(principal: Principal | None) -> Select:
+    """`select(Account)` over `account_roster_clause`: what the Accounts page lists and opens (`GET /api/accounts`,
+    its by-id twin, the record rows `GET /api/resources` joins). Every other reader — a task's account pin, the
+    sensed fold, a live login code — stays on `readable_account_select`, so an admin only sees and manages a
+    member's personal account here."""
+    return select(Account).where(account_roster_clause(principal))
 
 
 def granted_account_slugs(session: Session, principal: Principal | None) -> AllowedObjects:

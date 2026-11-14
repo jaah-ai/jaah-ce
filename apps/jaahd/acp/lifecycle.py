@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import importlib.util
 import json
 import sys
 from pathlib import Path
 from typing import Awaitable, Callable
+
+import path_module
 
 #: The neutral dispatcher, by its installed path (`<hub>/tools/`, beside `apps/`).
 DISPATCHER = Path(__file__).resolve().parents[3] / "tools" / "hook_bridge_core.py"
@@ -56,10 +57,7 @@ async def run_child(argv: list, stdin: bytes, env: dict, cwd: str, timeout: floa
 def _core():
     """The hook dispatcher `hook_bridge_core.py`, loaded by its installed path (a hook script, not a package
     module)."""
-    spec = importlib.util.spec_from_file_location("jaah_hook_bridge_core", DISPATCHER)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return path_module.load(DISPATCHER, "jaah_hook_bridge_core")
 
 
 def capped(text: str) -> str:

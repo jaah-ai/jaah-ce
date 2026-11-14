@@ -1,0 +1,41 @@
+# Google Cloud API, over the hand-written `gcp` type (adopted, AS3: its fields and Test - a signed assertion exchanged
+# at Google's token endpoint - are unchanged). Facts confirmed at the vendor's own docs: service account keys
+# https://cloud.google.com/iam/docs/keys-create-delete
+slug = "gcp"
+label = "Google Cloud"
+category = "cloud"
+credential_type = "gcp"
+vendor_docs_url = "https://cloud.google.com/iam/docs/keys-create-delete"
+summary = "Call Google Cloud APIs (Storage, BigQuery, Compute and more) with a service account key."
+
+[[auth]]
+kind = "service_account"
+fields = [
+  { key = "service_account_json", label = "Service account key", kind = "secret", required = true, placeholder = "{\"type\": \"service_account\", ...}", help = "Google Cloud console > IAM & Admin > Service accounts > the account (or Create service account) > Keys > Add key > Create new key > JSON: paste the whole downloaded file" },
+  { key = "project_id", label = "Project ID", kind = "text", required = false, help = "Leave blank to use the key's own project; otherwise the project ID from the console's project picker, such as acme-prod-123" },
+]
+
+[docs]
+agent_uses = [
+  "Read and write objects in Cloud Storage buckets a task names",
+  "Run BigQuery queries for a report",
+  "Read Cloud Logging entries and metrics to investigate an incident",
+  "Anything else the service account's roles allow, through gcloud or a client library",
+]
+prerequisites = [
+  "A Google Cloud project, and permission to create service accounts and keys (Service Account Admin and Service Account Key Admin)",
+  "The APIs agents use enabled in the project (APIs & Services > Library)",
+]
+limitations = [
+  "Google Cloud has no sign-in button for apps like Jaah: you connect with a service account key",
+  "Many organizations block key creation with the iam.disableServiceAccountKeyCreation policy; an organization admin must allow it for the project",
+  "Agents get exactly the service account's roles: grant only what tasks need",
+]
+troubleshooting = [
+  { symptom = "Test says Google rejected the key (invalid_grant: Invalid JWT Signature)", fix = "The key was deleted or disabled. Create a new JSON key for the service account and select Replace" },
+  { symptom = "Creating a key fails with Service account key creation is disabled", fix = "An organization policy blocks keys. Ask an organization admin to exempt the project from iam.disableServiceAccountKeyCreation" },
+  { symptom = "Test passes but agents get PERMISSION_DENIED", fix = "The service account lacks a role. Grant it under IAM & Admin > IAM > Grant access" },
+]
+faq = [
+  { q = "Does Jaah store the whole key file", a = "Yes, encrypted. Only a signed assertion ever goes to Google; the private key itself never leaves Jaah's server during the test" },
+]

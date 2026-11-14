@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
@@ -25,7 +24,7 @@ import runner_env  # python_cmd(): the node's own interpreter, never a PATH look
 import session_user
 
 from . import staged_write
-from .base import hub_root
+from .base import control_mcp_server, hub_root
 
 # Outcomes only — never an env overlay, a value from one, or a key list (`run_provider_cli`).
 log = logging.getLogger("jaahd.agent_layer")
@@ -72,6 +71,12 @@ def jaah_mcp_command() -> tuple[str, ...]:
     return (entry["command"], *(a.replace("${CLAUDE_PLUGIN_ROOT}", root) for a in entry["args"]))
 
 
+def control_server(name: str = "control") -> dict:
+    """The control server as an ACP stdio entry (`base.control_mcp_server`) running `jaah_mcp_command`, no env."""
+    command = jaah_mcp_command()
+    return control_mcp_server(command[0], command[1:], {}, name=name)
+
+
 def mcp_add_argv(binary: str, *, scope_args: tuple[str, ...] = ()) -> tuple[str, ...]:
     """The argv that registers the control-plane server with `binary`'s native MCP registry.
 
@@ -113,9 +118,8 @@ def run_provider_cli(argv, *, env: dict | None = None, cwd: str = "", input: str
                           f"and re-run the account's agent-layer check."}
     if not session_user.can_run_as_session_user():
         try:
-            proc = subprocess.run(
-                argv, env={**os.environ, **overlay}, cwd=cwd or None, input=input,
-                capture_output=True, text=True, timeout=PROVIDER_CLI_TIMEOUT_SECONDS)
+            proc = session_user.run_bounded(argv, env={**os.environ, **overlay}, cwd=cwd or None, input=input,
+                                            timeout=PROVIDER_CLI_TIMEOUT_SECONDS)
         except Exception as exc:  # noqa: BLE001 — FileNotFoundError (no binary), TimeoutExpired, OSError
             return {"exit_code": -1, "stdout": "",
                     "stderr": f"could not run {argv[0]!r} ({type(exc).__name__}: {exc})"}

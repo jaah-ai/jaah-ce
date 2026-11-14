@@ -27,12 +27,13 @@ from app import (
 )
 from app.actors import actor_names as resolve_actor_names
 from app.authz.principal import Principal
-from app.entity_shape import from_row, iso_or_none
+from app.entity_shape import from_row, iso_or_none, text_or_none
+from app.fleet_observe import TopProcess
 from app.models.identity import AdminUser
 from app.models.nodes import Microvm, MicrovmIntent, Node
 from app.models.orgs import Org
 from app.shared_storage import LEGACY_SHARED_ACCOUNTS_ROOT
-from app.tenancy.ids import is_operator_plane, is_tenant_org
+from app.tenancy.ids import is_operator_user, is_tenant_org
 from app.tenancy.labels import OrgRef, org_ref_of, org_refs
 
 if TYPE_CHECKING:
@@ -41,8 +42,7 @@ if TYPE_CHECKING:
 
 class NodeCounts(BaseModel):
     worktrees: int
-    # The slots a task can lease (`Worktree.number >= 1`): `worktrees` less the main clone. 0 beside a non-zero
-    # `worktrees` is a node with only its main clone, which runs no task.
+    # The slots a task can lease: `worktrees` less the ones being destroyed.
     task_slots: int = 0
     # The slots being destroyed (`retiring_at` set), counted in `worktrees`: the page shows them apart, and a node
     # delete does not count them as its own.
@@ -53,15 +53,6 @@ class NodeCounts(BaseModel):
     accounts: int
 
 
-class NodeTopProcessOut(BaseModel):
-    """One of the host's busiest processes: name (`comm`, never argv), user, CPU in percent of one core, RSS."""
-
-    name: str
-    user: str
-    cpu_pct: float
-    rss_kb: int
-
-
 class NodeHostMetricsOut(BaseModel):
     """One node's newest CPU/RAM/disk/network reading, already judged: the Load column's whole input.
 
@@ -70,11 +61,11 @@ class NodeHostMetricsOut(BaseModel):
 
     The levels are computed server-side, read off `node_host_metrics.LatestReading`'s properties; the
     client never compares a percentage to a threshold (as with `generation_placement`), so badge and chart
-    cannot disagree and the stale⇒`unknown` collapse cannot be bypassed. `level` is the worse of CPU and
-    memory. Every field is derived per request from one row plus the DB's `now()`."""
+    cannot disagree and the stale⇒`unknown` collapse cannot be bypassed. `level` is the worst of CPU,
+    memory and disk. Every field is derived per request from one row plus the DB's `now()`."""
 
-    # Null only for a tenant reading its node on another org's host, which is told its own disk and nothing
-    # of the host's CPU, memory or network (`_own_disk_only`).
+    # The host's for a tenant reading its node on another org's host, which is told its own disk and none of the
+    # host's other figures (`_own_disk_only`).
     cpu_pct: Optional[float]
     mem_pct: Optional[float]
     # The four-value vocabulary is `node_host_metrics`'s; `str`, not a Literal, to avoid a second home.
@@ -125,7 +116,7 @@ class NodeHostMetricsOut(BaseModel):
     psi_io_pct: Optional[float] = None
     # Only on `GET /api/nodes/{id}/metrics`'s `latest`: the roster never reads the JSONB
     # (`node_host_metrics.latest_map(with_processes=True)`), so it is null there.
-    top_processes: Optional[list[NodeTopProcessOut]] = None
+    top_processes: Optional[list[TopProcess]] = None
 
 
 class NodeDiskGateOut(BaseModel):
@@ -201,6 +192,9 @@ class CloudOut(BaseModel):
     root_grow: Optional[RootGrowOut] = None
     #: Why the machine is still silent; None once it has reported in, or when nothing was read.
     boot_report: Optional[BootReportOut] = None
+    #: What the launch's `ensure_break_glass` said to grant so the machine stays reachable when its daemon is down
+    #: (`cloud_node_launch.BREAK_GLASS_WARNING_KEY`); None when the provider needed nothing.
+    break_glass_warning: Optional[str] = None
 
 
 class NodeOut(BaseModel):
@@ -226,11 +220,6 @@ class NodeOut(BaseModel):
     # (`app/models/nodes.py::Node.draining`). On the list model: "which nodes still take new work" is a roster
     # question.
     draining: bool = False
-    # NodeLink: does this host mount the shared credential store (`nodes.shared_accounts_enabled`), the
-    # per-node half of the conjunction with an account's `nodelink`. On the list model (a fleet question).
-    # Defaults false for a presence-only host: nothing could have declared a mount, and the fail-closed
-    # answer is no.
-    nodelink_enabled: bool = False
     # Does this node report a NodeLink at the accounts token folder mounted (`nodelinks.accounts_nodelink_nodes`):
     # a login on it reaches every node on that NodeLink, so New account folds its Node pick away. On the list model.
     # False for a presence-only host.
@@ -264,6 +253,11 @@ class NodeOut(BaseModel):
     # reports them, so it shows its companions as missing until it updates: an upgrade clears it, and no
     # version marker can tell the two apart (the version shipping this is not knowable when it is written).
     missing_companions: list[str] = []
+    # Attested, yet no provider's CLI (`AgentProvider.binary`) is on it, so no account can launch here and no task
+    # runs (the dispatch refusal `routes/fleet.py::_cli_eligible` logs). False when never attested (None) and on a
+    # Multi-Node Host, which runs no work. A fresh node reads True until its runner tools install. The common case of
+    # that refusal, not all of it: CLIs that miss only this fleet's providers show as the CLI list itself.
+    agent_cli_missing: bool = False
     role: Optional[str] = None
     # The node's jaah-home override: the root of its jaah-managed repos. NULL = no override, no
     # implicit default. Acted on, unlike `infra`.
@@ -399,7 +393,10 @@ class NodeDetailOut(NodeOut):
     # why a node is behind. None until the node shipped one; the operator's (blanked for every tenant, as
     # `generation`). Detail model only.
     last_update: Optional[NodeUpdateOut] = None
-    # ── MicroVM (architecture §4.9) ─────────────────────────────────────────────────────────────────
+    # ── Shape and MicroVM (architecture §4.9) ───────────────────────────────────────────────────────
+    # The node's real shape and the shapes its page offers, current included (`app/node_shape.py`).
+    shape: str = "legacy"
+    shape_options: list[str] = ["legacy"]
     # The one sentence refusing a flip away from the current mark (`microvm_mode.flip_blocker`), in either
     # direction; None = the flip would go ahead (or there is no row).
     microvm_blocker: Optional[str] = None
@@ -411,6 +408,9 @@ class NodeDetailOut(NodeOut):
     # `{vcpus|ram_mib|disk_gib: {value, source}, override: {...}}` (`microvm_sizing.sizing_out`): what a VM here
     # gets before any project value, and the node's own override. None for a presence-only host.
     microvm_sizing: Optional[dict[str, Any]] = None
+    # A Whole-node VM's size, `{vcpus|ram_mib|disk_gib: {value, source}}` with source `node` or `default`
+    # (`node_vm_sizing.size_out`); None unless the node is one.
+    node_vm_size: Optional[dict[str, Any]] = None
     # The node's own MicroVM report (`config_snapshot['microvm']`, architecture §4.3), served as sent; None until
     # it reports one.
     microvm_facts: Optional[dict[str, Any]] = None
@@ -421,6 +421,8 @@ class NodeDetailOut(NodeOut):
     microvm_counts: dict[str, int] = {}
     # The ids of every `retained` VM row (kept on purpose for inspection), so its folder is not flagged leftover.
     microvm_retained_ids: list[str] = []
+    # How many tasks may run here at once (`nodes.max_running_tasks`); null = no limit.
+    max_running_tasks: Optional[int] = None
 
 
 #: How many of a node's VMs its detail lists, newest first: every live one fits, with recent history.
@@ -465,8 +467,8 @@ def _host_metrics_out(
         sampled_at=reading.bucket_at.isoformat(),
         # Stored entries were cleaned at ingest; one that no longer fits the shape is skipped, not a 500.
         top_processes=None if reading.top_processes is None else [
-            NodeTopProcessOut(**entry) for entry in reading.top_processes
-            if isinstance(entry, dict) and set(entry) == set(NodeTopProcessOut.model_fields)
+            TopProcess(**entry) for entry in reading.top_processes
+            if isinstance(entry, dict) and set(entry) == set(TopProcess.model_fields)
         ],
     )
 
@@ -540,8 +542,6 @@ def _node_out(
         # `False` for a presence-only host: a drain is an operator command, and an unregistered host was never
         # given one.
         draining=bool(row.draining) if row else False,
-        # `False` for a presence-only host: with no row it cannot have declared a mount (see `NodeOut`).
-        nodelink_enabled=row.shared_accounts_enabled if row else False,
         accounts_nodelink=row is not None and row.id in (accounts_nodelink or ()),
         microvm=bool(row.microvm) if row else False,
         session_kvm=bool(row.session_kvm) if row else False,
@@ -554,6 +554,7 @@ def _node_out(
         # A presence-only host has never attested: `None`, not `[]`.
         runner_clis=list(row.runner_clis) if row and row.runner_clis is not None else None,
         missing_companions=_missing_companions(row.runner_clis if row else None),
+        agent_cli_missing=kind != "multi_node_host" and _agent_cli_missing(row.runner_clis if row else None),
         role=row.role if row else None,
         jaah_home=row.jaah_home if row else None,
         infra=dict(row.infra) if row and row.infra else {},
@@ -587,7 +588,7 @@ def _node_out(
         operator_allocated=bool(row.operator_allocated) if row else False,
         jaah_cloud=row is not None and row.id in (jaah_cloud or ()),
         shared_machine=placed is not None and placed.shared_machine,
-        cloud=_cloud_out(row) if row is not None and row.id not in (jaah_cloud or ()) else None,
+        cloud=_cloud_out(row, hosted=row.id in (jaah_cloud or ())) if row is not None else None,
     )
     if detail:
         out: NodeOut = NodeDetailOut(
@@ -598,6 +599,7 @@ def _node_out(
             config_desired=dict(row.config_desired) if row and row.config_desired else {},
             org_transfer_cleanup_pending=bool(row.org_transfer_cleanup_pending) if row else False,
             last_update=next(iter(_updates_out(row.update_history, tenant=False)), None) if row else None,
+            max_running_tasks=row.max_running_tasks if row else None,
             **_microvm_detail(session, row),
             **common,
         )
@@ -615,7 +617,7 @@ def _microvm_detail(session: Session, row: Optional[Node]) -> dict[str, Any]:
         return {}
     if not edition_features.enabled("microvm"):
         return {}
-    from app import microvm_lifecycle, microvm_mode, microvm_placement, microvm_sizing
+    from app import microvm_lifecycle, microvm_mode, microvm_placement, microvm_sizing, node_shape
 
     vms = session.scalars(
         select(Microvm).where(Microvm.node_id == row.id)
@@ -635,7 +637,17 @@ def _microvm_detail(session: Session, row: Optional[Node]) -> dict[str, Any]:
         select(Microvm.id).where(Microvm.node_id == row.id, Microvm.state == microvm_placement.RETAINED)
     ).all()
     facts = (row.config_snapshot or {}).get(node_config.MICROVM_SNAPSHOT_KEY)
+    shape = node_shape.shape_of(session, row)
+    node_vm_size = None
+    if shape == node_shape.NODE_VM:
+        from app import node_vm_sizing
+
+        vnode = node_shape.vnode_of(session, row)
+        node_vm_size = node_vm_sizing.size_out(vnode, node_vm_sizing.host_reading(session, vnode))
     return dict(
+        shape=shape,
+        node_vm_size=node_vm_size,
+        shape_options=list(node_shape.offered(session, row)),
         microvm_counts={str(state): int(n) for state, n in counts.items()},
         microvm_retained_ids=[str(vm_id) for vm_id in retained],
         microvm_blocker=microvm_mode.flip_blocker(session, row),
@@ -667,7 +679,7 @@ def _microvm_editable(session: Session, row: Node, actor: AdminUser, principal: 
         return False  # The community edition has no MicroVMs.
     from app import microvm_mode
 
-    if is_operator_plane(actor.org_id, actor.is_superadmin):
+    if is_operator_user(actor):
         return True
     return (
         not node_allocation.locked_for(row, actor)
@@ -677,13 +689,21 @@ def _microvm_editable(session: Session, row: Node, actor: AdminUser, principal: 
 
 
 def _session_kvm_editable(session: Session, row: Node, actor: AdminUser, principal: Principal | None) -> bool:
-    """May `actor` flip this node's KVM for sessions? Only on a co-located node, and only the host's owner decides:
+    """May `actor` flip this node's KVM for sessions? Only on a co-located node — housed in a Whole-node VM, only
+    while its guest reports `kvm` — and only the host's owner decides:
     `/dev/kvm` widens the host kernel's attack surface for every node it carries. The operator plane on any such
     node; an Org Owner/Admin on its own org's node on its own org's host, unless the node is locked for it."""
     fact = _hosting_facts(session, [row.id]).get(row.id)
     if fact is None or fact.is_host:
         return False
-    if is_operator_plane(actor.org_id, actor.is_superadmin):
+    if not edition_features.enabled("multi_node_hosts"):
+        return False   # Unreached: the community edition has no co-located node.
+    from app import node_shape
+
+    if not row.kvm and node_shape.housed_in_vm(session, row):
+        # A Whole-node VM's sessions open its GUEST's /dev/kvm (nested): absent there, there is nothing to offer.
+        return False
+    if is_operator_user(actor):
         return True
     return (
         not node_allocation.locked_for(row, actor)
@@ -703,6 +723,14 @@ def _missing_companions(attested: Optional[list[str]]) -> list[str]:
         for provider in agent_providers.PROVIDERS if provider.binary in have
         for name in provider.companions if name not in have
     })
+
+
+def _agent_cli_missing(attested: Optional[list[str]]) -> bool:
+    """`NodeOut.agent_cli_missing` for an attested `runner_clis`: none of the catalogue's provider CLIs is on it."""
+    if attested is None:
+        return False
+    have = set(attested)
+    return not any(provider.binary in have for provider in agent_providers.PROVIDERS)
 
 
 def _hosting_facts(session: Session, node_ids: list[UUID]) -> dict[UUID, vnodes.Hosting]:
@@ -748,12 +776,13 @@ def _hosting_of(
     return "self_hosted", None, None
 
 
-def _cloud_out(row: Node) -> Optional[CloudOut]:
+def _cloud_out(row: Node, *, hosted: bool = False) -> Optional[CloudOut]:
     """`row`'s Your Cloud instance as `infra` records it, or None when it records none. An unregistered provider
-    reads under its key."""
+    reads under its key. A Jaah Hosted machine (`hosted`) keeps its own lifecycle (Billing): the operator is offered
+    Restart alone on it, no plan switch asked, and a tenant reader is served no block (`_narrow_for_tenant`)."""
     if not edition_features.enabled("cloud_nodes"):
         return None  # The community edition has no cloud nodes.
-    from app import cloud_boot_watch, cloud_lifecycle, clouds
+    from app import cloud_boot_watch, cloud_lifecycle, cloud_node_launch, clouds
 
     infra = row.infra or {}
     try:
@@ -768,16 +797,19 @@ def _cloud_out(row: Node) -> Optional[CloudOut]:
     switch_on = provider is not None and session is not None and cloud_lifecycle.switch_on(
         session, row.org_id, ref.provider
     )
-    actions = cloud_lifecycle.actions_for(infra, switch_on=switch_on, in_group=row.node_group_capacity_id is not None)
+    actions = (
+        [action for action in cloud_lifecycle.actions_for(infra, switch_on=True, in_group=True) if action == "restart"]
+        if hosted else
+        cloud_lifecycle.actions_for(infra, switch_on=switch_on, in_group=row.node_group_capacity_id is not None)
+    )
     change = infra.get("cloud_change")
     if isinstance(change, dict):
         change = {**change, "state": cloud_lifecycle.change_state(infra)}
     grow = cloud_lifecycle.root_grow_of(infra)
-    return CloudOut(
-        provider=ref.provider,
+    return from_row(
+        CloudOut, ref,
         provider_label=provider.label if provider is not None else ref.provider,
         account_noun=provider.account_noun if provider is not None else ref.provider,
-        instance_id=ref.instance_id, region=ref.region, zone=ref.zone,
         instance_type=infra.get("instance_type"),
         disk_gb=int(root_gb) if root_gb else None,
         state=cloud_lifecycle.state_of(infra) if cloud_lifecycle.actionable(infra) else None,
@@ -793,6 +825,7 @@ def _cloud_out(row: Node) -> Optional[CloudOut]:
             if grow is not None else None
         ),
         boot_report=_boot_report_out(infra.get(cloud_boot_watch.BOOT_REPORT_KEY)) if row.last_seen is None else None,
+        break_glass_warning=text_or_none(infra.get(cloud_node_launch.BREAK_GLASS_WARNING_KEY)),
     )
 
 
@@ -829,10 +862,12 @@ _N = TypeVar("_N", bound=NodeOut)
 _TENANT_WITHHELD_INFRA_KEYS: tuple[str, ...] = ("credential_id", "connection_id", "account_id")
 if edition_features.enabled("cloud_nodes"):
     from app.cloud_boot_watch import BOOT_REPORT_KEY
-    from app.cloud_node_launch import SHARED_STORE_CREDENTIAL_KEY
+    from app.cloud_node_launch import BREAK_GLASS_WARNING_KEY, SHARED_STORE_CREDENTIAL_KEY
 
-    # The boot watch's console tail is the operator's; a tenant reads its reason on `cloud.boot_report`.
-    _TENANT_WITHHELD_INFRA_KEYS += (SHARED_STORE_CREDENTIAL_KEY, BOOT_REPORT_KEY)
+    # The boot watch's console tail is the operator's; a tenant reads its reason on `cloud.boot_report`. The
+    # break-glass warning names the signing credential's grants: a tenant reads it on `cloud.break_glass_warning`,
+    # which a hosted machine (the operator's credential) serves no tenant.
+    _TENANT_WITHHELD_INFRA_KEYS += (SHARED_STORE_CREDENTIAL_KEY, BOOT_REPORT_KEY, BREAK_GLASS_WARNING_KEY)
 
 
 def _administers_own_hosts(actor: AdminUser, principal: Principal | None) -> bool:
@@ -854,9 +889,11 @@ def _on_a_foreign_host(reader: AdminUser, hosting: Optional[str], host_org_id: O
 def _own_disk_only(
     metrics: Optional[NodeHostMetricsOut], usage: Optional[vnodes.DiskUsage]
 ) -> Optional[NodeHostMetricsOut]:
-    """`metrics` as a tenant is told it for its node on another org's host: CPU, memory, network, /tmp, load, swap,
-    pressure and the top processes are the host's, so blanked; disk is the node's own — total = its effective cap, free = cap - use (null until
-    the host has measured it). The levels follow: CPU and memory `unknown`, the badge the disk's."""
+    """`metrics` as a tenant is told it for its node on another org's host. The C/M/D meter reads as its operator's:
+    CPU and memory are the host's percentages and levels; disk is the node's own — total = its effective cap,
+    free = cap - use (null until the host has measured it) — and the badge folds all three. Everything else is the
+    host's and blanked: its size (cores, memory total), network, /tmp, load, swap, pressure and the top processes
+    (other tenants' work). The /metrics history stays withheld (`routes/nodes/metrics.py`)."""
     if metrics is None:
         return None
     total = usage.cap_kb if usage is not None else None
@@ -868,15 +905,14 @@ def _own_disk_only(
         node_host_metrics.LEVEL_UNKNOWN if metrics.stale else node_host_metrics.classify(disk_pct)
     )
     return metrics.model_copy(update={
-        "cpu_pct": None, "mem_pct": None, "cpu_count": None, "mem_total_kb": None,
+        "cpu_count": None, "mem_total_kb": None,
         "net_rx_bps": None, "net_tx_bps": None,
         "load_1": None, "load_5": None, "load_15": None,
         "swap_total_kb": None, "swap_free_kb": None, "swap_pct": None,
         "psi_cpu_pct": None, "psi_mem_pct": None, "psi_io_pct": None, "top_processes": None,
         "tmp_inode_pct": None, "tmp_inode_level": node_host_metrics.LEVEL_UNKNOWN,
-        "cpu_level": node_host_metrics.LEVEL_UNKNOWN, "mem_level": node_host_metrics.LEVEL_UNKNOWN,
-        "disk_pct": disk_pct, "disk_free_kb": free, "disk_total_kb": total,
-        "disk_level": disk_level, "level": disk_level,
+        "disk_pct": disk_pct, "disk_free_kb": free, "disk_total_kb": total, "disk_level": disk_level,
+        "level": node_host_metrics.worse(node_host_metrics.worse(metrics.cpu_level, metrics.mem_level), disk_level),
     })
 
 
@@ -898,13 +934,16 @@ def _narrow_for_tenant(out: _N, reader: AdminUser, principal: Principal | None) 
     `hosted_on` are kept for a node on a host in the reader's own org, and BOTH blanked for one on another
     org's host (an operator host): the tenant must not be told which host carries it — that an operator machine
     does is told by `shared_machine` alone (a self-hosted one). On such a host
-    `host_metrics` keeps only the node's OWN disk (its cap and use) and blanks CPU, memory and network, which
-    are the host's (`_own_disk_only`).
+    `host_metrics` keeps the host's CPU and RAM bars and the node's OWN disk (its cap and use), and blanks the
+    host's other figures (`_own_disk_only`).
 
     Blanked to each field's empty value, never dropped (pinned wire shape). Applied by every session route
     returning `_node_out` (`list_nodes`, `get_node`, `update_node`, the three registration routes);
     `get_node_health` applies the same split to its own config fields.
     `model_copy` keeps the subclass (hence the TypeVar)."""
+    if out.cloud is not None and out.jaah_cloud and is_tenant_org(reader.org_id):
+        # A Jaah Hosted machine's instance is the operator's to see (`_cloud_out`).
+        out = out.model_copy(update={"cloud": None})
     if out.cloud is not None and out.cloud.actions:
         # Offered only what the doors would accept (`routes/nodes/lifecycle.py`, `delete.py`): an administrator of
         # the node's hosts, and Delete with `nodes:delete` too. Write access is not probed per row: a reader who

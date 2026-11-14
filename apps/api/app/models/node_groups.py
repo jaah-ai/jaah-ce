@@ -123,17 +123,12 @@ class NodeGroupCapacity(UuidPkMixin, OrgScoped, Base):
 
 
 class NodeGroupProject(UuidPkMixin, OrgScoped, Base):
-    """Which project gets worktrees on every node of a group: a line is (group, project).
+    """A Pool's project line: (group, project).
 
-    Per node, since slot numbers are scoped to `(node, project)` (`uq_worktrees_node_project_number`).
-    An assignment of the project to every node of the group, resolved at read time
-    (`app/slot_allocation.py::effective_assignments`) and never materialised per node; the slots it causes
-    are converged by `slot_allocation.converge`. Convergent: a fresh node has no `jaah_home` yet, so its
-    slots are declared on a later pass.
+    Unread storage kept for one release: placement reads node groups (`app/placement_groups.py`), never this
+    table, and no route writes or shows it any more; a later contraction drops it.
 
-    Not an entity. It carries no static count: a node's static slots come from its own `NodeProject` row.
-    The retired `worktrees_per_node` column (and its CHECK) stay in
-    the DB until dropped (`migrations/env.py::_RETIRING_COLUMNS`); the ORM does not map them.
+    Not an entity.
     """
 
     __tablename__ = "node_group_projects"
@@ -152,19 +147,14 @@ class NodeGroupProject(UuidPkMixin, OrgScoped, Base):
 
 
 class NodeProject(UuidPkMixin, StampedMixin, OrgScoped, Base):
-    """An assignment: `project` may hold worktrees on `node`. Placement, not a preference — a
-    (node, project) pair with no assignment (here or through the node's group) holds no worktree at all.
+    """An old (node, project) assignment, with its `static_slots` override.
 
-    `static_slots` is how many static slots the pair holds; NULL means none (0) — there is no group or
-    project default to fall back to. The rules live in
-    `app/slot_allocation.py`, the single home; nothing else re-derives them.
+    Unread storage kept for one release: placement reads node groups (`app/placement_groups.py`) and no static
+    slot is made from `static_slots`. No route reads or writes it any more; a later contraction drops it.
 
-    Not an entity (a join, like `NodeGroupProject`), but it carries the actor stamps: the pool clone
-    authenticates as the human who assigned the project (`created_by_id`, as `routes/pool_slots.py`'s
-    declarations do).
+    Not an entity (a join, like `NodeGroupProject`), but it carries the actor stamps.
 
-    No `set_updated_at` trigger (a join, `tests/test_entity_shape.py`): `slot_allocation.pin_to_declared`, the
-    writer, stamps `updated_at` itself.
+    No `set_updated_at` trigger (a join, `tests/test_entity_shape.py`).
     """
 
     __tablename__ = "node_projects"
@@ -281,6 +271,10 @@ class GhaRunnerPool(EntityMixin, OrgScoped, Base):
         PG_UUID(as_uuid=True), ForeignKey("credentials.id", ondelete="RESTRICT"),
         nullable=False, index=True,
     )
+    # The repository the operator lent their own personal credential for (`app/gha_pool_credential.py`), as
+    # the canonical `repo_url` at that save; NULL for the node's org's own credential. A lent token mints only
+    # while the project still names this repository, so a tenant editing its project cannot redirect it.
+    lent_repo_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     desired_count: Mapped[int] = mapped_column(Integer, nullable=False)
     desired_state: Mapped[str] = mapped_column(Text, nullable=False)
     # Born `pending`: every write is an instruction the node has not seen.

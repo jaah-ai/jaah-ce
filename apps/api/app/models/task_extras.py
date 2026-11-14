@@ -405,6 +405,19 @@ class TaskAttachment(OrgScoped, Base):
     )
     created_at: Mapped[datetime] = timestamp_column()
 
+    @classmethod
+    def copy_of(cls, source: Any, **own: Any) -> "TaskAttachment":
+        """A row sharing `source`'s object — the one home of every copy (an epic's final report, a filer's artifacts,
+        an automation's files, a template's images). The file facts are the source's: `filename`, `content_type`,
+        `size_bytes`, `s3_key`, `s3_bucket`, `etag`, `uploaded_at` (bytes confirmed once, on the source) and
+        `uploaded_by_id`. Everything else is the caller's, in `own`: the subject (`task_id=`, `org_template_id=`),
+        `kind`, `org_id`, `visibility`, `source_task_id` — or a fact overridden (a global template image's uploader is
+        the operator's user, never shown to an org: `uploaded_by_id=None`). `source` is a `TaskAttachment` or a
+        `TaskTemplateAsset`; a fact `own` names is never read from the source (a template asset has no `etag`)."""
+        copied = ("filename", "content_type", "size_bytes", "s3_key", "s3_bucket", "etag", "uploaded_at", "uploaded_by_id")
+        facts = {name: getattr(source, name) for name in copied if name not in own}
+        return cls(**facts, **own)
+
 
 class TaskPrStats(OrgScoped, Base):
     """A merged PR's diff stats, recorded at its task's `merged_pr` settle (R9) — one row per task, upserted.

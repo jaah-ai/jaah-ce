@@ -1,10 +1,11 @@
 """The account removals a node still owes, kept until the node carries them out.
 
-An account Delete (`routes/accounts.py::remove_account`) asks every node holding the account to remove it
-(`account_delete` for its credential dir, `account_shared_delete` for its token-share leaf). The CP's decision
-stands whatever the node's state: a node that is offline, or answers with a failure, gets the removal recorded on
-its row (`nodes.owed_account_removals`) and sent again each time it connects (`routes/node_bus.py`), until it
-answers `done`. The node kills the account's sessions and force-removes the files (`apps/jaahd/accounts.py`).
+An account Delete (`routes/accounts.py::remove_account`) records on every node holding the account the removal it
+owes (`nodes.owed_account_removals`: `account_delete` for its credential dir, `account_shared_delete` for its
+token-share leaf) in the commit that deletes the row, and returns; a durable workflow then sends them through
+`settle` (`app/durable/account_remove.py`). The CP's decision stands whatever the node's state: a node that is
+offline, or answers with a failure, keeps owing and is sent it again each time it connects (`routes/node_bus.py`),
+until it answers `done`. The node kills the account's sessions and force-removes the files (`apps/jaahd/accounts.py`).
 
 An owed removal names its target by node-side path or slug only: the account row is already gone when it is sent.
 """
@@ -14,7 +15,7 @@ import logging
 from typing import Any, Optional
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.orm import Session
 
 from app.models.nodes import Node
@@ -44,10 +45,10 @@ def _same(a: dict[str, Any], b: dict[str, Any]) -> bool:
     return a.get("verb") == b.get("verb") and a.get("args") == b.get("args")
 
 
-def settle(wire_node_id: str) -> None:
-    """A node connected: send it every removal it owes and forget each one it answers `done`. Never raises (the
-    node's dial must not fail on this); what still fails stays owed for its next connect."""
-    from app.db import SessionLocal
+def settle(wire_node_id: str, verb: Optional[str] = None) -> None:
+    """A node connected: send it every removal it owes (only VERB's, when given) and forget each one it answers
+    `done`. Never raises (the node's dial must not fail on this); what still fails stays owed for its next connect."""
+    from app.db import BridgedSession
     from app.entity_shape import optional_uuid
     from app.routes.commands import dispatch_and_audit_blocking
     from app.tenancy import exclusion_log, seam
@@ -59,12 +60,14 @@ def settle(wire_node_id: str) -> None:
         # Detached, then bound to the node's own org: `wire_node_id` is the machine key of the socket the node's
         # own credential opened (`routes/node_bus.py::_handshake`), so the org bound is the caller's own.
         with exclusion_log.caller("account_removal.settle"), seam.detached():
-            with SessionLocal() as session, seam.bind_from(session, Node, node_uuid):
+            with BridgedSession() as session, seam.bind_from(session, Node, node_uuid):
                 owed = session.scalar(select(Node.owed_account_removals).where(Node.id == node_uuid)) or []
                 if not owed:
                     return
                 done: list[dict[str, Any]] = []
                 for entry in owed:
+                    if verb is not None and entry.get("verb") != verb:
+                        continue
                     if _carry_out(session, dispatch_and_audit_blocking, wire_node_id, entry):
                         done.append(entry)
                 if done:
@@ -102,6 +105,31 @@ def _carry_out(session: Session, dispatch, node_id: str, entry: dict[str, Any]) 
     log.warning("node %s: owed %s %s failed again (%s)", node_id, verb, args,
                 (result or {}).get("stderr") or reply.get("status"))
     return False
+
+
+def slug_still_owed(slug: str) -> bool:
+    """Whether a connected node, in any org, still owes a removal naming SLUG. A new login under that slug is refused
+    until none does (`routes/commands.py::_require_account_access`): the Delete's workflow, delivering it after the
+    new login made its dir but before its row exists, would delete it. An offline node's debt does not hold the slug:
+    it is sent on the node's next connect, by when the new row exists and the debt lapses (`_slug_held_again`).
+    A fleet-wide read, as the slug is fleet-unique."""
+    from app import node_bus
+    from app.db import BridgedSession
+    from app.tenancy import seam
+
+    with seam.detached(), seam.operator_scope(), BridgedSession() as fleet:
+        rows = fleet.execute(
+            select(Node.id, Node.owed_account_removals).where(Node.owed_account_removals != text("'[]'::jsonb"))
+        ).all()
+    owing = {str(node_id) for node_id, owed in rows if any(_names_slug(entry, slug) for entry in owed or [])}
+    return bool(owing) and not owing.isdisjoint(node_bus.registry.connected_nodes())
+
+
+def _names_slug(entry: dict[str, Any], slug: str) -> bool:
+    args = entry.get("args")
+    if entry.get("verb") not in VERBS or not isinstance(args, dict):
+        return False
+    return str(args.get(VERBS[entry["verb"]]) or "").rstrip("/").rsplit("/", 1)[-1] == slug
 
 
 def _slug_held_again(session: Session, target: str) -> bool:

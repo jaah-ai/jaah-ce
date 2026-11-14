@@ -14,7 +14,7 @@ cron's Run now and a replica race are both safe. The `values` shapes, per kind:
 
   node_util           {cpu_pct, mem_pct}          node_id: mean of the node's minute buckets in the hour
                                                   [taken_at, taken_at + 1h)
-  worktree_occupancy  {free, task, user}          node_id + project_id: slot count per state
+  worktree_occupancy  {free, task}                node_id + project_id: slot count per state
   account_quota       {five_hour_pct, seven_day_pct}  account_id: the fleet-wide fold's fresh reading
                                                   (`app/account_fold.py::quota_readings`; 7d = `weekly_percent`)
   wallet_floor        {floor_state}               the org: `token_wallets.floor_state` (`ok`/`low`/`floor`)

@@ -12,7 +12,8 @@ import type { TaskTreeCounts } from '../../types'
 import { TEMPLATES_KEY, listTemplates, type TemplateCard } from './api'
 import { STARTER_MAX_TASKS, mostPopular } from './sections'
 import StartTemplateDialog from './StartTemplateDialog'
-import TemplateCardView from './TemplateCardView'
+import TemplateRowView from './TemplateRowView'
+import { FONT_WEIGHT, SIZE } from '../../theme'
 
 /* THE TASKS BOARD'S STARTERS, under the unfiltered list while the org has at most `STARTER_MAX_TASKS` tasks.
  * While the company setup is unfinished up to First task (every step before it), the setup diagram
@@ -39,15 +40,15 @@ export default function TemplateStarters(): JSX.Element | null {
   return (
     <Box component="section" aria-labelledby="task-starters-title" data-testid="task-template-starters" sx={{ px: { xs: 0, sm: 1 }, py: 2 }}>
       <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1, flexWrap: 'wrap', mb: 1.5 }}>
-        <Typography id="task-starters-title" component="h2" variant="subtitle1" sx={{ fontWeight: 600 }}>
+        <Typography id="task-starters-title" component="h2" variant="subtitle1" sx={{ fontWeight: FONT_WEIGHT.semibold }}>
           Most popular templates
         </Typography>
-        <Button component={RouterLink} to="/templates" data-testid="task-template-starters-all" sx={{ minHeight: 44 }}>
+        <Button component={RouterLink} to="/templates" data-testid="task-template-starters-all" sx={{ minHeight: SIZE.tapTarget }}>
           All templates
         </Button>
       </Box>
-      <CardGrid label="Templates">
-        {cards.map(c => <TemplateCardView key={c.id} card={c} onStart={setStarting} />)}
+      <CardGrid label="Templates" rows>
+        {cards.map(c => <TemplateRowView key={c.id} card={c} onStart={setStarting} />)}
       </CardGrid>
       {starting && <StartTemplateDialog card={starting} onClose={() => setStarting(null)} />}
     </Box>

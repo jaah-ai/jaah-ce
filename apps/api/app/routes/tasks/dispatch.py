@@ -3,23 +3,27 @@ from __future__ import annotations
 
 import functools
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import String, and_, bindparam, case, cast, false, func, literal, or_, select, true, update
 from sqlalchemy.orm import Session, aliased
 
 from app import actors, git_access, merge_lane_state, placement_grants, runner_terminations, slot_allocation, slot_state
 from app import comment_notify, comment_service
-from app.auth import require_user
+from app.auth import adopt_user, require_user
+from app.pipeline_gates import full_gate
+from app.clock import capped_doubling, utcnow
 from app.authz.declarations import feature
 from app.authz.object_access import named_user_may_start
 from app.authz.principal import Principal, current_principal
-from app.db import get_session
+from app.db_async import defer_off_loop, on_session
 from app.comment_service import Subject
+from app.entity_shape import commit_row, from_row
 from app.events import emit_console_event
 from app.identities import display_name
 from app.tenancy.copy import WITHHELD_ACTOR
@@ -30,7 +34,7 @@ from app.models.projects import Project
 from app.models.tasks import Task, TaskDependency
 from app.models.worktrees import Worktree
 from app.task_ancestry import may_stamp_starter
-from app import ce_caps, edition_features
+from app import ce_caps, edition_features, org_limits
 from app.task_lifecycle import (
     ACTIVE,
     DONE,
@@ -47,6 +51,7 @@ from app.task_lookup import get_task_or_404
 from app.task_title import draft_title
 from app.org_gate import require_org_active
 from app.routes.tasks import epics
+from app.pipeline import gate as pipeline_gate
 from app.routes.tasks.policy import (
     PERSONA_EPIC,
     TRANSITION_HOLD,
@@ -62,6 +67,7 @@ from app.routes.tasks.task_wire import (
     TaskDispatchOut,
     TaskDispatchProjectOut,
     TaskOut,
+    _subtree_task_ids,
     _task_attachments_meta,
     _task_effective_autonomous,
     _task_out_with_children,
@@ -122,15 +128,11 @@ def task_dispatch_out(
     reaches the parent epic, deliberately unfiltered). `None` is the unfiltered infrastructure principal
     dispatch requires; the default exists for `app/dispatch_compose/`, while the four helpers carry no
     default so a session-path caller fails closed."""
-    return TaskDispatchOut(
-        id=task.id,
-        project_id=task.project_id,
-        state=task.state,
-        persona=task.persona,
-        # The row's OWN column, unfiltered by principal for the same reason `finish_follow_up_key` below
-        # is: it names a structural fact about this Task rather than another object's content.
-        parent_task_id=task.parent_task_id,
-        title=task.title,
+    # The row's own columns `from_row` copies are unfiltered by principal: `parent_task_id`, `finish_follow_up_key`
+    # and the `model` pin (`dispatch_compose.compose._resolve_model` reads it) each name a structural fact about
+    # this Task rather than another object's content.
+    return from_row(
+        TaskDispatchOut, task,
         # Composed at DISPATCH from this persona's template plus its live input, via the one uniform path —
         # the runner's actual work item, never the stored snapshot (`_compose_dispatch_body`).
         body=_compose_dispatch_body(task, session),
@@ -144,14 +146,6 @@ def task_dispatch_out(
         prerequisite_recon_map=_task_prerequisite_recon_map(session, task, principal),
         prerequisite_artifacts=_task_prerequisite_artifacts(session, task, principal),
         attachments=_task_attachments_meta(session, task, principal),
-        # The row's own column, unfiltered: a structural fact about this Task, not another object's content.
-        finish_follow_up_key=task.finish_follow_up_key,
-        outcome_summary=task.outcome_summary,
-        outcome_pr_url=task.outcome_pr_url,
-        outcome_no_pr_reason=task.outcome_no_pr_reason,
-        outcome_no_pr_evidence=task.outcome_no_pr_evidence,
-        # The row's own pin, unfiltered (a fact about this Task); `dispatch_compose.compose._resolve_model` reads it.
-        model=task.model,
         project=_task_project_delivery(session, task),
     )
 
@@ -159,43 +153,97 @@ def task_dispatch_out(
 def _task_project_delivery(session: Session, task: Task) -> TaskDispatchProjectOut:
     """The delivery columns of `task`'s own project — never another object's, so unfiltered by principal."""
     project = session.scalars(select(Project).where(Project.id == task.project_id)).one()
-    return TaskDispatchProjectOut(
-        integration_branch=project.integration_branch, branch_prefix=project.branch_prefix,
-        gate_quick_cmd=project.gate_quick_cmd, gate_full_cmd=project.gate_full_cmd,
-        push_enabled=project.push_enabled,
-    )
+    return from_row(TaskDispatchProjectOut, project, gate_full_cmd=full_gate.full_gate_command(session, project))
 
 
 def dispatchable_tasks(project_id: int, session: Session) -> list[Task]:
-    """The project's dispatchable Tasks — every `ready` Task in project `project_id`, ordered
+    """The project's dispatchable Tasks — every `ready` non-epic Task in project `project_id`, ordered
     `priority DESC, id`; an unknown project matches nothing (`[]`). Keyed purely on `task.id`.
 
     Dependency gate: a Task with any unmet prerequisite is excluded, as is one whose parent
-    epic has one (`_parent_epic_has_unmet_prerequisite`); the NOT EXISTS reads live `state`. A `ready`
-    task is dispatchable iff `run_requested_at IS NOT NULL` (the Run bypass over hold mode and both
-    dependency gates) OR its epic is not in `hold` and every prerequisite is met."""
+    epic has one (`_parent_epic_has_unmet_prerequisite`); the NOT EXISTS reads live `state`. A Run
+    (`run_requested_at`) releases its epic's `hold` and nothing else (`_sequencing_floors`)."""
     return list(session.scalars(_dispatchable_statement(), {"dispatch_project_id": project_id}).all())
 
 
+def dispatchable_tasks_by_project(session: Session) -> dict[int, list[Task]]:
+    """`dispatchable_tasks` for every project in one statement: `{project id: its tasks, priority DESC, id}`, a
+    project with none absent. The lease drain's fleet-wide sweeps and allocation (`app/lease_drain.py`), which had
+    issued one SELECT per project each — a third of an idle pass's statements."""
+    out: dict[int, list[Task]] = {}
+    for task in session.scalars(_dispatchable_statement(fleet=True)).all():
+        out.setdefault(task.project_id, []).append(task)
+    return out
+
+
+def dispatchable_tasks_among(session: Session, ids_by_project: dict[int, list[int]]) -> dict[int, list[Task]]:
+    """`dispatchable_tasks_by_project`'s answer for the ids an earlier call of it gave, in its order, by one
+    primary-key read: a lease-drain node plan loads the pass's one read
+    (`routes/fleet.py::DispatchPassFacts.dispatchable_by_project`) rather than re-running the sequencing floors per
+    node. Only the state and archive floors, and the project, are checked again, so a task claimed, stopped,
+    cancelled, archived, moved or deleted since that read drops out; a sequencing floor that closed since (an epic
+    put on hold or stopped) holds it from the next pass on."""
+    wanted = sorted({task_id for ids in ids_by_project.values() for task_id in ids})
+    if not wanted:
+        return {}
+    rows = {
+        task.id: task
+        for task in session.scalars(
+            select(Task).where(Task.id.in_(wanted), Task.state.in_(_DISPATCHABLE_STATES), Task.archived_at.is_(None))
+        ).all()
+    }
+    out: dict[int, list[Task]] = {}
+    for project_id, ids in ids_by_project.items():
+        tasks = [rows[i] for i in ids if i in rows and rows[i].project_id == project_id]
+        if tasks:
+            out[project_id] = tasks
+    return out
+
+
+def _sequencing_floors(*, throttle: bool) -> Any:
+    """The sequencing gate `dispatchable_tasks`' SELECT and the claim's UPDATE share: every prerequisite met (the
+    task's own and its epic's), outside the vanish backoff, (`throttle`, the SELECT's only) its epic below its
+    throttle, and its epic not in `hold` unless the subtask was Run. A Run (`run_requested_at`) releases a `hold`
+    and nothing else: Start queues a task, it never skips its prerequisites, throttle or backoff. Never the access
+    floors (archived, paused epic, node grant), which both callers keep ahead of this clause.
+
+    The throttle is placement-time only: the claim follows a launch the pass already placed under it
+    (`EpicThrottleBudget`, `epic_has_room`), and the node ignores a refused claim, so refusing there would strand a
+    live runner that is later charged as `launch_never_claimed`."""
+    return and_(
+        or_(Task.run_requested_at.is_not(None), ~parent_epic_holds()),
+        *((~_parent_epic_throttled(),) if throttle else ()),
+        ~_has_unmet_prerequisite(),
+        ~_parent_epic_has_unmet_prerequisite(),
+        ~_vanish_backoff_holds(),
+    )
+
+
+def parent_epic_holds() -> Any:
+    """Correlated EXISTS: the enclosing Task row's parent is in `hold` mode. Fresh alias per call; shared with the
+    wait reason (`task_queue.py`)."""
+    parent = aliased(Task)
+    return (
+        select(parent.id)
+        .where(parent.id == Task.parent_task_id, parent.transition_mode == TRANSITION_HOLD)
+        .exists()
+    )
+
+
 @functools.cache
-def _dispatchable_statement() -> Any:
-    """`dispatchable_tasks`' SELECT, built once per process with the project as a bound parameter.
+def _dispatchable_statement(fleet: bool = False) -> Any:
+    """`dispatchable_tasks`' SELECT, built once per process with the project as a bound parameter; `fleet` is
+    the every-project form (`dispatchable_tasks_by_project`), ordered by project first.
 
     Built once because building it was the control plane's single hottest line: its four aliased
     correlated EXISTS cost ~9 ms of pure Python per construction, and the drain pass runs it (nodes + 3) x
     projects times every pass — ~20% of the api's CPU in the main profile. A `Select` is
     immutable, so one instance is safe to share across threads; the tenancy seam adds its criteria at
     execute time, per call, exactly as before."""
-    parent = aliased(Task)
-    parent_epic_holds = (
-        select(parent.id)
-        .where(parent.id == Task.parent_task_id, parent.transition_mode == TRANSITION_HOLD)
-        .exists()
-    )
     return (
         select(Task)
         .where(
-            Task.project_id == bindparam("dispatch_project_id"),
+            Task.project_id.is_not(None) if fleet else Task.project_id == bindparam("dispatch_project_id"),
             # Rendered into the SQL, not bound: the driver prepares a statement it runs this often and
             # Postgres then caches a GENERIC plan, which cannot prove a bound `$n` satisfies the partial
             # `ix_tasks_project_state_dispatchable` (`state = 'ready'`) and falls back to every row the
@@ -206,20 +254,14 @@ def _dispatchable_statement() -> Any:
             # An archived child must NEVER dispatch — it is kept only as evidence of a replaced
             # decomposition, excluded unconditionally whatever `state` it was frozen at.
             Task.archived_at.is_(None),
-            # A Stopped epic beats a manual Run: unconditional, outside the or_() below, since `run_requested_at`
-            # bypasses the other gates. Same predicate at both claim floors (`_parent_epic_paused`).
+            # An epic is a container that never runs (compose skips it): offered, it was leased a slot every
+            # pass and held it, starving its project of worktrees.
+            Task.persona != PERSONA_EPIC,
+            # A Stopped epic holds every subtask, a Run one included. Same predicate at both claim floors.
             ~_parent_epic_paused(),
-            or_(
-                Task.run_requested_at.is_not(None),
-                and_(
-                    ~parent_epic_holds,
-                    ~_has_unmet_prerequisite(),
-                    ~_parent_epic_has_unmet_prerequisite(),
-                    ~_vanish_backoff_holds(),
-                ),
-            ),
+            _sequencing_floors(throttle=True),
         )
-        .order_by(_PRIORITY_ORDER, Task.id)
+        .order_by(*((Task.project_id,) if fleet else ()), _PRIORITY_ORDER, Task.id)
     )
 
 
@@ -227,8 +269,7 @@ def _dispatchable_statement() -> Any:
 # A task whose runner vanished waits `base * 2^(n-1)` seconds (capped) after its latest vanish before it is
 # dispatchable again, `n` counting its vanishes inside the window. Without it a node that keeps losing runners
 # took the same 17 tasks back every ~3 minutes, 3-8 times each, and the node-fault refund kept every attempt
-# cap from ending the loop. Derived from the `runner_terminated` notes, so no column holds it; the Run
-# bypass (`run_requested_at`) skips it, so an operator's Start is never delayed.
+# cap from ending the loop. Derived from the `runner_terminated` notes, so no column holds it.
 VANISH_BACKOFF_BASE_SECONDS = 60
 VANISH_BACKOFF_CAP_SECONDS = 900
 VANISH_BACKOFF_WINDOW_SECONDS = 3600
@@ -238,7 +279,7 @@ def vanish_backoff_secs(vanishes: int) -> int:
     """How long a task with `vanishes` recent vanishes waits after the latest one. Pure."""
     if vanishes <= 0:
         return 0
-    return min(VANISH_BACKOFF_BASE_SECONDS * 2 ** (vanishes - 1), VANISH_BACKOFF_CAP_SECONDS)
+    return capped_doubling(vanishes - 1, VANISH_BACKOFF_BASE_SECONDS, VANISH_BACKOFF_CAP_SECONDS)
 
 
 def _lost_runner_notes_in_window(note: Any) -> list[Any]:
@@ -273,9 +314,9 @@ def _vanish_backoff_holds() -> Any:
 
 
 def _parent_epic_paused() -> Any:
-    """Correlated EXISTS: the enclosing Task row's parent is a `paused` epic — "a Stopped epic beats a
-    manual Run". One shared predicate for all three dispatch/claim gates, always an unconditional conjunct
-    OUTSIDE the Run-bypass `or_()`. Keyed on `persona == 'epic'`. Fresh alias per call."""
+    """Correlated EXISTS: the enclosing Task row's parent is a `paused` epic, which holds every subtask, a Run one
+    included. One shared predicate for all three dispatch/claim gates. Keyed on `persona == 'epic'`. Fresh alias
+    per call."""
     parent = aliased(Task)
     return (
         select(parent.id)
@@ -288,14 +329,113 @@ def _parent_epic_paused() -> Any:
     )
 
 
+def _parent_epic_throttled() -> Any:
+    """Correlated EXISTS: the enclosing Task row's parent epic has a throttle (`max_running`) and at least that many
+    of its OTHER unarchived subtasks have a live or launching runner (`org_limits.live_runner`; a parked hold waits
+    and does not count). The row itself is left out so a child whose own launch is in flight stays visible to the
+    re-dispatch and abandoned-launch sweeps. Same fresh-alias rule as `_parent_epic_paused`. Within one pass,
+    `EpicThrottleBudget` bounds what the allocation places on top of this count."""
+    parent = aliased(Task)
+    sibling = aliased(Task)
+    running = (
+        select(func.count())
+        .select_from(sibling)
+        .where(
+            sibling.parent_task_id == parent.id, sibling.id != Task.id, sibling.archived_at.is_(None),
+            org_limits.live_runner(sibling),
+        )
+        # Two levels down from the gated row: auto-correlation reaches only the enclosing EXISTS's `parent`.
+        .correlate_except(sibling)
+        .scalar_subquery()
+    )
+    return (
+        select(parent.id)
+        .where(
+            parent.id == Task.parent_task_id,
+            parent.persona == PERSONA_EPIC,
+            parent.max_running.is_not(None),
+            running >= parent.max_running,
+        )
+        .exists()
+    )
+
+
+def _epic_throttle(session: Session, epic_id: int, *, lock: bool = False) -> Optional[int]:
+    """Epic `epic_id`'s throttle (`max_running`), None when it has none or is not an epic. `lock` takes the epic row
+    `FOR UPDATE` to the caller's commit, as `transitions.throttle_epic_children` does, so concurrent admissions count
+    one after the other."""
+    stmt = select(Task.persona, Task.max_running).where(Task.id == epic_id)
+    row = session.execute(stmt.with_for_update() if lock else stmt).first()
+    return row.max_running if row is not None and row.persona == PERSONA_EPIC else None
+
+
+def _epic_children_running(session: Session, epic_id: int, *, besides: Optional[int] = None) -> int:
+    """How many of epic `epic_id`'s unarchived subtasks (other than `besides`) count against its throttle: a live or
+    launching runner (`org_limits.live_runner`), as `_parent_epic_throttled` counts them."""
+    return int(session.scalar(
+        select(func.count()).select_from(Task).where(
+            Task.parent_task_id == epic_id, Task.archived_at.is_(None), org_limits.live_runner(),
+            *((Task.id != besides,) if besides is not None else ()),
+        )
+    ) or 0)
+
+
+class EpicThrottleBudget:
+    """One allocation pass's per-epic ledger, beside `org_limits.DispatchBudget`: a pass places at most `max_running`
+    less the epic's counted subtasks (`_epic_children_running`), read once per epic per pass, however many of its
+    `ready` children `dispatchable_tasks_by_project` offered — that read is taken once, so the gate alone
+    (`_parent_epic_throttled`) cannot see the pass's own placements. A task the pass then fails to place is
+    `refund`ed."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+        # Per epic: placements still allowed this pass; None = no throttle.
+        self._left: dict[int, Optional[int]] = {}
+
+    def take(self, task: Task) -> bool:
+        """Spend one placement of `task`'s epic; False, spending nothing, when the throttle leaves no room."""
+        epic_id = task.parent_task_id
+        if epic_id is None:
+            return True
+        if epic_id not in self._left:
+            limit = _epic_throttle(self._session, epic_id)
+            self._left[epic_id] = (
+                None if limit is None else max(limit - _epic_children_running(self._session, epic_id), 0)
+            )
+        left = self._left[epic_id]
+        if left is None:
+            return True
+        if left <= 0:
+            return False
+        self._left[epic_id] = left - 1
+        return True
+
+    def refund(self, task: Task) -> None:
+        """Give back a placement `take` spent but the pass did not make."""
+        epic_id = task.parent_task_id
+        left = self._left.get(epic_id) if epic_id is not None else None
+        if epic_id is not None and left is not None:
+            self._left[epic_id] = left + 1
+
+
+def epic_has_room(session: Session, task_id: int) -> bool:
+    """Whether `task_id` may relaunch in the hold it kept (a parked restart, which no allocation places) under its
+    epic's throttle: fewer than `max_running` of its siblings count (`_epic_children_running`). Locks the epic row to
+    the caller's commit, so two nodes' relaunches in one pass count one after the other."""
+    epic_id = session.scalar(select(Task.parent_task_id).where(Task.id == task_id))
+    if epic_id is None:
+        return True
+    limit = _epic_throttle(session, epic_id, lock=True)
+    return limit is None or _epic_children_running(session, epic_id, besides=task_id) < limit
+
+
 def _parent_epic_has_unmet_prerequisite() -> Any:
     """Correlated EXISTS: the enclosing Task row's PARENT EPIC has a prerequisite that is neither `done`
     nor archived. Same shape and fresh-alias rule as `_parent_epic_paused`, same unmet semantics as
     `_has_unmet_prerequisite`.
 
     An epic is never dispatched, so its own edge has no row to gate: without this, epic B sequenced
-    behind task A would start its children immediately. Placed inside the Run-bypass `or_()` at every
-    gate, like the child's own dependency gate."""
+    behind task A would start its children immediately. At every gate, like the child's own dependency gate."""
     parent = aliased(Task)
     prereq = aliased(Task)
     return (
@@ -417,17 +557,11 @@ def claim_task_active_ready_by_id(
     by `task.id`, called after the dispatcher wins the slot lease. `state == READY` is the concurrency
     guard, so a second call returns False.
 
-    The floors (archived, paused epic, node grant, dependencies, hold) mirror `dispatchable_tasks`. Run
-    bypasses the three sequencing floors, never the node grant (an access decision). Bumps
+    The floors (archived, epic, paused epic, node grant, dependencies, hold) mirror `dispatchable_tasks`; its epic
+    throttle does not, since the placement already spent it (`_sequencing_floors`). Bumps
     `dispatch_attempts` via `_active_dispatch_values`; the ceiling is evaluated when the attempt ends.
     True iff this call won."""
-    now = datetime.now(timezone.utc)
-    parent = aliased(Task)
-    parent_epic_holds = (
-        select(parent.id)
-        .where(parent.id == Task.parent_task_id, parent.transition_mode == TRANSITION_HOLD)
-        .exists()
-    )
+    now = utcnow()
     row = session.execute(
         update(Task)
         .where(
@@ -435,20 +569,14 @@ def claim_task_active_ready_by_id(
             Task.state == READY,
             # An archived row must never be claimed even if its frozen `state` reads `ready` (defense in depth).
             Task.archived_at.is_(None),
+            # An epic never runs, so it is never claimed (as `dispatchable_tasks` never offers one).
+            Task.persona != PERSONA_EPIC,
             # A paused epic's child is never claimable — unconditional (see `_parent_epic_paused`).
             ~_parent_epic_paused(),
-            # Claimable only from a node its launcher is granted; unconditional, and Run does not bypass it.
+            # Claimable only from a node its launcher is granted.
             _node_grant_floor(session, task_id, node_id),
-            # Manual Run bypasses every sequencing floor exactly as in `dispatchable_tasks`.
-            or_(
-                Task.run_requested_at.is_not(None),
-                and_(
-                    ~parent_epic_holds,
-                    ~_has_unmet_prerequisite(),
-                    ~_parent_epic_has_unmet_prerequisite(),
-                    ~_vanish_backoff_holds(),
-                ),
-            ),
+            # The sequencing floors of `dispatchable_tasks`, less the epic throttle (`_sequencing_floors`).
+            _sequencing_floors(throttle=False),
         )
         .values(
             **_active_dispatch_values(now),
@@ -466,13 +594,19 @@ def claim_task_active_ready_by_id(
     if row is None:
         return False
     claimed_id, final_state = row
+    # This dispatch's routing decision, final in the claim's transaction (`agent_router.finalize_on_claim`): its
+    # own SAVEPOINT, never raises, so a decision record can never refuse or delay a claim.
+    from app import agent_router
+
+    agent_router.finalize_on_claim(session, claimed_id)
     # The plan precondition: starting a planner archives the epic's existing subtasks in the claim's
     # transaction, so a do-nothing re-run cannot settle `done` on stale children.
     claimed = session.get(Task, claimed_id)
     if claimed is not None:
         epics.archive_epic_children_for_plan(claimed, session)
-    emit_console_event(session, entity="task", id=claimed_id, action=final_state)
-    session.commit()
+        # Rounds an operator's Stop kept are now this runner's prompt's to carry, not its gate's to wait on.
+        runner_terminations.drop_kept_questions(session, claimed)
+    emit_console_event(session, entity="task", id=claimed_id, action=final_state, commit=True)
     log.info(
         "task %s claimed ready->%s by the dispatcher (github_synced_at=%s)",
         claimed_id, final_state, now,
@@ -524,18 +658,21 @@ def _save_unsaved_draft_before_dispatch(
     # After the commit and deferred, for the two reasons `_create_coder_task` states at the same seam.
     from app.durable.task_title_queue import enqueue_title
 
-    enqueue_title(task_id)
+    defer_off_loop(session, enqueue_title, task_id)
     session.refresh(task)
 
 
 def _start_epic(
     task_id: int, project: Project, session: Session, principal: Principal | None,
-    *, push_as_id: Optional[UUID] = None,
-) -> TaskOut:
+    *, push_as_id: Optional[UUID] = None, values: Optional[dict[str, Any]] = None, out: bool = True,
+    starter_id: Optional[UUID] = None,
+) -> Optional[TaskOut]:
     """Shared epic "go" transition, called by `start_task` on a draft epic:
     flips the epic `draft → active` via a single atomic guarded UPDATE, 409ing if already started. Assumes
-    the caller validated the persona. `push_as_id` is a `_push_identity_or_422`-vetted stand-in starter."""
-    starter = _starter_stamp(session, task_id, push_as_id or (principal.user_id if principal is not None else None))
+    the caller validated the persona. `push_as_id` is a `_push_identity_or_422`-vetted stand-in starter.
+    `values`: further columns the same UPDATE writes (`start_task`'s `run_without_repo` choice)."""
+    starter = _starter_stamp(
+        session, task_id, starter_id or push_as_id or (principal.user_id if principal is not None else None))
     landed = session.execute(
         update(Task)
         .where(Task.id == task_id, Task.persona == PERSONA_EPIC, Task.state == DRAFT)
@@ -547,6 +684,7 @@ def _start_epic(
             # its filer (`file_agent_top_level_task`), whose row was stamped its executor at filing, or a cross-org
             # operator (`_starter_stamp`); the absent key preserves that stamp, where `None` would erase it.
             **({"started_by_id": starter} if starter is not None else {}),
+            **(values or {}),
             **actors.task_actor_values(session),
         )
     )
@@ -556,12 +694,18 @@ def _start_epic(
             status_code=409,
             detail=f"epic {task_id} is not 'draft' (already started, or a concurrent request won)",
         )
-    emit_console_event(session, entity="task", id=task_id, action=ACTIVE)
-    session.commit()
+    return _started_out(session, task_id, principal, push_as_id, out=out)
+
+
+def _started_out(session: Session, task_id: int, principal: Principal | None, push_as_id: Optional[UUID],
+                 *, out: bool = True) -> Optional[TaskOut]:
+    """The epic's answer once its row is `active`: the console told, committed, the push-as member told, and the
+    row re-read with its children (`out`; a bulk start reads none)."""
+    emit_console_event(session, entity="task", id=task_id, action=ACTIVE, commit=True)
     if push_as_id is not None:
         _tell_push_as_member(session, task_id, principal, push_as_id)
     session.expire_all()
-    return _task_out_with_children(task_id, session, principal)
+    return _task_out_with_children(task_id, session, principal) if out else None
 
 
 # ── The one `* -> ready` edge, and the shared subtask dispatch flip on top of it ────────────────────
@@ -615,7 +759,7 @@ def _starter_stamp(session: Session, task_id: int, user_id: Optional[UUID]) -> O
 
 def _tell_push_as_member(session: Session, task_id: int, principal: Principal | None, push_as_id: UUID) -> None:
     """After a Start that named a stand-in (`push_as_id`) has committed: a comment from the operator mentioning
-    the member ("Started by Jaah support as @Bob."), so they learn their git account now answers for this task — the
+    the member ("Started by System as @Bob."), so they learn their git account now answers for this task — the
     mention is their bell entry and DM (`comment_notify`). Best-effort: the Start has landed, and a comment
     that fails must not read as a failed Start."""
     try:
@@ -631,13 +775,15 @@ def _tell_push_as_member(session: Session, task_id: int, principal: Principal | 
             session,
             Subject("task", task_id),
             author=operator,
-            # The operator's label as the tenant reads staff ("Jaah support"): stored text both sides read.
+            # The operator's label as the tenant reads staff (`WITHHELD_ACTOR`): stored text both sides read.
             body=f"Started by {operator_label} as @{display_name(member)}.",
             mentioned=lambda _comment: [member],
         )
-        session.commit()
-        session.refresh(comment)
-        comment_notify.notify_mentioned(session, task=task, comment=comment, author=operator, mentioned=fresh)
+        commit_row(session, comment)
+        defer_off_loop(
+            session, comment_notify.notify_mentioned_on_own_session, task.id, comment.id, operator.id,
+            [u.id for u in fresh],
+        )
     except Exception:  # noqa: BLE001 — see the docstring
         session.rollback()
         log.exception("start: could not tell %s they were named starter of task %s", push_as_id, task_id)
@@ -656,10 +802,9 @@ def _start(
 ) -> bool:
     """The single `* -> ready` edge — the one place in apps/api that starts a Task.
 
-    `run_requested` says whether this is the per-subtask Run, dispatching now past the epic's `hold` and
-    unmet prerequisites; it persists to `run_requested_at`, which the dispatch query and claim floors read
-    and the claim clears. One conditional UPDATE whose `rowcount` is the caller's guard; `sources` is the
-    legal source states, or None for the transition table's own. Resets `dispatch_attempts`, or a Task
+    `run_requested` says whether this is the per-subtask Run, releasing the epic's `hold` (and nothing else); it
+    persists to `run_requested_at`, which the dispatch query and claim floors read and the claim clears. One
+    conditional UPDATE whose `rowcount` is the caller's guard; `sources` is the legal source states, or None for the transition table's own. Resets `dispatch_attempts`, or a Task
     restarted from `system_failed` would sit at the cap."""
     # ── The chat cap belongs here, on the one start edge ────────────────────────────────────────────────
     # Mint-time checks alone are defeated by `stop -> create -> start` (`paused` is uncounted, since
@@ -677,11 +822,13 @@ def _start(
             # The row being started already exists and must never count against its own start.
             exclude_task_id=task_id,
         )
-    payload: dict[str, Any] = {"state": READY, **(values or {})}
+    # The transition watermark every lifecycle writer stamps (`Task.github_synced_at`): a hold kept from an earlier launch
+    # then reads as a restart that must find room under the Agents cap (`org_limits.parked_hold_clause`).
+    payload: dict[str, Any] = {"state": READY, "github_synced_at": utcnow(), **(values or {})}
     if TRANSITION_BY_NAME["start"].resets_attempts:
         payload["dispatch_attempts"] = 0
-    # Written both ways: a queueing start must clear a stale Run stamp, or it would bypass gates it declined.
-    payload["run_requested_at"] = datetime.now(timezone.utc) if run_requested else None
+    # Written both ways: a queueing start must clear a stale Run stamp, or it would release a hold it declined.
+    payload["run_requested_at"] = utcnow() if run_requested else None
     # The key is absent, not NULL, when no starter is named: NULL would erase an earlier human starter and
     # move pushes onto the system credential. A named starter always overwrites.
     if started_by is not None:
@@ -760,14 +907,17 @@ def _start(
 
 def _dispatch_subtask_ready(
     task: Task, session: Session, principal: Principal | None, *, run_requested: bool,
-    push_as_id: Optional[UUID] = None,
-) -> TaskOut:
+    push_as_id: Optional[UUID] = None, values: Optional[dict[str, Any]] = None, out: bool = True,
+    starter_id: Optional[UUID] = None,
+) -> Optional[TaskOut]:
     """Land a non-epic subtask at `ready` with the one-shot `run_requested_at` dispatch flag — the shared
     flip used by `start_task`'s non-epic branch and `force_start_task`. One conditional `UPDATE ... WHERE
     state != 'active'` whose `rowcount` is the guard, so an `active` row 409s rather than double-dispatching.
 
     Reset-fresh: every column that is residue of a prior attempt is wiped unconditionally in the same
-    UPDATE. The task's definition, identity and planner-authored `recon_map`/`phase_*` inputs stay."""
+    UPDATE. The task's definition, identity and planner-authored `recon_map`/`phase_*` inputs stay.
+
+    `values`: further columns the same UPDATE writes (`start_task`'s `run_without_repo` choice)."""
     task_id = task.id
     if not _start(
         task_id, session,
@@ -777,9 +927,9 @@ def _dispatch_subtask_ready(
         # not part of reset-fresh: it names who answers for the next attempt.
         # `push_as_id`: an acting operator's chosen org member (`_push_identity_or_422`).
         started_by=_starter_stamp(
-            session, task_id, push_as_id or (principal.user_id if principal is not None else None),
+            session, task_id, starter_id or push_as_id or (principal.user_id if principal is not None else None),
         ),
-        values=dict(_RESET_FRESH_COLUMNS),
+        values={**_RESET_FRESH_COLUMNS, **(values or {})},
         events=("run",),
     ):
         # Sibling-consistency with `stop`: discard the (no-op) UPDATE's transaction before the 409.
@@ -796,7 +946,7 @@ def _dispatch_subtask_ready(
     if push_as_id is not None:
         _tell_push_as_member(session, task_id, principal, push_as_id)
     session.expire_all()
-    return _task_out_with_children(task_id, session, principal)
+    return _task_out_with_children(task_id, session, principal) if out else None
 
 
 def _release_for_fresh_start(task: Task, session: Session) -> list[Any]:
@@ -804,7 +954,7 @@ def _release_for_fresh_start(task: Task, session: Session) -> list[Any]:
     `_start` commits it with the Start's own `task:run`, so a refused Start rolls it back. A refusal raises 409
     before anything is written. Returns the destroy intents to send after that commit."""
     if not edition_features.enabled("microvm"):
-        raise HTTPException(status_code=404, detail=ce_caps.NOT_IN_CE)  # The community edition has no MicroVMs.
+        raise ce_caps.not_in_edition()  # The community edition has no MicroVMs.
     from app import microvm_lifecycle
 
     _, refusal = microvm_lifecycle.fresh_start_refusal(session, task)
@@ -822,9 +972,10 @@ def _release_for_fresh_start(task: Task, session: Session) -> list[Any]:
 
 # ── Action route: start — the unified idempotent Start for EVERY task ──────────────────────────────
 class TaskStartIn(BaseModel):
-    """The start payload. `run_requested` is the ONE thing a caller declares: "dispatch now, past the epic's
-    hold and any unmet prerequisite", persisted to `run_requested_at`. Default False, so a bodyless POST
-    only queues — the conservative reading, since a mistaken bypass dispatches past an operator's hold."""
+    """The start payload. `run_requested` is the ONE thing a caller declares: "release the epic's hold for this
+    subtask", persisted to `run_requested_at`; prerequisites, throttle and backoff still gate it. Default False, so
+    a bodyless POST only queues — the conservative reading, since a mistaken Run dispatches past an operator's
+    hold."""
 
     run_requested: bool = False
     #: "Start fresh elsewhere": let go of the task's MicroVM (destroyed, no longer its place) and keep its next
@@ -835,10 +986,16 @@ class TaskStartIn(BaseModel):
     # the task's org is no member of it (`_starter_stamp`), so their Start leaves no starter and the push is
     # refused at push time. Absent: the presser, as ever. See `_push_identity_or_422`.
     push_as_id: Optional[UUID] = None
+    #: Run this task in an empty folder, without its project's repository — for a starter who cannot see it
+    #: (`GET /projects/{id}/git-reach`'s `read_problem`). Written to `tasks.run_without_repo`, so the lease
+    #: gives it a folder slot. 409 while the task still holds a git worktree. On an epic the choice is the whole
+    #: group's: written on the epic, which its children read (`slot_allocation.runs_without_repo`).
+    without_repo: bool = False
 
 
 def _push_identity_or_422(
     session: Session, task: Task, push_as_id: Optional[UUID], principal: Principal | None, actor: AdminUser,
+    *, without_repo: bool = False,
 ) -> Optional[UUID]:
     """`push_as_id` when an acting operator may name it as the task's starter, else a 422 naming why.
 
@@ -849,7 +1006,9 @@ def _push_identity_or_422(
 
     Absent, the Start must still leave someone to push as (`_refuse_starterless_start`)."""
     if push_as_id is None:
-        _refuse_starterless_start(session, task, principal.user_id if principal is not None else None)
+        _refuse_starterless_start(
+            session, task, principal.user_id if principal is not None else None, without_repo=without_repo,
+        )
         return None
     if principal is None or not principal.acting:
         raise HTTPException(
@@ -870,14 +1029,17 @@ def _push_identity_or_422(
     return user.id
 
 
-def _refuse_starterless_start(session: Session, task: Task, presser_id: Optional[UUID]) -> None:
+def _refuse_starterless_start(
+    session: Session, task: Task, presser_id: Optional[UUID], *, without_repo: bool = False,
+) -> None:
     """422 when this Start would put a repository task live with nobody to do its git work as.
 
     The presser is stamped only as a seat of the task's org (`_starter_stamp`); an operator acting as the org
-    is none. When the chain names no starter either and no cron owner stands in (`git_access.git_person_for_task`),
+    is none. When the chain names no starter either and no Run jobs as person stands in (`git_access.git_person_for_task`),
     the Start used to land anyway and the runner learned at push time, after the work, that every fetch and
-    push is refused. A folder task has no repository and needs nobody."""
-    if _starter_stamp(session, task.id, presser_id) is not None:
+    push is refused. A folder task has no repository and needs nobody, nor does one this Start runs
+    `without_repo`."""
+    if without_repo or _starter_stamp(session, task.id, presser_id) is not None:
         return
     if not slot_allocation.task_has_repo(session, task) or git_access.git_person_for_task(session, task) is not None:
         return
@@ -889,27 +1051,80 @@ def _refuse_starterless_start(session: Session, task: Task, presser_id: Optional
     )
 
 
+def _repo_choice(session: Session, task: Task, project: Project, *, without_repo: bool) -> dict[str, Any]:
+    """The `tasks.run_without_repo` a Start writes on a task whose project has a repository — on an epic, the
+    choice of its whole group (`slot_allocation.runs_without_repo`): True when it runs `without_repo`, else False
+    (a normal Start runs with the repository again) — except that while the task (or one of the epic's tasks)
+    still holds a slot the choice is kept, since it resumes into that slot and a held slot keeps its kind (Reset
+    gives it up). A `without_repo` Start is refused (409) while one of them still holds a git worktree (its next
+    run would reuse that copy) and when no node of the project can hold a folder slot beside its git worktrees
+    (`slot_allocation.node_mixes_kinds`: an older node, a MicroVM node), where it would only wait. Read before
+    anything is written."""
+    if not project.has_repo:
+        return {}
+    ids = _subtree_task_ids(task.id, session) if task.persona == PERSONA_EPIC else [task.id]
+    holds = slot_state.task_holds(session, ids)
+    if not without_repo:
+        return {} if holds else {"run_without_repo": False}
+    held = [hold["worktree_id"] for hold in holds.values()]
+    if held and session.scalar(select(literal(True)).where(Worktree.id.in_(held), Worktree.has_repo.is_(True))):
+        raise HTTPException(
+            status_code=409,
+            detail=("This task still holds a copy of the repository." if task.persona != PERSONA_EPIC
+                    else "A task in this group still holds a copy of the repository.")
+            + " Reset it, then start it without the repository.",
+        )
+    refusal = slot_allocation.folder_slot_refusal(session, project.id)
+    if refusal:
+        raise HTTPException(status_code=409, detail=refusal)
+    return {"run_without_repo": True}
+
+
 @router.post("/{task_id}/start", response_model=TaskOut)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",))
+@on_session(deferring=True)
 def start_task(
+    session: Session,
     task_id: int,
     body: Optional[TaskStartIn] = None,
     _user: AdminUser = Depends(require_user),
     principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
-) -> TaskOut:
+) -> Any:
     """Unified idempotent Start for ANY task — the single "make this live" lever every row exposes. Routed
     by persona and current state:
       - `active`, any task → NO-OP with no state write and no event, so a double-click cannot double-start.
       - EPIC, non-active: `draft` funnels through `_start_epic`; any other non-active state REACTIVATES the
         epic and resets each child's `fanout_attempts`. A lost race is the idempotent no-op, never a 409.
-      - NON-EPIC, non-active → dispatch via the shared `_dispatch_subtask_ready` helper."""
+      - NON-EPIC, non-active → dispatch via the shared `_dispatch_subtask_ready` helper.
+
+    A top-level task's first Start passes the pipeline's Start step (`app/pipeline/gate.py::start_decision`): its
+    gate open → the above; it waits for approvals → 202 `{state: "waiting", stage_id, gate}`, the press recorded and
+    the task left `draft` until the gate opens; the caller is not in the step's who → 403 `step_forbidden`."""
+    started = start_one(session, task_id, body, adopt_user(session, _user), principal)
+    if isinstance(started, pipeline_gate.StartDecision):
+        return JSONResponse(started.waiting_body(), status_code=202)
+    return started
+
+
+def start_one(
+    session: Session, task_id: int, body: Optional[TaskStartIn], _user: AdminUser, principal: Principal | None,
+    *, out: bool = True, pressing: bool = True, starter_id: Optional[UUID] = None,
+    pipeline_hint: Optional[dict[str, Any]] = None,
+) -> Any:
+    """`start_task`'s body, shared with the pipeline's Start step on many tasks (`app/pipeline/actions.py`, `out`
+    False: no row is read back). Returns the started row (or None without `out`), or the gate's waiting decision.
+    `pressing` False: an approval re-asks the gate, which counts the presses already recorded and no new one;
+    `starter_id` then names who the task starts as (its first presser), never the approver."""
     task = get_task_or_404(task_id, session)
 
     # `active` → idempotent no-op for ANY task: the set is the table's own `idempotent_noop` on `start`.
     if task.state in TRANSITION_BY_NAME["start"].idempotent_noop:
-        return _task_out_with_children(task_id, session, principal)
-    push_as_id = _push_identity_or_422(session, task, (body or TaskStartIn()).push_as_id, principal, _user)
+        return _task_out_with_children(task_id, session, principal) if out else None
+    start = body or TaskStartIn()
+    # A project with no repository ignores `without_repo` (`TaskStartIn.without_repo`).
+    without_repo = start.without_repo and bool(session.scalar(
+        select(Project.has_repo).where(Project.id == task.project_id)))
+    push_as_id = _push_identity_or_422(session, task, start.push_as_id, principal, _user, without_repo=without_repo)
     # A pending org dispatches nothing (`app/org_gate.py`); before the draft save, so a refusal writes nothing.
     require_org_active(session, task.org_id)
     # A MicroVM-only project with no usable MicroVM node: refused here, not spent at dispatch. The community
@@ -920,29 +1135,47 @@ def start_task(
         if task.persona != PERSONA_EPIC and task.project_id is not None \
                 and (refusal := microvm_mode.start_blocker(session, task.project_id)) is not None:
             raise HTTPException(status_code=409, detail=refusal)
+    # The repository choice's refusals, before the draft save too (`_repo_choice`).
+    project_row = session.get(Project, task.project_id)
+    repo_choice = (_repo_choice(session, task, project_row, without_repo=without_repo)
+                   if project_row is not None else {})
 
     # ── Starting an auto-saved draft is saving it ────────────────────────────────────────────────────
     # Otherwise it would dispatch a row others cannot see, titled "New task", and an epic without its
     # analysis children. Before any branch, through the shared door.
     _save_unsaved_draft_before_dispatch(task, session, principal)
 
+    # ── The pipeline's Start step (`app/pipeline/gate.py`) ───────────────────────────────────────────
+    # After the save (a waiting press keeps the saved draft), before any start write.
+    if project_row is not None:
+        decision = pipeline_gate.start_decision(session, project_row, task, principal,
+                                                _user.id if pressing else None, pressing=pressing,
+                                                **(pipeline_hint or {}))
+        if decision.forbidden:
+            session.rollback()
+            raise HTTPException(status_code=403, detail={
+                "code": "step_forbidden", "stage_id": str(decision.step.target.id) if decision.step else None})
+        if not decision.open:
+            session.commit()
+            return decision
+
     # NON-EPIC → dispatch the subtask via the shared helper.
     if task.persona != PERSONA_EPIC:
         project = session.get(Project, task.project_id)
         if project is None:
             raise HTTPException(status_code=422, detail=f"project {task.project_id} not found")
-        start = body or TaskStartIn()
         issued: list[Any] = []
         if start.fresh_elsewhere:
             issued = _release_for_fresh_start(task, session)
         # No cap check here: it lives on the `* -> ready` edge itself (`_start`).
-        out = _dispatch_subtask_ready(
+        started = _dispatch_subtask_ready(
             task, session, principal, run_requested=start.run_requested, push_as_id=push_as_id,
+            values=repo_choice, out=out, starter_id=starter_id,
         )
         # After the Start's commit, which carried the release: a refused Start rolled it back and sends nothing.
         for batch in issued:
             batch.send()
-        return out
+        return started
 
     # Epic, non-active: both paths dispatch children.
     project = session.get(Project, task.project_id)
@@ -952,7 +1185,8 @@ def start_task(
         # `_start_epic` 409s its own lost race, but a concurrent Start that moved the epic to `active` is success;
         # anything else re-raises.
         try:
-            return _start_epic(task_id, project, session, principal, push_as_id=push_as_id)
+            return _start_epic(task_id, project, session, principal, push_as_id=push_as_id, values=repo_choice,
+                               out=out, starter_id=starter_id)
         except HTTPException as exc:
             if exc.status_code != 409:
                 raise
@@ -961,10 +1195,10 @@ def start_task(
             current = get_task_or_404(task_id, session)
             if current.state != ACTIVE:
                 raise
-            return _task_out_with_children(task_id, session, principal)
+            return _task_out_with_children(task_id, session, principal) if out else None
 
     # Any other non-active state → REACTIVATE a paused/failed/blocked/stopped epic .
-    starter = _starter_stamp(session, task_id, push_as_id or _user.id)
+    starter = _starter_stamp(session, task_id, starter_id or push_as_id or _user.id)
     landed = session.execute(
         update(Task)
         .where(Task.id == task_id, Task.persona == PERSONA_EPIC, Task.state != ACTIVE)
@@ -979,6 +1213,7 @@ def start_task(
             awaiting_response_body=case(
                 (Task.state == SYSTEM_FAILED, None), else_=Task.awaiting_response_body,
             ),
+            **repo_choice,
             **actors.task_actor_values(session),
         )
     )
@@ -986,7 +1221,7 @@ def start_task(
         # A concurrent Start already flipped it: the idempotent no-op. Roll back before re-reading.
         session.rollback()
         session.expire_all()
-        return _task_out_with_children(task_id, session, principal)
+        return _task_out_with_children(task_id, session, principal) if out else None
     # Reset every direct child's fan-out budget for a clean retry; archived children keep theirs as evidence.
     session.execute(
         update(Task)
@@ -995,9 +1230,4 @@ def start_task(
         )
         .values(fanout_attempts=0, **actors.task_actor_values(session))
     )
-    emit_console_event(session, entity="task", id=task_id, action=ACTIVE)
-    session.commit()
-    if push_as_id is not None:
-        _tell_push_as_member(session, task_id, principal, push_as_id)
-    session.expire_all()
-    return _task_out_with_children(task_id, session, principal)
+    return _started_out(session, task_id, principal, push_as_id, out=out)

@@ -1,4 +1,4 @@
-"""Task state transitions: priority, reset, stop, wait-on-customer, set-state, force-start, complete."""
+"""Task state transitions: priority, reset, stop, set-state, force-start, complete."""
 from __future__ import annotations
 
 import logging
@@ -10,18 +10,20 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import and_, case, func, literal, or_, select, update
 from sqlalchemy.orm import Session
 
-from app import actors, fleet_verdicts, merge_lane_state, runner_terminations, slot_state, task_priority
-from app.auth import require_user
+from app import actors, fleet_verdicts, merge_lane_state, org_limits, runner_terminations, slot_state, task_lifecycle
+from app import task_priority
+from app.auth import adopt_user, require_user
 from app.authz.catalog import permission_key
 from app.authz.declarations import feature
 from app.authz.object_access import can_access, key_scope_satisfied
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller, current_principal
 from app.authz.visibility import TASK_SPEC, ObjectAccess
-from app.db import get_session
+from app.db_async import on_session
 from app.events import emit_console_event
 from app.models.identity import AdminUser
 from app.models.projects import Project
 from app.models.tasks import Task
+from app.models.worktrees import Worktree
 from app import task_sections
 from app.task_lifecycle import (
     ACTIVE,
@@ -95,25 +97,49 @@ def _priority_change(before: int | None, after: int | None) -> dict[str, Any] | 
 
 @router.patch("/{task_id}", response_model=TaskOut)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",), author_draft=True)
+@on_session
 def set_task_priority(
+    session: Session,
     task_id: int,
     body: TaskPriorityIn,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> TaskOut:
     """Set a Task's dispatch-order priority. Settable in ANY state (most useful on a queued task; no
-    transition semantics). Idempotent. It orders the dispatch worklist, not the console list."""
+    transition semantics). Idempotent. It orders the dispatch worklist, not the console list.
+
+    On an epic the new priority also lands on every unsettled sub-task in its subtree (not `done`, not
+    archived): the epic never dispatches itself, so its priority only means anything through its children,
+    which copy it once at creation. Each child that moved gets its own `prioritized` Timeline row."""
+    _user = adopt_user(session, caller.actor)
     task = get_task_or_404(task_id, session)
     before = task.priority
     task.priority = body.priority
+    if task.persona == PERSONA_EPIC:
+        # Epic first, then children — the lock order every epic writer keeps — so a plan fan-out inserting a
+        # child (which copies the epic's priority) cannot land between the subtree read and this write.
+        session.execute(select(Task.id).where(Task.id == task.id).with_for_update())
+        subtree = [tid for tid in _subtree_task_ids(task.id, session) if tid != task.id]
+        children = session.scalars(
+            select(Task)
+            .where(Task.id.in_(subtree), Task.state != DONE, Task.archived_at.is_(None))
+            .order_by(Task.id)
+            .with_for_update()
+        ).all() if subtree else []
+        for child in children:
+            if child.priority == body.priority:
+                continue
+            child_before, child.priority = child.priority, body.priority
+            emit_console_event(
+                session, entity="task", id=child.id, action="prioritized",
+                transition_extra=_priority_change(child_before, child.priority),
+            )
     session.flush()
     emit_console_event(
         session, entity="task", id=task.id, action="prioritized",
         transition_extra=_priority_change(before, task.priority),
+        commit=True,
     )
-    session.commit()
-    return _task_out(task, session=session, principal=principal)
+    return _task_out(task, session=session, principal=caller.principal)
 
 
 # ── Action route: reset (back to a clean, re-runnable draft) ────────────────────────────────────────
@@ -126,6 +152,8 @@ def set_task_priority(
 _RESET_TO_DRAFT_COLUMNS: dict[str, Any] = {
     **_RESET_FRESH_COLUMNS,
     "recon_map": None,
+    # A Start's choice to run without the repository (`Task.run_without_repo`): the next Start asks again.
+    "run_without_repo": False,
     # An SDK agent run's claim stamps (`agent_resolution.stamp_run`): a reset task has run nothing. Start keeps
     # them, as it keeps `bound_provider`; the next lease re-stamps or clears them.
     "run_agent_id": None,
@@ -178,6 +206,10 @@ def _reset_row(task_id: int, session: Session) -> tuple[bool, list[fleet_verdict
     )
     if landed.rowcount == 0:
         return False, []
+    # Reset takes the dispatch rows that never reached a result out of every metric (an earlier merge stays).
+    from app.outcome_ledger import writer as outcome_writer
+
+    outcome_writer.exclude(session, task_id, outcome_writer.EXCLUDE_RESET)
     merge_lane_state.lane_task_left_active(session, task_id)
     _drop_epic_report_published_by(task_id, session)
     # The Reset is still recorded as a kill, now for `runner_terminations.record`'s side effect: its
@@ -220,19 +252,18 @@ def _raise_not_resettable(task_id: int, session: Session) -> NoReturn:
         "it is already a clean draft" if current.state == DRAFT
         else f"'{current.state}' is not a state this Task may be reset from"
     )
-    raise HTTPException(
-        status_code=409,
-        detail=f"task {task_id} is '{current.state}' — {hint}",
-    )
+    raise HTTPException(status_code=409, detail=f"task {task_id} is '{current.state}' — {hint}")
 
 
 @router.post("/{task_id}/reset", response_model=TaskOut)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",))
+@on_session
 def reset_task(
+    session: Session,
     task_id: int,
+    # Composed in-process by its callers with an explicit pair (`set_task_state`), so the two dependencies stay.
     _user: AdminUser = Depends(require_user),
     principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
 ) -> TaskOut:
     """Reset a Task back to a clean, re-runnable `draft` from ANY state but `draft` itself — WITHOUT
     dispatching, so the operator can reconfigure it and Start it fresh.
@@ -253,6 +284,7 @@ def reset_task(
     body versions) are untouched. Columns are NULLed via `_RESET_TO_DRAFT_COLUMNS`, rows hidden by its
     `artifacts_hidden_before` watermark; `_RESET_FRESH_COLUMNS` also clears `awaiting_response_body`,
     the cold gate's row-free question."""
+    _user = adopt_user(session, _user)
     task = get_task_or_404(task_id, session)
     if task.persona == PERSONA_EPIC:
         return _reset_epic(task_id, session, principal)
@@ -323,11 +355,11 @@ def _reset_epic(epic_id: int, session: Session, principal: Principal | None) -> 
 
 @router.post("/{task_id}/stop", response_model=TaskOut)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",))
+@on_session
 def stop_task(
+    session: Session,
     task_id: int,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> TaskOut:
     """Park a stoppable in-flight Task into `paused` — the cockpit-side Stop, the table's `stop` transition.
     It mints the kill itself rather than relying on the ~5s settled-hold sweep, whose re-mint cooldown
@@ -338,9 +370,10 @@ def stop_task(
     guard; an already stopped or terminal Task is a 200 no-op. An epic Stop cascades to its unsettled
     children on the winning branch only; a stopped child may collapse its parent epic. The row it stops
     records an `operator` stop (`app/task_sections.py`); cascaded children record none."""
+    _user = adopt_user(session, caller.actor)
     _stop_task_core(task_id, session, _user)
     session.expire_all()
-    return _task_out_with_children(task_id, session, principal)
+    return _task_out_with_children(task_id, session, caller.principal)
 
 
 def _stop_task_core(
@@ -349,10 +382,9 @@ def _stop_task_core(
     user: AdminUser,
     *,
     stop_reason: str = task_sections.STOP_REASON_OPERATOR,
-    note: Optional[str] = None,
 ) -> bool:
     """`stop_task`'s whole effect, returning whether the stop landed (False: the state was not a `stop`
-    source, nothing written, the session rolled back). The stop record — `stop_reason`, `note`, who and
+    source, nothing written, the session rolled back). The stop record — `stop_reason`, who and
     when — rides the SAME conditional UPDATE as `state=paused`, so no reader sees one without the other."""
     task = get_task_or_404(task_id, session)
     # Read before the UPDATE, under a row lock (see `_terminates_a_running_runner`).
@@ -373,7 +405,6 @@ def _stop_task_core(
         .values(
             state=stop.target,
             stop_reason=stop_reason,
-            stop_note=note,
             stopped_by_id=user.id,
             stopped_at=func.now(),
             **actors.task_actor_values(session),
@@ -447,116 +478,20 @@ def _stop_task_core(
     return True
 
 
-# ── Action route: wait-on-customer — the "Waiting on customer" pause reason (D-waiting) ─────────────
-class WaitOnCustomerIn(BaseModel):
-    """An optional note shown with the reason on the row and the task page."""
-
-    note: Optional[str] = Field(default=None, max_length=task_sections.STOP_NOTE_MAX)
-
-
-@router.post("/{task_id}/wait-on-customer", response_model=TaskOut)
-@feature("tasks", "edit", object_type="task", object_params=("task_id",))
-def wait_on_customer(
-    task_id: int,
-    body: WaitOnCustomerIn = WaitOnCustomerIn(),
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
-) -> TaskOut:
-    """Put a not-done task into Stopped with the reason "Waiting on customer" and an optional note — a
-    stop RECORD, never a state (`app/task_sections.py`). A running or queued row (a `stop` source) is
-    stopped exactly as `stop_task` stops it; a draft, paused or failed row keeps its state and gains the
-    record alone. Starting it again clears the record (the clearing trigger).
-
-    400 for a `done` row and for a stage task (the reason belongs to the epic); 409 if it reached `done`
-    meanwhile."""
-    task = get_task_or_404(task_id, session)
-    if task.parent_task_id is not None:
-        raise HTTPException(status_code=400, detail="a stage task cannot wait on the customer; set it on the epic")
-    if task.state == DONE:
-        raise HTTPException(status_code=400, detail=f"task {task_id} is done; nothing to wait for")
-    note = (body.note or "").strip() or None
-    if task.state in TRANSITION_BY_NAME["stop"].sources:
-        if _stop_task_core(task_id, session, _user, stop_reason=task_sections.STOP_REASON_WAITING, note=note):
-            session.expire_all()
-            return _task_out_with_children(task_id, session, principal)
-        # The state moved under us: re-read, then take the record-only path unless it finished.
-        task = get_task_or_404(task_id, session)
-    read_state = task.state
-    if read_state == DONE or read_state in TRANSITION_BY_NAME["stop"].sources:
-        raise HTTPException(status_code=409, detail=f"task {task_id} moved to {read_state!r}; try again")
-    # Record only, state untouched; guarded on the state just read so a concurrent move is not overwritten.
-    landed = session.execute(
-        update(Task)
-        .where(Task.id == task_id, Task.state == read_state)
-        .values(
-            stop_reason=task_sections.STOP_REASON_WAITING,
-            stop_note=note,
-            stopped_by_id=_user.id,
-            stopped_at=func.now(),
-            **actors.task_actor_values(session),
-        )
-    )
-    if landed.rowcount == 0:
-        session.rollback()
-        raise HTTPException(status_code=409, detail=f"task {task_id} moved; try again")
-    # Not a lifecycle transition (the state is unchanged), so no transition row; the board still refreshes.
-    emit_console_event(session, entity="task", id=task_id, action="wait_on_customer", record_transition=False)
-    session.commit()
-    session.expire_all()
-    return _task_out_with_children(task_id, session, principal)
-
-
-def _clear_wait_record(task_id: int, session: Session) -> bool:
-    """Drop a "Waiting on customer" stop record, leaving the state and any other record alone. Returns
-    whether one was dropped; uncommitted."""
-    landed = session.execute(
-        update(Task)
-        .where(Task.id == task_id, Task.stop_reason == task_sections.STOP_REASON_WAITING)
-        .values(
-            stop_reason=None, stop_note=None, stopped_by_id=None, stopped_at=None,
-            **actors.task_actor_values(session),
-        )
-    )
-    return landed.rowcount > 0
-
-
-@router.delete("/{task_id}/wait-on-customer", response_model=TaskOut)
-@feature("tasks", "edit", object_type="task", object_params=("task_id",))
-def clear_wait_on_customer(
-    task_id: int,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
-) -> TaskOut:
-    """Dismiss "Waiting on customer" — the record goes, the state stays. Idempotent: no record is a 200."""
-    get_task_or_404(task_id, session)
-    if _clear_wait_record(task_id, session):
-        emit_console_event(session, entity="task", id=task_id, action="wait_cleared", record_transition=False)
-        session.commit()
-    session.expire_all()
-    return _task_out_with_children(task_id, session, principal)
-
-
 # ── Action route: set-state — the Details tab's unrestricted State control ─────────────────────────────
 # Any state from any state, beyond the operator-verb table. Each target keeps its real side effects by
 # composing the verb that means it (Stop ends a runner, Reset releases the slot, Start queues, Complete
 # closes); `active`/`awaiting_response`, and a target no verb reaches from here, are written directly.
-# `waiting_on_customer` is the pause reason, offered beside the states. Every other move drops that reason.
-SET_STATE_TARGETS: tuple[str, ...] = (*STATES, task_sections.STOP_REASON_WAITING)
-
-
 class SetStateIn(BaseModel):
-    """The state to put the task in, or `waiting_on_customer` with its optional note."""
+    """The state to put the task in."""
 
     state: str
-    note: Optional[str] = Field(default=None, max_length=task_sections.STOP_NOTE_MAX)
 
     @field_validator("state")
     @classmethod
     def _known(cls, value: str) -> str:
-        if value not in SET_STATE_TARGETS:
-            raise ValueError(f"state must be one of {', '.join(SET_STATE_TARGETS)}")
+        if value not in STATES:
+            raise ValueError(f"state must be one of {', '.join(sorted(STATES))}")
         return value
 
 
@@ -600,8 +535,7 @@ def _force_state(task_id: int, target: str, session: Session) -> None:
             emit_console_event(session, entity="task", id=parent_id, action="set_state")
     if read_state == SYSTEM_FAILED and parent_id is not None:
         _reevaluate_epic_child_failure(parent_id, session)
-    emit_console_event(session, entity="task", id=task_id, action="set_state")
-    session.commit()
+    emit_console_event(session, entity="task", id=task_id, action="set_state", commit=True)
     session.expire_all()
     if parent_id is not None:
         _maybe_roll_up_parent(task_id, session)
@@ -609,16 +543,16 @@ def _force_state(task_id: int, target: str, session: Session) -> None:
 
 @router.post("/{task_id}/set-state", response_model=TaskOut)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",))
+@on_session(deferring=True)
 def set_task_state(
+    session: Session,
     task_id: int,
     body: SetStateIn,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> TaskOut:
-    """Put a task in any state (or Waiting on customer) from any state. Choosing the current state only
-    drops a waiting reason. A refusal from a composed verb (the dispatch switch, the org gate, a stage
-    task's wait) passes through unchanged."""
+    """Put a task in any state from any state. Choosing the current state is a no-op. A refusal from a
+    composed verb (the dispatch switch, the org gate, a stage task's wait) passes through unchanged."""
+    _user = adopt_user(session, caller.actor)
     task = get_task_or_404(task_id, session)
     target, current, is_epic = body.state, task.state, task.persona == PERSONA_EPIC
     stoppable = TRANSITION_BY_NAME["stop"].sources
@@ -629,29 +563,22 @@ def set_task_state(
             _stop_task_core(task_id, session, _user)
             session.expire_all()
 
-    if target == task_sections.STOP_REASON_WAITING:
-        if task.parent_task_id is not None:
-            raise HTTPException(status_code=400, detail="a stage task cannot wait on the customer; set it on the epic")
-        if current == DONE:
-            _force_state(task_id, PAUSED, session)
-        return wait_on_customer(task_id, WaitOnCustomerIn(note=body.note), _user, principal, session)
-
     if target == current:
         pass
     elif target == DONE:
-        complete_task(task_id, None, _user, principal, session)
+        complete_task.session_body(session, task_id, None, _user, caller.principal)
     elif target == DRAFT:
         # An epic too: its Reset cascades to the whole tree (a forced draft would strand paused children).
-        reset_task(task_id, _user, principal, session)
+        reset_task.session_body(session, task_id, _user, caller.principal)
     elif target == READY and is_epic:
         # An epic is never queued (the dispatcher would take a `ready` epic as a unit): Ready starts it.
-        dispatch.start_task(task_id, None, _user, principal, session)
+        dispatch.start_task.session_body(session, task_id, None, _user, caller.principal)
     elif target == READY:
         if current in (ACTIVE, AWAITING_RESPONSE):
             # Refused before the stop, so a Start that would leave nobody to push as leaves the runner working.
-            _refuse_starterless_start(session, task, principal.user_id if principal is not None else None)
+            _refuse_starterless_start(session, task, caller.principal.user_id if caller.principal is not None else None)
             stop_first()
-        dispatch.start_task(task_id, None, _user, principal, session)
+        dispatch.start_task.session_body(session, task_id, None, _user, caller.principal)
     elif target == PAUSED:
         stop_first()
         _force_state(task_id, PAUSED, session)
@@ -662,11 +589,7 @@ def set_task_state(
         _force_state(task_id, target, session)
 
     session.expire_all()
-    if _clear_wait_record(task_id, session):
-        emit_console_event(session, entity="task", id=task_id, action="wait_cleared", record_transition=False)
-        session.commit()
-    session.expire_all()
-    return _task_out_with_children(task_id, session, principal)
+    return _task_out_with_children(task_id, session, caller.principal)
 
 
 # ── Action route: force-start — preempt a running task to start this one now ──
@@ -683,12 +606,12 @@ class ForceStartIn(BaseModel):
 
 @router.post("/{task_id}/force-start", response_model=TaskOut)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",))
+@on_session(deferring=True)
 def force_start_task(
+    session: Session,
     task_id: int,
     body: ForceStartIn,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> TaskOut:
     """Start THIS task almost immediately by stopping a running one to make room — PREEMPTION, for when
     every slot is taken. In one request:
@@ -706,6 +629,7 @@ def force_start_task(
     kill, re-queue and the target's bump, so a failed re-queue rolls everything back and a failed target
     start still leaves the target ahead. Intents are pushed after that commit. The victim is body-borne,
     so write access is checked here, with one 422 for missing and unauthorized alike."""
+    _user = adopt_user(session, caller.actor)
     task = get_task_or_404(task_id, session)
     require_org_active(session, task.org_id)  # before the victim is touched (`app/org_gate.py`)
     # A body-borne object identity, treated like `add_task_dependency`'s: a scoped read, the guard's two
@@ -713,34 +637,26 @@ def force_start_task(
     # 422 for missing and not-yours, so no id is confirmed.
     victim = session.scalar(select(Task).where(Task.id == body.stop_task_id))
     if victim is None or not (
-        can_access(session, principal, "task", victim.id, mode=ObjectAccess.WRITE)
+        can_access(session, caller.principal, "task", victim.id, mode=ObjectAccess.WRITE)
         and key_scope_satisfied(
-            session, principal, TASK_SPEC, victim.id,
+            session, caller.principal, TASK_SPEC, victim.id,
             key=permission_key("tasks", "edit"), mode=ObjectAccess.WRITE,
         )
     ):
         raise HTTPException(status_code=422, detail=f"task {body.stop_task_id} not found")
 
     if task.id == victim.id:
-        raise HTTPException(
-            status_code=409, detail=f"task {task_id} cannot make room for itself — name another task"
-        )
+        raise HTTPException(status_code=409, detail=f"task {task_id} cannot make room for itself — name another task")
     if task.persona == PERSONA_EPIC:
-        raise HTTPException(
-            status_code=409, detail="force-start applies to a dispatched task, not an epic"
-        )
+        raise HTTPException(status_code=409, detail="force-start applies to a dispatched task, not an epic")
     if task.state in TRANSITION_BY_NAME["start"].idempotent_noop:
-        raise HTTPException(
-            status_code=409, detail=f"task {task_id} is already {task.state!r} — nothing to force"
-        )
+        raise HTTPException(status_code=409, detail=f"task {task_id} is already {task.state!r} — nothing to force")
     # An epic is `active` as a rollup, never a runner, so nothing to stop.
     if victim.persona == PERSONA_EPIC or victim.state not in _RUNNER_RUNNING_STATES:
-        raise HTTPException(
-            status_code=409, detail=f"task {victim.id} is not running, nothing to stop"
-        )
+        raise HTTPException(status_code=409, detail=f"task {victim.id} is not running, nothing to stop")
     # Vetted before anything is stopped, so a bad stand-in refuses with the victim untouched; after the 409s above,
     # which name the plainer problem.
-    push_as_id = _push_identity_or_422(session, task, body.push_as_id, principal, _user)
+    push_as_id = _push_identity_or_422(session, task, body.push_as_id, caller.principal, _user)
     # A task a monthly budget holds would never take the room it made: refuse before stopping anything.
     from app import budgets
 
@@ -751,7 +667,7 @@ def force_start_task(
     if project is None:
         raise HTTPException(status_code=422, detail=f"project {task.project_id} not found")
     # The same finalize `start_task` does, before the preemption's transaction (it commits).
-    _save_unsaved_draft_before_dispatch(task, session, principal)
+    _save_unsaved_draft_before_dispatch(task, session, caller.principal)
 
     # ── (1) Stop the victim — `stop_task`'s non-epic arm ────────────────────────────
     # Epic-then-child: the victim's `_start` locks its epic, so holding the child lock first would invert
@@ -765,9 +681,7 @@ def force_start_task(
     # Under a row lock: this is the guard; the plain read above was for the error message.
     if not _terminates_a_running_runner(victim.id, session):
         session.rollback()
-        raise HTTPException(
-            status_code=409, detail=f"task {victim.id} is not running, nothing to stop"
-        )
+        raise HTTPException(status_code=409, detail=f"task {victim.id} is not running, nothing to stop")
     stop = TRANSITION_BY_NAME["stop"]
     landed = session.execute(
         update(Task)
@@ -776,9 +690,7 @@ def force_start_task(
     )
     if landed.rowcount == 0:
         session.rollback()
-        raise HTTPException(
-            status_code=409, detail=f"task {victim.id} moved before it could be stopped — retry"
-        )
+        raise HTTPException(status_code=409, detail=f"task {victim.id} moved before it could be stopped — retry")
     merge_lane_state.lane_task_left_active(session, victim.id)
     # Before the `stop`/`ready` emits and in this transaction, so the row sorts above them.
     runner_terminations.record(session, victim.id, runner_terminations.CAUSE_OPERATOR_PREEMPT)
@@ -831,9 +743,69 @@ def force_start_task(
     session.expire_all()
 
     # ── (4) Start the target — the shared non-epic flip; it commits and owns its own 409 ────────────
-    return _dispatch_subtask_ready(
-        task, session, principal, run_requested=body.run_requested, push_as_id=push_as_id,
+    started = _dispatch_subtask_ready(
+        task, session, caller.principal, run_requested=body.run_requested, push_as_id=push_as_id,
     )
+    assert started is not None  # `out` defaults on: the row is read back
+    return started
+
+
+# ── The epic throttle, applied at once ─────────────────────────────────────────────────────────────
+def throttle_epic_children(
+    epic_id: int, max_running: int, session: Session,
+) -> list[fleet_verdicts.IssuedIntents]:
+    """Bring epic `epic_id`'s running subtasks down to `max_running` now: the excess `active` ones, the most recently
+    launched first (their hold's `worktrees.dispatched_at`, else — a MicroVM run — `github_synced_at`), go back to `ready` by `task_lifecycle.THROTTLED` — the
+    runner killed with its hold kept, the attempt refunded, an `operator_preempt` termination recorded. An
+    `awaiting_response` subtask with a live runner counts (`org_limits.runner_started`) but is never preempted, so its
+    question is not lost; the dispatch gate (`dispatch._parent_epic_throttled`) holds the rest. Does not commit:
+    returns the kill batches the caller sends after its commit (`send_minted_intents`)."""
+    edge = task_lifecycle.THROTTLED
+    # Epic-then-child, as `stop_task`'s cascade and `_start` take them.
+    session.execute(select(Task.id).where(Task.id == epic_id).with_for_update()).first()
+    launched = (
+        select(func.max(Worktree.dispatched_at))
+        .where(Worktree.task_id == Task.id, Worktree.state == slot_state.TASK)
+        .scalar_subquery()
+    )
+    running = session.execute(
+        select(Task.id, Task.state)
+        .where(Task.parent_task_id == epic_id, Task.archived_at.is_(None), org_limits.runner_started())
+        .order_by(func.coalesce(launched, Task.github_synced_at).desc().nullslast(), Task.id.desc())
+        .with_for_update()
+    ).all()
+    excess = len(running) - max_running
+    victims = [row.id for row in running if row.state in edge.sources][:max(excess, 0)]
+    issued: list[fleet_verdicts.IssuedIntents] = []
+    for victim_id in victims:
+        moved = session.execute(
+            update(Task)
+            .where(Task.id == victim_id, Task.state.in_(edge.sources))
+            .values(
+                state=edge.target,
+                # Charged at `ready → active`; a throttled run resumes in place, so it must not spend one.
+                dispatch_attempts=func.greatest(Task.dispatch_attempts - 1, 0),
+                # The transition watermark: the kept hold now reads as parked (`org_limits.parked_hold_clause`).
+                github_synced_at=func.now(),
+                **_RUNNER_BINDING_CLEARED,
+                **actors.task_actor_values(session),
+            )
+        )
+        if moved.rowcount == 0:
+            continue
+        merge_lane_state.lane_task_left_active(session, victim_id)
+        runner_terminations.record(
+            session, victim_id, runner_terminations.CAUSE_OPERATOR_PREEMPT,
+            detail=f"its epic's throttle was lowered to {max_running}",
+        )
+        _, killed = kill_runner_keeping_hold(
+            victim_id, session, reason=fleet_verdicts.task_stopped_reason(victim_id), fresh_decision=True,
+        )
+        issued.extend(killed)
+        emit_console_event(session, entity="task", id=victim_id, action=READY)
+    if victims:
+        log.info("epic %s throttled to %s: %s back to ready", epic_id, max_running, victims)
+    return issued
 
 
 # ── Action route: complete ─────────────────────────────────────────────────────────────────────────
@@ -936,24 +908,34 @@ def apply_complete(
     # `advisor` included (owner decision; `runner_terminations.CAUSES`). Above the transition.
     if completed_a_running_runner:
         runner_terminations.record(session, task_id, cause)
+    elif (completed := session.get(Task, task_id)) is not None:
+        # No runner, but a Stop may have kept open rounds for a next run (`_QUESTIONS_KEPT_ANSWERABLE`) that
+        # `done` never makes: retire them, or they stay `open` for ever. The claim's own drop, so Reset-hidden
+        # history is kept here too.
+        runner_terminations.drop_kept_questions(session, completed)
+    # A hand-closed dispatch is settled by the operator: its outcome row ends `settled` like a runner's settle.
+    from app.outcome_ledger import writer as outcome_writer
+
+    outcome_writer.end_row(session, task_id, end_kind=outcome_writer.END_SETTLED, reason="operator_complete")
     # Two events, not a redundant double-emit: `complete` is the operator verb the activity log and epic
     # metrics read, while `done` is what enqueues the done-actions (`app/durable/task_done.py`: Jira comment, re-tag,
     # epic report), with no sweep behind it. Guarded by the write-site drift scanner.
     merge_lane_state.lane_task_left_active(session, task_id)
     emit_console_event(session, entity="task", id=task_id, action="complete")
-    emit_console_event(session, entity="task", id=task_id, action=DONE)
-    session.commit()
+    emit_console_event(session, entity="task", id=task_id, action=DONE, commit=True)
     return True
 
 
 @router.post("/{task_id}/complete", response_model=TaskOut)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",))
+@on_session
 def complete_task(
+    session: Session,
     task_id: int,
     body: Optional[CompleteTaskIn] = None,
+    # Composed in-process by its callers with an explicit pair (`set_task_state`), so the two dependencies stay.
     _user: AdminUser = Depends(require_user),
     principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
 ) -> TaskOut:
     """Close a Task out as `done` by operator decision — the table's `complete` transition executed. Any task
     but a `done` one, `draft` and `ready` included (the table row explains); `done` 409s, since a second
@@ -964,6 +946,7 @@ def complete_task(
 
     The transition is `apply_complete`, shared with the chat's `/exit`; this route adds the 409, the epic
     rollup and the final-report tail. The optional body carries the outcome (`CompleteTaskIn`)."""
+    _user = adopt_user(session, _user)
     task = get_task_or_404(task_id, session)
     # Read before the commit refreshes `task.state`. A hand-completed spent child stops holding its epic
     # failed (owner decision).
@@ -979,10 +962,7 @@ def complete_task(
             # Unreachable for any state in the vocabulary; kept for legacy/orphaned rows, failing closed like
             # `transitions_from`.
             hint = "that state is outside the task lifecycle vocabulary, so no operator verb applies to it"
-        raise HTTPException(
-            status_code=409,
-            detail=f"task {task_id} is '{current.state}' — {hint}",
-        )
+        raise HTTPException(status_code=409, detail=f"task {task_id} is '{current.state}' — {hint}")
     # Before the rollup: a still-failed epic would fail `state == ACTIVE` and never reach `done`.
     if recovered_a_failed_child:
         _reevaluate_epic_child_failure(recovered_childs_parent_id, session)

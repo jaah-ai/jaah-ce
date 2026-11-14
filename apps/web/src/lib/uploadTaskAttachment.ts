@@ -81,7 +81,7 @@ export function uploadTaskAttachment(taskId: number, file: File): Promise<Attach
 
 /** The subject's cached attachment list (`TaskAttachmentsField`, `lib/cachedRead.ts`), forgotten after EVERY write to
  *  it — this module's uploads and each `DELETE …/attachments/{id}` — so the form's next mount reads the server, not a
- *  list from before the write (the Answer tab and a pasted image write outside the field). */
+ *  list from before the write (the Q&A tab and a pasted image write outside the field). */
 export function forgetSubjectAttachments(subject: CommentSubject): void {
   forgetCachedRead(['subject-attachments', subject.kind, subject.id])
 }

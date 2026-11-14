@@ -20,6 +20,7 @@ from uuid import UUID
 
 from sqlalchemy import text
 
+from app.tenancy.inherit_trigger import interpolable
 # Imported rather than re-spelled: `keys.py` is the single home of the identifier shape.
 from app.tenancy.keys import (
     ORG_COLUMN,
@@ -37,14 +38,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 
 def _identifier(value: str, what: str) -> str:
-    """`value`, if it is a bare identifier of the shape this schema uses — otherwise a refusal.
-
-    Refuses rather than quotes, like `keys.py`. `fullmatch` because `$` matches before a newline."""
-    if not isinstance(value, str) or not _IDENTIFIER_RE.fullmatch(value):
-        raise ValueError(
-            f"{what} needs quoting and this statement interpolates bare; got {value!r}"
-        )
-    return value
+    """`value`, if it is a bare identifier of the shape this schema uses (`keys.py`) — otherwise a refusal
+    (`fullmatch`, because `$` matches before a newline: `inherit_trigger.py`)."""
+    return interpolable(value, what, pattern=_IDENTIFIER_RE, need="needs quoting and this statement interpolates bare")
 
 
 def child_tables_of(parent_table: str) -> dict[str, tuple[str, ...]]:
@@ -311,7 +307,7 @@ def rehome_set(
             )
         counts = ", ".join(f"(SELECT count(*) FROM a{index})" for index in range(len(component)))
         row = session.execute(text(f"WITH {', '.join(ctes)} SELECT {counts}"), params).one()
-        moved.update(zip(component, row))
+        moved.update(zip(component, row, strict=False))
     return moved
 
 

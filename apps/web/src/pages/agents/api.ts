@@ -5,6 +5,7 @@
 
 import { ApiError, apiDetail, del, get, patch, post } from '../../api'
 import { readAsOnce } from '../../lib/actAs'
+import { humanize } from '../../lib/humanize'
 import type { OrgRef } from '../../types'
 
 /** `AgentOut`: an org's own agent, or a catalog connector (`is_catalog`, with this org's `enabled`). */
@@ -61,14 +62,9 @@ export const DISTRIBUTION_LABEL: Readonly<Record<NonNullable<RegistryEntry['dist
 
 const LANGUAGE_LABEL: Readonly<Record<string, string>> = { python: 'Python', typescript: 'TypeScript', ...DISTRIBUTION_LABEL }
 
-/** A value a newer server added: its words, capitalised ("some_kind" → "Some kind"), never the raw token. */
-const spelled = (value: string) => {
-  const words = value.replace(/_/g, ' ')
-  return words.charAt(0).toUpperCase() + words.slice(1)
-}
-
-export const agentTypeLabel = (value: string): string => (value ? AGENT_TYPE_LABEL[value] ?? spelled(value) : '')
-export const languageLabel = (value: string): string => (value ? LANGUAGE_LABEL[value] ?? spelled(value) : '')
+/* A value a newer server added reads as its words (`humanize`), never the raw token. */
+export const agentTypeLabel = (value: string): string => (value ? AGENT_TYPE_LABEL[value] ?? humanize(value) : '')
+export const languageLabel = (value: string): string => (value ? LANGUAGE_LABEL[value] ?? humanize(value) : '')
 
 /** `ChoiceOut`: one picker entry. A disabled one carries the sentence saying why. */
 export type AgentChoice = {
@@ -124,7 +120,29 @@ export const updateAgent = (id: string, body: AgentEdit) => patch<Agent>(`/api/a
 export const refreshAgent = (id: string) => post<Agent>(`/api/agents/${encodeURIComponent(id)}/refresh`)
 export const deleteAgent = (id: string) => del(`/api/agents/${encodeURIComponent(id)}`)
 
-export const listCatalog = () => get<Agent[]>('/api/agent-catalog')
+
+/** `MarketplaceEntryOut` (`apps/api/app/routes/agent_marketplace.py`): one agent this org can use, every figure
+ *  Jaah's own — never one its publisher reported. */
+export type MarketplaceKind = 'builtin' | 'org_agent' | 'catalog' | 'registry'
+export type QuotaState = 'ok' | 'tiered' | 'blocked' | 'no_account' | 'not_applicable'
+export type LedgerMetric = { key: string; value: number; low: number | null; high: number | null }
+export type MarketplaceEntry = {
+  kind: MarketplaceKind
+  id: string | null
+  provider: string | null
+  display_name: string
+  description: string
+  personas: { name: string; label: string }[]
+  cost_band: { band: '$' | '$$' | '$$$'; low_usd: number; high_usd: number } | null
+  availability: { enabled: boolean; capable_nodes_online: number; quota_state: QuotaState }
+  router: { eligible: boolean; reason: string }
+  ledger: { state: 'no_ledger' | 'insufficient' | 'ok'; n: number; metrics: LedgerMetric[] | null }
+  enable_refusal: string | null
+  removed: boolean
+  /** Why the agent can no longer run (an SDK v1 agent), or null: never enabled, never routed. */
+  unsupported: string | null
+}
+export const listMarketplace = () => get<MarketplaceEntry[]>('/api/agent-marketplace')
 export const setConnectorEnabled = (id: string, enabled: boolean) =>
   post<Agent>(`/api/agent-catalog/${encodeURIComponent(id)}/${enabled ? 'enable' : 'disable'}`)
 export const publishConnector = (body: AgentRegistration) => post<Agent>('/api/agent-catalog', body)
@@ -172,11 +190,6 @@ export function refusalSentences(err: unknown, fallback: string): string[] {
     }
   }
   return [apiDetail(err, fallback)]
-}
-
-/** The commit as people read it: seven characters, or null before the first snapshot. */
-export function shortCommit(sha: string | null | undefined): string | null {
-  return sha ? sha.slice(0, 7) : null
 }
 
 /** "Name · v1.2.0" — an agent named for people, never by id or slug (AC-4). */

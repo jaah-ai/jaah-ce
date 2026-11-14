@@ -1,0 +1,42 @@
+slug = "gong"
+label = "Gong"
+category = "crm"
+vendor_docs_url = "https://help.gong.io/docs/receive-access-to-the-api"
+summary = "Read Gong calls, transcripts, users and deal activity with a Gong API access key."
+
+[[auth]]
+kind = "basic"
+fields = [
+  { key = "base_url", label = "API base URL", kind = "url", required = true, default = "https://api.gong.io", help = "Your company's API address, shown at the top of Gong's Admin center > Settings > Ecosystem > API page; keep https://api.gong.io unless that page names another" },
+  { key = "access_key", label = "Access key", kind = "secret", required = true, help = "In Gong, open Admin center > Settings > Ecosystem > API, select Get API key, name it Jaah, select Get API key again and copy the Access key" },
+  { key = "access_key_secret", label = "Access key secret", kind = "secret", required = true, help = "Shown beside the access key in the same Get API key window; copy it before closing, because Gong never shows it again" },
+]
+
+[test]
+path = "{base_url}/v2/workspaces"
+auth = { basic = ["access_key", "access_key_secret"] }
+list_field = "workspaces"
+
+[docs]
+agent_uses = [
+  "List calls in a date range and read their participants, topics and trackers",
+  "Read call transcripts to summarise a deal or pull customer quotes",
+  "Read users and workspaces to know who ran a call",
+  "Read activity and interaction stats for coaching reports",
+]
+prerequisites = [
+  "A Gong technical administrator, who alone can create API keys",
+]
+limitations = [
+  "A key reaches every call in the company, whatever the creating admin's own permissions; treat it as company-wide access",
+  "Gong limits the API to 3 calls per second and 10,000 calls per day per company by default",
+  "A key may carry an expiry (TTL) and a trusted-IP list set when it was created; a key restricted to IPs must allow the Jaah control plane and runners",
+]
+troubleshooting = [
+  { symptom = "Test says Gong rejected the access key (401)", fix = "The key was revoked, expired (its TTL ran out) or the secret was mistyped. Create a new key under Admin center > Settings > Ecosystem > API and select Replace on the secret" },
+  { symptom = "Test says Gong rejected the access key (403)", fix = "The key has a trusted-IP list that does not include the address Jaah calls from. Create a key without the IP restriction, or ask Gong support to add Jaah's addresses" },
+  { symptom = "Test says Gong cannot be reached at that address", fix = "The API base URL is wrong. Copy the base URL shown on Gong's API settings page, or put back https://api.gong.io" },
+]
+faq = [
+  { q = "Why does Gong need two values", a = "Gong authenticates with HTTP Basic: the access key is the user name and the access key secret the password. Jaah sends them that way" },
+]

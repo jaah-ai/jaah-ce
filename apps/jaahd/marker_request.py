@@ -3,8 +3,8 @@ the one home of what `upgrade_request.py`, `gha_request.py` and `nodelink_reques
 posture gate, the marker's path and its sandbox refusal, the monotonic floor's arithmetic, the write
 and every operator sentence about it: `MarkerChannel`), so each of those modules is a thin declaration
 plus its own throttle ladder. `uninstall_request.py`, `root_grow_request.py` and `disk_reclaim_trigger.py`
-use only where their marker lives (`marker_path`) and the node-posture gates (`requests_enabled`,
-`root_request_enabled`).
+use only where their marker lives (`marker_path`), the node-posture gates (`requests_enabled`,
+`root_request_enabled`) and the bare write (`write_empty`).
 
 The marker is EMPTY — a security property: anything this unprivileged process wrote into it would
 become attacker-chosen input to a root unit (apt versions, runner argv, mount options). Every parameter
@@ -70,6 +70,16 @@ def write_marker(
         except OSError as exc:
             log.debug("marker-request: could not preserve %s's age: %s", target, exc)
     return stale_age, None
+
+
+def write_empty(target: Path, caller_log: logging.Logger, log_prefix: str) -> bool:
+    """Create `target` EMPTY (`write_bytes(b"")`, never `touch()`); a failure is the caller's WARNING, not raised."""
+    try:
+        target.write_bytes(b"")
+    except OSError as exc:
+        caller_log.warning("%s: could not create %s: %s", log_prefix, target, exc)
+        return False
+    return True
 
 
 def marker_path(env_name: str, parts: tuple[str, ...], *, sandbox_refusal: str | None = None) -> Path:

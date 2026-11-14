@@ -15,9 +15,21 @@ what RUNS reads `dispatched_dependants`, never `route.dependant`.
 
 from __future__ import annotations
 
+import importlib
+from collections.abc import Sequence
 from typing import Any
 
+from fastapi import FastAPI
 from fastapi import routing as _routing
+
+
+def include_all(app: FastAPI, specs: Sequence[str]) -> None:
+    """Register `app.<module>`'s router for each spec, in order — `"routes.tags"` includes `app.routes.tags.router`;
+    `"routes.auth:catalog_router"` names another attribute. Order is the route table's precedence, so a registry
+    is read top to bottom exactly as the include calls it replaces were."""
+    for spec in specs:
+        module_path, _, attr = spec.partition(":")
+        app.include_router(getattr(importlib.import_module(f"app.{module_path}"), attr or "router"))
 
 
 def flat_routes(app: Any) -> list[Any]:

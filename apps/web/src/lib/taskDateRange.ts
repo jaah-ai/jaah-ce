@@ -25,6 +25,7 @@ import {
   zonedDayFromInput,
   zonedIso,
 } from './zonedDay'
+import { formatZonedSpan } from './zonedTime'
 
 export type TaskDateRangeId = 'all' | 'today' | 'recent' | 'wider' | 'exact'
 
@@ -179,3 +180,23 @@ export function dateRangePeriodLabel(id: TaskDateRangeId, from: string, to: stri
   }
 }
 
+
+/**
+ * AN EXACT WINDOW OF INSTANTS (`?after=`/`?before=`, `lib/taskUrlFilters.ts`) as wire bounds, sent VERBATIM —
+ * the link already chose the instants, so no calendar applies. `null` when neither is set, so the caller
+ * falls back to the Period choice: an exact window overrides it while present.
+ */
+export function instantWindowBounds(after: string, before: string): DateRangeBounds | null {
+  if (after === '' && before === '') return null
+  const bounds: DateRangeBounds = {}
+  if (after !== '') bounds.updatedAfter = after
+  if (before !== '') bounds.updatedBefore = before
+  return bounds
+}
+
+/** The same window as a chip title in `zone`: `Oct 30, 09:00 – 17:00 UTC`, `From …`, `Until …`. */
+export function instantWindowLabel(after: string, before: string, zone: string, now: Date = new Date()): string {
+  if (after === '') return `Until ${formatZonedSpan(before, null, zone, now).start}`
+  const span = formatZonedSpan(after, before === '' ? null : before, zone, now)
+  return span.end === null ? `From ${span.start}` : `${span.start} – ${span.end}`
+}

@@ -32,6 +32,22 @@ NODE_CREDENTIAL_PREFIX = "account_api_key:"
 # never leave the spillover pool.
 API_KEY_REF_PREFIX = "apikey:"
 
+# The optional, non-secret key beside an Anthropic API key in its credential's config, naming the workspace an
+# UNSCOPED key must send on every request (`anthropic-workspace-id`); Anthropic refuses such a key without it.
+WORKSPACE_ID_CONFIG_KEY = "workspace_id"
+
+# An Anthropic workspace ID as the Console shows it. It rides a header line (`ANTHROPIC_CUSTOM_HEADERS` is
+# newline-separated `Name: value`), so no whitespace or separators: anything looser could inject a header.
+# Read with `fullmatch`: `$` alone admits a trailing newline.
+_WORKSPACE_ID_RE = re.compile(r"wrkspc_[A-Za-z0-9]+")
+
+
+def is_valid_workspace_id(value):
+    """Whether `value` is an Anthropic workspace ID (`wrkspc_` + alphanumerics). Blank is "none", not valid:
+    callers treat it before asking."""
+    return _WORKSPACE_ID_RE.fullmatch(str(value or "")) is not None
+
+
 # ── The one PARSER of the credential name (both sides) ────────────────────────────────────────────────
 
 

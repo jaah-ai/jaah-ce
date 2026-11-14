@@ -2,12 +2,7 @@ import { useCallback, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
-import WorktreePool, {
-  deleteSlot,
-  isSyncEligible,
-  stopSlotStack,
-  syncSlotGit,
-} from '../components/WorktreePool'
+import WorktreePool, { deleteSlot, stopSlotStack } from '../components/WorktreePool'
 import { releaseSlot } from '../lib/slotRelease'
 import WorktreeToolbar from '../components/worktrees/WorktreeToolbar'
 import { useConfirm } from '../components/ConfirmDialog'
@@ -39,6 +34,7 @@ import {
 import type { NodeRecord, Worktree } from '../types'
 import PageHeader from '../ui/PageHeader'
 import { slotIdentity } from '../lib/poolSlot'
+import { useOtherOrgOf } from '../ui/OrgIndicator'
 
 /* ── /worktrees — the fleet's pool ─────────────────────────────────────────────────────────────────
  *
@@ -81,12 +77,11 @@ export type WorktreePoolView = {
 
 /** The verbs as one closed set: each id keys three MAPS (button, greying run, report), so a drifted
  *  literal would fail silently — no progress, no report, double-firable mid-run. */
-const SYNC = 'sync'
 const STOP = 'stop-stack'
 const RELEASE = 'release'
 /** `delete`, the word on screen (the route path is still `POST .../erase` for external clients). */
 const DELETE = 'delete'
-type BulkVerbId = typeof SYNC | typeof STOP | typeof RELEASE | typeof DELETE
+type BulkVerbId = typeof STOP | typeof RELEASE | typeof DELETE
 
 /* The host joins the identity once a selection spans nodes: `<project>#<number>` repeats across hosts, so
    two nodes' slots read as the same four named twice — and a Delete would erase both. Qualified only when
@@ -155,6 +150,8 @@ export default function Worktrees() {
   )
   const [confirm, confirmDialog] = useConfirm()
   const can = useCan()
+  /* An operator's release of another org's slot goes as that org (`lib/slotRelease.ts::releaseSlot`). */
+  const otherOrgOf = useOtherOrgOf()
   const { admin } = useAuth()
   /* The org-admin verdict off the principal (not a grantable key; `pool_slots.require_slot_writer` requires
      it beyond `worktrees:delete`), as the panel's own Delete. Named `canErase` after the route (`.../erase`). */
@@ -188,7 +185,6 @@ export default function Worktrees() {
   /* ── The bulk verbs ─────────────────────────────────────────────────────────────────────────────
      Each imports the row's own per-slot call so bulk and single presses cannot drift. Offered only while a
      picked row can take it, and saying why when none can. */
-  const syncable = selectedSlots.filter(isSyncEligible)
   const stoppable = selectedSlots.filter(s => s.stack_state === 'up' && s.may_edit)
   const releasable = selectedSlots.filter(s => s.state !== 'free' && s.may_edit)
 
@@ -196,44 +192,32 @@ export default function Worktrees() {
      again. The report names each slot by `slotIdentity` (the node joins only in the confirm, `identityOf`). */
   const { runs, reports, verb } = useBulkRuns<Worktree, BulkVerbId>({
     identity: slotIdentity,
+    confirm,
     onBatchClean: clearSelection,
   })
 
   const bulkActions: BulkAction[] = [
     verb({
-      id: SYNC, label: 'Sync', icon: '⟳', rows: syncable,
-      noneWhy: 'No picked slot is behind its base with a clean tree you may drive',
-      doing: 'Syncing', done: 'Synced', run: syncSlotGit,
-    }),
-    verb({
-      id: STOP, label: 'Stop', icon: '⏹', destructive: true, rows: stoppable,
+      id: STOP, label: 'Stop', icon: '⏹', rows: stoppable,
       /* Both halves of `stoppable` (`stack_state === 'up' && may_edit`), so the reason matches the row. */
       noneWhy: 'No picked slot has a stack running that you may drive',
-      confirm: () => confirm({
-        title: `Stop ${stoppable.length} stack${stoppable.length === 1 ? '' : 's'}?`,
-        message: 'The containers stop; their data volumes and the slots are untouched.',
-        identity: identityOf(stoppable, nodeLabelFor),
-        confirmLabel: 'Stop',
-        destructive: true,
-      }),
+      ask: { noun: 'stack', message: 'The containers stop; their data volumes and the slots are untouched.', names: identityOf(stoppable, nodeLabelFor) },
       doing: 'Stopping', done: 'Stopped', run: stopSlotStack,
     }),
     verb({
-      id: RELEASE, label: 'Release', icon: '⏏', destructive: true, rows: releasable,
-      noneWhy: 'No picked slot is held by a task or a person you may drive',
-      confirm: () => confirm({
-        title: `Release ${releasable.length} slot${releasable.length === 1 ? '' : 's'}?`,
+      id: RELEASE, label: 'Release', icon: '⏏', rows: releasable,
+      noneWhy: 'No picked slot is held by a task you may drive',
+      ask: {
+        noun: 'slot',
         /* Says what Release does NOT do (delete), so it is pressed when it should be. */
         message: 'The slots, their uncommitted work and their stacks survive; the next dispatch '
           + 'resets a tree. A task holding one is NOT completed or deleted by this.',
-        identity: identityOf(releasable, nodeLabelFor),
-        confirmLabel: 'Release',
-        destructive: true,
-      }),
+        names: identityOf(releasable, nodeLabelFor),
+      },
       /* WRAPPED, never passed bare: `releaseSlot(slot, force = false)` under a fan-out calling
          `run(slot)` is one arity change from force-releasing every row, and BULK MUST NEVER FORCE
          (`lib/slotRelease.ts::releaseSlot`). */
-      doing: 'Releasing', done: 'Released', run: slot => releaseSlot(slot),
+      doing: 'Releasing', done: 'Released', run: slot => releaseSlot(slot, false, otherOrgOf(slot.org)),
     }),
     /* DELETE IS SUPERADMIN-ONLY, as the row's Delete and `erase_slot` (`require_superadmin` +
        `worktrees:delete`); withheld, not disabled — it is somebody else's button. No `deletable` filter:
@@ -241,9 +225,9 @@ export default function Worktrees() {
        No `noneWhy`: only the running reason is reachable (the bar renders nothing with zero picked). */
     ...(canErase
       ? ([verb({
-          id: DELETE, label: 'Delete', icon: '🗑', destructive: true, rows: selectedSlots,
-          confirm: () => confirm({
-            title: `Delete ${selectedSlots.length} slot${selectedSlots.length === 1 ? '' : 's'}?`,
+          id: DELETE, label: 'Delete', icon: '🗑', rows: selectedSlots,
+          ask: {
+            noun: 'slot',
             /* The confirm states what CANNOT stop this press (no occupancy refusal): every declaration
                goes, any runner is killed; a directory on an unreachable node stays and is named. */
             message: 'De-declares each slot AND deletes its directory on its node. Nothing is '
@@ -251,10 +235,8 @@ export default function Worktrees() {
               + 'task runner, a console session — is ENDED. Unpushed work is lost. A directory stays '
               + 'only if its node cannot be reached; each is named in the report. This cannot be undone.',
               // Same caveat as the drawer's copy (`WorktreePool.tsx`): one node-side behaviour.
-            identity: identityOf(selectedSlots, nodeLabelFor),
-            confirmLabel: 'Delete',
-            destructive: true,
-          }),
+            names: identityOf(selectedSlots, nodeLabelFor),
+          },
           /* `deleteSlot` takes only a slot (the route dropped `force`), so no wrapper is needed. */
           doing: 'Deleting', done: 'Deleted', run: deleteSlot,
           /* What a row's 200 still owes the operator:
@@ -283,7 +265,7 @@ export default function Worktrees() {
 
   /* The filtered count, silent when nothing is filtered. On `visible`, deliberately: it answers the
      FILTER question, so folding must not claim rows were filtered out. It rides the actions, not a subtitle:
-     a header with no title portals its actions onto the Automation strip, and a subtitle would pull them back
+     a header with no title portals its actions onto a hosting tab strip, and a subtitle would pull them back
      into a row of their own whenever a filter is set. */
   const filteredCount = activeWorktreeFilterCount(filters) === 0
     ? undefined

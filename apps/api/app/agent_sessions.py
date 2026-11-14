@@ -1,13 +1,15 @@
 """The closed vocabularies the `sessions` table carries — the single home of all three.
 
-A leaf module: imports nothing from `app` at module scope, because revision 0135 reads its CHECK
+A leaf module: imports nothing from `app` at module scope but the leaf `app/runner_causes.py`, because revision 0135 reads its CHECK
 domains from here. `STATUSES` and `TRANSCRIPT_STATUSES` are DB CHECKs; `END_REASONS` is not, since its
-larger half is owned by `app/runner_breaks.py` (see `end_reasons()`). `tests/test_sessions_schema.py`
+larger half is owned by `app/runner_causes.py` (see `end_reasons()`). `tests/test_sessions_schema.py`
 asserts both halves.
 """
 from __future__ import annotations
 
 from typing import Optional
+
+from app.runner_causes import CAUSES
 
 # ── status: is the SESSION running? ──────────────────────────────────────────────────────────────────
 # `ended` means the fate was observed (`end_reason` names it); `unknown` means nobody saw one, so a
@@ -163,8 +165,6 @@ def shown_ending(reason: Optional[str], detail: Optional[str]) -> tuple[Optional
     head, sep, rest = detail.partition(": ")
     if not sep or not rest.strip():
         return reason, detail
-    from app.runner_breaks import CAUSES
-
     if head == reason:
         return reason, rest
     if head in CAUSES and reason in inferred_ends():
@@ -181,9 +181,6 @@ def shown_ending(reason: Optional[str], detail: Optional[str]) -> tuple[Optional
 def end_reasons() -> tuple[str, ...]:
     """The full `end_reason` domain: the lifecycle outcomes, then every break cause.
 
-    Deferred import: `app.runner_breaks` reaches `app.routes.tasks` at module scope, which would pull
-    the route layer into migration 0135's import graph. Read causes through this; never re-spell them.
+    Read causes through this; never re-spell them.
     """
-    from app.runner_breaks import CAUSES
-
     return (*LIFECYCLE_END_REASONS, *CAUSES)

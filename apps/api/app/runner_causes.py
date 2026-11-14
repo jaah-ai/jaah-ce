@@ -1,8 +1,8 @@
 """The break-cause vocabulary: why a runner session broke instead of finishing (SSOT).
 
-A leaf on purpose — no `app.` imports — so both `app/runner_breaks.py` (the incident collection, which
-re-exports it) and `app/runner_terminations.py` (whose termination causes superset it) read one tuple
-without an import cycle through `app.routes.tasks`.
+A leaf on purpose — no `app.` imports — so the break route (`app/routes/agent/runner_liveness.py`), the
+session vocabulary (`app/agent_sessions.py`) and `app/runner_terminations.py` (whose termination causes
+superset it) read one tuple without an import cycle through `app.routes.tasks`.
 """
 from __future__ import annotations
 

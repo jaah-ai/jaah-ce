@@ -2,6 +2,7 @@ import type { JSX } from 'react'
 import Box from '@mui/material/Box'
 import type { SxProps, Theme } from '@mui/material/styles'
 import { CopyButton } from './CopyButton'
+import { RADIUS } from '../theme'
 
 /* A value the operator must copy out, offered TWO ways at once: a Copy button (`ui/CopyButton`) and
  * `user-select: all` monospace text. `navigator.clipboard` is missing in insecure contexts and can be refused
@@ -47,7 +48,7 @@ export function CopyableValue({
             fontFamily: 'monospace',
             border: 1,
             borderColor: 'divider',
-            borderRadius: 1,
+            borderRadius: RADIUS.sm,
             bgcolor: 'action.hover',
             userSelect: 'all',
           },
@@ -68,5 +69,3 @@ export function CopyableValue({
     </Box>
   )
 }
-
-export default CopyableValue

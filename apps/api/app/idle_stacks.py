@@ -8,11 +8,12 @@ import logging
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
-from app import fleet_verdicts, project_identity, slot_state
+from app import fleet_verdicts, project_identity, slot_state, task_lifecycle
 from app.operator_settings import reads as settings_reads
 from app.models.projects import Project
+from app.models.tasks import Task
 from app.models.worktrees import SlotIntent, Worktree
 from app.node_identity import names_by_id
 
@@ -28,35 +29,61 @@ def idle_stop_hours() -> float:
     return settings_reads.get_float("pool_idle_stop_hours")
 
 
+# Same, for a slot held by a task that is not running (`pool_held_idle_stop_hours`).
+def held_idle_stop_hours() -> float:
+    return settings_reads.get_float("pool_held_idle_stop_hours")
+
+
 def stop_idle_stacks(session, journal: "DecisionLog") -> int:
     """Decide which slots' compose stacks come down; returns how many `stop_stack` intents were minted.
 
     Every predicate arm is affirmative and every unknown refuses (the open-direction mistake is `./dc down`
-    under somebody's feet): not the main clone; `stack_up is True`; `session is False` (a failed probe
+    under somebody's feet): `stack_up is True`; `session is False` (a failed probe
     arrives None and refuses); `console == not_attached`; quiet past the window; and an `observed_at`
     stamp. The stamp is required: an intent with no observation has all-None preconditions, the node's
     guards fail closed on absence, and `refused_stale` does not retire, so it is re-refused forever.
 
-    A held slot is never stopped (a launch may be in flight before any session exists). Re-minting is
+    The window depends on the hold. A free slot: `pool_idle_stop_hours`. A `task` hold (a
+    stopped or queued task's stack held a node's RAM for hours): `pool_held_idle_stop_hours`, and only when
+    its task row exists, its state is not in `task_lifecycle.RUNNER_RUNNING_STATES`, and no launch is in
+    flight for the hold (`fleet_verdicts.own_unanswered_lease_since` is NULL — a launch may be under way
+    before any session exists). The hold itself is kept; a stop never takes volumes, so the stack comes
+    back when the task runs again. Re-minting is
     suppressed while one is pending for the current stamp only; an older stamp is permanently
     `refused_stale`, and suppressing on it would wedge the idle-stop.
 
     Every refusal and mint is journaled under the `idle-stop` point against the slot's subject; the
     return value counts only stacks that came down."""
-    hours = idle_stop_hours()
-    threshold_secs = int(hours * 3600)
-    candidates = session.scalars(
-        select(Worktree).where(
-            Worktree.number != 0,
+    free_hours = idle_stop_hours()
+    held_hours = held_idle_stop_hours()
+    free_secs = int(free_hours * 3600)
+    held_secs = int(held_hours * 3600)
+    # One read for every candidate's task state and in-flight launch (outer join: a missing task row reads
+    # None and refuses below).
+    rows = session.execute(
+        select(
+            Worktree,
+            Task.state,
+            fleet_verdicts.own_unanswered_lease_since().label("lease_in_flight_since"),
+        )
+        .outerjoin(Task, Task.id == Worktree.task_id)
+        .where(
             Worktree.stack_up.is_(True),
             Worktree.session.is_(False),
             Worktree.console == fleet_verdicts.CONSOLE_NOT_ATTACHED,
-            Worktree.age_last_used_secs >= threshold_secs,
+            # Each kind of slot past its own window; the hold is re-checked per candidate below.
+            or_(
+                Worktree.age_last_used_secs >= free_secs,
+                and_(Worktree.state == slot_state.TASK, Worktree.age_last_used_secs >= held_secs),
+            ),
             Worktree.observed_at.is_not(None),
         )
     ).all()
-    if not candidates:
+    if not rows:
         return 0
+    candidates = [row[0] for row in rows]
+    # Captured with the scan: `task_id` pins the task the state belongs to against the re-read below.
+    scanned = {row[0].id: (row[0].task_id, row[1], row[2]) for row in rows}
     # The suppression key is the intent's own identity tuple on ids (a display name breaks on rename).
     # Do not `str()` either side: both are `nodes.id` uuids and `str(UUID) != UUID`, so the tuple would
     # match nothing and every pass would re-mint.
@@ -102,13 +129,12 @@ def stop_idle_stacks(session, journal: "DecisionLog") -> int:
         # A fresh read, not `tree.state`: the candidate SELECT never filtered on state, so this catches a hold
         # taken since that scan.
         hold = slot_state.read(session, worktree_id=tree.id)
-        if hold is not None and hold.state != slot_state.FREE:
-            journal.record(
-                "idle-stop", "NOT STOPPED",
-                f"the slot was {hold.state} when re-read, and a held slot is never stopped",
-                subject=subject,
-            )
+        refusal = _hold_refusal(hold, scanned[tree.id], tree.age_last_used_secs, free_secs, held_secs)
+        if refusal:
+            journal.record("idle-stop", "NOT STOPPED", refusal, subject=subject)
             continue
+        is_held = hold is not None and hold.state != slot_state.FREE
+        hours = held_hours if is_held else free_hours
         down_cmd = down_cmds.get(tree.project_id, "")
         if not down_cmd:
             # Not minted: the node fails closed on an intent naming no command, every tick, without retiring it.
@@ -126,6 +152,7 @@ def stop_idle_stacks(session, journal: "DecisionLog") -> int:
         # One home for the numbers, read by both the intent and the ledger entry.
         idle_note = (
             f"idle {tree.age_last_used_secs / 3600.0:.1f}h with no session (window {hours:g}h)"
+            + (f", task {scanned[tree.id][1]}" if is_held else "")
         )
         intent = fleet_verdicts.build_stop_stack_intent(
             tree.project_id, name, tree.number,
@@ -156,3 +183,23 @@ def stop_idle_stacks(session, journal: "DecisionLog") -> int:
             log.info("lease-drain: idle-stop — stop_stack minted for %s#%s on node %s",
                      recorded["project"], recorded["number"], node_names.get(tree.node_id, "unknown"))
     return minted
+
+
+def _hold_refusal(hold, scanned, age_secs: int, free_secs: int, held_secs: int) -> str:
+    """Why this candidate's hold refuses the stop, or "" when it does not (rule: `stop_idle_stacks`)."""
+    if hold is None or hold.state == slot_state.FREE:
+        if age_secs < free_secs:
+            return f"a free slot quiet {age_secs / 3600.0:.1f}h, not past the idle window"
+        return ""
+    scanned_task_id, task_state, lease_in_flight_since = scanned
+    if hold.state != slot_state.TASK or hold.task_id != scanned_task_id:
+        return f"the slot was {hold.state} for another task when re-read"
+    if task_state is None:
+        return f"the holding task {hold.task_id} has no row, so it cannot be shown not running"
+    if task_state in task_lifecycle.RUNNER_RUNNING_STATES:
+        return f"the holding task is {task_state}"
+    if lease_in_flight_since is not None:
+        return "a launch into this hold is in flight (its lease_slot order is unanswered)"
+    if age_secs < held_secs:
+        return f"held by a {task_state} task, quiet {age_secs / 3600.0:.1f}h, not past the held window"
+    return ""

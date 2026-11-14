@@ -1,13 +1,14 @@
 """Billing: plans and their products, comps, subscriptions, invoices, checkouts and billing notices."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Optional
 from uuid import UUID
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
@@ -26,6 +27,7 @@ from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base, EntityMixin, _in_check, org_unique, OrgScoped, timestamp_column, UuidPkMixin
 from app.models.orgs import BILLING_PLAN_QUOTA_COLUMNS, ORG_LIMIT_COLUMNS
+from app.models.products import kind_fk
 
 
 # ── Billing (`app/billing/`) ─────────────────────────────────────────────────────────────────────────
@@ -119,8 +121,8 @@ class BillingPlan(EntityMixin, Base):
     whether its orgs may use NodeVault (revision 0381, off by default — read through `app/nodevault_policy.py`);
     `nodelink_allowed` whether its orgs may use NodeLink (revision 0405, off by default — read through
     `app/tenant_defaults.py`); `merge_lane_enabled` whether its orgs' runner PRs go through the merge lane (revision
-    0407, off by default — read only through `app/plan_terms.py`); `static_slots` how many static worktrees a project may hold on one node (revision 0390, 0 = none — read through
-    `app/static_slots_policy.py`). Its bundled products are `billing_plan_products` rows.
+    0407, off by default — read only through `app/plan_terms.py`); `static_slots` is unread since static worktrees
+    went (a later contraction drops it). Its bundled products are engine lines (`product_lines`).
 
     The row keyed `_default` (`app/plan_terms.py::DEFAULTS_KEY`, revision 202610211200) is no plan an org buys: it
     is every plan's fallback. A field a plan names in `inherits` (`plan_terms.INHERITABLE`) reads `_default`'s
@@ -139,6 +141,10 @@ class BillingPlan(EntityMixin, Base):
             name="ck_billing_plans_cron_min_period_seconds",
         ),
         CheckConstraint("static_slots >= 0", name="ck_billing_plans_static_slots"),
+        CheckConstraint(
+            "outcome_survival_days >= 1 AND outcome_survival_days <= 365",
+            name="ck_billing_plans_outcome_survival_days",
+        ),
         CheckConstraint("min_agents IS NULL OR min_agents >= 1", name="ck_billing_plans_min_agents"),
         CheckConstraint(
             "max_agents IS NULL OR max_agents >= coalesce(min_agents, 1)", name="ck_billing_plans_max_agents",
@@ -180,7 +186,7 @@ class BillingPlan(EntityMixin, Base):
     stripe_account_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     livemode: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     duration_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    # The free trial a purchase of this plan opens with, once per org (`app/billing/subscriptions.py::trial_days`);
+    # The free trial a purchase of this plan opens with, once per org (`app/products/lanes/plan.py::trial_days`);
     # NULL = none (revision 202610201437).
     trial_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     # The agent cap a per-agent plan's trial runs under when the plan has no Max agents (`plan_terms.trial_agents_of`);
@@ -195,9 +201,42 @@ class BillingPlan(EntityMixin, Base):
     nodevault_allowed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("false"))
     nodelink_allowed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("false"))
     merge_lane_enabled: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("false"))
+    # Production QA's behaviour switch (revision 202611012000, off on every plan; `app/production_qa/`).
+    production_qa: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("false"))
+    # Benchmark mode's switch (revision 202611020500, off on every plan; `app/outcome_ledger/benchmark.py`).
+    benchmark_mode: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("false"))
+    # Agent performance's switch (revision 202611021400, off on every plan; the outcome ledger's console surfaces).
+    agent_performance: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("false"))
+    # Outgoing webhooks' switch (revision 202611110110, ON on every plan; `app/webhooks/`).
+    webhooks_enabled: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("true"))
+    # Custom pipelines' switch (revision 202611140800, ON on `business` only; `app/releases/basics.py`).
+    pipeline_custom_enabled: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("false"))
+    # Custom domains' switch (revision 202611141100, OFF on every plan; `app/hosted_apps/domains.py`).
+    custom_domains_allowed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("false"))
+    # Node groups' switch (revision 202611141900, ON on `business` only; `app/placement_groups.py`).
+    placement_groups_allowed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("false"))
+    # Easy Mode's retired switch (revision 202611032000; read by nothing since every cloud org may host apps, dropped
+    # once no release reads it) and its caps, each NULL = `(default)`'s (`app/plan_terms.py::EASY_MODE_TERMS`; the
+    # sponsorship end NULL = none).
+    easy_mode: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("false"))
+    easy_mode_apps: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    easy_mode_requests_month: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    easy_mode_egress_gb_month: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    easy_mode_db_mb: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    easy_mode_concurrency: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Revision 202611101910.
+    easy_mode_emails_month: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Revision 202611141100.
+    easy_mode_domains_per_app: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    easy_mode_sponsor_end: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     static_slots: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # Days after merge a build's outcome becomes `survived` (read through `app/plan_terms.py`).
+    outcome_survival_days: Mapped[int] = mapped_column(Integer, nullable=False, server_default="14")
     # Whether this plan's orgs may mark nodes MicroVM (revision 202610111900, ON by default).
     microvm_allowed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("true"))
+    # Whether this plan's orgs may run Whole-node VM nodes (revision 202611100100, OFF by default — read only through
+    # `app/plan_terms.py`).
+    node_vm_allowed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("false"))
     # Whether this plan's orgs may use playbooks (revision 202610122200, OFF by default — read only through
     # `app/plan_terms.py`).
     playbooks_enabled: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("false"))
@@ -237,6 +276,9 @@ class BillingPlan(EntityMixin, Base):
     # Tenant email (revision 202610240100): Gmail connections and hosted trigger addresses, ON — read only through
     # `app/plan_terms.py`.
     tenant_email_allowed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("true"))
+    # Intelligent routing (revision 202611012100): the agent router's Recommend and Auto modes (`app/agent_router/`),
+    # OFF — read only through `app/plan_terms.py`.
+    intelligent_routing: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True, server_default=text("false"))
     # The plan whose switches this plan also turns on, transitively (`plan_terms.plan_chain`; caps, prices,
     # duration and the then plan are never inherited), and the plan an org moves to once this plan's end passes
     # (`app/plan_rollover.py`). NULL = none.
@@ -254,8 +296,8 @@ class BillingPlan(EntityMixin, Base):
 
 class PlanTermsSnapshot(OrgScoped, Base):
     """Every org's effective plan terms as they stood when the plan engine gained inheritance and rollover
-    (revision 202610171800): the before-image Customers › Plan terms check compares `plan_terms.effective` with,
-    so a deploy that changed an existing org's terms shows. Written once by that migration, never after."""
+    (revision 202610171800). Written once by that migration, never after. The operator's Plan terms check that
+    compared it is retired; `billing.plans.ever_used` is its one remaining reader, and the table awaits its drop."""
 
     __tablename__ = "plan_terms_snapshots"
     __table_args__ = (
@@ -276,103 +318,6 @@ class PlanTermsSnapshot(OrgScoped, Base):
     taken_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     #: The migration revision that wrote it.
     revision: Mapped[str] = mapped_column(Text, nullable=False)
-
-
-#: `billing_plan_products.kind` / `org_plan_products.kind`: what a plan bundles (PRD D-5) — a Shared node of a
-#: tier, a Dedicated node of a size, Jaah AI credit each billing month, or Live Cast (how many projects may be
-#: published, `app/live_cast/entitlement.py`).
-PLAN_PRODUCT_KINDS = ("shared_node", "dedicated_node", "jaah_ai_credit", "live_cast")
-
-
-#: The kinds that make a node, so an `org_bundled_products` instance (Jaah AI credit's record is the ledger).
-BUNDLED_NODE_KINDS = ("shared_node", "dedicated_node")
-
-
-def _plan_product_checks(table: str) -> tuple[CheckConstraint, ...]:
-    """One product line's shape: its kind, a positive quantity, and the catalogue field(s) its kind needs."""
-    return (
-        _in_check("kind", PLAN_PRODUCT_KINDS, f"ck_{table}_kind"),
-        CheckConstraint("quantity >= 1", name=f"ck_{table}_quantity"),
-        CheckConstraint("credit_cents IS NULL OR credit_cents >= 0", name=f"ck_{table}_credit_cents"),
-        CheckConstraint("kind <> 'shared_node' OR tier_key IS NOT NULL", name=f"ck_{table}_shared_node"),
-        CheckConstraint(
-            "kind <> 'dedicated_node' OR (instance_type IS NOT NULL AND storage_gb IS NOT NULL)",
-            name=f"ck_{table}_dedicated_node",
-        ),
-        CheckConstraint("kind <> 'jaah_ai_credit' OR credit_cents IS NOT NULL", name=f"ck_{table}_jaah_ai_credit"),
-        CheckConstraint("kind <> 'live_cast' OR coalesce(backfill_tasks, 0) >= 1", name=f"ck_{table}_live_cast"),
-        CheckConstraint("backfill_tasks IS NULL OR kind = 'live_cast'", name=f"ck_{table}_backfill_tasks"),
-    )
-
-
-class _PlanProductLine:
-    """A product line's own columns, shared by a plan's line and an org's override line. The catalogue keys
-    (`tier_key`, `instance_type` + `storage_gb`) name `rental_prices` rows without a foreign key: the catalogue
-    is read, never changed, by bundles (PRD NC-2), so a write is validated against its active rows instead."""
-
-    kind: Mapped[str] = mapped_column(Text, nullable=False)
-    quantity: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
-    tier_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    instance_type: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    storage_gb: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    credit_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    #: A Live Cast line's backfill N: how many of a project's latest tasks are evaluated when it is published
-    #: (revision 202610130400). NULL on every other kind.
-    backfill_tasks: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
-
-
-class BillingPlanProduct(_PlanProductLine, EntityMixin, Base):
-    """One product a plan bundles, included in its price (PRD D-1, revision 0374). `name` is the line's label."""
-
-    __tablename__ = "billing_plan_products"
-    __table_args__ = (
-        *_plan_product_checks(__tablename__),
-        Index("ix_billing_plan_products_plan_id", "plan_id"),
-    )
-
-    plan_id: Mapped[UUID] = mapped_column(
-        ForeignKey("billing_plans.id", ondelete="CASCADE", name="fk_billing_plan_products_plan_id"), nullable=False
-    )
-
-
-class OrgPlanProduct(_PlanProductLine, EntityMixin, OrgScoped, Base):
-    """One line of an org's own product list, which replaces its plan's WHOLE list while
-    `orgs.products_overridden` is set (PRD D-6, revision 0374). `name` is the line's label."""
-
-    __tablename__ = "org_plan_products"
-    __table_args__ = (
-        org_unique(__tablename__),
-        *_plan_product_checks(__tablename__),
-        Index("ix_org_plan_products_org_id", "org_id"),
-    )
-
-
-#: `org_comps.end_mode`: never ends, ends at `ends_at`, or ends with the org's plan.
-COMP_END_MODES = ("never", "date", "plan")
-
-
-class OrgComp(_PlanProductLine, EntityMixin, OrgScoped, Base):
-    """A product the operator gives an org for free (a comp is a plan-bundle line with its
-    own end): one product line ADDED to its plan's or its override's list — it never sets `products_overridden` —
-    with an end of its own. `app/plan_bundles.py` claims a comp's node copies by `comp_id` and grants its Jaah AI
-    credit monthly, as a plan line's; at its end its copies follow the released lifecycle (warn → stop after
-    grace → delete, with Keep). `ended_at` is an operator's removal (`ended_by_id` who). `name` is the label."""
-
-    __tablename__ = "org_comps"
-    __table_args__ = (
-        org_unique(__tablename__),
-        *_plan_product_checks(__tablename__),
-        _in_check("end_mode", COMP_END_MODES, "ck_org_comps_end_mode"),
-        CheckConstraint("(end_mode = 'date') = (ends_at IS NOT NULL)", name="ck_org_comps_ends_at"),
-        Index("ix_org_comps_org_id", "org_id"),
-    )
-
-    end_mode: Mapped[str] = mapped_column(Text, nullable=False)
-    ends_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
-    ended_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
-    #: Provenance only, no foreign key (a user may be purged; the comp's record stays).
-    ended_by_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
 
 
 #: `customer_events.category` (`ck_customer_events_category`): the History feed's filter chips.
@@ -540,7 +485,7 @@ class BillingSetupAttempt(UuidPkMixin, OrgScoped, _BillingMirror, Base):
 
 class BillingCheckout(UuidPkMixin, OrgScoped, _BillingMirror, Base):
     """An org's self-serve purchase of a paid plan, from the confirm step to its first paid invoice
-    (`app/billing/subscriptions.py`). At most one LIVE checkout per (org, account, mode), so two tabs share
+    (`app/products/lanes/plan.py`). At most one LIVE checkout per (org, account, mode), so two tabs share
     one row — and so one `attempt`, and one idempotency key `checkout:{id}:subscribe:{attempt}`. `attempt`
     advances only when a first payment is declined, so a retry with a new card is a new request."""
 
@@ -630,6 +575,8 @@ class BillingNotice(UuidPkMixin, OrgScoped, Base):
     created_at: Mapped[datetime] = timestamp_column()
     resolved_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
     emailed_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
+    #: What raised it (`app/write_origin.py`), revision 202611130200. NULL on a row raised before the column.
+    origin: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class BillingNoticeRead(OrgScoped, Base):
@@ -687,7 +634,6 @@ class OrgBundledProduct(EntityMixin, OrgScoped, Base):
     __tablename__ = "org_bundled_products"
     __table_args__ = (
         org_unique(__tablename__),
-        _in_check("kind", BUNDLED_NODE_KINDS, "ck_org_bundled_products_kind"),
         _in_check("state", BUNDLED_PRODUCT_STATES, "ck_org_bundled_products_state"),
         CheckConstraint("ordinal >= 1", name="ck_org_bundled_products_ordinal"),
         # A plan's copies are one per (org, fingerprint, ordinal), a comp's one per (comp, fingerprint, ordinal):
@@ -706,7 +652,7 @@ class OrgBundledProduct(EntityMixin, OrgScoped, Base):
 
     fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
-    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, kind_fk("org_bundled_products"), nullable=False)
     node_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     hosting_id: Mapped[Optional[UUID]] = mapped_column(
         ForeignKey("node_rentals.id", ondelete="SET NULL", name="fk_org_bundled_products_hosting_id"), nullable=True
@@ -715,9 +661,105 @@ class OrgBundledProduct(EntityMixin, OrgScoped, Base):
     released_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
-    #: The comp this copy belongs to (`org_comps`); None for a copy of the plan's (or the override's) list.
-    #: CASCADE: a nulled pointer would make a comp's copy a plan copy. A comp is only ever ended, never deleted,
-    #: save by its org's purge.
+    #: The comp this copy belongs to (the product engine's comp line, `product_lines` owner `comp`); None for a copy
+    #: of the plan's (or the override's) list. CASCADE: a nulled pointer would make a comp's copy a plan copy. A comp
+    #: is only ever ended, never deleted. Checked at commit (revision 202611141700).
     comp_id: Mapped[Optional[UUID]] = mapped_column(
-        ForeignKey("org_comps.id", ondelete="CASCADE", name="fk_org_bundled_products_comp_id"), nullable=True
+        ForeignKey("product_lines.id", ondelete="CASCADE", name="fk_org_bundled_products_comp_id", deferrable=True,
+                   initially="DEFERRED"),
+        nullable=True,
     )
+
+
+#: `billing_stripe_writes.outcome`: Stripe applied it, refused it (a 4xx, a refused key), or could not be reached.
+STRIPE_WRITE_OUTCOMES = ("ok", "refused", "unavailable")
+
+
+class BillingStripeWrite(UuidPkMixin, Base):
+    """One MUTATING call the gateway sent to Stripe (`app/billing/gateway.py::StripeGateway._call`), whatever came
+    of it: Jaah's own Stripe write log. `origin` is the entry point that caused it (`app/write_origin.py`; `unknown`
+    is a reconcile finding). `customer_org_id` is the org of the Stripe customer the call was about when one is
+    known — a copied pointer, never the tenancy column `org_id`: the log is the deployment's. Pruned after 400 days
+    (`app/billing/reconcile.py::RETENTION`). A history record, never edited."""
+
+    __tablename__ = "billing_stripe_writes"
+    __table_args__ = (
+        _in_check("outcome", STRIPE_WRITE_OUTCOMES, "ck_billing_stripe_writes_outcome"),
+        Index("ix_billing_stripe_writes_at", "at"),
+        Index("ix_billing_stripe_writes_origin_at", "origin", "at"),
+        Index("ix_billing_stripe_writes_customer_org_at", "customer_org_id", "at",
+              postgresql_where=text("customer_org_id IS NOT NULL")),
+    )
+
+    at: Mapped[datetime] = timestamp_column()
+    method: Mapped[str] = mapped_column(Text, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
+    origin: Mapped[str] = mapped_column(Text, nullable=False)
+    customer_org_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    #: The API release that sent it (`app/version.py::TOOL_VERSION`).
+    release: Mapped[str] = mapped_column(Text, nullable=False)
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    stripe_request_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    #: The Stripe object it created or changed (the response's id; the target id when refused).
+    object_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    stripe_account_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    livemode: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    #: Stripe's refusal sentence, or why it could not be reached. NULL when it went through.
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+#: `billing_reconcile_runs.trigger` and `.outcome`.
+RECONCILE_TRIGGERS = ("nightly", "manual")
+RECONCILE_OUTCOMES = ("running", "ok", "failed")
+
+
+class BillingReconcileRun(UuidPkMixin, Base):
+    """One read-only comparison of what Jaah expects in Stripe with what Stripe holds (`app/billing/reconcile.py`).
+
+    `summary` is the per-kind counts the screen's first table shows; `lines` every object compared (org, kind, what,
+    Stripe's and Jaah's values), so the screen lists everything a run looked at, not only what differed. Its
+    differences are `billing_reconcile_diffs`. Pruned with its diffs after `reconcile.RUN_RETENTION`."""
+
+    __tablename__ = "billing_reconcile_runs"
+    __table_args__ = (
+        _in_check("trigger", RECONCILE_TRIGGERS, "ck_billing_reconcile_runs_trigger"),
+        _in_check("outcome", RECONCILE_OUTCOMES, "ck_billing_reconcile_runs_outcome"),
+        Index("ix_billing_reconcile_runs_started_at", "started_at"),
+    )
+
+    started_at: Mapped[datetime] = timestamp_column()
+    finished_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
+    trigger: Mapped[str] = mapped_column(Text, nullable=False)
+    outcome: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'running'"))
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    #: Who pressed Run (copied, not a foreign key: the record outlives the person). NULL for the nightly run.
+    requested_by_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    stripe_account_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    livemode: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    differences: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    summary: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    lines: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+
+
+class BillingReconcileDiff(UuidPkMixin, Base):
+    """One difference a reconcile run found: on `object_id`, Stripe says `stripe_value` where Jaah expects
+    `jaah_value` (`what` names the field in words). `customer_org_id` is the customer's org — a copied pointer, never
+    the tenancy column. Deleted with its run."""
+
+    __tablename__ = "billing_reconcile_diffs"
+    __table_args__ = (Index("ix_billing_reconcile_diffs_run", "run_id"),)
+
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("billing_reconcile_runs.id", ondelete="CASCADE", name="fk_billing_reconcile_diffs_run_id"),
+        nullable=False,
+    )
+    customer_org_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    lane: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    object_type: Mapped[str] = mapped_column(Text, nullable=False)
+    object_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    price_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    what: Mapped[str] = mapped_column(Text, nullable=False)
+    stripe_value: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    jaah_value: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = timestamp_column()

@@ -10,36 +10,46 @@ import { useTheme } from '@mui/material/styles'
 import { del, get, post } from '../../api'
 import { useCan } from '../../auth'
 import { FilterRow, FilterSelect } from '../../ui/FilterRow'
+import { FONT_SIZE, grid, LETTER_SPACING, SIZE } from '../../theme'
 import { ACTION_ICON, elapsedLabel } from '../../components/tasks/shared'
 import { useLiveRefetch } from '../../hooks/useLiveRefetch'
 import { useEventStream } from '../../hooks/useEventStream'
-import { useMinuteTick } from '../../hooks/useMinuteTick'
-import { compactCount, countOf } from '../../lib/humanize'
+import { MINUTE_MS, useNow } from '../../hooks/useNow'
+import { compactCount, countOf, groupedCountOf, humanize } from '../../lib/humanize'
 import { absoluteTime, compactAge, humanDuration, NO_VALUE } from '../../lib/relativeTime'
 import { formatZonedSpan, localInputToIso } from '../../lib/zonedTime'
+import { clickDownload } from '../../net/href'
 import { DateTimeBoundFields } from '../../ui/DateTimeBoundFields'
 import Banner from '../../ui/Banner'
-import { useConfirm } from '../../components/ConfirmDialog'
+import { danger, useConfirm } from '../../components/ConfirmDialog'
 import EmptyState from '../../ui/EmptyState'
 import NoMatchesState from '../../ui/NoMatchesState'
 import type { FeedColumn, FeedRowSpec, OverflowItem } from '../../ui/feed/types'
 import FilterBar from '../../ui/FilterBar'
 import type { Tone } from '../../ui/StatusChip'
 import { toneFor } from '../../ui/statusTone'
-import { FEED_NO_META, PHONE, SESSIONS_LIST_CONTAINER_SX, fieldTapTargetSx, monoSx, tapTargetSx } from '../../ui/listStyles'
+import { usePhone } from '../../hooks/usePhone'
+import { FEED_NO_META, PHONE, SESSIONS_LIST_CONTAINER_SX, fieldTapTargetSx, monoSx, tapTargetSx, ELLIPSIS_SX } from '../../ui/listStyles'
 import { contentSlotWidth, monoFamily } from '../../ui/feed/geometry'
-import { PageNav } from '../../ui/Pager'
-import { usePageClamp } from '../../hooks/usePageClamp'
+import ListPager from '../../ui/ListPager'
+import { useListPage, type Page, type SortDir } from '../../hooks/useListPage'
 import { usePagedLogFilters } from '../../hooks/usePagedLogFilters'
 import { useUrlFilters } from '../../hooks/useUrlFilters'
 import { useApiRead } from '../../hooks/useApiRead'
 import { useRowActions } from '../../hooks/useBusyIds'
 import SortMenu from '../../ui/SortMenu'
+import { nextSort, type SortState } from '../../ui/SortableHead'
 import SearchBox from '../../ui/SearchBox'
 import ListStates from '../../ui/feed/ListStates'
+import LinkButton from '../../ui/LinkButton'
+import RelativeTime from '../../ui/RelativeTime'
 import { paneLogPath } from './PaneLogPage'
-import { agentVersionLabel, shortCommit } from '../agents/api'
+import { agentVersionLabel } from '../agents/api'
+import { shortSha } from '../../lib/shortSha'
+import { oneOf } from '../../lib/strings'
 import { formatCostUsd } from '../../lib/taskCost'
+import { SESSIONS_POLL_MS } from '../../lib/pollIntervals'
+import Tip from '../../ui/Tip'
 
 /* Audit > Sessions: every agentic session, and what the control plane can and cannot hand back
  * about each. A tab panel: `AuditPage` owns the tab strip; the sort control leads this panel
@@ -157,16 +167,12 @@ export type AgentRef = { agent_id?: string | null; display_name: string; version
 
 /** "Report bot · v0.2.0 · 3f2a9c1" — the agent a session ran, as people name it. */
 export function agentRefLabel(ref: AgentRef): string {
-  const commit = shortCommit(ref.commit)
+  const commit = shortSha(ref.commit)
   return [agentVersionLabel(ref.display_name || 'Unnamed agent', ref.version), commit].filter(Boolean).join(' · ')
 }
 
-export type SessionList = {
-  items: Session[]
-  /** What the filters select; the pager's total. */
-  total: number
-  page: number
-  per: number
+/** `total` is what the filters select, the pager's total. */
+export type SessionList = Page<Session> & {
   /** The whole table, unfiltered — separates the two empty states. */
   total_unfiltered: number
   window: string
@@ -268,36 +274,36 @@ export function groupAttempts(attempts: UnsessionedAttempt[]): AttemptGroup[] {
 subgrid of the one container, so the columns align across rows. */
 const UNSESSIONED_GRID_SX = {
   display: 'grid',
-  gridTemplateColumns: 'minmax(0, 2fr) 3.5rem minmax(0, 2fr) minmax(0, 1fr)',
+  gridTemplateColumns: `minmax(0, 2fr) ${grid(9)} minmax(0, 2fr) minmax(0, 1fr)`,
   columnGap: 1.5,
   rowGap: 0.5,
-  fontSize: '0.8125rem',
+  fontSize: FONT_SIZE.md,
   minWidth: 0,
   [PHONE]: { gridTemplateColumns: 'minmax(0, 1fr) auto' },
 } as const
 const UNSESSIONED_ROWS_SX = {
-  display: 'grid', gridColumn: '1 / -1', gridTemplateColumns: 'subgrid', columnGap: 'inherit', rowGap: 0.25,
+  display: 'grid', gridColumn: '1 / -1', gridTemplateColumns: 'subgrid', columnGap: 'inherit', rowGap: 0,
   m: 0, p: 0, listStyle: 'none', alignItems: 'baseline',
 } as const
 /* A rule between rows, so a row whose reasons or "+N" list are open still reads as one unit (most needed on the phone). */
 const UNSESSIONED_ROW_SX = {
-  '&:not(:first-of-type)': { borderTop: 1, borderColor: 'divider', pt: 0.5, mt: 0.25 },
+  '&:not(:first-of-type)': { borderTop: 1, borderColor: 'divider', pt: 0.5, mt: 0 },
 } as const
 /* "+N" right after the title: the phone's 44px target is kept, but its glyph sits at the target's left edge (a
 centred one floated ~16px off the title) and negative block margins keep the target from heightening the row.
 A left margin parts it from an open row's "×N", which otherwise read as one token ("×2+2"). */
 const UNSESSIONED_MORE_SX = {
   font: 'inherit', whiteSpace: 'nowrap', verticalAlign: 'baseline', flexShrink: 0, ml: 0.5,
-  [PHONE]: { minWidth: 44, minHeight: 44, my: '-12px', textAlign: 'left', ml: 1 },
+  [PHONE]: { minWidth: SIZE.tapTarget, minHeight: SIZE.tapTarget, my: -2, textAlign: 'left', ml: 1 },
 } as const
 /* A row's runner reasons, spanning the row beneath it. */
 const UNSESSIONED_DETAIL_SX = {
-  gridColumn: '1 / -1', pl: 1.5, mb: 0.5, color: 'text.secondary', fontSize: '0.75rem', overflowWrap: 'anywhere',
+  gridColumn: '1 / -1', pl: 1.5, mb: 0.5, color: 'text.secondary', fontSize: FONT_SIZE.sm, overflowWrap: 'anywhere',
   whiteSpace: 'pre-line',
 } as const
 /* An open "+N" task's own runner reason: in the Cause and Node columns, beneath it on the phone. */
 const UNSESSIONED_OTHER_DETAIL_SX = {
-  gridColumn: '3 / -1', minWidth: 0, color: 'text.secondary', fontSize: '0.75rem', overflowWrap: 'anywhere',
+  gridColumn: '3 / -1', minWidth: 0, color: 'text.secondary', fontSize: FONT_SIZE.sm, overflowWrap: 'anywhere',
   whiteSpace: 'pre-line',
   [PHONE]: { gridColumn: '1 / -1', pl: 3 },
 } as const
@@ -305,7 +311,7 @@ const UNSESSIONED_OTHER_DETAIL_SX = {
 on the phone, beneath, at the others' indent. */
 const UNSESSIONED_LEAD_DETAIL_OPEN_SX = { mb: 0.5 } as const
 const UNSESSIONED_HEAD_SX = {
-  fontSize: '0.6875rem', textTransform: 'uppercase', letterSpacing: '0.04em', color: 'text.secondary',
+  fontSize: FONT_SIZE.xs, textTransform: 'uppercase', letterSpacing: LETTER_SPACING.caps, color: 'text.secondary',
 } as const
 
 // ── Filter vocabulary ─────────────────────────────────────────────────────────────────────────────
@@ -342,42 +348,22 @@ const NARROWINGS_CLEARED: Record<string, string> = {
   [URL_KEYS.status]: '', [URL_KEYS.transcript]: '', [URL_KEYS.endReason]: '', [URL_KEYS.node]: '',
 }
 
-/** A URL value the page offers, else `null` (so a stale or hand-typed link falls back rather than 422s). */
-function urlChoice<T extends string>(value: string | null, allowed: readonly T[]): T | null {
-  return value !== null && (allowed as readonly string[]).includes(value) ? (value as T) : null
-}
-
 /* Apart from `WINDOW_OPTIONS`: the orphan clause looks labels up there, and orphans are not counted over a
 custom range. */
 const CUSTOM_WINDOW_OPTION = { value: 'custom', label: 'Custom range' }
 
-const STATUS_OPTIONS: { value: string; label: string }[] = [
-  { value: 'running', label: 'Running' },
-  { value: 'ended', label: 'Ended' },
-  { value: 'unknown', label: 'Unknown' },
-]
+/** A filter's options from its server tokens, each labelled as words. */
+const optionsOf = (values: string[]) => values.map(value => ({ value, label: humanize(value) }))
 
-const TRANSCRIPT_OPTIONS: { value: string; label: string }[] = [
-  { value: 'pending', label: 'Pending' },
-  { value: 'uploading', label: 'Uploading' },
-  { value: 'uploaded', label: 'Uploaded' },
-  { value: 'failed', label: 'Failed' },
-  { value: 'gave_up', label: 'Gave up' },
-  { value: 'unavailable', label: 'Unavailable' },
-  { value: 'not_applicable', label: 'Not applicable' },
-]
+const STATUS_OPTIONS = optionsOf(['running', 'ended', 'unknown'])
+
+const TRANSCRIPT_OPTIONS = optionsOf(['pending', 'uploading', 'uploaded', 'failed', 'gave_up', 'unavailable', 'not_applicable'])
 
 /* The stale pseudo-state: a filter value, not an eighth transcript state. It is a compound predicate
  * single-homed in `app/sessions_cleanup.py::stale_clause`, never restated here. It rides the Transcript
  * dropdown and is mapped at the URL boundary to `stale=true` (as "All time" → `window=all`).
  * It lets the bulk delete's target set be looked at first. */
 const STALE_FILTER_VALUE = 'stale'
-
-/* Live refresh as in `CommandLog`: SSE drives it, the poll is the fallback when the stream is `down`.
- * The `session` entity fires at every write that changes this page
- * (`app/agent_session_lifecycle.py::_in_a_savepoint`, `app/routes/agent_sessions.py::session_changed`)
- * with the `id=0` sentinel, so the page refetches whole. */
-const POLL_MS = 15_000
 
 // ── Sorting ───────────────────────────────────────────────────────────────────────────────────────
 
@@ -390,10 +376,6 @@ type SortKey =
   | 'ended_at'
   | 'tokens'
   | 'transcript_status'
-
-type SortDir = 'asc' | 'desc'
-
-type SortState = { key: SortKey; dir: SortDir }
 
 /* The sort vocabulary in table order: the server's eight keys only (an unknown `sort` is a 422). One
  * list for desktop headings and the phone menu (as `pages/Projects.tsx`); each heading names its key,
@@ -414,6 +396,7 @@ const SORTABLE_COLUMNS: { key: SortKey; label: string; initial: SortDir }[] = [
 /* The header row (`FeedList`'s `columns`): each slot's value is mono shorthand ("—", "17m", "1h") that reads
  * only under its name. Keys match the row's slots; a sortable one names its server key and first direction from
  * `SORTABLE_COLUMNS`. `Status` rides the title's marker and `SortMenu` alone. */
+const SORT_KEYS = SORTABLE_COLUMNS.map(c => c.key)
 const sortColumn = (key: SortKey) => SORTABLE_COLUMNS.find(c => c.key === key)!
 const headedBy = (slot: string, key: SortKey, label?: string): FeedColumn =>
   ({ key: slot, label: label ?? sortColumn(key).label, sortKey: key, firstDir: sortColumn(key).initial })
@@ -439,33 +422,22 @@ const DEFAULT_ORDER_LABEL = 'Default order (running first, then newest)'
  * `toneFor` (`badge-failed` → error); the other six have no `badge-*` token, so they carry an explicit
  * `Tone` (neutral fallthrough would make "gave up" look like "not applicable"). Labels stay single words:
  * `ui/StatusChip` never shrinks; the sentence goes beside the pill. */
-type TranscriptPresentation = { tone: Tone; label: string; reason: string | null }
+type TranscriptPresentation = { tone: Tone; label: string; reason: string | null; glyph: string }
 
+/* The disc glyph is the state's shape, not its tint; `gave_up`'s is distinct from `failed`'s. Unknown → `!`, never
+ * a recognised shape. */
 const TRANSCRIPT_REASON: Record<string, TranscriptPresentation> = {
-  pending: { tone: 'info', label: 'pending', reason: 'Waiting for the node to upload' },
-  uploading: { tone: 'info', label: 'uploading', reason: 'Upload in progress' },
+  pending: { tone: 'info', label: 'pending', reason: 'Waiting for the node to upload', glyph: '○' },
+  uploading: { tone: 'info', label: 'uploading', reason: 'Upload in progress', glyph: '»' },
   // The only downloadable state, so nothing to explain.
-  uploaded: { tone: 'success', label: 'uploaded', reason: null },
-  failed: { tone: toneFor('badge-failed'), label: 'failed', reason: 'Upload failed' },
-  gave_up: { tone: 'error', label: 'gave up', reason: 'Gave up' },
+  uploaded: { tone: 'success', label: 'uploaded', reason: null, glyph: '✓' },
+  failed: { tone: toneFor('badge-failed'), label: 'failed', reason: 'Upload failed', glyph: '✕' },
+  gave_up: { tone: 'error', label: 'gave up', reason: 'Gave up', glyph: '⊘' },
   /* Fallback only: the server always records a reason (`routes/agent_sessions.py`), and the row's
   `transcript_error` renders — e.g. a transcript over the 100 MiB read ceiling still on disk. */
-  unavailable: { tone: 'neutral', label: 'unavailable', reason: 'The transcript could not be read from the node' },
-  not_applicable: { tone: 'neutral', label: 'n/a', reason: 'This session has no transcript' },
+  unavailable: { tone: 'neutral', label: 'unavailable', reason: 'The transcript could not be read from the node', glyph: '?' },
+  not_applicable: { tone: 'neutral', label: 'n/a', reason: 'This session has no transcript', glyph: '·' },
 }
-
-/* The disc glyph per state (shape, not tint): ○ pending, » uploading, ✓ uploaded, ✕ failed, ⊘ gave_up
- * (distinct from failed), ? unavailable, · not_applicable. Unknown → `!`, never a recognised shape. */
-const TRANSCRIPT_GLYPH: Record<string, string> = {
-  pending: '○',
-  uploading: '»',
-  uploaded: '✓',
-  failed: '✕',
-  gave_up: '⊘',
-  unavailable: '?',
-  not_applicable: '·',
-}
-const UNKNOWN_TRANSCRIPT_GLYPH = '!'
 
 /* Pre-payload placeholder only; the threshold is the server's `overdue_after_seconds`
  * (from `transcripts.LEASE_TTL`). */
@@ -509,6 +481,7 @@ function transcriptPresentation(
       tone: 'warning',
       label: row.transcript_status,
       reason: 'This console build does not recognise this transcript state',
+      glyph: '!',
     }
   }
 
@@ -521,8 +494,7 @@ function transcriptPresentation(
     }
     const attempts = row.transcript_attempts
     if (!attempts) return { ...base, reason: 'Gave up' }
-    const plural = attempts === 1 ? 'attempt' : 'attempts'
-    return { ...base, reason: `Gave up after ${attempts} ${plural}` }
+    return { ...base, reason: `Gave up after ${countOf(attempts, 'attempt')}` }
   }
   if (row.transcript_status === 'failed') {
     return { ...base, reason: withError(base.reason ?? 'Upload failed', row.transcript_error) }
@@ -536,7 +508,7 @@ function transcriptPresentation(
     /* An ended run that never produced anything to upload says why, rather than waiting on an upload that
     cannot come: its MicroVM failed, or its stream stored no event. */
     const nothing = !isRunning(row) && nothingToUpload(row)
-    if (nothing) return { tone: 'neutral', label: 'none', reason: nothing }
+    if (nothing) return { ...base, tone: 'neutral', label: 'none', reason: nothing }
     /* A run the server says is over, with no end reported: its upload starts only once its node ends it, so it is
     not late by any clock here — only an offline node is worth saying. */
     if (row.attempt_over) {
@@ -583,7 +555,7 @@ const STATUS_PRESENTATION: Record<string, { tone: Tone; glyph: string }> = {
 
 // ── The row's slot widths ─────────────────────────────────────────────────────────────────────────
 
-/* The row: a disc (transcript state, tinted by `transcriptPresentation`, shaped by `TRANSCRIPT_GLYPH`), a
+/* The row: a disc (transcript state, tinted and shaped by `transcriptPresentation`), a
  * title, a status marker (word and `end_reason` as its name/title), and seven fixed slots.
  * The reason is a note (`FeedNote`), not a slot: a slot would clip it (property #2).
  * Widths are priced against `ui/listStyles.ts`'s cluster sums: meta at ≥900px, node, task and transcript to
@@ -632,7 +604,7 @@ function usageLabel(row: Session): string {
   return dollars ? `${compactCount(tokens)} · ${dollars}` : compactCount(tokens)
 }
 
-/** The real span once ended, live elapsed while running (re-read by `useMinuteTick`); never a dash for a
+/** The real span once ended, live elapsed while running (re-read by `useNow`); never a dash for a
  *  running session. */
 function durationLabel(row: Session): string {
   if (row.ended_at) {
@@ -649,16 +621,14 @@ function orphanBanner(entries: { node: string | null; count: number }[]): string
   if (entries.length === 1) {
     const [only] = entries
     const where = only.node ?? 'an unattributed node'
-    const noun = only.count === 1 ? 'session' : 'sessions'
     const them = only.count === 1 ? 'it' : 'them'
-    return `${only.count} ${noun} on ${where} had no record until the node reported ${them}.`
+    return `${countOf(only.count, 'session')} on ${where} had no record until the node reported ${them}.`
   }
   const total = entries.reduce((sum, entry) => sum + entry.count, 0)
-  const noun = total === 1 ? 'session' : 'sessions'
   const breakdown = entries
     .map(entry => `${entry.node ?? 'unattributed'} (${entry.count})`)
     .join(', ')
-  return `${total} ${noun} had no record until a node reported them — ${breakdown}.`
+  return `${countOf(total, 'session')} had no record until a node reported them — ${breakdown}.`
 }
 
 /** The window clause: orphan counts share the rows' window, so the number moves with it. Empty for All
@@ -715,14 +685,6 @@ type StaleDeleteResult = {
   max_per_call?: number
 }
 
-/* The threshold in words ("6 hours"); `humanDuration(…, true)` renders a measurement ("6h 0m"). */
-function thresholdLabel(seconds: number): string {
-  if (seconds >= 86_400 && seconds % 86_400 === 0) return countOf(seconds / 86_400, 'day')
-  if (seconds >= 3_600 && seconds % 3_600 === 0) return countOf(seconds / 3_600, 'hour')
-  if (seconds >= 60) return countOf(Math.round(seconds / 60), 'minute')
-  return countOf(Math.max(0, Math.round(seconds)), 'second')
-}
-
 /** "session row(s)": the row is what goes, nothing is stopped. */
 function rowNoun(count: number): string {
   return count === 1 ? 'session row' : 'session rows'
@@ -737,7 +699,7 @@ function staleBanner(count: number, thresholdSeconds: number): string {
   const were = count === 1 ? 'was' : 'were'
   const them = count === 1 ? 'it' : 'them'
   return (
-    `${count.toLocaleString()} ${noun} ${were} dispatched more than ${thresholdLabel(thresholdSeconds)} ago ` +
+    `${count.toLocaleString()} ${noun} ${were} dispatched more than ${humanDuration(thresholdSeconds)} ago ` +
     `and never started — the run wrote no transcript file and never asked to upload one. Nothing will ever ` +
     `finish ${them}. Counted across every session you can see, not just this page or window.`
   )
@@ -798,7 +760,7 @@ const HELD_LIVE_UNDELETABLE_REASON =
 
 /** Reason 5, carrying the served threshold. */
 function tooYoungUndeletableReason(thresholdSeconds: number): string {
-  return `It started less than ${thresholdLabel(thresholdSeconds)} ago, so it may still be running`
+  return `It started less than ${humanDuration(thresholdSeconds)} ago, so it may still be running`
 }
 
 /* States reachable only through an upload ticket — `routes/sessions.py::_TICKETED_TRANSCRIPT_STATUSES`,
@@ -817,16 +779,11 @@ function hasUploadTicket(row: Session): boolean {
     || Boolean(row.transcript_leased_at)
 }
 
-/* The download as an anchor click, not a `fetch` (which would buffer an unbounded `.tar.gz` and lose the
- * server's filename) nor `location` assignment (which visibly leaves the SPA on a slow request). No
- * `download` attribute, which would override `Content-Disposition`. Same-origin cookie. */
+/* The download as an anchor click (`clickDownload`), not a `fetch` (which would buffer an unbounded `.tar.gz` and lose
+ * the server's filename) nor `location` assignment (which visibly leaves the SPA on a slow request). No `download`
+ * attribute (`null`): `Content-Disposition` names the file, and a refusal is shown, never saved. Same-origin cookie. */
 function startTranscriptDownload(sessionId: string): void {
-  const a = document.createElement('a')
-  a.href = `/api/sessions/${encodeURIComponent(sessionId)}/transcript.tar.gz`
-  a.rel = 'noopener'
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
+  clickDownload(`/api/sessions/${encodeURIComponent(sessionId)}/transcript.tar.gz`, null)
 }
 
 // ── The panel ─────────────────────────────────────────────────────────────────────────────────────
@@ -834,7 +791,7 @@ function startTranscriptDownload(sessionId: string): void {
 export default function SessionsTab() {
   /* Unconditionally and first, value unused: Started, Duration and the overdue test depend on the
   current time, and nothing else re-renders on a clock. */
-  useMinuteTick()
+  useNow(MINUTE_MS)
 
   const can = useCan()
   /* One key, asked under two names: `sessions:edit` gates the download
@@ -859,10 +816,10 @@ export default function SessionsTab() {
   const [defaultWindow] = useState<WindowValue>(() => (
     query || taskParam || searchParams.get(URL_KEYS.transcript) === STALE_FILTER_VALUE ? 'all' : DEFAULT_WINDOW
   ))
-  const windowValue = urlChoice(searchParams.get(URL_KEYS.window), WINDOW_VALUES) ?? defaultWindow
-  const status = urlChoice(searchParams.get(URL_KEYS.status), STATUS_OPTIONS.map(o => o.value)) ?? ''
-  const transcriptStatus = urlChoice(
-    searchParams.get(URL_KEYS.transcript), [...TRANSCRIPT_OPTIONS.map(o => o.value), STALE_FILTER_VALUE],
+  const windowValue = oneOf(WINDOW_VALUES, searchParams.get(URL_KEYS.window)) ?? defaultWindow
+  const status = oneOf(STATUS_OPTIONS.map(o => o.value), searchParams.get(URL_KEYS.status)) ?? ''
+  const transcriptStatus = oneOf(
+    [...TRANSCRIPT_OPTIONS.map(o => o.value), STALE_FILTER_VALUE], searchParams.get(URL_KEYS.transcript),
   ) ?? ''
   const endReason = searchParams.get(URL_KEYS.endReason) ?? ''
   const node = searchParams.get(URL_KEYS.node) ?? ''
@@ -873,12 +830,10 @@ export default function SessionsTab() {
     if (searchParams.get(URL_KEYS.window) === CUSTOM_WINDOW_OPTION.value) setFilters({ [URL_KEYS.window]: '' })
     // Mount only, by design (see above).
   }, [])
-  /* Search and page; every filter change resets the page through `applyFilter` (server-side paging). */
+  /* Search and the custom range; a filter change re-pins through `applyFilter`. */
   const {
-    zone, from, to, page, setPage, narrow: applyFilter, clearShared, sharedFiltersSet, searchFields, rangeFields,
-  } = usePagedLogFilters(1)
-  const [sort, setSort] = useState<SortState | null>(null)
-
+    zone, from, to, narrow: applyFilter, clearShared, sharedFiltersSet, searchFields, rangeFields,
+  } = usePagedLogFilters()
   const [confirm, confirmDialog] = useConfirm()
   const navigate = useNavigate()
 
@@ -887,24 +842,21 @@ export default function SessionsTab() {
   const { busy: deletes, error: deleteError, setError: setDeleteError, notice, setNotice, run: runDelete } = useRowActions()
   const deleting = deletes.size > 0
 
-  /* The request, built in one place. First load is exactly `page=1&window=24h`: no `sort`, no `status`,
-  no `per` (the server's PER_PAGE comes back on the envelope). */
+  /* The request, built in one place. First load is exactly `page=1&per=50&window=24h`: no `sort`, no `status`. */
   /* The custom range's bounds as sent. An inverted pair sends neither (the server 422s it) and says so. */
   const since = windowValue === 'custom' ? localInputToIso(from) : null
   const until = windowValue === 'custom' ? localInputToIso(to) : null
   const rangeInverted = typeof since === 'string' && typeof until === 'string' && Date.parse(since) > Date.parse(until)
 
-  const url = useMemo(() => {
+  /* Everything but the page, as sent: the page reads as 1 the moment any of it changes (`resetKey`), so page 4
+  of the old query is never asked for under the new. `prefix`: the Audit shell keeps every opened panel mounted
+  on ONE URL, so each panel's page keys are its own. */
+  const filterQuery = useMemo(() => {
     const params = new URLSearchParams()
-    params.set('page', String(page))
     params.set('window', windowValue === 'custom' ? 'all' : windowValue)
     if (!rangeInverted) {
       if (typeof since === 'string') params.set('since', since)
       if (typeof until === 'string') params.set('until', until)
-    }
-    if (sort) {
-      params.set('sort', sort.key)
-      params.set('dir', sort.dir)
     }
     if (status) params.set('status', status)
     /* The one mapping at this boundary: `stale` is not a transcript state (see `STALE_FILTER_VALUE`). */
@@ -914,8 +866,14 @@ export default function SessionsTab() {
     if (node) params.set('node', node)
     if (taskParam) params.set('task', taskParam)
     if (query) params.set('q', query)
-    return `/api/sessions?${params.toString()}`
-  }, [page, windowValue, since, until, rangeInverted, sort, status, transcriptStatus, endReason, node, taskParam, query])
+    return params.toString()
+  }, [windowValue, since, until, rangeInverted, status, transcriptStatus, endReason, node, taskParam, query])
+  const list = useListPage({ prefix: 'sessions_', sorts: SORT_KEYS, resetKey: filterQuery })
+  const { page, per, setPage, setPer, setSort } = list
+  const sort = useMemo<SortState<SortKey> | null>(
+    () => (list.sort ? { key: list.sort as SortKey, dir: list.dir } : null), [list.sort, list.dir],
+  )
+  const url = `/api/sessions?page=${page}&per=${per}&${filterQuery}${sort ? `&sort=${sort.key}&dir=${sort.dir}` : ''}`
 
   /* Three triggers (filters, the live stream, a delete) read through one generation fence, so a superseded
   response never lands; only a filter change re-shows the skeleton (`refresh` does not). */
@@ -939,42 +897,32 @@ export default function SessionsTab() {
   const [openAttemptGroups, setOpenAttemptGroups] = useState<ReadonlySet<string>>(new Set())
 
   /* Scoped to this page's entity; `load` re-reads the current request. */
-  useLiveRefetch(useEventStream('/api/stream', ['session']), () => void load(), POLL_MS)
+  /* Live refresh as in `CommandLog`: SSE drives it, the poll is the fallback when the stream is `down`. The
+   * `session` entity fires at every write that changes this page (`app/agent_session_lifecycle.py::_in_a_savepoint`,
+   * `app/routes/agent_sessions.py::session_changed`) with the `id=0` sentinel, so the page refetches whole. */
+  useLiveRefetch(useEventStream('/api/stream', ['session']), () => void load(), SESSIONS_POLL_MS)
 
-  const clearTaskFilter = useCallback(() => {
-    setFilters({ task: '' })
-    setPage(1)
-  }, [setFilters, setPage])
+  const clearTaskFilter = useCallback(() => setFilters({ task: '' }), [setFilters])
 
   /* Three-state heading: `initial`, reversed, then the server's default order (why `sort` is nullable). The
   phone menu spells the same exit. */
   const onSort = useCallback((key: SortKey) => {
-    setSort(current => {
-      if (!current || current.key !== key) {
-        return { key, dir: SORTABLE_COLUMNS.find(c => c.key === key)?.initial ?? 'desc' }
-      }
-      const initial = SORTABLE_COLUMNS.find(c => c.key === key)?.initial ?? 'desc'
-      if (current.dir === initial) return { key, dir: initial === 'asc' ? 'desc' : 'asc' }
-      return null
-    })
-    setPage(1)
-  }, [])
+    const next = nextSort(sort, key, sortColumn(key).initial)
+    setSort(next?.key ?? null, next?.dir)
+  }, [sort, setSort])
 
   /* Every heading shows from 900px (`FEED_NO_META`), so there the menu holds only what no heading sorts:
   Status, the default order, and the current key so the trigger still names it. Narrower, some headings drop
   and the menu lists every key. */
   const headingsPartial = useMediaQuery(FEED_NO_META)
   // `noSsr`: read on the first render, so a phone never flashes the long placeholder.
-  const phone = useMediaQuery(PHONE, { noSsr: true })
+  const phone = usePhone({ noSsr: true })
   const theme = useTheme()
   const menuColumns = headingsPartial
     ? SORTABLE_COLUMNS
     : SORTABLE_COLUMNS.filter(c => c.key === 'status' || c.key === sort?.key)
 
-  const clearSort = useCallback(() => {
-    setSort(null)
-    setPage(1)
-  }, [])
+  const clearSort = useCallback(() => setSort(null), [setSort])
 
   /* The window is not cleared: the empty state offers "clear the filters, or set Window to All time", and
   resetting the window here undid the second. The window is the scope, not a narrowing. One URL write for every
@@ -985,7 +933,6 @@ export default function SessionsTab() {
     otherwise reopen on 24h. */
     setFilters({ ...NARROWINGS_CLEARED, task: '', q: '', [URL_KEYS.window]: windowValue })
     clearShared()
-    setPage(1)
   }, [setFilters, clearShared, windowValue])
 
   /* See the set before deleting it. It widens the window too: `stale_count` ignores the window, so 24h
@@ -995,10 +942,9 @@ export default function SessionsTab() {
       ...NARROWINGS_CLEARED, task: '', q: '', [URL_KEYS.window]: 'all', [URL_KEYS.transcript]: STALE_FILTER_VALUE,
     })
     clearShared()
-    setPage(1)
   }, [setFilters, clearShared])
 
-  /* One filter's URL write, through `applyFilter` so the page resets. */
+  /* One filter's URL write, through `applyFilter` so the pinned instant moves with it. */
   const setUrlFilter = useCallback(
     (key: string, value: string) => applyFilter(() => setFilters({ [key]: value })),
     [applyFilter, setFilters],
@@ -1030,8 +976,10 @@ export default function SessionsTab() {
   ), [load, runDelete])
 
   const items = data?.items ?? []
-  const per = data?.per ?? 25
   const total = data?.total ?? 0
+  /* A result that shrank (narrowed filter, rows ageing out): `ListPager` clamps back; until it lands the page is
+  past the end. */
+  const pastEnd = page > Math.max(1, Math.ceil(total / per))
 
   /* The wider windows worth naming, each holding more than the last (an equal count offers the same rows again). */
   const widerWindows = useMemo(() => {
@@ -1042,9 +990,6 @@ export default function SessionsTab() {
       return true
     })
   }, [data?.wider_windows, total])
-
-  /* `total` makes the last page known; a result that shrank (narrowed filter, rows ageing out) clamps back. */
-  const totalPages = usePageClamp(page, setPage, total, per)
 
   /* Node options are the server's (every node holding a session under the other filters), valued by uuid (`?node=` is
   uuid-only; a name filters nothing) and labelled by name. An older server sends none, so the rows on screen stand in.
@@ -1098,7 +1043,7 @@ export default function SessionsTab() {
     : STALE_DELETE_CEILING
 
   // The row's name on its own mono line under the prose, in both row confirms.
-  const nameLine = (row: Session) => <Box sx={[monoSx, { mt: 1.5, fontSize: '0.75rem' }]}>{row.name}</Box>
+  const nameLine = (row: Session) => <Box sx={[monoSx, { mt: 1.5, fontSize: FONT_SIZE.sm }]}>{row.name}</Box>
 
   /* The redaction caveat before the bytes: the redactor counts what it caught, not what it missed. A
   dialog, so it must be acknowledged before the download starts. */
@@ -1120,7 +1065,7 @@ export default function SessionsTab() {
   }
 
   async function confirmDeleteSession(row: Session) {
-    const confirmed = await confirm({
+    const confirmed = await confirm(danger('Delete session', {
       title: 'Delete this session row?',
       message: (
         <>
@@ -1130,21 +1075,19 @@ export default function SessionsTab() {
           {nameLine(row)}
         </>
       ),
-      confirmLabel: 'Delete session',
-      destructive: true,
-    })
+    }))
     if (confirmed) await deleteSession(row)
   }
 
   /* The bulk confirm: the exact count, that the row is the only record of the session, and why no stored
   transcript is at risk. The capped-pass line only when the backlog could reach the ceiling. */
   async function confirmDeleteStale() {
-    const confirmed = await confirm({
+    const confirmed = await confirm(danger(`Delete ${groupedCountOf(staleCount, 'session')}`, {
       title: `Delete ${staleCount.toLocaleString()} ${rowNoun(staleCount)}?`,
       message: (
         <>
           This permanently deletes {staleCount.toLocaleString()} {rowNoun(staleCount)} — every session
-          dispatched more than {thresholdLabel(staleAfterSeconds)} ago whose run never started. There
+          dispatched more than {humanDuration(staleAfterSeconds)} ago whose run never started. There
           is no undo: the row is the only record that the session was dispatched at all.
           {/* Why the set is safe: an upload ticket is the only thing that creates an object key, and no row
           here ever asked for one. */}
@@ -1160,9 +1103,7 @@ export default function SessionsTab() {
           )}
         </>
       ),
-      confirmLabel: `Delete ${staleCount.toLocaleString()} ${staleCount === 1 ? 'session' : 'sessions'}`,
-      destructive: true,
-    })
+    }))
     if (confirmed) await deleteStaleSessions()
   }
 
@@ -1243,7 +1184,7 @@ export default function SessionsTab() {
       /* No row `ariaLabel`: it would make the disc and markers decorative, and they carry the state. */
       indicator: {
         tone: transcript.tone,
-        glyph: TRANSCRIPT_GLYPH[row.transcript_status] ?? UNKNOWN_TRANSCRIPT_GLYPH,
+        glyph: transcript.glyph,
         // The state only; the reason is a note.
         label: `Transcript ${transcript.label}`,
         /* `uploaded` defers to `blockedReason`: "available to download" is false without transcript storage. A tap
@@ -1256,11 +1197,12 @@ export default function SessionsTab() {
       /* The full name; `FeedList` clips with CSS. Never a `slice`. */
       title: row.name,
       titleText: row.name,
+      href: null,
       // The facts follow the name, not a wide dead band away from a short one.
       titleMaxWidth: TITLE_MAX,
       /* The phone drops the Tokens slot (`gate: 'meta'`), so its figure hugs the name there. */
       titleAside: phone && usage !== NO_VALUE ? (
-        <Box component="span" data-testid="session-usage-aside" sx={[monoSx, { color: 'text.disabled', fontSize: 11, ml: 0.75, whiteSpace: 'nowrap' }]}>
+        <Box component="span" data-testid="session-usage-aside" sx={[monoSx, { color: 'text.disabled', fontSize: FONT_SIZE.xs, ml: 0.5, whiteSpace: 'nowrap' }]}>
           {usage}
         </Box>
       ) : undefined,
@@ -1333,6 +1275,8 @@ export default function SessionsTab() {
         path is every other run, so naming it on each row would be noise. */
         ...(row.runtime === 'acp' || row.dispatched_runtime === 'acp' ? [{ key: 'runtime', text: 'Runtime: ACP host', tone: 'muted' as const }] : []),
         ...(row.account ? [{ key: 'account', text: `Account: ${row.account}`, tone: 'muted' as const }] : []),
+        // The slot it ran in: what the search's "slot" matches, so a hit says why it matched.
+        ...(row.worktree_ref ? [{ key: 'slot', text: `Slot: ${row.worktree_ref}`, tone: 'muted' as const }] : []),
         // The recorded cause of the end, whole.
         ...(row.end_detail ? [{
           key: 'end-detail',
@@ -1450,7 +1394,7 @@ export default function SessionsTab() {
               onClick={showStaleRows}
               variant="outlined"
               size="small"
-              aria-label={`Show the ${staleCount.toLocaleString()} stale ${staleCount === 1 ? 'session' : 'sessions'}`}
+              aria-label={`Show the ${groupedCountOf(staleCount, 'stale session')}`}
               sx={tapTargetSx}
             >
               Show them
@@ -1465,7 +1409,7 @@ export default function SessionsTab() {
                 disabled={deleting}
                 sx={tapTargetSx}
               >
-                Delete {staleCount.toLocaleString()} {staleCount === 1 ? 'session' : 'sessions'}
+                Delete {groupedCountOf(staleCount, 'session')}
               </Button>
             )}
           </Stack>
@@ -1486,7 +1430,6 @@ export default function SessionsTab() {
             onChange={next => setUrlFilter(URL_KEYS.window, next || 'all')}
             allLabel="All time"
             options={[...WINDOW_OPTIONS, CUSTOM_WINDOW_OPTION]}
-            minWidth={150}
             grow={phone}
           />
           {windowValue === 'custom' && <DateTimeBoundFields {...rangeFields} />}
@@ -1497,7 +1440,7 @@ export default function SessionsTab() {
             onChange={next => setUrlFilter(URL_KEYS.status, next)}
             allLabel="Any status"
             options={STATUS_OPTIONS}
-            minWidth={130}
+            minWidth={SIZE.fieldSm}
             grow={phone}
           />
           <FilterSelect
@@ -1517,10 +1460,9 @@ export default function SessionsTab() {
               ...TRANSCRIPT_OPTIONS,
               {
                 value: STALE_FILTER_VALUE,
-                label: `Stale (never started, over ${thresholdLabel(staleAfterSeconds)})`,
+                label: `Stale (never started, over ${humanDuration(staleAfterSeconds)})`,
               },
             ]}
-            minWidth={150}
             maxWidth={phone ? undefined : TRANSCRIPT_SELECT_CAP}
             grow={phone}
           />
@@ -1531,7 +1473,6 @@ export default function SessionsTab() {
             onChange={next => setUrlFilter(URL_KEYS.endReason, next)}
             allLabel="Any end reason"
             options={endReasonOptions}
-            minWidth={150}
             maxWidth={phone ? undefined : END_REASON_SELECT_CAP}
             grow={phone}
           />
@@ -1542,7 +1483,7 @@ export default function SessionsTab() {
             onChange={next => setUrlFilter(URL_KEYS.node, next)}
             allLabel="All nodes"
             options={nodeOptions}
-            minWidth={130}
+            minWidth={SIZE.fieldSm}
             grow={phone}
           />
           <SearchBox
@@ -1560,7 +1501,7 @@ export default function SessionsTab() {
             /* `m: 0` cancels the dense margin; `fieldTapTargetSx` is the 44px floor on the native input. 150px on
             the phone so the ⇅ after it shares its line at 390px rather than wrapping to a band of its own; 160px on
             the desktop (the placeholder whole) so the whole row fits one line at 1280px. */
-            sx={[{ m: 0, minWidth: { xs: 150, sm: 160 }, flex: { xs: '1 1 150px', sm: '1 1 160px' } }, fieldTapTargetSx]}
+            sx={[{ m: 0, minWidth: { xs: grid(25), sm: SIZE.fieldMd }, flex: { xs: `1 1 ${grid(25)}`, sm: `1 1 ${grid(26.5)}` } }, fieldTapTargetSx]}
           />
           {taskParam && (
             <Button
@@ -1600,7 +1541,7 @@ export default function SessionsTab() {
         <Typography
           variant="caption"
           data-testid="sessions-range-note"
-          sx={{ display: 'block', mt: 0.75, mb: 1, color: rangeInverted ? 'error.main' : 'text.secondary' }}
+          sx={{ display: 'block', mt: 0.5, mb: 1, color: rangeInverted ? 'error.main' : 'text.secondary' }}
         >
           {rangeInverted ? 'From is after To — range not applied.' : `Times in ${zone}.`}
         </Typography>
@@ -1637,18 +1578,17 @@ export default function SessionsTab() {
                 return (
                   <Box component="li" key={key} data-testid="unsessioned-attempt" sx={[UNSESSIONED_ROWS_SX, UNSESSIONED_ROW_SX]}>
                     <Box component="span" sx={{ minWidth: 0, display: 'flex', gap: 0.5, alignItems: 'baseline' }}>
-                      <MuiLink
+                      <Tip title={attempt.task_title ?? undefined}><MuiLink
                         component={RouterLink}
                         to={`/tasks/${attempt.task_id}`}
                         underline="hover"
-                        title={attempt.task_title ?? undefined}
-                        sx={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                        sx={ELLIPSIS_SX}
                       >
                         {attempt.task_title ?? `#${attempt.task_id}`}
-                      </MuiLink>
+                      </MuiLink></Tip>
                       {othersOpen && <EndedTimes attempts={attempts} taskId={attempt.task_id} />}
                       {others.length > 0 && (
-                        <MuiLink component="button" type="button" data-testid="unsessioned-attempt-more" underline="hover"
+                        <LinkButton data-testid="unsessioned-attempt-more" underline="hover"
                           aria-expanded={othersOpen} aria-controls={othersId}
                           aria-label={`+${countOf(others.length, 'task')}`}
                           onClick={() => setOpenAttemptGroups(open => {
@@ -1660,21 +1600,19 @@ export default function SessionsTab() {
                           sx={UNSESSIONED_MORE_SX}>
                           {/* The noun on the desktop, where the row has room; the phone keeps the bare count. */}
                           {phone ? `+${others.length}` : `+${countOf(others.length, 'task')}`}
-                        </MuiLink>
+                        </LinkButton>
                       )}
                     </Box>
-                    <Box component="span" title={absoluteTime(attempt.at)} sx={[monoSx, { color: 'text.secondary', textAlign: 'right' }]}>
-                      {compactAge(attempt.at)}
-                    </Box>
+                    <RelativeTime iso={attempt.at} compact sx={[monoSx, { color: 'text.secondary', textAlign: 'right' }]} />
                     {/* A note naming no node (or one this viewer cannot see) leaves no empty Node cell: the cause takes
                         it. */}
-                    <Box component="span" title={distinct(attempts.flatMap(x => (x.cause ? [x.cause] : []))).join('\n') || undefined}
+                    <Tip title={distinct(attempts.flatMap(x => (x.cause ? [x.cause] : []))).join('\n') || undefined}><Box component="span"
                       data-testid="unsessioned-attempt-cause"
                       sx={{ color: 'error.main', minWidth: 0, overflowWrap: 'anywhere', ...(nodes.length > 0 ? null : { gridColumn: 'span 2' }) }}>
                       {/* The heading says these runs ended; the column keeps only what ended them, each counted once. */}
                       {causes.map(({ label, count }) => `${count > 1 ? `${count} × ` : ''}${label.replace(/^Runner terminated — /, '')}`)
                         .join(' · ')}
-                    </Box>
+                    </Box></Tip>
                     {nodes.length > 0 && (
                       <Box component="span" data-testid="unsessioned-attempt-node" sx={[monoSx, { color: 'text.secondary', minWidth: 0, overflowWrap: 'anywhere', [PHONE]: { textAlign: 'right' } }]}>
                         {nodes.join(', ')}
@@ -1699,10 +1637,8 @@ export default function SessionsTab() {
                                 </MuiLink>
                                 <EndedTimes attempts={attempts} taskId={other.task_id} />
                               </Box>
-                              <Box component="span" data-testid="unsessioned-attempt-other-age" title={absoluteTime(other.at)}
-                                sx={[monoSx, { color: 'text.secondary', textAlign: 'right' }]}>
-                                {compactAge(other.at)}
-                              </Box>
+                              <RelativeTime iso={other.at} compact testId="unsessioned-attempt-other-age"
+                                sx={[monoSx, { color: 'text.secondary', textAlign: 'right' }]} />
                               {reasons.length > 0 && (
                                 <Box component="span" data-testid="unsessioned-attempt-other-detail" sx={UNSESSIONED_OTHER_DETAIL_SX}>
                                   {reasons.join('\n')}
@@ -1733,7 +1669,7 @@ export default function SessionsTab() {
           "nothing ever recorded" from "nothing matches" (opposite next actions); Clear is offered only when it
           would do something. `sessions-table` is kept from the `<Table>` era — suites and e2e read it. */}
       <ListStates
-        loading={loading || page > totalPages}
+        loading={loading || pastEnd}
         skeleton={{ rows: PAGE_SKELETON_ROWS }}
         failed={error && data === null && <EmptyState title="Could not load sessions" />}
         empty={total === 0}
@@ -1775,9 +1711,18 @@ export default function SessionsTab() {
         </Stack>
       )}
 
-      {/* A named landmark, and buttons that say what they page. */}
+      {/* A named landmark, and buttons that say what they page. `total` makes the last page known; a result that
+          shrank (narrowed filter, rows ageing out) clamps back. */}
       <Box component="nav" aria-label="Sessions pages">
-        <PageNav testId="pagination" noun="sessions" page={page} setPage={setPage} totalPages={totalPages} />
+        <ListPager
+          page={page}
+          per={per}
+          total={data ? total : null}
+          onPage={setPage}
+          onPer={setPer}
+          testId="pagination"
+          noun="sessions"
+        />
       </Box>
 
       {confirmDialog}

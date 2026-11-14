@@ -10,16 +10,17 @@ import { useQueryClient } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import ButtonBase from '@mui/material/ButtonBase'
 import Rating, { ratingClasses } from '@mui/material/Rating'
-import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
-import type { SxProps, Theme } from '@mui/material/styles'
 import { apiDetail, get, put } from '../../api'
 import { useApiRead } from '../../hooks/useApiRead'
+import { prefersReducedMotion } from '../../lib/motion'
 import { formatAverage, ratingSummaryTitle, voteListTitle } from '../../lib/taskRating'
 import { takeTaskPageSeed } from '../../lib/taskPageSeed'
 import type { TaskRating as Rating5 } from '../../types'
 import RatingBadge from './RatingBadge'
 import { VISUALLY_HIDDEN } from '../../ui/visuallyHidden'
+import { LINE_HEIGHT, RADIUS, SIZE } from '../../theme'
+import Tip from '../../ui/Tip'
 
 /* Last spark delay (150) + spark run (440) = 590, so 600 is the first tick with nothing animating.
    Change either and this follows. */
@@ -49,19 +50,9 @@ type Phase =
   /** The `PUT` landed and the sparks are firing. Collapses to the average when `SPARKLE_MS` elapses. */
   | 'celebrating'
 
-/* Read at vote time, not subscribed. The CSS also refuses to paint under the same query; this JS read
-   stops the stars being held open 600ms for an animation that will not run. `test/setup.ts` stubs
-   `matchMedia` at `matches: false`, so tests take the animating path. */
-function prefersReducedMotion(): boolean {
-  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false
-  return window.matchMedia('(prefers-reduced-motion: reduce)').matches === true
-}
-
 export default function TaskRating({
   taskId,
   canVote,
-  hideLabel = false,
-  sx,
   onRated,
 }: {
   taskId: number
@@ -70,15 +61,6 @@ export default function TaskRating({
    * server refuses the `PUT` regardless.
    */
   canVote: boolean
-  /**
-   * Keep the "Rate result" caption for assistive tech only, where the host already says it (a dialog's title) or
-   * has no room for it (beside the task page's tabs, which then name it on the stars' `title`).
-   */
-  hideLabel?: boolean
-  /**
-   * Host geometry, applied first.
-   */
-  sx?: SxProps<Theme>
   /** The aggregate after the caller's own vote lands, so a host showing it elsewhere (the task page's folded
    *  badge) moves with the vote rather than waiting for a reload. */
   onRated?: (rating: Rating5) => void
@@ -174,15 +156,14 @@ export default function TaskRating({
 
   const errorHint = error !== '' && (
     /* Compact in-strip notice; server detail on `title`. */
-    <Typography
+    <Tip title={error}><Typography
       component="span"
       variant="caption"
       data-testid="task-rating-error"
-      title={error}
-      sx={{ color: 'error.main', whiteSpace: 'nowrap', lineHeight: 1 }}
+      sx={{ color: 'error.main', whiteSpace: 'nowrap', lineHeight: LINE_HEIGHT.tight }}
     >
       not saved
-    </Typography>
+    </Typography></Tip>
   )
 
   /* Nothing to show and nothing to vote: render nothing (not "Not rated yet"). Uses `RatingBadge`'s own
@@ -204,25 +185,18 @@ export default function TaskRating({
     <Box
       component="span"
       data-testid="task-rating"
-      sx={[
-        {
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: 0.75,
-          // Sparks are positioned against this box and some sit outside it — no clipping.
-          position: 'relative',
-          minWidth: 0,
-        },
-        ...(Array.isArray(sx) ? sx : [sx]),
-      ]}
+      sx={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 0.5,
+        // Sparks are positioned against this box and some sit outside it — no clipping.
+        position: 'relative',
+        minWidth: 0,
+      }}
     >
-      {/* Names what the stars rate: the task's result. */}
-      <Typography
-        component="span"
-        variant="caption"
-        data-testid="task-rating-label"
-        sx={hideLabel ? VISUALLY_HIDDEN : { color: 'text.secondary', whiteSpace: 'nowrap' }}
-      >
+      {/* Names what the stars rate (the task's result) for assistive tech only: the host already says it (a dialog's
+          title) or has no room for it (beside the task page's tabs). */}
+      <Typography component="span" variant="caption" data-testid="task-rating-label" sx={VISUALLY_HIDDEN}>
         {showStars ? 'Rate result' : 'Result'}
       </Typography>
       {showStars ? (
@@ -230,7 +204,6 @@ export default function TaskRating({
           <Box
             component="span"
             sx={{ display: 'inline-flex', alignItems: 'center', position: 'relative' }}
-            title={hideLabel ? 'Rate result' : undefined}
             /* `Esc` backs out of a reopened control only; before a first vote there is nothing to return to. */
             onKeyDown={event => {
               if (event.key === 'Escape' && reopened && phase === 'idle') {
@@ -260,9 +233,9 @@ export default function TaskRating({
               }}
               sx={[
                 theme => ({
-                  /* Filled tone matches `RatingBadge`'s amber, not MUI's `#faaf00`. */
-                  color: '#b45309',
-                  ...theme.applyStyles('dark', { color: '#fcd34d' }),
+                  /* Filled tone matches `RatingBadge`'s amber, not MUI's own. */
+                  color: 'warning.dark',
+                  ...theme.applyStyles('dark', { color: 'warning.light' }),
                   /* Quiet empty tone (`text.disabled`) beside tab navigation. */
                   [`& .${ratingClasses.iconEmpty}`]: { color: 'text.disabled' },
                   /* Keep MUI's fill-to-pointer; drop its `scale(1.2)` on hover/active, which jumps ~4px
@@ -271,7 +244,7 @@ export default function TaskRating({
                   [`& .${ratingClasses.iconActive}`]: { transform: 'none' },
                   // `display: flex` removes the inline baseline gap.
                   display: 'flex',
-                  fontSize: '1.125rem',
+                  fontSize: SIZE.iconSm,
                   // Busy tint only; the reentry guard blocks the second click.
                   opacity: phase === 'saving' ? 0.75 : 1,
                   transition: theme.transitions.create('opacity', { duration: 120 }),
@@ -293,8 +266,8 @@ export default function TaskRating({
                       width: spark.size,
                       height: spark.size,
                       clipPath: SPARK_CLIP,
-                      backgroundColor: '#b45309',
-                      ...theme.applyStyles('dark', { backgroundColor: '#fde68a' }),
+                      backgroundColor: 'warning.dark',
+                      ...theme.applyStyles('dark', { backgroundColor: 'warning.light' }),
                       // Never eat a click.
                       pointerEvents: 'none',
                       opacity: 0,
@@ -319,12 +292,11 @@ export default function TaskRating({
           {myStars === null && count > 0 && <RatingBadge average={average} count={count} />}
         </>
       ) : (
-        <Tooltip
+        <Tip
           title={breakdown}
           /* `describeChild`: tooltip becomes the description, not the name, and MUI mirrors the string to
              the native `title` when closed (hand-setting `title` would double it). */
           describeChild
-          enterDelay={200}
           slotProps={{ tooltip: { sx: { whiteSpace: 'pre-line' } } }}
         >
           {canVote ? (
@@ -340,8 +312,8 @@ export default function TaskRating({
                  hit area instead. */
               sx={{
                 px: 0.5,
-                py: 0.25,
-                borderRadius: 0.5,
+                py: 0,
+                borderRadius: RADIUS.sm,
                 cursor: 'pointer',
                 '&:hover': { backgroundColor: 'action.hover' },
               }}
@@ -355,7 +327,7 @@ export default function TaskRating({
               <RatingBadge average={average} count={count} title={null} testId="task-rating-badge" />
             </Box>
           )}
-        </Tooltip>
+        </Tip>
       )}
 
       {errorHint}

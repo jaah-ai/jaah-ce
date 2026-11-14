@@ -7,9 +7,11 @@ optional check. Auto-merge is the native auto-complete; `close` abandons the PR.
 from __future__ import annotations
 
 import urllib.parse
+from collections.abc import Iterator
 
-from ..model import Annotation, Check, ForgeError, Job, PullRequest, Run, is_id, required_rollup, strip_heads
-from .base import PAGE_MAX, TRUNCATED, Adapter, capped, diff_stats, listed_item, take
+from ..model import Annotation, Check, ForgeError, Job, PullRequest, Run, required_rollup, strip_heads
+from .base import (MAX_MERGED_FILES, MAX_PAGES, MAX_PR_COMMITS, PAGE_MAX, TRUNCATED, Adapter, Started, capped, commit,
+                   diff_stats, iso, listed_item, merged_item, newest_merged, parse_time, provenance, take)
 
 _V = {"api-version": "7.1"}
 # The identity a cancelled auto-complete is set to (and may read back as): nobody, so not armed.
@@ -57,6 +59,11 @@ def _run(row: dict) -> Run:
                *outcome(row.get("status"), row.get("result")), row.get("queueTime") or "", branch=_branch(row))
 
 
+def _path(change: dict) -> str:
+    """The repository path one iteration change names, without Azure's leading `/`."""
+    return ((change.get("item") or {}).get("path") or change.get("originalPath") or "").lstrip("/")
+
+
 def _armed(pr: dict) -> bool:
     """Auto-complete set by someone (a cancelled one may read back as `_NOBODY`)."""
     return (pr.get("autoCompleteSetBy") or {}).get("id") not in (None, "", _NOBODY)
@@ -84,6 +91,13 @@ def merge_state(status: str, merge_status: str, draft: bool, checks: str,
 
 
 class Azure(Adapter):
+    DESCRIPTION = "description"
+    PR_NAME = "Azure DevOps PR"
+    NUMBER = "pullRequestId"
+    PRS = "pullrequests"
+    PARAMS = _V
+    CLOSE = {"status": "abandoned"}
+
     @property
     def _repo(self) -> str:
         name = self.login.repo_path.rsplit("/", 1)[-1]
@@ -92,22 +106,20 @@ class Azure(Adapter):
     def _web(self, number: int) -> str:
         return f"{self.login.web_url}/pullrequest/{number}"
 
-    def create(self, *, title, body, head, base, draft):
-        data = self.client.json("POST", f"{self._repo}/pullrequests", params=_V, json_body={
-            "sourceRefName": f"refs/heads/{head}", "targetRefName": f"refs/heads/{base}",
-            "title": title, "description": body, "isDraft": draft})
-        return self.view(int(data["pullRequestId"]))
+    def _create_payload(self, title, body, head, base, draft):
+        return {"sourceRefName": f"refs/heads/{head}", "targetRefName": f"refs/heads/{base}",
+                "title": title, "description": body, "isDraft": draft}
 
-    def find(self, head):
-        data = self.client.get(f"{self._repo}/pullrequests", params={
-            "searchCriteria.sourceRefName": f"refs/heads/{head}", "searchCriteria.status": "all", "$top": 1, **_V})
-        rows = data.get("value") or []
-        if not rows:
-            raise ForgeError(f"no Azure DevOps PR from branch '{head}'")
-        return int(rows[0]["pullRequestId"])
+    def _find_rows(self, head):
+        return self.client.get(self._pr_path(), params={
+            "searchCriteria.sourceRefName": f"refs/heads/{head}", "searchCriteria.status": "all", "$top": 1, **_V}
+        ).get("value") or []
 
     def _pr(self, number: int) -> dict:
-        return self.client.get(f"{self._repo}/pullrequests/{number}", params=_V)
+        return self.client.get(self._pr_path(number), params=_V)
+
+    # A PR's sub-resources (statuses, threads, iterations, commits) are spelled `pullRequests/...` below, as the
+    # recorded fixtures match them: not under `_pr_path`, whose collection is `pullrequests`.
 
     def _checks_and_gates(self, number: int, pr: dict):
         latest: dict[str, dict] = {}
@@ -160,42 +172,32 @@ class Azure(Adapter):
     def checks(self, number):
         return self._checks_and_gates(number, self._pr(number))[0]
 
+    def checks_for_sha(self, sha):
+        # The latest status per context (`latestOnly`); `pending`/`notSet` read as pending.
+        data = self.client.get(f"{self._repo}/commits/{sha}/statuses", params={"latestOnly": "true", **_V})
+        return [Check(f"status-{s.get('id')}", (s.get("context") or {}).get("name") or "",
+                      _STATUS.get(s.get("state") or "", "pending"), s.get("targetUrl") or "")
+                for s in data.get("value") or []]
+
     def auto_merge(self, pr):
         org = self.client.api_base.rsplit("/", 2)[0]  # drop `/{project}/_apis`
         me = self.client.get(f"{org}/_apis/connectionData", params=_V_PREVIEW)
         uid = (me.get("authenticatedUser") or {}).get("id")
         if not uid:
             raise ForgeError("Azure DevOps connectionData names no authenticated user")
-        self.client.json("PATCH", f"{self._repo}/pullrequests/{pr.number}", params=_V, json_body={
-            "autoCompleteSetBy": {"id": uid}, "completionOptions": _COMPLETION})
-        return self.view(pr.number)
+        return self._update(pr.number, {"autoCompleteSetBy": {"id": uid}, "completionOptions": _COMPLETION})
 
     def disable_auto_merge(self, pr):
         # Azure's documented cancel: auto-complete set by the empty identity.
-        self.client.json("PATCH", f"{self._repo}/pullrequests/{pr.number}", params=_V, json_body={
-            "autoCompleteSetBy": {"id": _NOBODY}})
-        return self.view(pr.number)
+        return self._update(pr.number, {"autoCompleteSetBy": {"id": _NOBODY}})
 
     def merge(self, pr):
         # The head the checks passed on: Azure refuses the completion if the source moved since.
-        self.client.json("PATCH", f"{self._repo}/pullrequests/{pr.number}", params=_V, json_body={
-            "status": "completed", "lastMergeSourceCommit": {"commitId": pr.extra.get("head_sha") or ""},
-            "completionOptions": _COMPLETION})
-        return self.view(pr.number)
-
-    def edit(self, number, *, title, body):
-        patch = {k: v for k, v in (("title", title), ("description", body)) if v is not None}
-        self.client.json("PATCH", f"{self._repo}/pullrequests/{number}", params=_V, json_body=patch)
-        return self.view(number)
+        return self._update(pr.number, {"status": "completed", "completionOptions": _COMPLETION,
+                                        "lastMergeSourceCommit": {"commitId": pr.extra.get("head_sha") or ""}})
 
     def ready(self, number):
-        self.client.json("PATCH", f"{self._repo}/pullrequests/{number}", params=_V, json_body={"isDraft": False})
-        return self.view(number)
-
-    def close(self, number):
-        self.client.json("PATCH", f"{self._repo}/pullrequests/{number}", params=_V,
-                         json_body={"status": "abandoned"})
-        return self.view(number)
+        return self._update(number, {"isDraft": False})
 
     def comment(self, number, body):
         data = self.client.json("POST", f"{self._repo}/pullRequests/{number}/threads", params=_V, json_body={
@@ -223,8 +225,7 @@ class Azure(Adapter):
 
     def run_head(self, run_id):
         """The build alone — and only a build of THIS repo: a build id is project-wide, not per repo."""
-        if not is_id(run_id):
-            raise ForgeError(f"'{run_id}' is not an Azure Pipelines build id")
+        self._id(run_id, "an Azure Pipelines build id")
         row = self.client.get(f"build/builds/{run_id}", params=_V)
         repo = self.login.repo_path.rsplit("/", 1)[-1].lower()
         if ((row.get("repository") or {}).get("name") or "").lower() != repo:
@@ -251,8 +252,7 @@ class Azure(Adapter):
         return head, jobs, notes
 
     def rerun(self, run, failed_only):
-        if not is_id(run.id):
-            raise ForgeError(f"'{run.id}' is not an Azure Pipelines build id")
+        self._id(run.id, "an Azure Pipelines build id")
         if failed_only:
             # Retries the failed jobs of the same build, in place.
             self.client.json("PATCH", f"build/builds/{run.id}", params={"retry": "true", **_V}, json_body={})
@@ -263,6 +263,23 @@ class Azure(Adapter):
             "definition": {"id": (build.get("definition") or {}).get("id")},
             "sourceBranch": build.get("sourceBranch"), "sourceVersion": build.get("sourceVersion")})
         return str(data["id"])
+
+    def dispatch(self, workflow, ref, inputs):
+        # `workflow` is a pipeline id, project-wide: only a pipeline that builds THIS repo is started.
+        self._id(workflow, "an Azure Pipelines pipeline id")
+        repo = self.login.repo_path.rsplit("/", 1)[-1].lower()
+        definition = self.client.get(f"build/definitions/{workflow}", params=_V)
+        if ((definition.get("repository") or {}).get("name") or "").lower() != repo:
+            raise ForgeError(f"Azure Pipelines pipeline {workflow} does not build {self.login.repo_path}")
+        body: dict = {"resources": {"repositories": {"self": {"refName": f"refs/heads/{ref}"}}}}
+        if inputs:
+            body["templateParameters"] = inputs
+        data = self.client.json("POST", f"pipelines/{workflow}/runs", params=_V, json_body=body)
+        run_id = str(data["id"])
+        sha = ((((data.get("resources") or {}).get("repositories") or {}).get("self") or {}).get("version")) or ""
+        if not sha:
+            sha = self.client.get(f"build/builds/{run_id}", params=_V).get("sourceVersion") or ""
+        return Started(run_id, ((data.get("_links") or {}).get("web") or {}).get("href") or "", sha)
 
     def prs(self, state, author, limit, head=None, base=None):
         def wanted(pr: dict) -> bool:
@@ -281,16 +298,7 @@ class Azure(Adapter):
         if base:
             criteria["searchCriteria.targetRefName"] = f"refs/heads/{base}"
 
-        def pages():
-            skip = 0
-            while True:
-                rows = self.client.get(f"{self._repo}/pullrequests", params={
-                    **criteria, "$top": size, "$skip": skip, **_V}).get("value") or []
-                yield rows
-                if len(rows) < size:
-                    return
-                skip += size
-
+        pages = self._pages(self._pr_path(), {**criteria, **_V}, size, "value", skip=True)
         # A listed PR carries no statuses or policy evaluations, so no checks or merge state: the row says only what
         # the listing does.
         return [listed_item(number=int(pr["pullRequestId"]), title=pr.get("title") or "",
@@ -299,41 +307,159 @@ class Azure(Adapter):
                             author=(pr.get("createdBy") or {}).get("uniqueName") or "",
                             state=_STATE.get(pr.get("status") or "", "closed"),
                             url=self._web(int(pr["pullRequestId"])), auto_merge=_armed(pr))
-                for pr in take(pages(), limit, wanted)]
+                for pr in take(pages, limit, wanted)]
 
-    def diff_stats(self, number):
-        # Azure DevOps serves no per-file line counts (Pull Request Iteration Changes 7.1 names a path and a
-        # change type only): files are counted, lines are null, and the result is `partial`.
+    def _changes(self, number: int) -> "Iterator[dict]":
+        """The PR's last iteration's file changes (folders left out), lazily: against the base (`$compareTo`
+        0), so the PR's whole change, not the last push's."""
         iterations = self.client.get(f"{self._repo}/pullRequests/{number}/iterations", params=_V)
         rows = iterations.get("value") if isinstance(iterations, dict) else iterations
         if not rows:
             raise ForgeError(f"Azure DevOps PR #{number} has no iterations")
         last = max(int(it["id"]) for it in rows)
+        skip = 0
+        while True:
+            data = self.client.get(f"{self._repo}/pullRequests/{number}/iterations/{last}/changes", params={
+                "$top": _CHANGES_PAGE, "$skip": skip, "$compareTo": 0, **_V})
+            for change in data.get("changeEntries") or []:
+                item = change.get("item") or {}
+                if not item.get("isFolder") and item.get("gitObjectType") != "tree":
+                    yield change
+            following = int(data.get("nextSkip") or 0)
+            if not data.get("nextTop") or following <= skip:
+                return
+            skip = following
 
-        def changes():
-            skip = 0
-            while True:
-                data = self.client.get(f"{self._repo}/pullRequests/{number}/iterations/{last}/changes", params={
-                    "$top": _CHANGES_PAGE, "$skip": skip, "$compareTo": 0, **_V})
-                yield from data.get("changeEntries") or []
-                following = int(data.get("nextSkip") or 0)
-                if not data.get("nextTop") or following <= skip:
-                    return
-                skip = following
-
-        files = (c for c in changes()
-                 if not (c.get("item") or {}).get("isFolder") and (c.get("item") or {}).get("gitObjectType") != "tree")
-        rows, more = capped(files)
+    def diff_stats(self, number):
+        # Azure DevOps serves no per-file line counts (Pull Request Iteration Changes 7.1 names a path and a
+        # change type only): files are counted, lines are null, and the result is `partial`.
+        rows, more = capped(self._changes(number))
         return diff_stats("azure_devops", (((c.get("item") or {}).get("path") or c.get("originalPath") or "", None, None)
                                            for c in rows),
                           TRUNCATED if more else NO_LINE_COUNTS)
 
+    def provenance(self, number):
+        pr = self._pr(number)
+        # One page one past the cap says whether the list was cut. Azure lists newest first; oldest first, as
+        # GitHub does. A commit names an author's name and email, never an account.
+        rows = self.client.get(f"{self._repo}/pullRequests/{number}/commits",
+                               params={"$top": MAX_PR_COMMITS + 1, **_V}).get("value") or []
+        commits = [commit(r["commitId"], (r.get("author") or {}).get("name") or "", None, r.get("comment") or "")
+                   for r in reversed(rows[:MAX_PR_COMMITS])]
+        paths, more_files = capped(_path(c) for c in self._changes(number))
+        return provenance("azure_devops", number, merged=pr.get("status") == "completed",
+                          merge_sha=(pr.get("lastMergeCommit") or {}).get("commitId"), commits=commits,
+                          more_commits=len(rows) > MAX_PR_COMMITS, files=paths, more_files=more_files)
+
+    def merged_prs(self, since, limit):
+        # Completed PRs closed since `since` (`queryTimeRangeType=closed`: the completion is the merge, and its
+        # `closedDate` the merge time); a completion whose merge did not succeed merged nothing.
+        criteria = {"searchCriteria.status": "completed", "searchCriteria.minTime": iso(since),
+                    "searchCriteria.queryTimeRangeType": "closed", **_V}
+        rows = take(self._pages(self._pr_path(), criteria, PAGE_MAX, "value", skip=True),
+                    MAX_PAGES * PAGE_MAX, lambda pr: pr.get("mergeStatus") in ("succeeded", "completed"))
+        return [merged_item(number=int(pr["pullRequestId"]), url=self._web(int(pr["pullRequestId"])),
+                            title=pr.get("title") or "", body=pr.get("description"), merged_at=when,
+                            files=[_path(c) for c in capped(self._changes(int(pr["pullRequestId"])),
+                                                            MAX_MERGED_FILES)[0]])
+                for when, pr in newest_merged(rows, lambda pr: parse_time(pr.get("closedDate")), since, limit)]
+
     def ci_log(self, check_id):
-        if not is_id(check_id):
-            raise ForgeError(f"'{check_id}' is not an Azure Pipelines build: it has no log here")
+        self._id(check_id, "an Azure Pipelines build: it has no log here")
         logs = self.client.get(f"build/builds/{check_id}/logs", params=_V)
         parts = []
         for log in logs.get("value") or []:
             text = self.client.text(f"build/builds/{check_id}/logs/{log['id']}", params=_V)
             parts.append(f"=== log {log['id']} ===\n{text}")
         return "\n".join(parts)
+
+    VARIABLE_RIGHTS = ("a token with Variable Groups (Read, create & manage) and Project and Team (Read), and the "
+                       "Administrator or Creator role on the project's Library")
+
+    # No repository-level variables exist: each level is a Library variable group of the project, `jaah-<repo>`
+    # (`jaah-<repo>-<E>` with --env), created on first `set`. A group-wide write is org-scoped: the org's own URL.
+    def _group_name(self, env: "str | None") -> str:
+        repo = self.login.repo_path.rsplit("/", 1)[-1]
+        return f"jaah-{repo}-{env}" if env else f"jaah-{repo}"
+
+    def _description(self, env: "str | None") -> str:
+        # The group's owner mark: two levels can share a name (repo `api` --env `prod`, repo `api-prod`), and a
+        # group someone made by hand may carry ours; only a group whose description is this one is written.
+        repo = self.login.repo_path.rsplit("/", 1)[-1]
+        return f"CI variables jaah-forge sets for {repo}" + (f", environment {env}" if env else "")
+
+    def _own_group(self, env: "str | None") -> "dict | None":
+        name = self._group_name(env)
+        group = self._group(name)
+        if group is not None and (group.get("description") != self._description(env)
+                                  or (group.get("type") or "Vsts") != "Vsts"):
+            raise ForgeError(f"Azure DevOps variable group {group.get('name')} is not the one jaah-forge keeps for "
+                             f"{self.login.repo_path}" + (f" environment {env}" if env else "")
+                             + ": rename or remove it, or set its variables by hand")
+        return group
+
+    def _org(self) -> str:
+        return self.client.api_base.rsplit("/", 2)[0]  # drop `/{project}/_apis`
+
+    def _group(self, name: str) -> "dict | None":
+        # `groupName` takes wildcards: the exact name is matched here.
+        rows = self.client.get("distributedtask/variablegroups", params={"groupName": name, **_V}).get("value") or []
+        return next((g for g in rows if (g.get("name") or "").casefold() == name.casefold()), None)
+
+    @staticmethod
+    def _extras(group: str) -> dict:
+        return {"group": group, "pipeline_yaml": f"variables:\n- group: {group}"}
+
+    def _put_group(self, group: dict, variables: dict) -> None:
+        # The WHOLE group: a secret read back as `{value: null, isSecret: true}` and sent back so keeps its value.
+        self.client.json("PUT", f"{self._org()}/_apis/distributedtask/variablegroups/{group['id']}", params=_V,
+                         json_body={"name": group.get("name"), "type": group.get("type") or "Vsts",
+                                    "description": group.get("description") or "", "variables": variables,
+                                    "variableGroupProjectReferences": group.get("variableGroupProjectReferences")
+                                    or []})
+
+    def variables(self, kind, env):
+        group = self._own_group(env)
+        secret = kind == "secret"
+        return [{"name": name, **({} if secret else {"value": (v or {}).get("value") or ""})}
+                for name, v in ((group or {}).get("variables") or {}).items()
+                if bool((v or {}).get("isSecret")) == secret]
+
+    def set_variable(self, kind, name, value, env):
+        group_name = self._group_name(env)
+        entry = {"value": value, "isSecret": kind == "secret"}
+        group = self._own_group(env)
+        if group is None:
+            project = urllib.parse.unquote(self.login.repo_path.split("/")[1])
+            project_id = self.client.get(
+                f"{self._org()}/_apis/projects/{urllib.parse.quote(project, safe='')}", params=_V).get("id")
+            if not project_id:
+                raise ForgeError(f"Azure DevOps names no id for project {project}")
+            description = self._description(env)
+            self.client.json("POST", f"{self._org()}/_apis/distributedtask/variablegroups", params=_V, json_body={
+                "name": group_name, "type": "Vsts", "description": description, "variables": {name: entry},
+                "variableGroupProjectReferences": [{"name": group_name, "description": description,
+                                                    "projectReference": {"id": project_id, "name": project}}]})
+            return {"action": "created", **self._extras(group_name)}
+        variables = dict(group.get("variables") or {})
+        action = "updated" if name in variables else "created"
+        variables[name] = entry
+        self._put_group(group, variables)
+        return {"action": action, **self._extras(group_name)}
+
+    def delete_variable(self, kind, name, env):
+        group_name = self._group_name(env)
+        group = self._own_group(env)
+        variables = dict((group or {}).get("variables") or {})
+        if name not in variables or bool((variables[name] or {}).get("isSecret")) != (kind == "secret"):
+            raise ForgeError(f"no {kind} {name} in Azure DevOps variable group {group_name}")
+        del variables[name]
+        if variables:
+            self._put_group(group, variables)
+        else:  # its last variable: the group goes, rather than standing empty
+            ids = ",".join(str((r.get("projectReference") or {}).get("id"))
+                           for r in group.get("variableGroupProjectReferences") or []
+                           if (r.get("projectReference") or {}).get("id"))
+            self.client.json("DELETE", f"{self._org()}/_apis/distributedtask/variablegroups/{group['id']}",
+                             params={"projectIds": ids, **_V})
+        return self._extras(group_name)

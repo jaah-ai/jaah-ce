@@ -27,7 +27,8 @@
  *    empty tail; scrolls only when the viewport is too short. Minimized it is a narrow
  *    rail (ring over "N/M", Restore, ✕), and under `CRAMPED_QUERY` it starts that way unless the user left it
  *    open; while an editor is split beside its list, on Audit and Settings and while acting as an org it is the
- *    rail whatever was stored, until the user restores it. Every step done, the ring becomes a ✓ and the caption "Done"
+ *    rail whatever was stored, until the user restores it, and so below the console's desktop width (1024px), where
+ *    the open dock leaves the page too narrow. Every step done, the ring becomes a ✓ and the caption "Done"
  *    (`ProgressGlyph`), so it never reads as a spinner that will not stop; the ✕ puts it away.
  *  · PHONE: no dragging. A collapsed BAR pinned just above the Sidebar's 60px bottom bar — title and "N/M";
  *    a tap opens the checklist above it (and closes it again), ✕ dismisses. The page gets the bar's height as
@@ -48,7 +49,7 @@
  */
 import { useEffect, useId, useRef, useState, type JSX } from 'react'
 import { useLocation } from 'react-router-dom'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQueryClient, type Query } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import ButtonBase from '@mui/material/ButtonBase'
 import Paper from '@mui/material/Paper'
@@ -62,12 +63,12 @@ import { createExternalStore, useExternalStore } from '../../lib/externalStore'
 import { readJson, writeJson } from '../../lib/safeStorage'
 import { DoneBadge } from '../../ui/DoneBadge'
 import { EXPAND_LESS_PATH, EXPAND_MORE_PATH, Icon } from '../../ui/icons'
-import { BOTTOM_NAV_HEIGHT, PHONE_QUERY } from '../../ui/listStyles'
+import { usePhone } from '../../hooks/usePhone'
+import { BOTTOM_NAV_HEIGHT, CRAMPED_QUERY, DOCK_RAIL_QUERY } from '../../ui/listStyles'
 import { ProgressRing, progressPct } from '../../ui/ProgressRing'
 import { useFormBarShown } from '../../ui/useFormBarShown'
 import { useOpenDetailPath } from '../ListDetail'
 import SetupChecklist, { checklistProgress, progressReading, useChecklistDismiss } from '../setupChecklist/SetupChecklist'
-import { MARGIN } from '../../ui/FloatingWindow'
 import {
   CLOSE_PATH,
   HEADER_GRADIENT,
@@ -80,6 +81,8 @@ import { useCompanySetupGuide } from './companySetupGuide'
 import { OWN_TASKS_QUERY, useGetStartedGuide } from './getStartedGuide'
 import type { Guide } from './guide'
 import SetupCelebration from './SetupCelebration'
+import { FONT_WEIGHT, LINE_HEIGHT, RADIUS, SIZE, grid } from '../../theme'
+import Tip from '../../ui/Tip'
 
 /** Whether the dock (desktop rail, phone bar folded into the navigation) was left minimized: a per-browser
  *  convenience. */
@@ -87,17 +90,6 @@ export const ONBOARDING_MINIMIZED_KEY = 'onboarding-widget:minimized'
 /** Too narrow for the open dock to leave the page its room: it starts as the rail there. 1599px, not a laptop's
  *  1440: there the open dock (~220px) cost the operator's wide tables a column (Products › Instance types lost
  *  Network). */
-export const CRAMPED_QUERY = '(max-width: 1599px)'
-/** The open dock's widest: the checklist's longest row, never a third of a laptop. */
-const DOCK_MAX_WIDTH = 360
-/** The bottom-right corner the Help launcher floats in, kept clear of the dock (`support/HelpLauncher.tsx`). */
-const HELP_LAUNCHER_CLEARANCE = 72
-/** The rail: the header's buttons, stacked. */
-const RAIL_WIDTH = 52
-
-/** The phone bar's height: one line at the 44px tap floor, since it rests over page content. The Sidebar's
- *  bottom bar (`BOTTOM_NAV_HEIGHT`) is under it. */
-const BAR_HEIGHT = 44
 /* Under the Sidebar's bottom bar and its sheet (both 40), so the navigation always wins; above page content. */
 const BAR_Z_INDEX = 39
 
@@ -189,10 +181,16 @@ function useRefetchOnNavigation(): void {
       first.current = false
       return
     }
-    void client.refetchQueries({ queryKey: [COMPANY_SETUP_QUERY], type: 'active' })
-    void client.refetchQueries({ queryKey: [OWN_TASKS_QUERY], type: 'active' })
+    /* Not a question still in flight or answered moments ago: a page load's own redirect (`/` → `/tasks`) and a
+       quick hop between pages would otherwise ask the same thing twice in a second. */
+    const stale = (query: Query) => query.state.fetchStatus !== 'fetching'
+      && Date.now() - query.state.dataUpdatedAt >= NAVIGATION_REFETCH_MIN_AGE_MS
+    void client.refetchQueries({ queryKey: [COMPANY_SETUP_QUERY], type: 'active', predicate: stale })
+    void client.refetchQueries({ queryKey: [OWN_TASKS_QUERY], type: 'active', predicate: stale })
   }, [client, pathname])
 }
+
+const NAVIGATION_REFETCH_MIN_AGE_MS = 5_000
 
 export default function OnboardingWidget(): JSX.Element | null {
   useRefetchOnNavigation()
@@ -219,7 +217,7 @@ export default function OnboardingWidget(): JSX.Element | null {
 
 /** One guide in its frame. Exported for the guide suites, which draw a guide without the choice above. */
 export function GuideFrame({ guide }: { guide: Guide }): JSX.Element {
-  const phone = useMediaQuery(PHONE_QUERY)
+  const phone = usePhone()
   const dismiss = useChecklistDismiss(guide.onDismiss)
   const body = (
     <SetupChecklist
@@ -257,7 +255,7 @@ function TitleBlock({ guide, inline }: { guide: Guide; inline?: boolean }): JSX.
         component="h2"
         variant={inline ? 'subtitle2' : 'subtitle1'}
         data-testid={`${guide.testIdPrefix}-title`}
-        sx={{ fontWeight: 700, lineHeight: 1.2, whiteSpace: 'nowrap' }}
+        sx={{ fontWeight: FONT_WEIGHT.bold, lineHeight: LINE_HEIGHT.snug, whiteSpace: 'nowrap' }}
       >
         {guide.title}
       </Typography>
@@ -265,7 +263,7 @@ function TitleBlock({ guide, inline }: { guide: Guide; inline?: boolean }): JSX.
         variant="caption"
         component="div"
         data-testid={`${guide.testIdPrefix}-count`}
-        sx={{ color: 'text.secondary', lineHeight: 1.3, whiteSpace: 'nowrap' }}
+        sx={{ color: 'text.secondary', lineHeight: LINE_HEIGHT.snug, whiteSpace: 'nowrap' }}
       >
         {progressReading(checklistProgress(guide.steps))}
       </Typography>
@@ -305,7 +303,10 @@ function DesktopWindow({ guide, dismiss, children }: { guide: Guide; dismiss: Di
   /* And on Audit and Settings, until the user restores it there (`AUDIT_PATH`, `SETTINGS_PATH`). */
   const { pathname } = useLocation()
   const onRailPage = pathname.startsWith(AUDIT_PATH) || pathname.startsWith(SETTINGS_PATH)
-  const railHere = acting || splitOpen || onRailPage
+  /* And under the desktop width (`DOCK_RAIL_QUERY`), the company guide's ask to start open included: open, the dock
+     left the page so little that its own top controls ran together. */
+  const narrow = useMediaQuery(DOCK_RAIL_QUERY, { noSsr: true })
+  const railHere = acting || splitOpen || onRailPage || narrow
   const [restoredHere, setRestoredHere] = useState(false)
   const [wasSplit, setWasSplit] = useState(splitOpen)
   if (splitOpen !== wasSplit) {
@@ -336,7 +337,7 @@ function DesktopWindow({ guide, dismiss, children }: { guide: Guide; dismiss: Di
     }
   }, [dismiss.failed])
   useOpenRequest(restore)
-  const ring = <ProgressGlyph guide={guide} size={30} />
+  const ring = <ProgressGlyph guide={guide} size={SIZE.thumb} />
 
   return (
     /* IN FLOW, at the layout row's right end (`order`): `App.tsx` mounts this before the Sidebar, and the row
@@ -359,33 +360,35 @@ function DesktopWindow({ guide, dismiss, children }: { guide: Guide; dismiss: Di
       sx={{
         order: 2,
         flex: '0 0 auto',
-        width: minimized ? RAIL_WIDTH : 'max-content',
-        maxWidth: DOCK_MAX_WIDTH,
+        /* The rail: the header's buttons, stacked. Open: never wider than the checklist's longest row, never a
+           third of a laptop. */
+        width: minimized ? grid(8.5) : 'max-content',
+        maxWidth: SIZE.measureNarrow,
         /* As tall as its rows, at the column's top: a full-height strip left most of it empty. Never
            down to the Help launcher's corner (`support/HelpLauncher.tsx`); a viewport too short scrolls the body. */
         alignSelf: 'flex-start',
-        maxHeight: `calc(100% - ${HELP_LAUNCHER_CLEARANCE}px)`,
+        maxHeight: `calc(100% - ${grid(12)})`,
         display: 'flex',
         flexDirection: 'column',
         borderLeft: 1,
         borderBottom: 1,
         borderColor: 'divider',
-        borderBottomLeftRadius: 8,
+        borderBottomLeftRadius: RADIUS.md,
         overflow: 'hidden',
       }}
     >
       {minimized ? (
         <Box
           data-testid="onboarding-widget-header"
-          sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1, py: 1.25, backgroundImage: HEADER_GRADIENT }}
+          sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1, py: 1, backgroundImage: HEADER_GRADIENT }}
         >
-          <Box title={guide.title} sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 0.25 }}>
+          <Tip title={guide.title}><Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 0 }}>
             {ring}
             {/* The rail's reading of the ring: without it a part-drawn gradient arc reads as a spinner. */}
-            <Typography variant="caption" data-testid={`${guide.testIdPrefix}-rail-count`} sx={{ lineHeight: 1, fontWeight: 600, color: 'text.secondary' }}>
+            <Typography variant="caption" data-testid={`${guide.testIdPrefix}-rail-count`} sx={{ lineHeight: LINE_HEIGHT.tight, fontWeight: FONT_WEIGHT.semibold, color: 'text.secondary' }}>
               {progressReading(checklistProgress(guide.steps))}
             </Typography>
-          </Box>
+          </Box></Tip>
           <HeaderButton label="Restore" path={RESTORE_PATH} testId="onboarding-widget-minimize" onClick={() => toggleMinimized(false)} />
           <DismissButton guide={guide} dismiss={dismiss} />
         </Box>
@@ -395,7 +398,7 @@ function DesktopWindow({ guide, dismiss, children }: { guide: Guide; dismiss: Di
           onDoubleClick={e => {
             if (!(e.target as HTMLElement).closest('button')) toggleMinimized()
           }}
-          sx={{ ...WINDOW_HEADER_SX, gap: 1.25 }}
+          sx={{ ...WINDOW_HEADER_SX, gap: 1 }}
         >
           {ring}
           <TitleBlock guide={guide} />
@@ -410,7 +413,7 @@ function DesktopWindow({ guide, dismiss, children }: { guide: Guide; dismiss: Di
           viewport is shorter than the list. */}
       <Box
         data-testid="onboarding-widget-body"
-        sx={{ display: minimized ? 'none' : 'block', flex: '0 1 auto', minHeight: 0, overflowY: 'auto', px: 1.75, pt: 1.5, pb: 1.25 }}
+        sx={{ display: minimized ? 'none' : 'block', flex: '0 1 auto', minHeight: 0, overflowY: 'auto', px: 1.5, pt: 1.5, pb: 1 }}
       >
         {children}
       </Box>
@@ -490,7 +493,7 @@ function PhoneBar({ guide, dismiss, children }: { guide: Guide; dismiss: Dismiss
     /* +1: the Paper's top border sits above the bar's own height. Never less than that (unlaid-out, jsdom). */
     const reserve = () => {
       const height = Math.ceil(paperRef.current?.getBoundingClientRect().height ?? 0)
-      root.setProperty(ONBOARDING_BAR_VAR, `${Math.max(BAR_HEIGHT + 1, height)}px`)
+      root.setProperty(ONBOARDING_BAR_VAR, `${Math.max(SIZE.tapTarget + 1, height)}px`)
     }
     reserve()
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(reserve)
@@ -527,10 +530,10 @@ function PhoneBar({ guide, dismiss, children }: { guide: Guide; dismiss: Dismiss
           zIndex: BAR_Z_INDEX,
           display: 'flex',
           flexDirection: 'column',
-          borderTopLeftRadius: 12,
-          borderTopRightRadius: 12,
-          borderBottomLeftRadius: 0,
-          borderBottomRightRadius: 0,
+          borderTopLeftRadius: RADIUS.md,
+          borderTopRightRadius: RADIUS.md,
+          borderBottomLeftRadius: RADIUS.none,
+          borderBottomRightRadius: RADIUS.none,
           borderTop: 1,
           borderColor: 'divider',
           overflow: 'hidden',
@@ -544,12 +547,13 @@ function PhoneBar({ guide, dismiss, children }: { guide: Guide; dismiss: Dismiss
           data-testid="onboarding-widget-body"
           hidden={!expanded}
           sx={{
-            /* Half the screen at most: the page keeps the other half above the sheet, its rows still in reach. */
-            maxHeight: `min(50dvh, calc(100dvh - ${BOTTOM_NAV_HEIGHT + BAR_HEIGHT + 2 * MARGIN}px))`,
+            /* Half the screen at most: the page keeps the other half above the sheet, its rows still in reach.
+               Clear of the bottom navigation, the bar and a window margin above and below (60 + 44 + 2 × 16). */
+            maxHeight: `min(50dvh, calc(100dvh - ${grid(22.5)}))`,
             overflowY: 'auto',
             px: 2,
-            pt: 1.75,
-            pb: 1.25,
+            pt: 1.5,
+            pb: 1,
             borderBottom: 1,
             borderColor: 'divider',
           }}
@@ -557,8 +561,10 @@ function PhoneBar({ guide, dismiss, children }: { guide: Guide; dismiss: Dismiss
           {children}
         </Box>
         <Box
+          /* One line at the tap floor, since it rests over page content; the Sidebar's bottom bar
+             (`BOTTOM_NAV_HEIGHT`) is under it. */
           sx={{
-            height: BAR_HEIGHT,
+            height: SIZE.tapTarget,
             display: 'flex',
             alignItems: 'center',
             pr: 0.5,
@@ -570,11 +576,11 @@ function PhoneBar({ guide, dismiss, children }: { guide: Guide; dismiss: Dismiss
             aria-expanded={expanded}
             aria-controls={panelId}
             onClick={() => setExpanded(e => !e)}
-            sx={{ flex: 1, minWidth: 0, height: '100%', justifyContent: 'flex-start', gap: 1.25, pl: 1.75, pr: 1, textAlign: 'left' }}
+            sx={{ flex: 1, minWidth: 0, height: '100%', justifyContent: 'flex-start', gap: 1, pl: 1.5, pr: 1, textAlign: 'left' }}
           >
-            <ProgressGlyph guide={guide} size={22} />
+            <ProgressGlyph guide={guide} size={SIZE.chip} />
             <TitleBlock guide={guide} inline />
-            <Icon viewBox="0 0 24 24" size={22} sx={{ fill: 'currentColor', color: 'text.secondary' }}>
+            <Icon viewBox="0 0 24 24" size={SIZE.chip} sx={{ fill: 'currentColor', color: 'text.secondary' }}>
               <path d={expanded ? EXPAND_MORE_PATH : EXPAND_LESS_PATH} />
             </Icon>
           </ButtonBase>

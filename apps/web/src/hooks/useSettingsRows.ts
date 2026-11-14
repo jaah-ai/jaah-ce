@@ -1,19 +1,20 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { apiDetail } from '../api'
+import { useCallback, useEffect } from 'react'
 import { useConfirm } from '../components/ConfirmDialog'
+import { useApiRead } from './useApiRead'
 import { useRowActions } from './useBusyIds'
 
 /* The controller of a Settings CRUD panel that owns its own fetch and writes (`settings/tags/TagsSection`
  * says why): the rows, the load / row-write failure banners, per-row busy flags and the confirm dialog.
  *
- * ONE REFETCH, MANY CALLERS (save, every row write), so responses interleave: a generation counter lets only
- * the newest write, and bumping it on unmount drops late resolves.
+ * The read is `useApiRead`'s: ONE REFETCH, MANY CALLERS (save, every row write), and react-query lands only
+ * the newest answer (an overtaken one, or one landing after unmount, is dropped).
  * SHAPE-CHECKED when `shapeError` is given: `get<T>` is an unchecked cast, and these panels render as the
  * fallback when the rest of `/settings` fails — a non-list is a load failure, never a white screen.
- * `fetch` returns the rows plus an optional `apply` for whatever else the same response carries (it runs only
- * for the newest, well-shaped response). `fetch` is read from a ref, so an inline closure is fine. */
-export interface SettingsRowsOptions {
-  fetch: () => Promise<{ rows: unknown; apply?: () => void }>
+ * `fetch` returns the rows plus `extra` for whatever else the same response carries: both land together as
+ * one answer, so a remount's cached paint carries both (a setter closure in the cache would be a dead
+ * mount's), and `extra` is `undefined` beside a malformed answer. */
+export interface SettingsRowsOptions<X> {
+  fetch: () => Promise<{ rows: unknown; extra?: X }>
   /** The load banner's fallback when the request fails. */
   failed: string
   /** The load banner when the rows are not a list; omitted = unchecked. */
@@ -24,45 +25,49 @@ export interface SettingsRowsOptions {
   enabled?: boolean
 }
 
-export function useSettingsRows<T>({ enabled = true, ...options }: SettingsRowsOptions) {
-  const [rows, setRows] = useState<T[] | null>(null)
-  const [loadError, setLoadError] = useState('')
+export function useSettingsRows<T, X = undefined>({
+  fetch, failed, shapeError, emptyOnFailure, enabled = true,
+}: SettingsRowsOptions<X>) {
   const { busy: busyIds, error: rowError, setError: setRowError, run } = useRowActions<string>()
   const [confirm, confirmDialog] = useConfirm()
-  const optionsRef = useRef(options)
-  optionsRef.current = options
-  const generation = useRef(0)
+  const { data, error, refresh } = useApiRead(
+    /* Keyed on the banner text: each panel's load-failure banner names its own rows, so it is the one string
+       every caller already passes that is unique per panel — no second name to keep in step with it. Two panels
+       with the same text would share one cache entry; today the four texts differ, and a copied text would show
+       as the wrong banner before it showed as the wrong rows. */
+    ['settings-rows', failed],
+    async () => {
+      const { rows, extra } = await fetch()
+      /* The hook's own check, not `useApiRead`'s `shapeError`: that one throws, and `apiDetail` composes the banner
+         as "<failed> — <shapeError>", naming the rows twice. Here the sentence stands alone and the rows settle
+         to `[]` (the panel draws empty under the banner, never the skeleton), as the hand-rolled read did. */
+      if (shapeError !== undefined && !Array.isArray(rows)) return { rows: [] as T[], extra: undefined, shapeError }
+      return { rows: rows as T[], extra, shapeError: undefined }
+    },
+    failed,
+    { enabled },
+  )
 
-  const load = useCallback(async () => {
-    if (!enabled) return
-    const { fetch, failed, shapeError, emptyOnFailure } = optionsRef.current
-    const mine = ++generation.current
-    try {
-      const { rows: next, apply } = await fetch()
-      if (mine !== generation.current) return
-      if (shapeError !== undefined && !Array.isArray(next)) {
-        setRows([])
-        setLoadError(shapeError)
-        return
-      }
-      setRows(next as T[])
-      apply?.()
-      setLoadError('')
-      // Clear a stale row failure here, or it sits over the successful write that followed.
-      setRowError('')
-    } catch (err) {
-      if (mine !== generation.current) return
-      if (emptyOnFailure) setRows(prev => prev ?? [])
-      setLoadError(apiDetail(err, failed))
-    }
-  }, [enabled])
+  /* A refused reader sees nothing of a cached answer: react-query hands cached data back under `enabled: false`,
+     and a reader who lost the key mid-session must not keep the earlier rows. */
+  const answer = enabled ? data : null
+  /* A request failure is always the LATEST outcome (react-query clears it on the next success); a held malformed
+     answer speaks only when no request failed after it. */
+  const loadError = enabled ? error || (answer?.shapeError ?? '') : ''
 
+  /* Once react-query has settled on a well-shaped answer (one overtaken by a later refetch never gets here): a
+     stale row failure cleared, or it sits over the successful write that followed. */
   useEffect(() => {
-    void load()
-    return () => {
-      generation.current += 1
-    }
-  }, [load])
+    if (!answer || answer.shapeError) return
+    setRowError('')
+  }, [answer, setRowError])
+
+  /* `null` = nothing landed yet (the skeleton). A failed FIRST load settles to `[]` only when asked; a later
+     failure keeps the last rows (`useApiRead` holds them under the banner). */
+  const rows = answer?.rows ?? (loadError && emptyOnFailure ? [] : null)
+
+  // Guarded here too, not only at mount: a refused reader's cards still call it, and `refetch` ignores `enabled`.
+  const load = useCallback(async () => { if (enabled) await refresh() }, [enabled, refresh])
 
   /** One row write: busy while in flight, refetch after, the refusal over the list. */
   async function rowWrite(busyKey: string, fallback: string, act: () => Promise<unknown>) {
@@ -72,5 +77,7 @@ export function useSettingsRows<T>({ enabled = true, ...options }: SettingsRowsO
     })
   }
 
-  return { rows, loadError, rowError, setRowError, load, busyIds, rowWrite, confirm, confirmDialog }
+  return {
+    rows, extra: answer?.extra, loadError, rowError, setRowError, load, busyIds, rowWrite, confirm, confirmDialog,
+  }
 }

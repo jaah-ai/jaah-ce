@@ -43,6 +43,9 @@ A co-located node's `/tmp` and `/var/tmp` (`layout.tmp_dir`/`var_tmp_dir`, bound
 every top-level directory of its session user in which nothing changed for `TMP_STALE_DAYS`
 (`sweep_stale_tmp`, run as that user).
 
+Each node tree's plugin cache (`enumerate_plugin_prunes`) loses its old plugin versions, run as the root's owner
+(`plugin_repair.prune_plugin_cache`: installed + predecessor + whatever a live session names stay).
+
 Runner trees (`plan_tree_cleanup`), only when the runner is IDLE: every `bin.*`/`externals.*` that is not
 the live version goes, `_update/` goes, `_work/_temp/` is emptied; `_work/_tool`, `_work/<repo>` and `_diag`
 are never touched. Ephemeral host slots (one user per slot, wiped per job by `gha_job.py`) are never
@@ -62,7 +65,6 @@ try:
 except ImportError:  # Windows: the bundle imports this module (`slot_repos`' erase); every reclaim path is Linux-only.
     pwd = None
 import shutil
-import socket
 import stat
 import subprocess
 import sys
@@ -82,6 +84,7 @@ import disk_events  # noqa: E402 — stdlib-only: the report spool, its writer, 
 import disk_reclaim_trigger  # noqa: E402 — the marker's one home
 import cloud_modules  # noqa: E402 — stdlib-only: the cloud-only modules, by name
 import env_helpers  # noqa: E402 — stdlib-only: the one COMPOSE_PROJECT_NAME rule
+import host_platform  # noqa: E402 — stdlib-only: the local-IPC dial
 from host_platform.linux import JAAH_PYTHON  # noqa: E402 — stdlib-only: the node's own interpreter
 from vnodehelper import layout  # noqa: E402 — stdlib-only: every vnode name, uid and path
 
@@ -629,13 +632,6 @@ def tree_entries(tree: Path) -> dict[str, str | None]:
     return out
 
 
-def _remove(path: str) -> None:
-    if os.path.islink(path) or not os.path.isdir(path):
-        os.unlink(path)
-    else:
-        shutil.rmtree(path)
-
-
 def config_version(tree: Path, run: Callable = subprocess.run) -> str | None:
     """The runner's own answer (`./config.sh --version`), run as the tree's owner by `--tree-self`."""
     try:
@@ -684,7 +680,7 @@ def apply_tree_cleanup(tree: Path, run: Callable = subprocess.run, now: Callable
             if name != "_update" and _age(target, t) < VERSION_MIN_AGE_S:
                 continue
             size = disk_events.tree_bytes(target)
-            _remove(target)
+            env_helpers.remove_path(target)
             result["runner_versions"] += size
         for rel in plan.empty:
             temp = tree / rel
@@ -694,7 +690,7 @@ def apply_tree_cleanup(tree: Path, run: Callable = subprocess.run, now: Callable
                 if _age(child.path, t) < TEMP_MIN_AGE_S:
                     continue
                 size = disk_events.tree_bytes(child.path)
-                _remove(child.path)
+                env_helpers.remove_path(child.path)
                 result["runner_temp"] += size
     except OSError as exc:
         result["error"] = f"runner tree cleanup failed: {exc.strerror or type(exc).__name__}"
@@ -795,16 +791,52 @@ def sweep_stale_tmp(tmp: Path, now: Callable[[], float] = time.time, uid: int | 
     return result
 
 
-def prune_tarball_cache(cache_dir: Path | None = None) -> int:
-    """Keep only the pinned runner tarball (`install.RUNNER_TARBALL`) in the root-owned cache. Bytes freed."""
+# ── each node tree's plugin cache ────────────────────────────────────────────────────────────────────
+
+PLUGIN_REPAIR = _HERE / "plugin_repair.py"
+
+
+@dataclass(frozen=True)
+class PluginPrune:
+    jaah_home: str
+    uid: int
+    gid: int
+    home: str
+
+
+def enumerate_plugin_prunes(vnodes: Iterable[layout.Vnode] = (), host_home: str | None = None) -> list[PluginPrune]:
+    """The host's and each vnode's JAAH_HOME whose shared `plugins` root is a real dir, pruned as that root's
+    OWNER (`plugin_repair.py --prune-cache`), never as root: the owner's processes are the live sessions it
+    must see, and a link planted in the cache can only reach that user."""
+    prunes = []
+    for home in [host_home or host_jaah_home(), *(layout.jaah_home(v) for v in vnodes)]:
+        if not home:
+            continue
+        try:
+            st = os.lstat(Path(home) / "plugins")
+            pw = pwd.getpwuid(st.st_uid)
+        except (OSError, KeyError):
+            continue
+        if stat.S_ISDIR(st.st_mode) and st.st_uid != 0:
+            prunes.append(PluginPrune(home, pw.pw_uid, pw.pw_gid, pw.pw_dir))
+    return prunes
+
+
+def prune_tarball_cache(cache_dir: Path | None = None, unit_dir: Path | None = None) -> int:
+    """Keep only the runner tarballs still in use in the root-owned cache: the package default
+    (`install.RUNNER_TARBALL` — this process carries no operator pin) and every version an installed
+    ephemeral unit runs (`install.installed_runner_versions`: the operator's pin, which the next job
+    unpacks). Bytes freed."""
     cache_dir = install.RUNNER_CACHE_DIR if cache_dir is None else cache_dir
+    versions = install.installed_runner_versions() if unit_dir is None else install.installed_runner_versions(unit_dir)
+    keep = {install.RUNNER_TARBALL, *(install.runner_tarball(version) for version in versions)}
     freed = 0
     try:
         entries = list(os.scandir(cache_dir))
     except OSError:
         return 0
     for entry in entries:
-        if entry.name == install.RUNNER_TARBALL or not entry.is_file(follow_symlinks=False):
+        if entry.name in keep or not entry.is_file(follow_symlinks=False):
             continue
         try:
             freed += entry.stat(follow_symlinks=False).st_blocks * 512
@@ -822,9 +854,7 @@ class _UnixConnection(http.client.HTTPConnection):
         self._path = path
 
     def connect(self) -> None:
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect(self._path)
+        self.sock = host_platform.connect_socket(self._path, timeout=self.timeout)
 
 
 class DockerError(Exception):
@@ -1129,7 +1159,7 @@ def host_jaah_home() -> str | None:
 
 
 def pool_mirror_roots(vnodes: Iterable[layout.Vnode] = ()) -> list[Path]:
-    """Every static-pool git mirror root on this host (`git_mirror.mirrors_root(shared=True)`): the host
+    """Every static-pool git mirror root on this host (`git_mirror.mirrors_root`): the host
     daemon's and each vnode daemon's. Resolved here, not by `git_mirror`: this pass runs as root, whose
     `$HOME` is not the daemon's state dir."""
     try:
@@ -1142,7 +1172,7 @@ def pool_mirror_roots(vnodes: Iterable[layout.Vnode] = ()) -> list[Path]:
 
 
 def pool_mirrors_bytes(roots: Iterable[Path]) -> int | None:
-    """Bytes the pool mirrors hold (removed by jaahd's roster sweep, never by this pass), or None when no
+    """Bytes the pool mirrors hold (removed by jaahd's mirror sweep, `git_mirror.sweep`, never by this pass), or None when no
     root exists — a node with no static pool reports no line."""
     present = [root for root in roots if root.is_dir() and not root.is_symlink()]
     return sum(disk_events.tree_bytes(root) for root in present) if present else None
@@ -1154,7 +1184,8 @@ def run_pass(*, run: Callable = subprocess.run, now: Callable[[], float] = time.
              host_live: frozenset[str] | None | str = "probe",
              statvfs: Callable = os.statvfs, warn_pct_file: Path = disk_events.WARN_PCT_FILE,
              tarball_cache: Path | None = None, mirror_roots: list[Path] | None = None,
-             tmp_sweeps: list[TmpSweep] | None = None) -> dict:
+             tmp_sweeps: list[TmpSweep] | None = None,
+             plugin_prunes: list[PluginPrune] | None = None) -> dict:
     """ONE reclaim pass over every engine and persistent runner tree on this host. Never raises for an
     engine's or tree's failure: each lands in `errors` and the rest of the pass goes on."""
     started = now()
@@ -1222,6 +1253,19 @@ def run_pass(*, run: Callable = subprocess.run, now: Callable[[], float] = time.
         error = _child_error(result)
         if error:
             errors.append(f"{os.path.basename(sweep.path)} of uid {sweep.uid}: {error}")
+    for prune in enumerate_plugin_prunes(vnodes) if plugin_prunes is None else plugin_prunes:
+        result = run_child([SETPRIV, f"--reuid={prune.uid}", f"--regid={prune.gid}", "--init-groups",
+                            "env", "-i", f"HOME={prune.home}", "PATH=/usr/bin:/bin",
+                            PYTHON, "-I", str(PLUGIN_REPAIR), "--prune-cache", "--jaah-home", prune.jaah_home], run)
+        removed = result.get("removed")
+        for item in removed if isinstance(removed, list) else []:
+            if isinstance(item, dict) and isinstance(item.get("versions"), list):
+                print(f"jaah-reclaim: plugin cache {prune.jaah_home}: pruned "
+                      + scrub_error(f"{item.get('plugin')} {', '.join(map(str, item['versions']))}")
+                      + f" — {_count(item.get('bytes')) or 0} bytes freed")
+        error = _child_error(result)
+        if error:
+            errors.append(f"plugin cache {prune.jaah_home}: {error}")
     freed["runner_versions"] += prune_tarball_cache(tarball_cache)
     mirrors = pool_mirrors_bytes(pool_mirror_roots(vnodes) if mirror_roots is None else mirror_roots)
 

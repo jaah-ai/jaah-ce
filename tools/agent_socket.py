@@ -9,7 +9,7 @@ A hook that never dials the socket must pay nothing for it. STDLIB ONLY at impor
 
 The two failure kinds are this module's own classes (they must exist before the daemon's module does) and
 `call` translates the daemon's into them; they must never be conflated: `AgentSocketUnavailable` (no answer —
-a caller holding an independent credential MAY fall back, as `control_plane_client.agent_api_request` does)
+a caller holding an independent credential MAY fall back, as `control_plane_client.create_system_task` does)
 versus `AgentSocketRefused` (the daemon said no — falling back would make every rule in
 `apps/jaahd/agent_vocabulary.py` advisory). A daemon client that will not LOAD (no daemon tree beside `tools/`,
 a run root the daemon refuses) is the first kind: no socket transport. On Windows the endpoint is a named

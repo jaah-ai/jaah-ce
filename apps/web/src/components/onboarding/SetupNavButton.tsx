@@ -4,10 +4,12 @@ import ButtonBase from '@mui/material/ButtonBase'
 import Typography from '@mui/material/Typography'
 import type { Theme } from '@mui/material/styles'
 import { DoneBadge } from '../../ui/DoneBadge'
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, RADIUS, SIZE, grid } from '../../theme'
 import { PHONE, schemed } from '../../ui/listStyles'
 import { ProgressRing, progressPct } from '../../ui/ProgressRing'
 import { checklistProgress, progressReading, progressSpoken } from '../setupChecklist/SetupChecklist'
 import { isGuideFinished, openOnboarding, useOnboardingGuide, usePhoneGuideFolded } from './OnboardingWidget'
+import Tip from '../../ui/Tip'
 
 /* THE SIDEBAR'S SETUP BUTTON — onboarding's door that never closes until setup is done. Shown to
  * anyone the widget has a guide for (`OnboardingWidget.tsx::useOnboardingGuide`: the org's "Set up your
@@ -35,30 +37,29 @@ export default function SetupNavButton({ shape }: { shape: SetupNavShape }): JSX
   }
 
   const glyph = finished ? (
-    <DoneBadge size={22} testId="sidebar-setup-done" />
+    <DoneBadge size={SIZE.chip} testId="sidebar-setup-done" />
   ) : (
-    <ProgressRing pct={pct} variant="gradient" size={22} testId="sidebar-setup-ring" />
+    <ProgressRing pct={pct} variant="gradient" size={SIZE.chip} testId="sidebar-setup-ring" />
   )
 
   const collapsed = shape === 'collapsed'
   return (
-    <ButtonBase
+    <Tip title={guide.title}><ButtonBase
       onClick={open}
       data-testid="sidebar-setup"
       data-shape={shape}
       aria-label={`Setup, ${progressSpoken(progress)}`}
-      title={guide.title}
       sx={(t: Theme) => ({
         flex: '0 0 auto',
         display: 'flex',
         flexDirection: collapsed ? 'column' : 'row',
         alignItems: 'center',
         justifyContent: 'flex-start',
-        gap: collapsed ? '2px' : '0.5rem',
-        margin: shape === 'sheet' ? '0 0 0.375rem' : collapsed ? '0.25rem 0.25rem 0.375rem' : '0.25rem 0.5rem 0.5rem',
-        padding: collapsed ? '0.375rem 0' : '0.4375rem 0.625rem',
-        minHeight: shape === 'sheet' ? 44 : undefined,
-        borderRadius: '8px',
+        gap: collapsed ? 0 : 1,
+        margin: shape === 'sheet' ? `0 0 ${grid(1)}` : collapsed ? `${grid(0.5)} ${grid(0.5)} ${grid(1)}` : `${grid(0.5)} ${grid(1)} ${grid(1)}`,
+        padding: collapsed ? `${grid(1)} 0` : `${grid(1)} ${grid(1.5)}`,
+        minHeight: shape === 'sheet' ? SIZE.tapTarget : undefined,
+        borderRadius: RADIUS.md,
         border: '1px solid',
         textAlign: 'left',
         fontFamily: 'inherit',
@@ -73,20 +74,20 @@ export default function SetupNavButton({ shape }: { shape: SetupNavShape }): JSX
     >
       {glyph}
       {collapsed ? (
-        <Typography component="span" data-testid="sidebar-setup-pct" sx={{ fontSize: '0.625rem', fontWeight: 700, lineHeight: 1 }}>
+        <Typography component="span" data-testid="sidebar-setup-pct" sx={{ fontSize: FONT_SIZE.xxs, fontWeight: FONT_WEIGHT.bold, lineHeight: LINE_HEIGHT.tight }}>
           {reading}
         </Typography>
       ) : (
         <>
-          <Typography component="span" sx={{ flex: 1, minWidth: 0, fontSize: '0.875rem', fontWeight: 600 }}>
+          <Typography component="span" sx={{ flex: 1, minWidth: 0, fontSize: FONT_SIZE.base, fontWeight: FONT_WEIGHT.semibold }}>
             Setup
           </Typography>
-          <Typography component="span" data-testid="sidebar-setup-pct" sx={{ fontSize: '0.8125rem', fontWeight: 700 }}>
+          <Typography component="span" data-testid="sidebar-setup-pct" sx={{ fontSize: FONT_SIZE.md, fontWeight: FONT_WEIGHT.bold }}>
             {reading}
           </Typography>
         </>
       )}
-    </ButtonBase>
+    </ButtonBase></Tip>
   )
 }
 
@@ -112,19 +113,19 @@ export function SetupNavBadge(): JSX.Element | null {
       component="span"
       data-testid="nav-more-setup-badge"
       aria-hidden="true"
-      sx={{ position: 'absolute', top: 1, right: 2, display: 'flex', lineHeight: 0 }}
+      sx={{ position: 'absolute', top: 1, right: 0, display: 'flex', lineHeight: LINE_HEIGHT.tight }}
     >
       {progress === 'done' ? (
-        <DoneBadge size={16} />
+        <DoneBadge size={SIZE.iconSm} />
       ) : (
         <Box
           component="span"
           sx={{
-            px: '5px',
-            borderRadius: '8px',
-            fontSize: '0.625rem',
-            fontWeight: 700,
-            lineHeight: '16px',
+            px: 0.5,
+            borderRadius: RADIUS.md,
+            fontSize: FONT_SIZE.xxs,
+            fontWeight: FONT_WEIGHT.bold,
+            lineHeight: LINE_HEIGHT.normal,
             bgcolor: 'primary.main',
             color: 'primary.contrastText',
             whiteSpace: 'nowrap',

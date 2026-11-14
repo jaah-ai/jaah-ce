@@ -3,7 +3,7 @@ and `edition.CE_MAX_AGENTS` agents at once (PRD §7: literals, never a setting, 
 
 Each cap is held twice on this side, by layers that refuse independently:
 * Accounts — `require_account_headroom` at `POST /api/accounts` and before the sign-in wizard dispatches
-  (`routes/commands.py`), then the `accounts_ce_cap` AFTER INSERT trigger (revision 202610262000), which
+  (`routes/commands.py`), then the `accounts_ce_cap` AFTER INSERT trigger (`migrations/versions/202611130100_baseline.py::install_ce_cap`), which
   catches every other insert path.
 * Agents — `org_limits` governs `runner_slots` by `CE_MAX_AGENTS` (`_Entitlement.term`): the placer's
   `DispatchBudget` holds an over-cap ready task back as `ready` (it queues, never fails), and a console session
@@ -13,7 +13,10 @@ Each cap is held twice on this side, by layers that refuse independently:
 A refusal is `CapRefusal`, rendered by `app/main.py` as `409 {detail, kind, limit, upgrade_url}`. A cloud-only surface
 answers `not_in_ce()`'s 404 instead: every removed route prefix (`app/main.py::_register_not_in_ce`) and each
 door the edition shuts inside a shared router (registering or deleting a node: it has exactly one).
-`GET /api/ce/limits` (`app/routes/ce_limits.py`) reads `status`. Nothing here runs on the cloud edition.
+`GET /api/ce/limits` (`app/routes/ce_limits.py`) reads `status`. Only `not_in_edition` runs on the cloud edition:
+the one spelling of the 404 a door inside a shared router raises behind its `edition_features.enabled` guard
+(that guard shape is what the community edition's tree check reads to know the rest of the block never runs
+there, so the guard stays inline and only the raise is shared).
 """
 from __future__ import annotations
 
@@ -41,7 +44,7 @@ _COPY: dict[str, str] = {
 #: What a cloud-only surface answers in the community edition, with the cloud sign-up link (`not_in_ce`).
 NOT_IN_CE = "Not in Jaah Community Edition. Available on Jaah Cloud."
 
-#: The constraint the accounts trigger names in its error (revision 202610252247).
+#: The constraint the accounts trigger names in its error (the baseline's `_ACCOUNTS_CE_CAP_FUNCTION_SQL`).
 TRIGGER_CONSTRAINT = "accounts_ce_cap"
 
 #: `{org: tasks}` the last dispatch pass held back at the Agents cap (`record_held_back`): the queue. One api
@@ -71,12 +74,10 @@ def refusal(kind: CapKind) -> CapRefusal:
     return CapRefusal(kind)
 
 
-def http_refusal(detail: str) -> HTTPException:
-    """The 409 for a refusal sentence a caller carried as text (the console's claim): the cap payload when it is
-    the CE Agents cap's own, else a plain 409."""
-    if edition.IS_CE and detail == _COPY["agents"]:
-        return refusal("agents")
-    return HTTPException(status_code=409, detail=detail)
+def not_in_edition() -> HTTPException:
+    """The 404 a cloud-only door raises behind its `edition_features.enabled` guard: `NOT_IN_CE`, the sentence every
+    edition gate shares. A whole cloud-only prefix is `app/main.py::_register_not_in_ce`'s instead."""
+    return HTTPException(status_code=404, detail=NOT_IN_CE)
 
 
 def account_count(session: Session, org_id: UUID) -> int:

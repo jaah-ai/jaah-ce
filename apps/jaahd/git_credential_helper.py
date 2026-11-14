@@ -20,7 +20,10 @@ A TOKEN NEVER GOES TO A FOREIGN DESTINATION. The login is for one repository (`w
 is refused — nothing printed, exit 1 — unless git's `protocol` is https, its `host` equals the served
 `host`, and its `path` is that repository's (`check_destination`). The same check runs twice: here, and in
 the broker, which this helper tells where git is going (`"for"` on the request) so a login is refused at
-its source too. Answering nothing lets git carry on to whatever else it has (on a runner, nothing:
+its source too. Nor to another org's repository in the Jaah GitHub org: when the login carries a
+`jaah_repo_prefix` (`<jaah org>/<org slug>-`), a `path` whose owner is that org (case-insensitive) must start
+with the prefix (`jaah_prefix_refusal`); an empty prefix (an older control plane) checks nothing. Answering
+nothing lets git carry on to whatever else it has (on a runner, nothing:
 `GIT_TERMINAL_PROMPT=0` makes it fail fast).
 
 HOW THE LOGIN IS SPOKEN. `scheme=basic` → `username=` + `password=`. `scheme=bearer` (an Azure DevOps
@@ -223,6 +226,29 @@ def _field(login: dict, key: str) -> str:
     return value
 
 
+def jaah_prefix_refusal(path: str, prefix: str) -> "str | None":
+    """Why `path` (a forge path, `owner/repo[.git][/...]`) may not be reached under `prefix`
+    (`<jaah org>/<org slug>-`, the control plane's `jaah_repo_prefix`), or None when it may: a path whose owner is
+    the Jaah org (case-insensitive) must start with the prefix (case-insensitive), with no dot or empty
+    segment. Another owner, or an empty/ownerless prefix (an older control plane), is never refused here.
+    Twin: `guards/access-guard-pre-push.py::jaah_prefix_refusal` (a standalone hook copied alone into a clone)."""
+    prefix = (prefix or "").strip().lstrip("/")
+    owner = prefix.split("/", 1)[0]
+    if "/" not in prefix or not owner:
+        return None
+    repo = urllib.parse.unquote(path or "").strip("/")
+    segments = repo.split("/")
+    dotted = any(seg in ("", ".", "..") for seg in segments)
+    # The owner is the first segment; with a dot or empty segment any segment naming the Jaah org counts, since
+    # `./jaah-apps/x` reaches it once normalized (and such a path is refused outright below).
+    if segments[0].casefold() != owner.casefold() and not (
+            dotted and owner.casefold() in (seg.casefold() for seg in segments)):
+        return None
+    if dotted or not repo.casefold().startswith(prefix.casefold()):
+        return f"{repo!r} is in the Jaah org {owner!r} but not this org's (its repositories start {prefix!r})"
+    return None
+
+
 # The attributes of git's request that say where a login would be sent.
 DESTINATION_KEYS = ("protocol", "host", "path")
 
@@ -268,6 +294,11 @@ def check_destination(attrs: dict[str, str], login: dict) -> None:
     if any(seg in ("", ".", "..") for seg in path.split("/")) or not (
             below in (mine, mine + ".git") or below.startswith((mine + ".git/", mine + "/info/"))):
         raise Refused(f"not answering for path {path!r}; the login is for {web_path!r} on {host!r}", loud=False)
+    # Another org's repository in the Jaah org is refused even when the served login names it.
+    prefix = login.get("jaah_repo_prefix")
+    refusal = jaah_prefix_refusal(path, prefix) if isinstance(prefix, str) else None
+    if refusal:
+        raise Refused(f"not answering: {refusal}")
 
 
 # Config keys that can redirect, proxy, re-trust or add a header to the credentialed connection. git prints
@@ -299,8 +330,17 @@ def check_config_scopes() -> None:
     if listing.returncode != 0:
         error = " ".join(listing.stderr.decode(errors="replace").split()) or f"exit {listing.returncode}"
         raise Refused(f"refused: could not read git config: {error}")
+    refusal = steering_refusal(listing.stdout, _working_directory())
+    if refusal:
+        raise Refused(refusal)
+
+
+def steering_refusal(listing: bytes, workdir: str) -> str:
+    """Why a `git config --list --show-scope --show-origin --includes -z` listing read in `workdir` may not be
+    answered (`check_config_scopes`' rule), or "" when nothing runner-writable steers the connection. The daemon
+    asks it of a held-over slot before its refresh (`slot_clone`)."""
     # `-z`: `<scope>\0<origin>\0<key>\n<value>\0` per entry.
-    fields = listing.stdout.split(b"\0")
+    fields = listing.split(b"\0")
     for i in range(0, len(fields) - 2, 3):
         scope = fields[i].decode(errors="replace")
         origin = fields[i + 1].decode(errors="replace")
@@ -310,14 +350,15 @@ def check_config_scopes() -> None:
             continue
         path = origin[len("file:"):] if origin.startswith("file:") else origin
         if path and not os.path.isabs(path) and origin.startswith("file:"):
-            path = os.path.join(_working_directory(), path)  # git prints the repository's own relative to its top
+            path = os.path.join(workdir, path)  # git prints the repository's own relative to its top
         # The key's subsection and the path are the planter's text, and the fix is a command someone may paste:
         # no control characters reach the terminal, and both are shell-quoted. `--file`, not `--<scope>`: the
         # key may sit in a file an include pulled in; `--unset-all`: it may be set more than once.
         key, path = _printable(key), _printable(path)
         fix = f"git config --file {shlex.quote(path)} --unset-all {shlex.quote(key)}"
-        raise Refused(f"refused: {'included' if included else scope} config sets {key} ({path}) — a key that can "
-                      f"redirect or intercept the credentialed connection; remove it ({fix})")
+        return (f"refused: {'included' if included else scope} config sets {key} ({path}) — a key that can "
+                f"redirect or intercept the credentialed connection; remove it ({fix})")
+    return ""
 
 
 def answer(attrs: dict[str, str], capabilities: set[str], login: dict) -> str:

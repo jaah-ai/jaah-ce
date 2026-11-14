@@ -5,8 +5,8 @@
  * keeps the worktree's own `.pi/` extensions off). Everything it knows comes from the run's `JAAH_PI_LAUNCH` document
  * (`agents/pi.py::PiAdapter.acp_launch`): the engine's hook file (`hooks`), THE neutral dispatcher's path
  * and the interpreter that runs it (`dispatcher`, `hook_bridge_core.py`; `python`), Pi's tool-input spellings (`tool_inputs`), its session file's turn mark
- * (`turn_mark`), and the question tool's name and no-answer result (`ask_tool`, `no_answer`). Every decision is the
- * dispatcher's:
+ * (`turn_mark`), the question tool's name and no-answer result (`ask_tool`, `no_answer`), and the project's linked remote
+ * MCP servers (`remote_mcp_servers`), registered for this run at load. Every decision is the dispatcher's:
  *
  *   tool_call               -> dispatch PreToolUse; a deny blocks the call with its reason, and so does a dispatcher
  *                              that cannot run (fail closed: the guards are unseen).
@@ -37,7 +37,34 @@ type Launch = {
 	turn_mark?: string;
 	ask_tool?: string;
 	no_answer?: string;
+	remote_mcp_servers?: AcpStdioServer[];
 };
+/** An ACP stdio `McpServer` (`agents/base.py::remote_mcp_servers`): `env` as `[{name, value}]`. */
+type AcpStdioServer = { name?: string; command?: string; args?: string[]; env?: { name: string; value: string }[] };
+
+/** This run's linked remote MCP servers, registered for this session only: never Pi's `mcp.json`, which every run of
+ * the account shares. `direct` exposure, as the control server's, so their tools are declared to the model. A server
+ * that cannot be registered is said on stderr (its name only) and skipped: the guards are registered first and never
+ * depend on it. */
+function registerRemoteServers(pi: any, servers: AcpStdioServer[]): void {
+	if (!servers.length) return;
+	if (typeof pi.registerMcpServer !== "function") {
+		process.stderr.write("jaah-harness: this pi registers no MCP server; the project's linked servers are not loaded\n");
+		return;
+	}
+	for (const server of servers) {
+		if (!server.name || !server.command) continue;
+		const env = Object.fromEntries((server.env ?? []).map((e) => [String(e.name), String(e.value)]));
+		try {
+			pi.registerMcpServer(server.name, {
+				command: server.command, args: (server.args ?? []).map(String), exposure: "direct",
+				...(Object.keys(env).length ? { env } : {}),
+			});
+		} catch (exc) {
+			process.stderr.write(`jaah-harness: linked MCP server ${server.name} not registered (${exc})\n`);
+		}
+	}
+}
 
 function launch(): Launch {
 	try {
@@ -153,6 +180,9 @@ export default function (pi: any) {
 		}
 		return undefined;
 	});
+
+	// After the guards, so a server that cannot be registered never leaves a run ungoverned.
+	registerRemoteServers(pi, doc.remote_mcp_servers ?? []);
 
 	if (!doc.ask_tool) return;
 	const Option = Type.Object({

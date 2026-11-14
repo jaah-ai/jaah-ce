@@ -1,28 +1,33 @@
-import { type FormEvent, type JSX, useEffect, useMemo, useRef, useState } from 'react'
-import { Link as RouterLink, useNavigate, useParams } from 'react-router-dom'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { type JSX, useEffect, useMemo, useRef, useState } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import MenuItem from '@mui/material/MenuItem'
 import TextField from '@mui/material/TextField'
-import { ApiError, apiDetail, isNotFound, retryUnlessNotFound } from '../../api'
+import { ApiError, apiDetail } from '../../api'
 import Breadcrumb from '../../components/Breadcrumb'
 import { TabPanel, Tabs, type TabDef } from '../../components/Tabs'
-import { useConfirm } from '../../components/ConfirmDialog'
 import { useChangeOrgAction } from '../../components/ChangeOrgDialog'
+import { useBaselineDirty } from '../../hooks/useBaselineDirty'
+import { useLeaveGuard } from '../../hooks/useLeaveGuard'
+import { useEditRecord } from '../../hooks/useEditRecord'
+import { useSubmit } from '../../hooks/useSubmit'
 import { useSettled } from '../../hooks/useSettled'
 import { useUrlTab } from '../../hooks/useUrlTab'
 import Banner from '../../ui/Banner'
 import { DetailPage, DetailSection } from '../../ui/detail/DetailPage'
-import DetailStatus from '../../ui/detail/DetailStatus'
-import FormActionBar from '../../ui/FormActionBar'
+import { EditStatus } from '../../ui/detail/DetailStatus'
+import CancelSaveBar from '../../ui/CancelSaveBar'
 import FormField from '../../ui/FormField'
-import FormTextField from '../../ui/FormTextField'
-import SubmitButton from '../../ui/SubmitButton'
+import FormBox from '../../ui/FormBox'
+import SelectField from '../../ui/SelectField'
+import type { Explain, HelpProp } from '../../ui/explain'
+import { EntityDescriptionField, EntityNameField } from '../../ui/EntityNameFields'
+import { LeaveGuardDialog } from '../../ui/UnsavedChangesDialog'
 import { PHONE, fieldTapTargetSx, tapTargetSx } from '../../ui/listStyles'
 import ChainStrip from './ChainStrip'
 import PromptPreviewDialog from './PromptPreviewDialog'
-import StageCard, { SELECT_WRAP_SX, withoutFieldWords } from './StageCard'
+import StageCard, { withoutFieldWords } from './StageCard'
 import { LockGlyph } from './PlaybooksPage'
 import StatusChip from '../../ui/StatusChip'
 import {
@@ -41,14 +46,28 @@ import {
   inputOf,
   issuesOf,
   labelOf,
-  playbookKey,
   updatePlaybook,
   validatePlaybook,
 } from './api'
+import { grid } from '../../theme'
+import Tip from '../../ui/Tip'
+
+/* The playbook fields' explanations (`ui/HelpLabel`): the engine reads them in `apps/api/app/playbook_engine.py`
+   and `playbook_prompt.py`. */
+const FULL_AUTO_HELP: Explain = {
+  tip: 'Default for whether stages may stop to ask questions.',
+  more: 'Only stages whose Asks questions is When Full Auto is off follow it; stages set to Never asks always run Full Auto.',
+  docs: 'console-reference/automation/playbooks',
+}
+/** What picking each option does: a line of its select's pop-up, keyed by the vocabulary key. */
+const META_OPTION_HELP: Record<string, Record<string, string>> = {
+  full_auto: { on: 'Stages run without stopping to ask.', off: 'Stages set to ask may stop for your answer.' },
+  seniority: { junior: 'Low model tier.', mid: 'Standard model tier.', senior: 'High model tier.' },
+}
 
 /* THE PLAYBOOK EDITOR — `/playbooks/:id`, and `/playbooks/new` (`mode="create"`: a blank draft, one stage, that
  * Save POSTs), on `FeatureEditPage`'s pattern: the form is seeded ONCE from the
- * fetched row (`base`), and Save sends only when the draft differs from it (the `PUT` is a full replace, so
+ * fetched row, and Save sends only when the draft differs from it (`useBaselineDirty`) (the `PUT` is a full replace, so
  * "diffed" is whether anything changed at all). Save and Cancel return to the list. A built-in, or any
  * playbook for a viewer who may not mutate, opens read-only; a built-in offers Duplicate, an editable copy
  * Duplicate and Delete.
@@ -162,36 +181,31 @@ function freshStage(rows: readonly Row[]): StageIn {
 
 /* THE PREVIEW CHIP STAYS BESIDE THE TRAIL: `PageHeader`'s aside row wraps, and on a phone (or a narrow pane) the
    lock and chip took a row of their own under a two-crumb trail. One line here; the trail wraps beside them. */
-const TITLE_ROW_SX = { '& > [data-slot="page-header"] [data-slot="title-row"]': { flexWrap: 'nowrap' } } as const
+const PAGE_SX = { '& > [data-slot="page-header"] [data-slot="title-row"]': { flexWrap: 'nowrap' } } as const
+/* THE STAGES TAB TAKES THE FULL WIDTH: a stage card's facts are a five-across grid, and in a maximised pane the `read`
+   cap stopped every card well short of the right edge. The Playbook tab's prose fields keep the reading measure. */
+const STAGES_PAGE_SX = [PAGE_SX, { maxWidth: 'none' }] as const
 
 export default function PlaybookEditPage({ mode }: { mode?: 'create' } = {}): JSX.Element {
   const creating = mode === 'create'
   const { id = '' } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const [confirm, confirmDialog] = useConfirm()
-  const changeOrg = useChangeOrgAction('playbook')
-
-  const query = useQuery({
-    queryKey: playbookKey(id),
-    queryFn: () => getPlaybook(id),
-    enabled: !creating,
-    retry: retryUnlessNotFound,
-  })
   const vocabQuery = useQuery({ queryKey: VOCABULARY_KEY, queryFn: getVocabulary, staleTime: Infinity })
   const vocab = vocabQuery.data
   const [blank] = useState(blankPlaybook)
-  const pb = creating ? blank : query.data
+  const [loaded, setLoaded] = useState<PlaybookOut | null>(null)
+  // A move changes `org` and `editable` on the row; refresh the row alone, never the draft (`onLoad` would re-seed).
+  const changeOrg = useChangeOrgAction('playbook', { onMoved: () => { if (!creating) void getPlaybook(id).then(setLoaded) } })
+  const pb = creating ? blank : loaded
   const readOnly = !pb?.editable
 
   // Seeded once per playbook: a background refetch must never overwrite the edit in progress.
   const [meta, setMeta] = useState<Meta | null>(null)
   const [rows, setRows] = useState<Row[]>([])
-  const [base, setBase] = useState<string | null>(null)
   const [checked, setChecked] = useState<Checked | null>(null)
   const [collapsed, setCollapsed] = useState<Set<number>>(new Set())
   const [previewCid, setPreviewCid] = useState<number | null>(null)
-  const [formError, setFormError] = useState('')
   // A new playbook's empty name is not an error to paint until the operator has typed in it.
   const [nameTouched, setNameTouched] = useState(!creating)
   const listRef = useRef<HTMLOListElement>(null)
@@ -223,20 +237,39 @@ export default function PlaybookEditPage({ mode }: { mode?: 'create' } = {}): JS
     const json = JSON.stringify(input)
     setMeta(m)
     setRows(seeded)
-    setBase(json)
     // A blank draft has no verdict yet: leaving it unchecked runs `/validate` straight away.
     setChecked(creating ? null : checkedFrom(json, seeded.map(r => r.cid), from.issues, from.stages))
     setCollapsed(new Set(seeded.length > 1 ? seeded.map(r => r.cid) : []))
   }
 
   useEffect(() => {
-    if (pb && base === null) seed(pb)
-    // seeded once per playbook, by design (above)
-  }, [pb, base])
+    if (creating && meta === null) seed(blank)
+    // seeded once, by design (above)
+  }, [creating, blank, meta])
 
   const input = useMemo(() => (meta ? inputFrom(meta, rows) : null), [meta, rows])
   const json = useMemo(() => (input ? JSON.stringify(input) : ''), [input])
-  const dirty = base !== null && json !== base
+  const { dirty, reset: forgetBase } = useBaselineDirty(input ? json : null)
+
+  /* Save and Duplicate are each a `useSubmit` under one banner (Save's refusal first); each clears its own on a new
+     attempt, and a load or a Save clears both. */
+  const save = useSubmit()
+  const duplicate = useSubmit()
+  const formError = save.formError || duplicate.formError
+
+  /* A new id (Duplicate navigates here) re-reads and re-seeds from the new row: the baseline moves with it
+     (`forgetBase` in the same batch as the new draft). Delete asks, removes, and returns to the list. */
+  const { loading, notFound, loadError, confirmDialog, deleting, deleteError, confirmAndDelete } = useEditRecord(
+    creating ? null : id, getPlaybook,
+    row => {
+      setLoaded(row)
+      seed(row)
+      forgetBase()
+      save.setFormError('')
+      duplicate.setFormError('')
+    },
+    { loadFallback: 'Could not load this playbook.', fixedLoadError: true, listTo: '/playbooks', deleteFallback: 'Could not delete the playbook.' },
+  )
 
   // Re-validate each edit once it has settled; a response for a superseded draft is dropped.
   const settledJson = useSettled(json, VALIDATE_DEBOUNCE_MS)
@@ -266,65 +299,51 @@ export default function PlaybookEditPage({ mode }: { mode?: 'create' } = {}): JS
     setFocusAfterMove(null)
   }, [focusAfterMove, rows])
 
-  const save = useMutation({
-    mutationFn: (sent: { body: PlaybookIn; cids: number[] }) => (creating ? createPlaybook(sent.body) : updatePlaybook(id, sent.body)),
-    onSuccess: saved => {
-      queryClient.setQueryData(playbookKey(saved.id), saved)
-      void queryClient.invalidateQueries({ queryKey: PLAYBOOKS_KEY })
-      navigate('/playbooks')
-    },
-    onError: (err, sent) => {
-      const issues = err instanceof ApiError && err.status === 422 ? issuesOf(err.body) : null
-      if (issues) {
+  /* A 422 carrying issues is placed on the stages and fields it names (no banner); any other refusal is the banner.
+     Resolves true once the write landed; where to go after is the caller's (the form's Save, the leave dialog's). */
+  const saveDraft = async (sent: { body: PlaybookIn; cids: number[] }): Promise<boolean> => {
+    const landed = await save.run(
+      'Could not save the playbook.',
+      async () => {
+        await (creating ? createPlaybook(sent.body) : updatePlaybook(id, sent.body))
+        void queryClient.invalidateQueries({ queryKey: PLAYBOOKS_KEY })
+      },
+      { mapError: (err, fallback) => {
+        const issues = err instanceof ApiError && err.status === 422 ? issuesOf(err.body) : null
+        if (!issues) return apiDetail(err, fallback)
         const prev = checked?.derived
         const placed = checkedFrom(JSON.stringify(sent.body), sent.cids, issues, [])
         setChecked({ ...placed, derived: prev ?? new Map() })
         focusIssue(placed.issues, sent.cids)
-      } else {
-        setFormError(apiDetail(err, 'Could not save the playbook.'))
-      }
-    },
+        return ''
+      } },
+    )
+    return landed !== null
+  }
+
+  const duplicateSaved = () => duplicate.run('Could not duplicate the playbook.', async () => {
+    const copy = await duplicatePlaybook(id)
+    void queryClient.invalidateQueries({ queryKey: PLAYBOOKS_KEY })
+    navigate(`/playbooks/${copy.id}`)
   })
 
-  const duplicate = useMutation({
-    mutationFn: () => duplicatePlaybook(id),
-    onSuccess: copy => {
-      void queryClient.invalidateQueries({ queryKey: PLAYBOOKS_KEY })
-      navigate(`/playbooks/${copy.id}`)
-    },
-    onError: err => setFormError(apiDetail(err, 'Could not duplicate the playbook.')),
-  })
+  /* The form's Save, and the leave dialog's: true once there is nothing left to write (saved, or an unchanged edit). */
+  async function submitDraft(): Promise<boolean> {
+    if (readOnly || !input) return false
+    save.setFormError('')
+    duplicate.setFormError('')
+    setNameTouched(true)
+    if (!dirty && !creating) return true
+    return saveDraft({ body: input, cids: rows.map(r => r.cid) })
+  }
+  /* Leaving with unsaved edits asks first (`hooks/useLeaveGuard`); a delete leaves on its own (`useEditRecord`). */
+  const guard = useLeaveGuard(dirty && !readOnly && !deleting, submitDraft)
 
-  const destroy = useMutation({
-    mutationFn: () => deletePlaybook(id),
-    onSuccess: () => {
-      // Leave first: removing the query under its mounted observer would refetch the deleted row.
-      navigate('/playbooks')
-      queryClient.removeQueries({ queryKey: playbookKey(id) })
-      void queryClient.invalidateQueries({ queryKey: PLAYBOOKS_KEY })
-    },
-    onError: err => setFormError(apiDetail(err, 'Could not delete the playbook.')),
-  })
-
-  // A new id (Duplicate navigates here) re-seeds from the new row.
-  const seededFor = useRef(id)
-  useEffect(() => {
-    if (seededFor.current !== id) {
-      seededFor.current = id
-      setBase(null)
-      setChecked(null)
-      setFormError('')
-    }
-  }, [id])
-
-  const notFound = isNotFound(query.error)
-  if (notFound || !pb || !meta || !input) {
+  if (loading || notFound || loadError || !pb || !meta || !input) {
     return (
-      <DetailStatus
+      <EditStatus
         trail={<Breadcrumb items={[{ label: 'Playbooks', to: '/playbooks' }, { label: 'Playbook' }]} />}
-        loading={!query.isError}
-        notFound={notFound && 'Playbook not found'}
-        error="Could not load this playbook."
+        loading={loading} notFound={notFound} loadError={loadError} notFoundTitle="Playbook not found"
       />
     )
   }
@@ -413,54 +432,39 @@ export default function PlaybookEditPage({ mode }: { mode?: 'create' } = {}): JS
   }
   const allCollapsed = rows.length > 0 && rows.every(r => collapsed.has(r.cid))
 
-  function onSubmit(e: FormEvent) {
-    e.preventDefault()
-    if (readOnly || !input) return
-    setFormError('')
-    setNameTouched(true)
-    if (!dirty && !creating) {
-      navigate('/playbooks')
-      return
-    }
-    save.mutate({ body: input, cids: rows.map(r => r.cid) })
-  }
+  const onSubmit = async () => { if (await submitDraft()) guard.leaveNow('/playbooks') }
 
-  async function onDelete() {
-    if (!pb) return
-    const ok = await confirm({
-      title: 'Delete playbook?',
-      message: 'This cannot be undone.',
-      identity: pb.name,
-      confirmLabel: 'Delete',
-      destructive: true,
-    })
-    if (ok) destroy.mutate()
-  }
+  const onDelete = () => confirmAndDelete(
+    { title: 'Delete playbook?', message: 'This cannot be undone.', identity: pb.name, confirmLabel: 'Delete', destructive: true },
+    async () => {
+      await deletePlaybook(id)
+      void queryClient.invalidateQueries({ queryKey: PLAYBOOKS_KEY })
+    },
+  )
 
-  const busy = save.isPending || duplicate.isPending || destroy.isPending
+  const busy = save.busy || duplicate.busy || deleting
   /* A built-in belongs to no org; another org's copy (read-only here) still moves. */
   const changeOrgButton = creating || !pb.org
     ? null
     : changeOrg.button({ id: pb.id, name: pb.name, org: pb.org, href: `/playbooks/${pb.id}` })
   const headerActions = creating ? undefined : builtIn ? (
     pb.may_duplicate ? (
-      <Button variant="contained" onClick={() => duplicate.mutate()} disabled={busy} data-testid="playbook-edit-duplicate" sx={tapTargetSx}>
+      <Button variant="contained" onClick={() => void duplicateSaved()} disabled={busy} data-testid="playbook-edit-duplicate" sx={tapTargetSx}>
         Duplicate
       </Button>
     ) : undefined
   ) : pb.editable ? (
     <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
       {/* Duplicate copies the SAVED row: with unsaved edits it would silently drop them, so it waits for Save. */}
-      <Button
+      <Tip title={dirty ? 'Save or cancel your changes first' : undefined}><Button
         variant="outlined"
-        onClick={() => duplicate.mutate()}
+        onClick={() => void duplicateSaved()}
         disabled={busy || dirty}
-        title={dirty ? 'Save or cancel your changes first' : undefined}
         data-testid="playbook-edit-duplicate"
         sx={tapTargetSx}
       >
         Duplicate
-      </Button>
+      </Button></Tip>
       {changeOrgButton}
       <Button variant="outlined" color="error" onClick={() => void onDelete()} disabled={busy} data-testid="playbook-edit-delete" sx={tapTargetSx}>
         Delete
@@ -476,20 +480,20 @@ export default function PlaybookEditPage({ mode }: { mode?: 'create' } = {}): JS
     <DetailPage
       breadcrumb={<Breadcrumb items={[{ label: 'Playbooks', to: '/playbooks' }, { label: creating ? 'New playbook' : pb.name }]} />}
       titleAside={
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexShrink: 0 }} data-testid="playbook-edit-aside">
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexShrink: 0 }} data-testid="playbook-edit-aside">
           {builtIn && <LockGlyph />}
           <StatusChip label="Preview" tone="info" />
         </Box>
       }
       actions={headerActions}
       testId="playbook-edit-page"
-      sx={TITLE_ROW_SX}
+      sx={tab === 'stages' ? STAGES_PAGE_SX : PAGE_SX}
     >
-      <Box component="form" noValidate onSubmit={onSubmit} data-testid="playbook-edit-form" sx={{ display: 'grid', gap: 2.5, mt: 1, minWidth: 0 }}>
-        {formError && <Banner severity="error">{formError}</Banner>}
+      <FormBox onSubmit={onSubmit} data-testid="playbook-edit-form" sx={{ display: 'grid', gap: 2.5, mt: 1, minWidth: 0 }}>
+        {(formError || deleteError) && <Banner severity="error">{formError || deleteError}</Banner>}
         {readOnly && <Banner severity="info">{readOnlyNote}</Banner>}
         {topIssues.length > 0 && (
-          <Box sx={{ display: 'grid', gap: 0.75 }} data-testid="playbook-issues">
+          <Box sx={{ display: 'grid', gap: 0.5 }} data-testid="playbook-issues">
             {topIssues.map((i, k) => (
               <Banner key={k} severity={i.severity === 'error' ? 'error' : 'warning'}>{i.message}</Banner>
             ))}
@@ -505,14 +509,12 @@ export default function PlaybookEditPage({ mode }: { mode?: 'create' } = {}): JS
                 sx={{
                   display: 'grid',
                   gap: 1.5,
-                  gridTemplateColumns: 'repeat(auto-fill, minmax(15rem, 1fr))',
+                  gridTemplateColumns: `repeat(auto-fill, minmax(${grid(40)}, 1fr))`,
                   [PHONE]: { gridTemplateColumns: '1fr' },
                 }}
               >
-                <FormTextField
+                <EntityNameField
                   id="playbook-name"
-                  label="Name"
-                  required
                   error={metaError('name')}
                   value={meta.name}
                   autoFocus={creating}
@@ -522,21 +524,23 @@ export default function PlaybookEditPage({ mode }: { mode?: 'create' } = {}): JS
                     patchMeta({ name: v })
                   }}
                   testId="playbook-edit-name" slotProps={{ htmlInput: { readOnly } }}
+                  help="Shown in the new task's Playbook menu; unique per organization."
                 />
-                {selectField('playbook-entry', 'Starts from', meta.entry, ['new_task', 'new_chat'], 'entry', v => patchMeta({ entry: v }))}
+                {selectField('playbook-entry', 'Starts from', meta.entry, ['new_task', 'new_chat'], 'entry', v => patchMeta({ entry: v }),
+                  undefined, "Where it's started: New Task or New Chat.")}
                 {selectField('playbook-full-auto', 'Full Auto', meta.full_auto_default ? 'on' : 'off', ['on', 'off'], 'full_auto',
-                  v => patchMeta({ full_auto_default: v === 'on' }), 'full_auto_default')}
+                  v => patchMeta({ full_auto_default: v === 'on' }), 'full_auto_default', FULL_AUTO_HELP)}
                 {selectField('playbook-seniority', 'Default seniority', meta.default_seniority, ['junior', 'mid', 'senior'], 'seniority',
-                  v => patchMeta({ default_seniority: v }), 'default_seniority')}
+                  v => patchMeta({ default_seniority: v }), 'default_seniority',
+                  'Model tier for every stage left at Playbook default.')}
                 <Box sx={{ gridColumn: '1 / -1' }}>
-                  <FormTextField
-                    id="playbook-description" label="Description"
+                  <EntityDescriptionField
+                    id="playbook-description"
                     error={metaError('description')}
-                    multiline
-                    minRows={2}
                     value={meta.description}
                     onChange={v => patchMeta({ description: v })}
                     testId="playbook-edit-description" slotProps={{ htmlInput: { readOnly } }}
+                    help="Shown under the name in the new task's Playbook menu."
                   />
                 </Box>
               </Box>
@@ -563,7 +567,7 @@ export default function PlaybookEditPage({ mode }: { mode?: 'create' } = {}): JS
                 </Button>
               </Box>
             )}
-            <Box component="ol" ref={listRef} sx={{ m: 0, p: 0, display: 'grid', gap: 1.25, minWidth: 0 }} data-testid="stage-list">
+            <Box component="ol" ref={listRef} sx={{ m: 0, p: 0, display: 'grid', gap: 1, minWidth: 0 }} data-testid="stage-list">
               {rows.map((r, i) => (
                   <StageCard
                     key={r.cid}
@@ -595,30 +599,19 @@ export default function PlaybookEditPage({ mode }: { mode?: 'create' } = {}): JS
           </DetailSection>
         </TabPanel>
 
-        <FormActionBar testId="playbook-form-actions" stretchTestIds={['playbook-edit-save']}>
-          <Button component={RouterLink} to="/playbooks" color="inherit" data-testid="playbook-edit-cancel" sx={tapTargetSx}>
-            {readOnly ? 'Back' : 'Cancel'}
-          </Button>
-          {!readOnly && (
-            <SubmitButton
-              testId="playbook-edit-save"
-              busy={save.isPending}
-              // Errors block Save; warnings do not (D7). A stale check with no errors lets Save through: the
-              // server re-validates and a refusal lands on the cards the same way.
-              disabled={busy || hasErrors}
-              data-checked={current ? 'current' : 'stale'}
-            >
-              {creating ? 'Create' : 'Save'}
-            </SubmitButton>
-          )}
-        </FormActionBar>
-      </Box>
+        {/* Errors block Save; warnings do not (D7). A stale check with no errors lets Save through: the server
+            re-validates and a refusal lands on the cards the same way. */}
+        <CancelSaveBar testId="playbook-form-actions" saveTestId="playbook-edit-save" cancelTo="/playbooks"
+          creating={creating} busy={save.busy} disabled={busy || hasErrors} readOnly={readOnly}
+          saveProps={{ 'data-checked': current ? 'current' : 'stale' }} />
+      </FormBox>
 
       {previewRow && (
         <PromptPreviewDialog playbook={input} stage={previewRow.stage} vocab={vocab} onClose={() => setPreviewCid(null)} />
       )}
       {confirmDialog}
       {changeOrg.dialog}
+      <LeaveGuardDialog leave={guard} message="This playbook has changes that have not been saved. Save them before leaving?" />
     </DetailPage>
   )
 
@@ -630,19 +623,32 @@ export default function PlaybookEditPage({ mode }: { mode?: 'create' } = {}): JS
     labelField: string,
     onPick: (v: string) => void,
     issueField: string = labelField,
+    help?: HelpProp,
   ) {
+    const optionHelp = META_OPTION_HELP[labelField] ?? {}
+    const choices = keys.flatMap(k =>
+      optionHelp[k] ? [{ label: withoutFieldWords(labelOf(vocab, labelField, k), label), help: optionHelp[k] }] : [])
     return (
-      <FormField label={label} error={metaError(issueField)}>
-        <TextField
-          id={fieldId}
-          select={!readOnly}
-          sx={[fieldTapTargetSx, SELECT_WRAP_SX]}
-          value={readOnly ? withoutFieldWords(labelOf(vocab, labelField, value), label) : value}
-          onChange={e => onPick(e.target.value)}
-          slotProps={{ htmlInput: { readOnly, 'data-testid': fieldId } }}
-        >
-          {!readOnly && keys.map(k => <MenuItem key={k} value={k}>{withoutFieldWords(labelOf(vocab, labelField, k), label)}</MenuItem>)}
-        </TextField>
+      <FormField label={label} help={help} choices={choices} error={metaError(issueField)}>
+        {readOnly ? (
+          <TextField
+            id={fieldId}
+            sx={fieldTapTargetSx}
+            value={withoutFieldWords(labelOf(vocab, labelField, value), label)}
+            slotProps={{ htmlInput: { readOnly, 'data-testid': fieldId } }}
+          />
+        ) : (
+          <SelectField
+            id={fieldId}
+            value={value}
+            onChange={onPick}
+            testId={fieldId}
+            options={keys.map(k => ({ value: k, label: withoutFieldWords(labelOf(vocab, labelField, k), label) }))}
+          >
+            {/* A stored value outside the vocabulary reads blank, as before, never as the first option. */}
+            {!keys.includes(value) && <option value="" disabled />}
+          </SelectField>
+        )}
       </FormField>
     )
   }

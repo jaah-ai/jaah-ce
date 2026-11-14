@@ -1,5 +1,5 @@
-/* The author badge component: a creator's initials in their hue, shared by the Activity Feed and the
- * creator filter picker — one drawing, so the picker and the row cannot show different badges for the
+/* The author badge component: a person's initials in their hue, shared by the board rows and the
+ * assignee filter picker — one drawing, so the picker and the row cannot show different badges for the
  * same person.
  * This file owns identity (initials, hue, full name on `title`); the host owns geometry via `sx`.
  * Why the hues are literals spread through `theme.applyStyles('dark', …)`: `lib/authorBadge.ts`'s
@@ -7,6 +7,7 @@
 import Box from '@mui/material/Box'
 import type { SxProps, Theme } from '@mui/material/styles'
 import { authorHue, authorInitials } from '../../lib/authorBadge'
+import Tip from '../../ui/Tip'
 
 export default function AuthorBadge({
   name,
@@ -29,10 +30,9 @@ export default function AuthorBadge({
 }): JSX.Element {
   const hue = authorHue(name)
   return (
-    <Box
+    <Tip title={name}><Box
       component="span"
       data-testid={testId}
-      title={name}
       /* Always `aria-hidden`, no opt-out: initials and a hue mean nothing to a screen reader. The HOST names
        * the author — the Activity Feed folds `created by <name>` into the row's accessible name. `title` on a generic span is
        * not a reliable accessible name, so there is no working "let the badge announce" variant. */
@@ -44,6 +44,6 @@ export default function AuthorBadge({
       ]}
     >
       {authorInitials(name)}
-    </Box>
+    </Box></Tip>
   )
 }

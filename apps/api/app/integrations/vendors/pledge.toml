@@ -1,0 +1,52 @@
+# Pledge: a partner API key sent as a Bearer token (developer.pledge.to, "API Basics"). Pledge's MCP server
+# (pledge-developer) needs no sign-in of its own: every tool takes the same API key as an argument.
+slug = "pledge"
+label = "Pledge"
+category = "payments"
+vendor_docs_url = "https://developer.pledge.to/guides/getting-started/"
+summary = "Search nonprofits, run fundraisers and record donations through your Pledge partner account."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "Sign in to the Pledge Impact Hub at https://www.pledge.to/impact-hub and open the Pledge APIs section: your API key is shown there. For the sandbox, sign in at https://staging.pledge.to/impact-hub instead and use that key (sandbox keys only work against api-staging.pledge.to)" },
+]
+
+# The partner account's webhook list: account-scoped, read-only and small.
+[test]
+method = "GET"
+path = "https://api.pledge.to/v1/webhooks"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+accept = ""
+
+[mcp]
+url = "https://www.pledge.to/partner/mcp"
+url_editable = false
+transport = "streamable_http"
+auth = "none"
+
+[docs]
+agent_uses = [
+  "Search Pledge's nonprofit database by name, EIN, cause or country to find the right beneficiary",
+  "Create or update a fundraiser for a campaign or event and return its hosted donation page",
+  "List donations for a fundraiser or date range to report on totals, donors and fees",
+  "Register or remove the webhook endpoints that tell your app a donation completed",
+]
+prerequisites = [
+  "A Pledge partner account (create one at https://www.pledge.to); a sandbox account at https://staging.pledge.to is separate and has its own key",
+  "For donations created through the API: a payment method on file in the Impact Hub, which Pledge bills in batches",
+]
+limitations = [
+  "Jaah tests and serves the production key only: a sandbox key is rejected by api.pledge.to, so keep sandbox work in your own app until Pledge offers a sandbox address here",
+  "There is no one-click Connect Pledge: Pledge offers apps no OAuth sign-in, only a partner API key sent as a Bearer token (https://developer.pledge.to/guides/getting-started/), so the API key is the only way in",
+  "Creating a donation through the API bills your payment method on file. Agents only do it when a task says so",
+]
+troubleshooting = [
+  { symptom = "Test says Pledge rejected the API key (401)", fix = "The key is mistyped, was regenerated, or is a sandbox key. Copy the production key again from the Impact Hub's Pledge APIs section and select Replace" },
+  { symptom = "Agents cannot find the Pledge tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with" },
+  { symptom = "Creating a donation fails with 422", fix = "The organization UUID is not eligible to receive donations. Have the agent search the nonprofit again and use the UUID Pledge returns" },
+]
+faq = [
+  { q = "Does Test create anything in Pledge", a = "No. It lists your account's webhook endpoints and discards the answer" },
+  { q = "How do the MCP tools get my key", a = "Each Pledge tool takes the API key as an argument. The agent reads it from this secret when it calls the tool, so the key never sits in the agent's configuration" },
+]

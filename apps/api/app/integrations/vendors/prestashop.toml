@@ -1,0 +1,47 @@
+# PrestaShop's Webservice: Basic auth with the webservice key as the user name and an empty password, at the
+# merchant's own shop address (a tenant URL, dialled only at a vetted public address).
+slug = "prestashop"
+label = "PrestaShop"
+category = "payments"
+vendor_docs_url = "https://devdocs.prestashop-project.org/8/webservice/tutorials/testing-access/"
+summary = "Read and update a PrestaShop store's products, orders, customers and stock through its Webservice."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "shop_url", label = "Shop URL", kind = "url", required = true, placeholder = "https://shop.example.com", help = "Your shop's public https address, the one customers visit, without /api or /admin at the end. If the shop lives in a folder, include it, such as https://example.com/shop" },
+  { key = "webservice_key", label = "Webservice key", kind = "secret", required = true, help = "In the PrestaShop back office, open Advanced Parameters > Webservice, set Enable PrestaShop's webservice to Yes and save. Then select Add new webservice key, select Generate, enter Jaah as the description, set Status to Yes, tick View (GET) for every resource agents should read (and Add, Modify or Delete only where they must write), and save" },
+]
+
+# The Webservice root lists the resources this key may use: one GET, no data read.
+[test]
+method = "GET"
+path = "{shop_url}/api/?output_format=JSON"
+auth = { basic = ["webservice_key"] }
+
+[docs]
+agent_uses = [
+  "Look up an order, its customer, carrier and payment state when a support task names an order reference",
+  "List products with low stock, or products missing a description or image, and report them",
+  "Update a product's price, stock or description when a task asks for it (needs Modify on the products resource)",
+  "Export orders for a date range to build a sales report",
+]
+prerequisites = [
+  "A PrestaShop 1.7 or 8 store served over https, reachable from the internet (Jaah refuses private and local addresses)",
+  "A back-office employee with access to Advanced Parameters > Webservice (usually the SuperAdmin profile)",
+  "Friendly URLs or URL rewriting working on the server: the Webservice answers under /api only when it is",
+]
+limitations = [
+  "The key's permission grid is the limit: an agent can use only the resources and methods ticked on the key",
+  "PrestaShop returns JSON from version 8.1 on; older stores answer in XML, which agents can still read but Test cannot check",
+  "In multistore mode a key reaches only the shops it is associated with",
+]
+troubleshooting = [
+  { symptom = "Test says PrestaShop rejected the webservice key (401)", fix = "The key was disabled, deleted or mistyped, or the Webservice is switched off. In Advanced Parameters > Webservice check Enable PrestaShop's webservice is Yes and the key's Status is Yes, then select Replace and paste the key again" },
+  { symptom = "Test keeps failing with 401 although the key is right", fix = "The web server drops the Authorization header before PrestaShop sees it. On Apache add CGIPassAuth On (or SetEnvIf Authorization \"(.*)\" HTTP_AUTHORIZATION=$1) to the shop's .htaccess, then test again" },
+  { symptom = "Test says PrestaShop answered, but not with an API response", fix = "/api is not reaching the Webservice: URL rewriting is off, or Shop URL points at a page other than the shop root. Turn on Friendly URL in Shop Parameters > Traffic & SEO and check Shop URL has no /admin or /api suffix" },
+]
+faq = [
+  { q = "Can I give agents read-only access", a = "Yes. Tick only View (GET) on the key's resources. Agents then cannot add, change or delete anything" },
+  { q = "My shop is on a private network. Can Jaah reach it", a = "No. Jaah only calls public https addresses, so the shop must be reachable from the internet" },
+]

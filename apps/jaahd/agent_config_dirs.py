@@ -59,9 +59,8 @@ def agent_config_dirs(*, read_cp: bool = True) -> list[str]:
 
 
 def slot_of(worktree: str) -> tuple[str, str] | None:
-    """`(project, number)` for a `<project>-N` / `<project>/N` pool worktree, else None (a main clone or
-    an ad-hoc dir). Same two shapes as `hooks/user-session-end.py`'s `slot_of`, but deliberately a second
-    copy: the hook must avoid daemon-space imports, and this one is stricter than the hook's tests absorb.
+    """`(project, number)` for a `<project>-N` / `<project>/N` pool worktree, else None (an ad-hoc dir).
+    The shape parse is `slot_from_basename`.
 
     SCOPED TO `$JAAH_HOME` when set: a scratch checkout like `~/work/2` would otherwise read as slot
     `(work, 2)`, a permanent silent decline in a kill-safety gate. `JAAH_HOME` unset falls back to the
@@ -75,6 +74,12 @@ def slot_of(worktree: str) -> tuple[str, str] | None:
         home = os.path.abspath(jaah_home)
         if not (path == home or path.startswith(home + os.sep)):
             return None
+    return slot_from_basename(path)
+
+
+def slot_from_basename(path: str) -> tuple[str, str] | None:
+    """The two pool shapes by name alone — `<project>/N` (numbered parent) first, then `<project>-N` — else
+    None. No scoping and no path normalisation: each caller decides those (`slot_of` here, and the hook's)."""
     base = os.path.basename(path)
     parent = os.path.basename(os.path.dirname(path))
     if parent and base and base.isdigit():

@@ -19,11 +19,13 @@ __all__ = [
     "DRAFT",
     "PAUSED",
     "READY",
+    "RUNNER_RUNNING_STATES",
     "STATES",
     "STOP_REASON_BALANCE",
     "STOP_REASON_JAAH_UNAVAILABLE",
     "NODE_AT_CAPACITY",
     "SLOT_DESTROYED",
+    "THROTTLED",
     "SYSTEM_FAILED",
     "SystemTransition",
     "BALANCE_RESUME",
@@ -185,7 +187,7 @@ class SystemTransition:
 
 # A task the system paused for the Jaah account — balance at the floor, or the platform account broken — is
 # resumed by it once the condition clears (`app/jaah_routing/pause.py`). Only those two reasons: an operator
-# Stop (`operator`), a wait on a customer and an idle kill (no record) are never resumed (AS4). The bound slot
+# Stop (`operator`) and an idle kill (no record) are never resumed (AS4). The bound slot
 # stays unless destroyed meanwhile (`SLOT_DESTROYED` below); the resume refunds the attempt the killed run was charged (`app/jaah_routing/pause.py`), so a pause
 # spends none.
 BALANCE_RESUME = SystemTransition(
@@ -215,6 +217,18 @@ SLOT_DESTROYED = SystemTransition(
 # Taken only by `app/node_capacity.py::return_to_queue`.
 NODE_AT_CAPACITY = SystemTransition(
     "node_at_capacity",
+    frozenset({ACTIVE}),
+    READY,
+    frozenset(),
+)
+
+
+# A running subtask of an epic whose throttle (`Task.max_running`) was just lowered below its running count goes back
+# to the queue, the most recently launched first: its runner is killed, its worktree hold kept so it resumes in place
+# once the throttle admits it, and its attempt refunded. Never `awaiting_response`: that counts against the throttle
+# but keeps its question. Taken only by `routes/tasks/transitions.py::throttle_epic_children`.
+THROTTLED = SystemTransition(
+    "throttled",
     frozenset({ACTIVE}),
     READY,
     frozenset(),
@@ -285,6 +299,8 @@ _RUNNER_END_STATES = {DONE, SYSTEM_FAILED, PAUSED}
 # runner is alive inside its own tool call. Not sufficient alone: an `epic` is `active` as a rollup, so
 # `routes/tasks/dispatch.py::_terminates_a_running_runner` also tests the persona.
 _RUNNER_RUNNING_STATES = frozenset({ACTIVE, AWAITING_RESPONSE})
+#: The public name for readers outside the lifecycle (the node task cap, the idle-stack sweep).
+RUNNER_RUNNING_STATES = _RUNNER_RUNNING_STATES
 
 # ── System Tasks ──────────────────────────────────────────────────────────────────────────────────
 
@@ -295,7 +311,7 @@ _SYSTEM_TASK_INITIAL_STATES = (DRAFT, READY, ACTIVE)
 # Terminal states a `dedup_open` match excludes: a finished prior row does not suppress a fresh one.
 _SYSTEM_TASK_TERMINAL_STATES = (DONE, SYSTEM_FAILED, PAUSED)
 # Plus `awaiting_response`: a row parked on a human decision about its current title/body is never
-# silently refreshed. Shared with `find_open_system_task`.
+# silently refreshed. Shared with `_find_open_system_task`.
 _SYSTEM_TASK_DEDUP_EXCLUDED_STATES = _SYSTEM_TASK_TERMINAL_STATES + (AWAITING_RESPONSE,)
 
 # ── The inline literal tuples, given a name ───────────────────────────────────────────────────────

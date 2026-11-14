@@ -25,13 +25,12 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
 
 from app import node_bus, node_credentials
-from app.db import get_session
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
-from app.node_bus import FRAME_CMD, registry, resolve_caller_async
+from app.entity_shape import refused_as
+from app.node_bus import FRAME_CMD, registry
 from app.routes.agent.auth import _check_token
 
 log = logging.getLogger("app.routes.cp_peer")
@@ -44,19 +43,17 @@ _NOT_A_PEER = "only a control-plane peer may drive another task's node sockets"
 
 def _peer_only(
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> node_credentials.AgentCaller:
     """`_check_token`, then the refusal every leg shares: a caller whose credential names a node is a
     node, not a peer.
 
-    Also hands the request's pooled connection back: `_check_token`'s credential read autobegan a
-    transaction that would otherwise pin a connection for the whole forwarded command (up to the node's
-    own timeout — 120s for a converge), and a fan-out of forwards would then exhaust this task's pool
-    and starve its health probe and its own presence writes. Nothing after this reads the session."""
+    No connection is held past here: `_check_token` hands its credential read's connection back before it
+    returns (`routes/agent/auth.py::_authenticate_and_admit`), and no leg reads the database, so a forwarded
+    command (up to the node's own timeout — 120s for a converge) pins nothing, and a fan-out of forwards cannot
+    exhaust this task's pool and starve its health probe and its own presence writes."""
     if caller.is_derived:
         log.warning("cp-peer: refused node %s — a node token cannot drive other nodes", caller.node_id)
         raise HTTPException(status_code=403, detail=_NOT_A_PEER)
-    session.rollback()
     return caller
 
 
@@ -91,12 +88,11 @@ async def forward_request(
     conn = registry.local(body.node_id)
     if conn is None:
         raise HTTPException(status_code=503, detail=f"node '{body.node_id}' is not connected to this task")
-    try:
+    with (
+        refused_as(504, node_bus.NodeRequestTimeout, chain=True),
+        refused_as(503, node_bus.NodeNotConnected, chain=True),
+    ):
         reply = await conn.request(body.envelope, timeout=body.timeout, frame_type=body.frame_type)
-    except node_bus.NodeNotConnected as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except node_bus.NodeRequestTimeout as exc:
-        raise HTTPException(status_code=504, detail=str(exc)) from exc
     return ForwardRequestOut(data=reply.data.decode("utf-8"))
 
 
@@ -111,8 +107,6 @@ async def forward_notify(
     conn = registry.local(body.node_id)
     if conn is None:
         raise HTTPException(status_code=503, detail=f"node '{body.node_id}' is not connected to this task")
-    try:
+    with refused_as(503, node_bus.NodeNotConnected, chain=True):
         await conn.notify(body.frame)
-    except node_bus.NodeNotConnected as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return Response(status_code=204)

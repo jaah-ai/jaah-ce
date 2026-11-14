@@ -53,9 +53,10 @@ from app.clock import utcnow as _now
 from app.entity_shape import optional_uuid, readable_error
 from app.models.automations import Automation, AutomationRunTarget, CronRun, TaskTrigger, TriggerDedup, TriggerDelivery
 from app.models.tasks import Task
+from app.production_qa import events as production_qa_events
 from app.target_resolver import REASON_NODE_DISABLED, TargetItem, target_key
-from app.task_ancestry import may_stamp_starter
 from app.task_lifecycle import _EPIC_SETTLED_STATES, AWAITING_RESPONSE, DRAFT
+from app.triggers import INCIDENT_SOURCE_KINDS, TRACKER_SOURCE_KINDS
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from app.authz.principal import Principal
@@ -113,12 +114,14 @@ REASON_NO_TARGETS = "No targets matched this rule"
 #: A Task action filed from a template whose row is gone, or no longer startable here (unpublished, switched off).
 REASON_TEMPLATE_DELETED = "Template deleted"
 REASON_TEMPLATE_UNAVAILABLE = "Template unavailable"
+#: The template's body gained a required input this action holds no value for: save the action with one.
+REASON_TEMPLATE_INPUT_MISSING = "Template input missing: {labels}"
 REASONS: tuple[str, ...] = (
     REASON_PREVIOUS_OPEN, REASON_NODE_DISABLED, REASON_NODE_GONE, REASON_PROJECT_GONE, REASON_TIMEOUT,
     REASON_QUEUE_FULL, REASON_NO_LONGER_TARGETED, REASON_OWNER_GONE, REASON_OWNER_OTHER_ORG, REASON_OWNER_LACKS,
     REASON_OWNER_NO_ACCESS, REASON_ASSIGNEE_UNREACHABLE, REASON_WAITING, REASON_FILING_FAILED, REASON_DEFERRED,
     REASON_NO_TARGETS, REASON_OWNER_NOT_ADMIN, REASON_SEND_FAILED, REASON_INTERRUPTED_UNSENT,
-    REASON_TEMPLATE_DELETED, REASON_TEMPLATE_UNAVAILABLE,
+    REASON_TEMPLATE_DELETED, REASON_TEMPLATE_UNAVAILABLE, REASON_TEMPLATE_INPUT_MISSING,
 )
 #: A target refused for one of these is the owner's authority, not the target's fault (an event marks its trigger
 #: failed when every target was refused this way — today's single-project behaviour).
@@ -300,6 +303,14 @@ def key_filer(session: Session, key_id: UUID, org_id: UUID) -> KeyFiler | str:
     return KeyFiler(owner=owner, principal=principal, key_id=context.key_id, key_name=context.name)
 
 
+def owner_outside_org(owner_org_id: Optional[UUID], org_id: UUID) -> bool:
+    """The tenancy rule every firing refuses on: an owner seated in another org than the automation's. A filing
+    runs under its owner's licence, so it never crosses the boundary. One home for the firing
+    (`_owner_or_reason`, `trigger_intake._authority_refusal`), the status that shows it before any firing
+    (`automation_service.has_foreign_owner`) and the creates that refuse to mint it (`routes/production_qa.py`)."""
+    return owner_org_id is not None and owner_org_id != org_id
+
+
 def _owner_or_reason(
     session: Session, automation: Automation, *, files_tasks: bool = True, filer: Optional[KeyFiler] = None,
 ) -> tuple[Optional["AdminUser"], Optional["Principal"], Optional[str]]:
@@ -321,7 +332,7 @@ def _owner_or_reason(
             owner = session.scalar(select(AdminUser).where(AdminUser.id == automation.created_by_id))
         if owner is None or owner.is_system:
             return None, None, REASON_OWNER_GONE
-        if owner.org_id is not None and owner.org_id != automation.org_id:
+        if owner_outside_org(owner.org_id, automation.org_id):
             return None, None, REASON_OWNER_OTHER_ORG
         principal = principal_for_user(session, owner)
     if not files_tasks:
@@ -350,6 +361,7 @@ def file_task_target(ctx: FireContext, item: TargetItem) -> TargetOutcome:
     from app.routes.tasks.policy import PERSONA_EPIC
     from app.routes.tasks.create import _create_epic_children, _link_template, _validated_assignee
     from app.routes.tasks.dispatch import _start, _start_epic
+    from app.pipeline import gate as pipeline_gate
 
     session, automation, params = ctx.session, ctx.automation, ctx.params
     pinned: Optional[UUID] = None
@@ -364,6 +376,22 @@ def file_task_target(ctx: FireContext, item: TargetItem) -> TargetOutcome:
     label = item.name or project.name
     if not can_access(session, ctx.principal, "project", project.id, mode=ObjectAccess.WRITE):
         raise TargetFailed(REASON_OWNER_NO_ACCESS.format(target=label), OUTCOME_SKIPPED)
+    if ctx.trigger_kind in TRACKER_SOURCE_KINDS and ctx.cause != CAUSE_MANUAL:
+        # A mention received before its issue's first start filed: a comment on that task now, not a second task.
+        # The comment and this target's ledger row commit together; a retried firing finds the row and posts no
+        # second comment.
+        from app.trackers import intake as tracker_intake
+
+        followed = tracker_intake.follow_up_task(session, ctx.event)
+        if followed is not None:
+            outcome = TargetOutcome(OUTCOME_SKIPPED, tracker_intake.followed_up_reason(followed))
+            prior = session.scalar(select(AutomationRunTarget.reason).where(
+                getattr(AutomationRunTarget, ctx.run_column) == ctx.run_id,
+                AutomationRunTarget.target_kind == item.kind, AutomationRunTarget.target_id == _key(item)))
+            if prior != outcome.reason:
+                tracker_intake.stage_follow_up(session, ctx.event or {}, followed)
+                _record(session, ctx, item, outcome)
+            return outcome
 
     template = _live_template(ctx)
     body, title, missing = _render(ctx, template)
@@ -388,6 +416,11 @@ def file_task_target(ctx: FireContext, item: TargetItem) -> TargetOutcome:
     try:
         session.add(task)
         session.flush()
+        if ctx.trigger_kind in TRACKER_SOURCE_KINDS and ctx.cause != CAUSE_MANUAL:
+            # The issue it was started from, in this commit; refused when the issue already has a live task.
+            from app.trackers import intake as tracker_intake
+
+            tracker_intake.link_filed_task(session, task, ctx.event)
         if epic:
             _create_epic_children(task, session)
         _copy_attachments(session, automation, params, task)
@@ -405,6 +438,10 @@ def file_task_target(ctx: FireContext, item: TargetItem) -> TargetOutcome:
         task_id = task.id
         if not params.get("start", True):
             # Left as a draft (the action's Start: Leave as draft): committed with its ledger row, never dispatched.
+            session.commit()
+        elif not pipeline_gate.start_decision(session, project, task, None, ctx.owner_id).open:
+            # The pipeline's Start step waits (approvals): a draft with its owner's press recorded, started when the
+            # gate opens (`app/pipeline/actions.py`).
             session.commit()
         elif epic:
             _start_epic(task_id, project, session, None)
@@ -448,12 +485,17 @@ def _live_template(ctx: FireContext) -> Optional["task_templates.AnyTemplate"]:
 def _render(ctx: FireContext, template: Optional["task_templates.AnyTemplate"] = None) -> tuple[str, str, list[str]]:
     """(body, title, missing paths). A schedule files its body literally and titles it from the body (the LLM title
     follows via the enqueue); an event renders its templates over the event, once per target. A template's body is
-    filed literally (no placeholders in template text) under the template's title, or an event's `title_template`."""
+    filed with its input placeholders filled from the action's `template_inputs` (no trigger placeholders) under the template's title, or an event's `title_template`."""
     from app.task_title import placeholder_title
 
     params = ctx.params
     if template is not None:
-        body = template.body.strip()
+        from app import task_templates
+
+        try:
+            body = task_templates.fill_inputs(template.body, params.get("template_inputs") or {}).strip()
+        except task_templates.MissingInputs as exc:
+            raise TargetFailed(REASON_TEMPLATE_INPUT_MISSING.format(labels=", ".join(exc.labels))) from exc
         title = " ".join((template.title or "").split()) or placeholder_title(_unbroken(body))
         if not (ctx.renders and (params.get("title_template") or "").strip()):
             return body, title, []
@@ -490,14 +532,13 @@ def _unbroken(body: str) -> str:
 
 def _feature_for(session: Session, params: dict[str, Any], project_id: int) -> Optional[UUID]:
     """The Task action's feature, while it is still an open feature of this project (it was checked at save; a
-    shipped or moved feature files the task without it rather than failing the firing)."""
-    from app.features import FEATURE_SHIPPED
+    deleted or moved feature files the task without it rather than failing the firing)."""
     from app.models.projects import Feature
 
     if not params.get("feature_id"):
         return None
     feature = session.scalar(select(Feature).where(Feature.id == UUID(str(params["feature_id"]))))
-    if feature is None or feature.project_id != project_id or feature.status == FEATURE_SHIPPED:
+    if feature is None or feature.project_id != project_id or feature.deleted_at is not None:
         return None
     return feature.id
 
@@ -510,6 +551,7 @@ def _build_task(ctx: FireContext, project: "Project", *, body: str, title: str, 
     `created_by_trigger_*`: git authority, the budget flag and the Task page read them). A template supplies the
     persona, autonomy and model pin (its editor's, validated but never re-authorized, as on Start)."""
     from app import task_source
+    from app.git_access import project_forge_person
     from app.routes.tasks.policy import DEFAULT_TRANSITION_MODE, PERSONA_EPIC
     from app.routes.tasks.create import _provider_on_plan_or_422, _playbook_plan_or_422, new_top_level_task
 
@@ -550,6 +592,7 @@ def _build_task(ctx: FireContext, project: "Project", *, body: str, title: str, 
     )
     if persona == PERSONA_EPIC:
         task.is_plannable = True
+        task.max_running = params.get("max_running")
         if plan is not None:
             task.playbook = plan.snapshot
     else:
@@ -560,9 +603,13 @@ def _build_task(ctx: FireContext, project: "Project", *, body: str, title: str, 
         # An event's task carries its source kind, as a trigger's always has (`trigger_source` refuses an unknown).
         task.source = task_source.trigger_source(ctx.trigger_kind)
     task.project_memory = params.get("project_memory")
-    # The owner started it: an automation files under the licence of the person who owns it, so the subtree pushes
-    # with their git access. Only a seat in the automation's org (`task_ancestry.may_stamp_starter`).
-    task.started_by_id = ctx.owner_id if may_stamp_starter(ctx.owner, automation.org_id) else None
+    # Set before the insert, so an action that never chose leaves the filing default to the row's now-final source.
+    if params.get("notify_when_done") is not None:
+        task.notify_when_done = bool(params["notify_when_done"])
+    # Its "Run as" person started it, so the subtree pushes with their git access: the action's own `run_as_id`, else
+    # the project's "Run jobs as", else the org's (`git_access.project_forge_person`, the one home of that rule). The
+    # owner stays its filer (`created_by_id`), whose licence the firing was checked against.
+    task.started_by_id = project_forge_person(ctx.session, project, run_as_id=optional_uuid(params.get("run_as_id")))
     task.org_id = automation.org_id
     task.created_by_automation_id = automation.id
     task.created_by_automation_name = automation.name
@@ -574,6 +621,10 @@ def _build_task(ctx: FireContext, project: "Project", *, body: str, title: str, 
             task.created_by_cron_id, task.created_by_cron_name = child.id, child.name
         else:
             task.created_by_trigger_id, task.created_by_trigger_name = child.id, child.name
+    # An automation's model or vendor is a system pin (`agent_router/pins.py`): the router falls back on it.
+    from app.agent_router import pins
+
+    pins.stamp(task, pins.SYSTEM)
     return task
 
 
@@ -599,11 +650,8 @@ def _copy_attachments(session: Session, automation: Automation, params: dict[str
     # Locked to this commit, so a concurrent delete of the source cannot reap the object before the copy names it.
     ).order_by(TaskAttachment.id).with_for_update()).all()
     for source in sources:
-        session.add(TaskAttachment(
-            org_id=task.org_id, task_id=task.id, kind=source.kind, filename=source.filename,
-            content_type=source.content_type, size_bytes=source.size_bytes, s3_key=source.s3_key,
-            s3_bucket=source.s3_bucket, etag=source.etag,
-            uploaded_at=source.uploaded_at, uploaded_by_id=source.uploaded_by_id, visibility=source.visibility,
+        session.add(TaskAttachment.copy_of(
+            source, org_id=task.org_id, task_id=task.id, kind=source.kind, visibility=source.visibility,
         ))
 
 
@@ -643,6 +691,11 @@ def fire(
     run_column, run_id = ("delivery_id", delivery.id) if is_event else ("cron_run_id", cron_run.id)
 
     resolution = target_resolver.resolve(session, automation)
+    if trigger_kind in TRACKER_SOURCE_KINDS:
+        # A tracker start files in its issue's mapped project only (`trackers.intake.narrowed`).
+        from app.trackers import intake as tracker_intake
+
+        resolution = tracker_intake.narrowed(resolution, event)
     keyed = (key_filer(session, delivery.api_key_id, automation.org_id)
              if delivery is not None and delivery.api_key_id is not None else None)
     filer = keyed if isinstance(keyed, KeyFiler) else None
@@ -932,6 +985,14 @@ def _fire_event(ctx: FireContext, descriptor, resolution, delivery: TriggerDeliv
     else:
         candidates = [item for item in resolution.fire if (item.kind, _key(item)) not in existing]
         gone = set()
+    # An incident's delivery takes the incident's dedup claim before anything files (`production_qa/events.py`).
+    incident = trigger is not None and trigger.source_kind in INCIDENT_SOURCE_KINDS
+    if incident and fresh and refusal is None and ctx.cause != CAUSE_MANUAL:
+        # A Run now renders a pasted sample: it takes no incident's claim.
+        project_ids = [int(i.id) for i in candidates if i.kind == TARGET_PROJECTS]
+        open_reason = production_qa_events.pre_file(session, trigger, delivery, project_ids[0]) if project_ids else None
+        if open_reason is not None:
+            return _incident_deduped(session, trigger, delivery, open_reason)
     side = _side_rows(ctx, resolution) if fresh else []
     running = {_key(i): open_in_target(session, automation.id, i.kind, i.id) for i in candidates}
     if refusal is not None:
@@ -997,6 +1058,11 @@ def _fire_event(ctx: FireContext, descriptor, resolution, delivery: TriggerDeliv
             continue
         outcome = _file_one(ctx, descriptor, item)
         missing += [path for path in outcome.missing_paths if path not in missing]
+        if incident and outcome.outcome == OUTCOME_FILED and outcome.task_id is not None:
+            filed_task = session.scalar(select(Task).where(Task.id == outcome.task_id))
+            if filed_task is not None:
+                production_qa_events.post_file(session, trigger, delivery, filed_task)
+                session.commit()
     if at_cap:
         if fresh and _queued_count(session, delivery) >= depth:
             for item in at_cap:
@@ -1008,6 +1074,22 @@ def _fire_event(ctx: FireContext, descriptor, resolution, delivery: TriggerDeliv
                     OUTCOME_QUEUED, REASON_WAITING.format(running=running[_key(item)], cap=cap)))
     delivery = session.scalar(select(TriggerDelivery).where(TriggerDelivery.id == delivery.id))
     return _finalize_event(ctx, delivery, owed=owed, missing=missing)
+
+
+def _incident_deduped(session: Session, trigger: TaskTrigger, delivery: TriggerDelivery, reason: str) -> FireResult:
+    """An incident delivery that may not file: `deduped` when its incident already has an open task, `filtered`
+    when the incident is another project's (commits)."""
+    from app import trigger_health
+    from app.production_qa.vocabulary import REASON_INCIDENT_TASK_OPEN
+    from app.triggers import DEDUPED, FILTERED
+
+    state = DEDUPED if reason == REASON_INCIDENT_TASK_OPEN else FILTERED
+    delivery.state, delivery.reason, delivery.processed_at = state, reason, _now()
+    delivery.claimed_until = None
+    delivery.event = None
+    trigger_health.apply_outcome(trigger, DEDUPED, reason=reason, now=delivery.processed_at)
+    session.commit()
+    return FireResult(outcome="noop", detail=reason, state=state, reason=reason)
 
 
 def _queued_count(session: Session, delivery: TriggerDelivery) -> int:
@@ -1088,6 +1170,9 @@ def _finalize_event(ctx: FireContext, delivery: TriggerDelivery, *, owed: list[T
     delivery.task_id = first_task
     if missing:
         delivery.missing_paths = list(missing)
+    if state != QUEUED and not filed and trigger is not None and trigger.source_kind in INCIDENT_SOURCE_KINDS:
+        # Nothing filed and nothing owed: the incident's claim goes free (`production_qa/events.py`).
+        production_qa_events.release_claim(session, delivery)
     authority = [r.reason for r in rows if r.reason.startswith(_AUTHORITY_PREFIXES)]
     _close_delivery(session, delivery, trigger, state, reason, acted=bool(filed), first_task=first_task,
                     authority_reason=authority[0] if state == SKIPPED and rows and len(authority) == len(rows)

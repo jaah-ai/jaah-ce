@@ -6,19 +6,22 @@ names a node, and a client-held pin would be a client-chosen node.
 
 Each flow has its own `FlowCookie` (name suffix, path, salt), so one flow's attempt cannot be read as
 another's. `itsdangerous` derives a distinct key per salt, which is what makes sharing one secret across
-the session cookie and both flow cookies safe.
+the session cookie and both flow cookies safe. The git/forge Connect flows' shared skeleton lives here too.
 """
 from __future__ import annotations
 
 import hmac
 import logging
 from typing import Any, Mapping, Optional, Sequence
+from urllib.parse import urlencode
 
 from fastapi import Request, Response
+from fastapi.responses import RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from app.auth import COOKIE_NAME as SESSION_COOKIE_NAME
-from app.auth import resolve_session_secret, session_cookie_is_secure
+from app.auth import session_cookie_is_secure, signer
+from app.config import console_url
 
 # Ten minutes: enough to approve on a vendor's screen, and about a vendor code's own lifetime.
 MAX_AGE = 600
@@ -55,8 +58,7 @@ class FlowCookie:
             raise ValueError(f"flow cookie {self.name!r}: optional members must be members")
 
     def _serializer(self) -> URLSafeTimedSerializer:
-        """The signer, built per call (as `auth._serializer` is) so a patched `SESSION_SECRET` applies."""
-        return URLSafeTimedSerializer(resolve_session_secret(), salt=self.salt)
+        return signer(self.salt)
 
     def set(self, response: Response, payload: Mapping[str, Any]) -> None:
         """Carry this attempt's facts to the callback, signed and timestamped.
@@ -117,11 +119,24 @@ UNVERIFIED_STATE_MISMATCH = "state_mismatch"
 UNVERIFIED_WRONG_USER = "wrong_user"
 
 
+def connect_errors(vendor: str, **extra: str) -> dict[str, str]:
+    """A Connect flow's closed vocabulary — the shared refusals naming `vendor` ("GitHub"), plus `extra`."""
+    return closed_errors({
+        "not_configured": f"no {vendor} app is designated in Settings",
+        UNVERIFIED_EXPIRED: "the connect attempt was not finished within ten minutes, or its cookie is gone",
+        UNVERIFIED_STATE_MISMATCH: "the callback's state did not match the one this browser started with",
+        UNVERIFIED_WRONG_USER: "the connect attempt belongs to a different signed-in user",
+        "denied": f"the authorization was declined at {vendor}",
+        "no_code": f"{vendor} returned no authorization code",
+        "exchange_failed": f"{vendor} refused to exchange the authorization code",
+        **extra,
+    })
+
+
 def closed_errors(errors: dict[str, str]) -> dict[str, str]:
     """A connect flow's closed slug vocabulary, checked to carry every slug `verified_attempt` can return — or
     the flow's redirect would 500 mid-redirect. `RuntimeError`, not `assert` (stripped under `-O`). Every flow
-    that redirects a browser on a `verified_attempt` refusal (`routes/git_connect.py`, `routes/forge_connect.py`,
-    `routes/credentials/connect.py`) builds its vocabulary through this."""
+    that redirects a browser on such a refusal builds its vocabulary through this (or `connect_errors`)."""
     missing = {UNVERIFIED_EXPIRED, UNVERIFIED_STATE_MISMATCH, UNVERIFIED_WRONG_USER} - set(errors)
     if missing:
         raise RuntimeError(f"verified_attempt can return slugs the flow's errors do not carry: {sorted(missing)}")
@@ -146,8 +161,7 @@ def verified_attempt(
     2. Its state equals the query's state, in constant time (login-CSRF defence).
     3. Its user id equals the signed-in user; the one refusal logged with both ids.
 
-    A vendor `error` and a missing `code` stay with the caller, `error` first: a decline carries no
-    code. Nothing about the cookie, state, verifier or code is ever logged.
+    A vendor `error` and a missing `code` are the caller's to judge; nothing of cookie, state or code is logged.
     """
     attempt, refusal = verified_anonymous_attempt(
         cookie, request, callback_state=callback_state, log=log, flow_name=flow_name, user_id=user_id,
@@ -200,3 +214,15 @@ def same_state(cookie_state: str, callback_state: str) -> bool:
     except UnicodeEncodeError:
         return False
     return hmac.compare_digest(cookie_bytes, callback_bytes)
+
+
+def finish_redirect(page: str, errors: dict[str, str], *, error: Optional[str] = None, **tags: str) -> RedirectResponse:
+    """A 303 to the console `page` saying how a connect ended: `git_connect=connected`, or `git_connect=error`
+    with `reason` one slug of the flow's closed `errors` (checked, never a message), then `tags` (the other
+    forges' flow names its forge). 303 so the follow is a plain GET and a reload cannot re-submit the code."""
+    if error is not None and error not in errors:
+        raise ValueError(f"{error!r} is not a member of the flow's closed error vocabulary")
+    if {"git_connect", "reason"} & tags.keys():
+        raise ValueError("a tag may not shadow the checked keys")
+    query = {"git_connect": "error", "reason": error} if error else {"git_connect": "connected"}
+    return RedirectResponse(f"{console_url(page)}?{urlencode({**query, **tags})}", status_code=303)

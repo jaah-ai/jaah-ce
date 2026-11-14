@@ -13,10 +13,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional, Sequence
 
-from sqlalchemy import ColumnElement, or_, select, true
+from sqlalchemy import ColumnElement, and_, not_, or_, select, true
 from sqlalchemy.orm import Session
 
-from app.models.task_extras import TaskAttachment
+from app.models.task_extras import ATTACHMENT_KIND_REPORT, TaskAttachment
 from app.models.tasks import Task
 from app.task_manifest import DOCUMENT_KINDS
 
@@ -104,13 +104,45 @@ def uploaded_clause() -> ColumnElement[bool]:
     return TaskAttachment.uploaded_at.is_not(None)
 
 
-def current_artifact(session: Session, task: Task, kind: str) -> Optional[TaskAttachment]:
+#: The app-access report's filename (`app/hosted_apps/admin.py`): a `web` app's URL, admin email and password, written
+#: by the control plane onto the app's epic.
+APP_ACCESS_FILENAME = "your-app.html"
+
+
+def app_access_clause() -> ColumnElement[bool]:
+    """The app-access report rows: a `report` the control plane wrote itself under `APP_ACCESS_FILENAME` — no
+    uploader (every runner upload names its executor) and not a copy (`source_task_id`). Members see it on the
+    Artifacts tab; every runner-facing read leaves it out (`not_app_access_clause`), since it holds a password."""
+    return and_(
+        TaskAttachment.kind == ATTACHMENT_KIND_REPORT, TaskAttachment.filename == APP_ACCESS_FILENAME,
+        TaskAttachment.uploaded_by_id.is_(None), TaskAttachment.source_task_id.is_(None),
+    )
+
+
+def not_app_access_clause() -> ColumnElement[bool]:
+    """Every row but an app-access report: what a runner (or a model reading for one) may be handed. Each column
+    `app_access_clause` reads is NOT NULL or tested with IS NULL, so the negation never drops a row to NULL."""
+    return not_(app_access_clause())
+
+
+def is_app_access(row: TaskAttachment) -> bool:
+    """`app_access_clause` in Python, for one row already read."""
+    return (row.kind == ATTACHMENT_KIND_REPORT and row.filename == APP_ACCESS_FILENAME
+            and row.uploaded_by_id is None and row.source_task_id is None)
+
+
+def current_artifact(
+    session: Session, task: Task, kind: str, *, exclude_app_access: bool = False,
+) -> Optional[TaskAttachment]:
     """The one latest-wins artifact read: the row a Task currently counts as its `kind` deliverable, or
     `None`. Superseded rows are kept (ordering, not a unique constraint).
 
     The watermark and upload filters are inside the ordering, so a hidden newest row is skipped rather
     than returned. Raises `ValueError` for a non-document kind: the human's `ATTACHMENT_KIND_FILE` input
-    is never Reset-hidden, and derived/reference kinds are never rows — both are caller bugs."""
+    is never Reset-hidden, and derived/reference kinds are never rows — both are caller bugs.
+
+    `exclude_app_access` skips an app-access report (`app_access_clause`), so a reader that hands the report to a
+    model falls back to the task's own newest one."""
     if kind not in DOCUMENT_KINDS:
         raise ValueError(
             f"current_artifact: {kind!r} is not a document artifact kind — expected one of "
@@ -127,6 +159,7 @@ def current_artifact(session: Session, task: Task, kind: str) -> Optional[TaskAt
                 TaskAttachment.created_at, task.artifacts_hidden_before
             ),
             uploaded_clause(),
+            not_app_access_clause() if exclude_app_access else true(),
         )
         .order_by(*_LATEST_FIRST)
         .limit(1)

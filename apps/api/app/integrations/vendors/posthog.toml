@@ -1,0 +1,92 @@
+# PostHog. Facts confirmed at the vendor's own docs: personal API keys (scopes chosen at creation, Bearer header,
+# private endpoints on us.posthog.com / eu.posthog.com or your own host) https://posthog.com/docs/api/personal-api-keys
+# and https://posthog.com/docs/api . Connect: PostHog identifies an app by a Client ID Metadata Document at the app's
+# own address (https://posthog.com/docs/api/oauth), which Jaah serves (`client_metadata`), on the region-agnostic
+# https://oauth.posthog.com; the account's region is found after the exchange (`grant_hooks.posthog_region`). The MCP
+# server (https://posthog.com/docs/model-context-protocol, one URL for US and EU) takes the personal API key or a
+# Connect row's live access token as a Bearer token. Probed 2026-11-03: GET /api/users/@me/ with a bad
+# key answers 401 authentication_error.
+slug = "posthog"
+label = "PostHog"
+category = "data"
+vendor_docs_url = "https://posthog.com/docs/api/personal-api-keys"
+summary = "Query PostHog events, insights, feature flags and experiments from agent work."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://oauth.posthog.com/oauth/authorize/"
+token_url = "https://oauth.posthog.com/oauth/token/"
+client_metadata = true
+scopes = [
+  { name = "user:read", label = "Know who signed in, for Test and the secret's name" },
+  { name = "project:read", label = "List the projects agents may query" },
+  { name = "query:read", label = "Run HogQL queries" },
+  { name = "insight:read", label = "Read saved insights and dashboards' insights" },
+  { name = "feature_flag:read", label = "Read feature flags and their rollout" },
+  { name = "experiment:read", label = "Read experiments and their results" },
+  { name = "person:read", label = "Look up persons behind events" },
+]
+on_grant_config = "app.integrations.grant_hooks:posthog_region"
+grant_fields = ["base_url"]
+
+[auth.oauth.registration]
+console_url = "https://posthog.com/docs/api/oauth"
+steps = [
+  "There is no app to create: Jaah serves its own client metadata document, and PostHog reads it at each sign-in",
+  "Open each environment's metadata document (the addresses below) and check it names Jaah and the redirect URI",
+  "Optionally ask PostHog to verify the client, so its consent screen shows Jaah as verified",
+]
+review = "Not required: PostHog accepts any HTTPS client metadata document; verification only changes the consent screen"
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "base_url", label = "PostHog host", kind = "url", required = true, placeholder = "https://us.posthog.com", default = "https://us.posthog.com", help = "https://us.posthog.com for PostHog Cloud US, https://eu.posthog.com for PostHog Cloud EU (the address you sign in at), or your self-hosted PostHog's address. Not the us.i.posthog.com ingestion host" },
+  { key = "api_key", label = "Personal API key", kind = "secret", required = true, placeholder = "phx_...", help = "PostHog > your avatar > Account settings > Personal API keys > Create personal API key: name it Jaah, pick the organizations or projects it may reach, choose scopes (at least User read, plus read on the data agents use, such as Query, Insight and Feature flag), then copy the key - PostHog shows it once" },
+]
+
+[test]
+method = "GET"
+path = "{base_url}/api/users/@me/"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+identity = [["email"], ["first_name"]]
+
+[mcp]
+url = "https://mcp.posthog.com/mcp"
+url_editable = false
+transport = "streamable_http"
+auth = "bearer_field:api_key"
+
+[docs]
+agent_uses = [
+  "Through PostHog's MCP server, once the secret is linked to a project, use PostHog's ready-made tools for insights, flags and errors",
+  "Run a HogQL query or read a saved insight to check a metric a task asks about",
+  "Look up a feature flag's rollout and conditions before or after a release",
+  "Read an experiment's results to report on a change",
+  "Find the events and persons behind a bug report",
+  "Create or update a feature flag or annotation, if the key has write scopes",
+]
+prerequisites = [
+  "A PostHog account in the organization and projects agents should reach",
+  "Know your PostHog host: US Cloud, EU Cloud or your own self-hosted address",
+]
+limitations = [
+  "Connect reads only (queries, insights, flags, experiments, persons); a personal API key with write scopes is needed to change a flag or add an annotation",
+  "Connect reaches PostHog Cloud (US or EU, found after sign-in); a self-hosted PostHog needs a personal API key",
+  "Both act as the person who signed in or created the key, within the scopes and projects chosen for it",
+  "PostHog limits each user to 10 personal API keys",
+  "PostHog rate-limits private API calls (for example, analytics queries are capped per minute); heavy query loops are throttled",
+  "The project API key (phc_) only sends events and cannot read data, so it does not work here",
+]
+troubleshooting = [
+  { symptom = "Test says PostHog rejected the personal API key (401)", fix = "The key was deleted, mistyped or is the project key (phc_) rather than a personal key (phx_). Create a personal key in Account settings and select Replace" },
+  { symptom = "Test says PostHog rejected the key (403)", fix = "The key lacks the User read scope Jaah's test uses. Edit the key's scopes in Account settings > Personal API keys" },
+  { symptom = "Test cannot reach PostHog or the key is rejected though it is correct", fix = "The host does not match where the account lives: an EU account needs https://eu.posthog.com. Fix PostHog host" },
+  { symptom = "Connect ends with no organisation or site for this sign-in", fix = "PostHog's US and EU clouds both refused the new token. Select Connect again and sign in to the account agents should use" },
+  { symptom = "Agents get 403 on one project", fix = "The key was limited to other projects. Add the project to the key's access, or create a key for it" },
+]
+faq = [
+  { q = "Is there a Sign in with PostHog button", a = "Yes: Connect PostHog. PostHog needs no app registered for it, so it works on every Jaah" },
+  { q = "Which scopes should the key have", a = "Read scopes for what agents should look at (Query, Insight, Feature flag, Experiment, Person) plus User read for the test. Add write scopes only for changes you want agents to make" },
+]

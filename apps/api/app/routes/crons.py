@@ -30,7 +30,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select, true, tuple_
+from sqlalchemy import func, or_, select, true
 from sqlalchemy.orm import Session
 
 from app import automation_service, cron_activities, cron_min_period, cron_runtime, keyset
@@ -38,7 +38,9 @@ from app.actors import actor_names, stamp_actor
 from app.auth import require_user
 from app.authz.catalog import Tenancy
 from app.authz.declarations import org_admin
-from app.entity_shape import RefOut, StrictModel, float_or_none, flush_or_409, from_row, get_or_404
+from app.entity_shape import (
+    RefOut, StrictModel, float_or_none, flush_or_409, from_row, get_or_404, partial_of, pick, refused_as,
+)
 from app.cron_runtime import SKIP_ESCALATION_THRESHOLD, cron_timezone, resolved_timezone_name
 from app.cron_schedule import (
     MIN_GAP_OCCURRENCES,
@@ -59,16 +61,18 @@ from app.crons import (
     SCHEDULE_KIND_INTERVAL,
     SCHEDULE_KINDS,
 )
-from app.db import get_session
+from app.db_async import DbDep, release
 from app.events import emit_console_event
 from app.models.automations import Cron, CronRun
+from app.offload import run_cpu
+from app.operator_settings import reads as settings_reads
 from app.models.identity import AdminUser
 from app.models.projects import Project
 from app.models.tasks import Task
 from app.org_gate import require_org_active
 from app.tenancy import rehome, seam
 from app.tenancy.create_surface import named_org
-from app.tenancy.ids import ORG_ZERO_ID, is_operator_plane
+from app.tenancy.ids import ORG_ZERO_ID, is_operator_user
 from app.tenancy.labels import OrgRef, org_ref_of, org_refs
 from app.user_activity import record_write
 
@@ -197,26 +201,14 @@ class CronCreate(StrictModel):
     timeout_seconds: Optional[float] = None
 
 
-class CronUpdate(StrictModel):
+class CronUpdate(partial_of(CronCreate)):  # type: ignore[misc,valid-type]  # generated base
     """The PATCH body. Every field optional; `model_fields_set`, never a `None` value, distinguishes
     "not provided" from "clear it". `min_gap_seconds: null` means no floor, distinct from the runtime
     default."""
 
-    # Lands on the row unjudged (`_apply` setattrs every provided field), so `write_cron_update` takes it
+    # `org_id` lands on the row unjudged (`_apply` setattrs every provided field), so `write_cron_update` takes it
     # back off the instance and carries it as a local; only `_rehomed` may decide where the row goes
     # (`_rehome_or_conflict`, `_entitled_to_rehome`).
-    org_id: Optional[UUID] = None
-    name: Optional[str] = None
-    description: Optional[str] = None
-    schedule_kind: Optional[str] = None
-    cron_expression: Optional[str] = None
-    interval_seconds: Optional[int] = None
-    activity_type: Optional[str] = None
-    activity_params: Optional[dict[str, Any]] = None
-    enabled: Optional[bool] = None
-    retention_mode: Optional[str] = None
-    min_gap_seconds: Optional[float] = None
-    timeout_seconds: Optional[float] = None
 
 
 class CronFireOut(BaseModel):
@@ -254,6 +246,8 @@ class FleetCronRunOut(BaseModel):
     #: page's own join, not a per-row lookup).
     cron_id: str
     cron_name: str
+    #: The automation the cron is the schedule of — the row's link (`automation_alerts.AUTOMATIONS_PATH`).
+    automation_id: Optional[str]
 
 
 class FailingCronOut(RefOut):
@@ -453,39 +447,23 @@ def _detail_out(session: Session, cron: Cron) -> CronDetail:
         .order_by(CronRun.fired_at.desc(), CronRun.id.desc())
         .limit(1)
     ).first()
-    return CronDetail(
-        id=str(cron.id),
-        name=cron.name,
+    return from_row(
+        CronDetail, cron,
         schedule_human=_schedule_human(cron),
-        schedule_kind=cron.schedule_kind,
         activity_label=_activity_label(cron),
-        enabled=cron.enabled,
         next_fire_at=_next_fire(cron, now),
         last_run_at=last.fired_at if last else None,
         last_outcome=last.outcome if last else None,
-        # A column on the row: tells "never fired" from "fired, kept nothing" with no extra read.
-        last_fired_at=cron.last_fired_at,
         # None means no kept run; a run with no sentence reads `''` (`cron_runs.detail` is NOT NULL).
         last_detail=last.detail if last else None,
         health=_health(cron, now),
-        description=cron.description,
-        cron_expression=cron.cron_expression,
-        interval_seconds=cron.interval_seconds,
-        activity_type=cron.activity_type,
         activity_params=cron.activity_params or {},
-        retention_mode=cron.retention_mode,
         min_gap_seconds=float_or_none(cron.min_gap_seconds),
         timeout_seconds=float_or_none(cron.timeout_seconds),
-        is_system=cron.is_system,
         # One id, one resolver — the same org indicator shape projects use
         # (`routes/projects.py::connect_existing_project`).
         org=org_ref_of(org_refs(session, [cron.org_id]), cron.org_id),
         timezone=resolved_timezone_name(),
-        schedule_anchor_at=cron.schedule_anchor_at,
-        last_tick_at=cron.last_tick_at,
-        consecutive_skips=cron.consecutive_skips,
-        created_at=cron.created_at,
-        updated_at=cron.updated_at,
         created_by=names.get(cron.created_by_id),
         updated_by=names.get(cron.updated_by_id),
     )
@@ -734,7 +712,7 @@ def _reconcile_later(background: BackgroundTasks) -> None:
 
 @router.get("/activity-types", response_model=ActivityTypesOut)
 @org_admin(Tenancy.CALLER_PLANE)
-def list_activity_types(
+async def list_activity_types(
     actor: AdminUser = Depends(require_user),
 ) -> ActivityTypesOut:
     """The activity registry, projected — no vocabulary of its own.
@@ -743,7 +721,7 @@ def list_activity_types(
     non-creatable activities and must be nameable. `creatable` lets the picker filter. A tenant is not
     offered machinery (`_refuse_machinery_for_a_tenant`) and sees no system cron to name.
     """
-    operator = _is_operator(actor)
+    operator = is_operator_user(actor)
     return ActivityTypesOut(
         activity_types=[
             from_row(
@@ -762,8 +740,9 @@ def list_activity_types(
 
 @router.post("/preview", response_model=SchedulePreviewOut)
 @org_admin(Tenancy.CALLER_PLANE)
-def preview_schedule(
+async def preview_schedule(
     body: SchedulePreviewIn,
+    db: DbDep,
     _actor: AdminUser = Depends(require_user),
 ) -> SchedulePreviewOut:
     """What an unsaved schedule would do — the sentence and its next firings, in the configured zone.
@@ -774,8 +753,9 @@ def preview_schedule(
 
     Read-only: the transient `Cron` is a
     validation vehicle never added to the session, so the preview refuses exactly what a save would.
-    Takes no `session`.
+    The session only warms the settings cache (the zone), so a miss opens no session of its own on the loop.
     """
+    await db.run_sync(settings_reads.overrides)
     draft = Cron(
         schedule_kind=body.schedule_kind,
         cron_expression=body.cron_expression,
@@ -830,11 +810,6 @@ def _creatable_descriptor(activity_type: str) -> cron_activities.ActivityDescrip
     return descriptor
 
 
-def _is_operator(actor: AdminUser) -> bool:
-    """Whether this superadmin is the deployment's operator (`is_operator_plane`), not a tenant's admin."""
-    return is_operator_plane(actor.org_id, actor.is_superadmin)
-
-
 def _refuse_machinery_for_a_tenant(actor: AdminUser, is_system: bool, label: str) -> None:
     """422 when a tenant superadmin points a cron at a system activity.
 
@@ -842,7 +817,7 @@ def _refuse_machinery_for_a_tenant(actor: AdminUser, is_system: bool, label: str
     (`cron_runtime._run_fire`), but a system one (lease-drain, task-pipeline, retention —
     `cron_system_activities`, `cron_retention`) sweeps every org from org zero. Only the operator may
     schedule, edit onto, or fire one."""
-    if is_system and not _is_operator(actor):
+    if is_system and not is_operator_user(actor):
         _reject(
             "activity_type",
             f"{label} is control-plane machinery that acts across every organization, so only an "
@@ -1015,10 +990,7 @@ def _rehomed(
             ),
         )
     if not operator and named != actor_org:
-        raise HTTPException(
-            status_code=403,
-            detail="org_id: a cron in your organization stays in your organization",
-        )
+        raise HTTPException(status_code=403, detail="org_id: a cron in your organization stays in your organization")
     target = named_org(session, named)
     if not _entitled_to_rehome(was_org=target, actor_org=actor_org):
         raise HTTPException(
@@ -1083,19 +1055,15 @@ def _plane_for_write(
         yield
 
 
-def _flush_or_conflict(session: Session, cron: Cron) -> None:
-    """Flush, turning the one constraint validation cannot mirror into a readable 409.
-
-    `uq_crons_system_activity_type` is a partial unique index only the database can decide at write
-    time, so flush-then-catch rather than SELECT-then-insert (no race window). The detail is built before
-    the flush: `session.rollback()` expires the instance, and a re-read would name the pre-patch activity.
-    """
-    flush_or_409(
-        session,
-        f"activity_type: a system cron for {cron.activity_type!r} already exists — there may be "
-        f"only one, so that double-scheduling it is unrepresentable rather than merely tested",
-        constraints=frozenset({"uq_crons_system_activity_type"}),
-    )
+# The one constraint validation cannot mirror, as a readable 409: `uq_crons_system_activity_type` is a partial unique
+# index only the database can decide at write time, so flush-then-catch rather than SELECT-then-insert (no race
+# window). The detail is formatted before the flush: `session.rollback()` expires the instance, and a re-read would
+# name the pre-patch activity.
+_ACTIVITY_TAKEN = (
+    "activity_type: a system cron for {!r} already exists — there may be "
+    "only one, so that double-scheduling it is unrepresentable rather than merely tested"
+)
+_ACTIVITY_UNIQUE = frozenset({"uq_crons_system_activity_type"})
 
 
 def _rehome_or_conflict(session: Session, cron: Cron, target: UUID) -> None:
@@ -1106,19 +1074,14 @@ def _rehome_or_conflict(session: Session, cron: Cron, target: UUID) -> None:
     data-modifying CTE). `ON UPDATE CASCADE` was tried and reverted: it would be a second tenant-move
     path without `rehome._blockers`' refusals.
 
-    The caller restores the attribute after `_changed_fields` and before `_flush_or_conflict`, so the
+    The caller restores the attribute after `_changed_fields` and before the flush, so the
     ORM does not issue a competing UPDATE. `session.flush()` first stays as a guard for future child
     writes. `RehomeBlocked` is unreachable for `crons` today but is translated, not swallowed — an
     operator must not be told a failed move succeeded.
     """
     session.flush()
-    try:
+    with refused_as(409, rehome.RehomeBlocked, chain=True, prefix="org_id: "):
         moved = rehome.rehome_row(session, Cron.__tablename__, cron.id, target)
-    except rehome.RehomeBlocked as blocked:
-        raise HTTPException(
-            status_code=409,
-            detail=f"org_id: {blocked}",
-        ) from blocked
     if moved:
         # The instance still holds the pre-move value; expiring the attribute reloads it on access
         # without marking it dirty, so the write seam sees no org change.
@@ -1130,13 +1093,13 @@ def _rehome_or_conflict(session: Session, cron: Cron, target: UUID) -> None:
 
 @router.get("/runs", response_model=FleetCronRunsPage)
 @org_admin(Tenancy.CALLER_PLANE)
-def list_fleet_cron_runs(
+async def list_fleet_cron_runs(
+    db: DbDep,
     limit: int = Query(default=RUNS_DEFAULT_LIMIT, ge=1, le=RUNS_MAX_LIMIT),
     before: Optional[str] = Query(default=None),
     cron: Optional[UUID] = Query(default=None),
     outcome: Optional[str] = Query(default=None),
     _actor: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> FleetCronRunsPage:
     """Every cron's firings, newest first, one bounded page at a time.
 
@@ -1149,30 +1112,36 @@ def list_fleet_cron_runs(
     bounded top-N plus the cron list and one outcome aggregate. If that outgrows the table, add an index on
     `(fired_at DESC, id DESC)` — not a count or an offset.
     """
+    page, next_before, schedules, outcomes, failing = await db.run_sync(
+        _list_fleet_cron_runs, limit=limit, before=before, cron=cron, outcome=outcome,
+    )
+    await release(db)
+    # Off the loop: a page of runs plus one picker entry per readable cron (fleet-wide for the operator).
+    return await run_cpu(_fleet_cron_runs_page, limit, page, next_before, schedules, outcomes, failing)
+
+
+def _list_fleet_cron_runs(
+    session: Session,
+    limit: int,
+    before: Optional[str],
+    cron: Optional[UUID],
+    outcome: Optional[str],
+) -> tuple[list[Any], Optional[str], list[tuple[str, str]], list[str], list[Any]]:
+    """`list_fleet_cron_runs`' reads: `(page, next_before, schedules, outcomes, failing)`, fully loaded rows."""
     # Refused, not silently empty: `outcome` is a published closed vocabulary, so an unknown value is a
     # caller bug (`_reject`).
     if outcome is not None and outcome not in RUN_OUTCOMES:
         _reject("outcome", f"{outcome!r} is not one of {', '.join(RUN_OUTCOMES)}")
-    query = (
-        select(CronRun, Cron.name)
-        .join(Cron, Cron.id == CronRun.cron_id)
-        .order_by(CronRun.fired_at.desc(), CronRun.id.desc())
-    )
+    query = select(CronRun, Cron.name, Cron.automation_id).join(Cron, Cron.id == CronRun.cron_id)
     if cron is not None:
         query = query.where(CronRun.cron_id == cron)
     if outcome is not None:
         query = query.where(CronRun.outcome == outcome)
-    if before is not None:
-        # Refused rather than ignored, so a bad cursor never silently restarts at page 1.
-        fired_at, run_id = keyset.decode_cursor(
-            before, _RUNS_CURSOR_SHAPE, is_stamp=lambda name: name == "fired_at", is_uuid=lambda name: name == "id",
-            status=422, detail=f"before: {before!r} is not a cursor from this endpoint's `next_before`",
-        )
-        query = query.where(tuple_(CronRun.fired_at, CronRun.id) < (fired_at, run_id))
-    # One row more than asked, discarded — answers "is there another page?" without a COUNT.
-    rows = session.execute(query.limit(limit + 1)).all()
-    has_more = len(rows) > limit
-    page = rows[:limit]
+    # A bad cursor is refused rather than ignored, so it never silently restarts at page 1.
+    page, next_before = keyset.stamp_id_cursor_page(
+        session, query, CronRun.fired_at, CronRun.id, before, limit, shape=_RUNS_CURSOR_SHAPE, is_uuid=True,
+        scalars=False, detail=f"before: {before!r} is not a cursor from this endpoint's `next_before`",
+    )
     # The cron picker offers EVERY cron the seam lets this caller read, fired or not — a quiet schedule is
     # exactly the one an operator looks for. Sorted here (code points, not the database collation) by name
     # with id as tiebreak: `crons.name` is not unique, so options would reshuffle.
@@ -1199,16 +1168,28 @@ def list_fleet_cron_runs(
         .group_by(Cron.id, Cron.name)
         .having(errors >= FAILING_STREAK_THRESHOLD)
     ).all()
+    return list(page), next_before, schedules, list(outcomes), list(failing)
+
+
+def _fleet_cron_runs_page(
+    limit: int,
+    page: list[Any],
+    next_before: Optional[str],
+    schedules: list[tuple[str, str]],
+    outcomes: list[str],
+    failing: list[Any],
+) -> FleetCronRunsPage:
+    """The response over `_list_fleet_cron_runs`' rows, on the CPU pool: touches no session."""
     return FleetCronRunsPage(
         runs=[
-            from_row(FleetCronRunOut, run, id=str(run.id), cron_id=str(run.cron_id), cron_name=cron_name)
-            for run, cron_name in page
+            from_row(
+                FleetCronRunOut, run, cron_name=cron_name,
+                automation_id=str(automation_id) if automation_id else None,
+            )
+            for run, cron_name, automation_id in page
         ],
         limit=limit,
-        next_before=(
-            keyset.encode_cursor(_RUNS_CURSOR_SHAPE, [page[-1][0].fired_at, page[-1][0].id])
-            if has_more and page else None
-        ),
+        next_before=next_before,
         crons=[FleetCronRef(id=cron_id, name=name) for cron_id, name in schedules],
         outcomes=sorted(outcomes),
         failing=[
@@ -1246,17 +1227,10 @@ def write_cron_create(
     `automation` when an automation save decided it, else derived from the row.
     """
     cron = Cron(
-        name=body.name,
-        description=body.description,
-        schedule_kind=body.schedule_kind,
-        cron_expression=body.cron_expression,
-        interval_seconds=body.interval_seconds,
-        activity_type=body.activity_type,
-        activity_params=body.activity_params,
-        enabled=body.enabled,
-        retention_mode=body.retention_mode,
-        min_gap_seconds=body.min_gap_seconds,
-        timeout_seconds=body.timeout_seconds,
+        **pick(
+            body, "name", "description", "schedule_kind", "cron_expression", "interval_seconds", "activity_type",
+            "activity_params", "enabled", "retention_mode", "min_gap_seconds", "timeout_seconds",
+        ),
         is_system=descriptor.is_system,
         org_id=org_id,
     )
@@ -1270,10 +1244,9 @@ def write_cron_create(
     session.add(cron)
     # A new row: no committed org (`was_org=None`); the org `org_for` just stamped decides.
     with _plane_for_write(session, cron, was_org=None, actor_org=actor.org_id):
-        _flush_or_conflict(session, cron)
+        flush_or_409(session, _ACTIVITY_TAKEN.format(cron.activity_type), constraints=_ACTIVITY_UNIQUE)
     automation_service.sync_cron(session, cron, automation)
-    emit_console_event(session, entity="cron", id=cron.id, action="upserted", org_id=cron.org_id)
-    session.commit()
+    emit_console_event(session, entity="cron", id=cron.id, action="upserted", org_id=cron.org_id, commit=True)
     session.refresh(cron)
     _reconcile_later(background)
     return _detail_out(session, cron)
@@ -1348,14 +1321,14 @@ def write_cron_update(
     # Every querying guard sits after `_validate` and inside one no-autoflush window. After `_validate`,
     # because `_apply` already set every provided field and a query would autoflush an unvalidated
     # merge (e.g. `name: null`) as a 500. No autoflush, because a valid row may still violate
-    # `uq_crons_system_activity_type`, which must surface via `_flush_or_conflict` as a 409.
+    # `uq_crons_system_activity_type`, which must surface via `_ACTIVITY_TAKEN` as a 409.
     with session.no_autoflush:
         if "org_id" in provided:
             # Taken straight back off the instance (see `CronUpdate.org_id`), before `_rehomed` queries.
             cron.org_id = was_org
             rehome_to = _rehomed(
                 session, cron, was_org=was_org, actor_org=actor.org_id, named=body.org_id,
-                operator=_is_operator(actor),
+                operator=is_operator_user(actor),
             )
         # Only when this request could have moved the answer: a cron already on an unreachable project
         # must still be disableable. Re-judged when the project, activity or org changes. The project
@@ -1398,7 +1371,7 @@ def write_cron_update(
     # The ORM write first, carrying every patched column but `org_id` (still `was_org`), so
     # `_plane_for_write` judges the committed org; the move below carries no ORM instance.
     with _plane_for_write(session, cron, was_org=was_org, actor_org=actor.org_id):
-        _flush_or_conflict(session, cron)
+        flush_or_409(session, _ACTIVITY_TAKEN.format(cron.activity_type), constraints=_ACTIVITY_UNIQUE)
     # The move second, after the ORM write and before the audit row. It raises on refusal, rolling back
     # the whole request.
     if rehome_to is not None and rehome_to != was_org:
@@ -1412,8 +1385,7 @@ def write_cron_update(
         session, actor, "cron_update", f"Updated cron {cron.name} ({', '.join(changed)})",
         data={"cron_id": str(cron.id), "changed": changed, **_via(via_task_id)},
     )
-    emit_console_event(session, entity="cron", id=cron.id, action="upserted", org_id=cron.org_id)
-    session.commit()
+    emit_console_event(session, entity="cron", id=cron.id, action="upserted", org_id=cron.org_id, commit=True)
     session.refresh(cron)
     _reconcile_later(background)
     return _detail_out(session, cron)

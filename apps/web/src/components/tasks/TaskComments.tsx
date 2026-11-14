@@ -2,11 +2,11 @@
  * (fewer words; one word where one word does):
  *   · `AuthorBadge` stands in for the name (full name on `title`).
  *   · One byline per comment: badge, relative age, "edited"; absolute time on `title`.
- *   · React/Edit/Delete sit right-aligned on the line under the message, always shown (no hover reveal).
+ *   · Reply puts "@Author " in the composer (`CommentComposerHandle.mention`) — not on my own comments.
+ *   · Reply/React/Edit/Delete sit right-aligned on the line under the message, always shown (no hover reveal).
  * Who may do what is the server's answer (`author_is_me`, `may_delete`) — presentation only; the route
  * re-decides, and the caller's identity is deliberately not on the wire.
- * Row actions reuse `ACTION_ICON` (./shared): `@mui/icons-material` is not a dependency (single home:
- * `ui/InfoTip.tsx`). Glyphs are `aria-hidden` inside named buttons.
+ * Row actions reuse `ACTION_ICON` (./shared): `@mui/icons-material` is not a dependency. Glyphs are `aria-hidden` inside named buttons.
  * Oldest first, composer at the bottom (unlike every other roster).
  * A task's images draw under the text as thumbnails, each a link to the full image in a new tab. Plain
  * `<img>` on the content route: same-origin, so the session cookie rides it and the 307 to storage needs no
@@ -24,20 +24,19 @@
  * its tooltip naming who; the "Add reaction" action opens the palette. Controls are drawn for everyone —
  * no field says who may react, so the route's 403 is the answer. The call answers the updated comment,
  * spliced in place; a full reload would re-run the deep-link and cost a round trip per click. */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import Box from '@mui/material/Box'
 import ButtonBase from '@mui/material/ButtonBase'
 import IconButton from '@mui/material/IconButton'
 import Popover from '@mui/material/Popover'
 import Stack from '@mui/material/Stack'
-import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import { alpha, useTheme, type Theme } from '@mui/material/styles'
 import { useLocation } from 'react-router-dom'
 
 import { apiDetail, del, get, patch, post, put, useApiRewriterVersion } from '../../api'
 import { useSubmit } from '../../hooks/useSubmit'
-import { useConfirm } from '../ConfirmDialog'
+import { danger, useConfirm } from '../ConfirmDialog'
 import { absoluteTime, relativeAge } from '../../lib/relativeTime'
 import { subjectBase, type CommentSubject, type CommentVisibility } from '../../lib/commentSubject'
 import { REACTIONS, reactionGlyph, reactionLabel } from '../../lib/reactions'
@@ -47,13 +46,18 @@ import type { MentionCandidate, TaskComment, TaskCommentReaction } from '../../t
 import SegmentedControl from '../../ui/SegmentedControl'
 import { ACTION_ICON } from './shared'
 import AuthorBadge from './AuthorBadge'
-import CommentComposer from './CommentComposer'
+import CommentComposer, { type CommentComposerHandle } from './CommentComposer'
 import CommentText from './CommentText'
 import TaskAttachmentsField from './TaskAttachmentsField'
-import { commentImageUrl, useCommentImages } from './useCommentImages'
+import { commentImagePath, useCommentImages } from './useCommentImages'
+import { ApiImg, apiLinkHref } from '../../net/href'
+import { ELLIPSIS_SX, PHONE, tapTargetSx } from '../../ui/listStyles'
+import EmptyState from '../../ui/EmptyState'
+import { FONT_SIZE, FONT_WEIGHT, grid, LINE_HEIGHT, RADIUS, SIZE } from '../../theme'
+import Tip from '../../ui/Tip'
 
 /* Badge geometry (the host owns the box, `AuthorBadge` the identity). 22px: smallest legible disc here. */
-const BADGE_SX = { width: 22, height: 22, fontSize: 10, flexShrink: 0 } as const
+const BADGE_SX = { width: SIZE.chip, height: SIZE.chip, fontSize: FONT_SIZE.xxs, flexShrink: 0 } as const
 
 /* The actions sit right-aligned on the line under the message, so the text keeps the row's full width.
    Always shown: no hover reveal. */
@@ -62,7 +66,7 @@ const ACTIONS_SX = {
   alignItems: 'center',
   flexShrink: 0,
   ml: 'auto',
-  gap: 0.25,
+  gap: 0,
 } as const
 
 /* Row-action button geometry (Edit/Delete/React): a 28px square with a 12px glyph on every width. Deliberately
@@ -70,20 +74,20 @@ const ACTIONS_SX = {
    chose compact over the floor here; a 44px button would double each comment's footer. */
 const ACTION_BUTTON_SX = (theme: Theme) => ({
   p: 0,
-  width: 28,
-  height: 28,
-  fontSize: 12,
-  lineHeight: 1,
+  width: SIZE.avatar,
+  height: SIZE.avatar,
+  fontSize: FONT_SIZE.sm,
+  lineHeight: LINE_HEIGHT.tight,
   color: 'text.secondary',
-  [theme.breakpoints.down('sm')]: { minHeight: 28, minWidth: 28 },
+  [theme.breakpoints.down('sm')]: { minHeight: SIZE.avatar, minWidth: SIZE.avatar },
 })
 
 /* A chip is a 22px pill; below `sm` its BUTTON grows to the 44px tap floor while the pill stays 22px —
    a 44px pill per reaction would double every reacted comment's height on a phone. */
 const chipSx = (theme: Theme) => ({
-  borderRadius: 999,
+  borderRadius: RADIUS.round,
   // The theme's own IconButton floor breakpoint (`theme.ts`), so a chip and its neighbours agree.
-  [theme.breakpoints.down('sm')]: { minHeight: 44, minWidth: 44 },
+  [theme.breakpoints.down('sm')]: { minHeight: SIZE.tapTarget, minWidth: SIZE.tapTarget },
   '&.Mui-focusVisible .reaction-pill': { outline: '2px solid', outlineOffset: 1 },
 })
 
@@ -96,6 +100,7 @@ export default function TaskComments({
   testId = 'task-comments',
   active = true,
   readOnly = false,
+  commentFooter,
 }: {
   /** Shorthand for a task `subject`; one of the two is required. */
   taskId?: number
@@ -112,6 +117,8 @@ export default function TaskComments({
   readOnly?: boolean
   /** Reports the count to the tab strip. */
   onCountChange?: (count: number) => void
+  /** The host's own note on a row's action line (a ticket's reply-email state); `null` draws nothing. */
+  commentFooter?: (comment: TaskComment) => ReactNode
   testId?: string
 }): JSX.Element {
   // Its hrefs are rewritten on the live host (`apiHref`): re-render when the rewriter is installed.
@@ -131,6 +138,7 @@ export default function TaskComments({
   const reading = useMemo(() => ({ get current() { return reads.current > 0 } }), [])
   const [candidates, setCandidates] = useState<MentionCandidate[]>([])
   const [draft, setDraft] = useState('')
+  const composer = useRef<CommentComposerHandle>(null)
   const [editing, setEditing] = useState<{ id: number; body: string } | null>(null)
   /** The open reaction palette: its anchor (the row's React button) and the comment it reacts to. */
   const [palette, setPalette] = useState<{ anchor: HTMLElement; commentId: number } | null>(null)
@@ -251,13 +259,7 @@ export default function TaskComments({
 
   const remove = useCallback(async (comment: TaskComment) => {
     /* Confirmed: deletion is unrecoverable (no tombstone, no undo). The message quotes the comment. */
-    const ok = await confirm({
-      title: 'Delete comment?',
-      message: comment.body.length > 120 ? `${comment.body.slice(0, 119)}…` : comment.body || 'Image',
-      confirmLabel: 'Delete',
-      destructive: true,
-    })
-    if (!ok) return
+    if (!await confirm(danger('Delete', { title: 'Delete comment?', message: comment.body.length > 120 ? `${comment.body.slice(0, 119)}…` : comment.body || 'Image' }))) return
     setError('')
     try {
       await del(`${base}/comments/${comment.id}`)
@@ -291,9 +293,7 @@ export default function TaskComments({
   return (
     <Stack spacing={0.5} data-testid={testId} onFocusCapture={ensureCandidates}>
       {comments.length === 0 && editing === null && (
-        <Typography variant="body2" sx={{ color: 'text.secondary' }} data-testid="task-comments-empty">
-          No comments yet.
-        </Typography>
+        <EmptyState inline title="No comments yet." />
       )}
 
       {comments.map(comment => {
@@ -308,8 +308,8 @@ export default function TaskComments({
             sx={{
               display: 'flex',
               alignItems: 'flex-start',
-              gap: 0.75,
-              py: 0.4,
+              gap: 0.5,
+              py: 0,
               // A hairline separates comments; a card each would waste space.
               borderTop: '1px solid',
               borderColor: 'divider',
@@ -320,7 +320,7 @@ export default function TaskComments({
                 : isInternal ? alpha(theme.palette.warning.main, 0.12) : 'transparent',
               transition: 'background-color 600ms',
               // And a solid rule down its edge, so it reads as staff-only at a glance, not by hue alone.
-              ...(isInternal ? { borderLeft: '3px solid', borderLeftColor: 'warning.main', pl: 0.75 } : null),
+              ...(isInternal ? { borderLeft: `${grid(0.5)} solid`, borderLeftColor: 'warning.main', pl: 0.5 } : null),
             }}
           >
             <AuthorBadge
@@ -329,44 +329,40 @@ export default function TaskComments({
               testId="task-comment-author"
             />
             <Box sx={{ minWidth: 0, flex: 1 }}>
-              <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center', minHeight: 18 }}>
+              <Stack direction="row" spacing={0.5} sx={{ alignItems: 'center', minHeight: grid(3) }}>
                 {/* The name is shown where the byline has room; dropped below 480px, where the badge alone does it. */}
                 <Typography
                   variant="caption"
                   sx={{
                     color: 'text.secondary',
-                    fontWeight: 600,
-                    whiteSpace: 'nowrap',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    maxWidth: '14rem',
-                    '@media (max-width:480px)': { display: 'none' },
+                    fontWeight: FONT_WEIGHT.semibold,
+                    ...ELLIPSIS_SX,
+                    maxWidth: grid(37),
+                    [PHONE]: { display: 'none' },
                   }}
                 >
                   {comment.author_name}
                 </Typography>
-                <Typography
+                <Tip title={`${comment.author_name} · ${absoluteTime(comment.created_at)}`}><Typography
                   variant="caption"
                   /* Who exactly and when exactly, on hover. */
-                  title={`${comment.author_name} · ${absoluteTime(comment.created_at)}`}
                   sx={{ color: 'text.secondary', whiteSpace: 'nowrap' }}
                 >
                   {relativeAge(comment.created_at)}
-                </Typography>
+                </Typography></Tip>
                 {comment.edited_at !== null && (
-                  <Typography
+                  <Tip title={`Edited ${absoluteTime(comment.edited_at)}`}><Typography
                     variant="caption"
                     sx={{ color: 'text.disabled' }}
-                    title={`Edited ${absoluteTime(comment.edited_at)}`}
                     data-testid="task-comment-edited"
                   >
                     edited
-                  </Typography>
+                  </Typography></Tip>
                 )}
                 {isInternal && (
                   <Typography
                     variant="caption"
-                    sx={{ color: 'warning.dark', fontWeight: 600, whiteSpace: 'nowrap' }}
+                    sx={{ color: 'warning.dark', fontWeight: FONT_WEIGHT.semibold, whiteSpace: 'nowrap' }}
                     data-testid="task-comment-internal"
                   >
                     Internal note
@@ -397,36 +393,35 @@ export default function TaskComments({
                     <CommentText
                       body={comment.body}
                       mentions={comment.mentions}
-                      sx={{ fontSize: '0.8125rem' }}
+                      sx={{ fontSize: FONT_SIZE.md }}
                     />
                   )}
                   {withImages && (comment.images ?? []).length > 0 && (
                     <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mt: 0.5 }}>
                       {(comment.images ?? []).map(image => (
-                        <Box
-                          key={image.id}
+                        <Tip key={image.id} title={image.filename}><Box
                           component="a"
-                          href={commentImageUrl(id, image.id)}
+                          href={apiLinkHref(commentImagePath(id, image.id))}
                           target="_blank"
                           rel="noopener"
-                          title={image.filename}
-                          sx={{ display: 'block', maxWidth: '100%', lineHeight: 0 }}
+                          sx={{ display: 'block', maxWidth: '100%' }}
                         >
                           <Box
-                            component="img"
-                            src={commentImageUrl(id, image.id)}
+                            component={ApiImg}
+                            src={commentImagePath(id, image.id)}
                             alt={image.filename}
                             loading="lazy"
                             data-testid="task-comment-image"
                             sx={{
-                              maxHeight: 160,
+                              display: 'block',
+                              maxHeight: grid(26.5),
                               maxWidth: '100%',
-                              borderRadius: 1,
+                              borderRadius: RADIUS.sm,
                               border: '1px solid',
                               borderColor: 'divider',
                             }}
                           />
-                        </Box>
+                        </Box></Tip>
                       ))}
                     </Box>
                   )}
@@ -435,50 +430,57 @@ export default function TaskComments({
               {/* One line under the message: reaction chips left, the row's actions right. Not while editing:
               the editor's own Save/Cancel own that spot, and a stray Edit would discard the draft. */}
               {editing?.id !== comment.id && (
-                <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 0.5, mt: 0.25 }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 0.5, mt: 0 }}>
                   <ReactionChips
                     reactions={comment.reactions ?? []}
                     onToggle={key => { void react(comment, key) }}
                     disabled={readOnly}
                   />
+                  {commentFooter?.(comment)}
                   {!readOnly && (
                   <Box sx={ACTIONS_SX}>
-                    <Tooltip title="React">
+                    {/* No name (a deleted author): nobody to address. */}
+                    {!comment.author_is_me && comment.author_name !== '' && (
                       <IconButton
                         size="small"
-                        aria-label="Add reaction"
-                        aria-haspopup="true"
-                        aria-expanded={palette?.commentId === comment.id}
-                        data-testid="task-comment-react"
-                        onClick={e => setPalette({ anchor: e.currentTarget, commentId: comment.id })}
+                        aria-label={`Reply to ${comment.author_name}`}
+                        data-testid="task-comment-reply"
+                        onClick={() => composer.current?.mention(comment.author_name)}
                         sx={ACTION_BUTTON_SX}
                       >
-                        <Box component="span" aria-hidden>{ACTION_ICON.react}</Box>
+                        <Box component="span" aria-hidden>{ACTION_ICON.reply}</Box>
                       </IconButton>
-                    </Tooltip>
+                    )}
+                    <IconButton
+                      size="small"
+                      aria-label="Add reaction"
+                      aria-haspopup="true"
+                      aria-expanded={palette?.commentId === comment.id}
+                      data-testid="task-comment-react"
+                      onClick={e => setPalette({ anchor: e.currentTarget, commentId: comment.id })}
+                      sx={ACTION_BUTTON_SX}
+                    >
+                      <Box component="span" aria-hidden>{ACTION_ICON.react}</Box>
+                    </IconButton>
                     {comment.author_is_me && (
-                      <Tooltip title="Edit">
-                        <IconButton
-                          size="small"
-                          aria-label="Edit comment"
-                          onClick={() => startEdit(comment)}
-                          sx={ACTION_BUTTON_SX}
-                        >
-                          <Box component="span" aria-hidden>{ACTION_ICON.edit}</Box>
-                        </IconButton>
-                      </Tooltip>
+                      <IconButton
+                        size="small"
+                        aria-label="Edit comment"
+                        onClick={() => startEdit(comment)}
+                        sx={ACTION_BUTTON_SX}
+                      >
+                        <Box component="span" aria-hidden>{ACTION_ICON.edit}</Box>
+                      </IconButton>
                     )}
                     {comment.may_delete && (
-                      <Tooltip title="Delete">
-                        <IconButton
-                          size="small"
-                          aria-label="Delete comment"
-                          onClick={() => { void remove(comment) }}
-                          sx={ACTION_BUTTON_SX}
-                        >
-                          <Box component="span" aria-hidden>{ACTION_ICON.delete}</Box>
-                        </IconButton>
-                      </Tooltip>
+                      <IconButton
+                        size="small"
+                        aria-label="Delete comment"
+                        onClick={() => { void remove(comment) }}
+                        sx={ACTION_BUTTON_SX}
+                      >
+                        <Box component="span" aria-hidden>{ACTION_ICON.delete}</Box>
+                      </IconButton>
                     )}
                   </Box>
                   )}
@@ -496,32 +498,32 @@ export default function TaskComments({
         onClose={() => setPalette(null)}
         anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
         transformOrigin={{ vertical: 'top', horizontal: 'right' }}
-        slotProps={{ paper: { role: 'group', 'aria-label': 'Reactions', sx: { p: 0.25 } } }}
+        slotProps={{ paper: { role: 'group', 'aria-label': 'Reactions', sx: { p: 0 } } }}
       >
         {/* Wraps rather than overflows: 8 × the 44px floor is ~356px, a 390px phone's popover limit. */}
         <Box sx={{ display: 'flex', flexWrap: 'wrap' }}>
           {paletteComment && REACTIONS.map(r => {
             const mine = (paletteComment.reactions ?? []).some(x => x.emoji === r.key && x.mine)
             return (
-              <Tooltip key={r.key} title={r.label}>
+              <Tip describeChild={false} key={r.key} title={r.label}>
                 <IconButton
                   aria-label={r.label}
                   aria-pressed={mine}
                   data-testid={`task-comment-reaction-pick-${r.key}`}
                   onClick={() => { void react(paletteComment, r.key) }}
                   sx={{
-                    width: 32,
-                    height: 32,
-                    fontSize: 18,
-                    lineHeight: 1,
-                    borderRadius: 1,
+                    width: SIZE.thumb,
+                    height: SIZE.thumb,
+                    fontSize: FONT_SIZE.lg,
+                    lineHeight: LINE_HEIGHT.tight,
+                    borderRadius: RADIUS.sm,
                     // Already mine: picking it again removes it, so say so before the click.
                     bgcolor: mine ? alpha(theme.palette.primary.main, 0.12) : undefined,
                   }}
                 >
                   <Box component="span" aria-hidden>{r.glyph}</Box>
                 </IconButton>
-              </Tooltip>
+              </Tip>
             )
           })}
         </Box>
@@ -542,7 +544,7 @@ export default function TaskComments({
           ariaLabel="Visibility"
           testId="task-comment-visibility"
           sx={{ alignSelf: 'flex-start' }}
-          buttonSx={{ py: 0.25, textTransform: 'none' }}
+          buttonSx={[{ py: 0, textTransform: 'none' }, tapTargetSx]}
           onChange={setVisibility}
           options={[{ value: 'public', label: 'Reply' }, { value: 'internal', label: 'Internal note' }]}
         />
@@ -557,6 +559,7 @@ export default function TaskComments({
         placeholder={internal ? 'Internal note' : 'Comment'}
         busy={busy}
         testId="task-comment-new"
+        handle={composer}
         {...(withImages
           ? { images: draftImages.images, onAddImages: draftImages.add, onRemoveImage: draftImages.remove }
           : {})}
@@ -596,7 +599,7 @@ function ReactionChips({
       sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 0.5 }}
     >
       {known.map(r => (
-        <Tooltip key={r.emoji} title={r.names.join(', ')}>
+        <Tip describeChild={false} key={r.emoji} title={r.names.join(', ')}>
           <ButtonBase
             aria-label={`${reactionLabel(r.emoji)}, ${r.count}`}
             aria-pressed={r.mine}
@@ -611,10 +614,10 @@ function ReactionChips({
               sx={{
                 display: 'inline-flex',
                 alignItems: 'center',
-                gap: 0.4,
-                height: 22,
-                px: 0.75,
-                borderRadius: 999,
+                gap: 0,
+                height: SIZE.chip,
+                px: 0.5,
+                borderRadius: RADIUS.round,
                 border: '1px solid',
                 borderColor: r.mine ? 'primary.main' : 'divider',
                 bgcolor: r.mine ? alpha(theme.palette.primary.main, 0.12) : 'transparent',
@@ -625,14 +628,14 @@ function ReactionChips({
                 },
               }}
             >
-              <Box component="span" aria-hidden sx={{ fontSize: 13, lineHeight: 1 }}>{reactionGlyph(r.emoji)}</Box>
+              <Box component="span" aria-hidden sx={{ fontSize: FONT_SIZE.md, lineHeight: LINE_HEIGHT.tight }}>{reactionGlyph(r.emoji)}</Box>
               <Typography
                 component="span"
                 variant="caption"
                 aria-hidden
                 sx={{
-                  lineHeight: 1,
-                  fontWeight: 600,
+                  lineHeight: LINE_HEIGHT.tight,
+                  fontWeight: FONT_WEIGHT.semibold,
                   fontVariantNumeric: 'tabular-nums',
                   color: r.mine ? 'primary.main' : 'text.secondary',
                 }}
@@ -641,7 +644,7 @@ function ReactionChips({
               </Typography>
             </Box>
           </ButtonBase>
-        </Tooltip>
+        </Tip>
       ))}
     </Box>
   )

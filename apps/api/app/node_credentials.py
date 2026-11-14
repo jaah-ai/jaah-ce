@@ -18,13 +18,13 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
 from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
+from app.clock import utcnow
 from app.dev_bypass import insecure_agent_enabled, is_local_env
 from app.models.nodes import Node
 from app.tenancy import seam
@@ -228,7 +228,7 @@ def issue(session: Session, node: Node) -> str:
     node.node_token_hash = digest(plaintext)
     # A rotation in flight dies with the credential it was rotating.
     node.pending_node_token_hash = None
-    node.node_token_issued_at = datetime.now(timezone.utc)
+    node.node_token_issued_at = utcnow()
     # Cleared: the new token must not claim the old one's last-used instant, which operators read to confirm
     # a rotation reached the node.
     node.node_token_used_at = None
@@ -286,7 +286,7 @@ def confirm_rotation(node: Node) -> None:
     Does not commit."""
     node.node_token_hash = node.pending_node_token_hash
     node.pending_node_token_hash = None
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     node.node_token_issued_at = now
     # It just authenticated this very call; NULL would replay the install-started event (`_write_used_at`).
     node.node_token_used_at = now
@@ -379,10 +379,11 @@ def _node_for_token(session: Session, presented: str) -> Optional[tuple[UUID, Op
 def _stamp_used(node_id: UUID) -> None:
     """Advance `node_token_used_at`, at most once per node per `_USED_AT_THROTTLE_SECONDS`.
 
-    Handed to one background-lane thread (`app/db.py`), never written here: the caller is still holding the
-    session it resolved the token on (an identity-lane connection), and a second checkout while holding one
-    is the hold-and-wait that starved the pool. Never the request's session either: committing
-    inside it would flush whatever the route had staged. Best-effort: a cosmetic clock never fails a request.
+    Handed to a task on the serving loop (`app/db_async.py::spawn`), never written here: the caller is still
+    holding the session it resolved the token on, and a second checkout while holding one is the hold-and-wait
+    that starved the pool. Never the request's session either: committing inside it would flush whatever the
+    route had staged. Best-effort: a cosmetic clock never fails a request. With no serving loop (a script), it is
+    written inline, on a session of its own.
     """
     now = time.monotonic()
     with _used_at_lock:
@@ -390,32 +391,33 @@ def _stamp_used(node_id: UUID) -> None:
             return
         _used_at_seen[node_id] = now
     try:
-        _stamper().submit(_write_used_at, node_id)
-    except RuntimeError as exc:  # the interpreter is shutting down
+        _start_stamp(node_id)
+    except RuntimeError as exc:  # the interpreter or the loop is shutting down
         log.debug("node-auth: could not queue the last-used stamp for node %s (%s)", node_id, exc)
 
 
-_stamper_executor = None
+def _start_stamp(node_id: UUID) -> None:
+    """Start the stamp's write off the caller (a seam the suite replaces to write inline)."""
+    from app import db_async
+
+    if not db_async.spawn(_stamp_on_loop, node_id, name="node-token-stamp"):
+        _write_used_at(node_id)
 
 
-def _stamper():  # type: ignore[no-untyped-def]
-    global _stamper_executor
-    with _used_at_lock:
-        if _stamper_executor is None:
-            # Local import: `app.db` builds the engine at import, and this module is imported by `app.auth`.
-            from app.db import background_executor
+async def _stamp_on_loop(node_id: UUID) -> None:
+    """`_write_used_at` (sync ORM code) in a greenlet on the serving loop, its session on the async pool."""
+    from sqlalchemy.util.concurrency import greenlet_spawn
 
-            _stamper_executor = background_executor(1, "node-token-stamp")
-        return _stamper_executor
+    await greenlet_spawn(_write_used_at, node_id)
 
 
 def _write_used_at(node_id: UUID) -> None:
     try:
-        from app.db import SessionLocal
+        from app.db import BridgedSession
         from app.events import emit_console_event
 
-        with SessionLocal() as stamp_session:
-            now = datetime.now(timezone.utc)
+        with BridgedSession() as stamp_session:
+            now = utcnow()
             # The FIRST use of a token is its install command fetching the bootstrap: the console's roster shows
             # the node deploying from then, so it hears it live. Every later stamp is a cosmetic clock, silent.
             first = stamp_session.execute(

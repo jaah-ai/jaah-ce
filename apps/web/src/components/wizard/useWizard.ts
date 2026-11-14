@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
 
-/* THE WIZARD — a stepper for long CREATE forms and multi-step purchase flows (the change-plan wizard,
- * `pages/org/billing/ChangePlanWizard.tsx`), never an edit page, never a tab strip (tabs are `components/Tabs.tsx`). Four pieces, one per file in this directory:
+/* THE WIZARD — a stepper for long CREATE forms and multi-step purchase flows (`pages/users/UserNewPage.tsx`), never an edit page, never a tab strip (tabs are `components/Tabs.tsx`). Four pieces, one per file in this directory:
  *   - `useWizard(steps)` (here): which step is showing, how far the user got, Next/Back/goTo, the block.
  *   - `WizardSteps`: the indicator — a full-label MUI `Stepper` at >= 600px, "Step 2 of 5 · When" plus a
  *     thin progress bar below it (never a row of truncated labels).
@@ -9,8 +8,7 @@ import { useEffect, useState } from 'react'
  *     is shown (`hidden`), like `TabPanel` — so a value typed on step 1 survives Next → Back, and the
  *     consumer keeps ONE form state for the whole create.
  *   - `WizardFooter`: Back / Next / Create on `ui/FormActionBar`, plus the blocked message. Create runs
- *     `validateAll()` first; nothing is posted before Create — the consumer's `onCreate` is the only POST.
- *   - `WizardReview`: the last step's read-only summary, one Edit link per step (→ `goTo`).
+ *     `validateAll()` first; nothing is posted before Create except by a step's own `onNext` (a step that saves first).
  * Step state is component state, NOT the URL (no `?step=`): a reload starts the create over, which is
  * what an unsaved create should do.
  *
@@ -27,8 +25,8 @@ import { useEffect, useState } from 'react'
  * never counted as reached, `index <= furthest` always holds, and both stay inside the list. The list must
  * hold at least one step.
  *
- * `initial` resumes a position (`reached` exposes it to save): the consumer carrying its draft across a remount
- * (`hooks/useRemountDraft.ts`) carries where the user was too. */
+ * `initial` resumes a position (`reached` exposes it to save): the consumer carrying its draft to a nested New
+ * page and back (`hooks/useNestedCreate.ts`) carries where the user was too. */
 
 export type WizardStep<Id extends string> = {
   id: Id

@@ -17,7 +17,7 @@ from env_helpers import now_iso
 from runner_clis import sense_runner_clis
 from reconcile import vocab, tick_wire, context
 from reconcile.vocab import CONSOLE_PROBE_UNAVAILABLE, CONTAINER_PRESENT, CONTAINER_UNREADABLE, OBSERVATION_VERSION
-from reconcile.tick_wire import RosterSlot, SLOT_FREE, SLOT_TASK, SLOT_USER
+from reconcile.tick_wire import RosterSlot, SLOT_FREE, SLOT_TASK
 from reconcile.context import ReconcileContext
 
 log = logging.getLogger(__name__)
@@ -66,7 +66,7 @@ async def observe_slot(
     # `cpn_of`'s fallback, from `repo_path`'s last segment (never `wt`'s basename or the display name), matching
     # `apply_stack_identity`.
     slot_repo = (slot.repo_path or "").rstrip("/").rsplit("/", 1)[-1] or slot.project
-    slot_identity = slot_repo if slot.is_main else f"{slot_repo}-{slot.number}"
+    slot_identity = f"{slot_repo}-{slot.number}"
 
     # ── git ────────────────────────────────────────────────────────────────────
     if slot.has_repo:
@@ -89,7 +89,11 @@ async def observe_slot(
     behind, ahead = ab if ab is not None else (None, None)
 
     # ── agents ─────────────────────────────────────────────────────────────────
-    agents_ok, agents_json, agent_cwds = await ctx.agents()
+    # The node-wide answer gates the orphan reap below; the slot's own answer is per account (`slot_agents`):
+    # one slow or failing account blinds only the slots it could be running, not every slot on the node.
+    node_agents_ok, _all, _all_cwds = await ctx.agents()
+    launched, launched_certain = context.launched_pane(wt) if slot.state == SLOT_TASK else (None, False)
+    agents_ok, agents_json, agent_cwds = ctx.slot_agents(wt, launched.account_dir if launched else None)
     live = context.live_session_in(wt, agent_cwds) if agents_ok else False
     meta = context._session_meta_for(wt, agents_json) if (agents_ok and live) else None
     # A CLI with no session list is never named by the session-list probe: its launched pane IS the
@@ -102,6 +106,20 @@ async def observe_slot(
         pane = context._vendor_runner_meta(wt)
         if pane is not None and (not live or pane[1]):
             live, meta = True, pane[0]
+    # A BLIND session list (`agents_ok` false: on a starved vnode the probe times out, rc 124, for many minutes)
+    # used to ship no identity at all, so the CP held the runner UNKNOWN only for its short grace and then
+    # reclaimed a working one as `vanished` / `launch_failed`. The pane this node launched is still exact
+    # identity evidence; it ships ALONE (`session`, the id and status stay unknown), so it never counts as a
+    # sighting (`last_seen_live`, the free-slot reap) and the stall detector still bounds a hung runner.
+    blind_identity = (context.launched_pane_identity(launched)
+                      if not agents_ok and slot.state == SLOT_TASK else None)
+    # …and when there is NO launched pane, say so: the CP gives a blind slot its long starved-node grace only
+    # while a runner may still be there, so a crashed runner on a node whose CLI is broken (not starved) is
+    # reclaimed on the normal grace. None = not judged: the list was read, the slot holds no task, or the
+    # registry could not tell (none kept, unreadable, a Windows pane not re-mapped this once).
+    launched_pane: bool | None = (
+        True if launched is not None else (False if launched_certain else None)
+    ) if not agents_ok and slot.state == SLOT_TASK else None
 
     # Any live process rooted in this tree. Does not vote on `session`; it is the reap's target set and the
     # operator's `session_cwd`/`cwd_processes`, in `probes` (an old node leaves the keys absent).
@@ -120,9 +138,7 @@ async def observe_slot(
     # Hygiene, not the restart path (`_DEATH_PREDICATE` reads the agent half), but the only thing that answers
     # debris, so a reap that cannot kill is a silent leak (`reap_orphan_processes` swallows per-pid
     # `OSError`).
-    # Never on the main clone (a human's shell reads like debris) or a `user`-owned slot: a human's own
-    # processes would be SIGKILLed within a pass — "while owned, nobody touches the slot".
-    if agents_ok and not live and cwd_busy and not slot.is_main and slot.state != SLOT_USER:
+    if node_agents_ok and agents_ok and not live and cwd_busy:
         reaped = await asyncio.to_thread(reap.reap_orphan_processes, wt)
         if reaped:
             log.warning(
@@ -198,6 +214,7 @@ async def observe_slot(
             "cwd_processes": [dict(p) for p in cwd_scan.processes],
             "cwd_process_count": cwd_scan.matched,
             "agents_ok": agents_ok,
+            "launched_pane": launched_pane,
             "docker_ok": docker_ok,
             "tmux_ok": tmux_ok,
             "console_ok": console_ok,
@@ -218,8 +235,10 @@ async def observe_slot(
         "session_account": _ok(agents_ok, _n(meta["account"]) if meta else None),
         "session_started_at": _ok(agents_ok, _n(meta["started"]) if meta else None),
         # Runner identity: the CP re-verifies `(pid, proc_started_at)`; a pid alone is reused.
-        "session_pid": _ok(agents_ok, meta["pid"] if meta else None),
-        "session_proc_started_at": _ok(agents_ok, _n(meta["proc_started"]) if meta else None),
+        "session_pid": (_ok(agents_ok, meta["pid"] if meta else None)
+                        if blind_identity is None else blind_identity[0]),
+        "session_proc_started_at": (_ok(agents_ok, _n(meta["proc_started"]) if meta else None)
+                                    if blind_identity is None else blind_identity[1]),
         "console": console,
         # Ages, never stamps.
         "age_last_used_secs": vocab._age_secs(slot.last_used),
@@ -426,7 +445,6 @@ def _observation_payload(
     entries: dict[tuple[str, str], dict],
     *,
     observed_at: str,
-    fetched: set[str],
     runners: list[dict],
     runners_ok: bool,
     accounts: list[dict],
@@ -444,9 +462,15 @@ def _observation_payload(
     `host_metrics` and `runner_clis` are the keys whose absence asserts nothing: None omits the key (a null
     would need a CP meaning — wipe or ignore — and both are wrong). For `runner_clis`, see its module.
     `platform` is `host_platform.platform_info()`, asked here when the caller did not (off the loop) already."""
-    # Name → `projects.id` off this tick's roster: a slot entry carries its project's id beside the name
-    # (C6). A project the roster does not name (a known slot only) goes by name alone; the CP falls back.
+    # `projects.id` beside each entry's name (C6). A known slot's row names its own id, keyed by the slot's
+    # ref — never by name: a carried-over slot's project may share its name with a newer project of the
+    # node's org. The roster's id serves the rest by name. The CP resolves ids only; an entry without one
+    # is skipped there.
+    slot_ids = {known.ref: known.project_id for known in tick.known_slots if known.project_id is not None}
     ids = {name: proj.project_id for name, proj in tick.projects.items() if proj.project_id is not None}
+    def _with_id(ref: tuple[str, str], entry: dict) -> dict:
+        project_id = slot_ids.get(ref, ids.get(entry.get("project", "")))
+        return {**entry, "project_id": project_id} if project_id is not None else entry
     payload = {
         "node_id": node_id,
         "observed_at": observed_at,
@@ -456,16 +480,11 @@ def _observation_payload(
         "runners_complete": runners_ok,
         "accounts_complete": accounts_ok,
         "worktrees": [
-            {**entry, "project_id": ids[entry["project"]]} if entry.get("project") in ids else entry
-            for _ref, entry in sorted(entries.items()) if entry.get("number") is not None
+            _with_id(ref, entry)
+            for ref, entry in sorted(entries.items()) if entry.get("number") is not None
         ],
         "runners": runners,
         "accounts": accounts,
-        # The write half of the fetch stamp (`RosterProject.fetch_stamp_age_secs`); without it gate 2 is
-        # inert.
-        "fetched_projects": sorted(fetched),
-        # The same projects by id (C6): the CP prefers these; the names stay for an older CP.
-        "fetched_project_ids": sorted({ids[name] for name in fetched if name in ids}),
     }
     if host_metrics is not None:
         payload["host_metrics"] = host_metrics
@@ -475,11 +494,20 @@ def _observation_payload(
     # `{os, arch, os_version}`, arch normalised (`host_platform/_types.py::normalise_arch`); a CP that predates it
     # ignores the key.
     # `launch_kinds`: which `launch.kind`s this node enacts (`agent_process.LAUNCH_KINDS`); the CP places an
-    # SDK agent run only where "agent" is listed, and a CP that predates it ignores the key.
+    # SDK agent run only where "agent" is listed, and a CP that predates it ignores the key. `blind_checkout`
+    # beside them: the CP places a blind review child only where it is listed (`blind_checkout.advertised`).
+    # `folder_slot`: this node reads a roster slot's own `has_repo` (`tick_wire.FOLDER_SLOT`), so the CP may
+    # put a folder slot inside a git project's entry — a static node only, as `blind_checkout`: a MicroVM
+    # session builds its tree from the project's kind (`microvm_session.build_worktree`), never a slot's.
     import agent_process  # noqa: PLC0415 — deferred: a leaf, read only here and on `lease_slot`
+    import blind_checkout  # noqa: PLC0415 — deferred, as `agent_process`
 
+    launch_kinds = list(agent_process.launch_kinds())
+    if blind_checkout.advertised():
+        launch_kinds.append(blind_checkout.BLIND_CHECKOUT)
+        launch_kinds.append(tick_wire.FOLDER_SLOT)
     payload["platform"] = {**(platform if platform is not None else host_platform.platform_info()),
-                           "launch_kinds": list(agent_process.launch_kinds())}
+                           "launch_kinds": launch_kinds}
     if runner_clis is not None:
         payload["runner_clis"] = runner_clis
         # This list senses each provider's ACP adapter (`runner_clis.RUNNER_CLI_BINARIES`), so its lacking one
@@ -536,7 +564,6 @@ async def post_observation(
     payload = _observation_payload(
         node_id, tick, entries,
         observed_at=observed_at,
-        fetched=ctx.fetched,
         runners=runner_entries,
         runners_ok=agents_ok and len(runner_entries) == len(agents_json),
         accounts=accounts or [],

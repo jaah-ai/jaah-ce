@@ -1,0 +1,43 @@
+slug = "klaviyo"
+label = "Klaviyo"
+category = "messaging"
+vendor_docs_url = "https://developers.klaviyo.com/en/reference/get_accounts"
+summary = "Manage profiles, lists, events and campaigns in your Klaviyo account."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "private_api_key", label = "Private API key", kind = "secret", required = true, help = "Klaviyo > your account name (bottom left) > Settings > Account > API keys > Create Private API Key. Give Accounts read access (accounts:read) plus what agents need, then copy the key, which starts with pk_" },
+]
+
+[test]
+method = "GET"
+path = "https://a.klaviyo.com/api/accounts"
+auth = { field = "private_api_key", header = "Authorization", prefix = "Klaviyo-API-Key" }
+accept = "application/vnd.api+json"
+# Klaviyo's dated API revision: stable for a year, retired after two (a retired one falls forward).
+headers = { revision = "2026-07-15" }
+identity = [["data", 0, "attributes", "contact_information", "organization_name"]]
+
+[docs]
+agent_uses = [
+  "Create or update profiles and subscribe them to lists",
+  "Track a custom event that triggers a Klaviyo flow",
+  "Read campaign and flow performance for a report",
+  "List segments and their members",
+]
+prerequisites = [
+  "A Klaviyo account and a user with the Owner, Admin or Manager role, which can create private API keys",
+]
+limitations = [
+  "Agents can use only the scopes chosen when the key was created; a missing scope answers 403 for that call",
+  "Klaviyo's public keys (site IDs) cannot be used here: only a private key starting with pk_",
+]
+troubleshooting = [
+  { symptom = "Test says Klaviyo rejected the private API key (401)", fix = "The key was deleted or mistyped. Create a new private key under Settings > Account > API keys and select Replace on the secret" },
+  { symptom = "Test says Klaviyo rejected the private API key (403)", fix = "The key lacks Accounts read access. Edit the key's scopes in Settings > Account > API keys, or create a key with accounts:read" },
+  { symptom = "An agent's call fails with 403 on another endpoint", fix = "Add the scope that endpoint needs (for example profiles:write) to the key, then rerun the task" },
+]
+faq = [
+  { q = "Which key type should I pick: Full, Read-only or Custom?", a = "Custom, with only the scopes agents need plus accounts:read for Test. Full access works too but grants more than most tasks need" },
+]

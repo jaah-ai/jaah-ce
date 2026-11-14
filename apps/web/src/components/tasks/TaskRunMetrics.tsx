@@ -1,24 +1,26 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Box from '@mui/material/Box'
-import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
-import type { Theme } from '@mui/material/styles'
 import { ApiError, get } from '../../api'
 import { useEventStream } from '../../hooks/useEventStream'
 import { useEventsSinceSeen } from '../../hooks/useLiveRefetch'
 import { useHiddenDeferral } from '../../hooks/useHiddenDeferral'
 import { touchesScope } from '../../lib/taskEventScope'
 import type { TaskRunMetrics as RunMetrics } from '../../types'
-import { compactCount } from '../../lib/humanize'
-import { fmtPriceKey, fmtTier } from '../../lib/models'
+import { capitalize, compactCount } from '../../lib/humanize'
+import { fmtPriceKey } from '../../lib/models'
 import { humanDuration } from '../../lib/relativeTime'
 import { formatBytes } from '../../lib/formatBytes'
 import { formatCostUsd } from '../../lib/taskCost'
 import { formatCorePct } from '../NodeLoadMeter'
 import { takeTaskPageSeed } from '../../lib/taskPageSeed'
 import { Banner } from '../../ui/Banner'
+import { Stat, FactsGrid } from '../../ui/FactsGrid'
+import { grid } from '../../theme'
+import { FEED_META } from '../../ui/listStyles'
+import Tip from '../../ui/Tip'
 
-// The Metrics tab's "Task Run Metrics" panel: total run time, agentic time, tokens in/out and token cost
+// Details › Metrics' "Task Run Metrics" panel: total run time, agentic time, tokens in/out and token cost
 // for ANY task, from `GET /api/tasks/{id}/run-metrics`. Fetched here (`useTaskRunMetrics`) because these
 // are computed server-side from state history + captured usage (unlike the Finisher-authored
 // `task.metrics`). The hook is exported so `pages/taskDetail/useTaskDetailLoad.ts` can read it ONCE and both gate the tab
@@ -49,85 +51,9 @@ function isRunMetrics(data: unknown): data is RunMetrics {
   )
 }
 
-/* One metric: `value` (a measurement, mono) or `absence` (prose) — exactly one. `<dt>`/`<dd>` so a screen
-   reader reads each pair as one; the UA `dd` indent is reset. */
-function Metric({
-  label,
-  value,
-  exact,
-  absence,
-  qualifier,
-  hint,
-  wide,
-}: {
-  label: string
-  value?: string
-  /** The unrounded figure when the tile abbreviates; tooltip + a11y name. */
-  exact?: string
-  absence?: string
-  /** A caveat ON this number ('partial', what it excludes), in the warning tone. */
-  qualifier?: string
-  /** Explains the metric; on the LABEL so it never shadows `exact`. */
-  hint?: string
-  /** Spans the whole grid row and ellipsizes on one line (a model id has no compact form); pass `exact`. */
-  wide?: boolean
-}) {
-  const labelNode = (
-    <Typography component="dt" variant="caption" sx={{ color: 'text.secondary' }}>
-      {label}
-      {hint && (
-        <Box component="span" aria-hidden="true" sx={{ ml: 0.4, color: 'text.disabled' }}>
-          ⓘ
-        </Box>
-      )}
-    </Typography>
-  )
-  const valueNode =
-    value !== undefined ? (
-      <Typography
-        component="span"
-        sx={(theme: Theme) => ({
-          fontFamily: theme.typography.mono.fontFamily,
-          fontSize: '1rem',
-          fontWeight: 600,
-          color: 'text.primary',
-          lineHeight: 1.3,
-          ...(wide && { display: 'block', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }),
-        })}
-      >
-        {value}
-      </Typography>
-    ) : (
-      /* Not mono, not `0`, deliberately quiet (see the header). */
-      <Typography component="span" sx={{ fontSize: '0.8125rem', color: 'text.disabled', lineHeight: 1.3 }}>
-        {absence}
-      </Typography>
-    )
-
-  return (
-    <Box
-      data-metric={label}
-      sx={{ display: 'flex', flexDirection: 'column', gap: 0.3, minWidth: 0, ...(wide && { gridColumn: '1 / -1' }) }}
-    >
-      {hint ? <Tooltip title={hint}>{labelNode}</Tooltip> : labelNode}
-      <Box component="dd" sx={{ m: 0, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 0.15 }}>
-        {exact && value !== undefined ? (
-          <Tooltip title={exact}>
-            <Box component="span" aria-label={`${label}: ${exact}`} sx={{ minWidth: 0, ...(wide && { display: 'block' }) }}>
-              {valueNode}
-            </Box>
-          </Tooltip>
-        ) : (
-          valueNode
-        )}
-        {qualifier && (
-          <Typography variant="caption" sx={{ color: 'warning.main', lineHeight: 1.35 }}>
-            {qualifier}
-          </Typography>
-        )}
-      </Box>
-    </Box>
-  )
+/* One tile's figure: a measurement (mono) or its absence (prose) — exactly one (`ui/FactsGrid`'s `Stat`). */
+function figure(value: string | null, absence: string): { value: string; absent: boolean; mono: true } {
+  return { value: value ?? absence, absent: value === null, mono: true }
 }
 
 export interface RunMetricsState {
@@ -148,8 +74,15 @@ interface Answer {
   error: string
 }
 
+/* An answer already in hand for `taskId` (the task page's `…/page` bundle part, or a handed-over read): the panel's
+   answer until its own read lands, so the caller commits it with the task instead of a render later. */
+export interface RunMetricsSeed {
+  taskId: number
+  data: unknown
+}
+
 /* The panel's read, live. `taskId` null (create mode, a non-numeric id) reads nothing. */
-export function useTaskRunMetrics(taskId: number | null): RunMetricsState {
+export function useTaskRunMetrics(taskId: number | null, seed?: RunMetricsSeed | null): RunMetricsState {
   const [answer, setAnswer] = useState<Answer | null>(null)
 
   // Generation guard: mount and live refetches can resolve out of order.
@@ -208,7 +141,13 @@ export function useTaskRunMetrics(taskId: number | null): RunMetricsState {
     reload()
   })
 
-  const current = answer !== null && answer.taskId === taskId ? answer : null
+  /* Its own read (which takes the same part off the page seed) replaces the seed's answer with the same figures, so the
+     handover never redraws; a task switch never shows the seed of another id. */
+  const current = answer !== null && answer.taskId === taskId
+    ? answer
+    : seed && taskId !== null && seed.taskId === taskId
+      ? { taskId, metrics: isRunMetrics(seed.data) ? seed.data : null, error: '' }
+      : null
   const isCurrent = useCallback(() => landedGenRef.current === fetchGenRef.current && !pendingRef.current, [])
   return { metrics: current?.metrics ?? null, error: current?.error ?? '', settled: current !== null, isCurrent }
 }
@@ -259,7 +198,7 @@ export function RunMetricsView({ metrics, error }: Pick<RunMetricsState, 'metric
   const cpuSeconds = metrics.cpu_seconds ?? null
   const hasUsage = peakRss !== null || peakCpu !== null || cpuSeconds !== null
   const modelValue = model
-    ? [model.tier ? fmtTier(model.tier) : null, model.ran ?? model.dispatched ?? 'CLI default']
+    ? [model.tier ? capitalize(model.tier) : null, model.ran ?? model.dispatched ?? 'CLI default']
         .filter(Boolean)
         .join(' → ')
     : null
@@ -281,80 +220,52 @@ export function RunMetricsView({ metrics, error }: Pick<RunMetricsState, 'metric
       )}
 
       {/* Four tiles, ONE ROW from 900px, 2×2 below (the optional Model tile takes its own full row) — a fixed count, since `auto-fit` orphans a 3+1 around
-          490-600px. Tracks capped at 12rem so the facts cluster instead of spreading across the Metrics
+          490-600px. Tracks capped at 192px so the facts cluster instead of spreading across the Metrics
           tab's full width. `minmax(0, …)` fits `42.8M / 613K` at 390px. */}
-      <Box
-        component="dl"
+      <FactsGrid fit
         sx={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(2, minmax(0, 12rem))',
-          gap: 1.5,
-          m: 0,
-          '@media (min-width:900px)': { gridTemplateColumns: 'repeat(4, minmax(0, 12rem))' },
+          gridTemplateColumns: `repeat(2, minmax(0, ${grid(32)}))`,
+          [FEED_META]: { gridTemplateColumns: `repeat(4, minmax(0, ${grid(32)}))` },
         }}
       >
-        <Metric
-          label="Total run time"
-          value={metrics.total_seconds === null ? undefined : humanDuration(metrics.total_seconds, true)}
-          absence={clockAbsence}
-        />
-        <Metric
-          label="Agentic time"
-          value={metrics.agentic_seconds === null ? undefined : humanDuration(metrics.agentic_seconds, true)}
-          absence={clockAbsence}
-        />
-        <Metric
+        <Stat label="Total run time" {...figure(metrics.total_seconds === null ? null : humanDuration(metrics.total_seconds, true), clockAbsence)} />
+        <Stat label="Agentic time" {...figure(metrics.agentic_seconds === null ? null : humanDuration(metrics.agentic_seconds, true), clockAbsence)} />
+        <Stat
           label="Tokens in / out"
           /* 'missing': the counts are zero for want of a capture, so no numbers at all. */
-          value={tokensMissing ? undefined : `${compactCount(tokens_in)} / ${compactCount(tokens_out)}`}
-          exact={`${tokens_in.toLocaleString()} in / ${tokens_out.toLocaleString()} out`}
-          absence="not captured"
+          {...figure(tokensMissing ? null : `${compactCount(tokens_in)} / ${compactCount(tokens_out)}`, 'not captured')}
+          exact={tokensMissing ? undefined : `${tokens_in.toLocaleString()} in / ${tokens_out.toLocaleString()} out`}
           qualifier={token_status === 'partial' ? 'partial — some captures are missing' : undefined}
         />
-        <Metric
+        <Stat
           label="Token cost estimate"
           hint="List rates when it ran"
-          value={costAbsent ? undefined : formatCostUsd(cost as number)}
-          absence="not captured"
+          {...figure(costAbsent ? null : formatCostUsd(cost as number), 'not captured')}
           /* "excluded": pre-per-class-capture sessions — unrecoverable, nothing to fix (unlike the line below). */
-          qualifier={
-            !costAbsent && cost_status === 'partial' ? 'partial — some usage is excluded' : undefined
-          }
+          qualifier={!costAbsent && cost_status === 'partial' ? 'partial — some usage is excluded' : undefined}
         />
         {hasUsage && (
           <>
-            <Metric label="Peak RAM" value={peakRss === null ? undefined : formatBytes(peakRss * 1024)} absence="not reported" />
-            <Metric label="Peak CPU" value={peakCpu === null ? undefined : formatCorePct(peakCpu)} absence="not reported" />
-            <Metric
-              label="CPU time"
-              value={cpuSeconds === null ? undefined : humanDuration(cpuSeconds)}
-              absence="not reported"
-            />
+            <Stat label="Peak RAM" {...figure(peakRss === null ? null : formatBytes(peakRss * 1024), 'not reported')} />
+            <Stat label="Peak CPU" {...figure(peakCpu === null ? null : formatCorePct(peakCpu), 'not reported')} />
+            <Stat label="CPU time" {...figure(cpuSeconds === null ? null : humanDuration(cpuSeconds), 'not reported')} />
           </>
         )}
-        {modelValue !== null && (
-          <Metric
-            label="Model"
-            value={modelValue}
-            exact={modelValue}
-            wide
-          />
-        )}
-      </Box>
+        {modelValue !== null && <Stat mono wide label="Model" value={modelValue} exact={modelValue} />}
+      </FactsGrid>
 
       {/* The one operator-FIXABLE gap: these models have no rate, so their spend is missing from the cost.
           Named individually (one price row each); the cost status is partial when any are present. A row
           added now prices later captures; a capture already written keeps the figure it was priced at. */}
       {unpriced_models.length > 0 && (
-        <Typography
+        <Tip title={`Price row names: ${unpriced_models.join(', ')}`}><Typography
           variant="caption"
           data-testid="run-metrics-unpriced"
-          title={`Price row names: ${unpriced_models.join(', ')}`}
           sx={{ color: 'warning.main', overflowWrap: 'anywhere' }}
         >
           Cost excludes {unpriced_models.length === 1 ? 'an unpriced model' : 'unpriced models'}:{' '}
           {unpriced_models.map(fmtPriceKey).join(', ')} — price {unpriced_models.length === 1 ? 'it' : 'them'} in Settings for later runs.
-        </Typography>
+        </Typography></Tip>
       )}
     </Box>
   )

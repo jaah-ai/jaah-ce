@@ -4,7 +4,8 @@
 // this cache — queries never key on session/credential data.
 import { QueryClient, defaultShouldDehydrateQuery, type Query } from '@tanstack/react-query'
 import { createSyncStoragePersister } from '@tanstack/query-sync-storage-persister'
-import type { Persister } from '@tanstack/react-query-persist-client'
+import type { PersistedClient, Persister } from '@tanstack/react-query-persist-client'
+import { TASK_LIST_SEED_GC_MS, TASK_LIST_SEED_KEY } from './lib/taskListSeed'
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -16,6 +17,9 @@ export const queryClient = new QueryClient({
   },
 })
 
+// Before the restore, so the restored seed keeps its own lifetime (`lib/taskListSeed.ts`).
+queryClient.setQueryDefaults(TASK_LIST_SEED_KEY, { gcTime: TASK_LIST_SEED_GC_MS })
+
 const STORAGE_KEY = 'cockpit.query-cache'
 
 /* THE PERSISTED CACHE IS ONE ORG'S. After an org switch (`components/account/OrgSwitcherList.tsx`) it must not
@@ -23,17 +27,19 @@ const STORAGE_KEY = 'cockpit.query-cache'
  * must not write its old org's cache back over the key every tab shares. `dropPersistedQueries` removes the
  * stored copy and stops this page writing it again; the next page load starts persisting afresh. */
 let persistHalted = false
+// The snapshot handed to the throttled persister and not yet written (see the `pagehide` flush below).
+let unsaved: PersistedClient | undefined
 
-const storagePersister = createSyncStoragePersister({
-  storage: {
-    getItem: key => window.localStorage.getItem(key),
-    setItem: (key, value) => {
-      if (!persistHalted) window.localStorage.setItem(key, value)
-    },
-    removeItem: key => window.localStorage.removeItem(key),
+const storage = {
+  getItem: (key: string) => window.localStorage.getItem(key),
+  setItem: (key: string, value: string) => {
+    unsaved = undefined // the throttle writes the latest snapshot, the one `unsaved` holds
+    if (!persistHalted) window.localStorage.setItem(key, value)
   },
-  key: STORAGE_KEY,
-})
+  removeItem: (key: string) => window.localStorage.removeItem(key),
+}
+
+const storagePersister = createSyncStoragePersister({ storage, key: STORAGE_KEY })
 
 /* A TAB ACTING AS AN ORG (`lib/actAs.ts`) neither restores nor saves: the stored copy is shared by every tab and
  * is the operator's own. Checked when a save is SCHEDULED, not when the throttled write lands, so an answer the
@@ -44,8 +50,40 @@ export function pauseQueryPersistence(paused: boolean): void {
   persistPaused = paused
 }
 
+/* THE LATEST SNAPSHOT IS WRITTEN AS THE PAGE GOES. The persister writes on a 1s trailing throttle, so a reload inside
+ * that second (a save, then F5) restored the copy from BEFORE the save's invalidation: a pre-save record younger than
+ * `staleTime`, which `hooks/useEditRecord.ts`'s `fetchQuery` answered with no GET. On `pagehide` — or the page going
+ * hidden, the last event a phone's discarded tab gets — the snapshot the throttle still holds is written at once; it carries the save's `isInvalidated` (or the re-read's answer), and
+ * react-query refetches a restored invalidated entry on its first read. One place for every page's save. */
+let flushOnHide = false
+
+/* Writes the snapshot the throttle has not written yet, synchronously. */
+function flushPersistedQueries(): void {
+  const client = unsaved
+  unsaved = undefined
+  if (!client) return
+  try {
+    storage.setItem(STORAGE_KEY, JSON.stringify(client))
+  } catch {
+    /* storage full or unavailable: the throttled write meets the same and is dropped the same way */
+  }
+}
+
+function persistClient(client: PersistedClient) {
+  if (persistPaused) return undefined
+  unsaved = client
+  if (!flushOnHide && typeof window !== 'undefined') {
+    flushOnHide = true
+    window.addEventListener('pagehide', flushPersistedQueries)
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') flushPersistedQueries()
+    })
+  }
+  return storagePersister.persistClient(client)
+}
+
 export const queryPersister: Persister = {
-  persistClient: client => (persistPaused ? undefined : storagePersister.persistClient(client)),
+  persistClient,
   restoreClient: () => (persistPaused ? undefined : storagePersister.restoreClient()),
   removeClient: () => storagePersister.removeClient(),
 }
@@ -55,6 +93,7 @@ export const queryPersister: Persister = {
  * (a project list the new user may not read, painting a page their own load would refuse). Called on an identity change
  * (`auth.tsx::setAdmin`); the new identity's own answers are saved afresh. */
 export function removePersistedQueries(): void {
+  unsaved = undefined // the outgoing identity's snapshot must not be flushed back on `pagehide`; the caller clears the cache first
   try {
     window.localStorage.removeItem(STORAGE_KEY)
   } catch {
@@ -81,8 +120,10 @@ export function dropPersistedQueries(): void {
  * digits — the same PII — and a rehydrated price would be stale.
  * `operator-dashboard`: the operator dashboard's cross-tenant figures (`pages/dashboard/`) — a year of every
  * section is large for localStorage, and a rehydrated answer would paint an old "as of".
+ * `exec-dashboard`: the command center (`pages/command-center/`) — the same "as of" reason, and one org's
+ * figures must not outlive the session that read them.
  * `health-components`: the Live badge (`hooks/useHealth.ts`); a rehydrated one would claim an old "connected".
- * `trial-agents`: the rail's trial meter (`components/TrialAgentsMeter.tsx`) — as `org-plan`, a rehydrated one would paint
+ * `trial-agents`: the rail's agents throttle (`components/TrialAgentsMeter.tsx`) — as `org-plan`, a rehydrated one would paint
  * an old peak, or a trial since converted.
  * `deployed-version`: `hooks/useVersionCheck.ts` latches a `true`; rehydrated into the NEW bundle it would offer
  * an update forever.
@@ -98,11 +139,13 @@ export function dropPersistedQueries(): void {
  * `agent-choices`, `agents-list`, `org-members`, `subject-attachments`, `task-dependencies`: the task form's cached reads
  * (`lib/cachedRead.ts`) — a rehydrated entry inside its `staleTime` would answer a reload with no GET, and a reload is
  * how an operator asks for the truth; `org-members` and attachment names are people's names and files besides.
- * `access-roles`: the role catalogue, read by `pages/NoAccess.tsx` and the access tabs (`hooks/useApiRead.ts`) under one key —
- * the latter never persists, so the key is listed here too, whichever reader's options are the live ones.
- * (`project-members`, `task-models` and `agent-providers` stay persisted: the first two are `ProjectEditPage`'s keys,
- * persisted there already, and a catalogue of providers holds nothing of anyone's.) */
-const UNPERSISTED_QUERIES: ReadonlySet<unknown> = new Set(['onboarding-own-tasks', 'company-setup', 'org-plan', 'trial-agents', 'customer-plan', 'org-billing', 'hosting-catalog', 'operator-dashboard', 'health-components', 'deployed-version', 'credentials', 'git-reach', 'git-connections', 'git-repo-owners', 'settings', 'credential-owners', 'legal-doc', 'accounts', 'cloud-connections', 'agent-choices', 'agents-list', 'org-members', 'subject-attachments', 'task-dependencies', 'own-org', 'access-roles'])
+ * `access-roles`, `project-members`: catalogues read under one key by a persisting reader (`pages/NoAccess.tsx` and the
+ * access tabs; `ProjectEditPage` and `TaskSpecFields`' cached read) AND by `hooks/useApiRead.ts` (the access tabs; the
+ * assignee lookup, `components/tasks/TaskPeople.tsx`), which never persists — listed here so the key behaves one way
+ * whichever reader's options are the live ones; a project's members are people's names besides.
+ * (`task-models` and `agent-providers` stay persisted: `task-models` is `hooks/useTaskModels`' key, and a catalogue of
+ * providers holds nothing of anyone's.) */
+const UNPERSISTED_QUERIES: ReadonlySet<unknown> = new Set(['onboarding-own-tasks', 'company-setup', 'org-plan', 'trial-agents', 'customer-plan', 'org-billing', 'hosting-catalog', 'operator-dashboard', 'exec-dashboard', 'health-components', 'deployed-version', 'credentials', 'git-reach', 'git-connections', 'git-repo-owners', 'settings', 'credential-owners', 'legal-doc', 'accounts', 'cloud-connections', 'agent-choices', 'agents-list', 'org-members', 'subject-attachments', 'task-dependencies', 'own-org', 'access-roles', 'project-members', 'node-groups'])
 
 /* A query may also opt out by `meta: { persist: false }` — the page-scoped reads of `hooks/useApiRead.ts`. */
 export const shouldPersistQuery = (query: Query): boolean =>

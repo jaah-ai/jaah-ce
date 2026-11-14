@@ -8,10 +8,19 @@ contract in tools/project_config.py — a hook in a foreign clone cannot reach o
   • `access-guard.push-enabled` — false blocks every push (layer 1 of 2; see the policy's "Residual gap").
   • `access-guard.branch-prefix` — stored with its trailing slash, or '' for none. Non-empty is an
     allowlist: only branches under the prefix may be pushed.
+    A GENESIS push (`is_genesis`, below) may also write the integration branch, `master` and `main`.
   • Both present, push enabled, empty prefix -> unrestricted; stdin is never read.
-  • `access-guard.protect-integration` — opt-in, written only for a MicroVM session clone
-    (`microvm_session`): `true` also refuses a push to the integration branch, `master` and `main`, whatever
-    the prefix. Unset (every other clone) changes nothing.
+  • `access-guard.protect-integration` — opt-in, written for a MicroVM session clone (`microvm_session`) and
+    for a slot clone landed on an empty forge (`worktree_mechanics/lifecycle.py::guard_clone`): `true` also
+    refuses a push to the integration branch, `master` and `main`, whatever the prefix. Unset (every other clone) changes nothing. Sole exception: a GENESIS push (`is_genesis`) —
+    every ref's remote sha is the zero sha AND `git ls-remote --heads` of the remote git is pushing to lists no
+    branch at all — goes through; an `ls-remote` that fails or times out refuses (branching-policy §Genesis).
+  • `access-guard.allow-force-push` — the repository's Allow force push: `true` lets a push (forced or not)
+    whose destination is `access-guard.integration-branch` through both checks above (`master`/`main` only
+    when one of them IS that branch). Absent, unparseable, or no integration-branch marker -> false.
+  • `access-guard.jaah-repo-prefix` — the project's `jaah_repo_prefix` (`<jaah org>/<org slug>-`): a push whose
+    URL (argv[2]) is in that Jaah GitHub org but whose `owner/repo` does not start with the prefix is refused
+    (`jaah_prefix_refusal`), whatever the other markers say. Unset or empty -> no check (an older control plane).
 Markers absent or unparseable -> BLOCK, naming the fix: unrestricted is a positively written pair, so
 absence can only mean an uninstalled or tampered guard. The prefix check reads the push DESTINATION ref
 from stdin, never the local branch name; no ref tuples on a restricted repo fails closed.
@@ -27,6 +36,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import urllib.parse
 
 PREFIX_CONFIG_KEY = "access-guard.branch-prefix"
 PUSH_ENABLED_CONFIG_KEY = "access-guard.push-enabled"
@@ -38,6 +48,10 @@ INTEGRATION_BRANCH_CONFIG_KEY = "access-guard.integration-branch"
 PROTECT_INTEGRATION_CONFIG_KEY = "access-guard.protect-integration"
 #: Refused under `PROTECT_INTEGRATION_CONFIG_KEY` beside the integration branch: the operator's branches.
 ALWAYS_PROTECTED = ("master", "main")
+# Opt-in, and only ever REMOVES the integration-branch refusal: anything but a parseable true is "off".
+ALLOW_FORCE_PUSH_CONFIG_KEY = "access-guard.allow-force-push"
+# Only ever ADDS a refusal: unset or empty is "no check", never a block (`jaah_prefix_refusal`).
+JAAH_REPO_PREFIX_CONFIG_KEY = "access-guard.jaah-repo-prefix"
 # Where the node's signed package installs the resolver; the refusal's command line comes from it.
 PACKAGED_PROJECT_CONFIG = "/usr/lib/jaahd/tools/project_config.py"
 # The Architectural Guard's hook, from the same root-owned package (never the clone's own `tools/`).
@@ -47,6 +61,14 @@ ARCHITECTURAL_GUARD_TIMEOUT_S = 300
 # `architectural_guard.PRE_PUSH_REFUSED`, restated because this file is copied alone into a clone: the ONLY exit code
 # that refuses — an uncaught error or a usage error (exit 1/2) is the guard's own failure and lets the push through.
 ARCHITECTURAL_GUARD_REFUSED = 3
+# A genesis push (`is_genesis`): the remote shas a ref git does not have on the remote carries, and the bound on
+# the `ls-remote` that proves the remote has no branch at all.
+ZERO_SHAS = frozenset({"0" * 40, "0" * 64})
+GENESIS_LS_REMOTE_TIMEOUT_S = 10
+# The only `GIT_*` variables the genesis `ls-remote` inherits: how to reach an ssh remote. Every other one (a
+# `GIT_DIR`, `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` — a pusher's `-c url.<empty>.insteadOf=<forge>`) could
+# point the check at another repository than the one pushed to.
+GENESIS_GIT_ENV_KEPT = frozenset({"GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS"})
 
 
 def read_config(key: str) -> str | None:
@@ -144,8 +166,64 @@ def block_push_disabled() -> int:
     return 1
 
 
-def check_prefix(lines: list[str], prefix: str, integration_branch: str = "") -> int:
+def remote_repo_path(url: str) -> str:
+    """The forge path (`owner/repo`, `.git` stripped) of a push URL — https, ssh (`ssh://…`) or scp-style
+    (`git@host:owner/repo.git`) — or "" for a local path or anything without a host."""
+    url = (url or "").strip()
+    if "://" in url:
+        parts = urllib.parse.urlsplit(url)
+        if not parts.netloc or parts.scheme.lower() == "file":
+            return ""
+        path = parts.path
+    else:
+        host, sep, path = url.partition(":")
+        if not sep or not host or "/" in host:
+            return ""
+    path = urllib.parse.unquote(path).strip("/")
+    return path[:-len(".git")] if path.lower().endswith(".git") else path
+
+
+def jaah_prefix_refusal(path: str, prefix: str) -> str | None:
+    """Why `path` (`owner/repo`) may not be pushed to under `prefix` (`<jaah org>/<org slug>-`), or None: a path
+    whose owner is the Jaah org (case-insensitive) must start with the prefix (case-insensitive), with no dot or
+    empty segment. Twin of `apps/jaahd/git_credential_helper.py::jaah_prefix_refusal`, restated because this
+    file is copied alone into a clone."""
+    prefix = (prefix or "").strip().lstrip("/")
+    owner = prefix.split("/", 1)[0]
+    if "/" not in prefix or not owner:
+        return None
+    repo = urllib.parse.unquote(path or "").strip("/")
+    segments = repo.split("/")
+    dotted = any(seg in ("", ".", "..") for seg in segments)
+    # The owner is the first segment; with a dot or empty segment any segment naming the Jaah org counts, since
+    # `./jaah-apps/x` reaches it once normalized (and such a path is refused outright below).
+    if segments[0].casefold() != owner.casefold() and not (
+            dotted and owner.casefold() in (seg.casefold() for seg in segments)):
+        return None
+    if dotted or not repo.casefold().startswith(prefix.casefold()):
+        return f"{repo!r} is in the Jaah org {owner!r} but not this org's (its repositories start {prefix!r})"
+    return None
+
+
+def check_jaah_repo(remote: str, prefix: str) -> int:
+    """1 (refused, printed) when the push URL `remote` is another org's repository in the Jaah org, else 0."""
+    refusal = jaah_prefix_refusal(remote_repo_path(remote), prefix)
+    if refusal is None:
+        return 0
+    print(f"❌ A push to {remote!r} is refused: {refusal}.")
+    return 1
+
+
+def check_prefix(lines: list[str], prefix: str, integration_branch: str = "", allow_integration: bool = False,
+                 remote: str | None = None, genesis_of=None) -> int:
+    """Refuse a push whose DESTINATION is outside the prefix — the integration branch excepted when
+    `allow_integration` (Allow force push), and the integration branch, `master` and `main` excepted on a genesis
+    push to `remote` (`genesis_of`, default `is_genesis`), so a prefixed project can bootstrap an empty
+    repository."""
     allowed_ref_prefix = f"refs/heads/{prefix}"
+    allowed_integration = f"refs/heads/{integration_branch}" if allow_integration and integration_branch else None
+    genesis_refs = {f"refs/heads/{b}" for b in (integration_branch, *ALWAYS_PROTECTED) if b}
+    genesis: bool | None = None  # asked once, and only when such a destination is pushed
     blocked = False
     saw_ref = False
     for line in lines:
@@ -154,7 +232,12 @@ def check_prefix(lines: list[str], prefix: str, integration_branch: str = "") ->
             continue
         saw_ref = True
         remote_ref = parts[2]
-        if not remote_ref.startswith(allowed_ref_prefix):
+        if remote_ref in genesis_refs and not remote_ref.startswith(allowed_ref_prefix):
+            if genesis is None:
+                genesis = (genesis_of or is_genesis)(lines, remote)
+            if genesis:
+                continue
+        if not remote_ref.startswith(allowed_ref_prefix) and remote_ref != allowed_integration:
             print(f"❌ This repo is branch-prefix restricted: push to '{remote_ref}' is blocked.")
             print(f"   Only branches prefixed '{prefix}' may be pushed.")
             for extra in refusal_recipe(prefix, integration_branch):
@@ -169,17 +252,57 @@ def check_prefix(lines: list[str], prefix: str, integration_branch: str = "") ->
     return 1 if blocked else 0
 
 
-def check_protected(lines: list[str], integration_branch: str, prefix: str) -> int:
-    """Refuse a push whose DESTINATION is the integration branch, `master` or `main`. No ref tuples at all
-    fails closed, as `check_prefix` does."""
+def is_genesis(lines: list[str], remote: str | None) -> bool:
+    """True only for a new repository's first push (branching-policy §Genesis): EVERY ref line's remote sha is
+    the zero sha (git holds no such ref on the remote) AND `git ls-remote --heads <remote>` — `remote` being the
+    URL git pushes to, from its pre-push argv — answers within `GENESIS_LS_REMOTE_TIMEOUT_S` and lists no branch
+    at all. A failure, a timeout, a malformed line or no lines is False: the push is refused (fail closed).
+    `ls-remote` runs outside the repository (`cwd="/"`) with no inherited `GIT_*` but `GENESIS_GIT_ENV_KEPT`, so
+    the clone's own config cannot rewrite the URL it asks, and a URL any remaining config rewrites
+    (`ls-remote --get-url`) refuses; the node's credential helper, in the system config, still answers."""
+    tuples = [line.split() for line in lines if line.strip()]
+    if not remote or not tuples or any(len(parts) < 4 or parts[3] not in ZERO_SHAS for parts in tuples):
+        return False
+    env = {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_") or k in GENESIS_GIT_ENV_KEPT},
+           "GIT_TERMINAL_PROMPT": "0"}
+
+    def ls_remote(*args: str) -> subprocess.CompletedProcess | None:
+        try:
+            return subprocess.run(["git", "ls-remote", *args, "--end-of-options", remote], capture_output=True,
+                                  text=True, check=False, stdin=subprocess.DEVNULL,
+                                  timeout=GENESIS_LS_REMOTE_TIMEOUT_S, cwd="/", env=env)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    # An `insteadOf` left in any config git still reads (the user's own) would make `ls-remote` ask another
+    # repository than the one pushed to: a URL that does not resolve to itself is never a genesis.
+    resolved = ls_remote("--get-url")  # local: reads config only, so the forge round trip stays one 10 s bound
+    if resolved is None or resolved.returncode != 0 or resolved.stdout.strip() != remote:
+        return False
+    proc = ls_remote("--heads")
+    return proc is not None and proc.returncode == 0 and not proc.stdout.strip()
+
+
+def check_protected(lines: list[str], integration_branch: str, prefix: str, allow_integration: bool = False,
+                    remote: str | None = None, genesis_of=None) -> int:
+    """Refuse a push whose DESTINATION is the integration branch, `master` or `main` — the integration branch
+    excepted when `allow_integration` (Allow force push), and every protected ref excepted on a genesis push to
+    `remote` (`is_genesis`). No ref tuples at all fails closed, as `check_prefix` does."""
     protected = {f"refs/heads/{b}" for b in (integration_branch, *ALWAYS_PROTECTED) if b}
+    if allow_integration and integration_branch:
+        protected.discard(f"refs/heads/{integration_branch}")
     saw_ref, blocked = False, False
+    genesis: bool | None = None  # asked once, and only when a protected destination is pushed
     for line in lines:
         parts = line.split()
         if len(parts) < 3 or not parts[2]:
             continue
         saw_ref = True
         if parts[2] in protected:
+            if genesis is None:
+                genesis = (genesis_of or is_genesis)(lines, remote)
+            if genesis:
+                continue
             print(f"❌ A push to '{parts[2]}' is refused: it is this project's integration branch or the "
                   "operator's.")
             for extra in refusal_recipe(prefix, integration_branch):
@@ -220,16 +343,30 @@ def main() -> int:
         return block_unconfigured(f"{PUSH_ENABLED_CONFIG_KEY} is unset or unparseable")
     if not push_enabled:
         return block_push_disabled()
+    jaah_prefix = read_config(JAAH_REPO_PREFIX_CONFIG_KEY) or ""
+    if jaah_prefix and check_jaah_repo((sys.argv[2:3] or [""])[0], jaah_prefix):
+        return 1
     protect = parse_push_enabled(read_config(PROTECT_INTEGRATION_CONFIG_KEY)) is True
     lines = None
     if prefix or protect:
-        # Read AFTER the two rule markers. It changes no verdict of its own — only the message, and, when
-        # protection was opted into, which branch that protection names.
+        # Read AFTER the two rule markers. It changes no verdict of its own — only the message, which branch
+        # protection names, and which branch Allow force push lets through (absent, none is).
         integration_branch = read_config(INTEGRATION_BRANCH_CONFIG_KEY) or ""
+        allow = bool(integration_branch) and parse_push_enabled(read_config(ALLOW_FORCE_PUSH_CONFIG_KEY)) is True
         lines = list(sys.stdin)
-        if protect and check_protected(lines, integration_branch, prefix):
+        # The URL git pushes to (argv[2]), never the remote's name: its fetch URL, which `ls-remote` would read,
+        # may differ from where the push goes.
+        remote = (sys.argv[2:3] or [""])[0]
+        verdicts: dict[bool, bool] = {}  # the forge is asked at most once per push, though both checks may ask
+
+        def genesis_of(push_lines: list[str], url: str | None) -> bool:
+            if True not in verdicts:
+                verdicts[True] = is_genesis(push_lines, url)
+            return verdicts[True]
+
+        if protect and check_protected(lines, integration_branch, prefix, allow, remote, genesis_of):
             return 1
-        if prefix and check_prefix(lines, prefix, integration_branch):
+        if prefix and check_prefix(lines, prefix, integration_branch, allow, remote, genesis_of):
             return 1
     # Synced AND unrestricted: stdin is read only by a guarded session's Architectural Guard step.
     return architectural_guard(lines)

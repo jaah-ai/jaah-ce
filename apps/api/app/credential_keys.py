@@ -530,7 +530,7 @@ def reset_provider(
 
 class _DataKeyCache:
     """Wrapped bytes → data key, bounded and expiring. Keyed by the SHA-256 of the wrapped block so the
-    map's keys carry nothing usable either. Thread-safe: routes run in uvicorn's thread pool."""
+    map's keys carry nothing usable either. Thread-safe: sync routes run in the server's thread pool."""
 
     def __init__(self, *, ttl: float, max_entries: int) -> None:
         self._ttl = ttl

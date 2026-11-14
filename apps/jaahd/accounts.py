@@ -35,6 +35,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import agent_config_dirs
@@ -42,6 +43,7 @@ import agent_providers
 import login_seal
 import session_user
 import environment
+import file_io
 import host_platform
 import ce_caps  # the community edition's account cap (a no-op on a cloud node)
 from host_platform import windows  # importable everywhere: no native call at import
@@ -54,10 +56,17 @@ import env_helpers
 from env_helpers import _norm_dir, jaah_dir, jaah_home, now_iso as _now_iso
 import notification_policy
 import plugin_repair
-from plugin_repair import MARKETPLACES, MCP_PLUGINS, OMC_MARKETPLACE_URL
+import runner_env  # python_cmd(): the node's own interpreter, never a PATH lookup
+from plugin_repair import MARKETPLACES, MCP_PLUGINS, OMC_MARKETPLACE_URL, RETIRED_PLUGINS
 from reconcile.accounts_probe import _fleet_auth_dirs, account_roster, invalidate_account_roster
 
 log = logging.getLogger(__name__)
+
+
+def _reply(code: int, out: object = None, err: str = "") -> dict:
+    """A verb's answer: `out` (when given) JSON-dumped as its stdout. Not `commands.refused_reply`, which logs
+    and adds `reason`."""
+    return {"exit_code": code, "stdout": "" if out is None else json.dumps(out), "stderr": err}
 
 # OAuth-wizard bookkeeping lives in the CP (apps/api/app/durable/accounts.py); this node only runs the
 # OAuth process and reports its outcome in each command's reply.
@@ -306,25 +315,21 @@ _O_NOFOLLOW = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
 _O_NONBLOCK = os.O_NONBLOCK if hasattr(os, "O_NONBLOCK") else 0
 _O_CLOEXEC = os.O_CLOEXEC if hasattr(os, "O_CLOEXEC") else 0
 _O_BINARY = os.O_BINARY if hasattr(os, "O_BINARY") else 0
-# Neither flag exists on Windows; a FIFO planted in place of an asset must not block the daemon's open.
-_NO_FOLLOW_NONBLOCK = _O_NOFOLLOW | _O_NONBLOCK
 
 
 def _read_plugin_file(src: Path, cache_root: Path) -> str:
     """A HUD asset's text, read as the daemon from a plugin tree the SESSION USER writes (one shared root per
     node tree, `plugin_repair.share_plugin_root`): only a regular file, never through a final link, and only
     one resolving inside `cache_root` — a planted link must not have the daemon copy a file only it may read
-    (the node credential) into a file the session user can. Raises OSError otherwise."""
+    (the node credential) into a file the session user can. Raises OSError otherwise (`file_io._regular_fd`'s
+    on a link, a FIFO or a directory)."""
     # Windows: before `realpath`, which opens through every link on the way (`windows.local_path_under`).
     if host_platform.is_windows() and not windows.local_path_under(str(src), str(cache_root)):
         raise _OutsideRunnerTree(errno.ENOENT, f"{src} resolves outside {cache_root}")
     real_root = os.path.realpath(cache_root)
     if not os.path.realpath(src).startswith(real_root + os.sep):
         raise OSError(f"{src} resolves outside {cache_root}")
-    fd = os.open(src, os.O_RDONLY | _NO_FOLLOW_NONBLOCK)
-    with os.fdopen(fd, encoding="utf-8") as fh:
-        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
-            raise OSError(f"{src} is not a regular file")
+    with os.fdopen(file_io._regular_fd(str(src)), encoding="utf-8") as fh:
         # Windows: no `O_NOFOLLOW`, so the realpath above can be raced — the HANDLE's final path decides.
         if host_platform.is_windows() and not agent_base.final_path_under(fh.fileno(), real_root):
             raise OSError(f"{src} resolves outside {cache_root}")
@@ -377,8 +382,8 @@ def _mcp_plugins_setup(config_dir: str, run) -> dict:
     `plugin_repair.MARKETPLACES`; a fresh account knows only the one `_omc_check` adds, and an install
     into an unknown marketplace fails with a "try `marketplace update`" message that points at a stale
     cache which is not the problem. Re-verifies against installed_plugins.json rather than trusting the
-    CLI's exit code; enabledPlugins is set only for plugins CONFIRMED present. Never raises, never blocks
-    the caller."""
+    CLI's exit code; enabledPlugins is set only for plugins CONFIRMED present, and `RETIRED_PLUGINS` are
+    dropped from it. Never raises, never blocks the caller."""
     try:
         errors: list[str] = []
         present = _installed_plugin_keys(config_dir)
@@ -434,6 +439,8 @@ def _mcp_plugins_setup(config_dir: str, run) -> dict:
         enabled = settings.get("enabledPlugins")
         if not isinstance(enabled, dict):
             enabled = {}
+        for plugin in RETIRED_PLUGINS:
+            enabled.pop(plugin, None)
         for plugin in confirmed:
             enabled[plugin] = True
         settings["enabledPlugins"] = enabled
@@ -461,8 +468,8 @@ _OAUTH_SCRAPE_TIMEOUT = 30.0
 _LOGIN_POLL_TIMEOUT = 120.0
 _LOGIN_POLL_INTERVAL = 3.0
 # AWAIT_CREDENTIALS mode's phase-2 window, SHORTER than paste mode's: `_login_await_redirect`'s reply is
-# NON-TERMINAL (the caller re-asks on `awaiting_redirect`), so a long window only pins one of
-# `commands.CommandBridge._dispatch_bound` slots. Paste mode's window is ONE-SHOT and terminal — never
+# NON-TERMINAL (the caller re-asks on `awaiting_redirect`), so a long window only pins a command
+# handler (`commands.CommandBridge._inflight`) for nothing. Paste mode's window is ONE-SHOT and terminal — never
 # unify the two.
 _LOGIN_AWAIT_POLL_TIMEOUT = 25.0
 # Wall-clock cap on the DETACHED `claude auth login` process. It outlives the command that spawned it, so
@@ -550,20 +557,26 @@ _CREDS_SHAPE_PY = (
 )
 
 
-def _delegated_creds_have_token(cred: Path) -> bool:
-    """`_creds_have_token`'s shape check run as the session user, for a file this uid cannot read. False
-    when the seam is unavailable or the check could not run — the poll stays in its "not yet" arm."""
+def _delegated_shape_check(cred: Path, script: str, *, label: str, absent: str) -> bool:
+    """`script` (`_CREDS_SHAPE_PY` or `_ANY_CREDENTIAL_SHAPE_PY`) run as the session user on `cred`, a file this
+    uid cannot read. False when the seam is unavailable or the check could not run — the poll stays in its "not
+    yet" arm. `label` names the check and `absent` the verdict in the warnings."""
     if not session_user.can_run_as_session_user():
-        log.warning("cannot read %s and cannot delegate the check to %r — treating it as no token",
-                    cred, session_user.session_user())
+        log.warning("cannot read %s and cannot delegate the check to %r — treating it as %s",
+                    cred, session_user.session_user(), absent)
         return False
     try:
         proc = session_user.run_as_session_user(
-            [sys.executable, "-I", "-c", _CREDS_SHAPE_PY, str(cred)], timeout=_DELEGATED_TIMEOUT)
+            [sys.executable, "-I", "-c", script, str(cred)], timeout=_DELEGATED_TIMEOUT)
     except Exception as exc:  # noqa: BLE001 — RuntimeError (switch gone), TimeoutExpired, OSError
-        log.warning("delegated credentials-shape check for %s failed (%s: %s)", cred, type(exc).__name__, exc)
+        log.warning("delegated %s check for %s failed (%s: %s)", label, cred, type(exc).__name__, exc)
         return False
     return (proc.stdout or "").strip() == "1"
+
+
+def _delegated_creds_have_token(cred: Path) -> bool:
+    """`_creds_have_token`'s shape check (`_CREDS_SHAPE_PY`) run as the session user."""
+    return _delegated_shape_check(cred, _CREDS_SHAPE_PY, label="credentials-shape", absent="no token")
 
 
 # Vendor-neutral "a JSON object with one non-empty string value", sound only after the mtime MOVED.
@@ -582,20 +595,10 @@ def _delegated_credential_written(cred: Path) -> bool:
     """`_delegated_creds_have_token`'s vendor-neutral twin: has the session user written a non-empty JSON
     object at `cred`? False when the seam is unavailable or the check could not run.
 
-    A separate function, not a parameter: collapsing them would let Claude's path reach the weak check
-    where the strong one is required."""
-    if not session_user.can_run_as_session_user():
-        log.warning("cannot read %s and cannot delegate the check to %r — treating it as no credential",
-                    cred, session_user.session_user())
-        return False
-    try:
-        proc = session_user.run_as_session_user(
-            [sys.executable, "-I", "-c", _ANY_CREDENTIAL_SHAPE_PY, str(cred)], timeout=_DELEGATED_TIMEOUT)
-    except Exception as exc:  # noqa: BLE001 — RuntimeError (switch gone), TimeoutExpired, OSError
-        log.warning("delegated credential-shape check for %s failed (%s: %s)",
-                    cred, type(exc).__name__, exc)
-        return False
-    return (proc.stdout or "").strip() == "1"
+    A separate name, not a parameter on the strong check: collapsing them would let Claude's path reach the
+    weak check where the strong one is required."""
+    return _delegated_shape_check(cred, _ANY_CREDENTIAL_SHAPE_PY, label="credential-shape",
+                                  absent="no credential")
 
 
 def _path_mtime(path: Path) -> float | None:
@@ -1172,12 +1175,12 @@ def _read_pre_creds_mtime(slug: str) -> float | None:
     baseline), matching phase 1's own None-if-absent convention for a fresh account's first login."""
     try:
         if host_platform.is_windows():
-            text = _read_own_handover(_pre_creds_mtime_path(slug), "pre-creds-mtime")
+            text = _read_own_handover(_pre_creds_mtime_path(slug), "pre-creds-mtime").decode("utf-8", "replace")
         else:
-            text = _pre_creds_mtime_path(slug).read_text().strip()
+            text = _pre_creds_mtime_path(slug).read_text()
     except OSError:
         return None
-    if not text:
+    if not text.strip():
         return None
     try:
         return float(text)
@@ -1203,22 +1206,28 @@ def _read_login_store(slug: str) -> str:
     Not `read_text()`, for `_read_login_provider`'s reasons (symlink, planted FIFO, no bound) in the same
     runner-writable dir. Every failure reads as `""`. The value is NEVER echoed (`_login_store_refusal`)."""
     try:
-        return _read_own_handover(_login_store_path(slug), "login-store")
+        return _read_own_handover(_login_store_path(slug), "login-store").decode("utf-8", "replace").strip()
     except OSError:
         return ""
 
 
-def _read_own_handover(path: Path, what: str) -> str:
-    """One handover file's stripped text, bounded at 4 KiB: `O_NOFOLLOW` + `O_NONBLOCK` + `S_ISREG`, and on
-    Windows also the daemon's own create (`_is_daemons_own`) — owner checked there only, so Linux reads as
-    it always has. Raises `OSError` on a missing file; every refusal (logged, `what` names it) reads `""`."""
+def _read_own_handover(path: Path, what: str, *, limit: int = 4096, own: bool = False,
+                       one_link: bool = False) -> bytes:
+    """One handover file's bytes, bounded at `limit`: `O_NOFOLLOW` + `O_NONBLOCK` + `S_ISREG`, and the daemon's
+    own create (`_is_daemons_own`) — on every platform when `own`, else on Windows only, so a Linux store or
+    mtime reads as it always has; `one_link` also refuses a hardlink (`st_nlink != 1`), a runner's way to
+    pass every other check with the daemon-owned `stdout.log`. `O_NONBLOCK` is what lets the FIFO arm run
+    at all (a writerless FIFO open never returns). Raises `OSError` on a missing file; every refusal
+    (logged, `what` names it) reads `b""`."""
     fd = os.open(path, os.O_RDONLY | _O_NONBLOCK | _O_NOFOLLOW | _O_BINARY)
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or (host_platform.is_windows() and not _is_daemons_own(fd, st)):
-            log.warning("refusing a non-regular or foreign %s handover at %s — reading it as absent", what, path)
-            return ""
-        return os.read(fd, 4096).decode("utf-8", "replace").strip()
+        if (not stat.S_ISREG(st.st_mode) or ((own or host_platform.is_windows()) and not _is_daemons_own(fd, st))
+                or (one_link and st.st_nlink != 1)):
+            log.warning("refusing a non-regular or foreign %s handover at %s (uid %s, nlink %s) — reading it as absent",
+                        what, path, st.st_uid, st.st_nlink)
+            return b""
+        return os.read(fd, limit)
     finally:
         os.close(fd)
 
@@ -1252,24 +1261,13 @@ def _read_login_seal_key(slug: str) -> bytes | None:
     """Phase 2's read side of `_login_seal_key_path` — None when there is no key (phase 1 ran for an older
     control plane, or the runtime dir is gone), which the caller reports as `login_seal_invalid`.
 
-    Symlink-safe like `_read_login_store` (`O_NOFOLLOW`, `S_ISREG`) and owner-checked like
-    `_read_login_provider`: the dir is runner-writable between the halves, and a planted key could only
-    make the unseal fail, but a planted FIFO would wedge the read. Bounded: a 2048-bit PEM is ~1.7 KiB."""
+    Symlink-safe and owner-checked (`_read_own_handover`, `own` on every platform): the dir is runner-writable
+    between the halves, and a planted key could only make the unseal fail, but a planted FIFO would wedge
+    the read. Bounded at 16 KiB: a 2048-bit PEM is ~1.7 KiB."""
     try:
-        fd = os.open(_login_seal_key_path(slug), os.O_RDONLY | _O_NONBLOCK | _O_NOFOLLOW | _O_BINARY)
+        return _read_own_handover(_login_seal_key_path(slug), "seal-key", limit=16384, own=True) or None
     except OSError:
         return None
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or not _is_daemons_own(fd, st):
-            log.warning("refusing a non-regular or foreign seal key for %s — reading it as absent", slug)
-            return None
-        pem = os.read(fd, 16384)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
-    return pem or None
 
 
 # The shape a provider value may take out of the phase-1 handover file (the catalogue's spelling);
@@ -1293,30 +1291,13 @@ def _read_login_provider(slug: str) -> str:
     path = _login_provider_path(slug)
     try:
         # This value selects which binary `_finalize_account_add` runs against a fresh credential, and the
-        # runtime dir is runner-writable for minutes between phases. `O_NOFOLLOW` + `S_ISREG` refuse a plant;
-        # `O_NONBLOCK` is what lets the FIFO arm run at all (a writerless FIFO open never returns). Refusal
-        # falls back to the DEFAULT, which never runs another vendor's binary.
-        fd = os.open(path, os.O_RDONLY | _O_NONBLOCK | _O_NOFOLLOW | _O_BINARY)
+        # runtime dir is runner-writable for minutes between phases: every `_read_own_handover` refusal, with
+        # ownership on every platform (for a Claude login this path is never written, so a runner can simply
+        # create it) and one link. Refusal falls back to the DEFAULT, which never runs another vendor's binary.
+        raw = _read_own_handover(path, "login-provider", limit=256, own=True, one_link=True)
     except OSError:
         return agent_providers.DEFAULT_PROVIDER
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            log.warning("refusing a non-regular login-provider handover at %s — reading it as %s",
-                        path, agent_providers.DEFAULT_PROVIDER)
-            return agent_providers.DEFAULT_PROVIDER
-        # Ownership too: for a Claude login this path is never written, so a runner can simply create it.
-        # And `st_nlink == 1`: a runner can hardlink the daemon-owned, group-rw `stdout.log` here and pass
-        # every other check. The daemon's own `O_EXCL` create is always owned by it with one link.
-        if not _is_daemons_own(fd, st) or st.st_nlink != 1:
-            log.warning("refusing a login-provider handover at %s (uid %s, nlink %s) — reading it as %s",
-                        path, st.st_uid, st.st_nlink, agent_providers.DEFAULT_PROVIDER)
-            return agent_providers.DEFAULT_PROVIDER
-        value = os.read(fd, 256).decode(errors="replace").strip()
-    except OSError:
-        return agent_providers.DEFAULT_PROVIDER
-    finally:
-        os.close(fd)
+    value = raw.decode("utf-8", "replace").strip()
     if not value:
         return agent_providers.DEFAULT_PROVIDER
     # Shape-checked before it can be echoed: `_login_provider_refusal` puts it in a stored, rendered reply.
@@ -1993,7 +1974,7 @@ def _login_start(slug: str, config_dir: str, run, *, require_existing: bool = Fa
     windows_refusal = _windows_sign_in_refusal(provider)
     if windows_refusal:
         log.warning("login start refused for %s: %s", slug, windows_refusal)
-        return {"exit_code": 1, "stdout": "", "stderr": windows_refusal}
+        return _reply(1, err=windows_refusal)
     import time
 
     # `declared` is kept separate: the completion mode turns on it. A provider's `completion()` decides
@@ -2006,7 +1987,7 @@ def _login_start(slug: str, config_dir: str, run, *, require_existing: bool = Fa
     if not login_seal.is_wire_key(peer_key):
         error = "login_seal_invalid: the wizard's peer key is missing or not a bounded base64 public key"
         log.warning("login start refused for %s: %s", slug, error)
-        return {"exit_code": 1, "stdout": "", "stderr": error}
+        return _reply(1, err=error)
 
     # Where the token belongs, before anything is created (it decides the login env and the mtime
     # baseline): the token store, resolved on this node — never the CP's say (`_login_store_for`).
@@ -2017,7 +1998,7 @@ def _login_start(slug: str, config_dir: str, run, *, require_existing: bool = Fa
                or store_refusal or _login_store_refusal(slug, securestorage_dir))
     if refusal:
         log.warning("login start refused for %s: %s", slug, refusal)
-        return {"exit_code": 1, "stdout": "", "stderr": refusal}
+        return _reply(1, err=refusal)
 
     runtime_dir, fifo_path, log_path, pid_path = _account_add_runtime(slug)
 
@@ -2028,7 +2009,7 @@ def _login_start(slug: str, config_dir: str, run, *, require_existing: bool = Fa
         _cleanup_account_add_runtime(slug)
         _set_provisioning(config_dir, _prov_block(step, status="error", error=error, started_at=started_at),
                           slug=slug)
-        return {"exit_code": 1, "stdout": "", "stderr": error}
+        return _reply(1, err=error)
 
     started_at = _now_iso()
     # Snapshot before this attempt touches the dir: a re-auth's dir already holds the old credential.
@@ -2036,207 +2017,196 @@ def _login_start(slug: str, config_dir: str, run, *, require_existing: bool = Fa
 
     # 1) creating_dir — acquire the per-slug flock (nonblocking). If already held, another login flow is
     #    in flight → distinct in_progress_elsewhere result; do NOT overwrite the in-flight provisioning.
-    lock_path = _account_add_lock_path(slug)
-    lock_fh = open(lock_path, "a+")
-    # The pinned log reader, hoisted so the `finally` closes it on every arm (None = nothing to close).
-    log_pin: _ScrapedLog | None = None
-    try:
+    with _slug_lock(slug) as taken:
+        if not taken:
+            return _LOGIN_BUSY()
+        # The pinned log reader, hoisted so the `finally` closes it on every arm (None = nothing to close).
+        log_pin: _ScrapedLog | None = None
         try:
-            host_platform.lock(lock_fh, blocking=False)
-        except OSError:
-            lock_fh.close()
-            return {"exit_code": 1, "stdout": json.dumps({"status": "in_progress_elsewhere"}),
-                    "stderr": "another login is in progress for this slug"}
+            if require_existing and not Path(config_dir).is_dir():
+                # Disk presence, not a registry record (a provisioned-outside-the-wizard account has none).
+                # The TOCTOU-safe re-check under the flock; persist nothing, which would create a phantom.
+                return _reply(1, err="account_not_found")
+            # A `shared_token_link` login mints in the PER-NODE home — a CLI is never run in a home another node
+            # can write — and `_publish_shared_login` copies only the credential into the store. A link left by
+            # an earlier login is dropped first (under the flock), so this one writes a fresh regular file.
+            _drop_credential_link(config_dir, provider)
 
-        if require_existing and not Path(config_dir).is_dir():
-            # Disk presence, not a registry record (a provisioned-outside-the-wizard account has none).
-            # The TOCTOU-safe re-check under the flock; persist nothing, which would create a phantom.
-            return {"exit_code": 1, "stdout": "", "stderr": "account_not_found"}
-        # A `shared_token_link` login mints in the PER-NODE home — a CLI is never run in a home another node
-        # can write — and `_publish_shared_login` copies only the credential into the store. A link left by
-        # an earlier login is dropped first (under the flock), so this one writes a fresh regular file.
-        _drop_credential_link(config_dir, provider)
+            # Clear any prior attempt's login and FIFO. A failed cleanup is terminal here, under its own code,
+            # before the first `O_EXCL` create (see `_cleanup_account_add_runtime`).
+            cleanup_failure = _cleanup_account_add_runtime(slug)
+            if cleanup_failure is not None:
+                code = errno.errorcode.get(cleanup_failure.errno, cleanup_failure.errno)
+                error = (f"login_runtime_cleanup_failed: the previous attempt's runtime dir {runtime_dir} "
+                         f"could not be removed ({code}: {cleanup_failure.strerror or cleanup_failure}), so "
+                         f"this attempt cannot start on a clean dir and nothing was created. This is NOT the "
+                         f"occupied-path refusal — nothing was planted, the leftovers are this node's own. "
+                         f"Repair or free that path and retry.")
+                log.error("login start for %s cannot clear its runtime dir: %s", slug, error)
+                return _fail("creating_dir", error, started_at)
 
-        # Clear any prior attempt's login and FIFO. A failed cleanup is terminal here, under its own code,
-        # before the first `O_EXCL` create (see `_cleanup_account_add_runtime`).
-        cleanup_failure = _cleanup_account_add_runtime(slug)
-        if cleanup_failure is not None:
-            code = errno.errorcode.get(cleanup_failure.errno, cleanup_failure.errno)
-            error = (f"login_runtime_cleanup_failed: the previous attempt's runtime dir {runtime_dir} "
-                     f"could not be removed ({code}: {cleanup_failure.strerror or cleanup_failure}), so "
-                     f"this attempt cannot start on a clean dir and nothing was created. This is NOT the "
-                     f"occupied-path refusal — nothing was planted, the leftovers are this node's own. "
-                     f"Repair or free that path and retry.")
-            log.error("login start for %s cannot clear its runtime dir: %s", slug, error)
-            return _fail("creating_dir", error, started_at)
-
-        _set_provisioning(config_dir,
-                          _prov_block("creating_dir", started_at=started_at, pre_creds_mtime=pre_creds_mtime),
-                          slug=slug)
-        ensure_account_dir(config_dir)
-        # The CLI creates neither the store root nor the account's leaf. Through an access point both land
-        # uid/gid 3000 whatever the mode.
-        if securestorage_dir:
-            root_refusal = shared_storage.ensure_shared_root()
-            if root_refusal:
-                return _fail("creating_dir", f"login_store_not_on_share: {root_refusal}", started_at)
-            # Re-asked before and after the create: a path planted since the refusal is never followed.
-            if not shared_storage.store_is_on_share(securestorage_dir):
-                return _fail("creating_dir", f"login_store_not_on_share: {securestorage_dir} is not a real "
-                             f"directory in the token store", started_at)
-            if host_platform.is_windows():
-                # The runner account's, as everything under its home — and the only one that can create it
-                # under a mounted NodeLink link (`\\wsl.localhost` is per-user).
-                failure = session_user.ensure_dir_as_session_user(securestorage_dir)
-                if failure:
-                    return _fail("creating_dir", f"login_store_not_on_share: could not create "
-                                 f"{securestorage_dir} ({failure})", started_at)
+            _set_provisioning(config_dir,
+                              _prov_block("creating_dir", started_at=started_at, pre_creds_mtime=pre_creds_mtime),
+                              slug=slug)
+            ensure_account_dir(config_dir)
+            # The CLI creates neither the store root nor the account's leaf. Through an access point both land
+            # uid/gid 3000 whatever the mode.
+            if securestorage_dir:
+                root_refusal = shared_storage.ensure_shared_root()
+                if root_refusal:
+                    return _fail("creating_dir", f"login_store_not_on_share: {root_refusal}", started_at)
+                # Re-asked before and after the create: a path planted since the refusal is never followed.
+                if not shared_storage.store_is_on_share(securestorage_dir):
+                    return _fail("creating_dir", f"login_store_not_on_share: {securestorage_dir} is not a real "
+                                 f"directory in the token store", started_at)
+                if host_platform.is_windows():
+                    # The runner account's, as everything under its home — and the only one that can create it
+                    # under a mounted NodeLink link (`\\wsl.localhost` is per-user).
+                    failure = session_user.ensure_dir_as_session_user(securestorage_dir)
+                    if failure:
+                        return _fail("creating_dir", f"login_store_not_on_share: could not create "
+                                     f"{securestorage_dir} ({failure})", started_at)
+                else:
+                    os.makedirs(securestorage_dir, mode=shared_storage.STORE_DIR_MODE, exist_ok=True)
+                if not shared_storage.store_is_on_share(securestorage_dir):
+                    return _fail("creating_dir", f"login_store_not_on_share: {securestorage_dir} is not a real "
+                                 f"directory in the token store", started_at)
+            # Create the parent explicitly (`makedirs` applies `mode` only to the leaf). 2770 when delegated:
+            # the session-user login writes its pid file here; 0700 on a one-uid host.
+            delegated = _login_runs_delegated()
+            runtime_dir_mode = 0o2770 if delegated else 0o700
+            # Daemon-owned IPC files: 0660 group `jaah` when delegated (FIFO read, log append), else 0600.
+            ipc_mode = 0o660 if delegated else 0o600
+            # Windows has no mode bits or groups to share: the `run\` ACLs grant both accounts Modify.
+            on_windows = host_platform.is_windows()
+            if on_windows:
+                # `run\` is the runner account's to create in; the handover dir is the daemon's own (`state\`).
+                _ensure_runner_dir(runtime_dir)
+                os.makedirs(_login_handover_dir(slug), exist_ok=True)
             else:
-                os.makedirs(securestorage_dir, mode=shared_storage.STORE_DIR_MODE, exist_ok=True)
-            if not shared_storage.store_is_on_share(securestorage_dir):
-                return _fail("creating_dir", f"login_store_not_on_share: {securestorage_dir} is not a real "
-                             f"directory in the token store", started_at)
-        # Create the parent explicitly (`makedirs` applies `mode` only to the leaf). 2770 when delegated:
-        # the session-user login writes its pid file here; 0700 on a one-uid host.
-        delegated = _login_runs_delegated()
-        runtime_dir_mode = 0o2770 if delegated else 0o700
-        # Daemon-owned IPC files: 0660 group `jaah` when delegated (FIFO read, log append), else 0600.
-        ipc_mode = 0o660 if delegated else 0o600
-        # Windows has no mode bits or groups to share: the `run\` ACLs grant both accounts Modify.
-        on_windows = host_platform.is_windows()
-        if on_windows:
-            # `run\` is the runner account's to create in; the handover dir is the daemon's own (`state\`).
-            _ensure_runner_dir(runtime_dir)
-            os.makedirs(_login_handover_dir(slug), exist_ok=True)
-        else:
-            _account_add_runtime_root().mkdir(mode=runtime_dir_mode, parents=True, exist_ok=True)
-            os.makedirs(runtime_dir, mode=runtime_dir_mode, exist_ok=True)
-        if delegated and not on_windows:
-            # `exist_ok=True` does not chmod an existing dir, so state the modes.
-            _share_with_session_user(_account_add_runtime_root(), runtime_dir_mode)
-            _share_with_session_user(runtime_dir, runtime_dir_mode)
-        # The freshness baseline, node-local (`_pre_creds_mtime_path`).
-        baseline = "" if pre_creds_mtime is None else repr(pre_creds_mtime)
-        if on_windows:
-            # O_EXCL there: the daemon-only dir admits no plant, and phase 2 reads only the daemon's own create.
-            _create_login_runtime_file(_pre_creds_mtime_path(slug), 0o600, baseline)
-            _create_login_runtime_file(_login_store_path(slug), 0o600, securestorage_dir)
-        else:
-            _pre_creds_mtime_path(slug).write_text(baseline)
-            # The store the baseline was taken of, and (below) the vendor, for phase 2.
-            _login_store_path(slug).write_text(securestorage_dir)
-        # Written only for a provider (absent reads as Claude). Via `_create_login_runtime_file`, and 0600,
-        # not `ipc_mode`: it is not IPC, and group write would let any runner pick phase 2's binary.
-        if declared is not None:
-            _create_login_runtime_file(_login_provider_path(slug), 0o600, provider)
-        # This login's seal key, minted here and stored 0600 like the vendor handover: phase 2 unseals
-        # the pasted code with it. The PEM never reaches a log or a reply.
-        try:
-            seal_pem = login_seal.new_private_key()
-        except login_seal.SealError as exc:
-            error = f"login_seal_invalid: {exc}"
-            log.warning("login start for %s could not mint its seal key: %s", slug, error)
-            return _fail("creating_dir", error, started_at)
-        _create_login_runtime_file(_login_seal_key_path(slug), 0o600, seal_pem.decode())
-
-        # 2) awaiting_oauth — spawn the DETACHED login (no window) and read the manual URL from its
-        #    stdout log.
-        _set_provisioning(config_dir,
-                          _prov_block("awaiting_oauth", started_at=started_at, pre_creds_mtime=pre_creds_mtime),
-                          slug=slug)
-        # The daemon owns the IPC files whichever uid runs the login (it scrapes the log, writes the FIFO).
-        # No FIFO on Windows: the code arrives later as a file (`_deliver_login_code`), so nothing is made now.
-        if not on_windows:
-            os.mkfifo(fifo_path, mode=ipc_mode)
-        # Symlink-safe create (`O_EXCL|O_NOFOLLOW`): a planted link would otherwise be truncated as the daemon.
-        if on_windows:
-            # Pinned on the create's OWN descriptor: with no `O_NOFOLLOW` a reopen by name would follow a link
-            # the runner swapped in between, and the tail read through it goes to the control plane.
-            log_pin = _ScrapedLog(log_path, _create_login_runtime_file(log_path, ipc_mode, keep_open=True))
-        else:
-            _create_login_runtime_file(log_path, ipc_mode)
-            # Pin the read side now, before the file is shared or written (see `_ScrapedLog`).
-            log_pin = _ScrapedLog.pinned(log_path)
-        if delegated and not on_windows:
-            # mkfifo applies the umask, so share explicitly — fd-based, since a path-based share could be
-            # redirected by a runner re-planting the name (see `_share_fifo_with_session_user`).
-            _share_fifo_with_session_user(fifo_path, ipc_mode)
-            # The log is deliberately NOT shared here: its create already set mode and group on the fd, so
-            # a path-based share could only be a no-op or a hijack.
-        _spawn_login_process(config_dir, fifo_path, log_path, pid_path, securestorage_dir, *vendor_arg)
-
-        oauth_url = _scrape_oauth_url(log_pin, time.monotonic() + _OAUTH_SCRAPE_TIMEOUT, *vendor_arg)
-        if oauth_url is None:
-            # No URL in the window. The vendor is asked first: it may know the login can never succeed
-            # here (an admin-gated login, D13). Its answer is a closed-set code, never log tail.
-            declared_refusal = _contained_refusal(params, _login_log_tail(log_pin))
-            if declared_refusal:
-                error = f"login_provider_refused: {declared_refusal}"
+                _account_add_runtime_root().mkdir(mode=runtime_dir_mode, parents=True, exist_ok=True)
+                os.makedirs(runtime_dir, mode=runtime_dir_mode, exist_ok=True)
+            if delegated and not on_windows:
+                # `exist_ok=True` does not chmod an existing dir, so state the modes.
+                _share_with_session_user(_account_add_runtime_root(), runtime_dir_mode)
+                _share_with_session_user(runtime_dir, runtime_dir_mode)
+            # The freshness baseline, node-local (`_pre_creds_mtime_path`).
+            baseline = "" if pre_creds_mtime is None else repr(pre_creds_mtime)
+            if on_windows:
+                # O_EXCL there: the daemon-only dir admits no plant, and phase 2 reads only the daemon's own create.
+                _create_login_runtime_file(_pre_creds_mtime_path(slug), 0o600, baseline)
+                _create_login_runtime_file(_login_store_path(slug), 0o600, securestorage_dir)
             else:
-                error = _scrape_failure_error(log_pin, *vendor_arg)
-            log.warning("login start for %s scraped no authorization URL: %s", slug, error)
-            return _fail("awaiting_oauth", error, started_at)
+                _pre_creds_mtime_path(slug).write_text(baseline)
+                # The store the baseline was taken of, and (below) the vendor, for phase 2.
+                _login_store_path(slug).write_text(securestorage_dir)
+            # Written only for a provider (absent reads as Claude). Via `_create_login_runtime_file`, and 0600,
+            # not `ipc_mode`: it is not IPC, and group write would let any runner pick phase 2's binary.
+            if declared is not None:
+                _create_login_runtime_file(_login_provider_path(slug), 0o600, provider)
+            # This login's seal key, minted here and stored 0600 like the vendor handover: phase 2 unseals
+            # the pasted code with it. The PEM never reaches a log or a reply.
+            try:
+                seal_pem = login_seal.new_private_key()
+            except login_seal.SealError as exc:
+                error = f"login_seal_invalid: {exc}"
+                log.warning("login start for %s could not mint its seal key: %s", slug, error)
+                return _fail("creating_dir", error, started_at)
+            _create_login_runtime_file(_login_seal_key_path(slug), 0o600, seal_pem.decode())
 
-        # 3) awaiting_code — URL surfaced; `awaiting_code` in both modes (a stored wire value).
-        _set_provisioning(config_dir,
-                          _prov_block("awaiting_code", oauth_url=oauth_url, started_at=started_at,
-                                      pre_creds_mtime=pre_creds_mtime),
-                          slug=slug)
-        # `securestorage_dir` is an OBSERVATION: the store this login mints into (`""` for a node-pinned
-        # provider). Present (not omitted) so absence means only "too old to say"; a path, so the CP can check
-        # equality against its own derivation.
-        # `login_completion` (provider only) reports the mode actually driven, since the two sides'
-        # catalogues may disagree across a deploy; absent for Claude (byte-identical).
-        reply = {"status": "awaiting_code", "config_dir": config_dir, "securestorage_dir": securestorage_dir}
-        # The sealed handoff: the URL readable only by the browser that sent `peer_key`, and this login's
-        # public key for the code coming back. `oauth_url` is deliberately NOT in the reply — the control
-        # plane must never hold it.
-        if len(oauth_url.encode("utf-8")) > _OAUTH_URL_MAX_BYTES:
-            # Bounded here, not by the control plane, which never sees the plaintext: an over-long URL
-            # would seal to a blob over its wire bound and fail there as a generic start failure.
-            error = ("oauth_url_scrape_failed: the authorize URL is over the "
-                     f"{_OAUTH_URL_MAX_BYTES}-byte bound")
-            log.warning("login start for %s scraped an over-long authorization URL: %s", slug, error)
-            return _fail("awaiting_oauth", error, started_at)
-        try:
-            reply["sealed_url"] = login_seal.seal(peer_key, oauth_url)
-            reply["seal_key"] = login_seal.public_key_b64(seal_pem)
-        except login_seal.SealError as exc:
-            error = f"login_seal_invalid: {exc}"
-            log.warning("login start for %s could not seal its authorization URL: %s", slug, error)
-            return _fail("awaiting_oauth", error, started_at)
-        if declared is not None:
-            reply["login_completion"] = (agent_providers.PASTE_CODE if paste_mode
-                                         else agent_providers.AWAIT_CREDENTIALS)
-        # `user_code` (provider only), scraped after the URL is in hand. Present — even `""` — whenever the
-        # vendor declares one, so absence means only "link-only login" (see `_scrape_user_code`). It is the
-        # RFC 8628 USER code, never the `device_code` polling secret; it goes into the reply, no log line.
-        user_code = _scrape_user_code(log_pin, time.monotonic() + _USER_CODE_SCRAPE_TIMEOUT, *vendor_arg)
-        if user_code is not None:
-            reply["user_code"] = user_code
-        return {"exit_code": 0, "stdout": json.dumps(reply), "stderr": ""}
-    except _LoginRuntimeUnsafe as exc:
-        # An occupied runtime path: before the `RuntimeError` arm (it subclasses it), under its own code,
-        # since it is a hostile act, not a broken host.
-        log.error("login start refused an occupied runtime path for %s: %s", slug, exc)
-        return _fail("awaiting_oauth", f"login_runtime_unsafe: {exc}", started_at)
-    except RuntimeError as exc:
-        # `_spawn_login_process`'s operator-diagnosable failures: the message travels to the console.
-        log.warning("login start could not spawn the login process for %s: %s", slug, exc)
-        return _fail("awaiting_oauth", f"login_spawn_failed: {exc}", started_at)
-    except Exception:
-        # Anything unexpected lands on a terminal error with the runtime cleaned up (`_fail` is idempotent).
-        log.exception("login start failed unexpectedly for %s", slug)
-        return _fail("awaiting_oauth", fail_code, started_at)
-    finally:
-        # The pinned log fd is released here and nowhere else; `close()` never raises.
-        if log_pin is not None:
-            log_pin.close()
-        try:
-            host_platform.unlock(lock_fh)
+            # 2) awaiting_oauth — spawn the DETACHED login (no window) and read the manual URL from its
+            #    stdout log.
+            _set_provisioning(config_dir,
+                              _prov_block("awaiting_oauth", started_at=started_at, pre_creds_mtime=pre_creds_mtime),
+                              slug=slug)
+            # The daemon owns the IPC files whichever uid runs the login (it scrapes the log, writes the FIFO).
+            # No FIFO on Windows: the code arrives later as a file (`_deliver_login_code`), so nothing is made now.
+            if not on_windows:
+                os.mkfifo(fifo_path, mode=ipc_mode)
+            # Symlink-safe create (`O_EXCL|O_NOFOLLOW`): a planted link would otherwise be truncated as the daemon.
+            if on_windows:
+                # Pinned on the create's OWN descriptor: with no `O_NOFOLLOW` a reopen by name would follow a link
+                # the runner swapped in between, and the tail read through it goes to the control plane.
+                log_pin = _ScrapedLog(log_path, _create_login_runtime_file(log_path, ipc_mode, keep_open=True))
+            else:
+                _create_login_runtime_file(log_path, ipc_mode)
+                # Pin the read side now, before the file is shared or written (see `_ScrapedLog`).
+                log_pin = _ScrapedLog.pinned(log_path)
+            if delegated and not on_windows:
+                # mkfifo applies the umask, so share explicitly — fd-based, since a path-based share could be
+                # redirected by a runner re-planting the name (see `_share_fifo_with_session_user`).
+                _share_fifo_with_session_user(fifo_path, ipc_mode)
+                # The log is deliberately NOT shared here: its create already set mode and group on the fd, so
+                # a path-based share could only be a no-op or a hijack.
+            _spawn_login_process(config_dir, fifo_path, log_path, pid_path, securestorage_dir, *vendor_arg)
+
+            oauth_url = _scrape_oauth_url(log_pin, time.monotonic() + _OAUTH_SCRAPE_TIMEOUT, *vendor_arg)
+            if oauth_url is None:
+                # No URL in the window. The vendor is asked first: it may know the login can never succeed
+                # here (an admin-gated login, D13). Its answer is a closed-set code, never log tail.
+                declared_refusal = _contained_refusal(params, _login_log_tail(log_pin))
+                if declared_refusal:
+                    error = f"login_provider_refused: {declared_refusal}"
+                else:
+                    error = _scrape_failure_error(log_pin, *vendor_arg)
+                log.warning("login start for %s scraped no authorization URL: %s", slug, error)
+                return _fail("awaiting_oauth", error, started_at)
+
+            # 3) awaiting_code — URL surfaced; `awaiting_code` in both modes (a stored wire value).
+            _set_provisioning(config_dir,
+                              _prov_block("awaiting_code", oauth_url=oauth_url, started_at=started_at,
+                                          pre_creds_mtime=pre_creds_mtime),
+                              slug=slug)
+            # `securestorage_dir` is an OBSERVATION: the store this login mints into (`""` for a node-pinned
+            # provider). Present (not omitted) so absence means only "too old to say"; a path, so the CP can check
+            # equality against its own derivation.
+            # `login_completion` (provider only) reports the mode actually driven, since the two sides'
+            # catalogues may disagree across a deploy; absent for Claude (byte-identical).
+            reply = {"status": "awaiting_code", "config_dir": config_dir, "securestorage_dir": securestorage_dir}
+            # The sealed handoff: the URL readable only by the browser that sent `peer_key`, and this login's
+            # public key for the code coming back. `oauth_url` is deliberately NOT in the reply — the control
+            # plane must never hold it.
+            if len(oauth_url.encode("utf-8")) > _OAUTH_URL_MAX_BYTES:
+                # Bounded here, not by the control plane, which never sees the plaintext: an over-long URL
+                # would seal to a blob over its wire bound and fail there as a generic start failure.
+                error = ("oauth_url_scrape_failed: the authorize URL is over the "
+                         f"{_OAUTH_URL_MAX_BYTES}-byte bound")
+                log.warning("login start for %s scraped an over-long authorization URL: %s", slug, error)
+                return _fail("awaiting_oauth", error, started_at)
+            try:
+                reply["sealed_url"] = login_seal.seal(peer_key, oauth_url)
+                reply["seal_key"] = login_seal.public_key_b64(seal_pem)
+            except login_seal.SealError as exc:
+                error = f"login_seal_invalid: {exc}"
+                log.warning("login start for %s could not seal its authorization URL: %s", slug, error)
+                return _fail("awaiting_oauth", error, started_at)
+            if declared is not None:
+                reply["login_completion"] = (agent_providers.PASTE_CODE if paste_mode
+                                             else agent_providers.AWAIT_CREDENTIALS)
+            # `user_code` (provider only), scraped after the URL is in hand. Present — even `""` — whenever the
+            # vendor declares one, so absence means only "link-only login" (see `_scrape_user_code`). It is the
+            # RFC 8628 USER code, never the `device_code` polling secret; it goes into the reply, no log line.
+            user_code = _scrape_user_code(log_pin, time.monotonic() + _USER_CODE_SCRAPE_TIMEOUT, *vendor_arg)
+            if user_code is not None:
+                reply["user_code"] = user_code
+            return _reply(0, reply)
+        except _LoginRuntimeUnsafe as exc:
+            # An occupied runtime path: before the `RuntimeError` arm (it subclasses it), under its own code,
+            # since it is a hostile act, not a broken host.
+            log.error("login start refused an occupied runtime path for %s: %s", slug, exc)
+            return _fail("awaiting_oauth", f"login_runtime_unsafe: {exc}", started_at)
+        except RuntimeError as exc:
+            # `_spawn_login_process`'s operator-diagnosable failures: the message travels to the console.
+            log.warning("login start could not spawn the login process for %s: %s", slug, exc)
+            return _fail("awaiting_oauth", f"login_spawn_failed: {exc}", started_at)
         except Exception:
-            pass
-        lock_fh.close()
+            # Anything unexpected lands on a terminal error with the runtime cleaned up (`_fail` is idempotent).
+            log.exception("login start failed unexpectedly for %s", slug)
+            return _fail("awaiting_oauth", fail_code, started_at)
+        finally:
+            # The pinned log fd is released here and nowhere else; `close()` never raises.
+            if log_pin is not None:
+                log_pin.close()
 
 
 def _account_add(slug: str, run, *, provider: str = agent_providers.DEFAULT_PROVIDER,
@@ -2247,7 +2217,7 @@ def _account_add(slug: str, run, *, provider: str = agent_providers.DEFAULT_PROV
 
     `provider` and `peer_key` are relayed, not judged."""
     if not _SLUG_RE.match(slug or ""):
-        return {"exit_code": -1, "stdout": "", "stderr": f"invalid slug: {slug!r}"}
+        return _reply(-1, err=f"invalid slug: {slug!r}")
     config_dir = str(Path(jaah_home()) / "auth" / slug)
     return _login_start(slug, config_dir, run, provider=provider, peer_key=peer_key)
 
@@ -2262,10 +2232,10 @@ def _account_reauth(slug: str, run, *, provider: str = agent_providers.DEFAULT_P
       persisting nothing. A cheap pre-flock reject; `_login_start` re-asserts it under the flock.
     - Never creates or re-enables an account (enabled is the DB's)."""
     if not _SLUG_RE.match(slug or ""):
-        return {"exit_code": -1, "stdout": "", "stderr": f"invalid slug: {slug!r}"}
+        return _reply(-1, err=f"invalid slug: {slug!r}")
     config_dir = str(Path(jaah_home()) / "auth" / slug)
     if not Path(config_dir).is_dir():
-        return {"exit_code": 1, "stdout": "", "stderr": "account_not_found"}
+        return _reply(1, err="account_not_found")
     return _login_start(slug, config_dir, run, require_existing=True, fail_code="account_reauth_failed",
                         provider=provider, peer_key=peer_key)
 
@@ -2280,7 +2250,7 @@ def _finalize_account_add(config_dir: str, slug: str, oauth_url: str | None, sta
     def _fail(step: str, error: str) -> dict:
         _set_provisioning(config_dir, _prov_block(step, status="error", error=error, started_at=started_at),
                           slug=slug)
-        return {"exit_code": 1, "stdout": "", "stderr": error}
+        return _reply(1, err=error)
 
     # The vendor from phase 1's record: this verb carries no `provider`.
     adapter = _declared_login_adapter(_read_login_provider(slug))
@@ -2295,8 +2265,7 @@ def _finalize_account_add(config_dir: str, slug: str, oauth_url: str | None, sta
         except Exception:  # noqa: BLE001 — see above: a degraded agent layer must not strand a credential
             log.exception("provider agent layer failed for %s — the account is registered but degraded",
                           slug)
-        return {"exit_code": 0, "stdout": json.dumps({"status": "done", "config_dir": config_dir}),
-                "stderr": ""}
+        return _reply(0, {"status": "done", "config_dir": config_dir})
 
     # 4) omc_check — install/repair OMC into the new account's Claude home. A new account's `plugins` is
     #    first linked at the node tree's shared root, so this installs into the one copy (no-op when OMC is
@@ -2348,8 +2317,7 @@ def _finalize_account_add(config_dir: str, slug: str, oauth_url: str | None, sta
                     slug, type(exc).__name__, exc)
 
     # 9) registering / 10) done — the CP clears provisioning to `done` from this reply.
-    return {"exit_code": 0, "stdout": json.dumps({"status": "done", "config_dir": config_dir}),
-            "stderr": ""}
+    return _reply(0, {"status": "done", "config_dir": config_dir})
 
 
 def _drop_credential_link(config_dir: str, provider: str) -> None:
@@ -2483,6 +2451,38 @@ def _account_add_lock_path(slug: str) -> Path:
     return locks_dir / f"account-add-{slug}.lock"
 
 
+@contextlib.contextmanager
+def _slug_lock(slug: str) -> Iterator[bool]:
+    """`_account_add_lock_path(slug)` taken non-blocking for the block: True holding it (released on exit; a
+    failed unlock is swallowed, the close releases it anyway), False when another flow holds it."""
+    lock_fh = open(_account_add_lock_path(slug), "a+")
+    try:
+        try:
+            host_platform.lock(lock_fh, blocking=False)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            try:
+                host_platform.unlock(lock_fh)
+            except Exception:
+                pass
+    finally:
+        lock_fh.close()
+
+
+# What a contended slug lock answers (the console reads `in_progress_elsewhere`): one spelling per verb family,
+# a fresh dict per call so no caller mutates the next reply.
+def _LOGIN_BUSY() -> dict:
+    return _reply(1, {"status": "in_progress_elsewhere"}, "another login is in progress for this slug")
+
+
+def _DELETE_BUSY() -> dict:
+    return _reply(1, err="account_add is in progress for this slug — cannot delete")
+
+
 class _LoginRefused(Exception):
     """`_login_readback`'s refusal, carrying the verb's answer."""
 
@@ -2510,7 +2510,7 @@ def _login_readback(slug: str, half: str) -> tuple[str, str, str, str, tuple]:
                    or _login_store_refusal(slug, securestorage_dir))
     if refusal:
         log.warning("login %s refused for %s: %s", half, slug, refusal)
-        raise _LoginRefused({"exit_code": 1, "stdout": "", "stderr": refusal})
+        raise _LoginRefused(_reply(1, err=refusal))
     return config_dir, securestorage_dir, stored_provider, declared, vendor_arg
 
 
@@ -2531,10 +2531,10 @@ def _login_submit_code(slug: str, sealed_code: str | None, finalize, *,
     import time
 
     if not _SLUG_RE.match(slug or ""):
-        return {"exit_code": -1, "stdout": "", "stderr": f"invalid slug: {slug!r}"}
+        return _reply(-1, err=f"invalid slug: {slug!r}")
     if not login_seal.is_wire_sealed(sealed_code):
         # Shape only, pre-lock: the login stays alive for a re-paste.
-        return {"exit_code": -1, "stdout": "", "stderr": "login_seal_invalid: malformed sealed code"}
+        return _reply(-1, err="login_seal_invalid: malformed sealed code")
 
     try:
         config_dir, securestorage_dir, stored_provider, declared, vendor_arg = _login_readback(slug, "submit_code")
@@ -2547,96 +2547,85 @@ def _login_submit_code(slug: str, sealed_code: str | None, finalize, *,
         _cleanup_account_add_runtime(slug)
         _set_provisioning(config_dir, _prov_block(step, status="error", error=error, started_at=started_at),
                           slug=slug)
-        return {"exit_code": 1, "stdout": "", "stderr": error}
+        return _reply(1, err=error)
 
     # `_login_start`'s lock, so a phase-2 submit never races a phase-1 start.
-    lock_fh = open(_account_add_lock_path(slug), "a+")
-    try:
+    with _slug_lock(slug) as taken:
+        if not taken:
+            return _LOGIN_BUSY()
         try:
-            host_platform.lock(lock_fh, blocking=False)
-        except OSError:
-            lock_fh.close()
-            return {"exit_code": 1, "stdout": json.dumps({"status": "in_progress_elsewhere"}),
-                    "stderr": "another login is in progress for this slug"}
+            started_at = _now_iso()
+            oauth_url = None
+            # Phase 1's pre-attempt snapshot (a re-auth's dir already holds the dead file).
+            pre_mtime = _read_pre_creds_mtime(slug)
 
-        started_at = _now_iso()
-        oauth_url = None
-        # Phase 1's pre-attempt snapshot (a re-auth's dir already holds the dead file).
-        pre_mtime = _read_pre_creds_mtime(slug)
+            # The login must still be alive: its PKCE verifier lives only in its memory.
+            try:
+                pid = int(_read_runner_text(pid_path).strip())
+            except (FileNotFoundError, ValueError):
+                return _fail("awaiting_code", "login_process_gone", started_at)
+            if not _pid_alive(pid):
+                return _fail("awaiting_code", "login_process_gone", started_at)
 
-        # The login must still be alive: its PKCE verifier lives only in its memory.
-        try:
-            pid = int(_read_runner_text(pid_path).strip())
-        except (FileNotFoundError, ValueError):
-            return _fail("awaiting_code", "login_process_gone", started_at)
-        if not _pid_alive(pid):
-            return _fail("awaiting_code", "login_process_gone", started_at)
+            # Under the flock and only for a live login: the key is this attempt's, and a stale one is a
+            # `login_process_gone` above, never a misleading seal error. Neither the PEM nor the plaintext is
+            # logged.
+            seal_pem = _read_login_seal_key(slug)
+            if seal_pem is None:
+                return _fail("awaiting_code", "login_seal_invalid: this login has no seal key on this node "
+                             "(its runtime dir is gone)", started_at)
+            try:
+                code = login_seal.unseal(seal_pem, sealed_code)
+            except login_seal.SealError as exc:
+                return _fail("awaiting_code", f"login_seal_invalid: {exc}", started_at)
+            if not _OAUTH_CODE_RE.match(code):
+                # Non-terminal: the login stays alive for a re-paste.
+                return _reply(-1, err="invalid or missing authorization code")
 
-        # Under the flock and only for a live login: the key is this attempt's, and a stale one is a
-        # `login_process_gone` above, never a misleading seal error. Neither the PEM nor the plaintext is
-        # logged.
-        seal_pem = _read_login_seal_key(slug)
-        if seal_pem is None:
-            return _fail("awaiting_code", "login_seal_invalid: this login has no seal key on this node "
-                         "(its runtime dir is gone)", started_at)
-        try:
-            code = login_seal.unseal(seal_pem, sealed_code)
-        except login_seal.SealError as exc:
-            return _fail("awaiting_code", f"login_seal_invalid: {exc}", started_at)
-        if not _OAUTH_CODE_RE.match(code):
-            # Non-terminal: the login stays alive for a re-paste.
-            return {"exit_code": -1, "stdout": "", "stderr": "invalid or missing authorization code"}
+            _set_provisioning(config_dir,
+                              _prov_block("polling_login", oauth_url=oauth_url, started_at=started_at,
+                                          pre_creds_mtime=pre_mtime),
+                              slug=slug)
 
-        _set_provisioning(config_dir,
-                          _prov_block("polling_login", oauth_url=oauth_url, started_at=started_at,
-                                      pre_creds_mtime=pre_mtime),
-                          slug=slug)
+            if not _deliver_login_code(fifo_path, code, pid):
+                return _fail("awaiting_code", "login_process_gone", started_at)
 
-        if not _deliver_login_code(fifo_path, code, pid):
-            return _fail("awaiting_code", "login_process_gone", started_at)
+            # Poll for a fresh credential, bounded under the command timeout.
+            poll_deadline = time.monotonic() + _LOGIN_POLL_TIMEOUT
+            while True:
+                # Freshness is the vendor's (`_login_creds_fresh`).
+                if _login_creds_fresh(declared, config_dir, securestorage_dir, pre_mtime):
+                    break
+                # A bad code makes the CLI print `Login failed: …` and re-prompt WITHOUT exiting (its FIFO
+                # stdin never EOFs), so detect rejection from the log — not just from a process exit.
+                if _login_failed_in_log(log_path, *vendor_arg):
+                    return _fail("polling_login", "login_rejected", started_at)
+                if not _pid_alive(pid) and not _login_creds_fresh(
+                        declared, config_dir, securestorage_dir, pre_mtime):
+                    # Exited without writing a fresh credential ⇒ rejected. The second `_login_creds_fresh` is a
+                    # race check, not a repeat: a CLI may write and exit between the two — do not hoist it.
+                    return _fail("polling_login", _login_exited_error(declared, config_dir, securestorage_dir),
+                                 started_at)
+                if time.monotonic() > poll_deadline:
+                    return _fail("polling_login", "login_timeout", started_at)
+                time.sleep(_LOGIN_POLL_INTERVAL)
 
-        # Poll for a fresh credential, bounded under the command timeout.
-        poll_deadline = time.monotonic() + _LOGIN_POLL_TIMEOUT
-        while True:
-            # Freshness is the vendor's (`_login_creds_fresh`).
-            if _login_creds_fresh(declared, config_dir, securestorage_dir, pre_mtime):
-                break
-            # A bad code makes the CLI print `Login failed: …` and re-prompt WITHOUT exiting (its FIFO
-            # stdin never EOFs), so detect rejection from the log — not just from a process exit.
-            if _login_failed_in_log(log_path, *vendor_arg):
-                return _fail("polling_login", "login_rejected", started_at)
-            if not _pid_alive(pid) and not _login_creds_fresh(
-                    declared, config_dir, securestorage_dir, pre_mtime):
-                # Exited without writing a fresh credential ⇒ rejected. The second `_login_creds_fresh` is a
-                # race check, not a repeat: a CLI may write and exit between the two — do not hoist it.
-                return _fail("polling_login", _login_exited_error(declared, config_dir, securestorage_dir),
-                             started_at)
-            if time.monotonic() > poll_deadline:
-                return _fail("polling_login", "login_timeout", started_at)
-            time.sleep(_LOGIN_POLL_INTERVAL)
-
-        # Reap the login BEFORE finalize: a CLI that stays alive could flush its settings over what
-        # finalize just registered. Only the process: the runtime dir holds the provider handover
-        # finalize reads, so it is removed after.
-        _kill_login_proc(pid_path)
-        published = (_publish_shared_login(slug, config_dir, securestorage_dir, stored_provider)
-                     or _login_unreadable_refusal(config_dir, stored_provider))
-        if published:
-            return _fail("polling_login", published, started_at)
-        result = finalize(config_dir, oauth_url, started_at)
-        # Remove the runtime dir (the repeated kill is idempotent).
-        _cleanup_account_add_runtime(slug)
-        return result
-    except Exception:
-        # Same terminal-error guarantee as phase 1.
-        log.exception("login submit_code failed unexpectedly for %s", slug)
-        return _fail("polling_login", fail_code, started_at)
-    finally:
-        try:
-            host_platform.unlock(lock_fh)
+            # Reap the login BEFORE finalize: a CLI that stays alive could flush its settings over what
+            # finalize just registered. Only the process: the runtime dir holds the provider handover
+            # finalize reads, so it is removed after.
+            _kill_login_proc(pid_path)
+            published = (_publish_shared_login(slug, config_dir, securestorage_dir, stored_provider)
+                         or _login_unreadable_refusal(config_dir, stored_provider))
+            if published:
+                return _fail("polling_login", published, started_at)
+            result = finalize(config_dir, oauth_url, started_at)
+            # Remove the runtime dir (the repeated kill is idempotent).
+            _cleanup_account_add_runtime(slug)
+            return result
         except Exception:
-            pass
-        lock_fh.close()
+            # Same terminal-error guarantee as phase 1.
+            log.exception("login submit_code failed unexpectedly for %s", slug)
+            return _fail("polling_login", fail_code, started_at)
 
 
 # Runs AS THE RUNNER ACCOUNT: the code arrives on stdin (never argv, env or a log), lands beside the code file
@@ -2692,8 +2681,7 @@ def _reauth_finalizer(slug: str):
     strips."""
     def _finalize(config_dir: str, oauth_url: str | None, started_at: str) -> dict:
         _reassert_provider_agent_layer(slug, config_dir)
-        return {"exit_code": 0, "stdout": json.dumps({"status": "done", "config_dir": config_dir}),
-                "stderr": ""}
+        return _reply(0, {"status": "done", "config_dir": config_dir})
     return _finalize
 
 
@@ -2753,7 +2741,7 @@ def _login_await_redirect(slug: str, finalize, *, fail_code: str = "account_add_
     import time
 
     if not _SLUG_RE.match(slug or ""):
-        return {"exit_code": -1, "stdout": "", "stderr": f"invalid slug: {slug!r}"}
+        return _reply(-1, err=f"invalid slug: {slug!r}")
 
     try:
         config_dir, securestorage_dir, stored_provider, declared, vendor_arg = _login_readback(slug, "await_redirect")
@@ -2761,7 +2749,6 @@ def _login_await_redirect(slug: str, finalize, *, fail_code: str = "account_add_
         return refused.result
 
     _, _, log_path, pid_path = _account_add_runtime(slug)
-    lock_path = _account_add_lock_path(slug)
 
     started_at = _now_iso()
     # Phase 1's pre-attempt snapshot (a re-auth's dir already holds the dead file).
@@ -2774,24 +2761,15 @@ def _login_await_redirect(slug: str, finalize, *, fail_code: str = "account_add_
     def _fail(step: str, error: str) -> dict:
         """Terminal arm: reap the login and persist the error. Cleans up only under the flock and only for
         this wait's own pid (a phase-1 restart may own the dir now); on contention, touches nothing."""
-        lock_fh = open(lock_path, "a+")
-        try:
-            try:
-                host_platform.lock(lock_fh, blocking=False)
-            except OSError:
+        with _slug_lock(slug) as taken:
+            if not taken:
                 log.warning("await_redirect for %s reporting %s without cleanup — another login flow "
                             "holds the slug lock", slug, error)
-            else:
-                try:
-                    if _read_login_pid(pid_path) in (None, pid):
-                        _cleanup_account_add_runtime(slug)
-                finally:
-                    host_platform.unlock(lock_fh)
-        finally:
-            lock_fh.close()
+            elif _read_login_pid(pid_path) in (None, pid):
+                _cleanup_account_add_runtime(slug)
         _set_provisioning(config_dir, _prov_block(step, status="error", error=error, started_at=started_at),
                           slug=slug)
-        return {"exit_code": 1, "stdout": "", "stderr": error}
+        return _reply(1, err=error)
 
     # ── observe, lock-free ──────────────────────────────────────────────────────────────────────────────
     # The login holds the device-auth poll. Read ONCE: this pid is the wait's identity.
@@ -2825,54 +2803,42 @@ def _login_await_redirect(slug: str, finalize, *, fail_code: str = "account_add_
                 return _fail("polling_login", "login_timeout")
             if time.monotonic() > poll_deadline:
                 # NON-TERMINAL: no cleanup, no SIGTERM — the login is still polling the vendor for its grant.
-                return {"exit_code": 0, "stdout": json.dumps({"status": "awaiting_redirect"}), "stderr": ""}
+                return _reply(0, {"status": "awaiting_redirect"})
             time.sleep(_LOGIN_POLL_INTERVAL)
     except Exception:
         log.exception("login await_redirect failed unexpectedly while polling for %s", slug)
         return _fail("polling_login", fail_code)
 
     # ── finish, under the flock ─────────────────────────────────────────────────────────────────────────
-    lock_fh = open(lock_path, "a+")
-    try:
+    with _slug_lock(slug) as taken:
+        if not taken:
+            return _LOGIN_BUSY()
         try:
-            host_platform.lock(lock_fh, blocking=False)
-        except OSError:
-            lock_fh.close()
-            return {"exit_code": 1, "stdout": json.dumps({"status": "in_progress_elsewhere"}),
-                    "stderr": "another login is in progress for this slug"}
+            # Re-verify the pid: a phase-1 restart may own this slug now; never adopt or reap it.
+            current = _read_login_pid(pid_path)
+            if current is not None and current != pid:
+                log.warning("await_redirect for %s found login pid %s where it was waiting on %s — another "
+                            "phase 1 restarted this slug", slug, current, pid)
+                return _LOGIN_BUSY()
 
-        # Re-verify the pid: a phase-1 restart may own this slug now; never adopt or reap it.
-        current = _read_login_pid(pid_path)
-        if current is not None and current != pid:
-            log.warning("await_redirect for %s found login pid %s where it was waiting on %s — another "
-                        "phase 1 restarted this slug", slug, current, pid)
-            return {"exit_code": 1, "stdout": json.dumps({"status": "in_progress_elsewhere"}),
-                    "stderr": "another login is in progress for this slug"}
-
-        # Reaped before the finalize, for `_login_submit_code`'s reason.
-        _kill_login_proc(pid_path)
-        published = (_publish_shared_login(slug, config_dir, securestorage_dir, stored_provider)
-                     or _login_unreadable_refusal(config_dir, stored_provider))
-        if published:
-            return _fail("polling_login", published)
-        result = finalize(config_dir, None, started_at)
-        # Remove the runtime dir (the repeated kill is idempotent).
-        _cleanup_account_add_runtime(slug)
-        return result
-    except Exception:
-        # Same terminal-error guarantee as both sibling phases.
-        log.exception("login await_redirect failed unexpectedly for %s", slug)
-        _cleanup_account_add_runtime(slug)
-        _set_provisioning(config_dir,
-                          _prov_block("polling_login", status="error", error=fail_code,
-                                      started_at=started_at), slug=slug)
-        return {"exit_code": 1, "stdout": "", "stderr": fail_code}
-    finally:
-        try:
-            host_platform.unlock(lock_fh)
+            # Reaped before the finalize, for `_login_submit_code`'s reason.
+            _kill_login_proc(pid_path)
+            published = (_publish_shared_login(slug, config_dir, securestorage_dir, stored_provider)
+                         or _login_unreadable_refusal(config_dir, stored_provider))
+            if published:
+                return _fail("polling_login", published)
+            result = finalize(config_dir, None, started_at)
+            # Remove the runtime dir (the repeated kill is idempotent).
+            _cleanup_account_add_runtime(slug)
+            return result
         except Exception:
-            pass
-        lock_fh.close()
+            # Same terminal-error guarantee as both sibling phases.
+            log.exception("login await_redirect failed unexpectedly for %s", slug)
+            _cleanup_account_add_runtime(slug)
+            _set_provisioning(config_dir,
+                              _prov_block("polling_login", status="error", error=fail_code,
+                                          started_at=started_at), slug=slug)
+            return _reply(1, err=fail_code)
 
 
 def _account_add_await_login(slug: str, run) -> dict:
@@ -2902,7 +2868,7 @@ def _account_delete(raw_config_dir: str) -> dict:
     per-slug flock."""
     config_dir = _norm_dir(raw_config_dir)
     if not config_dir:
-        return {"exit_code": -1, "stdout": "", "stderr": "account_delete needs config_dir"}
+        return _reply(-1, err="account_delete needs config_dir")
 
     # Function-local: `fleet_dispatch` pulls heavy imports at module scope.
     from fleet_dispatch import rebased_account_dir
@@ -2912,8 +2878,7 @@ def _account_delete(raw_config_dir: str) -> dict:
     # Auth root itself, or a DIRECT child only (spec R4) — not an arbitrary descendant, so a stale/buggy
     # caller passing a nested path errors instead of recursively deleting a subtree.
     if resolved != auth_root and resolved.parent != auth_root:
-        return {"exit_code": -1, "stdout": "",
-                "stderr": "account_delete: config_dir must be <jaah_home>/auth/ or a direct child of it"}
+        return _reply(-1, err="account_delete: config_dir must be <jaah_home>/auth/ or a direct child of it")
     # The token store is `auth/.shared` (`shared_storage.SHARED_ACCOUNTS_SEGMENT`): no slug starts with `.`, and a
     # sweep must never cross into a mount — it would erase every node's credentials in a mounted store.
     def is_mount(path: Path) -> bool:
@@ -2921,28 +2886,20 @@ def _account_delete(raw_config_dir: str) -> dict:
         return bool(shared_storage.mounts_under(str(path))) if host_platform.is_windows() else os.path.ismount(path)
 
     if resolved != auth_root and (resolved.name.startswith(".") or is_mount(resolved)):
-        return {"exit_code": -1, "stdout": "",
-                "stderr": "account_delete: config_dir names no account (a dot-dir or a mount point)"}
+        return _reply(-1, err="account_delete: config_dir names no account (a dot-dir or a mount point)")
     if resolved == auth_root:
         try:
             mounted = [child.name for child in auth_root.iterdir() if is_mount(child)]
         except OSError:
             mounted = []
         if mounted:
-            return {"exit_code": -1, "stdout": "",
-                    "stderr": f"account_delete: refusing to sweep {auth_root} while a share is mounted under it "
-                              f"({', '.join(sorted(mounted))}); delete the accounts one by one"}
+            return _reply(-1, err=f"account_delete: refusing to sweep {auth_root} while a share is mounted under "
+                                  f"it ({', '.join(sorted(mounted))}); delete the accounts one by one")
 
     slug = resolved.name
-    lock_fh = open(_account_add_lock_path(slug), "a+")
-    try:
-        host_platform.lock(lock_fh, blocking=False)
-    except OSError:
-        lock_fh.close()
-        return {"exit_code": 1, "stdout": "",
-                "stderr": "account_add is in progress for this slug — cannot delete"}
-
-    try:
+    with _slug_lock(slug) as taken:
+        if not taken:
+            return _DELETE_BUSY()
         # An add at `awaiting_code` holds no flock but leaves a detached login; kill it and its runtime.
         _cleanup_account_add_runtime(slug)
         # The CP decided: every process still using the account goes first, or its open files hold the tree.
@@ -2950,16 +2907,13 @@ def _account_delete(raw_config_dir: str) -> dict:
         failure = _remove_account_tree(resolved) if resolved.exists() else None
         if failure is None and resolved != auth_root:
             failure = _remove_local_store_leaf(slug)
-    finally:
-        host_platform.unlock(lock_fh)
-        lock_fh.close()
 
     if failure:
-        return {"exit_code": 1, "stdout": "", "stderr": failure}
+        return _reply(1, err=failure)
     # The forget: the account's place in the community edition's ledger is free again (a no-op on a cloud node).
     for forgotten in (ce_caps.admitted_accounts() if resolved == auth_root else [slug]):
         ce_caps.forget_account(api_key_account=forgotten)
-    return {"exit_code": 0, "stdout": json.dumps({"config_dir": config_dir, "deleted": True}), "stderr": ""}
+    return _reply(0, {"config_dir": config_dir, "deleted": True})
 
 
 def _remove_local_store_leaf(slug: str) -> str | None:
@@ -3155,7 +3109,7 @@ def _kill_account_users(paths: list[str]) -> None:
                 log.warning("account delete: no session user to stop the processes using %s", ", ".join(paths))
                 return
             proc = session_user.run_as_session_user(
-                ["python3", "-I", "-c", _KILL_USERS_PY],
+                [runner_env.python_cmd(), "-I", "-c", _KILL_USERS_PY],
                 env={"JAAH_KILL_UNDER": under, "PATH": session_user.delegated_path()}, timeout=30)
         else:
             proc = subprocess.run([sys.executable, "-I", "-c", _KILL_USERS_PY],
@@ -3224,12 +3178,11 @@ def _account_shared_delete(slug: str) -> dict:
     — never taken off the wire — and refused unless the leaf is a real (not symlinked) direct child of a
     real store root; the removal runs through a no-follow descriptor of that root."""
     if not _SLUG_RE.match(slug or ""):
-        return {"exit_code": -1, "stdout": "", "stderr": f"account_shared_delete: invalid slug: {slug!r}"}
+        return _reply(-1, err=f"account_shared_delete: invalid slug: {slug!r}")
     store = shared_storage.resolve_shared_auth_dir(slug)
     if not store:
-        return {"exit_code": 1, "stdout": "",
-                "stderr": "account_shared_delete: this node's token store is not usable right now (no "
-                          "JAAH_HOME, or a store mount that is not answering)"}
+        return _reply(1, err="account_shared_delete: this node's token store is not usable right now (no "
+                             "JAAH_HOME, or a store mount that is not answering)")
     root = shared_storage.account_token_root()
     # On Windows a mounted store's root IS a link — our NodeLink's (`share_mounted`), the only one accepted.
     # macOS: `.shared` is root's link to its staging mount; opened as that validated target, never followed blind.
@@ -3238,48 +3191,37 @@ def _account_shared_delete(slug: str) -> dict:
     opened = shared_storage.resolved_store_root(root)
     if not opened or (os.path.islink(opened) and not (windows and shared_storage.share_mounted())) \
             or os.path.islink(store) or paths.dirname(store) != root:
-        return {"exit_code": -1, "stdout": "",
-                "stderr": "account_shared_delete: the store must be a real direct child of the store root"}
+        return _reply(-1, err="account_shared_delete: the store must be a real direct child of the store root")
 
     slug = paths.basename(store)
-    lock_fh = open(_account_add_lock_path(slug), "a+")
-    try:
-        host_platform.lock(lock_fh, blocking=False)
-    except OSError:
-        lock_fh.close()
-        return {"exit_code": 1, "stdout": "",
-                "stderr": "account_add is in progress for this slug — cannot delete"}
-
-    root_fd = -1
-    try:
-        if windows:
-            return _remove_shared_leaf_windows(store, slug)
+    with _slug_lock(slug) as taken:
+        if not taken:
+            return _DELETE_BUSY()
+        root_fd = -1
         try:
-            root_fd = os.open(opened, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        except FileNotFoundError:
-            return {"exit_code": 0, "stdout": json.dumps({"slug": slug, "deleted": False, "absent": True}),
-                    "stderr": ""}
-        except OSError as exc:
-            return {"exit_code": 1, "stdout": "",
-                    "stderr": f"account_shared_delete: cannot open the store root ({type(exc).__name__})"}
-        try:
-            os.lstat(slug, dir_fd=root_fd)
-        except FileNotFoundError:
-            return {"exit_code": 0, "stdout": json.dumps({"slug": slug, "deleted": False, "absent": True}),
-                    "stderr": ""}
-        crossing = _mount_crossing(store)
-        if crossing:
-            return {"exit_code": 1, "stdout": "", "stderr": f"account_shared_delete: {crossing}"}
-        _kill_account_users(_account_paths(slug, store))
-        failure = _force_remove_leaf(root_fd, slug, store)
-        if failure:
-            return {"exit_code": 1, "stdout": "", "stderr": f"account_shared_delete: {failure}"}
-    finally:
-        if root_fd >= 0:
-            os.close(root_fd)
-        host_platform.unlock(lock_fh)
-        lock_fh.close()
-    return {"exit_code": 0, "stdout": json.dumps({"slug": slug, "deleted": True}), "stderr": ""}
+            if windows:
+                return _remove_shared_leaf_windows(store, slug)
+            try:
+                root_fd = os.open(opened, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                return _reply(0, {"slug": slug, "deleted": False, "absent": True})
+            except OSError as exc:
+                return _reply(1, err=f"account_shared_delete: cannot open the store root ({type(exc).__name__})")
+            try:
+                os.lstat(slug, dir_fd=root_fd)
+            except FileNotFoundError:
+                return _reply(0, {"slug": slug, "deleted": False, "absent": True})
+            crossing = _mount_crossing(store)
+            if crossing:
+                return _reply(1, err=f"account_shared_delete: {crossing}")
+            _kill_account_users(_account_paths(slug, store))
+            failure = _force_remove_leaf(root_fd, slug, store)
+            if failure:
+                return _reply(1, err=f"account_shared_delete: {failure}")
+        finally:
+            if root_fd >= 0:
+                os.close(root_fd)
+    return _reply(0, {"slug": slug, "deleted": True})
 
 
 def _remove_shared_leaf_windows(store: str, slug: str) -> dict:
@@ -3288,17 +3230,16 @@ def _remove_shared_leaf_windows(store: str, slug: str) -> dict:
     So the leaf is checked lexically (`store_is_on_share`) and `rm -rf` runs as the runner; whether a leaf
     behind the link existed cannot be told here, so a mounted store's removal reports `deleted`."""
     if not shared_storage.share_mounted() and not os.path.lexists(store):
-        return {"exit_code": 0, "stdout": json.dumps({"slug": slug, "deleted": False, "absent": True}), "stderr": ""}
+        return _reply(0, {"slug": slug, "deleted": False, "absent": True})
     if not shared_storage.store_is_on_share(store):
-        return {"exit_code": -1, "stdout": "",
-                "stderr": "account_shared_delete: the store must be a real direct child of the store root"}
+        return _reply(-1, err="account_shared_delete: the store must be a real direct child of the store root")
     crossing = _mount_crossing(store)
     if crossing:
-        return {"exit_code": 1, "stdout": "", "stderr": f"account_shared_delete: {crossing}"}
+        return _reply(1, err=f"account_shared_delete: {crossing}")
     err = session_user.remove_tree_as_session_user(store, timeout=60)
     if err:
-        return {"exit_code": 1, "stdout": "", "stderr": f"account_shared_delete: could not remove {store} ({err})"}
-    return {"exit_code": 0, "stdout": json.dumps({"slug": slug, "deleted": True}), "stderr": ""}
+        return _reply(1, err=f"account_shared_delete: could not remove {store} ({err})")
+    return _reply(0, {"slug": slug, "deleted": True})
 
 
 def _arg_peer_key(args: dict) -> str | None:
@@ -3340,13 +3281,12 @@ def _converge_shared_link_account(config_dir: str) -> dict | None:
     store = shared_storage.securestorage_dir(config_dir)
     if not store:
         if shared_storage.credential_file_present(config_dir, row.credential_file):
-            return {"exit_code": 0, "stdout": json.dumps({"linked": False}), "stderr": ""}
-        return {"exit_code": 1, "stdout": "",
-                "stderr": f"account_converge: {slug} has no credential on this node yet — nothing to link"}
+            return _reply(0, {"linked": False})
+        return _reply(1, err=f"account_converge: {slug} has no credential on this node yet — nothing to link")
     refusal = fleet_dispatch.ensure_shared_credential_link(config_dir, store, row.value, layer=True)
     if refusal:
-        return {"exit_code": 1, "stdout": "", "stderr": f"account_converge: {refusal}"}
-    return {"exit_code": 0, "stdout": json.dumps({"linked": True}), "stderr": ""}
+        return _reply(1, err=f"account_converge: {refusal}")
+    return _reply(0, {"linked": True})
 
 
 # The commands that put an account to use on this node, each with what it asks (the community edition's ledger,
@@ -3382,25 +3322,24 @@ def handle_account_command(command_type: str, args: dict, run) -> dict:
                                        action=_ACCOUNT_ADMITTING_COMMANDS[command_type])
         if why:
             log.warning("%s refused: %s", command_type, why)
-            return {"exit_code": 1, "stdout": "", "stderr": why}
+            return _reply(1, err=why)
     if command_type == "account_converge":
         # `config_dir` is checked against the roster, never trusted.
         config_dir = _norm_dir(args.get("config_dir", ""))
         if not config_dir:
-            return {"exit_code": -1, "stdout": "", "stderr": "account_converge needs config_dir"}
+            return _reply(-1, err="account_converge needs config_dir")
         known = {_norm_dir(str(d)) for d in _fleet_auth_dirs()}
         if config_dir not in known:
             # A miss forces one fresh roster read: this verb arrives right after the account was enabled.
             invalidate_account_roster()
             known = {_norm_dir(str(d)) for d in _fleet_auth_dirs()}
         if config_dir not in known:
-            return {"exit_code": -1, "stdout": "", "stderr": f"unknown account config_dir: {config_dir}"}
+            return _reply(-1, err=f"unknown account config_dir: {config_dir}")
         # Create the dir first (these nodes never held the account), as the session user at
         # `ACCOUNT_DIR_MODE`, as `reconcile.accounts_probe.AgentsProbeCache._run_converge` does.
         err = session_user.ensure_dir_as_session_user(config_dir, mode=ACCOUNT_DIR_MODE)
         if err:
-            return {"exit_code": 1, "stdout": "",
-                    "stderr": f"account_converge: could not create {config_dir}: {err}"}
+            return _reply(1, err=f"account_converge: could not create {config_dir}: {err}")
         # The launch path's own entry point (one mechanism). It never raises and reports degraded parts.
         import fleet_dispatch
 
@@ -3410,14 +3349,9 @@ def handle_account_command(command_type: str, args: dict, run) -> dict:
         res = fleet_dispatch.converge_account_layer(config_dir)
         # Phase 1's return code is the verb's; `None` (did not run) is a failure. Phase 2 is detached.
         phase1 = res.get("phase1")
-        return {
-            "exit_code": 0 if phase1 == 0 else 1,
-            "stdout": json.dumps(res),
-            "stderr": "" if phase1 == 0 else (
-                f"account_converge: settings/consent leg for {config_dir} "
-                f"{'did not run' if phase1 is None else f'exited {phase1}'}"
-            ),
-        }
+        return _reply(0 if phase1 == 0 else 1, res,
+                      "" if phase1 == 0 else (f"account_converge: settings/consent leg for {config_dir} "
+                                              f"{'did not run' if phase1 is None else f'exited {phase1}'}"))
 
     if command_type == "account_add":
         # Refused here, before anything runs: a dir left behind would read as a half-registered account.
@@ -3425,7 +3359,7 @@ def handle_account_command(command_type: str, args: dict, run) -> dict:
         refusal = _login_provider_refusal(provider)
         if refusal:
             log.warning("account_add refused: %s", refusal)
-            return {"exit_code": 1, "stdout": "", "stderr": refusal}
+            return _reply(1, err=refusal)
         # An older CP's `shared` flag is unread: every login mints into the token store. `provider` passed
         # only when not Claude's, keeping Claude's call unchanged
         # (`test_the_add_arm_calls_through_unchanged_for_claude`).
@@ -3444,7 +3378,7 @@ def handle_account_command(command_type: str, args: dict, run) -> dict:
         refusal = _login_provider_refusal(provider)
         if refusal:
             log.warning("account_reauth refused: %s", refusal)
-            return {"exit_code": 1, "stdout": "", "stderr": refusal}
+            return _reply(1, err=refusal)
         # Omitted for Claude, exactly as on the add arm above and for the same reason.
         provider_kw = ({} if agent_providers.implied_on_wire(provider) else {"provider": provider})
         return _account_reauth(args.get("slug", ""), run, peer_key=_arg_peer_key(args), **provider_kw)
@@ -3461,4 +3395,4 @@ def handle_account_command(command_type: str, args: dict, run) -> dict:
     if command_type == "account_shared_delete":
         return _account_shared_delete(args.get("slug", ""))
 
-    return {"exit_code": -1, "stdout": "", "stderr": f"unknown command_type: {command_type}"}
+    return _reply(-1, err=f"unknown command_type: {command_type}")

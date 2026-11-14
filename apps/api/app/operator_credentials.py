@@ -21,7 +21,7 @@ def opened(credential_id: str, credential_type: str, *, consumer: str) -> Option
     type or off the operator plane. `consumer` names the reader on the `credential_read` row it lands."""
 
     from app import data_access_events
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.models.credentials import Credential
     from app.tenancy import seam
     from app.tenancy.ids import OPERATOR_PLANE_ORG_IDS
@@ -31,7 +31,7 @@ def opened(credential_id: str, credential_type: str, *, consumer: str) -> Option
         return None
     # `detached()` first: the tenant Gmail OAuth client (`app/tenant_gmail/`) is asked for from org-bound requests
     # too — a member connecting their org's Gmail — and `operator_scope()` refuses to widen a bound org.
-    with seam.detached(), seam.operator_scope(), SessionLocal() as session:
+    with seam.detached(), seam.operator_scope(), BridgedSession() as session:
         row = session.get(Credential, wanted)
         if row is None or row.type != credential_type or row.org_id not in OPERATOR_PLANE_ORG_IDS:
             return None

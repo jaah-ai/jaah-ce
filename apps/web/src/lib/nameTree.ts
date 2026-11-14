@@ -13,13 +13,10 @@
 /** The separator's single home. */
 export const NAME_PATH_SEPARATOR = '/'
 
-/** What a row must carry to be filed in a tree. `org_id` (absent = no org) feeds the one-tenant drop
- *  rule (`nameTreeMove.ts`); `editable` (absent = the caller's key decides) the folder-lift rule. */
+/** What a row must carry to be filed in a tree. */
 export type NamedRow = {
   id: string
   name: string
-  org_id?: string | null
-  editable?: boolean | null
 }
 
 /**
@@ -103,15 +100,12 @@ export function buildNameTree<R extends NamedRow>(rows: readonly R[]): NameTreeN
   return roots
 }
 
-/** WHAT A ROSTER CALLS ITS OWN ROWS, and the one limit its server puts on a name — everything the shared
- *  tree modules say or refuse that differs per roster. One object per roster (`CREDENTIAL_TREE_KIND`,
- *  `PLAYBOOK_TREE_KIND`), so the copy and the DOM oracles cannot drift between its builders. */
+/** WHAT A ROSTER CALLS ITS OWN ROWS — everything the shared tree modules say that differs per roster.
+ *  One object per roster (`PLAYBOOK_TREE_KIND` in `pages/playbooks/PlaybooksPage.tsx`), so the copy and
+ *  the DOM oracles cannot drift between its builders. */
 export type NameTreeKind = {
   /** The row noun, singular and plural: "credential"/"credentials". */
   noun: { one: string; many: string }
-  /** The server's name cap (measured trimmed), mirrored so an over-long drop is refused before the
-   *  gesture; `null` when the server sets none. The server still decides. */
-  nameMax: number | null
   /** The prefix of every `data-*` / `data-testid` handle the tree rows carry (`credential-group`, …). */
   idPrefix: string
   /** `false` draws a group row with no mark (an empty disc slot): its disclosure and count already say it is a

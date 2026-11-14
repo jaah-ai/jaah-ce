@@ -1,6 +1,6 @@
-import { useCallback, useMemo } from 'react'
-import { useUrlFilters } from '../../hooks/useUrlFilters'
+import { useTypedUrlFilters } from '../../hooks/useUrlFilters'
 import { USER_STATUSES, type UserStatus } from '../../lib/users'
+import { oneOf } from '../../lib/strings'
 import { isUuidShaped } from '../../lib/uuidShape'
 
 /* THE PEOPLE ROSTER'S FILTERS, in the URL (`hooks/useUrlFilters.ts`): a pasteable "the disabled
@@ -16,11 +16,10 @@ export const EMPTY_USER_FILTERS: UserFilters = { q: '', status: '', org: '' }
 const Q_MAX = 200
 
 export function readUserFilters(params: URLSearchParams): UserFilters {
-  const status = params.get('status')
   const org = params.get('org') ?? ''
   return {
     q: (params.get('q') ?? '').slice(0, Q_MAX),
-    status: status !== null && (USER_STATUSES as readonly string[]).includes(status) ? status as UserStatus : '',
+    status: oneOf(USER_STATUSES, params.get('status')) ?? '',
     // `?org=` is a uuid server-side; anything else would 422.
     org: isUuidShaped(org) ? org : '',
   }
@@ -41,9 +40,5 @@ export function userFilterParams(filters: UserFilters, { operator }: { operator:
 
 /** Read through from the URL, patched one field at a time, cleared as one. */
 export function useUserFilters(): [UserFilters, (patch: Partial<UserFilters>) => void, () => void] {
-  const [params, setFilters] = useUrlFilters()
-  const filters = useMemo(() => readUserFilters(params), [params])
-  const patch = useCallback((next: Partial<UserFilters>) => setFilters(next), [setFilters])
-  const clear = useCallback(() => setFilters(EMPTY_USER_FILTERS), [setFilters])
-  return [filters, patch, clear]
+  return useTypedUrlFilters(readUserFilters, EMPTY_USER_FILTERS)
 }

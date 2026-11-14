@@ -5,6 +5,7 @@ import { ApiError, apiDetail, get } from '../../api'
 import { CATALOGUE_STALE_MS, cachedRead } from '../../lib/cachedRead'
 import { tabOrg } from '../../lib/activeOrg'
 import { actingAs } from '../../lib/actAs'
+import { capitalize, countOf } from '../../lib/humanize'
 import { humanDuration } from '../../lib/relativeTime'
 import { NODE_WAITING_NOTE } from '../../lib/welcomeWizard'
 import type { OrgRef, PipelineTask, TaskSourceOption, Worktree } from '../../types'
@@ -18,6 +19,7 @@ import { isSystemPersona, personaLabel, rawPersonaPrefixRe } from './personaRegi
 import { SYSTEM_PAUSE_CAUSE } from './pane/stopReason'
 import { LANE_PERSONA } from './laneRun'
 import { isChatTask } from './taskPersona'
+import { danger } from '../ConfirmDialog'
 // The in-flight set, generated from `apps/api/app/task_lifecycle.py` and re-exported here so `isArchiveRow`
 // and the delete confirms avoid `generated/`. Deliberately not the transition table's stoppable set: spec
 // R4.2 keeps them apart (one names a delete that stops a runner, the other a park).
@@ -58,13 +60,18 @@ function setFocusParam(params: URLSearchParams, focus: boolean) {
   params.set('focus', 'true')
 }
 
-/* Creator picks, shared by list and counting routes so a section total matches its rows. `append`, never
-`set` (several creators is normal), in pick order. Nothing written for an empty array. */
+/* Assignee picks, shared by list and counting routes so a section total matches its rows. `append`, never
+`set` (several assignees is normal), in pick order. Nothing written for an empty array. */
+function setAssigneeParams(params: URLSearchParams, assigneeIds: readonly string[]) {
+  for (const id of assigneeIds) params.append('assigned_to_id', id)
+}
+
+/* Creator picks, the same shape as assignees: a repeated `created_by_id=` per pick (a UNION), nothing when empty. */
 function setCreatorParams(params: URLSearchParams, creatorIds: readonly string[]) {
   for (const id of creatorIds) params.append('created_by_id', id)
 }
 
-/* Source picks, the same shape as creators: a repeated `source=` per pick (a UNION), nothing when empty. */
+/* Source picks, the same shape as assignees: a repeated `source=` per pick (a UNION), nothing when empty. */
 function setSourceParams(params: URLSearchParams, sources: readonly string[]) {
   for (const source of sources) params.append('source', source)
 }
@@ -73,8 +80,7 @@ function setSourceParams(params: URLSearchParams, sources: readonly string[]) {
 `hasTaskUrlFilters` agree on whether the board is narrowed. The one normalising seam, as
 `lib/taskUrlFilters.ts`'s writer is on the URL side. */
 /* THE BOARD'S SCOPE, as every row-set URL below sends it: the rail scope's own narrowing params
- * (`lib/taskScope.ts::scopeToListParams` — a project's `project_id`, a feature's or "No feature"'s
- * `feature_id`); empty is All projects. One helper, so the list, its totals and its roster never disagree
+ * (`lib/taskScope.ts::scopeToListParams` — a project's `project_id`, a feature's `feature_id`); empty is All projects. One helper, so the list, its totals and its roster never disagree
  * on the set. */
 export type BoardScopeFilter = URLSearchParams
 
@@ -87,44 +93,50 @@ function setSearchParam(params: URLSearchParams, q: string) {
   if (term !== '') params.set('q', term)
 }
 
+/* THE BOARD'S FILTERS, as every row-set URL below takes them: one object, so the list, its totals and
+ * the main pane's counts never disagree on the set. Every field but the scope is optional and defaults to
+ * "not narrowing", so a caller names only what it sets. */
+export type BoardFilter = {
+  scopeFilter: BoardScopeFilter
+  /* The toolbar's one "Show hidden" switch, translated in ONE place (`setHiddenParams`) to both
+     `include_hidden=true` (hidden system rows) and `include_archived=true` (`archived_at` set). One control,
+     by the operator's ask; asking for one class alone is not expressible. Both sort into the finished half
+     (`_TASK_LIST_COMPLETED_GROUP`), so the tick never displaces live work, though opted-in rows interleave by
+     recency with done rows and can push them past the window. */
+  showHidden?: boolean
+  /* The date range over last activity, already resolved by `lib/taskDateRange.ts` to at most two ISO
+     instants; the vocabulary and every refusal to send a bound live there. Unlike the tick, it removes rows,
+     hence it counts in the toolbar badge. */
+  bounds?: DateRangeBounds
+  /* "Assigned to any of these", each a repeated `assigned_to_id=` (no separator escaping), in array order;
+     counted in the badge. `sources` likewise, each a repeated `source=`; `creatorIds` each a `created_by_id=`. */
+  assigneeIds?: string[]
+  focus?: boolean
+  /* The search term: sent, not filtered in the browser, because the list is a bounded window. The server
+     matches it case-insensitively, every word in any order, against title, description and outcome
+     (`apps/api/app/routes/tasks/listing.py::task_search_clause`); `lib/taskUrlFilters.ts` owns the
+     operator-facing half. Absent: the unsearched board. */
+  q?: string
+  /* Absent: every source. */
+  sources?: string[]
+  /* The State filter (`lib/taskUrlFilters.ts`), `''` for every state. */
+  state?: string
+  /* The Persona filter (`lib/taskUrlFilters.ts`), `''` for every persona. */
+  persona?: string
+  /* The Creator filter (`lib/taskUrlFilters.ts`), EMPTY for every creator. */
+  creatorIds?: string[]
+}
+
 // Build the top-level list URL (R4). `limit` is always sent ("another page?" is `rows.length >= limit`);
 // the scope's params only when a scope is picked. The server's `state=` param has no caller here.
 //
-// `q` is sent, not filtered in the browser, because the list is a bounded window. The server matches it
-// case-insensitively as one phrase against title or body (`apps/api/app/routes/tasks/listing.py::list_tasks`);
-// `lib/taskUrlFilters.ts` owns the operator-facing half.
-//
-// `showHidden`: this function is the single home for its translation — the toolbar's one "Show hidden"
-// switch becomes both `include_hidden=true` (hidden system rows) and `include_archived=true`
-// (`archived_at` set). One control, by the operator's ask; asking for one class alone is not expressible.
-// Both sort into the finished half (`_TASK_LIST_COMPLETED_GROUP`), so the tick never displaces live
-// work, though opted-in rows interleave by recency with done rows and can push them past the window.
-//
-// `bounds` is the date range over last activity, already resolved by `lib/taskDateRange.ts` to at most
-// two ISO instants; the vocabulary and every refusal to send a bound live there. Unlike the tick, it
-// removes rows, hence it counts in the toolbar badge.
-//
-// `creatorIds`: "created by any of these", each a repeated `created_by_id=` (no separator escaping), in
-// array order; counted in the badge. `sources` likewise, each a repeated `source=`.
-export function buildTasksUrl(
-  scopeFilter: BoardScopeFilter,
-  showHidden = false,
-  limit: number = TASK_PAGE_SIZE,
-  bounds: DateRangeBounds = {},
-  creatorIds: string[] = [],
-  focus = false,
-  /* Defaulted so five-argument callers ask for the unsearched board. */
-  q = '',
-  /* Newest param, defaulted like `q`: every source. */
-  sources: string[] = [],
-  /* The State board's window (`pages/Tasks.tsx`): `sectionOrder` sorts it as the board draws it
-     (`?order=section`), so a page never fills with a later section while an earlier one waits; `excludeDone`
-     drops the rows a folded Done would not draw. Neither touches the counts: Done's header keeps its total. */
-  { sectionOrder = false, excludeDone = false }: { sectionOrder?: boolean; excludeDone?: boolean } = {},
-  /* The State filter (`lib/taskUrlFilters.ts`), `''` for every state. */
-  state = '',
-): string {
-  const params = boardFilterParams(scopeFilter, showHidden, bounds, creatorIds, focus, q, sources, state)
+// The State board's window (`pages/Tasks.tsx`): `sectionOrder` sorts it as the board draws it
+// (`?order=section`), so a page never fills with a later section while an earlier one waits; `excludeDone`
+// drops the rows a folded Done would not draw. Neither touches the counts: Done's header keeps its total.
+export function buildTasksUrl({
+  limit = TASK_PAGE_SIZE, sectionOrder = false, excludeDone = false, ...filter
+}: BoardFilter & { limit?: number; sectionOrder?: boolean; excludeDone?: boolean }): string {
+  const params = boardFilterParams(filter)
   if (excludeDone) params.set('exclude_done', 'true')
   if (sectionOrder) params.set('order', 'section')
   // After the narrowing params, `limit` being the one the counting route must not take, so this URL's
@@ -138,16 +150,10 @@ export function buildTasksUrl(
 /* The board's filter params WITHOUT `limit` — what the main pane (`./pane/`) pages with `?section=`/`?after=`
  * and asks `GET /api/tasks/counts` with, so its lists and their section counts name the SAME row set. The
  * same helpers, in the same order, as `buildTasksUrl`. */
-export function boardFilterParams(
-  scopeFilter: BoardScopeFilter,
-  showHidden = false,
-  bounds: DateRangeBounds = {},
-  creatorIds: string[] = [],
-  focus = false,
-  q = '',
-  sources: string[] = [],
-  state = '',
-): URLSearchParams {
+export function boardFilterParams({
+  scopeFilter, showHidden = false, bounds = {}, assigneeIds = [], focus = false, q = '', sources = [],
+  state = '', persona = '', creatorIds = [],
+}: BoardFilter): URLSearchParams {
   const params = new URLSearchParams()
   setScopeParams(params, scopeFilter)
   setHiddenParams(params, showHidden)
@@ -155,43 +161,45 @@ export function boardFilterParams(
   setSearchParam(params, q)
   if (bounds.updatedAfter) params.set('updated_after', bounds.updatedAfter)
   if (bounds.updatedBefore) params.set('updated_before', bounds.updatedBefore)
+  setAssigneeParams(params, assigneeIds)
   setCreatorParams(params, creatorIds)
   setSourceParams(params, sources)
   if (state !== '') params.set('state', state)
+  if (persona !== '') params.set('persona', persona)
   return params
 }
 
 /* The section totals' URL: the same row-set question asked of the counting route, beside `buildTasksUrl`
- * so both carry the same narrowing params via the same helpers (search, hidden, creators). No `limit`:
+ * so both carry the same narrowing params via the same helpers (search, hidden, assignees). No `limit`:
  * the route counts the whole filtered set, since a count over the window would pose as a total.
  */
-export function buildTagCountsUrl(
-  scopeFilter: BoardScopeFilter,
-  showHidden = false,
-  bounds: DateRangeBounds = {},
-  creatorIds: string[] = [],
-  focus = false,
-  q = '',
-  sources: string[] = [],
-  state = '',
-): string {
-  const query = boardFilterParams(scopeFilter, showHidden, bounds, creatorIds, focus, q, sources, state).toString()
+export function buildTagCountsUrl(filter: BoardFilter): string {
+  const query = boardFilterParams(filter).toString()
   return `/api/tasks/tag-counts${query ? `?${query}` : ''}`
 }
 
-/* The creator roster's URL ("who has tasks on this board"). It carries the board scope and the hidden tick
+/* The assignee roster's URL ("who has tasks on this board"). It carries the board scope and the hidden tick
  * (`setHiddenParams`), so the picker never offers someone whose only rows are hidden. It deliberately
  * omits:
  *   · the date window: the roster must not change under a moving pointer or make pick order matter;
- *   · creator ids: narrowing the roster by the current pick would be a one-way door.
- * Cost: a listed creator may have zero rows in the current period (`task_count` is scope-wide).
+ *   · assignee ids: narrowing the roster by the current pick would be a one-way door.
+ * Cost: a listed assignee may have zero rows in the current period (`task_count` is scope-wide).
  */
+export function buildTaskAssigneesUrl(scopeFilter: BoardScopeFilter, showHidden = false): string {
+  return rosterUrl('/api/tasks/assignees', scopeFilter, showHidden)
+}
+
+/* The creator roster's URL, on the assignee roster's terms (the server shares its scope, `RosterScope`). */
 export function buildTaskCreatorsUrl(scopeFilter: BoardScopeFilter, showHidden = false): string {
+  return rosterUrl('/api/tasks/creators', scopeFilter, showHidden)
+}
+
+function rosterUrl(path: string, scopeFilter: BoardScopeFilter, showHidden: boolean): string {
   const params = new URLSearchParams()
   setScopeParams(params, scopeFilter)
   setHiddenParams(params, showHidden)
   const query = params.toString()
-  return `/api/tasks/creators${query ? `?${query}` : ''}`
+  return `${path}${query ? `?${query}` : ''}`
 }
 
 /* The Source filter's vocabulary (`TaskSourceOption[]`, display order). Unscoped and fixed per deploy, so it
@@ -204,23 +212,25 @@ export const readTaskSources = () => cachedRead(['task-sources'], () => get<Task
 // `projects` and `canCreateIn`):
 //
 //   1. `boardProjectId` — the project the board is showing.
-//   2. on an "All projects" board (`boardProjectId` null) only: the user's FOCUSED PROJECT
-//      (`lib/focusedProject.ts`).
-//   3. the first creatable project of the viewer's OWN org (`ownOrgId`), else the first creatable one in
+//   1b. under All projects only (`boardProjectId === null`): `lastProjectId`, the project of the last task this
+//      viewer filed by hand (`lib/lastCreateProject.ts`).
+//   2. the first creatable project of the viewer's OWN org (`ownOrgId`), else the first creatable one in
 //      roster order — NAMED BY THE CALLER, NEVER SILENT. An operator's All orgs roster leads with tenants'
 //      projects, so roster order alone filed into a tenant.
-//   4. `null` — nothing creatable at all, the one case a create surface must refuse rather than guess at.
+//   3. `null` — nothing creatable at all, the one case a create surface must refuse rather than guess at.
 //
 // The caller must say where it landed whenever that is not the board: `offBoard` is
-// `id !== boardProjectId`, which covers rungs 2 and 3 on an "All projects" board and a board project the
+// `id !== boardProjectId`, which covers rung 2 on an "All projects" board and a board project the
 // caller may not create in. False when `id` is `null`. Callers: `useInlineTaskCreate`, `TaskEditForm`, and
 // `TaskDetailPage`'s create-mode seed. Every rung asks the grant map (`useCanOnProject('tasks:create', id)`),
-// so a stale id degrades down the ladder.
+// so a stale id degrades down the ladder. Each create-default caller passes `projects` without the viewer's hidden
+// ones, the board's own kept (`lib/taskMute.ts::withoutHiddenProjects`): a hidden project is never a default rung.
+// A seed's check (`useTaskDetailFiling`'s `prefill`) asks the whole roster, a seed naming its project.
 
 /** The resolved project and whether it is somewhere the operator is not looking (see above). */
 export type CreateProjectChoice = { id: number | null; offBoard: boolean }
 
-/** Just what the ladder needs; `org` lets rung 3 prefer the viewer's own org. */
+/** Just what the ladder needs; `org` lets rung 2 prefer the viewer's own org. */
 export type CreatableProject = { id: number; org?: { id: string } | null }
 
 export function resolveCreateProject(
@@ -229,16 +239,18 @@ export function resolveCreateProject(
   /** May this principal create in that project (`useCanOnProject('tasks:create', id)`). Defaults to
    *  allow-all for untaught hosts; every real host passes it. */
   canCreateIn: (id: number) => boolean = () => true,
-  /** The user's focused project (`hooks/useFocusedProjectId`), rung 2; null when none is set. */
-  focusedProjectId: number | null = null,
-  /** The viewer's own org (the tab's pin, `lib/activeOrg.ts::tabOrg`), rung 3's preference; null when unknown. */
+  /** The viewer's own org (the tab's pin, `lib/activeOrg.ts::tabOrg`), rung 2's preference; null when unknown. */
   ownOrgId: string | null = null,
+  /** The last hand-filed task's project (`lib/lastCreateProject.ts`), rung 1b; read only under All projects. */
+  lastProjectId: number | null = null,
 ): CreateProjectChoice {
   const creatable = (p: CreatableProject) => canCreateIn(p.id)
-  const preferred = boardProjectId ?? focusedProjectId
-  const onBoard = preferred === null ? undefined : projects.find(p => p.id === preferred && creatable(p))
+  const onBoard = boardProjectId === null ? undefined : projects.find(p => p.id === boardProjectId && creatable(p))
+  const last = boardProjectId !== null || lastProjectId === null
+    ? undefined
+    : projects.find(p => p.id === lastProjectId && creatable(p))
   const ownOrg = ownOrgId === null ? undefined : projects.find(p => creatable(p) && p.org?.id === ownOrgId)
-  const id = onBoard?.id ?? ownOrg?.id ?? projects.find(creatable)?.id ?? null
+  const id = onBoard?.id ?? last?.id ?? ownOrg?.id ?? projects.find(creatable)?.id ?? null
   return { id, offBoard: id !== null && id !== boardProjectId }
 }
 
@@ -276,23 +288,23 @@ export function refusedInOrg(err: unknown, project?: { org?: OrgRef | null }): O
 }
 
 /** The feature a board scope names (a rail feature node), as the create ladder reads it. */
-export type CreateScopeFeature = { id: string; name: string; projectId: number; status: 'active' | 'shipped' }
+export type CreateScopeFeature = { id: string; name: string; projectId: number }
 
 /** Where a new task is filed: the project ladder's answer plus the feature. `featureId` is the scope's
- *  feature when the ladder landed in ITS project and it is active; else null ("No feature" — the API refuses
- *  a mismatched pair and a shipped feature). `shippedFeature` names a SHIPPED scope feature the task
- *  therefore falls back from, so the composer can say so; null otherwise. */
-export type CreateTarget = CreateProjectChoice & { featureId: string | null; shippedFeature: string | null }
+ *  feature when the ladder landed in ITS project; else null, the project alone (the API refuses a mismatched
+ *  pair). */
+export type CreateTarget = CreateProjectChoice & { featureId: string | null }
 
 export function resolveCreateTarget(
   scope: {
     projects: CreatableProject[]
     boardProjectId: number | null
     feature?: CreateScopeFeature
-    focusedProjectId?: number | null
     ownOrgId?: string | null
     /** The operator's own pick on the create row; outranks the ladder while it is still creatable. */
     pickedProjectId?: number | null
+    /** The last hand-filed task's project, the ladder's rung 1b (`resolveCreateProject`). */
+    lastProjectId?: number | null
   },
   canCreateIn: (id: number) => boolean = () => true,
 ): CreateTarget {
@@ -300,22 +312,19 @@ export function resolveCreateTarget(
   const pickHolds = picked !== null && scope.projects.some(p => p.id === picked && canCreateIn(p.id))
   const choice = pickHolds
     ? { id: picked, offBoard: picked !== scope.boardProjectId }
-    : resolveCreateProject(scope.projects, scope.boardProjectId, canCreateIn, scope.focusedProjectId, scope.ownOrgId ?? null)
+    : resolveCreateProject(scope.projects, scope.boardProjectId, canCreateIn, scope.ownOrgId ?? null,
+      scope.lastProjectId ?? null)
   const feature = scope.feature !== undefined && scope.feature.projectId === choice.id ? scope.feature : undefined
-  return {
-    ...choice,
-    featureId: feature?.status === 'active' ? feature.id : null,
-    shippedFeature: feature?.status === 'shipped' ? feature.name : null,
-  }
+  return { ...choice, featureId: feature?.id ?? null }
 }
 
 // The `/tasks` page surfaces the epic/`persona` pipeline. Every row carries a persona.
 
 // ── The status vocabulary: what a row is actually doing ──
 // `Task.state` has seven values, and two cover several situations: `ready` is queued, held behind an
-// epic's `hold`, gated on an unmet prerequisite, or hand-Run and being claimed; `active` is launching,
+// epic's `hold`, or gated on an unmet prerequisite; `active` is launching,
 // working, or (on an epic) started but still dependency-gated. So the vocabulary is STATUS, derived from
-// fields the row carries (`run_requested_at`, `waiting_on_persona`, `runner_session_id`,
+// fields the row carries (`waiting_on_persona`, `runner_session_id`, `run_requested_at`,
 // `unmet_prerequisite_count`, the parent's `transition_mode` and prerequisite count): ten statuses over
 // seven states, derived only in `taskStatus()`.
 // Every label is one short word. `title` (tooltip and accessible name) is the word plus only the row's own
@@ -544,11 +553,8 @@ export function taskStatus(
       const why = orgWaitLabel(task.wait_reason)
       return { key: 'waiting', ...TASK_STATUS.waiting, title: why.startsWith('Waiting') ? why : `Waiting. ${why}` }
     }
-    // Ordered by which fact wins. Run bypasses the hold and dependency gates (`dispatchable_tasks`,
-    // apps/api/app/routes/tasks/), so a hand-Run child really is starting.
-    if (task.run_requested_at) {
-      return { key: 'starting', ...TASK_STATUS.starting }
-    }
+    // Ordered by which fact wins. A Run only queues: it releases an epic's hold and skips nothing else
+    // (`_sequencing_floors`, apps/api/app/routes/tasks/dispatch.py), so a ready row never reads Starting.
     if (task.waiting_on_persona) {
       return {
         key: 'waiting',
@@ -562,12 +568,12 @@ export function taskStatus(
       // Its own prerequisites are counted in the title, so the row's hover says what it waits on.
       const unmet = task.unmet_prerequisite_count ?? 0
       return unmet > 0
-        ? { key: 'waiting', ...TASK_STATUS.waiting, title: `Waiting. ${unmet} prerequisite${unmet === 1 ? '' : 's'}` }
+        ? { key: 'waiting', ...TASK_STATUS.waiting, title: `Waiting. ${countOf(unmet, 'prerequisite')}` }
         : { key: 'waiting', ...TASK_STATUS.waiting }
     }
-    if (opts?.parentTransitionMode === 'hold') return { key: 'held', ...TASK_STATUS.held }
+    if (opts?.parentTransitionMode === 'hold' && !task.run_requested_at) return { key: 'held', ...TASK_STATUS.held }
     // A `ready` row holding a slot (`ran_on.live`): a fresh lease its node is launching, or a slot kept from an
-    // earlier attempt — either way it is not waiting for a slot, which the hover must tell apart.
+    // earlier attempt. Still Queued until a node claims it; the hover names the slot.
     if (task.ran_on?.live) {
       return { key: 'queued', ...TASK_STATUS.queued, title: `Queued. Holds slot ${task.ran_on.slot} on ${task.ran_on.node}` }
     }
@@ -576,12 +582,15 @@ export function taskStatus(
   // `runner_session_id` is written at launch (apps/jaahd/fleet_dispatch.py), so a dispatched `active`
   // row without one is starting. Containers are excluded: never dispatched, their session is always null.
   if (task.state === 'active') {
-    // A container still behind the dependency gate is waiting, not running. Container-only (a hand-Run leaf
-    // has a real runner), and a live session wins (a dispatched legacy container really is working, and keeps
-    // `INDICATOR_INFLIGHT`). Knowingly imprecise: an epic gated after a child was hand-Run reads Waiting while
-    // that child works.
+    // A container still behind the dependency gate is waiting, not running. Container-only, and a live session
+    // wins (a dispatched legacy container really is working, and keeps `INDICATOR_INFLIGHT`).
     if (!task.runner_session_id && isContainerRow(task) && isDependencyGated(task, opts)) {
       return { key: 'waiting', ...TASK_STATUS.waiting }
+    }
+    // A container none of whose subtasks runs or asks, held by its first waiting subtask's reason (the server's
+    // rollup, `_epic_wait_reasons`): "Running" would claim work nobody is doing.
+    if (!task.runner_session_id && isContainerRow(task) && task.wait_reason) {
+      return { key: 'waiting', ...TASK_STATUS.waiting, title: `Waiting. ${orgWaitLabel(task.wait_reason)}` }
     }
     /* A merge-lane run is "Running" with or without a session: its run is the lane's, not a spawn the
        operator waits on, so "Starting" would never end. The tooltip says when it holds no slot, where the row
@@ -613,21 +622,20 @@ function stopReasonFact(task: PipelineTask): string | null {
   if (stop?.kind === 'failed') fact = stop.text?.trim() || null
   else if (stop?.kind === 'paused') fact = stop.by ? `By ${stop.by}` : null
   else if (stop?.kind === 'balance' || stop?.kind === 'jaah_unavailable') fact = SYSTEM_PAUSE_CAUSE[stop.kind]
-  else if (stop?.kind === 'waiting_on_customer') fact = `Waiting on customer${stop.text?.trim() ? `: ${stop.text.trim()}` : ''}`
   if (fact === null && task.state === 'system_failed') fact = task.failure_reason?.trim() || null
   if (fact === null) return null
-  // An epic stopped by a stage names that stage, as the pane's `stopPhrase` does.
+  // An epic stopped by a stage names that stage: the child's persona label, else its title.
   const stage = stop?.stage_persona ? personaLabel(stop.stage_persona) : stop?.stage_title
   if (stage) fact = `${stage}: ${fact}`
   const capped = fact.length > REASON_MAX ? `${fact.slice(0, REASON_MAX - 1)}…` : fact
-  return capped.charAt(0).toUpperCase() + capped.slice(1)
+  return capitalize(capped)
 }
 
 /* Whose answer screen this row's `?` opens — one home, since the tree pill, feed rail node and release
 notes all make it pressable. `null`: not asking, or asking in a way no answer screen serves (a chat). */
 export function answerTargetId(task: PipelineTask): number | null {
   /* A chat has no answer screen: its `?` is a conversation awaiting the operator's next line in the Web
-  Console. `/tasks/<id>?tab=answer` would render nothing, and submitting would re-dispatch a second
+  Console. `/tasks/<id>?tab=qa` would render nothing, and submitting would re-dispatch a second
   runner into the chat's slot (the API 409s). Returning null leaves no `onAnswer`, so
   `taskIndicatorAction`'s console branch takes the press. */
   if (isChatTask(task)) return null
@@ -638,8 +646,8 @@ export function answerTargetId(task: PipelineTask): number | null {
   return hasOwnOpenGate(task) ? task.id : (task.gated_child_id ?? null)
 }
 
-/* Where that press goes, spelled once. `?tab=answer` is the point: the detail page auto-selects Answer only
-for a principal who may write it, so a read-only reader would otherwise land on the Task tab. It is read
+/* Where that press goes, spelled once. `?tab=qa` is the point: the detail page auto-selects Q&A only
+while the task is gated, so the link names it outright. It is read
 by `hooks/useUrlTab.ts`, which falls back on a value the page does not offer. */
 export function answerHref(task: PipelineTask): string | null {
   const id = answerTargetId(task)
@@ -649,19 +657,20 @@ export function answerHref(task: PipelineTask): string | null {
 /* The path shape alone, separate from which task: `GateForm`'s `Copy all` needs its own gate's address
 even mid-delivery, when `answerHref` returns null. The param stays spelled once. */
 export function answerPath(id: number): string {
-  return `/tasks/${id}?tab=answer`
+  return `/tasks/${id}?tab=qa`
 }
 
 // The status pill: glyph plus label, named via `title`/`aria-label`, so a hidden label still leaves a
 // distinct non-colour signal. `data-status` is the machine-readable hook. Pass `taskStatus(task)` for a live
 // row, `statusForState(state)` for a bare history/rollup `state`.
-export function TaskStatusBadge({ status }: { status: TaskStatus }) {
+export function TaskStatusBadge({ status, iconOnly = false }: { status: TaskStatus; iconOnly?: boolean }) {
   return (
     <StatusChip
       label={status.label}
       tone={status.tone}
       glyph={status.glyph}
       title={status.title}
+      iconOnly={iconOnly}
       glyphTestId="badge-glyph"
       labelTestId="badge-label"
       data-status={status.key}
@@ -669,25 +678,25 @@ export function TaskStatusBadge({ status }: { status: TaskStatus }) {
   )
 }
 
-/* The wait reason as the task page's banner and footer read it: the server's sentence without the badge's own word
+/* The wait reason as the task page's header pill's hover reads it: the server's sentence without the badge's own word
  * ("Waiting: organization runner limit (1/1)" → "Organization runner limit (1/1)"). A capacity hold (no remedy of
  * its own, so no closing ".") and the node wait say when they clear. The list chip (`orgWaitLabel`) is this sentence's head. */
 export function orgWaitSentence(reason: string): string {
   // The node wait says when it ends too: it does not start until a node is online.
   if (reason === NODE_WAITING_NOTE) return `${reason} — starts once your node is online.`
   const rest = reason.replace(/^Waiting:\s*/, '')
-  const sentence = rest.charAt(0).toUpperCase() + rest.slice(1)
+  const sentence = capitalize(rest)
   return reason.startsWith('Waiting:') && !reason.endsWith('.') ? `${sentence} — starts when room frees up.` : sentence
 }
 
 /* The wait reason as a list or pill label: the banner's wording, first clause only. */
 export function orgWaitLabel(reason: string): string {
   // The first sentence only: a reason carrying its own remedy (`app/dispatch_wait.py::held_on_offline_node`)
-  // keeps the label short; the full sentence rides the pill's `title` and the task page's banner.
+  // keeps the label short; the full sentence rides the pill's hover.
   return orgWaitSentence(reason).split(' — ')[0].split('. ')[0].replace(/\.$/, '')
 }
 
-/* The wait reason as the task page header's one pill: the badge's word and the reason as one fact —
+/* The wait reason as a pill label: the badge's word and the reason as one fact —
  * "Waiting for your node", or "Waiting · Organization runner limit (1/1)" where the reason does not start with it. */
 export function orgWaitPillLabel(reason: string): string {
   const label = orgWaitLabel(reason)
@@ -843,14 +852,18 @@ export function TaskStatusIndicator({
   onOpenConsole,
   consoleSlot,
   onAnswer,
-  spellWaitReason,
+  waitReasonHover,
+  iconOnly = false,
 }: {
   task: PipelineTask
   /** The row's own name; the interactive pill is named for what it does. */
   name: string
-  /** A waiting row's pill reads its org hold whole ("Waiting for your node"), not the bare word: the task page's
-   *  header, where it has the room. */
-  spellWaitReason?: boolean
+  /** A waiting row's org hold whole on the pill's hover, name and tap ("Waiting for your node — starts once your node is
+   *  online."): the task page's header, where the pill is that reason's only home. */
+  waitReasonHover?: boolean
+  /** The glyph alone, the word on the hover and in the accessible name: the task page's header, where every badge is
+   *  an icon. */
+  iconOnly?: boolean
   parentTransitionMode?: string | null
   parentUnmetPrerequisites?: number | null
   /** Start this row. Omitted → a draft/paused pill stays inert. */
@@ -864,11 +877,17 @@ export function TaskStatusIndicator({
   onAnswer?: () => void
 }) {
   const bare = taskStatus(task, { parentTransitionMode, parentUnmetPrerequisites })
-  const status = spellWaitReason && bare.key === 'waiting' && task.state === 'ready' && task.wait_reason
-    ? { ...bare, label: orgWaitPillLabel(task.wait_reason), title: orgWaitSentence(task.wait_reason) }
+  const spelled = waitReasonHover && bare.key === 'waiting' && !!task.wait_reason
+  // The hover leads with the word: with `iconOnly` it is the word's only visible home.
+  const sentence = spelled && task.wait_reason ? orgWaitSentence(task.wait_reason) : ''
+  const status = spelled
+    ? { ...bare, title: sentence.startsWith(bare.label) ? sentence : `${bare.label}. ${sentence}` }
     : bare
+  /* A pill that spells a wait is that reason's only home on the page, so a tap opens its sentence: a
+     tap on a pressable pill would open the console instead (`ui/Tip`'s `tapActs`), and the header has its own door. */
+  const console = spelled ? undefined : onOpenConsole
   // Which verb and its name come from `taskIndicatorAction`; the pill draws only the glyph and chip.
-  const action = taskIndicatorAction(status, name, { onStart, onOpenConsole, onAnswer }, consoleSlot)
+  const action = taskIndicatorAction(status, name, { onStart, onOpenConsole: console, onAnswer }, consoleSlot)
 
   if (INDICATOR_INFLIGHT.includes(status.key)) {
     return (
@@ -883,6 +902,7 @@ export function TaskStatusIndicator({
         className={action.kind === 'console' ? INDICATOR_ACTION_CLASS : undefined}
         glyphTestId="badge-glyph"
         labelTestId="badge-label"
+        iconOnly={iconOnly}
         data-status={status.key}
       />
     )
@@ -909,35 +929,65 @@ export function TaskStatusIndicator({
         className={INDICATOR_ACTION_CLASS}
         glyphTestId="badge-glyph"
         labelTestId="badge-label"
+        iconOnly={iconOnly}
         data-status={status.key}
       />
     )
   }
   // Done included: one glyph per state everywhere, so the header pill matches the Details State field.
-  return <TaskStatusBadge status={status} />
+  return <TaskStatusBadge status={status} iconOnly={iconOnly} />
 }
 
 // A cached expanded-detail entry is either the fetched Task or a per-row error marker.
 export type ExpandedEntry = PipelineTask | { error: string }
 
-// R4.4: the web mirror of `_EPIC_SETTLED_STATES` (`apps/api/app/task_lifecycle.py`). Two members: a
-// `paused` child is stopped, not finished, so its phase stays expanded (R4.1).
-// Not derivable from the transition table: "may take `start`" and "the work is over" differ (as with
-// `LIVE_STATES`, spec R4.2).
-export const EPIC_SETTLED_STATES = new Set(['done', 'system_failed'])
+/* The expanded ids the board actually DRAWS: a top-level row it holds, or a child inside an expanded row it draws.
+   The remembered outline outlives the window (`saveExpandedTaskIds`), so an expansion of a row now out of scope,
+   filtered away or below the loaded window is still in `expanded` — and each of its live refreshes cost one
+   `GET /api/tasks/{id}`, the heaviest read, per `task` event, for a row nobody could see. It is refreshed again on
+   the first event after it is drawn. Ascending, as stored. */
+export function drawnExpandedIds(rows: readonly PipelineTask[], expanded: Readonly<Record<number, ExpandedEntry>>): number[] {
+  const drawn = new Set<number>()
+  const visit = (row: PipelineTask) => {
+    const entry = expanded[row.id]
+    if (entry === undefined || drawn.has(row.id)) return
+    drawn.add(row.id)
+    if ('id' in entry) for (const child of entry.children ?? []) visit(child)
+  }
+  rows.forEach(visit)
+  return [...drawn].sort((a, b) => a - b)
+}
 
-// R2/R3: a task the pipeline has not finished with. Drives per-phase completion and collapse-by-default;
-// a `paused` child keeps its phase open (plan D5).
-export function isActive(t: PipelineTask): boolean {
-  return !EPIC_SETTLED_STATES.has(t.state)
+/* The REMEMBERED expansions the board draws now: a `pending` id on a drawn row (top level, the pinned row, or a
+child of a drawn expanded row) not yet expanded. Restore reads only these — an id off the window costs nothing
+until the board draws it again. */
+export function drawnPendingIds(
+  rows: readonly PipelineTask[],
+  expanded: Readonly<Record<number, ExpandedEntry>>,
+  pending: ReadonlySet<number>,
+): number[] {
+  const found = new Set<number>()
+  const seen = new Set<number>()
+  const visit = (row: PipelineTask) => {
+    if (seen.has(row.id)) return
+    seen.add(row.id)
+    const entry = expanded[row.id]
+    if (entry === undefined) {
+      if (pending.has(row.id)) found.add(row.id)
+      return
+    }
+    if ('id' in entry) for (const child of entry.children ?? []) visit(child)
+  }
+  rows.forEach(visit)
+  return [...found].sort((a, b) => a - b)
 }
 
 /* The focus toggle's child state set, mirroring `_FOCUS_STATES` (apps/api/app/task_lifecycle.py), the
 authority. A mirror exists because expanded children arrive unbounded inside `GET /api/tasks/{id}`
 (see `setFocusParam`); top-level rows are filtered server-side.
 Narrower than the server's top-level set on purpose: `_FOCUS_TOP_LEVEL_STATES` keeps `ready` (its block
-says why), while a queued child should not reappear. Five members, not `!EPIC_SETTLED_STATES.has(state)`,
-which would let `ready` through. */
+says why), while a queued child should not reappear. Five members, not "every state but done and
+system_failed", which would let `ready` through. */
 const FOCUS_STATES = new Set(['draft', 'active', 'awaiting_response', 'paused', 'system_failed'])
 
 /* Would this child row survive focus? Children only (see above). The archived test mirrors the server
@@ -980,21 +1030,6 @@ export function isHiddenSystemRow(task: { hidden?: boolean; persona: string; sta
 
 /** The ⚙ marker's hover sentence for an `isHiddenSystemRow` row. */
 export const SYSTEM_ROW_TITLE = 'Kept off the board — system bookkeeping, or flagged hidden'
-
-// Which half of the board a top-level row belongs to (`true` = finished).
-// The client half of a hand-mirrored pair: the server's `_TASK_LIST_COMPLETED_GROUP`
-// (apps/api/app/routes/tasks/) orders the response; this places the separator. Terms are spelled the
-// same, in the same order, and tested on each side (shared.test.tsx, test_tasks_routes_listing.py). Not generated
-// (unlike `generated/taskTransitions.ts`): three predicates over two columns and one state.
-// `hidden === true`, not `isHiddenSystemRow`: the server reads the column alone (P3b), and the persona
-// fallback would misplace a `hidden=false` system-persona row. A hidden row asking a question is unfinished.
-export function isCompletedRow(task: PipelineTask): boolean {
-  return (
-    task.state === 'done' ||
-    task.archived_at != null ||
-    (task.hidden === true && task.state !== 'awaiting_response')
-  )
-}
 
 // `_create_epic_with_children` (apps/api routes/tasks/create.py) stores analysis children as `[<persona>]
 // <title>`; this strips that prefix at display, from the served roster's slugs (`rawPersonaPrefixRe`,
@@ -1061,16 +1096,20 @@ export function stateLabel(state: string): string {
 // The one persona list in `apps/web` not derived from the served roster: no served field says which
 // section a persona renders in, and `mode === 'analysis' && delivery === 'db'` would also match `finish`
 // and `prototyper` (persona_registry.py). shared.test.tsx pins each name as a registered pipeline persona.
-export const PREPARE_PERSONAS: readonly string[] = ['business_analysis', 'architecture', 'plan']
+export const PREPARE_PERSONAS: readonly string[] = ['business_analysis', 'app_wizard', 'architecture', 'plan']
 
-export type PersonaGroupKey = 'prepare' | 'coder' | 'finish' | 'other'
+export type PersonaGroupKey = 'prepare' | 'coder' | 'review' | 'finish' | 'other'
 
 // `finish` after `coder`. The group key is the persona (`coder`); the label stays
 // "Build", the phase an operator sees.
+/** The blind review children of a coder task (`apps/api/app/agent_router/personas.py::REVIEW_PERSONAS`). */
+export const BLIND_REVIEW_PERSONAS: readonly string[] = ['reviewer', 'security_reviewer', 'tester']
+
 export const PERSONA_GROUPS: { key: PersonaGroupKey; label: string }[] = [
   { key: 'prepare', label: 'Prepare' },
   { key: 'coder', label: 'Build' },
   { key: 'finish', label: 'Finish' },
+  { key: 'review', label: 'Blind review' },
   { key: 'other', label: 'Other' },
 ]
 
@@ -1087,6 +1126,8 @@ export function personaGroupOf(t: PipelineTask): PersonaGroupKey {
   if (t.persona === 'coder' || t.persona === 'translate' || t.persona === 'marketer'
     || t.persona === 'prototyper') return 'coder'
   if (t.persona === 'finish') return 'finish'
+  // A coder task's blind review children (`app/blind_review.py`): advisory, so their own section.
+  if (BLIND_REVIEW_PERSONAS.includes(t.persona)) return 'review'
   return 'other'
 }
 
@@ -1189,7 +1230,7 @@ export const TASK_ACTIONS = {
 // form's Go on an `active` row (`goTransitions`), whose intent reads as "restart with my edits".
 // `epic`: an epic's Reset cascades to every subtask (`routes/tasks/transitions.py::reset_task`), so the dialog says so.
 export function resetConfirmOptions(title: string, opts?: { thenRestart?: boolean; epic?: boolean }) {
-  return {
+  return danger(opts?.thenRestart ? 'Save and restart' : TASK_ACTIONS.reset.verb, {
     title: opts?.thenRestart ? 'Save and restart' : TASK_ACTIONS.reset.verb,
     message: opts?.epic ? (
       <>
@@ -1205,15 +1246,13 @@ export function resetConfirmOptions(title: string, opts?: { thenRestart?: boolea
         attachments are kept.
       </>
     ),
-    confirmLabel: opts?.thenRestart ? 'Save and restart' : TASK_ACTIONS.reset.verb,
-    destructive: true,
-  }
+  })
 }
 
 // The one wording for Stop, shared by the board's Stop (Tasks.tsx) and the task page's ⋯. `queued`: a
 // row Stop accepts that can ALSO still Start had nothing dispatched against it, so no runner is promised.
 export function stopConfirmOptions(title: string, queued: boolean) {
-  return {
+  return danger(TASK_ACTIONS.stop.verb, {
     title: 'Stop task',
     message: (
       <>
@@ -1222,9 +1261,7 @@ export function stopConfirmOptions(title: string, queued: boolean) {
         {queued ? '' : ' A live runner is not force-killed — it reconciles on its own.'}
       </>
     ),
-    confirmLabel: TASK_ACTIONS.stop.verb,
-    destructive: true,
-  }
+  })
 }
 
 /* What this press destroys, as a discriminated union: a nullable title meant "create" and made the
@@ -1247,7 +1284,7 @@ export function discardConfirmOptions(subject: DiscardSubject) {
   /* An empty Title has no name to quote; `undefined` explicitly rather than relying on `ConfirmDialog`'s
   truthiness. */
   const named = subject.kind === 'create' ? '' : displayTitle(subject.title).trim()
-  return {
+  return danger('Discard', {
     title: 'Discard changes',
     /* The row in the identity block, not mid-prose, where a long title pushed the "what is lost" clause down.
     Clamped: it only has to identify the row. */
@@ -1263,12 +1300,10 @@ export function discardConfirmOptions(subject: DiscardSubject) {
         step that has not finished yet; the task stays on the list.
       </>
     ),
-    confirmLabel: 'Discard',
     /* Not 'Cancel': the confirm is raised by a former Cancel button. Not "Keep editing" on the half-landed
     create, where the editor is locked (`data-locked`). */
     cancelLabel: subject.kind === 'created' ? 'Stay here' : 'Keep editing',
-    destructive: true,
-  }
+  })
 }
 
 /* A confirm banner's title budget: 72 characters, a bit over one line of the 420px modal at 0.8125rem.
@@ -1309,11 +1344,14 @@ export const ACTION_ICON = {
   stack: '🌐',
   // Duplicate, the ⋯ item that creates: ⧉ for a copied record, monochrome like its neighbours.
   duplicate: '⧉',
-  // "Move…" and "Waiting…" (`MoveToFeatureDialog`, `WaitOnCustomerDialog`).
-  file: '⇥',
+  // Pause, as a menu item (an automation's Pause).
   wait: '⏸',
   // A comment's "Add reaction": monochrome, like its Edit/Delete neighbours; the palette holds the colour.
   react: '☺',
+  // A comment's "Reply": puts @author in the composer; text presentation, like its neighbours.
+  reply: '↩\uFE0E',
+  // A task's Pin / Unpin (`lib/taskPin.ts`): the ⋯ item and the pinned row's one-click unpin.
+  pin: '📌',
 } as const
 
 // Whether a row's cleanup action reads "Archive" rather than "Delete", from state alone, so

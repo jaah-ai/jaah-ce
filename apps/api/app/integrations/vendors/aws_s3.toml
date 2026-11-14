@@ -1,0 +1,48 @@
+# AWS S3: an IAM access key, SigV4-signed; the Test lists the account's buckets (ListBuckets).
+slug = "aws_s3"
+label = "AWS S3"
+category = "data"
+vendor_docs_url = "https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListBuckets.html"
+summary = "Let agents read and write files in your Amazon S3 buckets."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "access_key_id", label = "Access key ID", kind = "text", required = true, placeholder = "AKIA...", help = "AWS console > IAM > Users > the agents' user > Security credentials > Access keys > Create access key; choose Application running outside AWS and copy the Access key ID" },
+  { key = "secret_access_key", label = "Secret access key", kind = "secret", required = true, help = "Shown once, beside the access key ID, when the key is created; download the .csv if you need to keep it" },
+  { key = "region", label = "Region", kind = "text", required = false, default = "us-east-1", placeholder = "us-east-1", help = "The region of the buckets agents use most, for example eu-west-1 (shown on each bucket in the S3 console)" },
+]
+
+[test]
+method = "GET"
+path = "https://s3.amazonaws.com/"
+auth = { sigv4 = { service = "s3", region = "us-east-1", access_key_field = "access_key_id", secret_key_field = "secret_access_key" } }
+# S3 refuses a SigV4 request without the payload hash; this is the hash of the empty body.
+headers = { "x-amz-content-sha256" = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" }
+accept = ""
+
+[docs]
+agent_uses = [
+  "Read a file from a bucket, such as an export, a log or a fixture, and use it in the task",
+  "Upload a build artifact, a report or a generated dataset to a bucket",
+  "List what is in a bucket or prefix to find the newest file",
+  "Check a bucket's policy, versioning or lifecycle settings while debugging",
+]
+prerequisites = [
+  "An AWS account and an IAM user for agents (not the root user).",
+  "An IAM policy on that user allowing s3:ListAllMyBuckets (the Test needs it) plus the bucket actions agents need, for example s3:GetObject and s3:PutObject on arn:aws:s3:::my-bucket/*.",
+]
+limitations = [
+  "Jaah tests by listing your buckets (ListBuckets). A user whose policy does not allow s3:ListAllMyBuckets fails the Test with a 403 even if it can read a bucket.",
+  "Only long-lived IAM access keys are supported. Temporary (STS) session credentials and IAM Identity Center sign-in are not.",
+  "The Test signs for us-east-1, the global S3 endpoint. An account whose service control policy denies us-east-1 fails the Test.",
+]
+troubleshooting = [
+  { symptom = "Test says AWS S3 rejected the secret access key (403)", fix = "Either the key pair is wrong or deactivated (check IAM > Users > Security credentials, and create a new key if needed), or the user lacks s3:ListAllMyBuckets. Add that action to the user's policy" },
+  { symptom = "Test says the access key ID cannot be sent", fix = "Paste only the 20-character access key ID, starting AKIA, with no spaces or quotes" },
+  { symptom = "Agents get AccessDenied on one bucket", fix = "Allow the needed actions on that bucket in the user's IAM policy, and check the bucket policy does not deny the user" },
+]
+faq = [
+  { q = "Can I limit agents to one bucket?", a = "Yes. Allow s3:ListAllMyBuckets for the Test and grant object actions only on that bucket's ARN" },
+  { q = "Does it work with S3-compatible storage such as R2 or MinIO?", a = "No. This card is for Amazon S3; use a custom connector for other storage" },
+]

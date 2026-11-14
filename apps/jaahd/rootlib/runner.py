@@ -3,8 +3,8 @@
 The helper constrains the CONTENTS and the caller names nothing: every command is a program a
 table names plus arguments derived from the helper's own root-only store, `shell=False`, argv as a list —
 never `shell=True`, `os.system`, a string command, or an argv element that arrived over the socket. `run()`
-asserts the shape rather than trusting the caller. This table holds what `rootlib` itself calls;
-`vnodehelper/runner.py` widens it with the vnode helper's own programs.
+asserts the shape rather than trusting the caller. The table is the ONE list of programs the root helpers
+(`rootlib` and `vnodehelper`) run; `tests/test_rootlib_runner.py` pins that every row has a caller.
 """
 from __future__ import annotations
 
@@ -26,6 +26,24 @@ PROGRAMS = {
     # writing it with the `iptables` binary rather than with `nft` is what keeps it legible to
     # `iptables -S` on a node, whichever backend the alternatives link resolves to.
     "iptables": "/usr/sbin/iptables",
+    # The vnode helper's own (`vnodehelper/ops.py`, `nodelinks.py`, `gha.py`).
+    "nft": "/usr/sbin/nft",
+    "useradd": "/usr/sbin/useradd",
+    "userdel": "/usr/sbin/userdel",
+    "groupadd": "/usr/sbin/groupadd",
+    "groupdel": "/usr/sbin/groupdel",
+    "systemctl": "/usr/bin/systemctl",
+    "usermod": "/usr/sbin/usermod",
+    "loginctl": "/usr/bin/loginctl",
+    "pgrep": "/usr/bin/pgrep",
+    "mount": "/usr/bin/mount",
+    "tailscale": "/usr/bin/tailscale",
+    # The MicroVM virtiofsd grant (`ops.ensure_microvm_grants`): `acl`, a package Depends.
+    "setfacl": "/usr/bin/setfacl",
+    # `host.grow_root` (`ops.grow_root`): growpart is `cloud-guest-utils`, the other two the filesystems' own.
+    "growpart": "/usr/bin/growpart",
+    "resize2fs": "/usr/sbin/resize2fs",
+    "xfs_growfs": "/usr/sbin/xfs_growfs",
 }
 # NO `install` ROW, and it is not an oversight: `install -o <user> -m <mode> <src> <dst>` is a general
 # "write any file as root with any owner and any mode" primitive — strictly larger than every program
@@ -49,17 +67,16 @@ class Result:
 
 
 def run(program: str, *args: str, check: bool = True, timeout: float = 60.0,
-        stdin_text: str | None = None, programs: dict[str, str] | None = None) -> Result:
+        stdin_text: str | None = None) -> Result:
     """Run one enumerated program with a fixed argv. `program` is a KEY into PROGRAMS, never a path.
 
     `stdin_text` carries input too large for a command line (`nft -f -`) so it still goes through here; a
     second `subprocess` site would skip the argv assertions (`tests/test_rootlib_runner.py` pins none
-    exists). `programs` is the vnode helper's wider table; `rootlib`'s own calls never pass it.
+    exists).
     """
-    table = PROGRAMS if programs is None else programs
-    if program not in table:
+    if program not in PROGRAMS:
         raise ValueError(f"{program!r} is not an enumerated program")
-    argv = [table[program], *args]
+    argv = [PROGRAMS[program], *args]
     for element in argv:
         if not isinstance(element, str):
             raise TypeError("argv elements must be str")

@@ -3,12 +3,19 @@ import TextField from '@mui/material/TextField'
 import type { JSX } from 'react'
 
 import { fieldTapTargetSx } from './listStyles'
+import { grid } from '../theme'
 
 /* The basis holds a full `mm/dd/yyyy, --:-- --` and its picker glyph. Growing below `md`: a pair too wide for one
  * line stacks as a full-width column under the search rather than two stubs at its left. Capped from `md` up, where
  * the pair sits beside the row's other controls. */
-const FIELD_PX = 196
-const FIELD_SX = { m: 0, flex: `1 1 ${FIELD_PX}px`, minWidth: { xs: 0, md: FIELD_PX }, maxWidth: { md: 240 } } as const
+const FIELD_SX = {
+  m: 0,
+  flexGrow: 1,
+  flexShrink: 1,
+  flexBasis: grid(32.5),
+  minWidth: { xs: 0, md: grid(32.5) },
+  maxWidth: { md: grid(40) },
+} as const
 
 const UNPARSEABLE_HELP = 'Not a date and time — this bound is not applied'
 
@@ -28,7 +35,7 @@ type Props = {
  * a filled-in range over a result set that was never narrowed. */
 export function DateTimeBoundFields({ from, to, onFrom, onTo, fromUnparseable, toUnparseable }: Props): JSX.Element {
   return (
-    <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, flex: { xs: `1 1 ${2 * FIELD_PX}px`, md: '0 1 auto' }, minWidth: 0 }}>
+    <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, flexGrow: { xs: 1, md: 0 }, flexShrink: 1, flexBasis: { xs: grid(65), md: 'auto' }, minWidth: 0 }}>
       <TextField
         label="From"
         type="datetime-local"

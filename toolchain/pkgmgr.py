@@ -22,6 +22,10 @@ from collections.abc import Sequence
 # than one upgrade.
 LOCK_TIMEOUT_S = 600
 APT_LOCK_OPT = f"-o DPkg::Lock::Timeout={LOCK_TIMEOUT_S}"
+# RETRY A FAILED FETCH, don't fail the transaction on it: a mirror answering `503` for ONE file while serving the
+# rest (Ubuntu's EC2 mirror, rootlesskit's .deb) failed a whole install, so a vnode create, for 20+ minutes. apt's
+# default is zero retries; with this it retries each failed download with backoff. dnf retries on its own.
+APT_RETRY_OPT = "-o Acquire::Retries=5"
 
 APT = "apt"
 DNF = "dnf"
@@ -58,7 +62,7 @@ def install_command(*packages: str, apt: Sequence[str] | None = None, dnf: Seque
     names = " ".join(shlex.quote(n) for n in _names(packages, apt, dnf, manager))
     update = f"{refresh_command(manager)}; " if refresh else ""
     if manager == APT:
-        return f"{update}DEBIAN_FRONTEND=noninteractive apt-get {APT_LOCK_OPT} install -y {names}"
+        return f"{update}DEBIAN_FRONTEND=noninteractive apt-get {APT_LOCK_OPT} {APT_RETRY_OPT} install -y {names}"
     return f"{update}dnf -y -q install {names}"
 
 
@@ -66,7 +70,7 @@ def refresh_command(manager: str | None = None) -> str:
     """The shell text that refreshes this host's package index. Raises RuntimeError with no package manager."""
     manager = manager or kind()
     if manager == APT:
-        return f"apt-get {APT_LOCK_OPT} update -qq"
+        return f"apt-get {APT_LOCK_OPT} {APT_RETRY_OPT} update -qq"
     if manager == DNF:
         return "dnf -q makecache"
     raise RuntimeError("pkgmgr: no apt-get or dnf on this host")
@@ -106,7 +110,7 @@ def install_file_command(path: str, manager: str | None = None) -> str:
     """The shell text that installs a downloaded package FILE (`./x.deb` / `./x.rpm`) with its dependencies."""
     manager = manager or kind()
     if manager == APT:
-        return f"apt-get {APT_LOCK_OPT} install -y {shlex.quote(path)}"
+        return f"apt-get {APT_LOCK_OPT} {APT_RETRY_OPT} install -y {shlex.quote(path)}"
     if manager == DNF:
         return f"dnf -y -q install {shlex.quote(path)}"
     raise RuntimeError("pkgmgr: no apt-get or dnf on this host")
@@ -138,10 +142,3 @@ def installed_version(package: str) -> str | None:
 
 def is_installed(package: str) -> bool:
     return installed_version(package) is not None
-
-
-def reinstall_hint(package: str = "jaah") -> str:
-    """The operator command that re-runs PACKAGE's maintainer scripts on this host, for a message."""
-    if kind() == DNF:
-        return f"dnf reinstall -y {package}"
-    return f"apt-get install --reinstall {package}"

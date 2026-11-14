@@ -14,7 +14,7 @@
  * No `orgId` (R5.6): an operator's org narrowing comes from the global filter (`lib/orgScope.ts`); a
  * stale persisted `orgId` from an older payload is ignored, like any unknown field. */
 
-import { readJsonObject, writeJson } from './safeStorage'
+import { adminScopedKey, readJsonObject, writeJson } from './safeStorage'
 import { readExpandedPaths, readTreeMode, type TreeViewMode } from './treeViewStorage'
 import { isUuidShaped } from './uuidShape'
 
@@ -75,12 +75,10 @@ export const DEFAULT_CREDENTIAL_VIEW: CredentialView = {
   sort: 'newest',
 }
 
-/**
- * The storage key, scoped to the signed-in admin's id; `null` gets its own `anon` bucket. `auth.tsx`
- * seeds `admin` from its snapshot, so the id is normally present on first render.
- */
+/** The storage key (`adminScopedKey`); `auth.tsx` seeds `admin` from its snapshot, so the id is normally present on
+ *  first render. */
 export function credentialViewStorageKey(adminId: string | null): string {
-  return `cockpit.credentials.view:${adminId ?? 'anon'}`
+  return adminScopedKey('cockpit.credentials.view', adminId)
 }
 
 /**

@@ -1,0 +1,47 @@
+# ClickHouse: a database user over the HTTPS interface; the Test runs `SELECT 1`.
+slug = "clickhouse"
+label = "ClickHouse"
+category = "data"
+vendor_docs_url = "https://clickhouse.com/docs/interfaces/http"
+summary = "Let agents run SQL against ClickHouse Cloud or your own ClickHouse server over HTTPS."
+
+[[auth]]
+kind = "basic"
+fields = [
+  { key = "base_url", label = "HTTPS endpoint", kind = "url", required = true, placeholder = "https://abc123xyz.us-east-1.aws.clickhouse.cloud:8443", help = "ClickHouse Cloud: open the service and select Connect > HTTPS, then copy the host and port as https://HOST:8443. A self-managed server: its HTTPS address, port 8443 by default" },
+  { key = "username", label = "User", kind = "text", required = true, default = "default", help = "The database user agents sign in as; ClickHouse Cloud's first user is named default" },
+  { key = "password", label = "Password", kind = "secret", required = true, help = "The user's password. ClickHouse Cloud shows the default user's password once when the service is created; reset it under the service's Settings > Reset password if you no longer have it" },
+]
+
+[test]
+method = "GET"
+path = "{base_url}/?query=SELECT%201%20FORMAT%20JSON"
+auth = { basic = ["username", "password"] }
+list_field = "data"
+
+[docs]
+agent_uses = [
+  "Run analytical SQL over event and log tables to answer questions in a task",
+  "Inspect databases, tables and column types with SHOW and DESCRIBE before changing a schema",
+  "Check that ingestion is current by reading the newest rows",
+  "Run the query an agent wrote for a report and attach the result",
+]
+prerequisites = [
+  "A ClickHouse Cloud service, or a self-managed ClickHouse server with its HTTPS interface open to the internet.",
+  "A database user for agents, granted SELECT on what they should read. In ClickHouse Cloud, create one under SQL console with CREATE USER and GRANT rather than handing out the default user.",
+  "If the service has an IP access list, an entry that allows Jaah's address.",
+]
+limitations = [
+  "Jaah tests with `SELECT 1`. It proves the address, user and password, not that the user may read a given table.",
+  "Only HTTPS endpoints are accepted. A server reachable only over the native protocol (port 9440) or a private network cannot be connected.",
+  "Queries run with the user's settings and quotas. Set readonly = 1 on the user's profile to keep agents read-only.",
+]
+troubleshooting = [
+  { symptom = "Test says ClickHouse rejected the password (401 or 403)", fix = "Check the user and password. In ClickHouse Cloud reset the password under the service's Settings, then select Replace on the secret" },
+  { symptom = "Test says ClickHouse cannot be reached", fix = "Use the HTTPS host with port 8443 from Connect > HTTPS. A stopped (idle) ClickHouse Cloud service wakes on the first request, so test again after a minute. Check the service's IP access list" },
+  { symptom = "A query fails with ACCESS_DENIED", fix = "Grant the user SELECT on the database or table: GRANT SELECT ON db.* TO agent_user" },
+]
+faq = [
+  { q = "Does it work with self-managed ClickHouse?", a = "Yes, when its HTTPS interface is reachable from the internet at a public address" },
+  { q = "Can agents write data?", a = "Only if the user may. Give agents a user with SELECT grants only, or readonly = 1 on its settings profile" },
+]

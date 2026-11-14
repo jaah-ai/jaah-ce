@@ -1,6 +1,7 @@
 import Box from '@mui/material/Box'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
+import EmptyState from '../../ui/EmptyState'
 import Banner from '../../ui/Banner'
 import type { ActivityType, ParamsProperty } from './api'
 
@@ -58,13 +59,11 @@ function StoredParams({
   const names = Object.keys(params)
   if (names.length === 0) {
     return (
-      <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-        No parameters.
-      </Typography>
+      <EmptyState inline title="No parameters." />
     )
   }
   return (
-    <Stack spacing={0.75} sx={{ mt: 1 }} data-testid="cron-params-readonly">
+    <Stack spacing={0.5} sx={{ mt: 1 }} data-testid="cron-params-readonly">
       {names.map(name => (
         <Box key={name} sx={{ minWidth: 0 }}>
           {/* THE LABEL RENDERS AT EVERY WIDTH: `ScheduleSummary`'s caption, not `ui/CellLabel` (which is

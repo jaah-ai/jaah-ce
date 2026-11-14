@@ -10,15 +10,17 @@ import type { Theme } from '@mui/material/styles'
 import { apiDetail, get, post, put } from '../../../api'
 import { useAuth } from '../../../auth'
 import { useBoardScope } from '../../../lib/boardScope'
-import { FOCUSED_PROJECT_PREF, readFocusedProjectId } from '../../../lib/focusedProject'
+import { withReturn } from '../../../lib/nestedCreate'
 import { withRemoved } from '../../../lib/sets'
 import { MUTED_PREF, readMuted, toggledMuted } from '../../../lib/taskMute'
 import { parseScope, SCOPE_PARAM, scopeKey, type TaskScope } from '../../../lib/taskScope'
+import { AUTO_STAGE_STATE } from '../../../lib/pipelineBoard'
 import { useDebouncedCallback } from '../../../hooks/useDebouncedCallback'
 import { useSubmit } from '../../../hooks/useSubmit'
 import { TASK_TREE_QUERY_KEY } from '../../../hooks/useTaskTree'
 import type { TaskTree as TaskTreeData } from '../../../types'
 import { schemed } from '../../../ui/listStyles'
+import FormBox from '../../../ui/FormBox'
 import Toast from '../../../ui/Toast'
 import { useDeleteFeature } from '../useDeleteFeature'
 import TaskTreeRow, { type DropEdge } from './TaskTreeRow'
@@ -30,18 +32,19 @@ import {
   keyInTree,
   nodeForKey,
   pillCounts,
-  railKey,
   reorderedIds,
   visibleRows,
   withFeatureOrder,
   type RailNode,
 } from './railModel'
 import { NO_AUTOFILL_INPUT } from '../../../ui/noAutofill'
-import { SystemChip } from '../../../ui/MarkChip'
+import { EyeIcon, EyeOffIcon } from '../../../ui/icons'
 import { orgQualifierFor } from '../../../lib/projectLabel'
+import { FONT_SIZE, FONT_WEIGHT, LETTER_SPACING, RADIUS, SIZE } from '../../../theme'
+import Tip from '../../../ui/Tip'
 
-/* THE TASK RAIL'S TREE (Architecture §5.1): Pinned, then All projects › Project › Feature /
- * Shipped. Selecting a node navigates the board to that scope (`?scope=`, pushed); the board is the
+/* THE TASK RAIL'S TREE (Architecture §5.1): Pinned, then All projects › Project › Feature.
+ * Selecting a node navigates the board to that scope (`?scope=`, pushed); the board is the
  * one publishing which scope shows (`lib/boardScope.ts`), and the rail lights it. Selecting a project also
  * opens it, persisted like a hand toggle; only the disclosure (or ArrowLeft) closes it.
  *
@@ -56,6 +59,20 @@ import { orgQualifierFor } from '../../../lib/projectLabel'
 export const FOCUS_COMPOSER_STATE = 'focusComposer'
 
 const EXPAND_WRITE_MS = 1_000
+
+/** A small button at the find box's right end (show hidden, clear). */
+const ADORNMENT_SX = {
+  flex: '0 0 auto',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  p: 0,
+  border: 0,
+  borderRadius: RADIUS.sm,
+  background: 'none',
+  cursor: 'pointer',
+  fontSize: FONT_SIZE.sm,
+} as const
 
 function readKeys(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : []
@@ -79,8 +96,6 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
   const onBoard = pathname === '/tasks'
   const boardScope = useBoardScope()
   const selectedKey = onBoard ? boardScope : null
-  // The row that lights for it (`railKey`: a project's no-feature scope lights the project).
-  const litKey = selectedKey === null ? null : railKey(selectedKey)
 
   // ── Per-user state ───────────────────────────────────────────────────────────────────────────────────
   const prefs = admin?.preferences
@@ -139,17 +154,21 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
     void updatePreferences({ task_rail_pins: next })
   }
 
-  // Mute (`lib/taskMute.ts`): this user's alone. The stored list, not one filtered by the tree, so a mute of a
+  // Hide / Show (`lib/taskMute.ts`): this user's alone. The stored list, not one filtered by the tree, so a hide of a
   // node this user cannot see right now is kept.
-  function toggleMute(key: string) {
+  function toggleHidden(key: string) {
     void updatePreferences({ [MUTED_PREF]: toggledMuted(readMuted(prefs), key) })
+    // Hiding unmounts the row the menu returns focus to: the find box keeps the keyboard's place instead.
+    requestAnimationFrame(() => filterRef.current?.focus())
   }
-
-  // The focused project (`lib/focusedProject.ts`): one per user, so setting one replaces the last.
-  const focusedProjectId = readFocusedProjectId(prefs)
-  function toggleFocus(projectId: number) {
-    void updatePreferences({ [FOCUSED_PROJECT_PREF]: focusedProjectId === projectId ? null : projectId })
-  }
+  // The find box's eye: hidden rows drawn greyed, so one can be shown again. This rail's own, never stored.
+  const [showHidden, setShowHidden] = useState(false)
+  const hiddenCount = tree
+    ? tree.projects.filter(p => p.muted).length
+      // A feature hidden inside a hidden project is counted once, by its project.
+      + tree.projects.reduce((n, p) => n + (p.muted ? 0 : p.features.filter(f => f.muted).length), 0)
+    : 0
+  const hiddenLabel = hiddenCount > 0 ? `Show hidden (${hiddenCount})` : 'Show hidden'
 
   // ── Navigation ───────────────────────────────────────────────────────────────────────────────────────
   function hrefFor(scope: TaskScope): string {
@@ -165,18 +184,18 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
     onNavigate?.()
   }
 
-  /** A row's click / Enter: selecting a project also opens it (and keeps it open — it never collapses it). */
+  /** A row's click / Enter: selecting a project also opens it (and keeps it open — it never collapses it), and the
+   *  board opens it on the stage that needs someone (`AUTO_STAGE_STATE`). */
   function activate(node: RailNode) {
     // The SAVED list, not `isOpen`: a project open only as the selection's ancestor (`forced`) drops out of
     // that set once it is itself selected. A leaf or a pinned (flattened) row has nothing here to open.
     if (node.kind === 'project' && node.expandable && !expandedSet.has(node.key)) setOpen(node.key, true)
-    if (node.scope) select(node.scope)
-    else if (node.expandable) setOpen(node.key, !node.expanded)
+    select(node.scope, node.scope.kind === 'project' ? { [AUTO_STAGE_STATE]: scopeKey(node.scope) } : undefined)
   }
 
   // ── Filter ───────────────────────────────────────────────────────────────────────────────────────────
   const [filter, setFilter] = useState('')
-  const matches = useMemo(() => (tree ? filterTree(tree, filter) : []), [tree, filter])
+  const matches = useMemo(() => (tree ? filterTree(tree, filter, showHidden) : []), [tree, filter, showHidden])
   // Two orgs' same-named projects: the rail draws each one's org slug (`lib/projectLabel.tsx`).
   const qualifierOf = useMemo(() => orgQualifierFor(tree?.projects ?? []), [tree])
   const filtering = filter.trim() !== ''
@@ -190,17 +209,19 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
       return matches.map(m => ({ id: `match|${m.node.key}`, node: m.node, level: 1, subtitle: m.path || undefined, highlight: { start: m.start, length } }))
     }
     const pinnedRows: Row[] = pins.flatMap(key => {
-      const node = nodeForKey(key, tree)
+      const node = nodeForKey(key, tree, showHidden)
       return node ? [{ id: `pin|${key}`, node: { ...node, expandable: false, expanded: false }, level: 1, pinned: true }] : []
     })
-    const treeRows: Row[] = visibleRows(tree, isOpen).map(node => ({ id: `node|${node.key}`, node, level: node.level }))
+    // The board's open node and its ancestors stay drawn while hidden, greyed, so the open scope keeps its lit row.
+    const keep = showHidden || new Set(selectedKey === null ? [] : [selectedKey, ...ancestorKeys(parseScope(selectedKey), tree)])
+    const treeRows: Row[] = visibleRows(tree, isOpen, keep).map(node => ({ id: `node|${node.key}`, node, level: node.level }))
     return [...pinnedRows, ...treeRows]
-  }, [tree, filtering, matches, pins.join('|'), expandedSet, forced])
+  }, [tree, filtering, matches, pins.join('|'), expandedSet, forced, showHidden, selectedKey])
 
   // ── Roving focus ─────────────────────────────────────────────────────────────────────────────────────
   const [focusId, setFocusId] = useState<string | null>(null)
   const rowEls = useRef(new Map<string, HTMLElement>())
-  const tabStop = rows.find(r => r.id === focusId)?.id ?? rows.find(r => r.node.key === litKey)?.id ?? rows[0]?.id
+  const tabStop = rows.find(r => r.id === focusId)?.id ?? rows.find(r => r.node.key === selectedKey)?.id ?? rows[0]?.id
 
   function focusRow(id: string | undefined) {
     if (!id) return
@@ -262,13 +283,13 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
     }
   }
 
-  // ── Row menu (Pin/Unpin, Mute/Unmute, Focus/Unfocus, Up/Down, New, Edit) ───────────────────────────────────────────────────────────────────────────
+  // ── Row menu (Pin/Unpin, Hide/Show, Up/Down, New, Edit) ───────────────────────────────────────────────────────────────────────────
   const [menu, setMenu] = useState<{ anchor: HTMLElement; node: RailNode; rowId: string } | null>(null)
   function menuFor(node: RailNode): boolean {
     if (node.kind === 'all') return createActionFor(node) !== undefined
-    return node.kind === 'project' || node.kind === 'feature'
+    return true
   }
-  const pinnable = (node: RailNode) => node.kind !== 'all' && node.kind !== 'shipped'
+  const pinnable = (node: RailNode) => node.kind !== 'all'
 
   // ── Create ───────────────────────────────────────────────────────────────────────────────────────────
   const [creating, setCreating] = useState<Creating | null>(null)
@@ -287,7 +308,7 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
     switch (node.kind) {
       case 'all':
         return tree.can_create_project
-          ? { label: 'New project', run: () => { navigate('/projects/new'); onNavigate?.() } }
+          ? { label: 'New project', run: () => { navigate(withReturn('/projects/new', `${pathname}${search}`)); onNavigate?.() } }
           : undefined
       case 'project': {
         const project = node.project!
@@ -296,9 +317,8 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
           : undefined
       }
       case 'feature':
-        // Filing into a shipped feature is refused, so it offers no "+".
-        return node.feature?.status === 'active' && node.project?.can_create_tasks && node.scope
-          ? { label: `New task in ${node.label}`, run: () => select(node.scope!, { [FOCUS_COMPOSER_STATE]: Date.now() }) }
+        return node.project?.can_create_tasks
+          ? { label: `New task in ${node.label}`, run: () => select(node.scope, { [FOCUS_COMPOSER_STATE]: Date.now() }) }
           : undefined
       default:
         return undefined
@@ -325,7 +345,7 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
   const [toast, setToast] = useState<{ severity: 'success' | 'error'; text: string } | null>(null)
   // Deleting the lit feature moves the board to its project; deleting another leaves the board where it is.
   const remove = useDeleteFeature({
-    onDeleted: (projectId, featureId) => { if (litKey === `feature:${featureId}`) select({ kind: 'project', projectId }) },
+    onDeleted: (projectId, featureId) => { if (selectedKey === `feature:${featureId}`) select({ kind: 'project', projectId }) },
     onError: text => setToast({ severity: 'error', text }),
   })
   async function fileTask(taskId: number, node: RailNode) {
@@ -346,21 +366,21 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
     }
   }
 
-  async function unfileTask(taskId: number, node: RailNode) {
+  async function fileIntoProject(taskId: number, node: RailNode) {
     const project = node.project!
     let moving = false
     try {
       const task = await get<{ project_id: number; feature_id?: string | null }>(`/api/tasks/${taskId}`)
       moving = task.project_id !== project.id
       if (moving) {
-        // Leaving a project leaves its feature: the move lands the task with no feature.
+        // Leaving a project leaves its feature: the move lands the task in the project alone.
         await put(`/api/tasks/${taskId}`, { project_id: project.id })
         void client.invalidateQueries({ queryKey: TASK_TREE_QUERY_KEY })
         setToast({ severity: 'success', text: `Task ${taskId} moved to ${project.name}` })
         return
       }
       if (!task.feature_id) {
-        setToast({ severity: 'success', text: `Task ${taskId} already has no feature` })
+        setToast({ severity: 'success', text: `Task ${taskId} is already in ${project.name}` })
         return
       }
       await put(`/api/tasks/${taskId}`, { feature_id: null })
@@ -374,7 +394,7 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
     }
   }
 
-  // ── Reorder a project's active features (drag, or the row menu's Move up / Move down) ─────────────────
+  // ── Reorder a project's features (drag, or the row menu's Move up / Move down) ─────────────────
   // Who is dragging: a drag-over sees only the types, so the tree says which rows are the dragged one's siblings.
   const [draggingFeature, setDraggingFeature] = useState<{ projectId: number; featureId: string } | null>(null)
   // The row's own `dragend` never arrives when a refetch unmounts it mid-drag, so the document's clears it too.
@@ -389,7 +409,7 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
     }
   }, [draggingFeature])
   const canReorder = (node: RailNode) =>
-    !touch && node.kind === 'feature' && node.feature?.status === 'active' && node.project?.can_edit_tasks === true
+    !touch && node.kind === 'feature' && node.project?.can_edit_tasks === true
 
   async function moveFeature(projectId: number, featureId: string, targetId: string, edge: DropEdge) {
     if (!tree) return
@@ -408,29 +428,28 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
     }
   }
 
-  /** The active sibling one step up or down, for the row menu; `undefined` at that end. */
+  /** The sibling one step up or down, for the row menu; `undefined` at that end. */
   function neighbour(node: RailNode, step: -1 | 1): string | undefined {
-    const active = node.project!.features.filter(f => f.status === 'active')
-    return active[active.findIndex(f => f.id === node.feature!.id) + step]?.id
+    const siblings = node.project!.features
+    return siblings[siblings.findIndex(f => f.id === node.feature!.id) + step]?.id
   }
 
   const filterRef = useRef<HTMLInputElement | null>(null)
 
   if (!tree) {
     return (
-      <Typography component="div" data-testid="rail-tree-loading" sx={{ px: 1.5, py: 1, fontSize: '0.75rem', opacity: 0.7 }}>
+      <Typography component="div" data-testid="rail-tree-loading" sx={{ px: 1.5, py: 1, fontSize: FONT_SIZE.sm, opacity: 0.7 }}>
         Loading projects…
       </Typography>
     )
   }
 
   const creatingRow = creating && (
-    <Box
+    <FormBox
       key="rail-create"
-      component="form"
       data-testid="rail-create"
-      onSubmit={e => { e.preventDefault(); void submitCreate() }}
-      sx={{ margin: '2px 4px', padding: `0 6px 0 ${22 + Math.max(0, creating.level - 2) * 12}px` }}
+      onSubmit={submitCreate}
+      sx={{ mx: 0.5, my: 0, pr: 1, pl: 3.5 + Math.max(0, creating.level - 2) * 2 }}
     >
       <InputBase
         autoFocus
@@ -445,26 +464,27 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
         placeholder="Feature name"
         inputProps={{ 'aria-label': 'New feature name', 'data-testid': 'rail-create-input' }}
         sx={(t: Theme) => ({
-          fontSize: '0.8125rem',
-          padding: '1px 6px',
-          borderRadius: '4px',
+          fontSize: FONT_SIZE.md,
+          py: 0,
+          px: 1,
+          borderRadius: RADIUS.sm,
           border: '1px solid',
           ...schemed(t, c => ({ borderColor: c.accent, color: c.textStrong, backgroundColor: c.bg })),
           ...(touch && { minHeight: t.custom.tapTargetPx }),
         })}
       />
       {createError && (
-        <Typography role="alert" data-testid="rail-create-error" sx={{ fontSize: '0.6875rem', color: 'error.main', px: 0.75 }}>
+        <Typography role="alert" data-testid="rail-create-error" sx={{ fontSize: FONT_SIZE.xs, color: 'error.main', px: 0.5 }}>
           {createError}
         </Typography>
       )}
-    </Box>
+    </FormBox>
   )
 
   let pinnedHeaderShown = false
   return (
     <Box data-testid="rail-tree-host" sx={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-      <Box sx={{ padding: '2px 8px 6px' }}>
+      <Box sx={{ pt: 0, px: 1, pb: 1 }}>
         <InputBase
           inputRef={filterRef}
           fullWidth
@@ -477,27 +497,39 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
           placeholder="Find a project or feature"
           inputProps={{ ...NO_AUTOFILL_INPUT, 'aria-label': 'Find a project or feature', 'data-testid': 'rail-filter' }}
           endAdornment={
-            filter !== '' && (
+            <>
+            {/* Drawn only while something is hidden: otherwise it would show nothing. */}
+            {(hiddenCount > 0 || showHidden) && (
+              <Tip title={hiddenLabel}><Box
+                component="button"
+                type="button"
+                aria-pressed={showHidden}
+                aria-label={hiddenLabel}
+                data-testid="rail-show-hidden"
+                onClick={() => setShowHidden(v => !v)}
+                sx={(t: Theme) => ({
+                  ...ADORNMENT_SX,
+                  width: touch ? SIZE.thumb : SIZE.iconMd,
+                  height: touch ? SIZE.thumb : SIZE.iconMd,
+                  opacity: showHidden ? 1 : 0.7,
+                  ...schemed(t, c => ({ color: showHidden ? c.accent : 'inherit' })),
+                  '&:hover': { opacity: 1, ...schemed(t, c => ({ backgroundColor: c.hoverBg })) },
+                })}
+              >
+                {showHidden ? <EyeIcon /> : <EyeOffIcon />}
+              </Box></Tip>
+            )}
+            {filter !== '' && (
               <Box
                 component="button"
                 type="button"
                 aria-label="Clear filter"
-                title="Clear"
                 data-testid="rail-filter-clear"
                 onClick={() => { setFilter(''); filterRef.current?.focus() }}
                 sx={(t: Theme) => ({
-                  flex: '0 0 auto',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  width: touch ? 32 : 20,
-                  height: touch ? 32 : 20,
-                  p: 0,
-                  border: 0,
-                  borderRadius: '4px',
-                  background: 'none',
-                  cursor: 'pointer',
-                  fontSize: '0.75rem',
+                  ...ADORNMENT_SX,
+                  width: touch ? SIZE.thumb : SIZE.iconMd,
+                  height: touch ? SIZE.thumb : SIZE.iconMd,
                   color: 'inherit',
                   opacity: 0.7,
                   '&:hover': { opacity: 1, ...schemed(t, c => ({ backgroundColor: c.hoverBg })) },
@@ -505,12 +537,14 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
               >
                 ✕
               </Box>
-            )
+            )}
+            </>
           }
           sx={(t: Theme) => ({
-            fontSize: '0.8125rem',
-            padding: '2px 8px',
-            borderRadius: '4px',
+            fontSize: FONT_SIZE.md,
+            py: 0,
+            px: 1,
+            borderRadius: RADIUS.sm,
             border: '1px solid',
             ...schemed(t, c => ({ borderColor: c.border, color: c.textStrong, backgroundColor: c.overlayHover })),
             ...(touch && { minHeight: t.custom.tapTargetPx }),
@@ -524,7 +558,7 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
         sx={{ display: 'flex', flexDirection: 'column' }}
       >
         {filtering && rows.length === 0 && (
-          <Typography data-testid="rail-filter-empty" sx={{ px: 1.5, py: 0.5, fontSize: '0.75rem', opacity: 0.8 }}>
+          <Typography data-testid="rail-filter-empty" sx={{ px: 1.5, py: 0.5, fontSize: FONT_SIZE.sm, opacity: 0.8 }}>
             Nothing matches “{filter.trim()}”
           </Typography>
         )}
@@ -540,7 +574,7 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
                 <Typography
                   aria-hidden="true"
                   data-testid={heading ? 'rail-pinned-heading' : 'rail-all-heading'}
-                  sx={{ px: 1.5, pt: allHeading ? 1 : 0.25, pb: 0.25, fontSize: '0.6875rem', fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', opacity: 0.75 }}
+                  sx={{ px: 1.5, pt: allHeading ? 1 : 0, pb: 0, fontSize: FONT_SIZE.xs, fontWeight: FONT_WEIGHT.semibold, letterSpacing: LETTER_SPACING.caps, textTransform: 'uppercase', opacity: 0.75 }}
                 >
                   {heading ? 'Pinned' : 'Projects'}
                 </Typography>
@@ -551,7 +585,6 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
                 testId={row.pinned ? 'rail-pinned-node' : filtering ? 'rail-match' : 'rail-node'}
                 level={row.level}
                 label={node.label}
-                labelAside={node.kind === 'project' && node.project?.system_kind ? <SystemChip /> : undefined}
                 qualifier={node.kind === 'project' && node.project ? qualifierOf(node.project) : null}
                 counts={isMutedNode(node) ? undefined : pillCounts(node, row.pinned || filtering)}
                 muted={isMutedNode(node)}
@@ -559,7 +592,7 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
                 highlight={row.highlight}
                 expandable={node.expandable}
                 expanded={node.expanded}
-                selected={node.key === litKey}
+                selected={node.key === selectedKey}
                 tabbable={row.id === tabStop}
                 touch={touch}
                 rowRef={el => { if (el) rowEls.current.set(row.id, el); else rowEls.current.delete(row.id) }}
@@ -568,20 +601,20 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
                   setFocusId(row.id)
                   activate(node)
                 }}
-                href={node.scope ? hrefFor(node.scope) : undefined}
+                href={hrefFor(node.scope)}
                 onToggle={() => setOpen(node.key, !node.expanded)}
                 onKeyDown={e => onRowKeyDown(e, row, index)}
                 onCreate={create?.run}
                 createLabel={create?.label}
-                onMenu={menuFor(node) && pinnable(node) && !filtering ? anchor => setMenu({ anchor, node, rowId: row.id }) : undefined}
+                onMenu={menuFor(node) && node.kind !== 'all' && !filtering ? anchor => setMenu({ anchor, node, rowId: row.id }) : undefined}
                 menuOpen={menu?.rowId === row.id}
                 onDropTask={
                   touch
                     ? undefined
-                    : node.kind === 'feature' && node.feature?.status === 'active'
+                    : node.kind === 'feature'
                       ? taskId => void fileTask(taskId, node)
                       : node.kind === 'project'
-                        ? taskId => void unfileTask(taskId, node)
+                        ? taskId => void fileIntoProject(taskId, node)
                         : undefined
                 }
                 icon={node.kind === 'feature' ? node.feature?.icon : undefined}
@@ -628,20 +661,12 @@ export default function TaskTree({ tree, touch = false, onNavigate }: TaskTreePr
             {pins.includes(menu.node.key) ? 'Unpin' : 'Pin'}
           </MenuItem>
         )}
-        {menu && (menu.node.kind === 'project' || menu.node.kind === 'feature') && (
+        {menu && menu.node.kind !== 'all' && (
           <MenuItem
-            data-testid="rail-mute-toggle"
-            onClick={() => { toggleMute(menu.node.key); setMenu(null) }}
+            data-testid="rail-hide-toggle"
+            onClick={() => { toggleHidden(menu.node.key); setMenu(null) }}
           >
-            {readMuted(prefs).includes(menu.node.key) ? 'Unmute' : 'Mute'}
-          </MenuItem>
-        )}
-        {menu && menu.node.kind === 'project' && (
-          <MenuItem
-            data-testid="rail-focus-toggle"
-            onClick={() => { toggleFocus(menu.node.project!.id); setMenu(null) }}
-          >
-            {focusedProjectId === menu.node.project!.id ? 'Unfocus' : 'Focus'}
+            {readMuted(prefs).includes(menu.node.key) ? 'Show' : 'Hide'}
           </MenuItem>
         )}
         {menu && canReorder(menu.node) && (['up', 'down'] as const).map(dir => {

@@ -1,8 +1,10 @@
 """Which engine runs a task — the effective agent.
 
-`resolve_agent(session, task, project)` is the single home of the rule. Every dispatch reader asks it — the
-pass's allocation and plan (`routes/fleet.py`), the MicroVM admission (`microvm_placement.admit`) and the
-unrunnable-agent sweep (`lease_drain._fail_unrunnable_agents`) — and none re-derives it:
+`resolve_agent(session, task, project)` is the single home of the rule. Every dispatch reader asks it through
+`agent_router.effective_choice`, its only caller outside the router, which returns it verbatim unless the task's
+routing decision chose otherwise — the pass's allocation and plan (`routes/fleet.py`), the MicroVM admission
+(`microvm_placement.admit`) and the unrunnable-agent sweep (`lease_drain._fail_unrunnable_agents`) — and none
+re-derives it:
 
 1. a task's own pick (`tasks.agent_id`) → `Sdk` when the agent is active, visible to the task's org, fetched
    at least once and declares the persona, else `Refused` with the sentence an operator reads;
@@ -25,7 +27,7 @@ string's one home. "Visible" is `agent.org_id = task.org_id` for an org agent, o
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Iterable, Optional, Union
 from uuid import UUID
 
 from sqlalchemy import select, update
@@ -149,16 +151,38 @@ def _persona_words(persona: Optional[str]) -> str:
 def load_agent(session: Session, agent_id: Optional[UUID]) -> Optional[Agent]:
     """The `agents` row for `agent_id`, catalog connectors included. A tenant-bound session cannot see the
     operator org a connector lives in, so a miss is retried on the catalog's own read
-    (`routes/agents.py::_catalog_rows`, detached and read-only)."""
+    (`catalog_rows`, detached and read-only)."""
     if agent_id is None:
         return None
     row = session.scalars(select(Agent).where(Agent.id == agent_id)).first()
     if row is not None:
         return row
-    from app.routes.agents import _catalog_rows
-
-    rows = _catalog_rows([agent_id])
+    rows = catalog_rows([agent_id])
     return rows[0] if rows else None
+
+
+def catalog_rows(ids: Optional[Iterable[UUID]] = None) -> list[Agent]:
+    """Catalog connectors (all, or those in `ids`), read on a fleet session: they live in the operator org,
+    which a tenant's bound session cannot see. Read-only and returned detached — never written through."""
+    from app.db import BridgedSession
+    from app.tenancy import seam
+
+    with seam.detached(), seam.operator_scope(), BridgedSession() as fleet:
+        return read_catalog(fleet, ids)
+
+
+def read_catalog(fleet: Session, ids: Optional[Iterable[UUID]]) -> list[Agent]:
+    """`catalog_rows`'s read on `fleet`, a session already in the operator scope (`routes/agents.py` reads it on
+    an async one); the rows come back detached."""
+    query = select(Agent).where(Agent.is_catalog.is_(True))
+    if ids is not None:
+        wanted = list(ids)
+        if not wanted:
+            return []
+        query = query.where(Agent.id.in_(wanted))
+    rows = list(fleet.scalars(query.order_by(Agent.display_name)))
+    fleet.expunge_all()
+    return rows
 
 
 def visible_to(session: Session, agent: Agent, org_id: UUID) -> bool:
@@ -172,7 +196,7 @@ def visible_to(session: Session, agent: Agent, org_id: UUID) -> bool:
     ) is not None
 
 
-def _unrunnable(session: Session, agent: Optional[Agent], org_id: UUID) -> Optional[str]:
+def unrunnable_reason(session: Session, agent: Optional[Agent], org_id: UUID) -> Optional[str]:
     """Why this agent cannot run for `org_id` whatever the persona, or None when it can."""
     if agent is None:
         return "The picked agent no longer exists"
@@ -213,7 +237,7 @@ def resolve_agent(session: Session, task: Task, project: Optional[Project]) -> C
         return Refused(playbook_engine.OFF_DETAIL)
     if task.agent_id is not None:
         agent = load_agent(session, task.agent_id)
-        why = _unrunnable(session, agent, task.org_id)
+        why = unrunnable_reason(session, agent, task.org_id)
         if why is not None:
             return Refused(why)
         if task.persona not in (agent.personas or []):
@@ -224,7 +248,7 @@ def resolve_agent(session: Session, task: Task, project: Optional[Project]) -> C
     if project is not None and project.default_agent_id is not None:
         agent = load_agent(session, project.default_agent_id)
         if agent is None or task.persona in (agent.personas or []):
-            why = _unrunnable(session, agent, task.org_id)
+            why = unrunnable_reason(session, agent, task.org_id)
             if why is not None:
                 return Refused(why)
             return Sdk(agent)

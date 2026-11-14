@@ -9,7 +9,7 @@ redeploy. One leaf per channel, each the one place its channel's network call is
                                       operator org's Gmail) if SES answered a final no (`deliver_system_email`)
     telegram(chat_id, text, what)   → `telegram_notify._send`           (`deliver_telegram`)
     forward(kind, *args)            → a named send that records its own outcome — a lead's Slack/HubSpot
-                                      forward, the access-request cards (`deliver_forward`, `FORWARDS`)
+                                      forward (`deliver_forward`, `FORWARDS`)
     after_answer(kind, *args)       → a door's post-answer work, sealed — the sign-up and password-reset
                                       emails, the operators' notices (`deliver_after_answer`, `AFTER_ANSWER`)
 
@@ -56,7 +56,7 @@ EMAIL_QUEUE = runtime.declare_queue("notify-email", **_CHANNEL_QUEUE)
 #: during a deploy's overlap no old task dequeues a send it cannot read.
 SYSTEM_EMAIL_QUEUE = runtime.declare_queue("notify-system-email", **_CHANNEL_QUEUE)
 TELEGRAM_QUEUE = runtime.declare_queue("notify-telegram", **_CHANNEL_QUEUE)
-#: Lead forwards and access-request cards: a vendor round trip each (HubSpot, several Slack posts).
+#: Lead forwards: a vendor round trip each (HubSpot, Slack).
 FORWARD_QUEUE = runtime.declare_queue("notify-forward", **runtime.VENDOR_QUEUE)
 
 #: A send's retry ladder: a refusal or an unreachable vendor is tried three times, 2s then 4s apart, before it is
@@ -159,14 +159,15 @@ def _email_aad(delivery_id: str) -> bytes:
 
 @DBOS.step()
 def _queue_delivery(
-    address: str, subject: str, mail_type: str, essential: bool, recipient_user_id: Optional[str]
+    address: str, subject: str, mail_type: str, essential: bool, recipient_user_id: Optional[str],
+    ref: Optional[str] = None,
 ) -> str:
     """The `queued` delivery-log row, as a step so a recovered workflow does not log one send twice."""
     from app import email_deliveries
 
     return email_deliveries.create(
         recipient=address, subject=subject, mail_type=mail_type, essential=essential,
-        recipient_user_id=uuid.UUID(recipient_user_id) if recipient_user_id else None,
+        recipient_user_id=uuid.UUID(recipient_user_id) if recipient_user_id else None, ref=ref,
     ).hex
 
 
@@ -182,6 +183,7 @@ def email(
     unsubscribe: Optional[UnsubscribeTarget] = None,
     recipient_user_id: Optional[uuid.UUID] = None,
     secrets: Sequence[str] = (),
+    ref: Optional[str] = None,
 ) -> bool:
     """Send one already-rendered system email (`app/system_mail.py`, over SES) to one address.
 
@@ -189,7 +191,7 @@ def email(
     the `email_deliveries` row written `queued` here, before anything else, so no outcome is silent. `unsubscribe`
     names whose preference a one-click unsubscribe turns off: an optional email gets RFC 8058's headers for it
     (`app/email_unsubscribe.py`; the caller rendered the same link into the footer); `recipient_user_id` (else the
-    target's user) is recorded on the row; `secrets` are values (a code, a tokened link) masked in the row's subject —
+    target's user) is recorded on the row, and `ref` (what it was about, `EmailDelivery.ref`) too; `secrets` are values (a code, a tokened link) masked in the row's subject —
     the real subject travels sealed with the body. Inline in a workflow (True when it went out); otherwise the body is sealed
     and handed to `deliver_system_email` with the row's id. Never raises."""
     from app import credential_crypto, email_deliveries, email_unsubscribe
@@ -198,7 +200,7 @@ def email(
     logged_subject = email_deliveries.redacted(subject, secrets)
     try:
         delivery_id = _queue_delivery(
-            address, logged_subject, mail_type, essential, str(user_id) if user_id else None
+            address, logged_subject, mail_type, essential, str(user_id) if user_id else None, ref
         )
     except Exception:  # noqa: BLE001 — a DB fault must not fail the caller's committed write
         log.exception("notify-outbox: the %s email could not be logged — not sent", what)
@@ -455,17 +457,16 @@ def _telegram_step(chat_id: int, text: str, what: str) -> str:
     return "sent" if telegram_notify._send(token, chat_id, text, what) else "failed"
 
 
-# ── Named sends: lead forwards, access-request cards ─────────────────────────────────────────────
+# ── Named sends: lead forwards ─────────────────────────────────────────────────────────────────
 
 
 #: The sends a caller may hand off by name: each makes its own network calls and writes its own outcome onto
-#: its row (the sales channel and HubSpot for a lead; each approver's card for an access request), so the whole
+#: its row (the sales channel and HubSpot for a lead), so the whole
 #: send is the durable unit. A name, not a callable, crosses the queue: nothing outside this list is enqueued.
 FORWARDS: dict[str, tuple[str, str]] = {
     "site_enquiry": ("app.site_enquiry", "forward_stored"),
     "signup": ("app.signup_notify", "forward"),
     "trust_request": ("app.trust_requests", "forward"),
-    "access_request_cards": ("app.slack_access_cards", "post_cards_for"),
 }
 
 
@@ -488,7 +489,12 @@ def deliver_forward(kind: str, args: tuple, kwargs: dict) -> str:
 def _forward_step(kind: str, args: tuple, kwargs: dict) -> str:
     import importlib
 
-    module, name = FORWARDS[kind]
+    target = FORWARDS.get(kind)
+    if target is None:
+        # A send retired while one was still queued (e.g. `access_request_cards`): drain it, never retry it.
+        log.warning("notify-outbox: dropped a queued %r forward — no such send any more", kind)
+        return "dropped"
+    module, name = target
     try:
         getattr(importlib.import_module(module), name)(*args, **kwargs)
     except Exception:

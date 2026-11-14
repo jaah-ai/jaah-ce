@@ -34,7 +34,6 @@ SPECS: dict[str, Spec] = {
     "node_agents_full_scan_secs": Spec(3600, 60, 86400),
     "node_agents_probe_max_parallel": Spec(2, 1, 16),
     "node_clone_timeout_secs": Spec(900, 300, 7200),
-    "node_max_concurrent_commands": Spec(64, 1, 256),
 }
 
 # Written by the pool-tick thread, read from the event loop and worker threads; a dict swap under a lock.

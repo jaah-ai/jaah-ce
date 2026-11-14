@@ -3,7 +3,7 @@ import type { Dispatch, ReactNode, SetStateAction } from 'react'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Stack from '@mui/material/Stack'
-import Tooltip from '@mui/material/Tooltip'
+import Tip from '../../ui/Tip'
 import Typography from '@mui/material/Typography'
 import { useTheme } from '@mui/material/styles'
 import SchedulerRoot from 'material-ui-cron'
@@ -12,14 +12,17 @@ import { useApiRead } from '../../hooks/useApiRead'
 import { useDebouncedCallback } from '../../hooks/useDebouncedCallback'
 import { formatZoned, formatZonedSpan } from '../../lib/zonedTime'
 import Banner from '../../ui/Banner'
+import { FONT_SIZE, FONT_WEIGHT, grid } from '../../theme'
+import { SCHEDULE_SUMMARY_CONTAINER, SCHEDULE_SUMMARY_NARROW } from '../../ui/listStyles'
+import { intervalUnits, type IntervalUnits } from '../../lib/relativeTime'
 import FormTextField from '../../ui/FormTextField'
+import { HelpLabel } from '../../ui/HelpLabel'
+import type { Explain } from '../../ui/explain'
 import { previewSchedule, type SchedulePreview } from './api'
 import {
   INTERVAL_TIMEZONE_NAME,
   SCHEDULE_KIND_CRON,
   SCHEDULE_KIND_INTERVAL,
-  intervalUnits,
-  type IntervalUnits,
   type ScheduleDraft,
 } from './schedule'
 
@@ -63,10 +66,10 @@ const CARD_WRAP_SX = {
   maxWidth: '100%',
   '& .form-col + *': { display: 'none' },
   '& .form-col > :first-child': { display: 'none' },
-  '& .form-col > *': { paddingTop: '6px', paddingBottom: '6px' },
+  '& .form-col > *': { pt: 1, pb: 1 },
 } as const
 
-const CARD_HEADER_SX = { padding: '6px 12px', gap: 1 } as const
+const CARD_HEADER_SX = { py: 1, px: 2, gap: 1 } as const
 
 /* The card is a light surface in both themes. It paints its chrome from `theme.palette.*`, which under
  * `cssVariables` holds the default (light) scheme's literals, while MUI controls inside it read
@@ -163,18 +166,15 @@ export default function ScheduleEditor({
           <FormTextField
             id="cron-schedule-kind"
             label="Schedule as"
-            help={SCHEDULE_KIND_HELP[draft.kind]}
+            help={SCHEDULE_KIND_HELP}
             testId="cron-schedule-kind"
-            select
-            slotProps={{ inputLabel: { shrink: true } }}
             value={draft.kind}
             disabled={disabled}
             onChange={kind => onChange({ ...draft, kind })}
+            options={SCHEDULE_KIND_OPTIONS}
           >
-            <option value={SCHEDULE_KIND_CRON}>A cron expression</option>
-            <option value={SCHEDULE_KIND_INTERVAL}>A fixed interval</option>
-            {/* An unknown kind renders as itself — a native select with no matching option shows the
-                first one, and a blind Save would then rewrite the row to it. */}
+            {/* An unknown kind renders as itself, leading the list — a native select with no matching option shows
+                the first one, and a blind Save would then rewrite the row to it. */}
             {draft.kind !== SCHEDULE_KIND_CRON && draft.kind !== SCHEDULE_KIND_INTERVAL && (
               <option value={draft.kind}>{draft.kind}</option>
             )}
@@ -402,14 +402,20 @@ function ReadingNote({ stored, reading }: { stored: string; reading: string }) {
 
 const CODE_SX = {
   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-  fontSize: '0.8125rem',
+  fontSize: FONT_SIZE.md,
   overflowWrap: 'anywhere',
 } as const
 
-const SCHEDULE_KIND_HELP: Record<string, string> = {
-  [SCHEDULE_KIND_CRON]: 'Fires at the named times, in the control plane’s zone.',
-  [SCHEDULE_KIND_INTERVAL]: `Fires at a fixed interval, in ${INTERVAL_TIMEZONE_NAME}.`,
-}
+const DOCS_REFERENCE = 'console-reference/automation/automations'
+
+const SCHEDULE_KIND_HELP: Explain = { tip: 'Named times, or a fixed gap between firings.', docs: DOCS_REFERENCE }
+const SCHEDULE_KIND_OPTIONS = [
+  { value: SCHEDULE_KIND_CRON, label: 'A cron expression', help: 'Fires at the named times, in the control plane’s zone.' },
+  { value: SCHEDULE_KIND_INTERVAL, label: 'A fixed interval', help: `Fires every so often, on a fixed ${INTERVAL_TIMEZONE_NAME} grid.` },
+]
+
+/** The collapsed row's label: what the line beside it says. */
+const SUMMARY_HELP = 'When it runs, in words, and its next run.'
 
 /* The interval as a number and unit. Any whole number: the server fires it on a fixed UTC grid
  * (`app/cron_schedule.py`) and refuses only a value out of range, by name. This form is not the validator. */
@@ -442,7 +448,7 @@ function IntervalField({
 
   return (
     <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-start', flexWrap: 'wrap' }}>
-      <Box sx={{ flex: '1 1 8rem', minWidth: '7rem' }}>
+      <Box sx={{ flex: `1 1 ${grid(21)}`, minWidth: grid(18.5) }}>
         <FormTextField
           id="cron-interval-count"
           label="Every"
@@ -456,10 +462,11 @@ function IntervalField({
           onChange={v => change({ count: countFrom(v), unit: units.unit })}
         />
       </Box>
-      <Box sx={{ flex: '1 1 9rem', minWidth: '8rem' }}>
+      <Box sx={{ flex: `1 1 ${grid(24)}`, minWidth: grid(21) }}>
         <FormTextField
           id="cron-interval-unit"
           label="Unit"
+          help="What Every counts: seconds, minutes, hours or days."
           testId="cron-interval-unit"
           slotProps={{ inputLabel: { shrink: true } }}
           value={units.unit}
@@ -486,7 +493,12 @@ function countFrom(raw: string): number | null {
 }
 
 /** Why "every 3 hours" lands where it does: the grid, not the moment of saving. */
-const INTERVAL_HELP = `Any whole number; from an hour up, whole minutes. Runs on a fixed ${INTERVAL_TIMEZONE_NAME} grid: every 3 hours is 00:00, 03:00, 06:00…`
+const INTERVAL_HELP: Explain = {
+  tip: 'How many units pass between firings.',
+  more: `Any whole number; from an hour up, whole minutes. It runs on a fixed ${INTERVAL_TIMEZONE_NAME} grid, not from `
+    + 'when you save: every 3 hours fires at 00:00, 03:00, 06:00…',
+  docs: DOCS_REFERENCE,
+}
 
 /* The authoritative preview: `POST /api/crons/preview` walks `app/cron_schedule.py::next_fire_for_row`,
  * the function the engine registers with. A 422 is a result: the refusal Save would earn. */
@@ -564,9 +576,8 @@ function ScheduleSummary({
         </Typography>
         {raw && <Box component="code" sx={{ ...CODE_SX, color: 'text.secondary' }}>{raw}</Box>}
         {/* A disabled cron still hovers its would-be fires — what enabling it would start. */}
-        <Tooltip
+        <Tip
           describeChild
-          enterTouchDelay={0}
           leaveTouchDelay={6000}
           title={
             <Box component="ol" sx={PREVIEW_LIST_SX} data-testid="cron-preview-list">
@@ -581,13 +592,10 @@ function ScheduleSummary({
             data-testid="cron-preview-next"
             sx={{
               color: 'text.secondary',
-              textDecoration: 'underline dotted',
-              textUnderlineOffset: '3px',
               cursor: 'help',
-              // Inline-block: the separator keeps out of the dotted underline that marks the hover.
-              '&::before': { content: disabledNote ? '"—"' : '"·"', display: 'inline-block', mr: '0.35em' },
+              '&::before': { content: disabledNote ? '"—"' : '"·"', display: 'inline-block', mr: 0.5 },
               // Too narrow for one line: its own line last, as a sentence ("Next run …"), not an orphaned "· next".
-              [`@container ${SUMMARY_CONTAINER} (width < 30rem)`]: {
+              [SCHEDULE_SUMMARY_NARROW]: {
                 flexBasis: '100%', order: 1, '&::before': { content: 'none' }, '&::first-letter': { textTransform: 'uppercase' },
               },
             }}
@@ -595,7 +603,7 @@ function ScheduleSummary({
             {disabledNote
               ?? (preview.next_fire_at.length === 0 ? 'never fires' : nextFact(preview.next_fire_at[0]))}
           </Typography>
-        </Tooltip>
+        </Tip>
       </>
     )
   }
@@ -605,11 +613,11 @@ function ScheduleSummary({
       data-testid="cron-schedule-preview"
       sx={{
         display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', columnGap: 1, rowGap: 0.5,
-        containerType: 'inline-size', containerName: SUMMARY_CONTAINER,
+        containerType: 'inline-size', containerName: SCHEDULE_SUMMARY_CONTAINER,
       }}
     >
-      <Typography variant="caption" component="span" sx={{ color: 'text.secondary', fontWeight: 600 }}>
-        Schedule
+      <Typography variant="caption" component="span" sx={{ color: 'text.secondary', fontWeight: FONT_WEIGHT.semibold }}>
+        <HelpLabel label="Schedule" help={SUMMARY_HELP} />
       </Typography>
       {body}
       {action}
@@ -617,13 +625,11 @@ function ScheduleSummary({
   )
 }
 
-const SUMMARY_CONTAINER = 'schedule-summary'
-
 const PREVIEW_LIST_SX = {
   m: 0,
   pl: 2.5,
-  fontSize: '0.8125rem',
-  '& li': { mb: 0.25 },
+  fontSize: FONT_SIZE.md,
+  '& li': { mb: 0 },
 } as const
 
 /** True when any two consecutive firings are less than a minute apart. */

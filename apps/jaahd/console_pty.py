@@ -144,8 +144,8 @@ class TmuxRelay:
 
     @classmethod
     def start(cls, argv: list[str], rows: int, cols: int, env: dict, *, out_dir: str | None = None) -> TmuxRelay:
-        """`argv` is the attach command (`session_user.tmux_cmd(sock, "attach", …)`): what precedes
-        `attach` addresses the server, and the whole of it runs in the relay pane. Or `tmux_cmd(sock)` +
+        """`argv` is the attach command (`session_user.tmux_attach_cmd(sock, "attach", …)`): what precedes
+        `attach` addresses the server, and the whole of it runs in the relay pane. Or `tmux_attach_cmd(sock)` +
         `[RUN, *command]`: the pane runs `command` itself (a MicroVM console's relay, `console.py`). Raises
         `OSError` when tmux refuses a step, after undoing what it made, so the caller's spawn-failure teardown
         runs."""

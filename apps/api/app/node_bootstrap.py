@@ -16,7 +16,7 @@ import ipaddress
 import re
 import shlex
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import NamedTuple
 from urllib.parse import urlsplit
 
@@ -58,7 +58,7 @@ APT_PATH = "/api/agent/apt"
 # to the tailnet. An accepted residual: the one `Access.INFRA` route reachable off the tailnet, an
 # exception to the machine surface never leaving it; do not move it. Both deployed CPs are internal ALBs, so off-VPC the
 # fetch itself still needs the
-# tailnet first (stated in `apps/web/src/components/NodeOnboardingDialog.tsx`).
+# tailnet first (stated in the console's node onboarding dialog).
 BOOTSTRAP_PATH = "/api/node-bootstrap"
 # The query that turns the same door into "does this node still exist?" (`present`/`absent`), asked by a
 # box whose node.env names another node: a deleted one is re-enrolled, a live one refused.
@@ -276,6 +276,13 @@ def is_undialable(base_url: str) -> bool:
     return address is not None and address.is_unspecified
 
 
+def cp_scheme_allowed(cp_base_url: str) -> bool:
+    """HTTPS or a loopback host only: the node token becomes apt's Basic-auth password, replayed on every
+    `apt-get update` for the machine's life. Loopback is exempt for the local `./dc` stack. The one rule
+    `cp_host` enforces and the Add node pre-flight (`cloud_node_launch.node_add_refusal`) asks ahead of it."""
+    return urlsplit(cp_base_url).scheme == "https" or is_loopback(cp_base_url)
+
+
 def cp_host(cp_base_url: str) -> str:
     """The `host[:port]` apt's `auth.conf` must name, derived from the same base URL the sources
     file uses so the two cannot disagree (a mismatch fails as an unexplained 401 in `apt-get update`).
@@ -290,10 +297,8 @@ def cp_host(cp_base_url: str) -> str:
         "cp_base_url",
         "host must be letters, digits, dots and hyphens with an optional port",
     )
-    # HTTPS or a loopback host only: the node token becomes apt's Basic-auth password, replayed on every
-    # `apt-get update` for the machine's life. Loopback is exempt for the local `./dc` stack.
     _require(
-        parts.scheme == "https" or is_loopback(cp_base_url),
+        cp_scheme_allowed(cp_base_url),
         "cp_base_url",
         "must be https — apt replays the node token as a Basic-auth password on every update, so "
         "http would send it in cleartext; only a loopback host is exempt",
@@ -1366,6 +1371,14 @@ def render_cloud_init(inputs: BootstrapInputs) -> str:
     return "#!/bin/bash\n" + _body(inputs) + "\n"
 
 
+def render_guest_script(inputs: BootstrapInputs) -> str:
+    """The user-data of a Whole-node VM's guest (`vnodes` housing `vm`): a plain Ubuntu node, the cloud path's body
+    with no tailnet join and no host marker — the guest reaches the control plane through its host's netns, whose
+    tailnet identity stays on the host, so no tailnet key is ever rendered here whatever `inputs` carries. It holds
+    the node token: it reaches the host only sealed in the enrolment envelope and the guest's seed."""
+    return render_cloud_init(replace(inputs, tailscale_auth_key=None, tailscale_login_server=None, vnode_host=False))
+
+
 def render_self_hosted_script(inputs: BootstrapInputs) -> str:
     """The script `routes/agent_bootstrap.py` serves to a bare Linux machine that asked for it.
 
@@ -1683,7 +1696,7 @@ install_anchor() {
 full_disk_access_guide() {
   echo "==> [jaah] NodeLinks need Full Disk Access for $JAAH_ROOT/bin/jaah-anchor:"
   echo "==> [jaah]   System Settings → Privacy & Security → Full Disk Access → + → ⌘⇧G → $JAAH_ROOT/bin/jaah-anchor → on"
-  echo "==> [jaah]   MDM-managed Mac: install the profile from the console's Add node dialog instead"
+  echo "==> [jaah]   MDM-managed Mac: install the profile from the console's New node dialog instead"
   console_uid="$(stat -f %u /dev/console 2>/dev/null || true)"
   [ -n "$console_uid" ] && [ "$console_uid" != 0 ] \
     && launchctl asuser "$console_uid" open 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles' >/dev/null 2>&1 \
@@ -2233,7 +2246,8 @@ _WINDOWS_TEMPLATE = r"""# The Jaah node installer for Windows x64, fetched from 
 #      tailnet join (with the single-use key minted for this fetch), WSL 2. Turning WSL 2 on can need a restart; the run
 #      then stops, and the same command run after the restart picks up here.
 #   2. the accounts: the local runner user jaah (non-admin; its password is held only by the Service
-#      Control Manager) and the daemon's virtual account NT SERVICE\jaahd; the data directories
+#      Control Manager and, for the daemon alone, etc\runner-logon) and the daemon's virtual account
+#      NT SERVICE\jaahd; the data directories
 #   3. the tailnet: unattended mode, so it stays connected with nobody signed in
 #   4. the bundle, from the CP's dist channel, sha256-verified, to @@ROOT@@\versions\<ver> + `current`
 #   5. @@DATA@@\etc: jaahd.env (the knobs) and node.env (identity; the token only ever lands here)
@@ -2851,13 +2865,17 @@ Assert-Preflight
 # -- 2. the accounts ----------------------------------------------------------------------------------
 Remove-Item -LiteralPath (Join-Path $JaahEtc 'installed') -Force -ErrorAction SilentlyContinue
 Write-Step "creating the runner account $JaahRunnerUser and the daemon account NT SERVICE\$JaahDaemonService"
-# A fresh random password on every install: nobody signs in as jaah, and only the Service Control Manager
-# keeps it. GUIDs are drawn from the system's secure random source. Never the account name inside it: the
-# complexity policy refuses a password containing it (measured on Windows Server 2025).
+# A fresh random password on every install: nobody signs in as jaah; the Service Control Manager keeps it, and
+# so does etc\runner-logon for the daemon's jailed tmux clients. GUIDs are drawn from the system's secure
+# random source. Never the account name inside it: the complexity policy refuses a password containing it
+# (measured on Windows Server 2025).
 $password = 'Svc-' + [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N').ToUpperInvariant() + '!'
 $secret = ConvertTo-SecureString $password -AsPlainText -Force
 $password = $null
 if ($runner) {
+    # The running daemon logs its tmux clients on with the old password (etc\runner-logon) until the new one is
+    # written below: stopped first, it cannot lock the account out with failed logons meanwhile.
+    Stop-Service -Name $JaahDaemonService -Force -ErrorAction SilentlyContinue
     Enable-LocalUser -Name $JaahRunnerUser
     Set-LocalUser -Name $JaahRunnerUser -Password $secret -PasswordNeverExpires $true -UserMayChangePassword $false -AccountNeverExpires
 } else {
@@ -3006,6 +3024,9 @@ $runnerService = Get-CimInstance Win32_Service -Filter "Name='$JaahRunnerService
 Register-JaahService $JaahEngineService 'Jaah container engine' 'Runs the jaah-engine WSL 2 distro (dockerd) for the Jaah runners, as the jaah account.'
 $engineService = Get-CimInstance Win32_Service -Filter "Name='$JaahEngineService'"
 $plain = (New-Object Management.Automation.PSCredential('x', $secret)).GetNetworkCredential().Password
+# The runner account's logon, for the daemon alone (it inherits etc's list, as node.env does): what a jailed tmux
+# command client runs as (apps/jaahd/tmux_jail.py, host_platform/windows.py RUNNER_LOGON_FILE).
+[IO.File]::WriteAllText((Join-Path $JaahEtc 'runner-logon'), ".\$JaahRunnerUser`n$plain`n", [Text.Encoding]::ASCII)
 $changed = Invoke-CimMethod -InputObject $runnerService -MethodName Change -Arguments @{ StartName = ".\$JaahRunnerUser"; StartPassword = $plain }
 $changedEngine = Invoke-CimMethod -InputObject $engineService -MethodName Change -Arguments @{ StartName = ".\$JaahRunnerUser"; StartPassword = $plain }
 $plain = $null

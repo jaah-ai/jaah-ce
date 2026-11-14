@@ -3,6 +3,7 @@
  * BOTH schemes — the dark column is the same hues stepped for the dark surface, not an automatic flip), in its
  * fixed set. Seven named series is the API's ceiling (`frame.py::TOP_GROUPS`); the eighth, "Other", is
  * always neutral grey so it never reads as a peer of a named group. */
+import { fnv1a } from '../lib/fnv1a'
 
 /** The id of a rollup series — the groups past the top seven, folded into one (the dashboard API's
  *  `frame.py::OTHER_GROUP`). Here, so the palette ships where the dashboard does not (the community edition). */
@@ -43,20 +44,10 @@ export function assignColors(mode: 'light' | 'dark', groups: readonly string[]):
       out.set(group, OTHER[mode])
       continue
     }
-    let slot = hash(group) % hues.length
+    let slot = fnv1a(group) % hues.length
     for (let i = 0; i < hues.length && taken.has(slot); i++) slot = (slot + 1) % hues.length
     taken.add(slot)
     out.set(group, hues[slot])
   }
   return out
-}
-
-/** FNV-1a: a stable, well-spread string hash. */
-function hash(s: string): number {
-  let h = 0x811c9dc5
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i)
-    h = Math.imul(h, 0x01000193)
-  }
-  return h >>> 0
 }

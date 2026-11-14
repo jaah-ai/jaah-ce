@@ -1,18 +1,20 @@
 import { type FormEvent, type MouseEvent, type ReactNode, useEffect, useRef } from 'react'
+import { Link as RouterLink } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Button, { type ButtonProps } from '@mui/material/Button'
-import CircularProgress from '@mui/material/CircularProgress'
 import Divider from '@mui/material/Divider'
 import Paper from '@mui/material/Paper'
 import Typography from '@mui/material/Typography'
 import type { Theme } from '@mui/material/styles'
-import type { SidebarColors } from '../theme'
+import { FONT_SIZE, FONT_WEIGHT, grid, LINE_HEIGHT, RADIUS, SIZE, type SidebarColors } from '../theme'
 import { get } from '../api'
+import { useAuth } from '../auth'
 import { useApiRead } from '../hooks/useApiRead'
 import { useColorMode } from '../hooks/useColorMode'
 import { safeHref } from '../lib/safeHref'
 import BusyButton from '../ui/BusyButton'
 import Banner from '../ui/Banner'
+import LoadingState from '../ui/LoadingState'
 import BrandWordmark from '../components/BrandWordmark'
 import { GitHubMark, MicrosoftMark } from '../components/ProviderMarks'
 
@@ -38,6 +40,8 @@ type PublicSettings = {
   terms_url?: string
   privacy_url?: string
   legal_version?: string
+  /* The console's Sentry DSN, blank = off; read by `main.tsx` (`lib/errorTracking.ts`), not this page. */
+  error_tracking_dsn_web?: string
 }
 
 /** The sign-up flow's operator-set links; each is null until read (or when the read failed). */
@@ -121,7 +125,7 @@ export function useStripLoginParams() {
 
 /* One height for every entry point: the password submit, GSI's `large` button (44px), and the two
    redirect buttons. */
-export const ENTRY_HEIGHT_PX = 44
+export const ENTRY_HEIGHT_PX = SIZE.tapTarget
 
 /* The ONE primary action's geometry: the shared entry-point height at every width, so it lines up with the
  * provider buttons (the ≤sm tap floor is the same 44px). No local focus ring: `theme.ts`'s `MuiButtonBase`
@@ -180,20 +184,20 @@ export const googleMount = {
 export const providerButtonSx = (t: Theme) => ({
   position: 'relative',
   height: ENTRY_HEIGHT_PX,
-  px: '42px',
-  borderRadius: '4px',
+  px: 7,
+  borderRadius: RADIUS.sm,
   border: '1px solid #dadce0',
   bgcolor: '#ffffff',
   color: '#3c4043',
-  fontSize: '0.875rem',
-  fontWeight: 500,
+  fontSize: FONT_SIZE.base,
+  fontWeight: FONT_WEIGHT.medium,
   letterSpacing: '0.25px',
   textTransform: 'none',
   whiteSpace: 'nowrap',
   '&:hover': { bgcolor: '#f8faff', borderColor: '#d2e3fc' },
   '& .provider-mark': {
     position: 'absolute',
-    left: 12,
+    left: grid(2),
     top: '50%',
     transform: 'translateY(-50%)',
     display: 'flex',
@@ -377,7 +381,7 @@ export function EntryCard({ onSubmit, wide = false, children }: {
           p: 3,
           width: '100%',
           // Wide: content no wider than GSI's widest button (`providerColumnSx`), plus the `p: 3` gutters.
-          maxWidth: wide ? (t: Theme) => `calc(${GSI_MAX_WIDTH}px + ${t.spacing(6)})` : 380,
+          maxWidth: wide ? (t: Theme) => `calc(${GSI_MAX_WIDTH}px + ${t.spacing(6)})` : grid(63),
           display: 'flex',
           flexDirection: 'column',
           gap: 2,
@@ -412,7 +416,7 @@ export function EntryFooter({ lead, children }: { lead: string; children: ReactN
         alignItems: 'center',
         justifyContent: 'center',
         flexWrap: 'wrap',
-        columnGap: 0.25,
+        columnGap: 0,
         typography: 'body2',
         color: 'text.secondary',
       }}
@@ -428,7 +432,7 @@ export const footerActionSx = {
   minHeight: ENTRY_HEIGHT_PX,
   px: 1,
   textTransform: 'none',
-  fontWeight: 600,
+  fontWeight: FONT_WEIGHT.semibold,
 } as const
 
 /** A card's primary action: full width, contained, a spinner while `busy`. `aria-hidden` keeps the accessible
@@ -440,6 +444,22 @@ export function EntrySubmit(props: ButtonProps & { busy: boolean }) {
 /** The one rule between an entry page's provider buttons and its own form, on `/login` and `/signup` alike. */
 export function EntryDivider() {
   return <Divider sx={{ typography: 'caption', color: 'text.secondary' }}>or</Divider>
+}
+
+/** Where a signed-in member changes their password: their profile's "Set new password", not an emailed link.
+ *  Nothing for a visitor who is signed out. */
+export const SIGNED_IN_PASSWORD_COPY = "You're signed in: use Set new password on your profile."
+export function SignedInPasswordNote(): JSX.Element | null {
+  const { admin } = useAuth()
+  if (!admin) return null
+  return (
+    <Banner
+      severity="info"
+      action={<Button component={RouterLink} to="/profile" size="small" color="inherit" sx={{ whiteSpace: 'nowrap' }} data-testid="signed-in-open-profile">Open profile</Button>}
+    >
+      {SIGNED_IN_PASSWORD_COPY}
+    </Banner>
+  )
 }
 
 /** The page's one heading and its line beneath (none when `children` is empty). */
@@ -466,7 +486,7 @@ export function EntryLoading({ label = 'Loading', error }: { label?: string; err
         <Banner severity="error">{error}</Banner>
       ) : (
         <Box sx={{ display: 'flex', justifyContent: 'center', py: 2 }}>
-          <CircularProgress size={28} aria-label={label} />
+          <LoadingState label={label} />
         </Box>
       )}
     </EntryCard>
@@ -481,17 +501,17 @@ function OrgMark({ name }: { name: string }) {
       aria-hidden="true"
       data-testid="invitation-org-mark"
       sx={{
-        width: 64,
-        height: 64,
-        borderRadius: 2,
+        width: grid(10.5),
+        height: grid(10.5),
+        borderRadius: RADIUS.md,
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
         bgcolor: 'primary.main',
         color: 'primary.contrastText',
-        fontSize: '1.75rem',
-        fontWeight: 600,
-        lineHeight: 1,
+        fontSize: (t: Theme) => t.typography.h5.fontSize,
+        fontWeight: FONT_WEIGHT.semibold,
+        lineHeight: LINE_HEIGHT.tight,
         mx: 'auto',
       }}
     >
@@ -520,7 +540,7 @@ export function InvitationHeading({
         <Typography variant="body2" sx={{ color: 'text.secondary', overflowWrap: 'anywhere' }}>
           {inviterName ? (
             <>
-              <Box component="strong" sx={{ color: 'text.primary', fontWeight: 600 }}>{inviterName}</Box>{' '}
+              <Box component="strong" sx={{ color: 'text.primary', fontWeight: FONT_WEIGHT.semibold }}>{inviterName}</Box>{' '}
               {/* One phrase: a narrow card wraps before it, never inside it ("invited you to / join"). */}
               <Box component="span" sx={{ whiteSpace: 'nowrap' }}>invited you to join</Box>
             </>
@@ -528,7 +548,7 @@ export function InvitationHeading({
             "You're invited to join"
           )}
         </Typography>
-        <Typography variant="h5" component="h1" sx={{ fontWeight: 600, overflowWrap: 'anywhere', mt: 0.25 }}>
+        <Typography variant="h5" component="h1" sx={{ fontWeight: FONT_WEIGHT.semibold, overflowWrap: 'anywhere', mt: 0 }}>
           {orgName}
         </Typography>
       </Box>

@@ -1,0 +1,46 @@
+slug = "custom_mcp"
+label = "Custom MCP server"
+category = "custom"
+credential_type = "mcp_server"
+vendor_docs_url = "https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization"
+summary = "Connect any remote MCP server by its URL, open or protected by a bearer token or OAuth, so agents can use its tools."
+
+[[auth]]
+kind = "mcp"
+fields = [
+  { key = "url", label = "Server URL", kind = "url", required = true, placeholder = "https://mcp.example.com/mcp", help = "The server's MCP endpoint as its provider documents it, usually ending in /mcp (or /sse for an older server). It must be https:// and reachable from the internet" },
+  { key = "transport", label = "Transport", kind = "text", required = false, placeholder = "streamable_http", help = "streamable_http for current MCP servers, sse for older ones that publish an /sse endpoint. Leave it blank for streamable_http" },
+  { key = "bearer_token", label = "Bearer token", kind = "secret", required = false, help = "For a server that takes an API key or token: paste it here. Leave it blank for an open server, or to press Connect and sign in with OAuth" },
+]
+
+[mcp]
+url = "https://mcp.example.com/mcp"
+url_editable = true
+transport = "streamable_http"
+auth = "bearer_field:bearer_token"
+
+[docs]
+agent_uses = [
+  "Use every tool the MCP server exposes, in the projects you link the connection to",
+  "Reach a service through its own hosted MCP server even when Jaah has no built-in card for it",
+  "Share one server definition with the whole organization, so each member connects with their own token or sign-in",
+]
+prerequisites = [
+  "The server's MCP URL, from its provider's documentation",
+  "If the server is protected: a bearer token, or an account to sign in with when the server supports MCP OAuth",
+  "To define a server the whole organization can reuse: an Org Owner or Admin. Open Secrets, select Add secret, pick the Custom category, then Add custom on the Custom MCP server card. Give it a name, the server URL, the transport and how it authenticates (none, bearer token or OAuth). Once saved every member sees it as its own card in the Custom category",
+]
+limitations = [
+  "Only https:// servers on the public internet can be connected; a server inside a private network is not reachable from Jaah's control plane",
+  "A connection reaches a task only in the projects you link it to",
+  "OAuth works with servers that publish MCP authorization metadata; a server that does not needs a bearer token instead",
+]
+troubleshooting = [
+  { symptom = "The Test says the server rejected the token (401)", fix = "The bearer token is wrong or revoked, or the server expects OAuth. Paste a new token, or clear it and press Connect" },
+  { symptom = "The Test cannot complete the MCP handshake", fix = "Check the URL and the transport: an older server publishes /sse and needs transport sse; a current one takes streamable_http on /mcp" },
+  { symptom = "Saving says the Server URL is refused", fix = "The host resolves to a private, loopback or cloud-metadata address, or it is not https. Use the server's public https address" },
+]
+faq = [
+  { q = "Does Jaah run the MCP server", a = "No. Jaah connects to a server someone else hosts; agents call its tools over the network with your connection" },
+  { q = "Can another organization see our custom MCP servers", a = "No. A custom MCP server belongs to the organization that defined it" },
+]

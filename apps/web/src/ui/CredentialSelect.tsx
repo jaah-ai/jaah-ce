@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { JSX, ReactNode } from 'react'
 import AsyncLookup, { type LookupOption } from './AsyncLookup'
+import type { HelpProp } from './explain'
 
 /* ── The console's one "choose a credential" control ──
  * Every surface that asks which stored credential to use renders this. What it owns:
@@ -80,6 +81,10 @@ export interface CredentialSelectProps {
   testId?: string
   fullWidth?: boolean
   size?: 'small' | 'medium'
+  /** The label's explanation, forwarded to `AsyncLookup` (a hover on the label, the input's `aria-description`). */
+  help?: HelpProp
+  /** `ui/FormField`'s cloned contract, forwarded to `AsyncLookup`. */
+  slotProps?: { htmlInput?: Record<string, unknown> }
 }
 
 export function CredentialSelect({
@@ -100,6 +105,8 @@ export function CredentialSelect({
   testId,
   fullWidth = true,
   size = 'small',
+  help,
+  slotProps,
 }: CredentialSelectProps): JSX.Element {
   /* The last option seen for each id, so the box names the saved id without a second request. Keyed by
   id: `value` can change under a remembered label, and a label paired with the wrong id is worse than
@@ -190,6 +197,8 @@ export function CredentialSelect({
       fetchOnFocus
       fullWidth={fullWidth}
       size={size}
+      help={help}
+      slotProps={slotProps}
     />
   )
 }

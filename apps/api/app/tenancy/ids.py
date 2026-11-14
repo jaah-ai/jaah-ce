@@ -11,7 +11,7 @@ environments so a migration can name it without querying, and an operator recogn
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 from uuid import UUID
 
 
@@ -40,11 +40,11 @@ OPERATOR_ORG = SeedOrg(
     id=ORG_ZERO_ID,
     slug="operator",
     name="Operator",
-    description=(
-        "Org zero — the operator plane. Fleet machinery, operator staff and the system rows that "
-        "run the control plane itself belong here. It is a row rather than a NULL so that every "
-        "org_id can be NOT NULL."
-    ),
+    # Shown on Customers > Operator > Overview, so it is what a person would write. The developer note it
+    # replaces: org zero is the operator plane — fleet machinery, operator staff and the system rows that run
+    # the control plane itself belong here — and it is a row rather than a NULL so every org_id can be NOT NULL.
+    # Seeding is insert-if-absent: an existing database keeps its text until edited on that Overview.
+    description="Runs the Jaah platform.",
 )
 
 
@@ -72,3 +72,23 @@ def is_operator_plane(org_id: UUID | None, is_superadmin: bool) -> bool:
     superadmin outside it keeps allow-all inside its own org. A new reader calls this rather than
     re-spelling the test."""
     return bool(is_superadmin) and org_id is not None and org_id in OPERATOR_PLANE_ORG_IDS
+
+
+class OrgSeat(Protocol):
+    """The two columns the operator verdict reads: an `AdminUser` row, typed without importing the ORM."""
+
+    org_id: UUID | None
+    is_superadmin: bool
+
+
+def is_operator_user(user: OrgSeat) -> bool:
+    """Whether `user` is the deployment's operator, rather than a tenant's own administrator.
+
+    `is_superadmin` alone is not the answer: a tenant org's superadmin holds it too. The verdict is
+    `is_operator_plane` (flag and org), shared with `authz.Principal.is_operator`; `OPERATOR_PLANE_ORG_IDS`
+    decides which org counts (org zero alone).
+
+    It authorizes configuration, never rows (`app/authz/catalog.py::Tenancy`). The `AdminUser` form, for a caller
+    holding the row rather than a `Principal`; `routes/settings.py` reads it in-handler (not a `Depends`, to avoid
+    resolving a second `AdminUser`; the PUT reaches it through `_settings_writer`)."""
+    return is_operator_plane(user.org_id, user.is_superadmin)

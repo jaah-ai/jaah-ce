@@ -3,7 +3,9 @@ import Link from '@mui/material/Link'
 import Typography from '@mui/material/Typography'
 import { useCallback, useLayoutEffect, useRef, type ElementType, type MouseEvent, type ReactNode, type Ref } from 'react'
 import { Link as RouterLink } from 'react-router-dom'
+import { FONT_SIZE, grid } from '../theme'
 import { ABOVE_PHONE } from '../ui/listStyles'
+import LinkButton from '../ui/LinkButton'
 
 export type BreadcrumbItem = {
   // A `ReactNode`, so a crumb can BE a control (the task editor's click-to-edit title) without a second
@@ -24,10 +26,10 @@ export type BreadcrumbItem = {
 // margin cancels the padding from layout, keeping the ~33x18 footprint.
 const CRUMB_HIT_SX = {
   display: 'inline-block',
-  py: '14px',
-  px: '8px',
-  my: '-14px',
-  mx: '-8px',
+  py: 2.5,
+  px: 1,
+  my: -2.5,
+  mx: -1,
 } as const
 
 // A small trail: earlier items with `to` are links, the last is the current page. MUI `Breadcrumbs`
@@ -40,17 +42,17 @@ const CRUMB_HIT_SX = {
    it the earlier crumbs shrink instead, since a 1024px split once left the title "1: Retir…". A half-trail
    floor clipped both names in a 344px trail while the title it reserved for needed less, and so did 8rem/33%:
    at 344px the names stay whole and the title keeps ~100px.
-   A split editor at 1024px left ~400px of header, and a wrapped "acme › No feature" / "› 32: title" cost the page
+   A split editor at 1024px left ~400px of header, and a wrapped "acme › Rail tree" / "› 32: title" cost the page
    a second line on every task. The phone keeps WRAP, NEVER TRUNCATE (below): there the title is the page's only
    identifier and a ~264px leftover would cut it to a word. A crumb holding an input still grows (`:has`). */
-const ONE_LINE_LAST_FLOOR = 'min(7rem, 30%)'
+const ONE_LINE_LAST_FLOOR = `min(${grid(18.5)}, 30%)`
 /* The wrapping trail's: a leftover narrower than this sends the last crumb to its own line, so a phone title is never
    a three-line sliver beside the crumbs (6rem fitted only "7420: Retire"). */
-const LAST_FLOOR = '10rem'
+const LAST_FLOOR = grid(26.5)
 /* EVERY EARLIER CRUMB KEEPS A FEW CHARACTERS: the title's floor alone let the shrinking crumbs go to
    nothing, the feature crumb first ("acme ▾ › › 7420: …"). Four characters and the ellipsis, plus room for a picker
    crumb's ▾ (`TaskBreadcrumb`); a crumb after the first also carries its leading `›` (below), so one em more. */
-const ONE_LINE_CRUMB_FLOOR = 'calc(4ch + 2em)'
+const ONE_LINE_CRUMB_FLOOR = `calc(4ch + ${grid(4)})`
 /* …BUT A FLOOR IS A MINIMUM WIDTH, and a name shorter than it ("ops ▾") was padded out to it, a blank before its `›`.
    A crumb whose text fits the floor anyway is marked `data-crumb-whole` and never shrinks instead: it costs no more. */
 const WHOLE_CHARS = 4
@@ -63,12 +65,12 @@ const ONE_LINE_SX = {
     // 45% of its own width clipped "mr-6382" to "mr-63…" with the header half empty.
     '& .MuiBreadcrumbs-li': {
       flex: '0 1 auto',
-      maxWidth: 'min(20rem, 45cqi)',
+      maxWidth: `min(${grid(53)}, 45cqi)`,
       minWidth: ONE_LINE_CRUMB_FLOOR,
       whiteSpace: 'nowrap',
       overflow: 'hidden',
     },
-    '& .MuiBreadcrumbs-li:not(:first-of-type)': { minWidth: `calc(${ONE_LINE_CRUMB_FLOOR} + 1em)` },
+    '& .MuiBreadcrumbs-li:not(:first-of-type)': { minWidth: `calc(${ONE_LINE_CRUMB_FLOOR} + ${grid(2)})` },
     '& .MuiBreadcrumbs-li:has(> [data-crumb-whole])': { minWidth: 'auto', flexShrink: 0 },
     '& .MuiBreadcrumbs-li:last-of-type': { flex: '1 100000 auto', maxWidth: 'none', minWidth: ONE_LINE_LAST_FLOOR },
     '& .MuiBreadcrumbs-li > *': { overflow: 'hidden', textOverflow: 'ellipsis' },
@@ -133,8 +135,8 @@ export default function Breadcrumb({
   endsAtParent?: boolean
   /** The trail's `<nav>`, for a caller that measures its crumbs (`TaskBreadcrumb`'s ellipsis snap). */
   navRef?: Ref<HTMLElement>
-  /* The current crumb's element. `'span'` except in the task editor, where the trail replaced the page
-     `<h1>` and must carry it (a heading landmark; `getByRole('heading', { level: 1 })` in three suites).
+  /* The current crumb's element. `'span'` except in the task editor and on a project's page, where the trail replaced
+     the page `<h1>` and must carry it (a heading landmark; `getByRole('heading', { level: 1 })` in their suites).
      Styled as a crumb either way. */
   currentComponent?: ElementType
 }) {
@@ -153,11 +155,11 @@ export default function Breadcrumb({
       // The app's own separator glyph, not MUI's `/`.
       separator={<span>›</span>}
       sx={{
-        fontSize: '0.8125rem',
+        fontSize: FONT_SIZE.md,
         /* THE SEPARATOR SITS BETWEEN CRUMBS, NEVER AT A LINE'S START: MUI's separator is its own
            flex item, free to wrap alone, so it is hidden (it is `aria-hidden` already) and each later crumb draws it
            as a `::before`. A crumb that wrapped to a new line (`useLineBreaks`) hands its "›" to the crumb ending the
-           line above, so a phone reads "acme › No feature ›" over "35: Answer…", never "› 35: Answer…". The last
+           line above, so a phone reads "acme › Rail tree ›" over "35: Answer…", never "› 35: Answer…". The last
            crumb's floor (below) is what keeps the title on the separator's line in the first place. */
         '& .MuiBreadcrumbs-separator': { display: 'none' },
         '& .MuiBreadcrumbs-li:not(:first-of-type)::before': SEPARATOR_SX,
@@ -179,15 +181,15 @@ export default function Breadcrumb({
            Short of the floor the crumb moves down, its "›" with it. Growing to the row's end is invisible (the
            text stays left). */
         '& .MuiBreadcrumbs-li:last-of-type': { flex: `1 1 ${LAST_FLOOR}` },
-        /* A LINKED LAST CRUMB (`endsAtParent`) that wraps fills its item, and its hit box would bleed 8px past the trail's
+        /* A LINKED LAST CRUMB (`endsAtParent`) that wraps fills its item, and its hit box would bleed 6px past the trail's
            edge (a scrollbar): capped at the item's width less the padding. Only the last: its width is the trail's, so
            the percentage resolves; on a shrink-to-fit earlier crumb it would wrap a short name mid-word. */
-        '& .MuiBreadcrumbs-li:last-of-type > a': { maxWidth: 'calc(100% - 16px)' },
+        '& .MuiBreadcrumbs-li:last-of-type > a': { maxWidth: `calc(100% - ${grid(2)})` },
         /* A crumb holding an INPUT takes real width (else a 108-char title edited in 170px, six lines).
            Gated on `:has(input, textarea)`: ungated, the read-only title wrapped in a ~250px column.
            `20rem` exceeds a phone's leftover (~264px at 390px) and is below a desktop's (~880px), so the
            editor wraps to its own line on phones and grows in place on desktop — no media query. */
-        '& .MuiBreadcrumbs-li:last-of-type:has(input, textarea)': { flex: '1 1 20rem' },
+        '& .MuiBreadcrumbs-li:last-of-type:has(input, textarea)': { flex: `1 1 ${grid(53)}` },
         ...(oneLine ? ONE_LINE_SX : null),
       }}
     >
@@ -197,10 +199,8 @@ export default function Breadcrumb({
         const whole = !isLast && text !== undefined && text.length <= WHOLE_CHARS ? { 'data-crumb-whole': '' } : null
         if (!isLast && !item.to && item.onClick) {
           return (
-            <Link
+            <LinkButton
               key={i}
-              component="button"
-              type="button"
               onClick={item.onClick}
               aria-label={item.ariaLabel}
               {...whole}
@@ -210,7 +210,7 @@ export default function Breadcrumb({
               sx={{ ...CRUMB_HIT_SX, font: 'inherit', color: 'inherit', cursor: 'pointer' }}
             >
               {item.label}
-            </Link>
+            </LinkButton>
           )
         }
         return item.to && !isLast ? (

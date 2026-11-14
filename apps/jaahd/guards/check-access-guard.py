@@ -5,8 +5,10 @@ install-access-guard.py.
 
 Usage: check-access-guard.py [project-name-or-clone-path]
   An exact control-plane project name is tried FIRST, then a literal clone path (a same-named directory
-  must never shadow the DB-declared clone). Omit to sweep every restricted project plus every project
-  with a local clone. Exit 0 = all conform (or nothing enrolled); 1 = unresolved argument or any FAIL.
+  must never shadow the DB-declared clone). A project is audited in EVERY clone this node holds for it
+  (each pool slot of its primary repository — `control_plane_client.resolve_slot_clones`). Omit to sweep every
+  restricted project plus every project with a local clone. Exit 0 = all conform (or nothing enrolled);
+  1 = unresolved argument or any FAIL.
 
 RESTRICTED (non-empty `branch_prefix` and/or `push_enabled = false`): the pre-push hook is present,
 byte-identical and executable; `core.hooksPath` does not redirect away from it; both markers are SET
@@ -25,15 +27,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import project_resolve  # noqa: E402
 from control_plane_client import ControlPlaneApiError  # noqa: E402
-from project_resolve import DeclaredGovernance, parse_git_bool  # noqa: E402
+from project_resolve import DISABLED_PUSH_URL, DeclaredGovernance, parse_git_bool  # noqa: E402
 
 SELF_DIR = Path(__file__).resolve().parent
 GUARD_SRC = SELF_DIR / "access-guard-pre-push.py"
 PREFIX_CONFIG_KEY = "access-guard.branch-prefix"
 PUSH_ENABLED_CONFIG_KEY = "access-guard.push-enabled"
 HOOKS_PATH_CONFIG_KEY = "core.hooksPath"
-# Byte-identical to install-access-guard.py's constant, retired tier name and all — see there for why.
-DISABLED_PUSH_URL = "disabled://readonly-guard-see-docs-policies-repo-access-levels-md"
 
 RED, GREEN, YELLOW, RESET = "\033[31m", "\033[32m", "\033[33m", "\033[0m"
 
@@ -67,18 +67,12 @@ def _resync_hint(name: str, declared: DeclaredGovernance | None) -> str:
 def _git_config(clone: str, key: str) -> str | None:
     """`key`'s value **in the clone's own config file**, or None when it is UNSET or multi-valued.
 
-    None vs '' is load-bearing: an empty prefix is a written value. `--local --get-all` must mirror
-    `access-guard-pre-push.py::read_config` EXACTLY so the checker cannot pass a clone the hook would
-    refuse; a wider scope would let `~/.gitconfig` or `GIT_CONFIG_*` satisfy the audit (see that
-    function for the reproduced bypass)."""
-    result = subprocess.run(
-        ["git", "-C", clone, "config", "--local", "--get-all", key],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return None
-    values = [line.strip() for line in result.stdout.splitlines()]
-    return values[0] if len(values) == 1 else None
+    None vs '' is load-bearing: an empty prefix is a written value. The `--local --get-all` read
+    (`project_resolve.git_config_values`) must mirror `access-guard-pre-push.py::read_config` EXACTLY so the
+    checker cannot pass a clone the hook would refuse; a wider scope would let `~/.gitconfig` or
+    `GIT_CONFIG_*` satisfy the audit (see that function for the reproduced bypass)."""
+    values = project_resolve.git_config_values(clone, key, local=True)
+    return values[0].strip() if values is not None and len(values) == 1 else None
 
 
 def _hooks_path_override(clone: str) -> str | None:
@@ -306,9 +300,9 @@ def main(argv: list[str]) -> int:
             # Keep a project if either side could fail: declared-restricted (even uncloned, so "not
             # cloned" is reported), or any project with a local clone to inspect for leftovers.
             targets = [
-                (name, clone, declared)
-                for name, clone, declared in project_resolve.sweep_all()
-                if declared.restricted or (clone and os.path.isdir(clone))
+                (name, clones, declared)
+                for name, clones, declared in project_resolve.sweep_all()
+                if declared.restricted or clones
             ]
     except ControlPlaneApiError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -318,8 +312,10 @@ def main(argv: list[str]) -> int:
         print("no restricted projects and no locally-resolvable clones found", file=sys.stderr)
         return 0
 
-    for name, clone, declared in targets:
-        check_repo(name, clone, declared)
+    for name, clones, declared in targets:
+        # No clone on this node: one entry, reported as a skip (a restricted project is listed regardless).
+        for clone in clones or [""]:
+            check_repo(name, clone, declared)
 
     print()
     if _fail_count == 0:

@@ -9,9 +9,11 @@ import PaneModeToggle from '../../components/tasks/pane/PaneModeToggle'
 import FilterBar from '../../ui/FilterBar'
 import AsyncMultiLookup from '../../ui/AsyncMultiLookup'
 import type { LookupOption } from '../../ui/AsyncLookup'
-import { CREDENTIALS_FILTERS_COMPACT, tapTargetSx } from '../../ui/listStyles'
+import { ABOVE_PHONE, CREDENTIALS_FILTERS_COMPACT, CREDENTIALS_FILTERS_NARROW, tapTargetSx } from '../../ui/listStyles'
+import { FONT_SIZE, SIZE, grid } from '../../theme'
 import { CREDENTIAL_HEALTHS, MAX_OWNER_IDS, type CredentialView } from '../../lib/credentialFilterStorage'
 import { useOrgVisible } from '../../ui/OrgIndicator'
+import { FILTER_STRIP_SX } from '../users/UserFilterStrip'
 import {
   listCredentialOwners,
   type CredentialOwner,
@@ -33,10 +35,12 @@ import {
  * The order is the packing: Search leads; Only-mine follows the pickers; Flat/Tree closes the row
  * as the one non-narrowing control — the shared `PaneModeToggle`.
  * NO STRANDED CONTROL: the pickers grow from `PICKER_PX` (capped at `PICKER_MAX_PX`) and Search
- * from `SEARCH_PX`, so a wrapped line fills its width; Only-mine and Flat/Tree wrap as ONE unit. At 1024px
+ * from `SIZE.fieldMd`, so a wrapped line fills its width; Only-mine and Flat/Tree wrap as ONE unit. At 1024px
  * the whole strip is one line. COMPACT UNDER A ~400px LIST (`CREDENTIALS_FILTERS_COMPACT`): beside an open
  * editor (a ~320px list) the default packing took three or four lines, so there Only-mine and Flat/Tree ride
- * Search's line and the pickers narrow to share the next (`COMPACT_SX`): two lines, three with Owner on a tight list.
+ * Search's line and the pickers narrow to share the next (`COMPACT_SX`). UNDER ~700px ON A DESKTOP
+ * (`CREDENTIALS_FILTERS_NARROW`: beside an open secret) Search takes line one whole instead, so its placeholder reads
+ * uncut (`NARROW_SX`): the toggles and pickers share the lines under it.
  * Visual order only (`order`); the DOM, and so the tab order, stays the one above.
  *
  * OWNER IS A SERVER-SEARCHED MULTI-PICK (`ui/AsyncMultiLookup`): a native select cannot hold the
@@ -49,49 +53,50 @@ import {
  *  email in Owner) from widening its control onto a line of its own. */
 const PICKER_PX = 140
 const PICKER_MAX_PX = 190
-/** Search's basis: with three pickers, Only-mine and Flat/Tree it packs a 1024px window's 768px strip. */
-const SEARCH_PX = 160
-
-/** The compact band's flex bases: three pickers and their two gaps fit a ~300px line; Search plus the
- *  Only-mine/Flat-Tree unit (~140px) fit another. */
-const COMPACT_PICKER_PX = 88
-const COMPACT_SEARCH_PX = 110
-
-/** Three chips of ordinary names side by side. */
-const OWNER_CHIPS_PX = 360
 
 /** The Owner box: a picker's basis, no cap. Holding chips it asks for room for a long name: on a wide strip the
  *  line still holds every control; on a phone (and beside an open editor) Owner takes a line of its own. */
 const OWNER_SX = {
-  flex: `1 1 ${PICKER_PX}px`,
+  flexGrow: 1,
+  flexShrink: 1,
+  flexBasis: PICKER_PX,
   minWidth: PICKER_PX,
-  [CREDENTIALS_FILTERS_COMPACT]: { order: 2, flex: `1 1 ${COMPACT_PICKER_PX * 2}px` },
+  [CREDENTIALS_FILTERS_COMPACT]: { order: 2, flex: `1 1 ${grid(29)}` },
 } as const
-const OWNER_WITH_CHIPS_SX = { ...OWNER_SX, flexBasis: OWNER_CHIPS_PX, [CREDENTIALS_FILTERS_COMPACT]: { order: 2, flexBasis: '100%' } } as const
+/* Holding chips: three chips of ordinary names side by side. */
+const OWNER_WITH_CHIPS_SX = { ...OWNER_SX, flexBasis: SIZE.measureNarrow, [CREDENTIALS_FILTERS_COMPACT]: { order: 2, flexBasis: '100%' } } as const
+
+/* A NARROW LIST ON A DESKTOP (under ~700px: beside an open secret): Search takes a line of its own, so its placeholder
+   reads whole instead of cut ("Name, descrip…") beside Type and Owner. Not on a phone: there the strip's three-line
+   budget holds (`e2e/credentials-filters.spec.ts`). After `COMPACT_SX`, so it wins over its Search basis. */
+const NARROW_SX = {
+  [ABOVE_PHONE]: { [CREDENTIALS_FILTERS_NARROW]: { '& .MuiTextField-root:not(:has(select))': { flex: '1 1 100%' } } },
+} as const
 
 /* THE COMPACT PACKING — widths, padding and order only; every control keeps its height (the phone's 44px floor).
    Pickers are the TextFields holding a `<select>`. The native select's right padding is MUI's `&&&` rule, so it
    is out-specified the same way. A closed value that still does not fit ellipsises (the open list stays whole). */
 const COMPACT_SX = {
   [CREDENTIALS_FILTERS_COMPACT]: {
-    '& .MuiTextField-root:not(:has(select))': { flex: `1 1 ${COMPACT_SEARCH_PX}px`, minWidth: COMPACT_SEARCH_PX },
-    '& .MuiTextField-root:has(select)': { order: 2, flex: `1 1 ${COMPACT_PICKER_PX}px`, minWidth: COMPACT_PICKER_PX, maxWidth: 'none' },
+    '& .MuiTextField-root:not(:has(select))': { flex: `1 1 ${grid(18)}`, minWidth: grid(18) },
+    '& .MuiTextField-root:has(select)': { order: 2, flex: `1 1 ${grid(14.5)}`, minWidth: grid(14.5), maxWidth: 'none' },
     '& .MuiNativeSelect-select.MuiNativeSelect-select.MuiNativeSelect-select': {
       pl: 1,
       pr: 3,
-      fontSize: '0.8125rem',
+      fontSize: FONT_SIZE.md,
       textOverflow: 'ellipsis',
     },
-    '& .MuiNativeSelect-icon': { right: 2 },
+    '& .MuiNativeSelect-icon': { right: 0 },
   },
 } as const
 
 /* A HOVER THAT IS NOT FOCUS: opening an editor reflows this strip, so a picker lands under the pointer
    that just clicked a row, and MUI's near-white hover outline then read as a focused field on arrival. The strip's
-   hover outline is a translucent text tone instead, a step above rest; focus keeps the primary ring. */
+   hover outline is a translucent text tone instead, a step above rest; focus keeps the primary ring. Its own 38%
+   tone, not `text.disabled`: that token went opaque for text contrast and made this outline read as focus again. */
 const HOVER_SX = {
   '& .MuiOutlinedInput-root:hover:not(.Mui-focused):not(.Mui-disabled):not(.Mui-error) .MuiOutlinedInput-notchedOutline': {
-    borderColor: 'rgba(var(--mui-palette-text-primaryChannel) / 0.45)',
+    borderColor: 'rgba(var(--mui-palette-common-onBackgroundChannel, 0 0 0) / 0.38)',
   },
 } as const
 
@@ -118,7 +123,7 @@ const OWNER_PROBE_LIMIT = 2
 const OWNER_SEARCH_LIMIT = 20
 
 /** The empty box: no owner picked narrows nothing. */
-const OWNER_PLACEHOLDER = 'All owners'
+const OWNER_PLACEHOLDER = 'Any'
 
 /** An owner as a picker row: the name, and how many credentials they own (capped on a search). */
 function ownerOption(owner: CredentialOwner): LookupOption {
@@ -178,11 +183,17 @@ const HEALTH_LABELS: Record<(typeof CREDENTIAL_HEALTHS)[number], string> = {
 }
 const HEALTH_OPTIONS = CREDENTIAL_HEALTHS.map(value => ({ value, label: HEALTH_LABELS[value] }))
 
-/** What Search matches, said in its placeholder: the operator's cross-tenant read (D1 — not narrowed to its own
- *  rows) also matches org and owner email (`apps/api/app/routes/credentials/roster.py::reads_as_operator`). */
+/** What Search matches, said in its placeholder under the field's own "Search" label (so no "Search" again): the
+ *  operator's cross-tenant read (D1 — not narrowed to its own rows) also matches org and owner email
+ *  (`apps/api/app/routes/credentials/roster.py::reads_as_operator`). Short enough to read whole at desktop width
+ *  (the longer "Name, description, org, owner" was cut). */
 export function searchPlaceholder(operator: boolean, mine: boolean): string {
-  return operator && !mine ? 'Search name, description, org, owner email' : 'Search name or description'
+  return operator && !mine ? 'Name, org, owner' : 'Name or description'
 }
+
+/** Search's share of the strip's spare width beside the growing pickers (1 each): enough that its placeholder
+ *  reads whole at desktop width instead of being cut ("Search name or descrip"). */
+const SEARCH_GROW = 4
 
 /** One option list plus fetch state. `forbidden` is separate from `error`: `/owners` needs
  *  `credentials:view` (narrower than the roster), so a 403 is an ENTITLEMENT answer, while a 500 is an
@@ -239,6 +250,8 @@ export type CredentialFilterStripProps = {
   typesLoading: boolean
   /** The owner option list from the page (`useCredentialFilterRosters`). */
   rosters: CredentialFilterRosters
+  /** May this viewer run a credential's Test (`./ownership.ts::testsCredentials`)? `false` drops "Last test failed". */
+  showTest: boolean
 }
 
 export default function CredentialFilterStrip({
@@ -248,6 +261,7 @@ export default function CredentialFilterStrip({
   typesError,
   typesLoading,
   rosters: { owners },
+  showTest,
 }: CredentialFilterStripProps): JSX.Element {
   /* The owner picker's existence (X2, R2.1). The `mine` toggle is PERMANENT (needs no roster). No picker
      on a 403 or a roster of ONE (it would narrow to what is already shown); neither is an error. A held
@@ -259,20 +273,21 @@ export default function CredentialFilterStrip({
   const operator = useOrgVisible()
 
   return (
-    /* A bare `<div>` (no box of its own) carrying the testid, so the chrome-budget oracle can remove and
-       re-measure (it adds zero pixels), and the compact band's descendant rules. */
-    <Box data-testid="credential-filters" sx={[HOVER_SX, COMPACT_SX]}>
+    /* The `<div>` carrying the testid, so the chrome-budget oracle can remove and re-measure, and the compact
+       band's descendant rules. Its only box is the Directory panels' top clearance (`FILTER_STRIP_SX`): the list
+       sits flush under the tab strip, which clipped the controls' floated labels. */
+    <Box data-testid="credential-filters" sx={[FILTER_STRIP_SX, HOVER_SX, COMPACT_SX, NARROW_SX]}>
       <FilterBar>
         <FilterRow>
           {/* SEARCH shares line one with Type at 448px. Debounced by the PAGE (R2.9), so the input never lags. */}
-          <FilterSearch value={view.q} onChange={q => onChange({ q })} placeholder={searchPlaceholder(operator, view.mine)} ariaLabel="Search secrets" minWidth={SEARCH_PX} />
+          <FilterSearch value={view.q} onChange={q => onChange({ q })} placeholder={searchPlaceholder(operator, view.mine)} ariaLabel="Search secrets" minWidth={SIZE.fieldMd} grow={SEARCH_GROW} />
 
           <FilterSelect
             label="Type"
             ariaLabel="Filter by type"
             value={view.type}
             onChange={next => onChange({ type: next })}
-            allLabel="All types"
+            allLabel="Any"
             options={types.map(t => ({ value: t.slug, label: t.label }))}
             minWidth={PICKER_PX}
             maxWidth={PICKER_MAX_PX}
@@ -325,7 +340,7 @@ export default function CredentialFilterStrip({
             value={view.health}
             onChange={next => onChange({ health: CREDENTIAL_HEALTHS.find(health => health === next) ?? '' })}
             allLabel="Any"
-            options={HEALTH_OPTIONS}
+            options={showTest ? HEALTH_OPTIONS : HEALTH_OPTIONS.filter(option => option.value !== 'test_failed')}
             minWidth={PICKER_PX}
             maxWidth={PICKER_MAX_PX}
             grow

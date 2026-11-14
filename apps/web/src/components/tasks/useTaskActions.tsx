@@ -58,6 +58,11 @@ export function useDeleteTask(): (task: PipelineTask) => Promise<void> {
   )
 }
 
+/** What the Start ask is told of a row (`usePushIdentity`). */
+const startTarget = (task: PipelineTask) => ({
+  projectId: task.project_id, title: task.title, assigneeId: task.assigned_to_id, epic: task.persona === 'epic',
+})
+
 export function useTaskActions({
   confirm, run, isBusy, withBusy, onRow, onMoved, deleteDialog, onDeleted, onDeleting,
 }: TaskActionsOptions): {
@@ -68,6 +73,8 @@ export function useTaskActions({
   reset: (task: PipelineTask) => Promise<void>
   complete: (task: PipelineTask) => Promise<void>
   confirmDelete: (task: PipelineTask) => Promise<void>
+  /** Discard a Jaah suggestion (`isSuggestion`): Delete with no confirm (an operator decision), a toast after. */
+  discard: (task: PipelineTask) => Promise<void>
   /** The push-identity ask, for a page's own Start door (the board's priority force-start); its dialog is in
    *  `preemptDialog`. */
   askPushIdentity: ReturnType<typeof usePushIdentity>['ask']
@@ -90,6 +97,8 @@ export function useTaskActions({
      (`components/GitReach.tsx`). Start never waits on it and a failed read says nothing; a `blocked` answer is a
      warning toast with the fix, since the runner would otherwise find out only when its push or PR is refused. */
   const [reachWarning, setReachWarning] = useState<{ reach: ProjectGitReach; seq: number } | null>(null)
+  // What Discard removed, said once (`discard`).
+  const [discarded, setDiscarded] = useState<{ text: string; seq: number } | null>(null)
   // Only the starter's own answer: an operator pushing as someone else (`push_as_id`) would be told about themself.
   const checkGitReach = (task: PipelineTask, pushAs: PushIdentity) => {
     if (task.has_repo === false || pushAs.push_as_id) return
@@ -104,12 +113,13 @@ export function useTaskActions({
   // The POST every door into Start shares (direct start, the dialog's "Just queue it"). A DB write
   // only, idempotent, so no confirm and no 409 case; the returned task replaces the row. The body
   // DECLARES the intent, always explicitly — `startIntentFor` is the single answer.
+  // A start without the repository (`without_repo`, chosen in the ask) has nothing to push: no push warning follows.
   const postStart = (task: PipelineTask, intent: StartIntent, pushAs: PushIdentity, freshElsewhere = false) =>
     run(task, 'Failed to start task', async () => {
       const body = freshElsewhere ? { ...startBody(intent, pushAs), fresh_elsewhere: true } : startBody(intent, pushAs)
       const updated = await post<PipelineTask>(CONTROLS.start.path(task.id), body)
       onRow?.(updated)
-      checkGitReach(updated, pushAs)
+      if (!pushAs.without_repo) checkGitReach(updated, pushAs)
       return updated
     })
 
@@ -119,14 +129,15 @@ export function useTaskActions({
   // when blocked the `PreemptDialog` offers `force-start` (the server re-queues the stopped task). Skipped for an
   // epic container and for `queue` intents. A FAILED FORECAST FALLS THROUGH TO THE ORDINARY START — a courtesy
   // must never block the primary verb.
-  // AN ACTING OPERATOR IS ASKED WHOM TO PUSH AS before anything (`usePushIdentity`; `{}` at once otherwise); Cancel
-  // starts nothing, and the answer rides whichever POST follows.
+  // THE START ASK COMES FIRST (`usePushIdentity`): whom an acting operator pushes as, and whether a starter who
+  // can't see the repository runs without it; Cancel starts nothing, and the answer rides whichever POST follows.
   async function start(task: PipelineTask, intent: StartIntent) {
     // BUSY FOR THE PROBE TOO, or a double click probes twice and opens two dialogs.
     if (isBusy(task)) return
-    const pushAs = await pushIdentity.ask({ projectId: task.project_id, title: task.title, assigneeId: task.assigned_to_id })
+    const pushAs = await pushIdentity.ask(startTarget(task))
     if (!pushAs) return
-    if (task.persona !== 'epic' && intent !== 'queue') {
+    // No preempt forecast for a start without the repository: it takes a folder, not a repository slot.
+    if (task.persona !== 'epic' && intent !== 'queue' && !pushAs.without_repo) {
       // The probe starts once; busy wraps its wait, and the value is read off the same promise.
       const probe = preemptForecast(task.id)
       await withBusy(task, async () => { await probe })
@@ -143,7 +154,7 @@ export function useTaskActions({
   // and no preempt dialog; a 409 (no other node) lands on the error line as Start's does.
   async function startElsewhere(task: PipelineTask, intent: StartIntent) {
     if (isBusy(task)) return
-    const pushAs = await pushIdentity.ask({ projectId: task.project_id, title: task.title, assigneeId: task.assigned_to_id })
+    const pushAs = await pushIdentity.ask(startTarget(task))
     if (!pushAs) return
     await postStart(task, intent, pushAs, true)
   }
@@ -205,6 +216,12 @@ export function useTaskActions({
     const verb = isArchiveRow(task) ? TASK_ACTIONS.archive.verb : TASK_ACTIONS.delete.verb
     const { failure, ...words } = deleteDialog(task, verb)
     if (!(await confirm({ ...words, confirmLabel: verb, destructive: true }))) return
+    await remove(task, failure)
+  }
+
+  // The DELETE both doors send, once the press is decided.
+  async function remove(task: PipelineTask, failure: string): Promise<boolean> {
+    let removed = false
     onDeleting?.(true)
     await run(task, failure, async () => {
       try {
@@ -214,7 +231,14 @@ export function useTaskActions({
         throw err
       }
       await onDeleted()
+      removed = true
     })
+    return removed
+  }
+
+  // A suggestion is one click away from gone: it is a draft nobody asked for, and Accept is beside it.
+  async function discard(task: PipelineTask) {
+    if (await remove(task, 'Failed to discard task')) setDiscarded({ text: `Discarded #${task.id}`, seq: Date.now() })
   }
 
   const preemptDialog = (
@@ -238,8 +262,13 @@ export function useTaskActions({
         onClose={() => setReachWarning(null)}
         testId="start-git-reach-toast"
       />
+      <Toast
+        toast={discarded && { text: discarded.text, severity: 'success', seq: discarded.seq }}
+        onClose={() => setDiscarded(null)}
+        testId="discard-toast"
+      />
     </>
   )
 
-  return { start, startElsewhere, stop, reset, complete, confirmDelete, askPushIdentity: pushIdentity.ask, preemptDialog }
+  return { start, startElsewhere, stop, reset, complete, confirmDelete, discard, askPushIdentity: pushIdentity.ask, preemptDialog }
 }

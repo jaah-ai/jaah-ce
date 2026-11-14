@@ -1,10 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Link as RouterLink } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Link from '@mui/material/Link'
 import Stack from '@mui/material/Stack'
-import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import { get } from '../../api'
 import { useApiRead } from '../../hooks/useApiRead'
@@ -16,8 +15,10 @@ import Banner from '../../ui/Banner'
 import { HomeChip } from '../../ui/MarkChip'
 import EmptyState from '../../ui/EmptyState'
 import LoadingState from '../../ui/LoadingState'
-import { fieldTapTargetSx, tapTargetSx } from '../../ui/listStyles'
-import { useConfirm } from '../ConfirmDialog'
+import FormTextField from '../../ui/FormTextField'
+import { tapTargetSx } from '../../ui/listStyles'
+import { grid } from '../../theme'
+import { danger, useConfirm } from '../ConfirmDialog'
 import {
   attachCredential,
   detachCredential,
@@ -41,18 +42,19 @@ export default function CredentialAccessTab({ credentialId, otherOrg = null }: {
     () => getCredentialAccess(credentialId),
     'Failed to load access',
   )
-  const [projects, setProjects] = useState<Project[]>([])
   const [choice, setChoice] = useState('')
   const { busy, formError: error, run } = useSubmit()
   const [confirm, confirmDialog] = useConfirm()
 
-  useEffect(() => {
-    // The picker is optional: a failed project list leaves Attach empty, not the tab broken.
-    const read = asOrg ? get<Project[]>('/api/projects', { headers: asOrg }) : listProjects()
-    read
-      .then(rows => setProjects(Array.isArray(rows) ? rows : []))
-      .catch(() => setProjects([]))
-  }, [otherOrgId])
+  // The picker is optional: a failed project list leaves Attach empty, not the tab broken.
+  const { data: projectRows, error: projectsError } = useApiRead(
+    ['credential-access-projects', otherOrgId],
+    () => (asOrg ? get<Project[]>('/api/projects', { headers: asOrg }) : listProjects())
+      .then(rows => (Array.isArray(rows) ? rows : [])),
+    'Failed to load projects',
+  )
+  // A failed read offers nothing, never the previous org's projects.
+  const projects = projectsError ? [] : projectRows ?? []
 
   async function handleAttach() {
     if (!choice) return
@@ -64,12 +66,7 @@ export default function CredentialAccessTab({ credentialId, otherOrg = null }: {
   }
 
   async function handleDetach(project: CredentialAccess['projects'][number]) {
-    const ok = await confirm({
-      title: 'Detach credential?',
-      message: `${project.name}'s runners stop receiving this credential.`,
-      confirmLabel: 'Detach',
-      destructive: true,
-    })
+    const ok = await confirm(danger('Detach', { title: 'Detach credential?', message: `${project.name}'s runners stop receiving this credential.` }))
     if (ok) await run('Failed to detach', async () => {
       await detachCredential(project.id, credentialId, asOrg)
       await reload()
@@ -145,21 +142,17 @@ export default function CredentialAccessTab({ credentialId, otherOrg = null }: {
             </Typography>
           ) : (
           <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', flexWrap: 'wrap' }}>
-            <TextField
+            <FormTextField
               id="credential-attach-project"
               label="Project"
-              select
-              size="small"
+              help="Attaching lets this project's tasks use the secret."
               value={choice}
-              onChange={event => setChoice(event.target.value)}
-              slotProps={{ select: { native: true }, inputLabel: { shrink: true } }}
-              sx={[fieldTapTargetSx, { flex: '1 1 12rem', minWidth: 0 }]}
+              onChange={setChoice}
+              options={available.map(project => ({ value: String(project.id), label: project.name }))}
+              sx={{ flex: `1 1 ${grid(32)}`, minWidth: 0 }}
             >
               <option value="">—</option>
-              {available.map(project => (
-                <option key={project.id} value={String(project.id)}>{project.name}</option>
-              ))}
-            </TextField>
+            </FormTextField>
             <Button
               data-testid="credential-attach"
               variant="contained"

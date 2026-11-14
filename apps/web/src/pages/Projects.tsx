@@ -1,52 +1,69 @@
 import { useState } from 'react'
-import { Link as RouterLink, useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 import Box from '@mui/material/Box'
-import Button from '@mui/material/Button'
-import { apiDetail, del, post } from '../api'
+import { apiDetail, del, get, post } from '../api'
 import { useAuth, useCan, useCanOnProject } from '../auth'
+import { lockedForMember } from '../lib/jaahManaged'
+import { isEnabled } from '../lib/editionFeatures'
 import { isOrgAdminSeat } from '../lib/orgAdmin'
 import { cascadeFailureText } from '../lib/erase'
 import { safeHref } from '../lib/safeHref'
-import { FORGE_LABELS, type Command, type Project } from '../types'
-import { CompactVerbLabel, compactVerbProps } from '../ui/CompactVerb'
+import { FORGE_LABELS, type Project } from '../types'
 import Banner from '../ui/Banner'
 import ListStates from '../ui/feed/ListStates'
 import LoadFailedState from '../ui/LoadFailedState'
 import type { FeedNote, FeedRowSpec, OverflowItem } from '../ui/feed/types'
 import { deleteItem, editItem } from '../components/tasks/rowActions'
 import { useOpenDetailPath } from '../components/ListDetail'
-import { ABOVE_PHONE, PROJECTS_LIST_CONTAINER_SX, PROJECTS_NO_ORG, SR_ONLY_SX, tapTargetSx } from '../ui/listStyles'
+import { ABOVE_PHONE, PHONE, PROJECTS_LIST_CONTAINER_SX, PROJECTS_NO_ORG, SR_ONLY_SX, tapTargetSx, ELLIPSIS_SX } from '../ui/listStyles'
+import { FONT_SIZE, FONT_WEIGHT } from '../theme'
 import { countOf } from '../lib/humanize'
 import { OrgIndicator, orgSlots, orgTitle, useOrgVisible } from '../ui/OrgIndicator'
 import PageHeader from '../ui/PageHeader'
 import SortMenu from '../ui/SortMenu'
-import { SystemChip } from '../ui/MarkChip'
+import { flipSort, rankRows } from '../ui/SortableHead'
 import { useChangeOrgAction } from '../components/ChangeOrgDialog'
-import { useConfirm } from '../components/ConfirmDialog'
+import { danger, useConfirm } from '../components/ConfirmDialog'
 import { useRowActions } from '../hooks/useBusyIds'
+import type { SortDir } from '../hooks/useListPage'
 import { useProjects, useWorktrees } from '../hooks/useRosters'
+import { useProjectCreateLabel } from '../hooks/useProjectCreateLabel'
+import { useTaskTree } from '../hooks/useTaskTree'
+import { MUTED_PREF, readMuted, toggledMuted } from '../lib/taskMute'
+import { EyeIcon, EyeOffIcon } from '../ui/icons'
+import NewButton from '../ui/NewButton'
+import Tip from '../ui/Tip'
 
-type SortKey = 'name' | 'active'
+type SortKey = 'name' | 'questions' | 'running' | 'queued' | 'active'
 
-/* THE TITLE AS NAME + ORG ON ONE LINE. The org is drawn only on a narrow list above the phone
-   (`PROJECTS_NO_ORG`, beside an open project), where its slot is off. THE NAME WINS: at a 1024px window
+/** The task-count columns (`GET /api/tasks/tree`'s project counts, top-level tasks). Running is `in_progress`
+ *  without its queued slice (`types.ts::TaskTreeCounts`). */
+type TaskColumn = 'questions' | 'running' | 'queued'
+const TASK_COLUMNS: { key: TaskColumn; label: string; noun: [string, string]; width: number; gate: 'projectsTasks' | 'projectsQuestions' }[] = [
+  { key: 'questions', label: 'Questions', noun: ['question', 'questions'], width: 84, gate: 'projectsQuestions' },
+  { key: 'running', label: 'Running', noun: ['running', 'running'], width: 70, gate: 'projectsTasks' },
+  { key: 'queued', label: 'Queued', noun: ['queued', 'queued'], width: 64, gate: 'projectsTasks' },
+]
+
+/* THE TITLE AS NAME + ORG ON ONE LINE. The org is drawn on the phone and on a narrow list above it
+   (`PROJECTS_NO_ORG`, beside an open project), where its slot is off: at 448px its 128px slot cut the names to "org-a-probe-p…". THE NAME WINS: at a 1024px window
    a full-width org cut the names to "org-a-pro…". The two WRAP inside a one-line clip (`TITLE_FIT_SX`): the org
    stays on the name's line only while the whole name and a few of its letters fit there, else it wraps onto the
    clipped line and the name keeps the row. On the line it grows into what the name leaves, up to its own width,
    ellipsised (its hover names it). */
-const TITLE_ROW_SX = { display: 'inline-flex', alignItems: 'center', gap: 0.75, maxWidth: '100%', minWidth: 0 } as const
+const TITLE_ROW_SX = { display: 'inline-flex', alignItems: 'center', gap: 0.5, maxWidth: '100%', minWidth: 0 } as const
 const TITLE_FIT_SX = {
   display: 'flex',
   flexWrap: 'wrap',
   alignItems: 'center',
-  columnGap: 0.75,
+  columnGap: 0.5,
   flex: '0 1 auto',
   minWidth: 0,
   // The name's own line box (`ui/feed/FeedList.tsx` TITLE_SX: line-height 1.3): a wrapped org is never seen.
   maxHeight: '1.3em',
   overflow: 'hidden',
 } as const
-const TITLE_NAME_SX = { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } as const
+const TITLE_NAME_SX = ELLIPSIS_SX
 const TITLE_ORG_SX = {
   display: 'none',
   // Placed on the name's line at its floor, then grown up to its whole name.
@@ -54,21 +71,24 @@ const TITLE_ORG_SX = {
   maxWidth: 'max-content',
   minWidth: 0,
   overflow: 'hidden',
-  fontSize: '0.6875rem',
+  fontSize: FONT_SIZE.xs,
+  [PHONE]: { display: 'inline-flex' },
   [ABOVE_PHONE]: { [PROJECTS_NO_ORG]: { display: 'inline-flex' } },
 } as const
 
 /** The active-slot count in words: the slot's hover and its accessible name. `null` active = not visible to
  *  this viewer (no `worktrees:view`). */
 export function projectCountsLabel(active: number | null): string {
-  return active === null ? 'Active slots hidden' : `${active} active slot${active === 1 ? '' : 's'}`
+  return active === null ? 'Active slots hidden' : countOf(active, 'active slot')
 }
-type SortDir = 'asc' | 'desc'
 
-/* The two sortable keys, each a fact on the row. Read by `ui/SortMenu`. */
-const SORTABLE_COLUMNS: { key: SortKey; label: string }[] = [
-  { key: 'name', label: 'Project' },
-  { key: 'active', label: 'Active WTs' },
+/* The sortable keys, each a fact on the row. Read by `ui/SortMenu` (the phone, where the header row is off) and the
+   header row. */
+const SORTABLE_COLUMNS: { key: SortKey; label: string; firstDir: SortDir }[] = [
+  { key: 'name', label: 'Project', firstDir: 'asc' },
+  // A count reads best largest first.
+  ...TASK_COLUMNS.map(c => ({ key: c.key, label: c.label, firstDir: 'desc' as const })),
+  { key: 'active', label: 'Active slots', firstDir: 'desc' },
 ]
 
 export default function Projects() {
@@ -83,18 +103,19 @@ export default function Projects() {
   const canReadWorktrees = can('worktrees:view')
   const canCreate = can('projects:create')
   const canEditProject = useCanOnProject()
-  const { admin } = useAuth()
+  const { admin, updatePreferences } = useAuth()
+  const createLabel = useProjectCreateLabel(canCreate)
   const changeOrg = useChangeOrgAction('project')
   const worktreesQuery = useWorktrees({ enabled: canReadWorktrees })
-  const projects = projectsQuery.data ?? []
+  /* A system project (`system_kind`: the org's Nodes project) is never listed: its tasks are reached from the
+     node's Automations tab. */
+  const projects = (projectsQuery.data ?? []).filter(p => !p.system_kind)
   const worktrees = worktreesQuery.data ?? []
   // `canReadWorktrees &&` is belt-and-braces here (a disabled query is not loading); explicit so a
   // future upgrade cannot make the page wait on a query it does not run.
   const loading = projectsQuery.isLoading || (canReadWorktrees && worktreesQuery.isLoading)
   // Delete failures share the banner but surface only once the load has succeeded.
-  const { busy: busyIds, withBusy, run, error: actionError, setError: setActionError } = useRowActions<number>()
-  // A NON-ERROR notice for `Run Check` (a ⋯ item has no cell to report into).
-  const [notice, setNotice] = useState('')
+  const { busy: busyIds, withBusy, error: actionError } = useRowActions<number>()
   // `canReadWorktrees &&` IS LOAD-BEARING HERE: disabling a query does not clear an error it already has
   // (a warm reload fires it from the persisted permission snapshot, 403s, then disables it).
   const loadFailed = projectsQuery.isError || (canReadWorktrees && worktreesQuery.isError)
@@ -102,49 +123,41 @@ export default function Projects() {
   const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({ key: 'name', dir: 'asc' })
   const [confirm, confirmDialog] = useConfirm()
 
+  /* The task counts, from the rail's own read (one cache): `null` without `tasks:view` or before it lands. */
+  const canReadTasks = can('tasks:view')
+  const { tree } = useTaskTree(canReadTasks)
+  const countsById = new Map((tree?.projects ?? []).map(t => [t.id, t.counts]))
+  function taskCount(p: Project, column: TaskColumn): number | null {
+    const counts = countsById.get(p.id)
+    if (!counts) return null
+    const queued = counts.queued ?? 0
+    if (column === 'questions') return counts.questions
+    return column === 'queued' ? queued : Math.max(0, counts.in_progress - queued)
+  }
+
+  /* HIDE / SHOW (`lib/taskMute.ts`): this user's, the same entry as the rail's Hide. A hidden project stays listed
+     here, greyed, so it can be shown again. */
+  const hiddenKeys = readMuted(admin?.preferences)
+  const isHidden = (p: Project) => hiddenKeys.includes(`project:${p.id}`)
+  function toggleHidden(p: Project) {
+    void updatePreferences({ [MUTED_PREF]: toggledMuted(hiddenKeys, `project:${p.id}`) })
+  }
+
   // `null` = not knowable (no `worktrees:view`), rendered as an em dash; 0 would be a lie.
   function activeCount(name: string): number | null {
     if (!canReadWorktrees) return null
     return worktrees.filter(w => w.project === name && w.state !== 'free').length
   }
 
+  /** One rule for the header row and `SortMenu`: the sorted column flips; another starts at its `firstDir`. */
   function toggleSort(key: SortKey) {
-    setSort(s => s.key === key ? { key, dir: s.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: 'asc' })
+    setSort(s => flipSort(s, key, SORTABLE_COLUMNS.find(c => c.key === key)?.firstDir ?? 'asc'))
   }
 
-  const sorted = [...projects].sort((a, b) => {
-    let av: string | number | null
-    let bv: string | number | null
-    if (sort.key === 'active') {
-      // `?? -1`: an unknowable count sorts below zero (`null` would not type-check). Constant per render,
-      // so the stable sort keeps server order.
-      av = activeCount(a.name) ?? -1
-      bv = activeCount(b.name) ?? -1
-    } else {
-      av = a.name
-      bv = b.name
-    }
-    if (av < bv) return sort.dir === 'asc' ? -1 : 1
-    if (av > bv) return sort.dir === 'asc' ? 1 : -1
-    return 0
-  })
-
-  /* RUN CHECK, as the ⋯ fires it: a second spelling of `components/CommandButton.tsx::useCommand`'s reply
-     read (a command fails unless the node says `done`; `result.reason` says why). This is the THIRD
-     caller `components/WorktreePool.tsx::runSlotCommand` names — an open debt to move the read beside
-     the hook. `run` makes the ⋯ inert meanwhile. */
-  function runCheck(p: Project) {
-    return run(p.id, `Could not run check on ${p.name}`, async () => {
-      setNotice('')
-      const cmd = await post<Command>('/api/commands', { command_type: 'check', args: { project_id: p.id } })
-      if (cmd.status === 'done') {
-        setNotice(`Check ran on ${p.name} — its output is in Audit > Nodes.`)
-        return
-      }
-      const reason = cmd.result && typeof cmd.result['reason'] === 'string' ? cmd.result['reason'] : cmd.status
-      setActionError(`Check on ${p.name} — ${reason}`)
-    })
-  }
+  // An unknowable count (`null`) ranks last either way.
+  const sorted = rankRows(projects, p => (
+    sort.key === 'name' ? p.name : sort.key === 'active' ? activeCount(p.name) : taskCount(p, sort.key)
+  ), sort.dir)
 
   // THE OPERATOR'S ARM erases every worktree directory of this project on every node, then deletes the
   // row; no per-slot refusal vetoes it. A partial failure keeps the project and names the unaddressable
@@ -160,21 +173,33 @@ export default function Projects() {
     projectsQuery.refetch(),
     ...(canReadWorktrees ? [worktreesQuery.refetch()] : []),
   ])
+  /* An Easy Mode project's app goes with it (`easy_mode_hosting`): its address is the typed gate, and the tenant
+     DELETE carries it as `confirm` (422 otherwise). A failed lookup falls back to the name; the server still refuses. */
+  async function hostedAppAddress(projectId: number): Promise<string | null> {
+    if (!isEnabled('easy_mode_hosting')) return null
+    try {
+      const apps = await get<{ address: string | null }[]>(`/api/hosted-apps?project_id=${projectId}`)
+      return apps.find(a => a.address)?.address ?? null
+    } catch {
+      return null
+    }
+  }
+
   async function deleteProject(p: Project) {
-    const ok = await confirm({
+    const address = await hostedAppAddress(p.id)
+    const ok = await confirm(danger('Delete', {
       title: 'Delete project',
-      identity: p.name,
+      identity: address ?? p.name,
       message: `Delete ${p.name}? Its tasks are deleted (running ones stopped) and every slot directory it has, `
-        + 'on every node, is erased — uncommitted work included.',
-      confirmLabel: 'Delete',
-      destructive: true,
-      typed: { name: p.name, action: 'deletion' },
+        + 'on every node, is erased — uncommitted work included.'
+        + (address ? ` Its app at ${address} is deleted too; the repo stays.` : ''),
+      typed: { name: address ?? p.name, action: 'deletion' },
       run: {
         // Under `withBusy`, so the row's verbs are withdrawn while the erase runs (as every row write is).
         action: () => withBusy(p.id, async () => {
           try {
             if (erasesDirectories) await post<void>(`/api/projects/${p.id}/erase`)
-            else await del(`/api/projects/${p.id}`)
+            else await del(`/api/projects/${p.id}${address ? `?confirm=${encodeURIComponent(address)}` : ''}`)
           } catch (err) {
             await refetchRosters()
             throw err
@@ -184,13 +209,13 @@ export default function Projects() {
         busyLabel: 'Deleting…',
         mapError: (err, fallback) => cascadeFailureText(err) ?? apiDetail(err, fallback),
       },
-    })
+    }))
     // The row stays busy (its verbs withdrawn) until the roster no longer lists it.
     if (ok) await withBusy(p.id, async () => { await refetchRosters() })
   }
 
   /* THE ROSTER AS FEED ROWS (`ui/feed/FeedList`): one markup, and the title takes what the trailing
-     cluster leaves. FLEET is the DISC; ACTIVE WTS is one `active` slot (`—` = not
+     cluster leaves. FLEET is the DISC; ACTIVE SLOTS is one `active` slot (`—` = not
      knowable); PORT BAND is `meta`-gated; REPO is a ⋯ item with a real `href`; every other verb is in
      the ⋯. */
   /* Org visibility, read once (a hook cannot run in the `.map`); `ui/OrgIndicator.tsx::useOrgVisible`. */
@@ -203,15 +228,17 @@ export default function Projects() {
        but `/projects/{id}` 404s for them. Gates the ⋯'s Edit too. */
     const navigable = canEditProject('projects:edit', p.id)
     // `web_url` derives from free text; React does not block `javascript:` (`lib/safeHref.ts`).
-    // Not for a project with no repository.
-    const repoHref = p.has_repo === false ? undefined : safeHref(p.web_url)
+    // Not for a project with no repository, nor for a member of one Jaah manages (`lib/jaahManaged.ts`).
+    const repoShown = p.has_repo !== false && !lockedForMember(p, admin)
+    const repoHref = repoShown ? safeHref(p.web_url) : undefined
     // Generic when the forge is unknown; the server normally withholds `web_url` then anyway.
     const forgeLabel = p.forge ? FORGE_LABELS[p.forge] : 'Repo'
     const active = activeCount(p.name)
     const busy = busyIds.has(p.id)
 
+    const hidden = isHidden(p)
     const actions: OverflowItem[] = [
-      { key: 'check', icon: '✓', label: 'Check', ariaLabel: `Run Check on ${p.name}`, onClick: () => void runCheck(p) },
+      { key: 'hide', label: hidden ? 'Show' : 'Hide', ariaLabel: `${hidden ? 'Show' : 'Hide'} ${p.name}`, onClick: () => toggleHidden(p) },
     ]
     if (repoHref) {
       actions.push({ key: 'repo', icon: '↗', label: forgeLabel, ariaLabel: `Open the ${p.forge ? `${forgeLabel} ` : ''}repo for ${p.name}`, href: repoHref })
@@ -231,7 +258,7 @@ export default function Projects() {
     }
 
     // More than one repository: every one on the row's hover, primary first, so the list never implies one repo.
-    const primaryRepo = p.has_repo !== false && (p.repos?.length ?? 0) > 1 ? p.repos?.find(r => r.is_primary) : undefined
+    const primaryRepo = repoShown && (p.repos?.length ?? 0) > 1 ? p.repos?.find(r => r.is_primary) : undefined
     const counts = projectCountsLabel(active)
     const notes: FeedNote[] = [
       ...(primaryRepo
@@ -241,28 +268,37 @@ export default function Projects() {
 
     return {
       key: String(p.id),
-      /* A NARROW LIST ABOVE THE PHONE (`PROJECTS_NO_ORG`: beside an open project) draws the org after the name,
+      /* THE EYE, the first column: shown or hidden for this user, and the press that flips it. */
+      indicator: {
+        tone: 'neutral',
+        glyph: hidden ? <EyeOffIcon /> : <EyeIcon />,
+        label: hidden ? 'Hidden' : 'Shown',
+        onPress: () => toggleHidden(p),
+        pressLabel: `${hidden ? 'Show' : 'Hide'} ${p.name}`,
+        data: { hidden },
+      },
+      muted: hidden,
+      /* THE PHONE AND A NARROW LIST ABOVE IT (`PROJECTS_NO_ORG`: beside an open project) draw the org after the name,
          on its line (`TITLE_ORG_SX`), its slot off. Ink only: the slot stays the one carrier of the org's
          `data-org-*` (`ui/OrgIndicator.tsx`). */
       title: (
         /* The org rides the hover too (`name · org`): a long name wraps the inline org out of sight, and
            this title wins over the row's own `titleText` hover, which also names the row's controls, so it
            carries the row's notes too. */
-        <Box component="span" sx={TITLE_ROW_SX} title={orgVisible ? [`${p.name} · ${orgTitle(p.org)}`, ...notes.map(n => n.text)].join('\n') : undefined}>
+        <Tip title={orgVisible ? [`${p.name} · ${orgTitle(p.org)}`, ...notes.map(n => n.text)].join('\n') : undefined}><Box component="span" sx={TITLE_ROW_SX}>
           <Box component="span" data-testid="project-title-fit" sx={TITLE_FIT_SX}>
             <Box component="span" data-testid="project-name" sx={TITLE_NAME_SX}>{p.name}</Box>
             {orgVisible && (
-              <Box component="span" data-testid="project-org-inline" title={orgTitle(p.org)} sx={TITLE_ORG_SX}>
+              <Tip title={orgTitle(p.org)}><Box component="span" data-testid="project-org-inline" sx={TITLE_ORG_SX}>
                 <OrgIndicator org={p.org} inkOnly />
-              </Box>
+              </Box></Tip>
             )}
           </Box>
-          {p.system_kind && <SystemChip />}
-        </Box>
+        </Box></Tip>
       ),
       notes: notes.length > 0 ? notes : undefined,
       titleText: p.name,
-      href: navigable ? `/projects/${p.id}` : undefined,
+      href: navigable ? `/projects/${p.id}` : null,
       busy,
       data: { project: p.name },
       slots: [
@@ -274,11 +310,37 @@ export default function Projects() {
            513->435, 1440 929->851. At 481 the title
            goes to ZERO, so it cannot be ungated; `SIDEBAR_SQUEEZE_SX` is the shared band. On top, the list's
            own width (`projectsOrg`): beside an open project the name had 63px, so a narrow list draws the org
-           after the name (`TITLE_ORG_SX` above). WITHHELD FROM EVERY NON-OPERATOR (`ui/OrgIndicator.tsx::useOrgVisible`). */
+           after the name (`TITLE_ORG_SX` above), as the phone does (`projectsOrg`). WITHHELD FROM EVERY NON-OPERATOR (`ui/OrgIndicator.tsx::useOrgVisible`). */
         ...orgSlots(orgVisible, p.org, { gate: 'projectsOrg' }),
+        /* Questions waiting, Running, Queued: `—` without `tasks:view` (or before the tree lands), never a false 0.
+           A waiting question takes the warning colour: it is the one asking for someone. */
+        ...TASK_COLUMNS.map(column => {
+          const n = taskCount(p, column.key)
+          const words = n === null ? `${column.label} unknown` : countOf(n, column.noun[0], column.noun[1])
+          return {
+            key: column.key,
+            width: column.width,
+            gate: column.gate,
+            align: 'center' as const,
+            mono: true,
+            testId: `col-project-${column.key}`,
+            title: words,
+            node: (
+              <>
+                <Box component="span" aria-hidden="true" sx={column.key === 'questions' && n ? { color: 'warning.main', fontWeight: FONT_WEIGHT.semibold } : undefined}>
+                  {n ?? '—'}
+                </Box>
+                <Box component="span" sx={SR_ONLY_SX}>{words}</Box>
+              </>
+            ),
+          }
+        }),
+        /* Off the phone: its width goes to the name; the project page lists the slots. Right of Questions despite the
+           meta/id/phone/ungated order: `display: none` leaves no gap, so Questions stays flush with the ⋯. */
         {
           key: 'counts',
           width: 54,
+          gate: 'phone',
           align: 'center',
           mono: true,
           testId: 'col-project-counts',
@@ -307,18 +369,11 @@ export default function Projects() {
           <>
             <SortMenu noun="projects" columns={SORTABLE_COLUMNS} sort={sort} onSort={toggleSort} />
             {/* ONLY FOR A VIEWER WHO CAN PRESS IT: `POST /api/projects` is `projects:create`. */}
+            {/* Add or New by the viewer's Git connections (`hooks/useProjectCreateLabel`). */}
             {/* Beside an open project the narrow list's Add is wordless at every width (`ui/CompactVerb`). */}
             {canCreate && (
-              <Button
-                component={RouterLink}
-                to="/projects/new"
-                variant="contained"
-                color="primary"
-                data-testid={besideDetail ? 'add-project-compact' : undefined}
-                {...compactVerbProps('Add project', tapTargetSx, besideDetail)}
-              >
-                <CompactVerbLabel label="Add project" wordless={besideDetail} />
-              </Button>
+              <NewButton label={createLabel} to="/projects/new" wordless={besideDetail} sx={tapTargetSx}
+                testId={besideDetail ? 'add-project-compact' : undefined} />
             )}
           </>
         }
@@ -328,11 +383,6 @@ export default function Projects() {
           unread. A failed read with no rows says it in `LoadFailedState` below, not twice. */}
       {error && !(loadFailed && !loading && sorted.length === 0) && (
         <Banner severity="error">{error}</Banner>
-      )}
-
-      {/* The ⋯'s Check outcome, until dismissed or replaced. */}
-      {notice && (
-        <Banner severity="info" testId="project-notice" onDismiss={() => setNotice('')}>{notice}</Banner>
       )}
 
       <ListStates
@@ -350,7 +400,22 @@ export default function Projects() {
         /* TWO TITLES: the roster is grant-scoped, so empty can mean "no project" or "none shared with you". */
         emptyTitle={canCreate ? 'No projects yet' : 'No projects visible'}
         emptyScoped
-        feed={{ ariaLabel: 'Projects', testId: 'projects-list', sections: [{ key: 'projects', rows: projectRows }] }}
+        feed={{
+          ariaLabel: 'Projects',
+          testId: 'projects-list',
+          sections: [{ key: 'projects', rows: projectRows, rail: false }],
+          /* The header row is off on the phone, where `SortMenu` carries the order. */
+          columns: {
+            title: { key: 'name', label: 'Project', sortKey: 'name' },
+            slots: [
+              ...(orgVisible ? [{ key: 'org', label: 'Org' }] : []),
+              ...TASK_COLUMNS.map(c => ({ key: c.key, label: c.label, sortKey: c.key })),
+              { key: 'counts', label: 'Slots', ariaLabel: 'Active slots', sortKey: 'active' },
+            ],
+          },
+          sort,
+          onSort: (key: string) => toggleSort(key as SortKey),
+        }}
       />
 
       {confirmDialog}

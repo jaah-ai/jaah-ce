@@ -169,6 +169,15 @@ def _destroyed_row_delete_statement(row_id: UUID):
     return delete(Worktree).where(Worktree.id == row_id)
 
 
+def forget_rebuilt(session: Session, row: Worktree) -> None:
+    """Drop a FREE slot whose node is being rebuilt from a fresh tree under another home (`node_shape._rehouse`):
+    nothing of it survives the rebuild, and a `destroy_slot` would reach the rebuilt node with a path outside its
+    home, which it refuses for good — leaving a retiring row whose path the node anchors on, refusing every lease.
+    So the row goes now, with any order still pending for it. Not committed."""
+    slot_allocation.cancel_destroy(session, row)
+    session.execute(_destroyed_row_delete_statement(row.id))
+
+
 def destroy_pending(session: Session, task_id: int) -> bool:
     """Is `task_id` held by a slot the CP has ordered destroyed? Then its runner's death is the destroy's
     kill, and its ack — not a dead-runner reclaim — returns the task to `ready`."""
@@ -260,8 +269,8 @@ def apply_ack(session: Session, intent: SlotIntent, outcome: str, report: Option
     payload = intent.payload if isinstance(intent.payload, dict) else {}
     task_id = held_task if held_task is not None else payload.get("task_id")
     if held_task is not None:
-        # The node killed the runner before either verdict (`_enact_destroy_slot`; slot 0, the one refusal
-        # before the kill, is never task-held), so the task goes back to the queue whatever became of the tree.
+        # The node killed the runner before either verdict (`_enact_destroy_slot`), so the task goes back to the
+        # queue whatever became of the tree.
         _end_hold_and_requeue(session, row, held_task, label)
     if not parsed.erased:
         detail = parsed.detail or intent.reason or "the node refused to erase the tree"

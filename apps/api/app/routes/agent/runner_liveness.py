@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -14,9 +13,7 @@ from app import (
     agent_sessions,
     agent_session_lifecycle,
     fleet_verdicts,
-    node_credentials,
     project_identity,
-    runner_breaks,
     runner_terminations,
     slot_destroy,
     slot_state,
@@ -24,7 +21,7 @@ from app import (
 # routes need one for a user who is NOT the caller (they carry no session cookie, only the node token).
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
-from app.db import get_session
+from app.db_async import on_session
 from app.task_lookup import get_task_or_404
 # Every PERSONA fact comes from the one registry record per persona (`app/persona_registry.py`).
 from app.persona_registry import DONE_CRITERION_OPERATOR, PERSONA_DONE_CRITERION
@@ -35,8 +32,8 @@ from app.routes.tasks.runner_settle import end_attempt, reassert_active, resume_
 from app.routes.tasks.slots import kill_runner_keeping_hold, send_minted_intents
 # State vocabulary and guard sets single-home in `app/task_lifecycle.py`.
 from app.task_lifecycle import ACTIVE, AWAITING_RESPONSE, PAUSED, SYSTEM_FAILED, _BREAK_RELAUNCH_STATES
-from app.entity_shape import get_or_404
-from app.routes.agent.auth import _check_token, _check_token_for_task, require_caller_task
+from app.runner_causes import CAUSES, TERMINAL_CAUSES
+from app.routes.agent.auth import AgentDoor, _check_token_for_task, require_caller_task
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 log = logging.getLogger("agent-routes")
@@ -47,21 +44,19 @@ log = logging.getLogger("agent-routes")
 # `apps/jaahd/reconcile/`.
 
 
-# ── Broken sessions: the runner-break collection ──────────────────────────────
-# The Needs-attention-shaped surface for runners that broke rather than finished (see
-# `app/runner_breaks.py`). These three routes are the whole agent-facing API.
+# ── Broken sessions: a runner that broke rather than finished ─────────────────
+# The cause rides onto the session row (Audit › Sessions), rests the account when it is a verdict on the
+# credential, and ends the attempt. Causes single-home in `app/runner_causes.py`.
 class RunnerBreakIn(BaseModel):
-    # The task whose runner broke. The incident is filed against that task's PROJECT, so a break is
-    # readable per repo the same way every other escalation is.
+    # The task whose runner broke.
     task_id: int
-    # One of `runner_breaks.CAUSES` (422 otherwise). Validated rather than free-text because the
-    # collection's value is that the buckets are comparable — an invented spelling starts a bucket of one.
+    # One of `runner_causes.CAUSES` (422 otherwise). Validated rather than free-text so the session's
+    # `end_reason` stays in its domain (`agent_sessions.end_reasons`).
     cause: str
     # The evidence line the classifier matched, so a human can check the verdict rather than trust it.
     detail: str = Field(default="", max_length=1000)
     session_id: str = Field(default="", max_length=200)
-    # The name, all the way down: `runner_breaks.record` renders it for humans and
-    # `account_fold.record_account_verdict` resolves it.
+    # The name, all the way down: `account_fold.record_account_verdict` resolves it.
     node_id: str = Field(default="", max_length=200)
     account: str = Field(default="", max_length=200)
     transcript: str = Field(default="", max_length=1000)
@@ -74,9 +69,6 @@ class RunnerBreakIn(BaseModel):
 
 
 class RunnerBreakOut(BaseModel):
-    incident_id: int
-    # False when this refreshed the existing incident for the same (cause, task) — i.e. a REPEAT break.
-    created: bool
     # The state `request_replace` left the Task in (`ready`, or `system_failed` with the retry budget spent),
     # or None when no attempt was ended; returned so the hook can log what its break caused.
     task_state: Optional[str] = None
@@ -87,7 +79,7 @@ class RunnerBreakOut(BaseModel):
 # ── A break as evidence about the ACCOUNT, not only about the session ─────────
 # Causes that are a verdict on the credential: a runner walling on its usage window has the freshest
 # reading of the account (discarding it caused re-death loops). A mapping because
-# `runner_breaks.CAUSES` describes a session and `quota_status` an account.
+# `runner_causes.CAUSES` describes a session and `quota_status` an account.
 _ACCOUNT_BREAK_VERDICTS = {
     "usage_limit": "usage_limit",
     "credit_exhausted": "credit_exhausted",
@@ -106,7 +98,7 @@ def _kill_is_fenced(body: "RunnerBreakIn", what: str) -> bool:
     if body.session_id:
         return True
     log.warning(
-        "runner break on task %s named no session_id — recording the incident and NOT minting a kill to "
+        "runner break on task %s named no session_id — recording the break and NOT minting a kill to "
         "%s. A report that does not say which attempt it is about cannot be told from a report about "
         "somebody else's live runner, and a kill is not a decision that can be taken back",
         body.task_id, what,
@@ -134,14 +126,14 @@ def _broken_runners_hold(
 
 @router.post("/runner-breaks", response_model=RunnerBreakOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def record_runner_break(
+    session: Session,
     body: RunnerBreakIn,
-    x_agent_task_id: str = Header(default=""),
-    caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
+    door: AgentDoor,
 ) -> RunnerBreakOut:
     """Record one broken session. Called by the runner's settle hook (`apps/jaahd/hooks/runner-status.py
-    settle`) when it finds its task `active` with no evidence, and by CP reclaim routes for `vanished`.
+    settle`) when it finds its task `active` with no evidence, and by its `StopFailure`/heartbeat arms.
     404 unknown task; 422 cause outside the vocabulary. Callers treat any failure as a logged no-op.
 
     `request_replace` is the deterministic failure signal (else a quota-walled runner idles with its task
@@ -153,12 +145,13 @@ def record_runner_break(
     cannot land (settled or stale report), the fallback stops whatever this same session still holds,
     fenced against a live replacement.
     """
+    caller, x_agent_task_id = door
     require_caller_task(session, caller, x_agent_task_id, body.task_id)
-    if body.cause not in runner_breaks.CAUSES:
+    if body.cause not in CAUSES:
         raise HTTPException(
             status_code=422,
             detail=f"cause {body.cause!r} is not a break cause — must be one of "
-                   f"{list(runner_breaks.CAUSES)}",
+                   f"{list(CAUSES)}",
         )
     task = get_task_or_404(body.task_id, session)
     # Its slot is being destroyed: the destroy's ack, not this route, returns the task to `ready`.
@@ -166,12 +159,7 @@ def record_runner_break(
     if destroying and body.cause in slot_destroy.KILL_SIGNATURE_CAUSES:
         # The CP's own kill reads as a death with no verdict: not a break at all.
         log.info("runner break on task %s (%s) ignored: its slot is being destroyed", task.id, body.cause)
-        return RunnerBreakOut(incident_id=0, created=False)
-    incident_id, created = runner_breaks.record(
-        session, task=task, cause=body.cause, detail=body.detail, session_id=body.session_id,
-        node_id=body.node_id, account=body.account, transcript=body.transcript,
-        observed_by=body.observed_by or "runner-hook",
-    )
+        return RunnerBreakOut()
     if body.session_id and body.detail.strip():
         # The runner's own words onto its session row (Audit › Sessions), wherever the attempt's end left it: a
         # break often lands after the row already ended with only a bare reason or the attempt's summary, which
@@ -196,7 +184,7 @@ def record_runner_break(
             )
     # A cause no relaunch clears ends the attempt even unasked: the settle path reports it without
     # `request_replace` and then posts a `/fail` that would only re-queue it.
-    terminal = body.cause in runner_breaks.TERMINAL_CAUSES
+    terminal = body.cause in TERMINAL_CAUSES
     if (body.request_replace or terminal) and not destroying:
         # The relaunch decision: `end_attempt` returns the row to `ready` (or `system_failed` on its last
         # attempt, or at once for a cause no relaunch clears) and mints its own kill (TRACKER-2335 S4).
@@ -215,7 +203,7 @@ def record_runner_break(
                 # (`tasks.stop_runner_on_unanswered_question`), and a relaunch would re-ask the question.
                 Task.question_runner_stopped_at.is_(None),
             ),
-            # The runner's self-reported cause, onto its own task's Timeline (the incident Task alone is hidden).
+            # The runner's self-reported cause, onto its own task's Timeline.
             # `runner_terminations.CAUSES` is derived from `runner_causes.CAUSES` (a superset), so `label_for` renders it.
             cause=body.cause,
         )
@@ -255,15 +243,12 @@ def record_runner_break(
     session.commit()
     send_minted_intents(issued)  # AFTER the commit — see `tasks.send_minted_intents`.
     log.info(
-        "runner break recorded: task=%s cause=%s incident=%s created=%s observed_by=%s "
+        "runner break recorded: task=%s cause=%s observed_by=%s "
         "request_replace=%s -> task_state=%s account_blocked=%s",
-        body.task_id, body.cause, incident_id, created, body.observed_by,
+        body.task_id, body.cause, body.observed_by,
         body.request_replace, task_state, account_blocked,
     )
-    return RunnerBreakOut(
-        incident_id=incident_id, created=created, task_state=task_state,
-        account_blocked=account_blocked,
-    )
+    return RunnerBreakOut(task_state=task_state, account_blocked=account_blocked)
 
 
 class HeartbeatIn(BaseModel):
@@ -282,11 +267,12 @@ class HeartbeatOut(BaseModel):
 
 @router.post("/tasks/{task_id}/heartbeat", response_model=HeartbeatOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def task_heartbeat(
+    session: Session,
     task_id: int,
     body: HeartbeatIn,
     _: None = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> HeartbeatOut:
     """The runner's own "I am still working" signal, fired on every `Stop` (a turn boundary;
     `apps/jaahd/hooks/runner-status.py rs_heartbeat`).
@@ -314,7 +300,7 @@ def _refuse_a_persona_with_no_operator_at_the_console(
     """404 an unknown id; 422 a persona whose done-criterion is not `operator`.
 
     The inverse of `_refuse_a_persona_with_no_terminal_call`, which refuses operator-criterion personas at
-    `/fail`, `/settle` and `task_pipeline_cp.block_task` because only the operator moves such rows. These
+    `/fail`, `/complete` and `task_pipeline_cp.block_task` because only the operator moves such rows. These
     doors report exactly that operator gesture. Non-interactive personas are refused because they have no
     console conversation (completing a `coder` on session exit would settle unshipped work). Keyed on
     `PERSONA_DONE_CRITERION`, never an `advisor` literal.
@@ -354,11 +340,12 @@ class ConsoleExitOut(BaseModel):
 
 @router.post("/tasks/{task_id}/console-exit", response_model=ConsoleExitOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def task_console_exit(
+    session: Session,
     task_id: int,
     body: ConsoleExitIn,
     _: None = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> ConsoleExitOut:
     """The operator typed `/exit` in their chat's Web Console — a `SessionEnd` hook reporting it
     (`apps/jaahd/hooks/runner-status.py console_exit`, acting only on `prompt_input_exit`;
@@ -384,7 +371,7 @@ def task_console_exit(
     # Re-read: `apply_complete` commits, so the loaded row is stale.
     session.expire_all()
     # Deleted meanwhile; a delete frees the worktree anyway.
-    row = get_or_404(session, Task, task_id, detail=f"task {task_id} not found")
+    row = get_task_or_404(task_id, session)
     return ConsoleExitOut(completed=completed, state=row.state)
 
 
@@ -400,11 +387,12 @@ class ConsoleResumeOut(BaseModel):
 
 @router.post("/tasks/{task_id}/console-resume", response_model=ConsoleResumeOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def task_console_resume(
+    session: Session,
     task_id: int,
     body: ConsoleResumeIn,
     _: None = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> ConsoleResumeOut:
     """The operator sent their chat another message — the runner's `UserPromptSubmit` hook reporting it
     (`apps/jaahd/hooks/runner-status.py console_resume`).
@@ -422,88 +410,3 @@ def task_console_resume(
         # Deleted between the guard and the writer's read; 404 like the heartbeat.
         raise HTTPException(status_code=404, detail=f"task {task_id} not found")
     return ConsoleResumeOut(outcome=outcome)
-
-
-class RunnerBreakRowOut(BaseModel):
-    # The INCIDENT row's id (not the broken task's — that is `task_id` below, parsed off the marker).
-    id: int
-    cause: str
-    project_id: int
-    project: str
-    title: str
-    state: str
-    # How many times this (cause, task) has broken. The number the collection exists to produce.
-    occurrences: int
-    updated_at: Optional[datetime]
-
-
-@router.get("/runner-breaks", response_model=list[RunnerBreakRowOut])
-@infra(Tenancy.OPERATOR)
-def list_runner_breaks(
-    cause: Optional[str] = None,
-    limit: int = Query(default=200, ge=1, le=1000),
-    _: None = Depends(_check_token),
-    session: Session = Depends(get_session),
-) -> list[RunnerBreakRowOut]:
-    """The broken-session collection, newest first — what breaks, how, and how often. `cause` narrows to
-    one bucket. Archived incidents are excluded (the purge below is what keeps this readable)."""
-    return [
-        RunnerBreakRowOut(
-            id=task.id,
-            cause=runner_breaks.cause_of(task),
-            project_id=task.project_id,
-            project=project_name,
-            title=task.title,
-            state=task.state,
-            occurrences=runner_breaks.occurrences_of(task.body),
-            updated_at=task.updated_at,
-        )
-        for task, project_name in runner_breaks.list_incidents(session, cause=cause, limit=limit)
-    ]
-
-
-class StaleEscalationOut(BaseModel):
-    id: int
-    # NOT Optional: `tasks.persona` is NOT NULL (migration 0113).
-    persona: str
-    project_id: int
-    project: str
-    title: str
-    state: str
-    updated_at: Optional[datetime]
-
-
-class PurgeStaleOut(BaseModel):
-    # The matched rows, returned on dry run and apply alike.
-    stale: list[StaleEscalationOut]
-    archived: int
-
-
-@router.post("/runner-breaks/purge-stale", response_model=PurgeStaleOut)
-@infra(Tenancy.OPERATOR)
-def purge_stale_escalations(
-    days: int = Query(default=runner_breaks.DEFAULT_STALE_DAYS, ge=1, le=3650),
-    apply: bool = False,
-    _: None = Depends(_check_token),
-    session: Session = Depends(get_session),
-) -> PurgeStaleOut:
-    """Archive automated escalation rows nobody has touched in `days`.
-
-    Dry run by default (`apply=false`). Archived, not deleted: only `archived_at` is written, so a wrong
-    window is undone by clearing one column. Scoped to hidden system rows with a `sysdedup:` marker, never
-    an operator's own Task; covers the whole escalation set.
-    """
-    stale = runner_breaks.stale_escalations(session, days=days)
-    rows = [
-        StaleEscalationOut(
-            id=task.id, persona=task.persona, project_id=task.project_id, project=project_name, title=task.title,
-            state=task.state, updated_at=task.updated_at,
-        )
-        for task, project_name in stale
-    ]
-    archived = 0
-    if apply and rows:
-        archived = runner_breaks.archive(session, [row.id for row in rows])
-        session.commit()
-        log.info("purged %s stale escalation rows (older than %s days)", archived, days)
-    return PurgeStaleOut(stale=rows, archived=archived)

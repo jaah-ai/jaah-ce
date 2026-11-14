@@ -38,7 +38,7 @@ from app.models.nodes import Node
 from app.models.projects import Project
 from app.models.tasks import Task
 from app.models.worktrees import Worktree
-from app.clock import as_utc as _as_utc, utcnow as _now
+from app.clock import utcnow as _now
 
 log = logging.getLogger(__name__)
 
@@ -596,10 +596,3 @@ def redacted_error(message: str, limit: int = 500) -> str:
     )
     cleaned = "".join(c if c >= " " and c != "\x7f" else " " for c in cleaned)
     return cleaned[:limit]
-
-
-def as_utc(value: Optional[datetime]) -> Optional[datetime]:
-    """Read a possibly-naive datetime as UTC. Postgres hands back aware values; a caller may not."""
-    if value is None:
-        return None
-    return _as_utc(value)

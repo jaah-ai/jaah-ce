@@ -12,5 +12,5 @@
     "strict": true,
     "composite": true
   },
-  "include": ["vite.config.ts", "obfuscate.ts", "devCsp.ts", "vitest.config.ts", "playwright.config.ts", "e2e/target.ts", "e2e/load.ts"]
+  "include": ["vite.config.ts", "obfuscate.ts", "devCsp.ts", "chunkImportPlugin.ts", "vitest.config.ts", "playwright.config.ts", "e2e/target.ts", "e2e/load.ts"]
 }

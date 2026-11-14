@@ -3,9 +3,8 @@
 
 Deleting the row stops neither the remote runner nor its session-ledger entry. `end_holder` closes the
 session as `abandoned` (never `normal`) and mints a `release_slot` intent; the kill rides
-`erase_tree_on_node`. The `tasks` row is never touched (the task is re-dispatched). Unlike release,
-delete also sweeps a `user` hold (`sweep_user_hold`). The node side is best effort and never raises,
-so a dead node cannot hold an operator's Delete hostage.
+`erase_tree_on_node`. The `tasks` row is never touched (the task is re-dispatched). The node side is
+best effort and never raises, so a dead node cannot hold an operator's Delete hostage.
 """
 from __future__ import annotations
 
@@ -37,55 +36,21 @@ class HolderSnapshot:
     project_id: Optional[int]
     number: int
     task_id: Optional[int]
-    owner_user_id: Optional[Any]
     session_id: Optional[str]
     pid: Optional[int]
-    # The owner in a word a human recognises (email, else name, else None), resolved at snapshot time
-    # because the row is deleted before `describe_holder` runs. None falls back to the raw id.
-    owner_label: Optional[str] = None
 
 
-def snapshot(row: Worktree, session=None) -> HolderSnapshot:
-    """Take the pre-mutation snapshot off a locked `worktrees` row.
-
-    `session` is optional and only buys the owner's name; without it the report shows their uuid. One
-    lookup per snapshot is fine: at most one owner, and this runs on delete paths only."""
+def snapshot(row: Worktree) -> HolderSnapshot:
+    """Take the pre-mutation snapshot off a locked `worktrees` row."""
     return HolderSnapshot(
         state=row.state,
         node_id=row.node_id,
         project_id=row.project_id,
         number=row.number,
         task_id=row.task_id,
-        owner_user_id=row.owner_user_id,
         session_id=row.launch_session_id,
         pid=row.pid,
-        owner_label=_owner_label(session, row.owner_user_id),
     )
-
-
-def _owner_label(session, owner_user_id) -> Optional[str]:
-    """A slot owner's email (else the name pair, `identities.person_label`), or None when it cannot be resolved.
-
-    Never raises: it runs inside a delete's transaction, and a failed label must not fail the delete.
-    Email first because it is the identity an operator can act on."""
-    if session is None or owner_user_id is None:
-        return None
-    try:
-        from sqlalchemy import select as _select  # noqa: PLC0415
-
-        from app.identities import person_label  # noqa: PLC0415
-        from app.models.identity import AdminUser  # noqa: PLC0415
-
-        row = session.execute(
-            _select(AdminUser.email, AdminUser.first_name, AdminUser.last_name).where(AdminUser.id == owner_user_id)
-        ).first()
-    except Exception:  # noqa: BLE001 — a label is never worth failing a delete for
-        log.warning("slot teardown: could not resolve the owner of a user-held slot", exc_info=True)
-        return None
-    if row is None:
-        return None
-    email, first_name, last_name = row
-    return str(email) if email else (person_label(first_name, last_name, None) or None)
 
 
 def describe_holder(snap: HolderSnapshot) -> Optional[str]:
@@ -96,12 +61,7 @@ def describe_holder(snap: HolderSnapshot) -> Optional[str]:
         return None
     if snap.state == slot_state.TASK:
         return f"task {snap.task_id}" if snap.task_id is not None else "a fleet task"
-    if snap.state == slot_state.USER:
-        if snap.owner_label:
-            return f"user {snap.owner_label}"
-        # The uuid is the fallback when no session was passed or the id resolves to no user.
-        return f"user {snap.owner_user_id}" if snap.owner_user_id is not None else "a user session"
-        # Unreachable through any writer (CHECK constraint); reported verbatim rather than as free.
+    # Any other state (a legacy row) is reported verbatim rather than as free.
     return f"state {snap.state!r}"
 
 
@@ -111,7 +71,6 @@ def end_holder(
     *,
     project: str,
     reason: str,
-    sweep_user_hold: bool,
 ) -> list[fleet_verdicts.IssuedIntents]:
     """End the runner (or session) inside one slot: the session ledger's close plus one durable
     `release_slot` intent. Returns the issued batches, which the caller pushes after its own commit.
@@ -128,8 +87,6 @@ def end_holder(
     number)` alone, so a re-declared slot could be swept; `VERB_RELEASE_SLOT` is superseding.
     """
     if snap.state == slot_state.FREE:
-        return []
-    if snap.state == slot_state.USER and not sweep_user_hold:
         return []
     # The ledger first and unconditionally: it depends on no node. `note_end` is savepoint-wrapped and
     # swallows its own failures.
@@ -323,6 +280,6 @@ def end_holders_for_node(
             continue
         ended.append(f"{project} #{snap.number} (was {holder})")
         issued.extend(
-            end_holder(session, snap, project=project, reason=reason, sweep_user_hold=True)
+            end_holder(session, snap, project=project, reason=reason)
         )
     return issued, ended

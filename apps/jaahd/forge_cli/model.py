@@ -30,9 +30,15 @@ class CliExit(Exception):
 
     code = EXIT_FORGE
 
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, *, status: "int | None" = None, rate_limited: bool = False) -> None:
         super().__init__(message)
         self.message = message
+        # The forge's HTTP status where an answer caused it (the message is capped, so never parse it), and
+        # whether that answer was a rate limit (GitHub answers one with 403 too).
+        self.status = status
+        self.rate_limited = rate_limited
+        # The forge's own words for that answer, where it gave any.
+        self.detail = ""
 
 
 class PolicyRefusal(CliExit):
@@ -42,12 +48,12 @@ class PolicyRefusal(CliExit):
 class ForgeError(CliExit):
     code = EXIT_FORGE
 
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, *, status: "int | None" = None, rate_limited: bool = False) -> None:
         # One line, capped.
         flat = " ".join(str(message).split())
         if len(flat) > FORGE_ERROR_CAP:
             flat = flat[: FORGE_ERROR_CAP - 1] + "…"
-        super().__init__(flat)
+        super().__init__(flat, status=status, rate_limited=rate_limited)
 
 
 class AlreadyMergeable(ForgeError):

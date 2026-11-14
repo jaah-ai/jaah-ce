@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import functools
 import logging
-import os
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Callable, Iterator
 
 from app import alert_stamps
 from app import task_pipeline_cp as control_plane_api
+from app.clock import utcnow
 
 # `app.task_lifecycle` is stdlib-only at import, so naming a state constant here costs nothing.
 from app.task_lifecycle import AWAITING_RESPONSE, SYSTEM_FAILED
@@ -35,15 +35,6 @@ from app.persona_registry import (
 
 # Pinned: log filters and saved searches key on the logger name.
 log = logging.getLogger("jaahd.tasks")
-
-def _task_env_int(name: str, default: int) -> int:
-    """Parse an int env var at call time (a test overrides it); the module constant snapshots it once."""
-    return int(os.environ.get(name, str(default)))
-
-
-# State-sync backstop cadence, 20 min: the webhook drives transitions near-instantly and this poll only
-# covers a missed delivery. Owned here, not shared with the fix-job family's own constant.
-TASK_SWEEP_INTERVAL = _task_env_int("AGENT_TASK_SWEEP_INTERVAL", 20 * 60)
 
 # ── The persona sets this sweep filters on, derived from `app/persona_registry.py` ────────────────────
 # Each set is a question asked of the registry records, read as membership only.
@@ -138,7 +129,9 @@ PERSONA_FINISH = "finish"
 # the disk of the host holding the worktree, so there is no control-plane equivalent.
 
 
-def reclaim_stale_active_analysis_children(lease_held: Callable[[str], bool]) -> None:
+def reclaim_stale_active_analysis_children(
+    lease_held: Callable[[str], bool], *, open_tasks: list[dict] | None = None,
+) -> None:
     """Lease-based `active → ready` reclaimer for a STALE epic analysis child — its ONLY always-on
     recovery, since the done-idle reap excludes it.
 
@@ -147,8 +140,8 @@ def reclaim_stale_active_analysis_children(lease_held: Callable[[str], bool]) ->
 
     Fails closed: an uncertain lease read counts as held, and a settle error leaves the child `active`.
     A `system_failed` child is settle-only; `awaiting_response` is never probed, since settling it would
-    answer a human's question."""
-    for task in control_plane_api.list_open_tasks():
+    answer a human's question. `open_tasks` is the pass's `list_open_tasks` read; None reads it here."""
+    for task in _open_tasks(open_tasks):
         # No `parent_task_id is None` skip: a crashed top-level analysis row must be reclaimed too. The
         # persona filter admits exactly the analysis personas and leaves a legacy decomposed coder alone.
         persona = task.get("persona")
@@ -195,18 +188,24 @@ def reclaim_stale_active_analysis_children(lease_held: Callable[[str], bool]) ->
                      "captured settled-output artifact (done-on-artifact; no re-dispatch)", task_id)
             continue
         # The response is read so a helper refusal is audible (see `_post_reclaim`).
-        _post_reclaim(lambda: control_plane_api.reclaim_active(task_id), task_id,
+        _post_reclaim(functools.partial(control_plane_api.reclaim_active, task_id), task_id,
                       sweep="epic-child-reclaimer", persona=persona,
                       landed="stale active child reclaimed active->ready (runner gone)")
 
 
+def _open_tasks(open_tasks: list[dict] | None) -> list[dict]:
+    """The pass's open-task read when the sweep handed one over (`task_pipeline_job.sweep_once` reads it once
+    for every consumer), else a fresh `list_open_tasks`."""
+    return control_plane_api.list_open_tasks() if open_tasks is None else open_tasks
+
+
 def _gone_rows(state: str, personas: tuple[str, ...] | None, gone: Callable[[str, Any], bool], *,
-               sweep: str, check: str, left: str) -> Iterator[tuple[dict, Any]]:
+               sweep: str, check: str, left: str, open_tasks: list[dict] | None) -> Iterator[tuple[dict, Any]]:
     """`(task, task_id)` for every open row in `state` (persona in `personas`; any when None) whose runner
     `gone(task_id, persona)` says is gone — the three task-keyed reclaimers' shared head. Fails CLOSED: a probe
     that raises is logged `"<sweep>: <check> for task <id> — <left>: <exc>"` (each caller's own words, which
     saved searches key on) and reclaims nothing; a runner still there, or not affirmably gone, leaves its row."""
-    for task in control_plane_api.list_open_tasks():
+    for task in _open_tasks(open_tasks):
         persona = task.get("persona")
         if personas is not None and persona not in personas:
             continue  # another path owns this criterion
@@ -225,7 +224,7 @@ def _gone_rows(state: str, personas: tuple[str, ...] | None, gone: Callable[[str
 
 
 def reclaim_stale_active_coders(
-    lease_held: Callable[[str], bool],
+    lease_held: Callable[[str], bool], *, open_tasks: list[dict] | None = None,
 ) -> None:
     """Lease-based `active → ready` reclaimer for a stale BUILD row — a `merged_pr`-persona task whose
     runner is gone with the work unfinished.
@@ -242,6 +241,7 @@ def reclaim_stale_active_coders(
     for task, task_id in _gone_rows(
         "active", _MERGED_PR_DONE_PERSONAS, lambda task_id, _persona: not lease_held(task_id),
         sweep="coder-reclaimer", check="lease check failed", left="treating as HELD (no reclaim)",
+        open_tasks=open_tasks,
     ):
         persona = task.get("persona")
         # A row that already reported a terminal is never requeued: `settle_task` commits the reference
@@ -258,7 +258,7 @@ def reclaim_stale_active_coders(
         # Restart the runner; an open PR is the unfinished delivery it returns to (`end_attempt` keeps the
         # slot bound). The response is read so a helper refusal is a WARNING on the first tick; the row is
         # left `active` for a later pass.
-        _post_reclaim(lambda: control_plane_api.reclaim_active_coder(task_id), task_id,
+        _post_reclaim(functools.partial(control_plane_api.reclaim_active_coder, task_id), task_id,
                       sweep="coder-reclaimer", persona=persona,
                       landed="stale active child reclaimed active->ready (nothing shipped, runner gone)")
 
@@ -284,6 +284,7 @@ def reclaim_stale_active_restartable_tasks(
     runner_held: Callable[[str], bool],
     chat_runner_confirmed_dead: Callable[[str], bool],
     lane_runner_held: Callable[[str], bool] | None = None,
+    *, open_tasks: list[dict] | None = None,
 ) -> None:
     """The `active` reclaimer for the rows whose only recovery is a FRESH RUNNER — the `outcome` and
     `operator` criteria (`_RESTART_ONLY_PERSONAS` above).
@@ -308,13 +309,16 @@ def reclaim_stale_active_restartable_tasks(
     for task, task_id in _gone_rows(
         "active", _RESTART_ONLY_PERSONAS, gone,
         sweep="restart-reclaimer", check="liveness check failed", left="leaving it active (no reclaim)",
+        open_tasks=open_tasks,
     ):
-        _post_reclaim(lambda: control_plane_api.reclaim_active(task_id), task_id,
+        _post_reclaim(functools.partial(control_plane_api.reclaim_active, task_id), task_id,
                       sweep="restart-reclaimer", persona=task.get("persona"),
                       landed="stale active row reclaimed active->ready (runner gone)")
 
 
-def reclaim_stale_awaiting_response_tasks(runner_confirmed_dead: Callable[[str], bool]) -> None:
+def reclaim_stale_awaiting_response_tasks(
+    runner_confirmed_dead: Callable[[str], bool], *, open_tasks: list[dict] | None = None,
+) -> None:
     """The `awaiting_response` reclaimer: a task parked on a RUNNER-RAISED question whose asker is gone.
 
     The operator's answer is delivered into the runner's session, so a dead session makes the row
@@ -330,6 +334,7 @@ def reclaim_stale_awaiting_response_tasks(runner_confirmed_dead: Callable[[str],
     for task, task_id in _gone_rows(
         AWAITING_RESPONSE, None, lambda task_id, _persona: runner_confirmed_dead(task_id),
         sweep="awaiting-response-reclaimer", check="liveness check failed", left="leaving it parked (no reclaim)",
+        open_tasks=open_tasks,
     ):
         try:
             answer = control_plane_api.reclaim_awaiting_response(task_id)
@@ -351,18 +356,19 @@ def reclaim_stale_awaiting_response_tasks(runner_confirmed_dead: Callable[[str],
                       "reclaim could take (no open round, or it moved) — nothing done", task_id)
 
 
-def expire_timed_out_awaiting_response_tasks() -> None:
+def expire_timed_out_awaiting_response_tasks(*, open_tasks: list[dict] | None = None) -> None:
     """The `awaiting_response` EXPIRER: a task parked on a question nobody has read within the operator's
     bounds. Two stages, both decided per row by `task_pipeline_cp.expire_awaiting_response`: past the
     timeout the runner is stopped and the question stays answerable; past the release bound the task is
     failed and its worktree handed back.
 
     The case the reclaimer above leaves alone: the runner is alive inside `AskUserQuestion` and the human
-    is not coming. No liveness probe, since liveness is not evidence here. Called for every parked row
-    because the age test belongs inside the atomic write (`expire_timed_out_awaiting_response_task`); a
-    refusal (too young, wedged-dispatch gate, `advisor` chat, moved) is ordinary and the helper logs expiries."""
-    for task in control_plane_api.list_open_tasks():
-        if task.get("state") != AWAITING_RESPONSE:
+    is not coming. No liveness probe, since liveness is not evidence here. Called for every parked row the read
+    marks `unanswered_due` (a row without the key counts as due); that mark is a hint, and the decision stays in
+    the atomic writes (`expire_timed_out_awaiting_response_task`). A refusal (an answer landed, wedged-dispatch
+    gate, moved — including a row the reclaimer above took this pass) is ordinary and the helper logs expiries."""
+    for task in _open_tasks(open_tasks):
+        if task.get("state") != AWAITING_RESPONSE or not task.get("unanswered_due", True):
             continue
         task_id = task.get("id")
         if task_id is None:
@@ -525,18 +531,6 @@ def sweep_epic_rollups() -> None:
 # 30 minutes: well above the 300s outcome-backfill cadence, so a normal backfill never flaps an alert.
 STUCK_EPIC_THRESHOLD_MINS = 30
 
-# Injected one-shot alert callback, mirroring the fanout-ceiling notifier: wired by main.py, and
-# unwired is a silent no-op.
-_notify_stuck_epic_fn: "Callable[[int, str, str, float], None] | None" = None
-
-
-def set_stuck_epic_notifier(fn: "Callable[[int, str, str, float], None] | None") -> None:
-    """Wire (or clear, with `None`) the injected stuck-epic alert callback. Called once by main.py's
-    `--sweep-tasks` branch before the sweep runs; a test calls it directly to inject a mock."""
-    global _notify_stuck_epic_fn
-    _notify_stuck_epic_fn = fn
-
-
 STUCK_EPIC_STAMP_FAMILY = "stuck-epic"
 
 
@@ -556,16 +550,12 @@ def _clear_rearmed_stuck_epic_stamps(reported_epic_ids: set[int], store=None) ->
 
 
 def _alert_stuck_epic(epic_id: int, project: str, reason: str, stuck_seconds: float) -> None:
-    """One-shot alert for an epic `active` with every current child `done` past the threshold, over
-    `_alert_epic_fanout_blocked`'s two surfaces. `reason` is embedded verbatim. Best-effort."""
+    """One-shot escalation for an epic `active` with every current child `done` past the threshold. `reason` is
+    embedded verbatim. Best-effort.
+
+    No alert of its own (a `self-heal` one is no notification, PRD R9): the hidden row parks unclaimed, so the
+    needs-attention announcers tell the operator about it as about any parked task."""
     minutes = stuck_seconds / 60
-    announced = False
-    if _notify_stuck_epic_fn is not None:
-        try:
-            _notify_stuck_epic_fn(epic_id, project, reason, stuck_seconds)
-            announced = True  # the operator has been told; the row below is the VIEW surface, not a page
-        except Exception as exc:  # noqa: BLE001 — best-effort: a notify failure must never break the sweep
-            log.warning("stuck-epic: epic %s notify callback failed: %s", epic_id, exc)
     _escalate_needs_attention_task(
         project,
         stuck_epic_title(epic_id),
@@ -574,7 +564,6 @@ def _alert_stuck_epic(epic_id: int, project: str, reason: str, stuck_seconds: fl
         "The reconcile rollup scan re-drives this every tick but cannot fix a genuinely-missing "
         "outcome — resolve the underlying cause and it will roll up on the next reconcile pass.",
         dedup_key=f"epic-stuck-{epic_id}",
-        announced=announced,
         about_task_id=epic_id,
     )
 
@@ -661,7 +650,7 @@ def sweep_needs_attention_notify(store=None) -> None:
       * the grace (`NOTIFY_GRACE_SECONDS`): a younger row belongs to the transition notifier and is skipped
         without claiming. A row with no readable age is treated as old, so absence cannot silence it.
       * the claim: atomic; a notify that raises releases it so the next tick retries."""
-    read_at = datetime.now(timezone.utc)
+    read_at = utcnow()
     rows = control_plane_api.list_needs_attention()
     present_ids: set[int] = set()
     stamps = store or alert_stamps.default_store()

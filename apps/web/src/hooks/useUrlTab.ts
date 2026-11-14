@@ -2,8 +2,8 @@ import { useCallback } from 'react'
 import { useSearchParams } from 'react-router-dom'
 
 /* The ONE home for a tab strip whose selection lives in the URL (`?tab=comments`), so a link lands on the
-   tab it names and a reload keeps it. Every `?tab=` strip reads through it; not Audit and the directory (a
-   path segment per tab) or a dialog's strip.
+   tab it names and a reload keeps it. Every `?tab=` strip reads through it; not the console's Audit page and the directory
+   (a path segment per tab) or a dialog's strip.
    - READ-THROUGH: the URL is the state; there is no component copy to drift from it.
    - An absent or unknown value — or a real tab this reader is not offered right now — reads as `fallback`,
      so a corrupt link never blanks the page. `fallback` may change per render (a gated task's is Answer):
@@ -12,7 +12,7 @@ import { useSearchParams } from 'react-router-dom'
      unless `pin`ned: a selection that must outlive a fallback about to change (the task page's hold on Task while
      its question waits, kept across a remount) writes the key anyway.
    - `replace: true`: the strip activates on focus, so arrowing across it would bury Back under tab hops.
-   - Other query keys are kept; `param` namespaces a second strip on one page (`?activity=qa`).
+   - Other query keys are kept; `param` namespaces a second strip on one page (`?details=versions`).
    - `aliases` maps a retired id to its tab, so old links still land; selecting writes the canonical id. */
 export function useUrlTab<Id extends string>(
   tabs: readonly { id: Id }[],

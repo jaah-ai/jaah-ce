@@ -23,6 +23,7 @@ Module map (imports run top to bottom; nothing imports upward):
 - `metrics.py` — `GET /api/nodes/{node_id}/metrics` and `/disk-events`.
 - `update.py` — `PUT /api/nodes/{node_id}`, its field guards, and lifting a transfer fence.
 - `register.py` — `POST /api/nodes`, `_registered_node`, token re-issue, tailnet re-enrolment.
-- `cloud.py` — `POST /api/nodes/cloud` and `/api/nodes/self-hosted`; the Mac Full Disk Access profile.
+- `cloud.py` — the cloud and self-hosted row builders an Add-node order runs; the Mac Full Disk Access profile.
 - `lifecycle.py` — `POST /api/nodes/{node_id}/cloud/stop|start`, `PUT …/cloud/instance-type|disk` (Your Cloud).
-- `delete.py` — `DELETE /api/nodes/{node_id}` and `delete_node_row`."""
+- `delete.py` — `DELETE /api/nodes/{node_id}` and `delete_node_row`.
+- `restart.py` — `POST /api/nodes/{node_id}/restart`: one node's hard restart (a host's: `app/routes/host_restart.py`)."""

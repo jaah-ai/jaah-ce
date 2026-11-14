@@ -2,12 +2,12 @@ import type { ReactNode } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiDetail, del } from '../../api'
 import { TASK_TREE_QUERY_KEY } from '../../hooks/useTaskTree'
-import { useConfirm } from '../ConfirmDialog'
+import { danger, useConfirm } from '../ConfirmDialog'
 import { PANE_QUERY_KEY } from './pane/queryKeys'
 
 /* DELETE A FEATURE — the one confirm + `DELETE /api/features/{id}` behind every Delete entry point: the
- * feature header's "…" menu (`pane/FeatureHeader.tsx`), the rail's row menu (`rail/TaskTree.tsx`) and the
- * Edit page (`pages/FeatureEditPage.tsx`). Its tasks are kept: the server leaves them under no feature. The
+ * rail's row menu (`rail/TaskTree.tsx`) and the Edit page (`pages/FeatureEditPage.tsx`). No task is deleted: its
+ * ideas move to the project, the rest keep the feature's name in later stages and past releases. The
  * caller renders `confirmDialog` and decides where to go after (`onDeleted`, with the feature's project). */
 
 export type DeletableFeature = { id: string; name: string; project_id: number }
@@ -29,12 +29,7 @@ export function useDeleteFeature({ onDeleted, onError }: {
   })
 
   const deleteFeature = async (feature: DeletableFeature) => {
-    const confirmed = await confirm({
-      title: `Delete “${feature.name}”?`,
-      message: 'Its tasks move to “Other”. No task is deleted or changed.',
-      confirmLabel: 'Delete',
-      destructive: true,
-    })
+    const confirmed = await confirm(danger('Delete', { title: `Delete “${feature.name}”?`, message: 'Its ideas move to the project. Started tasks keep it. No task is deleted.' }))
     if (confirmed) remove.mutate(feature)
   }
 

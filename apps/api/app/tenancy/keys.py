@@ -167,7 +167,7 @@ def same_org_keys() -> tuple[CompositeKey, ...]:
                     f"no `{ORG_COLUMN}` for this key to pair with (app/tenancy/manifest.py)"
                 )
             # Checked by columns and order, not name: a `(org_id, id)` unique is a different object that
-            # `REFERENCES parent(id, org_id)` cannot target (`contraction.py::unique_steps`).
+            # `REFERENCES parent(id, org_id)` cannot target.
             target = org_unique(entry.parent.__tablename__).name
             declared = {
                 constraint.name: tuple(column.name for column in constraint.columns)
@@ -182,8 +182,8 @@ def same_org_keys() -> tuple[CompositeKey, ...]:
                     "referenced columns, in that order, before a composite key may point at them, and "
                     "the parent's own primary key does not satisfy that. Add "
                     "`org_unique(__tablename__)` to that class AND a revision that builds it "
-                    "(app/models/base.py::org_unique; app/tenancy/contraction.py::apply_unique_constraint is "
-                    "the form)"
+                    "(app/models/base.py::org_unique; on a live table: CREATE UNIQUE INDEX CONCURRENTLY, then "
+                    "ADD CONSTRAINT ... USING INDEX)"
                 )
             keys.append(
                 CompositeKey(

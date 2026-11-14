@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from app import edition_features
-from app.clock import as_utc
+from app.clock import as_utc, utcnow
 from app.entity_shape import iso_or_none
 
 if TYPE_CHECKING:
@@ -351,7 +351,8 @@ def account_node_records(session) -> dict[str, list[dict[str, Any]]]:
 # (`routes/accounts.py::_account_out`) cannot disagree. The frozen `accounts` percentage columns are not read
 # (`models/credentials.py::Account`).
 
-# `accounts.quota_status` / `quota_status_until` stay: `record_account_verdict` writes them with a 900s TTL.
+# `accounts.quota_status` / `quota_status_until` stay: `record_account_verdict` writes them with a TTL
+# (`verdict_ttl_seconds`).
 # `resolved_quota_status` is where the two stores meet.
 
 # Writers of `account_observations`: `fleet_observe.account_upsert_statement` (`POST /api/agent/fleet/observe`)
@@ -426,7 +427,7 @@ def quota_is_stale(
     # `now` omitted uses this process's clock (unlike `standing_verdict`): the operand is the collector's
     # node-clock stamp, bounded by the 120s skew clamp (`fleet_observe._MAX_STAMP_SKEW_SECS`). Production
     # passes `now=db_clock(session)`; kept I/O-free for testing.
-    reference = now or datetime.now(timezone.utc)
+    reference = now or utcnow()
     stamped = (
         quota_updated_at
         if quota_updated_at.tzinfo
@@ -627,7 +628,9 @@ def quota_readings_for_node(session, node_id: str) -> dict[str, dict[str, Any]]:
 ACCOUNT_VERDICT_TTL_SECONDS = 900
 
 # A `usage_limit` break naming a plan-window wall (weekly / 7-day / monthly) with no parseable reset: such a
-# wall lasts hours to days, so 24h. See `verdict_ttl_seconds`.
+# wall lasts hours to days, so 24h. Also an API-key account's `auth_rejected`: no relaunch or re-login revives a
+# refused key, only rotating it (which lifts the verdict at once), so a 15-minute verdict only re-dispatched the
+# dead key every quarter hour. See `verdict_ttl_seconds`.
 ACCOUNT_VERDICT_TTL_LONG_SECONDS = 86400
 
 # Ceiling on a TTL read off a reset instant (a weekly window never resets later); bounds a misparse.
@@ -652,23 +655,29 @@ _MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
 _PLAN_WINDOW = re.compile(r"weekly|7[- ]day|monthly", re.I)
 
 
-def verdict_ttl_seconds(status: str, detail: str, *, now: Optional[datetime] = None) -> int:
+def verdict_ttl_seconds(
+    status: str, detail: str, *, now: Optional[datetime] = None, api_key: bool = False
+) -> int:
     """How long a runner-reported verdict is believed, in seconds — PURE, and it never raises.
 
     A standing verdict excludes for its whole TTL (`resolved_quota_status` lets nothing non-blocking clear
     it), and against a weekly wall the mirror may never publish an excluding figure, so only `usage_limit`
-    is scaled. `auth_rejected` stays short so a re-login is not exile
-    (tests/test_runner_breaks.py::test_the_account_verdict_expires_so_a_re_login_is_not_permanent_exile).
+    is scaled. An OAuth `auth_rejected` stays short so a re-login is not exile
+    (tests/test_runner_breaks.py::test_the_account_verdict_expires_so_a_re_login_is_not_permanent_exile); an
+    API-key one (`api_key`) stands `ACCOUNT_VERDICT_TTL_LONG_SECONDS`, since the key itself was refused and the
+    only fix, a rotation, lifts it (`clear_auth_rejection`).
 
     Ladder for `usage_limit`:
       1. a future reset instant parsed off `detail` → seconds until it, clamped to [default, max];
       2. else a plan-window word → `ACCOUNT_VERDICT_TTL_LONG_SECONDS`;
       3. else the default.
     Any parse failure falls down the ladder. `now` is injectable for tests."""
+    if status == "auth_rejected" and api_key:
+        return ACCOUNT_VERDICT_TTL_LONG_SECONDS
     if status != "usage_limit" or not detail:
         return ACCOUNT_VERDICT_TTL_SECONDS
     try:
-        now = now or datetime.now(timezone.utc)
+        now = now or utcnow()
         instant = _reset_instant(detail, now)
         names_window = bool(_PLAN_WINDOW.search(detail))
         if instant is not None:
@@ -809,8 +818,7 @@ def record_account_verdict(
     # verdict.
     try:
         return _write_account_verdict(
-            session, config_dir=config_dir, node_id=node_id, status=status,
-            ttl=verdict_ttl_seconds(status, detail), detail=detail,
+            session, config_dir=config_dir, node_id=node_id, status=status, detail=detail,
         )
     except Exception as exc:  # noqa: BLE001 — see above; a verdict must never take down the park
         log.error(
@@ -836,23 +844,24 @@ def _shown_detail(detail: str) -> Optional[str]:
 
 
 def _write_account_verdict(
-    session, *, config_dir: str, node_id: Optional[str], status: str, ttl: int, detail: str = ""
+    session, *, config_dir: str, node_id: Optional[str], status: str, detail: str = ""
 ) -> bool:
     """The verdict write itself, separated so the caller's `try` visibly covers every statement."""
     # Function-level import, repeated here: importing only in the caller once raised `NameError` inside its
     # blanket `try`, silently dropping every verdict.
     from app.entity_shape import SYSTEM_ACTOR_ID
-    from app.account_auth import account_slug_from_ref
+    from app.account_auth import account_slug_from_ref, is_api_key
     from app.node_identity import node_id_or_none
 
     # One reverse resolution for both spellings (`account_auth.account_slug_from_ref`, handling
     # `apikey:<slug>` and per-node dirs via `node_clone.account_slug_from_dir`). API-key accounts must resolve:
     # `auth_rejected` is the only automatic brake on the spillover lane, and without it a revoked key loops
     # dispatch indefinitely.
-    slug = session.scalar(
-        text("SELECT slug FROM accounts WHERE slug = :slug LIMIT 1"),
+    account = session.execute(
+        text("SELECT slug, auth_kind FROM accounts WHERE slug = :slug LIMIT 1"),
         {"slug": account_slug_from_ref(config_dir)},
-    )
+    ).first()
+    slug = account.slug if account is not None else None
     if not slug:
         log.warning(
             "runner break names account %r, which matches no row in `accounts` — no verdict recorded "
@@ -861,6 +870,7 @@ def _write_account_verdict(
         )
         return False
     # The stored column carries an expiry (`ttl`, migration 0093), or no re-login or top-up could undo it.
+    ttl = verdict_ttl_seconds(status, detail, api_key=is_api_key(account.auth_kind))
     # `now()` is the DB clock every reader uses via `standing_verdict`; never `datetime.now()` here.
     #
     # `updated_by_id` names the system actor; `updated_at` is owned by `trg_accounts_set_updated_at` (0109).

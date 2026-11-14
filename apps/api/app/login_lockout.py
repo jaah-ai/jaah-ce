@@ -101,13 +101,23 @@ def state(session: Session, identifier: Optional[str], source_ip: Optional[str])
 
     Read before the attempt and counted after it, unserialised: a concurrent burst can overshoot a threshold
     by its width, which the per-IP rate limit bounds. Serialising per identifier (an advisory lock held
-    across bcrypt) was rejected — a flood on one email would park a pooled connection per request."""
+    across bcrypt) was rejected — a flood on one email would park a pooled connection per request. A caller
+    whose compare runs with no connection held reads it again after the compare (`worse`), so the width is
+    the commit's latency, not the compare's."""
     if not identifier:
         return None
     hashed, now = identifier_hash(identifier), _now()
     if _locked(session, hashed, source_ip, now):
         return LOCKED
     return STEP_UP_REQUIRED if _stepped_up(session, hashed, now) else None
+
+
+def worse(first: State, second: State) -> State:
+    """The stricter of two reads of `state`: `LOCKED` over `STEP_UP_REQUIRED` over None."""
+    for answer in (LOCKED, STEP_UP_REQUIRED):
+        if answer in (first, second):
+            return answer
+    return None
 
 
 def record(session: Session, identifier: Optional[str], source_ip: Optional[str], reason: str) -> list[str]:

@@ -21,11 +21,6 @@ D-SUP-1 supervision, the rules that decide when an attempt ends:
     with `request_replace` (retried; if it never lands the attempt ends at once and `end_attempt` records it),
     posted ONCE per attempt — today's self-heal, break + replace;
   * a close intent cancels the turn and waits `CLOSE_GRACE_S` for the prompt to return, then stops the engine;
-  * a close intent carrying `handoff: true` (the console toggling the slot to its terminal front,
-    `reconcile.enact_launch._launch_into_slot`) is the outcome `handoff`: session/close, engine stop, and NO `end_attempt` —
-    the task stays `active` because another front opens the same native session next;
-  * a resumed session (`session/resume` or `session/load` opened it) sends no first prompt and waits for the
-    operator with no idle deadline until a turn has run: the conversation is already under way;
   * an exception in the turn loop is the outcome `host_error`, ended like any other.
 Ending an attempt is `attempt_end.end_attempt`, the same ladder the runner-status hook runs.
 
@@ -117,7 +112,6 @@ _BREAK_CAUSE = {"usage_limit": "usage_limit", "auth": "auth_expired", "api": "ap
 _REPLACE_CLASSES = frozenset({"usage_limit", "auth"})
 #: The break cause of an engine that never ran a turn (no process, or no session), when its error names none.
 _START_CAUSE = "crashed"
-NATIVE_REF_KEY = launch.NATIVE_REF_KEY  # re-exported: the launch writer and this reader share one spelling
 #: The dev check's fault flag (architecture C14): `api_error` fails the first prompt with a server-error frame
 #: (`FAULT_FRAME`). Honoured only in a test build (`fault_armed`).
 FAULT_ENV = "JAAH_ACP_FAULT"
@@ -173,7 +167,6 @@ _CLAIMED_STATES = frozenset({"active", AWAITING_STATE})
 END_TASK_CLOSED = "task_closed"
 END_IDLE = "idle_autoclose"
 END_CLOSE_INTENT = "close_intent"
-END_HANDOFF = "handoff"  # a close handing the native session to another front: the task stays active
 END_INIT_FAILED = "init_failed"
 END_SPAWN_FAILED = "spawn_failed"
 END_HOST_ERROR = "host_error"
@@ -685,7 +678,6 @@ class Host:
         self.rand = rand
         self.log = log
         self.norm = events.Normaliser(session_id=spec.session_id, task_id=spec.task_id, provider=spec.provider,
-                                      native_session_ref=str(spec.session_meta.get(NATIVE_REF_KEY) or ""),
                                       pricing_tier=_pricing_tier(spec.provider),
                                       input_includes_cached=_input_includes_cached(spec.provider),
                                       dialect=agent_providers.dialect_for(spec.provider))
@@ -698,10 +690,6 @@ class Host:
         self._pending: collections.deque[tuple[str, str]] = collections.deque()
         self._wake = asyncio.Event()
         self._close_requested = False
-        self._handoff = False  # the close intent hands the native session to another front (`END_HANDOFF`)
-        # The launch reopens an existing conversation (a resume ref; `how` resume/load, or a refused resume): no
-        # first prompt, no idle end before the operator speaks.
-        self._resumed = False
         self._turn_in_flight = False
         self._open_inputs = 0
         # The task is parked on a question the agent raised through the control plane itself (`input.request` from
@@ -715,7 +703,6 @@ class Host:
         self._end_now: str | None = None
         self._closing = asyncio.Event()
         self._elicit_cancels: dict[str, asyncio.Future] = {}
-        self._loading = False
         self._charter_in_session = False
         self.dialect = agent_providers.dialect_for(spec.provider)
         # This attempt's own dir (an SDK run's `runtime.run_dir`), "" when it has none: the run files below are
@@ -1000,8 +987,7 @@ class Host:
             self.log(f"task.fail not recorded: {exc}")
 
     async def _end(self, outcome: str, exit_code: int | None) -> None:
-        """`session_end`, every event flushed, then — unless the task closed itself or a hand-off moved it to the
-        next front — `end_attempt`."""
+        """`session_end`, every event flushed, then — unless the task closed itself — `end_attempt`."""
         self._outcome = outcome
         self.log(f"attempt ended outcome={outcome} exit_code={exit_code}")
         await self._drain_stderr()
@@ -1013,8 +999,7 @@ class Host:
         await self._session_end(outcome)
         self.emit(self.norm.session_end(exit_code, outcome))
         await self.batcher.flush()
-        # A hand-off leaves the task `active`: the next front's session is the attempt, not a break.
-        if outcome not in (END_TASK_CLOSED, END_HANDOFF):
+        if outcome != END_TASK_CLOSED:
             await asyncio.to_thread(attempt_end.end_attempt, record_break=self._record_break,
                                     log=self.log, call=self._sync_call)
 
@@ -1158,10 +1143,8 @@ class Host:
         context router's routing notes — for the system prompt."""
         if not self.lifecycle.runs("SessionStart"):
             return ""
-        # The engine's own session id is known only on a resume; a new session is named by the run's until it opens.
-        resume = str(self.spec.session_meta.get(NATIVE_REF_KEY) or "")
-        verdict = await self.lifecycle.fire("SessionStart", resume or self.spec.session_id,
-                                            source="resume" if resume else "startup")
+        # A new session is named by the run's own id until it opens.
+        verdict = await self.lifecycle.fire("SessionStart", self.spec.session_id, source="startup")
         return verdict["context"]
 
     def _drain_hook_context(self, *extra: str) -> str:
@@ -1187,8 +1170,8 @@ class Host:
                 "provider": self.spec.provider, "mode": modes.LAUNCH_MODE}
         if self.spec.runtime.get("profile") != PROFILE_ACP_CORE:
             meta.update(agent_vocabulary.extension_capability())
-        # `native_session_ref` is ours (the resume target); every other key is the provider's own `_meta`.
-        agent_meta = {k: v for k, v in self.spec.session_meta.items() if k != NATIVE_REF_KEY}
+        # Every `session_meta` key is the provider's own `_meta`.
+        agent_meta = dict(self.spec.session_meta)
         try:
             await self.client.initialize(jaah_meta=meta)
             if not await self._authenticate():
@@ -1208,22 +1191,11 @@ class Host:
             placed = bool(native or meta_path or in_file)
             if start_context and not placed:
                 self._guidance.append(start_context)
-            # `session/load` replays the old conversation as updates: history, not new events.
-            self._loading = True
-            try:
-                self.native_ref, how = await self.client.open_session(
-                    cwd=self.spec.worktree, mcp_servers=[dict(s) for s in self.spec.mcp_servers],
-                    additional_dirs=list(self.spec.additional_dirs), meta=meta, agent_meta=agent_meta,
-                    system_prompt=system if native else "",
-                    resume_ref=str(self.spec.session_meta.get(NATIVE_REF_KEY) or ""))
-            finally:
-                self._loading = False
+            self.native_ref = await self.client.open_session(
+                cwd=self.spec.worktree, mcp_servers=[dict(s) for s in self.spec.mcp_servers],
+                additional_dirs=list(self.spec.additional_dirs), meta=meta, agent_meta=agent_meta,
+                system_prompt=system if native else "")
             self._charter_in_session = bool(charter) and placed
-            # A launch naming a session to reopen (a console hand-off) never re-sends the task, even when the engine
-            # fell back to `session/new`: that would start the task over beside the conversation it was handed.
-            self._resumed = how in ("resume", "load") or bool(self.spec.session_meta.get(NATIVE_REF_KEY))
-            if self._resumed and how == "new":
-                self.log("resume refused by the engine; a new conversation waits for the operator")
         except (jsonrpc.JsonRpcError, jsonrpc.ConnectionClosed) as exc:
             self.emit(self.norm.on_prompt_error(exc)[:-1])  # the error, without a turn_end for no turn
             if self._last_cause:
@@ -1243,7 +1215,7 @@ class Host:
         assert client is not None  # opened above
         start = {
             "key_in_env": findings, "cli_versions": self.versions(_engine_argv0(self.argv)),
-            "mode": modes.LAUNCH_MODE, "how": how, "capabilities": client.agent_capabilities,
+            "mode": modes.LAUNCH_MODE, "capabilities": client.agent_capabilities,
             "answer_receipts": True,
         }
         if client.agent_info:
@@ -1495,32 +1467,28 @@ class Host:
     async def _turn_loop(self) -> str:
         if not await self._start_session():
             return END_INIT_FAILED
-        # A resumed conversation already holds the charter and the task: re-sending them would restart the work.
-        first = "" if self._resumed else self._first_prompt()
+        first = self._first_prompt()
         if first:
             self._pending.append((first, "task"))
-        turned = False
         nudged = False
         stop: str | None = None
         linger = float(self.spec.runtime.get("idle_linger_s", DEFAULT_IDLE_LINGER_S))
         idle_deadline: float | None = None  # survives wakes that bring no work
         while True:
             if self._close_requested:
-                return END_HANDOFF if self._handoff else END_CLOSE_INTENT
+                return END_CLOSE_INTENT
             if self._pending:
                 idle_deadline = None
                 stop = await self._turn(*self._pending.popleft())
-                turned = True
                 if self._end_now:
                     return self._end_now
                 if self._close_requested:
-                    return END_HANDOFF if self._handoff else END_CLOSE_INTENT
+                    return END_CLOSE_INTENT
                 if not await self._task_open():
                     return END_TASK_CLOSED
                 continue
             # Idle, after a turn (or before any when there was no first prompt).
-            # A resumed conversation waits for the operator with no idle end until a turn has run.
-            if self._open_inputs or (self._resumed and not turned):
+            if self._open_inputs:
                 idle_deadline = None
                 await self._wait(None)
                 continue
@@ -1592,15 +1560,33 @@ class Host:
             if self._turn_in_flight:
                 await self._cancel_turn()
         elif kind == "close":
-            self._handoff = self._handoff or payload.get("handoff") is True
             self._close_requested = True
             self._closing.set()
             self._cancel_elicitations()
             if self._turn_in_flight:
                 await self._cancel_turn()
             self._poke()
+        elif kind == "set_model":
+            model = str((payload or {}).get("model") or "")
+            if model:
+                # Off the control lane: a slow engine answer must not hold an `interrupt` queued behind it.
+                self._spawn_task(self._set_model(model))
         else:
             self.log(f"unknown control intent type={kind!r} ignored")
+
+    async def _set_model(self, model: str) -> None:
+        """An operator's model switch (`AcpClient.set_model`). Never raises: a refused switch (an unknown model,
+        an engine without a selector) is logged and the session runs on as it was."""
+        client = self.client
+        if client is None:  # no engine connected yet: nothing to switch
+            return
+        try:
+            switched = await client.set_model(self.native_ref, model)
+        except (jsonrpc.JsonRpcError, jsonrpc.ConnectionClosed) as exc:
+            self.log(f"set_model {model!r} refused by the agent ({type(exc).__name__}: {exc})")
+            return
+        self.log(f"set_model {model!r} " + ("applied" if switched else "ignored: the session advertised no model "
+                                                                       "selector"))
 
     def _cancel_elicitations(self) -> None:
         for fut in self._elicit_cancels.values():
@@ -1616,7 +1602,7 @@ class Host:
     # ── engine -> client ───────────────────────────────────────────────────────────────────────────
 
     def _on_notification(self, method: str, params: dict) -> None:
-        if method == "session/update" and not self._loading:
+        if method == "session/update":
             update = params.get("update")
             if isinstance(update, dict):
                 self.emit(self.norm.on_update(update))
@@ -1659,7 +1645,7 @@ class Host:
         if known is None or known.scope is not agent_vocabulary.Scope.TASK:
             raise jsonrpc.JsonRpcError(jsonrpc.METHOD_NOT_FOUND, f"Method not found: {_VERB_PREFIX}{verb}")
         try:
-            # The canonical name: a pre-rename method (`_jaah.ai/task/settle`) reaches the same row.
+            # The canonical row, by the method's own name.
             return await self.call(known.name, params, known.timeout_s)
         except agent_socket.AgentSocketRefused as exc:
             raise jsonrpc.JsonRpcError(-32000, f"refused: {exc.reason}") from None

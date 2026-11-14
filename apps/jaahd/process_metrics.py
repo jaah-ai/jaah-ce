@@ -6,7 +6,8 @@ tick. CPU % is percent of ONE core (top-style): the utime+stime delta between tw
 the elapsed time. A process is matched across walks by `(pid, starttime)`, so a recycled pid starts afresh;
 a process new since the last walk counts 0. The first walk is only a baseline and yields no reading.
 
-Top processes carry `comm` only — never argv, which holds secrets (tokens on command lines). A session is a
+Top processes (the union of the top `TOP_N` by CPU and by RSS) carry `comm` only — never argv or environ, which
+hold secrets (tokens on command lines); neither file is opened. A session is a
 live runner (`runner_registry.live_runners`): its usage is the process tree rooted at the pane pid;
 `cpu_seconds` adds the pane's reaped children (`cutime`+`cstime`), so it only grows over a session's life.
 
@@ -32,7 +33,7 @@ log = logging.getLogger("jaahd.process_metrics")
 PROC_ROOT = "/proc"
 
 SCAN_INTERVAL_SECS = 30.0
-TOP_N = 5          # per ranking; the union of top-by-CPU and top-by-RSS is at most 2 * TOP_N
+TOP_N = 15         # per ranking; the union of top-by-CPU and top-by-RSS is at most 2 * TOP_N = 30
 MAX_SESSIONS = 64
 _NAME_CAP = 32
 _SESSION_ID_CAP = 128

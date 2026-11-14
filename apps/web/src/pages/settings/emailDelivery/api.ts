@@ -2,7 +2,7 @@
 // is operator-only (`require_operator`), and every read goes past the operator's org filter (`UNFILTERED_READ`):
 // the rows are org zero's.
 
-import { del, get, post } from '../../../api'
+import { del, get, post, withQuery } from '../../../api'
 import { UNFILTERED_READ } from '../../../lib/orgScope'
 
 export type DeliveryStatus =
@@ -22,6 +22,8 @@ export type EmailDelivery = {
   sent_at: string | null
   last_event_at: string | null
   events: DeliveryEvent[]
+  /** The hosted app that sent it; null for the console's own mail. */
+  hosted_app_id: string | null
 }
 
 export type DeliveryPage = { items: EmailDelivery[]; next_before: string | null }
@@ -35,14 +37,19 @@ export type EmailSuppression = {
 }
 
 /** Newest first; `before` is the previous page's `next_before`. */
-export function listDeliveries(filters: { recipient?: string; status?: string; before?: string | null }) {
-  const query = new URLSearchParams()
-  if (filters.recipient) query.set('recipient', filters.recipient)
-  if (filters.status) query.set('status', filters.status)
-  if (filters.before) query.set('before', filters.before)
-  const qs = query.toString()
-  return get<DeliveryPage>(`/api/operator/email/deliveries${qs ? `?${qs}` : ''}`, UNFILTERED_READ)
+export function listDeliveries(
+  filters: { recipient?: string; status?: string; hostedAppId?: string; before?: string | null },
+) {
+  const { recipient, status, hostedAppId, before } = filters
+  return get<DeliveryPage>(withQuery('/api/operator/email/deliveries', { recipient, status, hosted_app_id: hostedAppId, before }), UNFILTERED_READ)
 }
+
+/** A hosted app with at least one delivery row, by name. */
+export type DeliveryApp = { id: string; name: string; slug: string }
+
+export const DELIVERY_APPS_QUERY = ['email-delivery-apps'] as const
+
+export const listDeliveryApps = () => get<DeliveryApp[]>('/api/operator/email/apps', UNFILTERED_READ)
 
 export const listSuppressions = () => get<EmailSuppression[]>('/api/operator/email/suppressions', UNFILTERED_READ)
 

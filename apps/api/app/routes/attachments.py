@@ -20,12 +20,14 @@ materialized into a workdir (`app/routes/tasks/task_wire.py::_task_attachments_m
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import mimetypes
 import os.path
 import re
-from datetime import datetime, timezone
-from typing import Annotated, Any, Callable, Optional, cast
+from datetime import datetime
+from collections.abc import Sequence
+from typing import Annotated, Any, Callable, NoReturn, Optional, cast
 from uuid import UUID
 
 from fastapi import (
@@ -41,15 +43,17 @@ from fastapi import (
 )
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
-from sqlalchemy import or_, select
+from sqlalchemy import Select, or_, select
 from sqlalchemy.orm import Session
 
 from app import attachment_storage, data_access_events, data_residency, hipaa, org_quotas, session_transcript_archive
-from app.auth import require_user
+from app.artifact_pinch_zoom import PINCH_ZOOM_SCRIPT, UTF16_BOMS
+from app.auth import adopt_user, require_user
 from app.authz.catalog import Tenancy
 from app.authz.declarations import feature, infra
-from app.db import get_session
-from app.entity_shape import get_or_404
+from app.clock import utcnow
+from app.db_async import DbDep, on_session, release
+from app.entity_shape import commit_row, get_or_404, or_404, refused_as
 from app.models.identity import AdminUser
 from app.models.task_extras import ATTACHMENT_KIND_COMMENT_IMAGE, ATTACHMENT_KIND_FILE, TaskAttachment
 from app.models.tasks import Task
@@ -135,6 +139,28 @@ _EXTRA_SUFFIX_TYPES: dict[str, str] = {
     ".webp": "image/webp",
 }
 
+#: Audio and video a browser plays with its own `<audio>`/`<video>`, no plugin: `{suffix: type}`. A literal table,
+#: so the stored and served type never depends on the interpreter's `mimetypes` (`_derived_content_type` reads it
+#: before that table). Media is never proxied: `media_redirect` hands it to storage by a signed `inline` URL, which answers Range
+#: requests, so a file of any size streams and seeks. Inert where it lands: a media element only decodes, the
+#: signed type is a media type, and S3's origin is not the console's. A codec the browser lacks shows the player's
+#: own error beside Download. Projected to the console by the inline-preview generator.
+MEDIA_SUFFIX_TYPES: dict[str, str] = {
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".flac": "audio/flac",
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".webm": "video/webm",
+    ".ogv": "video/ogg",
+    ".mov": "video/quicktime",
+}
+
 #: Stored types a free-form `file` may be served `inline` as — a closed allowlist (`artifact_content`
 #: decides); everything else downloads. `text/html` and scriptable `image/svg+xml` are safe only under
 #: the response CSP (`sandbox` without `allow-same-origin`, `default-src 'none'`; drop it and SVG is stored XSS); images and text are
@@ -193,6 +219,8 @@ def _derived_content_type(filename: str) -> str:
     suffix = os.path.splitext(filename)[1].lower()
     if suffix in _EXTRA_SUFFIX_TYPES:
         return _EXTRA_SUFFIX_TYPES[suffix]
+    if suffix in MEDIA_SUFFIX_TYPES:
+        return MEDIA_SUFFIX_TYPES[suffix]
     guessed, encoding = _BUILTIN_MIME.guess_type("f" + suffix)
     if guessed is None or encoding is not None:
         return "application/octet-stream"
@@ -343,10 +371,8 @@ def _refuse_over_quota(session: Session, task_id: int, adding: int) -> None:
     """The per-task and per-org byte quotas (`app/org_quotas.py`, 409), asked by every door that creates a
     task's row from a caller's bytes — the tickets in `_mint_ticket`, the buffered uploads in
     `_store_whole_file` — before the row is written. Support-ticket and support-chat files are not counted."""
-    org_id = session.scalar(select(Task.org_id).where(Task.id == task_id))
-    if org_id is None:
-        # Every caller has already 404'd an invisible task; a missing org must never read as exempt.
-        raise HTTPException(status_code=404, detail="task not found")
+    # Every caller has already 404'd an invisible task; a missing org must never read as exempt.
+    org_id = or_404(session.scalar(select(Task.org_id).where(Task.id == task_id)), detail="task not found")
     org_quotas.require_attachment_room(session, task_id=task_id, org_id=org_id, adding=adding)
 
 
@@ -428,7 +454,20 @@ def _store_whole_file(
     No transaction is held across the PUT (it would pin a pooled connection for the transfer and starve
     the pool), so the row is committed pending first — `uploaded_at` NULL, invisible to every reader
     (`task_artifacts.uploaded_clause`), exactly like a minted ticket — and stamped after the PUT. A
-    failed PUT leaves that pending row behind, unread."""
+    failed PUT leaves that pending row behind, unread.
+
+    Composed of its three steps, which an async route awaits apart (the PUT on a worker thread):
+    `_stage_whole_file`, `_put_whole_file`, `_stamp_whole_file`."""
+    where, key, subject_id = _stage_whole_file(session, attachment, body)
+    etag = _put_whole_file(where, key, body, subject_id)
+    _stamp_whole_file(session, attachment, etag)
+
+
+def _stage_whole_file(
+    session: Session, attachment: TaskAttachment, body: bytes
+) -> tuple[attachment_storage.Target, str, int]:
+    """`_store_whole_file`'s first step: the quota asked, the row committed pending with its key and bucket.
+    Returns the target, the key, and the subject id the PUT's refusal names."""
     if attachment.automation_id is not None:
         # An automation's Task-action file (`routes/automations.py`): the same caps, counted on the automation.
         org_quotas.require_attachment_room(
@@ -452,8 +491,14 @@ def _store_whole_file(
     attachment.s3_key = key
     attachment.s3_bucket = where.bucket
     session.commit()
+    return where, key, task_id
+
+
+def _put_whole_file(where: attachment_storage.Target, key: str, body: bytes, task_id: int) -> str:
+    """`_store_whole_file`'s PUT (network, no transaction held): the object's ETag, or the 502 that leaves the
+    pending row unconfirmed."""
     try:
-        etag = attachment_storage.put(where, key, body)
+        return attachment_storage.put(where, key, body)
     except attachment_storage.StorageUnavailable as exc:
         # The type, never the message: `detail` is relayed verbatim to the client.
         raise HTTPException(
@@ -464,11 +509,13 @@ def _store_whole_file(
                 f"upload can simply be retried"
             ),
         ) from None
-    # Stamped only after the PUT returned: the row stops being pending.
-    attachment.uploaded_at = datetime.now(timezone.utc)
+
+
+def _stamp_whole_file(session: Session, attachment: TaskAttachment, etag: str) -> None:
+    """`_store_whole_file`'s last step, after the PUT returned: the row stops being pending."""
+    attachment.uploaded_at = utcnow()
     attachment.etag = etag or None
-    session.commit()
-    session.refresh(attachment)
+    commit_row(session, attachment)
 
 
 def _mint_ticket(
@@ -557,8 +604,8 @@ def _mint_ticket(
     )
 
 
-def _complete_pending(
-    session: Session,
+async def _complete_pending(
+    db: DbDep,
     *,
     task_id: int,
     attachment_id: int,
@@ -581,19 +628,59 @@ def _complete_pending(
     can reach since 0251. `kinds` is the input/output boundary, as in `delete_attachment`. `cap` is the
     route's own ceiling (a comment image's is lower); `None` is `MAX_ATTACHMENT_SIZE`, read at call time
     for the reason `_refuse_oversize` gives."""
+    if cap is None:
+        cap = MAX_ATTACHMENT_SIZE
+    attachment, where = await db.run_sync(_pending_target, task_id, attachment_id, kinds)
+    # Every step so far was a read: its connection goes back before the HEAD.
+    await release(db)
+    landed = await asyncio.to_thread(_head_or_502, where, attachment.s3_key or "")
+    if landed is None:
+        await db.run_sync(_drop_unlanded, attachment)
+    assert landed is not None
+    if landed.size > cap:
+        # The object goes first (see above), off the loop.
+        await asyncio.to_thread(_drop_over_cap_object, where, attachment.s3_key or "")
+        await db.run_sync(_drop_over_cap_row, attachment, landed.size, cap)
+    return await db.run_sync(_stamp_landed_out, attachment, landed)
+
+
+def _pending_target(
+    session: Session, task_id: int, attachment_id: int, kinds: tuple[str, ...]
+) -> tuple[TaskAttachment, attachment_storage.Target]:
+    """`_complete_pending`'s reads, over the route's async session (`run_sync`): the pending row and its bucket."""
     get_task_or_404(task_id, session)
     attachment = get_or_404(session, TaskAttachment, attachment_id, detail="attachment not found", where=(
         TaskAttachment.task_id == task_id, TaskAttachment.kind.in_(kinds)))
-    _confirm_landed(session, attachment, cap=cap)
+    return attachment, _landed_target(attachment)
+
+
+def _stamp_landed_out(
+    session: Session, attachment: TaskAttachment, landed: attachment_storage.Landed
+) -> "AttachmentOut":
+    """`_stamp_landed`, answered as the row's wire shape, over the route's async session (`run_sync`)."""
+    _stamp_landed(session, attachment, landed)
     return AttachmentOut.model_validate(attachment)
 
 
 def _confirm_landed(session: Session, attachment: TaskAttachment, *, cap: Optional[int] = None) -> None:
     """`_complete_pending`'s subject-agnostic half, for a row its caller already authorized — a task's
     here, a ticket's in `routes/support_comments.py`, a support chat's in `routes/support_chat.py`: HEAD the object and stamp the row readable, or
-    remove it (see `_complete_pending`, which also says what `cap` is)."""
+    remove it (see `_complete_pending`, which also says what `cap` is). Composed of the steps `_complete_pending`
+    awaits apart."""
     if cap is None:
         cap = MAX_ATTACHMENT_SIZE
+    where = _landed_target(attachment)
+    landed = _head_or_502(where, attachment.s3_key or "")
+    if landed is None:
+        _drop_unlanded(session, attachment)
+    if landed.size > cap:
+        _drop_over_cap_object(where, attachment.s3_key or "")
+        _drop_over_cap_row(session, attachment, landed.size, cap)
+    _stamp_landed(session, attachment, landed)
+
+
+def _landed_target(attachment: TaskAttachment) -> attachment_storage.Target:
+    """The bucket a pending row's object was minted into, or the 409 for a row that is not pending."""
     attachment_id = attachment.id
     if attachment.uploaded_at is not None or not attachment.s3_key:
         raise HTTPException(
@@ -604,56 +691,70 @@ def _confirm_landed(session: Session, attachment: TaskAttachment, *, cap: Option
             ),
         )
     if attachment.ticket_id is not None:
-        where = _storage_or_503(attachment.ticket_id, subject="ticket", bucket=attachment.s3_bucket)
-    elif attachment.conversation_id is not None:
-        where = _storage_or_503(attachment.conversation_id, subject="conversation", bucket=attachment.s3_bucket)
-    else:
-        assert attachment.task_id is not None
-        where = _storage_or_503(attachment.task_id, bucket=attachment.s3_bucket)
+        return _storage_or_503(attachment.ticket_id, subject="ticket", bucket=attachment.s3_bucket)
+    if attachment.conversation_id is not None:
+        return _storage_or_503(attachment.conversation_id, subject="conversation", bucket=attachment.s3_bucket)
+    assert attachment.task_id is not None
+    return _storage_or_503(attachment.task_id, bucket=attachment.s3_bucket)
+
+
+def _head_or_502(where: attachment_storage.Target, key: str) -> Optional[attachment_storage.Landed]:
+    """The HEAD — the only evidence the upload happened (network): what landed, or None."""
+    with refused_as(
+        502, attachment_storage.StorageUnavailable, prefix="attachment storage could not be reached to confirm the upload: ",
+    ):
+        return attachment_storage.head(where, key)
+
+
+def _drop_unlanded(session: Session, attachment: TaskAttachment) -> NoReturn:
+    """No object arrived: the pending row goes (no reaper otherwise), and the 400 says to mint again."""
+    attachment_id = attachment.id
+    session.delete(attachment)
+    session.commit()
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"the upload did not arrive — no object was found for attachment {attachment_id}, so "
+            f"the pending row was removed; mint a new ticket and PUT the bytes again"
+        ),
+    )
+
+
+def _drop_over_cap_object(where: attachment_storage.Target, stored_ref: str) -> None:
+    """An over-cap object's delete (network), before its row's: key read before the row goes (see docstring)."""
     try:
-        landed = attachment_storage.head(where, attachment.s3_key)
-    except attachment_storage.StorageUnavailable as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"attachment storage could not be reached to confirm the upload: {exc}",
-        ) from None
-    if landed is None:
-        session.delete(attachment)
-        session.commit()
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"the upload did not arrive — no object was found for attachment {attachment_id}, so "
-                f"the pending row was removed; mint a new ticket and PUT the bytes again"
-            ),
-        )
-    if landed.size > cap:
-        # Key read before the row goes, object deleted before the row (see docstring).
-        stored_ref = attachment.s3_key
-        try:
-            attachment_storage.delete(where, stored_ref)
-        except attachment_storage.StorageUnavailable:
-            # Best effort: refusing to drop the row would be strictly worse. Logged for cleanup.
-            log.warning(
-                "orphaned over-cap stored object %s: its pending row is being removed", stored_ref
-            )
-        session.delete(attachment)
-        session.commit()
+        attachment_storage.delete(where, stored_ref)
+    except attachment_storage.StorageUnavailable:
+        # Best effort: refusing to drop the row would be strictly worse. Logged for cleanup.
         log.warning(
-            "attachment %s completed at %s bytes, over the %s byte cap — row and object removed",
-            attachment_id, landed.size, cap,
+            "orphaned over-cap stored object %s: its pending row is being removed", stored_ref
         )
-        # Same wording as every other 413, via its one home; `landed` already failed, so this raises.
-        _refuse_oversize(landed.size, cap)
+
+
+def _drop_over_cap_row(session: Session, attachment: TaskAttachment, size: int, cap: int) -> None:
+    """An over-cap upload's row goes after its object, and the 413 says why."""
+    attachment_id = attachment.id
+    session.delete(attachment)
+    session.commit()
+    log.warning(
+        "attachment %s completed at %s bytes, over the %s byte cap — row and object removed",
+        attachment_id, size, cap,
+    )
+    # Same wording as every other 413, via its one home; `size` already failed, so this raises.
+    _refuse_oversize(size, cap)
+
+
+def _stamp_landed(session: Session, attachment: TaskAttachment, landed: attachment_storage.Landed) -> None:
+    """The row made readable at the size and ETag S3 reports."""
     attachment.size_bytes = landed.size
     attachment.etag = landed.etag or None  # none sent: unverifiable, so read as drift (`live_cast/drift.py`)
-    attachment.uploaded_at = datetime.now(timezone.utc)
-    session.commit()
-    session.refresh(attachment)
+    attachment.uploaded_at = utcnow()
+    commit_row(session, attachment)
 
 
 def _signed_download_redirect(
-    row: TaskAttachment, *, for_browser: bool, inline: bool = False, content_type: str | None = None
+    row: TaskAttachment, *, for_browser: bool, inline: bool = False, content_type: str | None = None,
+    ttl_seconds: int = attachment_storage.DOWNLOAD_TTL_SECONDS,
 ) -> RedirectResponse:
     """Hand a bulk read to S3 instead of carrying it (operator decision D4/D8).
 
@@ -669,6 +770,7 @@ def _signed_download_redirect(
         # `content_type` overrides the stored type: a preview signs the type its name is served as.
         content_type=content_type if content_type is not None else row.content_type or "",
         inline=inline,
+        ttl_seconds=ttl_seconds,
     )
     return RedirectResponse(
         url=attachment_storage.browser_url(where, url) if for_browser else url,
@@ -777,11 +879,11 @@ async def _artifact_ticket_body(request: Request) -> ArtifactTicketIn:
 
 @router.post("/{task_id}/attachments", response_model=AttachmentOut, status_code=201)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",), author_draft=True)
-def upload_attachment(
+async def upload_attachment(
+    db: DbDep,
     task_id: int,
     file: UploadFile = File(...),
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> AttachmentOut:
     """Upload one file/image onto `task_id` (call repeatedly for more; no batch endpoint).
 
@@ -790,29 +892,62 @@ def upload_attachment(
     readable (`_store_whole_file`). For callers already holding a bounded file; the console uses
     `create_attachment_ticket`. Not a fallback for a bucketless plane: both doors refuse together
     (`_storage_or_503`)."""
+    cap = await db.run_sync(_upload_attachment, task_id)
+    # A read so far: its connection goes back before the body is buffered (off the loop: a spooled file).
+    await release(db)
+    content = await asyncio.to_thread(_read_bounded, file.file, cap)
+    where, key, subject_id, attachment = await db.run_sync(
+        _stage_attachment, task_id, file.filename, file.content_type, content, user
+    )
+    etag = await asyncio.to_thread(_put_whole_file, where, key, content, subject_id)
+    return await db.run_sync(_stamped_out, attachment, etag)
+
+
+def _upload_attachment(session: Session, task_id: int) -> int:
+    """`upload_attachment`'s checks before the body is read, over the route's async session (`run_sync`): the
+    task's file cap."""
     get_task_or_404(task_id, session)
     # Asked before reading the body, so a bucketless plane refuses without buffering.
     _storage_or_503(task_id)
-    content = _read_bounded(file.file, _task_file_cap(session, task_id))
-    filename = _stored_filename(file.filename, "attachment")
+    return _task_file_cap(session, task_id)
+
+
+def _stage_attachment(
+    session: Session,
+    task_id: int,
+    upload_filename: Optional[str],
+    content_type: Optional[str],
+    content: bytes,
+    user: AdminUser,
+) -> tuple[attachment_storage.Target, str, int, TaskAttachment]:
+    """`upload_attachment`'s pending row, over the route's async session (`run_sync`): `_stage_whole_file`."""
+    user = adopt_user(session, user)
+    filename = _stored_filename(upload_filename, "attachment")
     attachment = TaskAttachment(
         task_id=task_id,
         filename=filename,
-        content_type=file.content_type,
+        content_type=content_type,
         size_bytes=len(content),
         uploaded_by_id=user.id,
     )
-    _store_whole_file(session, attachment, content)
+    where, key, subject_id = _stage_whole_file(session, attachment, content)
+    return where, key, subject_id, attachment
+
+
+def _stamped_out(session: Session, attachment: TaskAttachment, etag: str) -> AttachmentOut:
+    """`_stamp_whole_file` after the PUT, answered as the row's wire shape, over the route's async session."""
+    _stamp_whole_file(session, attachment, etag)
     return AttachmentOut.model_validate(attachment)
 
 
 @router.post("/{task_id}/attachments/ticket", response_model=UploadTicketOut, status_code=201)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",), author_draft=True)
+@on_session
 def create_attachment_ticket(
+    session: Session,
     task_id: int,
     body: AttachmentTicketIn,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> UploadTicketOut:
     """The upload door the console uses: mint a pending row and a presigned PUT; the browser transfers
     to S3 itself (D4). `upload_attachment` is not a fallback for its 503 (same bucket, same refusal).
@@ -820,6 +955,7 @@ def create_attachment_ticket(
     Same declaration as `upload_attachment`: attaching is one permission whichever way the bytes travel.
     The cap is refused here on the declared size — an early no before a large transfer; `/confirm`
     overwrites the size with what S3 received."""
+    user = adopt_user(session, user)
     get_task_or_404(task_id, session)
     return _mint_ticket(
         session,
@@ -840,19 +976,19 @@ def create_attachment_ticket(
     "/{task_id}/attachments/{attachment_id}/confirm", response_model=AttachmentOut
 )
 @feature("tasks", "edit", object_type="task", object_params=("task_id",), author_draft=True)
-def confirm_attachment(
+async def confirm_attachment(
+    db: DbDep,
     task_id: int,
     attachment_id: int,
     _user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> AttachmentOut:
     """The second half of `create_attachment_ticket`: confirms the bytes arrived and makes the row
     visible. Same declaration as the ticket.
 
     `ATTACHMENT_KIND_FILE` only (`delete_attachment`'s boundary): an operator must not settle a runner's
     pending artifact. The rest is `_complete_pending`."""
-    return _complete_pending(
-        session,
+    return await _complete_pending(
+        db,
         task_id=task_id,
         attachment_id=attachment_id,
         kinds=(ATTACHMENT_KIND_FILE,),
@@ -861,11 +997,11 @@ def confirm_attachment(
 
 @router.delete("/{task_id}/attachments/{attachment_id}", status_code=204)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",), author_draft=True)
-def delete_attachment(
+async def delete_attachment(
+    db: DbDep,
     task_id: int,
     attachment_id: int,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> Response:
     """Remove one input attachment — the inverse of `upload_attachment`, with its declaration verbatim
     (detaching before dispatch is the same edit as attaching). The row goes, and its S3 object is reaped
@@ -876,6 +1012,25 @@ def delete_attachment(
     deliverables; nothing erases them). The `task_id` cross-check matters because authorization is on the
     path's task while the row is fetched by a global id; compared after the load so a cross-task id gets
     the same 404 as a missing one."""
+    stored_ref, stored_bucket = await db.run_sync(_delete_attachment, task_id, attachment_id, user)
+    if stored_ref:
+        # After the commit, off the loop: the reaper reads on a fleet session of its own and deletes from S3 (its
+        # `session` argument is unused).
+        await asyncio.to_thread(
+            attachment_storage.reap_unreferenced_object, None, stored_ref, stored_bucket  # type: ignore[arg-type]
+        )
+    return Response(status_code=204)
+
+
+def _delete_attachment(
+    session: Session,
+    task_id: int,
+    attachment_id: int,
+    user: AdminUser,
+) -> tuple[Optional[str], Optional[str]]:
+    """`delete_attachment`'s body, over the route's async session (`run_sync`): committed; returns the stored key
+    and bucket to reap."""
+    user = adopt_user(session, user)
     get_task_or_404(task_id, session)
     attachment = get_or_404(session, TaskAttachment, attachment_id, detail="attachment not found", where=(
         TaskAttachment.task_id == task_id, TaskAttachment.kind == ATTACHMENT_KIND_FILE))
@@ -895,20 +1050,19 @@ def delete_attachment(
     stored_bucket = attachment.s3_bucket
     session.delete(attachment)
     session.commit()
-    if stored_ref:
-        attachment_storage.reap_unreferenced_object(session, stored_ref, stored_bucket)
-    return Response(status_code=204)
+    return stored_ref, stored_bucket
 
 
 @router.post(
     "/{task_id}/comment-images/ticket", response_model=UploadTicketOut, status_code=201
 )
 @feature("tasks", "edit", object_type="task", object_params=("task_id",))
+@on_session
 def create_comment_image_ticket(
+    session: Session,
     task_id: int,
     body: AttachmentTicketIn,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> UploadTicketOut:
     """Stage one image for a comment not yet posted: a pending `comment_image` row and a presigned PUT.
 
@@ -916,6 +1070,7 @@ def create_comment_image_ticket(
     image exists only to be commented with. Raster types only (`COMMENT_IMAGE_CONTENT_TYPES`), capped at
     `MAX_COMMENT_IMAGE_SIZE`. The row stays unlinked (`comment_id` NULL) until a post or edit claims it; one
     no post or edit claims is reaped with its bytes (`app/comment_service.py::reap_unclaimed_images`)."""
+    user = adopt_user(session, user)
     get_task_or_404(task_id, session)
     if body.content_type not in COMMENT_IMAGE_CONTENT_TYPES:
         raise HTTPException(
@@ -939,21 +1094,17 @@ def create_comment_image_ticket(
     "/{task_id}/comment-images/{attachment_id}/confirm", response_model=AttachmentOut
 )
 @feature("tasks", "edit", object_type="task", object_params=("task_id",))
-def confirm_comment_image(
+async def confirm_comment_image(
+    db: DbDep,
     task_id: int,
     attachment_id: int,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> AttachmentOut:
     """The second half of `create_comment_image_ticket`. The uploader's own staged image only — anyone
     else's is the same 404 as a missing one. The rest is `_complete_pending`."""
-    uploader = session.scalar(
-        select(TaskAttachment.uploaded_by_id).where(TaskAttachment.id == attachment_id)
-    )
-    if uploader is None or uploader != user.id:
-        raise HTTPException(status_code=404, detail="attachment not found")
-    return _complete_pending(
-        session,
+    await db.run_sync(_confirm_comment_image, attachment_id, user)
+    return await _complete_pending(
+        db,
         task_id=task_id,
         attachment_id=attachment_id,
         kinds=(ATTACHMENT_KIND_COMMENT_IMAGE,),
@@ -961,13 +1112,23 @@ def confirm_comment_image(
     )
 
 
+def _confirm_comment_image(session: Session, attachment_id: int, user: AdminUser) -> None:
+    """`confirm_comment_image`'s uploader check, over the route's async session (`run_sync`)."""
+    user = adopt_user(session, user)
+    uploader = session.scalar(
+        select(TaskAttachment.uploaded_by_id).where(TaskAttachment.id == attachment_id)
+    )
+    if uploader is None or uploader != user.id:
+        raise HTTPException(status_code=404, detail="attachment not found")
+
+
 @router.get("/{task_id}/attachments/{attachment_id}/content")
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
-def user_task_attachment_content(
+async def user_task_attachment_content(
+    db: DbDep,
     task_id: int,
     attachment_id: int,
     request: Request,
-    # `Annotated[...] = False`, as `artifact_content`'s `download`.
     preview: Annotated[
         bool,
         Query(
@@ -979,7 +1140,6 @@ def user_task_attachment_content(
     ] = False,
     *,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> Response:
     """Browser-session analogue of `routes/agent/task_reads.py`'s `agent_task_attachment_content`, used by the rich
     editor's `attachment:<token>` resolver. Task-scoped 404 guard; never carries bytes — it redirects to
@@ -990,6 +1150,26 @@ def user_task_attachment_content(
     Reset abandons the runner's attempt, not the human's input. The one read of a comment image (the
     Comments tab's `<img src>`); a staged one (`comment_id` NULL, no comment yet) is its uploader's alone,
     the same 404 to anyone else."""
+    task, attachment, user = await db.run_sync(_user_task_attachment_content, task_id, attachment_id, user)
+    if preview and attachment.kind == ATTACHMENT_KIND_FILE:
+        # A read so far: its connection goes back before a proxied preview's S3 GET, made off the loop.
+        await release(db)
+        shown = await asyncio.to_thread(attachment_preview, attachment)
+        if shown is not None:
+            await db.run_sync(_record_attachment_read, request, task, attachment, user)
+            return shown
+    return await db.run_sync(_attachment_download, request, task, attachment, user)
+
+
+def _user_task_attachment_content(
+    session: Session,
+    task_id: int,
+    attachment_id: int,
+    user: AdminUser,
+) -> tuple[Task, TaskAttachment, AdminUser]:
+    """`user_task_attachment_content`'s guards, over the route's async session (`run_sync`): the task, the row, and
+    the caller joined to the session."""
+    user = adopt_user(session, user)
     task = get_task_or_404(task_id, session)
     # Whole entity: every column is small since 0251 dropped the bytes column.
     attachment = get_or_404(session, TaskAttachment, attachment_id, detail="attachment not found", where=(
@@ -1011,14 +1191,23 @@ def user_task_attachment_content(
     if not attachment.s3_key:
         # A key-less row names no bytes; answered as 404 rather than dereferencing NULL.
         raise HTTPException(status_code=404, detail="attachment not found")
-    if preview and attachment.kind == ATTACHMENT_KIND_FILE:
-        shown = attachment_preview(attachment)
-        if shown is not None:
-            hipaa.record_phi_read(
-                session, request, record_type="attachment", record_id=attachment.id, task_id=task_id,
-                org_id=task.org_id, user=user,
-            )
-            return shown
+    return task, attachment, user
+
+
+def _record_attachment_read(
+    session: Session, request: Request, task: Task, attachment: TaskAttachment, user: AdminUser
+) -> None:
+    """A served attachment is a PHI read in a HIPAA org, over the route's async session (`run_sync`)."""
+    hipaa.record_phi_read(
+        session, request, record_type="attachment", record_id=attachment.id, task_id=task.id,
+        org_id=task.org_id, user=user,
+    )
+
+
+def _attachment_download(
+    session: Session, request: Request, task: Task, attachment: TaskAttachment, user: AdminUser
+) -> Response:
+    """`user_task_attachment_content`'s download, over the route's async session (`run_sync`)."""
     # Redirect minted only after every guard ran. Disposition is `attachment` except for a comment
     # image, signed `inline` so a thumbnail opened in a tab shows: safe because its ticket admits only
     # raster types (`COMMENT_IMAGE_CONTENT_TYPES` — no SVG), and that type is what S3 is signed to
@@ -1032,43 +1221,32 @@ def user_task_attachment_content(
     # human's own inputs are not artifacts.
     if attachment.kind not in (ATTACHMENT_KIND_FILE, ATTACHMENT_KIND_COMMENT_IMAGE):
         data_access_events.record_committed(session, **_artifact_download(attachment, task), user=user)
-    hipaa.record_phi_read(
-        session, request, record_type="attachment", record_id=attachment.id, task_id=task_id,
-        org_id=task.org_id, user=user,
-    )
+    _record_attachment_read(session, request, task, attachment, user)
     return redirect
 
 
 @router.get("/{task_id}/attachments", response_model=list[AttachmentOut])
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
-def list_attachments(
-    task_id: int,
-    _user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-) -> list[AttachmentOut]:
+@on_session
+def list_attachments(session: Session, task_id: int, _user: AdminUser = Depends(require_user)) -> list[AttachmentOut]:
     """The task form's attachments row — inputs only, hence the `kind` filter: an output shown here
     would be advertised as a dispatch input. Deliverables are listed by `list_artifacts`."""
+    _user = adopt_user(session, _user)
     get_task_or_404(task_id, session)
-    rows = session.scalars(
-        select(TaskAttachment)
-        .where(
-            TaskAttachment.task_id == task_id,
-            TaskAttachment.kind == ATTACHMENT_KIND_FILE,
-            # Pending rows are not listed; a failed PUT would otherwise leave a permanent chip.
-            uploaded_clause(),
-        )
-        .order_by(TaskAttachment.id)
-    ).all()
+    rows = session.scalars(input_attachments_select(task_id)).all()
     return [AttachmentOut.model_validate(row) for row in rows]
+
+
+def input_attachments_select(task_id: int) -> Select:
+    """`list_attachments`' rows: the task's uploaded `file` inputs, oldest first (a pending row would be a dead chip)."""
+    inputs = select(TaskAttachment).where(TaskAttachment.task_id == task_id, TaskAttachment.kind == ATTACHMENT_KIND_FILE)
+    return inputs.where(uploaded_clause()).order_by(TaskAttachment.id)
 
 
 @router.get("/{task_id}/artifacts", response_model=list[ArtifactOut])
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
-def list_artifacts(
-    task_id: int,
-    _user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-) -> list[ArtifactOut]:
+@on_session
+def list_artifacts(session: Session, task_id: int, _user: AdminUser = Depends(require_user)) -> list[ArtifactOut]:
     """Every artifact a runner handed back for this task, metadata only, newest first — the Artifacts
     tab's picker.
 
@@ -1078,19 +1256,19 @@ def list_artifacts(
     Task-scoped with no parent-epic union (an artifact is this task's own output; an epic gets its one
     server-copied report). Reset-hidden rows are excluded via `app/task_artifacts.py`, and the content
     route repeats that filter so a kept URL dies too."""
+    _user = adopt_user(session, _user)
     task = get_task_or_404(task_id, session)
-    rows = visible_document_artifacts(session, task)
+    return artifacts_out(visible_document_artifacts(session, task))
+
+
+def artifacts_out(rows: Sequence[TaskAttachment], *, with_region: bool = True) -> list[ArtifactOut]:
+    """`list_artifacts`' rows (order kept), `current` the latest of each kind among them; no `source_task_id` (an
+    artifact is the task's own). `with_region=False` leaves the region unread (`routes/live_public.py` serves none)."""
     current_ids = current_artifact_ids(rows)
     return [
         ArtifactOut(
-            id=row.id,
-            kind=row.kind,
-            filename=row.filename,
-            content_type=row.content_type,
-            size_bytes=row.size_bytes,
-            created_at=row.created_at,
-            current=row.id in current_ids,
-            **stored_region(row),
+            id=row.id, kind=row.kind, filename=row.filename, content_type=row.content_type, size_bytes=row.size_bytes,
+            created_at=row.created_at, current=row.id in current_ids, **(stored_region(row) if with_region else {}),
         )
         for row in rows
     ]
@@ -1109,7 +1287,8 @@ def serve_artifact(
 ) -> Response:
     """One document artifact's bytes, past every guard — `artifact_content`'s delivery (its docstring carries the
     disposition and CSP argument), shared with the Live Cast viewer (`app/routes/live_public.py`). `on_redirect`
-    runs once a presigned URL is minted, before it leaves; `artifact.s3_key` is set. `verify_etag` (the viewer's):
+    runs once a DOWNLOAD's presigned URL is minted, before it leaves (a played media file's is a preview, not
+    recorded); `artifact.s3_key` is set. `verify_etag` (the viewer's):
     proxied bytes not carrying the row's `etag` raise `ArtifactChanged` instead of being served
     (`app/live_cast/drift.py`)."""
     # Parameters stripped: the allowlist is keyed on the bare type.
@@ -1117,6 +1296,11 @@ def serve_artifact(
     renderable = (
         artifact.kind not in FREEFORM_KINDS or base_type in INLINE_FILE_CONTENT_TYPES
     )
+    if artifact.kind in FREEFORM_KINDS and not download:
+        streamed = media_redirect(artifact)
+        if streamed is not None:
+            # A preview, like a proxied one: not recorded as a download.
+            return streamed
     # Only delivery branches here; every decision above and every header below is identical. A preview
     # is proxied because the CSP cannot be attached to an S3 response; downloads redirect (D8) so large
     # transfers skip this process. `MAX_PROXY_BYTES` bounds what may be buffered, not the upload cap.
@@ -1129,6 +1313,9 @@ def serve_artifact(
     body, etag = _fetched_or_502(artifact)
     if verify_etag and not (etag and etag == artifact.etag):
         raise ArtifactChanged(etag)
+    if base_type == "text/html" and not body.startswith(UTF16_BOMS):
+        # Pinch zooms the report inside its frame, not the page around it (`app/artifact_pinch_zoom.py`).
+        body += PINCH_ZOOM_SCRIPT
     return _sandboxed_inline(
         body, artifact.content_type or "application/octet-stream", artifact.filename,
         "attachment" if download or not renderable else "inline",
@@ -1192,6 +1379,17 @@ PREVIEW_SUFFIX_TYPES: dict[str, str] = {
 }
 
 
+def media_redirect(row: TaskAttachment) -> RedirectResponse | None:
+    """An audio or video file played in place (`MEDIA_SUFFIX_TYPES`, keyed on the NAME): a signed `inline` storage
+    URL typed as its media type, at any size, so the browser streams and seeks by Range. `None` for any other name."""
+    served = MEDIA_SUFFIX_TYPES.get(os.path.splitext(row.filename)[1].lower())
+    if served is None:
+        return None
+    return _signed_download_redirect(
+        row, for_browser=True, inline=True, content_type=served, ttl_seconds=attachment_storage.MEDIA_TTL_SECONDS,
+    )
+
+
 def attachment_preview(row: TaskAttachment) -> Response | None:
     """A human's attachment rendered in place (the console's full-screen viewer and image thumbnails), or `None`
     when its name is not a previewable format (`PREVIEW_SUFFIX_TYPES`) — the caller then answers with its download.
@@ -1201,6 +1399,9 @@ def attachment_preview(row: TaskAttachment) -> Response | None:
     PDF or text file that large gets `None` (the viewer never asks): a PDF is framed, and the console's `frame-src`
     refuses S3, and text is fetched same-origin. Private-cached briefly, since a thumbnail is re-rendered on every
     remount of its row. Every serve is a PHI read at the caller, thumbnails included: an image drawn is an image read."""
+    streamed = media_redirect(row)
+    if streamed is not None:
+        return streamed
     served = PREVIEW_SUFFIX_TYPES.get(os.path.splitext(row.filename)[1].lower())
     if served is None:
         return None
@@ -1218,11 +1419,10 @@ def attachment_preview(row: TaskAttachment) -> Response | None:
 
 @router.get("/{task_id}/artifacts/{artifact_id}/content")
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
-def artifact_content(
+async def artifact_content(
+    db: DbDep,
     task_id: int,
     artifact_id: int,
-    # `Annotated[...] = False`, not `= Query(False)`: the `Query` marker is truthy to an in-process
-    # caller (a test's CSP probe), which would silently get `attachment`.
     download: Annotated[
         bool,
         Query(
@@ -1236,7 +1436,6 @@ def artifact_content(
     *,
     request: Request,
     _user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> Response:
     """Serve one artifact's bytes — the sandboxed iframe's URL for a `report`, the markdown fetch for
     `prd`/`architecture`, and with `?download=1` the Download control for every kind.
@@ -1270,6 +1469,33 @@ def artifact_content(
     scripts on: a script can read what a viewer types into the frame and send it, or the artifact itself,
     out by navigating the frame away or over WebRTC — neither is CSP-governed; phishing and tracking,
     never the session. The frame has no `allow-top-navigation`, `allow-popups` or `allow-modals`."""
+    task, artifact, _user = await db.run_sync(_artifact_content, task_id, artifact_id, request, _user)
+    # The PHI read commits only in a HIPAA org: otherwise the reads' connection goes back here.
+    await release(db)
+    redirected = False
+
+    def downloaded() -> None:
+        nonlocal redirected
+        redirected = True
+
+    # Off the loop, with no connection held: a proxied preview is an S3 GET.
+    response = await asyncio.to_thread(serve_artifact, artifact, download=download, on_redirect=downloaded)
+    if redirected:
+        # Committed before the URL leaves: a failed record is a 500, never an unrecorded download.
+        await db.run_sync(_record_artifact_download, task, artifact, _user)
+    return response
+
+
+def _artifact_content(
+    session: Session,
+    task_id: int,
+    artifact_id: int,
+    request: Request,
+    _user: AdminUser,
+) -> tuple[Task, TaskAttachment, AdminUser]:
+    """`artifact_content`'s guards and its PHI read, over the route's async session (`run_sync`): committed;
+    returns the task, the artifact, and the caller joined to the session."""
+    _user = adopt_user(session, _user)
     task = get_task_or_404(task_id, session)
     # Whole entity (see `user_task_attachment_content`); bytes fetched only on the serving arm.
     artifact = get_or_404(session, TaskAttachment, artifact_id, detail="artifact not found", where=(
@@ -1292,23 +1518,22 @@ def artifact_content(
         session, request, record_type="artifact", record_id=artifact.id, task_id=task_id,
         org_id=task.org_id, user=_user,
     )
-    # Committed before the URL leaves: a failed record is a 500, never an unrecorded download.
-    return serve_artifact(
-        artifact, download=download,
-        on_redirect=lambda: data_access_events.record_committed(
-            session, **_artifact_download(artifact, task), user=_user
-        ),
-    )
+    return task, artifact, _user
+
+
+def _record_artifact_download(session: Session, task: Task, artifact: TaskAttachment, _user: AdminUser) -> None:
+    """The `artifact_downloaded` record, over the route's async session (`run_sync`)."""
+    data_access_events.record_committed(session, **_artifact_download(artifact, task), user=_user)
 
 
 @agent_router.post("/{task_id}/artifacts", response_model=AttachmentOut, status_code=201)
 @infra(Tenancy.ORG_SCOPED)
-def agent_upload_artifact(
+async def agent_upload_artifact(
+    db: DbDep,
     task_id: int,
     kind: str = Form(...),
     file: UploadFile = File(...),
     _: None = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> AttachmentOut:
     """The typed document-artifact channel a runner hands deliverables back through: `report`,
     `prd`/`architecture` (`app/persona_registry.py::PERSONA_MANIFEST`), and optional free-form `file`s.
@@ -1324,12 +1549,42 @@ def agent_upload_artifact(
     one writer). Append-only: latest-wins is answered at read time
     (`app/task_artifacts.py::current_artifact`), with no unique constraint, which is what lets many
     free-form `file`s coexist."""
+    filename, content_type, cap = await db.run_sync(_agent_upload_artifact, task_id, kind, file.filename)
+    # A read so far: its connection goes back before the body is buffered (off the loop: a spooled file).
+    await release(db)
+    content = await asyncio.to_thread(_read_bounded, file.file, cap)
+    where, key, subject_id, artifact = await db.run_sync(
+        _stage_artifact, task_id, kind, filename, content_type, content
+    )
+    etag = await asyncio.to_thread(_put_whole_file, where, key, content, subject_id)
+    return await db.run_sync(_stamped_out, artifact, etag)
+
+
+def _agent_upload_artifact(
+    session: Session,
+    task_id: int,
+    kind: str,
+    upload_filename: Optional[str],
+) -> tuple[str, str, int]:
+    """`agent_upload_artifact`'s checks before the body is read, over the route's async session (`run_sync`): the
+    stored filename and type, and the task's file cap."""
     task = get_task_or_404(task_id, session)
     _refuse_if_epic(task, task_id)
-    filename, content_type = _validated_artifact(kind, file.filename)
+    filename, content_type = _validated_artifact(kind, upload_filename)
     # Asked before reading the body (as in `upload_attachment`).
     _storage_or_503(task_id)
-    content = _read_bounded(file.file, _task_file_cap(session, task_id))
+    return filename, content_type, _task_file_cap(session, task_id)
+
+
+def _stage_artifact(
+    session: Session,
+    task_id: int,
+    kind: str,
+    filename: str,
+    content_type: str,
+    content: bytes,
+) -> tuple[attachment_storage.Target, str, int, TaskAttachment]:
+    """`agent_upload_artifact`'s pending row, over the route's async session (`run_sync`): `_stage_whole_file`."""
     artifact = TaskAttachment(
         task_id=task_id,
         kind=kind,
@@ -1339,20 +1594,21 @@ def agent_upload_artifact(
         # The original human behind the runner (starter, else creator — D3b), or NULL when the chain names none.
         uploaded_by_id=executor_user_id(session, task_id),
     )
-    _store_whole_file(session, artifact, content)
-    return AttachmentOut.model_validate(artifact)
+    where, key, subject_id = _stage_whole_file(session, artifact, content)
+    return where, key, subject_id, artifact
 
 
 @agent_router.post(
     "/{task_id}/artifacts/ticket", response_model=UploadTicketOut, status_code=201
 )
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def agent_artifact_ticket(
+    session: Session,
     task_id: int,
     request: Request,
     body: ArtifactTicketIn = Depends(_artifact_ticket_body),
     _: None = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> UploadTicketOut:
     """The runner's presigned door: declare the artifact, get a pending row and a URL to PUT it at
     (`apps/jaahd/session_sweep.py::put_object` sends the bytes; D4).
@@ -1387,18 +1643,18 @@ def agent_artifact_ticket(
     "/{task_id}/artifacts/{artifact_id}/confirm", response_model=AttachmentOut
 )
 @infra(Tenancy.ORG_SCOPED)
-def agent_confirm_artifact(
+async def agent_confirm_artifact(
+    db: DbDep,
     task_id: int,
     artifact_id: int,
     _: None = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> AttachmentOut:
     """The second half of `agent_artifact_ticket`: confirms the bytes landed and makes the row visible.
 
     `DOCUMENT_KINDS` only: an agent token may settle a runner's deliverable, never a human's pending
     input. The rest is `_complete_pending`."""
-    return _complete_pending(
-        session,
+    return await _complete_pending(
+        db,
         task_id=task_id,
         attachment_id=artifact_id,
         kinds=tuple(DOCUMENT_KINDS),

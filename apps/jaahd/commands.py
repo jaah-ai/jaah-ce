@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import subprocess
-from pathlib import Path
 from typing import Callable
 
 import clone_identity   # the delegated-op registry: a native git child must be admitted by the broker
@@ -27,10 +26,9 @@ from jaah_env import env_get
 import git_env   # `NO_REPO_CODE`: this seam pins repo-local code off on every git argv it runs
 import kill_gates as kill_gates_mod   # single home for a socket-correct tmux window kill
 import node_frame_auth   # single home for "is this CP->node frame authentic" (the cp_frame_proof check)
-import node_settings   # the CP's node tunables (`node_max_concurrent_commands`)
 from reconcile import tick_wire, accounts_probe, context, orchestrate  # the sensing pass, reused by the `reconcile` verb
 import session_user   # native git shell-outs run AS the session user (see _native_run)
-from worktree_mechanics import core, lifecycle   # in-process git-only retire/create mechanics
+from worktree_mechanics import core
 
 log = logging.getLogger("jaahd.commands")
 
@@ -45,7 +43,7 @@ NODE_TOKEN: str | None = None
 # Worktree-pool state-mutation verbs served natively. Account
 # selection is NOT here — the CP picks the account and hands it over on the `lease_slot` intent.
 MUTATION_COMMANDS = frozenset({
-    "release", "retire", "reconcile", "set_title", "create",
+    "release", "reconcile", "create",
 })
 
 # A little UNDER the CP's COMMAND_TIMEOUT (180s), so this daemon replies "failed" before the CP times out.
@@ -54,8 +52,7 @@ EXECUTE_TIMEOUT_SECONDS = 170.0
 _BUS_SCHEMA_VERSION = 1
 
 # Node-side occupancy policy — the NODE-side half of the double-guard (a node-bus command never
-# passes the CP's HTTP guard). Occupancy is `worktrees.state`;
-# slot 0 is structurally unleasable, so `is_main` off the roster is what `_retire` guards on.
+# passes the CP's HTTP guard). Occupancy is `worktrees.state`.
 # RELEASE IS DELIBERATELY UNGUARDED (owner decision: `worktrees:edit` carries no occupancy limit).
 
 # Command types the native execute path re-runs an occupancy check for. The CP's `delete_one_slot`
@@ -94,7 +91,7 @@ def _reply(status: str, result: dict | None = None) -> bytes:
 
 
 class _MutationRejected(Exception):
-    """A mutation verb's precondition failed (e.g. `retire` on the project's main clone).
+    """A mutation verb's precondition failed (e.g. an unresolvable roster).
     `_handle_mutation` catches it and replies `failed` — loudly, never silently."""
 
     def __init__(self, reason: str) -> None:
@@ -113,11 +110,6 @@ def _no_sensed_record_reason(project: str, number: str) -> str:
     )
 
 
-def _no_sensed_record(verb: str, project: str, number: str) -> dict:
-    """`_no_sensed_record_reason` as a loud verb reply."""
-    return {"status": "failed", "result": {"reason": f"{verb}: {_no_sensed_record_reason(project, number)}"}}
-
-
 # ── Native handler registry (strangler membrane) ───────────────────────────────────────────────────
 # `command_type` → in-process handler for a ported command family. APPEND-ONLY and self-registered:
 # a family lands by adding an import here, never by editing the `_on_message` routing ladder. A
@@ -130,6 +122,14 @@ NATIVE_HANDLERS: dict[str, NativeHandler] = {}
 # Command types handled by a DEDICATED `_on_message` branch before the registry `else`; a native
 # registration of one would be dead code, so `native_command` rejects it.
 _RESERVED_COMMAND_TYPES = MUTATION_COMMANDS
+
+
+def refused_reply(command_type: str, reason: str) -> dict:
+    """A native handler's refusal, as the console renders it: NON-ZERO exit AND the operator-facing sentence.
+
+    `_execute_native` maps `exit_code == 0` to `done`, so a refusal at 0 would ship as a green tick."""
+    log.info("%s: refused — %s", command_type, reason)
+    return {"exit_code": 1, "stdout": "", "stderr": reason, "reason": reason}
 
 
 def native_command(*command_types: str) -> Callable[[NativeHandler], NativeHandler]:
@@ -162,6 +162,7 @@ def native_command(*command_types: str) -> Callable[[NativeHandler], NativeHandl
 # `NATIVE_HANDLERS` / `_RESERVED_COMMAND_TYPES` are defined: each family module does `from commands
 # import native_command`, so an earlier import hits a half-initialized module.
 import accounts as accounts_mod  # noqa: E402,F401 — account_* family
+import restart_ops  # noqa: E402,F401 — node_restart (the console's hard restart, every edition)
 
 
 def _native_run(*argv, cwd=None, timeout: float | None = None, env=None) -> dict:
@@ -196,19 +197,12 @@ def _native_run(*argv, cwd=None, timeout: float | None = None, env=None) -> dict
                 "stderr": "session-user switch required but unavailable — refusing to run git as the "
                           "daemon uid; check jaah-runner@<node name>.service",
             }
-        # Registered as this daemon's own op, as `worktree_mechanics.core._run_git` does: delegation sheds
-        # the daemon's uid, and the broker would refuse the credential helper (`clone_identity`).
-        try:
-            with clone_identity.delegated_op(session_user.session_uid()) as registration:
-                return session_user.run_capped(
-                    list(argv), cwd=cwd, env=dict(env or {}), timeout=timeout, as_session_user=True,
-                    on_child_pid=registration.claim, failure_rc=core.SWITCH_UNAVAILABLE_RC,
-                )
-        except Exception as exc:  # noqa: BLE001 — the uid lookup or registration failed before the run
-            return {
-                "exit_code": core.SWITCH_UNAVAILABLE_RC, "stdout": "",
-                "stderr": f"session-user delegation failed: {exc}",
-            }
+        # Never admitted to the credential broker, as `worktree_mechanics.core._run_git`: no git on the session
+        # user's tmux channel is served a login (`clone_identity`).
+        return session_user.run_capped(
+            list(argv), cwd=cwd, env=dict(env or {}), timeout=timeout, as_session_user=True,
+            failure_rc=core.SWITCH_UNAVAILABLE_RC,
+        )
     if not (argv and argv[0] == "git"):
         return session_user.run_capped(list(argv), timeout=timeout, cwd=cwd, env=env)
     try:
@@ -240,7 +234,7 @@ def _native_failure_reason(result: dict) -> dict:
     return {}
 
 
-class CommandBridge:
+class CommandBridge(context.ReconcileLockHolder):
     """Executes each request handed to `deliver()` IN-PROCESS via its `NATIVE_HANDLERS`-registered
     handler, replying with the JSON result.
 
@@ -250,14 +244,12 @@ class CommandBridge:
     def __init__(
         self,
         node_id: str,
-        hub_root: Path,
         console_live_probe: Callable[[str, str], bool] | None = None,
         reconcile_lock: "asyncio.Lock | None" = None,
         account_probe_nudge: "Callable[[], None] | None" = None,
         agents_cache: "accounts_probe.AgentsProbeCache | None" = None,
     ) -> None:
         self._node_id = node_id
-        self._hub_root = hub_root
         # Forwarded into every ReconcileContext this bridge builds so the DONE-close gate's
         # console-liveness check works on this path too, not just the idle-tick loop's.
         self._console_live_probe = console_live_probe
@@ -279,35 +271,8 @@ class CommandBridge:
         self._background: set[asyncio.Task] = set()
         # Per-message dispatch bookkeeping: the read loop calls `deliver` inline, so a tracked task per
         # command is spawned rather than awaiting the handler there. `_inflight` lets `stop()`
-        # cancel/drain outstanding handlers; `_dispatch_sem` (`_dispatch_bound`) bounds concurrent handling.
+        # cancel/drain outstanding handlers. No count of concurrent commands is bounded here.
         self._inflight: set[asyncio.Task] = set()
-        self._dispatch_sem: asyncio.Semaphore | None = None
-        self._dispatch_limit = 0
-
-    def _serialization_lock(self) -> "asyncio.Lock":
-        """The shared reconcile-serialization lock, created lazily on first use so it binds to the
-        running event loop. `main._serve` injects one shared with the idle-tick publisher."""
-        if self._reconcile_lock is None:
-            self._reconcile_lock = context.new_reconcile_lock()
-        return self._reconcile_lock
-
-    def _dispatch_bound(self) -> asyncio.Semaphore:
-        """The upper bound on commands this bridge handles CONCURRENTLY, so a flood of slow provisioning
-        subprocesses cannot exhaust host resources; excess queues here, never on the message loop.
-
-        `node_max_concurrent_commands` (`node_settings`), read per command: a changed value builds a fresh
-        semaphore, and commands already holding or queued on the old one finish there, so for one drain
-        the two bounds overlap."""
-        limit = node_settings.get("node_max_concurrent_commands")
-        if self._dispatch_sem is None or limit != self._dispatch_limit:
-            self._dispatch_sem = asyncio.Semaphore(limit)
-            self._dispatch_limit = limit
-        return self._dispatch_sem
-
-    async def start(self) -> None:
-        """Bind the concurrency bound inside the running loop, not `__init__`. Optional: each command binds
-        it too."""
-        self._dispatch_bound()
 
     async def stop(self) -> None:
         # Cancel + drain any command handlers still in flight so a teardown never leaks a running task
@@ -332,22 +297,18 @@ class CommandBridge:
         task.add_done_callback(self._inflight.discard)
 
     async def _serve_one(self, msg) -> None:
-        """Handle one command under the concurrency bound. The semaphore is acquired HERE, inside the
-        task rather than in `deliver`, so an exhausted bound queues the excess without blocking the
-        message loop. A handler fault is caught so it neither sinks silently as an unretrieved task
-        exception nor leaves the requester hanging to its client timeout."""
-        # Resolved here, not in `deliver`: a WS frame can arrive before `start()` on a NATS-less daemon.
-        async with self._dispatch_bound():
+        """Handle one command. A handler fault is caught so it neither sinks silently as an unretrieved
+        task exception nor leaves the requester hanging to its client timeout."""
+        try:
+            await self._on_message(msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — reply "failed" so the requester never hangs
+            log.exception("command dispatch crashed: %s", exc)
             try:
-                await self._on_message(msg)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 — reply "failed" so the requester never hangs
-                log.exception("command dispatch crashed: %s", exc)
-                try:
-                    await msg.respond(_reply("failed", {"reason": f"internal error: {exc}"}))
-                except Exception:
-                    pass
+                await msg.respond(_reply("failed", {"reason": f"internal error: {exc}"}))
+            except Exception:
+                pass
 
     async def _on_message(self, msg) -> None:
         try:
@@ -398,7 +359,7 @@ class CommandBridge:
         "already in progress"; failures are logged, not raised. Outside a running loop it logs and skips."""
         if out.get("status") != "done":
             return
-        if command_type.startswith("stack_") or command_type in ("sync_develop", "rename_tmux"):
+        if command_type.startswith("stack_"):
             proj = args.get("project")
             num = args.get("number")
             if proj is None or num is None:
@@ -475,45 +436,6 @@ class CommandBridge:
             log.warning("sensed-record read failed for %s #%s: %s", project, number, exc)
             return None
 
-    async def _roster_pool(
-        self, project: str,
-    ) -> "tuple[worktree_mechanics_mod.PoolConfig, dict[int, dict[str, int]], tuple[int, int] | None]":
-        """This project's pool config, the CP's decided port band per slot, AND the operator's tier-2 auto
-        range — from ONE roster read, the one configuration source. Raises rather than return a
-        partial config.
-
-        The band and auto range ride the same tick: a copy on `args`, or a daemon default, would
-        give one decision two answers. `None` auto range = keep the documented default. A slot the roster
-        does not name has no band, which `apply_port_band` refuses. NOT cached: a stale roster would
-        let `create` pick a slot the CP no longer declares."""
-        tick = await tick_wire.fetch_pool_tick(self._node_id)
-        if not tick.ok:
-            raise RuntimeError(
-                "the CP pool-tick roster is unavailable, and it is the only pool-config source (R4) — "
-                "refusing to act on unverified pool configuration"
-            )
-        roster_project = tick.projects.get(project)
-        if roster_project is None:
-            raise RuntimeError(
-                f"project {project!r} is not in this node's CP pool roster "
-                f"(roster has: {', '.join(sorted(tick.projects)) or 'nothing'})"
-            )
-        bands: dict[int, dict[str, int]] = {}
-        for slot in tick.slots:
-            if slot.project != project:
-                continue
-            try:
-                bands[int(slot.number)] = dict(slot.ports)
-            except (TypeError, ValueError):
-                # Never key a band under a guessed number.
-                continue
-        return roster_project.pool_config(), bands, tick.auto_ports
-
-    async def _roster_pool_config(self, project: str) -> "worktree_mechanics_mod.PoolConfig":
-        """`_roster_pool`'s config half, for the verbs that touch no ports (retire/release)."""
-        config, _bands, _auto_ports = await self._roster_pool(project)
-        return config
-
     async def _worktree_live_session(self, project, number) -> str | None:
         """Real-time live-session guard for a slot's worktree — the backstop against a reap killing a
         LIVE runner. A FRESH `claude agents` probe, never the per-pass cache.
@@ -560,9 +482,7 @@ class CommandBridge:
     async def _handle_mutation(self, command_type: str, args: dict) -> dict:
         handlers = {
             "release": self._release,
-            "retire": self._retire,
             "reconcile": self._reconcile,
-            "set_title": self._set_title,
             "create": self._create,
         }
         handler = handlers[command_type]   # in MUTATION_COMMANDS by the _on_message guard
@@ -619,44 +539,6 @@ class CommandBridge:
                 return slot
         return None
 
-    async def _set_title(self, args: dict) -> dict:
-        """Set a slot's STICKY title. The title is user INTENT, not observed state, so it is written
-        DIRECTLY and never captured by reconcile from a live window. An empty/omitted title is a
-        deliberate "reset to default", stored as `null`.
-
-        No roster read: `mutated == 0` on the write itself says the slot does not exist."""
-        project = args.get("project")
-        number = args.get("number")
-        if not project or number is None:
-            return {"status": "failed", "result": {"reason": "set_title needs project + number"}}
-        title = args.get("title") or ""   # empty ⇒ clear the override to null
-
-        try:
-            response = await asyncio.to_thread(
-                control_plane_api.set_slot_holder,
-                self._node_id or "", str(project), number, title=title,
-                project_id=args.get("project_id"),
-            )
-        except Exception as exc:  # noqa: BLE001 — a title nobody recorded must be reported, never assumed
-            return {"status": "failed", "result": {"reason": (
-                f"the control-plane API refused/could not record title for {project} #{number} "
-                f"({type(exc).__name__}: {exc}) — nothing was changed"
-            )}}
-        # No row touched: a FAILED verb, or the next `rename_tmux` renames a live window to a title no row
-        # carries.
-        if isinstance(response, dict) and response.get("mutated") == 0:
-            return _no_sensed_record("set_title", str(project), str(number))
-        # A dropped title is a FAILED verb (safety): the CP answers 200 with `title_rejected`, but the
-        # names it refuses are the ones `console.py` resolves windows BY — a swallowed 200 lets the next
-        # `rename_tmux` + Console open spawn a SECOND agent into an occupied worktree.
-        rejected = (response or {}).get("title_rejected") if isinstance(response, dict) else None
-        if rejected:
-            return {"status": "failed", "result": {"reason": (
-                f"the control plane refused the title for {project} #{number}: {rejected} — nothing was "
-                f"changed, and the live tmux window was NOT renamed"
-            )}}
-        return {"status": "done", "result": {"project": project, "number": number, "title": title or None}}
-
     async def _release(self, args: dict) -> dict:
         """Tear down the slot's live session, best-effort killing the tmux window by the slot's persisted
         `tmux_target` — never a bare kill. NO git reset/clean, NO detach, NO parking: the next lease resets.
@@ -705,67 +587,11 @@ class CommandBridge:
 
         # The tree stays on its branch. Detaching here was a deadlock: a slot belongs to its task, the
         # task returns to THIS slot, and `fleet_decide` refuses a slot whose tree reports another branch.
-        # The next lease's `reset_to_base` handles a stale checkout.
+        # The next lease's refresh (`slot_clone.prepare`) handles a stale checkout.
 
         # No `holder` in the result: the node does not decide occupancy. `ctl.py::_mutate` reads only
         # `status`/`reason`/`path`.
         return {"status": "done", "result": {"project": project, "number": number, "released": True}}
-
-    async def _retire(self, args: dict) -> dict:
-        """Retire a RESOLVED fleet slot: `worktree_mechanics.lifecycle.retire_mechanics` refuses a
-        non-`fleet/(issue|task)-N` branch and detaches the tree to a fresh `origin/<base>`, leaving the
-        branch ref recoverable. Live-session guarded exactly like `_release`, with NO `--force` escape
-        hatch, and the main clone refused outright.
-
-        Like `_release`, it does not end the hold. The order below keeps the destructive step behind every
-        refusal; a mechanics failure leaves the tree untouched and reports `failed`."""
-        project = args.get("project")
-        number = args.get("number")
-        if not project or number is None:
-            return {"status": "failed", "result": {"reason": "retire needs project + number"}}
-
-        # Refuse the main clone categorically, before the mechanics: slot 0's tree is the project's main
-        # clone directory. `is_main` (the roster's attribute), not `number == 0`; an unavailable roster
-        # RAISES. A slot the roster lacks is not refused here — the probe and `ResetRefused` cover it.
-        try:
-            slot = await self._roster_slot(project, number)
-            if slot is not None and slot.is_main:
-                raise _MutationRejected(
-                    f"{project} #{number} is the project's MAIN CLONE — retire detaches the slot's tree "
-                    f"to a fresh origin/<base>, and doing that to the main clone is never what a retire "
-                    f"means"
-                )
-        except _MutationRejected as exc:
-            return {"status": "failed", "result": {"reason": exc.reason}}
-        # The SAME real-time probe `_release` uses, fail-closed on an unknown result: a retire
-        # must never reap a live runner's tree.
-        live_sid = await self._worktree_live_session(project, number)
-        if live_sid:
-            return {"status": "rejected", "result": {"reason": (
-                f"{project} #{number} has a LIVE session ({live_sid}) in its worktree — retire would kill "
-                "it; a resolved-slot retire is only ever for a slot whose issue is already CLOSED and idle"
-            )}}
-
-        # A `ResetRefused` must leave the slot intact.
-        try:
-            config = await self._roster_pool_config(str(project))
-        except Exception as exc:  # noqa: BLE001 — an unresolvable roster config is a loud retire failure
-            return {"status": "failed",
-                    "result": {"reason": f"retire: could not resolve pool config for {project!r}: {exc}"}}
-
-        try:
-            await asyncio.to_thread(lifecycle.retire_mechanics, config, number)
-        except core.ResetRefused as exc:
-            return {"status": "failed", "result": {"reason": str(exc)}}
-        except Exception as exc:  # noqa: BLE001 — any other mechanics fault is a loud per-task failure
-            return {"status": "failed", "result": {"reason": f"retire-mechanics failed: {exc}"}}
-
-        # The hold is the CP's; only the best-effort `last_used` stamp remains.
-        await self._stamp_last_used(project, number, args.get("project_id"))
-
-        return {"status": "done", "result": {
-            "project": project, "number": number, "retired": True,
-        }}
 
     async def _reconcile(self, args: dict) -> dict:
         """Serialize against the idle-tick projection (and any overlapping `reconcile`), then reconcile.
@@ -820,12 +646,7 @@ class CommandBridge:
                 return {"status": "failed", "result": {"reason": (
                     f"slot {project} #{number} is not in this node's CP pool roster"
                 )}}
-            # A fresh ctx has an empty `fetched` memo; without the age every call forks `git fetch`.
-            project_cfg = tick.projects.get(slot.project)
-            observation = await orchestrate.reconcile_slot(
-                slot, ctx,
-                fetch_stamp_age_secs=project_cfg.fetch_stamp_age_secs if project_cfg else None,
-            )
+            observation = await orchestrate.reconcile_slot(slot, ctx)
             if observation is None:
                 return {"status": "failed", "result": {
                     "reason": f"worktree {slot.project} #{slot.number} does not exist on disk"}}
@@ -839,68 +660,13 @@ class CommandBridge:
         return {"status": "done", "result": {"posted": True}}
 
     async def _create(self, args: dict) -> dict:
-        """Materialize a DECLARED-but-unbuilt worktree slot — `worktree_mechanics.lifecycle.create_mechanics` does
-        the git work ONLY and the daemon writes none of the record it returns (never the user-facing
-        `create` verb, which forwards HERE — recursion).
-
-        Busy slots from the roster are passed as `exclude`. `number` names a declared row, not an
-        allocation. Bands are a per-slot map because with no number the slot is chosen inside
-        `create_mechanics`."""
+        """`create` builds nothing: a repository slot is cloned at its lease (`lifecycle.claim_mechanics`) and a
+        folder slot is made there too, so there is no declared-but-unbuilt tree to materialise ahead of one."""
         project = args.get("project")
         if not project:
             return {"status": "failed", "result": {"reason": "create needs project"}}
-
-        exclude = await self._held_slots(str(project))
-
-        # The roster's declared rows bound `create_mechanics`' scan.
-        try:
-            config, bands, auto_ports = await self._roster_pool(str(project))
-        except Exception as exc:  # noqa: BLE001 — an unresolvable roster config is a loud create failure
-            return {"status": "failed",
-                    "result": {"reason": f"create: could not resolve pool config for {project!r}: {exc}"}}
-
-        def _mechanics() -> dict:
-            return lifecycle.create_mechanics(
-                config, number=args.get("number"), exclude=exclude, node_id=self._node_id,
-                bands=bands,
-                # The operator's tier-2 range, off the same tick as the bands.
-                auto_ports=auto_ports,
-            )
-
-        try:
-            record = await asyncio.to_thread(_mechanics)
-        except core.ResetRefused as exc:
-            # Pool-full or git failure — loud.
-            return {"status": "failed", "result": {"reason": str(exc)}}
-        except Exception as exc:  # noqa: BLE001 — any other mechanics fault is a loud per-task failure
-            return {"status": "failed", "result": {"reason": f"create-mechanics failed: {exc}"}}
-
-        number = record.pop("number", None)
-        if number is None:
-            return {"status": "failed", "result": {"reason": "create-mechanics record missing 'number'"}}
-        number = str(number)
-
-        # No write: slot EXISTENCE has one author, the sensor; a create-minted `path`-less row once wedged
-        # a slot number permanently.
-        return {"status": "done", "result": {
-            "project": project, "number": number, "path": record.get("path"),
-        }}
-
-    async def _held_slots(self, project: str) -> list[str]:
-        """Slot numbers for `project` the CP says something is IN — the set `create_mechanics` is told to
-        skip. `OCCUPIED_SLOT_STATES`, a positive test, not `!= "free"`: an undescribed slot's `""` must
-        not read as busy. An unfetchable roster RAISES — 'nothing busy' from a blind read double-leases."""
-        tick = await tick_wire.fetch_pool_tick(self._node_id)
-        if not tick.ok:
-            raise RuntimeError(
-                f"held-slot scan for {project!r}: the CP pool-tick roster is UNAVAILABLE, and it is the "
-                "only source for a slot's occupancy — refusing to report 'nothing busy' from a blind "
-                "read, which would double-lease a live slot"
-            )
-        return [
-            slot.number for slot in tick.slots
-            if slot.project == project and slot.state in OCCUPIED_SLOT_STATES
-        ]
+        return {"status": "failed", "result": {"reason": (
+            f"create: nothing to build for {project!r} — a slot's tree is made at its first lease")}}
 
     async def _kill_window(self, target: str, expect_cwd: str = "") -> None:
         """Best-effort teardown of a released slot's tmux window; never fails a release. `expect_cwd`
@@ -937,9 +703,8 @@ class CommandBridge:
 
         Reads `worktrees.state`; see `GUARDED_COMMAND_TYPES` for why the CP's own Delete passes.
 
-        FAIL-OPEN so a CP blip cannot block every operator command — unlike `_retire`/`_held_slots`, which
-        fail CLOSED because guessing wrong there destroys a live runner's work; this only re-checks a
-        decision the CP already made."""
+        FAIL-OPEN so a CP blip cannot block every operator command: this only re-checks a decision the CP
+        already made."""
         if command_type not in GUARDED_COMMAND_TYPES:
             return None
         project = args.get("project")
@@ -963,7 +728,7 @@ class CommandBridge:
 # Side-effect imports (registration), LAST so `from commands import native_command` resolves against a
 # fully-defined module. A family lands by ADDING a line here.
 import stack_ops as _stack_ops  # noqa: E402,F401 — registers stack_up/down/restart/rebuild
-import worktree_ops as _worktree_ops  # noqa: E402,F401 — registers rename_tmux/logs/sync_develop/open_finder/open_cursor/run/dispatch/check + worktree_erase
+import worktree_ops as _worktree_ops  # noqa: E402,F401 — registers logs/open_finder/open_cursor/run/dispatch + worktree_erase
 import fleet_windows as _fleet_windows  # noqa: E402,F401 — registers fleet_windows (a READ, never a MUTATION_COMMANDS member)
 import bedrock_close as _bedrock_close  # noqa: E402,F401 — registers jaah.close_session (K10, end a Jaah session's panes)
 import nodevault_commands as _nodevault_commands  # noqa: E402,F401 — registers the six nodevault.* verbs (§4.3)

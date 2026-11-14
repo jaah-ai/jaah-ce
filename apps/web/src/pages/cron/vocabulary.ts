@@ -6,36 +6,26 @@
  */
 
 import type { CronRun } from './api'
-import { NO_VALUE } from '../../lib/relativeTime'
-import { formatSpanBetween } from '../../lib/spanTime'
-import type { Tone } from '../../ui/StatusChip'
+import { formatSpanBetween, NO_VALUE } from '../../lib/relativeTime'
+import type { Presentation } from '../../ui/statusTone'
 
-/** Unknown tokens render as themselves in a `neutral` pill (the `ui/statusTone.ts` contract). `missed` is a
- *  failure (the scheduler never delivered it), toned as the Automations list's failing last run, never as a
- *  by-design skip. */
-export const OUTCOME_TONE: Record<string, Tone> = {
-  acted: 'success',
-  noop: 'neutral',
-  skipped: 'warning',
-  missed: 'error',
-  error: 'error',
-}
-
-/** The outcome's SHAPE on a feed row's state disc, beside `OUTCOME_TONE`: distinct at 11px, and `skipped`
- *  must not look like `noop`. Open on the wire, so an unknown outcome is `?`, never a throw. */
-export const OUTCOME_GLYPH: Record<string, string> = {
-  acted: '✓',
-  noop: '○',
-  skipped: '⊘',
-  missed: '!',
-  error: '✕',
+/** An outcome's word (said as an outcome, not a state name), its tone, and its SHAPE on a feed row's state disc
+ *  (distinct at 11px: `skipped` must not look like `noop`). Unknown tokens render as themselves in a `neutral`
+ *  pill with a `?` glyph (the `ui/statusTone.ts` contract), never a throw. `missed` is a failure (the scheduler
+ *  never delivered it), toned as the Automations list's failing last run, never as a by-design skip. */
+export const OUTCOME: Record<string, Presentation> = {
+  acted: { label: 'Acted', tone: 'success', glyph: '✓' },
+  noop: { label: 'Nothing to do', tone: 'neutral', glyph: '○' },
+  skipped: { label: 'Skipped', tone: 'warning', glyph: '⊘' },
+  missed: { label: 'Missed', tone: 'error', glyph: '!' },
+  error: { label: 'Failed', tone: 'error', glyph: '✕' },
 }
 
 /* HOW MUCH OF THE LEDGER A CRON KEEPS — `app/crons.py::RETENTION_MODES`, in words. No token means its bare
  * word: `none` still keeps every error and every unchosen skip (`ALWAYS_RECORDED_SKIP_REASONS`), `acted`
- * keeps missed rows too. `help` shows under the picker.
+ * keeps missed rows too. `help` is the mode's line in Keep logs' pop-up.
  * Named `..._OPTIONS`, not `RETENTION_MODES`: that name is the server's closed token set, a different shape.
- * All three reads (label, help, known?) live here, not at call sites. */
+ * Both reads (label, known?) live here, not at call sites. */
 
 /* The tokens, mirroring `app/crons.py`'s `RETENTION_NONE`/`RETENTION_ACTED`/`RETENTION_ALL` — named because
  * the Runs tab branches on them. */
@@ -56,23 +46,18 @@ export const RETENTION_MODE_OPTIONS: readonly { value: string; label: string; he
   {
     value: RETENTION_ACTED,
     label: 'When it acted',
-    help: 'Skips firings that found no work.',
+    help: 'Logs firings that did work, plus missed ones.',
   },
   {
     value: RETENTION_NONE,
     label: 'Errors only',
-    help: 'Only failures and unexpected skips.',
+    help: 'Logs only failures and unexpected skips.',
   },
 ]
 
 /** The picked mode's label, or the raw token for a mode this build has never heard of. */
 export function retentionLabel(mode: string): string {
   return RETENTION_MODE_OPTIONS.find(m => m.value === mode)?.label ?? mode
-}
-
-/** `undefined` for an unrecognised mode — nothing honest to say. */
-export function retentionHelp(mode: string): string | undefined {
-  return RETENTION_MODE_OPTIONS.find(m => m.value === mode)?.help
 }
 
 /** `false` makes the page add the stored token as an extra option, instead of a select silently showing the first. */
@@ -89,15 +74,6 @@ export function isKnownRetentionMode(mode: string): boolean {
  * `repr`), so it rides `note`. `missed` takes no clause at all (`OUTCOME_EXPLANATION`).
  */
 
-/** The leading word — the outcome, said as an outcome rather than as a state name. */
-const OUTCOME_WORD: Record<string, string> = {
-  acted: 'Acted',
-  noop: 'Nothing to do',
-  skipped: 'Skipped',
-  missed: 'Missed',
-  error: 'Failed',
-}
-
 /** The clause for a skip whose runtime detail is missing, keyed on the marker
  *  (`app/crons.py::SKIP_REASONS`). */
 const SKIP_CLAUSE: Record<string, string> = {
@@ -105,6 +81,7 @@ const SKIP_CLAUSE: Record<string, string> = {
   previous_task_open: 'the work the last firing created is still open',
   disabled: 'the cron was switched off when this firing came due',
   below_min_period: "the schedule is faster than the minimum period",
+  credential_rotating: 'the database password was being rotated',
 }
 
 /** A skip reason in words: its clause, or the token itself in words a reader can still place. Shared by the sentence
@@ -169,7 +146,7 @@ export type RunReading = {
 /** `run` in words, by the source order above. Typed on the three deciding fields, so the Automations Runs tab
  *  reads its skips through it too. */
 export function readRun(run: Pick<CronRun, 'outcome' | 'detail' | 'skip_reason'>): RunReading {
-  const word = OUTCOME_WORD[run.outcome] ?? run.outcome
+  const word = OUTCOME[run.outcome]?.label ?? run.outcome
   /* THE HEADLINE, NOT THE WHOLE DETAIL (see `splitDetail`). */
   const { headline: detail, moreLines } = splitDetail(run.detail)
 

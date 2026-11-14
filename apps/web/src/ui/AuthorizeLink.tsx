@@ -2,7 +2,8 @@ import { useState, type JSX } from 'react'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import { CopyButton } from './CopyButton'
-import CopyableValue from './CopyableValue'
+import { CopyableValue } from './CopyableValue'
+import { FONT_SIZE, grid } from '../theme'
 
 /* One authorization URL offered three ways: a button, `user-select: all` text, and a Copy button. A
  * popup blocker can swallow `target=_blank`, and the Clipboard API is refused in insecure contexts, so no
@@ -52,7 +53,7 @@ export function AuthorizeLink({
       <CopyableValue
         value={url}
         copyLabel="Copy link"
-        sx={{ flex: '1 1 12rem', fontSize: '0.75rem', wordBreak: 'break-all' }}
+        sx={{ flexGrow: 1, flexShrink: 1, flexBasis: grid(32), fontSize: FONT_SIZE.sm, wordBreak: 'break-all' }}
       />
     </Box>
   )

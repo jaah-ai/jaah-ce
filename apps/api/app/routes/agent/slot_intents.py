@@ -1,4 +1,4 @@
-"""Slot intents and holds reported by the node: intent ack, launch claim, slot holder and user-session end."""
+"""Slot intents and holds reported by the node: intent ack, launch claim and slot holder."""
 from __future__ import annotations
 
 import logging
@@ -8,28 +8,30 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import Float, bindparam, func, select, text
+from sqlalchemy import Float, bindparam, func, select, text, update
 from sqlalchemy.orm import Session
 
 from app import (
+    actors,
     agent_providers,
-    edition_features,
     entity_shape,
     fleet_observe,
     fleet_verdicts,
+    live_task_edits,
     node_capacity,
     node_credentials,
     project_identity,
+    runner_terminations,
     slot_destroy,
     slot_mutate,
     slot_state,
-    slot_teardown,
     slot_title,
 )
+from app.clock import utcnow
 # routes need one for a user who is NOT the caller (they carry no session cookie, only the node token).
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
-from app.db import get_session
+from app.db_async import DbDep, on_session, release, run_blocking_in_session
 from app.events import emit_console_event
 from app.node_clone import account_slug_from_dir
 from app.node_identity import node_ref, resolve_node_id
@@ -37,11 +39,18 @@ from app.models.tasks import Task
 from app.models.worktrees import SlotIntent, Worktree
 # Task transitions go through the watermark-gated helpers; the state machine single-homes in routes/tasks/.
 from app.routes.tasks import checkout_gate
-from app.routes.tasks.awaiting import await_response_on_wedged_dispatch, resume_dispatched_task_on_answer
+from app.routes.tasks.awaiting import (
+    await_response_on_wedged_dispatch,
+    rearm_undelivered_answer,
+    resume_dispatched_task_on_answer,
+)
+from app.routes.tasks.runner_settle import end_attempt
+from app.task_lifecycle import ACTIVE, AWAITING_RESPONSE, READY
 from app.user_activity import record_task_note
 from app.entity_shape import get_or_404
 from app.routes.agent.auth import _check_token, _wire_project, caller_node_ref
-from app.routes.agent.pool_tick import NODE_AUTHORED_OUTCOMES, SLOT_INTENT_RETIRING_OUTCOMES
+from app.fleet_verdicts import SLOT_INTENT_RETIRING_OUTCOMES
+from app.routes.agent.pool_tick import NODE_AUTHORED_OUTCOMES
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 log = logging.getLogger("agent-routes")
@@ -80,13 +89,13 @@ class SlotIntentAckOut(BaseModel):
     launch_recorded: bool = False
 
 
-# Identifies a gate-3 (unpushed-commits) refusal in the node's text
-# (`worktree_mechanics.reset.reset_to_base`). Fragile, but a miss only offers fewer options.
+# Identifies an older node's gate-3 (unpushed-commits) reset refusal in its text; a current node never sends
+# one. Fragile, but a miss only offers fewer options.
 _UNPUSHED_REFUSAL_MARKER = "absent from every origin ref"
 
 
 # Identifies a refusal that is contention, not a fault: another project's network git op held the node's one
-# credential-declaration lock past its wait (`worktree_mechanics.core._refresh_mirror`'s "clone-busy: "). A first clone
+# credential-declaration lock past its wait (an older node's mirror refresh, "clone-busy: "). A first clone
 # of a large repository holds it for minutes, so sibling claims refused this way are never charged to the park
 # budget; they back off once and retry. A miss only charges contention like a fault, as before.
 # Anchored: the marker opens the node's text, after at most its own fixed lead-in ("claim mechanics refused: "),
@@ -101,15 +110,17 @@ def _is_clone_busy(detail: Optional[str]) -> bool:
 def _is_uncharged(detail: Optional[str]) -> bool:
     """Contention for the clone lock, or a node at its session cap (`app/node_capacity.py`): a wait, never a
     fault, so neither spends the park budget nor notes a refused dispatch."""
-    return _is_clone_busy(detail) or node_capacity.is_capacity_wait(detail)
+    return _is_clone_busy(detail) or node_capacity.is_capacity_wait(detail) or (detail or "").startswith(
+        fleet_verdicts.RUNNER_BUSY_PREFIX)
 
 
 def _may_park(row: SlotIntent) -> bool:
     """May a spent retry budget retire this intent, or must the row stay pending and keep trying?
 
-    Parking suits verbs the CP re-plans. `deliver_answer` is never re-minted, so parking would strand the
-    Task in `awaiting_response` with an answered question; its refusals are transient sensing, and the
-    terminal case is `refused_stale` (arm 3 of `fleet_verdicts.purge_unexecutable_intents`). Unparked rows
+    Parking suits verbs the CP re-plans. A `deliver_answer` is re-minted only once retired (the sweep re-sends
+    the rounds `awaiting.rearm_undelivered_answer` re-arms), so it keeps trying until its age bound; its refusals
+    are transient sensing, and the terminal case is `refused_stale` (arm 3 of
+    `fleet_verdicts.purge_unexecutable_intents`). Unparked rows
     keep capped backoff, bounded at `UNEXECUTABLE_INTENT_MAX_AGE_SECS`, enforced here too since the purge
     and the budget run on different clocks. Both measure off `created_at`; an un-timestamped row parks on
     the plain budget.
@@ -123,7 +134,7 @@ def _may_park(row: SlotIntent) -> bool:
     # skew the age by the host's offset.
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
-    age_secs = (datetime.now(timezone.utc) - created).total_seconds()
+    age_secs = (utcnow() - created).total_seconds()
     return age_secs >= fleet_verdicts.UNEXECUTABLE_INTENT_MAX_AGE_SECS
 
 
@@ -232,6 +243,11 @@ def _note_dispatch_refusal(session: Session, row: SlotIntent, outcome: str) -> N
             # Inside the savepoint: its read and its payload casts must not cost the ack either.
             if _refused_dispatch_is_dead(session, row, payload, task_id):
                 return
+            if headline and checkout_gate.is_clone_refusal(row.reason):
+                # Whose login the clone used (the starter's): reads, so inside the savepoint too.
+                task = session.scalars(select(Task).where(Task.id == int(task_id))).first()
+                worded = checkout_gate.clone_refusal_sentence(session, task, row.reason) if task is not None else ""
+                cause = f"{worded} " if worded else cause
             record_task_note(
                 session, task_id, "dispatch_refused",
                 f"A dispatch onto {whose} was refused by the node, so this task did not start on it. "
@@ -330,6 +346,12 @@ def _park_task_on_wedged_intent(session: Session, row: SlotIntent, reason: str) 
             row.id, row.refusals, label, reason,
         )
         return
+    task = session.scalars(select(Task).where(Task.id == int(task_id))).first()
+    if checkout_gate.ends_on_refusal(task):
+        landed = _end_unwatched_run(session, int(task_id), row.reason or reason, row.node_id)
+        log.warning("slot-intent %s: PARKED after %d identical refusals on %s — %s. Task %s is a control-plane "
+                    "run nobody watches: ended -> %s, no question", row.id, row.refusals, label, reason, task_id, landed)
+        return
     if _UNPUSHED_REFUSAL_MARKER not in reason and checkout_gate.is_checkout_refusal(row.reason):
         # The node's own words (`row.reason`), not `reason`'s summary: the round names the cause itself.
         raised = checkout_gate.raise_round(session, int(task_id), row.project_id, row.reason or "", row.refusals or 0)
@@ -367,6 +389,86 @@ def _park_task_on_wedged_intent(session: Session, row: SlotIntent, reason: str) 
     )
 
 
+def _end_attempt_on_clone_refusal(session: Session, row: SlotIntent, detail: Optional[str],
+                                  node_id: Any) -> Optional[str]:
+    """End the attempt of the task whose `lease_slot` clone the node refused (`OUTCOME_CLONE_REFUSED`). Returns
+    the landed state, or None when the task was no longer live. Commits. A starter whose login cannot see the
+    repository is asked instead (`checkout_gate.access_question`): the task parks `awaiting_response` on that round.
+
+    The ack lands before the runner exists, so the task is still `ready`: the runner's own claim is the
+    `ready → active` edge that counts an attempt (`routes/tasks/dispatch.py::_active_dispatch_values`). The
+    attempt is counted here first, as `runner_settle.charge_unrunnable_agent` does for a launch that never
+    reaches a runner, else a refused clone would re-dispatch forever without spending budget. `active` stays a
+    source (counted already, so the increment skips it). The hold is `end_attempt`'s to handle."""
+    payload = row.payload if isinstance(row.payload, dict) else {}
+    task_id = payload.get("task_id")
+    if task_id is None:
+        return None
+    said = fleet_verdicts.redact_node_detail(detail) or "the node refused the clone and gave no reason"
+    # What a person reads on the failed task: whose login could not see what, and the fix (`clone_refusal_sentence`);
+    # the node's own words stay on the note's `detail`.
+    task = session.scalars(select(Task).where(Task.id == int(task_id))).first()
+    if checkout_gate.ends_on_refusal(task):
+        return _end_unwatched_run(session, int(task_id), detail, node_id)
+    # A starter whose login cannot see the repository is asked "Start anyway?" instead: no retry changes it.
+    if checkout_gate.access_question(session, task, detail) and checkout_gate.raise_round(
+            session, int(task_id), row.project_id, detail or "", 1):
+        return AWAITING_RESPONSE
+    worded = (checkout_gate.clone_refusal_sentence(session, task, detail) if task is not None else "") or said
+    session.execute(
+        update(Task).where(Task.id == int(task_id), Task.state == READY)
+        .values(dispatch_attempts=Task.dispatch_attempts + 1, **actors.task_actor_values(session))
+    )
+    landed = end_attempt(int(task_id), session, reason=worded, sources=(READY, ACTIVE),
+                         cause=runner_terminations.CAUSE_CLONE_FAILED,
+                         node=str(node_id) if node_id is not None else None, note_detail=said)
+    if landed is None:
+        session.rollback()
+    elif landed == READY:
+        _leave_refusing_node(session, int(task_id), row)
+    return landed
+
+
+def _end_unwatched_run(session: Session, task_id: int, detail: Optional[str], node_id: Any) -> Optional[str]:
+    """End a control-plane run (`checkout_gate.ends_on_refusal`) whose clone or checkout the node refused: straight to
+    `system_failed`, no question and no retry, so it holds no slot (the drain releases a terminal task's) and keeps
+    nothing waiting on it — the next release or lane pass files a fresh run. Any refusal ends it, a transient one too,
+    and so does a parked unpushed-commits refusal: nobody would answer either. Commits; the landed state, or None."""
+    said = fleet_verdicts.redact_node_detail(detail) or "the node refused the clone and gave no reason"
+    task = session.scalars(select(Task).where(Task.id == task_id)).first()
+    # `parked`: worded for a run nothing retries ("Retry once …", never "retrying"); a checkout refusal by `headline`.
+    worded = (checkout_gate.clone_refusal_sentence(session, task, detail, parked=True) if task is not None else "") \
+        or checkout_gate.headline(detail) or said
+    landed = end_attempt(task_id, session, reason=worded, final=True, sources=(READY, ACTIVE),
+                         cause=runner_terminations.CAUSE_CLONE_FAILED if checkout_gate.is_clone_refusal(detail) else None,
+                         node=str(node_id) if node_id is not None else None, note_detail=said)
+    if landed is None:
+        session.rollback()
+    return landed
+
+
+def _leave_refusing_node(session: Session, task_id: int, row: SlotIntent) -> None:
+    """Free a `ready` task's never-cloned slot on the node that refused its clone, so the next pass places it afresh
+    and placement leaves that node out (`launch_failures`, the `clone_failed` note `end_attempt` just wrote). A slot
+    kept there was re-offered to the same node only, and a node whose clone fails for its own reasons (the same login
+    cloned at once on another) stranded the task for hours. Nothing is lost: the clone never landed. Commits.
+
+    Only while the task's one hold is still the refused slot: `end_attempt` committed `ready` first, so a drain pass
+    may already have moved it, and a fresh slot elsewhere must never be wiped."""
+    from app.routes.tasks.slots import _release_task_slots, abandon_task_slots, send_minted_intents  # noqa: PLC0415
+
+    holds = session.execute(select(Worktree.node_id, Worktree.number).where(
+        Worktree.task_id == task_id, Worktree.state == slot_state.TASK)).all()
+    if [(h.node_id, h.number) for h in holds] != [(row.node_id, row.number)]:
+        return
+    reason = f"task {task_id}'s clone was refused on node {row.node_id}; it moves to another node"
+    _, issued = abandon_task_slots(task_id, session, reason=reason)
+    _release_task_slots(task_id, session, reason=f"released: {reason}")
+    session.commit()
+    send_minted_intents(issued)
+    log.warning("slot-intent: %s", reason)
+
+
 def _scrub_resolved_env(row: SlotIntent) -> list[str]:
     """Null the resolved environment out of an acked `lease_slot` payload. Returns the names that went.
 
@@ -388,16 +490,17 @@ def _scrub_resolved_env(row: SlotIntent) -> list[str]:
 
 @router.post("/slot-intents/{intent_id}/ack", response_model=SlotIntentAckOut)
 @infra(Tenancy.ORG_SCOPED)
-def ack_slot_intent(
+async def ack_slot_intent(
     intent_id: int,
     body: SlotIntentAckIn,
+    db: DbDep,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> SlotIntentAckOut:
     """Record what the node did with one intent, and — on a launch ack — stamp the runner's identity onto the
     lease.
 
-    `done`, `accepted`, `unsupported_verb` retire it; `refused_stale`, `refused_precondition`, `failed`
+    `done`, `accepted`, `unsupported_verb`, `clone_refused` retire it (a refused clone on a `lease_slot` also
+    ends the task's attempt, `_end_attempt_on_clone_refusal`); `refused_stale`, `refused_precondition`, `failed`
     stamp `acked_at` and stay pending, else a half-executed intent would look complete and orphan a runner —
     except on a row the CP already retired (`superseded`/`parked`), which keeps that outcome and is never
     budgeted. Each non-retiring ack is budgeted against `refusal_key` with doubling backoff; the
@@ -405,6 +508,27 @@ def ack_slot_intent(
     `deliver_answer` never parks). The ack lands first; the lease write is fenced and may write nothing for
     a superseded dispatch. `record_launch` admits a re-ack of the same dispatch.
     """
+    out, answer_retry = await db.run_sync(_ack_slot_intent, intent_id=intent_id, body=body, caller=caller)
+    if answer_retry is not None:
+        # The ack's own writes are committed (`record_launch` commits). The retry takes a task's answer lock on a
+        # connection of its own (`routes/tasks/answers.py::_AnswerLock`), blocking I/O, so it runs in a worker
+        # thread on a session of its own; a lease's ack does nothing after it.
+        from app.routes.tasks.answers import retry_answer_delivery_after_launch
+
+        await release(db)
+        await run_blocking_in_session(retry_answer_delivery_after_launch, **answer_retry, route=db)
+    return out
+
+
+def _ack_slot_intent(
+    session: Session,
+    intent_id: int,
+    body: SlotIntentAckIn,
+    caller: node_credentials.AgentCaller,
+) -> tuple[SlotIntentAckOut, Optional[dict[str, Any]]]:
+    """The ack, and the answer-delivery retry its launch owes (`retry_answer_delivery_after_launch`'s kwargs), or
+    None."""
+    answer_retry: Optional[dict[str, Any]] = None
     # Node-authored outcomes only: `superseded` and `parked` are the CP's (`fleet_verdicts.NODE_AUTHORED_OUTCOMES`).
     if body.outcome not in NODE_AUTHORED_OUTCOMES:
         raise HTTPException(
@@ -424,14 +548,19 @@ def ack_slot_intent(
     superseded_delivery = (
         row.verb == fleet_verdicts.VERB_DELIVER_ANSWER and row.outcome == fleet_verdicts.OUTCOME_SUPERSEDED
     )
+    # A refused clone retires the row but is no launch: a late one must not overwrite a retirement either.
+    clone_refused = body.outcome == fleet_verdicts.OUTCOME_CLONE_REFUSED
+    if clone_refused and caller.node_id is not None and caller.node_id != row.node_id:
+        # It ends a task's attempt: only the node the lease was ordered at may say its clone was refused.
+        raise HTTPException(status_code=403, detail=f"slot intent {intent_id} was ordered at another node")
     keeps_cp_retirement = superseded_delivery or (
         row.outcome in (fleet_verdicts.OUTCOME_SUPERSEDED, fleet_verdicts.OUTCOME_PARKED,
                         fleet_verdicts.OUTCOME_DONE, fleet_verdicts.OUTCOME_ACCEPTED)
-        and body.outcome not in SLOT_INTENT_RETIRING_OUTCOMES
+        and (body.outcome not in SLOT_INTENT_RETIRING_OUTCOMES or clone_refused)
     )
     # Before this ack locks the intent row: `apply_ack` takes the pair lock (`slot_allocation.lock_pair`).
     slot_destroy.lock_before_ack(session, row)
-    row.acked_at = datetime.now(timezone.utc)
+    row.acked_at = utcnow()
     # A kept retirement keeps its reason too: the operator reads why the CP retired it, not the node's echo.
     if not keeps_cp_retirement:
         row.outcome = body.outcome
@@ -446,6 +575,11 @@ def ack_slot_intent(
         node_capacity.return_to_queue(session, row)
     elif not keeps_cp_retirement:
         parked_reason = _account_for_refusal(row, body.outcome, body.detail)
+        if row.outcome == fleet_verdicts.OUTCOME_PARKED and row.verb == fleet_verdicts.VERB_DELIVER_ANSWER:
+            # Retired undelivered: a task edit's dismissal gives its rounds back to the operator; an answer's
+            # rounds are re-armed for the parked-task sweep's next delivery.
+            live_task_edits.reopen_undelivered_dismissal(session, row.payload)
+            rearm_undelivered_answer(session, row.payload)
         # On the task's own record, in the SAME transaction, so a rollback takes the note with it. Contention
         # is no refusal of the task's dispatch, and leaves the tally the note fences on untouched.
         if not _is_uncharged(body.detail):
@@ -467,6 +601,14 @@ def ack_slot_intent(
     if delivered_message and not already_retired and messaged_task_id is not None:
         emit_console_event(session, entity="task", id=int(messaged_task_id),
                            action="control_message", record_transition=False)
+    # A delivered live edit moves the runner's baseline (`app/live_task_edits.py`), only on this `done` of a row the
+    # CP had not retired: a superseded or failed delivery leaves it, so the next Save re-sends what never landed.
+    if (row.outcome == fleet_verdicts.OUTCOME_DONE and not already_retired
+            and row.verb in (fleet_verdicts.VERB_DELIVER_MESSAGE, fleet_verdicts.VERB_DELIVER_ANSWER,
+                             fleet_verdicts.VERB_SWITCH_MODEL)
+            and isinstance(row.payload, dict)
+            and not (body.detail or "").startswith(fleet_verdicts.NOT_SWITCHED_PREFIX)):
+        live_task_edits.stamp_delivered_view(session, row.payload.get("task_id"), row.payload.get("runner_view"))
     session.commit()
     if scrubbed_names and row.outcome in SLOT_INTENT_RETIRING_OUTCOMES:
         log.info(
@@ -485,10 +627,24 @@ def ack_slot_intent(
     # After the retiring commit, so the gate never asks about a rolled-back refusal. Best effort.
     if parked_reason:
         _park_task_on_wedged_intent(session, row, parked_reason)
+    # After the ack's commit: the attempt ends in its own transaction (`end_attempt` commits). Only on the ack
+    # that retires the row, so a re-sent `clone_refused` spends no second attempt.
+    if clone_refused and row.verb == fleet_verdicts.VERB_LEASE_SLOT and not already_retired \
+            and not keeps_cp_retirement:
+        try:
+            landed = _end_attempt_on_clone_refusal(session, row, body.detail, caller.node_id or row.node_id)
+        except Exception:  # noqa: BLE001 — the ack is committed; a failure here must not 500 it into a re-send
+            session.rollback()
+            log.exception("slot-intent %s: the node refused the clone, but ending the task's attempt FAILED — "
+                          "the task re-dispatches without spending one", intent_id)
+        else:
+            log.warning("slot-intent %s: the node refused the clone — task attempt ended -> %s", intent_id, landed)
 
     launch_recorded = False
     if (
         body.outcome in SLOT_INTENT_RETIRING_OUTCOMES
+        # A refused clone launched nothing.
+        and not clone_refused
         and body.generation is not None
         and body.dispatch_id
     ):
@@ -527,10 +683,8 @@ def ack_slot_intent(
                 and isinstance(row.payload, dict)
                 and row.payload.get("task_id") is not None
             ):
-                from app.routes.tasks.answers import retry_answer_delivery_after_launch
-
-                retry_answer_delivery_after_launch(
-                    session, worktree_id=worktree_id, generation=body.generation,
+                answer_retry = dict(
+                    worktree_id=worktree_id, generation=body.generation,
                     dispatch_id=body.dispatch_id, task_id=int(row.payload["task_id"]),
                     session_id=body.session_id,
                 )
@@ -557,7 +711,7 @@ def ack_slot_intent(
         outcome=row.outcome or body.outcome,
         retired=(row.outcome or body.outcome) in SLOT_INTENT_RETIRING_OUTCOMES,
         launch_recorded=launch_recorded,
-    )
+    ), answer_retry
 
 
 class SlotLaunchClaimIn(BaseModel):
@@ -576,11 +730,12 @@ class SlotLaunchClaimOut(BaseModel):
 
 @router.post("/slot-intents/{intent_id}/launch-claim", response_model=SlotLaunchClaimOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def claim_slot_launch(
+    session: Session,
     intent_id: int,
     body: SlotLaunchClaimIn,
     _: None = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> SlotLaunchClaimOut:
     """May the node spawn a runner for this `lease_slot` intent? The pre-launch half of the generation fence.
 
@@ -644,27 +799,15 @@ def claim_slot_launch(
 class SlotHolderIn(BaseModel):
     # The node's uuid (`worktrees.node_id`), checked against the credential.
     node_id: Optional[str] = None
-    # The identity. `project` (a name inside the caller's org) is read only when this is absent: every caller
-    # is a node-side hook shipped in the `jaah` .deb independently of the CP, so an older one still sends
-    # just the name (`_wire_project`). Unresolvable → 404.
+    # The identity (`_wire_project`); `project` is the display name beside it, never resolved. Unsent or
+    # unresolvable → 404.
     project_id: Optional[int] = None
     project: str = ""
     number: int
-    # `holder`/`session_id`/`source`/`task_id` are dead but declared so Pydantic does not drop them: an older
-    # .deb's teardown posts `holder='free'`, and a silent 200 would mislead it. `set_slot_holder` 409s when
-    # `model_fields_set` shows any of them.
-    holder: Optional[str] = None
-    session_id: Optional[str] = None
-    source: Optional[str] = None
-    task_id: Optional[int] = None
     # The operator-mutation half. `slot_columns.MUTATED` holds the exceptions to the two-writer split
     # (`app/slot_mutate.py`). `None` = not supplied; `title=""` is a real clear.
     last_used: Optional[datetime] = None
     title: Optional[str] = None
-
-
-# The dropped field names, single-homed so `SlotHolderIn` and `set_slot_holder`'s refusal cannot drift.
-_A14_DROPPED_HOLDER_FIELDS = frozenset({"holder", "session_id", "source", "task_id"})
 
 
 class SlotHolderOut(BaseModel):
@@ -693,32 +836,17 @@ def _prior_task_id_in_title(name: Optional[str]) -> Optional[int]:
 
 @router.post("/slot-holder", response_model=SlotHolderOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def set_slot_holder(
+    session: Session,
     body: SlotHolderIn,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> SlotHolderOut:
     """The slot-label mutation: this slot's Title and `last_used` stamp.
 
     Holds are bound by `slot_state.lease()`, so this route sets no holder; it remains the wire path for
-    `apps/jaahd/commands.py::_set_title`. 404 on an unknown project before any write; 409 for dropped
-    holder fields (`SlotHolderIn`).
+    `apps/jaahd/commands.py::_set_title`. 404 on an unknown project before any write.
     """
-    stale_fields = sorted(_A14_DROPPED_HOLDER_FIELDS & body.model_fields_set)
-    if stale_fields:
-        # Loud, not a 200 no-op. `model_fields_set` catches `session_id: null` too. Checked first; 409 matches
-        # what old nodes already handle.
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"slot-holder no longer accepts {stale_fields}: TRACKER-2335 (A14) deleted the holder "
-                "vocabulary these fields belonged to. There is exactly one origin for a held slot now (a "
-                "fleet Task dispatch), and this endpoint only mutates a slot's Title and last_used stamp — "
-                "it cannot claim or release one. If this was a release (holder='free'), the slot was NOT "
-                "released by this call; the node's `jaah` package needs upgrading to a build that no "
-                "longer posts this shape."
-            ),
-        )
     # Derived where possible, so no node can label another's slot. `resolve_node_id()` is the CP fallback.
     resolved_node = caller_node_ref(session, caller, body.node_id) or resolve_node_id()
     if not resolved_node:
@@ -726,7 +854,7 @@ def set_slot_holder(
             status_code=422,
             detail="slot-holder needs a node_id: pass it in the body or set NODE_ID on the API",
         )
-    project_row = _wire_project(session, caller, body.project_id, body.project)
+    project_row = _wire_project(session, body.project_id)
     if project_row is None:
         named = body.project_id if body.project_id is not None else repr(body.project)
         raise HTTPException(
@@ -792,8 +920,8 @@ def set_slot_holder(
     # Tagged with the caller's proven org (`routes/stream.py::_may_see_collection_sentinel`).
     emit_console_event(
         session, entity="worktree", id=0, action="upserted", org_id=caller.org_id,
+        commit=True,
     )
-    session.commit()
     return SlotHolderOut(
         project_id=project_id,
         project=project_row.name,
@@ -801,138 +929,3 @@ def set_slot_holder(
         mutated=mutated,
         title_rejected=title_rejected,
     )
-
-
-# ── A user session ended: the `/exit` hook's report, and a `user` hold's one node-originated release edge ──
-# The agent surface carries no command relay (`POST /node-command` is deleted and must not return): a
-# node reports what happened, and the CP decides through the intent table it owns. Operator pool verbs go
-# over the console's `POST /api/commands`.
-
-
-class UserSessionEndedIn(BaseModel):
-    """What `hooks/user-session-end.py` reports when a human's console session in a pool slot ends.
-
-    `project_id`/`number` address the slot (`project`, a name inside the caller's org, only from an older
-    daemon that sends no `project_id` — `_wire_project`). `session_id` is a staleness fence, not a credential: a
-    late hook cannot free a newer session's hold. `node_id` is the daemon's stamp
-    (`agent_vocabulary`'s `identity_body_keys`), checked against the credential (`caller_node_ref`).
-    """
-
-    project_id: Optional[int] = None
-    project: str = ""
-    # Bounded to int4 like `worktrees.number`, so a stray value is a 422, not a `DataError` 500.
-    number: int = Field(ge=0, le=2_147_483_647)
-    session_id: str = ""
-    node_id: Optional[str] = None
-
-
-class UserSessionEndedOut(BaseModel):
-    """`released` says whether this report ended a hold; `reason` names the outcome (the hook only logs it).
-    Always 200: nothing here is retryable.
-    """
-
-    released: bool
-    reason: str
-
-
-@router.post("/user-session-ended", response_model=UserSessionEndedOut)
-@infra(Tenancy.ORG_SCOPED)
-def user_session_ended(
-    body: UserSessionEndedIn,
-    caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
-) -> UserSessionEndedOut:
-    """The S7 release edge for a `user` hold — the node reports the
-    human's session ended, and the CP frees the hold.
-
-    A report, not a command: whether a hold ends is decided here via `slot_state.release`, like every other
-    release edge. Outcomes, all 200 (`UserSessionEndedOut.reason`):
-
-      * `released` — the row was `user`-held and is now `free`.
-      * `already free` — idempotent.
-      * `task-held` — refused: no session or runner may free a task's slot (`slot_state.release` lists
-        the edges that may). Logged at WARNING.
-      * `stale` — held by another session; compared only when both sides carry an id.
-      * `no such slot` — not a 404: the CP is not the authority on a node's pool.
-
-    `sweep_user_hold=False`, as `pool_slots.release_slot` passes for a `user` hold, so no intent is minted:
-    `release_slot` would kill every process in the tree, widening a `/exit`'s reach to anything the
-    operator left running. The tree stands as the console release leaves it (`end_holder` remains the call
-    site; `issued` is `[]`). No synchronous bus relay either. The node is derived (`caller_node_ref`, 403 on
-    mismatch); CP-self and insecure arms pass the claim through.
-    """
-    target = caller_node_ref(session, caller, body.node_id) or body.node_id
-    project_row = _wire_project(session, caller, body.project_id, body.project)
-    project_id = project_row.id if project_row is not None else None
-    worktree_id = (
-        slot_state.resolve_slot(session, node_id=target, project_id=project_id, number=body.number)
-        if target and project_id is not None
-        else None
-    )
-    # Locked, as `pool_slots._locked_slot_row`: state and session are read then decided on. The `generation`
-    # fence below backs it up.
-    row = (
-        session.execute(select(Worktree).where(Worktree.id == worktree_id).with_for_update()).scalar_one_or_none()
-        if worktree_id is not None
-        else None
-    )
-    if row is None:
-        return UserSessionEndedOut(released=False, reason="no such slot")
-    if row.state == slot_state.FREE:
-        return UserSessionEndedOut(released=False, reason="already free")
-    if row.state == slot_state.TASK:
-        log.warning(
-            "user-session-ended: %s #%s on node %s is task-held (task=%s); a session ending frees no "
-            "task hold — left as is",
-            project_row.name, body.number, target, row.task_id,
-        )
-        return UserSessionEndedOut(released=False, reason="task-held")
-    if body.session_id and row.session_id and body.session_id != row.session_id:
-        log.info(
-            "user-session-ended: %s #%s on node %s is held by session %s, not the ended %s — stale "
-            "report, hold kept",
-            project_row.name, body.number, target, row.session_id, body.session_id,
-        )
-        return UserSessionEndedOut(released=False, reason="stale")
-
-    # Snapshot before the release, which blanks the handles the teardown addresses.
-    prior = slot_teardown.snapshot(row, session)
-    # A console on the Jaah account gets no more credentials once its person has left it.
-    if edition_features.enabled("jaah_ai_credit"):
-        from app.jaah_routing import sessions as jaah_sessions
-
-        jaah_sessions.end_consoles(session, node_id=row.node_id, project_id=project_id, user_id=row.owner_user_id)
-    freed = slot_state.release(
-        session,
-        worktree_id=row.id,
-        generation=row.generation,
-        # Records which edge ended the hold.
-        reason="user session ended (/exit)",
-        # This route owns the transaction: release and teardown intent land together or not at all.
-        commit=False,
-    )
-    if not freed:
-        # Generation moved between the locked read and the UPDATE (impossible under the lock; `release`
-        # answering False must not be ignored). `stale`: the row was held a statement ago by a different hold.
-        session.rollback()
-        return UserSessionEndedOut(released=False, reason="stale")
-    # Tagged with the caller's org, like `set_slot_holder`'s sentinel — that site carries why.
-    emit_console_event(
-        session, entity="worktree", id=0, action="upserted", org_id=caller.org_id,
-    )
-    issued = slot_teardown.end_holder(
-        session,
-        prior,
-        project=project_row.name,
-        reason="user session ended (/exit)",
-        # False: a `/exit` ends the hold, not what the operator left running (see the docstring). `[]` for a
-        # `user` hold, so nothing is pushed.
-        sweep_user_hold=False,
-    )
-    session.commit()
-    # After the commit (`send_minted_intents`' contract). Deferred for the routes↔routes cycle
-    # `pool_slots.release_slot` names; `.send()` never raises.
-    from app.routes.tasks.slots import send_minted_intents  # noqa: PLC0415
-
-    send_minted_intents(issued)
-    return UserSessionEndedOut(released=True, reason="released")

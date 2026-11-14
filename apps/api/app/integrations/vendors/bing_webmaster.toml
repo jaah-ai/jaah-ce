@@ -1,0 +1,43 @@
+# Bing Webmaster Tools: an API key (OAuth is offered too, but no Jaah-owned app is in this wave). The key rides
+# the `apikey` query parameter; a bad key answers HTTP 400 with "InvalidApiKey" (confirmed 2026-11-03 by calling
+# GetUserSites with a made-up key). Key path confirmed at the vendor_docs_url page.
+slug = "bing_webmaster"
+label = "Bing Webmaster Tools"
+category = "marketing"
+vendor_docs_url = "https://learn.microsoft.com/en-us/bingwebmaster/getting-access"
+summary = "Read Bing search traffic, crawl errors and sitemaps, and submit URLs for indexing."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "bing.com/webmasters > Settings (gear, top right) > API access > accept the terms on first use > API Key > Generate API Key. Bing allows one key per user" },
+]
+
+[test]
+method = "GET"
+path = "https://ssl.bing.com/webmaster/api.svc/json/GetUserSites"
+auth = { query = "apikey", field = "api_key" }
+rejected_statuses = [400, 401, 403]
+list_field = "d"
+
+[docs]
+agent_uses = [
+  "List the sites in your Bing Webmaster Tools account and whether each is verified",
+  "Read search query and page traffic stats (clicks, impressions, position) for a site",
+  "Read crawl errors and crawl stats after a release changes URLs",
+  "Submit new or changed URLs and sitemaps so Bing recrawls them",
+]
+prerequisites = ["A site added and verified in Bing Webmaster Tools (bing.com/webmasters), on the account whose API key you use"]
+limitations = [
+  "One API key per Bing user: generating a new key retires the old one, so every place that uses it must be replaced at once",
+  "URL submission has a daily quota per site that Bing sets; agents see the remaining quota and stop when it is spent",
+  "The key reaches every site on the account; Bing has no per-site key",
+]
+troubleshooting = [
+  { symptom = "Test says Bing Webmaster Tools rejected the API key (400)", fix = "The key was regenerated or mistyped. Open Settings > API access, copy the current key and select Replace on the secret" },
+  { symptom = "Test says credentials accepted but an agent sees no sites", fix = "The key belongs to a Bing account with no sites. Add and verify the site in Bing Webmaster Tools, or use the key of the account that owns it" },
+  { symptom = "An agent's URL submission fails with a quota error", fix = "The site's daily submission quota is spent. Wait for the next day, or submit a sitemap instead" },
+]
+faq = [
+  { q = "Can I import my sites from Google Search Console", a = "Yes, in Bing Webmaster Tools under Add a site > Import from Google Search Console. Do it there before connecting" },
+]

@@ -23,7 +23,6 @@ refusal. Stdlib only (`cred_broker` imports this on the request path); no import
 or environment reads — the location is resolved per call (`_registry_dir`)."""
 from __future__ import annotations
 
-import json
 import logging
 import os
 import threading
@@ -31,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import env_helpers  # the atomic file write
+import file_io
 # The daemon's POSTURE; a stdlib-only leaf with no import-time work.
 import environment
 from jaah_env import env_get
@@ -167,19 +167,8 @@ def _load() -> dict[str, dict]:
         log.debug("runner-registry: this process has no registry of its own (%s posture with no pool "
                   "root) — no runner is identifiable", environment.posture())
         return {}
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return {}
-    except OSError as exc:
-        log.warning("runner-registry: cannot read %s (%s) — no runner will be identifiable", path, exc)
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except ValueError as exc:
-        log.warning("runner-registry: %s is not valid JSON (%s) — treating it as empty", path, exc)
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+    return file_io.read_json_or(path, {}, expect=dict, warn=lambda exc: log.warning(
+        "runner-registry: cannot read %s (%s) — no runner will be identifiable", path, exc))
 
 
 def _alive(pane_pid: int, entry: dict) -> bool:
@@ -544,6 +533,32 @@ def _live_runs_in(worktree: str) -> list[tuple[int, RunnerIdentity]]:
 def _newest_live_by_worktree() -> dict[str, RunnerIdentity]:
     """Recorded worktree (no trailing slash) -> its newest live runner, by pane start ticks."""
     return {root: max(runners, key=lambda r: r[0])[1] for root, runners in _live_by_worktree().items()}
+
+
+def live_in_worktree_certain(worktree: str) -> tuple[RunnerIdentity | None, bool]:
+    """`live_in_worktree`, plus whether a None is a DEFINITE "no launched pane here": False when this process
+    keeps no registry, the file is present but unreadable, or (Windows) an entry for this worktree could not be
+    re-mapped this once yet is not definitely gone. For `reconcile.observe.observe_slot`'s `launched_pane`, where a
+    wrong "none" costs a live runner the control plane's starved-node grace."""
+    ident = live_in_worktree(worktree)
+    if ident is not None:
+        return ident, True
+    path = _registry_path()
+    if path is None:
+        return None, False
+    unreadable: list[Exception] = []
+    entries = file_io.read_json_or(path, {}, expect=dict, warn=unreadable.append)
+    if unreadable:
+        return None, False
+    root = (worktree or "").rstrip("/")
+    if host_platform.is_windows() and root:
+        from host_platform import windows  # the MSYS reads exist only there
+        key = host_platform.path_key(root)
+        for entry in entries.values():
+            if (isinstance(entry, dict) and host_platform.path_key(str(entry.get("worktree", "")).rstrip("/")) == key
+                    and not _definitely_gone(windows, entry)):
+                return None, False
+    return None, True
 
 
 def _live_by_worktree() -> dict[str, list[tuple[int, RunnerIdentity]]]:

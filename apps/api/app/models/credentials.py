@@ -36,10 +36,9 @@ from app.models.base import (
 )
 
 
-class ProjectCredential(OrgScoped, Base):
-    """Join row: a credential attached to a project (0..N projects per credential). Both ends cascade."""
-
-    __tablename__ = "project_credentials"
+class _ProjectCredentialJoin:
+    """The shape of a project-to-credential join row: a composite key of both ends (each cascading) plus who
+    made it and when. `mapped_column` copies the columns, foreign keys included, onto each table."""
 
     project_id: Mapped[int] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
@@ -49,6 +48,19 @@ class ProjectCredential(OrgScoped, Base):
     )
     created_by_id: Mapped[UUID] = _actor_column()
     created_at: Mapped[datetime] = timestamp_column()
+
+
+class ProjectCredential(_ProjectCredentialJoin, OrgScoped, Base):
+    """Join row: a credential attached to a project (0..N projects per credential)."""
+
+    __tablename__ = "project_credentials"
+
+
+class ProjectMcpLink(_ProjectCredentialJoin, OrgScoped, Base):
+    """Join row: a project's explicit opt-in to an MCP connection (a credential). This revision lands the table
+    only; its routes and the logic that reads it are a later child (C4a)."""
+
+    __tablename__ = "project_mcp_links"
 
 
 class Account(EntityMixin, OrgScoped, Base):
@@ -114,12 +126,11 @@ class Account(EntityMixin, OrgScoped, Base):
     auto_assign: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true"
     )
-    # This account's own concurrent-runner cap (0277); NULL = none. Accepted only for a provider declaring
-    # `per_account_runner_cap` (DeepSeek: no quota to gate on, so this is what bounds its spend).
+    # This account's own concurrent-runner cap (0277); NULL = its org's default for a subscription account,
+    # no cap for an API-key one. Who may carry one: `routes/accounts.py::takes_runner_cap`.
     max_runners: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    # Unread by current nodes (they find the token themselves on the NodeLink).
-    # Kept for older jaahd packages during rollout: the roster still serves it as `shared`, written from what a
-    # node reports after a login (`routes/commands.py::_ensure_account_row`). Drop once every node is current.
+    # Where the token went after a login, as the node reported it (`routes/commands.py::_ensure_account_row`):
+    # the CP's own reads (a converge's pin waiver, the login store choice); no node wire carries it.
     shared: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
@@ -201,61 +212,6 @@ class AccountObservation(OrgScoped, Base):
     # Last heard, CP-stamped `now()` on insert and update (0099): the only stamp the dispatch freshness
     # window may read, so a slow node clock cannot drop its own accounts. DB-stamped, DB-compared.
     attested_at: Mapped[datetime] = timestamp_column()
-
-
-class CredentialOAuthFlow(OrgScoped, Base):
-    """One in-flight credential OAuth wizard: the CP's record of a login a node is running for a user.
-
-    RETIRED, NOT YET DROPPED: the node-CLI credential wizard retired with its one driver, so no
-    route reads or writes this table. It stays mapped until a later release drops it,
-    since a migration must stay additive while the outgoing release still maps it.
-
-    Holds no tokens and no authorization code, by design: `credentials` is the hardened secret store
-    (see `Credential`), and a second home would inherit none of its protections. Secrets live only in
-    the node process and, after one in-memory hop, the `credentials` row; the pasted code is dispatched
-    to the node and redacted by `routes/commands.py::_credential_safe_args`. Columns are only what the
-    completing request reads.
-
-    `user_id` is the scope, not provenance: every read filters on it. Not an entity (exempt in
-    `tests/test_entity_shape.py`). One live row per user is a DB constraint
-    (`uq_credential_oauth_flows_live_per_user`, partial on `error IS NULL`, migration 0175): the start
-    route awaits between reading and replacing flows, so only the index stops two concurrent starts from
-    spawning two vendor CLIs (the route retries on its failure). It is also why start has no node-grant
-    check.
-    """
-
-    __tablename__ = "credential_oauth_flows"
-
-    # Declared here too so autogenerate does not propose dropping the partial unique index (see the
-    # class docstring); spelled as migration 0175.
-    __table_args__ = (
-        Index("ix_credential_oauth_flows_user_id", "user_id"),
-        Index(
-            "uq_credential_oauth_flows_live_per_user", "user_id",
-            unique=True, postgresql_where=text("error IS NULL"),
-        ),
-    )
-
-    # Minted by the start route with `uuid4`, not `uuidv7()`: the handle goes to a node and a browser,
-    # and v7 leaks its creation time; server-side so a caller cannot address another session's login.
-    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
-    # CASCADE: a flow whose node is gone can never complete.
-    node_id: Mapped[UUID] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), nullable=False)
-    # CASCADE, not SET NULL: this is the scope, and a NULL would match any user's completing request.
-    user_id: Mapped[UUID] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("admin_users.id", ondelete="CASCADE"), nullable=False
-    )
-    # A `CREDENTIAL_TYPES` slug; text, like `Credential.type` (`app/credentials/registry.py`).
-    type_slug: Mapped[str] = mapped_column(Text, nullable=False)
-    # The `OAUTH_WIZARDS` driver, recorded so the flow finishes on the driver it started on.
-    driver: Mapped[str] = mapped_column(Text, nullable=False)
-    # NULL = live, non-NULL = spent: the whole state machine. A spent row rests because the node's login
-    # subprocess may live on and `credential_oauth_cancel` needs the pointer; a success is deleted in the
-    # credential-writing transaction. Value: `"<code>"` or `"<code>: <detail>"`, which the completing
-    # route's 502 and a repeat `complete` both carry.
-    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # No clock: nothing reads one (the per-user replacement reaps regardless of age). The partial index
-    # and the caller's next start bound this table.
 
 
 class ConsoleApiKeyLease(UuidPkMixin, OrgScoped, Base):
@@ -389,6 +345,10 @@ class Credential(EntityMixin, OrgScoped, Base):
             "ix_credentials_test_failed", text("created_at DESC"), text("id DESC"),
             postgresql_where=text("last_test_ok = false"),
         ),
+        Index(
+            "ix_credentials_needs_reconnect", text("created_at DESC"), text("id DESC"),
+            postgresql_where=text("needs_reconnect_at IS NOT NULL"),
+        ),
     )
 
     type: Mapped[str] = mapped_column(Text, nullable=False)
@@ -435,6 +395,14 @@ class Credential(EntityMixin, OrgScoped, Base):
     last_used_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
     last_tested_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
     last_test_ok: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # The last connection test's sentence, beside its verdict (`app/credentials/health.py::record_test`).
+    last_test_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Set when the vendor refuses a refresh for good (`oauth2_tokens._mark_needs_reconnect`) or a forge reports the
+    # token revoked (`git_probe.mark_revoked`), with why; cleared by any newly entered secret (the `config` setter
+    # below). Set, a runner fetch of the row answers 410. Machine-stamped, so the narrowed
+    # `updated_at` trigger does not list them (`app/credentials/health.py::MACHINERY_COLUMNS`).
+    needs_reconnect_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
+    needs_reconnect_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # The row's home as one key (NAMING above: system, project, personal, else org shared) and its folder: the
     # lowercased name up to its last `/`, `''` at the home's root. Generated, so no writer can let them drift;
     # the `::text` casts keep the expressions IMMUTABLE, which a generated column requires.
@@ -486,6 +454,13 @@ class Credential(EntityMixin, OrgScoped, Base):
             self.id = uuid4()
         if self.type is None:
             raise ValueError("a credential's type must be set before its config is sealed")
+        # A newly entered secret (a plaintext `str` under a secret key; a kept one arrives as a `SealedSecret`) is a
+        # new grant or key - a Connect, a refresh, a reconnect or a pasted token - so the row no longer needs one.
+        from app.credentials.registry import secret_keys
+
+        if any(isinstance(value.get(key), str) and value.get(key, "").strip() for key in secret_keys(self.type, value)):
+            self.needs_reconnect_at = None
+            self.needs_reconnect_reason = None
         self.config_sealed = seal_config(value, credential_id=self.id, type_slug=self.type)
         # Derived from the value just sealed, so every writer keeps them true (see the columns' note).
         self.has_stored_secret = health.has_stored_secret(self.type, value)
@@ -776,13 +751,6 @@ class CloudConnection(EntityMixin, OrgScoped, Base):
     extra_subnet_ids: Mapped[list[str]] = mapped_column(
         ARRAY(Text), nullable=False, default=list, server_default=text("'{}'::text[]")
     )
-    # Unread: a node's share is its org's NodeLink store (`org_shared_stores`). Dropped in a later release
-    # (additive while two releases overlap).
-    shared_efs_id: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
-    shared_efs_access_point_id: Mapped[str] = mapped_column(
-        Text, nullable=False, server_default=""
-    )
-    shared_efs_mount_ip: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     # `''` means no IAM role: normal for a node outside our account, which reaches the CP with its own
     # `NODE_TOKEN`. Kept on the API; the console no longer offers it.
     instance_profile: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
@@ -801,22 +769,25 @@ class CloudConnection(EntityMixin, OrgScoped, Base):
 
 
 class UserGitConnection(UuidPkMixin, StampedMixin, OrgScoped, Base):
-    """Which git credential one person's work uses on one forge root.
+    """One git account (credential) a person connected on one forge root.
 
-    One row per `(user, root)`: `root` is `forges.RepoRef.root` (`github.com`, `gitlab.com`,
-    `bitbucket.org`, `dev.azure.com`, or a self-managed GitLab's `host[/sub-path]`), and `forge` the
-    forge that root belongs to (`forges.forge_of_root`). `app/git_access.py` reads it, re-authorizing the
-    credential on every read, so a row is a preference, never an authorization.
+    Any number of rows per `(user, root)`, one per credential, exactly one of them `is_default`: `root` is
+    `forges.RepoRef.root` (`github.com`, `gitlab.com`, `bitbucket.org`, `dev.azure.com`, or a self-managed
+    GitLab's `host[/sub-path]`), and `forge` the forge that root belongs to (`forges.forge_of_root`).
+    `owners` holds the owners (users, orgs, groups, workspaces, Azure org/project) the account was last seen
+    to reach, lowercase; resolution picks the row whose account or owners match the repository's owner, else
+    the default (`app/git_access.py::selected_credential_id`). It re-authorizes the credential on every read,
+    so a row is a preference, never an authorization.
 
-    `admin_users.git_credential_id` is the pre-0291 single pointer, KEPT while two releases overlap: read
-    falls back to it only when its credential's root is the repo's root; writes and deletes here keep it
-    in step (`app/git_connections.py` is the single writer of both). Both FKs CASCADE: a deleted person
+    `app/git_connections.py` is the single writer. Both FKs CASCADE: a deleted person
     or credential takes the connection with it. Not an entity (exempt in `tests/test_entity_shape.py`):
-    the (user, root) pair is its identity, and a `name` would invent a second label."""
+    the (user, credential) pair is its identity, and a `name` would invent a second label."""
 
     __tablename__ = "user_git_connections"
     __table_args__ = (
-        UniqueConstraint("user_id", "root", name="uq_user_git_connections_user_root"),
+        Index("uq_user_git_connections_user_credential", "user_id", "credential_id", unique=True),
+        Index("uq_user_git_connections_user_root_default", "user_id", "root", unique=True,
+              postgresql_where=text("is_default")),
         CheckConstraint(in_domain_sql("forge", FORGES), name="ck_user_git_connections_forge"),
         # The reverse lookup for a credential delete (Postgres does not index the referencing side).
         Index("ix_user_git_connections_credential_id", "credential_id"),
@@ -830,3 +801,7 @@ class UserGitConnection(UuidPkMixin, StampedMixin, OrgScoped, Base):
     credential_id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("credentials.id", ondelete="CASCADE"), nullable=False
     )
+    is_default: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    owners: Mapped[Optional[list[str]]] = mapped_column(JSONB(none_as_null=True), nullable=True)

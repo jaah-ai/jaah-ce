@@ -21,9 +21,11 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app import alert_relay, edition_features, email_notify, notify_targets
+from app import alert_relay, edition_features, email_notify, notification_catalog, notify_targets
+from app.clock import utcnow
 from app.durable import notify_outbox
 from app.entity_shape import optional_uuid
+from app.models.identity import AdminUser
 from app.models.nodes import Node
 from app.models.notifications import Alert
 from app.models.tasks import Task
@@ -77,7 +79,7 @@ class AlertOutcome:
 
 def current_window_start(now: Optional[datetime] = None) -> datetime:
     """The tumbling bucket `now` falls in; single-homed so both producers align on one window."""
-    now = now or datetime.now(timezone.utc)
+    now = now or utcnow()
     return datetime.fromtimestamp(
         (int(now.timestamp()) // ALERT_WINDOW_SECONDS) * ALERT_WINDOW_SECONDS, tz=timezone.utc
     )
@@ -141,14 +143,22 @@ def record_alert(
     writable by any `NODE_TOKEN` holder (cf. `AlertIn`'s `task_id` strip).
 
     `tell_org_admins` also sends the alert to the Owners and Admins of the alert's org (`_tell_org_admins`), on
-    top of the operator channel. Set only by the in-process producers of `alert_relay.NODE_KINDS`: a parameter,
+    top of the operator channel, and for a node failure or AI login kind commits each of them a bell row. Set only by the in-process producers of `alert_relay.NODE_KINDS`: a parameter,
     never a `payload` key, so a node's own `POST /api/agent/alerts` never reaches a tenant's people; each producer
     bounds how often its node-reported facts can (`fleet_observe.emit_login_expiry_alerts`).
+
+    A kind that is no longer a notification (`notification_catalog.REMOVED_KINDS`) records nothing and is sent on
+    no channel.
 
     Never raises for a delivery problem; faults are logged and reported through `relay_failed`.
     """
     payload = payload or {}
     window_start = current_window_start()
+    if notification_catalog.event_for(kind) is None:
+        log.info("alert: kind=%s is no longer a notification — not recorded, not sent", kind)
+        return AlertOutcome(
+            delivered=False, relayed=False, relay_failed=False, deduped=False, window_start=window_start,
+        )
     # Hoisted out of `.values()` so the org walk below can reuse them.
     resolved_node = node_id_or_none(session, node_id)
     identity_task_id = _identity_int(task_id if task_id is not None else payload.get("task_id"))
@@ -209,7 +219,7 @@ def record_alert(
     if tell_org_admins and not alert_relay.is_test_flagged(event):
         # Once per row that landed, whatever the operator relay does next: the producers of these kinds do not
         # retry, so tying it to the relay's outcome would let an operator Slack outage cost the tenant its alert.
-        _tell_org_admins(session, result[1], event, kind)
+        _tell_org_admins(session, result[1], event, kind, node_id=resolved_node)
     # The answerable rule, evaluated once and used for both the Slack reply line and the correlation row,
     # so the promise and the row cannot drift apart (the row also needs `receipt`, known only after posting).
     #
@@ -236,6 +246,11 @@ def record_alert(
     # The email/Telegram legs whose person is brief and was told by the batch's first question
     # (`alert_relay.brief_skips`): a deliberate non-delivery, never a reason to fall through to the webhook.
     brief_skipped: list[str] = []
+    # Each examined recipient's per-channel outcome, written as their `notification_sent` row once the attempt ends.
+    outcomes = notify_targets.Outcomes()
+    # The catalog event the audit rows name. The split of `blocked` into `question` needs the round read, done
+    # inside the `try` below so a lookup fault is handled there; until then, the kind's own event.
+    audit_event = notification_catalog.event_for(kind) or kind
 
     def _email() -> bool:
         # The email leg (`app/email_notify.py`): best-effort, never raising. Called only on a path that ends
@@ -245,11 +260,11 @@ def record_alert(
         # a person is the delivery.
         emailed = email_notify.deliver_alert(
             session, event, task_id=answerable_task_id, answerable=answerable, question_id=question_id,
-            done=done_alert, assigned=assigned_alert, skipped=brief_skipped,
+            done=done_alert, assigned=assigned_alert, skipped=brief_skipped, outcomes=outcomes,
         )
         sent = edition_features.enabled("telegram") and telegram_notify.deliver_alert(
             session, event, task_id=answerable_task_id, answerable=answerable, question_id=question_id,
-            done=done_alert, assigned=assigned_alert, skipped=brief_skipped,
+            done=done_alert, assigned=assigned_alert, skipped=brief_skipped, outcomes=outcomes,
         )
         reached.extend(channel for channel, ok in (("email", emailed), ("telegram", sent)) if ok)
         return emailed or sent
@@ -259,13 +274,29 @@ def record_alert(
         # relay cannot import `models`). Inside the `try` so a lookup DB fault is handled like any relay
         # fault (withdraw, `relay_failed`, never raise). Named `fallthrough_reason` because `reason` is this
         # function's own parameter.
-        target, fallthrough_reason = notify_targets.resolve_slack_target(
+        # Every Slack channel of the person who takes the alert: the first (a DM, when they have one) carries the
+        # card and the reply promise; the others get the same alert at their own level once it is relayed.
+        slack_targets, fallthrough_reason = notify_targets.resolve_slack_targets(
             session, answerable_task_id, kind=kind, answerable=answerable, question_id=question_id,
-            done=done_alert, assigned=assigned_alert, assigned_by_id=assigned_by_id,
+            done=done_alert, assigned=assigned_alert, assigned_by_id=assigned_by_id, outcomes=outcomes,
         )
+        target = slack_targets[0] if slack_targets else None
+        more_targets = slack_targets[1:]
+        if answerable_task_id:
+            audit_event = notify_targets.alert_event(
+                session, kind, answerable_task_id, answerable=answerable, question_id=question_id,
+            )
+        if fallthrough_reason == notify_targets.REASON_EVENT_MUTED and _email():
+            # Slack is off for this personal card, but an Email or Telegram channel wants it: each channel's
+            # settings are its own, so that is the delivery. Never the shared channel; the row stays.
+            notify_targets.record_outcomes(result[1], outcomes, audit_event)
+            return AlertOutcome(
+                delivered=True, relayed=True, relay_failed=False, deduped=False,
+                window_start=window_start, channels=tuple(reached),
+            )
         if fallthrough_reason == notify_targets.REASON_EVENT_MUTED:
-            # The recipient muted this event: dropped, never fallen through to the shared channel (that
-            # would turn a mute into a redirect). No warning (nothing to fix), but one `log.info` so the
+            # Every channel of the recipient muted this event: dropped, never fallen through to the shared channel
+            # (that would turn a mute into a redirect). No warning (nothing to fix), but one `log.info` so the
             # suppression is auditable; `PERSONAL_EVENTS` bounds what a mute can suppress.
             #
             # The row is withdrawn: nothing was delivered, and the dedup identity carries no recipient,
@@ -275,12 +306,14 @@ def record_alert(
                 kind, event.get("repo"), event.get("issue"),
             )
             _withdraw_undelivered_alert(session, result[0])
+            notify_targets.record_outcomes(result[1], outcomes, audit_event)
             return AlertOutcome(
                 delivered=False, relayed=False, relay_failed=False, deduped=False,
                 window_start=window_start, muted=True,
             )
         if (done_alert or assigned_alert) and target is None and _email():
             # Slack has no way to reach the addressee, but email did: the card is delivered, the row stays.
+            notify_targets.record_outcomes(result[1], outcomes, audit_event)
             return AlertOutcome(
                 delivered=True, relayed=True, relay_failed=False, deduped=False,
                 window_start=window_start, channels=tuple(reached),
@@ -306,6 +339,7 @@ def record_alert(
                     fallthrough_reason,
                 )
             _withdraw_undelivered_alert(session, result[0])
+            notify_targets.record_outcomes(result[1], outcomes, audit_event)
             return AlertOutcome(
                 delivered=False, relayed=False, relay_failed=False, deduped=False,
                 window_start=window_start, recipient_misconfigured=misconfigured,
@@ -327,6 +361,7 @@ def record_alert(
                     "deployment's Slack credential",
                     fallthrough_reason,
                 )
+            notify_targets.record_outcomes(result[1], outcomes, audit_event)
             return AlertOutcome(
                 delivered=True, relayed=bool(reached), relay_failed=False, deduped=False,
                 window_start=window_start, channels=tuple(reached), batch_follow_on=not reached,
@@ -359,6 +394,9 @@ def record_alert(
             answerable = False
             if target is not None:
                 target = replace(target, answerable=False, question=None)
+        if target is not None and not target.answerable:
+            # The recipient's first Slack channel is not a DM, so no card and no reply promise: no correlation row.
+            answerable = False
         receipt: dict[str, str] = {}
         if answerable or notify_outbox.in_workflow():
             # Inline: the reply thread's correlation row needs the receipt, and inside a workflow (the
@@ -368,6 +406,12 @@ def record_alert(
             # Handed off (`durable/notify_outbox.py`): no request or cron waits on Slack. The row stands once
             # the send is enqueued; a refusal there is retried, then the worker withdraws this row.
             relayed = notify_outbox.slack(event, target, withdraw_alert_id=result[0])
+        if target is not None:
+            _audit_slack(session, outcomes, target, relayed)
+        for extra in more_targets:
+            ok = notify_outbox.slack(event, extra)
+            relayed = ok or relayed
+            _audit_slack(session, outcomes, extra, ok)
         if relayed:
             # With no addressee it fell through to the shared operator channel, which reached nobody in particular.
             reached.append("slack" if target is not None else "slack_channel")
@@ -408,6 +452,7 @@ def record_alert(
             window_start=window_start,
         )
 
+    notify_targets.record_outcomes(result[1], outcomes, audit_event)
     if receipt and answerable:
         # The correlation row letting a reply in this Slack thread answer this Task, keyed on the
         # `chat.postMessage` response's `D…` channel, never the `U…` member id. Written only on a non-empty
@@ -435,10 +480,39 @@ def record_alert(
     )
 
 
-def _tell_org_admins(session: Session, org_id: Optional[UUID], event: dict[str, Any], kind: str) -> None:
+def _audit_slack(session: Session, outcomes: notify_targets.Outcomes, target: notify_targets.SlackTarget, ok: bool) -> None:
+    """Record one Slack send's outcome against the membership it went to. Never raises: the send is already out."""
+    try:
+        owner = session.scalars(select(AdminUser).where(AdminUser.id == target.admin_user_id)).first()
+        if owner is not None:
+            outcomes.outcome_by_id(owner, notify_targets.SLACK, target.channel_id, "sent" if ok else "failed")
+    except Exception:
+        log.exception("alert: the Slack outcome of channel %s could not be recorded", target.channel_id)
+
+
+#: The kinds whose Owners and Admins also get a bell row (`_bell_org_admins`): the node failures and AI account logins
+#: of `app/notification_catalog.py`, each with its bell title; `_NODE_BELL_KINDS` open the node's page, the rest AI
+#: Accounts.
+_BELL_TITLES: dict[str, str] = {
+    "node-offline": "Node offline",
+    "runner-crashing": "Runner keeps crashing",
+    "node-disk-paused": "Node full",
+    "node-tmp-inodes": "Node full",
+    "login-expiring": "AI account login expiring",
+    "login-expired": "AI account login expired",
+}
+_NODE_BELL_KINDS = frozenset({"node-offline", "runner-crashing", "node-disk-paused", "node-tmp-inodes"})
+#: The console's AI Accounts list (`apps/web/src/App.tsx`), where an expiring login is renewed.
+_ACCOUNTS_PATH = "/accounts"
+
+
+def _tell_org_admins(
+    session: Session, org_id: Optional[UUID], event: dict[str, Any], kind: str, *, node_id: Optional[UUID] = None,
+) -> None:
     """Send `event` to each Owner and Admin of `org_id` (the alert row's) over every channel they turned on for
-    `kind` (the mention DM's legs, `comment_notify.notify_mentioned`). Best-effort, never raises: the alert is
-    already recorded. Reads only; leaves no work on `session`."""
+    `kind` (the mention DM's legs, `comment_notify.notify_mentioned`), and for a `_BELL_TITLES` kind add each a bell
+    row (`_bell_org_admins`, which commits it). Best-effort, never raises: the alert is already recorded. Leaves no
+    work on `session`."""
     from app import access
 
     if org_id is None:
@@ -449,13 +523,48 @@ def _tell_org_admins(session: Session, org_id: Optional[UUID], event: dict[str, 
         session.rollback()
         log.exception("alert: could not read the Owners and Admins for kind=%s — not sent to them", kind)
         return
+    if kind in _BELL_TITLES:
+        _bell_org_admins(session, org_id, [user.id for user in people], event, kind, node_id)
+    outcomes = notify_targets.Outcomes()
     for user in people:
         try:
-            email_notify.deliver_to_user(user, event, event_name=kind)
+            email_notify.deliver_to_user(user, event, event_name=kind, session=session, outcomes=outcomes)
             if edition_features.enabled("telegram"):
-                telegram_notify.deliver_to_user(user, event, event_name=kind)
-            target, _ = notify_targets.target_for_user(session, user, event=kind)
-            if target is not None:
-                notify_outbox.slack(event, target)
+                telegram_notify.deliver_to_user(user, event, event_name=kind, session=session, outcomes=outcomes)
+            targets, _ = notify_targets.targets_for_user(session, user, event=kind, outcomes=outcomes)
+            for target in targets:
+                ok = notify_outbox.slack(event, target)
+                outcomes.outcome_by_id(user, notify_targets.SLACK, target.channel_id, "sent" if ok else "failed")
         except Exception:
             log.exception("alert: kind=%s not delivered to an org Owner or Admin (%s)", kind, user.id)
+    notify_targets.record_outcomes(org_id, outcomes, notification_catalog.event_for(kind) or kind)
+
+
+def _bell_org_admins(
+    session: Session, org_id: UUID, user_ids: list[UUID], event: dict[str, Any], kind: str, node_id: Optional[UUID],
+) -> None:
+    """One `system_alert` `trigger_notices` row (the bell, `routes/inbox.py`) for each of `user_ids`, committed, so an
+    Owner or Admin with no working channel still sees the alert. Written exactly when `_tell_org_admins` tells
+    them. Best-effort, never raises: the alert is already recorded."""
+    from app.automation_alerts import MAX_DETAIL_CHARS
+    from app.models.automations import TriggerNotice
+    from app.one_line import one_line
+    from app.triggers import NOTICE_SYSTEM
+
+    if not user_ids:
+        return
+    href = f"/nodes/{node_id}" if kind in _NODE_BELL_KINDS and node_id is not None else (
+        "/nodes" if kind in _NODE_BELL_KINDS else _ACCOUNTS_PATH
+    )
+    summary = {
+        "text": _BELL_TITLES[kind],
+        "detail": one_line(str(event.get("reason") or ""), MAX_DETAIL_CHARS),
+        "href": href,
+    }
+    try:
+        for user_id in user_ids:
+            session.add(TriggerNotice(org_id=org_id, user_id=user_id, kind=NOTICE_SYSTEM, summary=dict(summary)))
+        session.commit()
+    except Exception:  # noqa: BLE001 — the channels still run; a lost bell row must not cost them
+        session.rollback()
+        log.exception("alert: kind=%s not posted to the bell of org %s's Owners and Admins", kind, org_id)

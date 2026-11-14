@@ -1,11 +1,12 @@
 // The Task page's reads: the cold load and its re-reads, the roster and slots beside it, and the live refetch.
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { ApiError, get } from '../../api'
 import { useCan } from '../../auth'
 import { forgetDeletedTasks } from '../../components/tasks/pane/queryKeys'
-import { useTaskRunMetrics } from '../../components/tasks/TaskRunMetrics'
+import { type RunMetricsSeed, useTaskRunMetrics } from '../../components/tasks/TaskRunMetrics'
 import { useEventStream } from '../../hooks/useEventStream'
-import { PROJECTS_KEY, listProjects, listWorktrees } from '../../hooks/useRosters'
+import { PROJECTS_KEY, listProjects, useProjects, useWorktrees } from '../../hooks/useRosters'
 import { STREAM_DOWN_POLL_MS, useEventsSinceSeen, useLiveRefetch } from '../../hooks/useLiveRefetch'
 import { useOrgScope } from '../../lib/orgScope'
 import { loadTaskDuplicateSeed, type TaskDuplicateSeed } from '../../lib/taskDuplicate'
@@ -26,6 +27,17 @@ import { forgetColdReads, readActivity, readArtifacts, readColdOnce } from './co
 import { duplicateShortfall } from './duplicateSeed'
 
 export type TaskDetailRead = ReturnType<typeof useTaskDetailLoad>
+
+/* How long a roster another surface read (the board's, a minute ago) answers this page with no `GET /api/projects`.
+   Longer than the client's default: projects change rarely, and a write anywhere in the console invalidates
+   `PROJECTS_KEY` (`useRosters.ts`) and an org-scope change resets every query, so the cache is never left behind. */
+const PROJECTS_STALE_MS = 60_000
+const NO_PROJECTS: Project[] = []
+const NO_WORKTREES: Worktree[] = []
+/** How often a waiting task's page re-reads on OTHER tasks' events (`waits`, below). */
+export const WAITING_REFETCH_MS = 10_000
+/** The task page's floor between two worktree re-reads driven by `worktree` events. */
+export const WORKTREES_REFETCH_MIN_MS = 30_000
 
 /** The cold read's trail names, with the row and filing they were read for: a name answers only while
  *  the page still shows that task in that project and feature (a move re-files it under names the API sent nowhere). */
@@ -66,16 +78,22 @@ export function useTaskDetailLoad(
     () => (isCreate || !id || id === handedId ? undefined : boardRow(Number(id))),
     [id, isCreate, handedId],
   )
-  /* Task Run Metrics, read here (not in its panel) so the strip can gate the Metrics tab without mounting a
-     hidden panel (the subtasks/artifacts rule). Read once this id's task has landed, so a cold load's first
-     read is the `…/page` bundle's part, and the page waits for it (`loading` below): like
-     Artifacts, a late tab would shift Activity under a travelling pointer. Live: a task that starts running
-     grows the tab. */
+  /* Task Run Metrics, read here (not in its panel) so the Details strip can gate its Metrics subtab without mounting a
+     hidden panel (the subtasks/artifacts rule). Like Artifacts, a late tab would shift Activity under a travelling
+     pointer, so the page waits for the answer — but a cold load whose `…/page` bundle carries `run_metrics` hands it
+     over IN THE SAME COMMIT as the task (`runMetricsSeed`), so the page paints the moment `…/page` lands. Only a read
+     without that part (a fallback read, a part the API withheld, an event heard while it was in flight) still waits
+     for its own `GET …/run-metrics`. Live: a task that starts running grows the tab. */
   /* A DELETE IN FLIGHT ENDS THE PAGE'S READS: the row's own `task` event, or the cache drop, would
      re-read `…/run-metrics` and `…/live-cast` for a row already gone — two console 404s. Cleared if refused. */
   const [deleting, setDeleting] = useState(false)
   const runMetricsId = !isCreate && !deleting && task !== null && String(task.id) === id ? task.id : null
-  const runMetrics = useTaskRunMetrics(runMetricsId)
+  /* The bundle's (or a handed-over read's) run-metrics answer, set beside `task` so both commit together. Only a STORED
+     bundle's: one an own-task event made stale is not stored, and its panel reads its own GET. */
+  const [runMetricsSeed, setRunMetricsSeed] = useState<RunMetricsSeed | null>(
+    () => (handed?.task && handed.runMetrics !== null ? { taskId: handed.task.id, data: handed.runMetrics } : null),
+  )
+  const runMetrics = useTaskRunMetrics(runMetricsId, runMetricsSeed)
   /* The copied row's parameters. `undefined` = not a copy or not landed — safe to conflate only because
      the create branch waits on `loading`, which the read rides. */
   const [duplicateSeed, setDuplicateSeed] = useState<TaskDuplicateSeed | undefined>(undefined)
@@ -87,14 +105,18 @@ export function useTaskDetailLoad(
   // Whether the editor holds unsaved work, reported up by the form. Holds the form's own row (`formTask`).
   const [formDirty, setFormDirty] = useState(false)
   // For the Details runner block; fire-and-forget (failure = no worktree link).
-  const [worktrees, setWorktrees] = useState<Worktree[]>([])
   /* `GET /api/projects`: the breadcrumb's project menu, the create/move ladder, the runner block
-     (`runnerProjectName`) and the From Jira control read it. */
-  /* Starts from the roster another surface already read (`['projects']`, the board's), so a page opened from the board
-     names its project on first paint; the page's own read below still replaces it. */
-  const [projects, setProjects] = useState<Project[]>(() => queryClient.getQueryData<Project[]>(PROJECTS_KEY) ?? [])
+     (`runnerProjectName`) and the From issue control read it. Under the roster's shared key (`PROJECTS_KEY`), BESIDE the
+     task's own read rather than after it, so the trail names its project when the row lands: a page opened from the
+     board paints from the board's roster with no request while it is fresh (`PROJECTS_STALE_MS`), concurrent readers
+     share one request, and a project write anywhere re-reads it here too. */
+  const rosterClient = useQueryClient()
+  // Not for an id that is not one: that page is not-found without a read (the load effect), and has no runner block.
+  const readsRosters = isCreate || (!!id && /^\d+$/.test(id))
+  const projectsQuery = useProjects({ enabled: readsRosters, staleTime: PROJECTS_STALE_MS })
+  const projects = Array.isArray(projectsQuery.data) ? projectsQuery.data : NO_PROJECTS
   // Until `/api/projects` answers, the trail's project crumb is a skeleton (`TaskBreadcrumb`'s `projectPending`).
-  const [projectsPending, setProjectsPending] = useState(() => !Array.isArray(queryClient.getQueryData(PROJECTS_KEY)))
+  const projectsPending = !Array.isArray(projectsQuery.data) && projectsQuery.fetchStatus === 'fetching'
   /* The project and feature NAMES `GET …/page` sent beside the row: the trail names both at once on a
      cold page, before the roster or the task tree lands. Set by each cold read (null without them: a fallback read,
      an older API); a re-read keeps them, and the breadcrumb asks them only for the filing they were read for. */
@@ -138,13 +160,15 @@ export function useTaskDetailLoad(
         ? await readColdOnce(id)
         : await Promise.all([get<PipelineTask>(`/api/tasks/${id}`), readActivity(id), readArtifacts(id)])
           .then(([detail, activity, artifacts]) => ({ bundle: null, detail, activity, artifacts, trail: null }))
-      if (bundle !== null && gen === fetchGenRef.current && ownEventsRef.current === heard) seedTaskPage(id, bundle)
+      const stored = bundle !== null && gen === fetchGenRef.current && ownEventsRef.current === heard
+      if (stored) seedTaskPage(id, bundle)
       if (gen !== fetchGenRef.current) return // superseded — discard
       coldIdRef.current = id
       if (cold) {
         setTrail(trailNames
           ? { ...trailNames, taskId: detail.id, projectId: detail.project_id, featureId: detail.feature_id ?? null }
           : null)
+        setRunMetricsSeed(stored && bundle.run_metrics !== undefined ? { taskId: detail.id, data: bundle.run_metrics } : null)
       }
       setTask(detail)
       setActivity(Array.isArray(activityEvents) ? activityEvents : [])
@@ -198,58 +222,46 @@ export function useTaskDetailLoad(
      inside an effect (after the load effect above has run). */
   const keepsHandedRead = () => handed !== undefined && handedIdRef.current === id
 
-  // The runner block's inputs: fire-and-forget. Keyed on the task-loaded flip (not `task`), so a
-  // not-found link issues nothing and SSE refetches do not re-pull worktrees.
-  const hasTask = task !== null
-  // `GET /api/worktrees` needs `worktrees:view`; skip rather than 403 on every open.
+  // The runner block's inputs. `GET /api/worktrees` needs `worktrees:view`; skip rather than 403 on every open.
   const can = useCan()
   const canReadWorktrees = can('worktrees:view')
+
+  useEffect(() => {
+    // Create mode waits for `projects` (the ladder, the crumb picker, and the From issue control).
+    if (!isCreate) return
+    void Promise.allSettled([
+      /* The form resolves its project once at mount, so `loading` waits for the roster: the query's own read when
+         one is in flight (one request), none while the cache is fresh. */
+      rosterClient.fetchQuery({ queryKey: PROJECTS_KEY, queryFn: listProjects, staleTime: PROJECTS_STALE_MS }),
+      /* The copied row rides the same gate: `TaskEditForm` seeds a copy in `useState` initialisers, so a
+         late seed would be ignored. Its failure is a WARNING over a working form, never the page error. */
+      duplicateOf === null
+        ? Promise.resolve()
+        : loadTaskDuplicateSeed(duplicateOf).then(
+            seed => {
+              setDuplicateSeed(seed)
+              setDuplicateWarning(duplicateShortfall(duplicateOf, seed))
+            },
+            /* Says nothing was copied; the form may still show the board's prefill. */
+            () => setDuplicateWarning(`Could not read task #${duplicateOf} — nothing was copied.`),
+          ),
+    ])
+      /* `allSettled`, NOT `all`: `all` rejects on the first failure and `finally` would mount the form
+         before the seed lands, silently discarding it (initialisers, no `key`). Each leg still reports
+         its own outcome. */
+      .finally(() => setLoading(false))
+  }, [isCreate, duplicateOf, rosterClient])
+
+  /* The slots, BESIDE the task's own read rather than after it: the set is org-wide and does not depend on the row,
+     so the runner block's link is ready when the row lands. Under the roster's shared key (`WORKTREES_KEY`), so another
+     surface's read in flight (the console dock, the pool) answers this one too; SSE refetches do not re-pull them,
+     `worktree` events do (below). Create mode never reads them; a failed read keeps the last-known set. */
+  const worktreesQuery = useWorktrees({ enabled: readsRosters && !isCreate && canReadWorktrees })
+  const worktrees = Array.isArray(worktreesQuery.data) ? worktreesQuery.data : NO_WORKTREES
+  const refetchWorktrees = worktreesQuery.refetch
   const loadWorktrees = useCallback(() => {
-    if (!canReadWorktrees) return
-    void listWorktrees()
-      .then(ws => setWorktrees(Array.isArray(ws) ? ws : []))
-      .catch(() => { /* keep the last-known set; the link simply won't update this cycle */ })
-  }, [canReadWorktrees])
-
-  useEffect(() => {
-    // Create mode fetches `projects` (the ladder, the crumb picker, and the From Jira control's credential),
-    // but never worktrees.
-    if (isCreate) {
-      void Promise.allSettled([
-        listProjects().then(ps => setProjects(Array.isArray(ps) ? ps : [])).finally(() => setProjectsPending(false)),
-        /* The copied row rides the same gate: `TaskEditForm` seeds a copy in `useState` initialisers, so a
-           late seed would be ignored. Its failure is a WARNING over a working form, never the page error. */
-        duplicateOf === null
-          ? Promise.resolve()
-          : loadTaskDuplicateSeed(duplicateOf).then(
-              seed => {
-                setDuplicateSeed(seed)
-                setDuplicateWarning(duplicateShortfall(duplicateOf, seed))
-              },
-              /* Says nothing was copied; the form may still show the board's prefill. */
-              () => setDuplicateWarning(`Could not read task #${duplicateOf} — nothing was copied.`),
-            ),
-      ])
-        /* `allSettled`, NOT `all`: `all` rejects on the first failure and `finally` would mount the form
-           before the seed lands, silently discarding it (initialisers, no `key`). Each leg still reports
-           its own outcome. */
-        .finally(() => setLoading(false))
-      return
-    }
-    if (!hasTask) return
-    loadWorktrees()
-  }, [hasTask, isCreate, loadWorktrees, duplicateOf])
-
-  /* Fetched once per page view, BESIDE the task's own read rather than after it, so the trail names its project when
-     the row lands. `projects` maps `project_id` to the runner block's repo name and feeds the crumb picker. */
-  useEffect(() => {
-    // Not for an id that is not one: that page is not-found without a read (the load effect).
-    if (isCreate || !id || !/^\d+$/.test(id)) return
-    void listProjects()
-      .then(ps => setProjects(Array.isArray(ps) ? ps : []))
-      .catch(() => { /* no worktree link or crumb picker this cycle */ })
-      .finally(() => setProjectsPending(false))
-  }, [isCreate, id])
+    if (canReadWorktrees && !isCreate) void refetchWorktrees()
+  }, [canReadWorktrees, isCreate, refetchWorktrees])
 
   /* Live: refetch detail + activity on a `task` event THAT CAN MOVE THIS PAGE — this task, its parent
      or a child (`touchesScope`, births included), debounced so a burst costs one read, deferred while the tab is
@@ -259,41 +271,56 @@ export function useTaskDetailLoad(
      An editor with unsaved work does NOT hold it: the state, the header and a raised question must reach
      the page whatever the form holds. The form keeps its own row instead (`formTask` below). */
   const eventStream = useEventStream()
-  /* A task that WAITS on others reads their moves into its own payload (`unmet_prerequisite_count`, `wait_reason`'s
-     slot count, `waiting_on_persona`), under ids this page does not hold: it keeps hearing every event (`null`). */
+  /* The ids whose `task` events move this page at once: this task, its parent, its children (`touchesScope`, births
+     included). `null` before a first answer, when every event is a don't-know. */
   const liveScope = useMemo<ReadonlySet<number> | null>(
-    () =>
-      task === null || (task.unmet_prerequisite_count ?? 0) > 0 || task.wait_reason || task.waiting_on_persona
-        ? null
-        : new Set([task.id, ...(task.parent_task_id !== null ? [task.parent_task_id] : []), ...(task.children ?? []).map(c => c.id)]),
+    () => (task === null
+      ? null
+      : new Set([task.id, ...(task.parent_task_id !== null ? [task.parent_task_id] : []), ...(task.children ?? []).map(c => c.id)])),
     [task],
   )
+  /* A task that WAITS on others reads their moves into its own payload (`unmet_prerequisite_count`, `wait_reason`'s
+     slot count, `waiting_on_persona`), under ids this page does not hold, so it hears every OTHER task's event too —
+     at most once per `WAITING_REFETCH_MS`: unthrottled, each open waiting page re-read its row, feed and
+     artifacts up to once a second on a busy fleet, and every open tab queued in the API's one request lane. */
+  const waits = task !== null
+    && ((task.unmet_prerequisite_count ?? 0) > 0 || !!task.wait_reason || !!task.waiting_on_persona)
   // A delete in flight reads as gone already: its own `task` event must not re-read the row.
   const gone = notFound || deleting
-  const liveRef = useRef({ notFound: gone, liveScope })
-  liveRef.current = { notFound: gone, liveScope }
+  const liveRef = useRef({ notFound: gone, liveScope, waits })
+  liveRef.current = { notFound: gone, liveScope, waits }
+  // An event that moves this page: the seed and any in-flight cold read are dropped AT ONCE, not after the debounce,
+  // so neither a panel's own live re-read nor the page's may answer from the cold load (its seed, or its read in flight).
+  const heardMove = (moves: boolean): boolean => {
+    if (moves && id) {
+      dropTaskPageSeed(id)
+      forgetColdReads(id)
+    }
+    if (moves) liveStaleRef.current = true
+    return moves
+  }
+  const reread = () => {
+    if (!liveRef.current.notFound) void load()
+  }
   useLiveRefetch(
     eventStream,
-    () => {
-      if (!liveRef.current.notFound) void load()
-    },
+    reread,
     // The stream down, the page polls as the board does: a question the board shows reaches it too.
     STREAM_DOWN_POLL_MS,
     {
       entity: 'task',
-      match: event => {
-        const moves = !liveRef.current.notFound && touchesScope(event, liveRef.current.liveScope)
-        // At once, not after the debounce: neither a panel's own live re-read nor the page's may answer from the
-        // cold load (its seed, or its read still in flight).
-        if (moves && id) {
-          dropTaskPageSeed(id)
-          forgetColdReads(id)
-        }
-        if (moves) liveStaleRef.current = true
-        return moves
-      },
+      match: event => heardMove(!liveRef.current.notFound && touchesScope(event, liveRef.current.liveScope)),
     },
   )
+  // Its own guard as well as its match: a stream resume reaches the refetch past `match`, and only a waiting page
+  // owes this second read.
+  useLiveRefetch(eventStream, () => { if (liveRef.current.waits) reread() }, null, {
+    entity: 'task',
+    minIntervalMs: WAITING_REFETCH_MS,
+    match: event => heardMove(
+      !liveRef.current.notFound && liveRef.current.waits && !touchesScope(event, liveRef.current.liveScope),
+    ),
+  })
   /* EVERY event naming this task ends its seed, a QUIET one (`hooks/useLiveRefetch.ts::QUIET_ACTIONS`: a control
      message, a metered tick) included — it moves a panel but never this page's re-read — and keeps an in-flight cold
      read from storing its bundle: a panel mounting after it reads fresh. */
@@ -338,11 +365,10 @@ export function useTaskDetailLoad(
     })
   }, [id, isCreate])
 
-  // …and worktrees on any `worktree` event, so a task dispatched while open gains its link and console
-  // button without a reload.
-  useEventsSinceSeen(eventStream, (events, overrun) => {
-    if (overrun || events.some(event => event.entity === 'worktree')) loadWorktrees()
-  })
+  // …and worktrees on `worktree` events, so a task dispatched while open gains its link and console button without
+  // a reload: at most once per `WORKTREES_REFETCH_MIN_MS`, since every node observation emits one and a busy pool
+  // re-read the whole set several times a minute.
+  useLiveRefetch(eventStream, loadWorktrees, null, { entity: 'worktree', minIntervalMs: WORKTREES_REFETCH_MIN_MS })
 
   return {
     task, setTask, formTask, activity, artifacts, artifactsError, setArtifactsError, artifactsEverShown,

@@ -19,7 +19,7 @@ export type PersonaSummary = {
   label: string
   /** The charter the runner actually runs, not always the persona name: `coder` runs under `implementer`. */
   charter_key: string
-  /** The fallback model TIER (label via `lib/models.ts::fmtTier`). There is no per-persona pin to report;
+  /** The fallback model TIER (its label is the id capitalized, `lib/humanize.ts::capitalize`). There is no per-persona pin to report;
    *  the resolution order that beats it is single-homed in `dispatch_compose.compose._resolve_model`. */
   default_model: string
   /** `build` or `analysis`: which charter flow governs the finish.

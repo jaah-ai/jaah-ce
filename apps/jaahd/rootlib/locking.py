@@ -70,7 +70,7 @@ def _flock(lock_path: Path, timeout: float, what: str) -> Iterator[None]:
                     raise LockTimeout(
                         f"{what} lock held by another operation for {timeout:.0f}s "
                         f"({attempt} attempts)"
-                    )
+                    ) from None
                 log.info("%s lock contended — retry %d", what, attempt)
                 time.sleep(RETRY_INTERVAL)
         if attempt > 1:

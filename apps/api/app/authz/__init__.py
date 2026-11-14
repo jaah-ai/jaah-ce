@@ -20,7 +20,8 @@ Module map — import each name from the module that owns it (this package re-ex
   `always`; `declaration_of` reads a handler's `__authz__`.
 - `principal`: `Principal`, `principal_for_user`, `current_principal`, `Caller`, `creates_org_rows`.
 - `visibility`: the SQL `visible_*_clause` predicates, `ObjectSpec`/`OBJECT_SPECS`, `scoped_*_select`.
-- `object_access`: `can_access`, `require_object_access`, `validated_ownership`, `stamp_owner_on_create`.
-- `enforce`: `_enforce` and its denials (`HintedDenial`), `enforce_in_process`, the read-scope binding.
+- `object_access`: `can_access`, `require_object_access`, `require_org_key`, `require_org_admin`,
+  `validated_ownership`, `stamp_owner_on_create`.
+- `enforce`: `_enforce` and its denials, `enforce_in_process`, the read-scope binding.
 - `guard`: `authz_guard` and `ORG_SCOPE_HEADER`.
 """

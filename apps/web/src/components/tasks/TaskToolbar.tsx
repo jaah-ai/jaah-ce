@@ -3,7 +3,6 @@ import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Menu from '@mui/material/Menu'
 import MenuItem from '@mui/material/MenuItem'
-import Switch from '@mui/material/Switch'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import type { Theme } from '@mui/material/styles'
@@ -13,31 +12,35 @@ import {
   dateRangeSummary,
   type TaskDateRangeId,
 } from '../../lib/taskDateRange'
-import type { TaskCreator, TaskSourceOption } from '../../types'
+import type { TaskAssignee, TaskSourceOption } from '../../types'
+import { countOf } from '../../lib/humanize'
 import { GROUP_BY_NONE, isTagGroupBy, type GroupByOption } from '../../lib/taskGrouping'
 import { useOfficialZone } from '../../lib/officialZone'
 import { useViewerMode } from '../../lib/viewerMode'
 import { PHONE } from '../../ui/listStyles'
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, RADIUS, SIZE } from '../../theme'
 import ToolbarMenu, {
-  CheckboxPage,
+  checkItem,
   GLYPH_BOX_SX,
   GLYPH_BUTTON_ON_SX,
   GLYPH_BUTTON_SX,
   moveWithinRadioGroup,
   PAGE_CAPTION_SX,
   PAGE_FIELD_SX,
-  RadioPage,
+  radioItem,
   rovingTabIndex,
   TOOLBAR_BUTTON_SX,
   TOOLBAR_LABEL_SX,
   type ToolbarMenuItem,
 } from '../../ui/ToolbarMenu'
-import { creatorLabel, rosterOffersAChoice, toggleCreatorId } from '../../lib/taskCreators'
+import { assigneeLabel, rosterOffersAChoice, toggleAssigneeId } from '../../lib/taskAssignees'
 import NewButton from '../../ui/NewButton'
-import { TemplatesIcon } from '../../ui/icons'
+import SettingCheckbox from '../../ui/SettingCheckbox'
 import AuthorBadge from './AuthorBadge'
+import type { TaskColumn } from '../../lib/taskColumns'
 import { STATE_TITLES, stateLabel } from './shared'
 import { KNOWN_TASK_STATES } from '../../generated/taskTransitions'
+import Tip from '../../ui/Tip'
 
 // The `/tasks` pane header's action cluster: Focus, the Filter & view MENU and the New split button
 // (New Chat is an entry in its ▾). It must fit ONE line at mobile width: each control collapses to its 44px
@@ -66,7 +69,7 @@ function PulseIcon({ on }: { on: boolean }) {
       focusable="false"
       data-testid="toolbar-focus-glyph"
       data-on={on ? 'true' : 'false'}
-      sx={{ width: 16, height: 16, display: 'block' }}
+      sx={{ width: SIZE.iconSm, height: SIZE.iconSm, display: 'block' }}
     >
       <Box
         component="path"
@@ -86,21 +89,21 @@ function PulseIcon({ on }: { on: boolean }) {
 }
 
 /* The split button's halves: one pill, a hairline between them. The caret keeps the 44px phone floor. */
-const SPLIT_MAIN_SX = { borderTopRightRadius: 0, borderBottomRightRadius: 0 } as const
+const SPLIT_MAIN_SX = { borderTopRightRadius: RADIUS.none, borderBottomRightRadius: RADIUS.none } as const
 const SPLIT_CARET_SX = {
-  minWidth: 32,
+  minWidth: SIZE.thumb,
   px: 0,
-  borderTopLeftRadius: 0,
-  borderBottomLeftRadius: 0,
+  borderTopLeftRadius: RADIUS.none,
+  borderBottomLeftRadius: RADIUS.none,
   borderLeft: '1px solid rgba(var(--mui-palette-primary-contrastTextChannel) / 0.35)',
-  [PHONE]: { minWidth: 44, minHeight: 44 },
+  [PHONE]: { minWidth: SIZE.tapTarget, minHeight: SIZE.tapTarget },
 } as const
 
 /* ── PERIOD ──────────────────────────────────────────────────────────────────────────────────────── */
 
 /* The pill row wraps: five words do not fit a 268px panel; a scroller hides options and truncation would
  * cut "Exact dates". */
-const PERIOD_PILLS_SX = { display: 'flex', flexWrap: 'wrap', gap: 0.75, px: 1.5, py: 1.5 } as const
+const PERIOD_PILLS_SX = { display: 'flex', flexWrap: 'wrap', gap: 0.5, px: 1.5, py: 1.5 } as const
 
 /* A real `<button>` for free keyboard access, so UA styling is reset: `appearance`, `m: 0`, and
  * `typography: 'body2'` (its longhands restore the face; `font: 'inherit'` does not). `minHeight` is 44px
@@ -110,25 +113,25 @@ const PERIOD_PILL_SX = {
   m: 0,
   font: 'inherit',
   typography: 'body2',
-  lineHeight: 1,
+  lineHeight: LINE_HEIGHT.tight,
   cursor: 'pointer',
   display: 'inline-flex',
   alignItems: 'center',
   justifyContent: 'center',
-  px: 1.25,
-  minHeight: 32,
-  borderRadius: 999,
+  px: 1,
+  minHeight: SIZE.thumb,
+  borderRadius: RADIUS.round,
   border: '1px solid',
   transition: 'background-color 120ms, border-color 120ms, color 120ms',
   /* Explicit focus ring: the stock one is low-contrast on the ACTIVE pill's `primary.main` fill. */
   '&:focus-visible': { outline: '2px solid', outlineColor: 'text.primary', outlineOffset: 2 },
-  [PHONE]: { minHeight: 44, px: 1.5 },
+  [PHONE]: { minHeight: SIZE.tapTarget, px: 1.5 },
 } as const
 
 /* The active preset is marked by fill, weight AND colour — never colour alone (WCAG 1.4.1); the fill
  * survives greyscale. `aria-checked` at the render site carries it to AT. */
 const PERIOD_PILL_ACTIVE_SX = {
-  fontWeight: 600,
+  fontWeight: FONT_WEIGHT.semibold,
   color: 'primary.contrastText',
   bgcolor: 'primary.main',
   borderColor: 'primary.main',
@@ -136,7 +139,7 @@ const PERIOD_PILL_ACTIVE_SX = {
 } as const
 
 const PERIOD_PILL_IDLE_SX = {
-  fontWeight: 400,
+  fontWeight: FONT_WEIGHT.regular,
   color: 'text.secondary',
   bgcolor: 'transparent',
   borderColor: 'divider',
@@ -162,13 +165,13 @@ const PERIOD_DATE_SX = (theme: Theme) => ({
   minWidth: 0,
 })
 
-/* ── CREATOR ─────────────────────────────────────────────────────────────────── */
+/* ── ASSIGNEE ─────────────────────────────────────────────────────────────────── */
 
 /* The host's half of `AuthorBadge`'s split, slightly smaller than the header strip's (it sits beside the
  * name). The row around it is `CheckboxPage`'s (`ui/ToolbarMenu.tsx`). */
-const CREATOR_BADGE_SX = { fontSize: 10, fontWeight: 700, lineHeight: 1, minWidth: 20 } as const
+const ASSIGNEE_BADGE_SX = { fontSize: FONT_SIZE.xxs, fontWeight: FONT_WEIGHT.bold, lineHeight: LINE_HEIGHT.tight, minWidth: SIZE.iconMd } as const
 
-export type NewMenuEntry = { id: 'task' | 'feature' | 'chat'; label: string; run: () => void }
+type NewMenuEntry = { id: 'task' | 'template' | 'chat'; label: string; run: () => void }
 
 export type TaskToolbarProps = {
   /* Focus: the board narrowed to work the operator can still act on. Drives `?focus=true` (`shared.tsx`'s
@@ -198,16 +201,21 @@ export type TaskToolbarProps = {
   onDateRangeChange: (id: TaskDateRangeId) => void
   onDateFromChange: (value: string) => void
   onDateToChange: (value: string) => void
-  /* Who created the rows. A real filter (badge, Clear). Multi-select: picks show the UNION; empty is off,
-   * so there is no "Everyone" option. The header's `CreatorFilterBar.tsx` is the fast path (three badges and a
+  /* Whom the rows are assigned to. A real filter (badge, Clear). Multi-select: picks show the UNION; empty is off,
+   * so there is no "Everyone" option. The header's `AssigneeFilterBar.tsx` is the fast path (three badges and a
    * `+N`); this page is the full list, never hidden by viewport. */
-  creators: TaskCreator[]
-  /* Marks the operator's own row "(you)" (`creatorLabel`, `lib/taskCreators.ts`), as the strip does.
+  assignees: TaskAssignee[]
+  /* Marks the operator's own row "(you)" (`assigneeLabel`, `lib/taskAssignees.ts`), as the strip does.
    * `null` before `/api/auth/me` resolves. */
   currentUserId: string | null
+  assigneeIds: string[]
+  onAssigneeIdsChange: (ids: string[]) => void
+  /* Who FILED the rows (`GET /api/tasks/creators`, caller first). A real filter (badge, chip, Clear), multi-select
+   * like Assignee and drawn the same way; its "System" entry stands for every row no human filed. Menu only. */
+  creators: TaskAssignee[]
   creatorIds: string[]
   onCreatorIdsChange: (ids: string[]) => void
-  /* Where the rows were filed from. A real filter (badge, Clear), multi-select like Creator: picks show the
+  /* Where the rows were filed from. A real filter (badge, Clear), multi-select like Assignee: picks show the
    * UNION, empty is off. `taskSources` is the server's vocabulary (`GET /api/tasks/sources`, display order) and
    * the ONLY source of the words: a code is never printed. `[]` until it answers. */
   taskSources: TaskSourceOption[]
@@ -217,6 +225,17 @@ export type TaskToolbarProps = {
    * selection it narrows the board to one project's drafts for a bulk verb. */
   stateFilter: string
   onStateFilterChange: (state: string) => void
+  /* What a project pipeline lists: its stages (`''`, the default) or one bucket (Not started, Done, Archived),
+   * each option's label carrying its count. A real filter (badge, Clear). Absent off a project pipeline: no page. */
+  listing?: { value: string; options: { value: string; label: string }[]; onPick: (value: string) => void }
+  /* One persona slug, `''` for every persona, and an exact window of ISO instants (`''` unset) — both from a
+   * link (`lib/taskUrlFilters.ts`), not this menu. Real filters (badge, chip, Clear); while set, the window
+   * stands in for the Period choice. */
+  persona: string
+  onPersonaClear: () => void
+  windowAfter: string
+  windowBefore: string
+  onWindowClear: () => void
   /* The free-text term, `''` off, held VERBATIM (a trailing space is half-typed). A real filter (its chip,
    * Clear), typed in the header's box (`pane/TaskSearchBox.tsx`), not this menu. The SERVER matches: `?q=` on `GET /api/tasks`, case-insensitive ONE PHRASE over title OR body,
    * and a NUMBER (`N`, `#N`, `task #N`) also matches the task id and issue number, sorted first
@@ -232,19 +251,28 @@ export type TaskToolbarProps = {
   groupBy: string
   onGroupByChange: (groupBy: string) => void
   groupByOptions: GroupByOption[]
+  /* Columns — which optional row columns this user sees (`lib/taskColumns.ts`), stored on their account. A VIEW
+   * setting, not in the badge. `columns` is what this viewer may choose among (the host drops Organization for
+   * whoever never sees it); absent `onToggleColumn` = no page (a principal who cannot write preferences). The host
+   * toggles against the STORED list, so two quick presses never overwrite each other. */
+  columns?: readonly TaskColumn[]
+  hiddenColumns?: readonly string[]
+  onToggleColumn?: (key: string) => void
   /* Optional; absence is the permission gate. `POST /api/tasks` declares `tasks:create`, which `tasks:view`
    * does not imply. The host withholds the handler (`Tasks.tsx`) and the button goes with it — no second
    * predicate, no disabled ＋. */
   onNewTask?: () => void
-  /* The New split button's ▾ — every object this selection lets the user create (Task, Feature),
-   * each entry present only where its permission holds (`pane/PaneHeader.tsx` builds them from
-   * the tree's `can_*` flags). Empty or absent: no ▾, and ＋ stands alone. */
-  newMenu?: NewMenuEntry[]
   /* Optional by the same mechanism; the host asks the narrower `useCanCreateChats`
    * (`hooks/useTaskAccess.ts`, single home). */
   onNewChat?: () => void
-  /** Opens the template gallery, beside New task; absent = no button. */
+  /** Opens the template gallery: the New ▾'s From template entry; absent = no entry. */
   onFromTemplate?: () => void
+}
+
+/* The Columns row's value: "All", else how many of the offered columns show ("6 of 9"). */
+function shownColumnsValue(columns: readonly TaskColumn[], hidden: readonly string[]): string {
+  const shown = columns.filter(column => !hidden.includes(column.key)).length
+  return shown === columns.length ? 'All' : `${shown} of ${columns.length}`
 }
 
 export default function TaskToolbar(props: TaskToolbarProps) {
@@ -260,8 +288,11 @@ export default function TaskToolbar(props: TaskToolbarProps) {
     onDateRangeChange,
     onDateFromChange,
     onDateToChange,
-    creators,
+    assignees,
     currentUserId,
+    assigneeIds,
+    onAssigneeIdsChange,
+    creators,
     creatorIds,
     onCreatorIdsChange,
     taskSources,
@@ -269,57 +300,100 @@ export default function TaskToolbar(props: TaskToolbarProps) {
     onSourcesChange,
     stateFilter,
     onStateFilterChange,
+    listing,
+    persona,
+    windowAfter,
+    windowBefore,
     groupBy,
     onGroupByChange,
     groupByOptions,
+    columns = [],
+    hiddenColumns = [],
+    onToggleColumn,
     onNewTask,
     onNewChat,
     onFromTemplate,
-    newMenu = [],
   } = props
   const [newAnchor, setNewAnchor] = useState<HTMLElement | null>(null)
-  const newEntries: NewMenuEntry[] = onNewChat ? [...newMenu, { id: 'chat', label: 'Chat', run: onNewChat }] : newMenu
+  /* The New ▾: Task, From template, Chat — each only where its handler is offered (absence is the permission gate).
+     A ▾ offering only what ＋ already does is a second control for one choice: none. */
+  const offered: NewMenuEntry[] = [
+    ...(onNewTask ? [{ id: 'task' as const, label: 'Task', run: onNewTask }] : []),
+    ...(onFromTemplate ? [{ id: 'template' as const, label: 'From template', run: onFromTemplate }] : []),
+    ...(onNewChat ? [{ id: 'chat' as const, label: 'Chat', run: onNewChat }] : []),
+  ]
+  const newEntries = offered.length === 1 && offered[0].id === 'task' ? [] : offered
   /* The control plane's zone, from the same hook as `Tasks.tsx`, so badge and request agree. Used only for
    * the badge count: `dateRangeIsActive` answers from the REAL bounds so the badge never claims a narrowing
    * the request does not make. */
   const zone = useOfficialZone()
   const viewer = useViewerMode()
   const activeRange = TASK_DATE_RANGES.find(range => range.id === dateRange)
-  const offerCreators = rosterOffersAChoice(creators)
+  const offerAssignees = rosterOffersAChoice(assignees)
   // The badge: one per filter NOT at its default (active filters, not hidden rows — the list is a bounded
   // window). It answers "why is this list short?", so it counts only what removes rows AND lives in the
-  // menu: period, creator and source (ONE each however many picks), state, hidden — each with a chip
-  // (`pane/FilterChips.tsx`). Not counted: Focus (its own lit button, no chip — a "2" beside one
+  // menu: period, assignee, creator and source (ONE each however many picks), state, hidden — each with a chip
+  // (`pane/FilterChips.tsx`) — and a pipeline's bucket (Show), whose row names it. Not counted: Focus (its own lit button, no chip — a "2" beside one
   // chip would read as a lie), search (its box is on the header, `pane/TaskSearchBox.tsx`), the selection (the header
   // says it) and Group by (drawing only).
   const activeFilters =
     (showHidden ? 1 : 0) +
-    (dateRangeIsActive(dateRange, dateFrom, dateTo, zone) ? 1 : 0) +
+    (windowAfter !== '' || windowBefore !== '' || dateRangeIsActive(dateRange, dateFrom, dateTo, zone) ? 1 : 0) +
+    (assigneeIds.length > 0 ? 1 : 0) +
     (creatorIds.length > 0 ? 1 : 0) +
     (sources.length > 0 ? 1 : 0) +
-    (stateFilter !== '' ? 1 : 0)
+    (stateFilter !== '' ? 1 : 0) +
+    (listing && listing.value !== '' ? 1 : 0) +
+    (persona !== '' ? 1 : 0)
 
   /* Each row's value in the same words its page uses, so level one and the ticked option never differ. */
   const periodValue = activeRange?.label ?? 'Any time'
-  /* The first PICKED creator in roster order plus a count, never "3 selected". It never says "Anyone" while
-   * a pick is in force: a pick can outlive the roster (`GET /api/tasks/creators` for the current scope; `[]`
+  /* The first PICKED assignee in roster order plus a count, never "3 selected". It never says "Anyone" while
+   * a pick is in force: a pick can outlive the roster (`GET /api/tasks/assignees` for the current scope; `[]`
    * on first paint, `pages/Tasks.tsx`), so it names the count instead. */
-  const pickedCreators = creators.filter(creator => creatorIds.includes(creator.id))
-  const creatorValue =
-    creatorIds.length === 0
+  const pickValue = (roster: TaskAssignee[], ids: string[]) => {
+    const picked = roster.filter(person => ids.includes(person.id))
+    return ids.length === 0
       ? 'Anyone'
-      : pickedCreators.length === 0
-        ? `${creatorIds.length} ${creatorIds.length === 1 ? 'person' : 'people'}`
-        : pickedCreators.length === 1
-          ? creatorLabel(pickedCreators[0], currentUserId)
-          : `${creatorLabel(pickedCreators[0], currentUserId)} +${pickedCreators.length - 1}`
-  /* As the creator's: the first pick's label plus a count, and a bare count before the vocabulary answers. */
+      : picked.length === 0
+        ? countOf(ids.length, 'person', 'people')
+        : picked.length === 1
+          ? assigneeLabel(picked[0], currentUserId)
+          : `${assigneeLabel(picked[0], currentUserId)} +${picked.length - 1}`
+  }
+  /* A person page (Assignee, Creator): the multi-select roster with each person's badge and row count. It never
+   * calls `nav`, so each extra pick costs one press. */
+  const personPage = (
+    id: 'assignee' | 'creator',
+    label: string,
+    roster: TaskAssignee[],
+    ids: string[],
+    onChange: (ids: string[]) => void,
+  ): ToolbarMenuItem => checkItem({
+    id, label, testId: `toolbar-${id}`, value: pickValue(roster, ids),
+    options: roster.map(person => {
+      /* "(you)" is on the visible label too, not only the accessible name. */
+      const name = assigneeLabel(person, currentUserId)
+      return {
+        value: person.id,
+        label: name,
+        /* The name, never the initials (the badge is `aria-hidden` at its source). */
+        ariaLabel: `Filter by ${name}`,
+        icon: <AuthorBadge name={person.name} sx={ASSIGNEE_BADGE_SX} testId={`toolbar-${id}-badge-${person.id}`} />,
+        /* The same count the header strip's tooltip carries. */
+        meta: String(person.task_count),
+      }
+    }),
+    values: ids,
+    onToggle: personId => onChange(toggleAssigneeId(ids, personId, roster)),
+  })
+  /* As the assignee's: the first pick's label plus a count, and a bare count before the vocabulary answers. */
   const pickedSources = taskSources.filter(source => sources.includes(source.value))
   const sourceValue =
     sources.length === 0
       ? 'Any'
       : pickedSources.length === 0
-        ? `${sources.length} ${sources.length === 1 ? 'source' : 'sources'}`
+        ? countOf(sources.length, 'source')
         : pickedSources.length === 1
           ? pickedSources[0].label
           : `${pickedSources[0].label} +${pickedSources.length - 1}`
@@ -328,12 +402,12 @@ export default function TaskToolbar(props: TaskToolbarProps) {
   const groupValue =
     groupByOptions.find(option => option.value === groupBy)?.label ?? (isTagGroupBy(groupBy) ? 'Tag group' : 'None')
 
-  /* The settings, in badge order: those that change WHICH rows (period, creator, hidden), then
+  /* The settings, in badge order: those that change WHICH rows (period, assignee, hidden), then
    * those that change how they are DRAWN (grouping). The switch ends the first run: it has no page.
    * Focus and Search are not here: each is its own control on the header (one decision, one control). Only
    * Hidden carries a `hint`: its word alone does not say which rows it adds.
-   * THE SINGLE-CHOICE PAGES (Period, State, Group by) SHUT THE PANEL ON A PICK: left open, its invisible
-   * backdrop swallowed the next click on the redrawn board. Creator and Source stay open for several picks. */
+   * THE SINGLE-CHOICE PAGES (Period, State, Show, Group by) SHUT THE PANEL ON A PICK: left open, its invisible
+   * backdrop swallowed the next click on the redrawn board. Assignee, Creator and Source stay open for several picks. */
   const menuItems: ToolbarMenuItem[] = [
     {
       kind: 'page',
@@ -347,8 +421,7 @@ export default function TaskToolbar(props: TaskToolbarProps) {
         <>
           <Box data-testid="toolbar-period" role="radiogroup" onKeyDown={moveWithinRadioGroup} aria-label="Period" sx={PERIOD_PILLS_SX}>
             {TASK_DATE_RANGES.map(range => (
-              <Box
-                key={range.id}
+              <Tip key={range.id} title={range.hint}><Box
                 component="button"
                 type="button"
                 role="radio"
@@ -360,7 +433,6 @@ export default function TaskToolbar(props: TaskToolbarProps) {
                   if (range.id !== 'exact') nav.pick()
                 }}
                 /* The tooltip carries the day count the labels drop. */
-                title={range.hint}
                 data-testid={`toolbar-period-${range.id}`}
                 sx={[
                   PERIOD_PILL_SX,
@@ -368,7 +440,7 @@ export default function TaskToolbar(props: TaskToolbarProps) {
                 ]}
               >
                 {range.label}
-              </Box>
+              </Box></Tip>
             ))}
           </Box>
           {/* The inputs appear only under "Exact dates"; their values survive leaving it. */}
@@ -409,147 +481,97 @@ export default function TaskToolbar(props: TaskToolbarProps) {
         </>
       ),
     },
-    /* Absent when there is nobody to choose between (`rosterOffersAChoice` in `lib/taskCreators.ts`, shared
+    /* Absent when there is nobody to choose between (`rosterOffersAChoice` in `lib/taskAssignees.ts`, shared
      * with the header strip) — unless a pick is in force, or a lit badge would have no row to open (the
      * roster is `[]` on first paint). */
-    ...(offerCreators || creatorIds.length > 0
-      ? ([
-          {
-            kind: 'page',
-            id: 'creator',
-            label: 'Creator',
-            value: creatorValue,
-            /* The one multi-select page (`CheckboxPage`): it never calls `nav`, so each extra pick costs one press. */
-            render: () => (
-              <CheckboxPage
-                testId="toolbar-creator"
-                label="Creator"
-                options={creators.map(creator => {
-                  /* "(you)" is on the visible label too, not only the accessible name. */
-                  const label = creatorLabel(creator, currentUserId)
-                  return {
-                    value: creator.id,
-                    label,
-                    /* The name, never the initials (the badge is `aria-hidden` at its source). */
-                    ariaLabel: `Filter by ${label}`,
-                    icon: (
-                      <AuthorBadge
-                        name={creator.name}
-                        sx={CREATOR_BADGE_SX}
-                        testId={`toolbar-creator-badge-${creator.id}`}
-                      />
-                    ),
-                    /* The same count the header strip's tooltip carries. */
-                    meta: String(creator.task_count),
-                  }
-                })}
-                values={creatorIds}
-                onToggle={id => onCreatorIdsChange(toggleCreatorId(creatorIds, id, creators))}
-              />
-            ),
-          },
-        ] satisfies ToolbarMenuItem[])
+    ...(offerAssignees || assigneeIds.length > 0
+      ? [personPage('assignee', 'Assignee', assignees, assigneeIds, onAssigneeIdsChange)]
       : []),
-    {
-      kind: 'page',
-      id: 'state',
-      label: 'State',
-      value: stateFilter === '' ? 'Any' : stateLabel(stateFilter),
-      closeOnPick: true,
-      render: nav => (
-        <RadioPage
-          testId="toolbar-state"
-          label="State"
-          options={[
-            { value: '', label: 'Any', hint: 'Every state', testId: 'toolbar-state-any' },
-            ...KNOWN_TASK_STATES.map(state => ({ value: state, label: stateLabel(state), hint: STATE_TITLES[state] ?? '', testId: `toolbar-state-${state}` })),
-          ]}
-          value={stateFilter}
-          onPick={onStateFilterChange}
-          nav={nav}
-        />
-      ),
-    },
+    /* The same rule for the creator roster. */
+    ...(rosterOffersAChoice(creators) || creatorIds.length > 0
+      ? [personPage('creator', 'Creator', creators, creatorIds, onCreatorIdsChange)]
+      : []),
+    radioItem({
+      id: 'state', label: 'State', testId: 'toolbar-state', closeOnPick: true,
+      shown: stateFilter === '' ? 'Any' : stateLabel(stateFilter),
+      options: [
+        { value: '', label: 'Any', hint: 'Every state', testId: 'toolbar-state-any' },
+        ...KNOWN_TASK_STATES.map(state => ({ value: state, label: stateLabel(state), hint: STATE_TITLES[state] ?? '', testId: `toolbar-state-${state}` })),
+      ],
+      value: stateFilter, onPick: onStateFilterChange,
+    }),
+    ...(listing
+      ? [radioItem({
+          id: 'show', label: 'Show', testId: 'toolbar-show', closeOnPick: true,
+          shown: listing.options.find(option => option.value === listing.value)?.label ?? listing.value,
+          options: listing.options.map(option => ({
+            ...option, hint: '', testId: `toolbar-show-${option.value === '' ? 'stages' : option.value}`,
+          })),
+          value: listing.value, onPick: listing.onPick,
+        })]
+      : []),
     /* Absent until the vocabulary answers, unless a pick is in force (so a lit badge always has its row). */
     ...(taskSources.length > 0 || sources.length > 0
-      ? ([
-          {
-            kind: 'page',
-            id: 'source',
-            label: 'Source',
-            value: sourceValue,
-            render: () => (
-              <CheckboxPage
-                testId="toolbar-source"
-                label="Source"
-                options={taskSources.map(source => ({
-                  value: source.value,
-                  label: source.label,
-                  ariaLabel: `Filter by ${source.label}`,
-                }))}
-                values={sources}
-                /* Kept in vocabulary order, so equal picks write equal URLs whatever the click order. */
-                onToggle={value => {
-                  const picked = new Set(sources)
-                  if (picked.has(value)) picked.delete(value)
-                  else picked.add(value)
-                  onSourcesChange(taskSources.filter(source => picked.has(source.value)).map(source => source.value))
-                }}
-              />
-            ),
+      ? [checkItem({
+          id: 'source', label: 'Source', testId: 'toolbar-source', value: sourceValue,
+          options: taskSources.map(source => ({
+            value: source.value,
+            label: source.label,
+            ariaLabel: `Filter by ${source.label}`,
+          })),
+          values: sources,
+          /* Kept in vocabulary order, so equal picks write equal URLs whatever the click order. */
+          onToggle: value => {
+            const picked = new Set(sources)
+            if (picked.has(value)) picked.delete(value)
+            else picked.add(value)
+            onSourcesChange(taskSources.filter(source => picked.has(source.value)).map(source => source.value))
           },
-        ] satisfies ToolbarMenuItem[])
+        })]
       : []),
     /* Not on the Live Cast viewer: its API always lists hidden rows, so the switch would change nothing there. */
     ...(viewer
       ? []
       : [
           {
-            /* Hidden is a switch, not a door (two states). Its `title` and accessible name name both classes — not
+            /* Hidden is a checkbox, not a door (two states). Its `title` and accessible name name both classes — not
              * guessable from the word. */
             kind: 'row',
             id: 'hidden',
             label: 'Hidden',
-            hint: 'System and archived tasks, among the finished ones',
-            /* The testid is on the Switch ROOT: MUI types `slotProps.input` to reject `data-*`. Specs drive its
-             * `switch` role. */
+            hint: 'System and archived tasks; for admins, everyone\'s drafts',
             control: (
-              <Switch
-                size="small"
+              <SettingCheckbox
+                name="hidden"
+                label="Show hidden tasks (system and archived)"
                 checked={showHidden}
-                onChange={e => onShowHiddenChange(e.target.checked)}
-                slotProps={{
-                  input: {
-                    'aria-label': 'Show hidden tasks (system and archived)',
-                  },
-                }}
-                data-testid="toolbar-hidden"
+                onChange={onShowHiddenChange}
+                labelHidden
+                dense
+                testId="toolbar-hidden"
               />
             ),
           } satisfies ToolbarMenuItem,
         ]),
-    {
-      kind: 'page',
-      id: 'group',
-      label: 'Group by',
-      value: groupValue,
-      closeOnPick: true,
-      /* A radio list shutting the panel on a pick. Option hints are `title`s. Testids spell each
-       * value (`toolbar-group-<value>`, `none` for None): e2e specs and a shared fixture reach them. */
-      render: nav => (
-        <RadioPage
-          testId="toolbar-group-by"
-          label="Group by"
-          options={groupByOptions.map(option => ({
-            ...option,
-            testId: `toolbar-group-${option.value === GROUP_BY_NONE ? 'none' : option.value}`,
-          }))}
-          value={groupBy}
-          onPick={onGroupByChange}
-          nav={nav}
-        />
-      ),
-    },
+    /* A radio list shutting the panel on a pick. Option hints are `title`s. Testids spell each
+     * value (`toolbar-group-<value>`, `none` for None): e2e specs and a shared fixture reach them. */
+    radioItem({
+      id: 'group', label: 'Group by', testId: 'toolbar-group-by', closeOnPick: true, shown: groupValue,
+      options: groupByOptions.map(option => ({
+        ...option,
+        testId: `toolbar-group-${option.value === GROUP_BY_NONE ? 'none' : option.value}`,
+      })),
+      value: groupBy, onPick: onGroupByChange,
+    }),
+    /* Columns: a multi-select that stays open, like Assignee — each tick is one press, saved to the account at once. */
+    ...(onToggleColumn && columns.length > 0
+      ? [checkItem({
+          id: 'columns', label: 'Columns', testId: 'toolbar-columns', value: shownColumnsValue(columns, hiddenColumns),
+          options: columns.map(column => ({ value: column.key, label: column.label, ariaLabel: `Show ${column.label}` })),
+          values: columns.map(column => column.key).filter(key => !hiddenColumns.includes(key)),
+          onToggle: onToggleColumn,
+        })]
+      : []),
   ]
 
   return (
@@ -568,7 +590,7 @@ export default function TaskToolbar(props: TaskToolbarProps) {
         alignItems: 'center',
         flexWrap: 'wrap',
         justifyContent: 'flex-end',
-        gap: '4px',
+        gap: 0.5,
         // The right edge, on line one beside the title or on a line of its own.
         ml: 'auto',
         // Never shrinks (members are at the 44px floor; shrinking shreds labels). The cap lets it WRAP: `0 0 auto`
@@ -580,13 +602,12 @@ export default function TaskToolbar(props: TaskToolbarProps) {
       {/* First the settings, then the create doors. */}
 
       {/* Focus, wordless at every width and immediately left of the Filter button. */}
-      <Button
+      <Tip title="Focus — hide finished tasks and queued subtasks"><Button
         variant="outlined"
         color="inherit"
         onClick={() => onFocusChange(!focus)}
         aria-pressed={focus}
         aria-label="Focus — hide finished tasks and queued subtasks"
-        title="Focus — hide finished tasks and queued subtasks"
         data-testid="toolbar-focus"
         sx={focus ? GLYPH_BUTTON_ON_SX : GLYPH_BUTTON_SX}
       >
@@ -594,7 +615,7 @@ export default function TaskToolbar(props: TaskToolbarProps) {
         <Box component="span" sx={GLYPH_BOX_SX}>
           <PulseIcon on={focus} />
         </Box>
-      </Button>
+      </Button></Tip>
 
       {/* One button for every setting; the panel is `ui/ToolbarMenu.tsx`'s, shared with `/worktrees`. */}
       {/* KEPT "Filter & view" after the List style page left: Group by still arranges the view rather
@@ -602,31 +623,14 @@ export default function TaskToolbar(props: TaskToolbarProps) {
       <ToolbarMenu
         name="Filter and view"
         heading="Filter & view"
-        hint="Period, creator, source, hidden and grouping"
+        hint="Period, assignee, creator, source, hidden and grouping"
         badgeCount={activeFilters}
         items={menuItems}
         onClear={onClearFilters}
       />
 
-      {/* FROM TEMPLATE, beside New task for the same creator: the template gallery (`/templates`), where Start and
-          Customize file the task. Wordless at phone width, like the other toolbar buttons. */}
-      {onFromTemplate && (
-        <Button
-          onClick={onFromTemplate}
-          variant="outlined"
-          color="inherit"
-          aria-label="From template"
-          title="From template"
-          data-testid="toolbar-from-template"
-          sx={{ ...TOOLBAR_BUTTON_SX, gap: 0.75 }}
-        >
-          <Box component="span" sx={GLYPH_BOX_SX}><TemplatesIcon /></Box>
-          <Typography component="span" variant="button" sx={TOOLBAR_LABEL_SX}>From template</Typography>
-        </Button>
-      )}
-
-      {/* THE NEW SPLIT BUTTON — a bare ＋ is New Task (its name is on `aria-label`); ▾ lists every other object this
-      selection lets the user create (`newEntries`: Feature, and Chat where `onNewChat` is offered). One control,
+      {/* THE NEW SPLIT BUTTON — the main half is New Task (`ui/NewButton`: its words, a ＋ on a phone); ▾ lists every other object this
+      selection lets the user create (`newEntries`: Task, From template, Chat). One control,
       two doors onto the same verb. With no Task permission the ▾ stands alone as "New". */}
       {(onNewTask || newEntries.length > 0) && (
         <Box data-testid="toolbar-new" sx={{ display: 'inline-flex', flex: '0 0 auto' }}>
@@ -674,7 +678,7 @@ export default function TaskToolbar(props: TaskToolbarProps) {
                   setNewAnchor(null)
                   entry.run()
                 }}
-                sx={{ [PHONE]: { minHeight: 44 } }}
+                sx={{ [PHONE]: { minHeight: SIZE.tapTarget } }}
               >
                 {entry.label}
               </MenuItem>

@@ -36,14 +36,6 @@ SECRET_NAME = re.compile(r"(_TOKEN|_API_KEY|_SECRET|PASSWORD)$", re.I)
 # Secret-shaped names a launch may legitimately carry. Empty: the control MCP server's env
 # (CONTROL_TASK_ID and kin) matches none of the shapes.
 SECRET_NAME_ALLOWED: frozenset[str] = frozenset()
-#: The one `session_meta` key that is the host's own (the native session a resume opens); the rest is the agent's.
-#: Written by `fleet_dispatch.launch_runner` (a console hand-off's `resume_ref`), read by `acp/host.py`.
-NATIVE_REF_KEY = "native_session_ref"
-#: The only shape a resumed native session id may take: a canonical UUID (every hand-off engine's session id is
-#: one). The id is reported by the session's own event stream, which the agent can write, and lands on a resume
-#: argv: anything else (`--last`, `latest`, an index, a `-c` override) would reopen another conversation or
-#: reconfigure the CLI. The CP checks the same shape (`apps/api/app/routes/console_runtime.py::_native_ref`).
-NATIVE_REF = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 #: A registry install's text fields (`runtime.install`), beside its `pin` (and optional `agent`).
@@ -222,20 +214,10 @@ def to_dict(spec: LaunchSpec) -> dict:
 
 
 def dump(spec: LaunchSpec, path: str | os.PathLike) -> None:
-    """Write launch.json atomically (tmp + rename). Validates first: a refused spec is never written, so a
-    key value never reaches disk. 0640: the host may run as another uid of the runner's group, nobody
-    else reads a run's argv and env."""
+    """Write launch.json atomically (`env_helpers.atomic_write_json`). Validates first: a refused spec is
+    never written, so a key value never reaches disk. 0640: the host may run as another uid of the runner's
+    group, nobody else reads a run's argv and env."""
     data = to_dict(spec)
     _from_dict(json.loads(json.dumps(data)))
-    target = Path(path)
-    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
-    try:
-        os.fchmod(fd, 0o640)  # a stale tmp keeps its old mode through O_TRUNC
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, sort_keys=True)
-            fh.write("\n")
-        os.replace(tmp, target)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    import env_helpers  # noqa: PLC0415 — the writer is the daemon's; the host only reads, stdlib-only
+    env_helpers.atomic_write_json(Path(path), data, mode=0o640, indent=2, sort_keys=True)

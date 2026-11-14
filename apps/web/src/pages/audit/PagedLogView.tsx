@@ -1,16 +1,17 @@
 import type { JSX, ReactNode } from 'react'
 import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
-import useMediaQuery from '@mui/material/useMediaQuery'
 import type { SxProps, Theme } from '@mui/material/styles'
 import type { usePagedLogFilters } from '../../hooks/usePagedLogFilters'
 import { DateTimeBoundFields } from '../../ui/DateTimeBoundFields'
 import { FilterRow } from '../../ui/FilterRow'
-import { ClearFiltersButton } from '../../ui/LogPagerFooter'
-import { fieldTapTargetSx, PHONE_QUERY } from '../../ui/listStyles'
+import { ClearFiltersButton } from '../../ui/FilterStates'
+import { usePhone } from '../../hooks/usePhone'
+import { fieldTapTargetSx } from '../../ui/listStyles'
 import SearchBox from '../../ui/SearchBox'
 import ToolbarMenu, { PAGE_BODY_SX, type ToolbarMenuItem } from '../../ui/ToolbarMenu'
 import { Q_MAX_LEN } from './queryLimits'
+import { grid } from '../../theme'
 
 type PagedLogFilters = ReturnType<typeof usePagedLogFilters>
 
@@ -28,8 +29,8 @@ function rangeValue({ from, to }: RangeFields): string {
  *  (one write: two in a row would each start from the same stale view, the second undoing the first). */
 export type PhoneFilterPages = { items: ToolbarMenuItem[]; count: number; onClear: () => void }
 
-/* On a phone From and To took a full row each under the search: they move behind the Filters button, as the
-   Nodes strip's do (`pages/nodes/roster/RosterFilterStrips.tsx::NodeFilterMenu`), after the tab's own pages. The
+/* On a phone From and To took a full row each under the search: they move behind the Filters button, as a list
+   page's select narrowings do (`ui/SelectFilters.tsx`), after the tab's own pages. The
    badge counts the filters set; Clear clears exactly those. */
 function PhoneFilterMenu({ range, pages }: { range: RangeFields; pages?: PhoneFilterPages }): JSX.Element {
   return (
@@ -78,7 +79,7 @@ export default function PagedLogView({
   sx?: SxProps<Theme>
   children: ReactNode
 }): JSX.Element {
-  const phone = useMediaQuery(PHONE_QUERY)
+  const phone = usePhone()
   return (
     <Box sx={sx}>
       <FilterRow>
@@ -89,7 +90,7 @@ export default function PagedLogView({
             ariaLabel={search.ariaLabel}
             maxLength={Q_MAX_LEN}
             placeholder={search.placeholder}
-            sx={[{ m: 0, minWidth: 170, flex: '1 1 170px' }, fieldTapTargetSx]}
+            sx={[{ m: 0, minWidth: grid(28), flex: `1 1 ${grid(28)}` }, fieldTapTargetSx]}
           />
         )}
         {phone ? (
@@ -122,7 +123,7 @@ export default function PagedLogView({
       <Typography
         variant="caption"
         data-testid={`${testIdPrefix}-zone-note`}
-        sx={{ display: 'block', mt: 0.75, mb: 1, color: 'text.secondary' }}
+        sx={{ display: 'block', mt: 0.5, mb: 1, color: 'text.secondary' }}
       >
         Times shown and filtered in {zone}.
       </Typography>

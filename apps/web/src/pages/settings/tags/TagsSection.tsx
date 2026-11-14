@@ -1,6 +1,5 @@
-import { type JSX, useState } from 'react'
+import type { JSX } from 'react'
 import Box from '@mui/material/Box'
-import Button from '@mui/material/Button'
 import Typography from '@mui/material/Typography'
 import { useCan } from '../../../auth'
 import { useSettingsRows } from '../../../hooks/useSettingsRows'
@@ -8,24 +7,32 @@ import Banner from '../../../ui/Banner'
 import EmptyState from '../../../ui/EmptyState'
 import { tapTargetSx } from '../../../ui/listStyles'
 import type { TagGroup } from '../../../types'
-import { listTagGroups, reorderTagGroups } from './api'
-import TagDialog, { type TagDialogTarget } from './TagDialog'
+import { listTagGroups, NEW_TAG_GROUP_URL, reorderTagGroups } from './api'
 import TagGroupCard from './TagGroupCard'
 import LoadingState from '../../../ui/LoadingState'
 import SectionHeader from '../../../ui/SectionHeader'
+import NewButton from '../../../ui/NewButton'
 
 /* Settings > Tasks > Tags — the tag vocabulary, and the only surface that can see a DRAFT group.
  * Not a knob (not in `app/operator_settings/`): a CRUD table, mounted as a synthetic section anchored by
  * one of the area's knob keys (see `Settings.tsx`), owning its own fetch and writes — routing them through
  * the page's `edits` map would make "Save (n)" miscount and Discard claim to undo a delete.
- * The panel owns the catalogue fetch, the group ORDER (a whole-list write) and the dialogs; everything
- * scoped to one group belongs to `TagGroupCard`.
+ * The panel owns the catalogue fetch and the group ORDER (a whole-list write); everything scoped to one group
+ * belongs to `TagGroupCard`. Creating and editing a group or a tag are pages (`TagGroupEditPage`, `TagEditPage`),
+ * which refresh this list through `TAGS_ROWS_KEY`.
  * Every write asks a `tags` key (`routes/tags.py`: create on `POST /api/tags/groups`, edit on
  * `PUT /api/tags/group-order` and updates, delete on deletes); the read asks `tasks:view` + `tags:view`
  * (`?include_draft=true`). Why a taxonomy is a tenant's subject: `apps/api/app/authz/`.
  * Write affordances are ABSENT without their key (the card gates its own controls; its header holds the
  * per-control key table). The group arrows arrive pre-ANDed with this panel's `tags:edit`, so a drawn
  * arrow is a pure POSITION fact. Presentation, never the boundary: see `components/RequireFeature.tsx`. */
+
+/** The list's load-failure text, which also keys its read (`hooks/useSettingsRows`). */
+const TAGS_LOAD_FAILED = 'Failed to load the tag groups.'
+/** The list's react-query key: the record pages invalidate it after a write. */
+export const TAGS_ROWS_KEY = ['settings-rows', TAGS_LOAD_FAILED] as const
+/** One group's page read (`TagGroupEditPage`): a tag's page refreshes it too, as it may sit behind that tag. */
+export const TAG_GROUP_KEY = ['tag-group'] as const
 
 export function TagsSection(): JSX.Element {
   /* This panel's own write keys: `canCompose` = `tags:create` (New group), `canReorder` = `tags:edit`
@@ -46,10 +53,9 @@ export function TagsSection(): JSX.Element {
     rows: groups, loadError, rowError: orderError, load, busyIds, rowWrite, confirm, confirmDialog,
   } = useSettingsRows<TagGroup>({
     fetch: async () => ({ rows: await listTagGroups() }),
-    failed: 'Failed to load the tag groups.',
+    failed: TAGS_LOAD_FAILED,
     enabled: canReadVocabulary,
   })
-  const [dialog, setDialog] = useState<TagDialogTarget | null>(null)
   /** The whole-list order write, busy under one key. */
   const reordering = busyIds.has('order')
 
@@ -71,21 +77,12 @@ export function TagsSection(): JSX.Element {
    * Header row and empty state share this value, one at a time: the empty state carries it while there are no
    * groups, the header once there are some, or when a first load failed and no empty state draws. Never during
    * the load, so it does not jump into the empty state. */
-  const newGroupButton = canCompose ? (
-    <Button
-      type="button"
-      variant="contained"
-      color="primary"
-      size="small"
-      onClick={() => setDialog({ kind: 'group', group: null })}
-      sx={tapTargetSx}
-    >
-      New group
-    </Button>
+  const newGroupButton = (worded = false) => canCompose ? (
+    <NewButton label="New group" to={NEW_TAG_GROUP_URL} worded={worded} sx={tapTargetSx} />
   ) : null
 
   const headerCaption = !canCompose && !canReorder && 'Creating groups and ordering them need tag grants you do not hold.'
-  const headerAction = groups === null ? (loadError ? newGroupButton : null) : groups.length > 0 ? newGroupButton : null
+  const headerAction = groups === null ? (loadError ? newGroupButton() : null) : groups.length > 0 ? newGroupButton() : null
 
   /* A refused reader gets a sentence, not a blank tab (Settings mounts this subtab unconditionally). New
    * group goes too: a group is born DRAFT, and composing into a list this panel cannot show has no
@@ -98,7 +95,7 @@ export function TagsSection(): JSX.Element {
           data-testid="tags-withheld"
           sx={{ color: 'text.secondary', maxWidth: '72ch' }}
         >
-          Reading the tag vocabulary needs task and tag grants you do not hold. Ask an operator.
+          Reading the tag vocabulary needs task and tag grants you do not hold. Ask your administrator.
         </Typography>
       </Box>
     )
@@ -118,7 +115,7 @@ export function TagsSection(): JSX.Element {
       {groups === null && !loadError && <LoadingState />}
 
       {groups !== null && groups.length === 0 && (
-        <EmptyState title="No tag groups yet" action={newGroupButton ?? undefined} />
+        <EmptyState title="No tag groups yet" action={newGroupButton(true) ?? undefined} />
       )}
 
       {groups?.map((group, index) => (
@@ -133,15 +130,10 @@ export function TagsSection(): JSX.Element {
            * silently dropped by the re-entry guard, and a concurrent delete turns the reorder into a 422. */
           panelBusy={reordering}
           onMoveGroup={direction => moveGroup(index, direction)}
-          onEditGroup={() => setDialog({ kind: 'group', group })}
-          onAddTag={() => setDialog({ kind: 'tag', group, tag: null })}
-          onEditTag={tag => setDialog({ kind: 'tag', group, tag })}
           onChanged={load}
           confirm={confirm}
         />
       ))}
-
-      {dialog && <TagDialog target={dialog} onClose={() => setDialog(null)} onSaved={load} />}
 
       {confirmDialog}
     </Box>

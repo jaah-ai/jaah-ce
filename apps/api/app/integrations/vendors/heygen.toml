@@ -1,0 +1,48 @@
+# HeyGen: hosted MCP server. Facts confirmed at https://docs.heygen.com/docs/heygen-remote-mcp-server and the server's own OAuth metadata (mcp.heygen.com/.well-known/oauth-protected-resource/mcp/v1; Dynamic Client Registration at api2.heygen.com/v1/oauth/register).
+# HeyGen admits only allow-listed client domains: Jaah's domain is the human setup task (setup-heygen.md).
+slug = "heygen"
+label = "HeyGen"
+category = "mcp"
+vendor_docs_url = "https://docs.heygen.com/docs/heygen-remote-mcp-server"
+summary = "Generate avatar videos and translations with HeyGen through its remote MCP server."
+
+[[auth]]
+kind = "mcp"
+
+[mcp]
+url = "https://mcp.heygen.com/mcp/v1/"
+url_editable = false
+transport = "streamable_http"
+auth = "oauth_dcr"
+
+[mcp.registration]
+console_url = "https://developers.heygen.com/mcp/overview"
+steps = [
+  "Follow the overview's domain whitelisting section to request access for a client not yet whitelisted: send HeyGen the request it asks for, naming the client Jaah",
+  "Ask HeyGen to whitelist both console domains listed in the next step; Jaah registers itself (Dynamic Client Registration) once they are",
+]
+
+[docs]
+agent_uses = [
+  "Create an avatar video from a script with HeyGen's video agent",
+  "Check a video's status and return its share link when it is ready",
+  "Translate a video and fetch its caption file (SRT or VTT)",
+]
+prerequisites = [
+  "A HeyGen account on any plan; video generation spends the plan's credits",
+  "Jaah's domain on HeyGen's MCP allow-list - an operator task; until it is done, HeyGen refuses the sign-in",
+]
+limitations = [
+  "HeyGen's remote MCP server accepts only allow-listed client domains",
+  "Every video an agent creates uses your HeyGen credits: say in the task how many videos are expected",
+]
+troubleshooting = [
+  { symptom = "Connect fails before the HeyGen sign-in window opens", fix = "HeyGen has not allow-listed this Jaah's domain yet. Ask an operator to finish Jaah's HeyGen setup task" },
+  { symptom = "Test says HeyGen rejected the token (401)", fix = "The sign-in expired or was revoked. Select Reconnect and sign in to HeyGen again" },
+  { symptom = "The secret shows Needs reconnect", fix = "HeyGen ended the grant (a password change, a revoked connection or a long idle period). Select Reconnect on the secret and sign in to HeyGen again" },
+  { symptom = "New tasks on the project have no HeyGen tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with, and an agent marked Not supported on that tab cannot load MCP servers" },
+]
+faq = [
+  { q = "Does this use my HeyGen API key", a = "No. You sign in to HeyGen; the server bills the same plan credits your account uses" },
+  { q = "What does Test do", a = "It opens an MCP session with HeyGen's server and lists its tools, then closes the session. It reads and changes nothing in your HeyGen account" },
+]

@@ -1,0 +1,41 @@
+slug = "loops"
+label = "Loops"
+category = "messaging"
+vendor_docs_url = "https://loops.so/docs/api-reference/intro"
+summary = "Send transactional email and manage contacts and events in Loops."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "Loops > Settings > API (app.loops.so/settings?page=api) > Generate key, then copy the key" },
+]
+
+[test]
+method = "GET"
+path = "https://app.loops.so/api/v1/api-key"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+identity = [["teamName"]]
+identity_phrase = "for team"
+
+[docs]
+agent_uses = [
+  "Send a transactional email from a template published in Loops",
+  "Create or update a contact and its properties",
+  "Send an event that starts a Loops automation, for example a signup or a finished trial",
+  "Add contacts to or remove them from mailing lists",
+]
+prerequisites = [
+  "A Loops account and team",
+  "For transactional email, a template published under Transactional, whose ID the agent needs",
+]
+limitations = [
+  "The key reaches the whole Loops team; Loops has no per-key permissions",
+  "Loops limits each team to about 10 requests per second",
+]
+troubleshooting = [
+  { symptom = "Test says Loops rejected the API key (401)", fix = "The key was revoked or mistyped. Generate a new key under Settings > API and select Replace on the secret" },
+  { symptom = "Sending fails with a transactional ID not found", fix = "Publish the template under Transactional in Loops and give the agent its transactional ID, shown on the template's Publish step" },
+]
+faq = [
+  { q = "Can agents send marketing campaigns?", a = "No. Loops' API sends transactional email and events; campaigns are sent from the Loops editor" },
+]

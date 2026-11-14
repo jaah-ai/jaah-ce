@@ -11,11 +11,12 @@ button removes.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from sqlalchemy import delete, exists, func, select, true
 from sqlalchemy.orm import Session
 
+from app.clock import utcnow
 from app.operator_settings import reads as settings_reads
 
 # Vocabularies imported from their owners (rendered into revision 0135's CHECKs), so a rename breaks
@@ -59,7 +60,7 @@ def stale_after() -> timedelta:
 
 def stale_cutoff(now: datetime | None = None) -> datetime:
     """The instant a row must have started before to count as stale. `now` is injectable for tests."""
-    return (now or datetime.now(timezone.utc)) - stale_after()
+    return (now or utcnow()) - stale_after()
 
 
 # ── Who may delete a row, and why it is not the clause that decides who may read one ─────────────────

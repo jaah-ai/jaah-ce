@@ -8,7 +8,7 @@ assembles the settings that point at them.
 
 All but `vis_trust`, `vis_window`, `launch_refusal` and the terminal pops is pure string assembly, and
 `node_naming` is the one rewrite of the composed prompts every launch applies.
-`vis_window` spawns tmux with a SANITIZED env (`tmux_safe_env`), never `os.environ`: the shared tmux
+`vis_window` spawns tmux with a SANITIZED env (`env_helpers._tmux_safe_env`), never `os.environ`: the shared tmux
 server freezes its first client's env into every window."""
 from __future__ import annotations
 
@@ -31,8 +31,9 @@ import session_user  # the uid-split seam: which tmux server a window lands on, 
 import shared_storage  # the single home of the shared credential store's path + env-var spelling
 import agent_providers  # which account layer a provider uses
 from agent_providers import DEFAULT_PROVIDER  # what `accounts.provider`'s server_default means
-from env_helpers import default_tmux_session, TMUX_SESSION_ENV_VAR  # single-home joins
-from jaah_env import env_get  # renamed env vars
+from env_helpers import (  # single-home joins
+    _tmux_safe_env, default_tmux_session, tmux_window_env_args, TMUX_SESSION_ENV_VAR,
+)
 
 # No vendor argv lives here (PRD R2.2): `agents.get_adapter(provider)` owns it and raises when unregistered.
 
@@ -197,14 +198,14 @@ def _window_safe(text: object) -> str:
 
 
 def slot_ref(project: str, number: object) -> str:
-    """The `{Project Name}` / `{Project Name}-{Worktree Id}` half of a slot's identity — the main clone
-    is a bare `{Project Name}`, never `{Project}-0`.
+    """The `{Project Name}-{Worktree Id}` half of a slot's identity (a bare `{Project Name}` when no number
+    is given).
 
     The one rendering of that rule. Takes `number`, not the path: under `repos/<project id>/{main,N}` the
     basename carries no project name. A legacy `acme-9`-shaped number passes through unchanged."""
     project = _window_safe(project)
     slot = _window_safe(number if number is not None else "").strip().strip("/")
-    if not slot or slot in ("main", "0"):
+    if not slot:
         return project
     if slot == project or slot.startswith(f"{project}-"):
         return slot
@@ -230,32 +231,6 @@ def task_slot_title(task_id: object, task_title: str) -> str:
     code, so `tests/test_fleet_launch.py` pins the literal. Empty title degrades to the bare id."""
     task_title = (task_title or "").strip()
     return f"{task_id}|{task_title}" if task_title else str(task_id)
-
-
-# ── project_name: the resolved `projects.name`, not a path-derived guess ───────────────────────────────
-# A path yields the REPO name, wrong whenever `projects.name` differs. Exported at the head of the
-# SessionEnd chain for `hooks/user-session-end.py`, which restates the literal (a hook must not import
-# daemon code; pinned by tests on both sides). Empty is degraded (path fallback), not a refusal.
-PROJECT_NAME_ENV = "JAAH_PROJECT_NAME"
-# Its `projects.id` beside it, exported the same way: the identity the hook's report addresses the slot by
-# (a name is display only). Empty ⇒ the report carries the name alone and the CP falls back.
-PROJECT_ID_ENV = "JAAH_PROJECT_ID"
-
-
-def vis_user_session_end_cmd(worktree: str, role: str, *, hooks_dir: str) -> str:
-    """The SessionEnd teardown hook for an INTERACTIVE `role=user` pool session — the interactive
-    counterpart of the runner's on-kill `settle` + role-clear pair.
-
-    `role == "user"` only: a user session gets no on-kill action (`VISIBLE_AUTOCLOSE=0`), so SessionEnd
-    is its only terminal signal; a runner's session end is not a decision about its task. `--worktree`
-    is explicit so a session started in a subdirectory reports the right slot. Empty when worktree/role
-    don't match or the script is missing."""
-    if not worktree or role != "user":
-        return ""
-    use = os.path.join(hooks_dir, "user-session-end.py")
-    if not os.path.isfile(use):
-        return ""
-    return f"{shq(runner_env.python_cmd())} {shq(use)} settle --worktree {shq(worktree)} >/dev/null 2>&1 || true"
 
 
 def vis_runner_status_cmd(sub: str, *, hooks_dir: str, args: tuple[str, ...] = ()) -> str:
@@ -341,7 +316,6 @@ def _lifecycle_chains(
     linger: object = None,
     autoclose: object = None,
     account_dir: str = "",
-    project_name: str = "",
     securestorage_dir: str = "",
     provider: str = DEFAULT_PROVIDER,
     guard: bool = False,
@@ -355,13 +329,11 @@ def _lifecycle_chains(
     Start = runner-status start. Stop = autoclose arm + heartbeat (so a spurious StopFailure self-heals).
     Every runner-status subcommand is `role == "runner"` STRICTLY (it reports against a TASK). StopFailure
     is wired only here, never in the harness settings (the harness hook-scope check cannot see this
-    file). The on-kill action is `extra` + settle — never a slot release. SessionEnd is per role and never
-    the other's: user ⇒ user-session-end settle, runner ⇒ `console_exit` (a runner releasing its own slot
-    is forbidden). UserPromptSubmit ⇒ `console_resume`, sharing the event with the harness's context
+    file). The on-kill action is `extra` + settle — never a slot release. SessionEnd is the runner's alone:
+    `console_exit` (a runner releasing its own slot is forbidden). UserPromptSubmit ⇒ `console_resume`, sharing the event with the harness's context
     router (different scripts, both run).
 
-    `linger`/`autoclose`/`project_name` fall back to `VISIBLE_LINGER`/`VISIBLE_AUTOCLOSE`/
-    `JAAH_PROJECT_NAME`. `securestorage_dir` has no env fallback: it is resolved per launch (`shared_storage.securestorage_dir`).
+    `linger`/`autoclose` fall back to `VISIBLE_LINGER`/`VISIBLE_AUTOCLOSE`. `securestorage_dir` has no env fallback: it is resolved per launch (`shared_storage.securestorage_dir`).
 
     `guard`: whether this session is under the Architectural Guard — the launch ran `guard_bundle.prepare_launch`
     first and says so explicitly, because a chain never reads the daemon env. True adds `vis_guard_cmd`'s two
@@ -374,15 +346,13 @@ def _lifecycle_chains(
         linger = os.environ.get("VISIBLE_LINGER", str(_VISIBLE_LINGER_DEFAULT))
     if autoclose is None:
         autoclose = os.environ.get("VISIBLE_AUTOCLOSE", "1") != "0"
-    if not project_name:
-        project_name = (env_get(PROJECT_NAME_ENV) or "")
     # Sentinel: sibling of the settings file (`${settingsf%.json}.stop_ts`).
     stem = settings_path[:-5] if settings_path.endswith(".json") else settings_path
     sentinel = stem + ".stop_ts"
 
     rs_start = rs_settle = rs_heartbeat = rs_wallcheck = ""
     rs_console_exit = rs_console_resume = ""
-    # `role == "runner"` strictly, not truthy: a `role=user` console tab has a role too, and none of these
+    # `role == "runner"` strictly, not truthy: a `role=console` tab has a role too, and none of these
     # task reports may ever fire from it.
     if role == "runner":
         rs_start = vis_runner_status_cmd("start", hooks_dir=hooks_dir)
@@ -443,17 +413,9 @@ def _lifecycle_chains(
     # No chain claims, releases or reconciles a slot: a runner is refused every pool verb, and the
     # daemon's ~5s projection pass already observes every slot.
     start = join_cmds(cfg_export, sec_export, wt_export, rs_start, vis_guard_cmd("--session-start") if guard else "")
-    # No `wt_export` in SessionEnd (`user-session-end.py` gets `--worktree`). The project-name pin rides
-    # only when that hook is wired.
-    use_cmd = vis_user_session_end_cmd(worktree, role, hooks_dir=hooks_dir)
-    proj_export = (
-        _export(PROJECT_NAME_ENV, project_name) if (project_name and use_cmd) else ""
-    )
-    project_id = (env_get(PROJECT_ID_ENV) or "").strip()
-    proj_id_export = _export(PROJECT_ID_ENV, project_id) if (project_id.isdigit() and use_cmd) else ""
-    # One hook per role, mutually exclusive by construction; `join_cmds` drops the empty one.
-    # `console_exit` needs none of the pins (stdin + inherited env); the account pair rides regardless.
-    endcmd = join_cmds(cfg_export, sec_export, proj_export, proj_id_export, use_cmd, rs_console_exit)
+    # SessionEnd is the runner's `console_exit` alone; it needs none of the pins (stdin + inherited env), the
+    # account pair rides with it. A console tab gets none: it has no SessionEnd duty.
+    endcmd = join_cmds(cfg_export, sec_export, rs_console_exit) if rs_console_exit else ""
     # UserPromptSubmit un-parks a chat the Stop heartbeat parked; no pins (its hook reads inherited env).
     promptcmd = rs_console_resume
     # StopFailure's break classification needs the account + worktree pins to find the right transcript.
@@ -728,20 +690,47 @@ def _seed_trust(project: str, config_dirs: tuple[str, ...]) -> None:
 
 # ── tmux spawn — the ONLY side-effecting process entry point ─────────────────────────────────────────────
 
-def tmux_safe_env() -> dict:
-    """The sanitized env every tmux-invoking subprocess must use (`env_helpers._tmux_safe_env`, a strict
-    allowlist): an auto-started tmux server freezes its first client's env into every window."""
-    from env_helpers import _tmux_safe_env
+# ── Window environment isolation ───────────────────────────────────────────────────────────────────────
+# tmux hands a new pane its server's GLOBAL environment overlaid by the session's; `-e` overrides only the
+# keys it names. On Linux a runner window therefore first execs `window_exec.py`, which rebuilds the
+# environment from the server's exec-time one plus the `-e` pairs. Where the fleet server is isolated
+# (`session_user.fleet_isolated`) no runner can write either scope; on the shared socket any same-uid process
+# can, at any moment — even between two commands of one client call, from a hook. So the loader variables
+# that act on the (dynamically linked) interpreter before its first line are NEUTRALISED by the create
+# command itself: `-e NAME=` (empty) is applied at spawn, after every scope, with nothing able to run in
+# between. Empty, not unset (tmux `-e` cannot unset): glibc ignores each of these when empty. None reaches the
+# runner: `window_exec.py` takes only the pairs, never these. macOS and Windows windows are not isolated yet:
+# no `/proc/<server>/environ` there.
 
-    return _tmux_safe_env()
+# What the dynamic loader and libc load code or data from, read by the interpreter before its first line —
+# each a no-op when empty (unlike `LD_SHOW_AUXV`/`LD_TRACE_LOADED_OBJECTS`, which act on presence alone).
+LAUNCH_POISON_ENV_VARS: tuple[str, ...] = (
+    "LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH", "LD_DEBUG", "LD_DEBUG_OUTPUT", "LD_PROFILE",
+    "LD_PROFILE_OUTPUT", "GCONV_PATH", "LOCPATH", "NLSPATH", "GLIBC_TUNABLES", "MALLOC_TRACE",
+)
+
+_WINDOW_EXEC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "window_exec.py")
 
 
-def env_window_args(env: dict) -> list[str]:
-    """The `-e K=V` flags a `new-window`/`new-session` needs so the window's env does not come from the
-    SERVER's frozen one (`env_helpers.tmux_window_env_args`)."""
-    from env_helpers import tmux_window_env_args
+def poison_neutral_args() -> list[str]:
+    """The `-e NAME=` flags, one per `LAUNCH_POISON_ENV_VARS`, that a create carries beside its own `-e` pairs."""
+    args: list[str] = []
+    for name in LAUNCH_POISON_ENV_VARS:
+        args += ["-e", f"{name}="]
+    return args
 
-    return tmux_window_env_args(env)
+
+def isolated_window_argv(cmd: str, window_pairs: list[str], shell: str) -> list[str]:
+    """The argv a Linux tmux create runs: more than one word, so tmux execs it directly (no `default-shell`),
+    the node's own interpreter in isolated mode (`-I`: no `PYTHON*` variable, no user site, no cwd on `sys.path`) running
+    `window_exec.py`, which execs `SHELL -c CMD` under the server's startup environment plus WINDOW_PAIRS (the
+    `-e` values, `K=V`) and tmux's per-pane values. Each exec keeps the pid, so the pane pid is still the launch ack's."""
+    import runner_env  # noqa: PLC0415 — the one spelling of the node's interpreter path
+
+    python = runner_env.python_cmd()
+    if not os.path.isfile(python):  # a Linux dev checkout without the `jaah-python` package
+        python = sys.executable
+    return [python, "-I", _WINDOW_EXEC, *window_pairs, "--", shell, cmd]
 
 
 def tmux_session(session: str | None = None) -> str:
@@ -769,14 +758,11 @@ def _live_pane_refusal(worktree: str, env: dict, socket: str) -> str:
     when the tmux query could not be trusted to answer at all.
 
     `|term`/`|web` windows are skipped (a human's shell or a view); the /proc cwd scan catches a shell."""
-    try:
-        listing = subprocess.run(
-            session_user.tmux_cmd(socket, "list-panes", "-a", "-F",
-                                  "#{pane_current_path}\t#{window_name}"),
-            env=env, capture_output=True, text=True, timeout=15,
-        )
-    except Exception as exc:  # noqa: BLE001 — a timeout says nothing about liveness, so it must refuse
-        return f"the tmux pane query failed ({exc}) — liveness is UNKNOWN"
+    listing = session_user.tmux_run(socket, "list-panes", "-a", "-F", "#{pane_current_path}\t#{window_name}",
+                                    env=env, timeout=15)
+    if listing is None:
+        # A timeout says nothing about liveness, so it must refuse.
+        return "the tmux pane query failed — liveness is UNKNOWN"
     if listing.returncode != 0:
         stderr = (listing.stderr or "").strip()
         if _TMUX_NO_SERVER_RUNNING in stderr or _TMUX_NO_CURRENT_TARGET in stderr:
@@ -816,7 +802,7 @@ def launch_refusal(worktree: str, *, env: dict | None = None, cwd_probe=None, pa
     if live_cwd:
         return "a LIVE process has its cwd inside this worktree"
     if env is None:
-        env = tmux_safe_env()
+        env = _tmux_safe_env()
     return (pane_probe or _live_pane_refusal)(worktree, env, session_user.fleet_socket(env))
 
 
@@ -838,24 +824,30 @@ def vis_window(
 
     `out`, when given, is filled with `{"window_id", "pane_pid"}`, for a caller that must reach the window
     later without using its NAME. No occupancy check (the interactive `ctl.py tmux-window` wants a second
-    window). Every tmux call uses `tmux_safe_env()`; the window's own env is passed with `-e` because
-    `new-window` runs under the SERVER's frozen env. `extra_env` adds per-window `-e K=V` pairs beyond the
+    window). Every tmux call uses `_tmux_safe_env()`; the window's own env is passed with `-e` because
+    `new-window` runs under the SERVER's frozen env, and on Linux CMD itself runs under `window_exec.py`
+    (`isolated_window_argv`) with the loader variables neutralised, so nothing a same-uid `set-environment` put
+    in the server reaches it. `extra_env` adds per-window `-e K=V` pairs beyond the
     allowlisted keys (a folder slot's git ceiling); `{}`/None adds nothing, so every other window's argv is
     unchanged. Refuses when the uid switch applies and the session user's server is not up."""
     session = tmux_session(session)
     target = f"={session}"
     if env is None:
-        env = tmux_safe_env()
+        env = _tmux_safe_env()
     # Per-window env, including the RESOLVED session, so a launcher hand-run in the pane defaults to the
     # session it is in (the worktree `.env` may have replaced `NODE_ID`).
-    win_env = env_window_args({**env, TMUX_SESSION_ENV_VAR: session})
-    for key, value in (extra_env or {}).items():
-        win_env += ["-e", f"{key}={value}"]
+    win_env = tmux_window_env_args({**env, TMUX_SESSION_ENV_VAR: session})
     # A community-edition node's CLI off-switches and posture paths (`ce_caps.window_env`; {} on a cloud node, so
     # its argv is unchanged): the server's frozen env is an allowlist, so they ride each window.
     import ce_caps  # noqa: PLC0415 — `ce_caps` imports this module
-    for key, value in ce_caps.window_env().items():
+    for key, value in {**(extra_env or {}), **ce_caps.window_env()}.items():
         win_env += ["-e", f"{key}={value}"]
+    # Linux only (`/proc/<server>/environ`): the command runs under `window_exec.py` with exactly the `-e` pairs
+    # over the server's startup env, and the create neutralises the loader variables (`poison_neutral_args`).
+    isolate = host_platform.is_linux()
+    # PATH rides too: tmux gave an unattached client's PATH (the daemon's, here) to every pane it spawned.
+    pairs = [*([f"PATH={env['PATH']}"] if env.get("PATH") else []), *win_env[1::2]]
+    argv = isolated_window_argv(cmd, pairs, env.get("SHELL") or "/bin/bash") if isolate else [cmd]
 
     # The socket every call below names. "" only on a host with no session user (dev, CI), where tmux's
     # own default label is correct because there is no second uid to land on.
@@ -888,12 +880,14 @@ def vis_window(
             session_user.tmux_cmd(socket, "has-session", "-t", target), env=env, capture_output=True
         )
         verb = "new-window" if has.returncode == 0 else "new-session"
+        neutral = poison_neutral_args() if isolate else []
         if has.returncode == 0:
-            create = session_user.tmux_cmd(socket, "new-window", "-t", target, "-n", label, "-c", start_dir,
-                                           *win_env, "-P", "-F", fmt, cmd)
+            create = session_user.tmux_cmd(socket, "new-window", "-t", target, "-n", label,
+                                           "-c", start_dir, *win_env, *neutral, "-P", "-F", fmt, *argv)
         else:
-            create = session_user.tmux_cmd(socket, "new-session", "-d", "-s", session, "-x", "220", "-y", "50",
-                                           "-n", label, "-c", start_dir, *win_env, "-P", "-F", fmt, cmd)
+            create = session_user.tmux_cmd(socket, "new-session", "-d", "-s", session, "-x", "220",
+                                           "-y", "50", "-n", label, "-c", start_dir, *win_env, *neutral,
+                                           "-P", "-F", fmt, *argv)
         created = subprocess.run(create, env=env, capture_output=True, text=True)
     # `capture_output` swallows stderr, so a failed spawn is printed: silent, it reads as a running runner.
     if created.returncode != 0:
@@ -912,20 +906,14 @@ def vis_window(
     if has.returncode != 0:
         # No socket-widening here: a group-usable daemon socket is one `tmux -S` away from a pane as
         # `jaahd`. Humans attach with `jaah tmux`.
-        subprocess.run(
-            session_user.tmux_cmd(socket, "set", "-t", target, "-g", "mouse", "on"),
-            env=env, capture_output=True,
-        )
+        session_user.tmux_run(socket, "set", "-t", target, "-g", "mouse", "on", env=env)
 
     if pipe_log and wid:
         parent = os.path.dirname(pipe_log)
         if parent:
             os.makedirs(parent, exist_ok=True)
         # The create socket only: window ids collide across servers (`@7` is `@7` everywhere).
-        subprocess.run(
-            session_user.tmux_cmd(socket, "pipe-pane", "-o", "-t", wid, f"cat >> {shq(pipe_log)}"),
-            env=env, capture_output=True,
-        )
+        session_user.tmux_run(socket, "pipe-pane", "-o", "-t", wid, f"cat >> {shq(pipe_log)}", env=env)
     return pane_pid
 
 
@@ -1007,15 +995,12 @@ def ensure_terminal(session: str | None = None) -> None:
 
     Reads the socket SET (a human may be attached on the drain-era server); the attach names the fleet
     socket, where new sessions are."""
-    env = tmux_safe_env()
+    env = _tmux_safe_env()
     session = tmux_session(session)
     target = f"={session}"
     for socket in session_user.manage_sockets(env):
-        has_client = subprocess.run(
-            session_user.tmux_cmd(socket, "list-clients", "-t", target),
-            env=env, capture_output=True, text=True,
-        )
-        if (has_client.stdout or "").strip():
+        has_client = session_user.tmux_run(socket, "list-clients", "-t", target, env=env)
+        if has_client is not None and (has_client.stdout or "").strip():
             return
-    attach = " ".join(shq(a) for a in session_user.tmux_cmd(session_user.fleet_socket(env), "attach"))
+    attach = " ".join(shq(a) for a in session_user.tmux_attach_cmd(session_user.fleet_socket(env), "attach"))
     pop_terminal("fleet console", f"{attach} -t {shq(target)}")

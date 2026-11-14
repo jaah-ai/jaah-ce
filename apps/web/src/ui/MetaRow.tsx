@@ -2,6 +2,7 @@ import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
 import type { JSX, ReactNode } from 'react'
 import { briefTimestamp, fmtTimestamp, NO_VALUE } from '../lib/relativeTime'
+import Tip from './Tip'
 
 /* The console's one read-only meta strip (`dt`/`dd` caption row: when a record happened, who touched
  * it), shared by `/users/:id` and `/groups/:id` so the "none" em-dash and null-actor rendering cannot
@@ -14,7 +15,7 @@ export function MetaRow({ children }: { children: ReactNode }): JSX.Element {
     <Box
       component="dl"
       sx={{
-        display: 'flex', flexWrap: 'wrap', columnGap: 2, rowGap: 0.25, m: 0, mt: 0.5,
+        display: 'flex', flexWrap: 'wrap', columnGap: 2, rowGap: 0, m: 0, mt: 0.5,
         pt: 0.5, borderTop: 1, borderColor: 'divider',
       }}
     >
@@ -38,9 +39,9 @@ export function MetaItem({
   return (
     <Box sx={{ minWidth: 0, display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', columnGap: 0.5 }}>
       <Typography variant="caption" component="dt" sx={{ color: 'text.secondary' }}>{label}</Typography>
-      <Typography variant="caption" component="dd" sx={{ m: 0, color: 'text.primary' }} title={title ?? ''}>
+      <Tip title={title ?? ''}><Typography variant="caption" component="dd" sx={{ m: 0, color: 'text.primary' }}>
         {value}
-      </Typography>
+      </Typography></Tip>
     </Box>
   )
 }
@@ -67,7 +68,7 @@ export function MetaActors({ createdBy, updatedBy }: { createdBy: string | null;
     ? <MetaActor label="Created and updated by" actor={createdBy} />
     : (
       // One flex item, so the pair wraps together: never "Created by" on one line and "Updated by" on the next.
-      <Box sx={{ display: 'flex', flexWrap: 'wrap', columnGap: 2, rowGap: 0.25 }}>
+      <Box sx={{ display: 'flex', flexWrap: 'wrap', columnGap: 2, rowGap: 0 }}>
         <MetaActor label="Created by" actor={createdBy} />
         <MetaActor label="Updated by" actor={updatedBy} />
       </Box>

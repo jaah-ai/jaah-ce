@@ -7,11 +7,13 @@ from typing import Any, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import case, func, literal_column, or_, select
 from sqlalchemy.orm import Session, object_session
 
 # `actors` as a module because `_task_out` takes an `actor_names` parameter that would shadow a bare import.
-from app import actors, agent_providers, edition_features, org_limits, runner_terminations, slot_allocation
+from app import actors, agent_providers, dispatch_wait, edition_features, org_limits, runner_terminations, slot_allocation
+from app import git_access
+from app.trackers import project_links
 from app.authz.catalog import permission_key
 from app.authz.object_access import can_access
 from app.authz.principal import Principal
@@ -29,8 +31,11 @@ from app.models.task_extras import ATTACHMENT_KIND_FILE, TaskAttachment, TaskPr
 from app.models.tasks import Task, TaskDependency, TaskQuestion
 # `_CONSOLE_INTERVIEW` is private to the composer and imported anyway: one frozenset, no second copy.
 from app.dispatch_compose.directives import interview_skipped
+from app.entity_shape import from_row
 from app.dispatch_compose.role_tables import _CONSOLE_INTERVIEW
-from app.persona_registry import DONE_CRITERION_OPERATOR, PERSONA_CHARTER, PERSONA_DONE_CRITERION
+from app.persona_registry import (
+    ALWAYS_INTERVIEWING_PERSONAS, DONE_CRITERION_OPERATOR, PERSONA_CHARTER, PERSONA_DONE_CRITERION,
+)
 from app.task_artifacts import (
     current_artifact,
     uploaded_clause,
@@ -43,6 +48,7 @@ from app import fleet_verdicts, merge_lane_state, task_sections
 from app.models.worktrees import SlotIntent
 from app.task_sections import Section, StageCandidate, StopKind
 from app.task_lifecycle import (
+    ACTIVE,
     AWAITING_RESPONSE,
     DONE,
     READY,
@@ -53,7 +59,7 @@ from app.task_lifecycle import (
 )
 from app.task_lookup import get_task_or_404
 from app.task_manifest import INPUT_MANIFEST
-from app import task_source
+from app import task_done_notice, task_source
 from app.task_run_metrics import RunCost
 from app.task_tags import TagRefOut
 from app.tenancy.labels import OrgRef, org_ref_of, org_refs
@@ -180,6 +186,14 @@ def _memory_counts_out(counts: Optional[dict[int, dict[str, int]]], task_id: int
     return None if counts is None else MemoryCountsOut(**counts.get(task_id, {}))
 
 
+class TaskLaneRunOut(BaseModel):
+    """A merge-lane run's gates and wall time in seconds, and whether it is past the stall bound (`slow`)."""
+
+    gates: int
+    wall_s: int
+    slow: bool
+
+
 class TaskPrOut(BaseModel):
     """One PR the task opened, in any of its project's repositories (`app/task_prs.py`); `repo_path` is `owner/name`."""
 
@@ -193,18 +207,9 @@ class TaskPrOut(BaseModel):
 def _prs_out(pr_map: Optional[dict[int, list[TaskPr]]], task_id: int) -> list[TaskPrOut]:
     """One row's `TaskOut.prs` from a batched `task_prs.prs_by_task` map; empty when no map was resolved."""
     return [
-        TaskPrOut(repo_path=r.repo_path, pr_number=r.pr_number, pr_url=r.pr_url, state=r.state,
-                  is_primary=r.is_primary)
+        from_row(TaskPrOut, r)
         for r in (pr_map or {}).get(task_id, [])
     ]
-
-
-class RanOnOut(BaseModel):
-    """A runner's node and slot, by name; `live` while the task holds that slot now."""
-
-    node: str
-    slot: int
-    live: bool
 
 
 class TaskMicrovmOut(BaseModel):
@@ -215,6 +220,16 @@ class TaskMicrovmOut(BaseModel):
     vm_id: UUID
     node: str
     may_edit: bool
+
+
+class TaskLiveLinkOut(BaseModel):
+    """The address a task's change is served at (`app/releases/live_link.py`): `state` is `live` (deployed and the
+    deploy seen; on an Easy Mode epic, the app serves), `deployed` (on Production, no deploy seen), `deploying`
+    (merged, on its way to Production), `on_dev` (merged, on Dev) or `provisioning` (an Easy Mode epic's app still
+    being set up)."""
+
+    url: str
+    state: str
 
 
 class TaskLiveSessionOut(BaseModel):
@@ -238,7 +253,7 @@ class TemplateRefOut(BaseModel):
 class TaskOut(BaseModel):
     id: int
     project_id: int
-    # The feature this task is filed in, or null ("No feature"). Always a feature of `project_id`.
+    # The feature this task is filed in, or null (filed in the project itself). Always a feature of `project_id`.
     feature_id: Optional[UUID]
     # Which tenant owns this row — the console's org indicator (`apps/web/src/ui/OrgIndicator.tsx`; shape in
     # `app/tenancy/labels.py::OrgRef`). Optional though `tasks.org_id` is NOT NULL: `null` means the id
@@ -255,6 +270,13 @@ class TaskOut(BaseModel):
     # personas are created hidden; the filter reads only this column, never `persona`. See
     # models/tasks.py:Task.hidden.
     hidden: bool
+    # A benchmark shadow (models/tasks.py:Task.shadow): the task page shows a Shadow badge off it.
+    shadow: bool = False
+    # Tell the recipients when it ships (models/tasks.py:Task.notify_when_done; rules: `app/task_done_notice.py`).
+    notify_when_done: bool = False
+    # Done, owed to THIS caller, and not opened by them since it shipped (`task_done_notice.unseen_ids`); cleared by
+    # `POST /api/tasks/{id}/seen`. False, never null, where it cannot be computed (nested child, unnamed caller).
+    done_unseen: bool = False
     # Still being typed: an auto-saved row whose author has not pressed Save (models/tasks.py:Task.unsaved). The
     # editor needs it to keep offering Discard. `true` is only ever seen by the author or a superadmin:
     # `authz.visible_task_clause` hides the row from everyone else.
@@ -270,6 +292,10 @@ class TaskOut(BaseModel):
     awaiting_response_body: Optional[str]
     # Unified pipeline discriminator, NOT NULL on every row. See models/tasks.py:Task.persona.
     persona: str
+    # The description's language, an ISO 639-1 code (null: not detected yet, reads as English), and whether a
+    # person picked it (`app/task_language.py`).
+    language: Optional[str]
+    language_pinned: bool
     # Operator dispatch-order lever: higher = sooner. Nullable; a legacy row reads as normal (0). Drives
     # the dispatch worklist ordering (`_PRIORITY_ORDER`) and is surfaced so the UI can display + set it.
     priority: Optional[int]
@@ -277,7 +303,7 @@ class TaskOut(BaseModel):
     # `slot_allocation.task_has_repo`, so a later change to the project's repositories never relabels a task already
     # leased. The one field the console reads to hide branch/PR surfaces. No default: `_task_out` decides it.
     has_repo: bool
-    # Terminal evidence: the closing PR URL + the runner's summary, written by its `/settle` call.
+    # Terminal evidence: the closing PR URL + the runner's summary, written by its `/complete` call.
     # A `done` row with a null `outcome_pr_url` renders "⚠ unverified".
     outcome_summary: Optional[str]
     outcome_pr_url: Optional[str]
@@ -352,6 +378,8 @@ class TaskOut(BaseModel):
     # Where the row came from (`app/task_source.py`): the stored code and its readable label. Never changes.
     source: str = task_source.CONSOLE
     source_label: str = task_source.SOURCE_LABELS[task_source.CONSOLE]
+    # A runner's own filing from another task (`task_source.is_suggested`): its draft sits under "Suggested by Jaah".
+    suggested: bool = False
     # ── Autonomous-mode fields ────────────────────────────────────────────────────────────────────────
     # Per-field rationale in models/tasks.py:Task; surfaced here so the console can display/edit them.
     autonomous: bool
@@ -375,6 +403,8 @@ class TaskOut(BaseModel):
     critic_verdict: Optional[str]
     # Epic transition-mode, surfaced so the epic edit form can display + set it. See models/tasks.py:Task.
     transition_mode: str
+    # Epic throttle (`models.Task.max_running`): at most this many subtasks run at once; NULL = no limit.
+    max_running: Optional[int] = None
     # This row's own model pin, so the form opens on the stored value. NULL is inherit
     # (`app/model_catalog.py`). Readable by any reader; writing is superadmin-only (`TaskUpdate.model`).
     model: Optional[str] = None
@@ -410,12 +440,12 @@ class TaskOut(BaseModel):
     # For a `ready` (non-epic) row, why it is not dispatching — a pending org or a full Agents cap
     # (`app/org_limits.py::wait_reason`, e.g. "Waiting: organization runner limit (1/1)"), else the
     # dispatcher's own fresh last decline (`app/dispatch_wait.py`, e.g. "Waiting: no free worktree");
-    # NULL otherwise. Batched per org via `org_limits.wait_reasons`.
+    # NULL otherwise. Batched per org via `org_limits.wait_reasons`. On an `active` epic none of whose subtasks
+    # is running or asking, its first waiting subtask's reason (`_epic_wait_reasons`).
     wait_reason: Optional[str] = None
-    # On the node wait (`wait_reason` is `org_limits.AWAITING_NODE`) of a single-row read: False when Add node is the
-    # remedy (`org_limits.awaits_first_node`: no node and none on its way), so every viewer gets it, not only the
-    # task's own org. NULL otherwise.
-    org_has_node: Optional[bool] = None
+    # Where the VIEWER fixes `wait_reason`, or NULL: set only when the hold is their own revoked git login
+    # (`git_access.revoked_hold_fix_url`). Detail route only, like `qa_entries`.
+    wait_fix_url: Optional[str] = None
     # How many of this row's prerequisites are unmet (usually 0): a non-zero count reads "Waiting" rather
     # than Queued or Running. Same semantics as the gate itself, so badge and dispatcher agree; batched via
     # `_unmet_prerequisite_counts`.
@@ -444,7 +474,7 @@ class TaskOut(BaseModel):
     # Where this task's runner runs, or last ran (`app/runner_places.py`); null when it never launched. A list
     # read resolves only a `ready` row's held slot (a fresh lease, or one kept from an earlier attempt) and leaves the
     # rest null.
-    ran_on: Optional[RanOnOut] = None
+    ran_on: Optional[runner_places.Place] = None
     # The running MicroVM this task's runner lives in, whose terminal the task page opens. Detail-only; null for a
     # slot-backed run, a VM not running yet, or a list read.
     microvm: Optional[TaskMicrovmOut] = None
@@ -453,6 +483,9 @@ class TaskOut(BaseModel):
     vm_hold_node: Optional[str] = None
     # This task's newest running agent session (`_live_session`). Detail-only; null when none runs, or a list read.
     live_session: Optional[TaskLiveSessionOut] = None
+    # The task's live link (`TaskLiveLinkOut`). Detail-only; null before a merge, without an address for its stage, or
+    # on a list read and nested children.
+    live_link: Optional[TaskLiveLinkOut] = None
     # When this `active` task's current run started: its newest RUNNING agent session's `started_at` (the same row
     # `live_session` names), so a board card can show the run's age. The list fills it with one batched
     # read over the page's active rows (`routes/tasks/listing.py::_run_started_ats`); the detail read takes it off
@@ -475,6 +508,10 @@ class TaskOut(BaseModel):
     # tracker chip renders. No default: `_task_out` is the sole constructor.
     external_task_system: Optional[str]
     external_task_id: Optional[str]
+    # The issue the task is linked to (`tracker_issue_links`, `trackers.project_links.task_issue_wire`):
+    # `{connection_id, tracker, tracker_label, key, url, origin}`, null when none — started by a tracker or picked
+    # by hand alike.
+    tracker_issue: Optional[dict[str, Any]] = None
     # Terminal-phase substrate: the epic's own persisted aggregate — `finish_report`
     # (verify/acceptance/time/tokens/benchmarks) plus the top-level `tokens_in`/`tokens_out`/`total_seconds`
     # mirrors `execute_finish_phase` writes. Null for a non-epic Task; the console renders an empty state.
@@ -539,6 +576,9 @@ class TaskOut(BaseModel):
     # lands within a few minutes. NULL means nothing in the subtree was captured, never read as 0 (a captured
     # zero is 0). Defaults to null for `cost_usd`'s reason: the board spreads mutation responses over the row.
     tokens_total: Optional[int] = None
+    # A merge-lane run's own wall time and gate count (`merge_lane_state.lane_run_view`): an active run's elapsed so
+    # far, and `slow` once past the stall bound. Null for any other persona and for a run with no stats yet.
+    lane_run: Optional[TaskLaneRunOut] = None
 
 
 class TaskListOut(TaskOut):
@@ -548,8 +588,8 @@ class TaskListOut(TaskOut):
     `awaiting_response_body` were roughly half a list response. `exclude=True` makes each absent rather
     than a misreadable null; the detail route and its nested `children` keep them all.
 
-    The provenance pair is split: `created_by` is resolved (the Activity Feed's Author column), while
-    `updated_by` is excluded because this route resolves none and its null would read as "no actor"."""
+    The provenance pair is split: `created_by` and `assigned_to` are resolved by name (the board's Creator →
+    Assignee cell), while `updated_by` and the actor ids are excluded (`test_list_row_carries_no_actor_uuid_anywhere` pins it) because this route resolves none and its null would read as "no actor"."""
 
     body: str = Field(default="", exclude=True)
     # The pending question's full prose — rendered by the detail page's GateForm, never by a list row.
@@ -561,12 +601,14 @@ class TaskListOut(TaskOut):
     outcome_no_pr_evidence: Optional[str] = Field(default=None, exclude=True)
     # Unbounded prose for the detail page's failure banner; no board row renders it.
     failure_reason: Optional[str] = Field(default=None, exclude=True)
+    # Detail-only: a list read never resolves it (`routes/tasks/read.py::_live_link`).
+    live_link: Optional[TaskLiveLinkOut] = Field(default=None, exclude=True)
     # `created_by` is deliberately NOT excluded — see the docstring's provenance-split note.
     updated_by: Optional[str] = Field(default=None, exclude=True)
-    # Both assignee fields, on `updated_by`'s truth argument: no board row renders an assignee and this
-    # route resolves no assignee ids, so an unexcluded pair would serialise "not resolved" as "nobody".
+    # The assignee's NAME is served (the board's Creator → Assignee cell, resolved with `created_by`); its id is
+    # not: a list row carries no actor uuid (`test_list_row_carries_no_actor_uuid_anywhere`). The id rides the
+    # detail read and `GET /api/tasks/assignees`.
     assigned_to_id: Optional[UUID] = Field(default=None, exclude=True)
-    assigned_to: Optional[str] = Field(default=None, exclude=True)
     # `org` is deliberately not excluded: the board is the org indicator's primary surface, and the detail
     # page must not name a tenant the board denied. Resolved in one batched query.
 
@@ -585,18 +627,57 @@ def _actor_label(actor_id: Optional[UUID], names: dict[UUID, str]) -> Optional[s
 
 def _org_wait_reasons(session: Session, rows) -> dict[int, str]:
     """`org_limits.wait_reasons` for those `rows` that can wait on their org: `ready`, and never an epic
-    (it is never dispatched). Keyed by task id."""
-    return org_limits.wait_reasons(session, [t for t in rows if t.state == READY and t.persona != PERSONA_EPIC])
+    (it is never dispatched). Keyed by task id. An `active` epic among `rows` gets its subtasks' rollup
+    (`_epic_wait_reasons`)."""
+    leaves = [t for t in rows if t.state == READY and t.persona != PERSONA_EPIC]
+    epic_ids = [t.id for t in rows if t.state == ACTIVE and t.persona == PERSONA_EPIC]
+    children = _live_children(session, epic_ids)
+    known = {t.id for t in leaves}
+    reasons = org_limits.wait_reasons(
+        session, [*leaves, *(c for c in children if c.state == READY and c.id not in known)],
+    )
+    return {**reasons, **_epic_wait_reasons(children, reasons)}
+
+
+def _live_children(session: Session, epic_ids: list[int]) -> list[Task]:
+    """The `ready`, `active` and `awaiting_response` subtasks of `epic_ids` an epic's viewer sees with it: not
+    archived, hidden or unsaved (those three are `visible_task_clause`'s own per-row gates)."""
+    if not epic_ids:
+        return []
+    return list(session.scalars(
+        select(Task).where(
+            Task.parent_task_id.in_(epic_ids), Task.state.in_((READY, ACTIVE, AWAITING_RESPONSE)),
+            Task.archived_at.is_(None), Task.hidden.is_(False), Task.unsaved.is_(False),
+        ).order_by(Task.id)
+    ).all())
+
+
+def _epic_wait_reasons(children: list[Task], reasons: Mapping[int, str]) -> dict[int, str]:
+    """`{epic id: reason}`: an epic whose subtasks are all waiting reads as waiting, not "Running", and says why —
+    its lowest-numbered waiting subtask's reason (`dispatch_wait.epic_wait`). The node wait is the org's, not the
+    subtask's, so it passes through as itself (the console's node remedy keys on it). Absent while any subtask
+    is running or asking (that is the epic's story) or none has a reason."""
+    busy = {c.parent_task_id for c in children if c.state != READY}
+    out: dict[int, str] = {}
+    for child in children:
+        why = reasons.get(child.id)
+        if child.state == READY and why and child.parent_task_id not in busy and child.parent_task_id not in out:
+            out[child.parent_task_id] = (
+                why if why == org_limits.AWAITING_NODE else dispatch_wait.epic_wait(child.id, why)
+            )
+    return out
 
 
 def _org_wait_reason_for(
     task: Task, reasons: Optional[dict[int, str]], *, gated: bool,
 ) -> Optional[str]:
     """This row's `TaskOut.wait_reason`. None while a prerequisite still gates it (`gated`): that is what
-    it waits on first, and the badge already names it. A Run (`run_requested_at`) bypasses that gate
-    (`dispatchable_tasks`), so its row is the dispatcher's and shows the dispatcher's reason — never a bare
-    "Starting" while it waits."""
-    if (gated and task.run_requested_at is None) or not reasons or task.state != READY:
+    it waits on first, and the badge already names it."""
+    if not reasons:
+        return None
+    if task.persona == PERSONA_EPIC:
+        return reasons.get(task.id) if task.state == ACTIVE else None
+    if gated or task.state != READY:
         return None
     return reasons.get(task.id)
 
@@ -651,10 +732,11 @@ def _task_out(
     waiting_on_persona: Optional[str] = None,
     unmet_prerequisite_count: Optional[int] = None,
     stage_output: Optional[str] = None,
-    ran_on: Optional[RanOnOut] = None,
+    ran_on: Optional[runner_places.Place] = None,
     microvm: Optional[TaskMicrovmOut] = None,
     vm_hold_node: Optional[str] = None,
     live_session: Optional[TaskLiveSessionOut] = None,
+    live_link: Optional[TaskLiveLinkOut] = None,
     # The caller's batched run start for an `active` row (`TaskOut.run_started_at`); `_task_out` never queries
     # for it. None = not resolved, or no running session.
     run_started_at: Optional[datetime] = None,
@@ -702,12 +784,29 @@ def _task_out(
     # The caller's batched `task_prs.prs_by_task` map; None derives it here when a session is passed, for this
     # row and its children in one select.
     pr_map: Optional[dict[int, list[TaskPr]]] = None,
+    # The caller's batched `project_links.task_issue_wire` map; None derives it here when a session is passed, for
+    # this row and its children in one select.
+    issue_map: Optional[dict[int, dict[str, Any]]] = None,
+    # The caller's batched `task_done_notice.unseen_ids` answer for this row; None derives it here when a session and
+    # a principal are passed. Nested children never carry it.
+    done_unseen: Optional[bool] = None,
+    # The caller's batched `merge_lane_state.lane_runs` map; None derives it here for a lane row when a session is
+    # passed.
+    lane_run_map: Optional[dict[int, dict[str, Any]]] = None,
     # The model to build: the list routes pass `TaskListOut`, built here directly rather than dumped and
     # re-validated per row.
     out_model: type[TaskOut] = TaskOut,
+    # Whether each child carries its long text and `metrics` blob (`_CHILD_HEAVY_FIELDS`). The console reads none of
+    # them on a child, and they were ~80% of an epic's detail payload; public Live Cast shows them.
+    full_children: bool = False,
 ) -> TaskOut:
     if pr_map is None and session is not None:
         pr_map = task_prs.prs_by_task(session, [task.id, *(c.id for c in children or [])])
+    if issue_map is None and session is not None:
+        issue_map = project_links.task_issue_wire(session, [task.id, *(c.id for c in children or [])])
+    if lane_run_map is None and session is not None and merge_lane_state.is_lane_persona(task.persona):
+        lane_run_map = merge_lane_state.lane_runs(session, [task])
+    own_lane_run = (lane_run_map or {}).get(task.id)
     if org_wait_reasons is None and session is not None:
         org_wait_reasons = _org_wait_reasons(session, [task, *(children or [])])
     if memory_count_map is None and session is not None:
@@ -857,44 +956,19 @@ def _task_out(
             unmet_prerequisite_count if unmet_prerequisite_count is not None else gate_map.get(task.id, 0)
         ),
     )
-    return out_model(
-        id=task.id,
-        project_id=task.project_id,
-        feature_id=task.feature_id,
+    return from_row(
+        out_model, task,
         org=org_ref_of(org_map, task.org_id),
-        parent_task_id=task.parent_task_id,
-        is_plannable=task.is_plannable,
-        title=task.title,
-        body=task.body,
-        state=task.state,
-        hidden=task.hidden,
-        unsaved=task.unsaved,
         playbook=playbook_engine.playbook_out(task.playbook),
         playbook_stage=playbook_engine.stage_out(task.playbook_stage),
-        archived_at=task.archived_at,
-        github_synced_at=task.github_synced_at,
-        awaiting_response_body=task.awaiting_response_body,
-        persona=task.persona,
-        priority=task.priority,
         # The task's own snapshot needs no read; NULL (never dispatched) reads its project, an identity-map hit
         # after the first row of a page.
         has_repo=slot_allocation.task_has_repo(session or object_session(task), task),
-        outcome_summary=task.outcome_summary,
-        outcome_pr_url=task.outcome_pr_url,
-        outcome_no_pr_reason=task.outcome_no_pr_reason,
-        outcome_no_pr_evidence=task.outcome_no_pr_evidence,
         failure_reason=task.awaiting_response_body if task.state == SYSTEM_FAILED else None,
         awaiting_response_options=parse_response_options(task.awaiting_response_body),
-        created_at=task.created_at,
-        updated_at=task.updated_at,
         created_by=_actor_label(task.created_by_id, actor_map),
         updated_by=_actor_label(task.updated_by_id, actor_map),
-        assigned_to_id=task.assigned_to_id,
         assigned_to=_actor_label(task.assigned_to_id, actor_map),
-        created_by_cron_id=task.created_by_cron_id,
-        created_by_cron_name=task.created_by_cron_name,
-        created_by_trigger_id=task.created_by_trigger_id,
-        created_by_trigger_name=task.created_by_trigger_name,
         created_by_automation_id=automation_id,
         created_by_automation_name=automation_name,
         template=(
@@ -903,33 +977,19 @@ def _task_out(
         ),
         trigger_budget_exceeded_usd=budget_exceeded,
         trigger_budget_usd=trigger_budget,
-        source=task.source,
         source_label=task_source.source_label(task.source),
-        autonomous=task.autonomous,
+        suggested=task_source.is_suggested(task.source, task.created_by_task_id),
         # Derived from (`autonomous`, `bound_provider`) only. The one field here that can query: one
         # `session.get` for an interviewing epic child on a single-row route; many-row callers pass no session.
         interview_skipped_reason=_interview_skipped_reason(session, task),
-        sweep_opt_out=task.sweep_opt_out,
-        project_memory=task.project_memory,
-        memory_arm=task.memory_arm,
-        memory_arm_source=task.memory_arm_source,
         memory_counts=_memory_counts_out(memory_count_map, task.id),
         prs=_prs_out(pr_map, task.id),
-        runner_session_id=task.runner_session_id,
-        run_requested_at=task.run_requested_at,
-        clarity_score=task.clarity_score,
-        spec_verdict=task.spec_verdict,
-        critic_verdict=task.critic_verdict,
-        transition_mode=task.transition_mode,
-        model=task.model,
-        bound_provider=task.bound_provider,
-        agent_id=task.agent_id,
-        bound_account_id=task.bound_account_id,
-        pinned_node_id=task.pinned_node_id,
+        tracker_issue=(issue_map or {}).get(task.id),
+        lane_run=TaskLaneRunOut(**own_lane_run) if own_lane_run else None,
         children=[
             # Still no session (no lookup per child); it gets the map, which skips the child's own fallback. Child
             # rows need labels for the Activity Feed's expanded epic.
-            _task_out(
+            _slim_child(_task_out(
                 c,
                 waiting_on_persona=waiting_map.get(c.id) if c.state == READY else None,
                 unmet_prerequisite_count=gate_map.get(c.id, 0),
@@ -952,7 +1012,8 @@ def _task_out(
                 # From this call's one grouped read (the child has no session); null when the parent resolved none.
                 memory_count_map=memory_count_map,
                 pr_map=pr_map,
-            )
+                issue_map=issue_map,
+            ), keep=full_children)
             for c in children
         ] if children is not None else None,
         section=section,
@@ -976,10 +1037,9 @@ def _task_out(
         questions=questions,
         waiting_on_persona=waiting_on_persona,
         wait_reason=wait_reason,
-        org_has_node=(
-            not org_limits.awaits_first_node(session, task.org_id)
-            if session is not None and task.org_id is not None and wait_reason == org_limits.AWAITING_NODE
-            else None
+        wait_fix_url=(
+            git_access.revoked_hold_fix_url(session, task, wait_reason, principal.user_id)
+            if qa_entries is not None and session is not None and principal is not None and wait_reason else None
         ),
         unmet_prerequisite_count=(
             unmet_prerequisite_count
@@ -997,18 +1057,16 @@ def _task_out(
         microvm=microvm,
         vm_hold_node=vm_hold_node,
         live_session=live_session,
+        live_link=live_link,
         run_started_at=run_started_at,
-        stale_reason=task.stale_reason,
-        stale_since=task.stale_since,
-        phase_index=task.phase_index,
-        phase_name=task.phase_name,
-        finish_follow_up_key=task.finish_follow_up_key,
-        external_task_system=task.external_task_system,
-        external_task_id=task.external_task_id,
-        metrics=task.metrics,
         available_transitions=_available_transitions_for(task),
         authored_draft=(
             authored_draft if authored_draft is not None else task.id in authored_draft_ids
+        ),
+        done_unseen=(
+            done_unseen if done_unseen is not None
+            else session is not None and principal is not None
+            and task.id in task_done_notice.unseen_ids(session, [task], principal.user_id)
         ),
         may_set_hidden=principal is not None and _may_set_hidden(task, principal),
         # The caller's batched answer, else this call's probe, else `None` (not computed). Only a probe that ran
@@ -1045,7 +1103,7 @@ def _stop_out(
         text, by, at = source.awaiting_response_body or None, None, source.github_synced_at
     else:
         # A stop with no record (an idle kill, an epic cascade) names no one; its time is the edge's.
-        text = source.stop_note if kind == "waiting_on_customer" else None
+        text = None
         by = _actor_label(source.stopped_by_id, actor_map)
         at = source.stopped_at or source.github_synced_at
     return StopOut(
@@ -1325,18 +1383,18 @@ def _latest_settled_output_note(session: Session, task: Task) -> Optional[str]:
     Either kind qualifies, only with a `data["summary"]` body; newest across both kinds wins. The Reset
     watermark is inside the ordering, or a soft-deleted newest note would be returned rather than
     skipped. `_task_prerequisite_outputs` applies each prerequisite's own watermark."""
-    row = session.scalars(
-        select(ActivityEvent)
+    # The body alone, of the newest row only: `.first()` on full rows would still stream every match.
+    summary = session.scalar(
+        select(ActivityEvent.data["summary"])
         .where(ActivityEvent.kind.in_(_SETTLED_OUTPUT_NOTE_KINDS))
         .where(_has_settled_output_body())
         .where(ActivityEvent.data["id"].astext == str(task.id))
         .where(visible_artifact_clause(
             ActivityEvent.created_at, task.artifacts_hidden_before))
         .order_by(ActivityEvent.created_at.desc(), ActivityEvent.id.desc())
-    ).first()
-    if row is None:
-        return None
-    return (row.data or {}).get("summary") or None
+        .limit(1)
+    )
+    return summary or None
 
 
 def _visible_prerequisites(session: Session, task: Task, principal: Principal | None) -> list[Task]:
@@ -1414,7 +1472,17 @@ def _task_prerequisite_artifacts(
     expected = INPUT_MANIFEST.get(task.persona) or ()
     if not expected:
         return None
-    prereqs = _visible_prerequisites(session, task, principal)
+    # A blind review child has no prerequisite edge: its documents are its coder's epic's (`blind_review.epic_inputs`),
+    # under the same visibility gate as an edge's.
+    from app import blind_review
+    from app.agent_router.personas import REVIEW_PERSONAS
+
+    if task.persona in REVIEW_PERSONAS:
+        inputs = blind_review.epic_inputs(session, task)
+        visible = set(_visible_task_ids(session, principal, [t.id for t in inputs])) if inputs else set()
+        prereqs = [t for t in inputs if t.id in visible]
+    else:
+        prereqs = _visible_prerequisites(session, task, principal)
     if not prereqs:
         return None
     out: list[PrerequisiteArtifactOut] = []
@@ -1423,11 +1491,7 @@ def _task_prerequisite_artifacts(
             row = current_artifact(session, prereq, kind)
             if row is None:
                 continue
-            out.append(
-                PrerequisiteArtifactOut(
-                    id=row.id, task_id=row.task_id, kind=kind, size_bytes=row.size_bytes
-                )
-            )
+            out.append(from_row(PrerequisiteArtifactOut, row, kind=kind))
             break
     return out or None
 
@@ -1452,6 +1516,13 @@ def _task_attachments_meta(
         session, principal, "task", task.parent_task_id, mode=ObjectAccess.READ
     ):
         task_ids.append(task.parent_task_id)
+        # A blind review child's parent is its coder; the human's uploads land on the coder's epic, one hop further.
+        from app.agent_router.personas import REVIEW_PERSONAS
+
+        epic = session.scalar(select(Task.parent_task_id).where(
+            Task.id == task.parent_task_id, Task.org_id == task.org_id)) if task.persona in REVIEW_PERSONAS else None
+        if epic is not None and can_access(session, principal, "task", epic, mode=ObjectAccess.READ):
+            task_ids.append(epic)
     rows = session.scalars(
         select(TaskAttachment)
         .where(
@@ -1469,7 +1540,8 @@ def _task_attachments_meta(
 
 
 def _task_effective_autonomous(session: Session, task: Task) -> bool:
-    """The autonomous-mode switch actually binding on `task` at dispatch: an epic child in
+    """The autonomous-mode switch actually binding on `task` at dispatch: an always-interviewing persona
+    (`Persona.always_interviews`) is never Full Auto; otherwise an epic child in
     `INTERVIEWING_CHILD_PERSONAS` takes its parent epic's `autonomous`, every other child runs Full
     Auto, and a parentless row takes its own.
 
@@ -1479,6 +1551,9 @@ def _task_effective_autonomous(session: Session, task: Task) -> bool:
 
     Ungated, unlike the fence hop: this is one bit of the epic's switch and must be the true dispatch
     value even when the principal cannot fetch the epic. A pure read."""
+    # An always-interviewing persona (App Wizard) asks whatever any switch says: the first rule.
+    if task.persona in ALWAYS_INTERVIEWING_PERSONAS:
+        return False
     # A playbook stage row: "Never asks" runs Full Auto; "Asks when Full Auto is off" takes the switch LIVE
     # (`playbook_engine.follows_full_auto`) — a child its container's, as an interviewing epic child does,
     # a one-stage row its own.
@@ -1549,6 +1624,20 @@ def _interview_skipped_reason(session: Optional[Session], task: Task) -> Optiona
 # gh-free: the plan RUNNER POSTs the breakdown, and this core only writes rows and edges.
 
 
+# A child's fields no console surface reads (the page's Subtasks, Audit and Details, the board's expanded epic): its long
+# texts and its `metrics` blob. Public Live Cast renders them, so it asks `_task_out(full_children=True)`.
+# `body` is a required string, so it empties rather than nulls.
+_CHILD_HEAVY_FIELDS: dict[str, Any] = {
+    "body": "", "metrics": None, "outcome_summary": None, "outcome_no_pr_evidence": None,
+    "awaiting_response_body": None, "questions": None, "qa_entries": None,
+}
+
+
+def _slim_child(child: TaskOut, *, keep: bool) -> TaskOut:
+    """`child` as an epic's `children` entry: unchanged when `keep`, else without `_CHILD_HEAVY_FIELDS`."""
+    return child if keep else child.model_copy(update=_CHILD_HEAVY_FIELDS)
+
+
 def _epic_children(parent_id: int, session: Session) -> list[Task]:
     """Every LIVE (non-archived) child of `parent_id`, ascending by id — the ONE query every route loading a
     Task's children shares, so `append_tasks`'s archive+replace cannot be forgotten by a new caller.
@@ -1596,12 +1685,8 @@ def _may_set_hidden(task: Task, principal: Principal) -> bool:
     )
 
 
-def _ran_on(session: Session, task_id: int) -> Optional[RanOnOut]:
-    return _ran_on_of(runner_places.places(session, [task_id]).get(task_id))
-
-
-def _ran_on_of(place: Optional[runner_places.Place]) -> Optional[RanOnOut]:
-    return None if place is None else RanOnOut(node=place.node, slot=place.slot, live=place.live)
+def _ran_on(session: Session, task_id: int) -> Optional[runner_places.Place]:
+    return runner_places.places(session, [task_id]).get(task_id)
 
 
 # ── What a chat may actually be asked to do, so the projection cannot advertise a refusal ──────────
@@ -1731,12 +1816,15 @@ def _answer_delivery_failures(task_ids: list[int], session: Session) -> dict[int
     in a row with the same reason; a changed reason restarts it at 1. No column of its own."""
     if not task_ids:
         return {}
-    # The key read under the verb test, as `task_sections.answer_delivering_keys` does.
-    is_deliver = SlotIntent.verb == fleet_verdicts.VERB_DELIVER_ANSWER
-    key = case((is_deliver, SlotIntent.payload["task_id"].astext))
+    # The key bare, not under a CASE: `ix_slot_intents_pane_writes_task` indexes `payload ->> 'task_id'` over
+    # the delivery verbs, so the IN is its index condition and no payload outside it is read. The verb a literal
+    # (`fleet_verdicts._not_done`'s reason: a generic plan proves no partial index's predicate from a bind). Under the CASE no
+    # index matched and every task read walked that index whole (~1.3K buffers).
+    key = SlotIntent.payload["task_id"].astext
     rows = session.execute(
         select(key, SlotIntent.reason, SlotIntent.refusals)
-        .where(is_deliver, key.in_([str(i) for i in task_ids]),
+        .where(SlotIntent.verb == literal_column(f"'{fleet_verdicts.VERB_DELIVER_ANSWER}'"),
+               key.in_([str(i) for i in task_ids]),
                SlotIntent.outcome.in_(_DELIVERY_FAILURE_OUTCOMES))
         .order_by(SlotIntent.created_at.desc(), SlotIntent.id.desc())
     ).all()

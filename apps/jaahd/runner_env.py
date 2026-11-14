@@ -1,7 +1,7 @@
 """How a process reads the runner identity (`CONTROL_TASK_ID`, `CONTROL_RUNNER_SESSION_ID`) its pane exported.
 
-A blank value is absent, never a blank identity: a blank id would let `control_plane_api._caller_task_id`
-fall through to the privileged `host` producer sentinel.
+A blank value is absent, never a blank identity: a blank id would let `caller_task_id` fall through to the
+privileged `host` producer sentinel.
 
 `tools/runner_env.py` is a facade that loads THIS file by path (`tools/jaahd_module.py`) and binds its names:
 this is the single home, for the tools tree too."""
@@ -32,6 +32,30 @@ def runner_session_id(default: str = "", env: "dict[str, str] | None" = None) ->
     return _read(source, "CONTROL_RUNNER_SESSION_ID", default)
 
 
+def caller_task_id() -> str:
+    """This process's `X-Agent-Task-Id` declaration for an agent-API call on the CREDENTIAL LEG (the daemon's
+    own calls, `control_plane_api`; the hub's tools client on its node-token fallback): its own console task
+    id inside a fleet runner's session, else the `host` producer sentinel.
+
+    Not consulted on the socket leg, where the daemon DERIVES the header from the calling process
+    (`runner_registry.resolve_peer` → `agent_vocabulary.caller_task_header`) — which is what makes
+    `apps/api/app/routes/agent/auth.py::_guard_task_creating_caller` (R30) unforgeable.
+
+    The task-creating routes require this header and reject a persona other than `plan`/`finish`.
+    `CONTROL_TASK_ID` is exported only into a runner's shell (`fleet_dispatch.build_auth_lines`), so cron
+    declares `host` while the same tool inside an implementer's session declares that implementer. Never
+    hardcode the sentinel at a call site.
+
+    `host` is NOT an unconditional fallback (a safe-off default may cover a switch, never an identity): inside
+    a runner (`CONTROL_RUNNER_SESSION_ID` set — dispatched runners only, credential-independent) a missing task
+    id means the id was LOST, so this declares nothing and the server 422s. Guards against accidental loss,
+    not forgery. Not `COCKPIT_AGENT_BASE` or `JAAH_WORKTREE` as the runner test: operator shells carry those."""
+    task_id_ = task_id().strip()
+    if task_id_:
+        return task_id_
+    return "" if runner_session_id().strip() else "host"
+
+
 # The installed standard's library root, exported into the launch env of every runner whose node is not at the
 # package path (`fleet_dispatch.build_auth_lines`, valued `host_platform.paths().lib_root`; see
 # `lib_root_relocated`). The Stop-hook gate and the pre-commit hook read it off Linux only; on Linux they keep the
@@ -59,8 +83,8 @@ def docker_env() -> dict[str, str]:
     return {DOCKER_HOST_ENV: host_platform.paths().docker_host}
 
 
-# The package's library root as the shipped hook commands spell it (`apps/jaahd/fleet_account_settings.json`,
-# the fleet-harness template), with its trailing `/` so a bare `lib=/usr/lib/jaahd` default
+# The package's library root as the shipped hook commands spell it (`infra/host/fleet-harness/settings.json`),
+# with its trailing `/` so a bare `lib=/usr/lib/jaahd` default
 # (the Stop hook's) is never touched.
 PACKAGED_LIB_PREFIX = "/usr/lib/jaahd/"
 
@@ -102,7 +126,7 @@ _PYTHON_COMMAND = re.compile(
 
 def rehome_python(text: str, python: str) -> str:
     """`text` with every `python3 ` at a command position rewritten to `python` (shell-quoted), for a shipped file
-    whose commands spell bare `python3` (`fleet_account_settings.json`, the fleet-harness template). A no-op when
+    whose commands spell bare `python3` (the fleet-harness template, `infra/host/fleet-harness/settings.json`). A no-op when
     `python` is `python3` itself. The shared source keeps the bare word; only the installed copy is rehomed, so a
     project's own `python3` and PATH are never touched."""
     if python == "python3":

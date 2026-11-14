@@ -27,7 +27,7 @@ The slot registry (`_slots`) is in memory only: a daemon restart forgets it, and
 in the cache (`<cache>/project-memory`, safe to delete) rather than being shipped.
 A registration is per bundle FILE (`_meta` is per project, shared by its slots), and is dropped once the
 control plane answers 410 — no open ON task left in the project — or its file is gone, so the registry is
-bounded by the project's live ON runners.
+bounded by the project's live ON runners. The registry and its refresh are `bundle_refresh`'s (shared with the guard's).
 """
 from __future__ import annotations
 
@@ -41,6 +41,7 @@ import sys
 import threading
 from dataclasses import dataclass
 
+import bundle_refresh
 import control_plane_api
 import env_helpers
 import fleet_launch
@@ -52,7 +53,9 @@ log = logging.getLogger("jaahd.project_memory_bundle")
 BUNDLE_SUFFIX = ".memory.json"
 #: The launch's budget for the first fetch (§2.6): never worth delaying a runner past it.
 FETCH_TIMEOUT_S = 2.0
-REFRESH_INTERVAL_S = 60.0
+#: The poll backstop. A change reaches a node at once on the CP's `refresh` frame (topic `memory`,
+#: `request_refresh`); this interval only bounds a lost frame.
+REFRESH_INTERVAL_S = 300.0
 #: The five exports, and nothing else, an ON launch adds (§4.4).
 ENV_BUNDLE = "JAAH_PROJECT_MEMORY"
 ENV_PERSONA = "JAAH_MEMORY_PERSONA"
@@ -74,17 +77,9 @@ HELPER_RELPATH = ("tools", "project_memory_node.py")
 DRAIN_TIMEOUT_S = 15.0
 REPORT_TIMEOUT_S = 10.0
 
-
-@dataclass
-class _Registration:
-    project_id: int
-    revision: int
-    mode: int
-
-
-_lock = threading.Lock()
-_registry: dict[str, _Registration] = {}
 _refresh_in_flight = False
+# Projects a refresh was asked for that no pass has started on yet (`request_refresh`); `None` in it = every one.
+_refresh_owed: set[int | None] = set()
 
 
 def bundle_path(meta: str, ref_key: str) -> str:
@@ -101,11 +96,12 @@ def fetch(project_id: int, since: object = None) -> tuple[int, dict]:
     return control_plane_api.agent_api_memory_bundle(project_id, since, timeout=FETCH_TIMEOUT_S)
 
 
-def _write(path: str, bundle: dict, mode: int) -> bool:
-    err = session_user.replace_file_as_session_user(path, json.dumps(bundle, sort_keys=True), mode=mode)
-    if err:
-        log.warning("project memory: could not write %s (%s) — the runner's hooks read no memory", path, err)
-    return not err
+#: Memory's registry (`bundle_refresh` says what each field means): a trusted file, an int revision, 410 stops it.
+#: Its names are this module's too (`refresh_step` and the tests reach them here; `_lock` also guards `_slots`).
+_bundles = bundle_refresh.BundleRegistry(label="project memory", log=log, fetch=fetch, empty=empty_bundle,
+                                         revision_of=lambda bundle: int(bundle.get("revision") or 0),
+                                         interval_s=REFRESH_INTERVAL_S, verify_written=False, drop_on_410=True)
+_lock, _registry, registered, refresh_once = _bundles.lock, _bundles.entries, _bundles.registered, _bundles.refresh_once
 
 
 def env_for(path: str, memory: dict) -> dict[str, str]:
@@ -139,9 +135,8 @@ def prepare_launch(memory: dict, *, meta: str, ref_key: str, mode: int, task_id:
         status, bundle = 0, {}
     if status != 200:
         bundle = empty_bundle(project_id)
-    _write(path, bundle, mode)
+    _bundles.register(path, project_id, bundle, mode)
     start_node_helper(task_id=task_id, worktree=worktree, session_id=session_id)
-    register(path, project_id, int(bundle.get("revision") or 0), mode)
     return env_for(path, memory)
 
 
@@ -208,11 +203,8 @@ def _drain(session_id: str, hub_root: str) -> list[dict]:
     argv = [sys.executable or "python3", "-I", os.path.join(hub_root, *HELPER_RELPATH), "--drain-spool",
             session_id]
     env = {"JAAH_HOME": env_helpers.jaah_home()}
-    if session_user.switch_needed():
-        proc = session_user.run_as_session_user(argv, env=env, timeout=DRAIN_TIMEOUT_S)
-    else:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=DRAIN_TIMEOUT_S,
-                              env={**os.environ, **env}, stdin=subprocess.DEVNULL)
+    proc = session_user.run_as_session_user_or_here(argv, env=env, timeout=DRAIN_TIMEOUT_S,
+                                                    stdin=subprocess.DEVNULL)
     out = proc.stdout or ""
     if proc.returncode != 0 or len(out) > DRAIN_OUTPUT_MAX:
         return []
@@ -257,52 +249,43 @@ def ship_orphan_spool_later(worktree: str, *, hub_root: str) -> None:
                      name="project-memory-orphan-spool", daemon=True).start()
 
 
-def register(path: str, project_id: int, revision: int, mode: int) -> None:
-    """Refresh `path` every `REFRESH_INTERVAL_S` from now on (a relaunch of the same task replaces its entry)."""
-    with _lock:
-        _registry[path] = _Registration(project_id=project_id, revision=revision, mode=mode)
+def _take_owed() -> frozenset[int] | None:
+    """The projects owed a refresh, cleared: None means every registration."""
+    owed = set(_refresh_owed)
+    _refresh_owed.clear()
+    return None if None in owed else frozenset(p for p in owed if p is not None)
 
 
-def registered() -> dict[str, _Registration]:
-    with _lock:
-        return dict(_registry)
-
-
-def refresh_once() -> None:
-    """One pass over every registration: re-ask with `since`, rewrite on a change; on 410 empty the file once
-    and stop refreshing it."""
-    for path, entry in registered().items():
-        if not os.path.exists(path):
-            with _lock:
-                _registry.pop(path, None)
-            continue
-        try:
-            status, bundle = fetch(entry.project_id, since=entry.revision)
-        except Exception as exc:  # noqa: BLE001 — a miss keeps the file there is; the next tick retries
-            log.info("project memory: refresh of %s failed (%s) — keeping the current bundle", path, exc)
-            continue
-        if status == 204:
-            continue
-        if status == 410:
-            _write(path, empty_bundle(entry.project_id), entry.mode)
-            with _lock:
-                _registry.pop(path, None)
-            continue
-        if _write(path, bundle, entry.mode):
-            with _lock:
-                if path in _registry:
-                    _registry[path].revision = int(bundle.get("revision") or 0)
-
-
-async def refresh_step() -> None:
-    """The 60s `project-memory` PeriodicStep: single-flight, off the loop, silent about its own failures."""
+async def refresh_step(*, requested: bool = False) -> None:
+    """The `project-memory` PeriodicStep (every `REFRESH_INTERVAL_S`, or at once via `request_refresh`):
+    single-flight, off the loop, silent about its own failures."""
     global _refresh_in_flight
-    if _refresh_in_flight or not registered():
+    if _refresh_in_flight:
+        # The pass in flight may have read before the change: what is owed makes it go round once more.
         return
     _refresh_in_flight = True
     try:
-        await asyncio.to_thread(refresh_once)
+        # The periodic pass covers every registration; a requested one only the projects asked for.
+        scope = _take_owed() if requested else None
+        while True:
+            if not registered():
+                return
+            await asyncio.to_thread(refresh_once, scope)
+            if not _refresh_owed:
+                return
+            scope = _take_owed()
     except Exception as exc:  # noqa: BLE001 — never cost the daemon its idle loop
         log.warning("project memory: refresh pass failed (%s)", exc)
     finally:
         _refresh_in_flight = False
+
+
+def request_refresh(project_id: int | None = None) -> None:
+    """The CP's `refresh` frame (topic `memory`, naming its project) or a node-bus reconnect (None: every project):
+    re-ask those bundles now rather than at the next `REFRESH_INTERVAL_S`. Spawns the pass and returns; never
+    raises (the poll is the backstop)."""
+    _refresh_owed.add(project_id)
+    try:
+        asyncio.ensure_future(refresh_step(requested=True))
+    except RuntimeError as exc:
+        log.debug("project memory: refresh not scheduled (%s) — the periodic pass covers it", exc)

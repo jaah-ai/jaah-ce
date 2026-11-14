@@ -1,35 +1,38 @@
 // The Task page at /tasks/:id (and /tasks/new): the route-mode switch composing the page's hooks and sections.
+import { useEffect, useRef } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import Box from '@mui/material/Box'
+import Button from '@mui/material/Button'
+import { useViewportIs } from '../../hooks/useViewportWidth'
 import { useAuth } from '../../auth'
 import Breadcrumb from '../../components/Breadcrumb'
 import TaskBreadcrumb from '../../components/tasks/TaskBreadcrumb'
 import { featureName } from '../../components/tasks/featureFiling'
+import { deescapeMarkdownText, TaskStatusIndicator } from '../../components/tasks/shared'
 import { featureIconFor } from '../../lib/featureIcon'
 import { LANE_PERSONA } from '../../components/tasks/laneRun'
-import MoveToFeatureDialog from '../../components/tasks/MoveToFeatureDialog'
-import WaitOnCustomerDialog from '../../components/tasks/WaitOnCustomerDialog'
 import { useTaskCreateDefaults } from '../../components/tasks/taskDefaults'
 import { useCanEditTaskRow } from '../../hooks/useTaskAccess'
 import { LiveRefetchPausedContext } from '../../hooks/useLiveRefetch'
+import { markTaskSeen } from '../../lib/taskSeen'
 import { useViewerMode } from '../../lib/viewerMode'
+import { SIZE, grid } from '../../theme'
 import DetailStatus from '../../ui/detail/DetailStatus'
 import { DetailPage } from '../../ui/detail/DetailPage'
 import { ActingForNotice } from '../../ui/OrgIndicator'
-import { OrgScopeInline } from '../../ui/OrgScopeControl'
-import TaskActivityPanel from './TaskActivityPanel'
+import { OrgScopeInline, useStripStandIn } from '../../ui/OrgScopeControl'
+import TaskDetailsTabPanel from './TaskDetailsTabPanel'
 import TaskCreateView from './TaskCreateView'
 import TaskDetailBanners from './TaskDetailBanners'
-import { TaskDetailCrumbs, TaskDetailHeaderActions, taskTitleAside } from './TaskDetailHeader'
-import TaskDetailsPanel from './TaskDetailsPanel'
+import { TaskDetailCrumbs, TaskDetailHeaderActions, taskOrgChip } from './TaskDetailHeader'
 import {
   TaskAgentPanel,
-  TaskAnswerPanel,
   TaskArtifactsPanel,
   TaskBodyPanel,
+  TaskQAPanel,
   TaskCommentsPanel,
   TaskDetailTabStrip,
-  TaskMetricsPanel,
+  TaskRoutingPanel,
   TaskSubtasksPanel,
 } from './TaskDetailTabs'
 import { LOADING_TRAIL_SX, PAGE_SX } from './taskDetailConstants'
@@ -41,7 +44,10 @@ import { savedProjectCrumbEditable, useTaskDetailFiling } from './useTaskDetailF
 import { useTaskDetailLoad } from './useTaskDetailLoad'
 import { useTaskDetailNavState } from './useTaskDetailNavState'
 import { useTaskDetailTabs } from './useTaskDetailTabs'
+import { useStartRefusedToast } from './useStartRefusedToast'
 import { useTaskPageViewport } from './useTaskPageViewport'
+import { useTaskBoardScope } from './useTaskBoardScope'
+import { parseScope, scopeHref } from '../../lib/taskScope'
 
 // The Task page at /tasks/:id: FULL-HEIGHT, TABBED, NON-SCROLLING — header and tab strip fixed, the
 // active panel takes the rest of `.app-main`.
@@ -49,18 +55,19 @@ import { useTaskPageViewport } from './useTaskPageViewport'
 // Tabs use the shared `components/Tabs` shell. Keep-mounted `[hidden]` panels are LOAD-BEARING: an
 // unmount-on-switch would discard an in-progress gate answer or description edit.
 //
-//   answer    (conditional, FIRST, auto-selected) the gate form, iff the task is at a gate
 //   task      the Description and the task's settings — content only
 //   subtasks  (conditional) the tree table in page mode
 //   artifacts (conditional) runner-handed documents (sandboxed HTML, markdown)
-//   details   everything ABOUT the run: fields, runner, unverified-done warning, Outcome, run metrics,
-//             Finisher notes, Blocks, attachments
+//   qa        (conditional, auto-selected at a gate) the gate form at a gate, else the Q&A trail
+//   comments  comments
 //   agent     (conditional) the ACP run's live event stream (`TaskActivity`)
-//   activity  append-only histories: Timeline · Q&A · Versions
+//   details   everything ABOUT the run, one subtab each (only those with data): Summary (fields, runner,
+//             unverified-done warning, Outcome, Finisher notes, Blocks, attachments) · Outcome (the ledger) · Metrics
+//             · Timeline · Versions · Review (review lanes' findings)
 //
 // Panels FIT rather than scroll: exactly FOUR panel-level scrollports are sanctioned (Subtasks rows,
-// Description, the Activity feed — one port shared by its subtabs — and the Agent tab's live event stream),
-// each unbounded by construction.
+// Description, the history feed — one port shared by Details' Timeline and Versions, the same on Q&A's
+// trail — and the Agent tab's live event stream), each unbounded by construction.
 // Anything else scrolling is a defect (`e2e/task-detail-fit.spec.ts` sweeps per tab and subtab). The one
 // nested exception: each Versions snapshot `<pre>` is bounded at 150px.
 //
@@ -73,6 +80,9 @@ import { useTaskPageViewport } from './useTaskPageViewport'
 // of the artifacts latch (`useTaskDetailTabs`) and the create seeds (`useTaskDetailFiling`); handlers last.
 
 const NO_OP = () => {}
+/** At or below this viewport the task is a full screen of its own (never beside the list): it carries Back. */
+const BACK_MAX_PX = 768
+const narrowViewport = (width: number) => width <= BACK_MAX_PX
 
 export default function TaskDetailPage(
   { mode = 'edit' }: { mode?: 'create' | 'create-chat' | 'edit' } = {},
@@ -85,11 +95,14 @@ export default function TaskDetailPage(
   const navigate = useNavigate()
   const { id } = useParams<{ id: string }>()
   const { admin } = useAuth()
+  /* FULL SCREEN ON A PHONE OR NARROW WINDOW, WITH A WAY BACK: to the page it was opened from, else the list. */
+  const narrow = useViewportIs(narrowViewport)
   /* The public Live Cast viewer (`lib/viewerMode.ts`) sees this page as a console `tasks:view` reader does, minus
      the comment composer and the operator's exceptions: people, cross-task edges, the compliance
      manifest. The write controls are already gone by permission (no `AuthProvider` there). */
   const viewer = useViewerMode()
   const nav = useTaskDetailNavState(isCreate, isChat)
+  const startRefusedToast = useStartRefusedToast()
   /* The operator's `task_default_*` settings for the CREATE surface (fences single-homed in
      `components/tasks/taskDefaults`). `loaded` gates the HANDOVER, not the render, so the form seeds
      once from real values; the page never waits. */
@@ -97,7 +110,24 @@ export default function TaskDetailPage(
   const read = useTaskDetailLoad({ id, isCreate, duplicateOf: nav.duplicateOf })
   const { task, activity, artifacts, loading, notFound, error, runMetricsId, runMetrics } = read
   const access = useTaskDetailAccess(task)
+  /* OPENING A FINISHED TASK ENDS ITS "NOT YET SEEN" MARK for this viewer (`lib/taskSeen.ts`): once per task, retried
+     on the next read only if the report failed. */
+  const seenRef = useRef<number | null>(null)
+  useEffect(() => {
+    if (!task?.done_unseen || seenRef.current === task.id) return
+    const taskId = task.id
+    seenRef.current = taskId
+    markTaskSeen(taskId).catch(() => {
+      if (seenRef.current === taskId) seenRef.current = null
+    })
+  }, [task?.id, task?.done_unseen])
   const { otherOrg, canEditThisTask, canRunThisTask } = access
+  /* THE BOARD BESIDE THIS TASK, kept on its URL so a reload or a shared link opens the same pipeline. */
+  // The loaded row only: whose org it is (`otherOrg`) is known from it, never from the board's cached copy.
+  const boardScope = useTaskBoardScope(task?.project_id, isCreate || viewer || task === null || otherOrg !== null)
+  const goBack = () => ((window.history.state as { idx?: number } | null)?.idx ?? 0) > 0
+    ? navigate(-1)
+    : navigate(boardScope ? scopeHref(parseScope(boardScope)) : '/tasks')
   // The loading trail asks it of the board's row: will its crumbs be pickers once loaded?
   const canEditRow = useCanEditTaskRow()
   const pageRef = useTaskPageViewport({ hasTask: task !== null, isCreate, loading, settled: runMetrics.settled })
@@ -106,18 +136,22 @@ export default function TaskDetailPage(
   })
   const { script } = derived
   const tabState = useTaskDetailTabs({
-    task, isCreate, artifacts, runMetrics, setArtifactsEverShown: read.setArtifactsEverShown, canRunThisTask, script,
+    task, isCreate, activity, artifacts, runMetrics, setArtifactsEverShown: read.setArtifactsEverShown, script,
     formDirty: read.formDirty,
   })
   const { activeTab } = tabState
   const filing = useTaskDetailFiling({
-    id, isCreate, task, formTask: read.formTask, setTask: read.setTask, formDirty: read.formDirty, cachedRow: read.cachedRow, projects: read.projects, loading, keepsHandedRead: read.keepsHandedRead, otherOrg, nav,
-    canEditThisTask, script,
+    id, isCreate, task, formTask: read.formTask, setTask: read.setTask, cachedRow: read.cachedRow, projects: read.projects, loading, keepsHandedRead: read.keepsHandedRead, otherOrg, nav,
+    canEditThisTask, script, formDirty: read.formDirty,
   })
   const actions = useTaskDetailActions({
-    id, isCreate, viewer, read, access, derived, ratingFolded: tabState.ratingFolded, setRatingOpen: tabState.setRatingOpen,
-    selectTab: tabState.selectTab, titleEditable: filing.titleEditable, onTitleRegenerated: filing.setDraftTitle,
+    id, isCreate, viewer, read, access, derived, selectTab: tabState.selectTab, titleEditable: filing.titleEditable, onTitleRegenerated: filing.setDraftTitle,
   })
+
+  /* The phone's org strip steps aside for a task this page shows or is about to: its filter is the header's ⋯ item
+     (`TaskDetailHeaderActions`). Not for a create (its chip is on the crumb row) nor a task not found or failed, which
+     the filter may be what hides. */
+  useStripStandIn(!isCreate && !notFound && !error && (loading || task !== null))
 
   const taskCrumbs = (
     <TaskDetailCrumbs
@@ -170,19 +204,27 @@ export default function TaskDetailPage(
       />
     ) : <TaskTrailSkeleton id={id} />
     /* THE PHONE'S ORG-SCOPE CHIP: the create surface draws it on its crumb row (`TaskCreateView`), so its loading trail
-       does too; a task's page leaves it to the shell's strip above the page, where it no longer
-       crowds a long title's trail onto three lines. */
+       does too; a task's page carries it in its ⋯ (`useStripStandIn` above), off the row Back and the trail share. */
     const loadingTrail = isCreate ? (
       <Box sx={LOADING_TRAIL_SX}>
-        <Box sx={{ minWidth: 0, maxWidth: '100%', flex: '1 1 10rem' }}>{loadingCrumbs}</Box>
+        <Box sx={{ minWidth: 0, maxWidth: '100%', flex: `1 1 ${grid(26.5)}` }}>{loadingCrumbs}</Box>
         <OrgScopeInline />
       </Box>
     ) : loadingCrumbs
     // The create surface keeps the plain status: its shell is the form's, one tab, drawn once the roster lands.
     if (isCreate) return <DetailStatus trail={loadingTrail} loading />
     /* THE PAGE'S SHELL WHILE IT LOADS, not a bare "Loading…" under the trail — single-homed in
-       `TaskPageSkeleton`, which the shell's task pane also draws while this chunk downloads. */
-    return <TaskPageSkeleton trail={loadingTrail} />
+       `TaskPageSkeleton`, which the shell's task pane also draws while this chunk downloads. A cold open from the board
+       heads it with the board's row whole — trail, org chip and an inert state pill, drawn as the loaded header draws
+       them (`TaskDetailHeader`), so the same row lands with no swap; the actions, tabs and body wait for the page's read. */
+    if (!cachedRow) return <TaskPageSkeleton trail={loadingTrail} />
+    return (
+      <TaskPageSkeleton
+        trail={loadingTrail}
+        org={taskOrgChip(cachedRow, admin)}
+        state={<TaskStatusIndicator task={cachedRow} name={deescapeMarkdownText(cachedRow.title)} waitReasonHover iconOnly />}
+      />
+    )
   }
 
   // ── /tasks/new (A1b/AC1c.1, AD-13) ──────────────────────────────────────────────────────────────
@@ -221,9 +263,15 @@ export default function TaskDetailPage(
         measure="fill"
         testId="task-page"
         headerTestId="task-page-header"
-        breadcrumb={taskCrumbs}
-        titleAside={taskTitleAside(task, admin)}
-        actions={<TaskDetailHeaderActions task={task} viewer={viewer} canRunThisTask={canRunThisTask} derived={derived} tabState={tabState} actions={actions} />}
+        breadcrumb={narrow ? (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}>
+            <Button size="small" onClick={goBack} data-testid="task-page-back" sx={{ minWidth: 0, minHeight: SIZE.tapTarget, flexShrink: 0 }}>
+              Back
+            </Button>
+            <Box sx={{ minWidth: 0, flex: 1 }}>{taskCrumbs}</Box>
+          </Box>
+        ) : taskCrumbs}
+        actions={<TaskDetailHeaderActions task={task} org={taskOrgChip(task, admin)} viewer={viewer} canRunThisTask={canRunThisTask} derived={derived} tabState={tabState} actions={actions} />}
         sx={PAGE_SX}
       >
         {otherOrg && (
@@ -236,31 +284,18 @@ export default function TaskDetailPage(
         {/* The Details tab's Delete/Archive confirm; portalled, at the page root. */}
         {actions.confirmDialog}
 
-        <MoveToFeatureDialog
-          task={actions.filingOpen ? task : null}
-          tree={filing.taskTree}
-          onClose={() => actions.setFilingOpen(false)}
-          onMoved={actions.holdUpdated}
-        />
-        <WaitOnCustomerDialog
-          task={actions.waitingOpen ? task : null}
-          onClose={() => actions.setWaitingOpen(false)}
-          onDone={actions.holdUpdated}
-        />
         {actions.preemptDialog}
+        {startRefusedToast}
 
         <TaskDetailBanners
           task={task}
           canRunThisTask={canRunThisTask}
-          stalledAnswer={tabState.stalledAnswer}
+          unheardAnswer={tabState.hasQA ? null : tabState.stalledAnswer}
           read={read}
           derived={derived}
           actions={actions}
         />
 
-        {tabState.gated && (
-          <TaskAnswerPanel current={activeTab} task={task} activity={activity} canRunThisTask={canRunThisTask} actions={actions} />
-        )}
         <TaskBodyPanel
           current={activeTab}
           task={read.formTask ?? task}
@@ -273,30 +308,30 @@ export default function TaskDetailPage(
           actions={actions}
           onDirtyChange={read.setFormDirty}
           onCancel={() => navigate('/tasks')}
-          onOpenAnswer={tabState.answerable ? () => tabState.selectTab('answer') : undefined}
+          canVote={admin != null}
+          tabState={tabState}
         />
         {/* Guarded like the strip, so no hidden panel dangles an `aria-labelledby`. */}
         {tabState.hasSubtasks && <TaskSubtasksPanel current={activeTab} task={task} />}
         {tabState.hasArtifacts && (
           <TaskArtifactsPanel current={activeTab} task={task} artifacts={artifacts} everShown={read.artifactsEverShown} />
         )}
+        {tabState.hasQA && (
+          <TaskQAPanel
+            current={activeTab}
+            task={task}
+            gated={tabState.gated}
+            activity={activity}
+            canRunThisTask={canRunThisTask}
+            stalledAnswer={tabState.stalledAnswer}
+            actions={actions}
+          />
+        )}
         <TaskCommentsPanel
           current={activeTab}
           task={task}
           readOnly={viewer}
           onCountChange={tabState.setCommentCount}
-        />
-        <TaskDetailsPanel
-          current={activeTab}
-          task={task}
-          admin={admin}
-          viewer={viewer}
-          script={script}
-          formDirty={read.formDirty}
-          access={access}
-          derived={derived}
-          tabState={tabState}
-          actions={actions}
         />
         {tabState.hasAgentSessions && (
           <TaskAgentPanel
@@ -306,14 +341,26 @@ export default function TaskDetailPage(
             onOpenInChat={actions.openRunnerChat}
           />
         )}
-        {tabState.hasRunMetrics && <TaskMetricsPanel current={activeTab} runMetrics={runMetrics} />}
-        <TaskActivityPanel
+        {tabState.hasRouting && (
+          <TaskRoutingPanel
+            current={activeTab}
+            task={task}
+            onAccepted={() => void read.load()}
+            onChange={() => tabState.selectTab('task')}
+          />
+        )}
+        <TaskDetailsTabPanel
           current={activeTab}
           task={task}
           activity={activity}
+          runMetrics={runMetrics}
+          admin={admin}
+          viewer={viewer}
           script={script}
+          formDirty={read.formDirty}
           gateLogHref={derived.gateLogHref}
-          canRunThisTask={canRunThisTask}
+          access={access}
+          derived={derived}
           tabState={tabState}
           actions={actions}
         />

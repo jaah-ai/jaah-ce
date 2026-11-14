@@ -1,4 +1,4 @@
-import Link from '@mui/material/Link'
+import ExternalLink from '../ui/ExternalLink'
 import Typography from '@mui/material/Typography'
 import type { SxProps, Theme } from '@mui/material/styles'
 import { CLOUD_SIGNUP_URL } from '../lib/edition'
@@ -25,9 +25,9 @@ export default function CloudUpsell({ children, cta, href, testId, sx }: {
   return (
     <Typography variant="body2" data-testid={testId} sx={[{ color: 'text.secondary' }, ...(Array.isArray(sx) ? sx : [sx])]}>
       {children && `${children} `}
-      <Link href={safeHref(href) ?? CLOUD_SIGNUP_URL} target="_blank" rel="noopener noreferrer" underline="hover" data-testid={`${testId}-link`}>
+      <ExternalLink href={safeHref(href) ?? CLOUD_SIGNUP_URL} underline="hover" data-testid={`${testId}-link`}>
         {cta}
-      </Link>
+      </ExternalLink>
     </Typography>
   )
 }

@@ -115,7 +115,7 @@ def not_runnable_reason(pb: Mapping[str, Any]) -> Optional[str]:
     all_stages = stages(pb)
     deliverables = [_default_option(stage)[1] for stage in all_stages]
     # A Plan settles only once it has filed something, so one that creates no stage could never settle.
-    for stage, deliverable in zip(all_stages, deliverables):
+    for stage, deliverable in zip(all_stages, deliverables, strict=False):
         if deliverable == v.PLAN and not stage_indexes_created_by(pb, stage.get("key")):
             return "Each Plan stage must create at least one stage."
     # A Chat is an operator-ended console session: inside a container it would hold a slot and the whole

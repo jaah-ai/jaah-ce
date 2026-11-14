@@ -3,8 +3,9 @@
  * with the launcher, because every page's layout reads it: the community edition's tree ships no launcher
  * (`support_assistant`, packages/editions/features.toml), and its pages lay out the same. */
 import { useEffect, type RefObject } from 'react'
-import { ABOVE_PHONE, SECTION_FILL_ATTR, SHELL_FILL_ATTR } from './listStyles'
+import { ABOVE_PHONE, SECTION_FILL_ATTR, SHELL_FILL_ATTR, SHELL_INSET } from './listStyles'
 import { FORM_ACTION_BAR_ATTR } from './FormActionBar'
+import { grid } from '../theme'
 
 /** The launcher's diameter. */
 export const LAUNCHER_SIZE = 56
@@ -20,9 +21,9 @@ const CLEARANCE_GAP = 8
  *  content gives the rest back, `LAUNCHER_CLEAR_ATTR`). Right, only on that bar (`LAUNCHER_SEAT_VAR`), so its last button ends clear
  *  of the launcher beside it. No phone: the launcher is not drawn there. */
 export const LAUNCHER_CLEARANCE_PX = LAUNCHER_INSET + LAUNCHER_SIZE + CLEARANCE_GAP
-/** A form action bar's right-hand room for the launcher level with it, less the scrollport's own 2rem. Save keeps
+/** A form action bar's right-hand room for the launcher level with it, less the scrollport's own right inset. Save keeps
  *  the orb's own LAUNCHER_INSET from it, not `CLEARANCE_GAP`, which put it almost under the orb's glow. */
-const LAUNCHER_SEAT_PX = LAUNCHER_INSET + LAUNCHER_SIZE + LAUNCHER_INSET - 32
+const LAUNCHER_SEAT = `calc(${LAUNCHER_INSET + LAUNCHER_SIZE + LAUNCHER_INSET}px - ${SHELL_INSET})`
 /** The same seat with no right inset under it; the list-detail pane's body takes its own inset off. */
 export const LAUNCHER_SEAT_FLUSH_PX = LAUNCHER_INSET + LAUNCHER_SIZE + LAUNCHER_INSET
 /** The seat a scrollport gives its form action bar; a scrollport off the launcher's corner sets it to 0. */
@@ -31,31 +32,32 @@ export const LAUNCHER_SEAT_VAR = '--launcher-seat'
  *  sit level with the bar, in the bar's seat (`LAUNCHER_SEAT_VAR`): a short form's bar sits mid-pane, where the seat
  *  only left Save short of the content's right edge. */
 export const BAR_SEAT_ATTR = 'data-bar-seat'
-/** On the detail pane's scrollport while it holds a form action bar but no drawn one ENDS its content: the bar sits in
- *  a hidden tab panel, or a card follows it (a user's Account under Profile). The bar's 1.75rem then left that content's
- *  last line under the orb at the pane's foot, so a spacer after the content restores the clearance: a spacer, not
- *  padding, which would lift a stuck bar off the scrollport's foot. Never with a fill page, which scrolls inside itself. */
+/** On a scrollport (`.app-main`, the detail pane's body) while it holds a form action bar but no drawn one ENDS its
+ *  content: the bar sits in a hidden tab panel, or a card follows it (a user's Account under Profile, a project's
+ *  Pipeline History under its Save). The bar's 1.75rem then left that content's last line under the orb at the foot,
+ *  so a spacer after the content restores the clearance: a spacer, not padding, which would lift a stuck bar off the
+ *  scrollport's foot. Never with a fill page, which scrolls inside itself, nor beside an open pane, off the corner. */
 export const LAUNCHER_CLEAR_ATTR = 'data-launcher-clear'
 export const LAUNCHER_CLEARANCE_SX = {
   [ABOVE_PHONE]: {
     paddingBottom: `${LAUNCHER_CLEARANCE_PX}px`,
-    [`&:has([${FORM_ACTION_BAR_ATTR}]), &:has([${SHELL_FILL_ATTR}])`]: { paddingBottom: '1.75rem' },
-    [`&[${LAUNCHER_CLEAR_ATTR}]::after`]: { content: '""', display: 'block', height: `calc(${LAUNCHER_CLEARANCE_PX}px - 1.75rem)` },
+    [`&:has([${FORM_ACTION_BAR_ATTR}]), &:has([${SHELL_FILL_ATTR}])`]: { paddingBottom: 4.5 },
+    [`&[${LAUNCHER_CLEAR_ATTR}]::after`]: { content: '""', display: 'block', height: `calc(${LAUNCHER_CLEARANCE_PX}px - ${grid(4.5)})` },
     /* A fill page's tab panel with no fill section of its own (a task's Details) has nothing to scroll inside: it
        shrank to the page, its last lines spilling into the scrollport's padding under the orb, out of scroll's reach.
        Kept whole, it overflows the page so the scrollport scrolls it, and a spacer after it clears the orb: the whole
        clearance, as no padding follows overflow. A panel with a form bar seats the launcher level with the bar instead. */
     [`& [${SHELL_FILL_ATTR}] > [role="tabpanel"]:not([hidden]):not(:has([${SECTION_FILL_ATTR}], [${FORM_ACTION_BAR_ATTR}]))`]: {
       flexShrink: 0,
-      '&::after': { content: '""', display: 'block', flexShrink: 0, height: `${LAUNCHER_CLEARANCE_PX}px` },
+      '&::after': { content: '""', display: 'block', flexShrink: 0, height: LAUNCHER_CLEARANCE_PX },
     },
-    [LAUNCHER_SEAT_VAR]: `${LAUNCHER_SEAT_PX}px`,
+    [LAUNCHER_SEAT_VAR]: LAUNCHER_SEAT,
     // `.app-main` beside an open detail pane is off the launcher's corner.
-    '&:has(~ [data-testid="detail-pane"])': { [LAUNCHER_SEAT_VAR]: '0px' },
+    '&:has(~ [data-testid="detail-pane"])': { [LAUNCHER_SEAT_VAR]: 0, '&::after': { display: 'none' } },
     [`& [${FORM_ACTION_BAR_ATTR}]`]: { paddingRight: `var(${LAUNCHER_SEAT_VAR})` },
   },
 } as const
-/** Bottom offset that centres the launcher on a stuck form action bar: the scrollport's 28px bottom inset, centred
+/** Bottom offset that centres the launcher on a stuck form action bar: the scrollport's 27px bottom inset (`grid(4.5)`), centred
  *  on the bar's 40px row. The page's `.app-main` and the detail pane's body share both. */
 export const BAR_SEAT_BOTTOM = 20
 
@@ -80,9 +82,8 @@ export function useBarSeat(scrollport: RefObject<HTMLElement | null>, active: bo
     let frame = 0
     const measure = () => {
       frame = 0
-      const bar = el.querySelector(`[${FORM_ACTION_BAR_ATTR}]`)
-      el.toggleAttribute(BAR_SEAT_ATTR, bar !== null && bar.getBoundingClientRect().bottom > window.innerHeight - band)
       const bars = Array.from(el.querySelectorAll(`[${FORM_ACTION_BAR_ATTR}]`))
+      el.toggleAttribute(BAR_SEAT_ATTR, bars.length > 0 && bars[0].getBoundingClientRect().bottom > window.innerHeight - band)
       el.toggleAttribute(LAUNCHER_CLEAR_ATTR, bars.length > 0 && el.querySelector(`[${SHELL_FILL_ATTR}]`) === null
         && !bars.some(b => b.getClientRects().length > 0 && !trailed(b, el)))
     }

@@ -87,6 +87,15 @@ class _GovPackColumns:
     unlock_threshold: Mapped[Decimal] = mapped_column(Numeric, nullable=False, server_default=text("0.8"))
 
 
+class _GovReleaseColumns:
+    """What a release is, whichever table holds it: the version, its FULL rule snapshot, and when it was cut."""
+
+    version: Mapped[str] = mapped_column(Text, nullable=False)
+    rules: Mapped[list[Any]] = _jsonb("[]")
+    changelog: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    released_at: Mapped[datetime] = timestamp_column()
+
+
 class GovManagedPack(EntityMixin, _GovPackColumns, Base):
     """A managed pack (origin `managed`): one global copy, written only by the seeder from a TOML in
     `app/governance/packs/`. An org edits one only by forking it into `gov_packs`. `slug` is the TOML's own
@@ -96,7 +105,7 @@ class GovManagedPack(EntityMixin, _GovPackColumns, Base):
     __table_args__ = (UniqueConstraint("slug", name="uq_gov_managed_packs_slug"),)
 
 
-class GovManagedPackRelease(UuidPkMixin, Base):
+class GovManagedPackRelease(UuidPkMixin, _GovReleaseColumns, Base):
     """One released version of a managed pack: the FULL rule snapshot (S3 rule shape). Immutable — a new
     version is a new row; an org on the managed pack pins one through `gov_org_settings.active_pack_version`."""
 
@@ -107,10 +116,6 @@ class GovManagedPackRelease(UuidPkMixin, Base):
         ForeignKey("gov_managed_packs.id", ondelete="CASCADE", name="fk_gov_managed_pack_releases_pack_id"),
         nullable=False,
     )
-    version: Mapped[str] = mapped_column(Text, nullable=False)
-    rules: Mapped[list[Any]] = _jsonb("[]")
-    changelog: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
-    released_at: Mapped[datetime] = timestamp_column()
 
 
 class GovPack(EntityMixin, OrgScoped, _GovPackColumns, Base):
@@ -131,7 +136,7 @@ class GovPack(EntityMixin, OrgScoped, _GovPackColumns, Base):
     upstream_version: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
-class GovPackRelease(UuidPkMixin, OrgScoped, Base):
+class GovPackRelease(UuidPkMixin, OrgScoped, _GovReleaseColumns, Base):
     """One snapshot of an org pack, written when it is forked and whenever a proposal is applied, so a
     proposal diffs two releases. Immutable, like a managed release."""
 
@@ -141,10 +146,6 @@ class GovPackRelease(UuidPkMixin, OrgScoped, Base):
     pack_id: Mapped[UUID] = mapped_column(
         ForeignKey("gov_packs.id", ondelete="CASCADE", name="fk_gov_pack_releases_pack_id"), nullable=False
     )
-    version: Mapped[str] = mapped_column(Text, nullable=False)
-    rules: Mapped[list[Any]] = _jsonb("[]")
-    changelog: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
-    released_at: Mapped[datetime] = timestamp_column()
 
 
 class GovRule(EntityMixin, OrgScoped, Base):

@@ -23,12 +23,6 @@ import env_helpers
 # boundary); `test_node_frame_auth.py` asserts the two agree.
 _CP_FRAME_LABEL = b"jaah-cp-frame-v1"
 
-# The config-snapshot key this daemon publishes, and the value that means "verifies the current label": a CP of
-# the previous release signs with `_CP_FRAME_LABEL` only for a node that reports it. Dropped once no CP of that
-# release can run (a rolling deploy or a rollback).
-WIRE_LABELS_SNAPSHOT_KEY = "wire_labels"
-CURRENT_WIRE_LABELS = "jaah"
-
 PROOF_FIELD = "cp_frame_proof"
 
 # `hmac.hexdigest()` shape, checked first so any other value (a lone surrogate would raise on `.encode()`)

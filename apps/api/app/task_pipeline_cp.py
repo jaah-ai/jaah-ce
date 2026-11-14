@@ -13,12 +13,13 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 # Stdlib-only at import (beyond the stdlib-only `app.task_lifecycle`): `task_pipeline.py`'s quick-tier
 # suites run on a bare host, so ORM, seam and route imports stay inside functions.
-from app.task_lifecycle import ACTIVE, DONE, DRAFT, _LIVE_UNIT_STATES
+from app.clock import utcnow
+from app.task_lifecycle import ACTIVE, AWAITING_RESPONSE, DONE, DRAFT, _LIVE_UNIT_STATES, _NEEDS_ATTENTION_STATES
 
 if TYPE_CHECKING:  # pragma: no cover — annotations only
     from sqlalchemy.orm import Session
@@ -32,10 +33,10 @@ def _cp_session() -> Iterator[Session]:
 
     One per call, not per pass: a session shared across the pass would let one refused row poison the
     rest."""
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.tenancy import seam
 
-    with seam.operator_scope(), SessionLocal() as session:
+    with seam.operator_scope(), BridgedSession() as session:
         yield session
 
 
@@ -43,30 +44,33 @@ def _cp_session() -> Iterator[Session]:
 
 
 def list_open_tasks() -> list[dict]:
-    """Open Tasks for the stale-runner reclaimers: every row in `_LIVE_UNIT_STATES`
+    """Open Tasks for the stale-runner reclaimers and the parked-task expirer: every row in `_LIVE_UNIT_STATES`
     (`ready`/`active`/`awaiting_response`/`system_failed`; never `draft`). Consumers filter on `state`
-    themselves. Each row carries `parent_task_id`, `persona`, `project` and the two terminal-reference
-    columns the coder reclaimer reads."""
-    from sqlalchemy import select
+    themselves. Each row carries `parent_task_id`, `persona`, `project`, the two terminal-reference
+    columns the coder reclaimer reads, and `unanswered_due`: for an `awaiting_response` row, whether
+    `expire_awaiting_response` could act on it (`awaiting.unanswered_question_may_be_due`); False otherwise.
+
+    Those columns only, never whole `Task` rows: hydrating every open task's full row (its body included) was
+    measurable CPU. A sweep pass reads this once and hands it to every consumer."""
+    from sqlalchemy import case, false, select
 
     from app.models.projects import Project
     from app.models.tasks import Task
+    from app.routes.tasks.awaiting import unanswered_question_may_be_due
 
     with _cp_session() as session:
         rows = session.execute(
-            select(Task, Project.name)
+            select(
+                Task.id, Project.name.label("project"), Task.state, Task.parent_task_id, Task.persona,
+                Task.outcome_no_pr_reason, Task.outcome_pr_url,
+                # CASE, so the per-row subqueries run for parked rows only.
+                case((Task.state == AWAITING_RESPONSE, unanswered_question_may_be_due()), else_=false())
+                .label("unanswered_due"),
+            )
             .join(Project, Task.project_id == Project.id)
             .where(Task.state.in_(_LIVE_UNIT_STATES))
         ).all()
-        return [
-            {
-                "id": t.id, "project": project_name,
-                "state": t.state, "parent_task_id": t.parent_task_id, "persona": t.persona,
-                "outcome_no_pr_reason": t.outcome_no_pr_reason,
-                "outcome_pr_url": t.outcome_pr_url,
-            }
-            for t, project_name in rows
-        ]
+        return [dict(row._mapping) for row in rows]
 
 
 def list_epics_fanout() -> list[dict]:
@@ -80,29 +84,30 @@ def list_epics_fanout() -> list[dict]:
     from app.routes.tasks.policy import PERSONA_EPIC
 
     with _cp_session() as session:
-        rows = session.execute(
-            select(Task, Project.name)
+        epics = session.execute(
+            select(Task.id, Project.name)
             .join(Project, Task.project_id == Project.id)
             .where(Task.persona == PERSONA_EPIC, Task.state == ACTIVE)
             .order_by(Task.id)
         ).all()
+        if not epics:
+            return []
+        # Every active epic's children in one read, not one per epic: this runs every pass.
+        children: dict[int, list[dict]] = {}
+        for child in session.execute(
+            select(Task.parent_task_id, Task.id, Task.title, Task.body, Task.state)
+            .where(Task.parent_task_id.in_([epic_id for epic_id, _ in epics]), Task.archived_at.is_(None))
+            .order_by(Task.id)
+        ).all():
+            children.setdefault(child.parent_task_id, []).append(
+                {"id": child.id, "title": child.title, "body": child.body, "state": child.state}
+            )
         out: list[dict] = []
-        for epic, project_name in rows:
-            child_rows = session.scalars(
-                select(Task)
-                .where(Task.parent_task_id == epic.id, Task.archived_at.is_(None))
-                .order_by(Task.id)
-            ).all()
-            if not any(c.state == DRAFT for c in child_rows):
+        for epic_id, project_name in epics:
+            child_rows = children.get(epic_id, [])
+            if not any(c["state"] == DRAFT for c in child_rows):
                 continue  # every child readied — nothing left to fan out
-            out.append({
-                "id": epic.id,
-                "project": project_name,
-                "children": [
-                    {"id": c.id, "title": c.title, "body": c.body, "state": c.state}
-                    for c in child_rows
-                ],
-            })
+            out.append({"id": epic_id, "project": project_name, "children": child_rows})
         return out
 
 
@@ -138,14 +143,46 @@ def list_finish_pending() -> list[dict]:
 
 
 def list_needs_attention() -> list[dict]:
-    """The Needs-attention set (all personas incl. hidden, in blocked/failed/triaged). `[]` when the
-    read fails: a miss skips one notify tick; the require_user view is authoritative."""
-    from app.routes.agent import task_reads as agent_task_reads
+    """The Needs-attention set `task_pipeline.sweep_needs_attention_notify` announces: every Task in an actionable
+    state (`_NEEDS_ATTENTION_STATES`, the one admission filter: a state missing there is never announced), every
+    persona, hidden rows included; the console board shows the same set via "Show hidden". Newest first. A light
+    projection plus `age_seconds` on the database's clock, for the sweep's grace gate
+    (`task_pipeline.NOTIFY_GRACE_SECONDS`), so the sweep never compares its clock to the database's.
+
+    The one exclusion changes only what is announced, never what the board shows: an interactive chat
+    (`OPERATOR_CRITERION_PERSONAS`, derived from the criterion map so a new live-human persona is covered) parks
+    `awaiting_response` at every turn with its human at the console, and an entry-notify would ping per turn.
+    Scoped to the park, not the persona, matching `task_notify.py`: a chat's `system_failed` (runner died, nobody
+    guaranteed watching) is still announced. The OR form is equivalent to `not_(and_(…))` since both columns are
+    NOT NULL.
+
+    `[]` when the read fails: a miss skips one notify tick; the require_user view is authoritative."""
+    from sqlalchemy import func, or_, select
+
+    from app.models.projects import Project
+    from app.models.tasks import Task
+    from app.routes.tasks.policy import OPERATOR_CRITERION_PERSONAS
 
     try:
         with _cp_session() as session:
-            rows = agent_task_reads.agent_list_needs_attention(_=None, session=session)
-            return [row.model_dump() for row in rows]
+            rows = session.execute(
+                select(
+                    Task.id, Task.persona, Task.state, Task.project_id, Project.name, Task.title, Task.hidden,
+                    # `updated_at` is the entry instant for a parked row; a later edit only delays this backstop.
+                    func.extract("epoch", func.now() - Task.updated_at).label("age_seconds"),
+                )
+                .join(Project, Project.id == Task.project_id)
+                .where(Task.state.in_(_NEEDS_ATTENTION_STATES))
+                .where(or_(
+                    Task.persona.notin_(OPERATOR_CRITERION_PERSONAS),
+                    Task.state != AWAITING_RESPONSE,
+                ))
+                .order_by(Task.id.desc())
+            ).all()
+            return [{
+                "id": r.id, "persona": r.persona, "state": r.state, "project_id": r.project_id, "project": r.name,
+                "title": r.title, "hidden": r.hidden, "age_seconds": float(r.age_seconds or 0.0),
+            } for r in rows]
     except Exception as exc:  # noqa: BLE001 — best-effort by contract
         log.warning("task-pipeline: needs-attention read failed: %s", exc)
         return []
@@ -186,7 +223,7 @@ def list_silent_active_tasks(now: Optional[datetime] = None, *, only: Optional[i
 
     from app.runner_liveness import NODE_STILL_TALKING_SECONDS, OBSERVATION_FRESH_SECONDS, SILENCE_THRESHOLD
 
-    now = now or datetime.now(timezone.utc)
+    now = now or utcnow()
     params = {
         "active": ACTIVE, "only": only, "cutoff": now - SILENCE_THRESHOLD,
         "talking": now - timedelta(seconds=NODE_STILL_TALKING_SECONDS),
@@ -198,61 +235,8 @@ def list_silent_active_tasks(now: Optional[datetime] = None, *, only: Optional[i
 
 # ── The transitions ──────────────────────────────────────────────────────────────────────────────────
 
-# What a `vanished` incident says when the loss was node-wide: points the operator at the node, since N
-# incidents with one timestamp share one cause (`app/runner_liveness.py`).
-_NODE_WIDE_LOSS_DETAIL = (
-    "SEVERAL runners on this node were lost in the SAME observation, so this is the NODE's fault and not "
-    # Scope-neutral: lands on an incident in the task's org (`app/tenancy/copy.py`).
-    "this task's: look at the node (its tmux server, its daemon) rather than at this task, and "
-    "expect sibling `vanished` incidents carrying the same stamp. This task's dispatch attempt was "
-    "REFUNDED rather than charged, so the node fault did not spend its retry budget."
-)
-
-
-def _record_vanished_runner(
-    task_id: int, observed_by: str, session: Session, *, node_fault: bool = False,
-    facts: Any = None, cause: str = "vanished",
-) -> None:
-    """Record the break causes no runner can report: its own disappearance (`vanished`), or a launch its node
-    never saw running (`launch_failed`). `facts` (`runner_liveness.RunnerFacts`, read before the reclaim cleared
-    the binding) names the node, account, session and launch on the incident, so it survives the node's deletion,
-    and marks whether the attached pane log is a predecessor launch's (`runner_breaks.predecessor_pane`).
-
-    Called only on a won reclaim (`if reclaimed:`), and each reclaim helper's atomic UPDATE carries
-    positive evidence of a runner, so a row that never had one produces no incident.
-
-    Best-effort: the transition is already committed, so failures are logged, never raised.
-    `node_fault` puts the node-wide cause in the incident body so N sibling incidents point at the
-    node."""
-    from app import runner_breaks
-    from app.models.tasks import Task
-
-    task = session.get(Task, task_id)
-    if task is None:
-        return
-    try:
-        runner_breaks.record(
-            session, task=task, cause=cause, observed_by=observed_by,
-            detail=_NODE_WIDE_LOSS_DETAIL if node_fault else "",
-            node_id=runner_breaks.node_label(
-                getattr(facts, "node", ""), getattr(facts, "node_id", ""),
-                own_node=getattr(facts, "own_node", False),
-            ),
-            account=getattr(facts, "account", ""),
-            session_id=getattr(facts, "session_id", ""),
-            launch=getattr(facts, "launch", "") or runner_breaks.UNKNOWN,
-            predecessor_pane=runner_breaks.predecessor_pane(
-                getattr(facts, "pane_log_written_at", None), getattr(facts, "launch_at", None)
-            ),
-        )
-    except Exception as exc:  # noqa: BLE001 — a recording failure must never fail the reclaim
-        log.warning("runner-break record failed for reclaimed task %s: %s", task_id, exc)
-        session.rollback()
-
-
-def _reclaim_active(task_id: int, observed_by: str, *, cause: Optional[str] = None) -> dict:
-    """The shared body of the `active` reclaim doors: node-wide read, atomic reclaim, and the `vanished`
-    incident on a won reclaim. The node-wide question is asked here because the reclaimers take liveness as
+def _reclaim_active(task_id: int, *, cause: Optional[str] = None) -> dict:
+    """The shared body of the `active` reclaim doors: node-wide read and atomic reclaim. The node-wide question is asked here because the reclaimers take liveness as
     an injected boolean (`task_pipeline_job._runner_held`), and this call holds the session. `cause` names a
     cause the caller observed itself (`reclaim_stalled`); None infers `launch_failed` or `vanished`."""
     from app import runner_liveness
@@ -262,13 +246,10 @@ def _reclaim_active(task_id: int, observed_by: str, *, cause: Optional[str] = No
 
     with _cp_session() as session:
         node_fault = runner_liveness.node_wide_runner_loss(str(task_id), session)
-        facts = runner_liveness.runner_facts(str(task_id), session)
-        cause = cause or (CAUSE_LAUNCH_FAILED if facts.never_sighted else CAUSE_VANISHED)
-        reclaimed = reclaim_active_task(task_id, session, node_fault=node_fault, cause=cause)
-        if reclaimed:
-            _record_vanished_runner(task_id, observed_by, session, node_fault=node_fault, facts=facts,
-                                    cause=cause)
-        return {"reclaimed": reclaimed}
+        if cause is None:
+            never_sighted = runner_liveness.launch_never_sighted(str(task_id), session)
+            cause = CAUSE_LAUNCH_FAILED if never_sighted else CAUSE_VANISHED
+        return {"reclaimed": reclaim_active_task(task_id, session, node_fault=node_fault, cause=cause)}
 
 
 def merge_lane_tick() -> dict:
@@ -292,27 +273,39 @@ def reclaim_active(task_id: int) -> dict:
     confirm the runner is gone: `reclaim_stale_active_analysis_children` and
     `reclaim_stale_active_restartable_tasks`. Without it such a row stays `active` forever.
 
-    No persona gate. Same helper as `reclaim_active_coder`; two doors only so the incident names the
-    sweep."""
-    return _reclaim_active(task_id, "reclaim-active")
+    No persona gate. Same helper as `reclaim_active_coder`."""
+    return _reclaim_active(task_id)
 
 
 def reclaim_active_coder(task_id: int) -> dict:
-    """Reclaim a stale build task `active → ready` — `reclaim_active` under the coder sweep's label.
+    """Reclaim a stale build task `active → ready` — `reclaim_active` for the coder sweep.
     Safe because the caller's merge-watch proves the runner gone with no terminal reported. An open PR
-    or pushed branch is not a bar: the restarted runner resumes onto it."""
-    return _reclaim_active(task_id, "reclaim-active-coder")
+    or pushed branch is not a bar: the restarted runner resumes onto it.
+
+    The terminal references are re-read here: the sweep judged them from its pass-wide read, and a settle
+    that recorded one since must not be requeued over."""
+    from sqlalchemy import select
+
+    from app.models.tasks import Task
+
+    with _cp_session() as session:
+        reported = session.execute(
+            select(Task.outcome_pr_url, Task.outcome_no_pr_reason).where(Task.id == task_id)
+        ).first()
+    if reported is not None and (reported.outcome_pr_url or reported.outcome_no_pr_reason):
+        return {"reclaimed": False}
+    return _reclaim_active(task_id)
 
 
 def reclaim_stalled(task_id: int, now: Optional[datetime] = None) -> dict:
-    """Reclaim an `active` row the stall detector found silent (`list_silent_active_tasks`), recording a
-    `stalled` incident: the same reclaim as `reclaim_active`, under the cause the detector observed. Re-judged
+    """Reclaim an `active` row the stall detector found silent (`list_silent_active_tasks`), under the
+    `stalled` cause: the same reclaim as `reclaim_active`, under the cause the detector observed. Re-judged
     first, so a relaunch or a fresh signal since the pass's read is never reclaimed."""
     from app.runner_terminations import CAUSE_STALLED
 
     if not list_silent_active_tasks(now, only=task_id):
         return {"reclaimed": False}
-    return _reclaim_active(task_id, "stall-detector", cause=CAUSE_STALLED)
+    return _reclaim_active(task_id, cause=CAUSE_STALLED)
 
 
 def reclaim_awaiting_response(task_id: int) -> dict:
@@ -324,17 +317,12 @@ def reclaim_awaiting_response(task_id: int) -> dict:
 
     with _cp_session() as session:
         node_fault = runner_liveness.node_wide_runner_loss(str(task_id), session)
-        # A parked runner asked its question, so it was running: always `vanished`, never `launch_failed`.
-        facts = runner_liveness.runner_facts(str(task_id), session)
-        reclaimed = reclaim_awaiting_response_task(task_id, session, node_fault=node_fault)
-        if reclaimed:
-            _record_vanished_runner(task_id, "reclaim-awaiting-response", session, node_fault=node_fault,
-                                    facts=facts)
-        return {"reclaimed": reclaimed}
+        return {"reclaimed": reclaim_awaiting_response_task(task_id, session, node_fault=node_fault)}
 
 
 def expire_awaiting_response(task_id: int) -> dict:
-    """Bound a task parked on a question nobody read, in two stages; called for every parked row.
+    """Bound a task parked on a question nobody read, in two stages; called for every parked row that
+    `list_open_tasks` marks `unanswered_due`.
 
     The older stage first, so a row past both bounds fails in one pass:
     `expire_timed_out_awaiting_response_task` fails it past the release bound, else
@@ -344,10 +332,10 @@ def expire_awaiting_response(task_id: int) -> dict:
     the launch ack, closing races where an answer or the hold arrived after that ack."""
     from sqlalchemy import select
 
-    from app import slot_state
     from app.models.worktrees import Worktree
     from app.routes.tasks.answers import retry_answer_delivery_after_launch
     from app.routes.tasks.awaiting import (
+        addressable_hold_filter,
         expire_timed_out_awaiting_response_task,
         stop_runner_on_unanswered_question,
     )
@@ -359,12 +347,7 @@ def expire_awaiting_response(task_id: int) -> dict:
         if not stopped:
             hold = session.execute(select(
                 Worktree.id, Worktree.generation, Worktree.dispatch_id, Worktree.launch_session_id,
-            ).where(
-                Worktree.task_id == task_id,
-                Worktree.state == slot_state.TASK,
-                Worktree.launch_session_id.isnot(None),
-                Worktree.dispatch_id.isnot(None),
-            )).first()
+            ).where(*addressable_hold_filter(task_id))).first()
             if hold is not None and hold.launch_session_id:
                 retry_answer_delivery_after_launch(
                     session, task_id=task_id, worktree_id=hold.id, generation=hold.generation,
@@ -461,9 +444,10 @@ def create_system_task(
     project_id: int | None = None,
 ) -> dict:
     """The deduped hidden-Task upsert behind `POST /api/agent/tasks/system`, called in process, so the
-    dedup guard, body marker and `adhoc`-needs-a-key 422 still apply. `HOST_PRODUCER_CALLER` declares a
+    dedup guard and `adhoc`-needs-a-key 422 still apply. `HOST_PRODUCER_CALLER` declares a
     producer with no Task behind it. `project_id`, or `about_task_id` (that task's project), names the project
-    by id — project names repeat across orgs; with neither, `project` is read as one of the operator's. Best-effort: `{}` on any failure."""
+    by id — project names repeat across orgs; with neither, the route answers 404 and this returns `{}`.
+    Best-effort: `{}` on any failure."""
     from app.routes.agent import auth as agent_auth, task_reads as agent_task_reads
 
     payload: dict[str, Any] = {
@@ -488,11 +472,10 @@ def create_system_task(
                     # Gone: never fall back to the name, which would be read in the operator plane.
                     log.warning("task-pipeline: task %s is gone; no %s system task filed", about_task_id, persona)
                     return {}
-            out = agent_task_reads.create_system_task(
+            out = agent_task_reads.create_system_task.session_body(
+                session,
                 body=agent_task_reads.SystemTaskIn(**payload),
                 x_agent_task_id=agent_auth.HOST_PRODUCER_CALLER,
-                _=None,
-                session=session,
             )
             return out.model_dump()
     except Exception as exc:  # noqa: BLE001 — best-effort, as on the node

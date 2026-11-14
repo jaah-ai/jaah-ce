@@ -103,7 +103,7 @@ def converge_on_node(slug: str, node_id: str, origin_node_id: str, actor: str) -
     tenant-owned. `origin_node_id` is resolved inside `seam.identity_scope()`, then `bind_from` scopes the
     rest (`durable/accounts.py::ensure_row`)."""
     # Deferred: this module is imported at DBOS registration time, before the app is wired.
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.models.nodes import Node
     from app.node_identity import node_id_or_none
     from app.routes.commands import _converge_one_node
@@ -112,7 +112,7 @@ def converge_on_node(slug: str, node_id: str, origin_node_id: str, actor: str) -
     # Attributed, or every read below lands as `UNATTRIBUTED` (see `app/durable/runtime.py::step_session`).
     with exclusion_log.caller("durable:account_converge.converge_on_node"):
         # A session only to derive the org; `_converge_one_node` owns its own session and transactions.
-        with SessionLocal() as session:
+        with BridgedSession() as session:
             with seam.identity_scope():
                 origin = node_id_or_none(session, origin_node_id)
             if origin is None:

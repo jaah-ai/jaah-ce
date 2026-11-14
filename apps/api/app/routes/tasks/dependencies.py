@@ -1,7 +1,7 @@
 """Task dependencies: the edge routes, cycle and deadlock checks, and staleness propagation."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -10,13 +10,14 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app import actors, merge_lane_state
-from app.auth import require_user
+from app.auth import adopt_user, require_user
 from app.authz.catalog import AUTHOR_DRAFT_KEY, permission_key
 from app.authz.declarations import feature
 from app.authz.object_access import author_draft_admits, authored_draft, can_access, key_scope_satisfied
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller
 from app.authz.visibility import TASK_SPEC, ObjectAccess
-from app.db import get_session
+from app.clock import utcnow
+from app.db_async import on_session
 from app.events import emit_console_event
 from app.models.identity import AdminUser
 from app.models.tasks import Task, TaskDependency
@@ -43,6 +44,20 @@ def _reaches(start_id: int, target_id: int, session: Session) -> bool:
     return False
 
 
+def contains_task(container_id: int, task_id: int, session: Session) -> bool:
+    """True if `container_id` is an ANCESTOR of `task_id` (its parent epic, that epic's parent, …). Such a task
+    finishes only once `task_id` does — an epic rolls up when its children finish — so `task_id` waiting on it
+    never ends. Walks `parent_task_id` up, bounded by a `seen` set."""
+    seen: set[int] = set()
+    current = session.scalar(select(Task.parent_task_id).where(Task.id == task_id))
+    while current is not None and current not in seen:
+        if current == container_id:
+            return True
+        seen.add(current)
+        current = session.scalar(select(Task.parent_task_id).where(Task.id == current))
+    return False
+
+
 def _gate_would_deadlock(task_id: int, depends_on_task_id: int, session: Session) -> bool:
     """True if the edge `task_id → depends_on_task_id` could never be satisfied, because the prerequisite
     sits UNDER the gate the edge itself would create.
@@ -50,7 +65,10 @@ def _gate_would_deadlock(task_id: int, depends_on_task_id: int, session: Session
     `_would_create_cycle` walks `task_dependencies` alone; this runs through `parent_task_id`:
     `_parent_epic_has_unmet_prerequisite` holds every child of a gated epic, so a prerequisite that is (or
     waits on) a child of `task_id` never reaches `done`. The traversal follows effective prerequisites
-    (own edges plus the parent epic's), bounded by a `seen` set."""
+    (own edges plus the parent epic's), bounded by a `seen` set. The reverse holds too: a prerequisite that
+    CONTAINS `task_id` (`contains_task`) finishes only after it."""
+    if contains_task(depends_on_task_id, task_id, session):
+        return True
     stack = [depends_on_task_id]
     seen: set[int] = set()
     while stack:
@@ -74,6 +92,17 @@ def _would_create_cycle(task_id: int, depends_on_task_id: int, session: Session)
     is already a transitive prerequisite of `depends_on_task_id`, so the new edge loops back. A self-edge
     is caught separately, with a clearer message."""
     return _reaches(depends_on_task_id, task_id, session)
+
+
+def stage_edge(session: Session, row_id: int, prereq_id: int, what: str, *, status: int = 422) -> None:
+    """`row_id` waits on `prereq_id`: an edge already there is a no-op (idempotent, like
+    `add_task_dependency`); a cycle rolls the whole build back and raises `status` naming `what`."""
+    if session.get(TaskDependency, {"task_id": row_id, "depends_on_task_id": prereq_id}) is not None:
+        return
+    if _would_create_cycle(row_id, prereq_id, session):
+        session.rollback()
+        raise HTTPException(status_code=status, detail=f"{what} {row_id} -> {prereq_id} would create a cycle")
+    session.add(TaskDependency(task_id=row_id, depends_on_task_id=prereq_id))
 
 
 # ── Phase-DAG staleness propagation ═════════════════════════════════════════════════════════════════
@@ -129,7 +158,7 @@ def _mark_stale(
         update(Task)
         .where(Task.id.in_(task_ids))
         .values(
-            stale_reason=reason, stale_since=datetime.now(timezone.utc),
+            stale_reason=reason, stale_since=utcnow(),
             **actors.task_actor_values(session),
         )
     )
@@ -254,17 +283,18 @@ def _dependencies_out(
 
 @router.get("/{task_id}/dependencies", response_model=TaskDependenciesOut)
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
+@on_session
 def get_task_dependencies(
+    session: Session,
     task_id: int,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> TaskDependenciesOut:
     """A Task's prerequisites + dependents + readiness. Read-only; 404 on unknown id. The RESPONSE embeds
     other tasks, which the route-level guard cannot scope (it reads path params, not response bodies), so
     the split lives in `_dependencies_out` — see `TaskDependenciesOut` for which halves are filtered."""
+    _user = adopt_user(session, caller.actor)
     get_task_or_404(task_id, session)
-    return _dependencies_out(task_id, session, principal)
+    return _dependencies_out(task_id, session, caller.principal)
 
 
 def _may_attach_prerequisite(
@@ -294,17 +324,18 @@ def _may_attach_prerequisite(
 
 @router.post("/{task_id}/dependencies", response_model=TaskDependenciesOut)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",), author_draft=True)
+@on_session
 def add_task_dependency(
+    session: Session,
     task_id: int,
     body: TaskDepAddIn,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> TaskDependenciesOut:
     """Declare `task_id` blocked-by `depends_on_task_id`. Rejects a self-edge (422), a cycle (422), and an
     edge whose prerequisite it would hold back (422, `_gate_would_deadlock`); idempotent otherwise. The
     gate applies at dispatch time, so a new unmet prerequisite only gates the next dispatch. Editable in
     any state."""
+    _user = adopt_user(session, caller.actor)
     get_task_or_404(task_id, session)
     dep_id = body.depends_on_task_id
     if dep_id == task_id:
@@ -313,18 +344,26 @@ def add_task_dependency(
     # 422): a body-borne id the route guard cannot see, or the route becomes a task-enumeration oracle. See
     # `_may_attach_prerequisite`.
     if session.get(Task, dep_id) is None or not _may_attach_prerequisite(
-        session, principal, task_id, dep_id
+        session, caller.principal, task_id, dep_id
     ):
         raise HTTPException(status_code=422, detail=f"prerequisite task {dep_id} not found")
     # Idempotent: an existing edge returns the current view, no duplicate insert, no event.
     if session.get(TaskDependency, {"task_id": task_id, "depends_on_task_id": dep_id}) is not None:
-        return _dependencies_out(task_id, session, principal)
+        return _dependencies_out(task_id, session, caller.principal)
     if _would_create_cycle(task_id, dep_id, session):
         raise HTTPException(
             status_code=422,
             detail=(
                 f"adding prerequisite {dep_id} to task {task_id} would create a dependency cycle "
                 f"(task {dep_id} already depends on task {task_id}, directly or transitively)"
+            ),
+        )
+    if contains_task(dep_id, task_id, session):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"task {dep_id} contains this task, so it can only finish after this one — waiting on it "
+                "would never end"
             ),
         )
     if _gate_would_deadlock(task_id, dep_id, session):
@@ -338,9 +377,8 @@ def add_task_dependency(
         )
     session.add(TaskDependency(task_id=task_id, depends_on_task_id=dep_id))
     # Emit on the DEPENDENT task so its console detail (which shows the dependency view) refetches live.
-    emit_console_event(session, entity="task", id=task_id, action="dependency_added")
-    session.commit()
-    return _dependencies_out(task_id, session, principal)
+    emit_console_event(session, entity="task", id=task_id, action="dependency_added", commit=True)
+    return _dependencies_out(task_id, session, caller.principal)
 
 
 @router.delete("/{task_id}/dependencies/{depends_on_task_id}", status_code=204)
@@ -348,19 +386,20 @@ def add_task_dependency(
     "tasks", "edit", object_type="task",
     object_params=("task_id", "depends_on_task_id"), author_draft=True,
 )
+@on_session
 def remove_task_dependency(
+    session: Session,
     task_id: int,
     depends_on_task_id: int,
     _user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> Response:
     """Remove the `task_id → depends_on_task_id` prerequisite edge. Idempotent — a 204 whether or not the
     edge existed, since removing an absent prerequisite is not an error. A removed prerequisite may unblock
     the Task; its `ready` recomputes on the next read."""
+    _user = adopt_user(session, _user)
     get_task_or_404(task_id, session)
     edge = session.get(TaskDependency, {"task_id": task_id, "depends_on_task_id": depends_on_task_id})
     if edge is not None:
         session.delete(edge)
-        emit_console_event(session, entity="task", id=task_id, action="dependency_removed")
-        session.commit()
+        emit_console_event(session, entity="task", id=task_id, action="dependency_removed", commit=True)
     return Response(status_code=204)

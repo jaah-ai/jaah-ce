@@ -1,4 +1,5 @@
-"""tools/jaahd_module.py — load a daemon module (`apps/jaahd/<file>`) by path, so `tools/` keeps no mirror of it.
+"""tools/jaahd_module.py — load a module another tree owns (`apps/jaahd/<file>` by default) by path, so `tools/`
+keeps no mirror of it.
 
 `tools/` and `apps/jaahd/` sit beside each other everywhere a tools script runs — the checkout, the .deb
 bundle (`/usr/lib/jaahd/tools` beside `/usr/lib/jaahd/apps/jaahd`) and the
@@ -17,20 +18,22 @@ from types import ModuleType
 JAAHD_DIR = Path(__file__).resolve().parents[1] / "apps" / "jaahd"
 
 
-def load(filename: str, module_name: str, *, siblings: bool = False) -> ModuleType:
-    """`apps/jaahd/<filename>` as `sys.modules[module_name]` (loaded once; the cached object afterwards).
+def load(filename: str, module_name: str, *, siblings: bool = False, home: Path | None = None) -> ModuleType:
+    """`<home>/<filename>` as `sys.modules[module_name]` (loaded once; the cached object afterwards).
 
-    `siblings` puts the daemon tree on `sys.path` (appended, so it never shadows a tools module) for a
-    daemon module that imports its own siblings by bare name (`environment`, `host_platform`)."""
+    `siblings` puts `home` on `sys.path` (appended, so it never shadows a tools module) for a module that
+    imports its own siblings by bare name (`environment`, `host_platform`). `home` is the daemon tree (read at
+    call time) unless a tool borrows from another (`check_docs_build.py` reads the api's support corpus)."""
     cached = sys.modules.get(module_name)
     if cached is not None:
         return cached
-    if siblings and str(JAAHD_DIR) not in sys.path:
-        sys.path.append(str(JAAHD_DIR))
-    path = JAAHD_DIR / filename
+    home = JAAHD_DIR if home is None else home
+    if siblings and str(home) not in sys.path:
+        sys.path.append(str(home))
+    path = home / filename
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None or not path.is_file():
-        raise ImportError(f"no daemon module at {path}")
+        raise ImportError(f"no module at {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module  # before exec: dataclasses resolve their module through sys.modules
     try:

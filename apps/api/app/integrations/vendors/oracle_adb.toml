@@ -1,0 +1,48 @@
+# Oracle Autonomous AI Database: TLS (wallet-less) connection details; no driver on the CP, so the Test is a format check.
+slug = "oracle_adb"
+label = "Oracle Autonomous AI Database"
+category = "data"
+vendor_docs_url = "https://docs.oracle.com/en-us/iaas/autonomous-database-serverless/doc/connect-introduction.html"
+summary = "Let agents query an Oracle Autonomous AI Database over a TLS connection, no wallet needed."
+
+[[auth]]
+kind = "db"
+fields = [
+  { key = "host", label = "Host", kind = "text", required = true, placeholder = "adb.us-ashburn-1.oraclecloud.com", help = "OCI console > Oracle AI Database > Autonomous AI Database > your database > Database connection; set TLS authentication to TLS and copy the host value from a connection string" },
+  { key = "port", label = "Port", kind = "text", required = true, default = "1521", placeholder = "1521", help = "The port value from the same TLS connection string: 1521 or 1522" },
+  { key = "service_name", label = "Service name", kind = "text", required = true, placeholder = "abc123_mydb_low.adb.oraclecloud.com", help = "The service_name value from the connection string; the _low service suits most agent queries, _high runs fewer, bigger ones" },
+  { key = "username", label = "User", kind = "text", required = true, placeholder = "AGENT_READER", help = "A database user created for agents (Database actions > Database users), or ADMIN" },
+  { key = "password", label = "Password", kind = "secret", required = true, help = "That database user's password" },
+]
+
+[test]
+kind = "format"
+patterns = { host = '[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+', port = '152[12]', service_name = '[A-Za-z0-9_]+(?:\.[A-Za-z0-9_-]+)+' }
+public_host_field = "host"
+
+[docs]
+agent_uses = [
+  "Run SQL against your Autonomous AI Database tables to answer a question or check data",
+  "Inspect schemas, tables and indexes with the data dictionary views before a migration",
+  "Run a PL/SQL procedure your team already uses for a report",
+]
+prerequisites = [
+  "An Autonomous AI Database with TLS (wallet-less) connections allowed: under Network, edit Mutual TLS (mTLS) authentication and untick Require mutual TLS so it reads Not Required. On a public endpoint Oracle requires an access control list before it allows that; add the addresses agents connect from.",
+  "A database user for agents, granted only the tables they need.",
+  "An Oracle client where the agent runs, such as the python-oracledb package in its thin mode, which needs no wallet.",
+]
+limitations = [
+  "Jaah cannot open an Oracle connection to test: it adds no database drivers. Test checks the values' format and that the host is a public address. The first real check is the agent's first query.",
+  "Only TLS connections are supported. A database that requires mutual TLS (a wallet) cannot be connected here.",
+  "A database on a private endpoint is reachable only from its virtual cloud network, so agents elsewhere cannot use it.",
+]
+troubleshooting = [
+  { symptom = "Test says Port is not in the format Oracle Autonomous AI Database uses", fix = "Use the port from the TLS connection string: 1521 or 1522" },
+  { symptom = "The agent's connection fails with ORA-12506 or is refused", fix = "The access control list does not allow the agent's address. Add it under Network > Access control list" },
+  { symptom = "The agent's connection fails asking for a wallet (ORA-29024 or a certificate error)", fix = "Mutual TLS is still required. Set Mutual TLS (mTLS) authentication to Not Required, then copy a TLS (not mTLS) connection string" },
+  { symptom = "The agent's sign-in fails with ORA-01017", fix = "The user name or password is wrong, or the user is locked. Reset it in Database actions > Database users and select Replace on the secret" },
+]
+faq = [
+  { q = "Is this the same as Oracle Autonomous Database?", a = "Yes. Oracle renamed Autonomous Database to Autonomous AI Database; connections work the same way" },
+  { q = "Why does Test say it was not called?", a = "Oracle speaks its own database protocol, and Jaah does not run database drivers. So Test checks the format only" },
+]

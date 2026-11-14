@@ -31,12 +31,12 @@ import {
   runLine,
   runOutcomeLabel,
   runOutcomeTone,
-  TARGET_OUTCOME_LABELS,
+  TARGET_OUTCOME,
   TARGET_OUTCOME_ORDER,
-  TARGET_OUTCOME_TONE,
   targetSummary,
 } from './vocabulary'
 import { CodeBlock } from '../../ui/CodeBlock'
+import { FONT_WEIGHT, LINE_HEIGHT, RADIUS, grid } from '../../theme'
 
 /* ── THE DETAIL, AND THE TWO SHAPES IT ARRIVES IN ───────────────────────────────────────────────────
  * One sentence, or a multi-line block: `lease-drain`'s DECISION JOURNAL (headline plus one ~70-95 char line per
@@ -46,22 +46,22 @@ import { CodeBlock } from '../../ui/CodeBlock'
  * `cron/vocabulary.ts::detailLines`. Block boxes, so a copy still yields the newlines (the grep contract). */
 const JOURNAL_LINE_SX = {
   display: 'block',
-  // 1.7 (siblings use 1.55): this is read line by line, twenty at a time.
-  lineHeight: 1.7,
+  // Running-text spacing: this is read line by line, twenty at a time.
+  lineHeight: LINE_HEIGHT.normal,
   pl: '2.5ch',
   textIndent: '-2.5ch',
   /* A blank line keeps its height (an empty block is 0px): an explicit floor of this line's own height, in CSS
    * rather than an `&nbsp;`, so what prints is what the runtime wrote. */
-  '&:empty': { minHeight: '1.275rem' },
+  '&:empty': { minHeight: grid(3) },
 }
 
 const JOURNAL_HEADLINE_SX = {
   ...JOURNAL_LINE_SX,
   pl: 0,
   textIndent: 0,
-  fontWeight: 600,
-  pb: 0.6,
-  mb: 0.6,
+  fontWeight: FONT_WEIGHT.semibold,
+  pb: 0.5,
+  mb: 0.5,
   borderBottom: 1,
   borderColor: 'divider',
 }
@@ -76,7 +76,7 @@ function RunDetail({ detail }: { detail: string }): JSX.Element {
     <DetailField label="Detail">
       {/* NO `maxHeight`: a clipped well under overlay scrollbars looks like the end, and at phone width it is a
           scroll trap. ONE SCROLL SURFACE: the page's. */}
-      <CodeBlock bordered sx={{ mt: 0.25, px: 1.25 }} testId="automation-run-detail-journal">
+      <CodeBlock bordered sx={{ px: 1 }} testId="automation-run-detail-journal">
         {lines.map((line, index) => (
           // Index as key: ordered lines of one immutable string, replaced whole.
           <Box key={index} component="span" sx={index === 0 ? JOURNAL_HEADLINE_SX : JOURNAL_LINE_SX}>{line}</Box>
@@ -116,13 +116,13 @@ function TargetLine({ target }: { target: RunTarget }): JSX.Element {
       component="li"
       data-testid="automation-run-target"
       data-outcome={target.outcome}
-      sx={{ py: 0.75, borderBottom: 1, borderColor: 'divider', minWidth: 0, '&:last-of-type': { borderBottom: 0 } }}
+      sx={{ py: 0.5, borderBottom: 1, borderColor: 'divider', minWidth: 0, '&:last-of-type': { borderBottom: 0 } }}
     >
       <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', columnGap: 1, minWidth: 0 }}>
         <Typography variant="caption" sx={{ color: 'text.secondary' }}>
           {KIND_NOUN[target.kind] ?? target.kind}
         </Typography>
-        <Typography variant="body2" sx={{ fontWeight: 500, overflowWrap: 'anywhere', minWidth: 0 }}>
+        <Typography variant="body2" sx={{ fontWeight: FONT_WEIGHT.medium, overflowWrap: 'anywhere', minWidth: 0 }}>
           {target.name || target.id}
         </Typography>
         {target.task_id !== null && <TaskLink taskId={target.task_id} variant="body2" />}
@@ -144,7 +144,7 @@ function TargetGroup({ run, outcome, defaultOpen }: {
   const [open, setOpen] = useState(defaultOpen)
   const targets = run.targets.filter(t => t.outcome === outcome)
   const listId = `automation-run-${run.id}-${outcome}`
-  const label = TARGET_OUTCOME_LABELS[outcome] ?? humanize(outcome)
+  const label = TARGET_OUTCOME[outcome]?.label ?? humanize(outcome)
   const count = outcomeCount(run, outcome)
   return (
     <Box data-testid="automation-run-group" data-outcome={outcome} sx={{ mt: 1 }}>
@@ -159,7 +159,7 @@ function TargetGroup({ run, outcome, defaultOpen }: {
           gap: 1,
           py: 0.5,
           px: 0.5,
-          borderRadius: 1,
+          borderRadius: RADIUS.sm,
           textAlign: 'left',
           '&:hover': { bgcolor: 'action.hover' },
           '&.Mui-focusVisible': { outline: 2, outlineColor: 'primary.main' },
@@ -168,7 +168,7 @@ function TargetGroup({ run, outcome, defaultOpen }: {
         <Box component="span" aria-hidden="true" sx={{ width: '1ch', color: 'text.secondary' }}>
           {open ? '▾' : '▸'}
         </Box>
-        <StatusChip label={`${label} · ${count}`} tone={TARGET_OUTCOME_TONE[outcome] ?? 'neutral'} data-status={outcome} />
+        <StatusChip label={`${label} · ${count}`} tone={TARGET_OUTCOME[outcome]?.tone ?? 'neutral'} data-status={outcome} />
       </ButtonBase>
       {open && (
         <Box id={listId} component="ul" sx={{ listStyle: 'none', m: 0, pl: 3.5, pr: 0 }}>
@@ -303,7 +303,7 @@ export default function AutomationRunPage(): JSX.Element {
               <DetailField label="Preview">
                 {preview ? (
                   <>
-                    <CodeBlock testId="automation-run-preview" bordered sx={{ mt: 0.25, px: 1.25 }}>
+                    <CodeBlock testId="automation-run-preview" bordered sx={{ px: 1 }}>
                       {preview.text}
                     </CodeBlock>
                     {preview.truncated && (

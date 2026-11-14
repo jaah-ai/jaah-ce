@@ -20,7 +20,7 @@ import platform as _platform
 import subprocess
 import sys
 
-from host_platform import _posix
+from host_platform import _posix, _types
 from host_platform._types import absent, Paths, Peer, Service, metrics_sample
 
 OS = "macos"
@@ -82,9 +82,7 @@ PROC_PIDTBSDINFO = 3
 PROC_PIDT_SHORTBSDINFO = 13
 MAXCOMLEN = 16
 
-
-def machine() -> str:
-    return _platform.machine()
+machine = _types.machine
 
 
 def os_version() -> str:
@@ -414,7 +412,7 @@ def start_time(pid: int) -> int | None:
 
 # No mount namespaces here; the console names its tmux client by pid, so no stdin tty; only the Linux fleet
 # server's recycle asks for children.
-mount_namespace = stdin_tty = child_pids = absent
+mount_namespace = stdin_tty = child_pids = socket_holders = ptrace_scope = absent
 
 
 def parent_of(pid: int) -> int | None:

@@ -40,8 +40,10 @@ def _socket_path(override: str | None = None) -> str:
     LAST so a test that monkeypatches the attribute still wins when nothing is set in the environment."""
     return override or environment.credential_socket_explicit() or SOCKET_PATH
 
-# A verb reply is a few hundred bytes (a settle summary more); 256 KiB still bounds a runaway stream.
-_MAX_REPLY_BYTES = 262144
+# Most verb replies are a few hundred bytes, but `projects.list` carries the node's org's projects
+# (`routes/portfolio.py::list_projects`, ~4 KB a row, up to 500 rows): 256 KiB truncated it on a control plane
+# with ~90 projects and blocked every commit's gate. 16 MiB fits the bounded list and still stops a runaway.
+_MAX_REPLY_BYTES = 16 * 1024 * 1024
 
 
 class AgentSocketError(RuntimeError):
@@ -120,17 +122,22 @@ def _exchange(label: str, body: dict, socket_path: str | None, timeout: float | 
         with host_platform.connect_socket(path, timeout=budget) as sock:
             sock.sendall(request.encode())
             sock.shutdown(socket.SHUT_WR)
-            buf = b""
-            while b"\n" not in buf and len(buf) < _MAX_REPLY_BYTES:
+            buf = bytearray()  # Appended in place: a multi-MiB reply must not re-copy itself per chunk.
+            while len(buf) < _MAX_REPLY_BYTES:
                 chunk = sock.recv(65536)
                 if not chunk:
                     break
                 buf += chunk
+                if b"\n" in chunk:
+                    break
     except (OSError, socket.timeout) as exc:
         raise AgentSocketUnavailable(f"{label}: node daemon unreachable at {path}: {exc}") from exc
 
     if not buf:
         raise AgentSocketUnavailable(f"{label}: node daemon closed the connection without replying")
+    if b"\n" not in buf and len(buf) >= _MAX_REPLY_BYTES:
+        # Named, not left to the JSON parse below: a truncated reply read as "malformed JSON" hid this cap.
+        raise AgentSocketUnavailable(f"{label}: node daemon reply exceeds {_MAX_REPLY_BYTES} bytes")
     try:
         reply = json.loads(buf.split(b"\n", 1)[0])
     except ValueError as exc:

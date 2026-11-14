@@ -24,7 +24,7 @@ locks the row it is about to change.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
@@ -34,10 +34,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import access, identities
+from app.clock import utcnow
 from app.identities import person_label_sql
 from app.access_admin import is_bypass_group_name
 from app.actors import stamp_actor
-from app.entity_shape import SYSTEM_ACTOR_ID, conflict_as_409, constraint_name, get_or_404
+from app.entity_shape import SYSTEM_ACTOR_ID, conflict_as_409, constraint_name, get_or_404, or_404
 from app.models.access import Group, UserGroupMembership
 from app.models.identity import AdminUser, UserIdentity
 from app.models.orgs import OrgInvitation
@@ -167,7 +168,7 @@ def invited_member(
     typed = {"first_name": first_name, "last_name": last_name}
     if member is not None and not (first_name or last_name):
         previous = session.scalar(select(OrgInvitation).where(OrgInvitation.id == member.invitation_id))
-        typed = dict(zip(("first_name", "last_name"), typed_names(previous)))
+        typed = dict(zip(("first_name", "last_name"), typed_names(previous), strict=False))
     invitation, made = invite(
         session, actor, org_id=org_id, identity=identity, grant={"typed_names": typed},
     )
@@ -179,8 +180,8 @@ def invited_member(
             # A concurrent invite made the row first: theirs is the one waiting.
             if constraint_name(exc) != _ONE_MEMBERSHIP_PER_ORG:
                 raise
-            raise HTTPException(status_code=409, detail=ALREADY_MEMBER)
-        member.disabled_at = datetime.now(timezone.utc)
+            raise HTTPException(status_code=409, detail=ALREADY_MEMBER) from exc
+        member.disabled_at = utcnow()
         # The system's disable, not an admin's (`held_by_invitation`): `enable_user` refuses a tenant admin
         # one it did not make, so the row stays inert even should its invitation link ever be lost.
         member.disabled_by_id = SYSTEM_ACTOR_ID
@@ -225,9 +226,7 @@ def _claimed_org(session: Session, invitation_id: UUID, identity_id: Optional[UU
             ),
             {"id": invitation_id, "identity": identity_id},
         ).scalar()
-    if org_id is None:
-        raise HTTPException(status_code=404, detail=NOT_FOUND)
-    return org_id
+    return or_404(org_id, detail=NOT_FOUND)
 
 
 def _locked(session: Session, invitation_id: UUID, identity_id: UUID) -> OrgInvitation:
@@ -261,7 +260,7 @@ def _decide(invitation: OrgInvitation, state: str, org_id: UUID) -> None:
     """Record the invitee's answer on the locked invitation, attributed to the inviting org's system actor (the
     invitee's own membership is in another org, and a provenance stamp would pin it against deletion)."""
     invitation.state = state
-    invitation.decided_at = datetime.now(timezone.utc)
+    invitation.decided_at = utcnow()
     stamp_actor(invitation, access.system_actor(org_id))
 
 
@@ -284,13 +283,13 @@ def accept(session: Session, admin: AdminUser, invitation_id: UUID) -> UUID:
                 member.disabled_at = None
                 member.disabled_by_id = None
             member.invitation_id = None
-            member.activated_at = datetime.now(timezone.utc)
+            member.activated_at = utcnow()
             identities.assert_member_row_not_superadmin(member)
             stamp_actor(member, access.system_actor(org_id))
             _apply_grant(session, member, invitation.grant or {})
             _decide(invitation, "accepted", org_id)
             session.commit()
-            _joined(member.id, org_id)
+            _joined(session, member.id, org_id)
             return org_id
         # A member here already (joined another way since the invite): the invitation is answered, nothing made.
         if member is not None:
@@ -303,15 +302,18 @@ def accept(session: Session, admin: AdminUser, invitation_id: UUID) -> UUID:
         _apply_grant(session, member, invitation.grant or {})
         _decide(invitation, "accepted", org_id)
         session.commit()
-        _joined(member.id, org_id)
+        _joined(session, member.id, org_id)
     return org_id
 
 
-def _joined(member_id: UUID, org_id: UUID) -> None:
-    """After the accept committed: the inviting org's `user_registered` triggers."""
+def _joined(session: Session, member_id: UUID, org_id: UUID) -> None:
+    """After the accept committed: the inviting org's `user_registered` triggers — on their own sessions, so off
+    the loop when an async route runs this (`app/db_async.py::defer_off_loop`)."""
     from app import trigger_user_registered
+    from app.db_async import defer_off_loop
 
-    trigger_user_registered.on_member_joined(member_id, org_id, via=trigger_user_registered.VIA_INVITATION)
+    defer_off_loop(session, trigger_user_registered.on_member_joined, member_id, org_id,
+                   via=trigger_user_registered.VIA_INVITATION)
 
 
 def decline(session: Session, admin: AdminUser, invitation_id: UUID) -> None:

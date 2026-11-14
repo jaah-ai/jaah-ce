@@ -3,9 +3,10 @@ sets make placement impossible. The one home for that translation: `app/routes/f
 `app/lease_drain.py` both call `allowed_nodes`/`allowed_accounts`.
 
 Two conjuncts in fixed order: the org floor (the task's tenant, `placement_org`), then the narrowing —
-nodes hosting the task's PROJECT, accounts its LAUNCHER may dispatch on (`authz.visible_account_clause`);
+nodes hosting the task's PROJECT, accounts its LAUNCHER may dispatch on (`authz.visible_account_clause`, plus the
+org's shared accounts for a launcher holding `accounts:view` on the task's project — `_launcher_account_ids`);
 the intersection means no binding or superadmin crosses tenants, and floor-first names the right
-operator action. `slot_state.lease`/`claim_for_user`'s atomic UPDATE enforces the floor again, closing
+operator action. `slot_state.lease`'s atomic UPDATE enforces the floor again, closing
 the point-in-time window; only this module can explain a refusal.
 
 The refusal is structural only (D3/D7): row presence, never liveness; `accounts.enabled`, never quota or
@@ -21,9 +22,11 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import edition_features, slot_allocation, slot_state, task_ancestry, tenant_defaults
+from app import blind_review, edition_features, placement_groups, slot_allocation, slot_state, task_ancestry, tenant_defaults
+from app.access_catalog import SCOPE_PROJECT
+from app.agent_router.personas import REVIEW_PERSONAS
 from app.authz.principal import principal_for_user
-from app.authz.visibility import AllowedObjects, visible_account_clause
+from app.authz.visibility import ACCOUNTS_VIEW_KEY, AllowedObjects, visible_account_clause
 from app.models.credentials import Account
 from app.models.identity import AdminUser
 from app.models.nodes import Node
@@ -74,27 +77,62 @@ _MAX_NAMES_IN_SENTENCE = 5
 
 @dataclass(frozen=True)
 class PlacementRefusal:
-    """One structural refusal: the machine key, the sentence a human reads, and the operator detail.
+    """One structural refusal: the machine key, what a human reads, and the operator detail.
 
-    `end_attempt(reason=...)` takes `sentence`, the Activity note's `extra` takes `cause`, and `detail`
-    is logged and stored nowhere.
+    A human reads `title` (what is missing) over `sentence` (the fix), `link` naming the words of `sentence`
+    that open the page where the fix is made; `message` joins them, with the project, for a carrier that shows
+    one line (`end_attempt(reason=...)`, so `task_notify`). The Activity note takes `sentence` as its summary
+    and `cause`, `title` and `link` as its data. `detail` is logged and stored nowhere.
 
-    The sentence names no node and no account: it is served at object-scoped `tasks:view`, a wider
+    Nothing a human reads names a node or an account: it is served at object-scoped `tasks:view`, a wider
     audience than the launcher (cf. `routes/tasks/activity.py::_strip_ungranted_account_slugs`; `NODE_SPEC` has no
     `unscoped_read_key`). `detail` carries the enumeration to the log. Account-set cardinality is
     disclosed, accepted."""
 
     cause: str
+    title: str
     sentence: str
     detail: str
+    #: `{"text": <words of sentence>, "href": <console path>}`, or None when no page fixes it.
+    link: Optional[dict[str, str]] = None
+
+    def message(self, project: str) -> str:
+        """The one-line form, for a carrier with no title: `<project>: <title>. <sentence>`."""
+        return f"{project}: {self.title}. {self.sentence}"
+
+
+#: Where each fix is made (`apps/web/src/routeGroups.ts`): the AI account roster and the node roster.
+_ACCOUNTS_PATH = "/accounts"
+_NODES_PATH = "/nodes"
+
+
+#: `(title, sentence, link)`, as each refusal's text builder returns it.
+RefusalText = tuple[str, str, Optional[dict[str, str]]]
+
+
+def _refusal(cause: str, text: RefusalText, detail: str) -> PlacementRefusal:
+    title, sentence, link = text
+    return PlacementRefusal(cause, title, sentence, detail, link)
+
+
+def _link(text: str, href: str) -> dict[str, str]:
+    return {"text": text, "href": href}
+
+
+#: The project page's Node groups field anchor; the web field renders the same `id`.
+NODE_GROUPS_ANCHOR = placement_groups.NODE_GROUPS_ANCHOR
+
+
+def _project_nodes_link(project: Project, text: str = "Node groups") -> dict[str, str]:
+    """The project's Node groups field, where the nodes it runs on are chosen."""
+    return _link(text, f"/projects/{project.id}?tab=general#{NODE_GROUPS_ANCHOR}")
 
 
 def allowed_nodes(
     session: Session, task_id: Optional[int], *, memo: Optional[dict] = None
 ) -> AllowedObjects:
     """The nodes this task may be placed on — `AllowedObjects` over `Node.id` (uuids): the org floor ∩
-    the nodes hosting its project (`slot_allocation.hosting_node_ids`: an assignment, where a dynamic
-    worktree is made when no static one is free). The launcher does not narrow nodes. A co-located node on another org's Multi-Node Host is
+    the nodes its project may start work on (`slot_allocation.placement_node_ids`: its node groups, else All). The launcher does not narrow nodes. A co-located node on another org's Multi-Node Host is
     dropped unless the task's org holds the operator's exception (`app/tenant_defaults.py`)."""
     return _allowed(session, task_id, "node", memo)
 
@@ -180,7 +218,7 @@ def _allowed(
     an unresolvable org gets the empty set.
 
     `memo` is a caller-owned per-pass dict keyed `(object_type, org, project, effective pin)` for nodes and
-    `(object_type, org, launcher)` for accounts (an epic's children share one entry). The pin is in the node
+    `(object_type, org, launcher, project)` for accounts (an epic's children, in its project, share one entry). The pin is in the node
     key because it narrows: two Nodes-project tasks pinned to different nodes must not share an answer. Per
     pass so a binding edit, enrolment or org move takes effect on the next pass."""
     org, launcher = _who_places(session, task_id, memo)
@@ -190,10 +228,19 @@ def _allowed(
     task = session.get(Task, task_id) if object_type == "node" else None
     if object_type == "node" and task is None:
         return AllowedObjects(unrestricted=False, ids=frozenset())
+    # The account set also reads the task's project: a project role carrying `accounts:view` opens the org's
+    # shared accounts to that project's tasks (`_launcher_account_ids`).
+    account_task = (
+        session.get(Task, task_id)
+        if object_type == "account" and launcher is not None and task_id is not None else None
+    )
+    project_id = account_task.project_id if account_task is not None else None
     pin = effective_pin(session, task, memo) if task is not None else None
+    blind = task is not None and task.persona in REVIEW_PERSONAS
     key = (
-        (object_type, org, task.project_id, pin) if task is not None
-        else (object_type, org, launcher)
+        # A blind review child's set is narrower than its project's: its own entry, other keys unchanged.
+        (object_type, org, task.project_id, pin, *(("blind",) if blind else ())) if task is not None
+        else (object_type, org, launcher, project_id)
     )
     if memo is not None and key in memo:
         return memo[key]
@@ -209,12 +256,15 @@ def _allowed(
         if pin is not None:
             # A pinned task (`effective_pin`): only its own node, whatever else hosts the project.
             ids = ids & {pin}
+        if blind:
+            # A blind review child: only a node that can check its PR out blind (`blind_review.node_can_run`).
+            ids = frozenset(blind_review.capable_node_ids(session, frozenset(ids)))
     elif launcher is None:
         # D5's creator-less case (or the system actor, which `launcher_user_id` skips): nobody to
         # narrow by, so only the floor applies (confining would be unfixable) — never a personal account.
         ids = floor if object_type == "node" else shareable_account_floor(session, floor)
     else:
-        ids = floor & _launcher_account_ids(session, launcher, floor)
+        ids = floor & _launcher_account_ids(session, launcher, floor, project_id)
     allowed = AllowedObjects(unrestricted=False, ids=ids)
     if memo is not None:
         memo[key] = allowed
@@ -254,31 +304,36 @@ def project_node_ids(session: Session, project_id: int, org_id: UUID) -> frozens
 
 
 def _placeable_project_nodes(session: Session, project_id: int, floor: frozenset) -> frozenset:
-    """`floor` narrowed to the nodes hosting `project_id`, less the dedicated-node exclusion
-    (`app/tenant_defaults.py`): never a co-located node on another org's host without the operator's exception,
-    whichever path leases, claims or builds on it. Hosting only: `Node.enabled` and liveness are the refusal's and
-    the dispatcher's questions."""
+    """`floor` narrowed to the nodes `project_id` may start work on (`slot_allocation.placement_node_ids`: enabled,
+    in its node groups or All), less the dedicated-node exclusion (`app/tenant_defaults.py`): never a co-located
+    node on another org's host without the operator's exception, whichever path leases, claims or builds on it.
+    The placement set, never the hosting one: a node still running a task of a project that left it starts no new
+    task there. Liveness is the dispatcher's question."""
     if not floor:
         return frozenset()
-    ids = floor & frozenset(slot_allocation.hosting_node_ids(session, project_id))
+    ids = floor & frozenset(slot_allocation.placement_node_ids(session, project_id))
     return ids - tenant_defaults.foreign_hosted_among(session, ids)
 
 
 def shareable_account_floor(
     session: Session, floor: frozenset, owner_id: Optional[UUID] = None
 ) -> frozenset:
-    """`floor` minus every PERSONAL account (`owner_id IS NOT NULL`) except `owner_id`'s own — the account
-    floor for a pick no launcher's reach narrows: the pinned relaunch (`routes/fleet.py::
-    _account_for_task`, `owner_id` = the launcher), a launcher-less task and a console (`None`). Personal
-    stays personal (G3): a colleague's account never lands on a runner or a terminal it did not bring."""
+    """`floor` minus every PERSONAL account (`owner_id IS NOT NULL`) except `owner_id`'s own and those shared
+    with `owner_id` (an account binding) — the account floor for a pick no launcher's reach narrows: the pinned
+    relaunch (`routes/fleet.py::_account_for_task`, `owner_id` = the launcher), a launcher-less task and a
+    console (`None`). Personal stays personal (G3): a colleague's account never lands on a runner or a terminal
+    it did not bring, unless an Org Owner/Admin shared it with that launcher."""
     if not floor:
         return frozenset()
     shareable = Account.owner_id.is_(None)
     if owner_id is not None:
         shareable = shareable | (Account.owner_id == owner_id)
-    return frozenset(
+    ids = frozenset(
         session.scalars(select(Account.id).where(Account.id.in_(floor), shareable)).all()
     )
+    if owner_id is not None:
+        ids |= _launcher_account_ids(session, owner_id, floor) & floor
+    return ids
 
 
 def launcher_of(session: Session, task_id: Optional[int]) -> Optional[UUID]:
@@ -286,17 +341,26 @@ def launcher_of(session: Session, task_id: Optional[int]) -> Optional[UUID]:
     return task_ancestry.launcher_user_id(session, task_id)
 
 
-def _launcher_account_ids(session: Session, launcher: UUID, floor: frozenset) -> frozenset:
+def _launcher_account_ids(
+    session: Session, launcher: UUID, floor: frozenset, project_id: Optional[int] = None
+) -> frozenset:
     """The accounts `launcher` may dispatch on, within `floor` (`authz.visible_account_clause`: its own,
     account bindings, and the org's unowned accounts for an org-wide holder — a superadmin included, so
-    nobody's task runs on a colleague's personal account). A launcher row gone is deny."""
+    nobody's task runs on a colleague's personal account). A launcher row gone is deny.
+
+    Plus, for a task of `project_id`, the org's unowned accounts when the launcher holds `accounts:view` on that
+    project (a Project Developer or Maintainer there, directly or through a group): a project member runs the
+    project's tasks on the org's shared accounts without a grant per account. Placement only — the
+    roster and every other project's task still read `visible_account_clause` — and never a personal account
+    by that arm (a personal one only through its own binding)."""
     user = session.get(AdminUser, launcher)
     if user is None:
         return frozenset()
     principal = principal_for_user(session, user)
-    return frozenset(
-        session.scalars(select(Account.id).where(visible_account_clause(principal))).all()
-    )
+    clause = visible_account_clause(principal)
+    if project_id is not None and principal.has_on_scope(SCOPE_PROJECT, project_id, ACCOUNTS_VIEW_KEY):
+        clause = clause | Account.owner_id.is_(None)
+    return frozenset(session.scalars(select(Account.id).where(clause)).all())
 
 
 def node_may_claim(session: Session, task_id: Optional[int], node_id: Optional[str]) -> bool:
@@ -360,10 +424,10 @@ def unplaceable_reason(
     # An SDK agent runs no model, so no account test applies to it; a
     # refused agent is the unrunnable-agent sweep's (`lease_drain._fail_unrunnable_agents`), never an account
     # sentence. `resolve_agent` returns `Builtin` for every task that names no agent, so built-ins are unchanged.
-    from app import agent_resolution
+    from app import agent_resolution, agent_router
 
     needs_account = isinstance(
-        agent_resolution.resolve_agent(session, task, project), agent_resolution.Builtin
+        agent_router.effective_choice(session, task, project), agent_resolution.Builtin
     ) and not _on_jaah_account(session, task.org_id, memo)
     refusal = (_pinned_refusal(session, task, project, memo)
                or _org_refusal(session, task, project, memo, needs_account=needs_account)
@@ -413,16 +477,16 @@ def _pinned_refusal(
         select(Node.org_id, Node.enabled).where(Node.id == pin)
     ).first()
     if node is None or node.org_id != org:
-        return PlacementRefusal(
+        return _refusal(
             CAUSE_PINNED_NODE_GONE,
-            _pinned_node_gone_sentence(project),
+            _pinned_node_gone_refusal_text(),
             f"task {task.id} places in org {org} and is pinned to node {pin}, which "
             + ("no longer exists" if node is None else f"belongs to org {node.org_id}"),
         )
     if not node.enabled:
-        return PlacementRefusal(
+        return _refusal(
             CAUSE_PINNED_NODE_DISABLED,
-            _pinned_node_disabled_sentence(project),
+            _pinned_node_disabled_refusal_text(),
             f"task {task.id} is pinned to node {pin}, which is disabled",
         )
     return None
@@ -439,9 +503,9 @@ def _org_refusal(
     (transient: a fresh project, missing pool mount at boot), which waits instead."""
     org, _launcher = _who_places(session, task.id, memo)
     if org is None:
-        return PlacementRefusal(
+        return _refusal(
             CAUSE_ORG_MISMATCH,
-            _no_org_sentence(project),
+            _no_org_refusal_text(),
             f"task {task.id} carries no org_id, no ancestor carries one, and its creator chain names "
             "no user with one — so there is no tenant whose pool it could be placed in",
         )
@@ -449,9 +513,9 @@ def _org_refusal(
     # conjunct is the fleet-wide exclusion.
     if (not _placeable_slot_exists(session, project.id, org_id=org)
             and _some_org_hosts(session, project.id)):
-        return PlacementRefusal(
+        return _refusal(
             CAUSE_ORG_MISMATCH,
-            _no_org_slot_sentence(project),
+            _no_org_slot_refusal_text(project),
             f"task {task.id} places in org {org}; no enabled node in that org hosts {project.name}, "
             f"though {project.name} is assigned to nodes elsewhere in the pool",
         )
@@ -459,9 +523,9 @@ def _org_refusal(
         if not _enabled_account_exists(session, org_id=None, owned_only=True):
             # No enabled account anywhere in the fleet: transient, wait.
             return None
-        return PlacementRefusal(
+        return _refusal(
             CAUSE_ORG_MISMATCH,
-            _no_org_account_sentence(project),
+            _no_org_account_refusal_text(),
             f"task {task.id} places in org {org}; no enabled `accounts` row belongs to that org, "
             "though enabled accounts exist elsewhere in the fleet",
         )
@@ -497,14 +561,14 @@ def _some_org_hosts(session: Session, project_id: int) -> bool:
 def _node_refusal(
     session: Session, task: Task, project: Project, memo: Optional[dict]
 ) -> Optional[PlacementRefusal]:
-    """Set test 1: is this project assigned to an enabled node in the task's org?
+    """Set test 1: may this project start work on an enabled node in the task's org?
 
     Runs after `_org_refusal`. The probe carries the org conjunct as well as the node set, so both read the
     population `_placeable_slot_clause` defines.
 
-    One cause. `allowed_nodes` is already "in-org nodes hosting the project", so an empty set and a
-    non-empty set of disabled nodes ask the operator for the same thing — assign the project to an
-    enabled in-org node."""
+    A project with no enabled node in its node groups (or All) is NOT refused: it waits, and the dispatch pass
+    says why (`dispatch_wait.no_node`). The refusal fires only when such nodes exist but none is open to the task
+    (the foreign-host exclusion, a blind review's narrowing)."""
     # No `unrestricted` arm: `_allowed` cannot answer it.
     org, _launcher = _who_places(session, task.id, memo)
     allowed = allowed_nodes(session, task.id, memo=memo)
@@ -515,9 +579,21 @@ def _node_refusal(
         # The project runs nowhere, possibly transiently (a fresh project;
         # `fleet_observe.gone_slot_keys` deletes slots reported gone). Wait.
         return None
-    return PlacementRefusal(
+    hosting = _placeable_project_nodes(session, project.id, org_floor(session, "node", org)) if org else frozenset()
+    if task.persona in REVIEW_PERSONAS and hosting and _placeable_slot_exists(
+            session, project.id, node_ids=hosting, org_id=org):
+        # Placeable but for `_allowed`'s blind narrowing: its own sentence, since the action is updating a node, not
+        # assigning one. Any other cause keeps the ordinary sentence below.
+        return _refusal(
+            CAUSE_NO_PROJECT_NODE,
+            ("No node can run blind reviews", "Update Jaah on one. MicroVM nodes can't.",
+             _link("Update Jaah", _NODES_PATH)),
+            f"task {task.id} is a blind review child; {project.name} is hosted on {_join(anywhere)}, none of them "
+            "reporting the blind_checkout launch kind",
+        )
+    return _refusal(
         CAUSE_NO_PROJECT_NODE,
-        _no_project_node_sentence(project),
+        _no_project_node_refusal_text(project),
         f"task {task.id} places in org {org}; {project.name} is hosted on {_join(anywhere)}, none of "
         "them an enabled node of that org",
     )
@@ -530,9 +606,10 @@ def _account_refusal(
     so another tenant's credential is never reachable."""
     allowed = allowed_accounts(session, task.id, memo=memo)
     if not allowed.ids:
-        return PlacementRefusal(
-            CAUSE_NO_USABLE_ACCOUNT, _no_usable_account_sentence(project),
-            "this launcher owns no account, holds no account-scope binding and no org-wide accounts:view",
+        return _refusal(
+            CAUSE_NO_USABLE_ACCOUNT, _no_usable_account_refusal_text(),
+            "this launcher owns no account, holds no account-scope binding, no org-wide accounts:view and no "
+            "accounts:view on the task's project",
         )
     if session.scalar(
         select(Account.id)
@@ -544,8 +621,8 @@ def _account_refusal(
     slugs = sorted(
         session.scalars(select(Account.slug).where(Account.id.in_(allowed.ids))).all()
     )
-    return PlacementRefusal(
-        CAUSE_NO_ENABLED_GRANTED_ACCOUNT, _no_enabled_account_sentence(project, len(slugs)),
+    return _refusal(
+        CAUSE_NO_ENABLED_GRANTED_ACCOUNT, _no_enabled_account_refusal_text(len(slugs)),
         f"usable {_join(slugs) or '<no account row still exists>'}, none of them enabled",
     )
 
@@ -553,8 +630,8 @@ def _account_refusal(
 def _placeable_slot_clause(session: Session, project_id: int):
     """What "the project can run here" means, in one place, so refusal and detail read the same population:
     a `nodes` predicate. Decided facts only, never liveness (D3/D7):
-    * the node hosts the project (`slot_allocation.hosting_node_ids`) — an assignment is enough, since a
-      dispatch makes a dynamic worktree where no static one is free;
+    * the project may start work on the node (`slot_allocation.placement_node_ids`) — never the hosting set: a
+      held row on a node the project left must not read as "a slot exists" and fail every waiting task finally;
     * `Node.enabled` — matches `live_nodes_for_project`, else a disabled-only node waits invisibly.
 
     `Node.draining` is deliberately not a conjunct, although `live_nodes_for_project` excludes it: the
@@ -562,7 +639,7 @@ def _placeable_slot_clause(session: Session, project_id: int):
     not terminally fail queued tasks. The wait ends when the drain disables the node; then the task gets
     the accurate refusal, or waits on "project runs nowhere" if that node held its only slots."""
     return (
-        Node.id.in_(slot_allocation.hosting_node_ids(session, project_id)),
+        Node.id.in_(slot_allocation.placement_node_ids(session, project_id)),
         Node.enabled.is_(True),
     )
 
@@ -611,77 +688,54 @@ def _join(names: list[str]) -> str:
     return f"{', '.join(shown[:-1])} and {shown[-1]}"
 
 
-def _no_org_sentence(project: Project) -> str:
+# Each builder returns `(title, sentence, link)`: the title names what is missing, the sentence only the fix, in
+# as few words as keep it actionable. "AI account" is the reader's word for
+# an `accounts` row; "admin" an Org Owner or Org Admin.
+
+
+def _no_org_refusal_text() -> RefusalText:
     """R11 — "this task belongs to no organization". Names no org (there is none) and must not imply the
     reader's."""
-    return (
-        f"This task cannot be placed: it is not attributed to an organization, so there is no pool "
-        f"{project.name} could start it in. Ask an operator to re-file it from the console so it is "
-        f"attributed, or to set its organization."
-    )
+    return "No organization", "Ask an admin to file the task again.", None
 
 
-def _no_org_slot_sentence(project: Project) -> str:
+def _no_org_slot_refusal_text(project: Project) -> RefusalText:
     """R11 — "your organization runs this project nowhere". Never names the other tenant that does: the
-    sentence reaches a wider `tasks:view` audience, and that fact would disclose another tenant."""
-    return (
-        f"This task cannot be placed: {project.name} is not assigned to any node in your organization. "
-        f"Ask an operator to assign the project to a node."
-    )
+    text reaches a wider `tasks:view` audience, and that fact would disclose another tenant."""
+    return "No node in your organization", "Change its Node groups or ask an admin.", _project_nodes_link(project)
 
 
-def _no_org_account_sentence(project: Project) -> str:
-    """R11 — "your organization holds no credential account". The action is to create one there, not to
-    share one. Names no slug and no other org."""
-    return (
-        f"This task cannot be placed: running it in {project.name} needs a credential account and your "
-        f"organization has none enabled. Ask an operator to add one to your organization."
-    )
+def _no_org_account_refusal_text() -> RefusalText:
+    """R11 — "your organization holds no AI account". The action is to create one there, not to share one.
+    Names no slug and no other org."""
+    return "No AI account in your organization", "Add one or ask an admin.", _link("Add one", _ACCOUNTS_PATH)
 
 
-def _no_project_node_sentence(project: Project) -> str:
-    """R11 — "this project is assigned to no enabled node in your organization"."""
-    return (
-        f"This task cannot be placed: {project.name} is not assigned to an enabled node in your "
-        f"organization. Ask an operator to assign the project to a node."
-    )
+def _no_project_node_refusal_text(project: Project) -> RefusalText:
+    """R11 — "this project runs on no enabled node in your organization"."""
+    return ("No enabled node", "Change its Node groups, or ask an admin.", _project_nodes_link(project))
 
 
-def _pinned_node_gone_sentence(project: Project) -> str:
+def _pinned_node_gone_refusal_text() -> RefusalText:
     """R11 — "the one node this task may run on is gone". Names no node (see `PlacementRefusal`)."""
-    return (
-        f"This task cannot be placed in {project.name}: it may run only on the node it was filed for, and that "
-        f"node no longer exists in your organization. File it again for a node that does."
-    )
+    return "Its node was removed", "File the task again.", None
 
 
-def _pinned_node_disabled_sentence(project: Project) -> str:
+def _pinned_node_disabled_refusal_text() -> RefusalText:
     """R11 — "the one node this task may run on is disabled"."""
-    return (
-        f"This task cannot be placed in {project.name}: it may run only on the node it was filed for, and that "
-        f"node is disabled. Enable the node, or file the task again for another."
-    )
+    return "Its node is disabled", "Enable it or file the task again.", _link("Enable it", _NODES_PATH)
 
 
-def _no_usable_account_sentence(project: Project) -> str:
-    """R11 — "you may dispatch on no credential account"."""
-    return (
-        f"This task cannot be placed: running it in {project.name} needs a credential account you can "
-        f"use. Add your own account, or ask an admin to share one."
-    )
+def _no_usable_account_refusal_text() -> RefusalText:
+    """R11 — "you may dispatch on no AI account"."""
+    return "No AI account", "Add one or ask an admin.", _link("Add one", _ACCOUNTS_PATH)
 
 
-def _no_enabled_account_sentence(project: Project, usable: int) -> str:
+def _no_enabled_account_refusal_text(usable: int) -> RefusalText:
     """R11 — "the accounts you can use are disabled".
 
     Takes the count, not slugs (see `PlacementRefusal`). Never 0: an empty set already returned
     `CAUSE_NO_USABLE_ACCOUNT`."""
     if usable == 1:
-        return (
-            f"This task cannot be placed in {project.name}: the one credential account you can use is "
-            f"disabled. Enable it, or ask an admin to share another."
-        )
-    return (
-        f"This task cannot be placed in {project.name}: every credential account you can use is "
-        f"disabled. Enable one, or ask an admin to share another."
-    )
+        return "AI account disabled", "Enable it or ask an admin.", _link("Enable it", _ACCOUNTS_PATH)
+    return "AI accounts disabled", "Enable one or ask an admin.", _link("Enable one", _ACCOUNTS_PATH)

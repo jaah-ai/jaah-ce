@@ -7,21 +7,15 @@
 // a fresh tab would come from nowhere. Accepted: a draft does not follow the operator to another tab, and
 // closing the tab discards it.
 
-import { readJson, readJsonObject, removeKey, writeJson } from './safeStorage'
+import { adminScopedKey, readJson, readJsonObject, removeKey, writeJson } from './safeStorage'
 
 /** The prefix every key shares, spelled once so `clearAllTaskDrafts` sweeps exactly what is built. */
 const DRAFT_KEY_PREFIX = 'cockpit.tasks.draft.'
 
-/**
- * The key the inline create text is stored under, scoped to the logged-in admin's id.
- *
- * ONE key for the create row's draft (`useInlineTaskCreate`, drawn by `FeedNewTaskRow`).
- *
- * SCOPED because a browser profile can be shared: inheriting ANOTHER PERSON'S PROSE would put their task
- * one Start press away from being filed under this operator's name. `null` gets its own `anon` bucket.
- */
+/** ONE key for the create row's draft (`useInlineTaskCreate`, drawn by `FeedNewTaskRow`), per admin
+ *  (`adminScopedKey`). */
 export function inlineTaskDraftStorageKey(adminId: string | null): string {
-  return `${DRAFT_KEY_PREFIX}inline:${adminId ?? 'anon'}`
+  return adminScopedKey(`${DRAFT_KEY_PREFIX}inline`, adminId)
 }
 
 /**

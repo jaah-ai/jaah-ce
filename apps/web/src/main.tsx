@@ -1,5 +1,9 @@
 // FIRST, before anything can make a request: a Stripe redirect's client secret leaves the address bar.
 import './lib/scrubRedirectSecret'
+// Before any request: this browser's own signed-in rate budget at the WAF.
+import './lib/browserBudget'
+// Before any chunk is imported: a chunk stuck on a dead connection is fetched again under a new address.
+import './lib/chunkImport'
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { createBrowserRouter, RouterProvider } from 'react-router-dom'
@@ -11,8 +15,13 @@ import App from './App'
 import ErrorBoundary from './components/ErrorBoundary'
 import { applyLogoFavicon } from './components/logoTheme'
 import { AuthProvider } from './auth'
+import { get } from './api'
+import { installClientTelemetry } from './lib/clientTelemetry'
+import { installErrorTracking } from './lib/errorTracking'
+import { installLoadTiming } from './lib/loadTiming'
 import { queryClient, queryPersister, shouldPersistQuery } from './queryClient'
 import { theme } from './theme'
+import { VISUALLY_HIDDEN } from './ui/visuallyHidden'
 import { APP_VERSION } from './version'
 import './styles.css'
 
@@ -34,17 +43,7 @@ const router = createBrowserRouter(
               variant="caption"
               data-testid="caption-probe"
               aria-hidden
-              sx={{
-                position: 'absolute',
-                width: '1px',
-                height: '1px',
-                padding: 0,
-                margin: '-1px',
-                border: 0,
-                overflow: 'hidden',
-                clipPath: 'inset(50%)',
-                whiteSpace: 'nowrap',
-              }}
+              sx={VISUALLY_HIDDEN}
             />
           </AuthProvider>
         </ErrorBoundary>
@@ -63,6 +62,19 @@ const router = createBrowserRouter(
 )
 
 applyLogoFavicon()
+// Uncaught errors and rejections, reported only for a flagged session (`lib/clientTelemetry.ts`).
+installClientTelemetry(window)
+// Sentry, off until the operator sets a console DSN (`lib/errorTracking.ts`). One public-settings read per page
+// load, under the login page's own query key; errors before it answers are not reported.
+queryClient
+  .fetchQuery({
+    queryKey: ['public-settings'],
+    queryFn: () => get<{ error_tracking_dsn_web?: string }>('/api/public/settings'),
+  })
+  .then(s => installErrorTracking(s?.error_tracking_dsn_web))
+  .catch(() => undefined)
+// Slow page loads and route changes, likewise reported only for a flagged session (`lib/loadTiming.ts`).
+installLoadTiming(window, listener => router.subscribe(state => listener(state.location.pathname)))
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>

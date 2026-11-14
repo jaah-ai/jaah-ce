@@ -5,7 +5,7 @@ roles expand to (`_seed_permissions` + `_seed_roles`), and every seeded identity
 `role_bindings` row. No key or grant row is written anywhere.
 
 No password default lives here (this runs in production). Fail closed:
-  * ADMIN_PASSWORD unset/empty raises RuntimeError, stopping `migrate && seed && exec uvicorn` rather
+  * ADMIN_PASSWORD unset/empty raises RuntimeError, stopping `migrate && seed && exec ./entrypoint.sh` rather
     than creating a guessable account.
   * An unset e2e fixture password skips that row with a printed reason.
 
@@ -17,20 +17,21 @@ is never resurrected.
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import uuid
-from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app import access, edition, edition_features, identities, plan_terms
+from app import access, edition, edition_features, identities, notification_channels, plan_terms
+from app.clock import utcnow
 from app.dev_bypass import FIXTURE_APP_ENVS
 from app.auth import hash_password
 from app.access_catalog import ROLES, ROLES_BY_SLUG, expand
 from app.authz.catalog import PERMISSION_CATALOG, PERMISSION_KEYS
-from app.db import SessionLocal
+from app.db import BridgedSession
 from app.models.access import Group, Permission, Role, RoleBinding, RolePermission
 from app.models.control_plane import SystemState
 from app.models.identity import AdminUser
@@ -42,13 +43,10 @@ from app.tenancy.ids import OPERATOR_ORG, ORG_ZERO_ID
 # No `E2E_ORGADMIN_B_PASSWORD` constant: nothing imports it.
 _DEFAULT_ADMIN_EMAIL = "admin@example.com"
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", _DEFAULT_ADMIN_EMAIL)
-# No default: "" means no credential configured, which refuses below.
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 # Dedicated Playwright login (the web e2e suite), separate from ADMIN_EMAIL so synthetic traffic is
 # attributable. Seeded only in a `_FIXTURE_APP_ENVS` environment with E2E_ADMIN_PASSWORD set.
 _DEFAULT_E2E_ADMIN_EMAIL = "e2e-smoke@cockpit.local"
 E2E_ADMIN_EMAIL = os.environ.get("E2E_ADMIN_EMAIL", _DEFAULT_E2E_ADMIN_EMAIL)
-E2E_ADMIN_PASSWORD = os.environ.get("E2E_ADMIN_PASSWORD", "")
 # Dedicated non-superadmin login for the RequireSuperadmin-gated routes. Same rationale and gates.
 _DEFAULT_E2E_NONSUPERADMIN_EMAIL = "e2e-nonsuperadmin@cockpit.local"
 E2E_NONSUPERADMIN_EMAIL = os.environ.get("E2E_NONSUPERADMIN_EMAIL", _DEFAULT_E2E_NONSUPERADMIN_EMAIL)
@@ -56,14 +54,14 @@ E2E_NONSUPERADMIN_PASSWORD = os.environ.get("E2E_NONSUPERADMIN_PASSWORD", "")
 # The org-admin of fixture org B, the principal isolation assertions sign in as. `is_superadmin=False`
 # is the point: a superadmin's allow-all bypasses the catalog and every read-seam predicate. Same gates.
 _DEFAULT_E2E_ORGADMIN_B_EMAIL = "e2e-orgadmin-b@cockpit.local"
-E2E_ORGADMIN_B_EMAIL = os.environ.get("E2E_ORGADMIN_B_EMAIL", _DEFAULT_E2E_ORGADMIN_B_EMAIL)
 SEED_MARKER_KEY = "seed_bootstrap"
+log = logging.getLogger("app.seed")
 
 # Fixture org B. Never the operator org (`app/tenancy/ids.py`): real orgs come from the console.
 # The id is fixed to match the org B created on the dev control plane, so every environment names the
 # same tenant. UUIDv7, like its siblings.
 FIXTURE_ORG_B_ID = uuid.UUID("01a05f8a-ec2e-7e01-8144-909a57017fd1")
-FIXTURE_ORG_B_SLUG = "org-b"
+FIXTURE_ORG_B_SLUG = "orgb"
 FIXTURE_ORG_B_NAME = "Org B"
 
 # The org-admin fixture's reach: `org_admin` at org B (`_bind_org_role`). Its old direct key set named
@@ -122,14 +120,15 @@ def _seed_fixture_login(
         password_hash=hash_password(password),
         role="admin",
         is_superadmin=superadmin,
-        activated_at=datetime.now(timezone.utc),
+        activated_at=utcnow(),
         # Org written explicitly, as for the bootstrap admin below.
         org_id=org_id,
     )
     session.add(row)
+    session.flush()
     if superadmin:
-        session.flush()
         access.join_everyone(session, row)
+    notification_channels.ensure_account_email(session, row)
     return True
 
 
@@ -138,9 +137,8 @@ def _adopt_org(user: AdminUser, org_id: uuid.UUID = ORG_ZERO_ID) -> None:
 
     Never moves a user that already has one (else `--ensure` would drag the org-B fixture back to org
     zero). Needed because an existing row takes the early return and pre-stamp databases hold NULL;
-    an org-less admin stamps rows with no org, so nothing it owns can be placed
-    (`routes/console.py::_claim_slot_for_console_user`). Only for rows seed owns; general backfills are
-    migrations' job.
+    an org-less admin stamps rows with no org, so nothing it owns can be placed. Only for rows seed owns;
+    general backfills are migrations' job.
     """
     if user.org_id is None:
         user.org_id = org_id
@@ -167,12 +165,10 @@ def _seed_fixture_org(session) -> bool:
             "name": FIXTURE_ORG_B_NAME,
             # The plan a self-serve org starts on, as before the Default plan went.
             "plan_key": PRESELECTED,
-            "description": (
-                "The e2e fixture second tenant. Seeded ONLY where APP_ENV is local/ci/test "
-                "(app/seed.py::_seed_fixture_org) so an isolation assertion has another tenant to be "
-                "isolated from before any browser opens. A real environment "
-                "gets its further orgs from the console, never from the seed."
-            ),
+            # Seeded only where APP_ENV is local/ci/test, so an isolation assertion has another tenant
+            # before any browser opens; a real environment gets further orgs from the console. The
+            # description is what an operator would write, since the Overview shows it.
+            "description": "Second test customer.",
         }])
         .on_conflict_do_nothing()
         .returning(Org.id)
@@ -234,11 +230,11 @@ def bind_superadmin(session, email: str) -> int:
 #: company owners (in their own tenant, `E2E_COMPANY_ORG_SLUG`): the company-setup card's e2e spec.
 E2E_DEVELOPERS_GROUP = "E2E Project Developers"
 E2E_COMPANY_OWNERS_GROUP = "E2E Company Owners"
-E2E_COMPANY_ORG_SLUG = "e2e-company-setup"
+E2E_COMPANY_ORG_SLUG = "e2ecompanysetup"
 #: A PENDING self-service org and its signed-up owner (an `org_signups` row), for the nine-step card and the
 #: Billing page: the self-service company-setup e2e spec. Seeded by
 #: `app/seed_dev_profile.py::_e2e_fixture_groups`; the spec sets the owner's password.
-E2E_SELF_SERVICE_ORG_SLUG = "e2e-self-service"
+E2E_SELF_SERVICE_ORG_SLUG = "e2eselfservice"
 E2E_SELF_SERVICE_OWNER_EMAIL = "e2e-self-owner@cockpit.local"
 
 
@@ -391,17 +387,17 @@ def create_admin(session, email: str, password: str, **fields) -> AdminUser:
         password_hash=hash_password(password),
         role="admin",
         is_superadmin=True,
-        activated_at=datetime.now(timezone.utc),
+        activated_at=utcnow(),
         # Org zero written explicitly, and first, so `identities.first_membership` is the operator seat:
         # `AdminUser` is `Stored` and the seam stamps from the bound scope, which is empty at boot. An
-        # org-less admin cannot claim a console slot (`routes/console.py::_claim_slot_for_console_user`), so
-        # the drain would lease and reset the worktree the operator is working in.
+        # org-less admin stamps rows with no org, so nothing it owns can be placed (`_adopt_org`).
         org_id=ORG_ZERO_ID,
         **fields,
     )
     session.add(admin)
     session.flush()
     access.join_everyone(session, admin)
+    notification_channels.ensure_account_email(session, admin)
     return admin
 
 
@@ -540,7 +536,7 @@ def bootstrap(session, *, ensure: bool = False, profile: str | None = None) -> b
     if marker is None:
         session.add(SystemState(
             key=SEED_MARKER_KEY,
-            value={"at": datetime.now(timezone.utc).isoformat()},
+            value={"at": utcnow().isoformat()},
         ))
     _run_profile(session, profile)
     return True
@@ -611,7 +607,7 @@ def main(argv: list[str] | None = None) -> None:
 
     args = argv if argv is not None else sys.argv[1:]
     ensure = "--ensure" in args
-    with migrate.serialized(), SessionLocal() as session:
+    with migrate.serialized(), BridgedSession() as session:
         bootstrap(session, ensure=ensure, profile=_profile_arg(args))
         if edition.IS_CE:
             # Deferred: the community edition's org, node and pool (`app/ce_bootstrap.py`), on every boot.

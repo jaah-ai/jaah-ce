@@ -78,13 +78,13 @@ def main(argv: list[str] | None = None) -> int:
     if args != ["reset-password"]:
         print(_USAGE, file=sys.stderr)
         return 2
-    from app.db import SessionLocal
+    from app.db import BridgedSession
 
     password = getpass.getpass("New password: ")
     if getpass.getpass("Repeat it: ") != password:
         print("The two passwords differ — nothing changed.", file=sys.stderr)
         return 1
-    with SessionLocal() as session:
+    with BridgedSession() as session:
         try:
             reset_password(session, password)
         except ValueError as exc:

@@ -60,11 +60,13 @@ def without_range(text: str, user: str, held: range) -> str:
     return "".join(f"{line}\n" for line in text.splitlines() if line.strip() != gone)
 
 
-def subid_line_needed(text: str, user: str, start: int | None = None) -> str | None:
-    """The line to append so `user` has a mapping range, or None when one already exists. `start`
-    pins the range (a caller-allocated block); without it the
-    first free range at or above the floor is taken (the gha pool's shape)."""
-    if any(owner == user for owner, _b, _c in parse_subid_ranges(text)):
+def subid_line_needed(text: str, user: str, start: int | None = None, uid: int | None = None) -> str | None:
+    """The line to append so `user` has a mapping range, or None when one already exists — under its name or,
+    given `uid`, its numeric uid (shadow-utils accepts either spelling). `start` pins the range (a
+    caller-allocated block); without it the first free range at or above the floor is taken (the gha pool's
+    shape)."""
+    owners = {user} if uid is None else {user, str(uid)}
+    if any(owner in owners for owner, _b, _c in parse_subid_ranges(text)):
         return None
     return f"{user}:{next_subid_start(text) if start is None else int(start)}:{SUBID_COUNT}"
 
@@ -73,7 +75,8 @@ def ensure_subids(user: str, check: bool, read_text: Callable[[Path], str],
                   append_text: Callable[[Path, str], None],
                   lock: Callable[[], ContextManager[None]] | None = None,
                   start: int | None = None,
-                  move: Callable[[Path, str, range, range], None] | None = None) -> tuple[bool, list[str]]:
+                  move: Callable[[Path, str, range, range], None] | None = None,
+                  uid: int | None = None) -> tuple[bool, list[str]]:
     """Subordinate uid/gid ranges for rootless docker's user-namespace mapping.
 
     A first-free range already on `RESERVED_UIDS` — handed out before the allocator skipped them — blocks every
@@ -85,23 +88,26 @@ def ensure_subids(user: str, check: bool, read_text: Callable[[Path], str],
 
     The read-compute-append is one critical section, locked HERE: this helper and the gha installer are
     separate processes, and two readers of the same highest range would append OVERLAPPING mappings,
-    breaking the isolation this file exists for. Check mode takes no lock: it writes nothing, and the lock
+    breaking the isolation this file exists for. Every allocator on the node comes through here: the gha
+    installer, and `infra/jaah/node_reprovision.py` (the regular node's session user, and each vnode user the
+    vnode helper builds while the daemon may be allocating too). Check mode takes no lock: it writes nothing, and the lock
     lives in a root-only dir, so the unprivileged drift report would fail on permissions. Override `lock`
     only with `contextlib.nullcontext` (tests) or when already holding it: `flock` is per open file
     description, so a nested acquire in one process deadlocks.
     """
     if check:
-        return _ensure_subids(user, check, read_text, append_text, start, move)
+        return _ensure_subids(user, check, read_text, append_text, start, move, uid)
     if lock is None:
         from .locking import node_lock as lock
     with lock():
-        return _ensure_subids(user, check, read_text, append_text, start, move)
+        return _ensure_subids(user, check, read_text, append_text, start, move, uid)
 
 
 def _ensure_subids(user: str, check: bool, read_text: Callable[[Path], str],
                    append_text: Callable[[Path, str], None],
                    start: int | None = None,
-                   move: Callable[[Path, str, range, range], None] | None = None) -> tuple[bool, list[str]]:
+                   move: Callable[[Path, str, range, range], None] | None = None,
+                   uid: int | None = None) -> tuple[bool, list[str]]:
     lines, ok = [], True
     for path in (Path("/etc/subuid"), Path("/etc/subgid")):
         try:
@@ -117,12 +123,12 @@ def _ensure_subids(user: str, check: bool, read_text: Callable[[Path], str],
                 lines.append(f"  DRIFT {what} (would move it to {new.start}-{new.stop - 1})")
                 ok = False
             elif move is None:
-                lines.append(f"  held  {what}: the slot's next reset moves it")
+                lines.append(f"  held  {what}: left in place (only a caller that owns its old range moves it)")
             else:
                 move(path, user, held, new)
                 text = rest + f"{user}:{new.start}:{SUBID_COUNT}\n"
                 lines.append(f"  moved {what} to {new.start}-{new.stop - 1}")
-        needed = subid_line_needed(text, user, start)
+        needed = subid_line_needed(text, user, start, uid)
         if needed is None:
             lines.append(f"  ok    {path} has a range for {user}")
             continue

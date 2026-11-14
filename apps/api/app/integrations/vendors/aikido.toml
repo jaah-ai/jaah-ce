@@ -1,0 +1,52 @@
+# Aikido Security. Facts confirmed at the vendor's own docs: client credentials from the workspace's REST API
+# integration, exchanged at the token endpoint with the pair as HTTP Basic https://apidocs.aikido.dev/reference/authorization
+# and https://apidocs.aikido.dev/reference/getaccesstoken . Probed 2026-11-03: the token endpoint answers 401
+# invalid_client for a bad pair and refuses the pair in the body; /api/public/v1/workspace answers 401 unauthenticated.
+slug = "aikido"
+label = "Aikido Security"
+category = "dev_tools"
+vendor_docs_url = "https://apidocs.aikido.dev/reference/authorization"
+summary = "Read Aikido Security findings, repositories and compliance status."
+
+[[auth]]
+kind = "service_account"
+fields = [
+  { key = "client_id", label = "Client ID", kind = "text", required = true, help = "Aikido > Settings > Integrations > API > REST API (app.aikido.dev/settings/integrations/api/aikido/rest) > Generate new credentials: name them Jaah, then copy the Client ID. Only workspace admins see this page" },
+  { key = "client_secret", label = "Client secret", kind = "secret", required = true, help = "Shown once, with the Client ID when you generate the credentials: copy it before closing" },
+]
+
+[test]
+method = "GET"
+path = "https://app.aikido.dev/api/public/v1/workspace"
+identity = [["name"]]
+identity_phrase = "in workspace"
+[test.token]
+url = "https://app.aikido.dev/api/oauth/token"
+client_id_field = "client_id"
+client_secret_field = "client_secret"
+client_auth = "basic"
+
+[docs]
+agent_uses = [
+  "List open security issues (code, dependencies, secrets, cloud, containers) and their severity",
+  "Read the details of an issue a task is about, to fix the vulnerable code",
+  "Check whether a repository's issues are resolved after a fix is merged",
+  "Export findings for a compliance or audit report",
+]
+prerequisites = [
+  "An Aikido Security workspace on a plan with REST API access, and the workspace admin role to create API credentials",
+]
+limitations = [
+  "API credentials reach the whole workspace: they are not limited to some repositories",
+  "Aikido's public API is read-mostly; agents fix code in your repository, not in Aikido",
+  "Access tokens last a short time; Jaah mints a fresh one for each Test, and agents mint their own",
+]
+troubleshooting = [
+  { symptom = "Test says Aikido Security rejected the client ID and client secret (401)", fix = "The credentials were revoked or mistyped. Generate new ones in Settings > Integrations > API > REST API and select Replace on both values" },
+  { symptom = "There is no REST API option in Aikido's integrations", fix = "Your account is not a workspace admin, or the plan has no API access. Ask your Aikido admin" },
+  { symptom = "Test passes but agents get 403 on an endpoint", fix = "That endpoint needs a plan feature your workspace lacks. Check the plan in Aikido's billing settings" },
+]
+faq = [
+  { q = "Why a client ID and secret instead of one key", a = "Aikido issues short-lived tokens through OAuth client credentials: the pair is exchanged for a token on each use, so a leaked token expires quickly" },
+  { q = "Can agents ignore or snooze an issue", a = "Only through what Aikido's public API allows; most triage stays in Aikido" },
+]

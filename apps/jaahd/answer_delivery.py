@@ -10,7 +10,9 @@ arithmetic over rows this cannot see. `Esc` yields an honest "User declined to a
 no-op if the picker already closed, and cannot fabricate an answer in any ordering. The one exception is a
 CLI whose dialog has its own free-text row (`ComposerTui.write_in_row`, declared per adapter): there the
 answer is typed INTO that row, its key read off the live screen, and returns as the tool's own result
-(`_write_in_on`) — still the operator's text, never a choice among the options.
+(`_write_in_on`) — still the operator's text, never a choice among the options. A `dismiss` delivery (the CP's
+dismissal of an open question by a task edit) never uses that row: the dialog is closed with `Esc` and the text
+goes as an ordinary message, since it answers nothing the question asked.
 
 The payload is a bracketed paste from STDIN (`load-buffer -` + `paste-buffer -d -p -r`), never a
 `send-keys -l` argv: one argv string is capped at `MAX_ARG_STRLEN` (~131 KB, `E2BIG`) and a literal newline
@@ -40,7 +42,6 @@ import time
 from typing import TYPE_CHECKING
 
 import cloud_modules
-import env_helpers
 import kill_gates
 import session_user
 
@@ -146,17 +147,10 @@ def pending_is_unsubmitted(pending: str, message: str) -> bool:
 
 def _capture(socket: str, target: str, run_fn) -> str:
     """The visible pane text of TARGET, or "" when it cannot be read."""
-    try:
-        probe = run_fn(
-            session_user.tmux_cmd(socket, "capture-pane", "-p", "-t", target),
-            capture_output=True, text=True, timeout=10, env=env_helpers._tmux_safe_env(),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.warning("answer-delivery: capture-pane for %s on %r failed (%s)", target, socket, exc)
+    probe = session_user.tmux_run(socket, "capture-pane", "-p", "-t", target, run=run_fn)
+    if probe is None or probe.returncode != 0:
         return ""
-    if getattr(probe, "returncode", 1) != 0:
-        return ""
-    return getattr(probe, "stdout", "") or ""
+    return probe.stdout or ""
 
 
 def pane_text_for_pid(pane_pid: int, run_fn=subprocess.run) -> str | None:
@@ -165,17 +159,8 @@ def pane_text_for_pid(pane_pid: int, run_fn=subprocess.run) -> str | None:
     reachable server has that pane or it cannot be read — a read-only probe, never a write. The pid is
     tmux's own answer at launch, so no operator-typed window name is resolved."""
     for socket in kill_gates._reachable_sockets():
-        try:
-            probe = run_fn(
-                session_user.tmux_cmd(socket, "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}"),
-                capture_output=True, text=True, timeout=10, env=env_helpers._tmux_safe_env(),
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            log.warning("pane-read: list-panes on %r failed (%s)", socket, exc)
-            continue
-        if getattr(probe, "returncode", 1) != 0:
-            continue
-        for row in (getattr(probe, "stdout", "") or "").splitlines():
+        rows = session_user.tmux_out(socket, "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}", run=run_fn)
+        for row in (rows or "").splitlines():
             pid, _, pane_id = row.partition(" ")
             if pid == str(pane_pid) and pane_id:
                 return _capture(socket, pane_id, run_fn) or None
@@ -185,15 +170,10 @@ def pane_text_for_pid(pane_pid: int, run_fn=subprocess.run) -> str | None:
 def _tmux(socket: str, run_fn, *args: str) -> bool:
     """One tmux command on SOCKET that carries no payload on stdin. False on any non-zero exit or OS error,
     logged, never raised."""
-    try:
-        probe = run_fn(
-            session_user.tmux_cmd(socket, *args),
-            capture_output=True, text=True, timeout=10, env=env_helpers._tmux_safe_env(),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.warning("answer-delivery: tmux %s on %r failed (%s)", args, socket, exc)
+    probe = session_user.tmux_run(socket, *args, run=run_fn)
+    if probe is None:
         return False
-    if getattr(probe, "returncode", 1) != 0:
+    if probe.returncode != 0:
         # tmux's own message ("can't find pane", …) IS the diagnosis.
         log.warning(
             "answer-delivery: tmux %s on %r exited non-zero (%s)",
@@ -209,14 +189,8 @@ _SHELLS = frozenset({"bash", "sh", "dash", "zsh", "fish", "ksh"})
 
 def _pane_command(socket: str, target: str, run_fn) -> str:
     """TARGET's foreground command (`#{pane_current_command}`), or "" when it cannot be read."""
-    try:
-        probe = run_fn(
-            session_user.tmux_cmd(socket, "display-message", "-p", "-t", target, "#{pane_current_command}"),
-            capture_output=True, text=True, timeout=10, env=env_helpers._tmux_safe_env(),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return (getattr(probe, "stdout", "") or "").strip() if getattr(probe, "returncode", 1) == 0 else ""
+    return session_user.tmux_out(socket, "display-message", "-p", "-t", target, "#{pane_current_command}",
+                                 run=run_fn) or ""
 
 
 def _send(socket: str, target: str, run_fn, *args: str) -> bool:
@@ -233,17 +207,8 @@ def _reap_orphan_answer_buffers(socket: str, run_fn) -> None:
     readable by every runner pane via `show-buffer`. Only other pids' buffers are reaped, so a concurrent
     delivery in this process is never a victim. Best effort; never stops the delivery it precedes."""
     mine = f"{_BUFFER_PREFIX}{os.getpid()}-"
-    try:
-        probe = run_fn(
-            session_user.tmux_cmd(socket, "list-buffers", "-F", "#{buffer_name}"),
-            capture_output=True, text=True, timeout=10, env=env_helpers._tmux_safe_env(),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.warning("answer-delivery: list-buffers on %r failed (%s)", socket, exc)
-        return
-    if getattr(probe, "returncode", 1) != 0:
-        return
-    for name in (getattr(probe, "stdout", "") or "").splitlines():
+    names = session_user.tmux_out(socket, "list-buffers", "-F", "#{buffer_name}", run=run_fn)
+    for name in (names or "").splitlines():
         name = name.strip()
         if name.startswith(_BUFFER_PREFIX) and not name.startswith(mine):
             log.warning(
@@ -264,23 +229,13 @@ def _paste(socket: str, target: str, run_fn, message: str) -> bool:
     a harmless no-op when it was never created), because the server is shared by every pane on the node."""
     _reap_orphan_answer_buffers(socket, run_fn)
     buffer_name = f"{_BUFFER_PREFIX}{os.getpid()}-{next(_BUFFER_SEQ)}"
-    try:
-        loaded = run_fn(
-            session_user.tmux_cmd(socket, "load-buffer", "-b", buffer_name, "-"),
-            input=message, capture_output=True, text=True, encoding="utf-8", timeout=10,
-            env=env_helpers._tmux_safe_env(),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        # Clean up even here: a `TimeoutExpired` after tmux read stdin leaves the buffer created.
-        log.warning(
-            "answer-delivery: load-buffer for %s on %r failed (%s)", target, socket, exc)
-        _tmux(socket, run_fn, "delete-buffer", "-b", buffer_name)
-        return False
-    if getattr(loaded, "returncode", 1) != 0:
-        log.warning(
-            "answer-delivery: load-buffer for %s on %r exited non-zero (%s)",
-            target, socket, (getattr(loaded, "stderr", "") or "").strip(),
-        )
+    loaded = session_user.tmux_run(socket, "load-buffer", "-b", buffer_name, "-", run=run_fn,
+                                   input=message, encoding="utf-8")
+    if loaded is None or loaded.returncode != 0:
+        # Clean up even when it did not run: a `TimeoutExpired` after tmux read stdin leaves the buffer created.
+        if loaded is not None:
+            log.warning("answer-delivery: load-buffer for %s on %r exited non-zero (%s)",
+                        target, socket, (getattr(loaded, "stderr", "") or "").strip())
         _tmux(socket, run_fn, "delete-buffer", "-b", buffer_name)
         return False
     if _tmux(socket, run_fn, "paste-buffer", "-d", "-p", "-r", "-b", buffer_name, "-t", target):
@@ -463,6 +418,7 @@ def deliver_answer(
     *,
     expect_cwd: str,
     tui: "ComposerTui | None" = None,
+    dismiss: bool = False,
     run_fn=subprocess.run,
     sleep_fn=time.sleep,
 ) -> bool:
@@ -472,9 +428,9 @@ def deliver_answer(
     injection hazard. `tui` is the runner CLI's screen (`AgentAdapter.tui()`); None is Claude Code, whose
     screen is this module's own constants. On the other CLIs `Esc` also ends the turn (measured per
     adapter), so it is sent only when the composer is NOT up: a runner already sitting at an idle composer
-    is not interrupted."""
+    is not interrupted. `dismiss`: the open question is closed, never written into (the module docstring)."""
     return _on_tmux(tmux_target, message, expect_cwd, run_fn, "answer-delivery",
-                    lambda pane: _answer_on(pane, message, tui, sleep_fn, tmux_target))
+                    lambda pane: _answer_on(pane, message, tui, sleep_fn, tmux_target, dismiss=dismiss))
 
 
 def _on_tmux(tmux_target: str, message: str, expect_cwd: str, run_fn, kind: str, deliver) -> bool:
@@ -490,7 +446,7 @@ def _on_tmux(tmux_target: str, message: str, expect_cwd: str, run_fn, kind: str,
 
 
 def _answer_on(pane, message: str, tui: "ComposerTui | None", sleep_fn, label: str, *,
-               require_composer: bool = False) -> bool:
+               require_composer: bool = False, dismiss: bool = False) -> bool:
     """`deliver_answer` once its target is proven — the same sequence on a tmux pane and a VM console."""
     if tui is not None:
         if pane.command() in _SHELLS:
@@ -498,6 +454,10 @@ def _answer_on(pane, message: str, tui: "ComposerTui | None", sleep_fn, label: s
             log.warning("answer-delivery: %s is running a shell, not the runner's CLI — refusing", label)
             return False
         screen = pane.capture()
+        if dismiss:
+            _close_question(pane, tui, sleep_fn)
+            return _paste_task_on(pane, message, tui, sleep_fn, _ANSWER_READY_SECS, _LANDED_LAUNCH_SECS,
+                                  label, what="answer")
         if tui.dialog_up(screen) or tui.write_in_open(screen):
             typed = _write_in_on(pane, message, tui, screen, sleep_fn, label)
             if typed is not None:
@@ -520,6 +480,20 @@ def _answer_on(pane, message: str, tui: "ComposerTui | None", sleep_fn, label: s
         log.info("answer-delivery: delivered to %s (%s)", label, pane.label)
         return True
     return False
+
+
+# `Esc`s that may close a dismissed question: its free-text field first (when open), then the dialog.
+_DISMISS_KEYS = 3
+
+
+def _close_question(pane, tui: "ComposerTui", sleep_fn) -> None:
+    """`Esc` while the question dialog or its free-text field is PROVEN on screen, until neither is: a vendor `Esc`
+    ends the turn, so none is sent once the dialog is gone."""
+    for _ in range(_DISMISS_KEYS):
+        screen = pane.capture()
+        if not (tui.dialog_up(screen) or tui.write_in_open(screen)) or not pane.key("Escape"):
+            return
+        sleep_fn(_SUBMIT_SETTLE_SECS)
 
 
 def _write_in_on(pane, message: str, tui: "ComposerTui", screen: str, sleep_fn, label: str) -> bool | None:
@@ -735,6 +709,7 @@ def deliver_vm_answer(
     task_id: object,
     session_id: object,
     tui: "ComposerTui | None" = None,
+    dismiss: bool = False,
     request=None,
     open_stream=None,
     sleep_fn=time.sleep,
@@ -748,7 +723,7 @@ def deliver_vm_answer(
     if not _proven_vm(vm_id, task_id=task_id, session_id=session_id, kind="answer-delivery", request=request):
         return False
     return _on_vm(vm_id, "answer-delivery", request, open_stream, lambda pane: _answer_on(
-        pane, message, tui, sleep_fn, pane.label, require_composer=True))
+        pane, message, tui, sleep_fn, pane.label, require_composer=True, dismiss=dismiss))
 
 
 def deliver_vm_message(

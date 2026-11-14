@@ -1,32 +1,25 @@
-import { useEffect, useState, type JSX } from 'react'
+import { useState, type JSX } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
+import { grid } from '../../theme'
 import Button from '@mui/material/Button'
-import InputAdornment from '@mui/material/InputAdornment'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
 import { apiDetail } from '../../api'
 import { useAuth } from '../../auth'
 import { useSubmit } from '../../hooks/useSubmit'
-import {
-  BUDGETS_QUERY,
-  budgetKey,
-  deleteBudget,
-  getBudget,
-  putBudget,
-  type BudgetReading,
-  type BudgetScope,
-} from '../../lib/budgets'
-import { dollarsToMicros, microsText, microsToDollarsInput } from '../../lib/jaahAi'
+import { BUDGETS_QUERY, budgetKey, deleteBudget, getBudget, type BudgetReading, type BudgetScope } from '../../lib/budgets'
+import { microsText, microsToDollarsInput } from '../../lib/jaahAi'
 import { isOrgAdminSeat } from '../../lib/orgAdmin'
 import { usePlanSwitch } from '../../lib/planSwitches'
 import type { OrgRef } from '../../types'
 import Banner from '../../ui/Banner'
-import FormTextField from '../../ui/FormTextField'
+import FormBox from '../../ui/FormBox'
 import { tapTargetSx } from '../../ui/listStyles'
 import LoadingState from '../../ui/LoadingState'
 import StatusChip from '../../ui/StatusChip'
 import SubmitButton from '../../ui/SubmitButton'
+import { BudgetAmountField, budgetMicros, useBudgetSave } from './budgetAmount'
 
 /* A project's or a group's monthly budget (`lib/budgets.ts`), saved on its own — never part of the page's form.
  * An Org Owner/Admin's only (the routes are `@org_admin`): anyone else gets nothing. With the plan's switch off,
@@ -56,32 +49,35 @@ function BudgetForm({ scope, scopeId, org }: BudgetFieldProps): JSX.Element {
   const asOrg = org ?? null
   const query = useQuery({ queryKey: budgetKey(scope, scopeId), queryFn: () => getBudget(scope, scopeId, asOrg) })
   const stored = query.data?.budget?.monthly_usd_micros ?? null
-  const [draft, setDraft] = useState(() => (stored === null ? '' : microsToDollarsInput(stored)))
-  useEffect(() => setDraft(stored === null ? '' : microsToDollarsInput(stored)), [stored])
+  const storedText = stored === null ? '' : microsToDollarsInput(stored)
+  const [draft, setDraft] = useState(storedText)
+  // Re-seed the draft in the same render the stored amount changes (React's "adjust state on a prop change"),
+  // never in an effect: an effect commits one frame with the read's figures beside an EMPTY amount.
+  const [seeded, setSeeded] = useState(stored)
+  if (seeded !== stored) {
+    setSeeded(stored)
+    setDraft(storedText)
+  }
   const { busy, formError, run, saved, clearSaved } = useSubmit()
+  const saveBudget = useBudgetSave()
 
   if (query.isPending) return <LoadingState rows={1} />
   if (query.isError) return <Banner severity="error">{apiDetail(query.error, 'Could not load the budget')}</Banner>
 
   const reading = query.data
   const budget = reading.budget
-  const micros = dollarsToMicros(draft)
-  const valid = micros !== null && micros > 0
+  const micros = budgetMicros(draft)
   const changed = micros !== stored
-  const refresh = () => client.invalidateQueries({ queryKey: [BUDGETS_QUERY] })
 
   async function save() {
-    if (!valid || micros === null) return
-    await run('Could not save the budget', async () => {
-      await putBudget(scope, scopeId, micros, asOrg)
-      await refresh()
-    })
+    if (micros === null) return
+    await run('Could not save the budget', () => saveBudget(scope, scopeId, micros, asOrg))
   }
 
   async function remove() {
     await run('Could not remove the budget', async () => {
       await deleteBudget(scope, scopeId, asOrg)
-      await refresh()
+      await client.invalidateQueries({ queryKey: [BUDGETS_QUERY] })
     })
   }
 
@@ -90,18 +86,9 @@ function BudgetForm({ scope, scopeId, org }: BudgetFieldProps): JSX.Element {
       {budget?.state === 'held' && (
         <Banner severity="warning" testId="budget-held">Budget reached — new tasks wait.</Banner>
       )}
-      <Box
-        component="form"
-        noValidate
-        onSubmit={e => {
-          e.preventDefault()
-          void save()
-        }}
-        sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: 1 }}
-      >
-        <Box sx={{ flex: '1 1 12rem', minWidth: 0, maxWidth: 280 }}>
-          <FormTextField
-            label="Monthly budget"
+      <FormBox onSubmit={save} sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: 1 }}>
+        <Box sx={{ flex: `1 1 ${grid(32)}`, minWidth: 0, maxWidth: grid(46.5) }}>
+          <BudgetAmountField
             error={formError || undefined}
             hint={saved ? 'Saved.' : undefined}
             value={draft}
@@ -111,14 +98,10 @@ function BudgetForm({ scope, scopeId, org }: BudgetFieldProps): JSX.Element {
             }}
             disabled={busy}
             testId="budget-amount"
-            slotProps={{
-              input: { startAdornment: <InputAdornment position="start">$</InputAdornment> },
-              htmlInput: { inputMode: 'decimal', placeholder: '100.00' },
-            }}
           />
         </Box>
-        <Box sx={{ display: 'flex', gap: 1, mt: 0.25, flexShrink: 0 }}>
-          <SubmitButton variant="outlined" busy={busy} disabled={!changed || !valid} testId="budget-save">
+        <Box sx={{ display: 'flex', gap: 1, flexShrink: 0 }}>
+          <SubmitButton variant="outlined" busy={busy} disabled={!changed || micros === null} testId="budget-save">
             Save
           </SubmitButton>
           {budget && (
@@ -134,7 +117,7 @@ function BudgetForm({ scope, scopeId, org }: BudgetFieldProps): JSX.Element {
             </Button>
           )}
         </Box>
-      </Box>
+      </FormBox>
       <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 1 }}>
         <Typography
           variant="body2"

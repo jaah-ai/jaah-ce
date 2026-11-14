@@ -11,12 +11,12 @@ import Box from '@mui/material/Box'
 import Portal from '@mui/material/Portal'
 import { useEffect, useRef } from 'react'
 import type { JSX } from 'react'
+import { ELLIPSIS_SX } from './listStyles'
+import { FONT_SIZE, LINE_HEIGHT, RADIUS, grid } from '../theme'
+import Tip from './Tip'
 
 /** Down-right of the cursor, clear of its hotspot and of the row under it. */
 const OFFSET_PX = 14
-
-/** Wide enough for a realistic full name; a longer one ellipsises (the whole string rides `title`). */
-const MAX_WIDTH_PX = 360
 
 export default function DragChip({ label }: { label: string }): JSX.Element {
   const ref = useRef<HTMLDivElement | null>(null)
@@ -32,12 +32,11 @@ export default function DragChip({ label }: { label: string }): JSX.Element {
   }, [])
   return (
     <Portal>
-      <Box
+      <Tip title={label}><Box
         ref={ref}
         data-testid="drag-chip"
         role="status"
         aria-live="polite"
-        title={label}
         sx={{
           position: 'fixed',
           top: 0,
@@ -45,23 +44,22 @@ export default function DragChip({ label }: { label: string }): JSX.Element {
           zIndex: 'tooltip',
           visibility: 'hidden',
           pointerEvents: 'none',
-          maxWidth: MAX_WIDTH_PX,
+          // Wide enough for a realistic full name; a longer one ellipsises (the whole string rides `title`).
+          maxWidth: grid(60),
           px: 1,
-          py: 0.375,
-          borderRadius: 1,
+          py: 0,
+          borderRadius: RADIUS.sm,
           bgcolor: 'background.paper',
           border: 1,
           borderColor: 'divider',
           boxShadow: 3,
-          fontSize: '0.8125rem',
-          lineHeight: 1.3,
-          whiteSpace: 'nowrap',
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
+          fontSize: FONT_SIZE.md,
+          lineHeight: LINE_HEIGHT.snug,
+          ...ELLIPSIS_SX,
         }}
       >
         {label}
-      </Box>
+      </Box></Tip>
     </Portal>
   )
 }

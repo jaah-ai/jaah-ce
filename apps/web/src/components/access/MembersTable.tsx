@@ -3,13 +3,16 @@ import { Link as RouterLink } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Link from '@mui/material/Link'
 import FeedList from '../../ui/feed/FeedList'
-import type { FeedColumn, FeedRowSpec, OverflowItem } from '../../ui/feed/types'
-import { PageNav } from '../../ui/Pager'
+import type { FeedColumn, FeedRowSpec, FeedSlot, OverflowItem } from '../../ui/feed/types'
+import ListPager from '../../ui/ListPager'
 import { useClientPage } from '../../hooks/usePageClamp'
 import RelativeTime from '../../ui/RelativeTime'
-import { absoluteTime, relativeAge, shortDay } from '../../lib/relativeTime'
+import { absoluteTime, relativeAge, shortDate } from '../../lib/relativeTime'
 import { customerUrl } from '../../lib/customers'
+import { countOf } from '../../lib/humanize'
+import { ORG_SETTINGS_TAB_PARAM, ORG_SETTINGS_URL } from '../../lib/orgAdmin'
 import { toggled } from '../../lib/sets'
+import { flipSort } from '../../ui/SortableHead'
 import type { MemberRow, ScopeType } from './api'
 
 // The role-binding list: the console's one list (`ui/feed/FeedList`) at every width, one renderer for two modes.
@@ -20,6 +23,8 @@ export type AccessTableMode = 'members' | 'principal'
 
 export type AccessSubject = {
   kind: 'user' | 'group' | 'scope'
+  /** The user's or group's id (`members` mode). */
+  id?: string
   name: string
   href?: string
   /** A group's size; shown under its name. */
@@ -32,7 +37,7 @@ export type AccessTableRow = {
   bindingId: string
   subject: AccessSubject
   role: { slug: string; name: string }
-  /** `via`: the group's or scope's name, and `at` its kind, for the read-only row's "Remove at …" link (to `href`). */
+  /** `via`: the group's or scope's name, and `at` its kind, for the read-only row's "Open … to remove" link (to `href`). */
   source: { kind: 'direct' | 'inherited' | 'group'; text: string; href?: string; via?: string; at?: 'group' | 'org' | 'project' }
   expiresAt: string | null
   status: 'active' | 'expired'
@@ -47,10 +52,9 @@ export type AccessTableRow = {
 
 export const PAGE_SIZE = 100
 
-/* An org's Access: the operator's customer page directly. A tenant has no `/customers`, so its link keeps the
-   retired `/orgs/:id`, whose redirect (`pages/customers/LegacyRedirects.tsx`) lands it on its own org in Settings. */
+/* An org's Access: the operator's customer page. A tenant has no `/customers`: its own org in Settings, on Access. */
 function orgAccessHref(id: string, operator: boolean): string {
-  return operator ? customerUrl(id, { tab: 'access' }) : `/orgs/${id}?tab=access`
+  return operator ? customerUrl(id, { tab: 'access' }) : `${ORG_SETTINGS_URL}&${ORG_SETTINGS_TAB_PARAM}=access`
 }
 
 /** Where an inherited binding is editable: a uuid names an org, an integer a project. */
@@ -104,6 +108,7 @@ export function toMemberRows(rows: MemberRow[], operator = false): AccessTableRo
       bindingId: m.binding_id,
       subject: {
         kind: p.kind,
+        id: p.id,
         name: p.name,
         href: p.kind === 'group' ? `/groups/${p.id}` : `/users/${p.id}`,
         memberCount: p.kind === 'group' ? p.member_count : undefined,
@@ -216,6 +221,15 @@ function bestRank(r: AccessTableRow, roleRank: Record<string, number>): number |
   return ranks.length ? Math.max(...ranks) : undefined
 }
 
+/** The role a person holds here in effect: the highest-ranked of the row's active grants, folded ones included
+ *  (access is their union). The row's own role when the catalog ranks none, or none is active. */
+export function effectiveRole(r: AccessTableRow, roleRank: Record<string, number> = {}): AccessTableRow['role'] {
+  const live = [r, ...(r.also ?? [])].filter(g => g.status === 'active' && roleRank[g.role.slug] !== undefined)
+  return live.reduce<AccessTableRow['role'] | undefined>(
+    (best, g) => (best && roleRank[best.slug] >= roleRank[g.role.slug] ? best : g.role), undefined,
+  ) ?? r.role
+}
+
 const byName = (a: AccessTableRow, b: AccessTableRow) =>
   a.subject.name.localeCompare(b.subject.name, undefined, { sensitivity: 'base' })
 
@@ -256,18 +270,22 @@ export function sortRows(rows: AccessTableRow[], sort: Sort, roleRank: Record<st
     .flatMap(r => [withKids(r), ...(r.subject.kind === 'group' ? (members.get(r.bindingId) ?? []).sort(cmp) : [])])
 }
 
-const matches = (r: AccessTableRow, q: string) =>
-  [r.subject.name, r.role.name, r.source.text, ...(r.also ?? []).flatMap(a => [a.role.name, a.source.text])]
+/* The role matched is the one the row shows (`effectiveRole`), never a folded grant's: a filter for Org Admin
+ * must not keep a row that reads Org Owner. */
+const matches = (r: AccessTableRow, q: string, roleRank: Record<string, number>) =>
+  [r.subject.name, effectiveRole(r, roleRank).name, r.source.text, ...(r.also ?? []).map(a => a.source.text)]
     .some(s => s.toLowerCase().includes(q))
 
-/** Case-insensitive over name, role and source. A group survives when it or any member matches; a
+/** Case-insensitive over name, shown role and source. A group survives when it or any member matches; a
  *  member-only match keeps just the matching members and flags the group `forceOpen`. */
-export function filterRows(rows: AccessTableRow[], filter: string): (AccessTableRow & { forceOpen?: boolean })[] {
+export function filterRows(
+  rows: AccessTableRow[], filter: string, roleRank: Record<string, number> = {},
+): (AccessTableRow & { forceOpen?: boolean })[] {
   const q = filter.trim().toLowerCase()
   if (!q) return rows
   return rows.flatMap(r => {
-    if (matches(r, q)) return [r]
-    const kids = r.children.filter(c => matches(c, q))
+    if (matches(r, q, roleRank)) return [r]
+    const kids = r.children.filter(c => matches(c, q, roleRank))
     return kids.length ? [{ ...r, children: kids, forceOpen: true }] : []
   })
 }
@@ -278,20 +296,24 @@ export function filterRows(rows: AccessTableRow[], filter: string): (AccessTable
 export function removeAt(row: AccessTableRow, onRemove: boolean): { text: string; title: string; href?: string } | undefined {
   if (!onRemove || !(isSpreadMember(row) || row.source.kind === 'inherited')) return undefined
   const at = row.source.at ?? 'group'
-  return { text: `Remove at ${at}`, title: `Remove at ${row.source.via ?? `the ${at}`}`, href: row.source.href }
+  // It opens the place, never removes here: the label says so.
+  return { text: `Open ${at} to remove`, title: `Open ${row.source.via ?? `the ${at}`} to remove`, href: row.source.href }
 }
 
 /** One drawn row: a top-level binding, or (`child`) an expanded group's member. */
 type Line = { row: AccessTableRow; expanded: boolean; child: boolean; nested: boolean; spacer: boolean }
 
 /* The trailing cluster, priced at the slot face (11px): a role name ("Project Maintainer"), a source ("Via Ops ·
-   from Operator", ellipsised, whole on hover), a short date, a prose age. Gated in `SlotGate`'s drop order — the
+   from Operator", wrapped to two lines, whole on hover), a short date, a prose age. Gated in `SlotGate`'s drop order — the
    dates at `meta` (≤899px, as the old table's own query folded them), the source at `id`, the role off the phone,
    where the row's hover note says them all — and dropped sooner by the list's own width (`ui/feed/fit.ts`). */
 const EXPIRES_SLOT = 80
 const LAST_ACTIVE_SLOT = 88
 const SOURCE_SLOT = 160
 const ROLE_SLOT = 120
+
+/** What a who-only list (`whoOnly`) leaves out: every role means the same there, and nothing is granted with an expiry. */
+const WHO_ONLY_DROPS = new Set(['role', 'expires'])
 
 const SLOT_COLUMNS: FeedColumn[] = [
   { key: 'expires', label: 'Expires' },
@@ -307,22 +329,28 @@ function bindingFeedRow(
   { row, expanded, child, nested, spacer }: Line,
   toggle: (key: string) => void,
   onRemove?: (row: AccessTableRow) => void,
+  roleRank?: Record<string, number>,
+  rowAction?: (row: AccessTableRow) => OverflowItem | undefined,
+  whoOnly = false,
 ): FeedRowSpec {
   const expired = row.status === 'expired'
   const count = row.subject.kind === 'group' ? row.subject.memberCount : null
   const at = child ? undefined : removeAt(row, !!onRemove)
   const also = (row.also ?? []).map(a => `${a.role.name} (${a.source.text}${a.status === 'expired' ? ', expired' : ''})`)
   const meta = [
-    row.role.name,
+    whoOnly ? null : row.role.name,
     row.source.text,
-    ...also,
-    count != null ? (count === 1 ? '1 member' : `${count} members`) : null,
-    !expired && row.expiresAt ? `Expires ${shortDay(row.expiresAt)}` : null,
+    ...(whoOnly ? [] : also),
+    count != null ? countOf(count, 'member') : null,
+    !expired && row.expiresAt ? `Expires ${shortDate(row.expiresAt)}` : null,
     row.lastActiveAt ? `Active ${relativeAge(row.lastActiveAt)}` : null,
     at && !at.href ? at.title : null,
   ].filter(Boolean).join(' · ')
+  const role = effectiveRole(row, roleRank)
   const actions: OverflowItem[] = []
-  if (at?.href) actions.push({ key: 'remove-at', label: at.title, ariaLabel: at.title, testId: 'member-remove-at', to: at.href })
+  const extra = child ? undefined : rowAction?.(row)
+  if (extra) actions.push(extra)
+  if (at?.href) actions.push({ key: 'remove-at', label: at.text, ariaLabel: at.title, testId: 'member-remove-at', to: at.href })
   else if (row.source.href) {
     actions.push({ key: 'source', label: `Open ${row.source.text}`, ariaLabel: `Open ${row.source.text}`, to: row.source.href })
   }
@@ -350,26 +378,29 @@ function bindingFeedRow(
     title: row.subject.name,
     titleText: row.subject.name,
     titleLines: 2,
-    href: row.subject.href,
+    href: row.subject.href ?? null,
     muted: expired,
     notes: [{ key: 'meta', tone: 'muted', text: meta }],
-    slots: [
+    slots: ([
       {
         key: 'expires', width: EXPIRES_SLOT, gate: 'meta', align: 'right', dim: true, testId: 'member-expires',
         title: row.expiresAt ? absoluteTime(row.expiresAt) : undefined,
-        node: expired ? 'Expired' : row.expiresAt ? shortDay(row.expiresAt) : 'Never',
+        node: expired ? 'Expired' : row.expiresAt ? shortDate(row.expiresAt) : 'Never',
       },
       {
         key: 'lastActive', width: LAST_ACTIVE_SLOT, gate: 'meta', align: 'right', dim: true, testId: 'member-last-active',
         node: <RelativeTime iso={row.lastActiveAt} />,
       },
       {
-        key: 'source', width: SOURCE_SLOT, gate: 'id', align: 'left', testId: 'member-source',
+        /* Two lines, and in a who-only list the dropped Expires width too, so "Via <group> · from <scope>" reads
+           whole without a hover while the member's name keeps its room. */
+        key: 'source', width: whoOnly ? SOURCE_SLOT + EXPIRES_SLOT : SOURCE_SLOT, lines: 2,
+        gate: 'id', align: 'left', testId: 'member-source',
         title: [row.source.text, ...also].join(' · '),
         node: row.source.href ? <Link component={RouterLink} to={row.source.href}>{row.source.text}</Link> : row.source.text,
       },
-      { key: 'role', width: ROLE_SLOT, gate: 'phone', align: 'left', testId: 'member-role', title: row.role.name, node: row.role.name },
-    ],
+      { key: 'role', width: ROLE_SLOT, gate: 'phone', align: 'left', testId: 'member-role', title: role.name, node: role.name },
+    ] satisfies FeedSlot[]).filter(slot => !whoOnly || !WHO_ONLY_DROPS.has(slot.key)),
     actions: actions.length > 0 ? actions : undefined,
     data: { kind: row.subject.kind, source: row.source.kind, status: row.status },
   }
@@ -381,6 +412,8 @@ export function MembersTable({
   filter = '',
   roleRank,
   onRemove,
+  rowAction,
+  whoOnly = false,
 }: {
   rows: AccessTableRow[]
   mode?: AccessTableMode
@@ -388,12 +421,16 @@ export function MembersTable({
   /** role slug → rank, for the Role sort. Absent → by role name. */
   roleRank?: Record<string, number>
   onRemove?: (row: AccessTableRow) => void
+  /** One more ⋯ item for a top-level row (none for an expanded group's member), or undefined for none. */
+  rowAction?: (row: AccessTableRow) => OverflowItem | undefined
+  /** A scope where every role means the same (an account: may use it), granted with no expiry — no Role or Expires. */
+  whoOnly?: boolean
 }): JSX.Element {
   const [sort, setSort] = useState<Sort>({ key: 'name', dir: 'asc' })
   const [open, setOpen] = useState<Set<string>>(() => new Set())
 
   const shown = useMemo(
-    () => filterRows(sortRows(rows, sort, roleRank), filter),
+    () => filterRows(sortRows(rows, sort, roleRank), filter, roleRank),
     [rows, sort, roleRank, filter],
   )
   // Pages count drawn rows, an expanded group's members included: a large group opened (or forced
@@ -412,7 +449,7 @@ export function MembersTable({
       ]
     })
   }, [shown, open, sort.key])
-  const { current, setPage, totalPages, pageItems, label } = useClientPage(lines, PAGE_SIZE)
+  const { current, setPage, pageItems } = useClientPage(lines, PAGE_SIZE)
   useEffect(() => { setPage(1) }, [filter])
   // A "Via <group>" row that opens a page has no group row above it there: drawn flush, not as an orphan child.
   const pageLines = useMemo(() => {
@@ -423,8 +460,7 @@ export function MembersTable({
     })
   }, [pageItems])
 
-  const onSort = (key: string) =>
-    setSort(s => (s.key === key ? { key: s.key, dir: s.dir === 'asc' ? 'desc' : 'asc' } : { key: key as SortKey, dir: 'asc' }))
+  const onSort = (key: string) => setSort(s => flipSort(s, key as SortKey, 'asc'))
   const toggle = (key: string) => setOpen(prev => toggled(prev, key))
 
   return (
@@ -433,17 +469,15 @@ export function MembersTable({
         ariaLabel={mode === 'principal' ? 'Access' : 'Members'}
         testId="members-table"
         emptyMessage="No matches."
-        sections={pageLines.length ? [{ key: 'members', rows: pageLines.map(line => bindingFeedRow(line, toggle, onRemove)) }] : []}
-        columns={{ title: { key: 'name', label: mode === 'principal' ? 'Scope' : 'Member', sortKey: 'name' }, slots: SLOT_COLUMNS }}
+        sections={pageLines.length ? [{ key: 'members', rows: pageLines.map(line => bindingFeedRow(line, toggle, onRemove, roleRank, rowAction, whoOnly)) }] : []}
+        columns={{
+          title: { key: 'name', label: mode === 'principal' ? 'Scope' : 'Member', sortKey: 'name' },
+          slots: whoOnly ? SLOT_COLUMNS.filter(c => !WHO_ONLY_DROPS.has(c.key)) : SLOT_COLUMNS,
+        }}
         sort={sort}
         onSort={onSort}
       />
-      <PageNav
-        page={current}
-        totalPages={totalPages}
-        setPage={setPage}
-        label={label}
-      />
+      <ListPager page={current} per={PAGE_SIZE} total={lines.length} onPage={setPage} />
     </Box>
   )
 }

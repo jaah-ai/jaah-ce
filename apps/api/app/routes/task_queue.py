@@ -26,29 +26,31 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session, aliased
+from sqlalchemy import and_, func, select
+from sqlalchemy.orm import Session
 
 from app import pool_state, slot_state
-from app.auth import require_user
+from app.auth import adopt_user
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller
 from app.authz.visibility import scoped_task_select
-from app.db import get_session
-from app.models.identity import AdminUser
+from app.db_async import on_session
+from app.entity_shape import from_row, names_of
 from app.models.nodes import Node
 from app.models.projects import Project
 from app.models.tasks import Task
 from app.models.worktrees import Worktree
 from app.routes import fleet as fleet_routes
 # The dispatcher's own read surface, gate predicates and order key — imported, never restated.
-from app.routes.tasks.policy import PERSONA_EPIC, TRANSITION_HOLD
+from app.routes.tasks.policy import PERSONA_EPIC
 from app.routes.tasks.dispatch import (
     _has_unmet_prerequisite,
     _parent_epic_has_unmet_prerequisite,
     _parent_epic_paused,
+    _parent_epic_throttled,
     _vanish_backoff_holds,
     dispatchable_tasks,
+    parent_epic_holds,
 )
 from app.task_lifecycle import _RUNNER_RUNNING_STATES
 from app.task_lookup import get_task_or_404
@@ -58,10 +60,12 @@ from app.task_priority import priority_label, sorts_ahead
 router = APIRouter(tags=["task-queue"])
 
 #: The ways a `ready` row can be held off the dispatcher, from the predicates `dispatchable_tasks`
-#: excludes on. A paused epic beats even a manual Run; the others sit inside the Run bypass.
+#: excludes on. A manual Run lifts only `HOLD_EPIC_HOLD`.
 HOLD_EPIC_PAUSED = "epic_paused"
 HOLD_PREREQUISITES = "prerequisites"
 HOLD_EPIC_HOLD = "epic_hold"
+#: Its epic already runs as many subtasks as its throttle allows (`routes/tasks/dispatch.py::_parent_epic_throttled`).
+HOLD_EPIC_THROTTLED = "epic_throttled"
 #: Its runner was lost recently, so its re-dispatch backs off (`routes/tasks/dispatch.py::vanish_backoff_secs`).
 HOLD_RUNNER_LOST = "runner_lost"
 #: Its own worktree is on a node that is not live (`pool_state.held_on_dead_nodes`). `dispatchable_tasks`
@@ -73,6 +77,7 @@ HOLD_NODE_OFFLINE = "node_offline"
 _HOLD_SENTENCES = {
     HOLD_PREREQUISITES: "Waiting on prerequisites",
     HOLD_EPIC_HOLD: "Epic is on hold",
+    HOLD_EPIC_THROTTLED: "Epic is at its throttle",
     HOLD_RUNNER_LOST: "Runner lost; retrying after a backoff",
     HOLD_EPIC_PAUSED: "Epic is stopped",
     HOLD_NODE_OFFLINE: "Its worktree's node is offline",
@@ -102,7 +107,8 @@ class DispatchForecastOut(BaseModel):
     #: `ahead + 1`: where this task would stand if marked ready now. None for a row that cannot queue.
     queue_position: Optional[int] = None
     #: Free runner places across the project's live nodes (0 for a node with no free worktree, unless
-    #: the task's own held slot sits there).
+    #: the task's own held slot sits there). No count caps dynamic worktrees, so an assigned node adds
+    #: `slot_allocation.UNBOUNDED_ROOM`: a large number means "not worktree-bound", never a real count.
     headroom: int
     #: True iff Stopping one of `running` could plausibly let this task dispatch (not self-held,
     #: dispatch on, a leasable live node, and a runner there to stop).
@@ -119,25 +125,18 @@ def _hold_reasons(session: Session, task_ids: list[int]) -> dict[int, Optional[s
     """Why each of `task_ids` is held, from the same predicates `dispatchable_tasks` excludes on, in one
     statement.
 
-    Arm order is gate order: a paused epic first (outside the Run bypass), then a Run request clears
-    the rest, then the two dependency gates (one label, one remedy), then the epic's `hold` mode, then the
-    lost-runner backoff."""
+    Arm order is gate order: a paused epic first, then the two dependency gates (one label, one remedy), then the
+    epic's `hold` mode (released by a Run), then its throttle, then the lost-runner backoff."""
     if not task_ids:
         return {}
-    parent = aliased(Task)
-    parent_epic_holds = (
-        select(parent.id)
-        .where(parent.id == Task.parent_task_id, parent.transition_mode == TRANSITION_HOLD)
-        .exists()
-    )
     rows = session.execute(
         select(
             Task.id,
-            Task.run_requested_at.is_not(None).label("run_requested"),
             _parent_epic_paused().label("epic_paused"),
             _has_unmet_prerequisite().label("own_prerequisite"),
             _parent_epic_has_unmet_prerequisite().label("epic_prerequisite"),
-            parent_epic_holds.label("epic_hold"),
+            and_(parent_epic_holds(), Task.run_requested_at.is_(None)).label("epic_hold"),
+            _parent_epic_throttled().label("epic_throttled"),
             _vanish_backoff_holds().label("runner_lost"),
         ).where(Task.id.in_(task_ids))
     ).all()
@@ -145,12 +144,12 @@ def _hold_reasons(session: Session, task_ids: list[int]) -> dict[int, Optional[s
     for row in rows:
         if row.epic_paused:
             out[row.id] = HOLD_EPIC_PAUSED
-        elif row.run_requested:
-            out[row.id] = None
         elif row.own_prerequisite or row.epic_prerequisite:
             out[row.id] = HOLD_PREREQUISITES
         elif row.epic_hold:
             out[row.id] = HOLD_EPIC_HOLD
+        elif row.epic_throttled:
+            out[row.id] = HOLD_EPIC_THROTTLED
         elif row.runner_lost:
             out[row.id] = HOLD_RUNNER_LOST
         else:
@@ -198,19 +197,13 @@ def _preempt_candidates(
     ).all()
     if not rows:
         return []
-    project_names = dict(
-        session.execute(
-            select(Project.id, Project.name).where(Project.id.in_({t.project_id for t in rows}))
-        ).all()
-    )
+    project_names = names_of(session, Project, (t.project_id for t in rows))
     return [
-        PreemptCandidateOut(
-            id=t.id,
-            title=t.title,
+        from_row(
+            PreemptCandidateOut, t,
             project_name=project_names.get(t.project_id, ""),
             priority=t.priority if t.priority is not None else 0,
             priority_label=priority_label(t.priority),
-            state=t.state,
             dispatched_at=dispatched_at.get(t.id),
         )
         for t in rows
@@ -235,11 +228,11 @@ def _queued_ahead(session: Session, task: Task) -> int:
 
 @router.get("/api/tasks/{task_id}/dispatch-forecast", response_model=DispatchForecastOut)
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
+@on_session
 def dispatch_forecast(
+    session: Session,
     task_id: int,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> DispatchForecastOut:
     """Would this task run now if it were marked ready — and if not, what stands in the way.
 
@@ -248,6 +241,7 @@ def dispatch_forecast(
 
     The target's own hold (from `_hold_reasons`) is answered first: no headroom or Stop moves it, so it
     gets one reason naming the gate, no position, no candidates."""
+    _user = adopt_user(session, caller.actor)
     task = get_task_or_404(task_id, session)
     if task.persona == PERSONA_EPIC or task.state in _RUNNER_RUNNING_STATES:
         return DispatchForecastOut(
@@ -269,8 +263,8 @@ def dispatch_forecast(
     ahead = _queued_ahead(session, task)
 
     live_nodes = pool_state.live_nodes_for_project(session, project.id)
-    running = _preempt_candidates(session, principal, live_nodes)
-    # Free static slots plus the dynamic worktrees each node could still make, as the allocator reads them.
+    running = _preempt_candidates(session, caller.principal, live_nodes)
+    # Free worktrees plus the dynamic worktrees each node could still make, as the allocator reads them.
     free_by_node = fleet_routes._room_by_node(session, project.id, live_nodes)
     # A task already holding a slot (Stopped mid-run) resumes into it, so that node counts as leasable.
     own_hold = slot_state.task_hold(session, task.id)

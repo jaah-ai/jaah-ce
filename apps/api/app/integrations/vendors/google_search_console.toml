@@ -1,0 +1,62 @@
+# Google Search Console through the Search Console API (webmasters v3). OAuth only: there is no API key for
+# site data. Confirmed 2026-11-03 at the vendor_docs_url page (sites.list, scopes).
+slug = "google_search_console"
+label = "Google Search Console"
+category = "marketing"
+vendor_docs_url = "https://developers.google.com/webmaster-tools/v1/sites/list"
+summary = "Read search performance, indexing status and sitemaps for your Search Console sites."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+authorize_extra = { access_type = "offline", prompt = "consent" }
+scopes = [
+  { name = "https://www.googleapis.com/auth/webmasters.readonly", label = "Read your sites' search queries, clicks, impressions, index coverage and sitemaps. Read only: agents cannot submit sitemaps or remove URLs" },
+]
+jaah_app = true
+[auth.oauth.registration]
+console_url = "https://console.cloud.google.com/auth/clients"
+steps = [
+  "In the Google Cloud console project picker, select or create the project named jaah-integrations. Every Jaah Google integration can share this project and its one OAuth client",
+  "Open APIs & Services > Library, search for Google Search Console API and select Enable",
+  "Open Google Auth Platform > Branding. Set App name to Jaah, the user support email to the shared support mailbox, Application home page to the public homepage of the company that runs this Jaah (its https address), Privacy policy and Terms of service to that company's privacy policy and terms pages, and add its domain under Authorized domains. Select Save",
+  "Open Google Auth Platform > Audience. Choose External, then select Publish app so the app is In production rather than Testing (Testing refresh tokens expire after 7 days)",
+  "Open Google Auth Platform > Data access, select Add or remove scopes, tick .../auth/webmasters.readonly and select Update, then Save",
+  "Open Google Auth Platform > Clients, select Create client, choose Application type Web application and name it Jaah. This client is the OAuth app: the redirect URIs (a later step) go under its Authorized redirect URIs, then select Create",
+]
+review = "Google verification: webmasters.readonly is listed under Data access; if Google marks it sensitive, submit the app in Google Auth Platform > Verification Center. Until verified, members see an unverified-app warning and the app is capped at 100 users"
+
+[test]
+method = "GET"
+path = "https://www.googleapis.com/webmasters/v3/sites"
+identity = [["siteEntry", 0, "siteUrl"]]
+identity_phrase = "with site"
+
+[docs]
+revoke_at = "your Google Account > Security > Your connections to third-party apps & services (myaccount.google.com/connections)"
+agent_uses = [
+  "List the sites (URL-prefix and Domain properties) the connected account can see, and its permission on each",
+  "Query search analytics: queries, pages, countries and devices with clicks, impressions, CTR and average position",
+  "Inspect a URL to see whether Google has indexed it, its canonical and its last crawl",
+  "List submitted sitemaps and their errors after a release changes the site's structure",
+]
+prerequisites = [
+  "A Google account that is a user (Full or Restricted) or owner of each Search Console property agents should read (Search Console > Settings > Users and permissions)",
+  "The site verified in Search Console. An unverified property returns no data",
+]
+limitations = [
+  "Read only: agents cannot submit sitemaps, request indexing or remove URLs, because the connection asks for the read-only scope",
+  "Search performance data covers the last 16 months and usually lags two to three days",
+  "URL Inspection is limited by Google to about 2,000 calls per day per property",
+]
+troubleshooting = [
+  { symptom = "Test says Google Search Console rejected the access token (401)", fix = "The grant was revoked or the Google password changed. Select Reconnect and approve again" },
+  { symptom = "Test says Connected to Google Search Console - credentials accepted, with no site named", fix = "The connected account is not a user of any property. In Search Console open Settings > Users and permissions on the property, select Add user, and add that account" },
+  { symptom = "An agent's query for https://example.com returns 403 for a Domain property", fix = "A Domain property is addressed as sc-domain:example.com, not as a URL. Tell the agent to use the siteUrl exactly as the Test or the site list shows it" },
+]
+faq = [
+  { q = "Does this connect Google Analytics too", a = "No. Google Analytics is a separate integration with its own scope" },
+  { q = "Can an agent fix indexing problems", a = "It can find them and tell you which pages and why, but the read-only scope stops it from requesting indexing; you do that in Search Console" },
+]

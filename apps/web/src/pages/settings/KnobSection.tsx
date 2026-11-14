@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Link as RouterLink } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Link from '@mui/material/Link'
@@ -6,26 +6,27 @@ import Typography from '@mui/material/Typography'
 import Button from '@mui/material/Button'
 import TextField from '@mui/material/TextField'
 import InputAdornment from '@mui/material/InputAdornment'
-import Alert from '@mui/material/Alert'
-import Stack from '@mui/material/Stack'
-import { alpha, useTheme } from '@mui/material/styles'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useTheme } from '@mui/material/styles'
+import { useQuery, useQueryClient, type QueryKey } from '@tanstack/react-query'
 import { ApiError, apiDetail, get, put } from '../../api'
 import { useAuth } from '../../auth'
 import { useApiRead } from '../../hooks/useApiRead'
 import { useSubmit } from '../../hooks/useSubmit'
-import { useConfirm } from '../../components/ConfirmDialog'
+import { danger, useConfirm } from '../../components/ConfirmDialog'
 import { useLeaveGuard } from '../../hooks/useLeaveGuard'
 import Banner from '../../ui/Banner'
-import UnsavedChangesDialog from '../../ui/UnsavedChangesDialog'
+import { LeaveGuardDialog } from '../../ui/UnsavedChangesDialog'
 import CredentialSelect, { type CredentialOption } from '../../ui/CredentialSelect'
 import { credentialMark } from '../../ui/credentialMarks'
-import HelpLabel from '../../ui/HelpLabel'
+import CancelSaveBar from '../../ui/CancelSaveBar'
+import HelpLabel, { ExplainMoreButton } from '../../ui/HelpLabel'
 import SectionCard from '../../ui/SectionCard'
+import SelectField from '../../ui/SelectField'
 import SettingCheckbox from '../../ui/SettingCheckbox'
-import { PHONE_QUERY } from '../../ui/listStyles'
+import { KNOB_SECTION_CONTAINER, PHONE_QUERY, KNOB_ROWS_MID, KNOB_ROWS_MID_CHOICE, KNOB_ROWS_WIDE } from '../../ui/listStyles'
 import { VISUALLY_HIDDEN } from '../../ui/visuallyHidden'
 import { getCredential, loadCredentialOptions, type Credential } from '../credentials/api'
+import { choiceLabel, knobChoices, knobExplain } from './knobHelp'
 import { knobNumber } from './knobNumber'
 import {
   CLOUD_CONNECTIONS_PATH,
@@ -34,37 +35,18 @@ import {
   listCloudConnectionOptions,
 } from './cloudConnections/api'
 import { RETENTION_QUERY_ROOT } from './retention/api'
+import { listVnodeHosts, VNODE_HOSTS_KEY } from '../nodes/vnodeHosts/api'
 import type { CloudConnectionOption, OperatorSetting, SettingsPayload, VnodeHost } from '../../types'
-import { humanize } from '../../lib/humanize'
-import { UNFILTERED_READ } from '../../lib/orgScope'
+import { oneOrgRead, UNFILTERED_READ } from '../../lib/orgScope'
 import { isEnabled } from '../../lib/editionFeatures'
-
-/* Support › Jarvis tools as a read/write grid (`./jarvisTools/`): the Help assistant's knobs, so loaded only with it
- * (`support_assistant`) — the community edition's tree leaves the directory out, and `import.meta.glob` yields `{}`
- * for an absent file. Without it no section is a grid. */
-type JarvisGrid = { readonly rows: unknown[] }
-type JarvisGridView = ComponentType<{
-  grid: JarvisGrid
-  value: (s: OperatorSetting) => boolean
-  onChange: (values: Record<string, boolean>) => void
-  editable: boolean
-  marked?: (s: OperatorSetting) => boolean
-  lit?: string | null
-  idPrefix: string
-}>
-const jarvisOn = isEnabled('support_assistant')
-const PermissionGrid: JarvisGridView | undefined = Object.values(jarvisOn
-  ? import.meta.glob<JarvisGridView>('./jarvisTools/PermissionGrid.tsx', { eager: true, import: 'default' })
-  : {})[0]
-const permissionGrid: (entries: OperatorSetting[]) => JarvisGrid | null = Object.values(jarvisOn
-  ? import.meta.glob<(entries: OperatorSetting[]) => JarvisGrid | null>(
-    './jarvisTools/permissionGrid.ts', { eager: true, import: 'permissionGrid' })
-  : {})[0] ?? ((): null => null)
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, SIZE, grid, tint } from '../../theme'
 
 /* KNOB SECTIONS — the ONE home for rendering and saving operator knobs (`GET`/`PUT /api/settings`), shared
  * by Settings (`pages/Settings.tsx`: categories, search, panels) and Products (`pages/Products.tsx`: the
- * knobs that define what is sold). A page holds ONE editor (`useKnobEditor`: the payload, the pending edits,
- * the save) and renders any slice of its knobs as cards (`KnobSection`) under one Save bar (`KnobSaveBar`).
+ * knobs that define what is sold) — and, over one org's own source (`KnobSource`), the customer page's
+ * Settings tab (`pages/customers/CustomerPage.tsx`: the org's overrides). A page holds ONE editor
+ * (`useKnobEditor`: the payload, the pending edits, the save) and renders any slice of its knobs as cards
+ * (`KnobSection`) under one Save bar (`KnobSaveBar`).
  * The server is unchanged by where a knob renders: key, validation, tier and the operator-only write are
  * `app/operator_settings/`'s and `app/routes/settings.py`'s.
  * GEOMETRY: a row is ONE line, LEFT-PACKED — label column, then the control right beside it,
@@ -101,11 +83,6 @@ function loadingName(id: string): CredentialOption {
     loadingNames.set(id, option)
   }
   return option
-}
-
-function choiceLabel(s: OperatorSetting, token: string): string {
-  const i = s.choices?.indexOf(token) ?? -1
-  return (i >= 0 ? s.choice_labels?.[i] : undefined) ?? humanize(token)
 }
 
 // The warning a choice carries while it is the value shown ('' or none: nothing to say).
@@ -214,18 +191,14 @@ function controlMin(s: OperatorSetting, value: string | boolean): string | undef
   if (s.kind === 'str' || s.kind === 'bool' || !s.unit) return undefined
   const digits = Math.max(...[value, s.value, s.fallback, s.maximum].map(v => (v === null || v === undefined ? 0 : String(v).length)))
   const chars = digits + s.unit.length
-  return `min(16rem, calc(${chars}ch + 2.75rem))`
+  return `min(${grid(42.5)}, calc(${chars}ch + ${grid(7)}))`
 }
 
+/* The phone touch floor at a pointer's 32px. AC11's focus ring is NOT here: `theme.ts`'s `FOCUS_RING` draws it on
+ * every `MuiButtonBase`, so a local copy would only shadow it. */
 export const touchTargetSx = {
-  minHeight: { xs: '44px', sm: 32 },
-  minWidth: { xs: '44px', sm: 'auto' },
-  // MUI's default Button focus is too faint for AC11; an explicit ring.
-  '&:focus-visible': {
-    outline: '2px solid',
-    outlineColor: 'primary.main',
-    outlineOffset: '2px',
-  },
+  minHeight: { xs: SIZE.tapTarget, sm: SIZE.thumb },
+  minWidth: { xs: SIZE.tapTarget, sm: 'auto' },
 }
 
 /* THE ONE CONTROL WIDTH. Every editable control — text, number, select, credential picker — fills its
@@ -243,7 +216,7 @@ const CONTROL_WIDTH = '100%'
  * value beside its unit ("30 minutes") — at 9rem against 8rem the control took width its value never used while
  * "Manifest transcript wait" wrapped. Wider cards grow both tracks to their maxima. The provenance's minimum fits
  * "Default · 3 attempts" and every shorter fallback on one line at the cell's 0.75rem (at 7rem and
- * body2's 14px most rows wrapped it in two). `ROW_MIN_HEIGHT` is the checkbox's own tap floor
+ * body2's 14px most rows wrapped it in two). The row minimum is the checkbox's own tap floor
  * (`theme.custom.tapTargetPx`), so a bool row and a text-field row come out the same height and the card
  * reads as an even list. A card too narrow for the three (a tablet window beside the expanded sidebar) keeps the label
  * and control side by side, the provenance under the LABEL in the room the taller control leaves there, so an
@@ -252,30 +225,23 @@ const CONTROL_WIDTH = '100%'
  * grid (`READ_ONLY_CARD_GRID`) and each row a subgrid of it, so the value track is the card's widest value
  * (capped at the control track's maximum, past which a value wraps) and the provenance sits right beside it —
  * the fixed control track left "Default" a third of the card away from a two-word value. */
-const LABEL_TRACK = 'minmax(12.5rem, 14rem)'
+const LABEL_TRACK = `minmax(${grid(33)}, ${grid(37)})`
 /* The two-column label: two columns are chosen down to a ~290px card, where 12.5rem would leave the control no
  * room, so the label's minimum is 12.5rem or all but the control's 8rem and the 1rem gap, whichever is less. */
-const MID_LABEL_TRACK = 'minmax(min(12.5rem, 100% - var(--knob-control-min, 8rem) - 1rem), 14rem)'
+const MID_LABEL_TRACK = `minmax(min(${grid(33)}, 100% - var(--knob-control-min, ${grid(21)}) - ${grid(2.5)}), ${grid(37)})`
 /* `--knob-control-min` is a row's own floor when its value needs more than 8rem (`controlMin`). */
-const CONTROL_TRACK = 'minmax(max(8rem, var(--knob-control-min, 8rem)), 16rem)'
-const ROW_MIN_HEIGHT = 44
+const CONTROL_TRACK = `minmax(max(${grid(21)}, var(--knob-control-min, ${grid(21)})), ${grid(42.5)})`
 /* The three columns follow the CARD's width, not the window's: beside the expanded sidebar a
  * 600–760px window leaves a ~230–390px card, and the window-gated grid clipped the unit and the provenance
- * off its right edge. `ROWS_WIDE` is the tracks' minimums (29rem) plus two 1rem gaps and the card's 20px of
+ * off its right edge. `KNOB_ROWS_WIDE` is the tracks' minimums (29rem) plus two 1rem gaps and the card's 20px of
  * border and padding (516px) plus 20px, so three columns rarely sit at their floors: 536px. Beside the
- * expanded sidebar the card measures ~440px at the 1024px floor and keeps two columns. `ROWS_MID` is the
+ * expanded sidebar the card measures ~440px at the 1024px floor and keeps two columns. `KNOB_ROWS_MID` is the
  * two-column minimums plus one gap and the padding; below it the row stacks as on a phone. The section root is
- * the query container; a control's touch sizing stays window-gated. */
-const KNOB_SECTION_CONTAINER = 'knob-section'
-const ROWS_MID = `@container ${KNOB_SECTION_CONTAINER} (min-width:292px)`
-const ROWS_WIDE = `@container ${KNOB_SECTION_CONTAINER} (min-width:536px)`
-/* A select row keeps the phone shape on a phone-width card (control the row's full width) and goes two-column only
- * where its control gets ~10rem beside the label's 12.5rem: the 8rem floor clipped a choice's words. */
-const ROWS_MID_CHOICE = `@container ${KNOB_SECTION_CONTAINER} (min-width:400px)`
+ * the query container; a control's touch sizing stays window-gated. The queries live in `ui/listStyles.ts`. */
 const MID_ROW_GRID = `${MID_LABEL_TRACK} ${CONTROL_TRACK}`
-const ROW_GRID = `${LABEL_TRACK} ${CONTROL_TRACK} minmax(8.5rem, 1fr)`
+const ROW_GRID = `${LABEL_TRACK} ${CONTROL_TRACK} minmax(${grid(22.5)}, 1fr)`
 const READ_ONLY_CARD_GRID = {
-  [ROWS_WIDE]: { display: 'grid', gridTemplateColumns: `${LABEL_TRACK} fit-content(16rem) minmax(7rem, 1fr)` },
+  [KNOB_ROWS_WIDE]: { display: 'grid', gridTemplateColumns: `${LABEL_TRACK} fit-content(${grid(42.5)}) minmax(${grid(18.5)}, 1fr)` },
 }
 const READ_ONLY_ROW_GRID = 'subgrid'
 
@@ -285,23 +251,76 @@ export const controlSx = {
    * one-line row that margin is what made a field row taller than a checkbox row. The ROW spaces itself
    * (and the search box, which shares this sx, is spaced by the page's own gap). */
   my: 0,
-  '& .MuiInputBase-root': { minHeight: { xs: '44px', sm: 'auto' } },
+  '& .MuiInputBase-root': { minHeight: { xs: SIZE.tapTarget, sm: 'auto' } },
   /* The tap target is the inner input (MUI's `1.4375em` content box), so the floor is PADDING, not
-   * `minHeight` (a border-box height truncates the value). FilterRow's recipe. */
-  '& .MuiInputBase-input': { pt: { xs: '10.5px', sm: '8.5px' }, pb: { xs: '10.5px', sm: '8.5px' } },
+   * `minHeight` (a border-box height truncates the value). FilterRow's recipe: 23px + 2 × 10.5px = 44px on a phone. */
+  '& .MuiInputBase-input': { py: { xs: `calc(${grid(3.5)} / 2)`, sm: 1 } },
 }
 
-/** Shared with panels that write a knob outside the editor (`components/PortGridSection`'s block fix). */
+/* A knob's `<select>`: `ui/SelectField`, the console's one dropdown; the `id` lands on the
+ * `<select>` itself, pairing with the row's `htmlFor`. `children` are its `<option>`s. */
+function KnobSelect({ id, value, describedBy, onChange, children }: {
+  id: string
+  value: string
+  describedBy: string
+  onChange: (value: string) => void
+  children: ReactNode
+}) {
+  return (
+    <SelectField
+      id={id}
+      value={value}
+      onChange={onChange}
+      slotProps={{ htmlInput: { 'aria-describedby': describedBy } }}
+      sx={controlSx}
+    >
+      {children}
+    </SelectField>
+  )
+}
+
+/** Shared with every reader of the `GET /api/settings` payload outside the editor. */
 export const SETTINGS_QUERY_KEY = ['settings']
 
 /** May this viewer write knob `s`? The served verdicts (see `useKnobEditor`'s WHO MAY SAVE); false before
  *  the payload lands. */
-export function knobWritable(payload: SettingsPayload | undefined, s: OperatorSetting | undefined): boolean {
+export function knobWritable(payload: KnobPayload | undefined, s: OperatorSetting | undefined): boolean {
   if (!payload || !s) return false
   return payload.editable === true || (payload.org_editable === true && s.tenant_editable === true)
 }
 
-const fetchSettings = () => get<SettingsPayload>('/api/settings')
+/** The ONE `GET /api/settings` reader, under `SETTINGS_QUERY_KEY`: every other reader of the payload (`AccountEditPage`'s
+ *  runner limit) shares it, so a save here refreshes them. */
+export const fetchSettings = () => get<SettingsPayload>('/api/settings')
+
+/** What the editor reads and writes: the knobs and the server's write verdicts (`app_title` is the login page's). */
+export type KnobPayload = Omit<SettingsPayload, 'app_title'>
+/** One save's body: `null` clears a knob's override; the rest as the server stores them. */
+export type KnobWrite = { values: Record<string, OperatorSetting['value'] | null>; take_telegram_webhook?: boolean }
+
+/** Where an editor's knobs live: the operator's own (`SETTINGS_SOURCE`) or one org's overrides
+ *  (`pages/orgs/api.ts::orgKnobSource`). Either write answers the read model, cached under `queryKey`. */
+export type KnobSource = {
+  queryKey: QueryKey
+  read: () => Promise<KnobPayload>
+  write: (body: KnobWrite) => Promise<KnobPayload>
+  /** Read a stored override holding the value it would fall back to as the default, with no Reset (true unless
+   *  said otherwise). On the operator's own settings a Reset would change nothing; an org's override is a real pin
+   *  on the org's endpoint (a later change to the global leaves it behind), so there it keeps its Reset. */
+  hideOverrideAtFallback?: boolean
+  /** What a landed save says after "Saved.", when the viewer may save: where the write took effect. */
+  savedNote?: string
+  /** The org whose credentials a credential knob may name: the one the write checks pointers against
+   *  (`operator_settings/writes.py::_validated_credential`). Absent: the viewer's own org (`PUT /api/settings`). */
+  credentialOrgId?: string
+}
+
+export const SETTINGS_SOURCE: KnobSource = {
+  queryKey: SETTINGS_QUERY_KEY,
+  read: fetchSettings,
+  write: body => put<SettingsPayload>('/api/settings', body),
+  savedNote: 'Live across the fleet within seconds.',
+}
 
 /** The one knob a refused save is about, of the keys it `sent`, or null when it names none or several: the
  *  server's own `detail.key` (the Telegram bot), else — for a 409/422 only, never a network failure or a 5xx — the
@@ -326,17 +345,35 @@ function editSaved(s: OperatorSetting, e: Edit): boolean {
   return s.kind === 'bool' ? Boolean(e.value) === Boolean(s.value) : String(e.value) === String(s.value ?? '')
 }
 
+/** A credential knob picker narrowed to what Save accepts (`operator_settings/writes.py::_validated_credential`):
+ *  rows of `orgId`, the org the write checks the pointer against, whatever the operator's global org filter says
+ *  (under "All orgs" the roster would carry every tenant's rows, members' personal connections included); never a
+ *  NodeVault row, since the control plane opens a knob's credential itself. `oneOrgRead` is ignored server-side for
+ *  a non-operator, whose reads are already their own org's. */
+export function knobCredentialScope(orgId: string | undefined): { headers?: HeadersInit; keep: (rows: Credential[]) => Credential[] } {
+  return {
+    headers: orgId ? oneOrgRead(orgId).headers : undefined,
+    keep: rows => rows.filter(row => row.nodevault !== true),
+  }
+}
+
 /* ── THE EDITOR ────────────────────────────────────────────────────────────────────────────────────── */
 export type KnobEditor = ReturnType<typeof useKnobEditor>
 
-/** One page's knob payload, pending edits and save. `enabled: false` skips the read (a viewer the GET would
- *  refuse: `GET /api/settings` asks `system:view`). */
-export function useKnobEditor({ enabled = true }: { enabled?: boolean } = {}) {
+/** One page's knob payload, pending edits and save, over `source` (the operator's own settings unless told
+ *  otherwise). `enabled: false` skips the read (a viewer the GET would refuse: `GET /api/settings` asks
+ *  `system:view`). `leaveKeys`: the query params whose change unmounts this editor (a tab strip's `?tab=`), so
+ *  the leave guard asks before one of them changes with edits pending. */
+export function useKnobEditor({ enabled = true, source = SETTINGS_SOURCE, leaveKeys }: {
+  enabled?: boolean
+  source?: KnobSource
+  leaveKeys?: readonly string[]
+} = {}) {
   const queryClient = useQueryClient()
   const settingsQuery = useQuery({
-    queryKey: SETTINGS_QUERY_KEY,
+    queryKey: source.queryKey,
     refetchOnWindowFocus: false,
-    queryFn: fetchSettings,
+    queryFn: source.read,
     enabled,
   })
   const settings = settingsQuery.data?.settings ?? null
@@ -353,6 +390,9 @@ export function useKnobEditor({ enabled = true }: { enabled?: boolean } = {}) {
   const [refusedBot, setRefusedBot] = useState('')
   /** The keys the last REFUSED save carried: a refusal names at most one knob, so the rest are marked on their rows. */
   const [failedKeys, setFailedKeys] = useState<string[]>([])
+  /** The last refused save was a 422 validation refusal (`OperatorSettingsError`): the writer is all or nothing, so
+   *  nothing landed. Not a Telegram token refusal, which follows a write of everything else. */
+  const [wholeRefused, setWholeRefused] = useState(false)
   /** The one knob the last refused save was about (`refusedKnob`), and how many refusals so far: a page re-finds the
    *  row on each one, the same knob refused twice included. */
   const [refused, setRefused] = useState<{ key: string | null; seq: number }>({ key: null, seq: 0 })
@@ -416,12 +456,8 @@ export function useKnobEditor({ enabled = true }: { enabled?: boolean } = {}) {
    * OPERATOR host. A failure is silent: the select keeps its current value and "Not set". */
   // Each list exists only with its feature (`lib/editionFeatures.ts`): no host, no cloud connection in the community edition.
   const wantsHosts = isEnabled('multi_node_hosts') && editable && isOperator && visibleKnobs.some(s => s.vnode_host)
-  const hosts = useApiRead(
-    ['knob-vnode-hosts'],
-    () => get<VnodeHost[]>('/api/vnode-hosts').then(rows => rows.filter(h => h.org_only !== true)),
-    '',
-    { enabled: wantsHosts },
-  ).data ?? NO_HOSTS
+  const hostRows = useQuery({ queryKey: VNODE_HOSTS_KEY, queryFn: listVnodeHosts, enabled: wantsHosts }).data
+  const hosts = useMemo(() => hostRows?.filter(h => h.org_only !== true) ?? NO_HOSTS, [hostRows])
 
   /* The connection list, once, on the same terms as the hosts: `GET /api/cloud-connections/options` serves
    * the caller's reach — EVERY org's for an operator — and the knob names an OPERATOR-OWN connection
@@ -430,6 +466,8 @@ export function useKnobEditor({ enabled = true }: { enabled?: boolean } = {}) {
    * is for one the settled list lacks. */
   const wantsConnections = isEnabled('cloud_nodes') && editable && isOperator && visibleKnobs.some(s => s.cloud_connection)
   const ownOrgId = admin?.org?.id
+  // The org the save checks a credential pointer against: the source's, else the viewer's own.
+  const credentialScope = useMemo(() => knobCredentialScope(source.credentialOrgId ?? ownOrgId), [source.credentialOrgId, ownOrgId])
   const connectionsResource = useApiRead(
     ['knob-cloud-connections', ownOrgId],
     () => listCloudConnectionOptions().then(options => options.connections.filter(c => c.org_id === ownOrgId)),
@@ -480,22 +518,6 @@ export function useKnobEditor({ enabled = true }: { enabled?: boolean } = {}) {
     setEdits(prev => ({ ...prev, [key]: next }))
   }
 
-  /* A grid click sets one or two switches (Write implies Read, `settings/jarvisTools`). A switch put back to
-   * its stored value is no longer pending, so the coupling never leaves a phantom edit behind. */
-  function editSwitches(values: Record<string, boolean>) {
-    clearSaved()
-    unmark(Object.keys(values))
-    setEdits(prev => {
-      const next = { ...prev }
-      for (const [key, value] of Object.entries(values)) {
-        const stored = settings?.find(s => s.key === key)?.value
-        if (value === Boolean(stored)) delete next[key]
-        else next[key] = { clear: false, value }
-      }
-      return next
-    })
-  }
-
   function discard() {
     setEdits({})
     setSaveError('')
@@ -508,11 +530,10 @@ export function useKnobEditor({ enabled = true }: { enabled?: boolean } = {}) {
   /** True when the write landed (the leave gate leaves only then). */
   async function save(): Promise<boolean> {
     if (!settings || dirtyKeys.length === 0) return false
-    let landed = false
     setRefusedBot('')
     setFailedKeys([])
     refuse(null)
-    const values: Record<string, unknown> = {}
+    const values: KnobWrite['values'] = {}
     for (const key of dirtyKeys) {
       const pending = edits[key]
       const setting = settings.find(s => s.key === key)
@@ -541,18 +562,19 @@ export function useKnobEditor({ enabled = true }: { enabled?: boolean } = {}) {
         values[key] = String(pending.value)
       }
     }
-    const putValues = (body: Record<string, unknown>) => put<SettingsPayload>('/api/settings', body).catch((err: unknown) => {
+    const putValues = (body: KnobWrite) => source.write(body).catch((err: unknown) => {
       if (isTokenRefused(err)) setRefusedBot(String(values[TELEGRAM_BOT_KEY] ?? ''))
       throw err
     })
     /* Every knob the refused save carried is marked, and the one it names says why on its row. A refusal can follow a
      * partial write (a refused Telegram bot is put back after the rest of the save landed), so the page re-reads what
      * is saved and drops the edits that now match it: what stays marked is what did not land. */
-    await run('Failed to save settings', () => putSettings().catch((err: unknown) => {
+    const landed = await run('Failed to save settings', () => putSettings().catch((err: unknown) => {
       setFailedKeys(Object.keys(values))
+      setWholeRefused(err instanceof ApiError && err.status === 422 && !isTokenRefused(err))
       refuse(refusedKnob(err, Object.keys(values), settings))
       if (err instanceof ApiError) {
-        void queryClient.fetchQuery({ queryKey: SETTINGS_QUERY_KEY, queryFn: fetchSettings, staleTime: 0 })
+        void queryClient.fetchQuery({ queryKey: source.queryKey, queryFn: source.read, staleTime: 0 })
           .then(fresh => setEdits(prev => Object.fromEntries(Object.entries(prev).filter(([key, e]) => {
             const row = fresh.settings.find(s => s.key === key)
             return !row || !editSaved(row, e)
@@ -561,9 +583,9 @@ export function useKnobEditor({ enabled = true }: { enabled?: boolean } = {}) {
       }
       throw err
     }))
-    return landed
+    return landed !== null
     async function putSettings() {
-      let data: SettingsPayload
+      let data: KnobPayload
       try {
         data = await putValues({ values })
       } catch (err) {
@@ -572,29 +594,26 @@ export function useKnobEditor({ enabled = true }: { enabled?: boolean } = {}) {
         const elsewhere = err instanceof ApiError && err.status === 409
           ? (err.detail as { code?: unknown; url?: unknown } | null) : null
         if (elsewhere?.code !== TELEGRAM_WEBHOOK_ELSEWHERE) throw err
-        const take = await confirm({
+        const take = await confirm(danger('Take it', {
           title: 'Take this Telegram bot?',
           message: <>
             It delivers elsewhere — another deployment, or this one's old address:{' '}
-            <Box component="span" sx={{ overflowWrap: 'anywhere', fontWeight: 600 }}>{String(elsewhere.url)}</Box>.
+            <Box component="span" sx={{ overflowWrap: 'anywhere', fontWeight: FONT_WEIGHT.semibold }}>{String(elsewhere.url)}</Box>.
             Saving points it here, and anything there stops receiving its Telegram messages.
           </>,
-          confirmLabel: 'Take it',
-          destructive: true,
-        })
+        }))
         // Thrown as the server's own sentence, so the save error reads it as is.
         if (!take) throw new ApiError(409, { key: TELEGRAM_BOT_KEY, message: 'Not saved: the bot still delivers elsewhere.' })
         data = await putValues({ values, take_telegram_webhook: true })
       }
       // The PUT returns the read model, so a changed verdict (org rehomed, flag revoked) lands now — over any
       // re-read a refused save left in flight, which would otherwise land after it with the older values.
-      await queryClient.cancelQueries({ queryKey: SETTINGS_QUERY_KEY })
-      queryClient.setQueryData(SETTINGS_QUERY_KEY, data)
+      await queryClient.cancelQueries({ queryKey: source.queryKey })
+      queryClient.setQueryData(source.queryKey, data)
       // An org's retention range follows these knobs: its form re-reads the bounds rather than show the old ones.
       if (Object.keys(values).some(key => RETENTION_BOUND_KEYS.includes(key))) {
         void queryClient.invalidateQueries({ queryKey: RETENTION_QUERY_ROOT })
       }
-      landed = true
       setEdits({})
       setSavedCount(Object.keys(values).length)
       setSaveCounts(prev => {
@@ -605,10 +624,11 @@ export function useKnobEditor({ enabled = true }: { enabled?: boolean } = {}) {
     }
   }
 
-  // Leaving the page (a link, a reload, a closed tab) with edits pending asks first.
-  const leave = useLeaveGuard(dirtyKeys.length > 0, save)
+  // Leaving the page (a link, a reload, a closed tab, one of `leaveKeys` changing) with edits pending asks first.
+  const leave = useLeaveGuard(dirtyKeys.length > 0, save, leaveKeys)
 
   return {
+    source,
     settings,
     loadError,
     editable,
@@ -620,13 +640,16 @@ export function useKnobEditor({ enabled = true }: { enabled?: boolean } = {}) {
     connectionsLoading,
     /** A connection list that LOADED and is empty: a failed read (data null) says nothing. */
     connectionsNone: !connectionsLoading && connectionsResource.data?.length === 0,
+    /** A credential picker's narrowing to what the save accepts (`knobCredentialScope`). */
+    credentialScope,
+    /** The last refusal was a validation one, refused before anything was written: nothing in that save landed. */
+    wholeRefused,
     visibleKnobs,
     rowEditable,
     canSave,
     dirtyKeys,
     unsavedIn,
     edit,
-    editSwitches,
     discard,
     save,
     saving,
@@ -654,12 +677,7 @@ export function useKnobEditor({ enabled = true }: { enabled?: boolean } = {}) {
     leaveTo: leave.leaveTo,
     /** The leave gate's dialog; `KnobAlerts` renders it. */
     leaveDialog: (
-      <UnsavedChangesDialog
-        open={leave.open}
-        saving={leave.saving}
-        onChoose={choice => void leave.onChoose(choice)}
-        message="Some settings are not saved. Save them before leaving?"
-      />
+      <LeaveGuardDialog leave={leave} message="Some settings are not saved. Save them before leaving?" />
     ),
   }
 }
@@ -688,7 +706,7 @@ export const TELEGRAM_WEBHOOK_ELSEWHERE = 'telegram_webhook_elsewhere'
 export function unsavedNote(n: number): ReactNode {
   if (n === 0) return null
   return (
-    <Typography component="span" variant="caption" sx={{ color: 'primary.main', fontWeight: 600, whiteSpace: 'nowrap' }}>
+    <Typography component="span" variant="caption" sx={{ color: 'primary.main', fontWeight: FONT_WEIGHT.semibold, whiteSpace: 'nowrap' }}>
       {n} unsaved
     </Typography>
   )
@@ -710,7 +728,7 @@ export function useLitJump(lit: string | null, clear: (next: null) => void, read
 }
 
 /* ── ONE SECTION'S CARD ────────────────────────────────────────────────────────────────────────────── */
-/** A card of knob rows — or the read/write grid when the section is one. `id` anchors deep links
+/** A card of knob rows. `id` anchors deep links
  *  and search jumps; `lit` is the row a search jump is lighting. */
 export function KnobSection({
   knobs,
@@ -726,7 +744,8 @@ export function KnobSection({
   lit?: string | null
 }) {
   const theme = useTheme()
-  const { edits, edit, editSwitches, rowEditable, resolved, hosts, connections, connectionsLoading, connectionsNone, unsavedIn, refusal, saving, save } = knobs
+  const { edits, edit, rowEditable, resolved, credentialScope, hosts, connections, connectionsLoading, connectionsNone, unsavedIn, refusal, saving, save } = knobs
+  const hideOverrideAtFallback = knobs.source.hideOverrideAtFallback ?? true
   /** The number field being typed in: it shows the raw digits; every other one groups them, as "Default ·" does. */
   const [focusedKey, setFocusedKey] = useState<string | null>(null)
 
@@ -741,7 +760,7 @@ export function KnobSection({
           id={inputId}
           name={s.key}
           label={s.label}
-          help={s.help}
+          help={knobExplain(s)}
           checked={value as boolean}
           disabled={false}
           onChange={v => edit(s.key, { clear: false, value: v })}
@@ -770,7 +789,7 @@ export function KnobSection({
              * the row's "Clear" did, so the row draws no second one (`pickerClears`). */
             onChange={next => edit(s.key, next === null && fallbackLabel(s) === NOT_SET ? { clear: true } : { clear: false, value: next ?? '' })}
             fetchOptions={(query, signal) => loadCredentialOptions(
-              query, signal, row => credentialOption(row, credentialTypes), { types: credentialTypes, sort: true },
+              query, signal, row => credentialOption(row, credentialTypes), { types: credentialTypes, sort: true, ...credentialScope },
             )}
             placeholder="Choose a credential"
           />
@@ -781,22 +800,14 @@ export function KnobSection({
     if (s.kind === 'str' && s.vnode_host) {
       const known = hosts.some(h => h.host_node_id === value)
       return (
-        <TextField
-          id={inputId}
-          size="small"
-          select
-          value={value as string}
-          onChange={e => edit(s.key, { clear: false, value: e.target.value })}
-          slotProps={{ select: { native: true }, htmlInput: { 'aria-describedby': helpId } }}
-          sx={controlSx}
-        >
+        <KnobSelect id={inputId} value={value as string} describedBy={helpId} onChange={v => edit(s.key, { clear: false, value: v })}>
           <option value="">Not set</option>
           {/* A stored host outside the list stays selectable, worded, never the raw id. */}
           {value !== '' && !known && <option value={value as string}>Unknown host</option>}
           {hosts.map(h => (
             <option key={h.host_node_id} value={h.host_node_id}>{h.name}</option>
           ))}
-        </TextField>
+        </KnobSelect>
       )
     }
     /* A connection id, picked from the operator's cloud connections (the host picker's twin). An empty settled
@@ -808,17 +819,11 @@ export function KnobSection({
       const hintId = `${inputId}-hint`
       return (
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
-          <TextField
+          <KnobSelect
             id={inputId}
-            size="small"
-            select
             value={value as string}
-            onChange={e => edit(s.key, { clear: false, value: e.target.value })}
-            slotProps={{
-              select: { native: true },
-              htmlInput: { 'aria-describedby': none ? `${helpId} ${hintId}` : helpId },
-            }}
-            sx={controlSx}
+            describedBy={none ? `${helpId} ${hintId}` : helpId}
+            onChange={v => edit(s.key, { clear: false, value: v })}
           >
             <option value="">None</option>
             {/* A stored connection outside the list stays selectable, worded, never the raw id — "Loading…" until
@@ -829,7 +834,7 @@ export function KnobSection({
             {connections.map(c => (
               <option key={c.id} value={c.id}>{connectionKnobLabel(c)}</option>
             ))}
-          </TextField>
+          </KnobSelect>
           {none && (
             <Typography id={hintId} variant="body2" sx={{ color: 'text.secondary' }} data-testid="settings-connection-hint">
               Needs one of your connections. Add one in{' '}
@@ -842,16 +847,7 @@ export function KnobSection({
     const choices = s.kind === 'str' && s.choices?.length ? s.choices : null
     if (choices) {
       return (
-        <TextField
-          id={inputId}
-          size="small"
-          select
-          value={value as string}
-          onChange={e => edit(s.key, { clear: false, value: e.target.value })}
-          // Native, like every select in this app (phones get their own picker); the `id` lands on the `<select>`.
-          slotProps={{ select: { native: true }, htmlInput: { 'aria-describedby': helpId } }}
-          sx={controlSx}
-        >
+        <KnobSelect id={inputId} value={value as string} describedBy={helpId} onChange={v => edit(s.key, { clear: false, value: v })}>
           {/* An override the catalogue no longer offers stays visible as its own option (an unmatched native select
           renders blank). */}
           {!choices.includes(value as string) && (
@@ -860,7 +856,7 @@ export function KnobSection({
           {choices.map(choice => (
             <option key={choice} value={choice}>{choiceLabel(s, choice)}</option>
           ))}
-        </TextField>
+        </KnobSelect>
       )
     }
     const numeric = s.kind !== 'str'
@@ -918,11 +914,11 @@ export function KnobSection({
           '& .MuiInputBase-input': {
             ...controlSx['& .MuiInputBase-input'],
             textAlign: numeric ? 'right' : 'left',
-            ...(numeric && s.unit && { pl: '4px' }),
+            ...(numeric && s.unit && { pl: 0.5 }),
           },
           ...(s.unit && {
-            '& .MuiInputBase-root': { ...controlSx['& .MuiInputBase-root'], pr: '10px' },
-            '& .MuiInputAdornment-root': { ml: '4px' },
+            '& .MuiInputBase-root': { ...controlSx['& .MuiInputBase-root'], pr: 1.5 },
+            '& .MuiInputAdornment-root': { ml: 0.5 },
           }),
           ...(numeric && {
             [theme.breakpoints.only('xs')]: {
@@ -943,9 +939,10 @@ export function KnobSection({
       const value = displayed(s, pending)
       const writable = rowEditable(s)
       /* A STORED override holding the very value it would fall back to reads as the default, with no Reset (it would
-       * change nothing): an editor's row only — a reader's "Set for your organization" is who set it, not what it is.
+       * change nothing), where the source says so (`KnobSource.hideOverrideAtFallback`): an editor's row only — a
+       * reader's "Set for your organization" is who set it, not what it is.
        * Not an empty one: an override of `''` on a knob with nothing to fall back to keeps its Clear. */
-      const storedAtDefault = !pending && s.overridden && writable && fallbackLabel(s) !== NOT_SET && atFallback(s, s.value)
+      const storedAtDefault = hideOverrideAtFallback && !pending && s.overridden && writable && fallbackLabel(s) !== NOT_SET && atFallback(s, s.value)
       const isOverridden = (pending ? !pending.clear : s.overridden) && !storedAtDefault
       const inputId = `setting-${s.key}`
       const helpId = `setting-help-${s.key}`
@@ -954,12 +951,12 @@ export function KnobSection({
       const minControl = writable ? controlMin(s, value) : undefined
       /* A text value is words — a select's choice ("Business trial") or free text (a model id): at the two-column
          floor it got 8rem and clipped them, so a phone-width card gives it the row's full width. */
-      const rowsMid = s.kind === 'str' ? ROWS_MID_CHOICE : ROWS_MID
+      const rowsMid = s.kind === 'str' ? KNOB_ROWS_MID_CHOICE : KNOB_ROWS_MID
       /* Nothing set this value: a plain "Default" source line. On a narrow card it stacks under the value as a row of
        * its own, so a card of defaults read "Default" under every value — there it is left out. */
       const atDefault = !isOverridden && (writable || !setByOperator(s))
-      /* A one-word "Clear" rides the control's line below `ROWS_WIDE` instead of a row of its own (the card grew by a
-       * row for one word); a longer "Reset to …" would squeeze the control, so it keeps stacking. Below `ROWS_WIDE` the
+      /* A one-word "Clear" rides the control's line below `KNOB_ROWS_WIDE` instead of a row of its own (the card grew by a
+       * row for one word); a longer "Reset to …" would squeeze the control, so it keeps stacking. Below `KNOB_ROWS_WIDE` the
        * row keeps the phone shape — label above, control and Clear beside it: a third track at mid width starved the
        * control to a few letters. */
       // Only while it holds a credential: an override of `''` (an older ✕) leaves the picker nothing to clear.
@@ -971,13 +968,13 @@ export function KnobSection({
       const failed = knobs.failedKey(s.key)
       // The knob the refusal names: its row says why, beside what is still saved.
       const refused = refusal?.key === s.key
-      const mark = failed || refused ? theme.palette.error.main : theme.palette.primary.main
+      const mark = failed || refused ? 'error' : 'primary'
       /* Two columns with a provenance line (and no Clear beside the control): the provenance sits under the label and
        * the control spans both lines, so the row keeps its neighbours' height. */
       const metaUnderLabel = !atDefault && !clearBeside
       const controlCellSx = {
         [rowsMid]: metaUnderLabel ? { gridColumn: 2, gridRow: '1 / span 2' } : {},
-        [ROWS_WIDE]: { gridColumn: 'auto', gridRow: 'auto' },
+        [KNOB_ROWS_WIDE]: { gridColumn: 'auto', gridRow: 'auto' },
       }
       return (
         <Box
@@ -991,21 +988,21 @@ export function KnobSection({
             display: 'grid',
             gridTemplateColumns: clearBeside ? 'minmax(0, 1fr) auto' : 'minmax(0, 1fr)',
             alignItems: 'center',
-            gap: '0.375rem',
-            py: '8px',
-            // Before `ROWS_WIDE`, which overrides it on a card wide enough for both.
+            gap: 1,
+            py: 1,
+            // Before `KNOB_ROWS_WIDE`, which overrides it on a card wide enough for both.
             [rowsMid]: {
               ...(!clearBeside && { gridTemplateColumns: MID_ROW_GRID }),
-              gap: '0.25rem 1rem',
-              minHeight: ROW_MIN_HEIGHT,
-              py: '4px',
+              gap: `${grid(0.5)} ${grid(2.5)}`,
+              minHeight: SIZE.tapTarget,
+              py: 0.5,
             },
-            [ROWS_WIDE]: {
+            [KNOB_ROWS_WIDE]: {
               gridTemplateColumns: readOnlyCard ? READ_ONLY_ROW_GRID : ROW_GRID,
               ...(readOnlyCard && { gridColumn: '1 / -1' }),
               /* A read-only card's provenance sits right after its value: a wider gap keeps the two apart. */
-              gap: readOnlyCard ? '0 1.5rem' : '0 1rem',
-              minHeight: ROW_MIN_HEIGHT,
+              gap: readOnlyCard ? `0 ${grid(4)}` : `0 ${grid(2.5)}`,
+              minHeight: SIZE.tapTarget,
               py: 0,
             },
             /* Out to the card's own padding (SectionCard's 1.5), no further: at -12px the card's clip
@@ -1016,14 +1013,14 @@ export function KnobSection({
             borderColor: 'divider',
             transition: 'background-color 600ms',
             ...(pending && {
-              bgcolor: alpha(mark, 0.08),
-              boxShadow: `inset 3px 0 0 ${mark}`,
+              bgcolor: tint(mark, 0.08),
+              backgroundImage: `linear-gradient(to right, ${(theme.vars ?? theme).palette[mark].main} ${grid(0.5)}, transparent ${grid(0.5)})`,
               ...theme.applyStyles('dark', {
-                bgcolor: alpha(mark, 0.16),
+                bgcolor: tint(mark, 0.16),
               }),
             }),
             ...(highlighted && {
-              bgcolor: alpha(theme.palette.warning.main, 0.18),
+              bgcolor: tint('warning', 0.18),
             }),
           }}
         >
@@ -1036,7 +1033,7 @@ export function KnobSection({
               ...(clearBeside && { gridColumn: '1 / -1' }),
               // The label at the foot of the row's first line, the provenance right under it.
               [rowsMid]: metaUnderLabel ? { gridRow: 1, alignSelf: 'end' } : {},
-              [ROWS_WIDE]: { gridRow: 'auto', alignSelf: 'auto', ...(clearBeside && { gridColumn: 'auto' }) },
+              [KNOB_ROWS_WIDE]: { gridRow: 'auto', alignSelf: 'auto', ...(clearBeside && { gridColumn: 'auto' }) },
             }}
           >
             {/* A read-only row's value is TEXT, so `htmlFor` would name an id that never renders: a span there. */}
@@ -1044,14 +1041,16 @@ export function KnobSection({
               component={writable ? 'label' : 'span'}
               htmlFor={writable ? inputId : undefined}
               data-testid="settings-row-label"
-              sx={{ fontWeight: 500 }}
+              sx={{ fontWeight: FONT_WEIGHT.medium }}
             >
               {/* Above the label at every width: below (MUI's default) hid the NEXT row's label, beside it hid this
                   row's own value, and on a phone a side tooltip runs off the screen. Covering the row above is the
                   trade: the reader is on this row. The FIRST row has no row above, only its card's title bar:
                   below, so the tip stays inside the card. */}
-              <HelpLabel label={s.label} help={s.help} placement={idx === 0 ? 'bottom-start' : 'top-start'} />
+              <HelpLabel label={s.label} help={knobExplain(s)} choices={knobChoices(s)} placement={idx === 0 ? 'bottom-start' : 'top-start'} />
             </Typography>
+            {/* The keyboard way to the pop-up, outside the `<label>` (a button inside it would steal its click). */}
+            <ExplainMoreButton label={s.label} help={knobExplain(s)} choices={knobChoices(s)} />
             <Box component="span" id={helpId} data-testid="settings-row-help" sx={VISUALLY_HIDDEN}>
               {s.help}
             </Box>
@@ -1060,7 +1059,7 @@ export function KnobSection({
               <Typography
                 data-testid="settings-row-failed"
                 variant="body2"
-                sx={{ color: 'error.main', fontSize: '0.75rem', lineHeight: 1.4 }}
+                sx={{ color: 'error.main', fontSize: FONT_SIZE.sm, lineHeight: LINE_HEIGHT.snug }}
               >
                 Not saved
               </Typography>
@@ -1074,12 +1073,12 @@ export function KnobSection({
             <Typography
               component="span"
               data-testid="settings-row-value"
-              sx={{ fontWeight: 500, wordBreak: 'break-word', ...controlCellSx }}
+              sx={{ fontWeight: FONT_WEIGHT.medium, wordBreak: 'break-word', ...controlCellSx }}
             >
               {valueAsWords(s, value, resolved, hosts, connections, connectionsLoading)}
             </Typography>
           ) : (
-            <Box data-testid="settings-input-wrap" sx={{ display: 'flex', width: '100%', ...controlCellSx, [ROWS_WIDE]: { width: 'auto', ...controlCellSx[ROWS_WIDE] } }}>
+            <Box data-testid="settings-input-wrap" sx={{ display: 'flex', width: '100%', ...controlCellSx, [KNOB_ROWS_WIDE]: { width: 'auto', ...controlCellSx[KNOB_ROWS_WIDE] } }}>
               {control(s, value, inputId, helpId)}
             </Box>
           )}
@@ -1087,13 +1086,13 @@ export function KnobSection({
           <Box
             data-testid="settings-row-meta"
             sx={{
-              fontSize: '0.75rem',
-              lineHeight: 1.2,
+              fontSize: FONT_SIZE.sm,
+              lineHeight: LINE_HEIGHT.snug,
               minWidth: 0,
               display: atDefault || metaEmpty ? 'none' : 'flex',
               alignItems: 'center',
               [rowsMid]: clearBeside ? { gridColumn: 'auto' } : { gridColumn: 1, gridRow: 2, alignSelf: 'start' },
-              [ROWS_WIDE]: { display: 'flex', gridColumn: 'auto', gridRow: 'auto', alignSelf: 'auto' },
+              [KNOB_ROWS_WIDE]: { display: 'flex', gridColumn: 'auto', gridRow: 'auto', alignSelf: 'auto' },
             }}
           >
             {!writable ? (
@@ -1119,17 +1118,17 @@ export function KnobSection({
                 onClick={() => edit(s.key, { clear: true })}
                 sx={{
                   ...touchTargetSx,
-                  fontSize: '0.75rem',
-                  px: '4px',
-                  mx: '-4px',
+                  fontSize: FONT_SIZE.sm,
+                  px: 0.5,
+                  mx: -0.5,
                   textAlign: 'left',
                   // A number's "Reset to 16,384 tokens" is one phrase: never break it. A choice's label may be long.
                   ...((s.kind === 'int' || s.kind === 'float') && { whiteSpace: 'nowrap' }),
                   /* Two columns, a pointer's window (under the label, or a Clear beside the control): the button keeps
                    * WCAG's 24px target but takes a text line's height, so the row stays its neighbours' height. */
                   [theme.breakpoints.up('sm')]: {
-                    [rowsMid]: { minHeight: 24, py: 0, my: '-5px' },
-                    [ROWS_WIDE]: { minHeight: 32, py: '4px', my: 0 },
+                    [rowsMid]: { minHeight: grid(4), py: 0, my: -1 },
+                    [KNOB_ROWS_WIDE]: { minHeight: SIZE.thumb, py: 0.5, my: 0 },
                   },
                 }}
               >
@@ -1148,7 +1147,7 @@ export function KnobSection({
             <Typography
               data-testid="settings-row-note"
               variant="body2"
-              sx={{ color: 'warning.main', gridColumn: '1 / -1', [ROWS_WIDE]: { pb: '8px' } }}
+              sx={{ color: 'warning.main', gridColumn: '1 / -1', [KNOB_ROWS_WIDE]: { pb: 1 } }}
             >
               {choiceNote(s, value)}
             </Typography>
@@ -1159,7 +1158,7 @@ export function KnobSection({
             <Typography
               data-testid="settings-row-refusal"
               variant="body2"
-              sx={{ color: 'error.main', gridColumn: '1 / -1', overflowWrap: 'anywhere', [ROWS_WIDE]: { pb: '8px' } }}
+              sx={{ color: 'error.main', gridColumn: '1 / -1', overflowWrap: 'anywhere', [KNOB_ROWS_WIDE]: { pb: 1 } }}
             >
               {`${refusal.message} Still saved: ${savedAsWords(s, resolved, hosts, connections, connectionsLoading)}.`}
             </Typography>
@@ -1170,22 +1169,11 @@ export function KnobSection({
     return readOnlyCard ? <Box data-testid="settings-rows-read-only" sx={READ_ONLY_CARD_GRID}>{cardRows}</Box> : cardRows
   }
 
-  // A read/write section is a grid with no provenance column; every other section is rows.
-  const grid = permissionGrid(entries)
+  // Every section is rows: a knob per row, its control in the one control column.
   return (
     <Box id={id} data-testid="settings-section" sx={{ containerType: 'inline-size', containerName: KNOB_SECTION_CONTAINER }}>
       <SectionCard title={title || undefined} actions={unsavedNote(unsavedIn(entries))}>
-        {grid && PermissionGrid ? (
-          <PermissionGrid
-            grid={grid}
-            value={s => displayed(s, edits[s.key]) as boolean}
-            onChange={editSwitches}
-            editable={entries.every(rowEditable)}
-            marked={s => edits[s.key] !== undefined}
-            lit={lit}
-            idPrefix="setting-row-"
-          />
-        ) : rows(entries)}
+        {rows(entries)}
       </SectionCard>
     </Box>
   )
@@ -1198,34 +1186,9 @@ export function KnobSection({
 export function KnobSaveBar({ knobs, bar = true }: { knobs: KnobEditor; bar?: boolean }) {
   const { canSave, dirtyKeys, saving, discard, save } = knobs
   if (!canSave) return null
-  /* Off the phone bar the pair rides a toolbar row at a pointer's 32px: the 44px touch floor kept a filled Save a
-   * head taller than the boxless Discard beside it. */
-  const buttonSx = bar ? touchTargetSx : { ...touchTargetSx, minHeight: 32, minWidth: 'auto' }
   const buttons = (
-    <Stack direction="row" spacing={1}>
-      <Button
-        type="button"
-        variant="text"
-        color="inherit"
-        size="small"
-        disabled={dirtyKeys.length === 0 || saving}
-        onClick={discard}
-        sx={buttonSx}
-      >
-        Discard
-      </Button>
-      <Button
-        type="button"
-        variant="contained"
-        color="primary"
-        size="small"
-        disabled={dirtyKeys.length === 0 || saving}
-        onClick={() => void save()}
-        sx={buttonSx}
-      >
-        {saving ? 'Saving…' : `Save${dirtyKeys.length ? ` (${dirtyKeys.length})` : ''}`}
-      </Button>
-    </Stack>
+    <CancelSaveBar plain size="small" testId="settings-save-bar" saveTestId="settings-save" onDiscard={discard} dirty={dirtyKeys.length > 0}
+      busy={saving} saveLabel={`Save${dirtyKeys.length ? ` (${dirtyKeys.length})` : ''}`} saveProps={{ onClick: () => void save() }} />
   )
   if (!bar) return buttons
   // Sticky only while there is something to save: a clean bar's two dead buttons must not ride over the page.
@@ -1241,9 +1204,9 @@ export function KnobSaveBar({ knobs, bar = true }: { knobs: KnobEditor; bar?: bo
          * (App.tsx's phone padding) to cover the content scrolling behind it. */
         [`@media ${PHONE_QUERY}`]: {
           position: sticky ? 'sticky' : 'static',
-          top: '-0.75rem',
-          mt: '-0.75rem',
-          pt: '0.75rem',
+          top: grid(-2),
+          mt: -2,
+          pt: 2,
           zIndex: 2,
           bgcolor: 'background.default',
           // Nothing to save, nothing to show: two dead buttons were a 69px band over the page.
@@ -1254,7 +1217,7 @@ export function KnobSaveBar({ knobs, bar = true }: { knobs: KnobEditor; bar?: bo
         justifyContent: 'flex-end',
         flexWrap: 'wrap',
         gap: 1,
-        pb: '12px',
+        pb: 2,
         borderBottom: '1px solid',
         borderColor: 'divider',
       }}
@@ -1273,7 +1236,7 @@ export function KnobSaveBar({ knobs, bar = true }: { knobs: KnobEditor; bar?: bo
 
 /** The last save's refusal; nothing when it landed. */
 function SaveError({ knobs }: { knobs: KnobEditor }) {
-  const { saveError, refusedBot, failedLabels, refusal, settings } = knobs
+  const { saveError, refusedBot, failedLabels, refusal, settings, wholeRefused, source } = knobs
   if (!saveError) return null
   // The knob a refusal names, so the alert says which control failed (its row says why, a screen away on a phone).
   const knob = refusal ? settings?.find(s => s.key === refusal.key) : undefined
@@ -1281,19 +1244,26 @@ function SaveError({ knobs }: { knobs: KnobEditor }) {
   return (
     <Banner
       severity="error"
-      // Telegram refused the bot's token: the fix is in its credential, as the webhook panel says.
+      // Telegram refused the bot's token: the fix is in its credential, as the webhook panel says. A refused
+      // credential pointer: the fix is a credential in the viewer's own org, added on the Credentials page — not
+      // on another org's page (`credentialOrgId`), where a credential the viewer adds would land in its own org.
       action={refusedBot ? (
         <Button component={RouterLink} to={`/credentials/${refusedBot}`} color="inherit" size="small" sx={{ whiteSpace: 'nowrap' }}>
           Open credential
+        </Button>
+      ) : knob?.credential_type?.length && !source.credentialOrgId ? (
+        <Button component={RouterLink} to="/credentials" color="inherit" size="small" sx={{ whiteSpace: 'nowrap' }}>
+          Open Credentials
         </Button>
       ) : undefined}
     >
       {knobPath && <span>{knobPath}: </span>}
       <span>{saveError}</span>
-      {/* Several knobs, one refusal naming at most one: the rest may sit on another category. */}
+      {/* Several knobs, one refusal naming at most one: the rest may sit on another category. A save is all or
+        * nothing on a validation refusal, so the valid ones did not land either: said plainly. */}
       {failedLabels.length > 1 && (
         <Box component="span" data-testid="settings-failed-labels" sx={{ display: 'block' }}>
-          Not saved: {failedLabels.join(', ')}.
+          {wholeRefused ? 'Nothing saved. Still pending' : 'Not saved'}: {failedLabels.join(', ')}.
         </Box>
       )}
     </Banner>
@@ -1304,6 +1274,7 @@ function SaveError({ knobs }: { knobs: KnobEditor }) {
 export function KnobAlerts({ knobs }: { knobs: KnobEditor }) {
   const { loadError, saved, savedCount, editable, confirmDialog } = knobs
   const what = savedCount > 1 ? `Saved ${savedCount} changes.` : 'Saved.'
+  const note = knobs.source.savedNote
   return (
     <>
       {confirmDialog}
@@ -1316,7 +1287,7 @@ export function KnobAlerts({ knobs }: { knobs: KnobEditor }) {
         </Box>
       )}
       {saved && (
-        <Alert severity="success" role="status">{editable ? `${what} Live across the fleet within seconds.` : what}</Alert>
+        <Banner severity="success" role="status">{editable && note ? `${what} ${note}` : what}</Banner>
       )}
     </>
   )

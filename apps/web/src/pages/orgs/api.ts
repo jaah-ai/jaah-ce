@@ -2,14 +2,13 @@
 // module owns the REQUEST shapes, each encoding a server decision.
 
 import { del, get, patch, post, put } from '../../api'
-import { countOf } from '../../lib/humanize'
-import { slugFrom } from '../../lib/slug'
+import { commonRefusalField } from '../../hooks/useSubmit'
 import type { OrgLimit as PlanLimit } from '../../lib/orgPlan'
 import type { ConfirmOptions } from '../../components/ConfirmDialog'
-import type { OperatorSetting, Org, SsoProvider } from '../../types'
-import type { OrgBundle } from '../../lib/bundles'
-import type { ProductLine, ProductLineIn } from '../../lib/planProducts'
-import type { PlanDryRun, PlanSwitchField } from '../settings/billing/api'
+import type { OperatorSetting, Org, RoutingAllowed, RoutingMaxMode, SsoProvider } from '../../types'
+import type { ProductLine } from '../../lib/planProducts'
+import type { EasyModeCaps, PlanDryRun, PlanSwitchField } from '../settings/billing/api'
+import type { KnobPayload, KnobSource } from '../settings/KnobSection'
 
 /** A new tenant. `slug` and `plan_key` (an active plan, never `_default`) are REQUIRED. */
 export type OrgCreateBody = {
@@ -47,6 +46,15 @@ export type OrgUpdateBody = {
   microvm_vcpus?: number | null
   microvm_ram_mib?: number | null
   microvm_disk_gib?: number | null
+  /* Intelligent routing (`routes/orgs.py::_apply_routing`), only with the plan feature: lowering the maximum lowers every
+   * project above it. `routing_allowed` null = every runner; tiers null = no bound. */
+  routing_max_mode?: RoutingMaxMode
+  routing_allowed?: RoutingAllowed | null
+  routing_tier_floor?: string | null
+  routing_tier_ceiling?: string | null
+  /* Who the org's background jobs run as (`routes/orgs.py::OrgUpdateIn`): an Org Owner/Admin or the operator; a
+   * member of this org, `null` = nobody. */
+  run_jobs_as_id?: string | null
 }
 
 /* `GET /api/orgs` lives in `lib/orgs.ts` (`ui/OrgSelect` needs it and `ui/**` may not import `pages/**`).
@@ -142,6 +150,21 @@ export const getOrgSettings = (id: string) => get<OperatorSetting[]>(`/api/orgs/
 export const putOrgSettings = (id: string, values: Record<string, OperatorSetting['value'] | null>) =>
   put<OperatorSetting[]>(`/api/orgs/${encodeURIComponent(id)}/settings`, { values })
 
+/** The pair as the one knob editor's source (`settings/KnobSection.tsx::useKnobEditor`), the customer page's
+ *  Settings tab. The operator alone reaches either call, so the envelope says the viewer may write. */
+export function orgKnobSource(id: string): KnobSource {
+  const envelope = (settings: OperatorSetting[]): KnobPayload => ({ settings, editable: true })
+  return {
+    queryKey: ['org-settings', id],
+    read: () => getOrgSettings(id).then(envelope),
+    write: ({ values }) => putOrgSettings(id, values).then(envelope),
+    // An org's override at the global's value is still a pin on the org: it keeps its Reset.
+    hideOverrideAtFallback: false,
+    // The org writer checks a credential pointer against this org's rows (`apply_org_overrides`).
+    credentialOrgId: id,
+  }
+}
+
 /** An org's cron minimum period (`routes/orgs.py`), all seconds. The chain: the operator's floor, then the
  * operator's per-org `override` (null = it follows `fallback`: a tenant org's plan's, else `(default)`'s, or
  * `operator_floor` for an operator-plane one; `fallback_source` says which), then the org admin's raise-only
@@ -171,6 +194,23 @@ export const getOrgCronMinPeriod = (id: string) => get<CronMinPeriod>(`/api/orgs
 export const patchOrgCronMinPeriod = (id: string, body: CronMinPeriodBody) =>
   patch<CronMinPeriod>(`/api/orgs/${encodeURIComponent(id)}/cron-min-period`, body)
 
+/** An org's outcome scan interval (`routes/orgs.py`), all minutes: the org admin's `own` (null = `global`, the
+ *  operator's default), what projects inherit (`effective`), and the bounds `own` must sit in. A project's own
+ *  interval beats both. */
+export type OutcomeScanInterval = { own: number | null; global: number; effective: number; minimum: number; maximum: number }
+
+// Read and write: an operator on any org, an Org Owner/Admin on their own. `own: null` clears; a 422's detail is a sentence.
+export const getOrgOutcomeScanInterval = (id: string) =>
+  get<OutcomeScanInterval>(`/api/orgs/${encodeURIComponent(id)}/outcome-scan-interval`)
+export const patchOrgOutcomeScanInterval = (id: string, body: { own: number | null }) =>
+  patch<OutcomeScanInterval>(`/api/orgs/${encodeURIComponent(id)}/outcome-scan-interval`, body)
+
+/** Whether the org's consoles report errors and stalls to Audit > Client errors. Operator only. */
+export type ClientTelemetry = { enabled: boolean }
+export const getOrgClientTelemetry = (id: string) => get<ClientTelemetry>(`/api/orgs/${encodeURIComponent(id)}/client-telemetry`)
+export const putOrgClientTelemetry = (id: string, enabled: boolean) =>
+  put<ClientTelemetry>(`/api/orgs/${encodeURIComponent(id)}/client-telemetry`, { enabled })
+
 /** The one bound a cron-minimum draft fails, named; nothing while it passes or is still empty. `floor` is the
  *  tier's lowest value: the operator floor for the operator's override, the upstream for an org's own. */
 export function cronPeriodError(trimmed: string, parsed: number | null, floor: number): string | undefined {
@@ -179,13 +219,6 @@ export function cronPeriodError(trimmed: string, parsed: number | null, floor: n
   if (parsed < floor) return `At least ${floor}`
   if (parsed > CRON_MIN_PERIOD_MAX) return `At most ${CRON_MIN_PERIOD_MAX}`
   return undefined
-}
-
-/** A period as words, in its largest whole unit: `10 seconds`, `1 hour`, `90 seconds`. */
-export function periodWords(seconds: number): string {
-  const units: [number, string][] = [[86400, 'day'], [3600, 'hour'], [60, 'minute'], [1, 'second']]
-  const [size, unit] = units.find(([n]) => seconds >= n && seconds % n === 0) ?? [1, 'second']
-  return countOf(seconds / size, unit)
 }
 
 /** One email domain of an org (`routes/orgs.py::OrgDomainOut`). */
@@ -212,6 +245,18 @@ export const deleteOwnOrg = (body: { name: string; code: string }) => post<void>
 /* Delete is SOFT: the org is hidden, its members' sign-in refused, its data kept, its billing ended. Restore
  * brings it back still disabled (a 409 unless deleted). */
 export const restoreOrg = (id: string) => post<Org>(`/api/orgs/${encodeURIComponent(id)}/restore`)
+
+/** Show a customer's setup guide again, Choose plan unticked (`routes/orgs.py::reset_org_setup`). 204. */
+export const resetOrgSetup = (id: string) => post<void>(`/api/orgs/${encodeURIComponent(id)}/setup/reset`)
+
+export function resetSetupConfirm(org: Pick<Org, 'name' | 'slug'>): ConfirmOptions {
+  return {
+    title: 'Reset setup',
+    identity: `${org.name} · ${org.slug}`,
+    message: `Show the setup guide to ${org.name}'s admins again, with Choose plan unticked unless the plan is paid? Their plan is kept; other done steps stay done.`,
+    confirmLabel: 'Reset',
+  }
+}
 
 /** What a Compliance Delete would erase (`execute: false`; `app/tenancy/offboard.py::Census.counts`); any
  *  `blockers` refuse the execute. */
@@ -254,22 +299,8 @@ export function fieldForDetail(detail: string): OrgFormField | null {
   if (/already answers to the slug/.test(detail) || /^the slug /.test(detail)) return 'slug'
   if (/already has the slug/.test(detail) || /slug (is also its tailnet tag|cannot be changed)/.test(detail)) return 'slug'
   if (/^slug /.test(detail)) return 'slug'
-  if (/^name /.test(detail)) return 'name'
-  if (/^description /.test(detail)) return 'description'
-  return null
+  return commonRefusalField(detail)
 }
-
-/* The slug pre-filled from a name — a DERIVATION, never a validation (the grammar is the server's:
- * `routes/commands.py::_SLUG_RE`, enforced at `routes/orgs.py`). Stops once the operator edits the slug
- * (`OrgDialog`): the handle is permanent. */
-export const slugFromName = (name: string) => slugFrom(name, 32)
-
-export type { BundleStatus, OrgBundle } from '../../lib/bundles'
-
-// Operator only. Retry answers every bundle again; a 409 with a sentence unless the copy is `failed` or `removed`
-// (or another retry holds it). It launches a machine, so it can take several seconds.
-export const retryOrgBundle = (id: string, bundleId: string) =>
-  post<OrgBundle[]>(`/api/orgs/${encodeURIComponent(id)}/bundles/${encodeURIComponent(bundleId)}/retry`)
 
 /** One overridable plan term: the org's effective `value`, whether it is the org's own, and its plan's. */
 export type Override<T> = { value: T; overridden: boolean; plan_value: T }
@@ -300,13 +331,25 @@ export type OrgPlan = {
     price: Override<number | null>
     min_agents: Override<number | null>
     max_agents: Override<number | null>
-    static_slots: Override<number | null>
+    /** The survival window, days; absent from an older server. */
+    outcome_survival_days?: Override<number>
+    /** The Easy Mode caps (`app/plan_terms.py::EASY_MODE_TERMS`); the sponsorship end a `YYYY-MM-DD` day, null = none.
+     *  Absent from an older server. */
+    easy_mode_apps?: Override<number>
+    easy_mode_requests_month?: Override<number>
+    easy_mode_egress_gb_month?: Override<number>
+    easy_mode_db_mb?: Override<number>
+    easy_mode_emails_month?: Override<number>
+    easy_mode_concurrency?: Override<number>
+    easy_mode_domains_per_app?: Override<number>
+    easy_mode_sponsor_end?: Override<string | null>
     /** The provider grid's `[row, auth]` cells (`lib/providerGrid.ts`); absent from an older server. */
     providers?: Override<string[][]>
   } & Record<PlanSwitchField, SwitchOverride>
   /** `trialable`: Stripe sells it above $0, so a move to it may open a free trial; `trial_days` its own trial length
-   *  (null = none). Both absent from an older server. */
-  choices: { key: string; name: string; trialable?: boolean; trial_days?: number | null }[]
+   *  (null = none); `sold` false for a plan Stripe does not sell (Free), whose move ends the plan subscription now.
+   *  All absent from an older server. */
+  choices: { key: string; name: string; trialable?: boolean; trial_days?: number | null; sold?: boolean }[]
   stripe_plan_key: string | null
   stripe_plan_name: string | null
   billing_connected: boolean
@@ -337,12 +380,13 @@ export type OrgPlanBody = {
   refund_prepaid?: boolean
   min_agents?: number | null
   max_agents?: number | null
-  static_slots?: number | null
-  products?: ProductLineIn[] | null
+  /** Days; null = back to the plan's. */
+  outcome_survival_days?: number | null
   /** The provider grid's cells, the whole list; null = back to the plan's. Accepted on the operator's own org too. */
   providers?: string[][] | null
   custom_unit_amount?: number | null
-} & Partial<Record<PlanSwitchField, boolean | null>>
+  // `EasyModeCaps`: null = back to the plan's (`OrgPlan.overrides`).
+} & EasyModeCaps & Partial<Record<PlanSwitchField, boolean | null>>
 
 export const getOrgPlan = (id: string) => get<OrgPlan>(`/api/orgs/${encodeURIComponent(id)}/plan`)
 export const updateOrgPlan = (id: string, body: OrgPlanBody) =>

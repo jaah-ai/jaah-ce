@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 import cloud_modules
 import control_plane_api
+import environment
 import host_platform
 import slot_repos
 from worktree_mechanics import core, ports as wm_ports
@@ -17,6 +18,7 @@ log = logging.getLogger(__name__)
 
 # The CP owns slot configuration; the node reads the worktree's own files (`.env` ports, compose name, stack
 # presence) because that is sensing — roster values would blind the CP's drift verdict.
+# `clone` is derived from the node's home when the CP sends `project_id` without it (`_roster_entry`).
 _ROSTER_GATED_FIELDS = ("clone", "base", "clone_url")
 
 
@@ -25,9 +27,9 @@ _ROSTER_GATED_FIELDS = ("clone", "base", "clone_url")
 _ROSTER_PRESENCE_GATED_FIELDS = ("branch_prefix",)
 
 
-# A project with no repository (`has_repo: false`) has nothing to clone or fetch: every git string
-# on its entry is `""` by contract, so only the clone path — which `wt_path` derives its folders from — is
-# gated.
+# An entry with no repository (`has_repo: false`) has nothing to clone or fetch: every git string
+# on it is `""` by contract, so only the clone path — which `wt_path` derives its folders from — is
+# gated. A folder slot inside a git entry (its own `has_repo: false`) rides the git entry's gate.
 _FOLDER_ROSTER_GATED_FIELDS = ("clone",)
 
 
@@ -37,23 +39,37 @@ _FOLDER_ROSTER_GATED_FIELDS = ("clone",)
 _DRAINING_ROSTER_GATED_FIELDS = ("clone", "base")
 
 
+# The `launch_kinds` entry (`reconcile/observe.py`) telling the CP this node reads a roster slot's own
+# `has_repo`, so one project's entry may carry git worktrees and folder slots at once; the CP sends a
+# per-slot kind only to a node that lists it.
+FOLDER_SLOT = "folder_slot"
+
+
 def wire_has_repo(raw: object) -> bool:
-    """The CP's `has_repo` as the node reads it, on a roster entry or an intent payload: only an explicit
-    `false` is a folder project. ABSENT MEANS TRUE, so a CP that predates folder slots keeps every slot on
+    """The CP's `has_repo` as the node reads it, on a roster entry, a roster slot or an intent payload: only an
+    explicit `false` is a folder. A slot's own key overrides its entry's (`_roster_entry`). ABSENT MEANS TRUE
+    on an entry (and inherit-the-entry on a slot), so a CP that predates folder slots keeps every slot on
     today's git path byte for byte."""
     return raw is not False
 
 
 def wire_push_enabled(raw: object) -> bool:
     """The CP's `push_enabled` on a roster entry: only an explicit `true` lets the node push on its own
-    (`worktree_mechanics.core._create_missing_base`). Absent — an older CP — is False, the side that pushes nothing."""
+    (`slot_clone._ensure_base`). Absent — an older CP — is False, the side that pushes nothing."""
     return raw is True
+
+
+def wire_jaah_repo_prefix(raw: object) -> str | None:
+    """The CP's `jaah_repo_prefix` on a roster entry: a string (`""` clears the guard's marker), else None — an
+    older CP, whose guard installs leave the marker as it is."""
+    return raw if isinstance(raw, str) else None
 
 
 def _mechanics_config(
     *, name: str, clone: str, base: str, clone_url: str, repo_path: str, branch_prefix: str,
     port_vars: tuple[str, ...], has_repo: bool, project_id: int | None = None,
-    repos: tuple = (), push_enabled: bool = False,
+    repos: tuple = (), push_enabled: bool = False, jaah_repo_prefix: str | None = None,
+    port_preferred: tuple[tuple[str, int], ...] = (),
 ) -> "core.PoolConfig":
     """The one roster → `worktree_mechanics.core.PoolConfig` conversion; a second construction is how a field (e.g.
     `clone_url`, read empty as "no remote") silently starts arriving empty.
@@ -64,7 +80,7 @@ def _mechanics_config(
         name=name, clone=clone, base=base, clone_url=clone_url, repo_path=repo_path,
         branch_prefix=branch_prefix,
         port_vars=list(port_vars), has_repo=has_repo, project_id=project_id, repos=repos,
-        push_enabled=push_enabled,
+        push_enabled=push_enabled, jaah_repo_prefix=jaah_repo_prefix, port_preferred=dict(port_preferred),
     )
 
 
@@ -74,7 +90,8 @@ def _pool_config(wire) -> "core.PoolConfig":
         name=wire.project, clone=wire.clone, base=wire.base, clone_url=wire.clone_url,
         repo_path=wire.repo_path, branch_prefix=wire.branch_prefix, port_vars=wire.port_vars,
         has_repo=wire.has_repo, project_id=wire.project_id, repos=wire.repos,
-        push_enabled=wire.push_enabled,
+        push_enabled=wire.push_enabled, jaah_repo_prefix=wire.jaah_repo_prefix,
+        port_preferred=wire.port_preferred,
     )
 
 
@@ -94,10 +111,8 @@ class RosterProject:
     # With its trailing slash, or `""`; the CP's, never derived (the `_roster_entry` presence gate).
     branch_prefix: str = ""
     port_vars: tuple[str, ...] = ()
-    # Per project: one fetch refreshes `origin/<base>` for every slot. Written by the observation POST, so
-    # `None` while that cannot land. `None` is not `0`: `None` means "fetch now" (`fetch_base_if_stale`'s gate
-    # 3).
-    fetch_stamp_age_secs: int | None = None
+    # The roster's `port_preferred` (`port_preferred_from_wire`); `()` = none or an older CP.
+    port_preferred: tuple[tuple[str, int], ...] = ()
     # False: a project with no repository, whose slots are empty folders (`wire_has_repo`).
     has_repo: bool = True
     # The entry's `projects.id` — the identity every daemon→CP call sends beside the display name. None =
@@ -110,6 +125,8 @@ class RosterProject:
     stack_down_cmd: str = ""
     # `projects.push_enabled` (`wire_push_enabled`).
     push_enabled: bool = False
+    # The org's `jaah_repo_prefix` (`wire_jaah_repo_prefix`); None = not said.
+    jaah_repo_prefix: str | None = None
 
     def pool_config(self) -> "core.PoolConfig":
         return _pool_config(self)
@@ -127,18 +144,14 @@ SLOT_FREE = "free"
 SLOT_TASK = "task"
 
 
-# A human's hold, singled out by the orphan reap (`_observe_one`) and the kill-runner sweep.
-SLOT_USER = "user"
-
-
 # The positive test, never `!= SLOT_FREE`: an undescribed slot parses as `""`, which must read neither busy
 # nor free — callers that must not guess also handle `""` explicitly.
-OCCUPIED_SLOT_STATES = frozenset({SLOT_TASK, SLOT_USER})
+OCCUPIED_SLOT_STATES = frozenset({SLOT_TASK})
 
 
 @dataclass(frozen=True)
 class RosterSlot:
-    """One CP-supplied pool slot. `is_main` is a roster attribute, not an `n == "0"` test.
+    """One CP-supplied pool slot.
 
     `state` is the only occupancy fact the CP serves; `tests/test_fleet_wire_contract.py` refuses a parser
     reading the retired `holder` keys."""
@@ -150,14 +163,10 @@ class RosterSlot:
     base: str
     clone_url: str
     repo_path: str
-    # The project's prefix, so a slot-scoped `reset_to_base` sees the same config as a project-scoped one.
+    # The project's prefix, so a slot-scoped call sees the same config as a project-scoped one.
     branch_prefix: str = ""
-    is_main: bool = False
     port_vars: tuple[str, ...] = ()
-    # The CP-decided port band (pairs, so the frozen dataclass stays hashable). `()` = no declared ports;
-    # `apply_port_band` refuses an absent band. A declared var the band omits is tier 2
-    # (`worktree_mechanics.ports.apply_auto_ports`).
-    ports: tuple[tuple[str, int], ...] = ()
+    port_preferred: tuple[tuple[str, int], ...] = ()
     # `worktrees.state` (`free`/`task`/`user`), decided by `slot_state`. `""` = the roster said nothing, not
     # `free`: test membership in `OCCUPIED_SLOT_STATES`, never `!= "free"`.
     state: str = ""
@@ -172,20 +181,21 @@ class RosterSlot:
     retiring: bool = False
     # The entry's `projects.id`, which `destroy_slot`'s compose project is checked against. None = not said.
     project_id: int | None = None
-    # False: an empty FOLDER slot of a project with no repository (`wire_has_repo`) — never a git tree, so
-    # no git runs against it, ever.
+    # False: an empty FOLDER slot — of a project with no repository, or a slot whose own `has_repo: false`
+    # overrides its git entry's (`wire_has_repo`) — never a git tree, so no git runs against it, ever.
     has_repo: bool = True
     # The project's `RosterProject.repos` / `stack_down_cmd`, so a session-start converge needs no second read.
     repos: tuple = ()
     stack_down_cmd: str = ""
     push_enabled: bool = False
+    jaah_repo_prefix: str | None = None
 
     @property
     def ref(self) -> tuple[str, str]:
         return (self.project, self.number)
 
     def pool_config(self) -> "core.PoolConfig":
-        """This slot's config for the mechanics (`reset_to_base` is the only slot-scoped call)."""
+        """This slot's config for the mechanics."""
         return _pool_config(self)
 
 
@@ -203,6 +213,9 @@ class KnownSlot:
     # The one discriminator between "declared, never built" and "built, then deleted"
     # (`_unmaterialised_slot_entry`); `""` spares the row. Not fatal if missing.
     observed_at: str = ""
+    # `projects.id` (C6): what the observation reports the slot under when the roster does not name its
+    # project (a slot retiring, or carried over from another org). Not fatal if missing.
+    project_id: int | None = None
 
     @property
     def ref(self) -> tuple[str, str]:
@@ -248,7 +261,7 @@ class PoolTick:
     # Every slot the CP has a row for. Empty is legitimate; absent or unparseable degrades the tick to
     # `ok=False`.
     known_slots: tuple[KnownSlot, ...] = ()
-    # The tier-2 range off the tick's fleet-global `grid` block
+    # The node-assigned port range off the tick's fleet-global `grid` block
     # (`worktree_mechanics.ports.auto_port_range_from_grid`): one pair, not a per-slot copy of a global fact. None =
     # no block, not a degrade — the default lives in `worktree_mechanics`.
     auto_ports: tuple[int, int] | None = None
@@ -258,27 +271,25 @@ class PoolTick:
     # The `microvm` rail's orders (`microvm_rail.intents_from_tick`), parsed on every tick like the mark: a
     # MicroVM node has no roster. Enacted only on a marked node.
     microvm_intents: tuple[dict, ...] = ()
-    # Every roster entry parsed into `projects` (none dropped as unusable): the only roster the pool-mirror
-    # sweep may read as "a project absent here is gone" (`sweep_pool_mirrors`).
+    # Every roster entry parsed into `projects` (none dropped as unusable): the only roster the legacy-layout
+    # migration lets a main clone go on (`legacy_layout.unlocked_candidates`).
     roster_complete: bool = False
 
 
-def port_band_from_wire(raw: object) -> tuple[tuple[str, int], ...]:
-    """The CP's port band for one slot → a sorted, hashable `(VAR, port)` tuple. The single parse.
-
-    A non-integer value is dropped, never defaulted (the node holds no grid and must not decide a port).
-    Sorted so a reordered dict is not a changed slot."""
+def port_preferred_from_wire(raw: object) -> tuple[tuple[str, int], ...]:
+    """The roster's `port_preferred` (`{VAR: port}`) → a sorted, hashable `(VAR, port)` tuple. A malformed
+    entry (bad name, non-int or bool, outside 1024-65535) is dropped: that var auto-assigns instead."""
     if not isinstance(raw, dict):
         return ()
-    band: dict[str, int] = {}
+    out: dict[str, int] = {}
     for var, port in raw.items():
-        if isinstance(port, bool):
+        name = var.strip() if isinstance(var, str) else ""
+        if (not wm_ports._port_var_name_ok(name) or isinstance(port, bool) or not isinstance(port, int)
+                or not 1024 <= port <= 65535):
+            log.warning("reconcile: ignoring preferred port %r for %r in the CP's roster", port, var)
             continue
-        try:
-            band[str(var)] = int(port)
-        except (TypeError, ValueError):
-            log.warning("reconcile: ignoring non-numeric port %r for %r in the CP's band", port, var)
-    return tuple(sorted(band.items()))
+        out[name] = port
+    return tuple(sorted(out.items()))
 
 
 def _roster_entry(entry: dict) -> tuple[RosterProject | None, list[RosterSlot]]:
@@ -290,6 +301,21 @@ def _roster_entry(entry: dict) -> tuple[RosterProject | None, list[RosterSlot]]:
     if not project:
         log.warning("reconcile: roster entry without a project name, skipping: %r", entry)
         return None, []
+    raw_project_id = entry.get("project_id")
+    project_id = (
+        raw_project_id if isinstance(raw_project_id, int) and not isinstance(raw_project_id, bool) else None
+    )
+    if "clone" not in entry and project_id is not None:
+        # A CP that no longer sends the legacy `clone` field: the node derives the anchor from a slot's CP-sent
+        # `path` (`core.slot_anchor`), so it agrees with those paths whatever home the CP recorded; a slotless
+        # entry falls back to the node's own home (`core.project_anchor`). An unset home derives `""`, and the
+        # gate below then refuses the entry.
+        sent_slots = entry.get("slots")
+        anchors = (core.slot_anchor(s.get("path"), s.get("number"), project_id)
+                   for s in (sent_slots if isinstance(sent_slots, list) else ()) if isinstance(s, dict))
+        clone = next((a for a in anchors if a), "") or core.project_anchor(
+            environment.pool_root_or_empty(), project_id)
+        entry = {**entry, "clone": clone}
     has_repo = wire_has_repo(entry.get("has_repo"))
     if has_repo:
         gated = _DRAINING_ROSTER_GATED_FIELDS if entry.get("draining") is True else _ROSTER_GATED_FIELDS
@@ -311,24 +337,17 @@ def _roster_entry(entry: dict) -> tuple[RosterProject | None, list[RosterSlot]]:
     branch_prefix = str(entry.get("branch_prefix") or "")
     raw_port_vars = entry.get("port_vars")
     port_vars = tuple(str(v) for v in raw_port_vars if v) if isinstance(raw_port_vars, list) else ()
-    # Non-int = "never fetched" (None). `bool` excluded: `True` would become age 1.
-    raw_fetch_age = entry.get("fetch_stamp_age_secs")
-    fetch_stamp_age_secs = (
-        raw_fetch_age if isinstance(raw_fetch_age, int) and not isinstance(raw_fetch_age, bool) else None
-    )
-    raw_project_id = entry.get("project_id")
-    project_id = (
-        raw_project_id if isinstance(raw_project_id, int) and not isinstance(raw_project_id, bool) else None
-    )
+    port_preferred = port_preferred_from_wire(entry.get("port_preferred"))
     # Absent/empty (an older CP, a folder project) is `()`, today's path (S4).
     repos = slot_repos.repos_from_wire(entry.get("repos")) if has_repo else ()
     stack_down_cmd = str(entry.get("stack_down_cmd") or "")
     push_enabled = wire_push_enabled(entry.get("push_enabled"))
+    jaah_repo_prefix = wire_jaah_repo_prefix(entry.get("jaah_repo_prefix"))
     roster_project = RosterProject(
         project=project, clone=clone, base=base, clone_url=clone_url, repo_path=repo_path,
-        branch_prefix=branch_prefix, port_vars=port_vars,
-        fetch_stamp_age_secs=fetch_stamp_age_secs, has_repo=has_repo, project_id=project_id,
-        repos=repos, stack_down_cmd=stack_down_cmd, push_enabled=push_enabled,
+        branch_prefix=branch_prefix, port_vars=port_vars, port_preferred=port_preferred,
+        has_repo=has_repo, project_id=project_id,
+        repos=repos, stack_down_cmd=stack_down_cmd, push_enabled=push_enabled, jaah_repo_prefix=jaah_repo_prefix,
     )
 
     out: list[RosterSlot] = []
@@ -343,9 +362,14 @@ def _roster_entry(entry: dict) -> tuple[RosterProject | None, list[RosterSlot]]:
             log.warning("reconcile: roster slot without a number in %s, skipping: %r", project, raw)
             continue
         number = str(number)
-        is_main = bool(raw.get("is_main"))
-        # The default path is keyed on `is_main`, never the slot index.
-        path = str(raw.get("path") or (clone if is_main else f"{clone}-{number}"))
+        if number == "0":
+            # An older CP's main-clone row: there is no slot 0, so the row is skipped, never reconciled; the
+            # tree itself is the migration pass's to remove.
+            continue
+        path = str(raw.get("path") or f"{clone}-{number}")
+        # The slot's own kind when it says one (a folder slot inside a git entry), else the entry's. A folder
+        # slot has no repository manifest; the entry's other strings stay, so `wt_path` derives the same path.
+        slot_has_repo = wire_has_repo(raw["has_repo"]) if "has_repo" in raw else has_repo
         out.append(
             RosterSlot(
                 project=project,
@@ -356,19 +380,19 @@ def _roster_entry(entry: dict) -> tuple[RosterProject | None, list[RosterSlot]]:
                 clone_url=clone_url,
                 repo_path=repo_path,
                 branch_prefix=branch_prefix,
-                is_main=is_main,
                 port_vars=port_vars,
-                ports=port_band_from_wire(raw.get("ports")),
+                port_preferred=port_preferred,
                 state=str(raw.get("state") or ""),
                 last_used=str(raw.get("last_used") or ""),
                 observed_at=str(raw.get("observed_at") or ""),
                 kind=str(raw.get("kind") or ""),
                 retiring=raw.get("retiring") is True,
                 project_id=project_id,
-                has_repo=has_repo,
-                repos=repos,
+                has_repo=slot_has_repo,
+                repos=repos if slot_has_repo else (),
                 stack_down_cmd=stack_down_cmd,
                 push_enabled=push_enabled,
+                jaah_repo_prefix=jaah_repo_prefix,
             )
         )
     return roster_project, out
@@ -475,9 +499,11 @@ def _known_slots(body: dict) -> tuple[KnownSlot, ...] | None:
                 entry,
             )
             return None
+        raw_project_id = entry.get("project_id")
         out.append(KnownSlot(
             project=project, number=str(number), path=path,
             observed_at=str(entry.get("observed_at") or ""),
+            project_id=raw_project_id if isinstance(raw_project_id, int) and not isinstance(raw_project_id, bool) else None,
         ))
     return tuple(out)
 
@@ -574,7 +600,7 @@ async def fetch_pool_tick(node_id: str | None) -> PoolTick:
 def slot_kind_mismatch(slot: RosterSlot, intent: SlotIntent) -> str:
     """`""` when the intent and the roster agree on what kind of slot this is, else the refusal.
 
-    The roster's `has_repo` decides how the node treats a slot; an intent that carries its own (`lease_slot`,
+    The roster slot's `has_repo` (its own, else its entry's) decides how the node treats a slot; an intent that carries its own (`lease_slot`,
     `destroy_slot`) must say the same thing, or the two halves of the CP disagree about whether this path is
     a git tree or an empty folder — and one of the two readings is destructive. Absent reads true on both
     sides (`wire_has_repo`)."""

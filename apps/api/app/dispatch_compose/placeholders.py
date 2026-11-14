@@ -1,17 +1,15 @@
-"""Template passes over prompt text: project-value placeholders, conditional blocks and name respelling."""
+"""Template passes over prompt text: project-value placeholders and conditional blocks."""
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
 
 from app import agent_providers
 from app.dispatch_compose.fencing import (
-    _FENCE_BEGIN,
-    _FENCE_END,
     defang_conditional_markers,
     defang_fence_markers,
 )
 from app.dispatch_compose.role_tables import _GATE_ABSENT_REWRITES
+from app.task_branch import TASK_SEGMENT, task_branch_prefix
 
 #: This module's own placeholder tokens, as a narrow alternation (unrecognized braces in operator prose stay
 #: verbatim). Case-sensitive. `_PLACEHOLDER_TOKEN_RE` captures the name for one-pass substitution;
@@ -67,7 +65,9 @@ def apply_project_values(
 ) -> str:
     """Substitute the four project-column placeholders in doctrine text, in one exact named pass.
 
-    `branch_prefix` may be empty (renders `{branch_prefix}fleet/task-7` as `fleet/task-7`); a blank gate
+    `branch_prefix` may be empty (renders `{branch_prefix}fleet/task-7` as `fleet/task-7`), and before
+    `fleet/task-` renders without a trailing `fleet/` (`app/task_branch.py`: a `fleet/` prefix spells
+    `fleet/task-7`, not `fleet/fleet/task-7`); a blank gate
     command means the project has no gate for that tier, and renders as `NO_QUICK_GATE`/`NO_FULL_GATE`,
     replacing a backtick pair around its token too so no empty code span is left. That is the value's own
     rendering, not a byte-divergence cause: the benign-value baseline has both gates set.
@@ -100,8 +100,13 @@ def apply_project_values(
     }
     no_gate = {"gate_quick_cmd": NO_QUICK_GATE, "gate_full_cmd": NO_FULL_GATE}
 
+    task_prefix = _both(task_branch_prefix(branch_prefix))
+
     def _render(m: re.Match[str]) -> str:
         opener, name, closer = m.groups()
+        if name == "branch_prefix" and not closer and m.string.startswith(TASK_SEGMENT + "task-", m.end()):
+            # A task branch spelled out (`{branch_prefix}fleet/task-<id>`): `fleet/` once (`app/task_branch.py`).
+            return opener + task_prefix
         if name in no_gate and not values[name].strip():
             # The phrase replaces a whole `{token}` code span; a lone tick is prose's, so it stays.
             return no_gate[name] if opener and closer else opener + no_gate[name] + closer
@@ -264,37 +269,6 @@ _CHARTER_TOOL_PREFIX = _CHARTER_PROVIDER.mcp_tool_prefix
 _CHARTER_ASK_TOOL = _CHARTER_PROVIDER.ask_tool
 _CHARTER_ASK_DISMISSED_RE = re.compile(
     r"\s+".join(map(re.escape, _CHARTER_PROVIDER.ask_dismissed_result.split())))
-
-
-def _outside_fence(text: str, respell: Callable[[str], str]) -> str:
-    """`text` with `respell` applied outside the untrusted fence (a task body is a record, left as typed):
-    before `_FENCE_BEGIN`, and after the last `_FENCE_END` when one follows it."""
-    begin = text.find(_FENCE_BEGIN)
-    if begin < 0:
-        return respell(text)
-    end = text.rfind(_FENCE_END)
-    if end < begin:
-        return respell(text[:begin]) + text[begin:]
-    return respell(text[:begin]) + text[begin:end] + respell(text[end:])
-
-
-def respell_vocabulary(text: str) -> str:
-    """`text` with every renamed agent verb (`agent_providers.VOCABULARY_SPELLINGS`) back in its pre-rename
-    spelling — dotted (`jaah-call merge_queue.batch`) and as a tool name, bare or after any provider's prefix
-    (`mcp__plugin_jaah_control__task_complete`) — outside the untrusted fence. For a node that does not report
-    `vocabulary: industry` (`_node_uses_legacy_vocabulary`): it serves only the pre-rename names."""
-    pairs = sorted(agent_providers.VOCABULARY_SPELLINGS, key=lambda pair: -len(pair[0]))
-
-    def respell(part: str) -> str:
-        for current, old in pairs:
-            part = re.sub(r"(?<![\w.-])" + re.escape(current) + r"(?![\w])", old, part)
-            # A tool name stands alone or right after a provider prefix (`…__` or `mcp_control_`), never
-            # inside a longer identifier — so a pre-rename name is never respelled twice.
-            part = re.sub(r"(?:(?<=__)|(?<=mcp_control_)|(?<![\w.-]))" + re.escape(current.replace(".", "_"))
-                          + r"(?![\w])", old.replace(".", "_"), part)
-        return part
-
-    return _outside_fence(text, respell)
 
 
 # ── Per-project operator instructions (`projects.agent_instructions`) ──

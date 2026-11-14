@@ -1,18 +1,18 @@
 import type { JSX } from 'react'
-import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import { apiDetail } from '../../api'
 import { useAuth } from '../../auth'
+import { useRowActions } from '../../hooks/useBusyIds'
 import { PHONE, PHONE_STATUS_LINE_SX } from '../../ui/listStyles'
 import { FilterRow, FilterSearch, matchesAny } from '../../ui/FilterRow'
-import { useConfirm } from '../../components/ConfirmDialog'
+import { danger, useConfirm } from '../../components/ConfirmDialog'
 import { useChangeOrgAction } from '../../components/ChangeOrgDialog'
 import PaneModeToggle from '../../components/tasks/pane/PaneModeToggle'
 import { loadListView, saveListView, usePersistedListView } from '../../lib/listViewStorage'
 import { buildNameTree, type NameTreeKind } from '../../lib/nameTree'
-import { NO_REFILING_DEPS, nameTreeRows } from '../../lib/nameTreeRows'
+import { nameTreeRows } from '../../lib/nameTreeRows'
 import { countOf } from '../../lib/humanize'
 import { absoluteTime, compactAge } from '../../lib/relativeTime'
 import Banner from '../../ui/Banner'
@@ -35,12 +35,14 @@ import {
   listAllOrgsPlaybooks,
   listPlaybooks,
 } from './api'
+import { grid, SIZE } from '../../theme'
+import Tip from '../../ui/Tip'
 
 /* THE PLAYBOOKS LIST — `/playbooks`. The org's own playbooks run from the task form's Playbook depth while the
  * org's plan has Playbooks on (`apps/api/app/playbook_engine.py`); the built-ins are what the standard
  * depths already do.
  * THE STANDARD LIST SHAPE, SHARED WITH AUTOMATIONS (`pages/automations/AutomationList.tsx`): a titleless `PageHeader`
- * (the Automation tab names the page; its actions portal onto that strip) whose action cluster is the shared Flat/Tree toggle (`components/tasks/pane/PaneModeToggle.tsx`), then the wordless ＋ New playbook
+ * (the Customize tab names the page; its actions portal onto that strip) whose action cluster is the shared Flat/Tree toggle (`components/tasks/pane/PaneModeToggle.tsx`), then New playbook
  * (`ui/NewButton`, to `/playbooks/new`) — and one filter strip below it: Search (name and description). An
  * operator's org narrowing is the GLOBAL org filter's (`lib/orgScope.ts`, served server-side), never a
  * page-level Org select — one decision, one control. The view persists per viewer (`lib/listViewStorage.ts`).
@@ -53,20 +55,26 @@ import {
  * validity verdict (`issues`); the full description hangs under the name, wrapping, never truncated.
  * Duplicate opens the new copy's editor. */
 
+const LOCK_TITLE = 'Built-in: duplicate it to edit a copy'
+
+/** The padlock drawn, not typed: the `🔒︎` character rendered as a near-illegible speck at the feed's marker size. */
+const LockIcon = ({ size }: { size: number }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+    <rect x="3" y="7" width="10" height="8" rx="1.5" fill="currentColor" />
+    <path d="M5 7V5a3 3 0 0 1 6 0v2" fill="none" stroke="currentColor" strokeWidth="1.6" />
+  </svg>
+)
+
 export const LockGlyph = () => (
-  <Box
+  <Tip title={LOCK_TITLE}><Box
     component="span"
     role="img"
     aria-label="Locked"
-    title="Built-in: duplicate it to edit a copy"
     data-testid="playbook-lock"
     sx={{ display: 'inline-flex', color: 'text.secondary', alignSelf: 'center' }}
   >
-    <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
-      <rect x="3" y="7" width="10" height="8" rx="1.5" fill="currentColor" />
-      <path d="M5 7V5a3 3 0 0 1 6 0v2" fill="none" stroke="currentColor" strokeWidth="1.6" />
-    </svg>
-  </Box>
+    <LockIcon size={SIZE.iconXs} />
+  </Box></Tip>
 )
 
 /** The row's mark: the server's validation verdict on the stored playbook (errors, then warnings). */
@@ -84,16 +92,15 @@ function validityMark(pb: PlaybookOut): FeedIndicator {
 
 const ENTRY_LABEL: Record<string, string> = { new_task: 'New task', new_chat: 'New chat' }
 
-/** Tree mode's vocabulary; `nameMax` only bounds drags, and this roster offers none. */
-const PLAYBOOK_TREE_KIND: NameTreeKind = { noun: { one: 'playbook', many: 'playbooks' }, nameMax: null, idPrefix: 'playbook' }
+/** Tree mode's vocabulary. */
+const PLAYBOOK_TREE_KIND: NameTreeKind = { noun: { one: 'playbook', many: 'playbooks' }, idPrefix: 'playbook' }
 
 export default function PlaybooksPage(): JSX.Element {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [confirm, confirmDialog] = useConfirm()
   const changeOrg = useChangeOrgAction('playbook')
-  const [error, setError] = useState('')
-  const [busyId, setBusyId] = useState<string | null>(null)
+  const { busy, error, run } = useRowActions<string>()
   const { admin } = useAuth()
   const orgVisible = useOrgVisible()
   /* An operator reads every org's copies; anyone else the task form's own-org list (one cache entry, the
@@ -109,33 +116,19 @@ export default function PlaybooksPage(): JSX.Element {
     next => saveListView('playbooks', admin?.id ?? null, next),
   )
 
-  const duplicate = useMutation({
-    mutationFn: duplicatePlaybook,
-    onMutate: id => setBusyId(id),
-    onSettled: () => setBusyId(null),
-    onSuccess: copy => {
+  const duplicate = (pb: PlaybookOut) =>
+    void run(pb.id, 'Could not duplicate the playbook.', async () => {
+      const copy = await duplicatePlaybook(pb.id)
       void queryClient.invalidateQueries({ queryKey: PLAYBOOKS_KEY })
       navigate(`/playbooks/${copy.id}`)
-    },
-    onError: err => setError(apiDetail(err, 'Could not duplicate the playbook.')),
-  })
-  const remove = useMutation({
-    mutationFn: deletePlaybook,
-    onMutate: id => setBusyId(id),
-    onSettled: () => setBusyId(null),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: PLAYBOOKS_KEY }),
-    onError: err => setError(apiDetail(err, 'Could not delete the playbook.')),
-  })
+    })
 
   async function onDelete(pb: PlaybookOut) {
-    const ok = await confirm({
-      title: 'Delete playbook?',
-      message: 'This cannot be undone.',
-      identity: pb.name,
-      confirmLabel: 'Delete',
-      destructive: true,
+    if (!await confirm(danger('Delete', { title: 'Delete playbook?', message: 'This cannot be undone.', identity: pb.name }))) return
+    await run(pb.id, 'Could not delete the playbook.', async () => {
+      await deletePlaybook(pb.id)
+      void queryClient.invalidateQueries({ queryKey: PLAYBOOKS_KEY })
     })
-    if (ok) remove.mutate(pb.id)
   }
 
   const rows = list.data ?? []
@@ -166,7 +159,7 @@ export default function PlaybooksPage(): JSX.Element {
       pb.editable
         ? editItem(pb.name, { to: `/playbooks/${pb.id}` })
         : { key: 'open', icon: '→', label: 'Open', ariaLabel: `Open ${pb.name}`, to: `/playbooks/${pb.id}` },
-      { key: 'duplicate', icon: '⧉', label: 'Duplicate', ariaLabel: `Duplicate ${pb.name}`, onClick: () => duplicate.mutate(pb.id) },
+      { key: 'duplicate', icon: '⧉', label: 'Duplicate', ariaLabel: `Duplicate ${pb.name}`, onClick: () => duplicate(pb) },
     ]
     if (changeOrgItem) items.push(changeOrgItem)
     if (pb.editable) {
@@ -185,14 +178,14 @@ export default function PlaybooksPage(): JSX.Element {
       title: pb.name,
       titleText: pb.name,
       href: `/playbooks/${pb.id}`,
-      busy: busyId === pb.id,
+      busy: busy.has(pb.id),
       markers: builtIn
         /* Hugs the name: as a column it sat at the row's far edge on a phone, read as nobody's. */
-        ? [{ key: 'lock', glyph: '🔒\uFE0E', label: 'Built-in: duplicate it to edit a copy', testId: 'playbook-lock', hug: true }]
+        ? [{ key: 'lock', glyph: <LockIcon size={SIZE.iconSm} />, label: LOCK_TITLE, tone: 'neutral', testId: 'playbook-lock', hug: true }]
         : undefined,
       slots: [
-        { key: 'entry', width: 72, gate: 'meta', align: 'left', dim: true, testId: 'playbook-entry', node: ENTRY_LABEL[pb.entry] ?? pb.entry },
-        { key: 'stages', width: 64, gate: 'id', align: 'right', testId: 'playbook-stages', node: countOf(pb.stages.length, 'stage') },
+        { key: 'entry', width: grid(12), gate: 'meta', align: 'left', dim: true, testId: 'playbook-entry', node: ENTRY_LABEL[pb.entry] ?? pb.entry },
+        { key: 'stages', width: grid(10.5), gate: 'id', align: 'right', testId: 'playbook-stages', node: countOf(pb.stages.length, 'stage') },
         /* WHICH TENANT OWNS THE COPY, for an operator only (`useOrgVisible`), riding `squeeze` immediately left
            of the ungated tail, as `/projects`' does (`ui/feed/geometry.ts::SlotGate`). A built-in belongs to no
            org by design (one global copy), not by omission: its slot stays BLANK rather than the indicator's
@@ -200,7 +193,7 @@ export default function PlaybooksPage(): JSX.Element {
         ...orgSlots(orgVisible, pb.org, { gate: 'squeeze' }).map(slot => (builtIn ? { ...slot, node: null, title: undefined } : slot)),
         {
           key: 'updated',
-          width: 40,
+          width: grid(6.5),
           align: 'right',
           dim: true,
           testId: 'playbook-updated',
@@ -215,15 +208,12 @@ export default function PlaybooksPage(): JSX.Element {
     }
   }
 
-  /* One section's rows: flat, or Tree mode's folders (`lib/nameTreeRows`, the Schedule's engine) with
-     re-filing off — `dragging: null` is its whole off switch. */
+  /* One section's rows: flat, or Tree mode's folders (`lib/nameTreeRows`, the Schedule's engine). */
   const sectionRows = (items: PlaybookOut[]): FeedRowSpec[] =>
     treeMode
       ? nameTreeRows(buildNameTree(items), {
-          ...NO_REFILING_DEPS,
           kind: PLAYBOOK_TREE_KIND,
-          leafRow: (pb, busy) => ({ ...rowOf(pb), busy: busy || busyId === pb.id }),
-          busyId,
+          leafRow: rowOf,
           expanded: new Set(view.expanded),
           onToggleGroup: toggleGroup,
         })
@@ -237,7 +227,7 @@ export default function PlaybooksPage(): JSX.Element {
 
   return (
     <Box data-testid="playbooks-page">
-      {/* Titleless: the Automation tab names the page, so the Preview mark rides the actions onto its strip. */}
+      {/* Titleless: the Customize tab names the page, so the Preview mark rides the actions onto its strip. */}
       <PageHeader
         actions={
           <>

@@ -108,8 +108,8 @@ PERMISSION_KEYS = frozenset(spec.key for spec in PERMISSION_CATALOG)
 OWNER_KEYS: frozenset[str] = expand_role(ROLES_BY_SLUG[access.OWNER_ROLE], PERMISSION_KEYS)
 
 
-#: Keys the catalogue offers and nothing honours — a classification, not a boundary. Mirrored in
-#: `apps/web/src/types.ts` (a parity test holds the two equal). No role decision reads it;
+#: Keys the catalogue offers and nothing honours — a classification, not a boundary. The console takes
+#: it as each key's `honoured` flag on `GET /api/permissions`, never a copy. No role decision reads it;
 #: an API key's `grants_all` set and `GET /api/permissions`' `honoured` flag do (`app/api_keys.py`). Nothing
 #: refuses or drops them: a role may carry one.
 #: `finance:view` and `finance:edit` are honoured by routes (`routes/billing.py`, `routes/billing_plans.py`, both
@@ -226,7 +226,7 @@ class Access(str, Enum):
     grantable capability can ever be used to grant more capability."""
 
     ORG_ADMIN = "org_admin"
-    """The TENANT-ADMIN gate (G4): an operator (`Principal.is_operator`), or an Org Owner/Admin
+    """The TENANT-ADMIN gate: an operator (`Principal.is_operator`), or an Org Owner/Admin
     (`Principal.org_role`) of the caller's own org. NO FEATURE KEY REACHES IT, like `SUPERADMIN`: user,
     group and org administration stay behind an org ROLE, so no project-scoped key can be used to grant
     more capability. The caller's own org is what the seam binds; `Tenancy.OPERATOR` is refused for it
@@ -277,7 +277,7 @@ class Tenancy(str, Enum):
 
     THE ADMISSION RULE IS ABOUT THE SUBJECT, NOT ABOUT THE TABLES, and the distinction has to be
     spelled out because the obvious reading is wrong. "Its rows have no org to belong to" would admit
-    almost none of the routes wearing this term: `Node`, `Account`, `Cron`, `Alert` and `PortGridVar`
+    almost none of the routes wearing this term: `Node`, `Account`, `Cron` and `Alert`
     are all `Stored` in `app/tenancy/manifest.py` — every one of them carries its own
     `org_id`. What makes a route operator-plane is that the QUESTION IT ANSWERS is a fleet question —
     "which nodes are alive", "what is the release every node should run", "which epics still need a

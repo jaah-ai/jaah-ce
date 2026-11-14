@@ -1,0 +1,41 @@
+# Loom: hosted MCP server. Facts confirmed at https://support.atlassian.com/atlassian-rovo-mcp-server/docs/getting-started-with-the-atlassian-remote-mcp-server/ (Loom has no MCP server of its own; Atlassian's Rovo MCP server serves it) and that server's own OAuth metadata (mcp.atlassian.com/.well-known/oauth-protected-resource/v2/mcp).
+# A catalog alias of `atlassian.toml`: the same server, so Loom users find it under its own name.
+slug = "loom"
+label = "Loom"
+category = "mcp"
+vendor_docs_url = "https://support.atlassian.com/atlassian-rovo-mcp-server/docs/getting-started-with-the-atlassian-remote-mcp-server/"
+summary = "Reach Loom videos and transcripts through Atlassian's Rovo MCP server, which serves Loom."
+
+[[auth]]
+kind = "mcp"
+
+[mcp]
+url = "https://mcp.atlassian.com/v2/mcp"
+url_editable = false
+transport = "streamable_http"
+auth = "oauth_dcr"
+
+[docs]
+agent_uses = [
+  "Find a Loom video a task names and read its transcript",
+  "Summarize a recorded walkthrough into steps or acceptance criteria",
+  "Search Jira and Confluence on the same connection, since the server is Atlassian's",
+]
+prerequisites = [
+  "A Loom workspace you reach with your Atlassian account (Loom's MCP access comes through Atlassian's Rovo MCP server)",
+  "If your organization restricts MCP clients, an admin allows this Jaah's domain in Atlassian Administration > Connectors > Atlassian MCP server",
+]
+limitations = [
+  "Loom has no MCP server of its own: this connection is Atlassian's Rovo MCP server, and the Loom tools it offers are Atlassian's choice",
+  "One Atlassian connection already covers Loom: you do not need both this card and the Atlassian card",
+]
+troubleshooting = [
+  { symptom = "Agents see Jira and Confluence tools but no Loom tools", fix = "You signed in with an Atlassian account that has no Loom access. Reconnect with the account you use for Loom" },
+  { symptom = "Test says Loom rejected the token (401)", fix = "The grant expired or was removed from your Atlassian account's Connected apps. Select Reconnect" },
+  { symptom = "The secret shows Needs reconnect", fix = "Loom ended the grant (a password change, a revoked connection or a long idle period). Select Reconnect on the secret and sign in to Loom again" },
+  { symptom = "New tasks on the project have no Loom tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with, and an agent marked Not supported on that tab cannot load MCP servers" },
+]
+faq = [
+  { q = "Why does signing in to Loom take me to Atlassian", a = "Loom's MCP access is served by Atlassian's Rovo MCP server, so you sign in with your Atlassian account" },
+  { q = "Does Jaah need an app registered at Atlassian", a = "No. Jaah registers itself with Atlassian's sign-in server the first time anyone connects, and every later connection reuses that registration" },
+]

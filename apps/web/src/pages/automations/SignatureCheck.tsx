@@ -2,6 +2,7 @@ import { useState } from 'react'
 import Typography from '@mui/material/Typography'
 import FormDialog from '../../ui/FormDialog'
 import FormTextField from '../../ui/FormTextField'
+import type { Explain } from '../../ui/explain'
 import { monoSx } from '../../ui/listStyles'
 
 /* A VERIFY-ONLY check of which secret a sender signs with: a console-created secret is never shown again, so
@@ -18,6 +19,12 @@ export async function signatureMatches(secret: string, body: string, signature: 
   const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(body)))
   const hex = Array.from(mac, b => b.toString(16).padStart(2, '0')).join('')
   return signature.trim().replace(/^sha256=/i, '').toLowerCase() === hex
+}
+
+/** The Body field: what to paste, and the one paste that cannot match. */
+const BODY_HELP: Explain = {
+  tip: 'One request’s raw body exactly as sent; CRLF won’t match.',
+  more: 'Every byte counts. A textarea turns CRLF line endings into LF, so a body sent with CRLF won’t match here.',
 }
 
 export default function SignatureCheckDialog({ onClose }: { onClose: () => void }) {
@@ -46,6 +53,7 @@ export default function SignatureCheckDialog({ onClose }: { onClose: () => void 
       </Typography>
       <FormTextField
         label="Secret"
+        help="The automation’s signing secret; it never leaves this browser."
         type="password"
         autoComplete="new-password"
         value={secret}
@@ -54,7 +62,7 @@ export default function SignatureCheckDialog({ onClose }: { onClose: () => void 
       />
       <FormTextField
         label="Body"
-        hint="CRLF line endings won’t match here."
+        help={BODY_HELP}
         multiline
         minRows={3}
         value={body}
@@ -64,6 +72,7 @@ export default function SignatureCheckDialog({ onClose }: { onClose: () => void 
       />
       <FormTextField
         label="Signature"
+        help="The request’s signature header, such as X-Jaah-Signature-256."
         placeholder="sha256=…"
         value={signature}
         onChange={edit(setSignature)}

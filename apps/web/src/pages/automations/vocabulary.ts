@@ -1,41 +1,76 @@
 /* THE AUTOMATIONS SURFACE'S WORDS. What the server words (the schedule sentence, a status reason, a target's
  * skip reason, a source kind's label via `pages/triggers/vocabulary.ts::useSourceKindLabels`) is never respelled
- * here; this owns only what the server has no word for: the When picker's order, tones, and the two policy lines
- * the editor states under When (AC7.1, AC7.2). */
+ * here; this owns only what the server has no word for: the When picker's order and tones. */
 
 import { humanize } from '../../lib/humanize'
+import { oneOf } from '../../lib/strings'
 import type { Tone } from '../../ui/StatusChip'
-import { OUTCOME_TONE, readRun } from '../cron/vocabulary'
+import type { Presentation } from '../../ui/statusTone'
+import { OUTCOME, readRun } from '../cron/vocabulary'
 import type { AutomationRun, When } from './api'
 
+/** A saved config's string field, else `fallback`: a When's `source_config`, an action's `params`. */
+export function str(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback
+}
+
 /** The When picker, in order: a schedule, then the event sources (`app/triggers.py::SOURCE_KINDS`). */
-export const WHEN_CHOICES = ['schedule', 'webhook', 'github', 'gmail', 'slack', 'user_registered'] as const
+export const WHEN_CHOICES = [
+  'schedule', 'webhook', 'github', 'sentry', 'datadog', 'pagerduty', 'cloudwatch', 'gmail', 'slack', 'user_registered',
+  'incident', 'deploy_failed', 'health_breach',
+] as const
 export type WhenChoice = (typeof WHEN_CHOICES)[number]
+
+/** The Production QA sources (`app/triggers.py::PRODUCTION_QA_SOURCE_KINDS`): offered for a new When only while the
+ *  org's `production_qa` switch is on, or to the operator; a saved one keeps its own kind. */
+export const PRODUCTION_QA_SOURCE_KINDS: ReadonlySet<string> = new Set([
+  'sentry', 'datadog', 'pagerduty', 'cloudwatch', 'incident', 'deploy_failed', 'health_breach', 'gitlab', 'azure_devops',
+  'bitbucket',
+])
 
 export const WHEN_CHOICE_LABELS: Record<WhenChoice, string> = {
   schedule: 'Schedule',
   webhook: 'Webhook',
   github: 'GitHub',
+  sentry: 'Sentry',
+  datadog: 'Datadog',
+  pagerduty: 'PagerDuty',
+  cloudwatch: 'CloudWatch',
   gmail: 'Email',
   slack: 'Slack',
   user_registered: 'New user',
+  incident: 'Incident',
+  deploy_failed: 'Release failed',
+  health_breach: 'Health breach',
 }
 
-/** AC7.1: one missed-run policy, stated where the schedule is set. */
-export const MISSED_RUNS_POLICY = 'Missed runs while down are skipped; the next run happens on schedule.'
-/** AC7.2 / D10: overlap is decided per target — a schedule skips it (`automation_fire.py::_fire_schedule`)... */
-export const OVERLAP_POLICY = 'A target whose previous task is still open is skipped.'
-/** ...an event queues it at the Concurrency cap and skips it only once the queue is full (`_fire_event`). */
-export const EVENT_OVERLAP_POLICY =
-  'A target at its Concurrency cap queues the new task until one finishes; a full queue skips it.'
+/** What picking each When does: a line of the Source label's pop-up (`ui/FormTextField`'s `FormOption.help`), at most 10 words. */
+export const WHEN_CHOICE_HELP: Record<WhenChoice, string> = {
+  schedule: 'Runs at set times or every so often.',
+  webhook: 'Runs each time another system calls its address.',
+  github: 'Runs on the repository events you list.',
+  sentry: 'Runs on each Sentry alert it receives.',
+  datadog: 'Runs on each Datadog alert it receives.',
+  pagerduty: 'Runs on each PagerDuty incident it receives.',
+  cloudwatch: 'Runs on each CloudWatch alarm it receives.',
+  gmail: 'Runs on each email reaching the chosen mailbox.',
+  slack: 'Runs when someone mentions Jaah in listed channels.',
+  user_registered: 'Runs each time a new member registers.',
+  incident: 'Files a task for each incident in its project.',
+  deploy_failed: 'Files a task for each failed release.',
+  health_breach: 'Files a task for each health breach.',
+}
 
 /** Above this many resolved targets the editor says how many tasks one run files (save is never blocked). */
 export const MANY_TARGETS = 100
 
-export const STATUS_TONE: Record<string, Tone> = { active: 'success', paused: 'neutral', failing: 'error' }
-export const STATUS_LABELS: Record<string, string> = { active: 'Active', paused: 'Paused', failing: 'Failing' }
-/** The status mark's glyph, in the feed's vocabulary (`ui/feed/types.ts::FeedIndicator`). */
-export const STATUS_GLYPH: Record<string, string> = { active: '●', paused: '■', failing: '✕' }
+/** An automation's status: its word, tone, and the status mark's glyph in the feed's vocabulary
+ *  (`ui/feed/types.ts::FeedIndicator`). */
+export const STATUS: Record<string, Presentation> = {
+  active: { label: 'Active', tone: 'success', glyph: '●' },
+  paused: { label: 'Paused', tone: 'neutral', glyph: '■' },
+  failing: { label: 'Failing', tone: 'error', glyph: '✕' },
+}
 
 /** The list's last-run column: the server's one outcome word (`automation_service.LAST_RUN_OUTCOMES`) as a
  *  glyph (the feed's vocabulary), a tone, and the word an operator reads on hover. A word this table does not
@@ -47,8 +82,8 @@ export const LAST_RUN_OUTCOME: Record<string, { glyph: string; tone: Tone; label
   // Passed over by design (filtered, deduped, already running): nothing ran, like `noop`.
   skipped: { glyph: '○', tone: 'neutral', label: 'Skipped' },
   // An occurrence the engine never delivered is a failure, drawn as the failing status disc draws one.
-  missed: { glyph: STATUS_GLYPH.failing, tone: STATUS_TONE.failing, label: 'Missed' },
-  error: { glyph: STATUS_GLYPH.failing, tone: STATUS_TONE.failing, label: 'Error' },
+  missed: { ...STATUS.failing, label: 'Missed' },
+  error: { ...STATUS.failing, label: 'Error' },
   // In flight or queued behind a target's cap: not yet an outcome.
   pending: { glyph: '»', tone: 'info', label: 'Pending' },
 }
@@ -96,11 +131,11 @@ const FAILED_RUN_OUTCOMES = new Set(['error', 'missed', 'failed'])
 
 /** A run's chip tone (Runs tab and run page): a failed run, or one with an errored target, in the list's failing
  *  tone (the same read `LAST_RUN_OUTCOME` gives the list's last-run column), so a missed run never reads like a
- *  by-design skip; anything else as Audit > Schedule tones it (`cron/vocabulary.ts::OUTCOME_TONE`), so a skip and
+ *  by-design skip; anything else as Audit > Schedule tones it (`cron/vocabulary.ts::OUTCOME`), so a skip and
  *  a run that did work differ at a glance. */
 export function runOutcomeTone(run: AutomationRun): Tone {
-  if (FAILED_RUN_OUTCOMES.has(run.outcome) || run.target_counts.error) return STATUS_TONE.failing
-  return OUTCOME_TONE[run.outcome] ?? 'neutral'
+  if (FAILED_RUN_OUTCOMES.has(run.outcome) || run.target_counts.error) return STATUS.failing.tone
+  return OUTCOME[run.outcome]?.tone ?? 'neutral'
 }
 
 /** Worded as every outcome is ("Missed", "Skipped"): a token outside the table (an older or newer server's,
@@ -127,19 +162,12 @@ export function runLine(run: AutomationRun, headline: string): string {
 }
 
 /** Per-target outcome words and tones (`app/automations.py::RUN_TARGET_OUTCOMES`). */
-export const TARGET_OUTCOME_LABELS: Record<string, string> = {
-  filed: 'Filed',
-  skipped: 'Skipped',
-  error: 'Error',
-  not_reached: 'Not reached',
-  queued: 'Queued',
-}
-export const TARGET_OUTCOME_TONE: Record<string, Tone> = {
-  filed: 'success',
-  skipped: 'warning',
-  error: 'error',
-  not_reached: 'warning',
-  queued: 'info',
+export const TARGET_OUTCOME: Record<string, { label: string; tone: Tone }> = {
+  filed: { label: 'Filed', tone: 'success' },
+  skipped: { label: 'Skipped', tone: 'warning' },
+  error: { label: 'Error', tone: 'error' },
+  not_reached: { label: 'Not reached', tone: 'warning' },
+  queued: { label: 'Queued', tone: 'info' },
 }
 /** The order a run's outcome groups are drawn in: what needs attention first (AC4.6). */
 export const TARGET_OUTCOME_ORDER = ['error', 'skipped', 'not_reached', 'queued', 'filed'] as const
@@ -157,7 +185,7 @@ function summaryOrder(counts: AutomationRun['target_counts']): string[] {
 export function targetSummary(run: AutomationRun): string {
   const segments: string[] = []
   for (const outcome of summaryOrder(run.target_counts)) {
-    const word = (TARGET_OUTCOME_LABELS[outcome] ?? outcome).toLowerCase()
+    const word = (TARGET_OUTCOME[outcome]?.label ?? outcome).toLowerCase()
     const reasons = Object.entries(run.target_counts[outcome]).sort((a, b) => b[1] - a[1])
     for (const [reason, n] of reasons) segments.push(reason ? `${n} ${word}: ${reason}` : `${n} ${word}`)
   }
@@ -170,7 +198,7 @@ const strings = (value: unknown): string[] =>
 /** The When choice an automation's When is. */
 export function whenChoiceOf(when: When): WhenChoice {
   if (when.kind === 'schedule') return 'schedule'
-  return (WHEN_CHOICES as readonly string[]).includes(when.source_kind) ? (when.source_kind as WhenChoice) : 'webhook'
+  return oneOf(WHEN_CHOICES, when.source_kind) ?? 'webhook'
 }
 
 /** When, human readable: the server's schedule sentence, or the source with what it listens for

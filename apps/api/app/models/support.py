@@ -108,7 +108,7 @@ class TrustDocumentRequest(UuidPkMixin, OrgScoped, Base):
     page, and the operator's decision on it (`app/trust_requests.py`, which owns every column's meaning).
 
     Always org zero, like `SiteEnquiry`: the requester is a prospect, not any tenant's member. Not an entity (a
-    request and its decision, like `access_requests`; `tests/test_entity_shape.py` exempt list): nobody creates
+    request and its decision; `tests/test_entity_shape.py` exempt list): nobody creates
     one in the console, so there is no `created_by`; `decided_by_id` and `documents_sent_by_id` are the only actors
     that ever write it."""
 
@@ -367,7 +367,10 @@ class TicketTaskLink(OrgScoped, Base):
 
     `task_id` NULL means the task was deleted (the wire says `removed`). `done_at` is stamped when the
     task reaches done, `done_acked_at` when an operator next replies or writes the status
-    (`app/support_activity.py`); a link with the first and not the second is the "task done" marker."""
+    (`app/support_activity.py`); a link with the first and not the second is the "task done" marker.
+    `running_at` is stamped the first time the task is seen running, when its ticket moves to `in_progress`
+    (`support_activity.move_on_task_running`) — once per link, so a later `active` never undoes a status
+    staff set since."""
 
     __tablename__ = "ticket_task_links"
     __table_args__ = (
@@ -392,6 +395,7 @@ class TicketTaskLink(OrgScoped, Base):
     created_at: Mapped[datetime] = timestamp_column()
     done_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
     done_acked_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
+    running_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
 
 
 class TicketRead(OrgScoped, Base):

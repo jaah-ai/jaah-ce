@@ -1,6 +1,7 @@
 import Box from '@mui/material/Box'
 import type { SxProps, Theme } from '@mui/material/styles'
 import type { HTMLAttributes, JSX, ReactNode } from 'react'
+import { FONT_SIZE, LINE_HEIGHT, RADIUS } from '../theme'
 
 /* The console's one monospace block — a payload, a log tail, a command, a rendered prompt. Every `<pre>` the
  * console shows is this, so they share one font, one wrap rule and one well.
@@ -41,15 +42,15 @@ export function CodeBlock({
         (theme: Theme) => ({
           m: 0,
           fontFamily: theme.typography.mono?.fontFamily ?? 'monospace',
-          fontSize: size === 'small' ? '0.75rem' : '0.8125rem',
-          lineHeight: 1.55,
+          fontSize: size === 'small' ? FONT_SIZE.sm : FONT_SIZE.md,
+          lineHeight: LINE_HEIGHT.normal,
           minWidth: 0,
           ...(wrap
             ? { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }
             : { whiteSpace: 'pre', overflowX: 'auto' }),
           ...(maxHeight !== undefined && { maxHeight, overflow: 'auto' }),
-          ...(tone === 'well' && { p: 1, bgcolor: 'action.hover', borderRadius: 1 }),
-          ...(tone === 'shell' && { p: 1.5, bgcolor: 'grey.900', color: 'grey.100', borderRadius: 1.5 }),
+          ...(tone === 'well' && { p: 1, bgcolor: 'action.hover', borderRadius: RADIUS.sm }),
+          ...(tone === 'shell' && { p: 1.5, bgcolor: 'grey.900', color: 'grey.100', borderRadius: RADIUS.md }),
           ...(bordered && { border: 1, borderColor: 'divider' }),
         }),
         ...(Array.isArray(sx) ? sx : [sx]),

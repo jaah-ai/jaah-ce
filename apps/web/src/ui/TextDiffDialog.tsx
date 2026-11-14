@@ -2,12 +2,14 @@ import { type JSX, Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import Box from '@mui/material/Box'
 import ButtonBase from '@mui/material/ButtonBase'
 import Typography from '@mui/material/Typography'
-import useMediaQuery from '@mui/material/useMediaQuery'
+import EmptyState from './EmptyState'
 import { alpha, type Theme } from '@mui/material/styles'
-import FormDialog from './FormDialog'
+import FormDialog, { DIALOG_PAD_X } from './FormDialog'
 import { withAdded } from '../lib/sets'
-import { PHONE_QUERY, tapTargetSx } from './listStyles'
+import { usePhone } from '../hooks/usePhone'
+import { tapTargetSx } from './listStyles'
 import { type DiffCell, type DiffRow, diffRows, diffStats, foldRows } from './textDiff'
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, RADIUS, grid } from '../theme'
 
 /* A git-like comparison of two texts (`ui/textDiff.ts`): side-by-side on a wide screen, one unified column on
  * a phone, where two columns of prose would be a few words wide. Unchanged runs fold to three lines of
@@ -16,26 +18,25 @@ import { type DiffCell, type DiffRow, diffRows, diffStats, foldRows } from './te
 
 type Tone = 'removed' | 'added'
 
-const CELL_PAD = '0.125rem 0.5rem'
-
 function toneColor(theme: Theme, tone: Tone) {
   return tone === 'removed' ? theme.palette.error.main : theme.palette.success.main
 }
 
 /* The empty side of a pure insert or delete — hatched, as git GUIs draw "no line here". */
 const emptySx = (theme: Theme) => ({
-  backgroundImage: `repeating-linear-gradient(-45deg, transparent 0 4px, ${theme.palette.divider} 4px 5px)`,
+  backgroundImage: `repeating-linear-gradient(-45deg, transparent 0 ${grid(1)}, ${theme.palette.divider} ${grid(1)} ${grid(1.5)})`,
 })
 
 const gutterSx = {
-  p: CELL_PAD,
+  py: 0,
+  px: 1,
   color: 'text.disabled',
   textAlign: 'right' as const,
   userSelect: 'none' as const,
   whiteSpace: 'nowrap' as const,
 }
 
-const textSx = { p: CELL_PAD, whiteSpace: 'pre-wrap' as const, overflowWrap: 'anywhere' as const, minWidth: 0 }
+const textSx = { py: 0, px: 1, whiteSpace: 'pre-wrap' as const, overflowWrap: 'anywhere' as const, minWidth: 0 }
 
 function lineSx(tone: Tone | null) {
   return (theme: Theme) => tone ? { bgcolor: alpha(toneColor(theme, tone), 0.1) } : {}
@@ -51,7 +52,7 @@ function CellText({ cell, tone }: { cell: DiffCell; tone: Tone | null }) {
           component={tone === 'removed' ? 'del' : 'ins'}
           sx={(theme: Theme) => ({
             textDecoration: 'none',
-            borderRadius: '2px',
+            borderRadius: RADIUS.sm,
             bgcolor: alpha(toneColor(theme, tone), 0.3),
           })}
         >
@@ -76,7 +77,7 @@ function SplitRow({ row }: { row: DiffRow }) {
   return (
     <Box data-testid="text-diff-row" data-kind={row.kind} sx={{ display: 'contents' }}>
       {side(row.before, 'removed')}
-      <Box sx={{ bgcolor: 'divider' }} aria-hidden="true" />
+      <Box sx={{ borderLeft: '1px solid', borderColor: 'divider' }} aria-hidden="true" />
       {side(row.after, 'added')}
     </Box>
   )
@@ -117,9 +118,7 @@ export function TextDiff({ rows, unified }: { rows: DiffRow[]; unified: boolean 
 
   if (!rows.some(r => r.kind === 'change')) {
     return (
-      <Typography variant="body2" sx={{ color: 'text.secondary', p: 2 }} data-testid="text-diff-none">
-        No differences.
-      </Typography>
+      <Box sx={{ p: 2 }}><EmptyState inline title="No differences." /></Box>
     )
   }
   const Row = unified ? UnifiedRow : SplitRow
@@ -131,10 +130,10 @@ export function TextDiff({ rows, unified }: { rows: DiffRow[]; unified: boolean 
       data-layout={unified ? 'unified' : 'split'}
       sx={(theme: Theme) => ({
         display: 'grid',
-        gridTemplateColumns: unified ? 'auto minmax(0, 1fr)' : 'auto minmax(0, 1fr) 1px auto minmax(0, 1fr)',
+        gridTemplateColumns: unified ? 'auto minmax(0, 1fr)' : 'auto minmax(0, 1fr) min-content auto minmax(0, 1fr)',
         ...theme.typography.mono,
-        fontSize: '0.75rem',
-        lineHeight: 1.6,
+        fontSize: FONT_SIZE.sm,
+        lineHeight: LINE_HEIGHT.normal,
         outline: 'none',
       })}
     >
@@ -149,7 +148,8 @@ export function TextDiff({ rows, unified }: { rows: DiffRow[]; unified: boolean 
               ...tapTargetSx(theme),
               gridColumn: '1 / -1',
               justifyContent: 'flex-start',
-              p: CELL_PAD,
+              py: 0,
+              px: 1,
               font: 'inherit',
               color: 'primary.main',
               bgcolor: alpha(theme.palette.primary.main, 0.06),
@@ -167,18 +167,14 @@ export default function TextDiffDialog({
   title,
   before,
   after,
-  beforeLabel = 'Before',
-  afterLabel = 'After',
   onClose,
 }: {
   title: string
   before: string
   after: string
-  beforeLabel?: string
-  afterLabel?: string
   onClose: () => void
 }): JSX.Element {
-  const phone = useMediaQuery(PHONE_QUERY)
+  const phone = usePhone()
   const rows = useMemo(() => diffRows(before, after), [before, after])
   const stats = useMemo(() => diffStats(rows), [rows])
   return (
@@ -193,11 +189,11 @@ export default function TextDiffDialog({
       testId="text-diff-dialog"
       contentSx={{ p: 0 }}
       header={
-        <Box sx={{ px: 2, pb: 1, display: 'flex', flexWrap: 'wrap', gap: 1.5, alignItems: 'baseline' }}>
+        <Box sx={{ px: DIALOG_PAD_X, pb: 1, display: 'flex', flexWrap: 'wrap', gap: 1.5, alignItems: 'baseline' }}>
           <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-            {beforeLabel} → {afterLabel}
+            Before → After
           </Typography>
-          <Typography variant="body2" data-testid="text-diff-stats" sx={{ fontWeight: 600 }}>
+          <Typography variant="body2" data-testid="text-diff-stats" sx={{ fontWeight: FONT_WEIGHT.semibold }}>
             <Box component="span" sx={{ color: 'error.main' }}>−{stats.removed}</Box>{' '}
             <Box component="span" sx={{ color: 'success.main' }}>+{stats.added}</Box>
           </Typography>

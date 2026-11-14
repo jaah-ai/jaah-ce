@@ -15,9 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
-import json
 import logging
-import subprocess
 import time
 from typing import Callable, Optional
 
@@ -37,37 +35,16 @@ _UNSENT = object()
 SENSE_FAILED = object()
 
 
-def _tailscale_json(*args: str) -> Optional[dict]:
-    if not environment.tailscale_askable():
-        return None
-    try:
-        proc = subprocess.run(
-            environment.tailscale_command(*args),
-            capture_output=True, text=True, timeout=_TAILSCALE_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.debug("egress-report: tailscale %s unavailable (%s)", args[0], exc)
-        return None
-    if proc.returncode != 0:
-        log.debug("egress-report: tailscale %s failed (rc=%s)", args[0], proc.returncode)
-        return None
-    try:
-        parsed = json.loads(proc.stdout or "{}")
-    except ValueError:
-        log.warning("egress-report: tailscale %s returned unparseable JSON", args[0])
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
 def tailnet_joined() -> bool:
-    status = _tailscale_json("status", "--json")
+    status = environment.tailscale_json("status", "--json", timeout=_TAILSCALE_TIMEOUT_SECONDS, who="egress-report")
     return bool(status) and status.get("BackendState") == "Running"
 
 
 def sense_egress_ipv4() -> object:
     """`GlobalV4` from netcheck (an `ip:port` string) as a bare public IPv4; None when netcheck found none;
     `SENSE_FAILED` when netcheck could not be run or read."""
-    report = _tailscale_json("netcheck", "--format=json")
+    report = environment.tailscale_json("netcheck", "--format=json", timeout=_TAILSCALE_TIMEOUT_SECONDS,
+                                        who="egress-report")
     if report is None:
         return SENSE_FAILED
     value = str(report.get("GlobalV4") or "").strip()

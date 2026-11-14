@@ -7,9 +7,10 @@ so `parents[2]` resolves on a node and in a clone alike. On macOS/Windows `kind(
 from __future__ import annotations
 
 import functools
-import importlib.util
 from pathlib import Path
 from types import ModuleType
+
+import path_module
 
 PKGMGR_PY = Path(__file__).resolve().parents[2] / "infra" / "jaah" / "pkgmgr.py"
 
@@ -17,9 +18,4 @@ PKGMGR_PY = Path(__file__).resolve().parents[2] / "infra" / "jaah" / "pkgmgr.py"
 @functools.lru_cache(maxsize=None)
 def load() -> ModuleType:
     """The `pkgmgr` module, executed once."""
-    spec = importlib.util.spec_from_file_location("jaah_pkgmgr", PKGMGR_PY)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"{PKGMGR_PY} is not loadable")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return path_module.load(PKGMGR_PY, "jaah_pkgmgr")

@@ -43,9 +43,11 @@ def _read_overrides(session: Optional[Session]) -> dict[str, Any]:
     try:
         if session is not None:
             return _load_row(session)
-        from app.db import SessionLocal
+        from app import db_async
 
-        with SessionLocal() as own_session:
+        # Its own session: on the async pool inside a `db_async.run_lending` route body (`side_session`).
+        db_async.hand_back()
+        with db_async.side_session() as own_session:
             return _load_row(own_session)
     except Exception:
         log.warning("operator_settings: could not read the %r row — proceeding with no overrides",
@@ -143,12 +145,13 @@ def _org_plane():
 def _read_org_overrides(org: UUID) -> dict[str, Any]:
     from sqlalchemy import select
 
-    from app.db import SessionLocal
+    from app import db_async
     from app.models.orgs import OrgSetting
 
     try:
         detached, operator = _org_plane()
-        with detached, operator, SessionLocal() as session:
+        db_async.hand_back()
+        with detached, operator, db_async.side_session() as session:
             rows = session.scalars(select(OrgSetting).where(OrgSetting.org_id == org)).all()
             # A row whose key is not an org-tier knob is dropped (written before a tier change, or by hand).
             return {row.key: row.value for row in rows if row.key in catalog.ORG_TIER_KEYS}
@@ -163,12 +166,13 @@ def _read_org_overrides(org: UUID) -> dict[str, Any]:
 def _read_overridden_keys() -> frozenset[str]:
     from sqlalchemy import distinct, select
 
-    from app.db import SessionLocal
+    from app import db_async
     from app.models.orgs import Org, OrgSetting
 
     try:
         detached, operator = _org_plane()
-        with detached, operator, SessionLocal() as session:
+        db_async.hand_back()
+        with detached, operator, db_async.side_session() as session:
             # Joined to `orgs`: `org_settings.org_id` has no foreign key (see `app/models/base.py::OrgScoped`), so a
             # deleted org's rows would otherwise refuse every unscoped read of that knob forever.
             keys = set(

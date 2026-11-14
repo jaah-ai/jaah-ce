@@ -1,0 +1,43 @@
+slug = "mailgun"
+label = "Mailgun"
+category = "messaging"
+vendor_docs_url = "https://documentation.mailgun.com/docs/mailgun/api-reference/authentication"
+summary = "Send and track email through your Mailgun domains."
+
+[[auth]]
+kind = "basic"
+fields = [
+  { key = "base_url", label = "Region", kind = "url", required = true, default = "https://api.mailgun.net", help = "https://api.mailgun.net for a US-region account; https://api.eu.mailgun.net if your domains are in the EU region (Mailgun shows each domain's region under Send > Sending > Domains)" },
+  { key = "api_user", label = "API user", kind = "text", required = true, default = "api", help = "Mailgun's API user name is always the word api - leave it as it is" },
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "Mailgun > your profile menu (top right) > API Security (Account Settings > API Keys) > Add new key, or the eye icon beside your Private API key. Copy the key" },
+]
+
+[test]
+method = "GET"
+path = "{base_url}/v4/domains"
+auth = { basic = ["api_user", "api_key"] }
+list_field = "items"
+
+[docs]
+agent_uses = [
+  "Send an email through one of your Mailgun domains, plain or from a stored template",
+  "Read delivery, open and bounce events for messages sent earlier",
+  "Validate an email address before sending",
+  "Manage mailing lists and suppressions",
+]
+prerequisites = [
+  "A Mailgun account with at least one sending domain verified under Send > Sending > Domains",
+  "Your account's region (US or EU), shown next to each domain",
+]
+limitations = [
+  "An account API key reaches every domain on the account. A domain's sending key can send for that domain only and cannot pass Test, which lists domains",
+  "On Mailgun's free plan, mail goes only to authorized recipients added on the sandbox domain",
+]
+troubleshooting = [
+  { symptom = "Test says Mailgun rejected the API key (401)", fix = "Check the Region: an EU account's key is rejected at api.mailgun.net. If the region is right, create a new key under API Security and select Replace on the secret" },
+  { symptom = "Test is rejected although sending works", fix = "You stored a domain sending key. Store an account API key instead (Account Settings > API Keys) so Jaah can list your domains" },
+  { symptom = "Sending fails with Sandbox subdomains are for test purposes only", fix = "Add the recipient under the sandbox domain's Authorized Recipients, or send from a verified custom domain" },
+]
+faq = [
+  { q = "Why is there an API user field?", a = "Mailgun's API uses HTTP Basic sign-in with the fixed user name api and your key as the password. Jaah keeps it as a field so agents receive the full pair" },
+]

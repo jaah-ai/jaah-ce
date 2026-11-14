@@ -1,0 +1,42 @@
+slug = "gemini_enterprise"
+label = "Gemini Enterprise"
+category = "ai_media"
+vendor_docs_url = "https://docs.cloud.google.com/gemini/enterprise/docs/authentication"
+summary = "Reach your Gemini Enterprise apps, agents and data stores on Google Cloud from agent sessions."
+default_base_url = "https://oauth2.googleapis.com"
+
+[[auth]]
+kind = "service_account"
+fields = [
+  { key = "service_account_json", label = "Service account key", kind = "secret", required = true, placeholder = "{\"type\": \"service_account\", ...}", help = "In the Google Cloud console open IAM & Admin > Service Accounts in the project that holds Gemini Enterprise, create or pick a service account, grant it the Discovery Engine Viewer role (more if agents should change things), then open its Keys tab > Add key > Create new key > JSON and paste the whole downloaded file" },
+  { key = "project_id", label = "Project ID", kind = "text", required = false, help = "The Google Cloud project id shown in the console's project picker; leave blank to use the key's own project" },
+  { key = "location", label = "Location", kind = "text", required = false, default = "global", help = "Where your Gemini Enterprise apps live, as shown on the Gemini Enterprise > Apps page in the console: global, us or eu" },
+]
+
+[test]
+tester = "app.credentials.testers:test_discovery_engine"
+
+[docs]
+agent_uses = [
+  "List the Gemini Enterprise apps (engines), data stores and agents in your project",
+  "Search and ask questions across the data your Gemini Enterprise apps index, with answers grounded in your company data",
+  "Read and update data store documents when the service account's role allows it",
+]
+prerequisites = [
+  "A Google Cloud project with Gemini Enterprise set up and the Discovery Engine API enabled",
+  "Permission to create service accounts and keys in that project (Service Account Admin and Service Account Key Admin), or an admin who can do it for you",
+]
+limitations = [
+  "Jaah connects with a service account key only; sign-in as a person and Workload Identity Federation are not offered yet",
+  "The Test checks the default collection of one location only (global, us or eu)",
+  "Agents act with the service account's IAM roles, not as an end user, so per-user document permissions in your data stores do not apply",
+]
+troubleshooting = [
+  { symptom = "The Test says Gemini Enterprise rejected the service account key (403) and Google names a missing permission", fix = "Grant the service account the Discovery Engine Viewer role (roles/discoveryengine.viewer) in IAM & Admin > IAM, and check that the Discovery Engine API is enabled in APIs & Services" },
+  { symptom = "The Test says Google refused: Invalid JWT Signature", fix = "The key was deleted or the file was changed. Create a new JSON key on the service account's Keys tab and select Replace" },
+  { symptom = "The Test passes but reports 0 apps", fix = "The apps live in another location or project. Set Location to us or eu, or set Project ID to the project shown on the Gemini Enterprise > Apps page" },
+]
+faq = [
+  { q = "Is this the same as a Gemini API key", a = "No. A Gemini API key from Google AI Studio calls the Gemini models; Gemini Enterprise is the Google Cloud product for company search and agents, reached with Google Cloud credentials" },
+  { q = "Does Jaah keep the private key", a = "It stores the key file encrypted and uses it only to mint short-lived Google access tokens; the key itself is never sent anywhere but to the agent that is allowed to use it" },
+]

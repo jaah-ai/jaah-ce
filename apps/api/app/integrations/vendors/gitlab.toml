@@ -1,0 +1,54 @@
+# GitLab API, over the hand-written `gitlab` type and provider (adopted, AS3: nothing of either changes; Connect is
+# the forges' shared engine with its hooks). Facts confirmed at the vendor's own docs: OAuth 2.0 (PKCE, rotating
+# refresh token) https://docs.gitlab.com/api/oauth2/ ; personal access tokens and scopes
+# https://docs.gitlab.com/user/profile/personal_access_tokens/
+slug = "gitlab"
+label = "GitLab"
+category = "dev_tools"
+credential_type = "gitlab"
+vendor_docs_url = "https://docs.gitlab.com/user/profile/personal_access_tokens/"
+summary = "Read and write GitLab projects, merge requests, issues and pipelines."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+# The registered provider's endpoints and scope (the conflict guard compares the endpoints).
+authorize_url = "https://gitlab.com/oauth/authorize"
+token_url = "https://gitlab.com/oauth/token"
+scopes = [
+  { name = "api", label = "Use the API: merge requests, issues, pipelines and project settings" },
+  { name = "read_user", label = "Read your profile, so the connection shows whose it is" },
+  { name = "write_repository", label = "Clone and push code over HTTPS" },
+]
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "token", label = "Personal access token", kind = "secret", required = true, placeholder = "glpat-...", help = "GitLab > your avatar > Edit profile > Access tokens > Add new token: name it Jaah, set an expiry date, tick api, read_user and write_repository, select Create token, then copy it - GitLab shows it once. A project or group access token (Settings > Access tokens) also works" },
+  { key = "base_url", label = "Base URL", kind = "url", required = false, help = "Leave blank for GitLab in the cloud. For a self-managed GitLab, its https root (not /api/v4)" },
+]
+
+[docs]
+agent_uses = [
+  "Clone, branch, commit and push code, and open merge requests for a task",
+  "Read and comment on issues and merge request discussions",
+  "Check CI/CD pipeline status and read job logs when a build fails",
+  "Search projects and code in your groups",
+]
+prerequisites = [
+  "A GitLab account with Developer access or more on the projects agents should work in",
+]
+limitations = [
+  "Agents act as the account (or bot user, for a project or group token) that owns the connection",
+  "GitLab personal access tokens expire, at most a year after creation on GitLab SaaS; replace them before then",
+  "Sign-in connects GitLab SaaS only. For a self-managed GitLab, use a personal access token and Base URL",
+]
+troubleshooting = [
+  { symptom = "Test says GitLab rejected the token (401)", fix = "The token expired, was revoked or lacks the api scope. Create a new token and select Replace, or Reconnect a sign-in" },
+  { symptom = "Agents get 403 pushing to a branch", fix = "The branch is protected, or the account has Reporter access only. Raise its role or allow it to push in Settings > Repository > Protected branches" },
+  { symptom = "Test cannot reach your self-managed GitLab", fix = "Base URL must be its https root and reachable from the internet. Check it in a browser" },
+]
+faq = [
+  { q = "Personal, project or group token", a = "A project or group access token acts as a bot user limited to that project or group, which suits a team connection. A personal token acts as you" },
+  { q = "Does the sign-in keep working", a = "Yes. GitLab's access tokens last two hours; Jaah refreshes them automatically" },
+]

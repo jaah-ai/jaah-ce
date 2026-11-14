@@ -1,7 +1,5 @@
-"""Worktree CLAIM/RETIRE/CREATE mechanics — HOW to do a thing to a worktree, never WHICH one. The CP
-decides the slot and its ports; `reconcile/` calls `lifecycle.claim_mechanics`/`lifecycle.create_mechanics`
-and `commands.py` calls `lifecycle.retire_mechanics`/`lifecycle.create_mechanics` in-process to make the host
-match.
+"""Slot CLAIM/RETIRE mechanics — HOW to do a thing to a slot, never WHICH one. The CP decides the slot and its
+ports; `reconcile/` calls `lifecycle.claim_mechanics` in-process to make the host match.
 
 NO LIVENESS VETO, ON EITHER SIDE OF THE WIRE. The only exclusion is the ROW: `app/slot_state.py::lease`'s
 `WHERE state = 'free' AND number > 0`. Safe because nothing frees a slot on silence — only completing,
@@ -11,18 +9,16 @@ refuses. The scan resolves unreadable `/proc/<pid>/cwd` (runners are `jaah`, the
 through the session user and fails OPEN on a skip.
 
 MODULES — import the one that owns a name (`from worktree_mechanics import ports`); this file exports none.
-  core         slot identity (`PoolConfig`, `slot_path`, `wt_branch`) and the git plumbing (`_run_git`, `_git`)
+  core         slot identity (`PoolConfig`, `slot_path`) and the git plumbing (`_run_git`, `_git`)
   env_file     a slot's `.env` I/O: cached reader, private-mode writer, mode hardening, `KEY=value` edits
-  ports        the port band, tier-2 auto ports, stack and node identity, `has_stack`
+  ports        node-assigned ports, stack and node identity, `has_stack`
   managed_env  the CP-managed, marker-tracked `.env` assignments
   processes    `/proc` reads, redacted command lines, the cwd scan
   reap         orphan reaping
-  reset        `reset_to_base`, released-slot sync, merged-branch pruning
-  lifecycle    roster, clone, create, claim and retire of a worktree or folder slot
+  lifecycle    the clone, guard and claim of a repository slot, and a folder slot's folder
 Siblings reach each other as `<module>.<name>`, so a test patch on the defining module reaches every caller.
 
-IMPORTS: stdlib + `session_user` (uid split) + `git_mirror` (the single home of credentialed git: every
-network op runs in the project's daemon-owned mirror, and a tree here is updated by a credential-free local
-fetch from it) + `clone_identity` (its `ProjectBusy`) + the stdlib-only `host_platform` seam (which OS answers;
+IMPORTS: stdlib + `session_user` (uid split) + `clone_identity` (whose credential a delegated op spends) +
+`slot_clone` (each tree is a standalone clone from the forge) + the stdlib-only `host_platform` seam (which OS answers;
 static pools only on Windows). MUST NOT import `main`, `state`, `commands`, `reconcile`, or any third-party
 distribution — hence the duplicate `PoolConfig`."""

@@ -59,33 +59,50 @@ def live_runner_hold(session, task_id: object) -> Optional[dict[str, Any]]:
     return hold
 
 
-def deliver_message_to_live_runner(session, task_id: int, text: str, *, sender: str) -> bool:
+def deliver_message_to_live_runner(
+    session, task_id: int, text: str, *, sender: str, runner_view: Optional[dict] = None,
+) -> bool:
     """Mint a `deliver_message` intent typing TEXT, prefixed with `CONTROL_PLANE_LABEL`, into task TASK_ID's
     live runner pane. True when minted. SENDER is the short name of the CP part speaking ("Merge lane"); it
-    rides the payload for the task page's message list (`routes/task_control_messages.py`), never the pane.
+    rides the payload for the task page's Timeline notices (`routes/task_control_messages.py`), never the pane.
 
     False — and nothing minted — when the task has no live, identified runner session or the text is blank;
     the caller keeps the message wherever it already recorded it (the merge lane: the PR comment and the
     queue row) and dispatches nothing. Not bound to any task state: the recipient is a working runner.
     `issue_intents` commits and pushes, so the message does not wait for the node's next pool tick.
-    Frame: `fleet_verdicts.build_deliver_message_intent`."""
-    clean = scrub_control_chars(text)
-    if not clean.strip():
+    Frame: `fleet_verdicts.build_deliver_message_intent`; RUNNER_VIEW rides it for the `done` ack
+    (`app/live_task_edits.py`)."""
+    return deliver_messages_to_live_runner(session, task_id, [(text, sender)], runner_view=runner_view)
+
+
+def deliver_messages_to_live_runner(
+    session, task_id: int, messages: list[tuple[str, str]], *, runner_view: Optional[dict] = None,
+) -> bool:
+    """`deliver_message_to_live_runner` for several `(text, sender)` MESSAGES at once: one hold lookup, one
+    `issue_intents` (one commit), all or nothing. False, nothing minted, when there is no live, identified
+    runner or every text is blank; blank texts are dropped."""
+    cleaned = [(scrub_control_chars(text), sender) for text, sender in messages]
+    cleaned = [(text, sender) for text, sender in cleaned if text.strip()]
+    if not cleaned:
         return False
     hold = live_runner_hold(session, task_id)
     if hold is None:
         return False
-    intent = fleet_verdicts.build_deliver_message_intent(
-        hold["project_id"], hold["project"], hold["slot"],
-        task_id=task_id, session_id=hold["session_id"], text=f"{CONTROL_PLANE_LABEL} {clean}", sender=sender,
-    )
-    # Rides `issue_intents`' commit: the task page's message list re-reads (`routes/task_control_messages.py`).
+    intents = [
+        fleet_verdicts.build_deliver_message_intent(
+            hold["project_id"], hold["project"], hold["slot"],
+            task_id=task_id, session_id=hold["session_id"], text=f"{CONTROL_PLANE_LABEL} {text}", sender=sender,
+            runner_view=runner_view,
+        )
+        for text, sender in cleaned
+    ]
+    # Rides `issue_intents`' commit: the task page's Timeline notices re-read (`routes/task_control_messages.py`).
     # The live `task` event a pane message's mint (and its delivery, `routes/agent/slot_intents.py`) emits — not a transition,
     # so no activity row.
     emit_console_event(session, entity="task", id=task_id, action="control_message", record_transition=False)
-    fleet_verdicts.issue_intents(session, hold["node_id"], [intent])
+    fleet_verdicts.issue_intents(session, hold["node_id"], intents)
     log.info(
-        "task %s: minted deliver_message for %s#%s session %s",
-        task_id, hold["project"], hold["slot"], hold["session_id"][:8],
+        "task %s: minted %d deliver_message for %s#%s session %s",
+        task_id, len(intents), hold["project"], hold["slot"], hold["session_id"][:8],
     )
     return True

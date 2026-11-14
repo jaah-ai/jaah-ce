@@ -23,18 +23,24 @@ _IDENT_RE = re.compile(r"\A[a-z_][a-z0-9_]{0,62}\Z")
 _MAX_IDENTIFIER = 63
 
 
-def _ident(value: str, what: str) -> str:
-    """`value`, if it is a plain lowercase identifier — otherwise a refusal naming what was wrong.
+def interpolable(value: str, what: str, *, pattern: re.Pattern[str], need: str) -> str:
+    """`value`, if it is a literal of the shape `pattern` that a DDL module may interpolate bare — otherwise a
+    refusal naming `what` was wrong and what it `need`s to be.
 
-    Refuses rather than quotes: a bad name here is a revision mistake. Single home for both DDL modules
-    (`contraction.py` imports it). The type is checked first so a non-string gets this refusal rather
-    than an anonymous `TypeError`."""
-    if not isinstance(value, str) or not _IDENT_RE.fullmatch(value):
-        raise ValueError(
-            f"{what} must be a bare lowercase SQL identifier for this module to interpolate it; "
-            f"got {value!r}"
-        )
+    Refuses rather than quotes: a bad literal here is a revision mistake, and refused at the near end, since a
+    malformed one would otherwise be a syntax error mid-deploy, after earlier autocommitted statements cannot be
+    rolled back. The type is checked first so a non-string gets this refusal rather than an anonymous `TypeError`.
+    Single home for every DDL module's check (this one, `rehome.py`), each with its own shape."""
+    if not isinstance(value, str) or not pattern.fullmatch(value):
+        raise ValueError(f"{what} {need}; got {value!r}")
     return value
+
+
+def _ident(value: str, what: str) -> str:
+    """`value`, if it is a plain lowercase identifier — otherwise a refusal naming what was wrong."""
+    return interpolable(
+        value, what, pattern=_IDENT_RE, need="must be a bare lowercase SQL identifier for this module to interpolate it",
+    )
 
 
 def _bounded(name: str, what: str) -> str:
@@ -109,8 +115,8 @@ def org_inherit_trigger_sql(table: str, pairs: tuple[tuple[str, str], ...]) -> s
     """`CREATE TRIGGER` for one table, carrying its derivation as trigger arguments.
 
     `pairs` is (parent table, local FK column) in the manifest's order (`Derived.pairs` is the home),
-    passed through so this module forms no second opinion. Identifiers are fixed census literals (see
-    `contraction.py::not_null_steps`); the arguments are string literals, re-quoted by `format('%I')`."""
+    passed through so this module forms no second opinion. Identifiers are fixed census literals, bounded
+    by `_ident`; the arguments are string literals, re-quoted by `format('%I')`."""
     args = ", ".join(
         f"'{_ident(parent, 'parent table')}', '{_ident(column, 'foreign-key column')}'"
         for parent, column in pairs

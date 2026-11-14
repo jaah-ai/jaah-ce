@@ -1,0 +1,37 @@
+slug = "generic_login"
+label = "Generic login"
+category = "custom"
+credential_type = "generic_login"
+vendor_docs_url = "https://datatracker.ietf.org/doc/html/rfc7617"
+summary = "Store a sign-in address, login and password for any site or service when no card fits."
+
+[[auth]]
+kind = "basic"
+fields = [
+  { key = "base_url", label = "URL", kind = "url", required = true, placeholder = "https://example.com/login", help = "The address where you sign in, for example https://example.com/login, so agents know which site the login is for" },
+  { key = "login", label = "Login", kind = "text", required = true, help = "The user name or email address you sign in with" },
+  { key = "password", label = "Password", kind = "secret", required = true, help = "The password for that login. Jaah stores it encrypted and never shows it again" },
+  { key = "totp_seed", label = "2FA seed", kind = "secret", required = false, help = "The base32 TOTP seed shown when the account set up two-factor sign-in, if it uses one. Never put it in the description: every task that may use the secret reads that" },
+]
+
+[docs]
+agent_uses = [
+  "Sign in to the site at the URL you saved, with the login and password, in tasks allowed to use the secret",
+  "Use the login for a tool or script that asks for a user name and password, without anyone pasting them into a prompt",
+]
+prerequisites = [
+  "An account on the site or service, with its sign-in address, login and password",
+  "A login without two-factor sign-in, or with its TOTP seed saved in 2FA seed so an agent can enter the code",
+]
+limitations = [
+  "There is no Test: a URL, login and password do not say how the site signs in (a form, single sign-on or HTTP Basic), so any test would be a guess",
+  "A site that asks for a captcha, or a second factor other than a TOTP code, blocks an agent at sign-in",
+]
+troubleshooting = [
+  { symptom = "The secret shows no Test button", fix = "Expected: a generic login cannot be tested. Check it by signing in once yourself with the same login" },
+  { symptom = "An agent reports the sign-in failed", fix = "Sign in yourself at the saved URL with the same login. If the password changed, open the secret and replace it; if the site now asks for a second factor, use a service account without one" },
+]
+faq = [
+  { q = "When should I use this card instead of a service's own card", a = "Only when the service has no card. A service's own card knows how it signs in and can test the secret" },
+  { q = "Can I store an API key here", a = "No. Use Generic API key, which records the header and prefix the key is sent under and can test it" },
+]

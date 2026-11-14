@@ -1,14 +1,14 @@
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import Typography from '@mui/material/Typography'
 import { useAuth, useCan, useCanOnAnyProject } from '../../auth'
 import { FormTextField } from '../../ui/FormTextField'
+import type { HelpProp } from '../../ui/explain'
 import { FIELD_SX } from '../../ui/formDensity'
-import { get } from '../../api'
 import { type Agent, type AgentChoice, DISABLED, listAgentChoices, listAgents, REMOVED } from '../../pages/agents/api'
-import type { ProviderChoice } from '../../types'
 import { agentsOn as gridAgentsOn, providerOn } from '../../lib/providerGrid'
+import { useApiRead } from '../../hooks/useApiRead'
 import { cachedRead, CATALOGUE_STALE_MS, ROSTER_STALE_MS } from '../../lib/cachedRead'
-import { readAsOnce } from '../../lib/actAs'
+import { listAgentProviders } from '../../hooks/useAgentProviders'
 import type { OrgRef } from '../../types'
 
 /* ── THE ONE AGENT PICKER (AC-10) ─────────────────────────────────────────────────────────────────────────
@@ -96,8 +96,8 @@ export function AgentPicker({
 }: {
   id: string
   label: string
-  /** A few words shown on hovering the label (`ui/HelpLabel`). */
-  help?: string
+  /** The label's explanation (`ui/HelpLabel`): a tooltip, and a pop-up when it says more. */
+  help?: HelpProp
   value: AgentPick
   onChange: (next: AgentPick) => void
   /** The task's persona: an agent that does not serve it is listed disabled. Null for a project default. */
@@ -126,18 +126,14 @@ export function AgentPicker({
   const agentsOn = gridAgentsOn(admin) || org !== null
   const canViewAgents = agentsOn && (can('agents:view') || canOnAny('agents:view'))
 
-  const [choices, setChoices] = useState<readonly AgentChoice[]>([])
-  const [loaded, setLoaded] = useState(false)
   const orgId = org?.id ?? null
   // Another org's cache entry; the viewer's own keeps the key other surfaces share (`TaskSpecFields`).
   const keyed = (...key: unknown[]) => (orgId === null ? key : [...key, orgId])
-  useEffect(() => {
-    let live = true
-    setChoices([])
-    setLoaded(false)
-    /* Both reads, and the picked agent's below, go through `lib/cachedRead`: the task form remounts on every
-     * own-task event, and a remount answers from cache instead of re-reading the catalogues. */
-    const builtinFallback = () => cachedRead(keyed('agent-providers'), () => get<ProviderChoice[]>('/api/accounts/providers', ...readAsOnce(org)), CATALOGUE_STALE_MS)
+  /* Both reads, and the picked agent's below, go through `lib/cachedRead`: the task form remounts on every
+   * own-task event, and a remount answers from cache instead of re-reading the catalogues. A failed catalogue is
+   * logged and reads as none (nothing the operator did failed). */
+  const choiceRead = useApiRead(['agent-picker-choices', persona ?? null, canViewAgents, orgId], () => {
+    const builtinFallback = () => cachedRead(keyed('agent-providers'), () => listAgentProviders(org), CATALOGUE_STALE_MS)
       .then(rows => (Array.isArray(rows) ? rows : []).map((p): AgentChoice => ({ kind: 'builtin', provider: p.value, display_name: p.label })))
     const read = canViewAgents
       ? cachedRead(keyed('agent-choices', persona ?? null), () => listAgentChoices(persona, org), ROSTER_STALE_MS).catch(err => {
@@ -145,26 +141,28 @@ export function AgentPicker({
         return builtinFallback()
       })
       : builtinFallback()
-    read
-      .then(rows => { if (live && Array.isArray(rows)) setChoices(rows) })
-      .catch(err => console.error('the provider catalogue could not be loaded:', err))
-      .finally(() => { if (live) setLoaded(true) })
-    return () => { live = false }
-  }, [persona, canViewAgents, orgId])
+    return read.then(
+      (rows): readonly AgentChoice[] => (Array.isArray(rows) ? rows : []),
+      (err: unknown) => { console.error('the provider catalogue could not be loaded:', err); return [] },
+    )
+  }, 'the agent choices could not be loaded')
+  const loaded = !choiceRead.loading
+  // A new persona or org offers nothing until its own choices land, never the previous key's.
+  const choices: readonly AgentChoice[] = (loaded ? choiceRead.data : null) ?? []
 
   /* The picked agent's row, for its name when the choices lack it (a disabled or withdrawn agent is not
    * offered), its status, and its `resolve_error` (a refresh that failed: the last good snapshot still runs,
    * but someone should look). Fetched only when an agent is picked. */
-  const [picked, setPicked] = useState<Agent | null>(null)
-  useEffect(() => {
-    setPicked(null)
-    if (!value.agentId || !canViewAgents) return
-    let live = true
-    cachedRead(keyed('agents-list'), () => listAgents(org), ROSTER_STALE_MS)
-      .then(rows => { if (live && Array.isArray(rows)) setPicked(rows.find(a => a.id === value.agentId) ?? null) })
-      .catch(err => console.error('the agent list could not be loaded:', err))
-    return () => { live = false }
-  }, [value.agentId, canViewAgents, orgId])
+  const readAgents = (): Promise<readonly Agent[]> => cachedRead(keyed('agents-list'), () => listAgents(org), ROSTER_STALE_MS).then(
+    (rows): readonly Agent[] => (Array.isArray(rows) ? rows : []),
+    // A failed read is a console line, never a banner: the picker still offers its choices; `picked` reads as none.
+    (err: unknown) => { console.error('the agent list could not be loaded:', err); return [] },
+  )
+  // `value.agentId` in the key: each pick re-reads the roster (`cachedRead` answers inside `ROSTER_STALE_MS`).
+  const agentsRead = useApiRead(['agent-picker-agents', value.agentId, orgId], readAgents, 'the agent list could not be loaded',
+    { enabled: Boolean(value.agentId) && canViewAgents })
+  const wanted = Boolean(value.agentId) && canViewAgents && !agentsRead.loading
+  const picked: Agent | null = wanted ? agentsRead.data?.find(a => a.id === value.agentId) ?? null : null
 
   /* The viewer's provider grid narrows the built-ins (`lib/providerGrid`); another org's choices come back as that
    * org's plan allows them. */
@@ -242,17 +240,15 @@ export function AgentPicker({
       </FormTextField>
       {/* Visible, not a help caption: a picked agent that will not run is a fact the operator must see. */}
       {pickReason && (
-        <Typography id={reasonId} component="p" variant="caption" data-testid="agent-pick-reason" sx={{ color: 'warning.main', mt: '0.35rem' }}>
+        <Typography id={reasonId} component="p" variant="caption" data-testid="agent-pick-reason" sx={{ color: 'warning.main', mt: 0.5 }}>
           {pickReason}
         </Typography>
       )}
       {picked?.resolve_error && (
-        <Typography id={warningId} component="p" variant="caption" data-testid="agent-resolve-warning" sx={{ color: 'warning.main', mt: '0.35rem' }}>
+        <Typography id={warningId} component="p" variant="caption" data-testid="agent-resolve-warning" sx={{ color: 'warning.main', mt: 0.5 }}>
           ⚠ Last refresh failed: {picked.resolve_error}
         </Typography>
       )}
     </>
   )
 }
-
-export default AgentPicker

@@ -5,19 +5,23 @@ import Button from '@mui/material/Button'
 import ButtonBase from '@mui/material/ButtonBase'
 import Checkbox from '@mui/material/Checkbox'
 import Chip from '@mui/material/Chip'
-import Dialog from '@mui/material/Dialog'
 import Popover from '@mui/material/Popover'
 import TextField from '@mui/material/TextField'
-import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import useMediaQuery from '@mui/material/useMediaQuery'
+import type { Theme } from '@mui/material/styles'
 import { get } from '../api'
 import { useApiRead } from '../hooks/useApiRead'
 import { matchesAny } from './FilterRow'
+import { DialogFrame } from './FormDialog'
 import { ELLIPSIS_SX, PHONE } from './listStyles'
+import { RADIUS, SIZE, grid } from '../theme'
 import { NO_AUTOFILL_INPUT } from './noAutofill'
 import SegmentedControl from './SegmentedControl'
+import HelpLabel, { ExplainMoreButton } from './HelpLabel'
+import type { ChoiceHelp, HelpProp } from './explain'
 import { capitalize } from '../lib/humanize'
+import Tip from './Tip'
 
 /* THE TARGET SELECTOR — one control for every kind of thing an automation can run on (Projects, Nodes,
  * and whatever comes next): the kind's ROSTER comes from an adapter, the control itself is identical.
@@ -69,6 +73,10 @@ export type TargetSelectorProps = {
   preview?: TargetPreview
   disabled?: boolean
   label?: string
+  /** The label's explanation (`ui/HelpLabel`); its pop-up adds one line per mode (All, Specific, All except) unless
+   *  `modeHelp` is false (a field whose only valid rule is one specific record). */
+  help?: HelpProp
+  modeHelp?: boolean
   /** Under the field when the org has none to pick: the one action that makes one. */
   emptyAction?: ReactNode
 }
@@ -91,9 +99,12 @@ export function isValidTarget(rule: TargetRule): boolean {
 
 type RosterResponse = { items: TargetItem[]; total: number }
 
+/** The one cache entry for a (kind, org) roster; `pages/automations/AutomationList.tsx::useRosters` reads it too. */
+export const targetRosterKey = (kind: TargetKind, orgId: string | null) => ['automation-target-roster', kind, orgId] as const
+
 function useTargetRoster(kind: TargetKind, orgId: string | null): TargetRoster {
   const { data, loading, error, reload } = useApiRead(
-    ['automation-target-roster', kind, orgId],
+    targetRosterKey(kind, orgId),
     () => get<RosterResponse>(`/api/automations/targets/${kind}?org_id=${encodeURIComponent(orgId ?? '')}`),
     `Couldn’t load ${kind}.`,
     { enabled: orgId !== null },
@@ -171,7 +182,8 @@ export function resolveLocally(rule: TargetRule, items: TargetItem[]): TargetPre
 }
 
 /** `removed`: not in the roster (drawn as an error). */
-export type SummaryName = { id: TargetId; name: string; removed: boolean }
+/** `nameless`: a removed id nobody knows a name for — its `name` already says so ("Project deleted"). */
+export type SummaryName = { id: TargetId; name: string; removed: boolean; nameless?: boolean }
 export type TargetSummary = {
   /** The never-truncated head: "All projects (12)", "3 projects: ", "All nodes except ". */
   lead: string
@@ -182,8 +194,9 @@ export type TargetSummary = {
   full: string
 }
 
-/** The words for a rule. A dangling id is named by `dangling`'s label (else "#id") plus "(removed)". The LAST entry
- *  for an id wins, so a server answer listed after the local guess replaces it. */
+/** The words for a rule. A dangling id is named by `dangling`'s label plus "(removed)"; a project with no known
+ *  name (no label, or the "#id" placeholder) reads "Project deleted". The LAST entry for an id wins, so a server answer
+ *  listed after the local guess replaces it. */
 export function summarizeTarget(
   rule: TargetRule,
   items: TargetItem[],
@@ -195,8 +208,11 @@ export function summarizeTarget(
   const names: SummaryName[] = rule.mode === 'all' ? [] : rule.ids.map(id => {
     const item = byKey.get(idKey(id))
     if (item) return { id, name: item.name, removed: false }
-    const entry = known.get(idKey(id))
-    return { id, name: entry?.label ?? `#${id}`, removed: true }
+    const label = known.get(idKey(id))?.label
+    /* A project leaves an org's roster by being deleted; a node also leaves it when a grant is revoked, so only a
+       project is worded as deleted. */
+    if (rule.kind === 'projects' && (!label || label === `#${id}`)) return { id, name: 'Project deleted', removed: true, nameless: true }
+    return { id, name: label ?? `#${id}`, removed: true }
   })
   const skipped = items.filter(i => i.state === 'disabled' && isTicked(rule, i.id)).length
   let lead: string
@@ -223,7 +239,7 @@ export function middleEllipsis(name: string, visible: number): string {
 
 /** A name the roster no longer holds says why; the suffix is never cut. */
 export function removedSuffix(name: SummaryName): string {
-  return name.removed ? ' (removed)' : ''
+  return name.removed && !name.nameless ? ' (removed)' : ''
 }
 
 export const MORE_SEPARATOR = ', '
@@ -304,6 +320,25 @@ const MODE_OPTIONS = [
   { value: 'specific' as const, label: 'Specific', testId: 'target-mode-specific' },
   { value: 'all_except' as const, label: 'All except', testId: 'target-mode-all_except' },
 ]
+/** The panel's modes, each with its effect as its hover (`modeChoices`: the label pop-up's lines). */
+function modeOptions(noun: { one: string; many: string }) {
+  const help = modeHelpOf(noun)
+  return MODE_OPTIONS.map(option => ({ ...option, help: help[option.value] }))
+}
+
+/** The pop-up's line per mode: what each one targets. */
+function modeChoices(noun: { one: string; many: string }): ChoiceHelp[] {
+  const help = modeHelpOf(noun)
+  return MODE_OPTIONS.map(option => ({ label: option.label, help: help[option.value] }))
+}
+
+function modeHelpOf(noun: { one: string; many: string }): Record<TargetMode, string> {
+  return {
+    all: `Every ${noun.one}, including ones added later.`,
+    specific: `Only the ticked ${noun.many}.`,
+    all_except: `Every ${noun.one} but the ticked ones, new ones included.`,
+  }
+}
 
 /** The panel's full height (search, shortcuts, the 320px list, footer); below this the page scrolls to make room. */
 const PANEL_ROOM_PX = 480
@@ -347,13 +382,15 @@ export default function TargetSelector({
   preview,
   disabled = false,
   label,
+  help,
+  modeHelp = true,
   emptyAction,
 }: TargetSelectorProps): JSX.Element {
   const { noun } = adapter
   const roster = adapter.useRoster(orgId)
   const items = roster.items
-  // Below MUI's `sm` (600px) the panel is a full-screen dialog. A plain query: no theme needed.
-  const phone = useMediaQuery('(max-width:599.95px)')
+  // Below MUI's `sm` (600px) the panel is a full-screen dialog.
+  const phone = useMediaQuery((t: Theme) => t.breakpoints.down('sm'))
   const uid = useId()
   const labelId = `${uid}-label`
   const listId = `${uid}-list`
@@ -398,6 +435,7 @@ export default function TargetSelector({
   const blocked = disabled || orgId === null
 
   const fieldLabel = label ?? capitalize(noun.many)
+  const choices = help && modeHelp ? modeChoices(noun) : undefined
   const empty = ready && items.length === 0 && summary.names.length === 0
   const stateText =
     orgId === null
@@ -414,10 +452,10 @@ export default function TargetSelector({
 
   return (
     <Box sx={{ minWidth: 0, width: '100%' }} data-testid={`target-selector-${adapter.kind}`}>
-      <Typography id={labelId} component="div" variant="caption" sx={{ color: 'text.secondary', mb: 0.25 }}>
-        {fieldLabel}
+      <Typography id={labelId} component="div" variant="caption" sx={{ color: 'text.secondary', mb: 0 }}>
+        <HelpLabel label={fieldLabel} help={help} choices={choices} />
       </Typography>
-      <Tooltip title={stateText ?? summary.full} placement="bottom-start" describeChild>
+      <Tip title={stateText ?? summary.full} placement="bottom-start" describeChild>
         <ButtonBase
           ref={triggerRef}
           disabled={blocked}
@@ -432,11 +470,11 @@ export default function TargetSelector({
             gap: 1,
             width: '100%',
             minWidth: 0,
-            minHeight: 40,
+            minHeight: grid(6.5),
             px: 1.5,
             border: 1,
             borderColor: showKindReason ? 'error.main' : 'divider',
-            borderRadius: 1,
+            borderRadius: RADIUS.sm,
             textAlign: 'left',
             justifyContent: 'flex-start',
             ...theme.typography.body2,
@@ -457,35 +495,30 @@ export default function TargetSelector({
             <SummaryLine summary={summary} />
           )}
           {stateText === null && (
-            <Chip
+            <Tip title={`Will run on ${resolution.resolvedCount} of ${resolution.universeCount} ${noun.many}`}><Chip
               size="small"
               label={`${resolution.resolvedCount} of ${resolution.universeCount}`}
               data-testid="target-resolved-chip"
-              title={`Will run on ${resolution.resolvedCount} of ${resolution.universeCount} ${noun.many}`}
               /* On a phone the names need the room more; the panel footer says the same. */
-              sx={{ flexShrink: 0, height: 22, [PHONE]: { display: 'none' } }}
-            />
+              sx={{ flexShrink: 0, height: SIZE.chip, [PHONE]: { display: 'none' } }}
+            /></Tip>
           )}
           <Box component="span" aria-hidden sx={{ flexShrink: 0, color: 'text.secondary' }}>▾</Box>
         </ButtonBase>
-      </Tooltip>
+      </Tip>
+      <ExplainMoreButton label={fieldLabel} help={help} choices={choices} />
       {orgId !== null && empty && emptyAction && (
         <Typography variant="body2" sx={{ mt: 0.5 }} data-testid="target-empty-action">{emptyAction}</Typography>
       )}
       {showKindReason && (
-        <Typography variant="caption" role="status" sx={{ color: 'error.main', display: 'block', mt: 0.25 }}>
+        <Typography variant="caption" role="status" sx={{ color: 'error.main', display: 'block', mt: 0 }}>
           {`Type changed, selection cleared. Pick ${noun.many}.`}
         </Typography>
       )}
       {phone ? (
-        <Dialog
-          open={open}
-          onClose={() => setAnchor(null)}
-          fullScreen
-          aria-labelledby={labelId}
-        >
+        <DialogFrame testId="target-picker-dialog" open={open} onClose={() => setAnchor(null)} fullScreen labelledBy={labelId}>
           <Panel {...panelProps} phone />
-        </Dialog>
+        </DialogFrame>
       ) : (
         <Popover
           open={open}
@@ -498,8 +531,8 @@ export default function TargetSelector({
               role: 'dialog',
               'aria-labelledby': labelId,
               sx: {
-                width: Math.max(anchor?.clientWidth ?? 0, 360),
-                maxWidth: 'calc(100vw - 32px)',
+                width: Math.max(anchor?.clientWidth ?? 0, SIZE.measureNarrow),
+                maxWidth: `calc(100vw - ${grid(5.5)})`,
                 // Below the trigger only: the panel scrolls rather than rising over the fields above it.
                 maxHeight: anchor ? spaceBelow(anchor) : undefined,
               },
@@ -618,7 +651,7 @@ function Panel({
     getScrollElement: () => scrollEl,
     estimateSize: () => 36,
     overscan: 8,
-    initialRect: { width: 360, height: 320 },
+    initialRect: { width: SIZE.measureNarrow, height: SIZE.measureNarrow },
   })
   useEffect(() => {
     if (virtual) virtualizer.scrollToIndex(active)
@@ -692,8 +725,7 @@ function Panel({
     const ticked = isTicked(rule, item.id)
     const optionId = `${listId}-opt-${index}`
     return (
-      <Box
-        key={idKey(item.id)}
+      <Tip key={idKey(item.id)} title={item.name}><Box
         id={optionId}
         role="option"
         aria-selected={ticked}
@@ -704,12 +736,11 @@ function Panel({
         data-testid={`target-option-${item.id}`}
         onMouseDown={event => event.preventDefault()}
         onClick={() => { setActive(index); toggle(item.id); listRef.current?.focus() }}
-        title={item.name}
         sx={{
           display: 'flex',
           alignItems: 'center',
           gap: 1,
-          minHeight: 36,
+          minHeight: grid(6),
           pr: 1.5,
           cursor: 'pointer',
           typography: 'body2',
@@ -737,7 +768,7 @@ function Panel({
             {item.detail}
           </Typography>
         )}
-      </Box>
+      </Box></Tip>
     )
   }
 
@@ -758,7 +789,7 @@ function Panel({
       )}
       <SegmentedControl<TargetMode>
         value={rule.mode}
-        options={MODE_OPTIONS}
+        options={modeOptions(noun)}
         onChange={mode => onChange(switchMode(rule, mode, items))}
         disabled={!ready}
         ariaLabel="Mode"
@@ -799,16 +830,14 @@ function Panel({
       {removed.length > 0 && (
         <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }} data-testid="target-dangling">
           {removed.map(n => (
-            <Chip
-              key={idKey(n.id)}
+            <Tip key={idKey(n.id)} title={`${n.name}: no longer available. Remove it, or its firings fail.`}><Chip
               size="small"
               color="error"
               label={`${n.name}${removedSuffix(n)}`}
-              title={`${n.name}: no longer available. Remove it, or its firings fail.`}
               onDelete={() => removeDangling(n.id)}
               data-testid={`target-dangling-${n.id}`}
               sx={{ maxWidth: '100%' }}
-            />
+            /></Tip>
           ))}
         </Box>
       )}
@@ -849,11 +878,11 @@ function Panel({
               m: 0,
               p: 0,
               overflowY: 'auto',
-              maxHeight: phone ? undefined : 320,
+              maxHeight: phone ? undefined : grid(53),
               flex: phone ? 1 : undefined,
               border: 1,
               borderColor: 'divider',
-              borderRadius: 1,
+              borderRadius: RADIUS.sm,
               position: 'relative',
               display: filtered.length === 0 ? 'none' : 'block',
               '&:focus-visible': { outline: 'none' },
@@ -894,7 +923,7 @@ function Panel({
         <Box
           component="ul"
           data-testid="target-resolved-list"
-          sx={{ m: 0, pl: 2.5, maxHeight: 160, overflowY: 'auto', typography: 'body2' }}
+          sx={{ m: 0, pl: 2.5, maxHeight: grid(26.5), overflowY: 'auto', typography: 'body2' }}
         >
           {resolution.resolved.map(r => (
             <Box component="li" key={idKey(r.id)} sx={{ overflowWrap: 'anywhere' }}>{r.name}</Box>

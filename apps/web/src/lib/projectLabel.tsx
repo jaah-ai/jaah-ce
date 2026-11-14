@@ -4,6 +4,9 @@ import type { OrgRef } from '../types'
 import { monoFamily } from '../ui/feed/geometry'
 import { orgTitle } from '../ui/OrgIndicator'
 import { VISUALLY_HIDDEN } from '../ui/visuallyHidden'
+import { ELLIPSIS_SX } from '../ui/listStyles'
+import { FONT_SIZE, FONT_WEIGHT, LETTER_SPACING } from '../theme'
+import Tip from '../ui/Tip'
 
 /* TWO PROJECTS, ONE NAME. A project name is unique only within its org, so an operator viewing every org can
  * meet two rows both called `web`. Every surface listing projects across orgs (the task rail, the project
@@ -38,31 +41,27 @@ export function spokenProjectName(name: string, org: OrgRef | null): string {
 export function OrgQualifier({ org }: { org: OrgRef | null }): JSX.Element | null {
   if (!org) return null
   return (
-    <Box
+    <Tip title={orgTitle(org)}><Box
       component="span"
       data-testid="project-org-qualifier"
       data-org-slug={org.slug}
-      title={orgTitle(org)}
       sx={theme => ({
         display: 'inline-block',
         verticalAlign: 'bottom',
         flex: '0 1000 auto',
-        minWidth: 0,
+        ...ELLIPSIS_SX,
         maxWidth: '100%',
-        ml: 0.75,
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-        whiteSpace: 'nowrap',
+        ml: 0.5,
         fontFamily: monoFamily(theme),
-        fontSize: '0.9em',
-        fontWeight: 400,
-        letterSpacing: 0,
+        fontSize: FONT_SIZE.xs,
+        fontWeight: FONT_WEIGHT.regular,
+        letterSpacing: LETTER_SPACING.none,
         textTransform: 'none',
         color: 'text.secondary',
       })}
     >
       <span aria-hidden="true">{org.slug}</span>
       <Box component="span" sx={VISUALLY_HIDDEN}>{` (${org.name})`}</Box>
-    </Box>
+    </Box></Tip>
   )
 }

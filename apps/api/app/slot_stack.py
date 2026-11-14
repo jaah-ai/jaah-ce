@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 from app import console_direct, fleet_decide, pool_state
-from app.clock import as_utc
+from app.log_on_change import ChangeLog
+from app.clock import as_utc, utcnow
 from app.entity_shape import optional_uuid
 
 log = logging.getLogger("slot-stack")
@@ -28,6 +29,10 @@ _DNS_NAME = re.compile(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[
 # Out-of-vocabulary sentinel: `resolve_stack` returns `prev_stack` verbatim for unknown, so this
 # separates unknown from "down". Non-empty on purpose — a falsy sentinel comes back as "down".
 _UNKNOWN = "\x00unknown"
+
+# Per node label, the last rejected tailnet name: `_reported_host` runs per slot row on every read, so
+# its warning fires once per change, not per row.
+_rejected_names = ChangeLog()
 
 
 def stack_state_for(
@@ -68,7 +73,7 @@ def urls_for(
     nowhere. Resolve it first (`node_identity.name_expr` / `names_by_id`).
 
     `None` rather than `{}` separates "no ports observed". Not freshness-gated: `urls` is addressing
-    (the deterministic port grid), and the console only links behind `stack_state === 'up'`. Rehosted from
+    (the node-assigned ports), and the console only links behind `stack_state === 'up'`. Rehosted from
     `localhost` because the console is remote; host rule: `console_direct.tailnet_suffix()`."""
     roles = fleet_decide.urls_from_ports(ports)
     if not roles:
@@ -88,9 +93,10 @@ def _reported_host(tailnet_dns_name: object, node_id: object) -> Optional[str]:
     reported = str(tailnet_dns_name).strip().rstrip(".").lower()
     own_label = str(node_id or "").strip().lower().split(".", 1)[0]
     if _DNS_NAME.fullmatch(reported) and own_label and reported.split(".", 1)[0] == own_label:
+        _rejected_names.forget(own_label)
         return reported
-    # The value is node-controlled, so only its shape is logged.
-    log.warning(
+    # The value is node-controlled, so only its shape is logged (the raw value stays in memory only).
+    (log.warning if _rejected_names.changed(own_label, str(tailnet_dns_name)) else log.debug)(
         "slot-stack: node %r reports a tailnet name that is not a DNS name under its own (%s, %d chars) — "
         "hosting its slot URLs on the derived name instead", own_label, type(tailnet_dns_name).__name__,
         len(str(tailnet_dns_name)),
@@ -136,5 +142,5 @@ def observation_is_fresh(observed_at: object) -> bool:
     if not isinstance(observed_at, datetime):
         return False
     stamp = as_utc(observed_at)
-    age = (datetime.now(timezone.utc) - stamp).total_seconds()
+    age = (utcnow() - stamp).total_seconds()
     return age <= pool_state.max_observation_age_secs()

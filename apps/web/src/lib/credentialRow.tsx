@@ -15,14 +15,17 @@ import type { JSX, ReactNode } from 'react'
 import { deleteItem, editItem, type OverflowItem } from '../components/tasks/rowActions'
 import { countOf } from './humanize'
 import type { Credential } from '../pages/credentials/api'
+import { ownershipLabel } from '../pages/credentials/ownership'
 import { contentSlotWidth } from '../ui/feed/geometry'
-import type { FeedIndicator, FeedMarker, FeedRowSpec, FeedSlot } from '../ui/feed/types'
+import type { FeedColumn, FeedIndicator, FeedMarker, FeedRowSpec, FeedSlot } from '../ui/feed/types'
 import { CopyButton } from '../ui/CopyButton'
-import { FEED_META } from '../ui/listStyles'
+import { FEED_META, ELLIPSIS_SX } from '../ui/listStyles'
 import { orgSlots, orgTitle } from '../ui/OrgIndicator'
 import { copyText } from '../ui/useCopyFlash'
 import { shortHash } from './nodeVaultKeys'
-import { absoluteTime, compactAge, NO_VALUE, relativeAge } from './relativeTime'
+import { FONT_SIZE, FONT_WEIGHT } from '../theme'
+import { absoluteTime, compactAge, DAY_MS, NO_VALUE, relativeAge } from './relativeTime'
+import Tip from '../ui/Tip'
 
 /* ── THE CLUSTER, RE-DERIVED IN A BROWSER ────────────────────────────────────────────────────────────
  * Chromium, `/credentials`, first row fixtured with the longest realistic value in every slot (119-char
@@ -104,7 +107,7 @@ export function credentialTypeSlotWidth(rows: readonly Credential[], besideDetai
  *  clearing by 149. Not narrowed below 220 (R1.4 protects the text). Second home below 1280: the ⋯ info
  *  item and `/credentials/:id`. */
 const DESCRIPTION_SLOT = 220
-export const DESCRIPTION_QUERY = '(min-width:1280px)'
+export { CREDENTIAL_DESCRIPTION_QUERY as DESCRIPTION_QUERY } from '../ui/listStyles'
 
 /** THE HEALTH CELLS — Last used and Last test, 64px each, as columns from 1440px
  *  (`credentialsHealthColumns`): `Never used` and `Failed · 23h` are the widest values at 11px. Narrower, the pair left
@@ -117,7 +120,6 @@ const HEALTH_SLOT = 64
 const HEALTH_FOLDED_SLOT = 72
 /** An expiry this close or closer is called out ("Expires in 3d"); `roster._health`'s `expiring` uses the same 7. */
 const EXPIRY_SOON_DAYS = 7
-const DAY_MS = 86_400_000
 
 /** Last used: `Used 3d` / `Never used`, with the sentence for its `title` and the row's hover. */
 function lastUsed(row: Credential): { text: string; sentence: string } {
@@ -150,7 +152,7 @@ export function credentialExpiry(expiresAt: string | null | undefined, now: numb
 }
 
 const TEST_TONE_SX = { ok: { color: 'success.main' }, failed: { color: 'error.main' } } as const
-const EXPIRY_TONE_SX = { expired: { color: 'error.main', fontWeight: 600 }, soon: { color: 'warning.main', fontWeight: 600 } } as const
+const EXPIRY_TONE_SX = { expired: { color: 'error.main', fontWeight: FONT_WEIGHT.semibold }, soon: { color: 'warning.main', fontWeight: FONT_WEIGHT.semibold } } as const
 
 /** A verdict in its tone: green OK, red Failed; the words say it too. */
 function testNode(text: string, ok: boolean | null): ReactNode {
@@ -159,12 +161,24 @@ function testNode(text: string, ok: boolean | null): ReactNode {
 }
 
 /** The ⋯ item's copy mark is `❐` (U+2750), not the app's usual `⧉` (U+29C9), which is TOFU on this stack
- *  (probed against a private-use codepoint). In a menu the glyph is decoration beside "Copy runner path"; the row's
+ *  (probed against a private-use codepoint). In a menu the glyph is decoration beside the copy item; the row's
  *  own control draws an SVG instead (`CopyRunnerPathButton`). */
 const COPY_GLYPH = '❐'
 
-/** The ⋯ item's label, and the head of the inline control's accessible name. */
+/** The ⋯ item's label, and the head of the inline control's accessible name, on a row with a runner path. */
 const COPY_PATH_LABEL = 'Copy runner path'
+/** The same control's label on a row with no runner path (a system row, a colleague's personal row): it copies
+ *  the full name instead, so every row can be copied. */
+const COPY_NAME_LABEL = 'Copy name'
+
+/** What a row's copy control copies: its runner path when a task can name it, else its full name. */
+export function credentialCopyTarget(
+  row: Pick<Credential, 'name' | 'ownership' | 'home_project' | 'home_path'>,
+  viewerEmail?: string | null,
+): { label: string; text: string } {
+  const path = credentialRunnerPath(row, viewerEmail)
+  return path !== null ? { label: COPY_PATH_LABEL, text: path } : { label: COPY_NAME_LABEL, text: row.name }
+}
 
 /** Between a home's segments, and after the last one before the name. */
 export const HOME_SEPARATOR = '›'
@@ -198,15 +212,12 @@ export function credentialRunnerPath(
 const HOME_PREFIX_SX = {
   flex: '0 1000 auto',
   // Never a percentage cap: the title is shrink-to-fit, so `50%` of it clipped the home with room to spare.
-  minWidth: 0,
-  overflow: 'hidden',
-  textOverflow: 'ellipsis',
-  whiteSpace: 'nowrap',
+  ...ELLIPSIS_SX,
   color: 'text.secondary',
   mr: 0.5,
 } as const
 const TITLE_WITH_HOME_SX = { display: 'inline-flex', maxWidth: '100%', minWidth: 0, verticalAlign: 'bottom' } as const
-const NAME_AFTER_HOME_SX = { flex: '0 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } as const
+const NAME_AFTER_HOME_SX = { flex: '0 1 auto', ...ELLIPSIS_SX } as const
 
 /** ⋯ description preview cap — 31 characters, read at the narrowest supported viewport. `MenuItem` never
  *  wraps and the paper is viewport-capped (416px at 448), so an uncapped long description CLIPPED. The
@@ -234,18 +245,18 @@ function capped(value: string): string {
   return value.length <= DESCRIPTION_MENU_CAP ? value : `${value.slice(0, DESCRIPTION_MENU_CAP - 1)}…`
 }
 
-/* COPY THIS CREDENTIAL'S RUNNER PATH, SAYING WHICH OF "COPIED" AND "COULD NOT" ACTUALLY HAPPENED — without
+/* COPY THIS CREDENTIAL'S RUNNER PATH (OR, WITH NONE, ITS NAME), SAYING WHICH OF "COPIED" AND "COULD NOT" ACTUALLY HAPPENED — without
  * the flash, success and a refused clipboard are the same nothing (`ui/CopyButton`'s `icon` face).
  * A `FeedRowSpec.titleAction`: it sits beside the name, outside the link, revealed on row hover and
- * keyboard focus, and is never drawn on touch — there the ⋯ "Copy runner path" is the route. */
-export function CopyRunnerPathButton({ path }: { path: string }): JSX.Element {
+ * keyboard focus, and is never drawn on touch — there the ⋯ copy item is the route. */
+export function CopyRunnerPathButton({ text, label = COPY_PATH_LABEL }: { text: string; label?: string }): JSX.Element {
   return (
     <CopyButton
       variant="icon"
       testId="credential-copy-path"
-      text={() => path}
-      label={`${COPY_PATH_LABEL} ${path}`}
-      copiedLabel={`Copied ${path}`}
+      text={() => text}
+      label={`${label} ${text}`}
+      copiedLabel={`Copied ${text}`}
       failedLabel="Copy unavailable — this browser refused the clipboard"
     />
   )
@@ -259,6 +270,9 @@ export type CredentialRowDeps = {
   /** May this viewer see the tenant (`ui/OrgIndicator.tsx::useOrgVisible`, the single home)? `false` omits
    *  the slot ENTIRELY AND drops the ⋯ org item (which names the tenant in plain text). */
   showOrg: boolean
+  /** May this viewer run a credential's Test (`pages/credentials/ownership.ts::testsCredentials`)? `false` omits
+   *  the Tested slot and every last-test fact (the folded health mark, the hovers): a viewer who can never test. */
+  showTest: boolean
   /** Beside an open record pane: the list is ~470px at 1280, and the owner and org slots (248px) left the name
    *  ~22px ("zz-t…"). `true` omits both slots; their ⋯ items stay, so nothing loses its home. */
   besideDetail?: boolean
@@ -297,6 +311,17 @@ export type CredentialRowDeps = {
  *  resolve (`own_credential` in `app/routes/credentials/`). */
 const UNRESOLVED_OWNER_LABEL = 'Owner: not known'
 
+/** WHO OWNS THE ROW, AS THE OWNER COLUMN SAYS IT: an org or system row is the org's or the control plane's, so it
+ *  reads as that ownership's own label (`pages/credentials/ownership.ts::OWNERSHIP_OPTIONS`), never its creator's
+ *  name; a personal row (or a payload that names no ownership) reads as its owner. `owner`, not `created_by`: an
+ *  Org Owner/Admin may make a personal row FOR a member, so its creator is not whose it is
+ *  (`routes/credentials/credential_wire.py::CredentialOut.owner`). An older payload without the field draws the
+ *  creator, which was its owner before the picker. `null` = unresolved. */
+function ownerLabel(row: Credential): string | null {
+  if (row.ownership === 'org' || row.ownership === 'system') return ownershipLabel(row.ownership)
+  return (row.owner === undefined ? row.created_by : row.owner) ?? null
+}
+
 /** Where the org slot is drawn (`meta`), the home's leading org segment would say the tenant twice per row and
  *  cut the name first: it hides there, and the slot's band is its one home. A home that is the org
  *  alone hides whole. Below the band the slot drops and the segment is the row's only tenant mark. */
@@ -322,14 +347,13 @@ function credentialTitle(row: Credential, orgSlotShown: boolean): ReactNode {
   const home = credentialHomeLabel(row.home_path)
   const hash = row.nodevault && row.nodevault_key_hash
     ? (
-      <Box
+      <Tip title={nodeVaultKeySentence(row.nodevault_key_hash)}><Box
         component="span"
         data-testid="credential-nodevault-hash"
-        title={nodeVaultKeySentence(row.nodevault_key_hash)}
-        sx={{ ml: 1, fontFamily: 'monospace', fontSize: '0.6875rem', color: 'text.disabled' }}
+        sx={{ ml: 1, fontFamily: 'monospace', fontSize: FONT_SIZE.xs, color: 'text.disabled' }}
       >
         {shortHash(row.nodevault_key_hash)}
-      </Box>
+      </Box></Tip>
     )
     : null
   if (!home) return hash ? <>{row.name}{hash}</> : row.name
@@ -337,27 +361,37 @@ function credentialTitle(row: Credential, orgSlotShown: boolean): ReactNode {
   const orgOnly = orgSlotShown && path.length === 1
   return (
     <Box component="span" sx={TITLE_WITH_HOME_SX}>
-      <Box
+      <Tip title={home}><Box
         component="span"
         data-testid="credential-home"
-        title={home}
         sx={orgOnly ? [HOME_PREFIX_SX, ORG_SEGMENT_WIDE_HIDDEN_SX] : HOME_PREFIX_SX}
       >
         {credentialHome(path, home, orgSlotShown)}
-      </Box>
+      </Box></Tip>
       <Box component="span" sx={NAME_AFTER_HOME_SX}>{row.name}{hash}</Box>
     </Box>
   )
 }
 
+/** THE HEADER ROW over `credentialFeedRow`'s slots, one label per slot key (a slot a list does not draw keeps its
+ *  label unused). Name, Type and Org carry the route's `RosterSort` keys; the health headers say "Used"/"Tested"
+ *  because "LAST USED" overruns the 64px `HEALTH_SLOT` at the header's caps. The caller appends its select column. */
+export const CREDENTIAL_TITLE_COLUMN: FeedColumn = { key: 'name', label: 'Name', sortKey: 'name' }
+export const CREDENTIAL_SLOT_COLUMNS: readonly FeedColumn[] = [
+  { key: 'description', label: 'Description' },
+  { key: 'last-used', label: 'Used', ariaLabel: 'Last used' },
+  { key: 'last-test', label: 'Tested', ariaLabel: 'Last test' },
+  { key: 'owner', label: 'Owner' },
+  { key: 'org', label: 'Org', sortKey: 'org' },
+  { key: 'health', label: 'Health', ariaLabel: 'Last used and last test' },
+  { key: 'type', label: 'Type', sortKey: 'type' },
+]
+
 /** THE CREDENTIAL AS A `ui/feed` ROW. Keyed on `id`: neither `type` nor `name` is unique (N1). It always
  *  carries its stored-secret disc, which the return type promises (`FeedRowSpec.indicator` is optional). */
 export function credentialFeedRow(row: Credential, deps: CredentialRowDeps): FeedRowSpec & { indicator: FeedIndicator } {
   const secretCount = row.secrets_set.length
-  /* `owner`, not `created_by`: an Org Owner/Admin may make a personal row FOR a member, so its creator is not
-     whose it is (`routes/credentials/credential_wire.py::CredentialOut.owner`). An older payload without the field draws the
-     creator, which was its owner before the picker. */
-  const owner = (row.owner === undefined ? row.created_by : row.owner) ?? null
+  const owner = ownerLabel(row)
   /* THREE ORG STATES from the wire pair: `org` resolved; `org` unresolved with `org_id` set (dangling — no
      FK, so representable); both absent. `apps/api/app/routes/credentials/credential_wire.py::CredentialOut` is the single
      home. A SHAPE CHECK, the same one `ui/OrgIndicator.tsx`'s `isOrgRef` makes, so an older API's truthy
@@ -372,21 +406,21 @@ export function credentialFeedRow(row: Credential, deps: CredentialRowDeps): Fee
      The owner's item is unconditional because its slot's gate is CSS this pure function cannot see; the
      description's appears only when `showDescription` is false. `rowActions.tsx` puts `disabledReason` on
      `title` and the accessible name, so the WHOLE string goes there and only the label is capped. */
-  const runnerPath = credentialRunnerPath(row, deps.viewerEmail)
-  const actions: OverflowItem[] = []
-  if (runnerPath !== null) {
-    actions.push({
-      /* "COPY RUNNER PATH" LEADS AND IS UNGATED: touch's only route to the clipboard (the inline control is
-         hover-revealed). The path a task names it by, in Tree mode too. None on a system row: no task sees it. */
+  const copy = credentialCopyTarget(row, deps.viewerEmail)
+  const actions: OverflowItem[] = [
+    {
+      /* THE COPY ITEM LEADS AND IS UNGATED, ON EVERY ROW: touch's only route to the clipboard (the inline control
+         is hover-revealed). The path a task names it by, in Tree mode too; a row no task of the viewer's can
+         reach (system, a colleague's personal row) copies its full name instead. */
       key: 'copy-name',
       icon: COPY_GLYPH,
-      label: COPY_PATH_LABEL,
+      label: copy.label,
       // Leads with the drawn label (WCAG 2.5.3).
-      ariaLabel: `${COPY_PATH_LABEL} ${runnerPath}`,
+      ariaLabel: `${copy.label} ${copy.text}`,
       // No flash in a closing menu; the inline control is where the answer lives.
-      onClick: () => { copyText(() => runnerPath, () => {}) },
-    })
-  }
+      onClick: () => { copyText(() => copy.text, () => {}) },
+    },
+  ]
   actions.push(
     {
       /* The owner's label is capped too (display names are unbounded); the full string rides `disabledReason`. */
@@ -457,7 +491,7 @@ export function credentialFeedRow(row: Credential, deps: CredentialRowDeps): Fee
      <1440, beside the ungated tail as that union prescribes for a complement), type (ungated). Beside an open record
      pane, type alone (`besideDetail`). */
   const used = lastUsed(row)
-  const tested = lastTest(row)
+  const tested = deps.showTest ? lastTest(row) : null
   const expiry = credentialExpiry(row.expires_at)
   const slots: FeedSlot[] = []
   if (deps.showDescription) {
@@ -481,17 +515,17 @@ export function credentialFeedRow(row: Credential, deps: CredentialRowDeps): Fee
       title: used.sentence,
       node: used.text,
     },
-    {
+    ...(tested ? [{
       key: 'last-test',
       width: HEALTH_SLOT,
-      gate: 'credentialsHealthColumns',
-      align: 'left',
+      gate: 'credentialsHealthColumns' as const,
+      align: 'left' as const,
       testId: 'col-credential-last-test',
       title: tested.sentence,
       node: testNode(tested.text, tested.ok),
-    },
+    }] : []),
     {
-      /* THE OWNER — a personal row's owner, else its creator, by display name (`CredentialOut.owner`). NEVER ACCESS
+      /* THE OWNER — "Organization" / "System", or a personal row's owner by display name (`ownerLabel`). NEVER ACCESS
          (access is the credential's Access tab, N7). Unresolved → `NO_VALUE` with words. */
       key: 'owner',
       width: OWNER_SLOT,
@@ -517,13 +551,13 @@ export function credentialFeedRow(row: Credential, deps: CredentialRowDeps): Fee
       gate: 'credentialsHealth',
       align: 'left',
       testId: 'col-credential-health',
-      title: [expiry?.text, used.sentence, tested.sentence].filter(Boolean).join(' · '),
+      title: [expiry?.text, used.sentence, tested?.sentence].filter(Boolean).join(' · '),
       node: expiry
         ? <Box component="span" sx={expiry.expired ? EXPIRY_TONE_SX.expired : EXPIRY_TONE_SX.soon}>{expiry.text}</Box>
         : (
           <>
             {used.text}
-            {tested.ok !== null && (
+            {tested && tested.ok !== null && (
               <>
                 {' '}
                 <Box component="span" role="img" aria-label={tested.ok ? 'last test OK' : 'last test failed'}>
@@ -595,16 +629,16 @@ export function credentialFeedRow(row: Credential, deps: CredentialRowDeps): Fee
     title: credentialTitle(row, deps.showOrg && !deps.besideDetail && orgResolved),
     titleText: row.name,
     /* The title is one line, ellipsised, so every row keeps one height; the full name is on hover
-       (`titleText`) and its runner path in the ⋯ menu's Copy runner path.
+       (`titleText`) and its runner path (or name) in the ⋯ menu's copy item.
        THE TYPE'S SECOND HOME: the hover, whole, for a list under ~400px (a phone, or beside an open credential)
        where the slot leaves the cluster. */
     notes: [
       { key: 'type', tone: 'muted', text: `Type: ${row.type_label}` },
       // The health's second home: the hover, whole, where its cells leave (beside an open record pane).
-      { key: 'health', tone: 'muted', text: `${used.sentence} · ${tested.sentence}` },
+      { key: 'health', tone: 'muted', text: tested ? `${used.sentence} · ${tested.sentence}` : used.sentence },
     ],
-    // The FULL runner path, whatever the title draws (Tree mode draws the last segment). None on a system row.
-    titleAction: runnerPath !== null ? <CopyRunnerPathButton path={runnerPath} /> : undefined,
+    // The FULL runner path (or name), whatever the title draws (Tree mode draws the last segment).
+    titleAction: <CopyRunnerPathButton text={copy.text} label={copy.label} />,
     href: `/credentials/${row.id}`,
     busy: deps.busy,
     slots,

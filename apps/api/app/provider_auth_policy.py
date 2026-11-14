@@ -38,9 +38,6 @@ def builtin_cells() -> tuple[Cell, ...]:
     return tuple((p.value, kind) for p in agent_providers.PROVIDERS for kind in p.auth_kinds)
 
 
-supported_pairs = builtin_cells
-
-
 def _known(cell: Cell) -> bool:
     """The decode rule: a built-in pair this build serves, `sdk`/`own`, or a well-formed `acp:<id>`/`api_key`. Shape
     only for a registry row: the registry is never fetched here, so neither the plan editor nor dispatch waits on it."""

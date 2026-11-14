@@ -6,12 +6,15 @@ import Box from '@mui/material/Box'
 import Checkbox from '@mui/material/Checkbox'
 import type { PipelineTask } from '../../../types'
 import { useIsPicked, type PickStore } from '../../../lib/pickStore'
+import { countOf } from '../../../lib/humanize'
 import { disclosureGlyph } from '../../ExpandToggleGlyph'
-import AuthorBadge from '../AuthorBadge'
+import TaskPeople from '../TaskPeople'
+import SuggestionActions from '../SuggestionActions'
+import PinnedMark from '../PinnedMark'
 import { startIntentFor } from '../controls'
 import CostBadge from '../CostBadge'
 import RatingBadge from '../RatingBadge'
-import { TaskPrSummary, taskPrs } from '../TaskPrList'
+import LaneRunFacts from '../LaneRunFacts'
 import { taskOverflowItems, taskRowActionFlags } from '../rowActions'
 import type { OverflowItem, TaskRowActionHandlers } from '../rowActions'
 import { indicatorHover, indicatorName, indicatorPress, SYSTEM_ROW_TITLE, TASK_STATUS, taskIndicatorAction, taskStatus } from '../shared'
@@ -24,22 +27,18 @@ import { tokensLabel, tokensTitle } from '../../../lib/taskTokens'
 import { ABOVE_PHONE, BOARD_NO_RATING, monoSx, SELECT_BOX_SX, SR_ONLY_SX } from '../../../ui/listStyles'
 import { orgSlots } from '../../../ui/OrgIndicator'
 import { AGE_SLOT } from '../../../ui/feed/geometry'
+import { FONT_SIZE } from '../../../theme'
 import type { FeedMarker, FeedNote, FeedRowSpec, FeedSlot } from '../../../ui/feed/types'
 import type { ViewRow } from './rows'
 import FeatureIcon from '../FeatureIcon'
 import { parseFeatureIcon } from '../../../lib/featureIcon'
+import Tip from '../../../ui/Tip'
 
 /* The task-shaped slots: `ui/feed` owns the cluster's shape; this board decides each width and the type
    properties a `FeedSlot` cannot express. */
 /* The persona rides `boardPersona` (`BOARD_NO_PERSONA`, ≤860px of board) — FIRST to go. MEASURED at a
    1440px window with the board narrowed: the title is 397px just above the gate and 477px just below. */
 const PERSONA_SLOT = 78
-
-/* THE PR SLOT — 132px: the first PR as `owner/name #123` (the repository ellipsises, the number never does), a
-   state dot and "+N" for the rest (`../TaskPrList.tsx`). Rides `boardPr` (`BOARD_NO_PR`, ≤980px of board), the
-   FIRST to go, priced so the title keeps its width just above the persona's gate. Reserved, not collapsed, as
-   the cost is: most finished rows have a PR. Left-aligned so the repository names start in one column. */
-const PR_SLOT = 132
 
 /* THE RATING SLOT — 36px. A fixed slot's cost comes out of the title.
    Content at this cluster's 11px (`RATING_SX`): `4.5` + star ≈ 3 x ~6.6 + 1.5 + ~9.9 ≈ 31px, +5px tolerance
@@ -50,10 +49,13 @@ const PR_SLOT = 132
    slot is already gone there). */
 const RATING_SLOT = 36
 
+/* THE ID LEAD — 34px: a five-digit id at the lead's 0.6875rem mono (~33px), so 10000+ never ellipsises. */
+export const ID_SLOT = 34
+
 /* `RatingBadge` sets `fontSize: '0.8125rem'` before composing `sx`, so the 11px the 36px rests on must be
    passed. Mono, weight and colour come from the badge. The reserved blank is the SLOT's (the badge is null
    at count 0); reservation beats collapse because rated rows are RARE and would step the columns 42px. */
-const RATING_SX = { fontSize: '0.6875rem' } as const
+const RATING_SX = { fontSize: FONT_SIZE.xs } as const
 
 /* THE TOKENS SLOT — 48px, priced like `RATING_SLOT`.
    The widest `lib/taskTokens.ts` figures are six characters (`999.9K`, `999.9M`): 6 x ~6.6 ≈ 40px mono at
@@ -69,7 +71,7 @@ const TOKENS_SLOT = 48
    reading). RESERVED, NOT COLLAPSED, for the cost's reason: nearly every dispatched row has a figure, so
    collapsing would step the columns on the rare uncaptured one. The blank is the slot's (the node is
    `undefined` when `tokensLabel` is empty — never 0). */
-const TOKENS_SX = { fontSize: '0.6875rem', display: 'inline-block', color: 'text.secondary' } as const
+const TOKENS_SX = { fontSize: FONT_SIZE.xs, display: 'inline-block', color: 'text.secondary' } as const
 
 /* THE COST SLOT — 64px, priced like `RATING_SLOT`.
    Sized for nine characters (`$1,204.50`): 9 x ~6.6 ≈ 59px mono at 11px, +5px tolerance. MEASURED at 900px:
@@ -82,14 +84,13 @@ const COST_SLOT = 64
 /* `CostBadge` sets `fontSize: '0.8125rem'` in its layout defaults, so the 11px must be passed as host
    geometry. Face, weight, colour and `textAlign: 'right'` come from the badge.
    RESERVED, NOT COLLAPSED: nearly every dispatched row has a cost, so collapsing would step the columns on
-   the rare costless one; reserving keeps author/age/⋯ one straight line. The blank is the badge's own null. */
-const COST_SX = { fontSize: '0.6875rem' } as const
+   the rare costless one; reserving keeps people/age/⋯ one straight line. The blank is the badge's own null. */
+const COST_SX = { fontSize: FONT_SIZE.xs } as const
 
-const AUTHOR_SLOT = 24
-
-/* `../AuthorBadge` owns initials, hue and the name on `title` (`lib/authorBadge.ts` says why the hue: two
-   letters collide). The slot adds weight and tracking — a 400-weight `RZ` at 10px is a smudge. */
-const AUTHOR_SX = { fontWeight: 700, letterSpacing: '0.02em' } as const
+/* THE CREATOR → ASSIGNEE SLOT — 44px: `RZ➜JS` at the slot's 10px mono, two badges of ~13px, the heavy arrow
+   with its padding, and their gaps measure ≈ 41px, +3px tolerance. Rides the author's old gate (`boardAuthor`: off ≤767px, phone included —
+   the row's name says who). Drawn by `../TaskPeople.tsx`. */
+const PEOPLE_SLOT = 44
 
 /* THE ORG SLOT — 72px, riding the `wide` GATE (`ui/feed/geometry.ts`'s `SlotGate`; derivation in
    `ui/listStyles.ts`'s `ORG_HIDDEN_ON_MOBILE_SX`, the single home of the boundary and title curve).
@@ -111,61 +112,32 @@ const AUTHOR_SX = { fontWeight: 700, letterSpacing: '0.02em' } as const
    `orgSlot` owns the `title`, `data-*` and the null em dash, so no presence branch here. */
 const ORG_SLOT_FEED = 128
 
-/* THE BULK PICK'S TICK RIDES THE AGE SLOT (as its own 26px column after the age,
-   the tick narrowed every title at a 1024px split). The age shows at rest; the tick takes its place while the row is
-   hovered or holds keyboard focus (a Tab reaches the tick, so `:focus-visible` reveals it; not `:focus-within`,
-   or the focus a click leaves on the box pins an unticked tick after the pointer goes), while it is
-   ticked, and on every pickable row once anything is picked (`picking`), so a pick in progress shows all its boxes. The 24px box
-   (`SELECT_BOX_SX`) fits the 28px slot. A hover-less (touch) device never reveals by hover: the ⋯ menu's Select
-   is its way in, after which `picking` shows the rest. Hidden is `opacity` plus `pointer-events`, never
-   `display`, so the tick stays in the tab order and hover never reflows the row. */
-const PICK_HOST_SX = { position: 'relative', display: 'block' } as const
-const PICK_REVEALED = {
-  '& .feed-pick': { opacity: 1, pointerEvents: 'auto' },
-  '& .feed-age': { visibility: 'hidden' },
-} as const
-const PICK_TICK_SX = {
-  ...SELECT_BOX_SX,
-  position: 'absolute',
-  top: '50%',
-  right: 0,
-  transform: 'translateY(-50%)',
-  opacity: 0,
-  pointerEvents: 'none',
-} as const
-const pickHostSx = (revealed: boolean) => [
-  PICK_HOST_SX,
-  {
-    '@media (hover: hover)': { '[data-testid="feed-row"]:hover &': PICK_REVEALED },
-    '[data-testid="feed-row"]:has(:focus-visible) &': PICK_REVEALED,
-  },
-  revealed ? PICK_REVEALED : null,
-]
-
+/* THE BULK PICK'S TICK RIDES THE STATE DISC (`FeedRowSpec.pick`, which owns the reveal and the geometry): the
+   age slot stays the age, and the tick costs no width. ONLY A DONE ROW'S DISC turns into the tick, while the disc is
+   hovered or the tick holds keyboard focus, and while it is ticked; picking one row never reveals the others'. Any other
+   pickable row keeps its disc (its own press, e.g. a draft's Start) and is picked from the ⋯ menu's Select; once
+   ticked it shows the tick too, so the pick stays visible. A hover-less (touch) device picks a done row by a
+   long-press. The 24px box (`SELECT_BOX_SX`) overhangs the 18px disc evenly. */
 /* THE TICK READS ITS OWN ROW from the pick store: a click re-renders this tick, never the board, so
    rapid clicks never queue behind a full re-render. Its reveal follows the live answer too. */
-function FeedPickTick({ store, taskId, picking, title, age, onToggle }: {
+function FeedPickTick({ store, taskId, title, onToggle }: {
   store: PickStore<PipelineTask>
   taskId: number
-  picking: boolean
   title: string
-  age: string
   onToggle: () => void
 }) {
   const checked = useIsPicked(store, taskId)
   return (
-    <Box component="span" data-testid="feed-pick-host" sx={pickHostSx(checked || picking)}>
-      <span className="feed-age">{age}</span>
-      <Checkbox
-        size="small"
-        className="feed-pick"
-        data-testid="feed-task-select"
-        checked={checked}
-        onChange={onToggle}
-        slotProps={{ input: { 'aria-label': `Select ${title}` } }}
-        sx={PICK_TICK_SX}
-      />
-    </Box>
+    <Checkbox
+      size="small"
+      className="feed-pick"
+      data-testid="feed-task-select"
+      data-revealed={checked ? 'true' : undefined}
+      checked={checked}
+      onChange={onToggle}
+      slotProps={{ input: { 'aria-label': `Select ${title}` } }}
+      sx={SELECT_BOX_SX}
+    />
   )
 }
 
@@ -200,8 +172,8 @@ function priorityMarker(value: number): FeedMarker {
 }
 
 /* WHY A NOT-YET-RUNNING ROW WAITS, as one sentence (`Waiting. Organization runner limit (1/1)`), or `null` when its state
-   word says all there is. The single home for the row's hover note, its accessible name and the ⋯
-   menu's reason line, so the three never word it apart. Held has one cause (its epic's hold mode), which its bare
+   word says all there is. The single home for the row's hover note and its accessible name, so the
+   two never word it apart. Held has one cause (its epic's hold mode), which its bare
    word does not say. */
 function waitSentence(row: ViewRow): string | null {
   const held = row.stateLabel === TASK_STATUS.held.label
@@ -212,9 +184,14 @@ function waitSentence(row: ViewRow): string | null {
 
 /* The row's accessible name. Carries the state WORD (the glyph is only the sighted reader's indicator). ITS
    PRESENCE SILENCES THE DISC AND MARKERS (`FeedRowSpec.ariaLabel`). */
+/** What follows the state word on a finished row its viewer has not opened (`ViewRow.unseen`). */
+export const UNSEEN = ', not yet seen'
+
 export function ariaLabelFor(row: ViewRow): string {
   const progress = row.epic ? `, ${row.doneChildCount} of ${row.childCount} subtasks done` : ''
-  const author = row.createdBy ? `, created by ${row.createdBy}` : ''
+  const author =
+    row.origin.kind !== 'human' ? `, filed by ${row.origin.label}` : row.createdBy ? `, created by ${row.createdBy}` : ''
+  const assignee = row.assignee ? `, assigned to ${row.assignee}` : ''
   /* THE RATING IS IN THE NAME: the badge sits inside the row's `Link`, whose `aria-label` REPLACES its contents.
      `ratingSummaryTitle` is the wording's single home; unrated rows add nothing. */
   const rating = row.ratingCount > 0 ? `, rated ${ratingSummaryTitle(row.ratingCount, row.ratingAverage)}` : ''
@@ -226,8 +203,8 @@ export function ariaLabelFor(row: ViewRow): string {
      `aria-hidden`, so each cell names itself; appending either would repeat it. */
   /* THE WAIT REASON IS IN THE NAME: the disc's hover is ~20px of target and no hover at all on a touch
      device, so `Waiting. Organization runner limit (1/1)` replaces the bare word wherever it adds a fact. */
-  const state = waitSentence(row) ?? row.stateLabel
-  return `Task ${row.id}: ${row.title} — ${state}${priority}${progress}${author}${rating}`
+  const state = `${waitSentence(row) ?? row.stateLabel}${row.unseen ? UNSEEN : ''}`
+  return `Task ${row.id}: ${row.title} — ${state}${priority}${progress}${author}${assignee}${rating}`
 }
 
 /** Everything about one row that the host knows and `./rows` does not. */
@@ -259,11 +236,21 @@ export type RowContext = {
   orgVisible: boolean
   /** The row's feature icon (`featureIconFor`), drawn before the title text; absent/null draws nothing. */
   featureIcon?: string | null
-  /** The bulk pick's tick, riding the age slot (`PICK_HOST_SX`): absent or `null` = no tick on this row (the board
-   *  offers no selection, or nobody may pick the row). `picking`: something on the board is picked, so every
-   *  tick shows at rest. `checked` is the pick when the board last rendered — the ⋯ menu's word; the tick reads
+  /** The bulk pick's tick, riding the state disc (`FeedRowSpec.pick`): absent or `null` = no tick on this row (the board
+   *  offers no selection, or nobody may pick the row). `checked` is the pick when the board last rendered — the ⋯ menu's word; the tick reads
    *  `store` live. Also the ⋯ menu's Select, the hover-less device's way in. */
-  select?: { checked: boolean; picking: boolean; store: PickStore<PipelineTask>; onToggle: () => void } | null
+  select?: { checked: boolean; store: PickStore<PipelineTask>; onToggle: () => void } | null
+  /** The columns this viewer hid (`lib/taskColumns.ts` keys: slot keys plus `id`, the lead). Absent = none. */
+  hiddenColumns?: ReadonlySet<string>
+  /** On a release's list, how many of this epic's parts it ships (`TaskListViewProps.parts`). An unfinished epic reads
+   *  "Part" for "Epic", with the count on hover. */
+  shipsParts?: number
+}
+
+/** A release's unfinished epic: its persona slot's word and hover (`RowContext.shipsParts`); null on any other row. */
+export function partOf(row: ViewRow, shipsParts: number | undefined): { label: string; title: string } | null {
+  if (shipsParts === undefined || !row.epic || row.task.state === 'done') return null
+  return { label: 'Part', title: `Ships ${countOf(shipsParts, 'part')} of an unfinished epic` }
 }
 
 /* ONE TASK ROW, AS FACTS — no pixels. */
@@ -271,8 +258,7 @@ export function buildFeedTaskRow(ctx: RowContext): FeedRowSpec {
   const { row, depth, handlers, busy, navigate } = ctx
   const leaf = ctx.leaf ?? depth > 0
 
-  /* Verbs derived and listed by `../rowActions` (shared with the table); `variant` makes a subtask's Start mean
-     Run rather than Queue. */
+  /* Verbs derived and listed by `../rowActions` (shared with the table). */
   const variant = leaf ? 'leaf' : 'root'
   const flags = taskRowActionFlags(row.task, variant, handlers)
   /* THE NODE IS A CONTROL, AND SO IS THE ROW BEHIND IT. Which verb the node offers is `taskIndicatorAction`
@@ -288,7 +274,7 @@ export function buildFeedTaskRow(ctx: RowContext): FeedRowSpec {
   /* A blocked Start (`flags.startBlockedReason`) is no press here: the ⋯ carries it disabled with the reason. */
   const start =
     handlers.onStart !== undefined && !flags.startBlockedReason
-      ? () => handlers.onStart!(row.task, startIntentFor(row.task, variant))
+      ? () => handlers.onStart!(row.task, startIntentFor(row.task))
       : undefined
   /* From `row.answerHref`, not `row.id`: a container's destination is the gated CHILD. Null → no closure at all,
      which `taskIndicatorAction` reads as "no answer navigation". */
@@ -309,20 +295,21 @@ export function buildFeedTaskRow(ctx: RowContext): FeedRowSpec {
   /* THE HOVER SENTENCE: the state and its facts, where its runner works, then what a click does
      (`indicatorHover`). From `row.stateTitle`, not `indicator.title`, so the hover never says "Starting" under a
      node reading "Running". */
+  const stateTitle = `${row.stateTitle}${row.unseen ? UNSEEN : ''}`
   const nodeTitle = indicatorHover(
-    rollupClause === null ? row.stateTitle : `${row.stateTitle}. ${rollupClause}`,
+    rollupClause === null ? stateTitle : `${stateTitle}. ${rollupClause}`,
     indicator.kind,
     flags.consoleSlot,
   )
   const nodeName = indicator.verb
     ? indicatorName(row.stateLabel, indicator.verb, row.title)
-    : row.stateLabel
+    : `${row.stateLabel}${row.unseen ? UNSEEN : ''}`
 
   const select = ctx.select
   const wait = waitSentence(row)
   const overflowItems: OverflowItem[] = [
-    ...taskOverflowItems(row.task, row.title, variant, handlers, flags),
-    // The tick's second home (a hover-less device never reveals it): see `PICK_HOST_SX`.
+    ...taskOverflowItems(row.task, row.title, handlers, flags),
+    // The tick's second home (a hover-less device never reveals it): see `FeedRowSpec.pick`.
     ...(select
       ? [{
           key: 'pick',
@@ -349,29 +336,12 @@ export function buildFeedTaskRow(ctx: RowContext): FeedRowSpec {
           },
           ...overflowItems,
         ]
-  /* THE WAIT REASON LEADS THE ⋯ — a disabled line, pressing nothing: on a phone the ⋯ (and the
-     long-press beside it) is where a reader goes for "why is this not running", and the disc's hover never shows
-     there. Its words are `waitSentence`'s, split at the state word so the menu reads "Waiting" over its cause.
-     Only on a row that already has a menu: a verbless row's reason is its name and its hover. */
-  const items: OverflowItem[] =
-    wait === null || verbs.length === 0
-      ? verbs
-      : [
-          {
-            key: 'wait-reason',
-            icon: row.glyph,
-            label: row.stateLabel,
-            ariaLabel: row.stateLabel,
-            disabled: true,
-            disabledReason: wait.startsWith(`${row.stateLabel}. `) ? wait.slice(row.stateLabel.length + 2) : wait,
-            testId: 'feed-wait-reason',
-            onClick: () => {},
-          },
-          ...verbs,
-        ]
+  /* THE WAIT REASON IS NOT A ⋯ ITEM: a disabled line heading the menu was a reason nobody could act on there. It is
+     the row's own: its name, and its disc's hover — and its TAP (`tapTitle`), the phone's way to it — with the fix,
+     where the viewer can make one, on the task page (`TaskDetailHeader`, from `TaskOut.wait_fix_url`). */
 
-  /* THE TRAILING CLUSTER — PR, persona, rating, tokens, cost, author (767, phone included), ORG (`wide`), age ungated (see each
-     `*_SLOT`). On a board narrower still (an editor and the console beside it) the org, then the author, follow
+  /* THE TRAILING CLUSTER — persona, rating, tokens, cost, people (767, phone included), ORG (`wide`), age ungated (see each
+     `*_SLOT`). On a board narrower still (an editor and the console beside it) the org, then the people cell, follow
      the board too (`BOARD_NO_ORG` / `BOARD_NO_AUTHOR`).
      Persona, tokens, cost and rating follow the BOARD's width and drop in the operator's order — persona, then
      tokens, then cost, then rating (`ui/listStyles.ts`'s `BOARD_NO_*`) — so the
@@ -380,17 +350,12 @@ export function buildFeedTaskRow(ctx: RowContext): FeedRowSpec {
      branch tests the data only: `ratingCount` is already gated to done-and-ratable rows in `./rows`. The tokens
      branch is `tokensLabel`'s verdict, nothing re-spelled. The cost has no branch — see its slot. */
   const tokens = tokensLabel(row.tokens)
+  const part = partOf(row, ctx.shipsParts)
   const slots: FeedSlot[] = [
-    /* Its own cell, outside the row's link, so its links are valid; `TaskPrSummary` keeps its clicks off the row. */
     {
-      key: 'pr',
-      testId: 'col-pr',
-      width: PR_SLOT,
-      gate: 'boardPr',
-      align: 'left',
-      node: taskPrs(row.task).length > 0 ? <TaskPrSummary prs={taskPrs(row.task)} taskTitle={row.title} /> : undefined,
+      key: 'persona', testId: 'col-persona', width: PERSONA_SLOT, gate: 'boardPersona', align: 'right',
+      title: part?.title ?? row.persona, node: part?.label ?? row.persona,
     },
-    { key: 'persona', testId: 'col-persona', width: PERSONA_SLOT, gate: 'boardPersona', align: 'right', title: row.persona, node: row.persona },
     {
       key: 'rating',
       testId: 'col-rating',
@@ -416,15 +381,14 @@ export function buildFeedTaskRow(ctx: RowContext): FeedRowSpec {
       align: 'right',
       node:
         tokens !== '' ? (
-          <Box
+          <Tip title={tokensTitle(row.tokens)}><Box
             component="span"
             data-testid="feed-tokens"
-            title={tokensTitle(row.tokens)}
             sx={theme => ({ ...monoSx(theme), ...TOKENS_SX })}
           >
             {tokens}
             <Box component="span" sx={SR_ONLY_SX}> tokens</Box>
-          </Box>
+          </Box></Tip>
         ) : undefined,
     },
     /* THE COST, right after the tokens: persona, verdict and spend are the WORK group; author and age the
@@ -442,14 +406,29 @@ export function buildFeedTaskRow(ctx: RowContext): FeedRowSpec {
       node: <CostBadge task={row.cost} sx={COST_SX} testId="feed-cost" />,
     },
     {
-      key: 'author',
-      width: AUTHOR_SLOT,
+      key: 'people',
+      testId: 'col-people',
+      width: PEOPLE_SLOT,
       // Off ≤767px, phone included: the title needs the width; the row's name says who (`ui/feed/geometry.ts`).
       gate: 'boardAuthor',
       align: 'center',
       mono: true,
-      fontSize: '0.625rem',
-      node: row.createdBy ? <AuthorBadge name={row.createdBy} sx={AUTHOR_SX} /> : undefined,
+      fontSize: FONT_SIZE.xxs,
+      node: (
+        <TaskPeople
+          creator={row.createdBy}
+          origin={row.origin}
+          assignee={row.assignee}
+          assigneeId={row.assigneeId}
+          projectId={row.task.project_id ?? null}
+          taskTitle={row.title}
+          onAssign={
+            handlers.onAssign !== undefined && (handlers.canEditRow?.(row.task) ?? true)
+              ? id => handlers.onAssign!(row.task, id)
+              : undefined
+          }
+        />
+      ),
     },
     /* WHICH TENANT OWNS THE ROW — placement and derivation in `ORG_SLOT_FEED`. Composed by
        `ui/OrgIndicator.tsx`'s `orgSlot`; reads `row.org` (the shared derivation), never `row.task.org`. */
@@ -459,28 +438,19 @@ export function buildFeedTaskRow(ctx: RowContext): FeedRowSpec {
     {
       key: 'age',
       width: AGE_SLOT,
-      /* Off a split at its floor (`boardAge`), but never while a pick is in progress: the tick rides this slot. There
-         the ⋯ menu's Select is the way in, as on a hover-less device. */
-      gate: ctx.select?.picking || ctx.select?.checked ? undefined : 'boardAge',
+      gate: 'boardAge',
       align: 'right',
       mono: true,
       dim: true,
-      // A run-aged row says what its figure counts (`ViewRow.ageTitle`).
+      // The exact moment the figure counts from (`ViewRow.ageTitle`), on every state.
       title: row.ageTitle ?? undefined,
-      // The tick's tap-floor pullback (`FeedSlot.compact`): the row's ⋯ holds the same verbs at full size.
-      compact: Boolean(ctx.select),
-      node: ctx.select ? (
-        <FeedPickTick
-          store={ctx.select.store}
-          taskId={row.id}
-          picking={ctx.select.picking}
-          title={row.title}
-          age={row.age}
-          onToggle={ctx.select.onToggle}
-        />
-      ) : row.age,
+      node: row.age,
     },
   ]
+
+  /* THE VIEWER'S HIDDEN COLUMNS (Filter & view > Columns). */
+  const hidden = ctx.hiddenColumns
+  const shownSlots = hidden && hidden.size > 0 ? slots.filter(slot => !hidden.has(slot.key)) : slots
 
   /* WHY A HELD OR WAITING ROW IS NOT RUNNING, on hover only: the whole sentence, list after
      the count included. A Queued row's is already the disc's hover sentence. */
@@ -498,13 +468,24 @@ export function buildFeedTaskRow(ctx: RowContext): FeedRowSpec {
       glyph: row.glyph,
       label: nodeName,
       title: nodeTitle,
+      tapTitle: wait !== null && !indicator.onPress,
       onPress: indicator.onPress,
       pressLabel: nodeName,
       pressGlyph: indicatorPress(indicator.kind)?.glyph,
       data: { press: indicator.kind },
       live: row.live,
       ring: row.epic && row.pct !== null ? { pct: row.pct } : null,
+      attention: row.unseen,
     },
+    // Only a done row's disc yields to the tick, or a row already ticked (from the ⋯): see `FeedPickTick`.
+    pick: select && (row.done || select.checked) ? (
+      <FeedPickTick
+        store={select.store}
+        taskId={row.id}
+        title={row.title}
+        onToggle={select.onToggle}
+      />
+    ) : undefined,
     disclosure:
       ctx.expanded === undefined
         ? 'spacer'
@@ -516,16 +497,36 @@ export function buildFeedTaskRow(ctx: RowContext): FeedRowSpec {
       </>
     ) : row.title,
     titleText: row.title,
+    /* A JAAH SUGGESTION'S ACCEPT AND DISCARD, beside its name at every width (`../SuggestionActions`). Only a root row:
+       a suggestion is a top-level filing. */
+    titleAside: !leaf ? (
+      <>
+        {/* A PINNED ROW SAYS SO, and the mark is its one-click Unpin (`lib/taskPin.ts`); Pin itself is in the ⋯. */}
+        {flags.pinned && <PinnedMark title={row.title} onUnpin={() => handlers.onTogglePin!(row.task)} />}
+        <SuggestionActions task={row.task} title={row.title} handlers={handlers} busy={busy} dense />
+        {/* A LANE RUN'S GATES AND WALL TIME, and its Slow mark, without opening it (`../LaneRunFacts`). */}
+        <LaneRunFacts run={row.task.lane_run} />
+      </>
+    ) : undefined,
     /* A SPLIT AT ITS FLOOR KEEPS A READABLE NAME: below the rating's gate (`BOARD_NO_RATING`, ≤680px of
        board — a 1366px window with an editor open) the trailing cluster still costs ~250px, and the one-line name
        fell to a few words. There it wraps to two lines instead. Above the phone only: a phone row stays one line
        (its own band already gives the name every slot it can). */
     titleWrapAt: [ABOVE_PHONE, BOARD_NO_RATING],
-    ariaLabel: ariaLabelFor(row),
+    // A release's part rides the name too: the persona slot is gated off on a phone.
+    ariaLabel: part ? `${ariaLabelFor(row)}, ${part.title.toLowerCase()}` : ariaLabelFor(row),
     href: row.href,
     // 34px: a five-digit id at the lead's 0.6875rem mono (~33px), so 10000+ never ellipsises; right-aligned,
-    // so ids share a right edge. Gone on the narrowest board too (`boardId`).
-    lead: { text: String(row.id), width: 34, gate: 'boardId' },
+    // so ids share a right edge. Gone on the narrowest board too (`boardId`). Every row's id, an epic's included,
+    // copies the task's absolute URL on click, at any status: a task is cited elsewhere by its link.
+    lead: hidden?.has('id') ? undefined : {
+      text: String(row.id),
+      width: ID_SLOT,
+      gate: 'boardId',
+      copy: { what: `link to task ${row.id}`, value: () => `${window.location.origin}${row.href}` },
+    },
+    /* WHO FILED IT, at every width (`lib/taskOrigin.ts`): a machine's row recedes; the people cell's glyph names it. */
+    quiet: row.origin.kind !== 'human',
     markers: [
       ...(row.system
         ? [{
@@ -538,14 +539,14 @@ export function buildFeedTaskRow(ctx: RowContext): FeedRowSpec {
       /* On `archived_at` only (see `ViewRow.archived`). */
       ...(row.archived ? [{ key: 'archived', glyph: '🗄', label: 'Archived' }] : []),
     ],
-    slots,
-    actions: items,
+    slots: shownSlots,
+    actions: verbs,
     busy,
     onRowClick: openConsole,
     rowClickLabel: 'Open the web console for',
-    /* THE PHONE'S PICK: a hover-less device never reveals the tick, so holding the row picks it — the
-       same toggle as the tick and the ⋯'s Select. */
-    onLongPress: select ? select.onToggle : undefined,
+    /* THE PHONE'S PICK: a hover-less device never reveals the tick, so holding a done row picks it — the
+       same toggle as the tick and the ⋯'s Select. Other rows pick from the ⋯ only, like their tick. */
+    onLongPress: select && row.done ? select.onToggle : undefined,
     deepLinked: ctx.deepLinked,
     notes: notes.length > 0 ? notes : undefined,
     detail: ctx.detail,

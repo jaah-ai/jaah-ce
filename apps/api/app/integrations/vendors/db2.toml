@@ -1,0 +1,47 @@
+# IBM Db2: database credentials for Db2's own wire protocol; no driver on the CP, so the Test is a format check.
+slug = "db2"
+label = "IBM Db2"
+category = "data"
+vendor_docs_url = "https://cloud.ibm.com/docs/Db2onCloud?topic=Db2onCloud-getting-started"
+summary = "Let agents query an IBM Db2 database, on IBM Cloud or your own server."
+
+[[auth]]
+kind = "db"
+fields = [
+  { key = "host", label = "Host", kind = "text", required = true, placeholder = "abc123.databases.appdomain.cloud", help = "IBM Cloud: Resource list > your Db2 instance > Service credentials > New credential > Add, then expand it and copy hostname. Your own server: its public host name" },
+  { key = "port", label = "Port", kind = "text", required = true, placeholder = "30376", help = "The port from the same service credential (port). Db2 on Cloud accepts SSL connections only, on that port" },
+  { key = "database", label = "Database", kind = "text", required = true, default = "bludb", placeholder = "bludb", help = "The database name from the service credential (database); Db2 on Cloud's is bludb" },
+  { key = "username", label = "User", kind = "text", required = true, help = "The username from the service credential, or the database user created for agents" },
+  { key = "password", label = "Password", kind = "secret", required = true, help = "The password from the same service credential" },
+]
+
+[test]
+kind = "format"
+patterns = { host = '[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+', port = '[1-9][0-9]{1,4}', database = '[A-Za-z][A-Za-z0-9_]{0,7}' }
+public_host_field = "host"
+
+[docs]
+agent_uses = [
+  "Run SQL against Db2 tables to answer a question or check data a bug left behind",
+  "Read the system catalog (SYSCAT views) to see tables, columns and indexes before changing a schema",
+  "Export a query result to CSV and attach it to the task",
+]
+prerequisites = [
+  "A Db2 on Cloud instance, or a Db2 server reachable from the internet over SSL.",
+  "A service credential (Db2 on Cloud) or a database user for agents, granted only the tables they need.",
+  "A Db2 client where the agent runs, such as the ibm_db Python package.",
+]
+limitations = [
+  "Jaah cannot open a Db2 connection to test: it adds no database drivers. Test checks the values' format and that the host is a public address. The first real check is the agent's first query.",
+  "Db2 on Cloud connections must use SSL. Agents connect with Security=SSL.",
+  "A Db2 database name is at most eight characters.",
+]
+troubleshooting = [
+  { symptom = "Test says Host must name a public address", fix = "Use the public hostname from the service credential, not a private endpoint. A private endpoint is reachable only from inside IBM Cloud" },
+  { symptom = "The agent's connection fails with SQL30082N (security processing failed)", fix = "The user name or password is wrong, or the credential was deleted. Create a new service credential and select Replace on the secret" },
+  { symptom = "The agent's connection times out", fix = "Check the port is the SSL port from the credential and the agent connects with SSL. An IP allowlist on the instance must allow the agent's address" },
+]
+faq = [
+  { q = "Does it work with Db2 on z/OS or IBM i?", a = "Any Db2 that accepts DRDA connections over SSL from the internet works, but agents need the matching client driver" },
+  { q = "Why does Test say IBM Db2 was not called?", a = "Db2 speaks its own database protocol, and Jaah does not run database drivers. So Test checks the format only" },
+]

@@ -12,11 +12,13 @@ import json
 import logging
 import os
 import re
+import shutil
 import stat
-import tempfile
+import sys
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 import account_auth  # import-free leaf: the API-key account's config-dir spelling
 import edition  # import-free leaf: the community edition keeps the node token out of the environment
@@ -24,6 +26,10 @@ import host_platform  # stdlib-only seam: the OS layout's daemon state root
 from jaah_env import env_get  # stdlib-only leaf
 from jaah_env import TRUTHY, env_flag_enabled, insecure_agent_enabled  # noqa: F401 — the one parse, re-exported for its node readers
 import environment  # stdlib-only leaf: the ONE home of every outward surface's env var name and default
+import path_module  # stdlib-only leaf
+
+# The staged write by path: `import agents.staged_write` would execute `agents/__init__`, which imports every adapter.
+_staged_write = path_module.load(Path(__file__).resolve().parent / "agents" / "staged_write.py", "_jaahd_staged_write")
 
 log = logging.getLogger("jaahd.env_helpers")
 
@@ -70,8 +76,8 @@ def dotenv_value(text: str, key: str) -> str:
     """What `key` resolves to in dotenv `text`, by the rule the compose env guard names the running
     stack with: the LAST `KEY=` line wins, an inline `#…` comment is cut, quotes and spaces are dropped;
     "" when absent. Not `_dotenv_kv` (bash-`source` rules, for `load_fleet_env`): the one reader behind
-    every "which stack is this `.env`" question (`compose_project_name`, the pool-port checker's `env_port`,
-    the worktree-agents snapshot's `env_key`) must agree with `./dc`, which exports the guard's reading."""
+    every "which stack is this `.env`" question (`compose_project_name`, the pool-port checker's `env_port`)
+    must agree with `./dc`, which exports the guard's reading."""
     prefix = re.compile(rf"^\s*{re.escape(key)}=")
     value = ""
     for line in text.splitlines():
@@ -89,7 +95,7 @@ def compose_project_name(text: str) -> str:
 def _dotenv_lines(path: Path):
     """Yield (key, value) for each KEY=VALUE line in a dotenv file. A generator: errors surface to the
     iterating caller."""
-    for raw in path.read_text().splitlines():
+    for raw in path.read_text(encoding="utf-8").splitlines():
         kv = _dotenv_kv(raw)
         if kv is not None:
             yield kv
@@ -263,13 +269,16 @@ def fleet_locks_dir() -> Path:
         return Path(host_platform.paths().state_dir, "locks")
     return jaah_dir("run", "locks")
 
-def log_dir(*parts: str) -> Path:
-    """`$FLEET_LOG_DIR` when set (tests, a non-default host layout), else `<jaah_home>/log`.
-
-    `or`, not a dict default: like bash's `${FLEET_LOG_DIR:-...}`, set-but-EMPTY means unset."""
-    override = os.environ.get("FLEET_LOG_DIR") or ""
-    root = Path(override) if override.strip() else jaah_dir("log")
+def _overridable_dir(env_name: str, default_sub: str, parts: tuple[str, ...]) -> Path:
+    """`$<env_name>` when set (tests, a non-default host layout), else `<jaah_home>/<default_sub>`."""
+    override = os.environ.get(env_name) or ""
+    root = Path(override) if override.strip() else jaah_dir(default_sub)
     return root.joinpath(*parts)
+
+
+def log_dir(*parts: str) -> Path:
+    """`$FLEET_LOG_DIR` else `<jaah_home>/log`. Like bash's `${FLEET_LOG_DIR:-...}`: set-but-EMPTY means unset."""
+    return _overridable_dir("FLEET_LOG_DIR", "log", parts)
 
 
 # The packaged answer for `daemon_state_dir`, named because the fleet doctor's `--reset-dev` refuses the
@@ -289,12 +298,9 @@ def daemon_state_dir(*parts: str) -> Path:
 
 
 def state_dir(*parts: str) -> Path:
-    """`$FLEET_STATE_DIR` when set, else `<jaah_home>/state` — durable sweep stamps, NOT logs.
-
-    Split from `log_dir` so relocating logs never re-arms idempotency stamps. Empty means unset."""
-    override = os.environ.get("FLEET_STATE_DIR") or ""
-    root = Path(override) if override.strip() else jaah_dir("state")
-    return root.joinpath(*parts)
+    """`$FLEET_STATE_DIR` else `<jaah_home>/state` — durable sweep stamps, NOT logs: split from `log_dir`
+    so relocating logs never re-arms idempotency stamps."""
+    return _overridable_dir("FLEET_STATE_DIR", "state", parts)
 
 
 def resolve_clone_root(project_id: int | str | None) -> str:
@@ -490,7 +496,7 @@ _TMUX_WINDOWS_ENV_KEYS: tuple[str, ...] = (
 
 # Which directory the tmux sockets live in (`session_user.tmux_tmpdir`): stripping `TMUX_TMPDIR` would
 # silently relocate every socket path. Servers are still found via mandatory `-S` from one seam
-# (`session_user.socket_args`/`tmux_cmd`/`manage_sockets`), since the default label resolves per-EUID.
+# (`session_user.tmux_cmd`/`manage_sockets`), since the default label resolves per-EUID.
 # The run root and vnode flag travel too, else a vnode child resolves the HOST's tree.
 _TMUX_SOCKET_ENV_KEYS: tuple[str, ...] = (
     environment.TMUX_TMPDIR_ENV, environment.RUN_ROOT_ENV, environment.VNODE_ENV)
@@ -745,38 +751,66 @@ def now_iso(ts: float | None = None) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
-def atomic_write_text(path: Path, content: str | bytes, *, mode: int, fsync: bool = False,
-                      suffix: str = ".tmp") -> None:
-    """Replace `path` with `content` (text, or bytes written as-is) atomically at `mode`: a `mkstemp` file
-    `.<name>.*<suffix>` in the same directory (same filesystem, so `os.replace` is a rename), chmodded
-    BEFORE the rename so the path never exists wider.
-    A concurrent reader sees the old file or the new one, never half of either; on failure the temp file
-    is removed and the original is untouched. `os.replace` also hands the target the temp file's owner,
-    and replaces a symlink rather than writing through it."""
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=suffix)
-    binary = isinstance(content, bytes)
+def version_key(name: str | Path) -> tuple[int, ...] | None:
+    """A dotted-integer version (`"4.15.1"`, or a directory so named) as a sortable tuple, so `4.150` outranks
+    `4.15`; None for any other spelling — a `5.6.0-beta` is not a release and never outranks one."""
+    parts = Path(name).name.split(".")
+    return tuple(int(p) for p in parts) if all(p.isdecimal() for p in parts) else None
+
+
+def newest_version_dir(root: Path) -> Path | None:
+    """The numerically newest `<root>/<version>` subdirectory (one `version_key` parses: a plugin cache's
+    installed releases), or None when the root is missing, unreadable or holds none."""
     try:
-        with os.fdopen(fd, "wb" if binary else "w", encoding=None if binary else "utf-8") as fh:
-            fh.write(content)
-            if fsync:
-                fh.flush()
-                os.fsync(fh.fileno())
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    except BaseException:
+        ranked = [(key, p) for p in root.iterdir() if p.is_dir() and (key := version_key(p)) is not None]
+    except OSError:
+        return None
+    return max(ranked, key=lambda pair: pair[0])[1] if ranked else None
+
+
+# $JAAH_HOME is shared by `jaahd` and `jaah` via group `jaah` + setgid dirs + UMask=0002 (the package's
+# postinst, D9); a registry rewritten 0644 by one could never be rewritten by the other. An existing file keeps
+# its own mode (`atomic_write_text(mode=None)`); only a created file takes this.
+SHARED_FILE_MODE = 0o664
+
+
+def atomic_write_text(path: Path, content: str | bytes, *, mode: int | None, fsync: bool = False,
+                      suffix: str = ".tmp") -> None:
+    """Replace `path` with `content` (text, or bytes written as-is) atomically at `mode`
+    (`agents/staged_write.replace_file`: a temp file beside it, moded BEFORE the rename so the path never
+    exists wider, and a failure leaves the original untouched). `mode=None`: an existing file's own mode is
+    restated (the temp file starts 0600 and the replace would otherwise narrow it); a created file takes
+    `SHARED_FILE_MODE`. The parent directory is created on demand."""
+    if mode is None:
         try:
-            os.unlink(tmp)
+            mode = path.stat().st_mode & 0o777
         except OSError:
-            pass
-        raise
+            mode = SHARED_FILE_MODE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _staged_write.replace_file(str(path), content, mode=mode, fsync=fsync, suffix=suffix)
 
 
-def atomic_write_json(path: Path, data: object, *, mode: int, indent: int | None = None,
+def atomic_write_json(path: Path, data: object, *, mode: int | None, indent: int | None = None,
                       sort_keys: bool = False, fsync: bool = False, suffix: str = ".tmp") -> None:
     """`atomic_write_text` of `data` as JSON — the one home of "serialise, then replace atomically". An
     indented document ends with a newline, as a file a person opens should."""
     text = json.dumps(data, indent=indent, sort_keys=sort_keys)
     atomic_write_text(path, text + "\n" if indent is not None else text, mode=mode, fsync=fsync, suffix=suffix)
+
+
+def remove_path(path: str, *, onexc: Callable[..., None] | None = None) -> None:
+    """Remove `path` whatever it is: a directory that is not a symlink with `shutil.rmtree`, anything else (a
+    file, a symlink, a dangling link) with `os.unlink`. Raises OSError, an absent path included. `onexc` is
+    `rmtree`'s error hook, passed as `onerror` before 3.12 (the hooks differ in their third argument, which the
+    daemon's one hook, `slot_clone._clear_readonly`, ignores)."""
+    if not os.path.isdir(path) or os.path.islink(path):
+        os.unlink(path)
+    elif onexc is None:
+        shutil.rmtree(path)
+    elif sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=onexc)
+    else:
+        shutil.rmtree(path, onerror=onexc)
 
 
 def _norm_dir(p: object) -> str:

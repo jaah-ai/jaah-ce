@@ -35,6 +35,7 @@ import {
   type CredentialTreePlace,
 } from './api'
 import { homeExpansionKey } from './credentialTree'
+import { FONT_SIZE, grid } from '../../theme'
 
 /** Skeleton rows while the root loads, as Flat mode's. */
 const ROOT_SKELETON_ROWS = 5
@@ -264,6 +265,7 @@ export default function CredentialTreeView(props: CredentialTreeViewProps) {
       // The whole name, wrapped: a folder is told apart by its name alone.
       title: <Box component="span" data-testid="credential-group-name" sx={{ overflowWrap: 'anywhere' }}>{label}</Box>,
       titleText: label,
+      href: null,
       titleLines: 'all',
       ariaLabel: `secret group ${label}, ${count} ${noun}`,
       disclosure: {
@@ -273,7 +275,7 @@ export default function CredentialTreeView(props: CredentialTreeViewProps) {
         label: 'secrets',
       },
       slots: [{
-        key: 'count', width: 72, align: 'right', node: count, fontSize: '13px', testId: 'credential-group-count',
+        key: 'count', width: grid(12), align: 'right', node: count, fontSize: FONT_SIZE.md, testId: 'credential-group-count',
         title: `${count} ${noun}`,
       }],
       children: isOpen ? children() : [],
@@ -408,6 +410,7 @@ function loadMoreRow(key: string, busy: boolean, onLoad: () => void): FeedRowSpe
       </Button>
     ),
     titleText: 'Load more',
+  href: null,
   }
 }
 
@@ -423,5 +426,6 @@ function errorRow(key: string, message: string, onRetry: () => void): FeedRowSpe
       </Box>
     ),
     titleText: message,
+  href: null,
   }
 }

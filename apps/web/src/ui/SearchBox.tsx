@@ -1,11 +1,13 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
 import IconButton from '@mui/material/IconButton'
 import InputAdornment from '@mui/material/InputAdornment'
 import TextField from '@mui/material/TextField'
-import Tooltip from '@mui/material/Tooltip'
+import Tip from './Tip'
 import type { SxProps, Theme } from '@mui/material/styles'
 import { useDebouncedCallback } from '../hooks/useDebouncedCallback'
+import { SearchIcon } from './icons'
 import { NO_AUTOFILL_INPUT } from './noAutofill'
+import { SIZE } from '../theme'
 
 /* THE DEBOUNCED SEARCH BOX, one for every list that searches server-side. The field is LOCAL STATE; the
  * committed term (`value`, the caller's query or URL key) catches up once typing has been quiet for
@@ -17,7 +19,8 @@ import { NO_AUTOFILL_INPUT } from './noAutofill'
  * hides once there is text, so it never covers the results being typed for. It sits ABOVE the box (flipping
  * below only without room): below, it covered the filter chips a list keeps under its search. The console's one debounce pair
  * lives here: a box that names no `delayMs` takes BOTH (tabs of one page that debounce differently are two
- * pages); a box with its own `delayMs` has no max-wait unless it also passes one. */
+ * pages); a box with its own `delayMs` has no max-wait unless it also passes one. `delayMs={0}` commits every
+ * keystroke at once: a list filtered in the browser, or a box whose caller debounces itself (`lib/orgs::useOrgSearch`). */
 export const SEARCH_DEBOUNCE_MS = 300
 export const SEARCH_MAX_WAIT_MS = 1000
 
@@ -34,7 +37,11 @@ export default function SearchBox({
   helperText,
   maxLength,
   testId,
+  inputTestId,
+  onKeyDown,
   resetKey,
+  autoFocus,
+  hintPlacement = 'top-start',
   sx,
 }: {
   /** The committed term, verbatim. */
@@ -54,8 +61,16 @@ export default function SearchBox({
   maxLength?: number
   /** The field's test id; the ✕ gets `${testId}-clear`. */
   testId?: string
+  /** The `<input>`'s own test id, where a test types into it by id. */
+  inputTestId?: string
+  /** After the box's own Enter/Escape handling (Settings' Enter opens the first result). */
+  onKeyDown?: (event: KeyboardEvent<HTMLDivElement>) => void
   /** Changed by the caller to discard the typed text and its pending commit (Clear all). */
   resetKey?: number
+  /** Focus the field on mount (a box the user just asked to open). */
+  autoFocus?: boolean
+  /** Where the `title` hint opens; below where the controls above the box must stay pressable. */
+  hintPlacement?: 'top-start' | 'bottom-start'
   sx?: SxProps<Theme>
 }) {
   const [draft, setDraft] = useState(value)
@@ -97,6 +112,7 @@ export default function SearchBox({
   const field = (
     <TextField
       data-testid={testId}
+      autoFocus={autoFocus}
       type="search"
       label={label}
       value={draft}
@@ -108,7 +124,8 @@ export default function SearchBox({
       onBlur={() => setFocused(false)}
       onChange={event => {
         setDraft(event.target.value)
-        scheduleCommit()
+        if (delayMs === 0) commit(event.target.value)
+        else scheduleCommit()
       }}
       onKeyDown={event => {
         if (event.key === 'Enter') {
@@ -118,19 +135,17 @@ export default function SearchBox({
           event.preventDefault()
           clear()
         }
+        onKeyDown?.(event)
       }}
       // The native ✕ of `type="search"` would be a second clear control beside ours.
       sx={[{ '& input::-webkit-search-cancel-button': { display: 'none' } }, ...(Array.isArray(sx) ? sx : [sx])]}
       slotProps={{
         inputLabel: { shrink: true },
-        htmlInput: { ...NO_AUTOFILL_INPUT, 'aria-label': ariaLabel, maxLength },
+        htmlInput: { ...NO_AUTOFILL_INPUT, 'aria-label': ariaLabel, maxLength, 'data-testid': inputTestId },
         input: {
           startAdornment: (
             <InputAdornment position="start" aria-hidden sx={{ color: 'text.secondary' }}>
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6">
-                <circle cx="7" cy="7" r="4.75" />
-                <path d="M10.5 10.5 14 14" strokeLinecap="round" />
-              </svg>
+              <SearchIcon size={SIZE.iconSm} />
             </InputAdornment>
           ),
           endAdornment: draft !== '' && (
@@ -152,16 +167,16 @@ export default function SearchBox({
   )
   if (!title) return field
   return (
-    <Tooltip
+    <Tip
       title={title}
       describeChild
-      placement="top-start"
+      placement={hintPlacement}
       open={hovered || (focused && draft === '')}
       disableHoverListener
       disableFocusListener
       disableTouchListener
     >
       {field}
-    </Tooltip>
+    </Tip>
   )
 }

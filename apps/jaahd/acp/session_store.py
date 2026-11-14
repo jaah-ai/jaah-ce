@@ -14,11 +14,16 @@ import time
 from pathlib import Path
 
 import env_helpers
+import file_io
 
 # Absent on Windows, where a final-component symlink needs a privilege the runner account does not hold.
 O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 O_BINARY = getattr(os, "O_BINARY", 0)
+
+# Above any legal file here: `control.json` holds at most `runtime.MAX_QUEUED_INTENTS` intents of
+# `runtime.MAX_INTENT_BYTES` each (64 MiB); past this bound a file is read as never written, not loaded whole.
+_FILE_BOUND = 256 << 20
 
 # The ids a file name is built from: no separator, no `..`, bounded.
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -52,17 +57,9 @@ def write_json_private(path: Path, obj: object, *, fsync: bool = False) -> None:
 
 
 def read_json(path: Path) -> object:
-    """The parsed file, or None when absent, unreadable or a symlink (a torn file is treated as never
-    written)."""
-    try:
-        fd = os.open(path, os.O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_BINARY)
-    except OSError:
-        return None
-    try:
-        with os.fdopen(fd, "rb") as fh:
-            return json.loads(fh.read().decode("utf-8"))
-    except (OSError, ValueError):
-        return None
+    """The parsed file, or None when absent, unreadable, a symlink, not a regular file, or over `_FILE_BOUND`
+    (`file_io.read_json_or`'s bounded read; a torn file is treated as never written)."""
+    return file_io.read_json_or(path, None, max_bytes=_FILE_BOUND)
 
 
 class SessionStore:

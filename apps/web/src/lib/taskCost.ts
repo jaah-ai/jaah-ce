@@ -4,6 +4,7 @@
  * No summing helper on purpose: `cost_usd` already is the server's Decimal subtree total; this file
  * formats a cost and never produces one. */
 import type { PipelineTask } from '../types'
+import { usdFormat } from './humanize'
 
 /* USD across fractions of a cent to hundreds of dollars:
      · ≥ $1   → 2 decimals ($1,204.50).
@@ -12,18 +13,14 @@ import type { PipelineTask } from '../types'
    A measured `0` prints `$0.00`; nothing-to-price is `cost_status: 'unavailable'` instead. */
 export function formatCostUsd(amount: number): string {
   if (amount > 0 && amount < 0.0001) return '< $0.0001'
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: amount < 1 ? 4 : 2,
-  }).format(amount)
+  return usdFormat({ minimumFractionDigits: 2, maximumFractionDigits: amount < 1 ? 4 : 2 }).format(amount)
 }
 
-/* Wire value as a number, or `null` for a don't-know. Private, to prevent client-side arithmetic.
+/* Wire value as a number, or `null` for a don't-know. Exported for a display parse and a sort key, never for
+   arithmetic: this file formats a cost and never produces one.
    Unparseable is a don't-know, not zero: absence is not a state.
    Blank is guarded because `Number('')` is 0; `Number.isFinite` also rejects `Infinity`. */
-function parseCostUsd(cost: string | null | undefined): number | null {
+export function parseCostUsd(cost: string | null | undefined): number | null {
   if (typeof cost !== 'string' || cost.trim() === '') return null
   const parsed = Number(cost)
   return Number.isFinite(parsed) ? parsed : null
@@ -45,13 +42,9 @@ export function hasCost(task: Pick<PipelineTask, 'cost_usd' | 'cost_status'>): b
 function formatListUsd(amount: number): string {
   if (amount > 0 && amount < 0.01) return '< $0.01'
   const cents = amount > 0 && amount < 1
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    /* Both bounds: USD's default minimum is 2, and older engines throw a RangeError when max < min. */
-    minimumFractionDigits: cents ? 2 : 0,
-    maximumFractionDigits: cents ? 2 : 0,
-  }).format(cents ? amount : Math.ceil(amount) || 0) // `|| 0` folds `Math.ceil(-0.4)`'s `-0`, which would print `-$0`.
+  /* Both bounds: USD's default minimum is 2, and older engines throw a RangeError when max < min. */
+  return usdFormat({ minimumFractionDigits: cents ? 2 : 0, maximumFractionDigits: cents ? 2 : 0 })
+    .format(cents ? amount : Math.ceil(amount) || 0) // `|| 0` folds `Math.ceil(-0.4)`'s `-0`, which would print `-$0`.
 }
 
 /**

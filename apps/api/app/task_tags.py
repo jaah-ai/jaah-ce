@@ -167,7 +167,7 @@ def replace_task_tags(session: Session, task: Task, tag_ids: list[UUID]) -> list
         for tag_id in wanted:
             _state, group_id, _name, _multi = found[tag_id]
             per_group.setdefault(group_id, []).append(tag_id)
-        for group_id, group_tag_ids in per_group.items():
+        for _group_id, group_tag_ids in per_group.items():
             _state, _gid, group_name, multi_select = found[group_tag_ids[0]]
             if not multi_select and len(group_tag_ids) > 1:
                 raise HTTPException(

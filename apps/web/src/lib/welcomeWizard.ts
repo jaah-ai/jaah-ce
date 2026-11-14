@@ -1,10 +1,10 @@
 // THE ONE SETUP STEP LIST — every org's, every surface's. The docked onboarding checklist
 // (`components/onboarding/companySetupGuide.tsx`, drawn by `components/onboarding/OnboardingWidget.tsx`) and the
 // sidebar's Setup button (`components/onboarding/SetupNavButton.tsx`) both draw THESE steps and count them the same
-// way (one onboarding, one count) — Choose plan -> Add node -> AI account -> Connect Git -> Add project ->
-// First task, then Done. Choose plan is a self-service org's only: an operator-created org has no plan
-// step, so it counts five. React-free.
-// It folds the server's list (`GET /api/org/setup`: seven steps for an operator-created org, nine for a
+// way (one onboarding, one count) — Choose plan -> Add node -> AI account -> Add project -> First task,
+// then Done. No Git step: Git is asked only when a project adds an existing repo. Choose plan is a self-service
+// org's only: an operator-created org has no plan step, so it counts four. React-free.
+// It folds the server's list (`GET /api/org/setup`: six steps for an operator-created org, eight for a
 // self-service one) and decides nothing the server has not: Assign nodes is automatic (onboarding assigns it),
 // Prepare repo rides First task, and First task is done once one has started (the server's `first_task` step).
 // THE NODE GATE: every step after Add node waits until the node is ready — a project's create starts its
@@ -18,10 +18,9 @@ import type { AccountLogin, CompanySetupStatus, CompanySetupStepStatusOut } from
 import { accountLoginPath } from '../pages/credentials/accountModel'
 import { NODES_ADD_PATH } from '../components/addNode/deepLink'
 import { isEnabled } from './editionFeatures'
-import { GIT_ADD_PATH } from './gitAddLink'
 import { PLAN_PAGE, type CompanySetupStepId } from './companySetup'
 
-export type WizardStepId = 'plan' | 'node' | 'account' | 'forge' | 'project' | 'task' | 'done'
+export type WizardStepId = 'plan' | 'node' | 'account' | 'project' | 'task' | 'done'
 
 /** `waiting`: the step offers nothing yet — the org awaits approval, or the node is not ready; its note says which. */
 export type WizardStepState = 'done' | 'todo' | 'in_progress' | 'failed' | 'waiting'
@@ -42,7 +41,6 @@ export const WIZARD_STEP_TITLES: Record<WizardStepId, string> = {
   plan: 'Choose plan',
   node: 'Add compute',
   account: 'AI account',
-  forge: 'Connect Git',
   project: 'Add a project',
   task: 'First task',
   done: 'Done',
@@ -55,8 +53,6 @@ export const SETUP_STEP_DESTINATIONS: Record<Exclude<WizardStepId, 'done'>, { to
   plan: { to: PLAN_PAGE, cta: 'Choose' },
   node: !isEnabled('cloud_nodes') ? { to: '/settings?area=this-machine', cta: 'This machine' } : { to: NODES_ADD_PATH, cta: 'Nodes' },
   account: { to: '/accounts/new', cta: 'Accounts' },
-  /* My Profile's Git tab (`pages/ProfilePage.tsx`'s `git-accounts`), its Add Git account form open. */
-  forge: { to: GIT_ADD_PATH, cta: 'Git' },
   project: { to: '/projects/new', cta: 'New project' },
   task: { to: '/tasks/new', cta: 'New task' },
 }
@@ -125,15 +121,14 @@ export function wizardSteps(status: CompanySetupStatus): WizardStep[] {
   const nodeStep = awaiting && !planPending ? { id: 'node' as const, state: 'waiting' as const, note: WAITING_NOTE } : node()
 
   /* After the node: each step's own signal — First task is done once one has started (the server's step). A step
-     not done yet waits while approval or the node is outstanding (the node gate); a done one stays done. Connect
-     Git needs no node, so only approval holds it. */
+     not done yet waits while approval or the node is outstanding (the node gate); a done one stays done. */
   const gate = awaiting ? WAITING_NOTE : nodeStep.state === 'done' ? null : NODE_WAITING_NOTE
   const nodeComing = nodeStep.state === 'in_progress' || nodeStep.state === 'todo'
-  const after = ([['account', 'add_account'], ['forge', 'connect_github'], ['project', 'add_project'], ['task', 'first_task']] as const)
+  const after = ([['account', 'add_account'], ['project', 'add_project'], ['task', 'first_task']] as const)
     .map(([id, serverId]): WizardStep =>
       isDone(serverId) ? { id, state: 'done', note: null }
         : gate === NODE_WAITING_NOTE && id === 'task' && status.task_queued && nodeComing ? { id, state: 'waiting', note: TASK_QUEUED_NOTE }
-        : gate !== null && !(id === 'forge' && gate === NODE_WAITING_NOTE) ? { id, state: 'waiting', note: gate }
+        : gate !== null ? { id, state: 'waiting', note: gate }
         // The server's own words for an open step: AI account's "Sign in: team-max" (added, signed in nowhere).
         : todoStep(id, server.get(serverId)))
 

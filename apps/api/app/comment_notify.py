@@ -3,9 +3,9 @@
 The `task_comment_mentions` row (the in-app notification) is written by
 `app/comment_mentions.py::sync_mentions` in the comment's own transaction; this module only DMs.
 
-The recipient is named, never derived: it asks `notify_targets.target_for_user` and sends nothing when
+The recipient is named, never derived: it asks `notify_targets.targets_for_user` and sends nothing when
 that is empty — falling through to the shared operator webhook would broadcast a remark to the channel.
-`mention` is a notification event (`app/preferences.py::NOTIFICATION_EVENTS`), deliberately absent from
+`mention` is a notification event (`app/notification_catalog.py`), deliberately absent from
 `alert_relay.ALERT_KINDS`, and writes no `alerts` row (that table's unique key is a dedup window).
 
 Every failure is caught and logged: a Slack outage must not fail the comment POST.
@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from typing import Any, Optional
 
 from app import alert_relay, edition_features, email_notify, notify_targets, org_names
-from app.config import get_settings
+from app.config import console_url
 from app.durable import notify_outbox
 from app.identities import display_name
 from app.models.identity import AdminUser
@@ -50,8 +50,27 @@ def excerpt(body: str) -> str:
 
 def ticket_console_url(ticket_id: int, comment_id: Optional[int] = None) -> str:
     """A ticket's page in the console (`/support/tickets/<id>`), optionally at one comment."""
-    base = f"{get_settings().frontend_url.rstrip('/')}/support/tickets/{ticket_id}"
+    base = console_url(f"/support/tickets/{ticket_id}")
     return f"{base}#comment-{comment_id}" if comment_id is not None else base
+
+
+def task_comment_console_url(task_id: int, comment_id: int) -> str:
+    """A task comment's place in the console (its Comments tab, at the comment), for `payload["console_url"]`,
+    which the relay origin-checks; never the github allowlist's `url` field."""
+    from app.trackers.writeback import task_url  # function-local: a wide import closure
+
+    return f"{task_url(task_id)}?tab=comments#comment-{comment_id}"
+
+
+def ticket_dm(
+    kind: str, ticket: Ticket, comment: TaskComment, actor: str, sentence: str, org_name: Optional[str],
+) -> dict[str, Any]:
+    """The DM for `kind` (mention, reaction) on a ticket: `sentence` (already inert mrkdwn) is the reason, since a
+    ticket has no task headline, led by its org (`org_names.org_lead`)."""
+    return alert_relay.message(kind, f"{org_names.org_lead(org_name)}{sentence}", payload={
+        "ticket_id": ticket.id, "comment_id": comment.id, "actor": actor,
+        "console_url": ticket_console_url(ticket.id, comment.id),
+    })
 
 
 def notify_mentioned(
@@ -81,9 +100,6 @@ def notify_mentioned(
             "mention DM fan-out capped at %s of %s (comment=%s)",
             MAX_FANOUT, len(mentioned), comment.id,
         )
-    # Function-local to keep a wide import closure off this path.
-    from app.task_external_comment import _console_task_url
-
     # A `select`, not `session.get`, so the tenancy seam scopes the read.
     # Best-effort, as the rest of the card: a failed read drops the headline's lead, never the fan-out.
     project_name = None
@@ -97,15 +113,13 @@ def notify_mentioned(
     org_name = org_names.org_name(session, subject.org_id)  # type: ignore[union-attr]
     delivered = 0
     for user in mentioned[:MAX_FANOUT]:
-        # The recipient's own row carries their delivery settings (`notify_targets.target_for_user` reads
+        # The recipient's own channels carry their delivery settings (`notify_targets.targets_for_user` reads
         # nothing else of theirs), so an operator named on a customer's ticket resolves like anyone.
-        target, reason = notify_targets.target_for_user(session, user, event="mention")
+        targets, reason = notify_targets.targets_for_user(session, user, event="mention")
         if ticket is not None:
             event = _ticket_event(ticket, comment, author, org_name)
         else:
             assert task is not None
-            # No `url`: that field is the github allowlist's. The console link rides in
-            # `payload["console_url"]`, which the relay origin-checks.
             # The line every task alert reads, composed by `alert_relay.task_headline_mrkdwn` from these
             # trusted fields. `question_body` is its body slot; a brief recipient's DM drops it.
             event = alert_relay.message("mention", issue=str(task.id), payload={
@@ -119,14 +133,14 @@ def notify_mentioned(
                 # so `<@U01ADMIN>`, `<!here>` or `<!channel>` would become live mentions.
                 # `alert_relay.inert_mrkdwn` is the recipe; the author's name goes through it too.
                 "question_body": alert_relay.inert_mrkdwn(excerpt(comment.body)),
-                "console_url": f"{_console_task_url(task.id)}?tab=comments#comment-{comment.id}",
+                "console_url": task_comment_console_url(task.id, comment.id),
             })
         # The email and Telegram legs on their own: a user may have either on and no Slack
         # (`app/email_notify.py`, `app/telegram_notify.py`).
-        personal = email_notify.deliver_to_user(user, event, event_name="mention")
+        personal = email_notify.deliver_to_user(user, event, event_name="mention", session=session)
         if edition_features.enabled("telegram"):
-            personal = telegram_notify.deliver_to_user(user, event, event_name="mention") or personal
-        if target is None:
+            personal = telegram_notify.deliver_to_user(user, event, event_name="mention", session=session) or personal
+        if not targets:
             # Ordinary, not an error: most people have no Slack method, and muted is a choice. Debug, so
             # the log is not flooded per comment per colleague.
             log.debug(
@@ -134,32 +148,53 @@ def notify_mentioned(
             )
             delivered += int(personal)
             continue
-        try:
-            if notify_outbox.slack(event, target) or personal:
-                delivered += 1
-        except alert_relay.AlertRelayError:
-            # Best-effort — see the module docstring.
-            log.warning("mention DM failed for %s (comment=%s)", user.id, comment.id)
-            delivered += int(personal)
+        for target in targets:
+            try:
+                personal = notify_outbox.slack(event, target) or personal
+            except alert_relay.AlertRelayError:
+                # Best-effort — see the module docstring.
+                log.warning("mention DM failed for %s (comment=%s)", user.id, comment.id)
+        delivered += int(personal)
     return delivered
 
 
 def _ticket_event(
     ticket: Ticket, comment: TaskComment, author: AdminUser, org_name: Optional[str] = None
 ) -> dict[str, Any]:
-    """The DM for a mention on a ticket. Tenant prose (title, author, excerpt) is escaped as in the task
-    arm; `reason` is the message, since a ticket is not a task and has no task headline. It leads with the
-    ticket's org (`org_names.org_lead`)."""
-    title = alert_relay.inert_mrkdwn(ticket.title)
-    return alert_relay.message(
-        "mention",
-        f"{org_names.org_lead(org_name)}"
-        f"{alert_relay.inert_mrkdwn(display_name(author))} mentioned you on ticket #{ticket.id} {title}: "
-        f"{alert_relay.inert_mrkdwn(excerpt(comment.body))}",
-        payload={
-            "ticket_id": ticket.id,
-            "comment_id": comment.id,
-            "actor": display_name(author),
-            "console_url": ticket_console_url(ticket.id, comment.id),
-        },
+    """The DM for a mention on a ticket; tenant prose (title, author, excerpt) is escaped as in the task arm."""
+    return ticket_dm(
+        "mention", ticket, comment, display_name(author),
+        f"{alert_relay.inert_mrkdwn(display_name(author))} mentioned you on ticket #{ticket.id} "
+        f"{alert_relay.inert_mrkdwn(ticket.title)}: {alert_relay.inert_mrkdwn(excerpt(comment.body))}",
+        org_name,
     )
+
+
+def task_rows_on_own_session(task_id: int, comment_id: int, user_ids: list[Any]):
+    """A session of its own with a task comment's rows loaded — `(session, task, comment, users by id)` — for a
+    post-commit DM a route on the event loop runs on a worker thread (`app/db_async.py::defer_off_loop`): the DM's
+    reads, its delivery rows and its sends must not run on the loop. The caller closes the session. The task and the
+    comment are read under the caller's own scope; the people by id, as `require_user` reads who is asking."""
+    from app.db import BridgedSession
+    from app.tenancy import seam
+
+    session = BridgedSession()
+    task = session.scalar(select(Task).where(Task.id == task_id))
+    comment = session.scalar(select(TaskComment).where(TaskComment.id == comment_id))
+    with seam.identity_scope():
+        users = {u.id: u for u in session.scalars(select(AdminUser).where(AdminUser.id.in_(user_ids)))}
+    return session, task, comment, users
+
+
+def notify_mentioned_on_own_session(task_id: int, comment_id: int, author_id: Any, mentioned_ids: list[Any]) -> int:
+    """`notify_mentioned` for a task comment, on a session of its own (`task_rows_on_own_session`). Never raises."""
+    try:
+        session, task, comment, users = task_rows_on_own_session(task_id, comment_id, [author_id, *mentioned_ids])
+        with session:
+            if task is None or comment is None or author_id not in users:
+                return 0
+            mentioned = [users[i] for i in mentioned_ids if i in users]
+            return notify_mentioned(session, task=task, comment=comment, author=users[author_id], mentioned=mentioned)
+    except Exception:  # noqa: BLE001 — the comment is committed; its DMs are a courtesy
+        log.exception("mention DMs for comment %s could not be sent", comment_id)
+        return 0

@@ -215,11 +215,10 @@ export function findTile(model: LayoutModel, tileKey: string): Tile | null {
 
 /**
  * The `{Project}-{N}` prefix every window of ONE pool slot carries — a CROSS-BOUNDARY FORMAT CONTRACT with
- * its single composer `apps/jaahd/fleet_launch.py::slot_ref` (via `slot_window_name`). The main clone is
- * bare `{Project}`, never `{Project}-0`. The node's sanitising arms are unneeded for a numeric `number`.
+ * its single composer `apps/jaahd/fleet_launch.py::slot_ref` (via `slot_window_name`). The node's sanitising arms are unneeded for a numeric `number`.
  */
 export function slotWindowPrefix(project: string, number: number): string {
-  return number === 0 ? project : `${project}-${number}`
+  return `${project}-${number}`
 }
 
 /**

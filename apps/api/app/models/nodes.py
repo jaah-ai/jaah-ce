@@ -66,6 +66,8 @@ class Node(EntityMixin, OrgScoped, Base):
         ),
         # The `app/node_disk_events.py` vocabulary (202610111800).
         CheckConstraint("disk_gate IN ('open', 'paused')", name="ck_nodes_disk_gate"),
+        # The tenant's per-node task cap (202611142200): NULL is no cap, never 0.
+        CheckConstraint("max_running_tasks >= 1", name="ck_nodes_max_running_tasks"),
         # A node token authenticates exactly one node.
         Index(
             "uq_nodes_node_token_hash", "node_token_hash", unique=True,
@@ -139,6 +141,9 @@ class Node(EntityMixin, OrgScoped, Base):
     microvm_vcpus: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     microvm_ram_mib: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     microvm_disk_gib: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # How many tasks may run on this node at once (revision 202611142200); NULL = no limit. The launch gate
+    # `launch_gates.TASKS` reads it; `PUT /api/nodes` writes it (0 there clears it).
+    max_running_tasks: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     # KVM for sessions (revision 202610292000): a co-located node's session user may open the host's `/dev/kvm`.
     # Written by `PUT /api/nodes` (the host's owner only); read by `vnodes.desired` for the host helper.
     session_kvm: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
@@ -149,8 +154,8 @@ class Node(EntityMixin, OrgScoped, Base):
     )
     # Where this host mounts that store (the switch says whether). The share is one trust domain,
     # so it must become per-org (spec §4.2), which needs a per-node path. Defaults to
-    # `app/shared_storage.py::LEGACY_SHARED_ACCOUNTS_ROOT`, which the node's `apps/jaahd/shared_storage.py`
-    # also carries. NOT NULL, not nullable-means-default. The node resolves its root itself (its
+    # `app/shared_storage.py::LEGACY_SHARED_ACCOUNTS_ROOT` (the node's `apps/jaahd/shared_storage_rule.py`,
+    # borrowed). NOT NULL, not nullable-means-default. The node resolves its root itself (its
     # `{jaah_home}/auth/.shared`
     # NodeLink at that path, else the legacy literal; `app/vnodes.py::permitted_accounts_roots`), so the console
     # API no longer accepts it from a body (`routes/nodes/update.py::NodeUpdateIn`).
@@ -207,6 +212,10 @@ class Node(EntityMixin, OrgScoped, Base):
     # Coarse bookkeeping, refreshed at most once/node/60s by the presence sweep; never the liveness source.
     first_seen: Mapped[datetime] = timestamp_column()
     last_seen: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
+    # The tenant node alerts' episode stamps (`app/node_alerts.py`, which owns their rules): when this node's open
+    # `node-offline` / `runner-crashing` episode was alerted; NULL = no episode open. Control-plane-written only.
+    offline_alerted_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
+    crash_alerted_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
     # The node's own stamp for its last observation pass: the liveness clock (`config_reported_at` only
     # moves when content changes).
     observed_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
@@ -600,6 +609,11 @@ class NodeOrder(EntityMixin, OrgScoped, Base):
             "ix_node_orders_open_node", "node_id",
             postgresql_where=text("stage NOT IN ('ready', 'failed')"),
         ),
+        # A MicroVM shape not applied yet (`node_orders.on_node_capability`, asked on every node report).
+        Index(
+            "ix_node_orders_shape_pending", "node_id",
+            postgresql_where=text("params ->> 'shape' = 'microvm' AND (params -> 'shape_applied') IS NULL"),
+        ),
     )
 
     path: Mapped[str] = mapped_column(Text, nullable=False)
@@ -608,7 +622,8 @@ class NodeOrder(EntityMixin, OrgScoped, Base):
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # The stage a `failed` order failed in, which a retry re-runs. NULL unless `failed`.
     failed_stage: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # Project ids, applied to `node_projects` when the node row is made.
+    # Project ids the order named. Kept and unread since node groups (every new node is in All); dropped with the
+    # retired assignment tables.
     project_ids: Mapped[list[int]] = mapped_column(
         JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
     )

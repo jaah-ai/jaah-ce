@@ -52,8 +52,7 @@ SSO_PROVIDERS = ("microsoft", "google")
 
 
 #: The four per-org cap columns, in `app/org_limits.py::LIMIT_KINDS` order less Agents, whose override is Max agents
-#: (a test pins the pairing). `limit_runner_slots` and `limit_active_worktrees` are retired: unmapped,
-#: hidden by `migrations/env.py::_RETIRING_COLUMNS`, dropped with their CHECKs by the next contraction revision.
+#: (a test pins the pairing).
 ORG_LIMIT_COLUMNS = ("limit_nodes", "limit_projects", "limit_users", "limit_github_runners")
 
 
@@ -80,6 +79,10 @@ ACCOUNT_INDIVIDUAL, ACCOUNT_ORGANIZATION = "individual", "organization"
 
 ACCOUNT_TYPES = (ACCOUNT_INDIVIDUAL, ACCOUNT_ORGANIZATION)
 
+# Intelligent routing's org maximum (`Org.routing_max_mode`), lowest first — the order `app/agent_router/modes.py`
+# ranks them in.
+ROUTING_MAX_MODES = ("off", "recommend", "auto")
+
 
 class Org(EntityMixin, Base):
     """An org — the tenancy axis, and the table every `org_id` points at.
@@ -88,11 +91,12 @@ class Org(EntityMixin, Base):
     can be NOT NULL and a forgotten predicate cannot fall through a nullable arm. No `org_id` here (the
     one `Axis` verdict in `app/tenancy/manifest.py`).
 
-    `slug` is the external handle (a tenant org's tailnet tag `tag:org-<slug>`), `name` the display
-    label. Grammar: `app/routes/commands.py::_SLUG_RE`, enforced by
-    `app/routes/orgs.py::_validated_slug`; lowercase-only under a case-sensitive unique index. A self-service
-    org's is generated (`app/org_slug.py`). Only an operator renames it, and only a tenant org's:
-    `app/routes/orgs.py::_rename_slug` moves its tailnet tag with it.
+    `slug` is the external handle (a tenant org's tailnet tag `tag:org-<slug>`, the `<slug>-` prefix of its
+    Jaah-made repos), `name` the display label. Grammar: `app/org_slug.py::ORG_SLUG_RE` (lowercase letters and
+    digits), enforced by `app/routes/orgs.py::_validated_slug`. A self-service org's is generated
+    (`app/org_slug.py`). Only an operator renames it, and only a tenant org's: `app/routes/orgs.py::_rename_slug`
+    moves its tailnet tag with it, and the org's Jaah-made repos are renamed on GitHub to the new prefix
+    (`app/durable/jaah_repo_prefix.py`).
 
     `enabled` is step one of a disable-then-destroy lifecycle; it gates dispatch and the domain join but not
     an existing user's login (`app/routes/orgs.py` says so). NOT NULL, default true.
@@ -117,13 +121,12 @@ class Org(EntityMixin, Base):
     `plan_end_overridden` with `plan_end_override` NULL = never ends, with a date = ends then; `hosting_allowed_override`
     NULL = the plan's, and so `compliance_enabled_override` (revision 0378), `nodevault_allowed_override`
     (revision 0381), `nodelink_allowed_override` (revision 0405) and `merge_lane_enabled_override` (revision 0407);
-    `products_overridden` makes the org's `org_plan_products` rows its whole product list (empty is valid);
+    `products_overridden` makes the org's override lines (`product_lines`) its whole product list (empty is valid);
     `pending_plan_key` is a priced plan chosen at sign-up and awaiting checkout.
 
     `colocation_allowed` is the operator's exception to a tenant org's isolation defaults
     (`app/tenant_defaults.py`): a node on another org's Multi-Node Host. Operator-owned like `limit_*`; false for
-    every new org, and read only for a tenant. `shared_store_allowed` is RETIRED (revision 0405): NodeLink is now the
-    plan term `nodelink_allowed`; the column stays while two releases overlap and nothing reads it.
+    every new org, and read only for a tenant. NodeLink is the plan term `nodelink_allowed` (revision 0405).
 
     `hipaa_enabled`/`hipaa_baa_effective_date`/`hipaa_acks` are HIPAA mode (`app/hipaa.py`): operator-only, off by default.
 
@@ -142,6 +145,7 @@ class Org(EntityMixin, Base):
             name="ck_orgs_lifecycle",
         ),
         _in_check("account_type", ACCOUNT_TYPES, "ck_orgs_account_type"),
+        _in_check("routing_max_mode", ROUTING_MAX_MODES, "ck_orgs_routing_max_mode"),
         *(
             CheckConstraint(f"{column} IS NULL OR {column} >= 0", name=f"ck_orgs_{column}")
             for column in ORG_LIMIT_COLUMNS + ORG_QUOTA_COLUMNS
@@ -153,6 +157,16 @@ class Org(EntityMixin, Base):
         *(
             CheckConstraint(f"{column} IS NULL OR {column} >= 0", name=f"ck_orgs_{column}")
             for column in ("max_agents_override", "static_slots_override")
+        ),
+        CheckConstraint(
+            "outcome_survival_days_override IS NULL OR "
+            "(outcome_survival_days_override >= 1 AND outcome_survival_days_override <= 365)",
+            name="ck_orgs_outcome_survival_days_override",
+        ),
+        CheckConstraint(
+            "outcome_scan_interval_minutes IS NULL OR "
+            "(outcome_scan_interval_minutes >= 15 AND outcome_scan_interval_minutes <= 1440)",
+            name="ck_orgs_outcome_scan_interval_minutes",
         ),
         CheckConstraint(
             "sso_provider IS NULL OR sso_provider IN (" + ", ".join(f"'{p}'" for p in SSO_PROVIDERS) + ")",
@@ -219,9 +233,6 @@ class Org(EntityMixin, Base):
     colocation_allowed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
-    shared_store_allowed: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=text("false")
-    )
     # The org's provider grid override: `[row, auth]` cells (`plan_terms.providers_term`); NULL = the plan's.
     providers_override: Mapped[Optional[list]] = mapped_column(JSONB(none_as_null=True), nullable=True)
     sso_provider: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -233,9 +244,21 @@ class Org(EntityMixin, Base):
         ForeignKey("admin_users.id", ondelete="SET NULL", use_alter=True, name="fk_orgs_sso_mfa_attested_by_id"),
         nullable=True,
     )
+    # "Run jobs as": whose git login and coding-agent account the org's projects' background jobs use (outcome scans, the
+    # merge lane's bot PRs, benchmark reviews) unless a project names its own (`projects.run_jobs_as_id`); resolved by
+    # `app/git_access.py::project_forge_person`. NULL: its fallback (the org's Owners/Admins). SET NULL.
+    run_jobs_as_id: Mapped[Optional[UUID]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("admin_users.id", ondelete="SET NULL", use_alter=True, name="fk_orgs_run_jobs_as_id"),
+        nullable=True,
+    )
     # Skip the console's second factor for every member: an operator-only setting for orgs used to
     # record videos and documentation. Never honoured for an operator-plane org (`app/mfa.py::org_skips`).
     mfa_skip: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    # The operator's client-error reporting switch for every member (revision 202610312100, `app/client_events.py`).
+    client_telemetry: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     # HIPAA mode (`app/hipaa.py`, the single home of what it changes): the operator's switch, the BAA effective date it
     # was turned on under (required while on, `routes/orgs.py::_apply_hipaa`), and each non-BAA surface warning an org
     # admin acknowledged, `{surface: {"by": <admin_user uuid>, "at": <iso ts>}}`.
@@ -249,7 +272,8 @@ class Org(EntityMixin, Base):
     billing_interval: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # The per-agent plan subscription's `trial_end` while it is `trialing`, else NULL (revision 202610220037): the
     # mirror the trial agent cap reads (`plan_terms.trial_live`), written with `agents_bought`. `agents_trial_peak` is
-    # the most agents the org wanted at once this trial (`app/trial_agents.py`), reset when a new trial starts.
+    # the most agents the org wanted at once since its trial started, trial or paid (`app/trial_agents.py`), reset
+    # when a new trial starts.
     agents_trial_until: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
     agents_trial_peak: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     # Slack messages on the org's behalf dropped because its plan leaves Slack out (revision 202610172330),
@@ -269,12 +293,29 @@ class Org(EntityMixin, Base):
     nodevault_allowed_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     nodelink_allowed_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     merge_lane_enabled_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # Production QA (revision 202611012000): the per-org override of `billing_plans.production_qa`.
+    production_qa_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # Benchmark mode (revision 202611020500): the per-org override of `billing_plans.benchmark_mode` — the only way
+    # an org gets it (no plan carries it).
+    benchmark_mode_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # Agent performance (revision 202611021400): the per-org override of `billing_plans.agent_performance`.
+    agent_performance_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # Outgoing webhooks (revision 202611110110): the per-org override of `billing_plans.webhooks_enabled`.
+    webhooks_enabled_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # Custom pipelines (revision 202611140800): the per-org override of `billing_plans.pipeline_custom_enabled`.
+    pipeline_custom_enabled_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # Custom domains (revision 202611141100): the per-org override of `billing_plans.custom_domains_allowed`.
+    custom_domains_allowed_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # Node groups (revision 202611141900): the per-org override of `billing_plans.placement_groups_allowed`.
+    placement_groups_allowed_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     # MicroVM nodes (revision 202610111900): the plan switch's per-org override (`plan_terms._switch`), and
     # the org's VM size ceilings — NULL = no org value, the next tier down decides (`app/microvm_sizing.py`).
     microvm_allowed_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     microvm_vcpus: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     microvm_ram_mib: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     microvm_disk_gib: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Whole-node VM nodes (revision 202611100100): the plan switch's per-org override; NULL = the plan's.
+    node_vm_allowed_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     # Playbooks (revision 202610122200): the plan switch's per-org override (`plan_terms._switch`); NULL = the plan's.
     playbooks_enabled_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     # Templates (org) (revision 202610281500): the plan switch's per-org override; NULL = the plan's.
@@ -308,12 +349,41 @@ class Org(EntityMixin, Base):
     azure_cloud_allowed_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     # Tenant email (revision 202610240100): the plan switch's per-org override; NULL = the plan's.
     tenant_email_allowed_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # Intelligent routing (revision 202611012100, `app/agent_router/`): the plan switch's per-org override (NULL = the
+    # plan's); the highest mode the org's projects may run (`off`/`recommend`/`auto` — lowering it demotes every
+    # project above it, `routes/orgs.py::update_org`); the providers and SDK agents the router may pick (NULL = all,
+    # else `{"providers": [...]|null, "agent_ids": [...]|null}`); and the model tier range (`model_catalog` tiers,
+    # NULL = no bound).
+    intelligent_routing_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    routing_max_mode: Mapped[str] = mapped_column(Text, nullable=False, server_default="off", default="off")
+    routing_allowed: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    routing_tier_floor: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    routing_tier_ceiling: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # The plan's other limits (revision 202610200100, `plan_terms`): the agent range a per-agent purchase must fall
-    # in (NULL = the plan's; 0 on the max = no upper bound), static slots, and the then plan — while
+    # in (NULL = the plan's; 0 on the max = no upper bound), and the then plan — while
     # `then_plan_overridden`, `then_plan_key_override` (NULL then = rolls into no plan), else the plan's.
     min_agents_override: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     max_agents_override: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Unread since static worktrees went; a later contraction drops it.
     static_slots_override: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # The outcome ledger's survival window in days; NULL = the plan's (`plan_terms.outcome_survival_days_of`).
+    outcome_survival_days_override: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Easy Mode (revision 202611032000): the per-org override of each cap (`plan_terms.EASY_MODE_TERMS`), NULL = the
+    # plan's; `easy_mode_override` overrode the retired switch and is read by nothing (dropped once no release reads it).
+    easy_mode_override: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    easy_mode_apps_override: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    easy_mode_requests_month_override: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    easy_mode_egress_gb_month_override: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    easy_mode_db_mb_override: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    easy_mode_concurrency_override: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Revision 202611101910.
+    easy_mode_emails_month_override: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Revision 202611141100.
+    easy_mode_domains_per_app_override: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    easy_mode_sponsor_end_override: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    # The org's outcome scan interval in minutes, set by its Owner/Admin; NULL = the operator default
+    # (`outcome_ledger.settings.scan_interval`).
+    outcome_scan_interval_minutes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     then_plan_overridden: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
@@ -462,7 +532,8 @@ class OrgSsoConnection(UuidPkMixin, StampedMixin, OrgScoped, Base):
     """An org's one SAML 2.0 or OIDC identity provider. `app/org_sso.py` owns every rule. SAML keeps the
     IdP metadata (pasted, or fetched from `saml_idp_metadata_url` on save); OIDC names an `oidc_client` credential
     (issuer, client id, sealed client secret). `tested_at` is the last passing test sign-in, cleared whenever the IdP
-    changes; `enforced` (SSO only) may be set only while it is. The org's one setting, not an entity
+    changes and stale once its OIDC credential is edited (`org_sso.is_tested`); `enforced` (SSO only) may be turned
+    on only while it is current. The org's one setting, not an entity
     (`tests/test_entity_shape.py`)."""
 
     __tablename__ = "org_sso_connections"
@@ -549,6 +620,9 @@ class OrgSignup(OrgScoped, Base):
     welcome_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # The plan the applicant chose (a `billing_plans.key`, revision 0374); NULL = none chosen (the default plan).
     plan_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # The agents the applicant chose on a per-agent `plan_key` (revision 202611092000), what approval's billing start
+    # buys; NULL = the plan's minimum, or a plan not priced per agent.
+    agents: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     # The multi-step sign-up (revision 202610201527). ISO 3166-1 alpha-2.
     country: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # NULL = a draft the applicant has not submitted yet; a row from before drafts carries its `signed_up_at`.

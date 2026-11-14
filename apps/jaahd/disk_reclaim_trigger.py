@@ -121,13 +121,10 @@ class DiskReclaimTrigger:
             asked = self.due()
             if asked is not None:
                 target = self._marker()
-                try:
-                    # `write_bytes(b"")`, not `touch()`: the marker must be EMPTY.
-                    target.write_bytes(b"")
+                if marker_request.write_empty(target, log, "disk-reclaim"):
                     self._last_write = self._clock()
                     log.info("disk-reclaim: asked for a %s pass (%s)", asked, target)
-                except OSError as exc:
-                    log.warning("disk-reclaim: could not create %s: %s", target, exc)
+                else:
                     asked = None
         try:
             self._drain()

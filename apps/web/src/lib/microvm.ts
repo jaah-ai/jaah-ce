@@ -2,6 +2,8 @@
  * words they render as. The resolver, the bounds and every refusal sentence are the server's
  * (`app/microvm_sizing.py`, `app/microvm_mode.py`, `app/microvm_egress.py`); nothing here re-derives one. */
 
+import type { Shape } from './nodeShape'
+
 /** The three sizes, in the server's display order (`microvm_sizing.FIELDS`). */
 export const SIZING_FIELDS = ['vcpus', 'ram_mib', 'disk_gib'] as const
 export type SizingField = (typeof SIZING_FIELDS)[number]
@@ -27,23 +29,34 @@ export const SIZING_LABELS: Record<SizingField, { label: string; unit: string }>
   disk_gib: { label: 'Disk', unit: 'GiB' },
 }
 
+/** RAM in GiB, to two places: 1536 MiB is 1.5. */
+export const gibOf = (mib: number) => Number((mib / 1024).toFixed(2))
+
 /** One size as words: `4 vCPU` (the unit, as the PRD and the catalogue's column spell it), `8 GiB` (whole GiB) or
- *  `1536 MiB`, `64 GiB`. */
-export function sizeText(field: SizingField, value: number): string {
+ *  `1536 MiB` — or, with `ramGib`, always GiB (`1.5 GiB`) — `64 GiB`. */
+export function sizeText(field: SizingField, value: number, ramGib = false): string {
   if (field === 'vcpus') return `${value} vCPU`
-  if (field === 'ram_mib') return value % 1024 === 0 ? `${value / 1024} GiB` : `${value} MiB`
+  if (field === 'ram_mib') return ramGib || value % 1024 === 0 ? `${gibOf(value)} GiB` : `${value} MiB`
   return `${value} GiB`
 }
 
-/** Where a size came from, as the PRD words it: `from project`. The system tier is Operator Settings. */
-export function sourceText(source: SizingSource): string {
-  return `from ${source}`
+/** Where a size came from, as the PRD words it: `from project`, or `default` for a Whole-node VM's unset size. The
+ *  system tier is Operator Settings. */
+export function sourceText(source: SizingSource | NodeVmSizeSource): string {
+  return source === 'default' ? 'default' : `from ${source}`
 }
 
 /** `4 vCPU — from project`: the value AND the level in force, always together (PRD quality bar). */
-export function sizedText(field: SizingField, sized: { value: number; source: SizingSource }): string {
-  return `${sizeText(field, sized.value)} — ${sourceText(sized.source)}`
+export function sizedText(field: SizingField, sized: { value: number; source: SizingSource | NodeVmSizeSource },
+  ramGib = false): string {
+  return `${sizeText(field, sized.value, ramGib)} — ${sourceText(sized.source)}`
 }
+
+/** A Whole-node VM's own size (`GET /api/nodes/{id}` `node_vm_size`): the node's value, else the default. */
+export type NodeVmSizeSource = 'node' | 'default'
+export type NodeVmSize = Record<SizingField, { value: number; source: NodeVmSizeSource }>
+/** `PUT /api/nodes/{id}`: only the changed sizes; null resets one to the default. */
+export type NodeVmSizeBody = { node_vm_size: Partial<Record<SizingField, number | null>> }
 
 /** A project's MicroVM fields (`routes/projects.py::ProjectOut`, architecture §4.9): its egress edits, the default
  *  they edit (read-only), the list its VMs get, and its size. Optional on `Project` for cached payloads. */
@@ -118,15 +131,20 @@ export type EgressRefusal = {
 }
 
 /** Where the node's report sits in its config snapshot (`app/node_config.py::MICROVM_SNAPSHOT_KEY`): the
- *  MicroVM tab renders it, so the Config Snapshot grid leaves it out. */
+ *  MicroVM tab renders it, so the node page's daemon config leaves it out. */
 export const MICROVM_SNAPSHOT_KEY = 'microvm'
 
 /** The node half of `GET /api/nodes/{id}` (architecture §4.9). Optional for cached payloads and fixtures. */
 export type NodeMicrovmDetail = {
+  /** The node's shape, and the shapes it may change to, its own included (`PUT {shape}`). */
+  shape?: Shape
+  shape_options?: Shape[]
   microvm?: boolean
   microvm_blocker?: string | null
   microvm_editable?: boolean
   microvm_sizing?: MicrovmSizing | null
+  /** A Whole-node VM's size; null on any other shape. */
+  node_vm_size?: NodeVmSize | null
   microvm_facts?: MicrovmFacts | null
   microvms?: NodeMicrovm[]
   /** Every VM row of the node counted by state, beyond the `microvms` slice (`NODE_MICROVMS_SHOWN`). */

@@ -6,8 +6,8 @@ WHERE IT HOLDS — human traffic only (decision D-F5):
   every cookie WebSocket (`authz._resolve_principal`) — `session_refusal`;
 * every sign-in, in `login_funnel` (`ip_policy` and its admission twin `admits`), and every org switch and completed
   second factor (`entry_refusal`), so a refused address never gets a session cookie at all;
-* every open console (`console_relay/tickets.py`: the ticket is bound to the address that minted it, and the sweep
-  ends a console whose address left the list) and every open `/api/stream` (re-checked at its keepalive).
+* every open console (`console_relay/tickets.py`: the browser leg's claim is judged from the address it dials
+  from, and the sweep ends a console whose claimed address left the list) and every open `/api/stream` (re-checked at its keepalive).
 Exempt by construction: node and runner traffic (`X-Agent-Token`, no cookie), trigger webhooks, SCIM, Telegram and
 Slack webhooks — none carries a session cookie. Exempt by rule: an operator-plane superadmin (`is_operator_plane`),
 the break-glass who clears a customer's list from its customer page. ANY FUTURE USER TOKEN TYPE (a personal API
@@ -16,7 +16,7 @@ token) must call `session_refusal` (or `refusal`) for its user, as the cookie do
 The check applies only while the org's plan has the switch `ip_allowlist_enabled` (`plan_terms`): with it off the
 ranges are kept and nothing is refused.
 
-The client address is `request.client.host`, which uvicorn sets from the ALB's own (rightmost) `X-Forwarded-For`
+The client address is `request.client.host`, which `app/proxy_headers.py` sets from the ALB's own (rightmost) `X-Forwarded-For`
 entry because it trusts nginx's loopback hop (`entrypoint.sh`); a client-forged header prefix is never read.
 
 Per-process caches, 30 s TTL: the session's org (`admin_id` → org, or exempt) and the org's ranges. A save clears
@@ -25,6 +25,7 @@ its org's entry here (`invalidate`); other API processes catch up within the TTL
 from __future__ import annotations
 
 import ipaddress
+import threading
 import time
 from contextlib import nullcontext
 from typing import Final, Iterable, Optional, Union
@@ -39,7 +40,7 @@ from app import login_funnel, plan_terms
 from app.models.identity import AdminUser
 from app.models.orgs import OrgIpRange
 from app.tenancy import seam
-from app.tenancy.ids import is_operator_plane
+from app.tenancy.ids import is_operator_user
 
 Network = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
@@ -132,6 +133,9 @@ _SESSION_ORGS_PRUNE_AT: Final = 10_000
 _SESSION_ORGS: dict[UUID, tuple[float, Optional[UUID]]] = {}
 #: org_id → (expires, the ranges that hold — empty while the switch is off or the list is empty).
 _ORG_RANGES: dict[UUID, tuple[float, tuple[Network, ...]]] = {}
+#: The prune walks `_SESSION_ORGS` while request threads insert into it; with no GIL that walk would raise
+#: "dictionary changed size during iteration". Single gets and sets stay lock-free (each is atomic).
+_SESSION_ORGS_LOCK = threading.Lock()
 
 
 def invalidate(org_id: UUID) -> None:
@@ -176,11 +180,12 @@ def _session_org(session: Session, admin_id: UUID) -> Optional[UUID]:
     # This read discovers the org, so no org filter can apply (`seam.identity_scope`).
     with seam.identity_scope():
         user = session.get(AdminUser, admin_id)
-        org_id = None if user is None or is_operator_plane(user.org_id, user.is_superadmin) else user.org_id
-    if len(_SESSION_ORGS) > _SESSION_ORGS_PRUNE_AT:
-        for key in [key for key, (expires, _) in _SESSION_ORGS.items() if expires <= now]:
-            _SESSION_ORGS.pop(key, None)
-    _SESSION_ORGS[admin_id] = (now + CACHE_TTL_SECONDS, org_id)
+        org_id = None if user is None or is_operator_user(user) else user.org_id
+    with _SESSION_ORGS_LOCK:
+        if len(_SESSION_ORGS) > _SESSION_ORGS_PRUNE_AT:
+            for key in [key for key, (expires, _) in _SESSION_ORGS.items() if expires <= now]:
+                _SESSION_ORGS.pop(key, None)
+        _SESSION_ORGS[admin_id] = (now + CACHE_TTL_SECONDS, org_id)
     return org_id
 
 
@@ -194,18 +199,22 @@ def refusal(session: Session, org_id: Optional[UUID], host: Optional[str]) -> Op
     return refusal_sentence(host)
 
 
-def session_refusal(admin_id: UUID, host: Optional[str]) -> Optional[str]:
-    """`refusal` for a verified session cookie's row, on the identity lane (`app/db.py`): the middleware and the
-    WebSocket principal call this before any route session exists."""
-    from app.db import IdentitySessionLocal
+async def session_refusal(admin_id: UUID, host: Optional[str]) -> Optional[str]:
+    """`refusal` for a verified session cookie's row, an identity read on the async pool (`app/db_async.py`): the
+    middleware and the event stream await this before any route session exists."""
+    from app import db_async
 
-    with IdentitySessionLocal() as session:
-        return refusal(session, _session_org(session, admin_id), host)
+    return await db_async.run_in_session(session_refusal_in, admin_id, host, identity=True)
+
+
+def session_refusal_in(session: Session, admin_id: UUID, host: Optional[str]) -> Optional[str]:
+    """`session_refusal` over a session the caller already holds (the relay's ticket claim, on a worker thread)."""
+    return refusal(session, _session_org(session, admin_id), host)
 
 
 def exempt(user: AdminUser) -> bool:
     """An operator-plane superadmin: never held to a tenant's list (the break-glass)."""
-    return is_operator_plane(user.org_id, user.is_superadmin)
+    return is_operator_user(user)
 
 
 # ── Sign-in (`app/login_funnel.py`) ──────────────────────────────────────────────────────────────────────────────────

@@ -101,7 +101,7 @@ class NodeRow(NamedTuple):
 
     NULL and very old fail the bound alike, but the report words them differently ("never" vs
     "stopped"). `generation` is `config_snapshot->>'version'`; `placement` is stamped by
-    `place_generations` and defaults to GENERATION_UNKNOWN, so stale-release fires only on positive proof.
+    `node_liveness_job._place_per_platform` (`place_generation` per row) and defaults to GENERATION_UNKNOWN, so stale-release fires only on positive proof.
     `slots` / `worktree_rows` are evidence only, never asserted on.
     """
     node_id: str
@@ -313,11 +313,6 @@ def any_generation_reported(rows: list[NodeRow]) -> bool:
     return any(row.generation for row in rows)
 
 
-def place_generations(rows: list[NodeRow], published: Optional[str]) -> list[NodeRow]:
-    """Stamp every row's `placement` against `published`. Pure — the read happens in the caller."""
-    return [row._replace(placement=place_generation(row.generation, published)) for row in rows]
-
-
 def _generation_text(row: NodeRow) -> str:
     """Human evidence for one node's generation: the version, where it sits, and how old the claim is."""
     if not row.generation:
@@ -337,33 +332,42 @@ def _bound_sentence() -> str:
     )
 
 
-def format_silent_report(rows: list[NodeRow]) -> str:
+def _format_report(rows: list[NodeRow], invariant: str, paragraphs: list[str],
+                   row_lines: Callable[[NodeRow], list[str]], resolve: str) -> str:
+    """One condition's Task body: the violated invariant, why it matters, a block per node, how it resolves."""
     lines = [
         "The control plane's `node-liveness` job (`apps/api/app/node_liveness.py`) found a violated "
         "invariant:",
         "",
-        "> **An `enabled` node must have reported inside a bounded multiple of its expected reporting "
-        "interval.**",
-        "",
-        "`nodes.last_seen` is written only for nodes the presence registry reports ONLINE, so a stale "
-        "`last_seen` on an `enabled` row means the node is not on the bus — while the control plane still "
-        "counts it as dispatchable capacity. Nothing else emits a comment, a notification or a failing "
-        "check when that happens: the row simply stops advancing (this is the aws1/aws2 outage, "
-        "2026-07-28 — two RUNNING instances silent for six days, `enabled = t` throughout).",
-        "",
-        _bound_sentence(),
+        f"> **{invariant}**",
         "",
     ]
-    lines += [
-        "**DO NOT RESTART THE NODE AS A FIRST ACTION. MEASURE FIRST.** A silent node mid-migration may be "
-        "STALE rather than dead, and a restart re-registers it and CLEARS this symptom — so \"the remedy "
-        "worked\" is not evidence the node was the fault. Reviving a node whose checkout is behind "
-        "`develop` is the MORE DANGEROUS outcome: it puts old code back into service past a coordinator "
-        "gate. This nearly happened on 2026-07-28 with two nodes ~800 commits behind.",
-        "",
-    ]
+    for paragraph in paragraphs:
+        lines += [paragraph, ""]
     for row in rows:
-        lines += [
+        lines += row_lines(row)
+    return "\n".join([*lines, "", resolve]) + "\n"
+
+
+def format_silent_report(rows: list[NodeRow]) -> str:
+    return _format_report(
+        rows,
+        "An `enabled` node must have reported inside a bounded multiple of its expected reporting "
+        "interval.",
+        [
+            "`nodes.last_seen` is written only for nodes the presence registry reports ONLINE, so a stale "
+            "`last_seen` on an `enabled` row means the node is not on the bus — while the control plane still "
+            "counts it as dispatchable capacity. Nothing else emits a comment, a notification or a failing "
+            "check when that happens: the row simply stops advancing (this is the aws1/aws2 outage, "
+            "2026-07-28 — two RUNNING instances silent for six days, `enabled = t` throughout).",
+            _bound_sentence(),
+            "**DO NOT RESTART THE NODE AS A FIRST ACTION. MEASURE FIRST.** A silent node mid-migration may be "
+            "STALE rather than dead, and a restart re-registers it and CLEARS this symptom — so \"the remedy "
+            "worked\" is not evidence the node was the fault. Reviving a node whose checkout is behind "
+            "`develop` is the MORE DANGEROUS outcome: it puts old code back into service past a coordinator "
+            "gate. This nearly happened on 2026-07-28 with two nodes ~800 commits behind.",
+        ],
+        lambda row: [
             f"- **{row.node_id}** — last seen "
             f"{_age_text(row.last_seen_age, row.last_seen, 'NEVER (last_seen is NULL)')}",
             f"  - observations: "
@@ -376,32 +380,24 @@ def format_silent_report(rows: list[NodeRow]) -> str:
             "`jaahd` back and confirm `last_seen` advances.",
             "  - if it should NOT be counted: set `enabled = f` on its `nodes` row — always safe, and it "
             "stops the roster asserting capacity that does not exist.",
-        ]
-    lines += [
-        "",
+        ],
         "Resolve this Task once every enabled node is reporting inside the bound; the next sweep "
         "re-checks and re-raises if it is not.",
-    ]
-    return "\n".join(lines) + "\n"
+    )
 
 
 def format_not_observing_report(rows: list[NodeRow]) -> str:
-    lines = [
-        "The control plane's `node-liveness` job (`apps/api/app/node_liveness.py`) found a violated "
-        "invariant:",
-        "",
-        "> **An `enabled` node that reaches the bus must also be OBSERVING.**",
-        "",
-        "These nodes are on the bus (`last_seen` is fresh) but their observation passes are not landing, "
-        "so they contribute nothing while the control plane counts them. A different condition from "
-        "silence, with a different remedy: the heartbeat path is healthy and the observation/ingest path "
-        "is not.",
-        "",
-        _bound_sentence(),
-        "",
-    ]
-    for row in rows:
-        lines += [
+    return _format_report(
+        rows,
+        "An `enabled` node that reaches the bus must also be OBSERVING.",
+        [
+            "These nodes are on the bus (`last_seen` is fresh) but their observation passes are not landing, "
+            "so they contribute nothing while the control plane counts them. A different condition from "
+            "silence, with a different remedy: the heartbeat path is healthy and the observation/ingest path "
+            "is not.",
+            _bound_sentence(),
+        ],
+        lambda row: [
             f"- **{row.node_id}** — last observation "
             f"{_age_text(row.observed_at_age, row.observed_at, 'NEVER (observed_at is NULL)')}, "
             f"but last seen {_age_text(row.last_seen_age, row.last_seen, 'never')}",
@@ -411,33 +407,26 @@ def format_not_observing_report(rows: list[NodeRow]) -> str:
             "  - if it SHOULD be observing: check the node's observation POST path (its `jaahd` is "
             "running, since the heartbeat arrives — the failure is downstream of presence).",
             "  - if it should NOT: set `enabled = f` on its `nodes` row.",
-        ]
-    lines += [
-        "",
+        ],
         "Resolve this Task once every enabled, connected node is observing inside the bound.",
-    ]
-    return "\n".join(lines) + "\n"
+    )
 
 
 def format_stale_release_report(rows: list[NodeRow]) -> str:
-    lines = [
-        "The control plane's `node-liveness` job (`apps/api/app/node_liveness.py`) found a violated "
-        "invariant:",
-        "",
-        "> **An `enabled` node must be running the published jaahd release.**",
-        "",
-        "These nodes are heartbeating — this is NOT a liveness alarm — but the release they report "
-        "(`config_snapshot->>'version'`) is strictly OLDER than the desired release the control plane "
-        "serves them (`GET /api/agent/release-desired` — the version the control plane is ITSELF "
-        "running, since CP and .deb ship from one commit), so "
-        "they are running old code while the control plane counts them as current capacity. This is the "
-        "failure class that ran undetected for 6.4 days: `aws1`/`aws2` heartbeated perfectly while frozen "
-        "796 commits back, because their self-update had failed every ~640s since it was armed. A "
-        "stale node is not a dead node, and it is the more dangerous of the two mid-migration.",
-        "",
-    ]
-    for row in rows:
-        lines += [
+    return _format_report(
+        rows,
+        "An `enabled` node must be running the published jaahd release.",
+        [
+            "These nodes are heartbeating — this is NOT a liveness alarm — but the release they report "
+            "(`config_snapshot->>'version'`) is strictly OLDER than the desired release the control plane "
+            "serves them (`GET /api/agent/release-desired` — the version the control plane is ITSELF "
+            "running, since CP and .deb ship from one commit), so "
+            "they are running old code while the control plane counts them as current capacity. This is the "
+            "failure class that ran undetected for 6.4 days: `aws1`/`aws2` heartbeated perfectly while frozen "
+            "796 commits back, because their self-update had failed every ~640s since it was armed. A "
+            "stale node is not a dead node, and it is the more dangerous of the two mid-migration.",
+        ],
+        lambda row: [
             f"- **{row.node_id}** — generation {_generation_text(row)}",
             "  - THERE IS NO PUSH TO RETRY — every node self-converges, cloud and desktop by the identical "
             "path. The daemon asks this control plane what it should be running on "
@@ -459,33 +448,14 @@ def format_stale_release_report(rows: list[NodeRow]) -> str:
             f"pointer to re-push at it. `apt-get install jaah=<version>` on `{row.node_id}` is the "
             "manual last resort; dpkg's postinst restarts the daemon.",
             "  - if it must not serve work until then: set `enabled = f` on its `nodes` row.",
-        ]
-    lines += [
-        "",
+        ],
         "Resolve this Task once every enabled node reports the published release.",
-    ]
-    return "\n".join(lines) + "\n"
+    )
 
 
 def format_config_drift_report(rows: list[NodeRow]) -> str:
-    lines = [
-        "The control plane's `node-liveness` job (`apps/api/app/node_liveness.py`) found a violated "
-        "invariant:",
-        "",
-        "> **An `enabled` node's live config must match the declaration on its `nodes` row.**",
-        "",
-        "These nodes report a `config_snapshot` that contradicts their own `nodes.config_desired` — the "
-        "roster's statement of what the node's fleet-critical knobs SHOULD be. They are not necessarily "
-        "unhealthy: a node can be fresh, observing, enrolled and current while running with its sweep "
-        "or its auto-update switched off underneath it, which is a fleet quietly doing less than "
-        "the roster says it does. That is the condition this names.",
-        "",
-        "`config_desired` is DATA on the row — `PUT /api/nodes/{node_id}` with "
-        "`{\"config_desired\": {...}}`, no deploy and no commit.",
-        "",
-    ]
-    for row in rows:
-        lines.append(f"- **{row.node_id}**")
+    def node_lines(row: NodeRow) -> list[str]:
+        lines = [f"- **{row.node_id}**"]
         for key, want, got in row.drift:
             if got is None:
                 lines.append(
@@ -496,18 +466,29 @@ def format_config_drift_report(rows: list[NodeRow]) -> str:
                 )
             else:
                 lines.append(f"  - `{key}` — declared `{want}`, reported `{got}`")
-        lines += [
+        return lines + [
             f"  - repair: ON {row.node_id} itself, `sudo python3 set_node_env.py --set KEY=VALUE "
             "--restart` — the script is `infra/jaah/set_node_env.py` in a acme checkout, stdlib-only, "
             "and no node package ships it, so copy it over first.",
             "  - if the DECLARATION is what is wrong, fix the row instead: `config_desired` on the "
             "node's `nodes` row is the authority, and a value nobody decided should not be in it.",
         ]
-    lines += [
-        "",
+
+    return _format_report(
+        rows,
+        "An `enabled` node's live config must match the declaration on its `nodes` row.",
+        [
+            "These nodes report a `config_snapshot` that contradicts their own `nodes.config_desired` — the "
+            "roster's statement of what the node's fleet-critical knobs SHOULD be. They are not necessarily "
+            "unhealthy: a node can be fresh, observing, enrolled and current while running with its sweep "
+            "or its auto-update switched off underneath it, which is a fleet quietly doing less than "
+            "the roster says it does. That is the condition this names.",
+            "`config_desired` is DATA on the row — `PUT /api/nodes/{node_id}` with "
+            "`{\"config_desired\": {...}}`, no deploy and no commit.",
+        ],
+        node_lines,
         "Resolve this Task once every enabled node reports what its row declares.",
-    ]
-    return "\n".join(lines) + "\n"
+    )
 
 
 # ── Delivery ─────────────────────────────────────────────────────────────────────
@@ -614,7 +595,7 @@ def _resolve_cleared_alarm(
 ) -> bool:
     """Close the Task this condition opened, now that the condition is gone. True if one was resolved.
 
-    Keyed on `dedup_key`, matched exactly by `GET /api/agent/tasks/system/open`. Best effort: an
+    Keyed on `dedup_key`, matched exactly by `task_reads._find_open_system_task`. Best effort: an
     unresolved cleared alarm is stale UI, so it warns rather than failing the sweep.
     """
     try:

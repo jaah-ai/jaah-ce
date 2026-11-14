@@ -11,14 +11,27 @@ import type { RosterSwitch } from './lib/planSwitches'
 
 export type TaskState = KnownTaskState
 
+/** The entity shape's audit stamps every CRUD-able row carries, as `app/entity_shape.py::EntityOut` serves them:
+ *  `created_by`/`updated_by` are resolved display names joined through the actor id, never actor uuids; `null`
+ *  when unresolved. */
+type EntityStamps = {
+  created_at: string | null
+  updated_at: string | null
+  created_by: string | null
+  updated_by: string | null
+}
+
 /* One slot's repositories (`routes/portfolio.py::WorktreeOut.repos`). `reason` is open: a newer node's word is
    shown raw. */
-export type SlotRepos = {
+type SlotRepos = {
   primary_repo_id?: number | null
   repos: { id: number; path: string; repo_path: string; base: string; primary: boolean }[]
   kept: { id: number; path: string; repo_path: string; reason: string }[]
   failed: { id: number; repo_path: string; reason: string; detail?: string }[]
 }
+
+/** A project's pipeline kind (`app/releases/basics.py`): a basic, custom, or none (no repository, or Ideas only). */
+export type PipelineMode = 'none' | 'pr_integration' | 'integration_release' | 'custom'
 
 export type Worktree = {
   // A uuid: never key on it arithmetically or compare it with a number.
@@ -52,12 +65,12 @@ export type Worktree = {
   number: number
   path: string
   branch: string | null
-  // The slot's occupancy, the only occupancy fact: `free` | `task` | `user` (`apps/api/app/slot_state.py`).
+  // The slot's occupancy, the only occupancy fact: `free` | `task` (`apps/api/app/slot_state.py`).
   // A task-owned slot is freed only by its task ending, being deleted or reset, or an operator's
   // explicit per-slot release — never by a session or runner. Runner liveness is a different question:
   // read it off the session fields (`lib/worktree.ts`'s `hasLiveSession`), never off `state`. Test
-  // occupancy with `lib/poolSlot.ts`'s `isHeld` (`state !== 'free'`), never one specific non-free value.
-  state: string
+  // occupancy with `lib/poolSlot.ts`'s `isHeld` (`state !== 'free'`).
+  state: 'free' | 'task'
   // How long the slot has been in its current `state` (the reaper's `idle_hours_expr()` input with
   // `last_seen_live`). Named for the WIRE (`holder_since`): the column is `state_since`, but
   // `app/routes/portfolio.py` still emits `holder_since=wt.state_since`. Renaming the serializer is a
@@ -67,11 +80,6 @@ export type Worktree = {
   last_seen_live: string | null
   // The id of the Task a runner is working here; a hold's human label lives in `title`.
   task_id: number | null
-  // The human who owns this tree when `state === 'user'` (FK to `admin_users.id`). Exactly one of
-  // `task_id`/`owner_user_id` is non-null, matching `state` (a server CHECK); never re-derived here.
-  owner_user_id: string | null
-  // The owner's resolved display identity, beside the raw id (never the bare uuid). `null` unless `user`.
-  owner_user_email: string | null
   stack_state: string | null
   ports: Record<string, number> | null
   urls: Record<string, string> | null
@@ -81,8 +89,7 @@ export type Worktree = {
   behind: number | null
   // Uncommitted work of any kind, tracked or untracked (`apps/jaahd/reconcile/context.py::wt_dirty`, the single
   // home of the rule; one column per `apps/api/app/models/`'s `Worktree.dirty`). null = unknown, never
-  // "clean". Drives Sync-All eligibility (null = not eligible; `WorktreePool.tsx::isSyncEligible`).
-  // Independent of `protected`.
+  // "clean". Independent of `protected`.
   dirty: boolean | null
   // Verbatim `status` from `claude agents --json` — that CLI's value set ('idle', 'busy', 'waiting' seen
   // live). NULL/'' alone means "no live session". Test with lib/worktree.ts's `hasLiveSession`.
@@ -96,20 +103,15 @@ export type Worktree = {
   account: string | null
   /** The account's display label (`WorktreeOut.account_name`); null when unresolved or not the reader's. */
   account_name?: string | null
-  // Sensed off the node's tmux window; kept for older-node compat (BA D5) and read by nothing here — the
-  // Title flows CP → node (BA R2).
-  window_name: string | null
   // The slot's Title, shown as is (BA R8). Resolved CP-side, never null or `""`
   // (`apps/api/app/slot_title.py::resolved_title` is the single home for an absent stored Title). Render
   // with lib/worktree.ts's resolveTitle; never compose, rewrite or default it client-side.
   title: string
   // The raw stored name, beside the resolved `title` (`WorktreeOut`,
   // apps/api/app/routes/portfolio.py). Never blank: an unrenamed slot carries `<project>/<number>`.
-  // `stored_opinion` (CP-side) decides whether it out-ranks a task-composed Title. Read-only here: the
-  // Title editor seeds from the resolved value (`lib/slotTitle.ts::titleEditorSeed`).
+  // `stored_opinion` (CP-side) decides whether it out-ranks a task-composed Title. Read-only here.
   name: string
-  // Free operator prose, raw, `""` when unset; renders as itself. Edited via the same `PUT .../title`
-  // (lib/slotTitle.ts), where an omitted key means "leave it alone".
+  // Free operator prose, raw, `""` when unset; renders as itself. Read-only here.
   description: string
   // AC9.6's "active task", decided CP-side (`WorktreeOut.task_active`) off a LEFT JOIN on `tasks`: true
   // iff `task_id` resolves to a live-state row. State names live only in
@@ -203,7 +205,7 @@ export type AccountNode = {
 }
 
 // A token-folder NodeLink an account is shared through (`ClaudeAccount.shared_via`).
-export type SharedVia = { id: string; name: string }
+type SharedVia = { id: string; name: string }
 
 /* How a runner account authenticates:
  *   'oauth'   — a Claude subscription login: a `config_dir` and session per node, and a plan quota.
@@ -354,12 +356,12 @@ export type ClaudeResources = {
  * together. Readers treat "not `paste_code`" as await-mode (the wait keeps running rather than asking for
  * a code nobody will get). */
 export const PASTE_CODE = 'paste_code'
-export const AWAIT_CREDENTIALS = 'await_credentials'
-export type LoginCompletion = typeof PASTE_CODE | typeof AWAIT_CREDENTIALS
+const AWAIT_CREDENTIALS = 'await_credentials'
+type LoginCompletion = typeof PASTE_CODE | typeof AWAIT_CREDENTIALS
 
 /* One itemized loss relative to Claude Code (`agent_providers.Degradation`). Rendered, not summarized:
  * `capability` is the heading, `consequence` the prose. `key` is a stable list key, never shown. */
-export type ProviderDegradation = {
+type ProviderDegradation = {
   key: string
   capability: string
   consequence: string
@@ -370,7 +372,7 @@ export type ProviderDegradation = {
 /* ── A provider's typed capability groups (`agent_providers.Capabilities`, architecture §3.4) ──
  * Served on the catalogue row as `capabilities`, field names as the dataclass. Every group is optional: an older
  * server serves none, and the Providers page renders an absent one as "—". */
-export type RuntimeMode = 'approval-required' | 'auto-accept-edits' | 'auto' | 'full-access' | 'plan'
+type RuntimeMode = 'approval-required' | 'auto-accept-edits' | 'auto' | 'full-access' | 'plan'
 
 export type ProviderCapabilities = {
   /** Per auth kind: `acp` (switchable), `legacy_only` (always the terminal path) or `acp_only` (always ACP); the
@@ -383,7 +385,9 @@ export type ProviderCapabilities = {
   runtime_modes?: { supported: RuntimeMode[]; native: RuntimeMode[] }
   auth?: { kinds: string[]; key_delivery: string; key_in_env: false }
   usage?: { tokens: boolean; cost: boolean; rate_limit_reset: boolean }
-  console?: { chat_view: boolean; terminal_view: boolean; toggle: boolean; reason?: string }
+  /** False ⇒ a project's linked MCP servers never reach this engine's sessions. */
+  supports_remote_mcp?: boolean
+  console?: { chat_view: boolean; terminal_view: boolean; reason?: string }
   gaps?: ProviderDegradation[]
 }
 
@@ -432,7 +436,7 @@ export type ProviderChoice = {
   /** The subset of `auth_kinds` the caller's org may add (its provider grid, `app/provider_auth_policy.py`); empty = the provider
    *  is not on the plan. Absent (an older server) = every supported kind. */
   allowed_auth_kinds?: AccountAuthKind[]
-  /** True ⇒ each account carries its own runner cap (`Account.max_runners`), offered on create and edit. */
+  /** True ⇒ an API-key account of this provider may carry its own runner cap; subscriptions always may (`takesRunnerCap`). */
   per_account_runner_cap: boolean
   /** Where a new account's Auto-assign box starts (`Account.auto_assign`). */
   auto_assign_default: boolean
@@ -464,10 +468,13 @@ export type Account = Provenance & {
   api_key_set: boolean
   /* The credential-broker row holding the key, or null — a handle, not a secret; not put into URLs here. */
   credential_id: string | null
+  /* The Anthropic workspace an unscoped Claude API key names on every request (`wrkspc_…`); '' = none.
+     Non-secret, served so the edit form can show it. */
+  workspace_id?: string
   /* Auto-assign: may the scheduler pick this account for a task that allows any provider? Off ⇒ only
      tasks (and consoles) that name this account's provider run on it. */
   auto_assign: boolean
-  /** This account's own concurrent-runner cap, or null for the fleet limit (`max_runners_per_account`). */
+  /** This account's own concurrent-runner cap, or null for its org's default (`max_runners_per_account`; none for an API key). */
   max_runners: number | null
   five_hour_percent: number | null
   weekly_percent: number | null
@@ -478,8 +485,14 @@ export type Account = Provenance & {
   quota_status_detail?: string | null
   /** When a node that held its session was deleted (`AccountOut.node_removed_at`); null for none. */
   node_removed_at?: string | null
+  /** When its first sign-in completed (`AccountOut.signed_in_at`); null while a sign-in is unfinished. */
+  signed_in_at?: string | null
   /** The owning tenant (`AccountOut.org`); `null` = unresolved. */
   org?: OrgRef | null
+  /** `personal` (one member's: `owner_id`, `owner` their name) or `org`. Optional so older API payloads parse. */
+  ownership?: 'personal' | 'org'
+  owner_id?: string | null
+  owner?: string | null
 }
 
 // One Tech Stack entry; the API enforces (layer, technology) uniqueness on write
@@ -489,8 +502,8 @@ export type TechStackEntry = {
   technology: string
 }
 
-// Mirrors ProjectOut (apps/api/app/routes/projects.py). `port_vars` is a list of bare env-var names
-// (e.g. ["FRONTEND_PORT", "API_PORT"]), not a KEY=NUM mapping.
+// Mirrors ProjectOut (apps/api/app/routes/projects.py). A slot's port variables are Environment rows of
+// source `port` (`components/projects/projectEnvVars.ts`), not a project field.
 // The governance fields at the bottom are non-nullable (NOT NULL, migrations 0102 and 0111): each is the
 // only source for a decision a runner cannot decline (branch, prefix, gate command, stack command), and
 // resolution is live API → on-disk cache → fail closed — so no `?? 'develop'` fallbacks. `access` is gone;
@@ -540,6 +553,12 @@ export type ProjectRepo = {
   forge_base_url: string | null
   integration_branch: string
   is_primary: boolean
+  /** The repository's Branch policy; the primary's are the project's own `branch_prefix`/`push_enabled`. Optional:
+      a cached roster can predate them. */
+  branch_prefix?: string
+  push_enabled?: boolean
+  /** Agents may push (forced too) to this repository's integration branch, after asking the user once per task. */
+  allow_force_push?: boolean
   /** `owner/name`. */
   name: string
   /** Its forge page; link this, never `repo_url`. */
@@ -569,8 +588,20 @@ export type Project = ProjectMicrovm & {
   /** Every connected repository (`routes/projects.py::ProjectRepoOut`); `repo_url`/`forge`/
       `forge_base_url`/`integration_branch` above are the primary's. Optional: a cached roster can predate it. */
   repos?: ProjectRepo[]
+  /** The open task moving the project's Jaah-made repository into its new one (`jaah_repo_replace.open_move_task_id`);
+   *  answered on the `PUT` only, null elsewhere. */
+  move_task_id?: number | null
+  /** On a Jaah repo, Jaah's to run (`ProjectOut.jaah_managed`): an org member sees and edits only what
+   *  `lib/jaahManaged.ts` lists. Optional: a cached roster can predate it. */
+  jaah_managed?: boolean
+  /** Each pipeline stage with an address, in pipeline order (`ProjectOut.live_urls`): General's live line. Optional: a
+   *  cached roster can predate it. */
+  live_urls?: { stage: string; url: string }[]
   /** A model TIER id from `GET /api/tasks/models`, or null for no project default. */
   default_model: string | null
+  /** Project memory for this project's tasks: On/Off, null = the org's System Settings default. Optional for older
+      fixtures. */
+  project_memory?: boolean | null
   /** The project's default agent — the agent picker's two halves, at most one set (`ProjectUpdate`). An
       unpicked task runs it. Optional for older fixtures. */
   default_agent_id?: string | null
@@ -581,24 +612,25 @@ export type Project = ProjectMicrovm & {
   /** Assigned to an enabled MicroVM node: New session opens a VM on it, repository or not. Optional: a cached
       roster can predate it. */
   on_microvm?: boolean
-  port_vars: string[] | null
-  port_block: number | null
+  /** Read only: the names of this project's Port rows, derived by the server. Optional: older fixtures lack it. */
+  port_vars?: string[]
   tech_stack: TechStackEntry[] | null
   notes: string | null
   /* Free text injected into the system prompt of every fleet agent dispatched here (a project-specific
      procedure, stated once). Nullable like `notes` — nothing fails closed on it. Not a governance column:
      any `projects:edit` holder writes it (`ProjectEditPage`'s Governance tab says why it renders there). */
   agent_instructions: string | null
-  /* An epic's escalation path: a question inside an epic goes to the analyst (business-analysis phase)
-     or the architect (every other phase and the epic row) — `app/notify_targets.py::_referred_role`; a
-     standalone task's question goes to its creator, where an unset role also falls through. Nullable,
-     unlike governance: "nobody named yet" is a normal, non-blocking state. UUID `users.id` strings, never
-     numbers (see `ManagedUser.id`). */
-  business_analyst_id: string | null
-  architect_id: string | null
+  /** Who the project's background jobs run as (`routes/projects.py::ProjectOut`); null = the org's default. Only an
+   *  Org Owner/Admin or the operator may change it. Optional for fixtures and cached rows; absent reads as null. */
+  run_jobs_as_id?: string | null
+  run_jobs_as_name?: string | null
+  /** Who background jobs actually run as (`git_access.project_forge_person`) and, when that person cannot push or
+   *  the pick was skipped for want of a forge login, why. The one-project read and the save answer only. */
+  jobs_run_as_name?: string | null
+  jobs_run_as_warning?: string | null
   /** The one branch runners rebase onto and open PRs into. No git/GitHub probe, no default anywhere. */
   integration_branch: string
-  /** Stored WITH its trailing slash (`sn/`), or `''` for none. Every branch we create is `{prefix}{rest}`. */
+  /** Stored WITH its trailing slash (`agent/`), or `''` for none. Every branch we create is `{prefix}{rest}`. */
   branch_prefix: string
   /** The always-on gate (pre-commit + Stop hook). */
   gate_quick_cmd: string
@@ -610,20 +642,65 @@ export type Project = ProjectMicrovm & {
   stack_down_cmd: string
   /** Push allowed ⇔ the destination ref is under `branch_prefix` AND this is true. Also gates the clone's push URL. */
   push_enabled: boolean
-  /** The `jira` credential for this project's Jira features, or null. The whole Jira config (site and
-      optional key live on the credential). A uuid string — never `Number()` it (`NaN` clears it). */
-  jira_credential_id: string | null
   /** The merge lane (`routes/projects.py::_project_out`). `merge_lane` whether it is active here; `merge_lane_reason` one line on why not, when offered;
       `merge_lane_offered` whether the org has the feature. Optional: a
       cached roster can predate them. */
   merge_lane?: boolean
   merge_lane_reason?: string | null
   merge_lane_offered?: boolean
+  /** The project's own merge lane switch, off by default: `merge_lane` is true only while it is on. */
+  merge_lane_enabled?: boolean
+  /** The pipeline's kind as stored (`routes/projects.py::ProjectOut.pipeline_mode`): the Pipeline tab shows while it
+      is `custom`. Optional: a cached roster can predate it. */
+  pipeline_mode?: PipelineMode
   /** The project's own PRs-per-batch cap; null = the lane's default (`MergeLane.batch_max`). */
   merge_lane_batch_max?: number | null
+  /** Minutes between outcome scans; null = inherit the org's, then the global default (15..1440). */
+  outcome_scan_interval_minutes?: number | null
+  /** The project's own CI security-check name patterns, beside the defaults (codeql, semgrep, snyk, …). */
+  security_check_patterns?: string[]
+  /** Intelligent routing (`routes/projects.py::ProjectOut`): the mode, capped at `routing_cap` (the org's maximum, `off`
+      without the plan feature); `routing_cap_reason` is why nothing above it, null when nothing is. Optional: a cached
+      roster can predate them. */
+  routing_mode?: RoutingMode
+  routing_latency_cap_hours?: number | null
+  blind_review?: boolean
+  blind_review_other_vendor?: boolean
+  /** The share of 30-day spend exploration and benchmark runs may take, 0..1 (default 0.1). */
+  experiment_budget_share?: number
+  routing_cap?: RoutingMaxMode
+  routing_cap_reason?: string | null
+  /** Why Blind review cannot be turned on now (plan, MicroVM, or no node able to check a PR out blind); null when it can. */
+  blind_review_reason?: string | null
   /** Whether the project's org holds Live Cast (`routes/projects.py::ProjectOut.live_cast_offered`): the edit page
       asks `GET …/live-cast` only then, since every Live Cast route 403s without it. Absent = no. */
   live_cast_offered?: boolean
+  /** Production QA (`routes/projects.py::ProjectOut`, `components/projects/ProjectProductionQaTab.tsx`).
+      `production_qa_offered` is the org's switch: the opt-in is refused while it is off. Optional: a cached roster can
+      predate them. */
+  production_qa_offered?: boolean
+  production_qa_enabled?: boolean
+  /** Benchmark mode (`routes/projects.py::ProjectOut`, `components/projects/ProjectBenchmarkTab.tsx`).
+      `benchmark_offered` is the org's switch: the tab exists only while it is on. The month's shadow spend and its cap
+      ride only then. Optional: a cached roster can predate them. */
+  benchmark_offered?: boolean
+  benchmark_opt_in?: boolean
+  benchmark_sample_rate?: number
+  benchmark_spent_usd?: number | null
+  benchmark_cap_usd?: number | null
+  benchmark_budget_reached?: boolean
+  production_qa_enabled_by?: string | null
+  production_environment?: string | null
+  deploy_workflows?: string[]
+  revert_policy?: RevertPolicy
+  regression_window_min?: number
+  regression_error_ratio?: number
+  regression_min_events?: number
+  regression_p95_ratio?: number
+  /** Native post-deploy probes, run from a node serving the project after each production deploy. A row's `id` keys
+      its incident fingerprint: a write keeps it on an existing row and omits it on a new one (the server assigns). */
+  health_probes?: HealthProbe[]
+  smoke_commands?: SmokeCommand[]
   /** Why a task started here could not be placed (`routes/projects.py::ProjectOut.dispatch_block`); null = placeable. */
   dispatch_block?: string | null
   /** What `dispatch_block` lacks: `no_node` blocks every start; `no_account` only a coding agent's (an SDK agent
@@ -633,8 +710,16 @@ export type Project = ProjectMicrovm & {
   updated_at: string
 }
 
+/** A health URL probe (`routes/projects.py::ProjectOut.health_probes`): ≤10, https only. */
+export type HealthProbe = { id?: string; name: string; url: string; expect_status: number }
+/** A smoke command probe (`routes/projects.py::ProjectOut.smoke_commands`): ≤5, `timeout_s` 1..300. */
+export type SmokeCommand = { id?: string; name: string; command: string; timeout_s: number }
+
+/** `projects.revert_policy` (`apps/api/app/production_qa/vocabulary.py::REVERT_POLICIES`). */
+export type RevertPolicy = 'off' | 'draft' | 'auto_file'
+
 /* GET /api/tasks/tree — the task rail's one read (`apps/api/app/task_tree.py`, the pinned shape). Every node
- * carries `Counts` over the default board's top-level rows; `questions + failed + paused + waiting == stopped`,
+ * carries `Counts` over the default board's top-level rows; `questions + failed + paused == stopped`,
  * `queued` is the slice of `in_progress` not yet running, and a parent's counts are the sum of its children's, so a
  * closed branch never hides a blocker. */
 export type TaskTreeCounts = {
@@ -642,11 +727,12 @@ export type TaskTreeCounts = {
   questions: number
   failed: number
   paused: number
-  waiting: number
   in_progress: number
   // Absent from an older payload: read as 0 (`boardSections.ts`).
   queued?: number
   draft: number
+  // The slice of `draft` that is Jaah's suggestions (`task_tree.SUGGESTED_SECTION`); absent from an older payload: 0.
+  suggested?: number
   done: number
   total: number
 }
@@ -654,7 +740,6 @@ export type TaskTreeCounts = {
 export type TaskTreeFeature = {
   id: string
   name: string
-  status: 'active' | 'shipped'
   lead_id: string
   /** `"<shape>-<colour>"` (`lib/featureIcon.ts`) or null for "No icon". */
   icon?: string | null
@@ -662,33 +747,32 @@ export type TaskTreeFeature = {
   show_progress: boolean
   /** This user muted it (`lib/taskMute.ts::applyMutes`); set client-side, never served. */
   muted?: boolean
-  shipped_at: string | null
   counts: TaskTreeCounts
 }
 
 export type TaskTreeProject = {
   id: number
   name: string
-  /** `Project.system_kind`: set on the per-org built-in project; absent on an ordinary one. */
-  system_kind?: string | null
   /** The project's org (`task_tree.py::ProjectNode.org`); names repeat across orgs (`lib/projectLabel.tsx`). */
   org?: OrgRef | null
   can_edit_project: boolean
   can_create_tasks: boolean
   can_edit_tasks: boolean
   features: TaskTreeFeature[]
-  /** The project's "No feature" rows; null when there are none, so the rail draws no empty node. */
-  unfiled: TaskTreeCounts | null
-  /** Without this user's muted features' (`lib/taskMute.ts::applyMutes`). */
+  /** Deleted features that still hold tasks on the board: only to name and icon those tasks' groups
+   *  (`boardSections.ts::featureBuckets`, `lib/featureIcon.ts`), never listed in the rail or a picker.
+   *  Absent from a tree an older API answered. */
+  deleted_features?: { id: string; name: string; icon: string | null }[]
+  /** Every row of the project, without this user's muted features' (`lib/taskMute.ts::applyMutes`). */
   counts: TaskTreeCounts
   /** This user muted it (`lib/taskMute.ts::applyMutes`); set client-side, never served. */
   muted?: boolean
 }
 
 /** `PipelineTask.stop` — the stop record (`routes/tasks/task_wire.py::StopOut`, pinned). */
-export type TaskStop = {
+type TaskStop = {
   /** `balance` / `jaah_unavailable`: the system paused work on the Jaah account (`task_sections.StopKind`). */
-  kind: 'question' | 'failed' | 'paused' | 'balance' | 'jaah_unavailable' | 'waiting_on_customer'
+  kind: 'question' | 'failed' | 'paused' | 'balance' | 'jaah_unavailable'
   text: string | null
   by: string | null
   at: string | null
@@ -704,7 +788,6 @@ export type FeatureSummary = {
   name: string
   project_id: number
   project_name: string
-  status: 'active' | 'shipped'
   /** `"<shape>-<colour>"` (`lib/featureIcon.ts`) or null for "No icon". */
   icon?: string | null
   can_edit: boolean
@@ -722,12 +805,14 @@ export type ProjectMember = {
   email: string
   first_name: string | null
   last_name: string | null
+  /** The account's org: one person is one account per org, so two rows may share a name and email. */
+  org_name?: string | null
 }
 
 // ── Nodes view & edit ──
 
 /* `nodes.infra` — free-form JSONB. The first six fields are human-authored; the rest is the launch
-   record (`create_cloud_node`, `node_group_reconcile._launch_one`), which `DELETE /api/nodes/{id}` and
+   record (`launch_cloud_node_row`, `node_group_reconcile._launch_one`), which `DELETE /api/nodes/{id}` and
    `node_group_reconcile._terminate_one` read to terminate the machine. Open by design: the console must
    carry keys it does not render (`NodeDetailPage::carriedInfraOf` subtracts the six it owns), or a Save
    would erase them. The four launch keys are named for type safety and `readonly` (the API refuses them
@@ -764,7 +849,7 @@ export const accountsCountHint = (n: number): string =>
 // in use, not a dispatch promise (`routes/nodes/reads.py::_counts_map`).
 export type NodeCounts = {
   worktrees: number
-  /** Leasable slots (the main clone excluded); absent from an older API. */
+  /** Leasable slots; absent from an older API. */
   task_slots?: number
   /** Slots being destroyed, included in `worktrees`; absent from an older API. */
   retiring_slots?: number
@@ -776,8 +861,8 @@ export type NodeCounts = {
    admin reads it. `actions` is the ONLY source of which verbs show (`components/CloudMachineSection.tsx`): the
    client never derives one from `state` or `provider`. Every write (`/api/nodes/{id}/cloud/...`) answers 202
    with this block. */
-export type NodeCloudAction = 'stop' | 'start' | 'change_type' | 'grow_disk' | 'delete'
-export type NodeCloudChange = {
+export type NodeCloudAction = 'stop' | 'start' | 'restart' | 'change_type' | 'grow_disk' | 'delete'
+type NodeCloudChange = {
   from_type: string
   to_type: string
   /* `stuck`: it stopped reporting (`cloud_lifecycle`); shown as failed, and the verbs are offered again. */
@@ -805,8 +890,12 @@ export type NodeCloud = {
   /* What the machine's boot log says while it has not connected (`infra.boot_report`): `stalled` when the
      reason is a cause, not progress. Absent from an older API; null until one is read. */
   boot_report?: { reason: string; at: string; stalled: boolean } | null
+  /* What the launch said to grant so the machine stays reachable when its daemon is down (`ensure_break_glass`);
+     null when nothing. Absent from an older API. */
+  break_glass_warning?: string | null
 }
-/* A refused stop or grow (409): the tasks running on the node, named so a forced stop says what it kills. */
+/* A refused stop, restart or grow (409): the tasks running on the node, named so a forced one says what it kills. A
+   restart's `detail` also names open sessions and nodes that stopped reporting. */
 export type NodeCloudStopRefusal = { detail: string; tasks: { id: number; title: string }[] }
 
 // GET /api/nodes row — mirrors NodeOut (apps/api/app/routes/nodes/node_wire.py). Presence is the node's live socket
@@ -833,7 +922,7 @@ export type NodeRecord = Provenance & {
      Required: coalescing absent to `false` would read "could not tell" as "not draining". */
   draining: boolean
   /* The operator allocated this machine to its tenant (`app/node_allocation.py`): the tenant uses it and places
-     projects on it, but changes only its labels and service switches, and never deletes it. */
+     projects on it, but changes only its labels and service switches (Delete stays theirs). */
   operator_allocated: boolean
   /* A Jaah Cloud machine (`NodeOut.jaah_cloud`): Jaah runs it for the tenant, so like an allocated node the tenant
      changes only its labels, switches and NodeLinks (`pages/NodeDetailPage.tsx`'s `allocationLocked`). */
@@ -841,9 +930,6 @@ export type NodeRecord = Provenance & {
   /* On a shared machine the operator runs that is not cloud-launched (`NodeOut.shared_machine`): locked like a Jaah
      Cloud machine, but worded as the operator's shared machine (`pages/NodeDetailPage.tsx`, the Nodes list's tag). */
   shared_machine: boolean
-  /* The retired per-node shared-accounts switch (`nodes.shared_accounts_enabled`), still served; unread by
-     the console: NodeLinks replaced it. */
-  nodelink_enabled: boolean
   /* Does the node report the accounts token folder mounted (`NodeOut.accounts_nodelink`): a login on it reaches every node
      on that NodeLink. Absent from an older server: false. */
   accounts_nodelink?: boolean
@@ -857,6 +943,9 @@ export type NodeRecord = Provenance & {
   /* Companion CLIs (executables a provider's CLI spawns, e.g. `pi` beside `pi-acp`) that are absent while their
      provider's CLI is present. Optional for an older server; absent reads `[]`. */
   missing_companions?: string[]
+  /* Attested, but no provider's CLI is installed, so no task can run here (`NodeOut.agent_cli_missing`). Optional
+     for an older server; absent reads false. */
+  agent_cli_missing?: boolean
   /* The OS the node was CREATED as (`Node.os`, never changed) and what the machine reports (`arch`,
      `os_version`; null until it does). `unsupported` is `{capability: one-line reason}` for what that OS
      cannot do (`apps/api/app/node_platform.py`), `{}` for Linux: the console disables a control by
@@ -948,6 +1037,9 @@ export type NodeDetail = NodeRecord & NodeMicrovmDetail & {
      other reader, so a tenant on a shared host never learns its node is co-located. Optional: fixtures predate them. */
   session_kvm?: boolean
   session_kvm_editable?: boolean
+  /* How many tasks may run on this node at once (`NodeDetailOut.max_running_tasks`); null = no limit. A PUT
+     takes 0..64, 0 clearing it. Optional: fixtures predate it; absent reads as no limit. */
+  max_running_tasks?: number | null
 }
 
 // ── Node credentials ────────────────────────────────────────────────────────────────
@@ -970,6 +1062,9 @@ export type NodeCredential = {
   /* Whether the line is run inside the tailnet join (`selfHostedScript`): only on a console the internet cannot
      reach (`register.py::_joins_tailnet_first`). Otherwise the bootstrap joins the tailnet itself. Absent = no. */
   onboarding_joins_tailnet?: boolean
+  /* The single-use key that join presents (`register.py::_join_auth_key`), so it runs unattended; null/absent =
+     the join asks for an interactive login. A credential, like `onboarding_command`. */
+  tailnet_auth_key?: string | null
 }
 
 /* `POST /api/nodes/{name}/tailnet-reenrol` → 201: a re-issued credential (the old token is dead) plus the
@@ -985,6 +1080,10 @@ export type NodeReenrolled = NodeCredential & {
 export type NodeDeleteResult = {
   // Slot rows deleted with the node; `0` is ordinary.
   slots_deleted: number
+  // A billed hosting named the machine and was ended, which removed it (`app/hosted_machines.py::end_hosting_of`).
+  hosting_ended?: boolean
+  // The nodes a host carried, deleted before it.
+  carried_deleted?: string[]
   // One phrase per hold this delete ended ("task <id>", "user <uuid>") — the killed runners and sessions.
   holders_ended: string[]
   // One line per directory not erased (unreachable, wedged, refusing, no path) — an orphan on that host.
@@ -1000,10 +1099,10 @@ export type NodeDeleteResult = {
 }
 
 // ── Creating a node from the control plane ──────────────────────────────────────────
-// `POST /api/nodes/cloud` launches an EC2 instance; `POST /api/nodes/self-hosted` registers a machine the
-// operator has. Both mint the one-time `NodeCredential` with the row.
-// Cloud: the bootstrap goes to EC2 as user-data. Self-hosted: the operator runs
-// `credential.onboarding_command`. Neither response carries a script.
+// `POST /api/node-orders` (the Add-node wizard) launches a cloud instance or registers a machine the
+// operator has; either mints the one-time `NodeCredential` with the row.
+// Cloud: the bootstrap goes to EC2 as user-data. Self-hosted: the operator runs the order's
+// `onboarding_command`. Neither response carries a script.
 
 /** An AWS credential a cloud connection may be built on (`GET /api/cloud-connections/options`).
  *  `region` is the credential's non-secret `region` config field (the registry's optional AWS field), so
@@ -1082,7 +1181,7 @@ export type VnodeHost = {
   shared_capacity?: number | null
 }
 
-export type VirtualNodeState = 'provisioning' | 'ready' | 'failed' | 'deleting'
+type VirtualNodeState = 'provisioning' | 'ready' | 'failed' | 'deleting'
 
 /** One row of `GET /api/vnode-hosts/{host}/virtual-nodes` — a node co-located on the host.
  *  `node_id`/`node_name` are null once the node row is gone and the host is tearing it down. */
@@ -1108,6 +1207,11 @@ export type VirtualNode = {
   inodes_used?: number | null
   usage_measured_at?: string | null
   over_cap?: boolean
+  /* A Whole-node VM's seed (it carries the node token) as its host last reported it; null for any other node or
+   * before a report. `seed_overdue` is the server's rule (`app/vnodes.py::seed_state`): still present well after
+   * the guest reported. */
+  seed?: 'present' | 'removed' | null
+  seed_overdue?: boolean
 }
 
 /** `PATCH /api/vnode-hosts/{host}/virtual-nodes/{id}` — operator only. A key left out is unchanged; null
@@ -1118,7 +1222,7 @@ export type VirtualNodeCapsPatch = { disk_cap_gb?: number | null; inode_cap?: nu
  *  the other two ("Only AWS is supported yet"), and the dialog greys them out. */
 export type CloudProvider = 'aws' | 'gcp' | 'azure'
 
-export type AllowedTypeOption = { instance_type: string; provider: CloudProvider; windows_capable: boolean }
+type AllowedTypeOption = { instance_type: string; provider: CloudProvider; windows_capable: boolean }
 
 /** One field of a provider's connection form (`clouds/base.py::ConnectionField`): rendered generically. `lookup`
  *  names the field whose options `GET /api/cloud-connections/lookup/{lookup}` lists (null = typed in); `parent` the
@@ -1192,7 +1296,7 @@ export type CloudConnectionRow = {
  *  org's own cloud account, reached under `credential_id`. Chosen per NodeLink in its Storage tab. One Jaah made
  *  and the cloud bills (`deletable_in_cloud`) stays when its last NodeLink leaves, until deleted under Storage;
  *  any other is deleted (row only) then. Ids fill in as a provision creates each object. */
-export type NodeLinkStoreStatus = 'pending' | 'provisioning' | 'ready' | 'failed' | 'deleting'
+type NodeLinkStoreStatus = 'pending' | 'provisioning' | 'ready' | 'failed' | 'deleting'
 
 export type NodeLinkStore = {
   id: string
@@ -1233,7 +1337,7 @@ export type NodeLinkStore = {
 
 // ── Dynamic node groups ─────────────────────────────────────────────────────────────
 // A desired capacity the CP holds by launching/terminating EC2 nodes on a timer — unlike
-// `CloudConnectionRow` / `POST /api/nodes/cloud`, a one-off launch. The console renders the gap:
+// `CloudConnectionRow` / a cloud `POST /api/node-orders`, a one-off launch. The console renders the gap:
 // `desired_total` vs `node_count`, when the loop last ran, and why it could not converge.
 // Launch details come from the group's cloud connection (`connection_id`), which the form requires.
 
@@ -1243,7 +1347,7 @@ export type NodeGroupMarket = 'on_demand' | 'spot'
 
 /** One (market, instance type) line holding `desired`. Unique on the pair server-side (a duplicate is a
  *  422; the form checks first). `node_count` shows which line is not converging. */
-export type NodeGroupCapacityRow = {
+type NodeGroupCapacityRow = {
   id: string
   market: NodeGroupMarket
   instance_type: string
@@ -1252,14 +1356,8 @@ export type NodeGroupCapacityRow = {
 }
 
 /** A project the group's nodes serve. `project_name` is denormalised. */
-export type NodeGroupProjectRow = {
-  id: string
-  project_id: number
-  project_name: string
-}
-
 /** One group as `GET /api/node-groups` returns it. */
-export type NodeGroupRow = {
+export type NodeGroupRow = EntityStamps & {
   id: string
   name: string
   description: string
@@ -1285,24 +1383,11 @@ export type NodeGroupRow = {
    *  only symptom of a group silently launching nothing. */
   last_error: string
   capacity: NodeGroupCapacityRow[]
-  projects: NodeGroupProjectRow[]
   /** The NodeLinks every node of the group is born attached to; `[]` = none. Optional: older reads lack it. */
   nodelink_ids?: string[]
   /** Server-derived totals, never re-summed here (another operator may add a line between reads). */
   desired_total: number
   node_count: number
-  created_at: string | null
-  updated_at: string | null
-  /** Resolved display names, never actor uuids. */
-  created_by: string | null
-  updated_by: string | null
-}
-
-/** A project a group may target (`GET /api/node-groups/assignable-projects`). Every project is eligible:
- *  a project runs on a node through its assignment alone, nothing to enable. */
-export type AssignableProject = {
-  id: number
-  name: string
 }
 
 // ── GitHub Actions runner pools ─────────────────────────────────
@@ -1360,11 +1445,11 @@ export type GhaRunnerActivity = {
 
 /** The instruction. `absent` is only the server's answer (set by DELETE; the row deletes itself once the
  *  node reports zero runners). */
-export type GhaRunnerPoolState = 'running' | 'paused' | 'absent'
+type GhaRunnerPoolState = 'running' | 'paused' | 'absent'
 
 /** Where the node stands. `pending` covers installing, draining and removing — read it with `state` and
  *  `observed`. */
-export type GhaRunnerPoolPhase = 'pending' | 'converged' | 'error'
+type GhaRunnerPoolPhase = 'pending' | 'converged' | 'error'
 
 export type GhaRunnerPool = {
   /** The node name, as the route's path param spells it. */
@@ -1474,10 +1559,22 @@ export type NodeDiskEventsPayload = { events: NodeDiskEvent[] }
 /** `app/node_host_metrics.py`'s `LEVEL_*` verbatim. A stale reading reports `unknown`, never `ok`. */
 export type NodeHostMetricsLevel = 'ok' | 'warn' | 'critical' | 'unknown'
 
+/** The host pressure figures a roster row (latest) and a metrics bucket (its mean) both carry; null when unreported
+ *  or withheld. Optional: an older server sends none. `/proc/loadavg`, the used share of `/proc/meminfo`'s swap, and
+ *  `/proc/pressure/{cpu,memory,io}` `some avg60`, 0..100. */
+export interface HostPressure {
+  load_1?: number | null
+  /** The used swap share; null where no swap is configured. */
+  swap_pct?: number | null
+  psi_cpu_pct?: number | null
+  psi_mem_pct?: number | null
+  psi_io_pct?: number | null
+}
+
 /** One node's newest bucketed reading. */
-export interface NodeHostMetrics {
-  /** Null (both, with `cpu_count`/`mem_total_kb`/network, levels `unknown`) for a tenant whose node shares
-   *  another org's host: those figures are the host's, so withheld (`routes/nodes/node_wire.py::_own_disk_only`). */
+export interface NodeHostMetrics extends HostPressure {
+  /** The host's figures for a tenant whose node shares another org's host, whose `cpu_count`/`mem_total_kb`/
+   *  network are withheld there (`routes/nodes/node_wire.py::_own_disk_only`). */
   cpu_pct: number | null
   mem_pct: number | null
   cpu_level: NodeHostMetricsLevel
@@ -1512,19 +1609,12 @@ export interface NodeHostMetrics {
    *  `level`. Null / `unknown` when unreported. Optional: an older server sends neither. */
   tmp_inode_pct?: number | null
   tmp_inode_level?: NodeHostMetricsLevel
-  /** Host load signals — latest, not windowed; null when unreported or withheld (foreign host, as CPU/RAM).
-   *  Optional: an older server sends none. `/proc/loadavg`. */
-  load_1?: number | null
+  /** The longer `/proc/loadavg` windows beside `HostPressure.load_1`; latest, not windowed, same nulls. */
   load_5?: number | null
   load_15?: number | null
-  /** `/proc/meminfo` SwapTotal/SwapFree, kB; `swap_pct` the used share (null where no swap is configured). */
+  /** `/proc/meminfo` SwapTotal/SwapFree, kB. */
   swap_total_kb?: number | null
   swap_free_kb?: number | null
-  swap_pct?: number | null
-  /** `/proc/pressure/{cpu,memory,io}` `some avg60`, 0..100. */
-  psi_cpu_pct?: number | null
-  psi_mem_pct?: number | null
-  psi_io_pct?: number | null
   /** Busiest processes by CPU and RSS (≤ 10; name only, never argv). The roster may leave it off; the
    *  `/metrics` payload's `latest` carries it. */
   top_processes?: NodeTopProcess[] | null
@@ -1583,7 +1673,7 @@ export interface TaskSessionUsagePayload {
 
 /** One bucket average; `at` is the bucket stamp, oldest-first. Disk/network are null for a bucket whose rows
  *  never carried them (an older daemon); every figure is null for the withheld-host reader above. */
-export interface NodeMetricsPoint {
+export interface NodeMetricsPoint extends HostPressure {
   at: string
   cpu_pct: number | null
   mem_pct: number | null
@@ -1594,12 +1684,6 @@ export interface NodeMetricsPoint {
   runners?: number | null
   /** Used share of /tmp's inode table. Optional: an older server sends none. */
   tmp_inode_pct?: number | null
-  /** Host load bucket means; null where the bucket never carried them. Optional: an older server sends none. */
-  load_1?: number | null
-  swap_pct?: number | null
-  psi_cpu_pct?: number | null
-  psi_mem_pct?: number | null
-  psi_io_pct?: number | null
 }
 
 /** GET /api/nodes/{node_id}/metrics?hours=N. `warn_pct`/`critical_pct` ride the payload so guide lines
@@ -1707,7 +1791,7 @@ export type NodeHealthFinding = {
 // ── Task tags ───────────────────────────────────────────────────────────────
 // The web-side single home of the three tag shapes (server field for field), read by every tag
 // surface. Ids are strings, `description` is `''` never null, `created_by`/`updated_by` are resolved
-// display names (the `PortGridVar` conventions).
+// display names.
 
 // The compact per-task tag ref carried on every task payload (server: TagRefOut).
 export type TagRef = {
@@ -1722,31 +1806,23 @@ export type TagRef = {
 }
 
 // One tag as an editable record (server: TagOut).
-export type Tag = {
+export type Tag = EntityStamps & {
   id: string
   tag: string
   name: string
   description: string
   position: number
   tag_group_id: string
-  created_at: string | null
-  updated_at: string | null
-  created_by: string | null
-  updated_by: string | null
 }
 
 // A tag group with its tags (server: TagGroupOut) — the catalog every tag surface reads.
-export type TagGroup = {
+export type TagGroup = EntityStamps & {
   id: string
   name: string
   description: string
   state: 'draft' | 'active'
   multi_select: boolean
   position: number
-  created_at: string | null
-  updated_at: string | null
-  created_by: string | null
-  updated_by: string | null
   tags: Tag[]
 }
 
@@ -1765,19 +1841,19 @@ export type TaskSourceOption = {
   label: string
 }
 
-// GET /api/tasks/creators — the board's creator roster for the picker, scoped by the list route's
-// project + hidden params.
-export type TaskCreator = {
-  // The user's uuid — what the filter sends (`created_by_id=`), unlike `PipelineTask.created_by`, a name
-  // (see `Provenance`).
+// GET /api/tasks/assignees — the board's assignee roster for the picker, scoped by the list route's
+// project + hidden params. GET /api/tasks/creators answers the same shape for the Creator filter (its "System"
+// entry stands for every row no human filed).
+export type TaskAssignee = {
+  // The user's uuid — what the filter sends (`assigned_to_id=`), unlike `PipelineTask.assigned_to`, a name.
   id: string
   // The person's label, derived server-side from First + Last (else the email —
-  // `apps/api/app/identities.py::person_label`), as `created_by` on a row, so
-  // `components/tasks/AuthorBadge.tsx` matches the Activity Feed.
+  // `apps/api/app/identities.py::person_label`), as `assigned_to` on a row, so
+  // `components/tasks/AuthorBadge.tsx` draws the same letters.
   name: string
-  // Top-level tasks in scope this person created (same rows the list route returns).
+  // Top-level tasks in scope assigned to this person (same rows the list route returns).
   // A `0` is real and always the caller's own: the route appends the caller at `task_count: 0` when the
-  // scope has none of theirs (`task_creators`, apps/api/app/routes/tasks/listing.py). Never use the count as a
+  // scope has none of theirs (`task_assignees`, apps/api/app/routes/tasks/listing.py). Never use the count as a
   // presence test — `filter(c => c.task_count)` deletes exactly that row.
   task_count: number
 }
@@ -1803,7 +1879,7 @@ export type TaskStopKind = TaskStop['kind']
 export type FeatureUserRef = { id: string; name: string }
 
 /* GET /api/features/{id} — `routes/features.py::FeatureOut`, the pinned shape. `lead` is labelled "Owner";
- * `can_edit` says whether THIS caller may edit, ship, reopen, delete and file into it. */
+ * `can_edit` says whether THIS caller may edit, delete and file into it. */
 export type FeatureOut = {
   id: string
   name: string
@@ -1811,16 +1887,24 @@ export type FeatureOut = {
   project_id: number
   project_name: string
   lead: FeatureUserRef
-  status: 'active' | 'shipped'
   /** `"<shape>-<colour>"` (`lib/featureIcon.ts`) or null for "No icon". */
   icon?: string | null
   /** Whether the task rail draws its completion ring; shared, off by default. */
   show_progress: boolean
-  shipped_at: string | null
-  shipped_by: FeatureUserRef | null
   created_at: string
   created_by: FeatureUserRef
   can_edit: boolean
+}
+
+/** A task's tracker issue link on the wire (`PipelineTask.tracker_issue`). `tracker` keys the mark; `tracker_label` is
+ *  the server's word for it. */
+export type TaskTrackerIssue = {
+  connection_id: string
+  tracker: string
+  tracker_label: string
+  key: string
+  url: string
+  origin: string
 }
 
 export type PipelineTask = Partial<Provenance> & {
@@ -1831,11 +1915,10 @@ export type PipelineTask = Partial<Provenance> & {
   // The project: which repo it ships to, the pool it draws from, and the task-access scope — who may see
   // and run this row. `useTaskAccess` keys every per-row permission on it, and the board scopes on it.
   project_id: number
-  /** The feature this row is filed in (hierarchy level 3); null is "No feature". Optional: older fixtures
+  /** The feature this row is filed in (hierarchy level 3); null files it in its project alone. Optional: older fixtures
    *  omit it. Filed with `PUT /api/tasks/{id}` `{feature_id}` (a stage task moves with its epic). */
   feature_id?: string | null
-  /** Why a Stopped row stopped (`routes/tasks/task_wire.py::StopOut`); null when it is not stopped. `kind: 'waiting_on_customer'`
-   *  is "Waiting on customer" (D-waiting), whose `text` is the operator's note. */
+  /** Why a Stopped row stopped (`routes/tasks/task_wire.py::StopOut`); null when it is not stopped. */
   stop?: TaskStop | null
   // The board section (`apps/api/app/task_sections.py`, the one home of the mapping). A parent is placed
   // by its children, so an epic whose stage is asking is `stopped`. Read, never re-derived client-side.
@@ -1850,9 +1933,15 @@ export type PipelineTask = Partial<Provenance> & {
      `assigned_to` is the resolved display name. `assigned_to_id` is the one actor uuid on this shape,
      because the form edits it: picked from `GET /api/projects/{id}/members`, sent on `POST /api/tasks` and
      `PUT /api/tasks/{id}` (null is a 422), and needed to preselect the current member. Both optional:
-     `TaskListOut` excludes them; detail and mutations carry both (`null` on pre-field rows). */
+     `TaskListOut` serves the name only (a list row carries no actor uuid); detail and mutations carry both
+     (`null` on pre-field rows). */
   assigned_to_id?: string | null
   assigned_to?: string | null
+  /* "Notify when done": its people hear when it finishes, and the board marks it until each has opened it.
+  `done_unseen`: that mark, for THIS viewer (the server excludes subtasks, notify-off rows and non-recipients);
+  cleared by `POST /api/tasks/{id}/seen`. Optional for older fixtures. */
+  notify_when_done?: boolean
+  done_unseen?: boolean
   title: string
   // Optional: the list route omits it (with `awaiting_response_body`; ~42KB of a ~95KB board). Detail
   // reads, mutation responses and an epic's nested children carry it. Same for `metrics` and
@@ -1887,11 +1976,18 @@ export type PipelineTask = Partial<Provenance> & {
   // Optional like `body`; read only by GateForm on the detail page.
   awaiting_response_body?: string | null
   persona: string
+  /* The description's language, an ISO 639-1 code (`app/task_language.py`); null: not detected yet, read as
+  English. `language_pinned`: a person picked it. Optional for older fixtures. */
+  language?: string | null
+  language_pinned?: boolean
   /* Where the row was filed from (`console`, `cron`, `agent`, `trigger:<kind>`), set once at filing and the
   board's Source filter value (`?source=`). `source_label` is the server's word for it — print that, never the
   code. Optional for older fixtures. */
   source?: string
   source_label?: string
+  /* A runner filed it on its own from another task (`task_source.is_suggested`): as a draft it sits under
+  "Suggested by Jaah" with Accept and Discard. Optional for older fixtures. */
+  suggested?: boolean
   /* The template this row was started from (`routes/tasks/task_wire.py::TemplateRefOut`): `id` while the template
   exists, null once deleted; `name` kept either way. Null/absent = not from a template. */
   template?: { id: string | null; name: string } | null
@@ -1899,6 +1995,8 @@ export type PipelineTask = Partial<Provenance> & {
   deleted) and its name, kept even after a delete; `''` = not filed by a trigger. Optional for older fixtures. */
   created_by_trigger_id?: string | null
   created_by_trigger_name?: string
+  /* The schedule that filed this row (`TaskOut.created_by_cron_name`), kept after a delete; `''` = none. */
+  created_by_cron_name?: string
   /* The automation that filed this row — or, on a detail read, its epic (`TaskOut.created_by_automation_id`):
   the live automation's id (null once deleted) and its kept name. Optional for older fixtures. */
   created_by_automation_id?: string | null
@@ -1922,10 +2020,15 @@ export type PipelineTask = Partial<Provenance> & {
   // (`app/cron_activity_runner.py`). Always sent; optional for older fixtures. Surfaces on
   // Needs-attention and behind "Show hidden".
   hidden?: boolean
+  /** A benchmark shadow (`routes/tasks/task_wire.py::TaskOut.shadow`): the header shows a Shadow badge. */
+  shadow?: boolean
   // Soft-archive stamp: non-null = off the default board (the toolbar's opt-in brings it back —
   // `components/tasks/TaskToolbar.tsx`), and sorted into the finished half whatever its `state`
-  // (`isCompletedRow`). Always sent; optional for older fixtures.
+  // (`routes/tasks/listing.py::_TASK_LIST_COMPLETED_GROUP`). Always sent; optional for older fixtures.
   archived_at?: string | null
+  /** On the pipeline page only (`lib/pipelineBoard.ts`): the item's stage and in-stage group, off `…/pipeline/items`. */
+  pipeline_stage?: string | null
+  pipeline_group?: string | null
   awaiting_response_options: string[] | null
   // Dispatch-order lever: higher = sooner. Nullable; null reads as normal (0).
   priority: number | null
@@ -1938,13 +2041,20 @@ export type PipelineTask = Partial<Provenance> & {
       Jira"; both null together otherwise. A record of origin, never re-synced. */
   external_task_system: string | null
   external_task_id: string | null
+  /** The tracker issue the task is linked to (`trackers/project_links.py::task_issue_wire`), started by the tracker
+      (`origin: 'intake'`, read-only here) or picked on the task form; null when none. Optional: older rows and
+      fixtures omit it. */
+  tracker_issue?: TaskTrackerIssue | null
   // Epic transition mode: 'auto' (dispatch a dep-satisfied child) | 'hold' (keep it `ready` until Run).
   // Read off the parent epic at dispatch; edited on the epic form (components/tasks/TaskForm.tsx,
   // default 'auto'). Always sent; extensible server-side.
   transition_mode?: string
-  /** Project memory: the row's own On/Off (null = Default — its epic's, then System Settings), and what its
-      last dispatch resolved (`memory_arm`, null until one does) and why (`memory_arm_source`, one of
-      `app/project_memory/vocabulary.py::ARM_SOURCES`). Optional for older fixtures. */
+  /** An epic's Throttle cap: at most this many subtasks running at once under 'auto'; null = no limit. Optional for
+      older fixtures. */
+  max_running?: number | null
+  /** Project memory: the row's own legacy value (no longer read: the project decides — `Project.project_memory`,
+      then System Settings), and what its last dispatch resolved (`memory_arm`, null until one does) and why (`memory_arm_source`, one of
+      `app/models/tasks.py::MEMORY_ARM_SOURCES`). Optional for older fixtures. */
   project_memory?: boolean | null
   memory_arm?: boolean | null
   memory_arm_source?: string | null
@@ -1965,6 +2075,9 @@ export type PipelineTask = Partial<Provenance> & {
   /** The one node that may place this task (`tasks.pinned_node_id`); NULL = any. Written by operators only
       (`TaskUpdate.pinned_node_id`). Optional for older fixtures. */
   pinned_node_id?: string | null
+  /** The one account that may run this task (`tasks.bound_account_id`); NULL = any. Re-pinned from the task
+      form's Account select (`TaskUpdate.account_id`). Optional for older fixtures. */
+  bound_account_id?: string | null
   // Terminal evidence from the runner's settle call (no later backstop derives them). A `done` row with a
   // null `outcome_pr_url` renders the detail page's "⚠ Unverified" banner (`pages/taskDetail/TaskDetailsPanel.tsx`),
   // the false-close guard.
@@ -1996,6 +2109,11 @@ export type PipelineTask = Partial<Provenance> & {
       `agent_session_id`, `runtime` (`legacy`/`acp`) and ISO `started_at`. An `acp` run records its session
       here, not necessarily in `runner_session_id`. Null when none runs. Detail only. */
   live_session?: { id: string; runtime: string; started_at: string } | null
+  /** Where the task's merged change runs, with that stage's address (`app/hosted_apps/live_link.py`; the release
+      model's generalisation adds `on_dev` and `deployed`): `on_dev` merged but not released, `deploying` while its
+      release runs, `deployed` released with no deploy events, `live` released and deployed (an epic: while the app
+      serves), `provisioning` on an epic whose app is being set up. Absent otherwise. Detail only. */
+  live_link?: { url: string; state: 'on_dev' | 'deploying' | 'deployed' | 'live' | 'provisioning' } | null
   // Why a `system_failed` row failed, as its terminal writer stored it; null in every other state. Detail
   // only (the list omits it). Rendered by the detail page's failure banner (`failureCause`).
   failure_reason?: string | null
@@ -2032,9 +2150,8 @@ export type PipelineTask = Partial<Provenance> & {
   // decline ("Waiting: node runner limit (5/5)"). Server-derived (`app/org_limits.py::wait_reason`),
   // printed as-is; null = nothing known holds it back.
   wait_reason?: string | null
-  // On the node wait of a single-task read: false when Add node is the remedy (the task's org has no node and none
-  // on its way), true otherwise (`TaskOut.org_has_node`); null off the node wait.
-  org_has_node?: boolean | null
+  // Where the viewer fixes `wait_reason` (their own revoked git login: Profile › Git); null otherwise. Detail route only.
+  wait_fix_url?: string | null
   // When this row's current run started (`TaskOut`/`TaskListOut`), null while none has: the board's running age
   // (`components/tasks/listViews/rows.ts`). Optional for older fixtures and servers.
   run_started_at?: string | null
@@ -2118,6 +2235,10 @@ export type PipelineTask = Partial<Provenance> & {
   // (`lib/taskTokens.ts`). Absent/`null` = this payload resolved no capture (nothing captured, or a mutation
   // response) — never read it as 0; `pages/Tasks.tsx`'s `replaceTaskEverywhere` carries the last figure.
   tokens_total?: number | null
+  // A merge-lane run's own gates and wall time in seconds (a live run's elapsed so far), and whether it is past the
+  // stall bound (`TaskOut.lane_run`); drawn by `components/tasks/LaneRunFacts.tsx`. Null for any other persona and
+  // for a run that has reported none yet; absent from older servers.
+  lane_run?: { gates: number; wall_s: number; slow: boolean } | null
 }
 
 /* ── The five-star rating on a done Task ──────────────────────────────────────────────────────────
@@ -2147,14 +2268,14 @@ export type TaskRating = {
 
 // Per-child interval from the `task:active`/`task:done` trail (`_epic_time_metrics`). `seconds` is null
 // when either endpoint is missing.
-export type FinishTimePerChild = {
+type FinishTimePerChild = {
   persona: string
   active_at: string | null
   done_at: string | null
   seconds: number | null
 }
 
-export type FinishTimeMetrics = {
+type FinishTimeMetrics = {
   epic_start_at: string | null
   epic_end_at: string | null
   total_seconds: number | null
@@ -2163,35 +2284,35 @@ export type FinishTimeMetrics = {
 
 // Per-phase token rollup (same-persona children summed). `capture_status` is "missing" when any child
 // of the phase has no captured `Task.metrics` row, so a lost capture reads incomplete, not 0.
-export type FinishTokenPerPhase = {
+type FinishTokenPerPhase = {
   tokens_in: number
   tokens_out: number
   capture_status: 'captured' | 'missing'
 }
 
-export type FinishTokenMetrics = {
+type FinishTokenMetrics = {
   tokens_in: number
   tokens_out: number
   per_phase: Record<string, FinishTokenPerPhase>
 }
 
-export type FinishReExploration = {
+type FinishReExploration = {
   duplicate_target_count: number
   duplicated_targets: string[]
 }
 
-export type FinishDataLossEntry = {
+type FinishDataLossEntry = {
   child_id: number
   persona: string
   missing_ancestor_ids: number[]
 }
 
-export type FinishBenchmarks = {
+type FinishBenchmarks = {
   re_exploration: FinishReExploration
   data_loss_between_phases: FinishDataLossEntry[]
 }
 
-export type FinishVerifyReport = {
+type FinishVerifyReport = {
   missing_analysis_artifacts: { child_id: number; persona: string }[]
   unresolved_coders: { child_id: number; state: TaskState }[]
   // Follow-ups filed under the finisher's LAST SHOT rule (`finish_follow_up_key`), reported apart from
@@ -2214,7 +2335,7 @@ export type TaskPr = {
 }
 
 /** A PR one of an epic's build children recorded, as its Finish report lists it. */
-export type FinishPr = TaskPr & { child_id: number }
+type FinishPr = TaskPr & { child_id: number }
 
 export type FinishReport = {
   finish_task_id: number
@@ -2245,7 +2366,7 @@ export type EpicMetrics = {
    a monospace mockup (never re-wrap); `description` is prose.
    Not length-bounded on the wire (`routes/tasks._option_detail_text` is verbatim). Clamps live at render
    boundaries: `slack_blocks._OPTION_DETAIL_TOTAL_MAX`, `routes/tasks._QA_TRAIL_OPTION_TEXT_MAX_CHARS`,
-   and the console's `GateForm` `OPTION_DETAIL_MAX_CHARS`, applied inside its two renderers.
+   and the console's `questionParts.OPTION_DETAIL_MAX_CHARS`, applied inside `OptionDescription`/`OptionPreview`.
    `recommended` resolves the "(Recommended)" convention server-side; do not badge it twice if the
    label also spells it. */
 export type QuestionOption = {
@@ -2334,20 +2455,7 @@ export type TaskQuestion = {
   delivered_at?: string | null
   round: number
   created_at: string
-  /* The round reworded in plain terms by the control plane's summary model (`apps/api/app/question_plain.py`),
-     written after the round is asked. Display only: answers still post the runner's own labels. Null until the
-     rewording lands, or when it failed; optional for an older API. */
-  plain?: QuestionPlain | null
 }
-
-/* `plain` on a round: a headline question, one line of why, and per option (index-aligned with `options`) a
-   short label and gist. `options` is `[]` on a free-text round. */
-export type QuestionPlain = {
-  headline: string
-  why: string | null
-  options: QuestionPlainOption[]
-}
-export type QuestionPlainOption = { short: string; gist: string | null }
 
 // Mirrors TaskDepRef / TaskDependenciesOut (apps/api/app/routes/tasks/dependencies.py): `prerequisites` block this
 // task, `dependents` are blocked by it, `unmet_prerequisite_ids` gate dispatch, `ready` iff none unmet.
@@ -2382,14 +2490,12 @@ export type TaskDependencies = {
 
 // Mirrors TaskBodyVersionOut (apps/api/app/routes/tasks/create.py): a snapshot of a Task's `body` taken just
 // before an overwrite — the prior description. `source`: 'manual', 'agent_filed_edit' (an advisor chat
-// amending its draft), 'runner_break_refresh' or 'system_dedup_refresh'. `restored_from_id` is legacy,
-// null on every live row, kept so historical rows deserialise. Newest first from
-// GET /api/tasks/{id}/body-versions; `TaskVersions` is the sole reader.
+// amending its draft) or 'system_dedup_refresh'. Newest first from
+// GET /api/tasks/{id}/body-versions; `TaskVersions`' `useTaskBodyVersions` is the sole reader.
 export type TaskBodyVersion = {
   id: number
   body: string
   source: string
-  restored_from_id: number | null
   created_at: string
 }
 
@@ -2451,7 +2557,22 @@ export type CommandPage = {
  * `is_operator_plane` is served: org zero's id lives only in `apps/api/app/tenancy/ids.py`.
  * `enabled` is the first step of a two-step lifecycle; `routes/orgs.py` is the single home for what it
  * does and does not yet gate. */
-export type Org = OrgMicrovm & {
+/** The org's routing maximum (`models/orgs.py::ROUTING_MAX_MODES`) and a project's mode (`models/projects.py::ROUTING_MODES`),
+ *  lowest first. */
+export type RoutingMaxMode = 'off' | 'recommend' | 'auto'
+export type RoutingMode = 'inherit' | 'recommend' | 'auto'
+/** The runners the router may pick (`agent_router/policy_settings.py`): a null half = all of it. */
+export type RoutingAllowed = { providers: string[] | null; agent_ids: string[] | null }
+/** Intelligent routing for one org (`routes/orgs.py::OrgRoutingOut`). */
+export type OrgRouting = {
+  offered: boolean
+  max_mode: RoutingMaxMode
+  allowed: RoutingAllowed | null
+  tier_floor: string | null
+  tier_ceiling: string | null
+}
+
+export type Org = EntityStamps & OrgMicrovm & {
   id: string
   slug: string
   name: string
@@ -2461,6 +2582,12 @@ export type Org = OrgMicrovm & {
   is_operator_plane: boolean
   /** How many `admin_users` are bound to this org — a count, never a roster. */
   user_count: number
+  /** Intelligent routing (`routes/orgs.py::OrgOut.routing`). Optional for fixtures; absent reads as not offered. */
+  routing?: OrgRouting | null
+  /** Who its projects' background jobs run as by default (`routes/orgs.py::OrgOut`); null = nobody, and they do not
+   *  run. The name is the person's display name, else their email. Optional for fixtures; absent reads as null. */
+  run_jobs_as_id?: string | null
+  run_jobs_as_name?: string | null
   /** The role a domain join grants (`routes/orgs.py::OrgOut.default_role`); null = none. Optional for
    *  fixtures and cached payloads; absent reads as null. */
   default_role?: string | null
@@ -2478,9 +2605,9 @@ export type Org = OrgMicrovm & {
    *  no plan (an operator org), `plan_ends_at` null = never ends. Optional for fixtures; absent reads as null. */
   plan_name?: string | null
   plan_ends_at?: string | null
-  /** A coding agent can run for it: an enabled account, or on the Jaah account (`jaah_routing.orgs_with_a_coder`).
-   *  Served on the operator's roster; null/absent = not read (another reader's view). */
-  has_coder?: boolean | null
+  /** Someone a task there can push as (an enabled Owner, else a superadmin): the operator's read of one org
+   *  (`GET /api/orgs/{id}`) only; absent otherwise. */
+  has_owner?: boolean | null
   /** Only on the answer of approve and of the welcome-email route: what THIS request's send did. `skipped` =
    *  no sign-up to welcome; null = no send was asked. */
   welcome_outcome?: WelcomeOutcome | 'skipped' | null
@@ -2518,10 +2645,6 @@ export type Org = OrgMicrovm & {
    *  Optional: absent from a server that does not serve them yet. */
   parent_org?: OrgRef | null
   staging_org?: OrgRef | null
-  created_at: string | null
-  updated_at: string | null
-  created_by: string | null
-  updated_by: string | null
 }
 
 /** `routes/orgs.py::HipaaOut`. */
@@ -2573,7 +2696,7 @@ export type OrgSignup = {
   billing_error?: string | null
 }
 
-export type OrgEnquiry = { company: string; role: string; note: string; created_at: string }
+type OrgEnquiry = { company: string; role: string; note: string; created_at: string }
 
 // ── RBAC: superadmin user management (server contract in apps/api) ──
 
@@ -2592,7 +2715,7 @@ export type OrgEnquiry = { company: string; role: string; note: string; created_
    (the last two after the alphabetical seven, for the same reason). `accounts`, `audit`, `crons`,
    `nodes`, `sessions`, `workflows` were carved from `system:*` — `App.tsx` and `Sidebar.tsx` ask them now,
    and a migration gave every `system:<action>` grantee the tier key. `system` remains the settings
-   subject (settings, command log, port grid, node-groups reads, cloud-node defaults). `tags` is asked by
+   subject (settings, command log, node-groups reads, cloud-node defaults). `tags` is asked by
    `routes/tags.py`'s authoring routes.
    `groups` and `users`: their `view` keys admit the Directory shell (`/users`, `/groups` and the
    editors) READ-ONLY. Writing it stays a superadmin's — no grantable key may admit a write to
@@ -2615,39 +2738,6 @@ export type PermissionKey = `${Feature}:${Action}`
 export const PERMISSION_KEYS: readonly PermissionKey[] = FEATURES.flatMap(feature =>
   ACTIONS.map(action => `${feature}:${action}` as PermissionKey),
 )
-
-/** Keys the catalogue offers and nothing honours — the grid draws them disabled.
- *  `apps/api/app/authz/catalog.py::UNHONOURED_PERMISSION_KEYS` is the single home for the set and each key's
- *  reason (and for why `finance:view`, honoured on `/clients`, is instead in
- *  `CONSOLE_ONLY_PERMISSION_KEYS`). Mirrored here because the grid renders at module scope.
- *  The `users:*`/`groups:*` write halves are superadmin-only (`@superadmin_only` on `routes/users.py` /
- *  `routes/groups.py`), so offering them would promise a delegation no grant confers.
- *  Presentation only: the grant door still accepts these keys (deliberately), and a grant confers
- *  nothing; this only stops the operator being offered a delegation that cannot happen.
- *  Guarded by the server-side permission-catalog parity test (parses both homes, quick tier): whoever
- *  gives one of these a `@feature` route edits both. */
-export const UNHONOURED_PERMISSION_KEYS: readonly PermissionKey[] = [
-  ...(['crons', 'workflows'] as const).flatMap(feature =>
-    ACTIONS.map(action => `${feature}:${action}` as PermissionKey),
-  ),
-  // Portfolio Compliance gates on `view` and `edit` only (the API's compliance authoring routes).
-  'compliance:create', 'compliance:delete',
-  // The identity shell — writes are superadmin-only (routes/users.py, routes/groups.py).
-  'users:create', 'users:edit', 'users:delete',
-  'groups:create', 'groups:edit', 'groups:delete',
-  // Read-and-narrow subjects with no mutating door.
-  'audit:create', 'audit:edit', 'audit:delete',
-  'sessions:create', 'sessions:delete',
-  // No route by design — apps/api/app/routes/nodes/__init__.py's docstring.
-  'nodes:create',
-  // No API route at all (finance:view and finance:edit gate the billing routes).
-  'finance:create', 'finance:delete',
-  // SDK agents gate on `view` and `edit` only (routes/agents.py).
-  'agents:create', 'agents:delete',
-  // Task templates gate their writes on `edit` alone (routes/task_templates.py).
-  'templates:view', 'templates:create', 'templates:delete',
-]
-
 /* ── Group admin shapes (apps/api/app/routes/groups.py) ────────────────
    Mirror the admin-API contract verbatim. */
 
@@ -2657,7 +2747,7 @@ export const UNHONOURED_PERMISSION_KEYS: readonly PermissionKey[] = [
  * console from offering a 400. One home so the list page and the edit page agree on case.
  * `toLowerCase()` vs the server's `casefold()` diverge on a few characters (`ß`), only ever in the safe
  * direction (the UI offers, the server refuses) — never a bypass. */
-export const RESERVED_GROUP_NAME = 'superadmin'
+const RESERVED_GROUP_NAME = 'superadmin'
 
 export function isReservedGroupName(name: string | null | undefined): boolean {
   return typeof name === 'string' && name.toLowerCase() === RESERVED_GROUP_NAME
@@ -2754,7 +2844,7 @@ export type Membership = {
 /* No display label on the wire: a person is labelled from `first_name`/`last_name` (the structured pair),
  * else the email — `lib/memberLabel.ts::memberName`, the console's half of the API's
  * `apps/api/app/identities.py::person_label`. `description` is free text, `''` when unset. */
-export type ManagedUser = Provenance & {
+export type UserFacts = Provenance & {
   id: string
   email: string
   description: string
@@ -2775,6 +2865,10 @@ export type ManagedUser = Provenance & {
    *  signed in (or accepted) yet; `declined` — turned the invitation down; null — a working account.
    *  Access granted to a `pending` account applies the moment they accept. Optional for an older payload. */
   invitation_status?: 'pending' | 'declined' | null
+}
+
+// GET /api/users — the list row (`routes/users.py::UserOut`).
+export type ManagedUser = UserFacts & {
   /** Managed by the org's identity provider over SCIM (`routes/users.py::UserOut.scim_managed`). Absent = no. */
   scim_managed?: boolean
 }
@@ -2785,58 +2879,50 @@ export type InvitationOutcome = 'sent' | 'not_configured' | 'failed' | 'rate_lim
 
 export type ManagedUserCreated = ManagedUser & { invitation: InvitationOutcome }
 
-/** A delivery channel — `app/preferences.py`'s `NOTIFICATION_METHOD_TYPES`; `lib/notificationPrefs.ts`
- *  names it. A union so an unrenderable `type` is a compile error, not a blank row. */
-export type NotificationMethodType = 'slack' | 'email' | 'telegram'
+/** One alert's or group's level on a channel (`app/notification_catalog.py`). */
+export type NotificationLevel = 'off' | 'brief' | 'full'
 
-/** Where a user's alerts go: a channel plus their id there. At most one per type (the server enforces
- *  on write and dedups on read, `app/preferences.py::NotificationsPreferences`). For Slack a member id
- *  (`U0123ABCD`), refused on write if empty or malformed. For email ALWAYS `''`: delivery goes to the
- *  account's login email (`admin_users.email`), and a non-empty id is refused (422). For telegram ALWAYS
- *  `''`: delivery goes to the person's linked Telegram chat (`/api/auth/me/telegram-link`). */
-export type NotificationMethod = {
-  type: NotificationMethodType
-  user_id: string
-  /** Slack only: the member's display name, stored by Connect (`app/slack_link.py`); absent on an older link. */
-  display_name?: string
+/** One destination a membership's alerts go to (`app/notification_channels.py::channel_document`). `effective` is
+ *  every visible event's resolved level; `settings` what is stored (`{}` = the type's defaults). */
+export type NotificationChannel = {
+  id: string
+  type: 'email' | 'slack' | 'telegram'
+  label: string
+  account_email: boolean
+  slack_kind: 'dm' | 'channel' | null
+  telegram_chat_type: 'private' | 'group' | 'supergroup' | null
+  status: 'active' | 'unverified' | 'unlinked' | 'needs_reconnect' | 'workspace_mismatch'
+  settings: { groups: Record<string, NotificationLevel>; events: Record<string, NotificationLevel> }
+  effective: Record<string, NotificationLevel>
 }
 
-/** `brief` reduces the Slack card to a headline plus a link — no question prose, options or answer
- *  buttons (`app/alert_relay.py::relay_alert`). */
-export type NotificationEventDetail = 'full' | 'brief'
+/** The alert groups and alerts a membership sees, in panel order (`notification_catalog.catalog_document`). */
+export type NotificationCatalog = { groups: { key: string; label: string; events: { key: string; label: string }[] }[] }
 
-export type NotificationEventPreference = {
-  enabled: boolean
-  detail: NotificationEventDetail
-  // false: not emailed (a one-click unsubscribe or the row's Email box); other channels unaffected.
-  email: boolean
+/** One Add channel choice (`notification_channels.add_options`): unavailable with a `reason` is listed disabled;
+ *  unavailable with none is not listed. */
+export type NotificationAddOption = {
+  type: 'email' | 'slack' | 'telegram'
+  kind: 'address' | 'dm' | 'channel' | 'private' | 'group'
+  available: boolean
+  reason: string | null
 }
 
-/**
- * `preferences.notifications`, as `GET /api/auth/me` and `GET /api/users/{id}` serve it. `methods` (where
- * to deliver) and `events` (the subscription) are independent; empty `methods` is the default and
- * delivers nothing.
- * No per-user credential: one deployment-wide `notifications_slack_credential_id`; whether it exists is
- * `Admin.notification_methods_available` (`auth.tsx`), never this document.
- * `events` is keyed by `string`: the server derives kinds from `alert_relay.ALERT_KINDS`, so a newer API
- * can send one this build does not list — it must ride along untouched (`lib/notificationPrefs.ts`).
- */
-export type UserNotificationsPreference = {
-  methods: NotificationMethod[]
-  events: Record<string, NotificationEventPreference>
+/** `GET/PATCH/DELETE …/notification-channels`: what every call answers. */
+export type NotificationChannelsDocument = {
+  channels: NotificationChannel[]
+  catalog: NotificationCatalog
+  add_options: NotificationAddOption[]
 }
 
 // Per-user console preferences (the `preferences` JSON on GET/PATCH /api/users/{id}); every key optional.
 // Closed: the server's UserPreferences is extra=forbid (422 on other keys). `theme` drives [data-theme]
-// (auth.tsx); `nav_collapsed_groups` is the retired sidebar fold set (no reader; kept so stored documents still validate); `notifications` is rendered by
-// `components/NotificationsPanel`. Stored per user. Keys the console no longer reads are left out: a write
-// merges over the stored document (`lib/userSettings.ts::mergedUserPreferences`), so they are carried as stored.
+// (auth.tsx). Stored per user. Alerts are not here: they are `NotificationChannel`s. Keys the console
+// no longer reads are left out: a write merges over the stored document
+// (`lib/userSettings.ts::mergedUserPreferences`), so they are carried as stored.
 export type UserPreferences = {
-  wide_mode?: boolean
   /** `null`/absent = never picked: the operator's default applies (`lib/colorScheme.ts`). */
   theme?: 'light' | 'dark' | null
-  nav_collapsed_groups?: string[]
-  notifications?: UserNotificationsPreference
   /** The "Get started" card's flags: side effects, not settings — absent from `UserSettingsDraft`, read
    *  and written only through `lib/onboarding.ts` (the single home for the step vocabulary). */
   onboarding_dismissed?: boolean
@@ -2848,28 +2934,14 @@ export type UserPreferences = {
   task_muted?: string[]
   /** Whether the board's Done section is open. Collapsed by default (AC-6.5). */
   task_done_expanded?: boolean
-  /** The focused project (`lib/focusedProject.ts`); null or absent = none. */
-  focused_project_id?: number | null
+  /** The board columns this user hid (Filter & view > Columns, `lib/taskColumns.ts`). */
+  task_hidden_columns?: string[]
 }
 
 // GET /api/users/{id} — the ManagedUser row plus audit timestamps and editable `preferences`.
-export type UserDetail = Provenance & {
-  id: string
-  email: string
+export type UserDetail = UserFacts & {
   /** Proven by an SSO sign-in; email notifications go only to such an address. Absent reads as unknown. */
   email_verified?: boolean
-  /** See `ManagedUser`: no `name` — the label is derived from the pair, else the email. */
-  description: string
-  first_name: string | null
-  last_name: string | null
-  is_superadmin: boolean
-  activated_at: string | null
-  /** When a superadmin disabled the account (it cannot sign in), or null while active. */
-  disabled_at: string | null
-  /** Who disabled it, as a display name; null while active. */
-  disabled_by: string | null
-  /** A confirmed TOTP factor exists. An admin's reset clears it; the user enrols again at next sign-in. */
-  mfa_enrolled: boolean
   /** Linked to an account at the org's SAML/OIDC identity provider (`UserOut.sso_linked`). Absent = no. */
   sso_linked?: boolean
   /** The operator's password-door override (`routes/users.py::UserOut`): null follows the role rule. */
@@ -2878,9 +2950,11 @@ export type UserDetail = Provenance & {
   password_door?: boolean
   /** The operator's second-factor exemption: set, sign-in asks for no code. */
   mfa_exempt?: boolean
+  /** This membership's console errors and stalls are reported to Audit > Client errors (`UserOut.client_telemetry`).
+   *  Absent reads as off. */
+  client_telemetry?: boolean
   created_at: string | null
   last_seen_at: string | null
-  memberships: Membership[]
   preferences: UserPreferences | null
   /** The credential this account's runners push with, or null — a common, valid state. A uuid
    *  string: never `Number()` it. Not optional: on `UserOut`, so a PATCH response re-seeds it. */
@@ -2888,19 +2962,6 @@ export type UserDetail = Provenance & {
   /* `effective_permission_keys`: the keys authorization uses. Optional: the list route returns the
      narrower `UserOut`. */
   effective_permission_keys?: string[]
-  /* Project ids this account can see under `projects:view` (all for a superadmin target), so the focused-
-     project dropdown offers the edited user's roster rather than the viewer's.
-     Optional: `PATCH /api/users/{id}` returns `UserOut` without it. `[]` is a real answer; `undefined`
-     says nothing — never default it (`UserEditPage`'s `UserPatchResponse` note); branch on
-     `=== undefined`. */
-  accessible_project_ids?: number[]
-  /* The events this user may see and set in their Alerts panel (`app/preferences.subscribable_events`).
-     Optional for `accessible_project_ids`' reason: a PATCH response is silent about it. */
-  notification_events?: string[]
-  /** See `ManagedUser`. */
-  org_id?: string | null
-  /** See `ManagedUser`. */
-  invitation_status?: 'pending' | 'declined' | null
 }
 
 // GET/PUT /api/settings — one live operator knob. `apps/api/app/operator_settings/` is the single home
@@ -2911,6 +2972,11 @@ export type OperatorSetting = {
   key: string
   label: string
   help: string
+  // The explanation pop-up (`Knob.more`/`choice_help`/`docs`): its paragraph, one effect line per choice (paired by
+  // position with `choices`), and a reader-docs route path. Absent on an older server's payload.
+  more?: string | null
+  choice_help?: string[] | null
+  docs?: string | null
   // Which tier owns the knob: `'operator'` (one fleet-wide value) or `'org'` (each tenant may override) —
   // `org > operator > env > default` (`app/operator_settings/`; wire field
   // `routes/settings.py::SettingKnobOut.tier`, the single home for why it is served). The tenant view
@@ -2963,7 +3029,7 @@ export type OperatorSetting = {
 
 // `PipelineTask.playbook` / `.playbook_stage` — `TaskOut`'s two playbook projections.
 export type TaskPlaybookRef = { id: string, name: string, simple: boolean }
-export type TaskPlaybookStage = {
+type TaskPlaybookStage = {
   key: string
   label: string
   expert: string
@@ -2987,7 +3053,7 @@ export type TaskCreateDefaults = {
 }
 
 // `TaskOut.memory_counts`: memory units per event kind (`project_memory.events.memory_counts`).
-export type MemoryCounts = {
+type MemoryCounts = {
   injected: number
   read: number
   cited: number
@@ -3016,46 +3082,6 @@ export type SettingsPayload = {
   // The viewer is a tenant Org Admin (not the operator): it may save the knobs marked `tenant_editable`, for
   // its own org (`SettingsOut.org_editable`). Absent reads as no.
   org_editable?: boolean
-}
-
-// GET /api/port-grid — one per-service range start. `name` is the `.env` var (`FRONTEND_PORT`); a row
-// makes the var tier 1 (deterministic from the slot number). Without a row it is tier 2, auto-assigned
-// between `auto_port_floor` and `auto_port_ceiling` — why deleting a row is safe
-// (`components/PortGridSection.tsx`). `projects` lists who declares it, resolved server-side.
-export type PortGridVar = {
-  id: string
-  name: string
-  // Always a string, `''` for none (`routes/port_grid.py::PortGridVarOut`).
-  description: string
-  range_start: number
-  projects: string[]
-  created_at: string | null
-  updated_at: string | null
-  // Resolved display names, joined through the actor id.
-  created_by: string | null
-  updated_by: string | null
-}
-
-// The GET /api/port-grid envelope: rows plus the five scalar grid knobs (also shown in the "Ports"
-// settings group under Nodes), carried so the window column and overlap check need no second fetch. `warnings` are
-// advisory: the rows are already saved — "saved, with warnings", never a rejected write.
-export type PortGridPayload = {
-  vars: PortGridVar[]
-  block_size: number
-  stride: number
-  window: number
-  auto_port_floor: number
-  auto_port_ceiling: number
-  warnings: string[]
-}
-
-// POST /api/port-grid/reband — one entry per node. Partial results are normal; render every entry.
-export type RebandResult = {
-  node_id: string
-  // An open string (`routes/port_grid.py::reband` passes unrecognised replies through). `'ok'` is the only
-  // success.
-  status: string
-  detail: string
 }
 
 // GET /api/tasks/{id}/control-messages (`routes/task_control_messages.py`): what reached the task's runner pane
@@ -3121,7 +3147,7 @@ export type TaskRunMetrics = {
 // One pricing row (`ModelPriceOut`, GET /api/model-prices). `name` is the canonical family (`opus`,
 // `sonnet`, `haiku`, `fable`) — the join key, collapsed server-side by
 // `app/model_prices.py::canonical_model`. Rates are $/MTok decimal strings (money, never floats).
-export type ModelPrice = {
+export type ModelPrice = EntityStamps & {
   id: string
   name: string
   description: string
@@ -3130,17 +3156,13 @@ export type ModelPrice = {
   cache_write_1h_per_mtok: string
   cache_read_per_mtok: string
   output_per_mtok: string
-  created_at: string | null
-  updated_at: string | null
-  created_by: string | null
-  updated_by: string | null
 }
 
 // ── Email templates ─────────────────────────────────────────────────────────
 // The operator's email template CONTENT (`app/routes/email_templates.py`); the layout and each type's field
 // set are code (`app/email_templates.py`), so a type is served, never created. `fields` is keyed by the
 // type's field keys, every key present (the server fills a missing one from its default).
-export type EmailTemplateField = {
+type EmailTemplateField = {
   key: string
   label: string
   default: string
@@ -3148,7 +3170,7 @@ export type EmailTemplateField = {
   required: boolean
 }
 
-export type EmailTemplatePlaceholder = { key: string; description: string }
+type EmailTemplatePlaceholder = { key: string; description: string }
 
 export type EmailTemplateType = {
   key: string
@@ -3160,17 +3182,13 @@ export type EmailTemplateType = {
   active_id: string | null
 }
 
-export type EmailTemplate = {
+export type EmailTemplate = EntityStamps & {
   id: string
   type: string
   name: string
   description: string
   fields: Record<string, string>
   is_active: boolean
-  created_at: string | null
-  updated_at: string | null
-  created_by: string | null
-  updated_by: string | null
 }
 
 // ── Task comments ────────────────────────────────────────────────────────────
@@ -3201,6 +3219,8 @@ export type TaskComment = {
   visibility?: 'public' | 'internal'
   /** The raw typed text; the micro-format is parsed at render. */
   body: string
+  /** Ticket comments, read for operators only: the author is support staff, so the requester is emailed the reply. */
+  author_is_staff?: boolean
   author_name: string
   author_is_me: boolean
   /** Whether the delete control is drawn; the route re-decides on the call. */
@@ -3232,7 +3252,7 @@ export type MentionCandidate = {
 }
 
 /** A running task the forecast offers to stop, lowest priority first. */
-export type PreemptCandidate = {
+type PreemptCandidate = {
   id: number
   title: string
   project_name: string
@@ -3265,4 +3285,46 @@ export type TrustedDevice = {
   last_used_at: string | null
   expires_at: string
   current: boolean
+}
+
+/** What a flagged console session reports (`client_events.kind`); the server 422s anything else. */
+export type ClientEventKind =
+  | 'render_error'
+  | 'chunk_error'
+  | 'stall'
+  | 'uncaught_error'
+  | 'page_load'
+  | 'navigation'
+  | 'slow_read'
+  | 'slow_write'
+
+/** `GET /api/client-events` — one reported console error or stall, newest first. `occurred_at` is the
+ *  browser's clock, `created_at` the server's. */
+export type ClientEvent = {
+  id: number
+  kind: ClientEventKind
+  org_id: string | null
+  org_name: string | null
+  user_id: string | null
+  user_email: string | null
+  route: string | null
+  message: string | null
+  detail: unknown
+  build_version: string | null
+  user_agent: string | null
+  client_ip: string | null
+  occurred_at: string | null
+  created_at: string
+}
+
+/** One keyset page; `next_before_id` is echoed back as `before_id`, null at the end. */
+export type ClientEventsPage = {
+  items: ClientEvent[]
+  next_before_id: number | null
+}
+
+/** `GET /api/client-events/flagged` — who reports now: orgs with the switch on, and flagged memberships. */
+export type FlaggedClients = {
+  orgs: { id: string; name: string }[]
+  users: { id: string; email: string; org_id: string | null; org_name: string | null }[]
 }

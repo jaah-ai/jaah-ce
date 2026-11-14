@@ -1,64 +1,12 @@
 // GENERATED from packages/editions/features.toml by tools/editions/edition_map.py — do not edit.
 /* The ce edition's features: guard a feature by its name (`isEnabled('<slug>')`). Import-free. */
 
-export type FeatureName =
-  | 'billing'
-  | 'hostings'
-  | 'cloud_nodes'
-  | 'node_groups'
-  | 'multi_node_hosts'
-  | 'nodelink'
-  | 'microvm'
-  | 'gha_runners'
-  | 'apt_self_upgrade'
-  | 'tailnet'
-  | 'node_log_archive'
-  | 'cpu_profiling'
-  | 'knowledge_base'
-  | 'support_assistant'
-  | 'site_chat'
-  | 'project_memory'
-  | 'full_doctrine'
-  | 'compliance'
-  | 'merge_lane'
-  | 'jaah_ai_credit'
-  | 'sso'
-  | 'scim'
-  | 'siem_export'
-  | 'tenant_mail'
-  | 'system_mail'
-  | 'data_residency'
-  | 'org_transfer'
-  | 'multi_org_tenancy'
-  | 'signup'
-  | 'users_invites'
-  | 'oauth_signin'
-  | 'forge_connect'
-  | 'event_triggers'
-  | 'slack'
-  | 'telegram'
-  | 'legal_acceptance'
-  | 'customers'
-  | 'control_plane_view'
-  | 'live_cast'
-  | 'operator_dashboard'
-  | 'model_prices'
-  | 'trust_center'
-  | 'site_enquiry'
-  | 'session_efficiency'
-  | 'aws'
-
-export const ENABLED: ReadonlySet<FeatureName> = new Set<FeatureName>()
-
-export function isEnabled(feature: FeatureName): boolean {
-  return ENABLED.has(feature)
-}
-
-export const LABELS: Readonly<Record<FeatureName, string>> = {
+export const LABELS = {
   billing: 'Billing and plans',
   hostings: 'Hostings',
   cloud_nodes: 'Cloud nodes',
   node_groups: 'Node groups',
+  placement_groups: 'Node groups',
   multi_node_hosts: 'Multi-Node Hosts',
   nodelink: 'NodeLink shared folders',
   microvm: 'MicroVM sessions',
@@ -92,6 +40,7 @@ export const LABELS: Readonly<Record<FeatureName, string>> = {
   telegram: 'Telegram',
   legal_acceptance: 'Terms acceptance',
   customers: 'Customers',
+  easy_mode_hosting: 'Easy Mode app hosting',
   control_plane_view: 'Control plane view',
   live_cast: 'Live Cast',
   operator_dashboard: 'Operator dashboard',
@@ -100,64 +49,29 @@ export const LABELS: Readonly<Record<FeatureName, string>> = {
   site_enquiry: 'Website enquiries',
   session_efficiency: 'Session efficiency',
   aws: 'Amazon Web Services',
-}
+  exec_dashboard: 'Command center',
+} as const satisfies Readonly<Record<string, string>>
+
+export type FeatureName = keyof typeof LABELS
+
+export type EditionName = 'cloud' | 'ce'
 
 /** Each edition's features, the map's columns (`test/edition.ts` switches editions with them). */
-export const BY_EDITION: Readonly<Record<string, ReadonlySet<FeatureName>>> = {
-  cloud: new Set<FeatureName>([
-      'billing',
-      'hostings',
-      'cloud_nodes',
-      'node_groups',
-      'multi_node_hosts',
-      'nodelink',
-      'microvm',
-      'gha_runners',
-      'apt_self_upgrade',
-      'tailnet',
-      'node_log_archive',
-      'cpu_profiling',
-      'knowledge_base',
-      'support_assistant',
-      'site_chat',
-      'project_memory',
-      'full_doctrine',
-      'compliance',
-      'merge_lane',
-      'jaah_ai_credit',
-      'sso',
-      'scim',
-      'siem_export',
-      'tenant_mail',
-      'system_mail',
-      'data_residency',
-      'org_transfer',
-      'multi_org_tenancy',
-      'signup',
-      'users_invites',
-      'oauth_signin',
-      'forge_connect',
-      'event_triggers',
-      'slack',
-      'telegram',
-      'legal_acceptance',
-      'customers',
-      'control_plane_view',
-      'live_cast',
-      'operator_dashboard',
-      'model_prices',
-      'trust_center',
-      'site_enquiry',
-      'session_efficiency',
-      'aws',
-  ]),
+export const BY_EDITION: Readonly<Record<EditionName, ReadonlySet<FeatureName>>> = {
+  cloud: new Set(Object.keys(LABELS) as FeatureName[]),
   ce: new Set<FeatureName>(),
+}
+
+export const ENABLED: ReadonlySet<FeatureName> = BY_EDITION['ce']
+
+export function isEnabled(feature: FeatureName): boolean {
+  return ENABLED.has(feature)
 }
 
 /** Each feature's console paths, which render the upsell in an edition without it (`test/edition.ts` derives an
  *  edition's `REMOVED_CONSOLE_ROUTES` from them). */
 export const CONSOLE_ROUTES: Readonly<Partial<Record<FeatureName, readonly string[]>>> = {
-  billing: ['/org/billing/*', '/org/plan', '/settings/billing', '/products/*'],
+  billing: ['/org/billing/*', '/settings/billing', '/products/*'],
   cloud_nodes: ['/nodes/*', '/networks', '/settings/nodes'],
   node_groups: ['/nodes/groups/*'],
   multi_node_hosts: ['/nodes/hosts/*', '/hosts/*'],
@@ -167,14 +81,13 @@ export const CONSOLE_ROUTES: Readonly<Partial<Record<FeatureName, readonly strin
   sso: ['/settings/sso'],
   scim: ['/settings/scim'],
   multi_org_tenancy: ['/settings/organizations'],
-  users_invites: ['/users/*', '/groups/*', '/access', '/requests'],
-  customers: ['/customers/*', '/clients/*', '/orgs/*'],
+  users_invites: ['/users/*', '/groups/*', '/access'],
+  customers: ['/customers/*'],
 }
 
 /** The console paths this edition renders as the upsell for the feature it lacks. */
 export const REMOVED_CONSOLE_ROUTES: readonly { path: string; feature: FeatureName }[] = [
   { path: '/org/billing/*', feature: 'billing' },
-  { path: '/org/plan', feature: 'billing' },
   { path: '/settings/billing', feature: 'billing' },
   { path: '/products/*', feature: 'billing' },
   { path: '/nodes/*', feature: 'cloud_nodes' },
@@ -193,8 +106,5 @@ export const REMOVED_CONSOLE_ROUTES: readonly { path: string; feature: FeatureNa
   { path: '/users/*', feature: 'users_invites' },
   { path: '/groups/*', feature: 'users_invites' },
   { path: '/access', feature: 'users_invites' },
-  { path: '/requests', feature: 'users_invites' },
   { path: '/customers/*', feature: 'customers' },
-  { path: '/clients/*', feature: 'customers' },
-  { path: '/orgs/*', feature: 'customers' },
 ]

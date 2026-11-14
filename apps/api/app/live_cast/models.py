@@ -9,8 +9,8 @@ the two viewer-activity tables are `Shared` — an anonymous viewer belongs to n
   across every org, and `featured`, the one project the bare `live.jaah.ai` opens.
 * `live_cast_items` — one task's verdict against the frozen rules, and an admin's override. A
   verdict counts only while its two shas are current (`app/live_cast/visibility.py`); an override counts until
-  an admin resets it, and nothing automatic ever writes one (NC-6) — save a merge lane run, filed Hidden
-  (`app/live_cast/state.py::hide_system_task`).
+  an admin resets it, and nothing automatic ever writes one (NC-6) — save a task the merge lane files, filed
+  Hidden (`app/live_cast/state.py::hide_system_task`).
 * `live_viewer_events` and `live_viewer_minutes` — Jaah's own measurement of the viewer
   (`app/live_analytics.py` writes and reads both): one row per page view, named action or console click, and one
   presence row per (minute, visitor, tab). A visitor is a random id the browser keeps; no IP and no raw User-Agent

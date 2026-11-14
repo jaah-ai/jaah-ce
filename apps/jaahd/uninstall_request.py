@@ -41,11 +41,7 @@ def request_uninstall(marker: Path | None = None) -> bool:
         log.info("uninstall-request: not on this node (virtual node, not Linux, or sandbox) — no request")
         return False
     target = marker_path() if marker is None else Path(marker)
-    try:
-        # `write_bytes(b"")`, not `touch()`: the marker must be EMPTY.
-        target.write_bytes(b"")
-    except OSError as exc:
-        log.warning("uninstall-request: could not create %s: %s", target, exc)
+    if not marker_request.write_empty(target, log, "uninstall-request"):
         return False
     log.info("uninstall-request: the control plane deleted this node — wrote %s for jaah-uninstall.path", target)
     return True

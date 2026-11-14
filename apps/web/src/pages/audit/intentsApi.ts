@@ -5,7 +5,7 @@
  * Computes and judges nothing: `state`, `age_seconds`, `withheld_seconds` and the refusal halves are
  * derived SERVER-side, since a skewed browser clock would misjudge due/withheld. */
 
-import { get } from '../../api'
+import { get, withQuery } from '../../api'
 
 /** The queue's two halves: one parameter because one server predicate splits them (`routes/nodes/intents.py`
  *  single-homes which outcomes retire a row). */
@@ -88,8 +88,10 @@ export type FleetIntentPage = {
 /** Filters; `''` equals absent, translated here so a blank `verb=` never goes on the wire. */
 export type FleetIntentFilters = {
   set: IntentSet
-  /** 1-based; omitted for the first page, so the first request is exactly `set=<set>&page=1`. */
+  /** 1-based; omitted for the first page, so the first request is exactly `set=<set>&page=1&per=50`. */
   page?: number
+  /** Rows per page (`hooks/useListPage`'s `per`); omitted, the server's default comes back on the envelope. */
+  per?: number
   verb?: string
   /** Retired set only; the server 422s `state`/`outcome` against the wrong half. */
   outcome?: string
@@ -101,15 +103,10 @@ export type FleetIntentFilters = {
   node?: string
 }
 
-/** The URL is built here so its first-load shape can be asserted; `per` is not sent, so the server's
- *  default comes back on the envelope. */
+/** The URL is built here so its first-load shape can be asserted. */
 export function listFleetIntents(filters: FleetIntentFilters) {
-  const params = new URLSearchParams({ set: filters.set })
-  params.set('page', String(filters.page ?? 1))
-  if (filters.verb) params.set('verb', filters.verb)
-  if (filters.outcome) params.set('outcome', filters.outcome)
-  if (filters.state) params.set('state', filters.state)
-  if (filters.refusing) params.set('refusing', 'true')
-  if (filters.node) params.set('node', filters.node)
-  return get<FleetIntentPage>(`/api/nodes/intents?${params}`)
+  return get<FleetIntentPage>(withQuery('/api/nodes/intents', {
+    set: filters.set, page: filters.page ?? 1, per: filters.per || undefined, verb: filters.verb, outcome: filters.outcome,
+    state: filters.state, refusing: filters.refusing, node: filters.node,
+  }))
 }

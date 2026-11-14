@@ -33,7 +33,7 @@ from app.dispatch_compose.role_tables import _CONSOLE_INTERVIEW, _NEVER_ASKS, _N
 from app.dispatch_compose.roles import _ROLES
 from app.dispatch_compose.system_prompt import apply_provider_values, resolve_provider
 from app.models.identity import AdminUser
-from app.persona_registry import PERSONA_CHARTER, REGISTRY
+from app.persona_registry import PERSONA_CHARTER, REGISTRY, TASK_CREATION_LICENCE
 from app.task_manifest import (
     ARTIFACT_KIND_LABELS,
     KIND_MEDIA,
@@ -152,14 +152,12 @@ class TerminalOut(BaseModel):
 
 
 class TaskCreationLicenceOut(BaseModel):
-    """The persona's authority to file work — a `persona_registry.TaskCreationLicence`, rendered.
-
-    Null on a persona holding no licence (nearly all; R30 makes creation a named licence).
-    """
+    """The persona's authority to file work — `persona_registry.TASK_CREATION_LICENCE`, rendered (every
+    persona holds the same one)."""
 
     #: The licence's `shapes`, sorted — a `frozenset`'s order is not stable across processes.
     shapes: list[str]
-    #: The licence's `constraint` verbatim — the sentence the server quotes when it refuses a call.
+    #: The licence's `constraint` verbatim — the bound in one sentence.
     constraint: str
 
 
@@ -197,7 +195,7 @@ class PersonaDetailOut(PersonaRow):
     manifest: list[ManifestRowOut]
     #: `Persona.terminals` joined to `TERMINAL_REFERENCES`, so the join lives in one place.
     terminals: list[TerminalOut]
-    #: `Persona.licence`, or null where the persona holds none.
+    #: `TASK_CREATION_LICENCE`; optional on the wire for older clients, never null today.
     task_creation_licence: Optional[TaskCreationLicenceOut]
     #: The role brief from `_ROLES[charter_key]`, ordered by `_ROLE_SECTION_ORDER`. An uncarried key is
     #: absent, never an empty section. Empty for a persona with no `_ROLES` entry.
@@ -304,7 +302,7 @@ def _row_out(name: str) -> dict[str, Any]:
 def _detail_out(name: str) -> PersonaDetailOut:
     """One persona's whole page: the record, plus the tables it joins to (read with `.get()`)."""
     p = REGISTRY[name]
-    licence = p.licence
+    licence = TASK_CREATION_LICENCE
     return PersonaDetailOut(
         **_row_out(name),
         settle_states=list(p.settle_states),
@@ -327,13 +325,7 @@ def _detail_out(name: str) -> PersonaDetailOut:
             TerminalOut(type=terminal, required_references=list(TERMINAL_REFERENCES.get(terminal, ())))
             for terminal in p.terminals
         ],
-        task_creation_licence=(
-            None
-            if licence is None
-            else TaskCreationLicenceOut(
-                shapes=sorted(licence.shapes), constraint=licence.constraint
-            )
-        ),
+        task_creation_licence=TaskCreationLicenceOut(shapes=sorted(licence.shapes), constraint=licence.constraint),
         role_sections=_role_sections(p.charter_key),
     )
 
@@ -343,7 +335,7 @@ def _detail_out(name: str) -> PersonaDetailOut:
 
 @router.get("", response_model=PersonasOut)
 @feature("tasks", "create")
-def list_personas(
+async def list_personas(
     _actor: AdminUser = Depends(require_user),
 ) -> PersonasOut:
     """Every dispatchable persona (`PERSONA_CHARTER`), in the registry's declaration order.
@@ -356,7 +348,7 @@ def list_personas(
 
 @router.get("/{name}", response_model=PersonaDetailOut)
 @feature("tasks", "create")
-def get_persona(
+async def get_persona(
     name: str,
     _actor: AdminUser = Depends(require_user),
 ) -> PersonaDetailOut:

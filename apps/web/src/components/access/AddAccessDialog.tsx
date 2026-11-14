@@ -2,15 +2,15 @@ import { useState } from 'react'
 import type { JSX } from 'react'
 import { Link as RouterLink } from 'react-router-dom'
 import Link from '@mui/material/Link'
-import ListItemText from '@mui/material/ListItemText'
-import MenuItem from '@mui/material/MenuItem'
-import TextField from '@mui/material/TextField'
 import { useSubmit } from '../../hooks/useSubmit'
+import type { LookupOption } from '../../ui/AsyncLookup'
+import AsyncMultiLookup from '../../ui/AsyncMultiLookup'
 import FormDialog from '../../ui/FormDialog'
-import HelpLabel from '../../ui/HelpLabel'
-import { DEFAULT_ROLE_SLUG, addBindings, rolesForScope } from './api'
+import FormField from '../../ui/FormField'
+import FormTextField from '../../ui/FormTextField'
+import SelectField from '../../ui/SelectField'
+import { addBindings, defaultRole, principalOf, rolesForScope, searchPrincipals, toLookupOption } from './api'
 import type { AccessRole, AccessScope, PickerEntry } from './api'
-import PrincipalMultiSelect from './PrincipalMultiSelect'
 import ScopePicker, { type ScopeOption } from './ScopePicker'
 
 // Who + Role + Expires, ONE `POST /api/access/bindings` for every principal (all or nothing). DM1: the
@@ -19,7 +19,16 @@ import ScopePicker, { type ScopeOption } from './ScopePicker'
 // Two modes, one write: a scope's Access tab fixes the scope and picks WHO; a principal's page (a group's
 // Bindings tab) fixes the principal and picks WHERE, the roles narrowing to what that scope carries.
 
-type ScopeMode = { scope: AccessScope; roles: AccessRole[] }
+/** `preset`: who the dialog is for, fixed (a member row's "Set project role": the roles are narrowed to them);
+ *  `title` names that act. */
+type ScopeMode = {
+  scope: AccessScope
+  roles: AccessRole[]
+  preset?: LookupOption[]
+  title?: string
+  /** Who only: the scope's first role, no Role or Expires (an account, where every role means "may use it"). */
+  whoOnly?: boolean
+}
 type PrincipalMode = {
   principal: PickerEntry
   /** Every role; narrowed here to the picked scope's type. */
@@ -37,11 +46,6 @@ const today = () => {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
 }
 
-/** Developer where the scope carries it, else the WEAKEST role on offer (the list is highest rank first):
- *  a default must never be the most powerful choice, e.g. Org Owner at org scope. */
-const defaultRole = (roles: AccessRole[]) =>
-  roles.find(r => r.slug === DEFAULT_ROLE_SLUG)?.slug ?? roles[roles.length - 1]?.slug ?? ''
-
 export function AddAccessDialog(props: (ScopeMode | PrincipalMode) & {
   onClose: () => void
   onAdded: () => Promise<void>
@@ -53,11 +57,14 @@ export function AddAccessDialog(props: (ScopeMode | PrincipalMode) & {
   const [picked, setPicked] = useState<ScopeOption | null>(null)
   const scope: AccessScope | null = 'scope' in props ? props.scope : picked && { type: picked.type, id: picked.id }
   const roles = 'scope' in props ? props.roles : scope ? rolesForScope(props.roles, scope.type) : []
-  const [principals, setPrincipals] = useState<PickerEntry[]>(() => (fixed ? [fixed] : []))
+  const [principals, setPrincipals] = useState<LookupOption[]>(
+    () => (fixed ? [toLookupOption(fixed)] : 'preset' in props && props.preset ? props.preset : []),
+  )
   const [role, setRole] = useState(() => defaultRole(roles))
   const [expires, setExpires] = useState('')
   const { busy, formError: error, run } = useSubmit()
-  const showExpiry = scope !== null && scope.type !== 'org'
+  const whoOnly = 'scope' in props && props.whoOnly === true
+  const showExpiry = scope !== null && scope.type !== 'org' && !whoOnly
 
   const pickScope = (next: ScopeOption | null) => {
     setPicked(next)
@@ -68,11 +75,11 @@ export function AddAccessDialog(props: (ScopeMode | PrincipalMode) & {
     }
   }
 
-  const submit = async (who: PickerEntry[]) => {
+  const submit = async (who: LookupOption[]) => {
     if (!who.length || !role || !scope) return
-    await run('Add failed', async () => {
+    await run('Grant failed', async () => {
       const body = {
-        principals: who.map(({ kind, id }) => ({ kind, id })),
+        principals: who.map(principalOf),
         role,
         scope,
         expires_at: showExpiry && expires ? endOfDay(expires) : null,
@@ -85,25 +92,37 @@ export function AddAccessDialog(props: (ScopeMode | PrincipalMode) & {
 
   return (
     <FormDialog
-      title="Add access"
-      submitLabel="Add"
-      busyLabel="Add"
+      testId="add-access-dialog"
+      title={('title' in props && props.title) || (whoOnly ? 'Add' : 'Grant access')}
+      submitLabel={whoOnly ? 'Add' : 'Grant'}
+      busyLabel={whoOnly ? 'Add' : 'Grant'}
       busy={busy}
       error={error}
       submitDisabled={!principals.length || !role || !scope}
       onSubmit={() => void submit(principals)}
       onClose={onClose}
     >
-      {'scope' in props ? (
+      {'scope' in props && props.preset?.length ? (
+        <FormTextField label="Who" value={props.preset.map(p => p.label).join(', ')} onChange={() => {}} readOnly />
+      ) : 'scope' in props ? (
         <>
-          <PrincipalMultiSelect
+          {/* Users and groups of the scope's org (`GET /api/access/principals`); the route takes no signal — the
+              lookup itself discards a superseded answer. */}
+          <AsyncMultiLookup
             key={`${props.scope.type}:${props.scope.id}`}
-            scope={props.scope}
+            id="add-access-who"
+            testId="principal-select"
+            fetchOnFocus
+            label="Who"
+            help="Members or groups; pick several."
             value={principals}
             onChange={setPrincipals}
+            fetchOptions={q => searchPrincipals(props.scope, q).then(rows => rows.map(toLookupOption))}
             onEnterComplete={who => void submit(who)}
+            stacked
             autoFocus
-            help="Members or groups; pick several."
+            /* An open list covers Grant: a pick closes it; typing or a click reopens it for the next. */
+            closeOnSelect
           />
           {/* The picker finds only the org's members; someone new is invited first (a new org has none). */}
           {props.scope.type === 'org' && (
@@ -121,30 +140,27 @@ export function AddAccessDialog(props: (ScopeMode | PrincipalMode) & {
           onChange={pickScope}
         />
       )}
-      <TextField
-        select
-        label={<HelpLabel label="Role" help="What they may do at this scope." />}
-        value={role}
-        disabled={!roles.length}
-        onChange={e => setRole(e.target.value)}
-        slotProps={{
-          select: { renderValue: slug => roles.find(r => r.slug === slug)?.name ?? '' },
-        }}
-      >
-        {roles.map(r => (
-          <MenuItem key={r.slug} value={r.slug}>
-            <ListItemText primary={r.name} secondary={r.description} />
-          </MenuItem>
-        ))}
-      </TextField>
+      {/* Each role's description, once its option's second line, is a line of the label's pop-up. */}
+      {!whoOnly && (
+        <FormField label="Role" help="What they may do at this scope."
+          choices={roles.flatMap(r => (r.description ? [{ label: r.name, help: r.description }] : []))}>
+          <SelectField
+            value={role}
+            disabled={!roles.length}
+            onChange={setRole}
+            options={roles.map(r => ({ value: r.slug, label: r.name }))}
+          />
+        </FormField>
+      )}
       {showExpiry && (
-        <TextField
+        <FormTextField
           type="date"
-          label={<HelpLabel label="Expires" help="Access ends after this day; blank never expires." />}
+          label="Expires"
+          help="Access ends after this day; blank never expires."
           value={expires}
-          onChange={e => setExpires(e.target.value)}
-          helperText={expires ? undefined : 'Never'}
-          slotProps={{ inputLabel: { shrink: true }, htmlInput: { min: today() } }}
+          onChange={setExpires}
+          hint={expires ? undefined : 'Never'}
+          slotProps={{ htmlInput: { min: today() } }}
         />
       )}
     </FormDialog>

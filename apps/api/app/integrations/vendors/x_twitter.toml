@@ -1,0 +1,45 @@
+# X (Twitter) API v2 with an app-only bearer token. Every read is billed per resource on pay-per-use pricing, so the
+# Test is a format check (architecture §3.2). X documents the bearer token as "a byte array of unspecified format":
+# the pattern accepts the URL-safe characters such tokens are made of and refuses a pasted "Bearer " prefix or spaces.
+# Confirmed 2026-11-03 at the vendor_docs_url page and https://docs.x.com/x-api/getting-started/pricing.
+slug = "x_twitter"
+label = "X (Twitter)"
+category = "marketing"
+vendor_docs_url = "https://docs.x.com/fundamentals/authentication/oauth-2-0/bearer-tokens"
+summary = "Search and read public posts, users and trends on X with your app's bearer token."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "bearer_token", label = "Bearer token", kind = "secret", required = true, help = "console.x.com (developer portal) > Projects & Apps > your app > Keys and tokens > Bearer Token > Generate (or Regenerate). X shows it once; copy it straight away" },
+]
+
+[test]
+kind = "format"
+patterns = { bearer_token = "[A-Za-z0-9%._~+/=-]{40,}" }
+
+[docs]
+agent_uses = [
+  "Search recent public posts for a keyword, hashtag or mention",
+  "Look up a user's profile and their recent public posts",
+  "Count posts over time for a topic to spot a spike after a launch",
+]
+prerequisites = [
+  "An X developer account with a Project and an App (console.x.com)",
+  "Credit or a plan on the developer account: X bills every read on pay-per-use pricing",
+]
+limitations = [
+  "Jaah's Test checks only the token's shape and does not call X, because X bills every read. The first real check is an agent's first call",
+  "An app-only bearer token reads public data only. Agents cannot post, like, follow or read direct messages with it",
+  "X applies per-endpoint rate limits and a monthly cap on posts read; a busy agent can hit them and must wait",
+]
+troubleshooting = [
+  { symptom = "Test says Bearer token is not in the format X (Twitter) uses", fix = "Paste the token alone, without the word Bearer, spaces or quotes. Regenerate it under Keys and tokens if you no longer have it" },
+  { symptom = "An agent gets 401 Unauthorized although the format check passed", fix = "The token was regenerated or the app was deleted. Generate a new bearer token and select Replace on the secret" },
+  { symptom = "An agent gets 402 or a CreditsDepleted error", fix = "The developer account has no credit left. Add credit or a plan in the developer console" },
+  { symptom = "An agent gets 429 Too Many Requests", fix = "The endpoint's rate limit for the app is spent. Wait for the window shown in the x-rate-limit-reset header" },
+]
+faq = [
+  { q = "Why is the Test only a format check", a = "Every X API read is billed, so testing on each save would cost money. The format check catches typos; the first agent call proves the token" },
+  { q = "Can agents post as our account", a = "Not with a bearer token. Posting needs user-context OAuth, which this connection does not use" },
+]

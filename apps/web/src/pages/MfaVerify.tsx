@@ -8,6 +8,8 @@ import Typography from '@mui/material/Typography'
 import { type Admin, type MfaStage, mfaPath, useAuth } from '../auth'
 import { ApiError, apiDetail, get, post } from '../api'
 import { useSubmit } from '../hooks/useSubmit'
+import { countOf } from '../lib/humanize'
+import { FONT_WEIGHT } from '../theme'
 import Banner from '../ui/Banner'
 import FormTextField from '../ui/FormTextField'
 import { EntryCard, EntryFooter, EntryHeading, EntryLoading, EntrySubmit, footerActionSx, submitSx, tapFloorInput } from './authEntry'
@@ -153,19 +155,19 @@ export function TrustDeviceCheckbox({
   return (
     <FormControlLabel
       // Pulls the box's padding back so its edge sits on the field's left edge.
-      sx={{ ml: '-0.5rem', mr: 0, alignSelf: 'flex-start' }}
+      sx={{ ml: -1, mr: 0, alignSelf: 'flex-start' }}
       control={
         <Checkbox
           id="mfa-remember-device"
           checked={checked}
           disabled={disabled}
           onChange={e => onChange(e.target.checked)}
-          sx={t => ({ p: '0.5rem', minWidth: t.custom.tapTargetPx, minHeight: t.custom.tapTargetPx })}
+          sx={t => ({ p: 1, minWidth: t.custom.tapTargetPx, minHeight: t.custom.tapTargetPx })}
         />
       }
       label={
         <Typography component="span" variant="body2">
-          Trust this device for {days} {days === 1 ? 'day' : 'days'}
+          Trust this device for {countOf(days, 'day')}
         </Typography>
       }
     />
@@ -211,7 +213,7 @@ export default function MfaVerify() {
     <EntryCard onSubmit={handleSubmit}>
       <EntryHeading title="Two-factor sign-in">
         {useRecovery ? 'Enter a recovery code for ' : 'Enter the code from your authenticator app for '}
-        <Box component="span" sx={{ color: 'text.primary', fontWeight: 500 }}>
+        <Box component="span" sx={{ color: 'text.primary', fontWeight: FONT_WEIGHT.medium }}>
           {pending.email}
         </Box>
       </EntryHeading>

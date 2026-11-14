@@ -1,0 +1,48 @@
+slug = "jaah"
+label = "Jaah"
+category = "dev_tools"
+vendor_docs_url = "https://datatracker.ietf.org/doc/html/rfc6750"
+summary = "Lets agents call a Jaah control plane's API with a Jaah API key: tasks, projects, nodes and secrets."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "base_url", label = "URL", kind = "url", required = true, placeholder = "https://console.example.com", help = "The console's address, without a path. A new secret starts with the console you are using" },
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "A Jaah API key: Settings > API keys > New key, shown once. It starts with jaah_" },
+  { key = "key_id", label = "Key", kind = "text", required = false, help = "Filled by the form: the id of the API key the secret holds, so the key can be found in Settings > API keys" },
+]
+
+[test]
+method = "GET"
+path = "{base_url}/api/auth/me"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+identity = [["email"]]
+
+[docs]
+agent_uses = [
+  "Create, read and update tasks and epics, and comment on them",
+  "Read projects, nodes and worktrees to plan or report on work",
+  "Start automations and schedules, and read what they did",
+  "Reach another Jaah control plane, such as a separate organization or a self-hosted console",
+]
+prerequisites = [
+  "A Jaah account in the organization: every member can hold Jaah API keys",
+  "To create the key from this form: nothing else - choose New and Save makes a key with every permission you hold and no expiry",
+  "To use a key you already have: its secret, copied when it was created or last rotated",
+]
+limitations = [
+  "A key acts as the person who made it, narrowed to the permissions ticked on it: work agents do is attributed to that person",
+  "A key stops working when it is revoked or expires, or when its owner is disabled. It never does more than its owner can",
+  "Keys never reach the routes that manage keys, sessions or sign-in, nor streams and WebSockets",
+  "New is offered only for the console you are using: for another console, make the key there and paste it",
+]
+troubleshooting = [
+  { symptom = "Test says Jaah rejected the API key (401)", fix = "The key was revoked, expired, rotated without overlap, or its owner is disabled. Make a new key in Settings > API keys and paste it, or choose New" },
+  { symptom = "Test says Jaah rejected the API key (403)", fix = "The request came from an address outside the key's IP allowlist or the organization's. Add the control plane's address to the allowlist, or clear the key's allowlist" },
+  { symptom = "Test says Jaah returned HTTP 404", fix = "The URL includes a path. Enter only the console's address, such as https://console.example.com" },
+]
+faq = [
+  { q = "Which person do agents act as", a = "The key's owner: the person who created it. Make the key from a dedicated account if you want agents' work attributed separately" },
+  { q = "What does New create", a = "A key named after the secret, with every permission its owner holds, Org administration off and no expiry. It is listed in Settings > API keys, where it can be edited or revoked" },
+  { q = "Does the key expire", a = "A key made by New does not. A key made in Settings > API keys lasts until the expiry chosen there" },
+]

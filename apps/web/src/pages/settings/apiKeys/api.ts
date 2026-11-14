@@ -51,7 +51,6 @@ export type ApiKeyUpdateBody = Partial<KeyGrants & { name: string; description: 
 
 export type RotateOverlap = 'none' | '1h' | '24h' | '7d'
 
-export const API_KEYS_KEY = ['api-keys'] as const
 export const API_KEYS_URL = '/settings/api-keys'
 export const NEW_API_KEY_URL = `${API_KEYS_URL}/new`
 export const apiKeyUrl = (id: string) => `${API_KEYS_URL}/${encodeURIComponent(id)}`

@@ -3,6 +3,7 @@ import { get } from '../api'
 import type { NodeRecord } from '../types'
 import { useEventStream } from './useEventStream'
 import { useStreamedQuery } from './useStreamedQuery'
+import { STREAM_DOWN_POLL_MS } from './useLiveRefetch'
 
 /* The roster (`GET /api/nodes`, a `nodes:view` read — `apps/api/app/routes/nodes/reads.py::list_nodes`) under ONE
    key, so every surface naming a node serves it from the same cache: a slot's label, the audit filter, a
@@ -13,11 +14,10 @@ import { useStreamedQuery } from './useStreamedQuery'
    gets a terminal empty roster rather than a spinner or a 403 per event and poll. */
 export const NODES_KEY = ['nodes-list']
 export const listNodes = () => get<NodeRecord[]>('/api/nodes')
-const POLL_MS = 30_000
 
 export function useNodesRoster(enabled = true) {
   const stream = useEventStream()
-  return useStreamedQuery(stream, { pollMs: POLL_MS, entity: 'node' }, { queryKey: NODES_KEY, queryFn: listNodes, enabled })
+  return useStreamedQuery(stream, { pollMs: STREAM_DOWN_POLL_MS, entity: 'node' }, { queryKey: NODES_KEY, queryFn: listNodes, enabled })
 }
 
 /* The nodes a picker may offer to take work: every one but a Multi-Node Host, which runs none
@@ -25,8 +25,8 @@ export function useNodesRoster(enabled = true) {
 export const workNodes = (nodes: readonly NodeRecord[]): NodeRecord[] =>
   nodes.filter(n => n.hosting !== 'multi_node_host')
 
-/* The same roster, busiest first (`?order=activity`, `apps/api/app/activity_rank.py`): what a create wizard
-   pre-picks from (`lib/topPicks.ts`). Under `NODES_KEY`, so a roster invalidation refetches it too; not live. */
+/* The same roster, busiest first (`?order=activity`, `apps/api/app/activity_rank.py`): the order New project
+   names the nodes it places on. Under `NODES_KEY`, so a roster invalidation refetches it too; not live. */
 export function useNodesByActivity(enabled = true) {
   return useQuery({
     queryKey: [...NODES_KEY, 'activity'],

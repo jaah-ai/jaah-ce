@@ -14,8 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 from app import (
     agent_runs,
@@ -26,11 +25,13 @@ from app import (
     forges,
     notify_targets,
     org_names,
+    task_done_notice,
     task_pipeline,
     user_activity,
 )
+from app.clock import utcnow
 from app.operator_settings import reads as settings_reads
-from app.db import SessionLocal
+from app.db import BridgedSession
 from app.durable import notify_outbox
 from sqlalchemy import func, select
 
@@ -268,7 +269,7 @@ def _is_interactive_chat(task_id: int) -> bool:
     # Deferred: `app.routes.tasks` pulls the routes layer into DB-free suites.
     from app.persona_registry import DONE_CRITERION_OPERATOR, PERSONA_DONE_CRITERION
 
-    session = SessionLocal()
+    session = BridgedSession()
     try:
         task = session.get(Task, task_id)
         if task is None:
@@ -317,7 +318,7 @@ def _announce_question_round(task_id: int, question_id: int) -> None:
         stamps.release(round_stamp)
         stamps.release(attention_stamp)
 
-    session = SessionLocal()
+    session = BridgedSession()
     try:
         task = session.get(Task, task_id)
         if task is None:
@@ -406,7 +407,7 @@ def _announce_assignment(task_id: int, *, assignee_id, assigned_by_id) -> None:
         log.debug("task-notify: task %s assignment names nobody else — no card", task_id)
         return
 
-    session = SessionLocal()
+    session = BridgedSession()
     try:
         task = session.get(Task, task_id)
         if task is None:
@@ -437,60 +438,29 @@ def _announce_assignment(task_id: int, *, assignee_id, assigned_by_id) -> None:
     _record_alert_in_new_session(built)
 
 
-# ── An SDK agent's own message to its task's channel ──────────────────────────────────────────────────
-# The alert kind (`alert_relay.ALERT_KINDS`, CP-only) and the cap the `notify` route enforces, counted off the
-# kind's own `alerts` rows: one hour, per task, with no table of its own.
-AGENT_MESSAGE_KIND = "agent-message"
+# ── An agent's message to named members (`routes/agent_org.py::notify_org`) ────────────────────────────
+# Its alert kind and catalog event (`notification_catalog`, group "Messages"), and the cap both agent message doors
+# enforce, counted off the kind's own `alerts` rows: one hour, per task, with no table of its own. The task-scoped
+# `notify` (`routes/agent_sdk.py`) is no notification (PRD R9): it writes no row and spends nothing, but still
+# answers 429 past the cap.
+ORG_NOTIFY_EVENT = "message"
 AGENT_MESSAGE_MAX_CHARS = 2000
 AGENT_MESSAGES_PER_HOUR = 30
 
 
 def agent_messages_last_hour(session, task_id: int) -> int:
-    """How many messages task `task_id`'s agent has posted in the last hour: its `agent-message` alert rows.
+    """How many messages task `task_id`'s agent has posted in the last hour: its `agent_message` Activity notes, which
+    both doors write once per post (the org door to named members, `POST …/notify` to nobody)."""
+    from app.models.audit import ActivityEvent
 
-    A withdrawn row (nothing reached anyone) is not counted, so a muted or failed post does not spend the cap."""
-    since = datetime.now(timezone.utc) - timedelta(hours=1)
+    since = utcnow() - timedelta(hours=1)
     return session.scalar(
-        select(func.count()).select_from(Alert).where(
-            Alert.kind == AGENT_MESSAGE_KIND, Alert.task_id == task_id, Alert.created_at >= since,
+        select(func.count()).select_from(ActivityEvent).where(
+            ActivityEvent.kind == "task_note:agent_message",
+            ActivityEvent.data["id"].as_integer() == task_id,
+            ActivityEvent.created_at >= since,
         )
     ) or 0
-
-
-def announce_agent_message(task_id: int, message: str) -> None:
-    """Post an SDK agent's informational `message` to its task's channel: one `alerts` row (the console's
-    record) relayed to the task's addressee like any task alert, headed by the agent's display name
-    (`payload["actor"]`: "Acme Bot posted").
-
-    Best-effort, like every leg here: a Slack outage never fails the agent's call, so every failure is
-    logged and swallowed. Runs off the request (the route queues it), on sessions of its own."""
-    try:
-        _announce_agent_message(task_id, message)
-    except Exception:
-        log.exception("task-notify: posting an agent message for task %s failed — nothing was sent", task_id)
-
-
-def _announce_agent_message(task_id: int, message: str) -> None:
-    node_id = resolve_node_id()
-    if not node_id:
-        log.debug("task-notify: NODE_ID unset — no agent message for task %s", task_id)
-        return
-    session = SessionLocal()
-    try:
-        task = session.get(Task, task_id)
-        if task is None:
-            return
-        built = build_task_notify_event(
-            task, session.get(Project, task.project_id), node_id, AGENT_MESSAGE_KIND, reason_body=message,
-            org=org_names.org_name(session, task.org_id),
-        )
-        # Tenant prose reaching an mrkdwn field: escaped so `<!channel>` cannot ping (`comment_notify`'s recipe).
-        built["payload"]["question_body"] = alert_relay.inert_mrkdwn(message)
-        built["payload"]["actor"] = agent_runs.run_agent_name(task) or "Agent"
-    finally:
-        session.close()
-    # A fresh `issue` per message: `uq_alerts_dedup` would otherwise fold every post in a 300s window into one.
-    _record_alert_in_new_session({**built, "issue": f"{AGENT_MESSAGE_KIND}-{uuid.uuid4().hex[:12]}"})
 
 
 def _deliver_task_transition(event: dict) -> None:
@@ -509,21 +479,21 @@ def _deliver_task_transition(event: dict) -> None:
     def _load_and_build() -> dict | None:
         """The DB half, as a blocking call, kept off the event loop.
 
-        Opening a session inline on the single uvicorn loop blocks it for the whole `pool_timeout` under a
+        Opening a session inline on the single serving loop blocks it for the whole `pool_timeout` under a
         saturated pool, starving `GET /api/health`. `None` means "nothing to announce"."""
         # Deferred: `app.routes.tasks` pulls the routes layer into DB-free suites. The criterion map is a
         # persona fact single-homed in `routes/tasks/`.
         from app.persona_registry import DONE_CRITERION_OPERATOR, PERSONA_DONE_CRITERION
 
-        session = SessionLocal()
+        session = BridgedSession()
         try:
             task = session.get(Task, event["id"])
             if task is None:
                 return None
             # An interactive row's human is already at the console. A chat (`DONE_CRITERION_OPERATOR`, not an
             # `advisor` literal) parks `awaiting_response` at every turn, so an alert would be noise per turn.
-            # Before the claim so nothing is burned; `routes/agent/task_reads.py::agent_list_needs_attention` excludes the
-            # same personas, so no backstop waits on it. Narrowed to `awaiting_response`: a chat's `system_failed`
+            # Before the claim so nothing is burned; `task_pipeline_cp.list_needs_attention` excludes the same
+            # personas, so no backstop waits on it. Narrowed to `awaiting_response`: a chat's `system_failed`
             # must still be announced, or a dead chat is announced nowhere. Keyed off the loaded `task.state`.
             if (
                 PERSONA_DONE_CRITERION.get(task.persona) == DONE_CRITERION_OPERATOR
@@ -600,23 +570,33 @@ def _deliver_done_transition(event: dict) -> None:
     train the recipient to mute the channel; the epic's own `done` is announced once. Visible only: a
     hidden Runner-cron row is scheduled maintenance.
 
-    Best-effort; `notify_targets.resolve_slack_target(..., done=True)` narrows the audience to the
-    creator, and with none `alert_record` relays nothing rather than falling to the shared chat."""
+    Owed only: a task filed with `notify_when_done` off sends nothing (`app/task_done_notice.py` holds the rules).
+
+    Best-effort; `notify_targets.resolve_slack_targets(..., done=True)` narrows the card's audience to the
+    assignee (else a human-filed task's creator), and with none `alert_record` relays nothing rather than falling
+    to the shared chat. A human-filed task's creator, when not the card's addressee, is told on their own channels
+    (`_tell_creator`) under the same one-shot claim."""
     # Gated before any DB load so a synthetic `done` never DMs a real person.
     node_id = _emitting_node_id("no shipped card for task", event.get("id"))
     if node_id is None:
         return
 
-    def _load_and_build() -> tuple[int, dict] | None:
+    def _load_and_build() -> tuple[int, dict, object] | None:
         """The DB half, as a blocking call, kept off the event loop (same rule as the transition leg).
 
-        `None` means "nothing to announce" (the four early exits here). The task id rides back because the
-        claim key needs it and the ORM instance must not outlive the session."""
-        session = SessionLocal()
+        `None` means "nothing to announce" (the five early exits here). The task id rides back because the
+        claim key needs it and the ORM instance must not outlive the session; so does the creator a human-filed
+        task also owes the notice to."""
+        session = BridgedSession()
         try:
             task = session.get(Task, event["id"])
             if task is None:
                 # Deleted since the emitting commit; nothing claimed yet.
+                return None
+            if not task.notify_when_done:
+                # Filed with the notice off (an automation's or agent's work by default). Before the claim, so a
+                # later toggle-on and re-ship still announces. Debug: most machine-filed rows pass here.
+                log.debug("task-notify: task %s has notify_when_done off — no shipped card", task.id)
                 return None
             if task.hidden:
                 # A hidden row sends no shipped card (this leg only; blocked/failed alerts still announce hidden
@@ -639,6 +619,9 @@ def _deliver_done_transition(event: dict) -> None:
                          "no card, and the claim stays unarmed for the real shipment", task.id, task.state)
                 return None
             task_id = task.id
+            creator_id = (
+                task.created_by_id if task_done_notice.human_filed(task.source, task.persona) else None
+            )
             project = session.get(Project, task.project_id)
             # Empty on purpose: `None` falls back to `task.awaiting_response_body`, which a park writes and an
             # answer never clears, so a once-blocked task would ship with a stale question.
@@ -648,12 +631,12 @@ def _deliver_done_transition(event: dict) -> None:
             )
         finally:
             session.close()
-        return task_id, built
+        return task_id, built, creator_id
 
     loaded = _load_and_build()
     if loaded is None:
         return
-    task_id, built = loaded
+    task_id, built, creator_id = loaded
 
     # One card per task, ever. Claimed before the alert so two events for one task cannot both send.
     # Its own family, never `needs-attention` (see `done_stamp_key`).
@@ -683,12 +666,50 @@ def _deliver_done_transition(event: dict) -> None:
         or getattr(outcome, "recipient_misconfigured", False)
     ):
         stamps.release(stamp)
+        # A misconfigured addressee is final for this family (never re-armed), so the creator is told now or never;
+        # a failed relay or a dedup hit is retried, and the creator hears on the retry that keeps the claim.
+        if creator_id is not None and getattr(outcome, "recipient_misconfigured", False):
+            _tell_creator(task_id, creator_id, built)
+        return
+    # Only once the claim is kept: a released one is retried, and the creator must not hear twice.
+    if creator_id is not None:
+        _tell_creator(task_id, creator_id, built)
+
+
+def _tell_creator(task_id: int, creator_id, built: dict) -> None:
+    """Tell a human-filed task's creator it shipped, on their own channels (`user_notify.deliver`), unless they are
+    the card's addressee already (`notify_targets._task_addressee`) or may no longer read it. Never raises: the card
+    has gone, and its claim is kept."""
+    from app import user_notify
+    from app.models.identity import AdminUser
+
+    session = BridgedSession()
+    try:
+        creator = session.get(AdminUser, creator_id)
+        if creator is None or creator.is_system:
+            return
+        addressee = notify_targets._task_addressee(session, task_id)
+        if addressee is not None and addressee.id == creator.id:
+            return
+        if not notify_targets.may_read_task(session, creator, task_id):
+            log.info("task-notify: task %s's creator may no longer read it — not told it shipped", task_id)
+            return
+        notice = alert_relay.message(
+            "done", built.get("reason"), repo=built.get("repo"), test=bool(built.get("test")), task_id=task_id,
+            payload=dict(built.get("payload") or {}),
+        )
+        user_notify.deliver(session, creator, notice, event_name="done")
+        session.commit()
+    except Exception:
+        log.exception("task-notify: could not tell task %s's creator it shipped", task_id)
+    finally:
+        session.close()
 
 
 def _note_claim_held(task_id, kind: str) -> None:
     """A second event found this entry's claim held: an earlier attempt sent it, or deliberately did not (a mute,
     no recipient), and either way owns it. Its `task_note:notification` row says so; the earlier row says which."""
-    session = SessionLocal()
+    session = BridgedSession()
     try:
         _note_delivery(session, task_id, kind, "not_sent", "an earlier attempt handled it")
     finally:
@@ -701,7 +722,7 @@ def _record_alert_in_new_session(fields: dict) -> "alert_record.AlertOutcome":
 
     Blocking (a urllib POST inside `record_alert`), so the caller hops it off the event loop.
     Best-effort: `record_alert` swallows delivery faults and the teardown is guarded."""
-    session = SessionLocal()
+    session = BridgedSession()
     try:
         outcome = alert_record.record_alert(session, **fields)
         # Returned so the caller can release its needs-attention claim on a delivery failure.
@@ -711,15 +732,13 @@ def _record_alert_in_new_session(fields: dict) -> "alert_record.AlertOutcome":
                 "channel (relay failed; the dedup row was withdrawn so a retry is not suppressed)",
                 fields.get("kind"), fields.get("repo"), (fields.get("payload") or {}).get("task_id"),
             )
-        if fields.get("kind") != AGENT_MESSAGE_KIND:
-            # An agent's own post already has its row (`task_note:agent_message`).
-            try:
-                result, why = delivery_outcome(outcome, queued=not notify_outbox.in_workflow())
-            except Exception:
-                # A malformed outcome (a test double) must never fail the notifier it describes.
-                log.exception("task-notify: unreadable outcome for kind=%s", fields.get("kind"))
-            else:
-                _note_delivery(session, (fields.get("payload") or {}).get("task_id"), fields.get("kind"), result, why)
+        try:
+            result, why = delivery_outcome(outcome, queued=not notify_outbox.in_workflow())
+        except Exception:
+            # A malformed outcome (a test double) must never fail the notifier it describes.
+            log.exception("task-notify: unreadable outcome for kind=%s", fields.get("kind"))
+        else:
+            _note_delivery(session, (fields.get("payload") or {}).get("task_id"), fields.get("kind"), result, why)
         return outcome
     finally:
         session.close()
@@ -734,6 +753,11 @@ NOTE_ACTION = "notification"
 #: `UNROUTED_KIND`, outside the `task_note:` namespace the task feed reads.
 NO_ROUTE = "no recipient or channel"
 UNROUTED_KIND = "notification_unrouted"
+#: An addressee Jaah cannot reach (`AlertOutcome.recipient_misconfigured`: their Slack, email or Telegram link is
+#: missing or wrong): what failed, then the two places a person fixes it — the recipient's own alert links, or the
+#: org's connections.
+RECIPIENT_UNREACHABLE = ("Jaah could not reach the recipient. Check their alert settings under Profile › Alerts"
+                     " and the org's connections in Settings")
 _CHANNEL_NAMES = {"slack": "Slack", "slack_channel": "the Slack operator channel", "email": "email",
                   "telegram": "Telegram"}
 
@@ -751,7 +775,7 @@ def delivery_outcome(outcome: "alert_record.AlertOutcome", *, queued: bool = Fal
     if outcome.relay_failed:
         return "not_sent", "the provider refused it"
     if outcome.recipient_misconfigured:
-        return "not_sent", "the recipient's Slack is unusable"
+        return "not_sent", RECIPIENT_UNREACHABLE
     if outcome.batch_follow_on:
         return "not_sent", "brief: the batch's first question was sent"
     return "not_sent", NO_ROUTE

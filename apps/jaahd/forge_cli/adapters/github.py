@@ -5,11 +5,12 @@ import urllib.parse
 
 import dataclasses
 import re
+import time
 
-from ..model import (AlreadyMergeable, Annotation, Check, ForgeError, Job, PullRequest, Run, is_advisory, is_id,
-                     rollup)
-from .base import (MAX_DIFF_FILES, MAX_PR_COMMITS, PAGE_MAX, TRUNCATED, Adapter, capped, commit, diff_stats, every,
-                   pr_item, provenance, take)
+from .. import sealed_box
+from ..model import AlreadyMergeable, Annotation, Check, ForgeError, Job, PullRequest, Run, is_advisory, is_id, rollup
+from .base import (MAX_DIFF_FILES, MAX_MERGED_FILES, MAX_PAGES, MAX_PR_COMMITS, PAGE_MAX, TRUNCATED, Adapter, Started,
+                   capped, commit, diff_stats, every, merged_item, newest_merged, parse_time, pr_item, provenance, take)
 
 _PR_FIELDS = """id number url state isDraft mergeStateStatus reviewDecision headRefName baseRefName headRefOid
 autoMergeRequest{enabledAt} commits(last:1){nodes{commit{statusCheckRollup{state%s}}}}"""
@@ -31,6 +32,9 @@ _AUTO_MERGE = """mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequest
 pullRequest{number}}}"""
 _DISABLE_AUTO_MERGE = "mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id}){pullRequest{number}}}"
 _READY = "mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{number}}}"
+#: A just-dispatched run's row can 404 for a few seconds (`_new_run_row`): re-read this many times, this far apart.
+DISPATCH_READ_TRIES = 6
+DISPATCH_READ_PAUSE_S = 2.0
 # GitHub will not ARM auto-merge on a PR that can merge now: "Pull request is in clean status".
 _MERGEABLE_NOW = re.compile(r"\bis in (?:clean|unstable|has_hooks) status\b", re.IGNORECASE)
 # A repository with "Allow auto-merge" off (GitHub's default), or a base with no branch protection, refuses
@@ -133,22 +137,12 @@ def _run(row: dict) -> Run:
 
 
 class GitHub(Adapter):
-    @property
-    def _repo(self) -> str:
-        return f"repos/{self.login.repo_path}"
+    def _create_payload(self, title, body, head, base, draft):
+        return {"title": title, "body": body, "head": head, "base": base, "draft": draft}
 
-    def create(self, *, title, body, head, base, draft):
-        data = self.client.json("POST", f"{self._repo}/pulls",
-                                json_body={"title": title, "body": body, "head": head, "base": base, "draft": draft})
-        return self.view(int(data["number"]))
-
-    def find(self, head):
+    def _find_rows(self, head):
         owner = self.login.repo_path.split("/", 1)[0]
-        rows = self.client.get(f"{self._repo}/pulls",
-                               params={"head": f"{owner}:{head}", "state": "all", "per_page": 1})
-        if not rows:
-            raise ForgeError(f"no GitHub PR from branch '{head}'")
-        return int(rows[0]["number"])
+        return self.client.get(self._pr_path(), params={"head": f"{owner}:{head}", "state": "all", "per_page": 1})
 
     def view(self, number, ignore=frozenset()):
         owner, name = self.login.repo_path.split("/", 1)
@@ -191,17 +185,6 @@ class GitHub(Adapter):
         return [pr_item(_pull_request(n), n.get("title") or "", (n.get("author") or {}).get("login") or "")
                 for n in take(pages(), limit, mine)]
 
-    def _pages(self, path: str, key: "str | None", params: dict, per_page: int):
-        """REST pages of `path` (its `key` array, or the answer itself), until a short page ends them."""
-        page = 1
-        while True:
-            data = self.client.get(path, params={**params, "per_page": per_page, "page": page})
-            rows = (data.get(key) if key else data) or []
-            yield rows
-            if len(rows) < per_page:
-                return
-            page += 1
-
     def runs(self, workflow, branch, limit):
         if workflow is None:
             path = f"{self._repo}/actions/runs"  # every workflow's runs
@@ -209,20 +192,19 @@ class GitHub(Adapter):
             # The API names a workflow by its file's basename (or its numeric id), never by its path.
             path = f"{self._repo}/actions/workflows/{urllib.parse.quote(workflow.rsplit('/', 1)[-1], safe='')}/runs"
         size = min(limit, PAGE_MAX)
-        rows = take(self._pages(path, "workflow_runs", {"branch": branch} if branch else {}, size), limit)
+        rows = take(self._pages(path, {"branch": branch} if branch else {}, size, "workflow_runs"), limit)
         if branch:
             # The `branch` filter is served from an index that intermittently answers stale (observed: one
             # call in eight returned an 11-day-old "newest" run). The unfiltered newest page is current, so
             # its runs on `branch` are merged in: the newest run is right whichever answer was fresh.
-            fresh = next(self._pages(path, "workflow_runs", {}, size))
+            fresh = next(self._pages(path, {}, size, "workflow_runs"))
             seen = {r["id"] for r in rows}
             rows += [r for r in fresh if r.get("head_branch") == branch and r["id"] not in seen]
             rows = sorted(rows, key=lambda r: (r.get("created_at") or "", r["id"]), reverse=True)[:limit]
         return [_run(r) for r in rows]
 
     def _run_row(self, run_id):
-        if not is_id(run_id):
-            raise ForgeError(f"'{run_id}' is not a GitHub Actions run id")
+        self._id(run_id, "a GitHub Actions run id")
         return _run(self.client.get(f"{self._repo}/actions/runs/{run_id}"))
 
     def run_head(self, run_id):
@@ -244,18 +226,17 @@ class GitHub(Adapter):
     def run(self, run_id):
         head = self._run_row(run_id)
         jobs, notes = [], []
-        for row in every(self._pages(f"{self._repo}/actions/runs/{run_id}/jobs", "jobs", {"filter": "latest"},
-                                     PAGE_MAX)):
+        for row in every(self._pages(f"{self._repo}/actions/runs/{run_id}/jobs", {"filter": "latest"}, PAGE_MAX,
+                                     "jobs")):
             jobs.append(Job(str(row["id"]), row.get("name") or "", *outcome(row.get("status"), row.get("conclusion"))))
             # A job IS a check run: its `::warning::`/`::notice::` lines are that check run's annotations.
-            for ann in every(self._pages(f"{self._repo}/check-runs/{row['id']}/annotations", None, {}, PAGE_MAX)):
+            for ann in every(self._pages(f"{self._repo}/check-runs/{row['id']}/annotations", {}, PAGE_MAX)):
                 notes.append(Annotation(_LEVEL.get(ann.get("annotation_level") or "", "notice"),
                                         ann.get("message") or "", row.get("name") or "", ann.get("title") or ""))
         return head, jobs, notes
 
     def rerun(self, run, failed_only):
-        if not is_id(run.id):
-            raise ForgeError(f"'{run.id}' is not a GitHub Actions run id")
+        self._id(run.id, "a GitHub Actions run id")
         self.client.json("POST", f"{self._repo}/actions/runs/{run.id}/{'rerun-failed-jobs' if failed_only else 'rerun'}")
         return run.id  # re-run in place: the same run, a new attempt
 
@@ -264,11 +245,32 @@ class GitHub(Adapter):
         data = self.client.json("POST", f"{self._repo}/actions/workflows/{urllib.parse.quote(workflow, safe='')}"
                                 "/dispatches", json_body={"ref": ref, "inputs": inputs, "return_run_details": True})
         run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
-        return str(run_id) if run_id is not None else None
+        if run_id is None:
+            return Started()
+        # The dispatch names no commit: the run's own row does, the branch head it resolved at the start.
+        row = self._new_run_row(self._id(str(run_id), "a GitHub Actions run id"))
+        return Started(str(run_id), row.get("html_url") or data.get("html_url") or "", row.get("head_sha") or "")
+
+    def _new_run_row(self, run_id):
+        """A just-dispatched run's row. GitHub names the run before its row is readable: the first reads can
+        answer 404 for a few seconds (observed live), so a 404 is re-read, `DISPATCH_READ_TRIES` times at most."""
+        for attempt in range(DISPATCH_READ_TRIES):
+            try:
+                return self.client.get(f"{self._repo}/actions/runs/{run_id}")
+            except ForgeError as exc:
+                if exc.status != 404 or attempt == DISPATCH_READ_TRIES - 1:
+                    raise
+                time.sleep(DISPATCH_READ_PAUSE_S)
+        raise AssertionError("unreachable")
 
     def checks(self, number):
         pr = self.view(number)
-        sha, required = pr.extra["head_sha"], pr.extra["required"]
+        required = pr.extra["required"]
+        # No required set (no branch protection): every check gates, but an advisory one.
+        return [dataclasses.replace(c, required=(not required or c.name in required) and not is_advisory(c.name))
+                for c in self.checks_for_sha(pr.extra["head_sha"])]
+
+    def checks_for_sha(self, sha):
         out: list[Check] = []
         runs = self.client.get(f"{self._repo}/commits/{sha}/check-runs", params={"per_page": 100})
         for run in runs.get("check_runs") or []:
@@ -280,16 +282,12 @@ class GitHub(Adapter):
                 state = "failure"
             else:
                 state = "skipped"  # neutral, skipped
-            name = run.get("name") or ""
-            # No required set (no branch protection): every check gates, but an advisory one.
-            out.append(Check(str(run["id"]), name, state, run.get("html_url") or "",
-                             (not required or name in required) and not is_advisory(name)))
+            out.append(Check(str(run["id"]), run.get("name") or "", state, run.get("html_url") or ""))
         combined = self.client.get(f"{self._repo}/commits/{sha}/status")
         for status in combined.get("statuses") or []:
             state = {"success": "success", "pending": "pending"}.get(status.get("state"), "failure")
-            name = status.get("context") or ""
-            out.append(Check(f"status-{status['id']}", name, state, status.get("target_url") or "",
-                             (not required or name in required) and not is_advisory(name)))
+            out.append(Check(f"status-{status['id']}", status.get("context") or "", state,
+                             status.get("target_url") or ""))
         return out
 
     def auto_merge(self, pr):
@@ -315,18 +313,13 @@ class GitHub(Adapter):
         body = {"merge_method": "merge"}
         if pr.extra.get("head_sha"):
             body["sha"] = pr.extra["head_sha"]  # refuse to merge a head that moved since the checks passed
-        self.client.json("PUT", f"{self._repo}/pulls/{pr.number}/merge", json_body=body)
+        self.client.json("PUT", f"{self._pr_path(pr.number)}/merge", json_body=body)
         return self.view(pr.number)
 
     def status(self, sha, *, state, context, description):
         data = self.client.json("POST", f"{self._repo}/statuses/{sha}",
                                 json_body={"state": state, "context": context, "description": description})
         return {"sha": sha, "context": context, "state": data.get("state") or state, "url": data.get("url") or ""}
-
-    def edit(self, number, *, title, body):
-        patch = {k: v for k, v in (("title", title), ("body", body)) if v is not None}
-        self.client.json("PATCH", f"{self._repo}/pulls/{number}", json_body=patch)
-        return self.view(number)
 
     def comment(self, number, body):
         data = self.client.json("POST", f"{self._repo}/issues/{number}/comments", json_body={"body": body})
@@ -336,26 +329,20 @@ class GitHub(Adapter):
         self._graphql(_READY, {"id": self.view(number).extra["node_id"]}, "ready for review")
         return self.view(number)
 
-    def close(self, number):
-        self.client.json("PATCH", f"{self._repo}/pulls/{number}", json_body={"state": "closed"})
-        return self.view(number)
-
     def diff_stats(self, number):
-        rows, more = capped(r for page in self._pages(f"{self._repo}/pulls/{number}/files", None, {}, PAGE_MAX)
-                            for r in page)
+        rows, more = capped(self._rows(f"{self._pr_path(number)}/files", {}, PAGE_MAX))
         if not more and len(rows) == MAX_DIFF_FILES:
             # GitHub's file list itself stops at 3,000: the PR's own count says whether it did here.
-            more = int(self.client.get(f"{self._repo}/pulls/{number}").get("changed_files") or 0) > MAX_DIFF_FILES
+            more = int(self.client.get(self._pr_path(number)).get("changed_files") or 0) > MAX_DIFF_FILES
         return diff_stats("github", ((r["filename"], int(r["additions"]), int(r["deletions"])) for r in rows),
                           TRUNCATED if more else None)
 
     def provenance(self, number):
-        pr = self.client.get(f"{self._repo}/pulls/{number}")
+        pr = self.client.get(self._pr_path(number))
         # GitHub's own commit list stops at 250, and its file list at 3,000: the PR's counts say whether either did.
-        rows, more_commits = capped((r for page in self._pages(f"{self._repo}/pulls/{number}/commits", None, {},
-                                                                PAGE_MAX) for r in page), MAX_PR_COMMITS)
-        paths, more_files = capped(r["filename"] for page in self._pages(f"{self._repo}/pulls/{number}/files", None,
-                                                                         {}, PAGE_MAX) for r in page)
+        rows, more_commits = capped(self._rows(f"{self._pr_path(number)}/commits", {}, PAGE_MAX), MAX_PR_COMMITS)
+        paths, more_files = capped(r["filename"] for r in self._rows(f"{self._pr_path(number)}/files", {},
+                                                                      PAGE_MAX))
         commits = [commit(r["sha"], ((r.get("commit") or {}).get("author") or {}).get("name") or "",
                           (r.get("author") or {}).get("login"), (r.get("commit") or {}).get("message") or "")
                    for r in rows]
@@ -364,9 +351,59 @@ class GitHub(Adapter):
             commits=commits, more_commits=more_commits or int(pr.get("commits") or 0) > len(commits),
             files=paths, more_files=more_files or int(pr.get("changed_files") or 0) > len(paths))
 
+    def merged_prs(self, since, limit):
+        # Closed PRs by latest update, newest first: a merge is an update, so the first row updated before
+        # `since` ends the scan — no row past it can have merged since.
+        pages = self._pages(self._pr_path(), {"state": "closed", "sort": "updated", "direction": "desc"},
+                            PAGE_MAX)
+        rows = take(pages, MAX_PAGES * PAGE_MAX,
+                    stop=lambda r: (parse_time(r.get("updated_at")) or since) < since)
+        return [merged_item(number=int(r["number"]), url=r.get("html_url") or "", title=r.get("title") or "",
+                            body=r.get("body"), merged_at=when,
+                            files=[f["filename"] for f in self.client.get(
+                                f"{self._pr_path(r['number'])}/files", params={"per_page": MAX_MERGED_FILES})])
+                for when, r in newest_merged(rows, lambda r: parse_time(r.get("merged_at")), since, limit)]
+
     def ci_log(self, check_id):
         if not is_id(check_id):
             raise ForgeError(f"'{check_id}' is a commit status, not a GitHub Actions job: it has no log here")
         # GitHub serves the log from a presigned URL on another host: the one credential-free hop.
         return self.client.text(f"{self._repo}/actions/jobs/{urllib.parse.quote(check_id)}/logs",
                                 anonymous_hop=True)
+
+    # CI variables and secrets: Actions' own, at the repository or one deployment environment.
+    VARIABLE_RIGHTS = ("the repository permissions Variables and Secrets (Read and write) — plus Environments (Read "
+                       "and write) for --env — on the Jaah GitHub App (its owner adds them on github.com and each "
+                       "installation accepts), or the same on a fine-grained token")
+
+    DEPENDABOT_RIGHTS = ("the repository permission Dependabot secrets (Read and write) on the Jaah GitHub App (its "
+                         "owner adds it on github.com and each installation accepts), or the same on a fine-grained "
+                         "token")
+
+    def _settings(self, env, dependabot=False):
+        if dependabot:
+            return f"{self._repo}/dependabot"
+        return f"{self._repo}/environments/{urllib.parse.quote(env, safe='')}" if env else f"{self._repo}/actions"
+
+    def variables(self, kind, env, dependabot=False):
+        key = "variables" if kind == "variable" else "secrets"
+        # Variables page at 30 at most; secrets at 100.
+        rows = every(self._pages(f"{self._settings(env, dependabot)}/{key}", {},
+                                 30 if kind == "variable" else PAGE_MAX, key))
+        return [{"name": r["name"], **({"value": r.get("value", "")} if kind == "variable" else {})}
+                for r in rows]
+
+    def set_variable(self, kind, name, value, env, dependabot=False):
+        base = self._settings(env, dependabot)
+        if kind == "secret":
+            key = self.client.get(f"{base}/secrets/public-key")
+            resp = self.client.raw("PUT", f"{base}/secrets/{name}", json_body={
+                "encrypted_value": sealed_box.seal_b64(key["key"], value), "key_id": key["key_id"]})
+            return {"action": "created" if resp.status == 201 else "updated"}
+        return self._upsert_variable("PATCH", f"{base}/variables", name, {"name": name, "value": value},
+                                     {"name": name, "value": value})
+
+    def delete_variable(self, kind, name, env, dependabot=False):
+        key = "variables" if kind == "variable" else "secrets"
+        self.client.json("DELETE", f"{self._settings(env, dependabot)}/{key}/{name}")
+        return {}

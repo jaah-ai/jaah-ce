@@ -2,7 +2,7 @@
 new task says where its boot went.
 
 The deployed boot is two interpreters under one shell (the ECS task definition's
-`api_command`): `python -c` migrates and seeds, then the shell execs `./entrypoint.sh`, which execs uvicorn.
+`api_command`): `python -c` migrates and seeds, then the shell execs `./entrypoint.sh`, which execs Granian.
 The shell stamps `/proc/uptime` into `JAAH_BOOT_T0` before the first and `JAAH_BOOT_SEEDED` before the
 second, so every phase is the difference of two readings of ONE clock (`CLOCK_BOOTTIME`, which
 `/proc/uptime` reads) and the phases chain end to start: they sum to the `boot_seconds` the ready line
@@ -77,7 +77,7 @@ def done(phase: str) -> None:
 
 
 def ready() -> None:
-    """The last line: the whole boot, shell stamp to the app's startup complete (uvicorn binds next)."""
+    """The last line: the whole boot, shell stamp to the app's startup complete (Granian binds next)."""
     t0, end = _stamp(_T0_ENV), _now()
     if t0 is None or end is None:
         return

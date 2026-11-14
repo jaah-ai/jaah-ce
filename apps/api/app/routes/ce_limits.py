@@ -15,7 +15,7 @@ from app import edition, ce_bootstrap, ce_caps
 from app.authz.catalog import Tenancy
 from app.authz.declarations import always
 from app.authz.principal import Principal, current_principal
-from app.db import SessionLocal
+from app.db_async import DbDep
 from app.entity_shape import tenant_org_or_404
 from app.tenancy import seam
 
@@ -59,12 +59,12 @@ class CeLimitsOut(BaseModel):
 
 @router.get("/limits", response_model=CeLimitsOut)
 @always(Tenancy.ORG_SCOPED)
-def get_ce_limits(principal: Principal | None = Depends(current_principal)) -> Any:
+async def get_ce_limits(principal: Principal | None = Depends(current_principal), *, db: DbDep) -> Any:
     if not edition.IS_CE:
         raise HTTPException(status_code=404, detail=NOT_CE)
     if principal is not None and principal.org_id == ce_bootstrap.CE_ORG_ID:
         org_id = principal.org_id
     else:
         org_id = tenant_org_or_404(principal, detail=NOT_CE)
-    with seam.bound_to(org_id), SessionLocal() as session:
-        return ce_caps.status(session, org_id)
+    with seam.bound_to(org_id):
+        return await db.run_sync(ce_caps.status, org_id)

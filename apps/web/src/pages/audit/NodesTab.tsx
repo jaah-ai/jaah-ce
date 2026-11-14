@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import Box from '@mui/material/Box'
 import { get } from '../../api'
 import { useCan } from '../../auth'
 import { useApiRead } from '../../hooks/useApiRead'
@@ -17,13 +18,14 @@ import NoMatchesState from '../../ui/NoMatchesState'
 import { AGE_SLOT } from '../../ui/feed/geometry'
 import type { FeedRowSpec } from '../../ui/feed/types'
 import StatusChip from '../../ui/StatusChip'
-import { PageNav } from '../../ui/Pager'
-import { usePageClamp } from '../../hooks/usePageClamp'
+import ListPager from '../../ui/ListPager'
+import { useListPage } from '../../hooks/useListPage'
 import { toneFor } from '../../ui/statusTone'
-import { PER_PAGE, setRangeParams, usePagedLogFilters } from '../../hooks/usePagedLogFilters'
+import { setRangeParams, usePagedLogFilters } from '../../hooks/usePagedLogFilters'
 import ListStates from '../../ui/feed/ListStates'
 import PagedLogView from './PagedLogView'
 import { UNBOUND_NODE_LABEL, commandPath } from './CommandDetailPage'
+import { grid, SIZE } from '../../theme'
 
 function targetLabel(cmd: Command): string {
   const a = cmd.args
@@ -49,12 +51,7 @@ const UNBOUND_NODE = '@none'
    `dispatched` IS WHY `statusToken` BELOW LEARNED IT: 759 rows an operator could not ask for was the
    defect, and answering that ask with 759 red `failed` marks would have been a control whose results
    contradict themselves. Its tone is `ui/statusTone.ts`'s to decide and it is neutral there. */
-const STATUS_OPTIONS = [
-  { value: 'done', label: 'done' },
-  { value: 'failed', label: 'failed' },
-  { value: 'rejected', label: 'rejected' },
-  { value: 'dispatched', label: 'dispatched' },
-]
+const STATUS_OPTIONS = ['done', 'failed', 'rejected', 'dispatched'].map(value => ({ value, label: value }))
 
 /* Dispatch is synchronous, so an audit-log row is normally already terminal — no more
  * queued/running/cancelled. `dispatched` IS THE ONE NON-TERMINAL SURVIVOR, and it belongs in this set
@@ -107,9 +104,8 @@ const STATUS_GLYPH: Record<string, string> = {
  * the search box, the status filter and the date range that the sibling Activity tab has always had are
  * here too. The epic's ask was "browsable, searchable, filterable"; this half of it was only browsable.
  *
- * `/command-log` is now a REDIRECT onto `/audit/nodes` (App.tsx), so this tab is the only thing
- * that renders the command log; the wrapper page that route used to have is deleted. The redirect stays
- * because bookmarks still name the old path. */
+ * This tab is the only thing that renders the command log; the wrapper page the retired
+ * command-log route used to have is deleted. */
 export default function NodesTab() {
   /* EVERY ONE OF THESE IS A QUERY PARAMETER, and that IS the fix. What this page had was
      `commands.filter(c => c.node_id === nodeFilter)` — a pass over the fifty rows already in memory —
@@ -117,10 +113,16 @@ export default function NodesTab() {
      never passed one. `query` is the debounced value that actually travels (`ui/SearchBox` holds the live
      text), so a fast typist costs one request rather than one per keystroke. */
   const {
-    zone, query, from, to, page, setPage, narrow, clearShared, sharedFiltersSet, searchFields, rangeFields,
-  } = usePagedLogFilters(1)
+    zone, query, from, to, narrow, clearShared, sharedFiltersSet, searchFields, rangeFields,
+  } = usePagedLogFilters()
   const [nodeFilter, setNodeFilter] = useState('')
   const [status, setStatus] = useState('')
+  /* EVERY FILTER CHANGE LANDS ON PAGE 1 (`resetKey`): a narrowed result set that still has 3 pages would
+     leave the reader on a page that no longer exists, staring at an empty table. `prefix`: the Audit shell keeps
+     every opened panel mounted on ONE URL, so each panel's page keys are its own. */
+  const { page, per, setPage, setPer } = useListPage({
+    prefix: 'commands_', resetKey: JSON.stringify([query, nodeFilter, status, from, to]),
+  })
 
   const navigate = useNavigate()
   const openPath = useOpenDetailPath()
@@ -129,8 +131,6 @@ export default function NodesTab() {
      beside no way to clear what filtered it. */
   const hasFilters = Boolean(sharedFiltersSet || nodeFilter || status)
 
-  /* EVERY FILTER CHANGE RESETS THE PAGE (`narrow`): a narrowed result set that still has 3 pages
-     would leave the reader on a page that no longer exists, staring at an empty table. */
   function clearFilters() {
     narrow(() => {
       clearShared()
@@ -146,13 +146,13 @@ export default function NodesTab() {
   const url = useMemo(() => {
     const params = new URLSearchParams()
     params.set('page', String(page))
-    params.set('per', String(PER_PAGE))
+    params.set('per', String(per))
     if (query) params.set('q', query)
     if (nodeFilter) params.set('node_id', nodeFilter)
     if (status) params.set('status', status)
     setRangeParams(params, from, to)
     return `/api/command-log?${params.toString()}`
-  }, [page, query, nodeFilter, status, from, to])
+  }, [page, per, query, nodeFilter, status, from, to])
 
   /* Initial load, every page change and every filter change all go through REST (spec R3), keyed on `url`.
      A superseded response is discarded by the hook's generation fence (a fast typist plus the debounce). */
@@ -237,11 +237,6 @@ export default function NodesTab() {
     [nodeNames, nodeFilter],
   )
 
-  /* THE ONLY WAY TO BE STRANDED PAST THE LAST PAGE, since every filter change routes through `narrow`
-     and resets to 1: the result set SHRINKS underneath the reader — a live refetch after a node is
-     deleted, say — leaving "Page 5 of 2" beside a disabled Next and no way forward. The hook clamps back. */
-  const totalPages = usePageClamp(page, setPage, total, PER_PAGE)
-
   /* THE LOG AS FEED ROWS. Status is the MARK (`ui/statusTone`'s tone, this file's `STATUS_GLYPH` shape),
      the WORD staying on the disc's `title`, at the head of the accessible name and on `data-status`.
      Type and target are ONE title — WHAT was run and WHAT against — with the full string on the row's
@@ -293,7 +288,7 @@ export default function NodesTab() {
       slots: [
         {
           key: 'result',
-          width: 130,
+          width: grid(21.5),
           gate: 'meta',
           testId: 'col-cmd-result',
           title: resultSummary(cmd),
@@ -301,7 +296,7 @@ export default function NodesTab() {
         },
         {
           key: 'node',
-          width: 104,
+          width: grid(17),
           gate: 'id',
           mono: true,
           testId: 'col-cmd-node',
@@ -363,7 +358,7 @@ export default function NodesTab() {
             onChange={next => narrow(() => setNodeFilter(next))}
             allLabel="All nodes"
             options={nodeOptions}
-            minWidth={160}
+            minWidth={SIZE.fieldMd}
           />
           <FilterSelect
             label="Status"
@@ -372,7 +367,6 @@ export default function NodesTab() {
             onChange={next => narrow(() => setStatus(next))}
             allLabel="Any status"
             options={STATUS_OPTIONS}
-            minWidth={150}
           />
         </>
       }
@@ -404,13 +398,18 @@ export default function NodesTab() {
           to tell a filtered page from the end of the log. Two other pages in this repo were built not
           to repeat that, and named this endpoint as the example until this change
           (`pages/credentials/api.ts`, `pages/credentials/Credentials.tsx`, both since updated). */}
-      <PageNav
-        testId="nodes-pagination"
-        page={page}
-        setPage={setPage}
-        totalPages={totalPages}
-        sx={{ mt: 1.5, pt: 1, borderTop: 1, borderColor: 'divider' }}
-      />
+      {/* THE ONLY WAY TO BE STRANDED PAST THE LAST PAGE, since every filter change lands on page 1: the result
+          set SHRINKS underneath the reader — a live refetch after a node is deleted, say. `ListPager` clamps back. */}
+      <Box sx={{ mt: 1.5, pt: 1, borderTop: 1, borderColor: 'divider' }}>
+        <ListPager
+          page={page}
+          per={per}
+          total={data ? total : null}
+          onPage={setPage}
+          onPer={setPer}
+          testId="nodes-pagination"
+        />
+      </Box>
     </PagedLogView>
   )
 }

@@ -21,7 +21,7 @@ export type PersonaRecord = {
   pipeline: boolean
   dispatchable: boolean
   charter_key: string | null
-  /** A model TIER id (`app/model_catalog.py`), never a vendor model; label via `lib/models.ts::fmtTier`. */
+  /** A model TIER id (`app/model_catalog.py`), never a vendor model; label: the id capitalized (`lib/humanize.ts::capitalize`). */
   default_model: string | null
   mode: string | null
   delivery: string | null
@@ -46,7 +46,6 @@ const NEVER_MATCHES = /(?!)/
 let roster: readonly PersonaRecord[] = []
 let byName: ReadonlyMap<string, PersonaRecord> = new Map()
 let options: readonly PersonaOption[] = []
-let pickerHint = ''
 /* Derived with the roster, never lazily (a lazy set would keep the pre-load answer). Empty before load. */
 let systemPersonas: ReadonlySet<string> = new Set()
 /* Rebuilt with the roster, never memoised on first call. */
@@ -57,7 +56,7 @@ function escapeForPattern(literal: string): string {
 }
 
 /** Seed the cache (from `usePersonaRegistry` and tests). Never filter or reorder: the served order IS the vocabulary. */
-export function setPersonaRegistry(rows: readonly PersonaRecord[], hint: string): void {
+export function setPersonaRegistry(rows: readonly PersonaRecord[]): void {
   roster = rows
   byName = new Map(rows.map(row => [row.name, row]))
   /* Picker options in served order. `operator_pickable` is the server's dispatchable-and-settleable set. A
@@ -65,7 +64,6 @@ export function setPersonaRegistry(rows: readonly PersonaRecord[], hint: string)
   options = rows
     .filter(row => row.operator_pickable && row.option_label)
     .map(row => ({ value: row.name, label: row.option_label as string }))
-  pickerHint = hint
   /* `pipeline: false` IS the system-persona flag (producers whose rows are created hidden). */
   systemPersonas = new Set(rows.filter(row => !row.pipeline).map(row => row.name))
   /* `_create_epic_with_children` (apps/api routes/tasks/create.py) stores child titles as `[<persona>] <title>`;
@@ -111,11 +109,6 @@ export function projectDefaultPersona(persona: string): boolean {
 /** EMPTY before load; the picker then renders the stored value as its own option. */
 export function personaOptions(): readonly PersonaOption[] {
   return options
-}
-
-/** As served. Empty before load. */
-export function personaPickerHint(): string {
-  return pickerHint
 }
 
 /** A function: the vocabulary is unknown at import time. */

@@ -40,6 +40,9 @@ _NONCE_BYTES = 12
 
 # Every header field, in a fixed order: the AAD binds them all, so editing any one breaks the seal.
 _BOUND_FIELDS = ("format", "version", "provider", "auth_kind", "name", "description", "max_runners")
+# The workspace an unscoped key names (non-secret, `account_auth.WORKSPACE_ID_CONFIG_KEY`). Present only when set, and bound only when
+# present, so a bundle exported before it existed still opens.
+_WORKSPACE_FIELD = "workspace_id"
 # Each derivation holds about 32 MiB: a few at a time, so a loop of wrong passphrases cannot exhaust memory.
 _KDF_SLOTS = threading.BoundedSemaphore(4)
 _KDF_WAIT_SECONDS = 10
@@ -68,14 +71,16 @@ def _derive(passphrase: str, salt: bytes) -> bytes:
 
 
 def _aad(header: dict[str, Any]) -> bytes:
-    return json.dumps([header.get(f) for f in _BOUND_FIELDS], separators=(",", ":")).encode()
+    fields = _BOUND_FIELDS + ((_WORKSPACE_FIELD,) if _WORKSPACE_FIELD in header else ())
+    return json.dumps([header.get(f) for f in fields], separators=(",", ":")).encode()
 
 
 def build(
     *, provider: str, auth_kind: str, name: str, description: str, max_runners: Optional[int],
-    api_key: Optional[str], passphrase: Optional[str],
+    api_key: Optional[str], passphrase: Optional[str], workspace_id: str = "",
 ) -> dict[str, Any]:
-    """The bundle for one account. `api_key` (with `passphrase`) is sealed when given; `None` for OAuth."""
+    """The bundle for one account. `api_key` (with `passphrase`) is sealed when given; `None` for OAuth.
+    `workspace_id` rides in the clear beside it, only when set."""
     bundle: dict[str, Any] = {
         "format": FORMAT,
         "version": VERSION,
@@ -86,6 +91,8 @@ def build(
         "max_runners": max_runners,
         "key": None,
     }
+    if workspace_id:
+        bundle[_WORKSPACE_FIELD] = workspace_id
     if api_key is not None:
         salt, nonce = os.urandom(_SALT_BYTES), os.urandom(_NONCE_BYTES)
         sealed = AESGCM(_derive(validated_passphrase(passphrase), salt)).encrypt(
@@ -117,8 +124,10 @@ def header(bundle: Any) -> dict[str, Any]:
         raise BundleError("the export's 'max_runners' is not a whole number")
     if bundle.get("key") is not None and not isinstance(bundle.get("key"), dict):
         raise BundleError("the export's 'key' is malformed")
+    if _WORKSPACE_FIELD in bundle and not isinstance(bundle[_WORKSPACE_FIELD], str):
+        raise BundleError(f"the export's '{_WORKSPACE_FIELD}' is not text")
     return {f: bundle[f] for f in ("format", "version", "provider", "auth_kind", "name", "description",
-                                   "max_runners")}
+                                   "max_runners")} | {_WORKSPACE_FIELD: bundle.get(_WORKSPACE_FIELD)}
 
 
 def opened_key(bundle: dict[str, Any], passphrase: Any) -> str:

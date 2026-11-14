@@ -16,6 +16,7 @@ import { Terminal } from '@xterm/xterm'
 import {
   DIRECT_SUBPROTOCOLS,
   directDialUrl,
+  directAckPromisesKeepaliveAcks,
   directHelloFrame,
   directSubprotocols,
   fetchDirectGrant,
@@ -25,7 +26,9 @@ import {
   sanitizeDirectReason,
   type DirectGrant,
 } from '../lib/directConsole'
-import { sessionHeaders } from '../lib/activeOrg'
+import { send, readJsonOrNull } from '../api'
+import { useTabLeftBehind } from '../lib/activeOrg'
+import { openSocket, silenceWatchdog, type SilenceWatchdog } from '../net/streams'
 import { clipboardFiles } from '../lib/clipboardFiles'
 import { ClipboardAddon } from '@xterm/addon-clipboard'
 import { FitAddon } from '@xterm/addon-fit'
@@ -33,6 +36,7 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import '@xterm/xterm/css/xterm.css'
 import Box from '@mui/material/Box'
 import { RAW } from '../theme'
+import { isApplePlatform } from '../ui/modifierKey'
 import { copyText } from '../ui/useCopyFlash'
 import { attachControlPlaneBadges } from './consoleLabels'
 
@@ -73,31 +77,38 @@ function disposeQuietly(disposable: { dispose: () => void }): void {
   }
 }
 
-// `attachOnly` is set on every RECONNECT, never a first attach: it forbids the daemon's create path, so a
-// retry cannot silently spawn a NEW agent (kind=clauded runs clauded_wt.py against account quota) and
-// claim a free slot. A request, not the enforcement: the CP applies its own tier and budget bounds.
+// Handlers off BEFORE close(): a dead connection's close may only arrive minutes later, or never, and some engines
+// fire onclose synchronously. What the caller does next (a reconnect, a relay dial, a retry) is what matters.
+function closeQuietly(socket: WebSocket): void {
+  socket.onmessage = null
+  socket.onclose = null
+  try {
+    socket.close()
+  } catch {
+    /* already closing */
+  }
+}
+
+// Every dial is `attach_only=1`: the console attaches to a slot's live session and never creates one. A
+// request, not the enforcement: the CP applies its own tier bounds.
 function consoleOpenUrl(
   projectId: number, number: number, nodeId: string | undefined,
-  kind: string, cols: number, rows: number, attachOnly: boolean,
+  kind: string, cols: number, rows: number,
   view: string | undefined,
   layout: string | undefined,
-  provider: string | undefined,
 ): string {
-  const attach = attachOnly ? '&attach_only=1' : ''
   // `node` rides every attempt: dropping it could re-attach to another node's same-numbered slot.
   const node = nodeId ? `&node=${encodeURIComponent(nodeId)}` : ''
   // `view=@<window_id>`: show ONE window of the node's shared `fleet` session. `layout=<spec>`: one window
   // whose panes are the designed tiles. Both omitted when absent so a plain console's URL is unchanged.
   const viewParam = view ? `&view=${encodeURIComponent(view)}` : ''
   const layoutParam = layout ? `&layout=${encodeURIComponent(layout)}` : ''
-  // `provider`: the account's provider for a NEW session; absent = Any (the CP's Auto-assign pick).
-  const providerParam = provider ? `&provider=${encodeURIComponent(provider)}` : ''
-  return `/api/console/${projectId}/${number}/open?kind=${kind}&cols=${cols}&rows=${rows}${node}${attach}${viewParam}${layoutParam}${providerParam}`
+  return `/api/console/${projectId}/${number}/open?kind=${kind}&cols=${cols}&rows=${rows}${node}&attach_only=1${viewParam}${layoutParam}`
 }
 
 /** A close as the reconnect decision reads it — a socket's `CloseEvent`, or a refused open's body, whose
- *  `detail` is the API's one line for the pane to print and `throttled` its 429 (the create budget spent). */
-type ConsoleClose = { code: number; reason: string; detail?: string; throttled?: boolean }
+ *  `detail` is the API's one line for the pane to print. */
+type ConsoleClose = { code: number; reason: string; detail?: string }
 
 // A transport failure before any verdict: the code a dropped handshake closes with, so the pane reads it
 // exactly as it read the old socket's (recoverable, 'disconnected').
@@ -108,21 +119,17 @@ const ABNORMAL_CLOSE: ConsoleClose = { code: 1006, reason: '' }
  * relay's same-origin path, or to the close the old socket would have carried: the refusal's own
  * `close_code`; 4401 for a bare 401/403 (an auth middleware's answer); otherwise ABNORMAL_CLOSE — a
  * network error or a proxy's 502 during an API deploy must retry, never end the console.
- * A raw `fetch`, not `api()`: a 401 here is the pane's verdict to render, not a global sign-out.
+ * `send`, not `api()`: a 401 here is the pane's verdict to render, not a global sign-out.
  */
 async function openConsole(path: string): Promise<{ url: string } | { closed: ConsoleClose }> {
   let res: Response
   try {
-    res = await fetch(path, { method: 'POST', credentials: 'same-origin', headers: sessionHeaders(undefined, 'POST') })
+    res = await send(path, { method: 'POST', credentials: 'same-origin' })
   } catch {
     return { closed: ABNORMAL_CLOSE }
   }
-  let body: unknown = null
-  try {
-    body = await res.json()
-  } catch {
-    /* no JSON body — decided by the status alone */
-  }
+  // No JSON body: decided by the status alone.
+  const body = await readJsonOrNull(res)
   const fields = (body ?? {}) as { url?: unknown; close_code?: unknown; reason?: unknown; detail?: unknown }
   if (res.ok) {
     // Same-origin relative path only: anything else is not this API's answer.
@@ -134,9 +141,7 @@ async function openConsole(path: string): Promise<{ url: string } | { closed: Co
     const reason = typeof fields.reason === 'string' ? fields.reason : ''
     // One line, whatever the server sent: the pane composes it into a single terminal row.
     const detail = typeof fields.detail === 'string' ? fields.detail.split('\n')[0].trim() : ''
-    return {
-      closed: { code: fields.close_code, reason, ...(detail ? { detail } : {}), ...(res.status === 429 ? { throttled: true } : {}) },
-    }
+    return { closed: { code: fields.close_code, reason, ...(detail ? { detail } : {}) } }
   }
   if (res.status === 401 || res.status === 403) return { closed: { code: UNAUTHORIZED_CLOSE_CODE, reason: '' } }
   return { closed: ABNORMAL_CLOSE }
@@ -229,13 +234,7 @@ export function makeClipboardProvider(write: (text: string) => void) {
 // A `paste` event only fires if the browser runs its paste command. xterm claims Ctrl+V (a C0 control,
 // writes SYN and calls preventDefault), so off-Apple no paste event is ever born; ⌘V is unaffected. So
 // off-Apple the chord is handed back to the browser, giving up the literal SYN. Ctrl+Shift+V is included
-// (xterm already ignores it) to keep one rule.
-const APPLE_PLATFORM = /^(Mac|iPhone|iPad|iPod)/
-
-export function isApplePlatform(platform: string | undefined): boolean {
-  return APPLE_PLATFORM.test(platform ?? '')
-}
-
+// (xterm already ignores it) to keep one rule. The platform test is `ui/modifierKey`'s.
 // `keyCode` is what xterm's own dispatch switches on; `code` covers Firefox's keypress, which has none.
 export function isPasteChord(
   event: Pick<KeyboardEvent, 'ctrlKey' | 'altKey' | 'metaKey' | 'code' | 'keyCode'>,
@@ -251,7 +250,18 @@ export function isPasteChord(
 // Foreground tabs only: Chrome throttles hidden-tab intervals to ~1/min, so those rely on reconnect.
 export const KEEPALIVE_INTERVAL_MS = 25_000
 
-// A DENYLIST on purpose: an unenumerated code must fall on the recoverable side (uvicorn sends 1012 on
+// A SILENT TERMINAL IS A DEAD ONE. The relay answers every keepalive with an empty binary frame
+// (`apps/api/app/console_relay/server.py::KEEPALIVE_ACK`), so a relay socket that has heard nothing — no output, no
+// ack — for SILENT_AFTER_MS sits on a connection some network dropped without a close: it is closed and reconnected
+// through the ordinary 4503 path (`reconnectDelayMs(1)`), re-attaching the same session. Armed by the first ack, so
+// a relay that predates it is never torn down. The direct transport is watched the same way when the node's hello
+// ack advertises the answer (`directAckPromisesKeepaliveAcks`, `apps/jaahd/console.py::KEEPALIVE_ACK`); a silent
+// direct socket is closed and the pane moves to the relay (`useRelayInstead`), since the path to the node is what died.
+export const SILENT_AFTER_MS = 30_000
+// What a reconnect after the watchdog fired says beside 'relay interrupted' / 'Direct connection unavailable'.
+const SILENT_DETAIL = 'no answer for 30s'
+
+// A DENYLIST on purpose: an unenumerated code must fall on the recoverable side (a server sends 1012 on
 // every relay restart). Terminal codes:
 //   4401/4404 — unauthorized / no worktree.
 //   4502      — node unavailable; terminal on a FIRST attach only. On a reconnect it is handled before
@@ -261,22 +271,20 @@ export const KEEPALIVE_INTERVAL_MS = 25_000
 //               apps/api/app/console_relay/server.py; refused opens: routes/console.py::console_open).
 //               This pane cannot verify that table.
 //   4400      — direct path: a hello the node could not read (our bug); the relay never emits it.
-//   4409      — the org's cap refused the slot claim (routes/console.py::console_open); its reason is the sentence to show.
 //   4408      — a HIPAA org's console closed after 15 minutes with no keystroke (relay `BROWSER_CLOSE_IDLE`).
 //   4403      — the viewer's address left the org's IP allowlist (relay `BROWSER_CLOSE_NETWORK`).
 // 1005 is absent: no peer here emits a bare close frame (timeouts surface as 1006).
-const NON_RETRYABLE_CLOSE_CODES = new Set([1000, 4400, 4401, 4403, 4404, 4408, 4409, 4502])
+const NON_RETRYABLE_CLOSE_CODES = new Set([1000, 4400, 4401, 4403, 4404, 4408, 4502])
 // The session-level verdict: falling back or recreating would announce an end in reverse.
 const SESSION_ENDED_CLOSE_CODE = 1000
-// `console_open`'s `_WS_UPSTREAM_UNAVAILABLE` refusal: usually "no live session" for an attach_only dial, but a
-// CATCH-ALL (NODE_TOKEN mismatch, no account, failed create, no tmux), hence the budgeted response in
-// scheduleSessionGoneRetry. Not 1000: treating 4502 as an ending strands a fine slot; treating 1000 as
+// `console_open`'s `_WS_UPSTREAM_UNAVAILABLE` refusal: usually "no live session", but a CATCH-ALL
+// (NODE_TOKEN mismatch, no account, no tmux), hence the re-attach cadence in scheduleSessionGoneRetry. Not 1000: treating 4502 as an ending strands a fine slot; treating 1000 as
 // recoverable respawns a shell somebody exited.
 const SESSION_GONE_CLOSE_CODE = 4502
 
 // Printed for a 4502 only when the opener's row also said no session (`hadLiveSession === false`).
-// Neither fact alone means "empty": a wedged runner has a tmux window with nothing sensed
-// (`lib/worktree.ts::canOpenConsoleOn` still offers it), and 4502 is a catch-all. Valid only until this
+// Neither fact alone means "empty": a wedged runner has a tmux window with nothing sensed, and 4502 is
+// a catch-all. Valid only until this
 // pane has held a session (`sessionHeldRef`). Never match the node's reason string instead — the node
 // ships independently, so a rephrase would break it silently. Claims only the slot, not the task.
 // Kept to one short clause: both retry paths compose it into a single terminal row.
@@ -284,6 +292,8 @@ const SLOT_EMPTY_REASON = 'this slot has no session running in it'
 
 // Token missing/invalid/expired/foreign/revoked collapse to one code (no slot-enumeration oracle).
 const UNAUTHORIZED_CLOSE_CODE = 4401
+// The relay's own transport broke; the node-side session lives on (see `closeReason`).
+const RELAY_FAILED_CLOSE_CODE = 4503
 const RECONNECT_BASE_DELAY_MS = 1000
 const RECONNECT_MAX_DELAY_MS = 15_000
 // Hold time before the attempt streak is forgiven; resetting on `onopen` let a flapping backend retry
@@ -295,26 +305,13 @@ export const RECONNECT_MAX_ATTEMPTS = 20
 // Flat cadence past the ladder, for as long as the pane is mounted: the ordinary outage (node off the
 // bus, relay 4503) must recover without a click. Flat because waiting longer teaches nothing. Hidden tabs
 // are clamped to ~1/min by the browser. Cost is bounded by the overlay's lifetime, like the keepalive;
-// a node-off-bus dial is refused at the CP without refreshing the session. No jitter and no
-// `connecting` status per dial (it would flicker the header dot).
+// a node-off-bus dial is refused at the CP without refreshing the session. No `connecting` status per
+// dial (it would flicker the header dot).
 export const RECONNECT_IDLE_DELAY_MS = 10_000
 
-// Create-capable dials per outage before the cadence reverts to attach-only. One covers the ordinary
-// case; two spare cover transient failures. Each clauded create spends quota even if the console is
-// unusable (`_post_create_not_found`), so an unattended tab must not keep paying. The cadence keeps
-// re-attaching regardless; starting anew goes back to the Reconnect button.
-export const SESSION_GONE_CREATE_BUDGET = 3
-
-// Max fraction `jitter` pulls a backoff delay earlier (never past the ceiling). De-synchronises the N
-// sockets of a tiled console dropped by one outage. Per pane, default 0 = the exact deterministic
-// schedule; only tiles get a non-zero value (`paneJitter` in ConsoleTiles.tsx).
-const RECONNECT_JITTER = 0.5
-
-/** Delay before reconnect `attempt`, pulled earlier by `jitter` ∈ [0,1). Exported for tests. */
-export function reconnectDelayMs(attempt: number, jitter: number = 0): number {
-  const base = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** (attempt - 1), RECONNECT_MAX_DELAY_MS)
-  const spread = Math.min(Math.max(jitter, 0), 1)
-  return Math.round(base * (1 - RECONNECT_JITTER * spread))
+/** Delay before reconnect `attempt`. Exported for tests. */
+export function reconnectDelayMs(attempt: number): number {
+  return Math.min(RECONNECT_BASE_DELAY_MS * 2 ** (attempt - 1), RECONNECT_MAX_DELAY_MS)
 }
 
 // tmux's per-view title `#{window_id} #{window_name}` (OSC 0). `@<digits>` is an unambiguous prefix, so
@@ -329,20 +326,24 @@ export function parseViewTitle(title: string): { id: string; name: string } | nu
 
 // 4503 = the relay's own transport broke; the node-side session lives on. `hadLiveSession` reaches only
 // the 4502 arm, as `=== false` (see SLOT_EMPTY_REASON); `undefined` reads as `true`.
-// A refused open's `detail` is printed only where it says why the OPEN failed: a throttled (429) create, and a
-// 4502 that was not a reconnect to a live session. A 4503 keeps its reconnect wording with the detail beside it;
+// A refused open's `detail` is printed only where it says why the OPEN failed: a 4502 that was not a
+// reconnect to a live session. A 4503 keeps its reconnect wording with the detail (or the
+// relay's close reason) beside it;
 // a reconnect's 4502 keeps the session-ended wording.
 function closeReason(evt: ConsoleClose, hadLiveSession?: boolean): string {
   if (evt.code === 4401) return 'not authorized'
-  if (evt.throttled && evt.detail) return evt.detail
   if (evt.code === 4404) return 'slot not found'
   if (evt.code === 4403) return evt.reason || 'your network is no longer allowed'
   if (evt.code === 4408) return evt.reason || 'closed after 15 minutes of inactivity'
-  if (evt.code === 4409) return evt.reason || 'limit reached'
   if (evt.code === 4502) {
     return hadLiveSession === false ? evt.detail || SLOT_EMPTY_REASON : evt.reason || 'no live session'
   }
-  if (evt.code === 4503) return evt.detail ? `relay interrupted (${evt.detail})` : 'relay interrupted'
+  if (evt.code === 4503) {
+    // The refused open's detail, else the relay's own close reason (`console_relay/server.py`: an invalid ticket,
+    // a partner leg that never arrived, an unreachable owner) — so a pane that keeps reconnecting says why.
+    const why = evt.detail || evt.reason
+    return why ? `relay interrupted (${why})` : 'relay interrupted'
+  }
   return 'disconnected'
 }
 
@@ -357,7 +358,7 @@ function closeReason(evt: ConsoleClose, hadLiveSession?: boolean): string {
 // Terminal verdicts are about the SESSION, reported as on the CP path:
 //   * 1000 — the user's shell exited; retrying would respawn it.
 //   * 4502 on a NAMED FLEET WINDOW (`view`/`layout`) — tmux window ids are never reused.
-// A 4502 on a worktree slot arms one budgeted create (armCreateOnSessionGone) instead.
+// A 4502 on a worktree slot keeps re-attaching on the cadence instead.
 //
 // 5s: half the relay cadence — one handshake to one node, with a user actively waiting. Exported for tests.
 export const DIRECT_RETRY_DELAY_MS = 5000
@@ -440,7 +441,7 @@ type Props = {
   kind: 'clauded' | 'term'
   // Fresh identity each render is fine: read through a ref, never re-dials.
   onStatusChange: (status: ConsoleStatus) => void
-  // Bumping re-runs the connect effect as a FIRST attach (may create) — the manual escape.
+  // Bumping re-runs the connect effect as a FIRST attach — the manual escape.
   reconnectNonce: number
   // `@<window_id>` of the node's `fleet` session for a layout tile. Part of the connect identity.
   view?: string
@@ -453,8 +454,6 @@ type Props = {
   fontSize?: number
   // The window the PTY reports it is showing (drift signal, `view` panes only).
   onWindowChange?: (win: { id: string; name: string }) => void
-  // See RECONNECT_JITTER. Zero by default.
-  jitter?: number
   // Dial the node directly instead of via the CP relay. In the connect deps, so a flip tears down the old
   // socket (cleanup runs first) before the new one exists — one PTY never has two live attachments.
   direct?: boolean
@@ -470,9 +469,6 @@ type Props = {
   // absent keeps quoting the node. Read through a ref, not a connect dep: re-dialling for a refined
   // snapshot of the past would cost for no gain.
   hadLiveSession?: boolean
-  // Catalogue value of the provider whose account runs a NEW session; absent = Any. Fixed per open; a
-  // connect dep so a different pick re-dials.
-  provider?: string
 }
 
 /** The single-pane console's terminal size — the size this component has always rendered at. */
@@ -481,12 +477,15 @@ export const DEFAULT_FONT_SIZE = 13
 const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
   {
     projectId, number, nodeId, kind, onStatusChange, reconnectNonce,
-    view, layout, autoFocus = true, fontSize = DEFAULT_FONT_SIZE, onWindowChange, jitter = 0,
-    direct = false, directUrlOverride, readOnly = false, hadLiveSession, provider,
+    view, layout, autoFocus = true, fontSize = DEFAULT_FONT_SIZE, onWindowChange,
+    direct = false, directUrlOverride, readOnly = false, hadLiveSession,
   },
   ref,
 ) {
   const mountRef = useRef<HTMLDivElement | null>(null)
+  /* Left behind by an org switch in another tab (`lib/activeOrg.ts`): the pane closes its socket and opens none until
+     this tab is current again, then re-attaches the same session — like every other connection of the tab. */
+  const leftBehind = useTabLeftBehind()
   const fitRef = useRef<FitAddon | null>(null)
   // Disposed BEFORE term.dispose() — see the load site.
   const webglRef = useRef<WebglAddon | null>(null)
@@ -587,7 +586,7 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
 
   useEffect(() => {
     const container = mountRef.current
-    if (!container) return
+    if (!container || leftBehind) return
 
     const term = new Terminal({
       convertEol: false,
@@ -659,17 +658,15 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
     // `ws` is replaced by each reconnect, so handlers read it live. `torndown` is set by cleanup before
     // closing so a switched-away socket's close is never acted on; `socket !== ws` is belt-and-braces.
     let ws: WebSocket | null = null
+    // The live socket's silence watchdog (either transport); replaced per dial, stopped on its close and at teardown.
+    let silence: SilenceWatchdog | null = null
+    // This pane's relay has answered a keepalive: every later relay socket is watched from its open, so one that dies
+    // before its own first ack is still caught. Never set by a relay that predates the ack.
+    let relayAcks = false
     let torndown = false
     let attempt = 0
     // Announce-once latch for the session-gone cadence; cleared by a connection that HOLDS. Gates nothing else.
     let sessionGoneAnnounced = false
-    // One-shot create permission, armed by a 4502 and spent by the next dial. Latching it would make every
-    // cadence dial create-capable, including 4503s from `_post_create_not_found` (agent already launched),
-    // relaunching every 10s against quota.
-    let mayCreateNextDial = false
-    // Total ceiling per outage (one-shot bounds only the rate); reset by a connection that holds.
-    let createDialsSpent = 0
-    let budgetAnnounced = false
     let retryTimer: number | null = null
     // Wall-clock deadline of the pending retry: a suspended page freezes timers but not Date.now(), so
     // this detects an overdue retry. Read only by retryNowIfOwed.
@@ -688,10 +685,7 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
     // Re-fetch-once latch: a daemon restart drops in-memory grants and closes 4401, same as a bad token.
     // Boolean, not a counter, to prevent a CP↔node loop.
     let grantRefetched = false
-    // Whether this pane ever dialled; NEVER cleared. Only the first dial of the effect (the user's own
-    // act) or an armed one may create. A resettable counter let every post-drop dial create, which on a
-    // pocketed phone meant an agent launched per idle-sweep cycle all night. Recovery still works: the
-    // attach-only dial gets 4502, which arms one gated create.
+    // Whether this pane ever dialled; NEVER cleared. Read only by a `disabled` answer's switch to the relay.
     let dialedOnce = false
     // The in-flight attempt's deadline; effect-scoped because it covers the grant fetch too.
     let dialTimer: number | null = null
@@ -748,52 +742,18 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
       // Announced once per outage; the re-attach redraw wipes it anyway.
       if (attempt === 1) term.write(`\r\n\x1b[90m[${reason} — reconnecting…]\x1b[0m\r\n`)
       onStatusChangeRef.current({ state: 'connecting', label: 'reconnecting…', transport, notice })
-      armRetry(connect, reconnectDelayMs(attempt, jitter))
+      armRetry(connect, reconnectDelayMs(attempt))
     }
 
-    // May the next dial create? Shared by both transports — one place decides when a tab spends quota.
-    //   'not-allowed' — read-only viewer or hidden page (a pocketed phone must not create overnight).
-    //                   Both still re-attach on the cadence.
-    //   'armed'       — one create-capable dial permitted.
-    //   'exhausted'   — per-outage budget spent; attach-only from here.
-    const armCreateOnSessionGone = (): 'armed' | 'not-allowed' | 'exhausted' => {
-      if (readOnlyRef.current || document.visibilityState !== 'visible') {
-        mayCreateNextDial = false
-        return 'not-allowed'
-      }
-      // Cleared on every non-armed answer so the post-condition is uniform for all callers.
-      if (createDialsSpent >= SESSION_GONE_CREATE_BUDGET) {
-        mayCreateNextDial = false
-        return 'exhausted'
-      }
-      mayCreateNextDial = true
-      return 'armed'
-    }
-
-    // 4502 on a reconnect is the NORMAL end of a node outage (node back without the old tmux window;
-    // every reconnect is attach_only), so keep dialling every 10s with budgeted create permission.
-    // Creating spends quota and claims a slot — accepted because it is budgeted (SESSION_GONE_CREATE_BUDGET,
-    // armed per 4502 answer; 4503 from `_post_create_not_found` means creation can half-succeed
-    // expensively), the alternative is a dead console the user is trying to reach, and 1000 stays terminal.
-    // Read-only panes take the cadence too (a viewer is the common case) but never create.
+    // 4502 on a reconnect is the NORMAL end of a node outage (node back without the old tmux window), so
+    // keep re-attaching every 10s: a session that starts in the slot is picked up without a click. 1000
+    // stays terminal.
     const scheduleSessionGoneRetry = (reason: string) => {
       const every = RECONNECT_IDLE_DELAY_MS / 1000
       if (!sessionGoneAnnounced) {
         term.write(`\r\n\x1b[90m[${reason} — reconnecting, every ${every}s]\x1b[0m\r\n`)
       }
       sessionGoneAnnounced = true
-      // Arm one create; announce budget exhaustion once. `readOnlyRef`, not `mayWrite()`: the question is
-      // the tier (the CP/node enforce it; this keeps a viewer from wasting the budget). Visibility gate
-      // bounds the lifetime cost — the budget resets per held connection — and retryNowIfOwed lands the
-      // create when the user returns.
-      if (armCreateOnSessionGone() === 'exhausted' && !budgetAnnounced) {
-        budgetAnnounced = true
-        term.write(
-          '\r\n\x1b[90m[still no session after '
-          + `${SESSION_GONE_CREATE_BUDGET} attempts to start one — still reconnecting every ${every}s, `
-          + 'but use Reconnect to start a new session]\x1b[0m\r\n',
-        )
-      }
       onStatusChangeRef.current({
         state: 'closed',
         label: `${reason} — retrying every ${every}s`,
@@ -805,7 +765,7 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
     }
 
     // Revoke rather than leave live for its TTL (revokeDirectGrant). Retries do NOT release — the grant
-    // is held across reconnects; only a create-capable dial and teardown release.
+    // is held across reconnects; only teardown and an abandoned node release.
     const releaseGrant = () => {
       if (!grant) return
       revokeDirectGrant(projectId, number, kind, grant.token, nodeId)
@@ -851,10 +811,10 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
     // The CP said direct console is OFF for this node (not failing — not configured). Re-dialling a
     // capability that is off would strand the console forever, so this effect moves to the relay for good
     // and says so once. No node is ever dialled, and no retry cadence is armed.
-    // `mayOpen`/`mayCreate` are the abandoned direct dial's own permissions, carried over so the switch
-    // cannot mint a create the `dialedOnce` latch would refuse: a `disabled` answering a LATER dial (after
-    // a 4401 re-fetch, say a node restarting with its suffix unset) must reach the relay attach-only.
-    const useRelayInstead = (reason: string, mayOpen: boolean, mayCreate: boolean) => {
+    // `firstDial`: the abandoned direct dial was the effect's first, so the relay dial is a first attach too.
+    // A `disabled` answering a LATER dial (after a 4401 re-fetch, say a node restarting with its suffix
+    // unset) reaches the relay as a reconnect.
+    const useRelayInstead = (reason: string, firstDial: boolean) => {
       if (torndown) return
       if (dialTimer !== null) {
         window.clearTimeout(dialTimer)
@@ -863,10 +823,8 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
       abortDial = null
       dialEpoch += 1
       transport = 'cp'
-      // Not the first dial: attach-only, and a 4502 enters the session-gone cadence (both read `attempt`).
-      if (!mayOpen && attempt === 0) attempt = 1
-      // An armed create was cleared before the grant await but never charged — hand it to the relay dial.
-      if (mayCreate) mayCreateNextDial = true
+      // Not the first dial: a 4502 enters the session-gone cadence (reads `attempt`).
+      if (!firstDial && attempt === 0) attempt = 1
       inputAllowedRef.current = true
       const detail = sanitizeDirectReason(reason)
       // NO EMOJI: the same string goes to xterm (see `retryDirect`).
@@ -892,9 +850,8 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
       }
       const reason = closeReason(closed, hadLiveSessionRef.current)
       // Before the denylist, since 4502 is in it. Only on a RECONNECT (`attempt > 0`): a first-attach 4502
-      // is a refused create, and retrying won't change it. Read-only panes included (cadence, no create).
-      // Named fleet windows (`layout`/`view`) excluded: `_open_layout_pty`/`_open_view_pty` never create
-      // and window ids are not reused, so the cadence would rebuild a grid every 10s forever.
+      // means the slot has nothing to attach to. Read-only panes included.
+      // Named fleet windows (`layout`/`view`) excluded: window ids are not reused, so the cadence would rebuild a grid every 10s forever.
       if (closed.code === SESSION_GONE_CLOSE_CODE && attempt > 0 && view === undefined && layout === undefined) {
         scheduleSessionGoneRetry(reason)
         return
@@ -912,13 +869,8 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
     const dialCp = async () => {
       dialEpoch += 1
       const epoch = dialEpoch
-      // Reconnects are attach_only unless a 4502 armed a create (scheduleSessionGoneRetry). The one-shot
-      // is spent by the dial that actually goes out — the open is that dial — and cleared unconditionally.
-      const mayCreate = mayCreateNextDial && createDialsSpent < SESSION_GONE_CREATE_BUDGET
-      mayCreateNextDial = false
-      if (mayCreate) createDialsSpent += 1
       const opened = await openConsole(
-        consoleOpenUrl(projectId, number, nodeId, kind, term.cols, term.rows, attempt > 0 && !mayCreate, view, layout, provider),
+        consoleOpenUrl(projectId, number, nodeId, kind, term.cols, term.rows, view, layout),
       )
       // Overtaken by teardown or a newer dial (`epoch`) — acting would open a second socket.
       if (torndown || epoch !== dialEpoch) return
@@ -929,7 +881,7 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
       let socket: WebSocket
       try {
         const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-        socket = new WebSocket(`${proto}//${window.location.host}${opened.url}`)
+        socket = openSocket(`${proto}//${window.location.host}${opened.url}`)
       } catch (err) {
         // A throwing constructor (rejected URL, blocked port) would otherwise escape the timer and stall.
         term.write(`\r\n\x1b[90m[reconnect failed: ${String(err)}]\x1b[0m\r\n`)
@@ -939,8 +891,17 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
       socket.binaryType = 'arraybuffer'
       ws = socket
       wsRef.current = socket
+      silence?.stop()
+      const watchdog = silenceWatchdog(SILENT_AFTER_MS, () => {
+        if (torndown || socket !== ws) return
+        closeQuietly(socket)
+        onCpClosed({ code: RELAY_FAILED_CLOSE_CODE, reason: '', detail: SILENT_DETAIL })
+      })
+      silence = watchdog
+      if (relayAcks) watchdog.arm()
 
       socket.onopen = () => {
+        watchdog.heard()
         onStatusChangeRef.current({ state: 'connected', label: 'connected', transport, notice })
         // Only the active pane focuses, so a reconnect elsewhere cannot steal the caret.
         if (autoFocusRef.current) term.focus()
@@ -949,11 +910,9 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
         stableTimer = window.setTimeout(() => {
           stableTimer = null
           attempt = 0
-          // A held connection ends the outage: reset the latch, budget and opener snapshot (see
-          // `sessionHeldRef`). Resetting on open would trust a session that has not proved it stays.
+          // A held connection ends the outage: reset the latch and opener snapshot (see `sessionHeldRef`).
+          // Resetting on open would trust a session that has not proved it stays.
           sessionGoneAnnounced = false
-          createDialsSpent = 0
-          budgetAnnounced = false
           hadLiveSessionRef.current = undefined
           sessionHeldRef.current = true
         }, RECONNECT_STABLE_AFTER_MS)
@@ -962,14 +921,23 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
         if (mayWrite()) sendResize(socket, term.cols, term.rows)
       }
       socket.onmessage = (evt: MessageEvent) => {
+        watchdog.heard()
         if (typeof evt.data === 'string') {
           term.write(evt.data)
-        } else {
-          term.write(new Uint8Array(evt.data as ArrayBuffer))
+          return
         }
+        const bytes = new Uint8Array(evt.data as ArrayBuffer)
+        // The relay's keepalive answer (empty): proof the socket is alive, nothing to draw.
+        if (bytes.length === 0) {
+          relayAcks = true
+          watchdog.arm()
+          return
+        }
+        term.write(bytes)
       }
       // No onerror: close always follows error, so onclose is the single decider.
       socket.onclose = (evt: CloseEvent) => {
+        watchdog.stop()
         if (torndown || socket !== ws) return
         onCpClosed(evt)
       }
@@ -980,14 +948,9 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
       dialEpoch += 1
       const epoch = dialEpoch
 
-      // One-shot create permission, spent here as in dialCp.
-      const mayCreate = mayCreateNextDial && createDialsSpent < SESSION_GONE_CREATE_BUDGET
-      mayCreateNextDial = false
-      // `mayOpen`: first dial of the effect or an armed one; latched before the dial so a failed first
-      // attempt still counts.
-      const mayOpen = mayCreate || !dialedOnce
+      // Latched before the dial so a failed first attempt still counts.
+      const firstDial = !dialedOnce
       dialedOnce = true
-      // The budget is charged below the await, by the dial that actually goes out.
 
       // Whole-attempt deadline, armed before any step (DIRECT_ATTEMPT_TIMEOUT_MS).
       if (dialTimer !== null) window.clearTimeout(dialTimer)
@@ -1000,11 +963,8 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
         else retryDirect(reason)
       }, DIRECT_ATTEMPT_TIMEOUT_MS)
 
-      // A create-capable dial must carry a FRESH account choice: the grant snapshots the CP's credential
-      // account pick and lives up to 24h, so reusing it would bypass the relay's per-open quota pick.
-      if (mayOpen) releaseGrant()
       if (!grant) {
-        const result = await fetchDirectGrant(projectId, number, kind, nodeId, provider)
+        const result = await fetchDirectGrant(projectId, number, kind, nodeId)
         // Overtaken by teardown or this attempt's own deadline (`epoch`) — acting would orphan a socket.
         if (torndown || epoch !== dialEpoch) {
           // Never stored, so cleanup cannot revoke it — hand it back here.
@@ -1012,7 +972,7 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
           return
         }
         if (!result.ok && result.disabled) {
-          useRelayInstead(result.reason, mayOpen, mayCreate)
+          useRelayInstead(result.reason, firstDial)
           return
         }
         if (!result.ok) {
@@ -1023,7 +983,6 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
         lastGrantMintAt = Date.now()
       }
 
-      if (mayCreate) createDialsSpent += 1
       let socket: WebSocket
       try {
         // `directDialUrl` only ever yields the machine the CP named; `isGrantedHost` gates the token too.
@@ -1032,7 +991,7 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
         const protocols = isGrantedHost(grant.directUrl, dial)
           ? directSubprotocols(grant.token)
           : [...DIRECT_SUBPROTOCOLS]
-        socket = new WebSocket(dial, protocols)
+        socket = openSocket(dial, protocols)
       } catch {
         // Error text deliberately unreported: some engines quote the subprotocol, which holds the token.
         retryDirect('the direct address could not be dialled')
@@ -1046,20 +1005,31 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
       let handled = false
       let acked = false
 
-      // Handlers are detached BEFORE close(): some engines fire onclose synchronously.
-      const abandon = (reason: string) => {
-        if (handled || torndown) return
+      // Armed only by an ack that promises keepalive answers (see SILENT_AFTER_MS). A silent socket means the
+      // path to the node died without a close: leave it and take the relay, attach-only, re-attaching the session.
+      silence?.stop()
+      const watchdog = silenceWatchdog(SILENT_AFTER_MS, () => {
+        if (handled || torndown || socket !== ws) return
         handled = true
-        socket.onmessage = null
-        socket.onclose = null
+        closeQuietly(socket)
         if (stableTimer !== null) {
           window.clearTimeout(stableTimer)
           stableTimer = null
         }
-        try {
-          socket.close()
-        } catch {
-          /* already closing — the retry scheduled below is what matters */
+        // This effect never dials the node again, so the grant would only hold a slot in its store (see 4401).
+        releaseGrant()
+        useRelayInstead(`the node stopped answering: ${SILENT_DETAIL}`, false)
+      })
+      silence = watchdog
+
+      const abandon = (reason: string) => {
+        if (handled || torndown) return
+        handled = true
+        watchdog.stop()
+        closeQuietly(socket)
+        if (stableTimer !== null) {
+          window.clearTimeout(stableTimer)
+          stableTimer = null
         }
         retryDirect(reason)
       }
@@ -1068,12 +1038,9 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
       socket.onopen = () => {
         // C-7: the TEXT hello is the first thing on the wire.
         try {
-          /* attach_only on a retry unless a 4502 armed a create (`mayCreate`); ALWAYS for a read-only pane
-             — on this transport the browser composes the flag (the node and grant enforce it). `view` rides
-             the hello here (the CP path uses a query parameter). */
-          socket.send(directHelloFrame(
-            term.cols, term.rows, !mayOpen || readOnlyRef.current, view, layout,
-          ))
+          /* Always attach_only — on this transport the browser composes the flag (the node and grant
+             enforce it). `view` rides the hello here (the CP path uses a query parameter). */
+          socket.send(directHelloFrame(term.cols, term.rows, view, layout))
         } catch {
           abandon('the direct connection closed before the handshake could be sent')
         }
@@ -1082,6 +1049,7 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
       socket.onmessage = (evt: MessageEvent) => {
         // Queued messages run after cleanup; an unacked frame here would arm a retry on a disposed terminal.
         if (torndown || socket !== ws || handled) return
+        watchdog.heard()
         if (!acked) {
           // Before the ack, only the ack is legal; anything else is not our protocol.
           if (!isDirectAck(evt.data)) {
@@ -1089,6 +1057,7 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
             return
           }
           acked = true
+          if (directAckPromisesKeepaliveAcks(evt.data)) watchdog.arm()
           inputAllowedRef.current = true
           // Outage over: clear the notice on the ack (it describes right now).
           notice = ''
@@ -1109,8 +1078,6 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
             attempt = 0
             grantRefetched = false
             directRetryAnnounced = false
-            createDialsSpent = 0
-            budgetAnnounced = false
             // Retired on both transports so flipping direct mode gives one account (see `sessionHeldRef`).
             hadLiveSessionRef.current = undefined
             sessionHeldRef.current = true
@@ -1121,12 +1088,15 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
         }
         if (typeof evt.data === 'string') {
           term.write(evt.data)
-        } else {
-          term.write(new Uint8Array(evt.data as ArrayBuffer))
+          return
         }
+        const bytes = new Uint8Array(evt.data as ArrayBuffer)
+        // The node's keepalive answer (empty): proof the socket is alive (heard above), nothing to draw.
+        if (bytes.length > 0) term.write(bytes)
       }
 
       socket.onclose = (evt: CloseEvent) => {
+        watchdog.stop()
         if (torndown || socket !== ws || handled) return
         handled = true
         if (stableTimer !== null) {
@@ -1154,7 +1124,7 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
           }
           if (firstRefusal) {
             grantRefetched = true
-            // Same attempt, fresh credential; `dialedOnce` is a latch, so no create permission is re-earned.
+            // Same attempt, fresh credential.
             void dialDirect()
             return
           }
@@ -1169,22 +1139,6 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
           return
         }
 
-        // 4502 on a worktree slot: arm one budgeted, tier- and visibility-gated create. Named fleet windows
-        // are excluded (terminal, below). Only when this dial's hello did NOT ask to open (`mayOpen`, not
-        // `mayCreate` — the first dial also asks): a 4502 to an open request is the node refusing to create.
-        if (evt.code === SESSION_GONE_CLOSE_CODE && !mayOpen && view === undefined && layout === undefined) {
-          const budget = armCreateOnSessionGone()
-          if (budget === 'exhausted' && !budgetAnnounced) {
-            budgetAnnounced = true
-            term.write(
-              '\r\n\x1b[90m[still no session after '
-              + `${SESSION_GONE_CREATE_BUDGET} attempts to start one — still reconnecting to the node, `
-              + 'but use Reconnect to start a new session]\x1b[0m\r\n',
-            )
-          }
-          retryDirect(directCloseReason(evt, hadLiveSessionRef.current))
-          return
-        }
         // Only a named fleet window's 4502 is terminal; a slot's falls through to the cadence.
         if (evt.code === SESSION_GONE_CLOSE_CODE && (view !== undefined || layout !== undefined)) {
           const reason = directCloseReason(evt, hadLiveSessionRef.current)
@@ -1201,19 +1155,19 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
       }
     }
     // Each effect run starts fresh: otherwise a chevron switch shows the outgoing session's close and
-    // offers a Reconnect (a create-capable first attach) over a healthy connect.
+    // offers a Reconnect (a first attach) over a healthy connect.
     onStatusChangeRef.current({ state: 'connecting', label: 'connecting…', transport, notice })
     connect()
 
     // ── Coming back from a suspended tab ───────────────────────────────────────────────────────────
     // Mobile browsers freeze a hidden page's timers, so an armed retry can sit minutes overdue.
-    // `visibilitychange`/`online` fire it NOW, changing only WHEN, never `attempt` or create permission.
+    // `visibilitychange`/`online` fire it NOW, changing only WHEN, never `attempt`.
     // `retryTimer !== null` means a reconnect is owed, which makes repeated events self-limiting.
     const retryNowIfOwed = () => {
       if (torndown || retryTimer === null) return
       if (document.visibilityState === 'hidden') return
-      // OVERDUE, not merely pending: firing any pending retry would collapse the backoff and the
-      // create-cadence rate limit (flaky cellular bursts `online`). A frozen page's deadline has passed.
+      // OVERDUE, not merely pending: firing any pending retry would collapse the backoff (flaky cellular
+      // bursts `online`). A frozen page's deadline has passed.
       if (Date.now() < retryDueAt) return
       window.clearTimeout(retryTimer)
       retryTimer = null
@@ -1368,6 +1322,7 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
       if (copyTimer !== null) window.clearTimeout(copyTimer)
       // Set BEFORE closing: some engines fire onclose synchronously.
       torndown = true
+      silence?.stop()
       if (retryTimer !== null) window.clearTimeout(retryTimer)
       if (stableTimer !== null) window.clearTimeout(stableTimer)
       if (dialTimer !== null) window.clearTimeout(dialTimer)
@@ -1387,7 +1342,7 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
     }
     // `view`/`fontSize` are connect identity (a different window; a different cell box and PTY size).
     // `direct`/`directUrlOverride`: a flip must tear down the live socket before dialling.
-  }, [projectId, number, nodeId, kind, reconnectNonce, view, layout, fontSize, direct, directUrlOverride, mayWrite, provider])
+  }, [projectId, number, nodeId, kind, reconnectNonce, view, layout, fontSize, direct, directUrlOverride, mayWrite, leftBehind])
 
   // Plain `<div>` mount for xterm. `data-testid="console-body"` replaces the retired `.console-body`
   // class (Selector Stability Contract rule 2).
@@ -1402,8 +1357,8 @@ const ConsolePane = forwardRef<ConsolePaneHandle, Props>(function ConsolePane(
         // near-black under the light scheme, which the DOM-renderer fallback and a11y tree would use.
         bgcolor: RAW.dark.terminalBg,
         color: RAW.dark.textPrimary,
-        px: '0.5rem',
-        py: '0.35rem',
+        px: 1,
+        py: 0.5,
         /* NOT what routes terminal touch-drags (the JS handler does; this node is not an ancestor of the
            painted cells). Kept as a defensive guard against page scroll / pull-to-refresh on engines that
            reserve scrollbar width; measured 0px here. */

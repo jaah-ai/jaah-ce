@@ -18,7 +18,6 @@ org's own. The optional filters (`trigger_config.UserRegisteredConfig`) are appl
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 from uuid import UUID
 
@@ -26,9 +25,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import access, identities
-from app.config import get_settings
+from app.clock import utcnow
+from app.config import console_url
 from app.entity_shape import iso_or_none
-from app.db import SessionLocal
+from app.db import BridgedSession
 from app.identities import display_name
 from app.models.audit import ActivityEvent
 from app.models.identity import AdminUser, UserIdentity
@@ -56,7 +56,7 @@ USER_EVENT_KEYS = (
 
 
 def _frontend() -> str:
-    return get_settings().frontend_url.rstrip("/")
+    return console_url()
 
 
 def _event(**values: Any) -> dict[str, Any]:
@@ -112,7 +112,7 @@ def _member_facts(session: Session, user: AdminUser, org: Org, *, via: str) -> d
         provider=_provider_of(user.identity), scope=USER_SCOPE_ORG, moment=MOMENT_JOINED, via=via,
         org_id=str(org.id), org_name=org.name, org_slug=org.slug,
         url=f"{_frontend()}/users/{user.id}",
-        registered_at=iso_or_none(user.activated_at or user.created_at or datetime.now(timezone.utc)) or "",
+        registered_at=iso_or_none(user.activated_at or user.created_at or utcnow()) or "",
     )
 
 
@@ -156,7 +156,7 @@ def _platform(org_id: UUID, *, moment: str) -> None:
     from app import trigger_intake
 
     try:
-        with SessionLocal() as session, seam.detached(), seam.operator_scope():
+        with BridgedSession() as session, seam.detached(), seam.operator_scope():
             event = _signup_facts(session, org_id, moment=moment)
         if event is None:
             return
@@ -172,7 +172,7 @@ def on_member_joined(user_id: UUID, org_id: UUID, *, via: str) -> None:
     from app import trigger_intake
 
     try:
-        with SessionLocal() as session, seam.detached(), seam.bound_to(org_id):
+        with BridgedSession() as session, seam.detached(), seam.bound_to(org_id):
             user = session.scalar(select(AdminUser).where(AdminUser.id == user_id, AdminUser.org_id == org_id))
             org = session.scalar(select(Org).where(Org.id == org_id))
             if user is None or org is None:

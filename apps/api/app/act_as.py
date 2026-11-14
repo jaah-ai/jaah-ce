@@ -36,7 +36,7 @@ from app.entity_shape import optional_uuid
 from app.models.identity import AdminUser
 from app.models.orgs import Org
 from app.tenancy import seam
-from app.tenancy.ids import is_operator_plane, is_tenant_org
+from app.tenancy.ids import is_operator_user, is_tenant_org
 
 ACT_AS_HEADER = "x-jaah-act-as"
 #: The 409 detail for a target that cannot be acted as; the web leaves act-as on it.
@@ -51,7 +51,7 @@ _PERSON_ATTR = "_act_as_person"
 #: The guard's answer for THIS request: True when its reader is an operator's tab acting as an org, False when
 #: the guard resolved it as not acting, `None` when no guard resolved it (off a request, or an `@always`/infra route
 #: the guard answers without a principal). Set once by `authz._bind_read_scope`, never outside a request. Read by
-#: `actors.actor_names`, so the operator reads a colleague's name where the org reads "Jaah support", and by
+#: `actors.actor_names`, so the operator reads a colleague's name where the org reads `WITHHELD_ACTOR`, and by
 #: `request_caller.current`.
 _READER_ACTING: ContextVar[Optional[bool]] = ContextVar("act_as_reader_acting", default=None)
 
@@ -86,7 +86,7 @@ def target_org(session: Session, user: AdminUser, raw: Optional[str]) -> Optiona
     `None` for no header and for a caller who is not an operator (ignored, never refused). An operator naming
     anything but a live tenant org is refused 409 `act_as_unavailable`. `orgs` is not tenant-owned, so the read
     needs no scope."""
-    if raw is None or not is_operator_plane(user.org_id, user.is_superadmin):
+    if raw is None or not is_operator_user(user):
         return None
     org_id = optional_uuid(raw)
     if org_id is None:
@@ -99,7 +99,7 @@ def target_org(session: Session, user: AdminUser, raw: Optional[str]) -> Optiona
 
 def _detached_copy(user: AdminUser) -> AdminUser:
     columns: dict[str, Any] = {attr.key: getattr(user, attr.key) for attr in sa_inspect(AdminUser).column_attrs}
-    return AdminUser(**columns)
+    return AdminUser(**columns, identity=user._loaded_identity())
 
 
 def seat_user(user: AdminUser, org_id: UUID) -> AdminUser:

@@ -3,12 +3,13 @@ import Link, { type LinkProps } from '@mui/material/Link'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
 import { Link as RouterLink } from 'react-router-dom'
-import { DBOS_STATUS_HELP, DBOS_STATUS_TONE } from '../lib/dbosStatus'
+import { DBOS_STATUS_HELP, dbosStatus } from '../lib/dbosStatus'
 import { NO_VALUE } from '../lib/relativeTime'
 import { CopyButton } from './CopyButton'
 import { DetailField } from './detail/DetailPage'
 import { monoSx, PRE_WRAP_SX } from './listStyles'
 import StatusChip from './StatusChip'
+import { FONT_SIZE } from '../theme'
 
 /* THE PRIMITIVES A RUN PAGE TAKES FROM HERE (`Mono`, and the DBOS run pieces the cron and workflow pages
  * share), so they read as one panel. The grouper is `ui/detail/DetailPage`'s `DetailSection` and the label/value
@@ -32,7 +33,7 @@ export function Mono({ children, testId, wrap = 'anywhere', muted, block }: {
       data-testid={testId}
       sx={[
         monoSx,
-        { fontSize: '0.8125rem', overflowWrap: wrap === 'word' ? 'break-word' : 'anywhere' },
+        { fontSize: FONT_SIZE.md, overflowWrap: wrap === 'word' ? 'break-word' : 'anywhere' },
         wrap === 'pre' ? PRE_WRAP_SX : null,
         muted ? { color: 'text.secondary' } : null,
       ]}
@@ -43,16 +44,21 @@ export function Mono({ children, testId, wrap = 'anywhere', muted, block }: {
 }
 
 /** An id field: the token in mono plus a Copy button. */
-export function CopyableIdField({ label, id, testId, ariaLabel }: {
+export function CopyableIdField({ label, id, testId, ariaLabel, halves }: {
   label: string
   id: string
   testId: string
   ariaLabel: string
+  /** A long unbroken value (a fingerprint) that wraps as two even halves, never one stray character. */
+  halves?: boolean
 }): JSX.Element {
+  const mid = Math.ceil(id.length / 2)
   return (
     <DetailField label={label}>
       <Stack direction="row" sx={{ alignItems: 'center', gap: 0.5, flexWrap: 'wrap' }}>
-        <Mono>{id}</Mono>
+        {halves
+          ? <Mono wrap="word">{id.slice(0, mid)}<wbr />{id.slice(mid)}</Mono>
+          : <Mono>{id}</Mono>}
         <CopyButton testId={testId} label="Copy" ariaLabel={ariaLabel} text={() => id} />
       </Stack>
     </DetailField>
@@ -62,7 +68,7 @@ export function CopyableIdField({ label, id, testId, ariaLabel }: {
 /** A DBOS workflow status pill; a status a newer DBOS invents renders as itself in grey. */
 export function DbosStatusChip({ status }: { status: string }): JSX.Element {
   return (
-    <StatusChip label={status} tone={DBOS_STATUS_TONE[status] ?? 'neutral'} title={DBOS_STATUS_HELP[status]} data-status={status} />
+    <StatusChip label={status} tone={dbosStatus(status).tone} title={DBOS_STATUS_HELP[status]} data-status={status} />
   )
 }
 

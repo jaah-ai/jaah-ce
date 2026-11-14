@@ -3,6 +3,7 @@
 import type { QueryClient } from '@tanstack/react-query'
 import { TASK_TREE_QUERY_KEY } from '../../../hooks/useTaskTree'
 import { isEnabled } from '../../../lib/editionFeatures'
+import { dropFromTaskListSeed } from '../../../lib/taskListSeed'
 
 /** The board's State counts (`pages/Tasks.tsx`'s `feedStateCounts`) sit under this prefix. */
 export const PANE_QUERY_KEY = ['tasks', 'pane'] as const
@@ -20,6 +21,7 @@ export function featureQueryKey(featureId: string) {
  *  answer 404), and the lists and counts that drew it are invalidated once for the whole batch. */
 export function forgetDeletedTasks(client: QueryClient, ids: readonly number[]): void {
   if (isEnabled('live_cast')) for (const id of ids) client.removeQueries({ queryKey: taskLiveCastKey(id) })
+  dropFromTaskListSeed(client, ids)
   void client.invalidateQueries({ queryKey: PANE_QUERY_KEY })
   void client.invalidateQueries({ queryKey: TASK_TREE_QUERY_KEY })
 }

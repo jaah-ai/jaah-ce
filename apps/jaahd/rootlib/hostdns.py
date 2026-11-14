@@ -7,11 +7,20 @@ so the uplink resolver behind it is used directly. The result is normally a priv
 range; the host table's `ct original` rules admit only DNAT'd flows. Sensed at install time (the boot
 rebuild re-reads it). One address, so no failover: a dead resolver shows as a hang.
 
+A node that names no reachable resolver at all (only a loopback stub or Tailscale's, e.g. a VPS whose
+/etc/resolv.conf points at a local caching daemon) falls back to a public resolver, `PUBLIC_FALLBACK`,
+reached over the uplink like any other DNAT'd query. The trade, chosen over failing every vnode on the
+node: those vnodes' queries go to that third party, and names only the node's own stub
+answers (a private zone) do not resolve inside them. The fallback is logged, so the journal says so.
+
 Stdlib only, no import-time side effects — the rebuild oneshot imports this before anything else exists.
 """
 from __future__ import annotations
 
 import ipaddress
+import logging
+
+_log = logging.getLogger(__name__)
 
 # systemd-resolved's uplink list never names the stub; `/etc/resolv.conf` is the fallback.
 RESOLV_SOURCES = (
@@ -30,15 +39,8 @@ RESOLV_SOURCES = (
 TAILSCALE_RESOLVER = ipaddress.IPv4Address("100.100.100.100")
 
 
-class NoResolver(Exception):
-    """The node has no reachable upstream resolver, so a vnode would have no DNS.
-
-    Raised rather than defaulted: a public-resolver fallback would leak queries to a third party and
-    break every private name the node resolves.
-    """
-
-    REMEDY = ("configure a non-loopback nameserver on this node, or add the file that carries this "
-              "node's uplink resolver to rootlib.hostdns.RESOLV_SOURCES")
+# The resolver a vnode uses when the node names none it can reach (module docstring): Cloudflare's anycast.
+PUBLIC_FALLBACK = "1.1.1.1"
 
 
 def parse_nameservers(text: str) -> tuple[str, ...]:
@@ -65,7 +67,7 @@ def parse_nameservers(text: str) -> tuple[str, ...]:
 
 
 def node_resolver(sources: tuple[str, ...] = RESOLV_SOURCES) -> str:
-    """The first IPv4 resolver this node knows that a vnode can reach, or `NoResolver`.
+    """The first IPv4 resolver this node knows that a vnode can reach, else `PUBLIC_FALLBACK`.
 
     First-wins across the sources; loopback and Tailscale's 100.100.100.100 are skipped in every file, since
     neither is reachable from a vnode whichever file named it.
@@ -82,8 +84,10 @@ def node_resolver(sources: tuple[str, ...] = RESOLV_SOURCES) -> str:
             parsed = ipaddress.IPv4Address(address)
             if not parsed.is_loopback and parsed != TAILSCALE_RESOLVER:
                 return address
-    raise NoResolver(
-        "no IPv4 nameserver a vnode can reach on this node (loopback and 100.100.100.100 do not count); read "
-        f"{', '.join(read) if read else 'none of ' + ', '.join(sources)}"
-        f" — {NoResolver.REMEDY}"
+    _log.warning(
+        "no IPv4 nameserver a vnode can reach on this node (loopback and 100.100.100.100 do not count); read %s"
+        " — vnodes use the public resolver %s; configure a non-loopback nameserver on this node to keep their"
+        " queries on it",
+        ", ".join(read) if read else "none of " + ", ".join(sources), PUBLIC_FALLBACK,
     )
+    return PUBLIC_FALLBACK

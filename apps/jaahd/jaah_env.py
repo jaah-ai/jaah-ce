@@ -9,13 +9,28 @@ bypass read through it (`insecure_agent_enabled`), which the api (`app/dev_bypas
 from __future__ import annotations
 
 import os
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional, TypeVar
+
+Number = TypeVar("Number", int, float)
 
 
 def env_get(name: str, default: Optional[str] = None, environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
     """`name`'s value when it is PRESENT (even empty), else `default`; `environ` defaults to the process env."""
     env = os.environ if environ is None else environ
     return env.get(name, default)
+
+
+def env_number(name: str, default: Number, *, parse: Callable[[str], Number],
+               environ: Optional[Mapping[str, str]] = None) -> Number:
+    """`name` through `parse` (`int` or `float`), or `default` when it is absent, blank or does not parse — a
+    knob with a working default never takes the daemon down. A caller that bounds the value does so on top."""
+    raw = env_get(name, environ=environ)
+    if raw is None or raw == "":
+        return default
+    try:
+        return parse(raw)
+    except ValueError:
+        return default
 
 
 # ── Environment-flag truthiness ──────────────────────────────────────────────────────────────────────

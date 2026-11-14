@@ -16,7 +16,6 @@ producer calls. The daemon's half of the reclaim (trigger, warn cache) is `disk_
 from __future__ import annotations
 
 import contextlib
-import datetime
 import json
 import logging
 import os
@@ -29,7 +28,6 @@ from typing import Callable
 # 0 where the platform lacks the flag (a POSIX-only flag must not break Windows).
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 log = logging.getLogger("jaahd.disk_events")
 
@@ -39,11 +37,6 @@ SPOOL_MAX_FILES = 50
 # The warn line jaahd caches from the CP's observe response (`disk_reclaim_trigger.record_observe_response`).
 # A number the root pass validates: an unprivileged writer may only move a pass's trigger LABEL, never its rule.
 WARN_PCT_FILE = SPOOL / "warn_pct"
-
-
-def utc_now() -> str:
-    """ISO-8601 UTC, second precision — the contract's `started_at`/`finished_at` spelling."""
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # A walk of a home its (untrusted) user may still be filling stops here: the figure is a report, never a
@@ -140,7 +133,8 @@ def report_removed_users(removed: dict[str, int], started_at: str, spool: Path =
     """Write the `converge` report for `removed` — nothing at all when no user was removed."""
     if not removed:
         return None
-    return write_report(removed_users_report(removed, started_at, utc_now()), spool)
+    import env_helpers  # noqa: PLC0415 — the stamp's one home; this module stays stdlib-only at import time
+    return write_report(removed_users_report(removed, started_at, env_helpers.now_iso()), spool)
 
 
 def used_pct(path: str = "/", statvfs: Callable | None = None) -> float:
@@ -156,19 +150,14 @@ def used_pct(path: str = "/", statvfs: Callable | None = None) -> float:
 def read_warn_pct(path: Path = WARN_PCT_FILE) -> float | None:
     """The cached warn %, or None (no file, unreadable, not a number in (0, 100]) — no node-side default.
 
-    Root reads a file the unprivileged daemon writes: never through a link, never blocking, 32 bytes at most."""
+    Root reads a file the unprivileged daemon writes (`file_io.read_bounded`: never through a link, never
+    blocking; a file over 32 bytes is refused, not truncated — the writer emits a short float)."""
+    import file_io  # noqa: PLC0415 — stdlib-only itself, but this module stays stdlib-only at import time
+
     try:
-        fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
-    except OSError:
+        value = float(file_io.read_bounded(str(path), 32).decode().strip())
+    except ValueError:
         return None
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
-        value = float(os.read(fd, 32).decode().strip())
-    except (OSError, ValueError, UnicodeDecodeError):
-        return None
-    finally:
-        os.close(fd)
     return value if 0 < value <= 100 else None
 
 

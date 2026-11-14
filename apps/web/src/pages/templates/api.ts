@@ -1,4 +1,4 @@
-import { apiFetch, del, get, patch, post, postForm, put } from '../../api'
+import { del, get, getBlob, patch, post, postForm, put, withQuery } from '../../api'
 import { paintableImageUrl, type AttachmentResolver } from '../../components/richtext/attachmentResolver'
 import type { PipelineTask } from '../../types'
 
@@ -31,6 +31,9 @@ export const CARD_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image
 export const CARD_IMAGE = 'card_image'
 export const BODY_IMAGE = 'body_image'
 
+/** One `{{input: Label}}` placeholder in a template's body (`app/task_templates.py::inputs_of`). */
+export type TemplateInput = { label: string; required: boolean }
+
 /** One row of the gallery and the manage list (`_card`). */
 export type TemplateCard = {
   id: string
@@ -49,6 +52,8 @@ export type TemplateCard = {
   starts_90d: number
   editable: boolean
   may_start: boolean
+  /** What Start asks for, in body order. */
+  inputs: TemplateInput[]
 }
 
 export type TemplateAsset = { id: string; kind: string; filename: string; content_type: string | null }
@@ -114,11 +119,7 @@ export function templateAssetResolver(id: string, assets: readonly TemplateAsset
     if (cached) return cached
     const asset = assets.find(a => a.filename === token)
     if (!asset) return Promise.reject(new Error(`no template image for token: ${token}`))
-    const url = apiFetch(assetContentUrl(id, asset.id), { credentials: 'same-origin' }).then(async resp => {
-      if (!resp.ok) throw new Error(`failed to fetch template image: ${token}`)
-      const blob = await resp.blob()
-      return paintableImageUrl(blob, asset.content_type || blob.type)
-    })
+    const url = getBlob(assetContentUrl(id, asset.id)).then(blob => paintableImageUrl(blob, asset.content_type || blob.type))
     painted.set(token, url)
     url.catch(() => painted.delete(token))
     return url
@@ -142,13 +143,8 @@ export const templateRefProblem = (ref: TemplateRef | undefined): string | null 
 export const TEMPLATES_KEY = ['templates'] as const
 
 /** The gallery's cards: published and visible to the caller; with `q`, ranked by match. */
-export const listTemplates = (q = '', purpose: string | null = null): Promise<TemplateCard[]> => {
-  const params = new URLSearchParams()
-  if (q.trim() !== '') params.set('q', q.trim())
-  if (purpose !== null) params.set('purpose', purpose)
-  const query = params.toString()
-  return get<TemplateCard[]>(`/api/templates${query ? `?${query}` : ''}`)
-}
+export const listTemplates = (q = '', purpose: string | null = null): Promise<TemplateCard[]> =>
+  get<TemplateCard[]>(withQuery('/api/templates', { q: q.trim(), purpose }))
 
 export const setFavorite = (id: string, on: boolean) =>
   on ? put<void>(`/api/templates/${encodeURIComponent(id)}/favorite`, undefined)
@@ -159,8 +155,8 @@ export const duplicateTemplate = (id: string) =>
 
 /** Files a task from the template in `projectId`; the server copies title, description, persona, involvement,
  *  model and images, links the row and counts the start. The caller then starts it. */
-export const createFromTemplate = (templateId: string, projectId: number) =>
-  post<PipelineTask>('/api/tasks', { template_id: templateId, project_id: projectId })
+export const createFromTemplate = (templateId: string, projectId: number, inputs: Record<string, string> = {}) =>
+  post<PipelineTask>('/api/tasks', { template_id: templateId, project_id: projectId, template_inputs: inputs })
 
 /** Customize's address: the create form seeded from the template, its project left to pick. */
 export const customizePath = (id: string) => `/tasks/new?template=${encodeURIComponent(id)}`

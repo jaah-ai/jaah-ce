@@ -13,17 +13,19 @@ from sqlalchemy import (
     Index,
     Integer,
     SmallInteger,
+    String,
     Text,
+    cast,
+    false,
     text,
     UniqueConstraint,
+    func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from app.features import TASK_FEATURE_PROJECT_FK, TASK_FEATURE_INDEX
 from app.task_sections import (
-    TASK_STOP_NOTE_CHECK,
-    TASK_STOP_NOTE_CHECK_SQL,
     TASK_STOP_REASON_CHECK,
     TASK_STOP_REASON_CHECK_SQL,
     TASK_STOP_RECORD_CHECK,
@@ -31,12 +33,25 @@ from app.task_sections import (
     TASK_STOPPED_BY_FK,
 )
 from app.task_source import TASK_SOURCE_CHECK, TASK_SOURCE_CHECK_SQL, TASK_SOURCE_INDEX
-# Leaf import (stdlib-only).
-from app.task_memory_arm import ARM_SOURCES as MEMORY_ARM_SOURCES
+from app import task_done_notice
 # Leaf import (stdlib-only): the playbook tables' CHECKs render from the closed sets.
 from app.playbook_vocabulary import ENTRY_LABELS, SENIORITY_TIERS
 from app.models.agent_sessions import AGENT_OR_PROVIDER_SQL
 from app.models.base import Base, EntityMixin, _in_check, org_unique, OrgScoped, timestamp_column
+
+#: `tasks.pin_source`: who pinned the task's runner or model.
+PIN_HUMAN, PIN_SYSTEM = "human", "system"
+PIN_SOURCES = (PIN_HUMAN, PIN_SYSTEM)
+
+#: `tasks.review_tier`: the review depth a coder runner declares, the code-review policy's tiers.
+REVIEW_TIERS = ("trivial", "minor", "standard", "major", "security")
+
+# Where a task's effective memory arm came from (`project_memory/switch.py::effective_memory`), the closed set
+# `tasks.memory_arm_source`'s CHECK renders from; the community edition, with no project memory, keeps both.
+MEMORY_ARM_SOURCES: tuple[str, ...] = ("task", "epic", "default", "holdout", "killed", "plan", "project")
+#: The largest epic throttle (`Task.max_running`) a write accepts: far above any epic's subtask count, so it never
+#: limits a real choice, and it keeps an absurd number a 422 rather than an INTEGER overflow's 500.
+MAX_RUNNING_CEILING = 1000
 
 
 # The compliance fix-job state lives on the hidden `compliance_fix` group Task (`Task.compliance_group_id`,
@@ -83,10 +98,9 @@ class Task(OrgScoped, Base):
         ),
         Index("ix_tasks_template_id", "template_id", postgresql_where=text("template_id IS NOT NULL")),
         Index("ix_tasks_org_template_id", "org_template_id", postgresql_where=text("org_template_id IS NOT NULL")),
-        # The stop record is whole or absent, and a note rides a wait only (`app/task_sections.py`).
+        # The stop record is whole or absent (`app/task_sections.py`).
         CheckConstraint(TASK_STOP_REASON_CHECK_SQL, name=TASK_STOP_REASON_CHECK),
         CheckConstraint(TASK_STOP_RECORD_CHECK_SQL, name=TASK_STOP_RECORD_CHECK),
-        CheckConstraint(TASK_STOP_NOTE_CHECK_SQL, name=TASK_STOP_NOTE_CHECK),
         # Revision 0383; the value list is `app/task_source.py`'s.
         CheckConstraint(TASK_SOURCE_CHECK_SQL, name=TASK_SOURCE_CHECK),
         Index(TASK_SOURCE_INDEX, "project_id", "source"),
@@ -94,9 +108,12 @@ class Task(OrgScoped, Base):
             "memory_arm_source IN (" + ", ".join(f"'{s}'" for s in MEMORY_ARM_SOURCES) + ")",
             name="ck_tasks_memory_arm_source",
         ),
+        CheckConstraint("max_running IS NULL OR max_running >= 1", name="ck_tasks_max_running"),
         Index("ix_tasks_pinned_node_id", "pinned_node_id", postgresql_where=text("pinned_node_id IS NOT NULL")),
         CheckConstraint(AGENT_OR_PROVIDER_SQL.format(provider="bound_provider"), name="ck_tasks_agent_or_provider"),
         Index("ix_tasks_agent_id", "agent_id", postgresql_where=text("agent_id IS NOT NULL")),
+        _in_check("pin_source", PIN_SOURCES, "ck_tasks_pin_source"),
+        _in_check("review_tier", REVIEW_TIERS, "ck_tasks_review_tier"),
         Index("ix_tasks_bound_account_id", "bound_account_id", postgresql_where=text("bound_account_id IS NOT NULL")),
         # The fire engine's overlap read: an automation's newest task per project / per pinned node.
         Index(
@@ -135,7 +152,7 @@ class Task(OrgScoped, Base):
     project_id: Mapped[int] = mapped_column(
         ForeignKey("projects.id"), nullable=False, index=True
     )
-    # The feature this task is filed in; NULL is "No feature". Always a feature of `project_id` (the
+    # The feature this task is filed in; NULL files it in the project itself. Always a feature of `project_id` (the
     # composite keys above). A stage task takes its epic's by the resolve trigger on insert, and a filing or
     # move rewrites the whole subtree (`routes/tasks/update.py::_apply_feature_filing`).
     feature_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
@@ -160,6 +177,9 @@ class Task(OrgScoped, Base):
     hidden: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # A benchmark shadow (revision 202611020500; `app/outcome_ledger/benchmark.py`): a hidden coder re-running a sampled
+    # task on another configuration. Its PR is a draft that is never enqueued or merged; it settles `shadow_pr` only.
+    shadow: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     # Created by the task editor's auto-save and never explicitly saved. Drives the "New task" title,
     # withheld LLM title refinement and deferred epic children. Unlike `hidden` (off every list), it
     # narrows the audience to the author. Cleared once by explicit Save/Go (`TaskUpdate.autosave=False`)
@@ -197,9 +217,7 @@ class Task(OrgScoped, Base):
     # non-dispatched value, so a persona does not imply dispatch.
     persona: Mapped[str] = mapped_column(Text, nullable=False)
     # Per-source dedup key for a hidden system Task: the match for `create_system_task` dedup and the
-    # `app/lease_drain.py` alarm channels, as an index probe instead of a `body LIKE` scan. Not yet
-    # universal: `app/runner_breaks.py` still matches on the body marker. The `<!-- sysdedup:KEY -->`
-    # marker is still stamped into `body` for older workers during rollout (additive-migrations rule).
+    # `app/lease_drain.py` alarm channels, as an index probe instead of a `body LIKE` scan.
     dedup_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # Operator dispatch-order lever: higher = sooner, with 0 meaning normal. The order-by vocabulary
     # (`priority DESC, id`) is app-layer, not a DB constraint.
@@ -250,12 +268,20 @@ class Task(OrgScoped, Base):
     # (`app/slot_state.py`). NULL = never dispatched. Read only through `slot_allocation.task_has_repo`, so a
     # finished task keeps its kind after its project's repository flips.
     has_repo: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # Its starter chose to run it in an empty folder, without its project's repository (Start's `without_repo`,
+    # `routes/tasks/dispatch.py::_repo_choice`): what the planner reads (`slot_allocation.runs_without_repo`); on an
+    # epic, its children's too. A normal Start and Reset clear it. Apart from `has_repo`, the lease's snapshot, so an older folder run never
+    # reads as this choice.
+    run_without_repo: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
     # What the LAST dispatch actually launched, stamped by `app/lease_drain.py` from the compose verdict:
     # the effective tier (inherited or pinned; NULL for an exact override) and the concrete `--model` the
     # provider's CLI was given (NULL = none: the CLI's own default). Historical fact, never a setting — the
     # console renders "High → gpt-5.6-sol" from them. NULL on both = never dispatched since 0274.
     dispatched_tier: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     dispatched_model: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # What the live runner was last given — `{"body", "involvement", "model"}` — stamped at dispatch and on a
+    # delivered live edit; an explicit Save diffs against it (`app/live_task_edits.py`). NULL = not since 202611021400.
+    runner_view: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
     # Autonomous-mode master switch. NOT NULL, default true.
     autonomous: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true"
@@ -309,11 +335,20 @@ class Task(OrgScoped, Base):
     # dedup key); the epic view groups it under Finish. In a column, not the body, so the predicate cannot
     # be spoofed.
     finish_follow_up_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # The language of the description's prose, an ISO 639-1 code; NULL reads as English. Rules: `app/task_language.py`.
+    language: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # True once a person picked `language`: re-detection ("Re-generate title") never overwrites it.
+    language_pinned: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     # Who created this task (see `Project.created_by_id`). A runner-filed row (coder/finish/follow-up
     # children, an agent filing and its analysis children, a system task) takes the filer's original
     # executor (`task_ancestry.executor_user_id`: starter, else creator); an epic's fan-out children take the
     # epic's own creator, never the principal whose request fanned it out (`routes/tasks/create.py::
-    # _create_epic_children`). Indexed (plain) for the board's creator filter.
+    # _create_epic_children`). A row its filer leaves None is stamped with the system actor at flush
+    # (`actors.stamp_dirty_task_actors`); NULL only once its person is deleted, which the dashboards read as
+    # the system actor's.
+    # Indexed (plain) for the board's creator filter.
     created_by_id: Mapped[Optional[UUID]] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("admin_users.id", ondelete="SET NULL"), nullable=True,
         index=True,
@@ -335,12 +370,11 @@ class Task(OrgScoped, Base):
         index=True,
     )
     # The stop record: why this row stopped, who stopped it and when (`app/task_sections.py`). Written by
-    # `routes/tasks/transitions.py::_stop_task_core` and the record-only wait-on-customer path; cleared by the
+    # `routes/tasks/transitions.py::_stop_task_core` and the system pauses; cleared by the
     # `trg_tasks_clear_stop_record` trigger when the row leaves for ready/active/done/draft. NULL on nearly
     # every row. Not a state: `Task.state` alone still drives the lifecycle.
     stop_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    stop_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # An actor stamp, RESTRICT like `features.shipped_by_id`: SET NULL would leave a half-record the
+    # An actor stamp, RESTRICT like `features.deleted_by_id`: SET NULL would leave a half-record the
     # record check refuses.
     stopped_by_id: Mapped[Optional[UUID]] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("admin_users.id", ondelete="RESTRICT", name=TASK_STOPPED_BY_FK),
@@ -370,6 +404,16 @@ class Task(OrgScoped, Base):
     # This Task's model pin; NULL defers to the persona stage default and the project card. Values and
     # precedence: `app/model_catalog.py`. No DB CHECK.
     model: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Who set this task's runner or model (`agent_id`, `bound_provider`, `model`): `human` (the task form) or
+    # `system` (an automation). A recorded fact the router reads, never inferred: the claim stamps
+    # `bound_provider` itself. NULL = nobody pinned. One writer: `app/agent_router/pins.py::stamp`.
+    pin_source: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # The review depth the coder runner declared for its change (`REVIEW_TIERS`), at `pull_request_enqueue` or its
+    # settle; the latest declaration wins. NULL = undeclared. One writer: `app/review_findings.py::declare_tier`.
+    review_tier: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # A blind review child's subject (`app/blind_review.py::review_target`): `{coder_task_id, pr_number, pr_url,
+    # base_branch, head_branch, head_sha}` of the PR its coder last reported. NULL on every other task.
+    review_target: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
     # Cron provenance: a SET NULL FK plus a durable name snapshot, so a task still names a deleted cron.
     # NULL/`''` when no cron created it.
     created_by_cron_id: Mapped[Optional[UUID]] = mapped_column(
@@ -414,13 +458,22 @@ class Task(OrgScoped, Base):
     source: Mapped[str] = mapped_column(
         Text, nullable=False, default="console", server_default="console"
     )
+    # Whether reaching `done` tells its recipients and marks it unseen for them (revision 202611021800). Declared after
+    # `source`: its default reads `source` and `persona` off the INSERT (`app/task_done_notice.py`, the rule's home);
+    # an explicit value wins. The server default is the backfill, so a raw-SQL row is OFF.
+    notify_when_done: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=task_done_notice.column_default, server_default="false"
+    )
     # How an epic sequences dep-satisfied children, read only off the parent: `auto` dispatches, `hold`
     # waits for a per-subtask Run. App-layer vocabulary.
     transition_mode: Mapped[str] = mapped_column(
         Text, nullable=False, default="auto", server_default="auto"
     )
+    # An epic's throttle, read only off the parent like `transition_mode`: at most this many of its subtasks run
+    # at once (`routes/tasks/dispatch.py::_parent_epic_throttled`). NULL = no limit.
+    max_running: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     # One-shot manual Run: stamped by Run, cleared on the next `ready → active` claim
-    # (`_active_dispatch_values`). Bypasses `hold` and unmet prerequisites.
+    # (`_active_dispatch_values`). Releases its epic's `hold`, and nothing else.
     run_requested_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
     # Why the lease-drain last declined this `ready` task (no account, no worktree) and when;
     # machinery, written without touching `updated_at`, read only while fresh (`app/dispatch_wait.py`).
@@ -443,8 +496,7 @@ class Task(OrgScoped, Base):
     # null together.
     external_task_system: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     external_task_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # Done-comment bookkeeping, shaped like the auto-retag pair (`app/task_external_comment.py` is the
-    # only writer): success stamp plus per-task failure counter.
+    # Retired done-comment bookkeeping, unused; dropped next release.
     external_done_comment_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
     external_done_comment_attempts: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, default=0, server_default="0"
@@ -471,6 +523,45 @@ class Task(OrgScoped, Base):
     )
     created_at: Mapped[datetime] = timestamp_column()
     updated_at: Mapped[datetime] = timestamp_column(onupdate=True)
+
+
+def task_search_text() -> Any:
+    """The ONE text a `GET /api/tasks?q=` search matches: title, description, outcome summary and no-PR
+    evidence, space-joined.
+
+    `ix_tasks_search_trgm` indexes exactly this expression (`migrations/versions/202611130100_baseline.py` spells it in SQL), and the
+    planner uses that index only for a textually identical expression, so the search builds it here and nowhere
+    else. Literals, not binds, for the same reason. Change it only together with a migration that rebuilds the
+    index."""
+    blank, space = text("''"), text("' '")
+    return (
+        Task.title
+        .op("||")(space).op("||")(Task.body)
+        .op("||")(space).op("||")(func.coalesce(Task.outcome_summary, blank))
+        .op("||")(space).op("||")(func.coalesce(Task.outcome_no_pr_evidence, blank))
+    )
+
+
+def task_id_text() -> Any:
+    """A task's number as text, the `?q=` number arm's partial match (`196` finds #1964). `ix_tasks_id_text_trgm`
+    indexes exactly this expression, so a numbered search ORs two index probes instead of scanning."""
+    return cast(Task.id, String)
+
+
+# Declared, not DDL-only, so `alembic revision --autogenerate` sees them and never emits their drop. The `q`
+# search: each word an unanchored `ILIKE` over `task_search_text()` as an index probe, not a scan.
+Index(
+    "ix_tasks_search_trgm",
+    task_search_text().label("search_text"),
+    postgresql_using="gin",
+    postgresql_ops={"search_text": "gin_trgm_ops"},
+)
+Index(
+    "ix_tasks_id_text_trgm",
+    task_id_text().label("id_text"),
+    postgresql_using="gin",
+    postgresql_ops={"id_text": "gin_trgm_ops"},
+)
 
 
 # ── DB-only pipeline status vocabularies ──────────────────────────────────────────────────────────
@@ -513,8 +604,8 @@ class TaskQuestion(OrgScoped, Base):
     # The operator's free-text note beside the choice; separate from `chosen_resolution` (see
     # `app/routes/tasks/answers.py::_resolution_for_delivery`). NULL = none typed.
     comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # The round reworded in plain terms (`app/question_plain.py::QuestionPlain`), written after the round is
-    # recorded. DISPLAY ONLY: an answer is matched against `options`, never this. NULL = not reworded.
+    # RETIRED: the old LLM rewording of the round, no longer written or read. Kept only while the previous
+    # release can still write it (migrations stay additive across the overlap); drop it in a later migration.
     plain: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
     status: Mapped[str] = mapped_column(
         Text, nullable=False, default="open", server_default="open"
@@ -584,11 +675,65 @@ class TaskRating(OrgScoped, Base):
     updated_at: Mapped[datetime] = timestamp_column(onupdate=True)
 
 
+class TaskDoneView(OrgScoped, Base):
+    """When one person last opened one Task: what clears its "done but not seen" mark for them
+    (`app/task_done_notice.py`, the rule's home; written by `POST /api/tasks/{id}/seen`).
+
+    One row per (task, person), upserted, as `task_ratings`; only a recipient of the task's done notice gets one. Both
+    FKs cascade. A pure edge, so no entity shape."""
+
+    __tablename__ = "task_done_views"
+
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True
+    )
+    # Indexed for the cascade from `admin_users`.
+    user_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("admin_users.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
+    )
+    seen_at: Mapped[datetime] = timestamp_column()
+
+
+class TaskQuestionDraft(OrgScoped, Base):
+    """One person's unsent answer to one OPEN round, so closing the task does not lose it
+    (`app/routes/tasks/question_drafts.py`, the only writer besides the resolve paths that clear it).
+
+    One row per (round, person), upserted, as `task_ratings`; an empty draft is no row. `picked` is SOURCE
+    indices into the round's `options`, `attachment_ids` the task's own uploaded files riding with it. Both
+    FKs cascade. A pure edge with a payload, so no entity shape. `task_id` is the round's own task, stored
+    because the tenancy derivation must reach a `Stored` parent (`task_questions` is itself `Derived`), and it
+    is what a task's drafts are listed by."""
+
+    __tablename__ = "task_question_drafts"
+
+    question_id: Mapped[int] = mapped_column(
+        ForeignKey("task_questions.id", ondelete="CASCADE"), primary_key=True
+    )
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Indexed for the cascade from `admin_users`.
+    user_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("admin_users.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
+    )
+    picked: Mapped[list[int]] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    note: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    attachment_ids: Mapped[list[int]] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    # Set explicitly by the upsert (`onupdate` does not reach a Core statement).
+    updated_at: Mapped[datetime] = timestamp_column(onupdate=True)
+
+
 class TaskBodyVersion(OrgScoped, Base):
     """Snapshot-on-write version history for a Task's `body`.
 
     Each row is the body about to be replaced, captured just before an edit (a prior description, not
-    the new value). `source`: `manual` | `agent_filed_edit` | `runner_break_refresh` |
+    the new value). `source`: `manual` | `agent_filed_edit` |
     `system_dedup_refresh`. `restored_from_id` is historical only (no live writer sets it); `SET NULL`
     keeps a snapshot valid if the version it names is removed."""
 

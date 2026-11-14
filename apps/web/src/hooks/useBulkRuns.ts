@@ -1,14 +1,17 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useRef, useState, type ReactNode } from 'react'
 
+import type { ConfirmOptions } from '../components/ConfirmDialog'
 import type { BulkAction } from '../ui/BulkActionBar'
+import { countOf } from '../lib/humanize'
 import {
-  omitKey,
+  bulkIdentity,
   runOverSelection,
   type BulkReport,
   type BulkRowNote,
   type BulkRun,
   type BulkVerb,
 } from '../lib/bulkRun'
+import { withoutKey } from '../lib/sets'
 
 /* The stateful half of a page's bulk verbs (`lib/bulkRun.ts` is the fan-out, `ui/BulkRunReports.tsx` the
  * banners): per-verb runs in flight, per-verb reports, and the BATCH rule — the page's selection is
@@ -17,11 +20,15 @@ import {
  * report), so a drifted literal would fail silently — no progress, no report, double-firable mid-run. */
 export function useBulkRuns<Row, Id extends string = string>({
   identity,
+  confirm,
   failureLine,
   onBatchClean,
 }: {
   /** The row's name as the report speaks it. */
   identity: (row: Row) => string
+  /** The page's `useConfirm`, for a verb that `ask`s first (a bar with no asking verb passes none); an asking
+   *  verb on a page that passed none never runs. */
+  confirm?: (options: ConfirmOptions) => Promise<boolean>
   /** One refused row's report line; see `lib/bulkRun.ts::defaultFailureLine` for the default. */
   failureLine?: (row: Row, err: unknown) => string
   /** Fired by the last run standing when EVERY run in its batch was clean (the page clears its selection). */
@@ -44,7 +51,7 @@ export function useBulkRuns<Row, Id extends string = string>({
    *  first still answers for. */
   runReason: (id: Id) => string | undefined
   /** One `BulkAction` over this hook's state: grey while its own run goes or nothing is eligible (saying
-   *  which), one press = optional confirm → fan-out → `after`. The page keeps its words and its confirm payload. */
+   *  which), one press = optional `ask` → fan-out → `after`. The page keeps its words. */
   verb: <T>(spec: BulkVerbSpec<Row, Id, T>) => BulkAction
 } {
   const [reports, setReports] = useState<Record<string, BulkReport>>({})
@@ -66,7 +73,7 @@ export function useBulkRuns<Row, Id extends string = string>({
       if (batch.current.live === 0) batch.current.clean = true
       batch.current.live += 1
       setRuns(prev => ({ ...prev, [id]: { verb: verb.doing, done: 0, total: rows.length } }))
-      setReports(prev => omitKey(prev, id))
+      setReports(prev => withoutKey(prev, id))
       /* The `prev[id]` test is defensive: it stops a late callback resurrecting a finished run's line. */
       const { done, failures, notes, degraded } = await runOverSelection(rows, run, {
         identity,
@@ -79,7 +86,7 @@ export function useBulkRuns<Row, Id extends string = string>({
       batch.current.live -= 1
       /* A degraded run keeps the selection like a refused one: those are the rows to look at again. */
       if (failures.length > 0 || degraded) batch.current.clean = false
-      setRuns(prev => omitKey(prev, id))
+      setRuns(prev => withoutKey(prev, id))
       setReports(prev => ({
         ...prev,
         [id]: { verb: verb.done, done, total: rows.length, failures, notes, degraded },
@@ -98,28 +105,37 @@ export function useBulkRuns<Row, Id extends string = string>({
   }, [runs])
 
   const verb = useCallback(<T,>({
-    id, label, icon, destructive, rows, noneWhy, doing, done, run, inspect, confirm, after,
+    id, label, icon, rows, noneWhy, doing, done, run, inspect, ask, after,
   }: BulkVerbSpec<Row, Id, T>): BulkAction => ({
     id,
     label,
     icon,
-    destructive,
+    destructive: ask !== undefined,
     disabled: !!runs[id] || rows.length === 0,
     disabledReason: runReason(id) ?? (rows.length === 0 ? noneWhy : undefined),
     onRun: () => {
       void (async () => {
-        if (confirm && !(await confirm())) return
+        /* The destructive confirm, one shape for every page: `Label N nouns?`, the rows named, the verb's own
+           word on the button; a typed gate types the count. */
+        if (ask && !(await confirm?.({
+          title: `${label} ${countOf(rows.length, ask.noun)}?`,
+          message: ask.message,
+          identity: ask.names ?? bulkIdentity(rows, identity),
+          confirmLabel: label,
+          destructive: true,
+          typed: ask.typed ? { name: String(rows.length), action: `the ${label.toLowerCase()}` } : undefined,
+        }))) return
         await runBulk(id, { doing, done }, rows, run, inspect)
         await after?.()
       })()
     },
-  }), [runs, runReason, runBulk])
+  }), [runs, runReason, runBulk, confirm, identity])
 
   return { runs, reports, runBulk, runReason, verb }
 }
 
 /** A page's bulk verb, as `useBulkRuns().verb` builds it into a `BulkAction`. */
-export type BulkVerbSpec<Row, Id, T> = Pick<BulkAction, 'label' | 'icon' | 'destructive'> & {
+export type BulkVerbSpec<Row, Id, T> = Pick<BulkAction, 'label' | 'icon'> & {
   id: Id
   /** The eligible rows, derived from the selection as it is NOW. */
   rows: readonly Row[]
@@ -129,8 +145,9 @@ export type BulkVerbSpec<Row, Id, T> = Pick<BulkAction, 'label' | 'icon' | 'dest
   done: string
   run: (row: Row) => Promise<T>
   inspect?: (row: Row, result: T) => BulkRowNote | null
-  /** The page's own confirm, resolving false to drop the press. */
-  confirm?: () => Promise<boolean>
+  /** Asks first (the verb is then destructive): the count's `noun`, the consequence, whether the count must be
+   *  typed, and the rows' names when not `identity`'s (a slot joins its node). */
+  ask?: { noun: string; message: ReactNode; typed?: boolean; names?: string }
   /** After the fan-out settles (a refetch). */
   after?: () => Promise<unknown> | void
 }

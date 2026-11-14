@@ -1,3 +1,5 @@
+import { capitalize } from './humanize'
+
 // A model id as a heading: "opus" → "Opus". A BARE CANONICAL FAMILY is the normal input now that the
 // platform stores one; the dated `claude-<family>-<ver>` shapes are historical and still format —
 // "claude-opus-4-8" → "Opus 4.8", with a trailing date segment dropped (e.g. "...-20250805"). Falls
@@ -8,7 +10,7 @@ export function fmtModel(id: string | null): string {
   if (parts.length > 1 && /^\d{6,}$/.test(parts[parts.length - 1])) parts = parts.slice(0, -1)
   const family = parts[0]
   if (!/^[a-z]+$/.test(family)) return id
-  const cap = `${family[0].toUpperCase()}${family.slice(1)}`
+  const cap = capitalize(family)
   const version = parts.slice(1).join('.')
   return version ? `${cap} ${version}` : cap
 }
@@ -21,12 +23,6 @@ export function fmtModelBrief(id: string | null): string {
   const family = parts[0]
   if (!/^[a-z]+$/.test(family)) return fmtModel(id)
   return family
-}
-
-// A model TIER id as its label: "high" → "High". The tier set is the server's (`app/model_catalog.py`,
-// `GET /api/tasks/models`); a surface without the catalogue in hand capitalizes, which is exactly its label.
-export function fmtTier(id: string): string {
-  return id ? `${id[0].toUpperCase()}${id.slice(1)}` : id
 }
 
 // A priced usage key as its label. The node suffixes a model id with its pricing tier (`@peak`,

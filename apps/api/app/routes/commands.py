@@ -16,8 +16,7 @@ import json
 import logging
 import os
 import re
-from contextlib import contextmanager
-from typing import Any, Iterator, Optional
+from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -25,14 +24,14 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
 from app import (
-    account_auth, agent_providers, console_direct, cp_peers, edition, forges, identities, ce_caps, node_bus,
-    project_identity, provider_auth_policy,
+    account_auth, agent_providers, console_direct, cp_peers, edition, identities, ce_caps, jaah_repos, node_bus,
+    project_identity, project_repos, provider_auth_policy,
 )
 from app.account_slug import new_account_slug
-from app.auth import require_user
 from app.authz.declarations import feature_any
 from app.authz.object_access import (
     OWNERSHIP_PERSONAL,
@@ -41,11 +40,12 @@ from app.authz.object_access import (
     stamp_owner_on_create,
     validated_ownership,
 )
-from app.authz.principal import Principal, creates_org_rows, current_principal
-from app.authz.visibility import ObjectAccess, sees_all_nodes, worktree_editable_clause
+from app.authz.principal import AsyncCaller, Principal, creates_org_rows, current_caller
+from app.authz.visibility import ObjectAccess, sees_all_nodes, worktree_may_edit
 from sqlalchemy.exc import TimeoutError as SQLTimeoutError
 
-from app.db import SessionLocal, get_session, release_connection
+from app.db import release_connection
+from app.db_async import DbDep, async_session, release
 from app.events import emit_console_event
 from app.login_seal_wire import (
     CHUNK_CIPHERTEXT_BYTES,
@@ -61,16 +61,16 @@ from app.models.nodes import Node
 from app.models.orgs import Org
 from app.models.projects import Project
 from app.models.worktrees import Worktree
-from app.node_clone import clone_for_slot_path, resolve_auth_dir, resolve_clone
+from app.node_clone import resolve_auth_dir
 from app.node_identity import (
-    bus_key, cp_node_id, is_uuid_shaped, node_id_or_none, node_matches, node_ref, resolve_node_id,
+    bus_key, cp_node_id, node_id_or_none, node_matches, node_ref, resolve_node_id,
 )
 from app.shared_storage import resolve_shared_auth_dir
 from app.org_gate import require_org_active
 from app.tenancy import seam
 from app.tenancy.copy import not_available
 from app.command_read import command_read
-from app.tenancy.ids import ORG_ZERO_ID, is_tenant_org
+from app.tenancy.ids import is_tenant_org
 
 router = APIRouter(prefix="/api/commands", tags=["commands"])
 log = logging.getLogger("cockpit-commands")
@@ -81,15 +81,13 @@ COMMAND_TIMEOUT = float(os.environ.get("COMMAND_TIMEOUT", "180"))
 
 # Types that name a slot and so need `project_id` + `number` — input validation, not policy. They are also
 # checked by `_require_editable_slot`.
-SLOT_ARG_TYPES = {"release", "retire", "set_title"}
+SLOT_ARG_TYPES = {"release"}
 VALID_TYPES = SLOT_ARG_TYPES | {
     # `create` materialises a new slot's tree (names no existing slot); `reconcile` re-observes one slot
     # or, with neither arg, the whole pool.
     "create", "reconcile",
-    "check",
     "stack_up", "stack_down", "stack_restart", "stack_rebuild",
-    "logs", "sync_develop", "open_finder", "open_cursor", "run",
-    "rename_tmux",
+    "logs", "open_finder", "open_cursor", "run",
     # Account lifecycle and re-auth: host-local account registry and credential dir, not a slot.
     "account_add", "account_add_submit_code", "account_delete",
     "account_reauth", "account_reauth_submit_code",
@@ -110,13 +108,16 @@ VALID_TYPES = SLOT_ARG_TYPES | {
     # "Update this node now". No args and no `_resolve_command_args` arm: the node reads the target
     # version itself (`GET /api/agent/release-desired`), so no version string reaches a root `apt-get`.
     "node_update",
+    # "Restart this node's daemon now" (`apps/jaahd/restart_ops.py`). No args. Its console doors are
+    # `POST /api/nodes/{id}/restart` and `POST /api/hosts/{id}/restart` (`app/routes/nodes/restart.py`, `app/routes/host_restart.py`).
+    "node_restart",
     # "Converge this node's self-hosted GitHub Actions runners now". No args, as `node_update`: the node
     # reads its desired state (`GET /api/agent/gha-runners/desired`, including a live registration token)
     # itself, so no operator input reaches the root `install.py` and no secret sits in a bus frame or the
     # audit log.
     "gha_runners_apply",
-    # "Converge this node's NodeLink mount now". No args, as `gha_runners_apply`: the node reads its desired
-    # store (`GET /api/agent/nodelink`) itself. Sent by `app/nodelink.py::request_converge`.
+    # "Converge this node's NodeLink mounts now". No args, as `gha_runners_apply`: the node reads its desired
+    # NodeLinks (`GET /api/agent/nodelinks`) itself. Sent by `app/nodelink.py::request_converge`.
     "nodelink_converge",
 }
 
@@ -125,7 +126,7 @@ VALID_TYPES = SLOT_ARG_TYPES | {
 # `@feature_any("worktrees:edit", "system:create")` is the floor the kernel enforces; this table is the
 # narrowing it cannot express. A disjunction because the two keys reach different verbs of one POST.
 
-# Both halves are load-bearing: without `_require_command_key` a `worktrees:edit` holder reaches `retire`;
+# Both halves are load-bearing: without `_require_command_key` a `worktrees:edit` holder reaches `create`;
 # widen the declaration and this table is the only barrier. The authz registry test pins both.
 
 # One route (settled decision 5); `worktrees:view` grants none of these (settled decision 7). Fails closed:
@@ -133,16 +134,17 @@ VALID_TYPES = SLOT_ARG_TYPES | {
 _WORKTREE_OR_SYSTEM = frozenset({"worktrees:edit", "system:create"})
 _SYSTEM_ONLY = frozenset({"system:create"})
 
-# A per-op narrowing on `run`: `ports_reband` rewrites every slot's `.env` and restarts stacks, and its
-# dedicated route (`POST /api/port-grid/reband`) is superadmin, so this generic verb must not be weaker.
-_RUN_OP_SUPERADMIN_ONLY = frozenset({"ports_reband"})
+# A `run` op the current node no longer has but an older jaahd still runs (`ports_reband` rewrote every slot's
+# `.env` and restarted its stacks). Refused for everyone while node versions are mixed; dropped with the
+# retired port-block column's contraction revision.
+_RUN_OPS_RETIRED = frozenset({"ports_reband"})
 
-# A per-org narrowing on the pool verbs: `retire`/`create`/`reconcile` shape the operator's pool,
+# A per-org narrowing on the pool verbs: `create`/`reconcile` shape the operator's pool,
 # never anything a tenant owns — yet `system:create` is grantable to a tenant admin, and a tenant-born
 # superadmin holds every key. Keyed on the org (`is_tenant_org`), not `is_operator`, so the operator's
 # non-superadmin staff keep their fleet. `node_update` and `gha_runners_apply` are not here: they converge
 # the target node only, and the node WRITE probe below confines a tenant to their own org's nodes.
-_OPERATOR_ORG_ONLY = frozenset({"retire", "create", "reconcile"})
+_OPERATOR_ORG_ONLY = frozenset({"create", "reconcile"})
 
 COMMAND_TYPE_KEYS: dict[str, frozenset[str]] = {
     # ── the worktree tier: `worktrees:edit` OR `system:create` ──────────────────────────────────────
@@ -154,22 +156,15 @@ COMMAND_TYPE_KEYS: dict[str, frozenset[str]] = {
     "stack_restart": _WORKTREE_OR_SYSTEM,
     "stack_rebuild": _WORKTREE_OR_SYSTEM,
     # Git + shell conveniences scoped to the one worktree the caller is looking at.
-    "sync_develop": _WORKTREE_OR_SYSTEM,
     "logs": _WORKTREE_OR_SYSTEM,
     "open_finder": _WORKTREE_OR_SYSTEM,
     "open_cursor": _WORKTREE_OR_SYSTEM,
-    "rename_tmux": _WORKTREE_OR_SYSTEM,
 
     # ── everything else: `system:create` ────────────────────────────────────────────────────────────
-    # `set_title` relabels one driveable slot, so it rides the worktree tier (as
-    # `PUT /api/worktrees/{project}/{number}/title`). `retire`, `create` and `reconcile` shape what the
-    # fleet may dispatch onto, so they stay system-only (releasing only ends a hold).
-    "set_title": _WORKTREE_OR_SYSTEM,
-    "retire": _SYSTEM_ONLY,
+    # `create` and `reconcile` shape what the fleet may dispatch onto, so they stay system-only
+    # (releasing only ends a hold).
     "create": _SYSTEM_ONLY,
     "reconcile": _SYSTEM_ONLY,
-    # Repo-wide operations against a project's clone, not against any one worktree.
-    "check": _SYSTEM_ONLY,
     # `run` executes an arbitrary declared op, so it stays admin-only.
     "run": _SYSTEM_ONLY,
     # Account lifecycle: host-local registry and OAuth credentials; unreachable by `worktrees:edit`.
@@ -187,6 +182,7 @@ COMMAND_TYPE_KEYS: dict[str, frozenset[str]] = {
     "sync_access_guard": _SYSTEM_ONLY,
     # Converges the node's own package — the most system-shaped verb.
     "node_update": _SYSTEM_ONLY,
+    "node_restart": _SYSTEM_ONLY,
     # Converges the node's runner pool (root-side). Its own route is `nodes:edit` plus a WRITE grant; this
     # covers the generic POST.
     "gha_runners_apply": _SYSTEM_ONLY,
@@ -226,8 +222,7 @@ WORKTREE_TIER_TYPES = frozenset(
 _CALLER_MUST_NOT_SUPPLY = ("path", "holder", "config_dir", "stack_up_cmd", "stack_down_cmd")
 
 # The only args a session may supply on either phase-1 login verb — an allowlist. `shared` is absent: the
-# CP re-adds it for a new `account_add` on a node that reports a mounted token share (an old `jaahd`'s
-# override; a current one ignores it). The two arms stay separate because only `account_add` re-adds `shared`. `_test` is live (the node and
+# node alone chooses the store. `_test` is live (the node and
 # `routes/portfolio.py` read it). `provider` is validated and re-injected by `_with_resolved_provider`,
 # so its membership is currently redundant — kept as the declaration of what a session may send.
 # `peer_key` is the wizard's per-login public key. `with_code` is retired: a caller still
@@ -235,7 +230,7 @@ _CALLER_MUST_NOT_SUPPLY = ("path", "holder", "config_dir", "stack_up_cmd", "stac
 _ACCOUNT_PHASE1_CALLER_ARGS = frozenset({"slug", "peer_key", "_test", "provider"})
 
 # The Add-Account wizard's three verbs, which a non-administrator may also run to bring their OWN account
-# (G2): `accounts:create` held anywhere — a Developer or Maintainer — admits them on the PERSONAL path
+# (G2): `accounts:create` held anywhere — every org member (`access_catalog.MEMBER_KEYS`) — admits them on the PERSONAL path
 # (`_personal_account_path`), which makes the account theirs, confines an enrolment and a continuation to
 # their own login, and leaves the org's accounts untouched. Every other account verb stays system-only.
 _PERSONAL_ACCOUNT_VERBS = frozenset({"account_add", "account_add_submit_code", "account_add_await_login"})
@@ -244,8 +239,8 @@ _ACCOUNTS_CREATE_KEY = "accounts:create"
 _SYSTEM_CREATE_KEY = "system:create"
 
 
-def _personal_account_path(
-    session: Session, principal: Principal | None, command_type: str, args: dict[str, Any]
+async def _personal_account_path(
+    db: AsyncSession, principal: Principal | None, command_type: str, args: dict[str, Any]
 ) -> bool:
     """Admit this caller on the Add-Account wizard's PERSONAL path? One of `_PERSONAL_ACCOUNT_VERBS`, held
     `accounts:create` (anywhere — a Developer or Maintainer, G2) and not the verb's own org-wide
@@ -256,8 +251,8 @@ def _personal_account_path(
         return False
     if principal.has_org(_SYSTEM_CREATE_KEY) or not principal.has(_ACCOUNTS_CREATE_KEY):
         return False
-    _require_account_access(session, principal, command_type, args)
-    _require_own_account_slug(session, principal, args)
+    await _require_account_access_async(db, principal, command_type, args)
+    await db.run_sync(_require_own_account_slug, principal, args)
     return True
 
 
@@ -280,10 +275,7 @@ def _require_command_key(
         if personal_path and command_type in _PERSONAL_ACCOUNT_VERBS:
             # Admitted and confined by `_personal_account_path`.
             return
-    raise HTTPException(
-        status_code=403,
-        detail=f"forbidden: {command_type} requires one of {sorted(required)}",
-    )
+    raise HTTPException(status_code=403, detail=f"forbidden: {command_type} requires one of {sorted(required)}")
 
 
 # One constant detail for all three refusals below (unknown project, unknown slot, not drivable), so the
@@ -304,24 +296,13 @@ def _require_editable_slot(
     reads grants and slot ownership, not `system:create` or `WIDE_WORKTREE_KEYS`); a superadmin does.
     Node-scoped, since `(project_id, number)` is not unique across nodes. Every miss (unknown project —
     `_require_project` answers it with this same detail — unknown slot, not drivable) is 404
-    `_NO_SUCH_SLOT`: fail-closed and non-disclosing. Runs after the 422s.
-
-    The clause needs `Worktree` in the enclosing `select_from` (as `authz.can_access`); a bare select
-    cross-joins and is a silent allow-all. Selected as a column so both refusals share one round trip."""
-    row = session.execute(
-        select(worktree_editable_clause(principal).label("may_edit"))
-        .select_from(Worktree)
-        .where(
-            # Resolved in-statement: `node_id` is the node uuid and the column a uuid FK. Fails closed
-            # (unresolvable → NULL → no row → 404).
-            Worktree.node_id == node_ref(node_id),
-            Worktree.project_id == project_id,
-            Worktree.number == number,
-        )
-    ).first()
-    if row is not None and row.may_edit:
-        return
-    raise HTTPException(status_code=404, detail=_NO_SUCH_SLOT)
+    `_NO_SUCH_SLOT`: fail-closed and non-disclosing. Runs after the 422s. `authz.worktree_may_edit` is the
+    probe (one round trip; `node_ref` resolves in-statement and fails closed: unresolvable → NULL → 404)."""
+    if not worktree_may_edit(
+        session, principal,
+        Worktree.node_id == node_ref(node_id), Worktree.project_id == project_id, Worktree.number == number,
+    ):
+        raise HTTPException(status_code=404, detail=_NO_SUCH_SLOT)
 
 
 # Account-add slug format — validated here (fast fail) AND authoritatively in the agent (T7).
@@ -334,8 +315,7 @@ SLUG_RULE = "slug must be lowercase letters/digits/-/_, start alphanumeric, max 
 # Commands needing a worktree `path` resolved from the CP's Worktree cache.
 _PATH_COMMANDS = {
     "stack_up", "stack_down", "stack_restart", "stack_rebuild", "run",
-    "logs", "sync_develop", "open_finder", "open_cursor",
-    "rename_tmux",
+    "logs", "open_finder", "open_cursor",
 }
 
 
@@ -367,30 +347,14 @@ def _resolve_command_args(
     command_type: str, args: dict[str, Any], session: Session, node_id: str,
 ) -> dict[str, Any]:
     """Inject the CP-decided fields, per command family: the project's name beside its id, worktree
-    `path`, the stack command pair for the four stack verbs, `base` + `clone_url` for `sync_develop`, `clone_path` +
-    `gate_cmd` for `check`, `config_dir` for `account_delete` (from the `accounts` row by `slug`), and
-    `repo_root` + `branch_prefix` + `push_enabled` for `sync_access_guard`.
+    `path`, the stack command pair for the four stack verbs, `config_dir` for `account_delete` (from the
+    `accounts` row by `slug`), and `branch_prefix` + `push_enabled` + `allow_force_push` +
+    `integration_branch` + `repos` (every repository's policy) for `sync_access_guard`.
 
     A project is named by `args["project_id"]` only; a name never resolves to a row (names are unique
     per org, not fleet-wide). The resolved row's name is forwarded as `project` for daemons that still
     match their roster by name; an id naming no row strips any caller `project`/`repo` so a stale name
-    cannot steer the node, and every injection below then misses (the node fails closed).
-
-    Clone paths are computed for `node_id` from `Node.jaah_home` plus the project's id
-    (`app/node_clone.py`)."""
-
-    def _clone_for(project_id: Optional[int]) -> str:
-        # The main clone's STORED path first — where the node last reported it — else `resolve_clone`'s.
-        node = session.scalar(select(Node).where(node_matches(node_id)))
-        jaah_home = node.jaah_home if node else None
-        stored = session.scalar(
-            select(Worktree.path).where(
-                Worktree.node_id == (node.id if node else None),
-                Worktree.project_id == project_id,
-                Worktree.number == 0,
-            )
-        ) if node is not None and project_id is not None else None
-        return clone_for_slot_path(jaah_home, stored, 0) or resolve_clone(jaah_home, project_id)
+    cannot steer the node, and every injection below then misses (the node fails closed)."""
 
     out = dict(args)
     project: Optional[Project] = None
@@ -418,21 +382,6 @@ def _resolve_command_args(
             )
             if path:
                 out.setdefault("path", path)
-        if command_type == "sync_develop":
-            # The integration branch is a Project column, always overwritten: a surviving caller `base`
-            # would be a rebase target the caller chose. A miss leaves it absent; the node fails closed.
-
-            # The pop is outside the `project is not None` test, or omitting the project would keep the
-            # caller's `base`.
-            out.pop("base", None)
-            # The remote likewise: the node fetches from this URL, never the tree's `origin`. Absent when the
-            # project has no repository reference; the node fails closed.
-            out.pop("clone_url", None)
-            if project is not None:
-                out["base"] = project.integration_branch
-                ref = forges.repo_ref_or_none(project)
-                if ref is not None:
-                    out["clone_url"] = ref.clone_url()
         if command_type in ("stack_up", "stack_down", "stack_restart", "stack_rebuild"):
             # The stack command lines are Project columns, and the node has no default of its own. Both
             # ride all four verbs (`stack_restart`/`stack_rebuild` need down and up).
@@ -445,17 +394,6 @@ def _resolve_command_args(
             if project is not None:
                 out["stack_up_cmd"] = project.stack_up_cmd
                 out["stack_down_cmd"] = project.stack_down_cmd
-    elif command_type == "check":
-        # The clone path comes from the Project row, always overwritten. `repo_root` is popped too (the node
-        # handler reads it as its source), and `gate_cmd` is a Project column.
-        out.pop("clone_path", None)
-        out.pop("repo_root", None)
-        out.pop("gate_cmd", None)
-        if project is not None:
-            clone = _clone_for(project.id)
-            if clone:
-                out["clone_path"] = clone
-            out["gate_cmd"] = project.gate_quick_cmd
     elif command_type in ("account_delete", "account_converge"):
         # The node removes credentials at this path — the highest-consequence injection. Derived for the
         # target node (`resolve_auth_dir(<that node's jaah_home>, slug)`).
@@ -489,20 +427,32 @@ def _resolve_command_args(
                     if config_dir:
                         out["config_dir"] = config_dir
     elif command_type == "sync_access_guard":
-        # Same injection and allowlist as `check`. `branch_prefix`/`push_enabled` decide what the clone may
-        # push, so a caller pair is never kept; the node fails closed on either absent.
+        # No `repo_root`: the node derives the project's clone from its own home and `project_id`
+        # (`apps/jaahd/worktree_mechanics/core.py::project_anchor`), so a caller's is dropped.
+        # `branch_prefix`/`push_enabled` decide what the clone may push, so a caller pair is never kept; the node fails closed on either absent.
         out.pop("repo_root", None)
         out.pop("branch_prefix", None)
         out.pop("push_enabled", None)
         # Popped for the same reason; the clone's refusal messages name it as the PR base.
         out.pop("integration_branch", None)
+        out.pop("allow_force_push", None)
+        out.pop("repos", None)
+        # The project's org prefix in the Jaah GitHub org (`jaah_repos.jaah_repo_prefix`) — whose repositories the
+        # clone may push to there; `""` (no Jaah org) clears the marker. Project-level, so every clone takes it.
+        out.pop("jaah_repo_prefix", None)
         if project is not None:
-            clone = _clone_for(project.id)
-            if clone:
-                out["repo_root"] = clone
+            # The anchor's (the primary's) policy, then every repository's — the primary's too, whose clone may sit
+            # under `_repos/<rid>/` after a primary swap — for the node to match each clone by `repo_id`.
             out["branch_prefix"] = project.branch_prefix
             out["push_enabled"] = project.push_enabled
+            out["allow_force_push"] = project.allow_force_push
             out["integration_branch"] = project.integration_branch
+            out["jaah_repo_prefix"] = jaah_repos.jaah_repo_prefix(jaah_repos.org_slug_of(session, project.org_id))
+            out["repos"] = [
+                {"repo_id": row.id, "branch_prefix": row.branch_prefix, "push_enabled": row.push_enabled,
+                 "allow_force_push": row.allow_force_push, "integration_branch": row.integration_branch}
+                for row in project_repos.repos_of(session, project.id)
+            ]
     return out
 
 
@@ -536,9 +486,7 @@ async def _dispatch(
         ) from exc
     except node_bus.NodeRequestTimeout as exc:
         log.warning("command dispatch: node %s did not reply within %ss", node_id, timeout)
-        raise HTTPException(
-            status_code=504, detail=f"node '{node_id}' did not respond in time",
-        ) from exc
+        raise HTTPException(status_code=504, detail=f"node '{node_id}' did not respond in time") from exc
     return _parse_reply(reply)
 
 
@@ -558,7 +506,7 @@ def _audit_org(session: Session, resolved_node_id: Optional[UUID], actor: str) -
     operator's who asked.
 
     `_record_audit`'s `org_id=` comment says why. Both reads go through `__table__` so the read seam does
-    not filter the derivation (as `fleet_verdicts._persist_intents`)."""
+    not filter the derivation (as `fleet_verdicts._persist_kwargs`)."""
     if resolved_node_id is not None:
         node_org = session.execute(
             select(Node.__table__.c.org_id).where(Node.__table__.c.id == resolved_node_id)
@@ -584,7 +532,7 @@ def _record_audit(
     `CommandAudit`'s only writer; `GET /api/command-log` reads it. Not best-effort: exceptions propagate,
     so no mutation is reported successful unaudited.
 
-    Commits by default, because `get_session` does not commit on teardown and `_ensure_account_row`
+    Commits by default, because a route session does not commit on teardown and `_ensure_account_row`
     rolls back on two branches. `commit=False` is for a caller with its own open mutation —
     `routes/pool_slots.py::release_slot` passes it so this helper does not own its transaction. Either
     way the row is flushed and its event emitted before return."""
@@ -593,7 +541,7 @@ def _record_audit(
         # A nullable uuid FK; fails open (unresolvable value → NULL) so the audit row is never lost over a
         # lookup. `or "local"` resolves only if a `local` node is registered.
         node_id=resolved_node_id,
-        # The node's org first, never overridden by the caller (as `fleet_verdicts._persist_intents`):
+        # The node's org first, never overridden by the caller (as `fleet_verdicts._persist_kwargs`):
         # under `Tenancy.OPERATOR` nothing stamps this `Stored` row, and a refused create would lose the
         # audit of a destructive command. With no node, the bound org, then the actor's (`org_id` is NOT
         # NULL and the dispatch already ran) — attribution, not an ambient default. All empty → `None`.
@@ -659,10 +607,15 @@ def _credential_safe_args(command_type: str, args: dict[str, Any]) -> dict[str, 
         return redacted
     if command_type.startswith(_NODEVAULT_PREFIX):
         return _nodevault_redacted(args)
-    if command_type == "trigger_preflight" and "input" in args:
+    if command_type == "trigger_preflight" and ("input" in args or "grant" in args):
         # The delivered event (up to 1 MiB of a sender's payload) and the state document: the deliveries log
-        # is their record, not this permanent row. Marked, never dropped, as the paste-code arm.
-        return {**args, "input": None, "input_redacted": True}
+        # is their record, not this permanent row. The grant (`trigger_preflight_script.mint_grant`) buys the
+        # trigger owner's git login until it expires. Marked, never dropped, as the paste-code arm.
+        redacted = {**args}
+        for key in ("input", "grant"):
+            if key in redacted:
+                redacted[key], redacted[f"{key}_redacted"] = None, True
+        return redacted
     return args
 
 
@@ -815,72 +768,32 @@ def _echo_safe_args(command_type: str, args: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in args.items() if k not in ("stack_up_cmd", "stack_down_cmd")}
 
 
-def _config_dir_from_reply(result: Optional[dict[str, Any]]) -> Optional[str]:
-    """The host's config dir out of an account command's own JSON stdout, or None if unusable.
+def _reply_str(result: Optional[dict[str, Any]], key: str) -> Optional[str]:
+    """The non-empty string `key` out of an account command's own JSON stdout, or None if unusable.
 
-    The CP (in a container with a different `$HOME`) cannot derive it. Untrusted stdout: anything
-    malformed returns None, and no row is created."""
+    Untrusted stdout, parsed by `_stdout_payload` like every reply reader: anything malformed returns None.
+    `config_dir` — the host's config dir, which the CP (in a container with a different `$HOME`) cannot derive;
+    None creates no row. `status` — the node's own status, which `*_await_login` needs: `awaiting_redirect`
+    (still alive) and `done` (finalized) are both exit 0 and dispatch status `done`, and confusing them either
+    ends a live wizard or strands a finished one."""
     payload = _stdout_payload(result)
-    if payload is None or not isinstance(payload.get("config_dir"), str):
+    if payload is None or not isinstance(payload.get(key), str):
         return None
-    return payload["config_dir"].strip() or None
+    return payload[key].strip() or None
 
 
 def _securestorage_dir_from_reply(result: Optional[dict[str, Any]]) -> Optional[str]:
     """The credential store the node says this login was actually pointed at, out of a phase-1 reply's own
     JSON stdout — `""` for an ordinary local mint, None when the node said nothing usable.
 
-    Asked because deciding and observing differ under deploy skew: an old `jaahd` ignores `shared: true`
-    and mints locally, exit 0, so `accounts.shared` records where the token went (`_ensure_account_row`;
+    Asked because the node decides where it mints (its share when one is mounted, else its own disk), so
+    `accounts.shared` records where the token went (`_ensure_account_row`;
     cf. `apps/jaahd/accounts.py::_login_store_refusal`). `""` (a current node reporting local) and None
     (too old, or unparseable — worth a log line) both record local."""
     payload = _stdout_payload(result)
     if payload is None or not isinstance(payload.get("securestorage_dir"), str):
         return None
     return payload["securestorage_dir"].strip()
-
-
-# The authorize URL's ceiling: node stdout is untrusted, and this string reaches `command_audit_log`, the
-# durable `workflow_events` projection and a DOM href. 2048, not ~512, because a Google consent URL measures
-# ~550 chars (pinned by `tests/test_commands_login_reply.py::_GOOGLE_CONSENT_URL`).
-_OAUTH_URL_MAX_LEN = 2048
-
-
-def _oauth_url_from_reply(
-    result: Optional[dict[str, Any]], *, provider: Optional[str] = None,
-) -> Optional[str]:
-    """The plaintext authorization URL out of a login reply's own JSON stdout. Untrusted subprocess
-    stdout: anything missing or malformed returns None.
-
-    No route reads it today (its last reader, the node-CLI credential wizard, now retired). The account
-    verbs (`account_add`/`account_reauth`) never read it: their login reports `sealed_url`
-    (`durable/accounts.py::_sealed_login`), and a plaintext answer is refused upstream (`login_seal_unsupported`).
-
-    Over-long fails closed to None rather than truncating (a truncated authorize URL loses its `state`
-    and `code_challenge`). With a `provider`, the host is also anchored: the node's own scrape guards
-    against its CLI, this guards against the node (rolled back, mis-provisioned, owned), since `safeHref`
-    admits any http(s). A refusal is the ordinary `oauth_url_scrape_failed` path. `provider=None` and a
-    provider declaring no prefix (Claude) skip the anchor — the roster decides.
-    """
-    payload = _stdout_payload(result)
-    if payload is None or not isinstance(payload.get("oauth_url"), str):
-        return None
-    url = payload["oauth_url"].strip()
-    if len(url) > _OAUTH_URL_MAX_LEN:
-        return None
-    # `authorize_url_admits`, not `startswith`: the match is the roster's fact, and for a constant
-    # verification page it is equality — the only spelling that refuses a prefilled `?user_code=` tail or
-    # a suffix-glued host.
-    admits = agent_providers.authorize_url_admits(provider, url) if provider is not None else None
-    if admits is False:
-        # Never logs the URL (attacker-chosen text), only its length.
-        log.warning(
-            "a node reported a %d-character authorize URL that provider %r's declared anchor (%r) does "
-            "not admit; publishing no URL, which surfaces as the ordinary scrape failure",
-            len(url), provider, agent_providers.authorize_url_prefix(provider),
-        )
-        return None
-    return url or None
 
 
 # The publishable shape of a device-auth user code — the CP twin of
@@ -911,21 +824,9 @@ def _user_code_from_reply(result: Optional[dict[str, Any]]) -> Optional[str]:
     return code
 
 
-def _payload_status_from_reply(result: Optional[dict[str, Any]]) -> Optional[str]:
-    """The node's own `status` out of an account command's JSON stdout, or None if unusable.
-
-    `*_await_login` needs it: `awaiting_redirect` (still alive) and `done` (finalized) are both exit 0
-    and dispatch status `done`, and confusing them either ends a live wizard or strands a finished one.
-    Parsed by `_stdout_payload` like every reply reader."""
-    payload = _stdout_payload(result)
-    if payload is None or not isinstance(payload.get("status"), str):
-        return None
-    return payload["status"].strip() or None
-
-
 #: The verbs that may name a project, always by `args.project_id` (an int, `projects.id`). A name is never
 #: accepted: names are unique per org, not fleet-wide. Pinned by `tests/test_commands_args.py`.
-_PROJECT_COMMANDS = WORKTREE_TIER_TYPES | SLOT_ARG_TYPES | {"create", "reconcile", "check", "sync_access_guard"}
+_PROJECT_COMMANDS = WORKTREE_TIER_TYPES | SLOT_ARG_TYPES | {"create", "reconcile", "sync_access_guard"}
 
 _PG_INT4 = (-2_147_483_648, 2_147_483_647)
 
@@ -966,7 +867,7 @@ def _require_account_access(
     principal: Principal | None,
     command_type: str,
     args: dict[str, Any],
-) -> None:
+) -> Optional[str]:
     """The account half of the object floor — the command bus otherwise checked only the node.
 
     Without it `system:create` plus one node grant reached `account_delete` for any account on it. A
@@ -976,37 +877,66 @@ def _require_account_access(
 
     Known residual: missing vs ungranted is distinguishable, so a `system:create` holder can enumerate
     slugs; 404-on-both was reverted (it breaks new-slug adds and
-    `test_system_create_is_unchanged_for_every_command_type`). Shape errors are the later 422 arms'."""
+    `test_system_create_is_unchanged_for_every_command_type`). Shape errors are the later 422 arms'.
+
+    Returns the slug when no row is visible: its fleet-wide refusals (`_refuse_unseen_slug`) read on sessions
+    of their own, which the route awaits off this one (`_require_account_access_async`)."""
     if command_type not in _ACCOUNT_TIER_COMMANDS:
-        return
+        return None
     slug = args.get("slug")
     if not isinstance(slug, str) or not slug:
-        return
+        return None
     account_id = session.scalar(select(Account.id).where(Account.slug == slug))
     if account_id is None:
-        _refuse_slug_held_by_another_org(principal, slug)
-        return
+        return slug
     # 404, never 403 — see `require_object_access`.
     require_object_access(session, principal, "account", account_id, mode=ObjectAccess.WRITE)
+    return None
 
 
-def _refuse_slug_held_by_another_org(principal: Principal | None, slug: str) -> None:
+async def _require_account_access_async(
+    db: AsyncSession, principal: Principal | None, command_type: str, args: dict[str, Any],
+) -> None:
+    """`_require_account_access` on the route's session, then the refusals a slug with no visible row owes —
+    after the route's read-only connection is handed back, as they read on sessions of their own."""
+    slug = await db.run_sync(_require_account_access, principal, command_type, args)
+    if slug is None:
+        return
+    await release(db)
+    await _refuse_slug_held_by_another_org(principal, slug)
+    if command_type == "account_add":
+        await run_in_threadpool(_refuse_slug_still_being_removed, slug)
+
+
+async def _refuse_slug_held_by_another_org(principal: Principal | None, slug: str) -> None:
     """Refuse an account verb naming a slug that the caller's org cannot see but another org holds.
 
     The seam makes a foreign row look missing, which is the permissive branch for every account verb; but
     `accounts.slug` is fleet-unique (`uq_accounts_slug`) and observations fold by slug
     (`app/account_fold.py`), so a tenant's node could write the operator's account health.
 
-    A fleet-wide read under `seam.detached()` on its own `SessionLocal()`, one scalar out
+    A fleet-wide read under `seam.detached()` on its own session, one scalar out
     (listed in the tenancy-scope census); it reads only whether the slug is taken, already a
     fleet-wide fact. Skipped for the operator plane. 409, as `POST /api/accounts` gives for the same
     collision."""
     if principal is None or principal.is_operator:
         return
-    with seam.detached(), seam.operator_scope(), SessionLocal() as fleet:
-        taken = fleet.scalar(select(Account.id).where(Account.slug == slug)) is not None
+    with seam.detached(), seam.operator_scope():
+        async with async_session() as fleet:
+            taken = await fleet.scalar(select(Account.id).where(Account.slug == slug)) is not None
     if taken:
         raise HTTPException(status_code=409, detail=account_slug_not_available(slug))
+
+
+def _refuse_slug_still_being_removed(slug: str) -> None:
+    """Refuse a new login under a slug a deleted account's removal is still owed for
+    (`account_removal.slug_still_owed`): carried out after the login made its dir, it would delete the new one."""
+    from app import account_removal
+
+    if account_removal.slug_still_owed(slug):
+        raise HTTPException(
+            status_code=409, detail=f"account {slug!r} is still being removed from a node; retry in a minute",
+        )
 
 
 def _require_own_account_slug(
@@ -1045,20 +975,8 @@ def account_slug_not_available(slug: str) -> str:
     return not_available(f"account slug '{slug}'")
 
 
-def _provider_mints_on_shared_store(provider: str) -> bool:
-    """True iff a login for `provider` writes its credential to the shared fleet store rather than to the
-    node's own disk — which is the question both shared-account behaviours on this route turn on.
-
-    Read off the catalogue's `node_pinned` (`app/agent_providers.py`), never a provider-name comparison. A
-    `shared_token_link` provider mints on the share too (its login runs in the store). For a
-    `node_pinned` provider the injected `shared: true` stands down (its credentials are node-local). An
-    unknown value answers True (keeps the guard); unreachable, since unknown providers are 422d first."""
-    row = agent_providers.by_value(provider)
-    return row is None or not row.node_pinned
-
-
 def _with_resolved_provider(args: dict[str, Any], provider: str) -> dict[str, Any]:
-    """`args` carrying the provider the control plane resolved — injected, exactly as `shared` is.
+    """`args` carrying the provider the control plane resolved — injected, never the caller's claim.
 
     An existing account's provider comes off its roster row (`_account_row_provider`), so a request that
     omitted it still reaches the node with the right one. The default provider is removed, not just not
@@ -1085,9 +1003,8 @@ def _account_slug_is_new(session: Session, slug: str) -> bool:
 
     Enrolment (`apps/web/src/pages/credentials/Accounts.tsx::onEnrol`) reuses `mode="add"` with a fixed
     slug. The row, not a UI-supplied mode, is the authority: a slug with a row has its own `accounts.shared`
-    answer, so the injected `shared: true` applies only to a new slug
-    (cf. `_login_start`'s `shared_override`). Racy but harmless: `_ensure_account_row`'s
-    `ON CONFLICT DO NOTHING` keeps an existing row."""
+    answer and its own owner. Racy but harmless: `_ensure_account_row`'s `ON CONFLICT DO NOTHING` keeps an
+    existing row."""
     return session.scalar(select(Account.id).where(Account.slug == slug)) is None
 
 
@@ -1111,7 +1028,7 @@ def _node_share_root(session: Session, node_id: Optional[str]) -> Optional[str]:
     return session.scalar(select(Node.shared_accounts_root).where(node_matches(node_id)))
 
 
-def _operator_node_in_another_org(principal: Principal | None, node_id: Optional[str]) -> Optional[Any]:
+async def _operator_node_in_another_org(principal: Principal | None, node_id: Optional[str]) -> Optional[Any]:
     """The operator's target node `(id, org_id, runner_clis, shared_accounts_root, name, org_name)` when the
     request's own read could not see it.
 
@@ -1121,17 +1038,18 @@ def _operator_node_in_another_org(principal: Principal | None, node_id: Optional
     for a tenant — `is_operator`, not the superadmin flag."""
     if principal is None or not principal.is_operator or not node_id:
         return None
-    with seam.detached(), seam.operator_scope(), SessionLocal() as fleet:
-        return fleet.execute(
-            select(
-                Node.id, Node.org_id, Node.runner_clis, Node.shared_accounts_root, Node.name,
-                Org.name.label("org_name"),
-            ).outerjoin(Org, Org.id == Node.org_id).where(node_matches(node_id))
-        ).first()
+    with seam.detached(), seam.operator_scope():
+        async with async_session() as fleet:
+            return (await fleet.execute(
+                select(
+                    Node.id, Node.org_id, Node.runner_clis, Node.shared_accounts_root, Node.name,
+                    Org.name.label("org_name"),
+                ).outerjoin(Org, Org.id == Node.org_id).where(node_matches(node_id))
+            )).first()
 
 
-def _refuse_operator_add_in_another_org(
-    session: Session, foreign_node: Any, slug: Any, personal: bool
+async def _refuse_operator_add_in_another_org(
+    db: AsyncSession, foreign_node: Any, slug: Any, personal: bool
 ) -> None:
     """The two `account_add`s an operator may not start on another org's node.
 
@@ -1148,25 +1066,29 @@ def _refuse_operator_add_in_another_org(
         )
     if not isinstance(slug, str) or not slug:
         return
-    with _account_row_session(session, foreign_node) as row_session:
-        taken = row_session.scalar(select(Account.id).where(Account.slug == slug)) is not None
+    taken = await _on_account_row_session(
+        db, foreign_node, lambda row_session: row_session.scalar(select(Account.id).where(Account.slug == slug)),
+    ) is not None
     if taken:
-        raise HTTPException(
-            status_code=409, detail=f"account '{slug}' already exists in that node's organization"
-        )
+        raise HTTPException(status_code=409, detail=f"account '{slug}' already exists in that node's organization")
 
 
-@contextmanager
-def _account_row_session(session: Session, foreign_node: Optional[Any]) -> Iterator[Session]:
-    """The session phase 1's roster row is written on: the request's own, or, for the operator's node in
-    another org (`_operator_node_in_another_org`), one bound to that node's org, as
+async def _on_account_row_session(db: AsyncSession, foreign_node: Optional[Any], fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+    """`fn(session, ...)` on the session phase 1's roster row is written on: the request's own, or, for the
+    operator's node in another org (`_operator_node_in_another_org`), one bound to that node's org, as
     `durable/accounts.py::ensure_row` binds phase 2's. On the request's, the node would resolve to no row
-    and the org-less insert would be refused."""
+    and the org-less insert would be refused. The request's connection is handed back before the other opens."""
     if foreign_node is None:
-        yield session
-        return
-    with seam.detached(), SessionLocal() as row_session, seam.bind_from(row_session, Node, foreign_node.id):
-        yield row_session
+        return await db.run_sync(fn, *args, **kwargs)
+    await release(db)
+
+    def _bound(row_session: Session) -> Any:
+        with seam.bind_from(row_session, Node, foreign_node.id):
+            return fn(row_session, *args, **kwargs)
+
+    with seam.detached():
+        async with async_session() as row_session:
+            return await row_session.run_sync(_bound)
 
 
 #: The audit `actor` for a converge fired with no operator in hand (the durable workflow) — the `system:*`
@@ -1209,9 +1131,12 @@ def _converge_shared_account_fleet_wide(
     # Deferred: importing an `app/durable/` module registers its workflow with DBOS, and this module loads
     # before the runtime; call-time lookup also lets tests stand in for the enqueue.
     from app.durable.account_converge import enqueue_converge
+    # A DBOS step's session (never a request's): this runs inside `durable/accounts.py`'s phase-2 step.
+    from app.durable.runtime import step_session
+    from app.tenancy import exclusion_log
 
     try:
-        with SessionLocal() as session:
+        with step_session(exclusion_log.caller_label()) as session:
             with seam.identity_scope():
                 origin = node_id_or_none(session, origin_node_id)
             if origin is None:
@@ -1254,9 +1179,13 @@ def _converge_one_node(slug: str, node_id: str, actor: str) -> None:
     Raises on every outcome a retry could fix, after writing the audit row. A missing `config_dir` is
     split: a target with no Jaah home yet raises (transient); a gone or unshared account row is
     permanent and returns. Both leave an audit row."""
+    # A DBOS step's session (`durable/account_converge.py::converge_on_node` is the only caller).
+    from app.durable.runtime import step_session
+    from app.tenancy import exclusion_log
+
     # Seeded before the `try` so the `except` arms can always name the node.
     node_name = node_id
-    with SessionLocal() as session:
+    with step_session(exclusion_log.caller_label()) as session:
         try:
             # The log-facing name, not the uuid the queue carries (the uuid addresses; the name is for
             # operators). `or node_id` if the row vanished.
@@ -1344,7 +1273,7 @@ def _fan_out_best_effort(
 def _ensure_account_row(
     session: Session, slug: str, result: Optional[dict[str, Any]], *,
     enabled: bool, node_id: Optional[str] = None, principal: Principal | None = None,
-    provider: str = agent_providers.DEFAULT_PROVIDER, born_shared: bool = False,
+    provider: str = agent_providers.DEFAULT_PROVIDER,
     personal: bool = False, name: Optional[str] = None,
 ) -> None:
     """Give an Add-Account wizard slug its `accounts` roster row — the DB SSOT the dispatcher reads from,
@@ -1368,7 +1297,7 @@ def _ensure_account_row(
     if not slug:
         return
     # The phase-1 refusal: no reported credential dir means no row — the "credentials landed" signal.
-    config_dir = _config_dir_from_reply(result)
+    config_dir = _reply_str(result, "config_dir")
     if not config_dir:
         log.warning(
             "account wizard reply for slug %r was done without a usable config_dir — no accounts row "
@@ -1380,14 +1309,15 @@ def _ensure_account_row(
     # (unresolvable slug), so it is tested for truth first.
     reported_store = _securestorage_dir_from_reply(result)
     # That node's own share root (0185); an unknown node falls back to the fleet default.
-    expected_store = resolve_shared_auth_dir(slug, _node_share_root(session, node_id))
+    share_root = _node_share_root(session, node_id)
+    expected_store = resolve_shared_auth_dir(slug, share_root)
     shared_observed = bool(expected_store) and reported_store == expected_store
     try:
         # `name`: the person's label, else the slug (NOT NULL, no default), as the create route.
-        # `shared` is the node's report of exactly the store the CP composes for it: an old node mints there
-        # only when asked (`born_shared`), a current one whenever its share is mounted. Phase 1 decides it;
-        # phase 2 only updates `enabled`. `provider` is written on the insert only (immutable via PUT); a
-        # winning phase-2 insert takes the default, having observed no choice.
+        # `shared` is the node's report of exactly the store the CP composes for it: a node mints there
+        # whenever its share is mounted. Phase 1 decides it; phase 2 only updates `enabled`. `provider` is
+        # written on the insert only (immutable via PUT); a winning phase-2 insert takes the default,
+        # having observed no choice.
         shared = shared_observed
         values: dict[str, Any] = {
             "slug": slug, "name": name or slug, "enabled": enabled, "shared": shared,
@@ -1474,20 +1404,21 @@ def _ensure_account_row(
             if is_shared:
                 _fan_out_best_effort(session, slug, node_id, principal)
             return
-        if born_shared and enabled and not shared_observed:
-            # Phase 2 won the insert for a login the CP asked to share: the token is on the share but the
-            # row says pinned, so an old node reads its own config dir. Fail-closed; a re-auth fixes it.
+        provider_row = agent_providers.by_value(provider)
+        mints_on_share = not personal and not (provider_row is not None and provider_row.node_pinned)
+        if enabled and share_root and mints_on_share and not shared_observed:
+            # Phase 2 won the insert on a node that mounts a token share, for a login that mints there (an
+            # org account of a provider that is not node-pinned): no phase-1 reply observed where the token
+            # went, so the row says pinned while the token may sit on the share. Fail-closed.
             log.error(
-                "account %r: phase 2 created the roster row for a login the control plane asked to mint "
-                "on the SHARED store, but no phase-1 reply observed where the token went — the row is "
-                "PINNED to node %r as the fail-closed answer. If an old node cannot find the token, "
-                "re-authenticate the account.",
+                "account %r: phase 2 created the roster row with no phase-1 reply observing where the token "
+                "went — the row is PINNED to node %r, which mounts a token share. If another node cannot "
+                "find the token, re-authenticate the account.",
                 slug, node_id,
             )
         # A winning insert already enabled (phase 2 won); if shared, the converge is still owed.
         fan_out_shared = enabled and shared
-        emit_console_event(session, entity="account", id=new_id, action="upserted")
-        session.commit()
+        emit_console_event(session, entity="account", id=new_id, action="upserted", commit=True)
         if fan_out_shared:
             _fan_out_best_effort(session, slug, node_id, principal)
     except Exception:
@@ -1505,7 +1436,7 @@ def _audit_after_dispatch(
     executed — losing the record of a command that ran (fail-open), silently for callers that swallow
     every exception (`slot_teardown.py`, `pool_slots.py`). So the scrubbed `audit_args` are logged first,
     then it still raises. No retry: another `pool_timeout` wait during saturation is what starved
-    `/api/health` (`app/db._pool_kwargs`)."""
+    `/api/health` (`app/pool_watch.py`)."""
     try:
         return _record_audit(session, node_id, command_type, audit_args, status, result, actor, commit=commit)
     except SQLTimeoutError:
@@ -1518,7 +1449,7 @@ def _audit_after_dispatch(
 
 
 async def dispatch_and_audit(
-    session: Session, node_id: str, command_type: str, args: dict[str, Any], actor: str,
+    session: Session | AsyncSession, node_id: str, command_type: str, args: dict[str, Any], actor: str,
     *, timeout: float = COMMAND_TIMEOUT,
 ) -> tuple[dict[str, Any], int]:
     """Dispatch one command and record its audit row — the combined flow `enqueue_command` and
@@ -1530,10 +1461,19 @@ async def dispatch_and_audit(
     The caller's connection returns to the pool for the node round trip (after `bus_key`, the last read),
     so the pool bounds concurrent statements, not concurrent commands (`db.release_connection`). The
     price: the bus-key read and the audit write are separate transactions; a session that has written
-    keeps its connection. `_dispatch`'s frame-proof lookup opens its own session."""
+    keeps its connection. `_dispatch`'s frame-proof lookup opens its own session.
+
+    `session` is a sync `Session` or a route's `AsyncSession`; on the latter each DB step runs through
+    `run_sync`, with the same release before the wait."""
+
+    async def on_session(fn: Any, *fn_args: Any, **fn_kwargs: Any) -> Any:
+        if isinstance(session, AsyncSession):
+            return await session.run_sync(fn, *fn_args, **fn_kwargs)
+        return fn(session, *fn_args, **fn_kwargs)
+
     audit_args = _credential_safe_args(command_type, args)
-    bus_target = bus_key(session, node_id)
-    release_connection(session)
+    bus_target = await on_session(bus_key, node_id)
+    await on_session(release_connection)
     try:
         reply = await _dispatch(
             node_id, command_type, args, bus_target=bus_target, timeout=timeout,
@@ -1541,16 +1481,16 @@ async def dispatch_and_audit(
     except HTTPException as exc:
         # Through the same sink as the success path: this runs after the release too, and a
         # `dispatched` row records a command the node is executing while the CP stopped listening.
-        _audit_after_dispatch(
-            session, node_id, command_type, audit_args, "dispatched", {"reason": exc.detail}, actor,
+        await on_session(
+            _audit_after_dispatch, node_id, command_type, audit_args, "dispatched", {"reason": exc.detail}, actor,
         )
         raise
     status = str(reply.get("status") or "failed")
     result = reply.get("result") if isinstance(reply.get("result"), dict) else None
     # The reply returns to the caller unscrubbed (it needs the real document); only the audit copy is
     # redacted, composed at the call so the scrub is visible at every sink.
-    audit_id = _audit_after_dispatch(
-        session, node_id, command_type, audit_args, status,
+    audit_id = await on_session(
+        _audit_after_dispatch, node_id, command_type, audit_args, status,
         _credential_safe_result(command_type, result), actor,
     )
     return reply, audit_id
@@ -1575,9 +1515,7 @@ def dispatch_and_audit_blocking(
             reply = node_bus.run_on_serving_loop(bus_target, coro, timeout=timeout + 5)
         except concurrent.futures.TimeoutError:
             # Only a wedged serving loop gets here (`_dispatch`'s own deadline is 5s tighter): `_dispatch`'s 504.
-            raise HTTPException(
-                status_code=504, detail=f"node '{node_id}' did not reply within {timeout}s",
-            ) from None
+            raise HTTPException(status_code=504, detail=f"node '{node_id}' did not reply within {timeout}s") from None
     except HTTPException as exc:
         _audit_after_dispatch(
             session, node_id, command_type, audit_args, "dispatched", {"reason": exc.detail}, actor,
@@ -1601,14 +1539,38 @@ async def _dispatch_on_a_throwaway_loop(dispatch):
         await cp_peers.aclose_running_loop_client()
 
 
+def _dispatch_from_sync(dispatch):  # type: ignore[no-untyped-def]
+    """Await `dispatch` from sync code, on the serving loop wherever it can be reached: inline in a greenlet there
+    (`AsyncSession.run_sync`), through `run_on_loop` from a foreign thread. With no serving loop (a script): a
+    throwaway loop on this thread. A sync caller ON a loop outside a greenlet blocks that loop either way, so it
+    awaits a throwaway loop on a thread of its own, as it always did."""
+    from sqlalchemy.util.concurrency import await_only, in_greenlet
+
+    from app import db_async
+
+    on_serving_loop = db_async.on_serving_loop()
+    if in_greenlet():
+        return await_only(dispatch if on_serving_loop else _dispatch_on_a_throwaway_loop(dispatch))
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        loop = db_async.serving_loop()
+        if loop is not None and loop.is_running():
+            return db_async.run_on_loop(dispatch, timeout=INTERNAL_DISPATCH_TIMEOUT + 5)
+        return asyncio.run(_dispatch_on_a_throwaway_loop(dispatch))
+    # The loop this thread runs is blocked until the worker returns, so the worker's sessions must not hop to it.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(db_async.run_unbridged, asyncio.run, _dispatch_on_a_throwaway_loop(dispatch)).result()
+
+
 def dispatch_and_audit_sync(
     session: Session, node_id: str, command_type: str, args: dict[str, Any], actor: str, *, commit: bool = True,
 ) -> None:
     """Sync entry point for non-request call sites that fire a command without waiting on its result —
     the mechanical compliance auto-merge and the mechanical orphan reap, both `app/routes/agent/`.
 
-    Called from a sync route (no loop: `asyncio.run()` starts one) and from inside the main loop (the
-    coroutine runs on a dedicated thread). Not a wrapper over `dispatch_and_audit`: a `Session` is not
+    Called from a sync route and from inside the serving loop: the dispatch runs there (`_dispatch_from_sync`).
+    Not a wrapper over `dispatch_and_audit`: a `Session` is not
     thread-safe, so only the dispatch crosses and the audit is written on the caller's thread. A timeout
     is logged and swallowed (a `"dispatched"` row is still written); the audit write propagates.
     `commit=False` leaves the audit row in the caller's transaction (an outbox handler inside its SAVEPOINT).
@@ -1619,18 +1581,11 @@ def dispatch_and_audit_sync(
     # The same release as `dispatch_and_audit`, on this thread (the session's). Before the coroutine is
     # built: `release_connection` can raise, and an unawaited `_dispatch(...)` would add a RuntimeWarning.
     release_connection(session)
-    coro = _dispatch_on_a_throwaway_loop(_dispatch(
-        node_id, command_type, args, bus_target=bus_target,
-        timeout=INTERNAL_DISPATCH_TIMEOUT,
-    ))
     try:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            reply = asyncio.run(coro)
-        else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                reply = pool.submit(asyncio.run, coro).result()
+        reply = _dispatch_from_sync(_dispatch(
+            node_id, command_type, args, bus_target=bus_target,
+            timeout=INTERNAL_DISPATCH_TIMEOUT,
+        ))
     except HTTPException as exc:
         log.warning(
             "internal dispatch %s (node=%s) did not complete: %s", command_type, node_id, exc.detail,
@@ -1669,6 +1624,19 @@ def _default_node_in_callers_org(
     is a 409. Returns the uuid (a name is not an identifier); `require_object_access(..., WRITE)` still runs
     on it. Draining nodes stay
     eligible (these verbs are not leases)."""
+    writable = _writable_nodes_in_callers_org(session, principal)
+    # `prefer_connected=False` drops the liveness tiebreak for a caller addressing an existing row
+    # (`routes/pool_slots.py::_resolved_node_id`): deterministic, first writable node by name.
+    if prefer_connected:
+        for node_id in writable:
+            if node_bus.registry.is_connected(node_id):
+                return node_id
+    return writable[0]
+
+
+def _writable_nodes_in_callers_org(session: Session, principal: Principal) -> list[str]:
+    """`_default_node_in_callers_org`'s candidates, by name: the uuids of the enabled nodes this caller may
+    write to. Raises its two 409s."""
     nodes = session.scalars(
         select(Node).where(Node.enabled.is_(True)).order_by(Node.name)
     ).all()
@@ -1683,13 +1651,7 @@ def _default_node_in_callers_org(
     ]
     if not writable:
         raise HTTPException(status_code=409, detail=_NO_GRANTED_NODE_IN_ORG)
-    # `prefer_connected=False` drops the liveness tiebreak for a caller addressing an existing row
-    # (`routes/pool_slots.py::_resolved_node_id`): deterministic, first writable node by name.
-    if prefer_connected:
-        for node in writable:
-            if node_bus.registry.is_connected(str(node.id)):
-                return str(node.id)
-    return str(writable[0].id)
+    return [str(node.id) for node in writable]
 
 
 def default_dispatch_node(
@@ -1720,6 +1682,19 @@ def default_dispatch_node(
     return resolve_node_id() or "local"
 
 
+async def _default_dispatch_node_async(db: AsyncSession, principal: Principal | None) -> str:
+    """`default_dispatch_node` for the route on the loop: the tenant arm's liveness tiebreak
+    (`node_bus.registry.is_connected`, a placement read) runs in the threadpool, off the route's connection."""
+    if principal is not None and is_tenant_org(principal.org_id):
+        writable = await db.run_sync(_writable_nodes_in_callers_org, principal)
+        await release(db)
+        connected = await run_in_threadpool(
+            lambda: next((node_id for node_id in writable if node_bus.registry.is_connected(node_id)), None)
+        )
+        return connected or writable[0]
+    return await db.run_sync(default_dispatch_node, principal)
+
+
 def _echo(
     audit_id: int, node_id: str, command_type: str, args: dict[str, Any], status: str,
     result: Optional[dict[str, Any]], *, user: AdminUser,
@@ -1739,24 +1714,30 @@ def _echo(
 
 
 @router.post("", response_model=CommandOut, status_code=201)
-# The declaration is a floor, not the whole answer: `authz_guard` denies holders of neither key, then
-# `_require_command_key` decides which one this `command_type` needs (see `COMMAND_TYPE_KEYS`).
-@feature_any("worktrees:edit", "system:create")
+# The declaration is a floor, not the whole answer: `authz_guard` denies holders of none of the keys, then
+# `_require_command_key` decides which one this `command_type` needs (see `COMMAND_TYPE_KEYS`). `accounts:create`
+# (every member, `access_catalog.MEMBER_KEYS`) opens the door only to the Add-Account wizard's personal path
+# (`_personal_account_path`); it is in no verb's `COMMAND_TYPE_KEYS`, so every other verb still 403s.
+@feature_any("worktrees:edit", "system:create", "accounts:create")
 async def enqueue_command(
     body: CommandRequest,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    db: DbDep,
+    caller: AsyncCaller = Depends(current_caller),
 ):
+    # Every wait below that is not a DB statement (the threadpool, the durable engine, the node bus, a
+    # fleet-wide session) follows `release(db)`: nothing has been written before the audit row.
+    # The caller is read from this same session; detached, so a helper's rollback cannot expire it.
+    if caller.actor in db:
+        db.expunge(caller.actor)
     # The personal path (G2): decided first, because it is the one narrower door onto three system verbs.
-    personal_only = _personal_account_path(session, principal, body.command_type, body.args)
+    personal_only = await _personal_account_path(db, caller.principal, body.command_type, body.args)
     # Before the `VALID_TYPES` 422, so a `worktrees:edit`-only caller gets a 403 on a system verb rather
     # than an inventory of verbs.
-    _require_command_key(body.command_type, principal, personal_path=personal_only)
+    _require_command_key(body.command_type, caller.principal, personal_path=personal_only)
     # The org half, before anything else resolves, so a tenant learns nothing from later errors
     # (`_OPERATOR_ORG_ONLY`). Decided once for every plane-dependent sentence below; `None` reads as a
     # tenant (fail-closed).
-    tenant_seat = principal is None or is_tenant_org(principal.org_id)
+    tenant_seat = caller.principal is None or is_tenant_org(caller.principal.org_id)
     if body.command_type in _OPERATOR_ORG_ONLY and tenant_seat:
         # Worded for a tenant: names the operator, never the operator's deployment (`app/tenancy/copy.py`).
         raise HTTPException(
@@ -1789,29 +1770,31 @@ async def enqueue_command(
         raw_name = body.args.pop("name", None)
         account_name = (raw_name.strip() or None) if isinstance(raw_name, str) else None
         if not body.args.get("slug"):
+            await release(db)
             body.args["slug"] = await run_in_threadpool(new_account_slug)
 
     # An unpinned body defaults per plane via `default_dispatch_node`. `principal is None` takes the
     # operator arm here (it names the caller's own host), though the `_OPERATOR_ORG_ONLY` check reads it
     # as a tenant (that one refuses, so it fails closed).
-    # Off the loop: `default_dispatch_node` reads the DB (`node_bus.registry.is_connected` — a shared
-    # placement-table read), never on the event loop.
-    node_id = body.node_id or await run_in_threadpool(default_dispatch_node, session, principal)
+    # `node_bus.registry.is_connected` is a shared placement-table read, never on the event loop
+    # (`_default_dispatch_node_async`).
+    node_id = body.node_id or await _default_dispatch_node_async(db, caller.principal)
 
     # The node must be one this caller may see (D13). It widens nothing, and stops a zero-grant caller
     # enumerating hosts via the echoed `node_id`. Probed by uuid only when the value resolves
     # (`routes/pool_slots.py::reserve_worktree`); the agent plane is exempt.
-    target_node_uuid = node_id_or_none(session, node_id)
-    foreign_node = (
-        _operator_node_in_another_org(principal, node_id) if target_node_uuid is None else None
-    )
+    target_node_uuid = await db.run_sync(node_id_or_none, node_id)
+    foreign_node = None
+    if target_node_uuid is None:
+        await release(db)
+        foreign_node = await _operator_node_in_another_org(caller.principal, node_id)
     if foreign_node is not None:
         # The audit row stays where it is; this line names the org the operator reached into.
         log.info("operator %s: %s on node %s in org %s, outside the operator's org",
-                 user.email, body.command_type, node_id, foreign_node.org_id)
+                 caller.actor.email, body.command_type, node_id, foreign_node.org_id)
     if target_node_uuid is not None:
-        require_object_access(session, principal, "node", target_node_uuid, mode=ObjectAccess.WRITE)
-    elif not sees_all_nodes(principal):
+        await db.run_sync(require_object_access, caller.principal, "node", target_node_uuid, mode=ObjectAccess.WRITE)
+    elif not sees_all_nodes(caller.principal):
         # Presence-only (unregistered but connected) is superadmin-only, matching
         # `routes/nodes/reads.py::list_nodes`: `bus_key` falls back to the raw value, so otherwise a zero-grant
         # caller could reach it by name and read 503-vs-reply as a liveness oracle.
@@ -1821,60 +1804,44 @@ async def enqueue_command(
         # (`app/org_gate.py`). The org the row lands in is the answering node's (`_ensure_account_row`),
         # else the caller's; refused before anything is dispatched.
         node_org = (
-            session.scalar(select(Node.org_id).where(Node.id == target_node_uuid))
+            await db.scalar(select(Node.org_id).where(Node.id == target_node_uuid))
             if target_node_uuid is not None
             else foreign_node.org_id if foreign_node is not None else None
         )
-        require_org_active(session, node_org or user.org_id)
+        await db.run_sync(require_org_active, node_org or caller.actor.org_id)
         # The community edition's account cap, before a login runs (`app/ce_caps.py`); re-signing-in an account
         # already on the roster adds no row.
         slug = body.args.get("slug")
-        if edition.IS_CE and not (slug and session.scalar(select(Account.id).where(Account.slug == slug))):
-            ce_caps.require_account_headroom(session, node_org or user.org_id)
+        if edition.IS_CE and not (slug and await db.scalar(select(Account.id).where(Account.slug == slug))):
+            await db.run_sync(ce_caps.require_account_headroom, node_org or caller.actor.org_id)
 
     # The account must be one this caller may write — a node grant is not an account grant. Here, not per
     # verb, so no verb can join the tier and miss the floor.
-    _require_account_access(session, principal, body.command_type, body.args)
+    await _require_account_access_async(db, caller.principal, body.command_type, body.args)
     # Personal or the org's, for a new `account_add` (`authz.validated_ownership`); relayed to the login.
     account_personal = personal_only
     if body.command_type == "account_add":
         # One administrator question for every create door (`authz.creates_org_rows`), and never on the
         # personal path.
         ownership = validated_ownership(
-            body.args.get("ownership"), may_create_org=not personal_only and creates_org_rows(principal)
+            body.args.get("ownership"), may_create_org=not personal_only and creates_org_rows(caller.principal)
         )
         account_personal = personal_only or ownership == OWNERSHIP_PERSONAL
         if foreign_node is not None:
-            _refuse_operator_add_in_another_org(session, foreign_node, body.args.get("slug"), account_personal)
+            await _refuse_operator_add_in_another_org(db, foreign_node, body.args.get("slug"), account_personal)
     # The project must be one this caller's org can read — the third object floor.
-    _require_project(session, body.command_type, body.args)
+    await db.run_sync(_require_project, body.command_type, body.args)
 
     if body.command_type == "run":
         op = body.args.get("op")
         if not isinstance(op, str) or not op:
-            raise HTTPException(
-                status_code=422,
-                detail="run commands require a non-empty string args.op",
-            )
-        # `is_operator`, not the bare flag: `POST /api/port-grid/reband` is gated by `require_operator`, and
-        # this door must not be weaker for a tenant-born superadmin.
-        if op in _RUN_OP_SUPERADMIN_ONLY and not (principal is not None and principal.is_operator):
-            # Two readers, two sentences: operator staff read the bar; a tenant reads no "deployment" or
-            # "superadmin" (`app/tenancy/copy.py`).
-            detail = (
-                f"run op '{op}' is the operator's — your organization cannot run it"
-                if tenant_seat
-                else f"run op '{op}' requires the deployment's operator — a superadmin in an operator-plane org"
-            )
-            raise HTTPException(status_code=403, detail=detail)
+            raise HTTPException(status_code=422, detail="run commands require a non-empty string args.op")
+        if op in _RUN_OPS_RETIRED:
+            raise HTTPException(status_code=422, detail=f"run op '{op}' was retired")
 
-    # Declared before the branch: two phase-1 consumers below (the `shared` injection, `start_login`,
-    # shared with `account_reauth`) read it. True is safe only because each consumer is gated on
-    # `account_add`, whose arm always sets it.
+    # Declared before the branch: handed to `start_login` below (shared with `account_reauth`). True is
+    # safe only because it means something for `account_add` alone, whose arm always sets it.
     account_add_is_new = True
-    # Whether an old `jaahd` is told to mint on its share: False except for a new `account_add` on a node
-    # reporting a mounted token share — fail-closed.
-    born_shared = False
     # The operator's agent-CLI choice, declared early for the same reason. `DEFAULT_PROVIDER` is what an
     # absent `args.provider` means end to end.
     account_provider = agent_providers.DEFAULT_PROVIDER
@@ -1919,7 +1886,7 @@ async def enqueue_command(
         # An existing account answers for itself (as `PUT /api/accounts/{id}`): an equal echo passes, a
         # disagreeing value is 422, an absent one resolves to the row's (`_account_row_provider`). Covers
         # `account_reauth` and enrolments; only a new add lets the caller's value stand.
-        existing_provider = _account_row_provider(session, slug)
+        existing_provider = await db.run_sync(_account_row_provider, slug)
         if existing_provider is not None:
             if "provider" in body.args and account_provider != existing_provider:
                 raise HTTPException(
@@ -1949,27 +1916,29 @@ async def enqueue_command(
         if body.command_type == "account_add" and existing_provider is None:
             # A new subscription account: the provider grid of the org the row lands in
             # (`app/provider_auth_policy.py`), as `POST /api/accounts` checks a key account's.
-            provider_auth_policy.require_allowed(
-                session, node_org or user.org_id, account_provider, account_auth.AUTH_KIND_OAUTH
+            await db.run_sync(
+                provider_auth_policy.require_allowed,
+                node_org or caller.actor.org_id, account_provider, account_auth.AUTH_KIND_OAUTH,
             )
         else:
             # An existing account's enrolment or re-login: its pair was allowed once, but its org's provider
             # grid decides whether its provider may sign in now (any cell of it on).
             account_org = (
-                session.scalar(select(Account.org_id).where(Account.slug == slug))
-                if existing_provider is not None else user.org_id
+                await db.scalar(select(Account.org_id).where(Account.slug == slug))
+                if existing_provider is not None else caller.actor.org_id
             )
-            if not provider_auth_policy.provider_on_plan(session, account_org, account_provider):
+            if not await db.run_sync(provider_auth_policy.provider_on_plan, account_org, account_provider):
+                refusal = await db.run_sync(provider_auth_policy.refusal, account_org, account_provider)
                 raise HTTPException(
                     status_code=422,
-                    detail=f"{provider_auth_policy.refusal(session, account_org, account_provider)} Nothing was started.",
+                    detail=f"{refusal} Nothing was started.",
                 )
         if row is not None and row.needs_attested_binary:
             # The provider's only server-side gate (the dialog's picker is a courtesy, and enrolments have
             # none): the node must attest the CLI in `runner_clis` (`app/models/nodes.py::Node.runner_clis`). NULL
             # and `[]` both refuse (fail closed), with the detail saying which. 409: the request is fine,
             # the fleet's state refuses it.
-            login_node = session.get(Node, target_node_uuid) if target_node_uuid is not None else foreign_node
+            login_node = await db.get(Node, target_node_uuid) if target_node_uuid is not None else foreign_node
             # An unregistered node has no attestation — the same refusal. `target_node_uuid` is resolved.
             attested = login_node.runner_clis if login_node is not None else None
             if attested is None or row.binary not in attested:
@@ -1996,9 +1965,9 @@ async def enqueue_command(
         if body.command_type == "account_add":
             # The discriminator, read once, before any dispatch. Its own call rather than
             # `existing_provider is None`: "does a row exist" must not depend on the provider column.
-            account_add_is_new = _account_slug_is_new(session, slug)
+            account_add_is_new = await db.run_sync(_account_slug_is_new, slug)
             if (not account_add_is_new and body.args.get("ownership") is not None
-                    and not _ownership_matches_row(session, principal, slug, account_personal)):
+                    and not await db.run_sync(_ownership_matches_row, caller.principal, slug, account_personal)):
                 # An existing account already answers who owns it; decided once, at create. The wizard's own
                 # restart repeats the owner it started with, which is not a change.
                 raise HTTPException(
@@ -2007,18 +1976,6 @@ async def enqueue_command(
                         "This account's owner was set when its sign-in was first started and cannot be "
                         "changed. Add a new account to choose a different owner."
                     ),
-                )
-            # Old-node compatibility only (a current `jaahd` mints into `{JAAH_HOME}/auth/.shared` on its
-            # own and ignores the flag): an old node mints on its share when told `shared: true`
-            # (`_login_start`'s `shared_override`) and REFUSES that when no share is mounted
-            # (`_login_store_refusal`), so the flag goes only to a node reporting a mounted token share
-            # (`nodes.shared_accounts_root`). A personal-path account and a `node_pinned` provider are
-            # never told, exactly as before.
-            if account_add_is_new and not personal_only and _provider_mints_on_shared_store(account_provider):
-                # Another org's node is invisible to this request's read: its own row answers.
-                born_shared = bool(
-                    foreign_node.shared_accounts_root if foreign_node is not None
-                    else _node_share_root(session, node_id)
                 )
         # No shared-node 409: the row records what the node observed.
         if body.command_type == "account_add":
@@ -2030,7 +1987,7 @@ async def enqueue_command(
             # `test_every_shipping_provider_publishes_the_unlimited_sentinel_today` fails when that changes.
             row = agent_providers.by_value(account_provider)
             # Unknown values and unregistered nodes were already refused above. Another org's node is counted
-            # in that org (`_account_row_session`), where its accounts are.
+            # in that org (`_on_account_row_session`), where its accounts are.
             limit_node = target_node_uuid if target_node_uuid is not None else getattr(foreign_node, "id", None)
             if (
                 row is not None
@@ -2038,14 +1995,16 @@ async def enqueue_command(
                 and row.max_accounts_per_node > 0
                 and limit_node is not None
             ):
-                with _account_row_session(session, foreign_node) as count_session:
-                    pinned_here = count_session.execute(
+                pinned_here = await _on_account_row_session(
+                    db, foreign_node,
+                    lambda count_session: count_session.execute(
                         select(func.count()).select_from(Account).where(
                             Account.provider == account_provider,
                             Account.node_id == limit_node,
                             Account.slug != slug,
                         )
-                    ).scalar_one()
+                    ).scalar_one(),
+                )
                 if pinned_here >= row.max_accounts_per_node:
                     raise HTTPException(
                         status_code=409,
@@ -2065,6 +2024,7 @@ async def enqueue_command(
         # state, which `CODE_TIMEOUT_SECONDS` ends, so no freshness window.
         from app.durable import accounts as durable_accounts
 
+        await release(db)
         # It refuses a duplicate, not a replacement: the wizard reads any 409 as "resume the running
         # attempt", which re-attached an operator who changed the login settings to the dead attempt. So
         # identical parameters → 409; different ones (`login_request` lists them) → cancel the live
@@ -2072,7 +2032,7 @@ async def enqueue_command(
         live_login = await run_in_threadpool(durable_accounts.login_request, node_id, slug)
         if personal_only and live_login is not None:
             # Never cancel or resume someone else's login from the personal path.
-            await _require_own_login(durable_accounts, principal, node_id, slug)
+            await _require_own_login(durable_accounts, caller.principal, node_id, slug)
         requested_login = {
             "reauth": body.command_type == "account_reauth",
             "peer_key": body.args["peer_key"],
@@ -2087,10 +2047,7 @@ async def enqueue_command(
             await run_in_threadpool(durable_accounts.cancel_login, node_id, slug)
             in_flight = False
         if in_flight:
-            raise HTTPException(
-                status_code=409,
-                detail=f"{body.command_type} already in progress for slug '{slug}'",
-            )
+            raise HTTPException(status_code=409, detail=f"{body.command_type} already in progress for slug '{slug}'")
 
     if body.command_type in ("account_add_submit_code", "account_reauth_submit_code"):
         # Phase 2: the pasted authorization code, SEALED by the browser to the node's per-login key.
@@ -2133,7 +2090,7 @@ async def enqueue_command(
             )
 
     if body.command_type in SLOT_ARG_TYPES:
-        # Input validation for both slot verbs: naming the slot is required. The node's origin check is
+        # Input validation for the slot verb: naming the slot is required. The node's origin check is
         # the authoritative gate.
         project_id = body.args.get("project_id")
         number = body.args.get("number")
@@ -2145,10 +2102,7 @@ async def enqueue_command(
         try:
             int(number)
         except (TypeError, ValueError):
-            raise HTTPException(
-                status_code=422,
-                detail="args.number must be a valid integer",
-            )
+            raise HTTPException(status_code=422, detail="args.number must be a valid integer") from None
 
     is_account_phase1 = body.command_type in ("account_add", "account_reauth")
     is_account_phase2 = body.command_type in ("account_add_submit_code", "account_reauth_submit_code")
@@ -2168,32 +2122,14 @@ async def enqueue_command(
         try:
             slot_number = int(body.args["number"])
         except (TypeError, ValueError):
-            raise HTTPException(
-                status_code=422,
-                detail="args.number must be a valid integer",
-            )
+            raise HTTPException(status_code=422, detail="args.number must be a valid integer") from None
         # And the slot must be one the caller may drive — a per-row answer no feature key can express.
-        _require_editable_slot(session, principal, node_id, int(body.args["project_id"]), slot_number)
+        await db.run_sync(_require_editable_slot, caller.principal, node_id, int(body.args["project_id"]), slot_number)
         command_args = {k: v for k, v in body.args.items() if k not in _CALLER_MUST_NOT_SUPPLY}
-    elif body.command_type == "account_add":
-        # Where the node mints the token, CP-decided: a caller's `shared` is stripped and never kept. An
-        # enrolment sends no flag (the row has its own `shared`; a True would strand the token on the
-        # share). A boolean, never a path (`resolve_shared_auth_dir`). This is the audit copy; the workflow
-        # injects its own (`authenticate_account`). An allowlist: this verb decides where a token lands.
-        command_args = _with_resolved_provider(
-            {k: v for k, v in body.args.items() if k in _ACCOUNT_PHASE1_CALLER_ARGS},
-            account_provider,
-        )
-        # `born_shared` re-injects `shared` for exactly one case — a new account, of a provider whose CLI
-        # can use the share, on a node reporting a mounted token share. The node's override is one-way
-        # (`_login_start`, `shared_override`), so the value is `true` or absent, never `false`. Enrolments
-        # and re-auths send nothing (`_account_slug_is_new`).
-        if born_shared:
-            command_args["shared"] = True
-    elif body.command_type == "account_reauth":
-        # The same allowlist on `account_reauth`, so a caller's `shared` never reaches the audit copy (inert
-        # today, but not a value a caller may send). A separate arm, so the `shared` injection above stays
-        # unreachable from a re-auth.
+    elif body.command_type in ("account_add", "account_reauth"):
+        # An allowlist: these verbs decide where a token lands, and the node alone chooses the store (its
+        # share when one is mounted), so a caller's `shared` is stripped and never kept. This is the audit
+        # copy; the workflow builds its own start args (`authenticate_account`).
         command_args = _with_resolved_provider(
             {k: v for k, v in body.args.items() if k in _ACCOUNT_PHASE1_CALLER_ARGS},
             account_provider,
@@ -2205,9 +2141,7 @@ async def enqueue_command(
             slug_arg = body.args.get("slug")
             # The same type test the floor uses: a non-`str` slug would pass both otherwise.
             if not isinstance(slug_arg, str) or not slug_arg:
-                raise HTTPException(
-                    status_code=422, detail="account_converge requires a non-empty string args.slug",
-                )
+                raise HTTPException(status_code=422, detail="account_converge requires a non-empty string args.slug")
         # The same strip: `config_dir` is the path a host removes, CP-derived from (slug, target node). The
         # sanctioned deprovision routes (superadmin) call `dispatch_and_audit` directly.
         command_args = {k: v for k, v in body.args.items() if k not in _CALLER_MUST_NOT_SUPPLY}
@@ -2217,13 +2151,14 @@ async def enqueue_command(
         # the steps are synchronous and `app/durable/accounts.py::dispatch` needs a free serving loop.
         from app.durable import accounts as durable_accounts
 
+        await release(db)
         if personal_only and (is_account_phase2 or is_account_await):
             # A continuation reaches only the caller's own login: a code pasted into a colleague's
             # login would bind their new account to this caller's vendor identity.
-            await _require_own_login(durable_accounts, principal, node_id, slug)
+            await _require_own_login(durable_accounts, caller.principal, node_id, slug)
 
-        # `command_args`, not `body.args`: the audit row records what the fleet executed (for `account_add`
-        # they differ by the CP-decided `shared`).
+        # `command_args`, not `body.args`: the audit row records what the fleet executed (the allowlisted
+        # args and the resolved provider).
         audit_args = _credential_safe_args(body.command_type, command_args)
         if is_account_phase1:
             status, result = await run_in_threadpool(
@@ -2232,15 +2167,11 @@ async def enqueue_command(
                 # recorded inputs are a replay contract.
                 True,
                 # The creator as an id (workflow inputs are persisted and replayed); `None` stays a no-op.
-                str(principal.user_id) if principal is not None else None,
-                # The discriminator, carried rather than re-derived: after a replay the workflow's own
-                # `ensure_row` would have inserted the row, and a retry would misread itself as an enrolment.
-                # Meaningless for `account_reauth`.
+                str(caller.principal.user_id) if caller.principal is not None else None,
+                # Create vs enrol. Unread by the workflow; kept in position like the argument above.
                 account_add_is_new,
                 # The agent CLI must cross here too, or the operator gets a Claude login under their label.
                 account_provider,
-                # The share decision, carried: a persisted input cannot drift on replay.
-                born_shared,
                 # The wizard's per-login public key, validated above; the node seals the URL to it.
                 peer_key,
                 # Personal (the caller's own) or the org's; decided above, carried like the rest.
@@ -2258,37 +2189,39 @@ async def enqueue_command(
             )
         # No audit row for a non-terminal await ping: on this engine it dispatches nothing, and the log
         # records executions. Terminal replies keep their row.
-        if is_account_await and _payload_status_from_reply(result) == "awaiting_redirect":
+        if is_account_await and _reply_str(result, "status") == "awaiting_redirect":
             # `id=0` means "no row" here only; the wizard ignores this body, and making `CommandOut.id`
             # Optional would change every client's shape.
             return _echo(
                 0, node_id, body.command_type, audit_args, status,
                 _credential_safe_result(body.command_type, result, echo=True, provider=account_provider),
-                user=user,
+                user=caller.actor,
             )
-        audit_id = _record_audit(
-            session, node_id, body.command_type, audit_args, status,
-            _credential_safe_result(body.command_type, result), user.email,
+        audit_id = await db.run_sync(
+            _record_audit, node_id, body.command_type, audit_args, status,
+            _credential_safe_result(body.command_type, result), caller.actor.email,
         )
         if body.command_type == "account_add" and status == "done":
             # Phase 1's disabled roster row is written at the route so a config dir is never stranded;
             # phase 2's enabled row is written in the workflow.
-            with _account_row_session(session, foreign_node) as row_session:
-                _ensure_account_row(
-                    row_session, slug, result, enabled=False, node_id=node_id, principal=principal,
-                    provider=account_provider, born_shared=born_shared,
-                    # This insert is the one that wins, so the ownership choice and the name must ride it.
-                    personal=account_personal, name=account_name,
-                )
+            await _on_account_row_session(
+                db, foreign_node, _ensure_account_row,
+                slug, result, enabled=False, node_id=node_id, principal=caller.principal,
+                provider=account_provider,
+                # This insert is the one that wins, so the ownership choice and the name must ride it.
+                personal=account_personal, name=account_name,
+            )
         return _echo(
             audit_id, node_id, body.command_type, audit_args, status,
             _credential_safe_result(body.command_type, result, echo=True, provider=account_provider),
-            user=user,
+            user=caller.actor,
         )
 
-    resolved_args = _resolve_command_args(body.command_type, command_args, session, node_id)
+    resolved_args = await db.run_sync(
+        lambda session: _resolve_command_args(body.command_type, command_args, session, node_id)
+    )
     reply, audit_id = await dispatch_and_audit(
-        session, node_id, body.command_type, resolved_args, user.email,
+        db, node_id, body.command_type, resolved_args, caller.actor.email,
     )
     status = str(reply.get("status") or "failed")
     result = reply.get("result") if isinstance(reply.get("result"), dict) else None
@@ -2301,5 +2234,5 @@ async def enqueue_command(
         status,
         # The reply scrubber too: a reply can be a live credential document.
         _credential_safe_result(body.command_type, result, echo=True, provider=account_provider),
-        user=user,
+        user=caller.actor,
     )

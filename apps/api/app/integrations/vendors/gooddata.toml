@@ -1,0 +1,42 @@
+slug = "gooddata"
+label = "GoodData"
+category = "data"
+vendor_docs_url = "https://www.gooddata.com/docs/cloud/api-and-sdk/api/authentication/"
+summary = "Lets agents read workspaces, metrics and dashboards, run computations and manage the semantic layer in GoodData."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "base_url", label = "Host URL", kind = "url", required = true, placeholder = "https://yourcompany.cloud.gooddata.com", help = "The address you open GoodData at, such as https://yourcompany.cloud.gooddata.com, with no path after it" },
+  { key = "api_token", label = "API token", kind = "secret", required = true, help = "GoodData > Home > Settings > Developer > Personal access tokens > Manage > Create; copy the token when it is shown" },
+]
+
+[test]
+method = "GET"
+path = "{base_url}/api/v1/profile"
+auth = { field = "api_token", header = "Authorization", prefix = "Bearer" }
+identity = [["name"], ["userId"]]
+
+[docs]
+agent_uses = [
+  "List workspaces, data sources, metrics, insights (visualizations) and dashboards",
+  "Run an execution (a computation) to read a metric's values",
+  "Read and update the logical data model and metrics as code through the declarative API",
+  "Manage users, user groups and workspace permissions with an admin's token",
+]
+prerequisites = [
+  "A GoodData Cloud organization (or a GoodData.CN deployment reachable over https) and its address",
+  "A user account whose permissions match what agents should do; the token acts as that user. A user who is not an organization admin needs the permission to create their own tokens (SELF_CREATE_TOKEN)",
+]
+limitations = [
+  "An API token acts as the user who created it, with that user's organization and workspace permissions",
+  "GoodData shows the token only once; if it is lost, create a new one and replace it in Jaah",
+  "A GoodData.CN deployment reachable only on a private network cannot be tested or used from Jaah",
+]
+troubleshooting = [
+  { symptom = "Test says GoodData rejected the API token (401)", fix = "The token is wrong or was deleted. Create a new one in Settings > Developer > Personal access tokens, select Replace on the secret, and paste it" },
+  { symptom = "Test says GoodData returned HTTP 404", fix = "The Host URL is not your organization's root. Use the address you open GoodData at, such as https://yourcompany.cloud.gooddata.com, with no path" },
+]
+faq = [
+  { q = "Does it work with GoodData.CN?", a = "Yes, when the deployment is reachable over https from the internet: use its address as the Host URL and a token created in it" },
+]

@@ -1,8 +1,7 @@
 import { nanoid } from 'nanoid'
 import type { NavigateFunction } from 'react-router-dom'
-import { get } from '../api'
+import { get, getBlob } from '../api'
 import { enterActAs } from './actAs'
-import { sessionHeaders } from './activeOrg'
 import { ATTACHMENT_SCHEME } from '../components/richtext/attachmentResolver'
 import type { FilingTarget } from '../components/tasks/featureFiling'
 import type { StagedAttachment } from '../components/tasks/TaskAttachmentsField'
@@ -92,15 +91,10 @@ function isInlineToken(body: string, filename: string): boolean {
   return false
 }
 
-/** One attachment's bytes as a stageable `File`. Plain `fetch`, not `api.get`: the route answers BYTES
- *  (as `attachmentResolver` uses it). */
-async function fetchAttachmentFile(taskId: number, attachment: Attachment): Promise<File> {
-  const resp = await fetch(
-    `/api/tasks/${taskId}/attachments/${attachment.id}/content`,
-    { credentials: 'same-origin', headers: sessionHeaders(undefined) },
-  )
-  if (!resp.ok) throw new Error(`failed to read attachment ${attachment.filename}`)
-  const blob = await resp.blob()
+/** One attachment's bytes as a stageable `File`, read from its content route. `getBlob`, not `get`: the route
+ *  answers BYTES (as `attachmentResolver` uses it). */
+async function fetchAttachmentFile(contentUrl: string, attachment: Attachment): Promise<File> {
+  const blob = await getBlob(contentUrl)
   // `||`, not `??`: `Blob.type` and a stored `content_type` can be `''`, never null.
   return new File([blob], attachment.filename, {
     type: attachment.content_type || blob.type || 'application/octet-stream',
@@ -137,23 +131,43 @@ const DUPLICATE_COPY_MAX_BYTES = 100 * 1024 * 1024
  *  broken images. STRIPPING them is the caller's step: `stripAttachmentImage` belongs to the editor
  *  module and importing it here would be a cycle. */
 export function deadInlineTokens(seed: TaskDuplicateSeed): string[] {
-  const body = seed.source.body ?? ''
-  return seed.unavailable.filter(filename => isInlineToken(body, filename))
+  return deadTokensIn(seed.source.body ?? '', seed.unavailable)
 }
 
-/** Read a row and everything a copy of it may carry. THE ROW READ IS FATAL, THE BYTES ARE NOT: a failed
- *  attachment is a named omission in `unavailable`; a failed LIST sets `attachmentsUnknown`. */
-export async function loadTaskDuplicateSeed(taskId: number): Promise<TaskDuplicateSeed> {
-  const source = await get<PipelineTask>(`/api/tasks/${taskId}`)
-  const body = source.body ?? ''
+/** Every `attachment:<token>` an inline image in `body` references. A scan, not a regex over an unbounded body. */
+export function inlineAttachmentTokens(body: string): string[] {
+  const needle = `](${ATTACHMENT_SCHEME}`
+  const tokens: string[] = []
+  for (let at = body.indexOf(needle); at !== -1; at = body.indexOf(needle, at + 1)) {
+    const start = at + needle.length
+    const end = body.indexOf(')', start)
+    if (end > start) tokens.push(body.slice(start, end))
+  }
+  return tokens
+}
+
+/** The `unavailable` names `body` still references inline. */
+export function deadTokensIn(body: string, unavailable: readonly string[]): string[] {
+  return unavailable.filter(filename => isInlineToken(body, filename))
+}
+
+/** What a create copied from another record's files: both staging stores, plus what did not come across. */
+export type AttachmentCopies = Pick<TaskDuplicateSeed, 'inlineImages' | 'files' | 'unavailable' | 'attachmentsUnknown'>
+
+/** Every file a record lists, as the create form's staged copies — a task's (Duplicate) or a support ticket's
+ *  (`?ticket=`). THE BYTES ARE NOT FATAL: a failed file is a named omission in `unavailable`; a failed LIST sets
+ *  `attachmentsUnknown`. `contentUrl` names one file's bytes route on that record. */
+export async function loadAttachmentCopies(
+  body: string,
+  listUrl: string,
+  contentUrl: (attachment: Attachment) => string,
+): Promise<AttachmentCopies> {
   let listed: Attachment[] = []
   try {
-    listed = await get<Attachment[]>(`/api/tasks/${taskId}/attachments`)
+    listed = await get<Attachment[]>(listUrl)
   } catch {
     // The copy opens with its parameters and SAYS the attachments are unknown.
-    return {
-      source, inlineImages: new Map(), files: [], unavailable: [], attachmentsUnknown: true,
-    }
+    return { inlineImages: new Map(), files: [], unavailable: [], attachmentsUnknown: true }
   }
   const fetched: { attachment: Attachment; file: File }[] = []
   const unavailable: string[] = []
@@ -166,12 +180,24 @@ export async function loadTaskDuplicateSeed(taskId: number): Promise<TaskDuplica
         continue
       }
       try {
-        fetched.push({ attachment: next, file: await fetchAttachmentFile(taskId, next) })
+        fetched.push({ attachment: next, file: await fetchAttachmentFile(contentUrl(next), next) })
       } catch {
         unavailable.push(next.filename)
       }
     }
   }))
   const { inlineImages, files } = splitDuplicateAttachments(body, fetched)
-  return { source, inlineImages, files, unavailable, attachmentsUnknown: false }
+  return { inlineImages, files, unavailable, attachmentsUnknown: false }
+}
+
+/** Read a row and everything a copy of it may carry. THE ROW READ IS FATAL, THE BYTES ARE NOT
+ *  (`loadAttachmentCopies`). */
+export async function loadTaskDuplicateSeed(taskId: number): Promise<TaskDuplicateSeed> {
+  const source = await get<PipelineTask>(`/api/tasks/${taskId}`)
+  const copies = await loadAttachmentCopies(
+    source.body ?? '',
+    `/api/tasks/${taskId}/attachments`,
+    attachment => `/api/tasks/${taskId}/attachments/${attachment.id}/content`,
+  )
+  return { source, ...copies }
 }

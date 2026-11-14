@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from app.persona_registry import PERSONA_MANIFEST, PERSONA_SETTLE_STATES, PERSONA_TERMINALS
 from app.task_lifecycle import AWAITING_RESPONSE
 from app.task_manifest import ARTIFACT_KIND_LABELS, KIND_MEDIA, OUTCOME_SUMMARY_TARGET_CHARS, REQUIRED_HARD
-from app.task_settle import FOLDER_BUILD_TERMINALS, TERMINAL_REFERENCES
+from app.task_settle import FOLDER_BUILD_TERMINALS, SHADOW_TERMINALS, TERMINAL_REFERENCES
 
 # Points at the charter's "The control plane tools" section; restates only the task-id rule.
 _CONTROL_TOOLS_POINTER = (
@@ -47,6 +47,14 @@ _TERMINAL_PROSE: dict[str, str] = {
         "you verified"
     ),
     "outcome": "the work itself, delivered. It settles you `done`",
+    "review": (
+        "your blind review, with `findings` (one entry per defect, `[]` when you found none). It settles you "
+        "`done`; your findings are advisory and never block the change"
+    ),
+    "shadow_pr": (
+        "a benchmark shadow's open DRAFT PR, never merged, enqueued or readied. It settles you `done`; the duel's "
+        "review closes the PR"
+    ),
 }
 
 #: Description of each reference parameter; asserted to cover every name in `TERMINAL_REFERENCES`.
@@ -92,6 +100,12 @@ def folder_settle_terms(terms: SettleTerms) -> SettleTerms:
         return terms
     manifest = (("report", REQUIRED_HARD),) + tuple(row for row in terms.manifest if row[0] != "report")
     return SettleTerms(manifest=manifest, terminals=FOLDER_BUILD_TERMINALS, settle_states=terms.settle_states)
+
+
+def shadow_settle_terms(terms: SettleTerms) -> SettleTerms:
+    """`terms` for a benchmark shadow (`app/outcome_ledger/benchmark.py`): its one ending is `shadow_pr`. The
+    server's own swap (`task_settle.terminals_of`) is the authority; this mirrors it."""
+    return SettleTerms(manifest=terms.manifest, terminals=SHADOW_TERMINALS, settle_states=terms.settle_states)
 
 
 def _manifest_block_for(rows) -> str:
@@ -178,8 +192,10 @@ def _settle_tool_for(terms: SettleTerms, *, summary_hint: str = "", gate_arg: st
         "folder<!--end:repo-->;** a path outside it is refused.\n\n"
         "3. **Complete** by calling `mcp__plugin_jaah_control__task_complete` with these arguments:\n\n"
         f"   - `summary` (REQUIRED): <{hint}>. **Aim for under {OUTCOME_SUMMARY_TARGET_CHARS} "
-        "characters.** Say what you did and how it ended. Anything you must NAME here (an assumption, a "
-        "deferred follow-up, a blockage) gets a clause; its reasoning goes in your report<!--if:repo--> "
+        "characters.** Written for a person (the runner charter's How you write for a person): how it ended "
+        "and what they should do, if anything. Name only what the person must act on (an assumption to "
+        "confirm, a blockage, a part of the ask not delivered) in a clause; its reasoning and other "
+        "follow-ups go in your report<!--if:repo--> "
         "and PR body<!--end:repo-->. Length is not enforced.\n"
         "   - `terminal_type` (REQUIRED) — the ending you are claiming. Yours:\n"
         + _terminal_block_for(terms.terminals)
@@ -191,9 +207,11 @@ def _settle_tool_for(terms: SettleTerms, *, summary_hint: str = "", gate_arg: st
         "   - A **422 naming missing artifact(s)**: upload each named kind with `artifact_upload` and "
         "call `task_complete` again. Your summary and references are kept.\n"
         "   - Any other refusal (409 on state, 422 on terminal type or references) recorded nothing. Fix "
-        "what it names, or `task_fail` with its reason.\n"
+        "what it names, or `task_fail` with a reason written for a person (the runner charter's How you write for a person); the refusal text goes "
+        "in your report.\n"
         "   - On a tool ERROR, call `task_get` (no arguments). `null` means your task already settled: "
-        "stop, do NOT `task_fail`. Otherwise retry ONCE, then `task_fail` naming the error.\n\n"
+        "stop, do NOT `task_fail`. Otherwise retry ONCE, then `task_fail` with a reason written for a person; the "
+        "error goes in your report.\n\n"
         "5. **Asking, blocked, failed.** <!--if:ask-->With Autonomous OFF, interview through the "
         "AskUserQuestion tool per the directive above the fence. "
         + _asking_clause_for(terms.settle_states) +
@@ -205,10 +223,14 @@ def _settle_tool_for(terms: SettleTerms, *, summary_hint: str = "", gate_arg: st
         "unrecoverable error, a gate you cannot make green, a blocker the answer confirmed cannot be "
         "cleared)<!--else:ask-->You have no ask channel: an autonomous-OFF task runs as ON and you never "
         "settle from `awaiting_response`. For a BLOCKER only a human could clear, deliver everything not "
-        "blocked, then name the blocker and who could clear it in your `task_fail`. An irreducible failure "
-        "(a credential you lack, an unrecoverable error, a gate you cannot make green)<!--end:ask--> → "
+        "blocked, then settle with the blocker and who could clear it named in your `summary`. An "
+        "irreducible failure, with nothing deliverable (an unrecoverable error, a gate you cannot make "
+        "green)<!--end:ask--> → "
         "`task_fail` with `reason`, and `session_id` set to the VALUE of the `CONTROL_RUNNER_SESSION_ID` "
         "environment variable (arguments are not shell-expanded; omit it if unset). Neither call is for "
         "a decision you can resolve and document<!--if:ask-->, and `task_fail` is not for a blocker you "
-        "have not asked about<!--end:ask-->. Then stop."
+        "have not asked about<!--end:ask-->. Waiting on another task is never a failure: "
+        "`task_wait` with that task's number, a `reason` and the same `session_id`; your task waits and "
+        "restarts by itself. Every `reason` and `summary` is shown to a person as written: follow the "
+        "runner charter's How you write for a person. Then stop."
     )

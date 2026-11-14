@@ -30,7 +30,7 @@ export default function OwnerMemberLookup({ value, onChange, selfId, disabled }:
     return user.id === selfId ? { ...row, label: `You (${row.label})` } : row
   }
   return (
-    <FormField label="Owned by">
+    <FormField label="Owned by" help="The member it belongs to.">
       <AsyncLookup
         id="credential-owner-member"
         value={value}

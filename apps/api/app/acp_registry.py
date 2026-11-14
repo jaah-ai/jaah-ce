@@ -28,7 +28,7 @@ The rules, each with one home below:
   host fetches the key from the node broker and sends it in ACP `authenticate` before `session/new`
   (`apps/jaahd/acp/host.py`). A binding that stopped being usable — or whose account's `(provider, auth_kind)` pair,
   or the agent's own `acp:` row, the org's provider grid no longer runs — refuses the run, named
-  (`agent_resolution._unrunnable`).
+  (`agent_resolution.unrunnable_reason`).
 """
 from __future__ import annotations
 

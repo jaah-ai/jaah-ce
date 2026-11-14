@@ -1,5 +1,5 @@
 import Box from '@mui/material/Box'
-import Tooltip from '@mui/material/Tooltip'
+import Tip from '../../ui/Tip'
 import { useApiRead } from '../../hooks/useApiRead'
 import Banner from '../../ui/Banner'
 import LoadFailedState from '../../ui/LoadFailedState'
@@ -7,12 +7,13 @@ import FeedList from '../../ui/feed/FeedList'
 import { GATE_SX, monoFamily } from '../../ui/feed/geometry'
 import type { FeedColumn, FeedIndicator, FeedRowSpec } from '../../ui/feed/types'
 import LoadingState from '../../ui/LoadingState'
-import { fmtTier } from '../../lib/models'
+import { FONT_SIZE, grid } from '../../theme'
+import { capitalize } from '../../lib/humanize'
 import { ELLIPSIS_SX, PERSONAS_LIST_CONTAINER_SX } from '../../ui/listStyles'
 import { listPersonas, type PersonaSummary } from './api'
 import { DELIVERY_LABEL, labelOf } from './vocabulary'
 
-/* Automation, the PERSONAS tab body: every persona a runner can be dispatched as.
+/* Audit > Personas, the tab body: every persona a runner can be dispatched as.
  * Headerless: the shell owns the page's `<h1>`, title and subtitle.
  * A gateway: each row links to `PersonaDetailPage` and carries only what picks the link — purpose,
  * model, delivery, reachability.
@@ -49,7 +50,7 @@ const FOCUS_TEXT_SX = { ...ELLIPSIS_SX, display: 'block' } as const
  *  width `PERSONAS_NO_FOCUS` is priced at): so the title is capped and the focus sits beside the label, with no
  *  dead band between them or after Delivery. A cap through the slot, not `titleMaxWidth`: a capped title lets a
  *  row's ⚙ marker push its slots off the header's. `cqw` is the roster's own width (`PERSONAS_LIST_CONTAINER_SX`). */
-const FOCUS_WIDTH = 'max(200px, calc(100cqw - 600px))'
+const FOCUS_WIDTH = `max(${grid(33)}, calc(100cqw - ${grid(100)}))`
 
 /** Delivery's slot: its longest label, "Control-plane record", whole. */
 const DELIVERY_WIDTH = 144
@@ -71,13 +72,13 @@ export function nameDiffersFromLabel(name: string, label: string): boolean {
   return letters(name) !== letters(label)
 }
 
-const NAME_SX = { ml: 0.5, color: 'text.secondary', fontFamily: monoFamily, fontSize: '0.6875rem', ...GATE_SX.personasLead } as const
+const NAME_SX = { ml: 0.5, color: 'text.secondary', fontFamily: monoFamily, fontSize: FONT_SIZE.xs, ...GATE_SX.personasLead } as const
 
 function FocusText({ focus }: { focus: string }) {
   return (
-    <Tooltip title={focus} describeChild slotProps={{ tooltip: { sx: FOCUS_TIP_SX } }}>
+    <Tip title={focus} describeChild slotProps={{ tooltip: { sx: FOCUS_TIP_SX } }}>
       <Box component="span" tabIndex={0} sx={FOCUS_TEXT_SX}>{focus}</Box>
-    </Tooltip>
+    </Tip>
   )
 }
 
@@ -168,15 +169,15 @@ export default function PersonasTab({ enabled = true }: {
         node: persona.focus ? <FocusText focus={persona.focus} /> : NO_BRIEF,
       },
       {
-        // The tier's label (`fmtTier`), monospaced like the raw persona name; it drops with that name.
+        // The tier's label (its id capitalized), monospaced like the raw persona name; it drops with that name.
         key: 'model',
-        width: 72,
+        width: grid(12),
         gate: 'personasLead',
         align: 'right',
         mono: true,
         testId: 'persona-model',
-        title: `Model tier: ${fmtTier(persona.default_model)}`,
-        node: fmtTier(persona.default_model),
+        title: `Model tier: ${capitalize(persona.default_model)}`,
+        node: capitalize(persona.default_model),
       },
       {
         /* The persona page's label (`vocabulary.ts`); the raw `db`/`pr`/`outcome` token rides the hover. */

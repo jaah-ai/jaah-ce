@@ -1,0 +1,52 @@
+slug = "microsoft_fabric"
+label = "Microsoft Fabric"
+category = "data"
+default_base_url = "https://login.microsoftonline.com"   # where the secret goes: the token endpoint
+vendor_docs_url = "https://learn.microsoft.com/en-us/rest/api/fabric/articles/get-started/create-entra-app"
+summary = "Lets agents list and work with Fabric workspaces, lakehouses, warehouses and items through a service principal."
+
+[[auth]]
+kind = "service_account"
+fields = [
+  { key = "tenant_id", label = "Tenant ID", kind = "text", required = true, placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", help = "Azure portal > Microsoft Entra ID > Overview > Tenant ID (a GUID, or a domain such as yourcompany.onmicrosoft.com)" },
+  { key = "client_id", label = "Client ID", kind = "text", required = true, placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", help = "Azure portal > Microsoft Entra ID > App registrations > your app > Overview > Application (client) ID" },
+  { key = "client_secret", label = "Client secret", kind = "secret", required = true, help = "Your app > Certificates & secrets > Client secrets > New client secret; copy the Value column (not the Secret ID) right after creating it" },
+]
+
+[test]
+method = "GET"
+path = "https://api.fabric.microsoft.com/v1/workspaces"
+list_field = "value"
+[test.token]
+url = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+client_id_field = "client_id"
+client_secret_field = "client_secret"
+scope = "https://api.fabric.microsoft.com/.default"
+
+[docs]
+agent_uses = [
+  "List the workspaces the service principal is a member of, and the items in each (lakehouses, warehouses, notebooks, pipelines, semantic models)",
+  "Create, update or delete Fabric items in workspaces where the service principal holds the Contributor role or higher",
+  "Run notebooks and data pipelines on demand and poll their job status",
+  "Read item definitions to review or version a notebook or pipeline",
+]
+prerequisites = [
+  "A Microsoft Fabric capacity (trial, F SKU or Power BI Premium P SKU) and a workspace on it",
+  "An app registration in Microsoft Entra ID with a client secret: Azure portal > Microsoft Entra ID > App registrations > New registration",
+  "A Fabric administrator who checks Admin portal > Tenant settings > Developer settings > Service principals can call Fabric public APIs is on for the app (scope it to a security group the app belongs to). Creating workspaces or connections also needs Service principals can create workspaces, connections, and deployment pipelines",
+  "The app added to each workspace agents should reach: open the workspace > Manage access > Add people or groups, search for the app's name, and give it Contributor (Viewer is enough for read-only work)",
+]
+limitations = [
+  "A service principal sees only the workspaces it was added to; My workspace is never reachable",
+  "Some Fabric APIs do not support service principals yet; Microsoft lists the supported identities on each API's reference page",
+  "Client secrets expire (at most two years); create a new one and replace it in Jaah before the old one lapses",
+]
+troubleshooting = [
+  { symptom = "Test says Microsoft Fabric rejected the client ID and client secret (400) or (401) - check both", fix = "The tenant, client ID or secret is wrong, or the secret expired. Check the Tenant ID on Microsoft Entra ID > Overview, the Application (client) ID on the app's Overview, and paste the secret's Value (not its Secret ID)" },
+  { symptom = "Test says Microsoft Fabric rejected the access token it issued (401) or (403)", fix = "Entra issued a token but Fabric refused the app. Turn on Service principals can call Fabric public APIs in Admin portal > Tenant settings > Developer settings, and make sure the app is in the security group that setting names. The change can take up to 15 minutes to apply" },
+  { symptom = "The Test passes but agents see no workspaces", fix = "The app is not a member of any workspace. Open each workspace > Manage access > Add people or groups and add the app with Contributor or Viewer" },
+]
+faq = [
+  { q = "Why a service principal and not a sign-in button?", a = "A service principal keeps working when the person who set it up leaves or changes their password, and its access is limited to the workspaces you add it to. Fabric supports it for unattended automation, which is how agents work" },
+  { q = "Can I reuse the app registration I use for Power BI?", a = "Yes. One app registration can serve both; add a Microsoft Fabric secret and a Power BI secret that carry the same values, and turn on each product's service principal tenant setting" },
+]

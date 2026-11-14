@@ -68,6 +68,26 @@ export const PREVIEW_SUFFIX_TYPES: Readonly<Record<string, string>> = {
   '.yml': 'text/plain',
 }
 
+/** THE NAMES PLAYED IN PLACE BY THE BROWSER'S OWN `<audio>`/`<video>`, AND THE TYPE EACH IS SERVED AS —
+ *  the mirror of `MEDIA_SUFFIX_TYPES`. The server streams them from storage by a signed `inline` URL
+ *  (`media_redirect`) at any size, so neither the proxy ceiling nor the text cap applies. Read by
+ *  `components/tasks/artifactKinds.ts` and `components/tasks/attachmentPreview.ts`. */
+export const MEDIA_SUFFIX_TYPES: Readonly<Record<string, string>> = {
+  '.aac': 'audio/aac',
+  '.flac': 'audio/flac',
+  '.m4a': 'audio/mp4',
+  '.m4v': 'video/mp4',
+  '.mov': 'video/quicktime',
+  '.mp3': 'audio/mpeg',
+  '.mp4': 'video/mp4',
+  '.oga': 'audio/ogg',
+  '.ogg': 'audio/ogg',
+  '.ogv': 'video/ogg',
+  '.opus': 'audio/ogg',
+  '.wav': 'audio/wav',
+  '.webm': 'video/webm',
+}
+
 /** THE UPLOAD CEILING IN BYTES — the mirror of `MAX_ATTACHMENT_SIZE`, the bound the upload route
  *  enforces with a 413 (`_read_bounded`); each org's own limit sits under it (`lib/maxFileBytes`,
  *  which the pickers read). THE BROWSER CHECKS FIRST, and that ordering is the

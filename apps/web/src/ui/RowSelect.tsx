@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 import Checkbox from '@mui/material/Checkbox'
 import type { FeedSlot } from './feed/types'
 import { SELECT_BOX_SX } from './listStyles'
+import Tip from './Tip'
 
 /* A LIST PAGE'S SELECT COLUMN, drawn once: the row's tick, the select-all tick over it, and the slot both sit
  * in. The picks live in `hooks/useRowSelection.ts`; this file is only their ink, so every roster (nodes, users,
@@ -42,15 +43,17 @@ export function SelectAllBox({ testId, allSelected, someSelected, onChange, show
 }) {
   const label = allSelected ? `Clear the selection of all ${shown}` : `Select all ${shown}`
   return (
-    <Checkbox
-      size="small"
-      data-testid={testId}
-      checked={allSelected}
-      indeterminate={someSelected && !allSelected}
-      onChange={onChange}
-      slotProps={{ input: { 'aria-label': label, title: label } }}
-      sx={SELECT_BOX_SX}
-    />
+    <Tip title={label}>
+      <Checkbox
+        size="small"
+        data-testid={testId}
+        checked={allSelected}
+        indeterminate={someSelected && !allSelected}
+        onChange={onChange}
+        slotProps={{ input: { 'aria-label': label } }}
+        sx={SELECT_BOX_SX}
+      />
+    </Tip>
   )
 }
 

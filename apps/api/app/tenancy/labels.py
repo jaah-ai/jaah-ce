@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.orgs import Org
+from app.entity_shape import from_row
 
 
 class OrgRef(BaseModel):
@@ -43,7 +44,7 @@ def org_refs(session: Session, org_ids: Iterable[Optional[UUID]]) -> dict[UUID, 
     rows = session.execute(
         select(Org.id, Org.slug, Org.name).where(Org.id.in_(wanted))
     ).all()
-    return {row.id: OrgRef(id=row.id, slug=row.slug, name=row.name) for row in rows}
+    return {row.id: from_row(OrgRef, row) for row in rows}
 
 
 def org_ref_of(refs: Mapping[UUID, OrgRef], org_id: Optional[UUID]) -> Optional[OrgRef]:

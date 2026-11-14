@@ -7,7 +7,7 @@ enabled — the same rule `routes/agent/task_reads.py::agent_task_bundle` serves
 missed that check never turns a name into a read of another org's row.
 
 Read on a fleet session of its own: a catalog connector is a row of org zero, which a tenant's bound
-session cannot see (`routes/agents.py::_catalog_rows`). Read-only; nothing is returned but plain values.
+session cannot see (`agent_resolution.catalog_rows`). Read-only; nothing is returned but plain values.
 """
 from __future__ import annotations
 
@@ -34,13 +34,13 @@ def run_agent(org_id: UUID, run_agent_id: Optional[UUID], run_agent_commit: Opti
     its org may not run."""
     if run_agent_id is None:
         return None
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.tenancy import seam
 
     enabled = select(AgentEnablement.agent_id).where(
         AgentEnablement.agent_id == run_agent_id, AgentEnablement.org_id == org_id
     )
-    with seam.detached(), seam.operator_scope(), SessionLocal() as fleet:
+    with seam.detached(), seam.operator_scope(), BridgedSession() as fleet:
         row = fleet.execute(
             select(Agent.id, Agent.display_name, Agent.version).where(
                 Agent.id == run_agent_id,

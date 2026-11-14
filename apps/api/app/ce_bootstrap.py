@@ -13,16 +13,14 @@ Runs only when `edition.IS_CE`; the cloud boot never reaches it (PRD §7). Two e
   elsewhere. The edition never needs `APP_ENV`: no install wraps or signs under a key published in this repo.
 * `run(session)` — after the seed (`app/seed.py::main`), on every boot, idempotent: the single org (org zero,
   which the seed converges; its first boot turns every built-in provider on and arms the dispatch crons), its
-  cloud-only system crons deleted, the single node (`os` ubuntu, credential minted at its INSERT), every project of
-  the org assigned to that node, a pool ceiling of `_CE_PORT_BLOCK - 1` slots per project
-  (`slot_allocation.pool_bound`; worktrees are not the cap, live agents are), per-account runner caps that never
+  cloud-only system crons deleted, the single node (`os` ubuntu, credential minted at its INSERT; every project runs on it with
+  no write, the All group of `app/placement_groups.py`), per-account runner caps that never
   bind below `CE_MAX_AGENTS`, the
   node's identity file `NODE_ENV_FILE` (0600) on the `jaah-node-identity` volume, and every enqueued or pending run of
   a cloud-only workflow cancelled (an install upgraded from a release that still shipped its module).
 
-The pool is a ceiling, not pre-declared rows: a slot belongs to a (node, project) pair and a static slot needs a
-repository (`slot_allocation.static_target`), so on a fresh install with no project the pair's slots are made
-per task, up to that ceiling.
+The pool is no pre-declared rows: a slot belongs to a (node, project) pair and is made per task
+(`slot_allocation.add_dynamic`).
 """
 from __future__ import annotations
 
@@ -269,44 +267,25 @@ def _ensure_node(session: Session, org_id) -> tuple["Node", str]:
     return node, token if token is not None else issue(session, node)
 
 
-#: The org's port block: the clone plus ten slots, one port each. The pool ceiling it implies is independent of
-#: `CE_MAX_AGENTS` (worktrees are not capped; live agents are), and both the pin and the check below read it, so a
-#: boot whose pool already matches rewrites nothing.
-_CE_PORT_BLOCK = 11
-
-
-def _ensure_pool(session: Session, org_id, node: "Node") -> None:
-    """Every project assigned to the node, and the pair's slot ceiling exactly `_CE_PORT_BLOCK - 1`."""
-    from app import slot_allocation
-    from app.operator_settings import cache, writes
-    from app.routes.assignments import auto_assign_as
-
-    # Attributed to each project's creator: a pool clone authenticates as its assignment's creator.
-    auto_assign_as(session, None, node_id=node.id)
-    if slot_allocation.pool_bound(session, org_id) != _CE_PORT_BLOCK - 1:
-        # `index_ceiling` is `(block_size - 1) // stride`: one port each, the clone plus the ten slots. Both knobs,
-        # so a stride edited in Settings cannot push the block past its own maximum and stop the boot.
-        writes.apply_org_overrides(
-            session, org_id, {"port_stride": 1, "port_block_size": _CE_PORT_BLOCK}
-        )
-        cache.invalidate_cache()
-
-
 def _ensure_runner_caps(session: Session, org_id) -> None:
-    """No per-account cap binds below the edition's session cap: accounts carry none of their own, and the
-    fleet's default is at least `CE_MAX_AGENTS`. The edition's own session cap is not this module's to enforce."""
+    """No runner cap binds below the edition's session cap: an account's own cap below `CE_MAX_AGENTS` is cleared
+    (one at or above it is the user's and kept), and the org's default is raised to at least `CE_MAX_AGENTS`. The
+    edition's own session cap is not this module's to enforce."""
     from app.models.credentials import Account
     from app.operator_settings import cache, reads, writes
 
     session.execute(
-        update(Account).where(Account.org_id == org_id, Account.max_runners.is_not(None)).values(max_runners=None)
+        update(Account).where(Account.org_id == org_id, Account.max_runners < edition.CE_MAX_AGENTS)
+        .values(max_runners=None)
     )
-    if reads.get_int("max_runners_per_account") < edition.CE_MAX_AGENTS:
-        writes.apply_overrides(session, {"max_runners_per_account": edition.CE_MAX_AGENTS})
+    # Org-tier, so read and raised as the edition's one org's own value; a lower one set in Settings is raised
+    # back at the next boot.
+    if reads.get_int("max_runners_per_account", org=org_id) < edition.CE_MAX_AGENTS:
+        writes.apply_org_overrides(session, org_id, {"max_runners_per_account": edition.CE_MAX_AGENTS})
         cache.invalidate_cache()
 
 
-#: The system crons the baseline ships disarmed (revision 202610251700's arming procedure): without them nothing
+#: The system crons the baseline ships disarmed (the baseline's arming procedure): without them nothing
 #: places a ready task, advances an epic or notices a dead node.
 _DISPATCH_CRONS = ("node-liveness", "task-pipeline", "lease-drain")
 
@@ -390,7 +369,6 @@ def run(session: Session) -> dict[str, str]:
         _drop_cloud_crons(session, CE_ORG_ID)
         _cancel_cloud_workflows()
         node, token = _ensure_node(session, CE_ORG_ID)
-        _ensure_pool(session, CE_ORG_ID, node)
         _ensure_runner_caps(session, CE_ORG_ID)
         session.flush()
         node_id = str(node.id)

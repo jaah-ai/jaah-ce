@@ -1,0 +1,68 @@
+slug = "zendesk"
+label = "Zendesk"
+category = "support"
+vendor_docs_url = "https://developer.zendesk.com/api-reference/introduction/security-and-auth/"
+summary = "Read and update Zendesk tickets, users and organizations in your Zendesk Support account."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+# Every endpoint is on the account's own address: Connect asks for the subdomain first and fills it in
+# (https://developer.zendesk.com/api-reference/ticketing/oauth/grant_type_tokens/).
+authorize_url = "https://{subdomain}.zendesk.com/oauth/authorizations/new"
+token_url = "https://{subdomain}.zendesk.com/oauth/tokens"
+scopes = [
+  { name = "read", label = "Read tickets, users, organizations and help center articles" },
+  { name = "write", label = "Reply to and update tickets, users and organizations" },
+]
+jaah_app = true
+
+[auth.oauth.registration]
+console_url = "https://apps.zendesk.com/"
+steps = [
+  "Zendesk lets no one create a global OAuth client directly. Sign in to a Zendesk developer (sponsored) account Jaah owns, one whose subdomain starts with d3v-, and in Admin Center open Apps and integrations > APIs > OAuth clients",
+  "Select Add OAuth client: name Jaah, an identifier starting with zdg- (for example zdg-jaah), client kind Confidential, and the redirect URIs below; save and copy the secret straight away, as you lose the client page once Zendesk converts it",
+  "At apps.zendesk.com sign in as that account, open Global OAuth > Request new OAuth, pick the zdg- client and submit the request",
+  "Once Zendesk approves it, the client works for every Zendesk account: its identifier is the Client ID",
+]
+review = "Required: Zendesk must approve the global OAuth client before any account other than the developer one can connect, and apps distributed to customers go through Zendesk Marketplace review"
+
+[[auth]]
+kind = "basic"
+fields = [
+  { key = "subdomain", label = "Subdomain", kind = "text", required = true, placeholder = "acme", help = "The first part of your Zendesk address: for acme.zendesk.com enter acme" },
+  { key = "email", label = "Agent email", kind = "email", required = true, help = "The email the Zendesk agent or admin signs in with; agents act as this user" },
+  { key = "api_token", label = "API token", kind = "secret", required = true, help = "In Zendesk Admin Center, open Apps and integrations > APIs > Zendesk API, turn on Token access on the Settings tab, select Add API token, describe it as Jaah, and copy the token before saving (Zendesk shows it once)" },
+]
+
+[test]
+path = "https://{subdomain}.zendesk.com/api/v2/users/me.json"
+auth = { basic = ["email", "api_token"], user_suffix = "/token" }
+identity = [["user", "email"], ["user", "name"]]
+
+[docs]
+agent_uses = [
+  "Search tickets and read their comments, for example every urgent ticket waiting on your team",
+  "Reply to tickets with public or internal comments, and change status, priority, assignee or tags",
+  "Look up and update end users and organizations",
+  "Read help center articles to draft answers from your own documentation",
+]
+prerequisites = [
+  "A Zendesk Support account and a Zendesk admin who can turn on token access and create an API token",
+]
+limitations = [
+  "An API token is account-wide: with it, the agent email can be any agent's, so keep the secret's audience small",
+  "Connect signs in at your account's own address, so it asks for your subdomain first; agents then act as the person who signed in, with that person's role",
+  "Zendesk rate-limits by plan (for example 400 requests a minute on Suite Professional), shared by every integration",
+  "Agents send `<email>/token` as the Basic user name and the API token as the password, as Zendesk requires",
+]
+troubleshooting = [
+  { symptom = "Test says Zendesk rejected the API token (401)", fix = "The token was deleted, token access is turned off, or the email is not an agent or admin. In Admin Center > Apps and integrations > APIs > Zendesk API check Token access is on and the token is listed, then select Replace on the secret" },
+  { symptom = "Test says Zendesk cannot be reached at that address", fix = "The subdomain is wrong. Enter only the first part of your address, for acme.zendesk.com enter acme, with no https:// and no .zendesk.com" },
+  { symptom = "The Zendesk window says the client is invalid", fix = "Jaah's Zendesk client is not approved for other accounts yet. Connect with an API token until it is" },
+  { symptom = "An agent gets 403 Forbidden on a ticket", fix = "The agent email's role cannot see that ticket's group or brand. Use an email whose role has access, or widen the role in Admin Center > People > Team > Roles" },
+]
+faq = [
+  { q = "Does Zendesk support a host-mapped domain like support.acme.com", a = "Enter the zendesk.com subdomain, not the mapped domain: the API is always served at SUBDOMAIN.zendesk.com" },
+  { q = "Zendesk calls API tokens deprecated - will this stop working", a = "Zendesk recommends OAuth, which Connect uses, but still serves API tokens" },
+]

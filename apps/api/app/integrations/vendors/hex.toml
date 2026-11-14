@@ -1,0 +1,43 @@
+# Hex: hosted MCP server. Facts confirmed at https://learn.hex.tech/docs/administration/mcp-server and the server's own OAuth metadata (app.hex.tech/.well-known/oauth-protected-resource; Dynamic Client Registration at auth.app.hex.tech/oauth2/register).
+slug = "hex"
+label = "Hex"
+category = "mcp"
+vendor_docs_url = "https://learn.hex.tech/docs/administration/mcp-server"
+summary = "Search Hex projects and run Hex's AI analyst on your data through the Hex MCP server."
+
+[[auth]]
+kind = "mcp"
+fields = [
+  { key = "url", label = "Server URL", kind = "url", required = false, placeholder = "https://app.hex.tech/mcp", help = "Leave blank for Hex's multi-tenant US cloud. Otherwise enter your Hex address followed by /mcp - for example https://eu.hex.tech/mcp, https://hc.hex.tech/mcp for Hex's HIPAA cloud, or https://yourcompany.hex.tech/mcp for a single-tenant workspace (the address you open Hex at)" },
+]
+
+[mcp]
+url = "https://app.hex.tech/mcp"
+url_editable = true
+transport = "streamable_http"
+auth = "oauth_dcr"
+
+[docs]
+agent_uses = [
+  "Search Hex projects and read a published app's results",
+  "Ask Hex's AI to answer a data question against your workspace's connected warehouse (a connection marked sensitive needs Allow sensitive data connections in MCP, API, and CLI under Settings > Integrations)",
+  "Start a new Hex thread for an analysis and return the link in the task",
+]
+prerequisites = [
+  "A Hex workspace on the Team or Enterprise plan, and a Hex user with the Explorer role or higher",
+  "Your Hex address if it is not app.hex.tech (EU or single-tenant workspaces)",
+]
+limitations = [
+  "Agents act as the signed-in Hex user and see only what that user can see",
+  "Analyses run on your Hex plan and count toward its usage",
+]
+troubleshooting = [
+  { symptom = "Test says Hex rejected the token (401)", fix = "The sign-in expired or was revoked. Select Reconnect and sign in to Hex again" },
+  { symptom = "Test or Connect cannot reach the server", fix = "The Server URL is wrong for your workspace. Set it to the address you open Hex at followed by /mcp, then Reconnect" },
+  { symptom = "The secret shows Needs reconnect", fix = "Hex ended the grant (a password change, a revoked connection or a long idle period). Select Reconnect on the secret and sign in to Hex again" },
+  { symptom = "New tasks on the project have no Hex tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with, and an agent marked Not supported on that tab cannot load MCP servers" },
+]
+faq = [
+  { q = "Does Jaah need an app registered at Hex", a = "No. Jaah registers itself with Hex's sign-in server the first time anyone connects, and every later connection reuses that registration" },
+  { q = "Can I use Hex's EU or single-tenant cloud", a = "Yes. Set Server URL to that address followed by /mcp; Jaah dials it only after checking it resolves to a public address" },
+]

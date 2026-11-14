@@ -10,7 +10,8 @@ import { apiDetail } from '../api'
  * `useEditRecord`, `AbortController` lookups via `useAsyncOptions`) keep their own wiring.
  *
  * `key` is the query key: the first element names the read (unique across the app, or shared by sites that read
- * the same thing the same way), the rest are what the read depends on — a change re-reads; so does every mount. `enabled: false` holds the read with `loading` true (skeleton, not a
+ * the same thing the same way), the rest are what the read depends on — a change re-reads; so does every mount (a
+ * catalogue's `staleTime` aside). `enabled: false` holds the read with `loading` true (skeleton, not a
  * false empty state). `refetchInterval` polls while a number, never in a hidden tab (react-query's own rule);
  * there is no focus refetch (below).
  * `apiDetail(err, fallback)` shows the server's `detail` verbatim; `fallbackMessage` is required so no generic
@@ -27,21 +28,38 @@ export function useApiRead<T>(
   key: QueryKey,
   fetcher: () => Promise<T>,
   fallbackMessage: string,
-  { enabled = true, refetchInterval = false }: {
+  { enabled = true, refetchInterval = false, staleTime = 0, shapeError }: {
     enabled?: boolean
+    /** The error when the answer is not a list (`get<T>` is an unchecked cast; a non-list must never white-screen). */
+    shapeError?: string
+    /** A server-defined catalogue's mount answers from cache this long (`lib/cachedRead.ts`'s `*_STALE_MS`). */
+    staleTime?: number
     /** A number polls; `false`/`null` does not; a function decides from the latest answer (none yet = `null`). */
     refetchInterval?: number | false | null | ((data: T | null) => number | false | null)
   } = {},
-): { data: T | null; loading: boolean; error: string; reload: () => Promise<void>; refresh: () => Promise<void> } {
+): {
+  data: T | null
+  loading: boolean
+  error: string
+  reload: () => Promise<void>
+  refresh: () => Promise<void>
+  /** Whether THIS mount's read has landed: a cached answer paints first, and may predate a write made elsewhere. */
+  fetchedAfterMount: boolean
+} {
   const query = useQuery({
     queryKey: key,
     /* Called with NO arguments: react-query hands its `QueryFunctionContext` to the function it is given, and a
        bare reference such as `listProviders` (whose optional first parameter is an org id) would read it as one. */
-    queryFn: () => fetcher(),
+    queryFn: async () => {
+      const next = await fetcher()
+      if (shapeError !== undefined && !Array.isArray(next)) throw new Error(shapeError)
+      return next
+    },
     enabled,
     /* Every mount re-reads (the cached answer paints at once meanwhile): a write made elsewhere must show on the
-       next visit, as it did with the hand-rolled reads; siblings mounting together still share the one read. */
-    staleTime: 0,
+       next visit, as it did with the hand-rolled reads; siblings mounting together still share the one read. A
+       catalogue passes its own `staleTime`. */
+    staleTime,
     refetchInterval: typeof refetchInterval === 'function'
       ? query => refetchInterval(query.state.data ?? null) || false
       : refetchInterval || false,
@@ -73,5 +91,6 @@ export function useApiRead<T>(
     error: query.error ? apiDetail(query.error, fallbackMessage) : '',
     reload,
     refresh,
+    fetchedAfterMount: query.isFetchedAfterMount,
   }
 }

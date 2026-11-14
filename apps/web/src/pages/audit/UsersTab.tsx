@@ -1,32 +1,32 @@
 import { useCallback, useMemo, useRef, useState, type JSX } from 'react'
 import Box from '@mui/material/Box'
 import type { Theme } from '@mui/material/styles'
-import Button from '@mui/material/Button'
-import useMediaQuery from '@mui/material/useMediaQuery'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { get } from '../../api'
-import { useApiRead } from '../../hooks/useApiRead'
+import { usePagedList } from '../../hooks/usePagedList'
 import { PER_PAGE } from '../../hooks/usePagedLogFilters'
 import { compactAge } from '../../lib/relativeTime'
 import { toggled } from '../../lib/sets'
 import { localInputToIso, viewerZone, formatZoned } from '../../lib/zonedTime'
 import Banner from '../../ui/Banner'
-import EmptyState from '../../ui/EmptyState'
+import LoadFailedState from '../../ui/LoadFailedState'
 import NoMatchesState from '../../ui/NoMatchesState'
 import { AGE_SLOT } from '../../ui/feed/geometry'
 import type { FeedNote, FeedRowSpec, FeedSlot } from '../../ui/feed/types'
 import StatusChip from '../../ui/StatusChip'
+import { usePhone } from '../../hooks/usePhone'
 import {
-  AUDIT_FOLD_FILTERS, AUDIT_LIST_CONTAINER_SX, AUDIT_NO_ACTOR, FEED_NO_ID, PHONE_QUERY, tapTargetSx,
+  AUDIT_FOLD_FILTERS, AUDIT_LIST_CONTAINER_SX, AUDIT_NO_ACTOR, FEED_NO_ID, tapTargetSx,
 } from '../../ui/listStyles'
-import { StaleResultBanner } from '../../ui/LogPagerFooter'
-import { Pager } from '../../ui/Pager'
+import RetryBanner from '../../ui/RetryBanner'
+import { LoadMoreFooter } from '../../ui/PagedList'
 import { useAuth } from '../../auth'
 import { useOpenDetailPath } from '../../components/ListDetail'
 import { isOpenPath } from '../../lib/listDetail'
+import { countOf } from '../../lib/humanize'
 import { AUDIT_TAB_PATHS, normalizePathname } from '../../routeGroups'
 import SegmentedControl from '../../ui/SegmentedControl'
-import { RadioPage } from '../../ui/ToolbarMenu'
+import { radioItem } from '../../ui/ToolbarMenu'
 import ActivitySearch, { type ActivityChip } from './ActivitySearch'
 import {
   apiParams,
@@ -67,6 +67,8 @@ import {
 } from './rows'
 import { statusGlyph, statusTone } from './status'
 import type { AuditOrg, AuditPage, AuditRow } from './types'
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, RADIUS, SIZE } from '../../theme'
+import Tip from '../../ui/Tip'
 
 /* Audit › Activity (tab id `users`, address `/audit`) — the searchable activity log: "what changed
  * recently, and who changed it", built for 10M events.
@@ -76,12 +78,8 @@ import type { AuditOrg, AuditPage, AuditRow } from './types'
  * sentence reads once, whole.
  * FILTERS LIVE IN THE URL (`./activityFilters.ts`): a pasted link
  * restores the view, Back undoes a chip. Every change pushes one; free text commits only on Enter.
- * KEYSET PAGING: a local stack of cursors (Newer pops, Older pushes), RESET by any filter change (so
- * changing a filter and changing it back starts at the newest page). Newer/Older are off while a read is in
- * flight, and Older only follows a `next_cursor` from a response for the current filters — the hook keeps
- * the previous response on screen while the next loads, and its cursor belongs to that query. No page
- * numbers and no ceiling: `total` is exact, the planner's estimate ("About 2.3M events") or a floor
- * ("10,000+ events"), never below the rows already paged through.
+ * KEYSET PAGING (`hooks/usePagedList.ts`, "Load older"). No page numbers and no ceiling: `total` is exact, the
+ * planner's estimate ("About 2.3M events") or a floor ("10,000+ events"), never below the rows already loaded.
  * No live tail: a backward-looking reader should not have rows reorder under the cursor. */
 
 /** Skeleton rows: the height a populated list settles at. */
@@ -105,7 +103,7 @@ const ACTION_SLOT = 150
 const ACTOR_SLOT = 170
 /* A keyed request's actor cell, one line: the key (body font, up to three quarters of the slot) before the address, each
  * ellipsising on its own. */
-const ACTOR_KEYED_SX = { display: 'flex', gap: 0.75, minWidth: 0 } as const
+const ACTOR_KEYED_SX = { display: 'flex', gap: 0.5, minWidth: 0 } as const
 const ACTOR_KEY_SX = (theme: Theme) => ({
   flex: '0 1 auto', maxWidth: '75%', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis',
   fontFamily: theme.typography.fontFamily, color: 'text.primary',
@@ -121,8 +119,6 @@ const OPENS_SLOT_KEYS: ReadonlySet<string> = new Set(['actor', 'org'])
 /** The 4xx band's floor: a refused row's tone and glyph, for a record that carries no status of its own. */
 const REFUSED_BAND = 400
 
-const NO_CURSORS: readonly string[] = []
-
 /* WHO DID IT, WHERE THE ACTOR COLUMN IS GONE: beside an open event or on a phone the `auditActor` slot
  * drops, and nothing on the row said who acted. A 16px mark before the sentence keeps it scannable down the list: a
  * person's initial, or ⚙ for the system. Shown exactly where the slot is hidden (the gate's two queries), absent
@@ -135,37 +131,36 @@ const ACTOR_MARK_SX = {
   alignItems: 'center',
   justifyContent: 'center',
   flex: '0 0 auto',
-  width: 16,
-  height: 16,
-  mr: 0.75,
-  borderRadius: '50%',
+  width: SIZE.iconSm,
+  height: SIZE.iconSm,
+  mr: 0.5,
+  borderRadius: RADIUS.round,
   bgcolor: 'action.selected',
   color: 'text.secondary',
-  fontSize: '0.625rem',
-  fontWeight: 600,
-  lineHeight: 1,
+  fontSize: FONT_SIZE.xxs,
+  fontWeight: FONT_WEIGHT.semibold,
+  lineHeight: LINE_HEIGHT.tight,
   verticalAlign: 'text-bottom',
   '&::before': { content: 'attr(data-mark)' },
 } as const
 
 function ActorMark({ actor, system }: { actor: string; system: boolean }): JSX.Element {
   return (
-    <Box
+    <Tip title={actor}><Box
       component="span"
       role="img"
       aria-label={`by ${actor}`}
-      title={actor}
       data-testid="audit-actor-mark"
       data-mark={system ? '⚙' : (actor.trim()[0] ?? '?').toUpperCase()}
       sx={ACTOR_MARK_SX}
-    />
+    /></Tip>
   )
 }
 
 export default function UsersTab(): JSX.Element {
   const zone = useMemo(viewerZone, [])
   /* The band as a value: the title wraps below it. */
-  const onPhone = useMediaQuery(PHONE_QUERY)
+  const onPhone = usePhone()
   const { admin } = useAuth()
   const operator = admin?.is_operator === true
   const defaultType = defaultActionType(admin?.org_hipaa)
@@ -184,28 +179,20 @@ export default function UsersTab(): JSX.Element {
     [search, defaultType, operator],
   )
 
-  /* The request without its cursor: the identity the cursor stack belongs to. */
+  /* The request without its cursor: a filter change restarts at the newest page. */
   const base = useMemo(() => apiParams(filters, PER_PAGE).toString(), [filters])
-  const [cursors, setCursors] = useState<{ base: string; stack: readonly string[] }>({ base, stack: NO_CURSORS })
-  /* A filter change RESETS the stack (state, not a mask: masking it let changing a filter and changing it
-     back restore the old depth). Page 3 of the old query is not page 3 of the new. Set during render, so no
-     frame requests the old cursor under the new filters. */
-  if (cursors.base !== base) setCursors({ base, stack: NO_CURSORS })
-  const stack = cursors.base === base ? cursors.stack : NO_CURSORS
-  const cursor = stack.length > 0 ? stack[stack.length - 1] : null
-  const url = `/api/audit?${base}${cursor === null ? '' : `&cursor=${encodeURIComponent(cursor)}`}`
-
-  /* Superseded responses are fenced by the hook. Each response carries the request it answers: the hook
-     keeps the last one on screen while the next is in flight, so `data` alone cannot say whose it is. */
-  const depth = stack.length
-  const { data: read, loading, error, reload } = useApiRead(
-    ['audit-user-activity', url, depth],
-    () => get<AuditPage>(url).then(page => ({ page, url, depth })),
-    'Failed to load the activity log',
+  const fetchPage = useCallback(
+    (cursor: string | null) =>
+      get<AuditPage>(`/api/audit?${base}${cursor === null ? '' : `&cursor=${encodeURIComponent(cursor)}`}`),
+    [base],
   )
-  const data = read?.page ?? null
-  /* The shown page answers THIS request: only then is its `next_cursor` this query's next page. */
-  const current = read !== null && read.url === url && !loading
+  const paging = usePagedList({
+    fetchPage,
+    rowsOf: page => page.items,
+    nextOf: page => page.next_cursor,
+    errorFallback: 'Failed to load the activity log',
+  })
+  const { rows: items, lastPage: data, loading, error, reload } = paging
 
   /* Labels a pick carried, so a chip reads as a name before (and after) the next response names it. */
   const [picked, setPicked] = useState<ReadonlyMap<string, string>>(() => new Map())
@@ -258,7 +245,6 @@ export default function UsersTab(): JSX.Element {
     if (chip.facet === 'session') update({ session: '' })
   }
 
-  const items = data?.items ?? []
   const lines = useMemo(() => toLines(items), [items])
 
   const hasFilters = writeFilters(filters, defaultType).toString() !== ''
@@ -273,21 +259,6 @@ export default function UsersTab(): JSX.Element {
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set())
 
   const toggleExpanded = (key: string) => setExpanded(prev => toggled(prev, key))
-
-  function older() {
-    const next = current ? read.page.next_cursor : null
-    if (!next) return
-    setCursors({ base, stack: [...stack, next] })
-  }
-
-  function newer() {
-    if (loading) return
-    setCursors({ base, stack: stack.slice(0, -1) })
-  }
-
-  function newest() {
-    setCursors({ base, stack: NO_CURSORS })
-  }
 
   /** The operator's Organization slot — absent for a tenant, so their row is unchanged. */
   function orgSlot(org: AuditOrg | null, unattributed = false): FeedSlot[] {
@@ -370,6 +341,7 @@ export default function UsersTab(): JSX.Element {
       disclosure: 'spacer',
       title: <><ActorMark actor={actorText(row)} system={isMachineRow(row) || (actorLabel(row) === null && !isUnattributed(row))} />{primary}</>,
       titleText: primary,
+      href: null,
       /* Beside its open event the list is narrow: the selected row wraps to two lines rather than cut its sentence. */
       titleLines: onPhone ? 'all' : current ? 2 : undefined,
       onRowClick: openDetails,
@@ -448,7 +420,7 @@ export default function UsersTab(): JSX.Element {
         tone: 'neutral',
         glyph: '⚙',
         label: 'Task pipeline',
-        title: `${line.rows.length} pipeline event${line.rows.length === 1 ? '' : 's'} for ${subject}`,
+        title: `${countOf(line.rows.length, 'pipeline event')} for ${subject}`,
         data: { status: 'pipeline' },
       },
       disclosure: {
@@ -459,6 +431,7 @@ export default function UsersTab(): JSX.Element {
       },
       title: sentence,
       titleText: sentence,
+      href: null,
       titleLines: onPhone ? 'all' : undefined,
       data: { 'task-id': line.taskId, 'pipeline-trail': trail.join(' → '), 'row-kind': 'pipeline' },
       slots: [
@@ -575,22 +548,6 @@ export default function UsersTab(): JSX.Element {
     onTo: (value: string) => update({ to: value }, { replace: true }),
   }
 
-  /* The count is the shown page's; the rows already paged through set its floor. */
-  const pager = read && (
-    <Pager
-      testId="audit-pagination"
-      labelTestId="audit-pagination-count"
-      depth={stack.length}
-      label={eventCount(read.page.total, read.page.total_kind, read.depth * PER_PAGE + read.page.items.length)}
-      previousLabel="Newer"
-      nextLabel="Older"
-      previousDisabled={!(stack.length > 0 && !loading)}
-      nextDisabled={!(current && read.page.next_cursor !== null)}
-      onPrevious={newer}
-      onNext={older}
-    />
-  )
-
   return (
     /* The query container the `audit*` gates and `contentSlotWidth`'s `cqw` read: the tab's own width, which is
        the list's. On the frame, not the list, so the filter strip folds on it too (`AUDIT_FOLD_FILTERS`). */
@@ -622,22 +579,11 @@ export default function UsersTab(): JSX.Element {
       foldQuery={AUDIT_FOLD_FILTERS}
       /* On a phone the type is a Filters page, beside From/To: on its own row it pushed the list a row down. */
       phoneFilters={{
-        items: [{
-          kind: 'page',
-          id: 'type',
-          label: 'Type',
-          value: ACTION_TYPES.find(t => t.value === filters.type)?.label ?? 'All',
-          render: nav => (
-            <RadioPage
-              testId="audit-type"
-              label="Activity type"
-              options={ACTION_TYPES.map(t => ({ ...t, hint: '' }))}
-              value={filters.type}
-              onPick={next => update({ type: next })}
-              nav={nav}
-            />
-          ),
-        }],
+        items: [radioItem({
+          id: 'type', label: 'Type', groupLabel: 'Activity type', testId: 'audit-type',
+          options: ACTION_TYPES.map(t => ({ ...t, hint: '' })),
+          value: filters.type, onPick: next => update({ type: next }),
+        })],
         count: filters.type === defaultType ? 0 : 1,
         onClear: () => update({ type: defaultType, from: '', to: '' }),
       }}
@@ -657,7 +603,9 @@ export default function UsersTab(): JSX.Element {
       )}
 
       {error && data !== null && (
-        <StaleResultBanner error={error} onRetry={() => void reload()} retryTestId="audit-retry" />
+        <Box sx={{ mt: 1 }}>
+          <RetryBanner onRetry={() => void (paging.hasMore ? paging.loadMore() : reload())} retryTestId="audit-retry">{error} Showing the last result that loaded.</RetryBanner>
+        </Box>
       )}
 
       {/* Busy while a read is in flight: the rows turn only when the page lands. */}
@@ -670,29 +618,25 @@ export default function UsersTab(): JSX.Element {
           loading={loading && data === null}
           skeleton={{ rows: SKELETON_ROWS, label: 'Loading activity…' }}
           failed={error && data === null && (
-            <EmptyState
-              title={`Could not load the activity log: ${error}`}
-              action={<Button variant="outlined" data-testid="audit-retry" onClick={() => void reload()}>Retry</Button>}
-            />
+            <LoadFailedState title={`Could not load the activity log: ${error}`} onRetry={() => void reload()} testId="audit-retry" />
           )}
           empty={items.length === 0}
-          /* An empty page past the newest (rows aged out, or the last page was exactly full) keeps its way
-             back: without it the pager would vanish with the rows. */
-          noMatch={read !== null && read.depth > 0 ? (
-            <>
-              <EmptyState
-                title="No older activity"
-                action={<Button variant="outlined" data-testid="audit-newest" onClick={newest}>Newest</Button>}
-              />
-              {pager}
-            </>
-          ) : (data?.any_visible ?? false) && (
+          noMatch={(data?.any_visible ?? false) && (
             <NoMatchesState title="No activity matches your filters" onClear={hasFilters ? clearFilters : undefined} />
           )}
           emptyTitle="No activity recorded yet"
           feed={{ ariaLabel: 'Activity log', testId: 'audit-table', sections: [{ key: 'activity', rows: auditRows }] }}
         >
-          {pager}
+          {/* The count is the newest answer's; the rows already loaded set its floor. */}
+          <LoadMoreFooter
+            hasMore={paging.hasMore}
+            loading={loading}
+            onMore={() => void paging.loadMore()}
+            label="Load older"
+            testId="audit-load-more"
+            caption={data && eventCount(data.total, data.total_kind, items.length)}
+            sx={{ mt: 1 }}
+          />
         </ListStates>
       </Box>
     </PagedLogView>

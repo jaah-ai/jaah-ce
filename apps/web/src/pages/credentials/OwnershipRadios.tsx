@@ -1,26 +1,23 @@
-import FormControl from '@mui/material/FormControl'
-import FormControlLabel from '@mui/material/FormControlLabel'
-import FormLabel from '@mui/material/FormLabel'
-import Radio from '@mui/material/Radio'
-import RadioGroup from '@mui/material/RadioGroup'
+import Box from '@mui/material/Box'
 import type { SxProps, Theme } from '@mui/material/styles'
 import type { ReactNode } from 'react'
-import HelpLabel from '../../ui/HelpLabel'
+import { ChoiceField } from '../../ui/ChoiceField'
 import { PHONE } from '../../ui/listStyles'
 import type { CredentialOwnership } from './api'
 import { OWNERSHIP_OPTIONS, ownershipOf } from './ownership'
 
-/* A phone stacks the three: in a row at 360px System wrapped onto a line of its own, and with the gaps cut to
- * fit, each label ran into the next radio. */
-const PHONE_COLUMN_SX = { [PHONE]: { flexDirection: 'column' } } as const
-/* `oneLine`: a narrower dialog's 448px still holds the three in a row once MUI's 16px gap after each is cut. */
-const PHONE_ROW_SX = { [PHONE]: { flexWrap: 'nowrap', '& .MuiFormControlLabel-root': { mr: 1 } } } as const
+/* `oneLine`: the choices stay in a row on a phone once the gap between them is cut; without it `ui/ChoiceField`
+ * stacks them there. Its one user is the custom connections tab (`custom/ConnectionsTab`): Personal and
+ * Organization in a row above the inputs, where a stack would push the Connect row below the fold. */
+const PHONE_ROW_SX = { '& .MuiRadioGroup-root': { [PHONE]: { flexDirection: 'row', flexWrap: 'nowrap', columnGap: 1 } } } as const
 
-/* The Owner choice both credential forms show (`CredentialEditPage`, `settings/cloudConnections/
- * AwsCredentialFields`). Radios, not a select: three choices, all visible. Each explains itself on hover.
+/* The Owner choice the credential form (`CredentialEditPage`), the custom connections tab (`custom/ConnectionsTab`)
+ * and the account editor (`AccountEditPage`, `options` without System: an account has no system owner) show.
+ * Radios, not a select: every choice visible (`ui/ChoiceField`). Each explains itself on hover.
  * `personalOwner` (the member picker, `OwnerMemberLookup`) is drawn under the radios while Personal is chosen,
  * `orgHome` (the Home picker, `credentialForm.tsx::HomeProjectField`) while Organization is. */
-export default function OwnershipRadios({ labelId, value, onChange, disabled, sx, personalOwner, orgHome, oneLine = false }: {
+export default function OwnershipRadios({ value, onChange, disabled, sx, personalOwner, orgHome, oneLine = false, options }: {
+  /** Unused: `ui/ChoiceField` names its own legend. Kept so callers need no change. */
   labelId: string
   value: CredentialOwnership
   onChange: (next: CredentialOwnership) => void
@@ -28,25 +25,27 @@ export default function OwnershipRadios({ labelId, value, onChange, disabled, sx
   sx?: SxProps<Theme>
   personalOwner?: ReactNode
   orgHome?: ReactNode
-  /** Keep the three in a row on a phone too (a form where a stack would push its submit row below the fold). */
+  /** Keep the choices in a row on a phone too (a form where a stack would push its submit row below the fold). */
   oneLine?: boolean
+  /** The owners offered, in `OWNERSHIP_OPTIONS` order; all three when omitted. */
+  options?: readonly CredentialOwnership[]
 }) {
   return (
-    <FormControl sx={sx}>
-      <FormLabel id={labelId}>Owner</FormLabel>
-      <RadioGroup row aria-labelledby={labelId} sx={oneLine ? PHONE_ROW_SX : PHONE_COLUMN_SX} value={value} onChange={event => onChange(ownershipOf(event.target.value))}>
-        {OWNERSHIP_OPTIONS.map(option => (
-          <FormControlLabel
-            key={option.value}
-            value={option.value}
-            aria-description={option.help}
-            control={<Radio size="small" disabled={disabled} />}
-            label={<HelpLabel label={option.label} help={option.help} />}
-          />
-        ))}
-      </RadioGroup>
+    <Box sx={[{ display: 'flex', flexDirection: 'column' }, oneLine && PHONE_ROW_SX, ...(Array.isArray(sx) ? sx : [sx])]}>
+      <ChoiceField
+        label="Owner"
+        help={{
+          tip: 'Decides who, and which tasks, can use it.',
+          docs: 'using-jaah/credentials/how-credentials-work',
+        }}
+        row
+        disabled={disabled}
+        value={value}
+        onChange={next => onChange(ownershipOf(next))}
+        options={OWNERSHIP_OPTIONS.filter(option => !options || options.includes(option.value))}
+      />
       {value === 'personal' && personalOwner}
       {value === 'org' && orgHome}
-    </FormControl>
+    </Box>
   )
 }

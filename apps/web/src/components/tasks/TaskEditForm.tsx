@@ -1,52 +1,51 @@
 import {
-  type FormEvent, type MutableRefObject, useCallback, useEffect, useMemo, useRef, useState,
+  type FormEvent, type MutableRefObject, type ReactNode, useCallback, useEffect, useMemo, useRef, useState,
 } from 'react'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import CircularProgress from '@mui/material/CircularProgress'
-import MuiLink from '@mui/material/Link'
-import Tooltip from '@mui/material/Tooltip'
-import Typography from '@mui/material/Typography'
+import Link from '@mui/material/Link'
+import { Link as RouterLink } from 'react-router-dom'
+import Tip from '../../ui/Tip'
 import { apiDetail, patch, post, put } from '../../api'
+import { countOf } from '../../lib/humanize'
 import { useMaxFileBytes } from '../../lib/maxFileBytes'
 import { useAuth } from '../../auth'
+import { saveLastCreateProject } from '../../lib/lastCreateProject'
+import { readMuted, withoutHiddenProjects } from '../../lib/taskMute'
 import { useOtherOrg } from '../../ui/OrgIndicator'
 import { isOrgAdminSeat } from '../../lib/orgAdmin'
+import { planSurfaceShown } from '../../lib/planSwitches'
 import { useActingAs } from '../../lib/actAs'
 import { useCanPickAgent } from '../agents/AgentPicker'
 import { useCanOnProject } from '../../auth'
 import { useCanCreateChats, useCanRunTasksOnProject } from '../../hooks/useTaskAccess'
 import { useAwaitingApprovalReason } from '../../lib/orgLifecycle'
-import { safeHref } from '../../lib/safeHref'
-import { useFocusedProjectId } from '../../hooks/useFocusedProjectId'
 import { useTaskAutosaveSeconds } from '../../lib/taskAutosaveInterval'
 // The create-time seed a row's Duplicate hands over (see the `duplicateSeed` prop).
 import type { TaskDuplicateSeed } from '../../lib/taskDuplicate'
 import type { TaskPrefill } from './taskPrefill'
 // The ticket → PUT → complete sequence from its ONE home, shared with `TaskAttachmentsField`.
 import { uploadTaskAttachment } from '../../lib/uploadTaskAttachment'
-import ActAsCoderOrg from './ActAsCoderOrg'
+import { RecommendationBlock } from '../routing/RecommendationBlock'
 import ActAsToCreate from './ActAsToCreate'
 import type { OrgRef, PipelineTask, Project, TaskPlaybookRef } from '../../types'
-import { AsyncLookup, type LookupOption } from '../../ui/AsyncLookup'
 import { Banner } from '../../ui/Banner'
+import { modEnterCapture } from '../../ui/modEnter'
+import { MOD_ENTER_LABEL } from '../../ui/modifierKey'
 import { useConfirm } from '../ConfirmDialog'
 import { BUTTON_SX } from '../../ui/formDensity'
 import { FormActionBar } from '../../ui/FormActionBar'
-import { FormField } from '../../ui/FormField'
 import { SubmitButton } from '../../ui/SubmitButton'
-import {
-  createAttachmentResolver,
-  paintableImageUrl,
-  releasePaintedUrl,
-  type AttachmentResolver,
-} from '../richtext/attachmentResolver'
+import EmptyState from '../../ui/EmptyState'
+import { createAttachmentResolver, useStagedImagePaint, type AttachmentResolver } from '../richtext/attachmentResolver'
 import { can, CONTROLS, startBody, startIntentFor } from './controls'
 import { type PushIdentity, readStarters, usePushIdentity } from './PushIdentityDialog'
 import { NEW_TASK_CRUMB } from './TaskBreadcrumb'
-import { getJiraIssue, type JiraIssueRef, type JiraIssueText, searchJiraIssues } from './jiraApi'
+import TaskPageFields, { useTaskPageFields } from './TaskPageFields'
+import { isSuggestion } from './listViews/boardSections'
+import IssuePicker, { heldElsewhere, issueField, useIssuePick, useProjectHasTrackers } from '../trackers/IssuePicker'
 import {
-  createRefusal, refusedInOrg, type DiscardSubject, discardConfirmOptions, orgWaitSentence, resetConfirmOptions,
+  createRefusal, refusedInOrg, type DiscardSubject, discardConfirmOptions, resetConfirmOptions,
   resolveCreateProject,
 } from './shared'
 import { type PrereqCommitHandle, TaskDependsOn } from './TaskDependencies'
@@ -83,10 +82,10 @@ import TaskSpecFields, {
 // posts); 'save' writes and stops. Both modes offer both; `goTransitions` is what an edit-mode Go posts.
 export type SubmitIntent = 'save' | 'go'
 
-/* The field vocabulary — model/provider sentinels and hints, Hidden, Project memory, Debug — is single-homed in
+/* The field vocabulary — model/provider sentinels and hints, Hidden, Throttle — is single-homed in
  * `TaskSpecFields`, which renders every field of this form. Re-exported where this module's callers read it. */
 export {
-  DEBUG_HINT, stripAttachmentImage, type TaskModelChoice,
+  THROTTLE_HINT, stripAttachmentImage,
 } from './TaskSpecFields'
 
 /* The persona an edit SHOWS for a row: a one-stage playbook row shows the expert it runs as, not its settle persona
@@ -121,21 +120,10 @@ export function goTransitions(row: PipelineTask): string[] {
  * applies: `goTooltip`/`saveTooltip`. */
 export const NO_CHANGES_HINT = 'No changes to save'
 export const PICK_PROJECT_HINT = 'Pick a project'
-export const RUNNING_GO_HINT = 'Running. Save, then restart to apply.'
-// A row waiting on a question (`awaiting_response`): its runner is live, so Go would reset it.
-// Built from parts: "Answer it" links to the Answer tab when the host offers one (`onOpenAnswer`).
-const AWAITING_BEFORE_LINK = 'Waiting on a question. '
-export const AWAITING_ANSWER_LINK = 'Answer it'
-const AWAITING_AFTER_LINK = ', or save and restart.'
-export const AWAITING_GO_HINT = AWAITING_BEFORE_LINK + AWAITING_ANSWER_LINK + AWAITING_AFTER_LINK
-/* Go is gated on "may this row be STARTED" (the transition table), which is also false for a state outside
- * the vocabulary (legacy `cancelled`) — where RUNNING_GO_HINT would be a lie. So this covers the rest. */
-export const NOT_STARTABLE_GO_HINT = 'Can’t start from this state.'
-// A `ready` row is already started: Go would only re-save it. One the org holds (`wait_reason`) says the
-// hold's sentence instead (`orgWaitSentence`): it does not start until the hold clears.
-export const QUEUED_GO_HINT = 'Queued. Starts on its own.'
 // A `done` row's Go is withheld until something is edited, exactly as Save is.
 export const DONE_GO_HINT = 'Done. Edit to run again.'
+// Go's hover while acting as an org you aren't a member of: Go asks whose git account to push with.
+export const PUSH_AS_HINT = 'Save and start. Asks whom to push as.'
 
 // What a partially-completed create still owes, i.e. what the retry press will DO. `prereq`: the task
 // landed but its prerequisite edges were refused (neither uploads nor start reached).
@@ -151,9 +139,6 @@ export function retryActionLabel(intent: SubmitIntent, stage: RetryStage = 'uplo
 
 const START_TITLE_MAX = 60
 
-/* The act-as push caption's container: below ~460px its sentence wrapped to two lines, so the short one shows. */
-const PUSH_CAPTION_CONTAINER = 'push-caption'
-const PUSH_CAPTION_NARROW = `@container ${PUSH_CAPTION_CONTAINER} (max-width: 459px)`
 
 /** One description line as plain words: markdown's images dropped, links to their text, markers, emphasis and
  *  escapes removed (`\\[ops\\]` is how the editor writes `[ops]`). */
@@ -196,7 +181,6 @@ type UploadFailure = { name: string; detail: string; inline: boolean }
 function uploadFailureBanner(
   failures: UploadFailure[], lead: string, retryLabel: string,
 ): string {
-  const plural = failures.length > 1 ? 's' : ''
   /* Every failure carries its OWN reason, paired per file: one shared `detail` would pin a 413 on a PDF that
    * was refused for permission. */
   const named = failures.map(f => `${f.name}: ${f.detail}`).join('; ')
@@ -211,7 +195,7 @@ function uploadFailureBanner(
       ? `, or remove the file with its × and press it again to continue without `
         + `${failures.length > 1 ? 'them' : 'it'}`
       : ' — the description stays paused until it lands, so press Discard if it keeps failing'
-  return `${lead} ${failures.length} attachment${plural} failed to upload (${named}). `
+  return `${lead} ${countOf(failures.length, 'attachment')} failed to upload (${named}). `
     + `Press “${retryLabel}” to try again${escape}.`
 }
 
@@ -223,31 +207,6 @@ export const PERSONA_TO_CODER_WARNING =
 
 // The axes are wordless by operator instruction; each position's tooltip and `aria-label` is its label from
 // the position table in `TaskAxisControls`.
-
-// ── FROM JIRA: fill the Description from a Jira issue ─────────────────────────────────────────────────
-// On Save the task records its source (`external_task_system: 'jira'` + `external_task_id`, a pair the
-// server validates together). It reads through the project's `jira_credential_id`, so it is absent on a
-// project without Jira rather than 409ing per keystroke.
-
-/* What the Jira pick is doing, as one discriminated union (the states are mutually exclusive): the wait,
- * the confirm it may ask first, the outcome, the failure. The pick REWRITES the Description, so every stage
- * is visible. */
-type JiraPick =
-  | { kind: 'idle' }
-  | { kind: 'loading'; key: string }
-  /* The issue is in hand and the Description is non-empty, so the replace waits for a confirm. `previous`
-   * restores the lookup on decline, making it a true cancel. */
-  | { kind: 'confirm'; issue: JiraIssueText; previous: LookupOption | null }
-  /* Settled. `replaced` is false for an empty Jira description (`''`): the link is recorded, but blanking the
-   * operator's prose would import nothing and also block Save (a non-empty body is the gate). */
-  | { kind: 'done'; key: string; url: string; summary: string; replaced: boolean }
-  | { kind: 'error'; message: string }
-
-/** Typeahead row → lookup option. The KEY leads the label so identity survives truncation; `AsyncLookup`
- *  highlights the matched run. Status is the dim `hint` column; null when the server did not decorate. */
-function jiraOption(ref: JiraIssueRef): LookupOption {
-  return { key: ref.key, label: `${ref.key} · ${ref.summary}`, hint: ref.status ?? undefined }
-}
 
 // The task create/edit form (spec cockpit-task-fleet-dispatch-workflow R1 + the draft-edit route). One form
 // for BOTH modes with ONE field set: a field is gated by the ROW it writes (`dispatchedRow`,
@@ -261,7 +220,7 @@ function jiraOption(ref: JiraIssueRef): LookupOption {
 //     transition_mode can change mid-run). Every field pre-fills from the task.
 // The field set splits by whether the row is DISPATCHED (`dispatchedRow`), not by parentage:
 //   • epic (a top-level container, never dispatched): Body plus Full Auto, which its two interviewing
-//     children are dispatched with (`showsAutonomous`), and Debug.
+//     children are dispatched with (`showsAutonomous`), and Throttle.
 //   • every other row (incl. a top-level `coder` task, which is dispatched): Body plus the per-dispatch model pin
 //     (`showsModelPin`). An epic CHILD renders no Full Auto (its column is inert).
 // A PAGE form, not a modal: the page shell (`TaskDetailPage`) owns scroll locking and viewport handling.
@@ -284,7 +243,6 @@ export default function TaskEditForm({
   onActionError,
   onSavedNotRestarted,
   onFiled,
-  onOpenAnswer,
   readOnly = false,
   canStart = true,
   titleDraft,
@@ -292,6 +250,7 @@ export default function TaskEditForm({
   featureIdDraft,
   onDirtyChange,
   submitRef,
+  rating,
 }: {
   mode: 'create' | 'edit'
   /* Did this create open at the CHAT position? A chat is an ordinary task with the `advisor` persona, created
@@ -308,7 +267,7 @@ export default function TaskEditForm({
    * would reset its waiting runner unasked. EDIT ONLY; defaults to `task`. */
   liveTask?: PipelineTask
   /* Every project the operator may see (`GET /api/projects`). The task's
-   * project is its scope, and `Project.jira_credential_id` is the From Jira control's config (`jiraOwner`). */
+   * project is its scope (`formProject`): its model default, its org, its repo. */
   projects: Project[]
   // The `/tasks` board's project, the first rung of `resolveCreateProject` (`shared.tsx`). Silent.
   // Irrelevant in edit mode.
@@ -345,8 +304,6 @@ export default function TaskEditForm({
    * start, so a host's pick for the row lands before it can run (the header's Live Cast). Answers ''
    * or the refusal, which stops the pass like a refused prerequisite. */
   onFiled?: (row: PipelineTask) => Promise<string>
-  /* Selects the host's Answer tab: "Answer it" in the bar's waiting reason links to it. Absent, plain text. */
-  onOpenAnswer?: () => void
   /* Read-only for a `tasks:view` principal without `tasks:edit`: every field non-editable, the Description
    * rendered, and the Save/Go/Retry block ABSENT (a greyed Save advertises a capability they lack). A PROP,
    * not `useCan()` here (tests need no permission mock). EDIT-ONLY: create's route is gated on `tasks:create`
@@ -360,13 +317,13 @@ export default function TaskEditForm({
    * retry still owing images stays. Defaults TRUE. The create surface does not use it: it asks about the
    * PROJECT it will create in (`goPermitted`), resolved in here, so it cannot come down as a prop. */
   canStart?: boolean
-  /* The breadcrumb owns the Title and the PROJECT: the page holds their drafts and hands
-   * them down to be SUBMITTED. Optional with a fallback to internal state, so a host without a breadcrumb (unit
+  /* The breadcrumb owns the Title and the PROJECT: the page holds their drafts and hands them down (a create
+   * submits the project and feature; an edit's crumbs move the task themselves). Optional with a fallback to internal state, so a host without a breadcrumb (unit
    * tests) keeps working. `undefined` = not lifted, distinct from `''`: a blanked title reaches `submit()` as
    * `''`, which the server's `exclude_unset` handling leaves alone. */
   titleDraft?: string
   projectIdDraft?: number
-  /* The breadcrumb's staged FEATURE: `null` is "No feature", `undefined` not lifted (the stored filing
+  /* The breadcrumb's staged FEATURE: `null` is the project alone, `undefined` not lifted (the stored filing
    * stands). The page keeps it and `projectIdDraft` in agreement — a feature is always of the staged
    * project — so the PUT never earns the API's mismatch 422. */
   featureIdDraft?: string | null
@@ -375,6 +332,8 @@ export default function TaskEditForm({
   /* Lets a host run THIS form's save (same path as Save). Resolves to whether it landed. A ref because it
    * closes over render-fresh state; a prop would re-render the host per keystroke. */
   submitRef?: MutableRefObject<(() => Promise<boolean>) | null>
+  /* EDIT ONLY: the folded rating (`TaskRating`), drawn among the page's fields (`TaskPageFields`). */
+  rating?: ReactNode
 }) {
   const maxFileBytes = useMaxFileBytes()
   const isEdit = mode === 'edit'
@@ -411,21 +370,21 @@ export default function TaskEditForm({
     (id: number) => canOnProject('tasks:create', id),
     [canOnProject],
   )
-  const focusedProjectId = useFocusedProjectId()
   /* An unchosen default skips a project whose tasks could not be placed (`Project.dispatch_block`): the first
-   * creatable unblocked one wins, else the original pick. A board or focused project that resolved is kept. */
+   * creatable unblocked one wins, else the original pick. A board project that resolved is kept. */
   const [ownProjectId] = useState<number | null>(() => {
     if (isEdit) return task?.project_id ?? null
-    // A template seed (Customize) takes only the scope's project — the board's, else the focused one — and
-    // otherwise leaves it for the author to pick (`taskPrefill.ts`; the bar says "Pick a project").
+    // A template seed (Customize) takes only the board's project and otherwise leaves it for the author to
+    // pick (`taskPrefill.ts`; the bar says "Pick a project").
     if (prefillSeed?.template !== undefined) {
-      const scope = filterProjectId ?? focusedProjectId
-      return projects.some(p => p.id === scope && canCreateInProject(p.id)) ? scope : null
+      return projects.some(p => p.id === filterProjectId && canCreateInProject(p.id)) ? filterProjectId : null
     }
-    const pick = resolveCreateProject(projects, filterProjectId, canCreateInProject, focusedProjectId).id
-    const chosen = pick !== null && (pick === filterProjectId || pick === focusedProjectId)
-    if (chosen || !projects.find(p => p.id === pick)?.dispatch_block) return pick
-    return resolveCreateProject(projects.filter(p => !p.dispatch_block), null, canCreateInProject).id ?? pick
+    // Never a hidden project, unless it is the board's (`lib/taskMute.ts::withoutHiddenProjects`).
+    const visible = withoutHiddenProjects(projects, readMuted(admin?.preferences), [filterProjectId])
+    const pick = resolveCreateProject(visible, filterProjectId, canCreateInProject).id
+    const chosen = pick !== null && pick === filterProjectId
+    if (chosen || !visible.find(p => p.id === pick)?.dispatch_block) return pick
+    return resolveCreateProject(visible.filter(p => !p.dispatch_block), null, canCreateInProject).id ?? pick
   })
   const [ownTitle] = useState(task?.title ?? '')
   const projectId: number | null = projectIdDraft ?? ownProjectId
@@ -480,10 +439,11 @@ export default function TaskEditForm({
   const playbookSentRef = useRef(task?.playbook != null)
   // The server's own reason for refusing a conversion (CONTRACT-4's 400 body), shown beside the control (AC7.5).
   const [personaError, setPersonaError] = useState('')
-  // Epic transition mode: create + epic editor only (read off the PARENT epic at dispatch, meaningless on a
-  // child; `tasks.py`). 'auto' dispatches a dependency-satisfied child; 'hold' keeps it `ready` for a manual
-  // Run.
+  // Epic Throttle: create + epic editor only (read off the PARENT epic at dispatch, meaningless on a child;
+  // `tasks.py`). 'auto' dispatches a dependency-satisfied child, at most `max_running` at once (null = no cap);
+  // 'hold' keeps it `ready` for a manual Run.
   const [transitionMode, setTransitionMode] = useState(seedRow?.transition_mode ?? 'auto')
+  const [maxRunning, setMaxRunning] = useState<number | null>(seedRow?.max_running ?? null)
   /* `hidden` — EDIT ONLY, top-level rows only (`_apply_hidden`, apps/api routes/tasks/update.py: a child is hidden
    * with its epic). Independent of the persona: converting a system row never un-hides it. */
   const [hidden, setHidden] = useState(task?.hidden ?? false)
@@ -501,7 +461,9 @@ export default function TaskEditForm({
   const [involvement, setInvolvement] = useState<TaskInvolvement>(() => {
     if (chatPreset && task === undefined) return 'chat'
     /* Off the RESOLVED `persona`, so a chat copied by a principal who may not create one lands on `guided`. */
-    return involvementForTask(persona, seedRow?.autonomous ?? prefillSeed?.template?.autonomous ?? true)
+    return involvementForTask(
+      persona, seedRow?.autonomous ?? prefillSeed?.template?.autonomous ?? prefillSeed?.autonomous ?? true,
+    )
   })
   const autonomous = autonomousForInvolvement(involvement)
   /* ── The create-time seed, applied when `createDefaults` ARRIVES ──────────────────────────────────────
@@ -513,9 +475,10 @@ export default function TaskEditForm({
    * Involvement axis ends it; named for `task_default_autonomous`). A ref: nothing renders off them. */
   /* A duplicate counts as touched: both axes were seeded from the copied row, and the late seed would
    * half-undo the copy. Two fields, not one: each is retired by its own control. */
-  /* A link-seeded persona counts as touched too: the late defaults seed must not replace what the link asked for. */
+  /* A link-seeded persona or involvement counts as touched too: the late defaults seed must not replace what the
+   * link asked for. */
   const untouchedRef = useRef({
-    autonomous: !duplicating && prefillSeed?.template === undefined,
+    autonomous: !duplicating && prefillSeed?.template === undefined && prefillSeed?.autonomous === undefined,
     persona: !duplicating && prefillSeed?.persona === undefined,
   })
   /* May this principal reach the chat position (`useCanCreateChats`: `worktrees:edit` on top of
@@ -560,17 +523,20 @@ export default function TaskEditForm({
   /* The SDK half of the one agent picker (`tasks.agent_id`), from `task` like the provider (a duplicate starts
    * on Default). At most one of `provider`/`agentId` is set: the picker writes both on every pick. */
   const [agentId, setAgentId] = useState<string | null>(task?.agent_id ?? null)
+  /* The router's recommendation this person took with "Use this" (`RecommendationBlock`): the Config itself, sent
+   * back as `routing_accepted_config` while the picker still holds it. A later picker move drops it (`applySpec`). */
+  const [acceptedPick, setAcceptedPick] = useState<Record<string, unknown> | null>(null)
+  /* Whether the recommendation block shows a pick now (`RecommendationBlock.onShown`). */
+  const [recommendationShown, setRecommendationShown] = useState(false)
   /* The node pin (`tasks.pinned_node_id`), null = Any. From `task`, never a duplicate's source (a copy
    * starts on Any). Under `taskNodePinShown`, enforced server-side (`_pinned_node_or_refuse`). */
   const [pinnedNodeId, setPinnedNodeId] = useState<string | null>(task?.pinned_node_id ?? null)
-  /* The account pin (`tasks.bound_account_id`), null = Any. Create only (`showsAccountPicker`), on the POST and the
-   * create flow's auto-save PUTs alike (`_account_pick_or_422`, which also stamps the account's provider). Once one
-   * was sent, Any is sent too, so a later PUT can take it back. */
-  const [accountId, setAccountId] = useState<string | null>(null)
+  /* The account pin (`tasks.bound_account_id`), null = Any. From `task`, never a duplicate's source (a copy starts on
+   * Any). Create and edit alike (`showsAccountPicker`), so a row stuck on a bad account can be re-pinned in place
+   * (`_account_pick_or_422`, which also stamps the account's provider). On create, once one was sent, Any is sent
+   * too, so a later auto-save PUT can take it back; on edit only a change rides. */
+  const [accountId, setAccountId] = useState<string | null>(task?.bound_account_id ?? null)
   const accountSentRef = useRef(false)
-  /* Project memory On/Off, null = Default. From `task`, never a duplicate's source (a copy starts on Default,
-   * `lib/taskDuplicate.ts`). The Default option's "(On)/(Off)" is the operator's knob off the identity payload. */
-  const [projectMemory, setProjectMemory] = useState<boolean | null>(task?.project_memory ?? null)
   /* ── ASSIGNED TO — whose inbox this task's notifications land in (`PipelineTask.assigned_to_id`) ─────────
    * Edit seeds from the row; create from the signed-in principal (`admin.id`): the API refuses an empty value
    * (`PUT` with null is a 422), so `''` means only "no principal yet", and `assigneeField` then omits the key.
@@ -583,15 +549,15 @@ export default function TaskEditForm({
    * CREATE rides `TaskCreate` (`priorityCreateField`); EDIT goes through the set-priority route
    * (`PATCH /api/tasks/{id}`), only when it moved — see `submit()`. */
   const [priority, setPriority] = useState<number>(seedRow?.priority ?? DEFAULT_PRIORITY)
-  /* ── FROM JIRA ──────────────────────────────────────────────────────────────────────────────────────
-   * Pre-filled from the STORED link (only the key is stored, so that is the label). Other trackers open as
-   * `null`; submit writes the pair only when the operator moved it. */
-  const [jiraIssue, setJiraIssue] = useState<LookupOption | null>(() => (
-    seedRow?.external_task_system === 'jira' && seedRow.external_task_id
-      ? { key: seedRow.external_task_id, label: seedRow.external_task_id }
-      : null
-  ))
-  const [jiraPick, setJiraPick] = useState<JiraPick>({ kind: 'idle' })
+  /* ── FROM ISSUE (`components/trackers/IssuePicker.tsx`) ───────────────────────────────────────────────
+   * Seeded from the STORED link (a duplicate's from its source); submit sends it only when the operator moved it.
+   * A duplicate's link is a hand link on the copy, whatever started the source. */
+  const issuePick = useIssuePick({
+    stored: duplicateSeed !== undefined && seedRow?.tracker_issue ? { ...seedRow.tracker_issue, origin: 'manual' } : seedRow?.tracker_issue,
+    storedProjectId: seedRow?.project_id ?? null,
+    body: () => bodyRef.current,
+    setBody: text => setBody(text),
+  })
   // The in-app confirm before Go's destructive `reset` step (see `submit`), rendered once at the end.
   const [confirm, confirmDialog] = useConfirm()
   /* An acting operator's Go asks whom to push as (`PushIdentityDialog.tsx`, the row Start's same ask) before any
@@ -667,15 +633,15 @@ export default function TaskEditForm({
    * this ref in place. */
   const stagedImagesRef = useRef<Map<string, File> | null>(null)
   // Lazily (`??=`), so a Map is not built and discarded every render.
-  stagedImagesRef.current ??= new Map(duplicateSeed?.inlineImages)
+  stagedImagesRef.current ??= new Map(duplicateSeed?.inlineImages ?? prefillSeed?.staged?.inlineImages)
   const stagedImages = stagedImagesRef.current
   /* Staging for deliberately ATTACHED files, deliberately not the map above: inline images are keyed by the
    * body's `attachment:<token>` (so a pasted-then-deleted image is skipped), while attached files have no body
    * reference and may share a filename. Hence a LIST of `{ key, file }` with minted keys, in STATE (chips
    * render from it). Create only; edit uploads on pick. */
-  // A duplicate opens with the source's unreferenced attachments already staged, uploaded on Save.
+  // A duplicate or ticket seed opens with the source's files the body does not show inline already staged, uploaded on Save.
   const [stagedAttachments, setStagedAttachments] = useState<File[]>(
-    () => (duplicateSeed?.files ?? []).map(entry => entry.file),
+    () => duplicateSeed ? duplicateSeed.files.map(entry => entry.file) : [...(prefillSeed?.staged?.files ?? [])],
   )
   // Tokens already uploaded; a retry pass re-attempts only the rest.
   const [uploadedTokens, setUploadedTokens] = useState<Set<string>>(new Set())
@@ -703,40 +669,12 @@ export default function TaskEditForm({
      (`taskPrefill.ts::TemplateSeed.resolve`); nothing is re-uploaded — the create copies each one the body still names
      (`routes/tasks/create.py`). */
   const templateSeed = prefillSeed?.template
-  const sourceResolver = useMemo<AttachmentResolver | undefined>(
-    () => editResolver ?? templateSeed?.resolve,
-    [editResolver, templateSeed],
+  // ONE resolver for both modes, staged-first (`useStagedImagePaint`); only a token this form did not stage goes
+  // to the server. Unmount releases every paint: the upload has landed, and the fresh mount uses `editResolver`.
+  const { resolve: resolveAttachmentSrc, release: releaseStagedPaint } = useStagedImagePaint(
+    token => stagedImages.get(token),
+    editResolver ?? templateSeed?.resolve,
   )
-  // Painted URLs for images staged in THIS form, by token. A ref: minting must not render. The PROMISE is
-  // cached, set before it settles, so two resolves of one token mint one URL and a release finds it pending.
-  const stagedBlobsRef = useRef<Map<string, Promise<string>>>(new Map())
-  // Revoked on unmount, or each pins its File for the tab's lifetime — and `TaskDetailPage` re-keys this form
-  // on `${task.id}:${task.updated_at}`. Safe: the upload has landed, and the fresh mount uses `editResolver`.
-  useEffect(() => () => {
-    for (const url of stagedBlobsRef.current.values()) void url.then(releasePaintedUrl, () => {})
-    stagedBlobsRef.current.clear()
-  }, [])
-  // ONE resolver for both modes, staged-first: `RichTextEditor`'s `insertImageFiles` inserts the node
-  // optimistically, so in edit mode resolving from the server raced the upload and latched "⚠ image
-  // unavailable" (permanently, via `listPromise`'s cache). Only tokens this form did NOT stage go to the server.
-  // tiptap reads the resolver ONCE (`attachmentImage`'s `addNodeView()`), so a later identity never reaches
-  // the node view.
-  const resolveAttachmentSrc = useMemo<AttachmentResolver>(() => {
-    const blobs = stagedBlobsRef.current
-    return async (token: string) => {
-      const cached = blobs.get(token)
-      if (cached) return cached
-      const file = stagedImages.get(token)
-      if (file) {
-        // Inert even for the uploader's own file (M9): `attachmentResolver.ts::paintableImageUrl`.
-        const url = paintableImageUrl(file, file.type)
-        blobs.set(token, url)
-        return url
-      }
-      if (!sourceResolver) throw new Error(`no staged image for token: ${token}`)
-      return sourceResolver(token)
-    }
-  }, [sourceResolver])
 
   // No project at all: nothing to create in.
   const noProjects = !isEdit && projects.length === 0
@@ -768,43 +706,39 @@ export default function TaskEditForm({
   const { dispatchedRow, showsModelPin, showsAgentPicker, showsAutonomous } =
     taskSpecGates(persona, playbook, isOrgAdmin, isChildEdit, canPickAgent)
   const showsNodePin = taskNodePinShown('task', admin, dispatchedRow)
-  const showsAccountPicker = !isEdit && dispatchedRow
+  const showsAccountPicker = dispatchedRow
 
-  /* ── WHICH PROJECT THIS FORM IS IN, AND WHETHER IT HAS A JIRA ─────────────────────────────────────────────
-   * Also the `task` Depth's model default (`TaskSpecFields`' `defaultModel`). `projectId` (the task's
-   * own, or the crumb's staged move; on create the resolved target) in `projects` reaches
-   * `Project.jira_credential_id` (the whole Jira config). A null credential renders NOTHING (a field that 409s
-   * per keystroke is worse than none). `readOnly` folds into `jiraProjectId` so submit cannot write the pair
-   * without a visible control. */
-  const jiraOwner = projectId === null ? undefined : projects.find(p => p.id === projectId)
-  const jiraProjectId = !readOnly && jiraOwner?.jira_credential_id != null ? jiraOwner.id : null
+  /* ── WHICH PROJECT THIS FORM IS IN, AND WHETHER IT LINKS A TRACKER ─────────────────────────────────────────
+   * Also the `task` Depth's model default (`TaskSpecFields`' `defaultModel`). `projectId` (the task's own, or the
+   * crumb's staged move; on create the resolved target) in `projects`. The From issue field shows when the project
+   * links a tracker project, or the form already holds a link (so it can be cleared); with no tracker linked it shows
+   * disabled, pointing at the project's Issue trackers; never read-only, so submit cannot write a link without a
+   * visible control. */
+  const formProject = projectId === null ? undefined : projects.find(p => p.id === projectId)
+  const projectHasTrackers = useProjectHasTrackers(readOnly ? null : projectId)
+  const previewOrg = useOtherOrg(formProject?.org ?? task?.org)
 
   /* Is the submitted row a chat? Off the PERSONA (what is submitted), not the Involvement position (`chat`
    * writes the advisor only at `task`). The Description placeholder and Depends-on panel all
    * read this ONE const; keying some on the position once promised a conversation over a prototyper run. */
   const submitsChatRow = persona === ADVISOR_PERSONA
 
-  /* The Jira pair is submitted only when the operator MOVED it, so unrelated PUTs are unchanged and a link
-   * written by another tracker is never wiped. Cleared → both nulls: `update_task` merges a missing half from
-   * the stored row, and a lone null is a 422 (the pair rule). */
-  const jiraKey = jiraIssue?.key ?? null
-  const storedJiraKey = task?.external_task_system === 'jira' ? task.external_task_id : null
-  /* ── A COPIED JIRA KEY IS THIS PROJECT'S OR NOBODY'S ─────────────────────────────────────────────────────
-   * Searched keys come from the target project's own site; a DUPLICATE's key is copied, and the copy may land
-   * in another project (`resolveCreateProject` falls through silently). Submitted there, it would be
-   * stamped on a row with a DIFFERENT Jira credential, and `comment_on_done_task` would post onto some other
-   * site's issue. The server checks only the pair's shape (`_external_issue_or_422`), so this is the fence
-   * (a server-side check is a follow-up). Re-derived every render: the crumb can move the project. */
-  const duplicateJiraOwnerId = duplicateSeed === undefined ? null
-    : projects.find(project => project.id === duplicateSeed.source.project_id)?.id ?? null
-  const jiraKeyIsForeign =
-    duplicateSeed !== undefined
-    && jiraKey !== null
-    && jiraKey === duplicateSeed.source.external_task_id
-    && jiraProjectId !== duplicateJiraOwnerId
-  const externalIssueFields = !jiraKeyIsForeign && jiraProjectId !== null && jiraKey !== storedJiraKey
-    ? { external_task_system: jiraKey === null ? null : 'jira', external_task_id: jiraKey }
-    : {}
+  /* ── A LINK IS ITS PROJECT'S OR NOBODY'S ───────────────────────────────────────────────────────────────────
+   * A pick, a stored link and a duplicate's copy each belong to the project they came from (`heldElsewhere`). Once
+   * the form's project moves (the crumb; a duplicate landing elsewhere, `resolveCreateProject` falls through
+   * silently), the link is neither shown nor sent: the server would refuse the whole save. A copy also needs its
+   * project to still link a tracker. Re-derived every render. */
+  const heldIssue = issuePick.held
+  const copiedIssue = duplicateSeed !== undefined && heldIssue !== null
+    && heldIssue.connection_id === duplicateSeed.source.tracker_issue?.connection_id
+    && heldIssue.key === duplicateSeed.source.tracker_issue?.key
+  const issueIsForeign = heldElsewhere(heldIssue, projectId) || (copiedIssue && projectHasTrackers !== true)
+  const issueLinked = projectHasTrackers === true || (heldIssue !== null && !issueIsForeign)
+  // Known to link none (not while the read is in flight): the field shows disabled with the way to link one.
+  const issueUnlinked = !issueLinked && projectHasTrackers === false
+  const issueShown = !readOnly && projectId !== null && (issueLinked || issueUnlinked)
+  /* `tracker_issue` only when the operator MOVED it (`issueField`), so unrelated writes leave the link alone. */
+  const issueFields = readOnly || issueIsForeign ? {} : issueField(issuePick, isEdit ? task?.tracker_issue : null)
   /* The assignee on every write (POST, both PUT arms, each auto-save tick; the server suppresses the notice on
    * `autosave`). Sent whenever held (a resend is a no-op); omitted when empty (would 422). One spread. */
   const assigneeField = assignedToId !== '' ? { assigned_to_id: assignedToId } : {}
@@ -819,7 +753,7 @@ export default function TaskEditForm({
   const priorityChangedFrom = (row: PipelineTask) => priority !== (row.priority ?? DEFAULT_PRIORITY)
   /* The Title the picked issue's SUMMARY fills: only an empty Title on EDIT (`TaskCreate` has no `title`;
    * `create_task` derives it from the body). Evaluated at SUBMIT, so a typed title is never overwritten. */
-  const jiraTitleFill = isEdit && title.trim() === '' && jiraPick.kind === 'done' ? jiraPick.summary : ''
+  const issueTitleFill = isEdit && title.trim() === '' && issuePick.state.kind === 'done' ? issuePick.state.issue.title : ''
   /* The Description NOW, for a question asked across an await. */
   const bodyRef = useRef(body)
   bodyRef.current = body
@@ -831,20 +765,22 @@ export default function TaskEditForm({
   /* `!isEpicPersona(persona)`, not `persona === 'coder'`: picking Architect after leaving `epic` hid the
    * warning while the server still archived the children. */
   const warnsPersonaTeardown = personaChanged && !isEpicPersona(persona) && (task?.child_count ?? 0) > 0
+  // Caused by: it rides Save after the PUT, like priority (`TaskPageFields`).
+  const pageFields = useTaskPageFields({ task, isEdit, readOnly })
 
   /* ── UNSAVED WORK, reported UP ─────────────────────────────────────────────────────────────────────────
    * The page gates the "Tasks" crumb on this (there is no router blocker in the app). Field-by-field against
-   * the STORED row, so typing and deleting leaves it clean. `title` and `projectId` are included: the
-   * breadcrumb edits them and they ride this submit. CREATE: dirty = something to lose. */
+   * the STORED row, so typing and deleting leaves it clean. `title` is included: the breadcrumb edits it and
+   * it rides this submit. The project and feature crumbs are not: a pick moves the task at once
+   * (`useTaskDetailFiling`'s `moveNow`), so it is never unsaved work. CREATE: dirty = something to lose. */
   const dirty = isEdit && task !== undefined
     ? title !== (task.title ?? '')
-      || (projectId !== null && projectId !== task.project_id)
-      || (featureIdDraft !== undefined && featureIdDraft !== (task.feature_id ?? null))
       || body !== (task.body ?? '')
       || autonomous !== (task.autonomous ?? true)
       || personaChanged
       || (playbook?.id ?? null) !== (task.playbook?.id ?? null)
       || transitionMode !== (task.transition_mode ?? 'auto')
+      || maxRunning !== (task.max_running ?? null)
       || hidden !== (task.hidden ?? false)
       // The model pin alone is a real edit (`?? MODEL_INHERIT` mirrors the seed).
       || model !== (task.model ?? MODEL_INHERIT)
@@ -854,14 +790,16 @@ export default function TaskEditForm({
       || agentId !== (task.agent_id ?? null)
       // The node pin alone is a real edit.
       || pinnedNodeId !== (task.pinned_node_id ?? null)
-      // The project-memory choice alone is a real edit (`?? null` mirrors the seed).
-      || projectMemory !== (task.project_memory ?? null)
-      // The Jira link alone is a real edit.
-      || jiraKey !== storedJiraKey
+      // The account pin alone is a real edit.
+      || accountId !== (task.bound_account_id ?? null)
+      // The issue link alone is a real edit.
+      || 'tracker_issue' in issueFields
       // The assignee alone is a real edit (`?? ''` mirrors the seed).
       || assignedToId !== (task.assigned_to_id ?? '')
       // The priority alone is a real edit (it rides its own PATCH).
       || priorityChangedFrom(task)
+      // Caused by, its own write after the PUT.
+      || pageFields.dirty
       // The prerequisite panel diffs against its fetched graph and reports only the answer.
       || prereqStaged
     // CREATE only: staged attachments are held in the browser until Save. Edit uploads on pick.
@@ -926,41 +864,29 @@ export default function TaskEditForm({
   /* A pending org starts nothing (the API 403s it): Go is disabled with the reason, Save stays (a draft is fine). */
   const awaitingApproval = useAwaitingApprovalReason()
   /* A create into a project nothing can run (`Project.dispatch_block`) would start a task that sits unplaced: Go is
-   * disabled with the server's sentence beside it; Save stays (a draft is fine). Edit is not gated here. A missing
+   * disabled with the server's sentence on its hover; Save stays (a draft is fine). Edit is not gated here. A missing
    * coding-agent account (`no_account`) does not block a picked SDK agent, which needs none. */
   const createProject = isEdit ? undefined : projects.find(p => p.id === projectId)
   const dispatchBlock = createProject?.dispatch_block_kind === 'no_account' && agentId !== null
     ? null
     : (createProject?.dispatch_block ?? null)
-  /* Go held off by the row or project, not by an empty or in-flight form: the push caption goes with it,
-   * while an untouched create keeps it so the bar does not jump at the first keystroke. */
+  /* Go held off by the row or project, not by an empty or in-flight form. */
   const goBlocked = goNotStartable || goDoneUnchanged || awaitingApproval !== undefined || dispatchBlock !== null
   const goDisabled = !canSubmit || goBlocked
-  // Said on the action bar’s note line; not while the retry button stands in for Go.
-  const barDispatchBlock = !inRetry && dispatchBlock !== null
-
   /* Hover text per button: a withheld action explains itself. `''` renders no tooltip (an empty create
-   * description, where the form's hint already speaks). One reason per button, so no precedence: Go's
-   * dead-state is "cannot be started" (running vs not), `NO_CHANGES_HINT` is Save's alone. */
-  /* Why the ROW withholds Go, off the live row (`goRow`). Also said on the bar's note line: a hover alone
-   * hid it from a phone and from anyone not pointing at the button. */
-  const rowGoHint = !goNotStartable ? null
-    : goRow?.state === 'active' ? RUNNING_GO_HINT
-    : goRow?.state === 'awaiting_response' ? AWAITING_GO_HINT
-    // The org's hold, in the header pill's and banner's words: it starts when the hold clears, not "on its own".
-    : goRow?.state === 'ready' ? (goRow.wait_reason ? orgWaitSentence(goRow.wait_reason) : QUEUED_GO_HINT)
-    : NOT_STARTABLE_GO_HINT
-  const barRowGoHint = !inRetry && rowGoHint !== null && awaitingApproval === undefined && dispatchBlock === null
-  /* While the bar says why the row cannot start, Go is withdrawn rather than greyed: beside a greyed Save
-   * it was a second dead button, and on a phone the pair took the whole bar. The reason line is the explanation. */
-  const goHidden = barRowGoHint
+   * description). One reason per button, so no precedence: `NO_CHANGES_HINT` is Save's alone.
+   * While the ROW cannot start (running, queued, waiting on a question), Go is withdrawn rather than greyed and
+   * nothing on the bar says why: the header's status chip already does. */
+  /* A Jaah suggestion (`isSuggestion`): the header's Accept/Discard (`SuggestionActions`) are its one set, so the bar
+   * keeps only Save — Go would be a second Accept, Close a second way out. */
+  const suggestionDraft = isEdit && task !== undefined && isSuggestion(task)
+  const goHidden = suggestionDraft || (!inRetry && goNotStartable && awaitingApproval === undefined && dispatchBlock === null)
   const goTooltip = awaitingApproval ? awaitingApproval
     : dispatchBlock !== null ? dispatchBlock
-    : rowGoHint !== null ? rowGoHint
     : goDoneUnchanged ? DONE_GO_HINT
-    : canSubmit ? 'Save and start this task' : ''
+    : canSubmit ? (acting ? PUSH_AS_HINT : 'Save and start this task') : ''
   /* A create with no project yet (Customize outside a project scope): Save is dead for that reason alone, so the
-   * bar says it — a disabled Save with nothing beside it read as broken. */
+   * Save's hover says it. */
   const needsProject = !isEdit && !inRetry && !readOnly && !selectedProjectKnown
   const saveTooltip = noChanges ? NO_CHANGES_HINT : needsProject ? PICK_PROJECT_HINT : ''
 
@@ -985,11 +911,7 @@ export default function TaskEditForm({
         // Un-stage a failed upload (file and object URL): nothing is stored under this token. Create mode never
         // lands here (it has a retry pass from this map).
         stagedImages.delete(filename)
-        const staleBlob = stagedBlobsRef.current.get(filename)
-        if (staleBlob) {
-          void staleBlob.then(releasePaintedUrl, () => {})
-          stagedBlobsRef.current.delete(filename)
-        }
+        releaseStagedPaint(filename)
         /* And strip the node: edit mode has no retry channel, so a dangling ref would stay as a permanent
          * `⚠ image unavailable` dispatched to a runner. The banner carries the server's reason. */
         setBody(prev => stripAttachmentImage(prev, filename))
@@ -1110,7 +1032,7 @@ export default function TaskEditForm({
         current = name === 'start'
           ? await post<PipelineTask>(
               control.path(current.id),
-              startBody(startIntentFor(current, current.parent_task_id == null ? 'root' : 'leaf'), pushAsRef.current),
+              startBody(startIntentFor(current), pushAsRef.current),
             )
           : await post<PipelineTask>(control.path(current.id))
       } catch (err) {
@@ -1125,55 +1047,6 @@ export default function TaskEditForm({
       }
     }
     return current
-  }
-
-  /* ── THE PICK: one round-trip, then the Description ─────────────────────────────────────────────────────
-   * The value is set FIRST so the field shows the choice during the read; a failed read puts it back (a link
-   * whose text never arrived would be false). Nothing is saved here — Save stores both. */
-  async function pickJiraIssue(next: LookupOption | null) {
-    if (jiraProjectId === null) return
-    const previous = jiraIssue
-    setJiraIssue(next)
-    if (next === null) {
-      setJiraPick({ kind: 'idle' })
-      return
-    }
-    setJiraPick({ kind: 'loading', key: next.key })
-    let issue: JiraIssueText
-    try {
-      issue = await getJiraIssue(jiraProjectId, next.key)
-    } catch (err) {
-      setJiraIssue(previous)
-      // The server's sentence (a 404 means "does not exist OR the credential cannot see it"), plus which issue
-      // and that the Description was left alone.
-      setJiraPick({
-        kind: 'error',
-        message: `${next.key} was not loaded: ${apiDetail(err, 'Jira could not be reached.')}`
-          + ' The Description is unchanged.',
-      })
-      return
-    }
-    /* The one question: replacing typed prose is unrecoverable (no undo across `setContent`), so the replace
-     * waits for a press only when both texts are non-empty; the common create case (empty box) goes straight. */
-    if (issue.description.trim() !== '' && bodyRef.current.trim() !== '') {
-      setJiraPick({ kind: 'confirm', issue, previous })
-      return
-    }
-    applyJiraIssue(issue)
-  }
-
-  /* An issue with no Jira description is a LINK, not a replace: blanking the body would import nothing and
-   * make Save go dead (`canSubmit` needs a non-empty body). */
-  function applyJiraIssue(issue: JiraIssueText) {
-    const replaced = issue.description.trim() !== ''
-    if (replaced) setBody(issue.description)
-    setJiraPick({ kind: 'done', key: issue.key, url: issue.url, summary: issue.summary, replaced })
-  }
-
-  /** Declining is a true CANCEL: the lookup returns to its previous value. */
-  function declineJiraIssue(previous: LookupOption | null) {
-    setJiraIssue(previous)
-    setJiraPick({ kind: 'idle' })
   }
 
   // The host's own write for a filed create (`onFiled`); a refusal stops the pass before uploads and start.
@@ -1223,11 +1096,37 @@ export default function TaskEditForm({
     return provider !== (task?.bound_provider ?? PROVIDER_ANY) ? { bound_provider: provider } : {}
   }
 
+  /** Does the agent picker still hold this router Config? An agent by id; a built-in by its provider (Default = none). */
+  function pickHeld(pick: Record<string, unknown>): boolean {
+    if (pick.kind === 'agent') return agentId === pick.agent_id && provider === PROVIDER_ANY
+    // Where the form draws the model pin, a model moved off the pick's tier is the person's own choice.
+    const tierHeld = !showsModelPin || model === ((pick.model as string | null) ?? (pick.tier as string | null) ?? MODEL_INHERIT)
+    return agentId === null && provider === ((pick.provider as string | null) ?? PROVIDER_ANY) && tierHeld
+  }
+
+  /* "Use this": the recommendation becomes the picker's pick (and the model pin's, where the form draws one), as a
+   * person's own pick would; the next write carries it with `routing_accepted_config`. */
+  function takeRecommendation(pick: Record<string, unknown>) {
+    if (pick.kind === 'agent') {
+      setAgentId(pick.agent_id as string)
+      setProvider(PROVIDER_ANY)
+    } else {
+      setAgentId(null)
+      setProvider((pick.provider as string | null) ?? PROVIDER_ANY)
+      if (showsModelPin) setModel((pick.model as string | null) ?? (pick.tier as string | null) ?? MODEL_INHERIT)
+    }
+    setAcceptedPick(pick)
+  }
+
   function formFields() {
     return {
       body: body.trim(),
-      // On the same gate as the Debug control: the column is read only off a PARENT EPIC.
+      // On the same gate as the Throttle control: the columns are read only off a PARENT EPIC. The cap rides only as
+      // a real choice (create: a number; edit: a change), so a form opened earlier never reverts another writer's.
       ...(isEpicPersona(persona) ? { transition_mode: transitionMode } : {}),
+      ...(isEpicPersona(persona) && maxRunning !== (isEdit ? (task?.max_running ?? null) : null)
+        ? { max_running: maxRunning }
+        : {}),
       // `showsAutonomous`: false only on an epic child, whose column is inert.
       ...(showsAutonomous ? { autonomous } : {}),
       /* Absent for a non-superadmin and an epic (absent ≠ empty); a chat may pin (no persona rule server-side).
@@ -1235,20 +1134,25 @@ export default function TaskEditForm({
       ...(showsModelPin ? { model } : {}),
       /* The agent picker (`showsAgentPicker`): ONE half per write, never both (`_AGENT_OR_PROVIDER`). */
       ...(showsAgentPicker ? agentPickFields() : {}),
+      /* While a recommendation is on screen, the answer to it: the pick taken with "Use this" while the picker still
+       * holds it (`acceptedPick`), else null — a runner change is then the person's own choice. Absent when none was
+       * shown, so nothing is recorded for a recommendation nobody saw. */
+      ...(showsAgentPicker && recommendationShown
+        ? { routing_accepted_config: acceptedPick !== null && pickHeld(acceptedPick) ? acceptedPick : null }
+        : {}),
       /* The node pin (`showsNodePin`): only a real choice — Any on create is the absent field, on edit only a change.
        * `null` takes the row back to Any. */
       ...(showsNodePin && pinnedNodeId !== (isEdit ? (task?.pinned_node_id ?? null) : null)
         ? { pinned_node_id: pinnedNodeId }
         : {}),
-      /* The account pin (`showsAccountPicker`): only a real choice, never beside an agent pick (which runs on none). */
-      ...(showsAccountPicker && agentId === null && (accountId !== null || accountSentRef.current)
+      /* The account pin (`showsAccountPicker`): only a real choice — on create a pick (or Any after one was sent), on
+       * edit only a change — and never beside an agent pick (which runs on none; the PUT 422s the pair). */
+      ...(showsAccountPicker && agentId === null
+        && (isEdit ? accountId !== (task?.bound_account_id ?? null) : accountId !== null || accountSentRef.current)
         ? { account_id: accountId }
         : {}),
-      /* Only a real choice: on create Default is the absent field, on edit only a change (a form opened earlier
-       * must not revert another writer's choice). `null` takes the row back to Default. */
-      ...(projectMemory !== (isEdit ? (task?.project_memory ?? null) : null) ? { project_memory: projectMemory } : {}),
-      // The Jira pair when the lookup moved, both-or-neither (`TaskCreate` validates it like the PUT).
-      ...externalIssueFields,
+      // The issue link when the picker moved it (`TaskCreate` and the PUT take the same shape).
+      ...issueFields,
       ...assigneeField,
       /* On every write while it may still change (create, auto-save, an unsaved row); `null` takes one back. */
       ...(playbookOpen && (playbook !== null || playbookSentRef.current)
@@ -1272,26 +1176,15 @@ export default function TaskEditForm({
   /* What an EDIT submits. `target` is the row written. */
   function editFields(target: PipelineTask) {
     // AC2.2/AC2.3: an emptied Title OMITS `title` (the server's `exclude_unset` keeps the stored one —
-    // `update_task`, apps/api/app/routes/tasks/update.py — rather than 422ing on ''). Exception: a Jira import into an
-    // EMPTY Title fills it (`jiraTitleFill`); a typed title always wins.
+    // `update_task`, apps/api/app/routes/tasks/update.py — rather than 422ing on ''). Exception: an issue pick into an
+    // EMPTY Title fills it (`issueTitleFill`); a typed title always wins.
     const titleField = title.trim() !== ''
       ? { title: title.trim() }
-      : jiraTitleFill !== '' ? { title: jiraTitleFill } : {}
-    /* The move: `project_id` rides the PUT only when the crumb's picker moved it, so unrelated PUTs are
-     * unchanged and a save is not refused for a move nobody asked for. The server authorizes the destination
-     * and refuses a live subtree; its 400 surfaces through `error`. */
-    const projectField = projectId !== null && projectId !== target.project_id
-      ? { project_id: projectId }
-      : {}
-    /* The filing, the same way: only when the crumb's feature picker moved it. With a moved project both ride
-     * one PUT and agree (the page stages them together). */
-    const featureField = featureIdDraft !== undefined && featureIdDraft !== (target.feature_id ?? null)
-      ? { feature_id: featureIdDraft }
-      : {}
+      : issueTitleFill !== '' ? { title: issueTitleFill } : {}
+    /* No `project_id`/`feature_id`: the crumbs move the task themselves (`useTaskDetailFiling`'s `moveNow`), so a
+     * Save never re-sends a filing from a row it may have opened on before the move. */
     return {
       ...titleField,
-      ...projectField,
-      ...featureField,
       ...formFields(),
       // AC7.5/CONTRACT-4: sent ONLY when changed, so no unrequested conversion is posted. `is_plannable` is
       // deliberately ABSENT (AC7.6: no control).
@@ -1418,6 +1311,7 @@ export default function TaskEditForm({
     if (intent === 'go' && projectId !== null) {
       const pushAs = await pushIdentity.ask({
         projectId, title: startTitle(title, body), assigneeId: assignedToId === '' ? null : assignedToId,
+        epic: isEpicPersona(persona),
       })
       if (!pushAs) return false
       pushAsRef.current = pushAs
@@ -1450,6 +1344,8 @@ export default function TaskEditForm({
         if (priorityChangedFrom(task)) {
           saved = await patch<PipelineTask>(`/api/tasks/${task.id}`, { priority })
         }
+        // Not in `editFields`, so never auto-saved: a keystroke must not file a defect link.
+        await pageFields.save(task)
         // The prerequisite draft before Go, so an edge declared now gates this dispatch.
         if (!(await flushPrereqs(task.id))) return false
         // Go: save, then the row's transition sequence (`runGoTransitions`, which owns its failure). A failed
@@ -1470,82 +1366,59 @@ export default function TaskEditForm({
           setSubmittingIntent(null)
           settled = saved
         }
-      } else if (filedRow !== null) {
-        // Remembered like the POST arm's, so a retry after a failed prerequisite or upload finishes a Go as a Go.
+      } else {
+        // Remembered BEFORE anything can fail, so a retry after a failed prerequisite, upload or start finishes the
+        // intent pressed (Go). Safe this early: its readers wait on `createdTask` (the submit handler) or `retryStage`.
         setCreateIntent(intent)
-        // The row already EXISTS — never a second POST: this is the retry pass (Risk 1) or the ordinary Save after
-        // an auto-save tick filed the row. It writes the fields first (the operator kept typing). The PUT carries NO
-        // `autosave` flag, which is the whole finalize: it clears `unsaved`, derives the title and refinement, builds
-        // an epic's children and publishes the row (`_finalize_unsaved_draft`, apps/api/app/routes/tasks/dispatch.py).
-        // `persona` rides unconditionally (see `createSurfaceFields`).
-        let savedCreate = await put<PipelineTask>(`/api/tasks/${filedRow.id}`, {
-          ...createSurfaceFields(),
-          persona,
-        })
+        /* `filedRow`: the row already EXISTS — never a second POST: this is the retry pass (Risk 1) or the ordinary
+         * Save after an auto-save tick filed the row. It writes the fields first (the operator kept typing). The PUT
+         * carries NO `autosave` flag, which is the whole finalize: it clears `unsaved`, derives the title and
+         * refinement, builds an epic's children and publishes the row (`_finalize_unsaved_draft`,
+         * apps/api/app/routes/tasks/dispatch.py). `persona` rides unconditionally (see `createSurfaceFields`). */
+        let row = filedRow !== null
+          ? await put<PipelineTask>(`/api/tasks/${filedRow.id}`, { ...createSurfaceFields(), persona })
+          : await post<PipelineTask>('/api/tasks', {
+            ...createSurfaceFields(),
+            persona,
+            // `TaskCreate` takes priority directly; only a non-default level rides.
+            ...priorityCreateField,
+            ...templateCreateField,
+          })
+        // The project the next create under All projects defaults to (`lib/lastCreateProject.ts`), recorded once the
+        // row is filed, before anything else can fail.
+        saveLastCreateProject(admin?.id ?? null, row.project_id)
         // The first tick filed the row with the priority of THEN; a later level takes the action route, only if it
         // moved.
-        if (priorityChangedFrom(filedRow)) {
-          savedCreate = await patch<PipelineTask>(`/api/tasks/${filedRow.id}`, { priority })
+        if (filedRow !== null && priorityChangedFrom(filedRow)) {
+          row = await patch<PipelineTask>(`/api/tasks/${row.id}`, { priority })
         }
-        setCreatedTask(savedCreate)
-        if (!(await flushFiled(savedCreate))) return false
-        // A previously refused prerequisite is retried here (staged, not lost).
-        if (!(await flushPrereqs(filedRow.id))) return false
+        setCreatedTask(row)
+        if (!(await flushFiled(row))) return false
+        // Now there is an id for edges (a previously refused prerequisite is retried here, staged, not lost): before
+        // uploads and start, so a Go dispatches with its gate declared.
+        if (!(await flushPrereqs(row.id))) return false
         // Both staged sets, in sequence (each is internally `Promise.all`; the second's state writes must not
         // interleave). `failed` is their union.
         const failed = [
-          ...await uploadPendingStagedImages(filedRow.id),
-          ...await uploadPendingStagedFiles(filedRow.id),
+          ...await uploadPendingStagedImages(row.id),
+          ...await uploadPendingStagedFiles(row.id),
         ]
         if (failed.length > 0) {
           setRetryStage('upload')
-          setError(uploadFailureBanner(failed, 'Still', retryActionLabel(intent)))
-          setSubmittingIntent(null)
-          return false
-        }
-        if (intent === 'go') {
-          const started = await startCreatedTask(savedCreate)
-          setSubmittingIntent(null)
-          if (started !== null) settled = started
-        } else {
-          setRetryStage(null)
-          setSubmittingIntent(null)
-          // The row the PUT returned (finalized), not the POST's pre-finalize "New task" row.
-          settled = savedCreate
-        }
-      } else {
-        const created = await post<PipelineTask>('/api/tasks', {
-          ...createSurfaceFields(),
-          persona,
-          // `TaskCreate` takes priority directly; only a non-default level rides.
-          ...priorityCreateField,
-          ...templateCreateField,
-        })
-        setCreatedTask(created)
-        // Remembered BEFORE anything can fail, so a retry finishes the intent pressed (Go).
-        setCreateIntent(intent)
-        if (!(await flushFiled(created))) return false
-        // Now there is an id for edges: before uploads and start, so a Go dispatches with its gate declared.
-        if (!(await flushPrereqs(created.id))) return false
-        const failed = [
-          ...await uploadPendingStagedImages(created.id),
-          ...await uploadPendingStagedFiles(created.id),
-        ]
-        if (failed.length > 0) {
-          setRetryStage('upload')
-          setError(uploadFailureBanner(failed, 'Task created, but', retryActionLabel(intent)))
+          setError(uploadFailureBanner(failed, filedRow !== null ? 'Still' : 'Task created, but', retryActionLabel(intent)))
           setSubmittingIntent(null)
           return false
         }
         if (intent === 'go') {
           // `startCreatedTask` owns the failure; `createdTask` is set, so a re-submit can never POST again.
-          const started = await startCreatedTask(created)
+          const started = await startCreatedTask(row)
           setSubmittingIntent(null)
           if (started !== null) settled = started
         } else {
           setRetryStage(null)
           setSubmittingIntent(null)
-          settled = created
+          // The row the write returned (a PUT's is finalized, not the POST's pre-finalize "New task" row).
+          settled = row
         }
       }
     } catch (err) {
@@ -1572,163 +1445,17 @@ export default function TaskEditForm({
     return settled !== null
   }
 
-  /* ── FROM JIRA ───────────────────────────────────────────────────────────────────────────────────────
-   * Where this task's TEXT comes from, so it sits with the what-this-task-is controls, not behind Advanced.
-   * ABSENT when the project has no Jira credential (`jiraProjectId`). `ui/AsyncLookup` owns debounce,
-   * superseded-response discard, loading/error lines and a non-submitting Enter; this block adds only the
-   * pick's consequence.
-   * Two placements, ONE instance (`stowed`, placed by `TaskSpecFields`), never a `display: none` pair: a hidden twin could hold
-   * an armed, unresolvable replace (`pages/credentials/Accounts.tsx`'s `RowActions` records that trap). Cost:
-   * crossing slots remounts `AsyncLookup` and resets its input state (e.g. on rotation); `jiraPick` and
-   * `jiraIssue` live on the form, so a pick and an armed confirm survive. Accepted. */
-  const fromJira = (stowed: boolean) => jiraProjectId === null ? null : (
-    <Box
-      data-testid="task-form-jira"
-      /* The wrapper is what the placement changes. In the settings ROW it is a flex CELL with an 18rem basis (a
-       * key plus the front of its summary; the popup is where summaries are read), a floor and two caps, each
-       * `min()`-ed against the real space:
-       * · floor `min(13rem, 100%)` — a bare min-width beats max-width and overflowed the `<form>` at 481-490px,
-       *   scrolling `.app-main` sideways.
-       * · 26rem — wider shows nothing more (at 34rem it grew to ~544px around a ten-character key).
-       * Inside ADVANCED it is a full-width strip set off by a RULE (the tab's "different kind of thing" idiom). */
-      sx={stowed
-        ? { mb: '0.5rem', pb: '0.5rem', borderBottom: '1px solid', borderColor: 'divider' }
-        : { flex: '1 1 18rem', minWidth: 'min(13rem, 100%)', maxWidth: 'min(26rem, 100%)' }}
-    >
-      <FormField
-        label="From Jira"
-        // The invalid state through `ui/FormField` (helper slot, error colour, `aria-describedby`).
-        error={jiraPick.kind === 'error' ? jiraPick.message : undefined}
-      >
-        <AsyncLookup
-          id="task-from-jira"
-          testId="task-form-jira-lookup"
-          /* Shown ⇔ submitted: a copied key that will NOT ride the POST (`jiraKeyIsForeign`) shows blank. */
-          value={jiraKeyIsForeign ? null : jiraIssue}
-          onChange={next => void pickJiraIssue(next)}
-          /* The server decides what matches (key or summary words). Not memoised: `AsyncLookup` reads its fetcher
-           * from a ref. */
-          fetchOptions={(query, signal) =>
-            searchJiraIssues(jiraProjectId, query, signal).then(rows => rows.map(jiraOption))}
-          placeholder="Issue key, or words from the summary"
-          // WCAG 2.5.3: the accessible name CONTAINS the visible label.
-          ariaLabel="From Jira — issue key or summary"
-          /* Two characters: one would spend a Jira round-trip on an unusable list. */
-          minChars={2}
-          noOptionsText="No matching Jira issues"
-          disabled={locked}
-        />
-      </FormField>
-
-      {/* The round-trip, said out loud: the pick rewrites the Description, so the wait cannot be silent. */}
-      {jiraPick.kind === 'loading' && (
-        <Box
-          role="status"
-          data-testid="task-form-jira-loading"
-          sx={{ mt: '0.35rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}
-        >
-          <CircularProgress size={12} thickness={5} />
-          <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-            {`Loading ${jiraPick.key} from Jira…`}
-          </Typography>
-        </Box>
-      )}
-
-      {/* ── THE ONE CONFIRM ──────────────────────────────────────────────────────────────────────────────
-      Shown only when the replace would destroy existing prose (`pickJiraIssue`). Names the issue and summary. A
-      plain bordered block, not `ui/Banner` (page-level, with an unsuppressable testid). Both buttons are
-      `type="button"` (inside the `<form>`). `autoFocus` on Replace: the pick was an Enter. */}
-      {jiraPick.kind === 'confirm' && (
-        <Box
-          role="group"
-          aria-label="Replace the Description from Jira"
-          data-testid="task-form-jira-confirm"
-          sx={{
-            mt: '0.5rem',
-            p: '0.5rem 0.75rem',
-            display: 'flex',
-            flexWrap: 'wrap',
-            alignItems: 'center',
-            gap: '0.5rem',
-            border: '1px solid',
-            borderColor: 'warning.main',
-            borderRadius: 2,
-            /* The two answers stay together, ranged right. Structural, not a viewport rule: the block's width comes from
-             * its CELL (a 481px rule split the answers at 700-1000px viewports; see `ui/FieldRow`'s header). */
-            justifyContent: 'flex-end',
-          }}
-        >
-          <Typography
-            variant="caption"
-            sx={{
-              flex: '1 1 15rem',
-              minWidth: 0,
-              color: 'text.primary',
-              wordBreak: 'break-word',
-            }}
-          >
-            {`Replace the Description with ${jiraPick.issue.key} — “${jiraPick.issue.summary}”? `
-              + 'What is written there now is lost.'}
-          </Typography>
-          {/* ONE flex item, so the pair wraps as a unit or not at all. */}
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flex: '0 0 auto' }}>
-            <Button
-              sx={BUTTON_SX}
-              type="button"
-              size="small"
-              variant="contained"
-              color="primary"
-              autoFocus
-              data-testid="task-form-jira-replace"
-              onClick={() => applyJiraIssue(jiraPick.issue)}
-            >
-              Replace
-            </Button>
-            <Button
-              sx={BUTTON_SX}
-              type="button"
-              size="small"
-              variant="text"
-              color="inherit"
-              data-testid="task-form-jira-keep"
-              onClick={() => declineJiraIssue(jiraPick.previous)}
-            >
-              Keep mine
-            </Button>
-          </Box>
-        </Box>
-      )}
-
-      {/* What happened (the write is to this form only). The key links out through `lib/safeHref` (the URL is
-      built from an operator-typed base), degrading to plain text. */}
-      {jiraPick.kind === 'done' && (
-        <Typography
-          component="p"
-          variant="caption"
-          role="status"
-          data-testid="task-form-jira-status"
-          sx={{
-            mt: '0.35rem',
-            mb: 0,
-            wordBreak: 'break-word',
-            color: jiraPick.replaced ? 'text.secondary' : 'warning.main',
-          }}
-        >
-          {jiraPick.replaced ? 'Description replaced from ' : 'No description in Jira on '}
-          {safeHref(jiraPick.url)
-            ? (
-              <MuiLink href={safeHref(jiraPick.url)} target="_blank" rel="noreferrer">
-                {jiraPick.key}
-              </MuiLink>
-            )
-            : jiraPick.key}
-          {jiraPick.replaced
-            ? '. Nothing is saved yet — press Save.'
-            : ', so the Description is unchanged. The issue key is still saved.'}
-          {jiraTitleFill !== '' && ` The Title will be set to “${jiraTitleFill}”.`}
-        </Typography>
-      )}
-    </Box>
+  /* ── FROM ISSUE ──────────────────────────────────────────────────────────────────────────────────────
+   * Where this task's TEXT comes from, so it sits with the what-this-task-is controls. Two placements, ONE instance
+   * (`stowed`, placed by `TaskSpecFields`), never a `display: none` pair: a hidden twin could hold an armed,
+   * unresolvable replace. The pick's state lives on this form (`issuePick`), so it survives the slot change. */
+  const fromIssue = (stowed: boolean) => !issueShown || projectId === null ? null : (
+    <IssuePicker projectId={projectId} pick={issuePick} disabled={locked || issueUnlinked} stowed={stowed}
+      titleFill={issueTitleFill} heldHidden={issueIsForeign}
+      reason={issueUnlinked
+        // `?tab=advanced`: General with its Advanced fold open, where Issue trackers sits (`ProjectEditPage`).
+        ? <>Link an issue tracker in <Link component={RouterLink} to={`/projects/${projectId}?tab=advanced`} color="inherit">project settings</Link>.</>
+        : undefined} />
   )
 
   /* ── THE SPEC `TaskSpecFields` RENDERS, from this form's own state ─────────────────────────────────────────
@@ -1746,10 +1473,10 @@ export default function TaskEditForm({
     pinned_node_id: pinnedNodeId,
     account_id: accountId,
     autonomous,
-    project_memory: projectMemory,
     priority,
     playbook_id: playbook?.id ?? null,
     transition_mode: transitionMode,
+    max_running: maxRunning,
     assignee_id: assignedToId === '' ? null : assignedToId,
     attachment_ids: [],
     feature_id: null,
@@ -1761,14 +1488,16 @@ export default function TaskEditForm({
     if (next.model !== spec.model) setModel(next.model)
     if (next.bound_provider !== spec.bound_provider) setProvider(next.bound_provider)
     if (next.agent_id !== spec.agent_id) setAgentId(next.agent_id)
+    // The person's own pick replaces the recommendation they took.
+    if (next.bound_provider !== spec.bound_provider || next.agent_id !== spec.agent_id) setAcceptedPick(null)
     if (next.pinned_node_id !== spec.pinned_node_id) setPinnedNodeId(next.pinned_node_id)
     if (next.account_id !== spec.account_id) {
       if (next.account_id) accountSentRef.current = true
       setAccountId(next.account_id ?? null)
     }
-    if (next.project_memory !== spec.project_memory) setProjectMemory(next.project_memory)
     if (next.priority !== spec.priority) setPriority(next.priority)
     if (next.transition_mode !== spec.transition_mode) setTransitionMode(next.transition_mode)
+    if (next.max_running !== spec.max_running) setMaxRunning(next.max_running)
     if (next.assignee_id !== spec.assignee_id) setAssignedToId(next.assignee_id ?? '')
     if (next.hidden !== spec.hidden) setHidden(next.hidden)
     // `autonomous` and `playbook_id` are projections of the axes, written by `applyAxes`.
@@ -1792,7 +1521,7 @@ export default function TaskEditForm({
    * uses the real graph. Not for a chat (off the live persona, `submitsChatRow`): a chat is not placed in a
    * pipeline. */
   const dependsOn = submitsChatRow ? null : (
-    <Box sx={{ mt: '1rem' }}>
+    <Box sx={{ mt: 2.5 }}>
       <TaskDependsOn
         taskId={task?.id ?? createdTask?.id ?? null}
         parentTaskId={task?.parent_task_id ?? null}
@@ -1808,10 +1537,16 @@ export default function TaskEditForm({
   return (
     <Box
       component="form"
-      // Implicit submit stays on `'save'`; Go is click-only. The project select and the Debug checkbox fire
+      // Implicit submit stays on `'save'`; Go is a click or Cmd/Ctrl+Enter. The project select and the Hidden checkbox fire
       // implicit submission here, so Enter-as-Go would dispatch a runner off a stray keystroke. A pending retry
       // resumes its original intent, Go included.
       onSubmit={e => void submit(e, createdTask !== null ? createIntent : 'save')}
+      // Cmd/Ctrl+Enter anywhere in the form is Go (operator decision: create and edit alike), under exactly the gates
+      // the button has.
+      onKeyDownCapture={modEnterCapture(
+        () => void submit(undefined, 'go'),
+        !(readOnly || inRetry || !goPermitted || goHidden || goDisabled),
+      )}
       // No `<h3>`: the page heading already names the task; `aria-label` keeps the accessible name.
       aria-label={isEdit ? 'Edit task' : 'New task'}
       data-testid="task-form-card"
@@ -1838,17 +1573,15 @@ export default function TaskEditForm({
       {/* `role="alert"`: here the banner can be the only signal that a write half landed (created, not started). */}
       {error && <Banner severity="error" action={refusedOrg ? <ActAsToCreate org={refusedOrg} /> : undefined}>{error}</Banner>}
       {noProjects ? (
-        <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-          No project yet — add one first.
-        </Typography>
+        <EmptyState inline title="No project yet — add one first." />
       ) : (
         <>
           {/* The Project and the Title are the breadcrumb's (`{Project} › Tasks › {id}: {title}`); their values
-          still ride this submit (`titleDraft`/`projectIdDraft`). An emptied title is still OMITTED from the PUT;
-          `project_id` still rides a create. */}
+          title still rides this submit (`titleDraft`). An emptied title is still OMITTED from the PUT;
+          `project_id` rides a create only (an edit's crumb moves the task at once). */}
 
           {/* EVERY FIELD — the Description, the axes row, Attachments, Assigned to and Advanced — is `TaskSpecFields`'
-          (the one task-create form, D7); this form owns the writes and hands in From Jira and Depends on. */}
+          (the one task-create form, D7); this form owns the writes and hands in From issue and Depends on. */}
           <TaskSpecFields
             context="task"
             value={spec}
@@ -1864,8 +1597,8 @@ export default function TaskEditForm({
             readOnly={readOnly}
             disabled={submitting}
             createDefaults={createDefaults}
-            defaultModel={jiraOwner?.default_model ?? null}
-            hasRepo={jiraOwner?.has_repo !== false}
+            defaultModel={formProject?.default_model ?? null}
+            hasRepo={formProject?.has_repo !== false}
             axes={{ depth, involvement, playbook }}
             onAxesChange={applyAxes}
             playbookOpen={playbookOpen}
@@ -1897,11 +1630,28 @@ export default function TaskEditForm({
                * editor 15 seconds into typing. */
               paused: inRetry,
             }}
-            jiraField={fromJira}
+            issuePicker={fromIssue}
             dependsOn={dependsOn}
+            /* Only where "Use this" has a picker to set (`showsAgentPicker`) and a write to ride, and while the org's
+               plan has `intelligent_routing` on (the operator always; without it the preview never answers a pick). */
+            recommendation={showsAgentPicker && !readOnly && planSurfaceShown(admin, 'intelligent_routing') ? (
+              <RecommendationBlock
+                projectId={projectId}
+                persona={persona}
+                title={title}
+                body={body}
+                taskId={task?.id ?? null}
+                org={previewOrg}
+                accepted={acceptedPick !== null && pickHeld(acceptedPick)}
+                onUse={takeRecommendation}
+                onShown={setRecommendationShown}
+              />
+            ) : undefined}
           />
 
-          {/* Tags are edited on the DETAILS tab (`pages/taskDetail/TaskDetailsPanel.tsx`), the one task property this form does not
+          {isEdit && <TaskPageFields fields={pageFields} rating={rating} disabled={submitting} />}
+
+          {/* Tags are edited on the DETAILS tab (`pages/taskDetail/TaskSummaryPanel.tsx`), the one task property this form does not
           own. */}
         </>
       )}
@@ -1915,66 +1665,9 @@ export default function TaskEditForm({
       {!readOnly && (
       <FormActionBar
         testId="task-form-actions"
-        /* The bar's own line above the actions, read from the left: right-aligned beside them it crowded Close/Save/Go,
-           and outside the bar a phone's stuck bar covered it. */
-        note={(needsProject || (goPermitted && (barDispatchBlock || barRowGoHint || (acting && !goBlocked)))) && (
-          <>
-            {needsProject && (
-              <Typography variant="caption" data-testid="task-form-pick-project" sx={{ color: 'text.secondary', display: 'block' }}>
-                {PICK_PROJECT_HINT}
-              </Typography>
-            )}
-            {/* Why Go is disabled on this project, said where it is read (the tooltip alone needs a hover). */}
-            {barDispatchBlock && (
-              <Typography variant="caption" data-testid="task-form-dispatch-block" sx={{ color: 'text.secondary', display: 'block' }}>
-                {dispatchBlock}
-                {/* An operator on their own plane has no account, but an org they act as may. */}
-                {createProject?.dispatch_block_kind === 'no_account' && <ActAsCoderOrg projectOrg={createProject.org} />}
-              </Typography>
-            )}
-            {/* …and why this ROW withholds it (running, waiting on a question), the same way. */}
-            {barRowGoHint && (
-              <Typography variant="caption" data-testid="task-form-go-blocked" sx={{ color: 'text.secondary', display: 'block' }}>
-                {rowGoHint === AWAITING_GO_HINT && onOpenAnswer ? (
-                  <>
-                    {AWAITING_BEFORE_LINK}
-                    <MuiLink
-                      component="button"
-                      type="button"
-                      variant="caption"
-                      data-testid="task-form-open-answer"
-                      onClick={onOpenAnswer}
-                      sx={{ verticalAlign: 'baseline' }}
-                    >
-                      {AWAITING_ANSWER_LINK}
-                    </MuiLink>
-                    {AWAITING_AFTER_LINK}
-                  </>
-                ) : rowGoHint}
-              </Typography>
-            )}
-            {/* Not beside a blocked Go: under a dispatch block it was a second note about a dead button. */}
-            {acting && !goBlocked && (
-              /* One short line when the form is narrow — a phone, or the editor beside the list — keyed on
-                 the caption's own width: the act-as bar above already names the org. */
-              <Typography
-                variant="caption"
-                data-testid="task-form-push-caption"
-                sx={{ color: 'text.secondary', display: 'block', containerType: 'inline-size', containerName: PUSH_CAPTION_CONTAINER }}
-              >
-                <Box component="span" sx={{ [PUSH_CAPTION_NARROW]: { display: 'none' } }}>
-                  You aren’t a member of {acting.name}: Go asks whose git account to push with.
-                </Box>
-                <Box component="span" data-testid="task-form-push-caption-short" sx={{ display: 'none', [PUSH_CAPTION_NARROW]: { display: 'inline' } }}>
-                  Go asks whom to push as.
-                </Box>
-              </Typography>
-            )}
-          </>
-        )}
         /* Save and Go sit inside the `<span>` their tooltips need; the span is the flex item, so both are named to
          * take the spare width. A lone Save (Go withdrawn or not permitted) keeps its own width: stretched, a
-         * disabled Save took the whole bar under the reason line. */
+         * disabled Save took the whole bar. */
         stretchTestIds={!goPermitted || goHidden ? ['task-form-retry'] : [
           'task-form-save-wrap', 'task-form-go-wrap',
           'task-form-save', 'task-form-go', 'task-form-retry',
@@ -1983,31 +1676,33 @@ export default function TaskEditForm({
         {/* DISCARD (ex-Cancel): it abandons typed work and navigates to the list (`onCancel` →
         `navigate('/tasks')`); on a dirty form it asks first (`discardAndCancel`). The prop and `task-form-cancel`
         testid keep their names (a stable seam for two call sites and ~40 test renders). */}
+        {!suggestionDraft && (
         <Button
             sx={BUTTON_SX}
             /* `() => void …`: the handler is async (it awaits the confirm), as elsewhere in this repo. */
             type="button" onClick={() => void discardAndCancel()} variant="text" color="inherit" data-testid="task-form-cancel">
           {offersDiscard ? 'Discard' : 'Close'}
         </Button>
+        )}
         {!inRetry ? (
           <>
-            {/* Save is `type="submit"`, so Enter writes without running; Go is click-only. */}
+            {/* Save is `type="submit"`, so Enter writes without running; Go is a click or Cmd/Ctrl+Enter (below). */}
             {/* Wrapped in a span: MUI gives a disabled button `pointer-events: none`, so only the wrapper hears the hover
             that shows why. Present in both states so the row's geometry does not change. */}
-            <Tooltip title={saveTooltip}>
+            <Tip describeChild={false} title={saveTooltip}>
               <Box component="span" data-testid="task-form-save-wrap" sx={{ display: 'flex' }}>
                 <SubmitButton sx={BUTTON_SX} busy={submittingIntent === 'save'} disabled={saveDisabled} variant="outlined" testId="task-form-save">
                   Save
                 </SubmitButton>
               </Box>
-            </Tooltip>
+            </Tip>
             {/* Go is the one action the permission answer takes (`goPermitted`: `canStart` for a held row, the resolved
             project for a create) — offered, it would land the save and 403 on the transition. ABSENT, not disabled;
             Discard and Save untouched (unlike `readOnly`). Also absent while the bar's reason line says why the row
             cannot start (`goHidden`). */}
             {goPermitted && !goHidden && (
             // Same span, same reason as Save's.
-            <Tooltip title={goTooltip}>
+            <Tip describeChild={false} title={goTooltip}>
               <Box component="span" data-testid="task-form-go-wrap" sx={{ display: 'flex' }}>
                 <Button
                 sx={BUTTON_SX}
@@ -2016,12 +1711,26 @@ export default function TaskEditForm({
                   variant="contained"
                   color="primary"
                   data-testid="task-form-go"
+                  aria-keyshortcuts="Control+Enter Meta+Enter"
                   onClick={e => void submit(e, 'go')}
                 >
-                  {submittingIntent === 'go' ? CONTROLS.start.busy : 'Go'}
+                  {submittingIntent === 'go' ? CONTROLS.start.busy : (
+                    <>
+                      Go
+                      {/* Out of the accessible name (that stays "Go"; `aria-keyshortcuts` carries the key). */}
+                      <Box
+                        component="span"
+                        aria-hidden
+                        data-testid="task-form-go-shortcut"
+                        sx={theme => ({ ml: 0.5, [theme.breakpoints.down(481)]: { display: 'none' } })}
+                      >
+                        ({MOD_ENTER_LABEL})
+                      </Box>
+                    </>
+                  )}
                 </Button>
               </Box>
-            </Tooltip>
+            </Tip>
             )}
           </>
         ) : (

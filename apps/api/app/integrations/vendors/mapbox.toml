@@ -1,0 +1,45 @@
+# Mapbox: an access token. The Tokens API "retrieve a token" call is free and answers 200 with a `code` for any
+# token, valid or not (TokenValid, TokenInvalid, TokenMalformed, TokenExpired, TokenRevoked), so the Test reads that
+# code. Confirmed 2026-11-03 at the vendor_docs_url page and by calling it with a made-up token (200, TokenMalformed).
+slug = "mapbox"
+label = "Mapbox"
+category = "marketing"
+vendor_docs_url = "https://docs.mapbox.com/api/accounts/tokens/"
+summary = "Geocode, route and render maps with your Mapbox access token."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "access_token", label = "Access token", kind = "secret", required = true, placeholder = "pk.eyJ1... or sk.eyJ1...", help = "console.mapbox.com > Tokens (account.mapbox.com/access-tokens) > Create a token. Use a public token (pk.) for maps, geocoding and directions; a secret token (sk.) only when agents must manage styles, datasets or tokens, and tick just the scopes they need" },
+]
+
+[test]
+method = "GET"
+path = "https://api.mapbox.com/tokens/v2"
+auth = { query = "access_token", field = "access_token" }
+rejected_when = { path = ["code"], values = ["TokenInvalid", "TokenMalformed", "TokenExpired", "TokenRevoked"] }
+identity = [["token", "user"]]
+identity_phrase = "as"
+
+[docs]
+agent_uses = [
+  "Geocode addresses and place names, and reverse-geocode coordinates",
+  "Compute driving, walking or cycling directions and travel-time matrices",
+  "Render static map images for a report or a page",
+  "Configure Mapbox GL JS in an app with the right token and style URL",
+]
+prerequisites = ["A Mapbox account (console.mapbox.com). The free tier covers light use; heavier use needs a billing method on the account"]
+limitations = [
+  "Requests agents make count against your Mapbox account's free tier and are billed beyond it",
+  "A public token restricted to URLs works only from those web origins; agents call from servers, so use an unrestricted public token or a secret token for them",
+  "A secret token can do only what its scopes allow; Mapbox shows a secret token once, when it is created",
+]
+troubleshooting = [
+  { symptom = "Test says Mapbox rejected the access token (TokenInvalid) or (TokenRevoked)", fix = "The token was deleted, rotated or mistyped. Create a token in console.mapbox.com > Tokens and select Replace on the secret" },
+  { symptom = "Test says Mapbox rejected the access token (TokenMalformed)", fix = "What was pasted is not a whole token. Tokens start with pk. or sk. and are long; copy it again with the copy button" },
+  { symptom = "An agent gets 403 Forbidden on a styles or datasets call", fix = "A public token cannot reach those APIs. Create a secret token with the styles:read or datasets:read scope and replace the secret" },
+]
+faq = [
+  { q = "Public or secret token", a = "Public (pk.) for maps, geocoding and directions; secret (sk.) only for account APIs such as uploads, datasets and token management" },
+  { q = "Does the Test cost anything", a = "No. Jaah calls Mapbox's token check, which is not billed" },
+]

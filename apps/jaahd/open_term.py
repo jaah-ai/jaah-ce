@@ -61,30 +61,22 @@ def main(argv: list[str] | None = None) -> int:
         if not shutil.which("tmux"):
             print("open_term.py attach: tmux required", file=sys.stderr)
             return 1
-        from fleet_launch import tmux_safe_env
+        from env_helpers import _tmux_safe_env
 
         # Sanitized env: a tmux client command auto-starts the server, which freezes the first caller's
         # env into every window it ever hosts (guard: env_helpers._tmux_safe_env).
-        env = tmux_safe_env()
+        env = _tmux_safe_env()
         session = target.split(":", 1)[0]
         # Walk the socket set: mid upgrade-drain a session may still be on the daemon's own server.
         sockets = kill_gates._reachable_sockets()
         # Best-effort focus; stop at the first server that owns it, so a same-named window elsewhere is not.
         for socket in sockets:
-            focused = subprocess.run(
-                session_user.tmux_cmd(socket, "select-window", "-t", target),
-                env=env, capture_output=True,
-            )
-            if focused.returncode == 0:
+            if session_user.tmux_out(socket, "select-window", "-t", target, env=env) is not None:
                 break
         # Pop only if no client is attached on ANY server (`=name` avoids tmux's prefix-matching);
         # otherwise every Console click would pop another terminal.
         for socket in sockets:
-            clients = subprocess.run(
-                session_user.tmux_cmd(socket, "list-clients", "-t", f"={session}"),
-                env=env, capture_output=True, text=True,
-            ).stdout
-            if clients.strip():
+            if session_user.tmux_out(socket, "list-clients", "-t", f"={session}", env=env):
                 return 0
         _pop_terminal(title or session, attach_command(session))
         return 0

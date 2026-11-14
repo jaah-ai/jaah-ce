@@ -1,23 +1,23 @@
-"""The reconcile passes: fetch → execute → probe → publish, the launch lane, materialisation, mirror sweep."""
+"""The reconcile passes: fetch → execute → probe → publish, the launch lane, and the legacy-layout migration."""
 from __future__ import annotations
 
 import asyncio
 import functools
 import logging
-import os
 from typing import Awaitable, Callable, Sequence
 
 import cloud_modules
-import host_platform
 import git_mirror
-import pool_origins
-from worktree_mechanics import core, processes, lifecycle
-from env_helpers import now_iso
-from reconcile import vocab, tick_wire, context, observe, execute
+import host_platform
+import legacy_layout
+from worktree_mechanics import processes
+from env_helpers import jaah_dir, now_iso
+from jaah_env import env_number
+from reconcile import vocab, tick_wire, observe, execute
 from reconcile.vocab import (
     CONTAINER_ABSENT, CONTAINER_UNREADABLE, VERB_DELIVER_ANSWER, VERB_DELIVER_MESSAGE, VERB_LEASE_SLOT,
 )
-from reconcile.tick_wire import RosterSlot, SLOT_FREE, SLOT_TASK, SlotIntent
+from reconcile.tick_wire import RosterSlot, SlotIntent
 from reconcile.context import ReconcileContext
 
 # The MicroVM marker (D0); None on a community-edition node, which is never a MicroVM node.
@@ -27,113 +27,35 @@ microvm_bridge = cloud_modules.load("microvm_bridge")
 log = logging.getLogger(__name__)
 
 
-def sweep_pool_mirrors(tick: tick_wire.PoolTick) -> list[str]:
-    """Remove the static pool's mirrors (`git_mirror.sweep_shared`) of projects and repositories this tick's
-    roster no longer names → the names removed. A removed project's mirror holds its whole history,
-    session-group readable, and a second copy of its clone on disk.
-
-    Fail-closed: nothing goes unless the tick is `ok`, its roster parsed whole (`roster_complete`), and every
-    known slot's project is on it — a project still holding a slot the roster filtered out is one whose id
-    this node cannot read, so it may yet be the owner of any mirror."""
-    if not tick.ok or not tick.roster_complete:
+async def migrate_legacy_layout(tick: tick_wire.PoolTick, *,
+                                fresh_context: "Callable[[], ReconcileContext]" = ReconcileContext) -> list[str]:
+    """`legacy_layout`'s three steps (its module docstring), with step 1 under the enactment lock of each free slot it would erase (so a
+    lease cannot clone into a tree while it goes; a slot whose lock is held — an enactment in flight — is skipped
+    this pass) → the paths erased. Off the loop, on ONE fresh agents probe (`fresh_context()`, no cross-tick cache)
+    taken only when there is a candidate; steps 2 and 3 touch nothing a lease reads, so they run unlocked."""
+    repos_root = str(jaah_dir("repos"))
+    free = [legacy_layout.Slot(path=slot.path, free=True)
+            for slot in tick.slots if slot.has_repo and slot.state == tick_wire.SLOT_FREE]
+    legacy = [slot for slot in free if await asyncio.to_thread(legacy_layout.slot_trees, slot.path)]
+    later = await asyncio.to_thread(legacy_layout.unlocked_candidates, repos_root,
+                                    roster_complete=tick.roster_complete)
+    if not legacy and not later:
         return []
-    if any(known.project not in tick.projects for known in tick.known_slots):
-        return []
-    keep = {
-        proj.project_id: (frozenset(spec.id for spec in proj.repos) if proj.repos else None)
-        for proj in tick.projects.values() if proj.project_id is not None
-    }
-    ids_complete = all(proj.project_id is not None for proj in tick.projects.values())
-    removed = git_mirror.sweep_shared(keep, ids_complete=ids_complete)
-    if removed:
-        log.info("reconcile: removed pool mirrors the roster no longer names: %s", ", ".join(removed))
-    return removed
-
-
-# ── Convergence: declared → materialised ──────────────────────────────────────
-def _materialisation_budget() -> int:
-    """How many declared-but-unbuilt slots one pass may build, read at call time. `0` disables convergence
-    (the kill switch for a misbehaving remote)."""
-    return vocab._env_int("POOL_MATERIALISE_PER_PASS", 1)
-
-
-def _unmaterialised_candidates(pool_tick: tick_wire.PoolTick) -> list[RosterSlot]:
-    """This pass's declared-but-unbuilt slots, in roster order.
-
-    Excluded: `is_main` (the main clone materialises as the first slot's clone rung, `ensure_clone`); an
-    existing directory; a state other than `free`/`task` (`user` is a human's tree; `""` fails closed).
-    Included regardless of `observed_at`: a row is a human's capacity declaration, so a vanished
-    tree is rebuilt, empty (the CP alerts: `app/fleet_observe.py::vanished_hold_statement`). `task` is
-    included because only that task's own edge frees the slot and the resume leg never builds a tree.
-    No race with dispatch: `execute_intents` completes before this runs.
-
-    Excluded too: a slot this daemon just erased. `pool_slots.py::delete_one_slot` deletes the row first
-    and the tree second, so a roster fetched before that commit would rebuild a tree for a row already
-    gone. `worktree_mechanics.core.was_just_erased` is a short-lived in-process note, not a lock."""
-    return [
-        slot for slot in pool_tick.slots
-        if not slot.is_main
-        and slot.state in (SLOT_FREE, SLOT_TASK)
-        and not os.path.isdir(slot.path)
-        and not core.was_just_erased(slot.path)
-        # Ordered destroyed (`destroy_slot`): rebuilding it would hand a retry an empty tree to report on.
-        and not slot.retiring
-    ]
-
-
-def _tick_roster(pool_tick: tick_wire.PoolTick, project: str) -> dict[int, dict]:
-    """One project's declared slots as `{number: record}` for the mechanics, from this pass's tick (not a
-    second `roster_from_db` read that could also be unavailable)."""
-    return {
-        int(slot.number): {"number": int(slot.number), "path": slot.path}
-        for slot in pool_tick.slots
-        if slot.project == project and str(slot.number).isdigit()
-    }
-
-
-async def materialise_declared_slots(
-    ctx: ReconcileContext, pool_tick: tick_wire.PoolTick, *, node_id: str | None = None,
-) -> list[str]:
-    """Make the host match the CP for at most `_materialisation_budget()` declared slots. Returns the paths
-    built; never raises into the pass.
-
-    The CP dictates which slots exist, the node builds them (the `create` verb's op, not a second
-    implementation). Bounded: a first clone is minutes of network. Failures are logged per slot; unbuilt
-    rows are reported `unmaterialised` and spared."""
-    budget = _materialisation_budget()
-    if budget <= 0:
-        return []
-    built: list[str] = []
-    for slot in _unmaterialised_candidates(pool_tick):
-        if len(built) >= budget:
-            log.info(
-                "reconcile: materialisation budget (%d) spent — %s #%s and any further declared slots stay "
-                "unmaterialised this pass and are retried next pass",
-                budget, slot.project, slot.number,
-            )
-            break
-        project = pool_tick.projects.get(slot.project)
-        config = project.pool_config() if project is not None else slot.pool_config()
-        try:
-            record = await asyncio.to_thread(
-                lifecycle.create_mechanics,
-                config, number=slot.number, node_id=node_id,
-                roster=_tick_roster(pool_tick, slot.project),
-                band=dict(slot.ports),
-                # From this tick, like the band, so one `.env` write is sourced from one answer.
-                auto_ports=pool_tick.auto_ports,
-            )
-        except Exception as exc:  # noqa: BLE001 — a build failure must never wedge the probe/publish halves
-            log.warning(
-                "reconcile: could not materialise declared slot %s #%s at %s: %s — it stays unmaterialised "
-                "(row spared) and is retried next pass",
-                slot.project, slot.number, slot.path, exc,
-            )
-            continue
-        path = str((record or {}).get("path") or slot.path)
-        log.info("reconcile: materialised declared slot %s #%s at %s", slot.project, slot.number, path)
-        built.append(path)
-    return built
+    agents_ok, _agents_json, cwds = await fresh_context().agents()
+    locks = {slot.path: execute.slot_lock(slot.path) for slot in legacy}
+    held = [slot for slot in legacy if not locks[slot.path].locked()]
+    for slot in held:
+        await locks[slot.path].acquire()
+    try:
+        trees = await asyncio.to_thread(legacy_layout.free_legacy_trees, held)
+        erased = await asyncio.to_thread(legacy_layout.erase_idle, trees, agents_ok, cwds)
+    finally:
+        for slot in held:
+            locks[slot.path].release()
+    # Re-read: a main step 1 just freed is erasable on this pass.
+    later = await asyncio.to_thread(legacy_layout.unlocked_candidates, repos_root,
+                                    roster_complete=tick.roster_complete)
+    return erased + await asyncio.to_thread(legacy_layout.erase_idle, later, agents_ok, cwds)
 
 
 # ── Slot observation (D4) ─────────────────────────────────────────────────────
@@ -153,20 +75,12 @@ async def scan_pool_cwds(ctx: ReconcileContext, paths: "Sequence[str]") -> None:
     except Exception as exc:  # noqa: BLE001 — a failed pre-scan costs speed, never correctness
         log.warning("reconcile: the pooled cwd walk failed (%s) — every slot falls back to its own", exc)
         return
-    ctx.adopt_cwd_scans(dict(zip(wanted, scans)))
+    ctx.adopt_cwd_scans(dict(zip(wanted, scans, strict=False)))
 
 
-async def reconcile_slot(
-    slot: RosterSlot,
-    ctx: ReconcileContext,
-    *,
-    fetch_stamp_age_secs: int | None = None,
-) -> dict | None:
-    """Observe one slot; None when absent on disk. The pass sends all observations in one POST.
-
-    `fetch_base_if_stale` first, so ahead/behind reads a refreshed `origin/<base>`; `fetch_stamp_age_secs`
-    None means "never fetched" and fetches."""
-    await context.fetch_base_if_stale(slot, age_secs=fetch_stamp_age_secs, fetched=ctx.fetched)
+async def reconcile_slot(slot: RosterSlot, ctx: ReconcileContext) -> dict | None:
+    """Observe one slot; None when absent on disk. The pass sends all observations in one POST. Ahead/behind
+    reads the slot clone's own `origin/<base>`, refreshed at each lease (`slot_clone.refresh`)."""
     return await observe.observe_slot(ctx, slot)
 
 
@@ -211,13 +125,15 @@ async def launch_pass(
     ctx: ReconcileContext,
     tick: tick_wire.PoolTick,
     intents: "Sequence[tuple[SlotIntent, dict]]",
+    running: "asyncio.Semaphore | None" = None,
 ) -> tuple[dict, ...]:
     """Enact one fast lane's pushed intents (`LAUNCH_LANE_VERBS` or `SIGNAL_LANE_VERBS`) and nothing else — no
     probes, no POST, no projection write. The lane a human pressing Run, or answering a question, waits on (it
     otherwise waited out a whole in-flight pass holding the lock).
 
-    The caller owns exclusion between launch passes (`main.NodeStatePublisher`); per-tree exclusion against a
-    probing pass is `execute_intent`'s `slot_lock`.
+    The caller owns how lane passes share the node (`main.NodeStatePublisher`: the launch lane's passes overlap
+    under one shared `running` bound, the pane-write lane's take turns); per-tree exclusion against any other
+    pass is `execute_intent`'s `slot_lock`, and a re-served intent is enacted once (`execute._enact_once`).
 
     Returns the raw entries it declined, for the projection pass: on a degraded tick (no roster), and when
     an older intent for the same slot is still pending — this lane cannot order across channels, and a
@@ -249,7 +165,8 @@ async def launch_pass(
             runnable.append(intent)
     if runnable:
         ctx.adopt_auto_ports(tick.auto_ports)
-        await execute.execute_intents(ctx, {s.ref: s for s in tick.slots}, (), pushed=tuple(runnable))
+        await execute.execute_intents(ctx, {s.ref: s for s in tick.slots}, (), pushed=tuple(runnable),
+                                      running=running)
     return tuple(declined)
 
 
@@ -287,7 +204,7 @@ _PROBE_CONCURRENCY_DEFAULT = 6
 
 def _probe_concurrency() -> int:
     """Slot probes in flight at once, read per pass, floored at 1 (a bad value degrades to sequential)."""
-    return max(1, vocab._env_int("JAAHD_PROBE_CONCURRENCY", _PROBE_CONCURRENCY_DEFAULT))
+    return max(1, env_number("JAAHD_PROBE_CONCURRENCY", _PROBE_CONCURRENCY_DEFAULT, parse=int))
 
 
 async def _probe_slot_entry(slot: RosterSlot, ctx: ReconcileContext, tick: tick_wire.PoolTick) -> dict:
@@ -308,11 +225,7 @@ async def _probe_slot_entry(slot: RosterSlot, ctx: ReconcileContext, tick: tick_
 async def _probe_slot_entry_locked(slot: RosterSlot, ctx: ReconcileContext, tick: tick_wire.PoolTick) -> dict:
     """`_probe_slot_entry`'s body, with this slot's tree already held."""
     try:
-        project = tick.projects.get(slot.project)
-        observation = await reconcile_slot(
-            slot, ctx,
-            fetch_stamp_age_secs=project.fetch_stamp_age_secs if project else None,
-        )
+        observation = await reconcile_slot(slot, ctx)
         if observation is not None:
             return observe._observed_slot_entry(slot, observation)
         # Absent dir: the verdict is `_unprobed_slot_entry`'s (shared with the `known_slots` loop); the log
@@ -379,7 +292,7 @@ async def reconcile_pass(
     # (1) FETCH.
     pool_tick = tick if tick is not None else await tick_wire.fetch_pool_tick(node_id or pass_ctx.node_id)
     observed: dict | None = None
-    # Before the execute and converge arms, which allocate tier-2 ports: how an operator's grid edit reaches
+    # Before the execute and converge arms, which allocate node-assigned ports: how an operator's grid edit reaches
     # the allocator.
     pass_ctx.adopt_auto_ports(pool_tick.auto_ports)
     # The MicroVM marker (D0): jaahd's whole part in switching a node's mode. Linux and macOS.
@@ -411,14 +324,12 @@ async def reconcile_pass(
         observed_at = now_iso()
         # Wire state per slot: an entry spares a row; silence deletes it.
         entries: dict[tuple[str, str], dict] = {}
-        # (1.5) Each clone's `origin` follows a changed Repo URL (a repo rename), before anything fetches.
-        await pool_origins.repoint_origins(pool_tick)
         slots_by_ref = {s.ref: s for s in pool_tick.slots}
         # (2) EXECUTE — before any publish, against the revisions the CP decided on.
         if pool_tick.intents or pushed:
             await execute.execute_intents(pass_ctx, slots_by_ref, pool_tick.intents, pushed=pushed)
-        # (2.5) CONVERGE — build at most one slot the CP declared and this host has not materialised.
-        await materialise_declared_slots(pass_ctx, pool_tick, node_id=node_id or pass_ctx.node_id)
+        # No pre-build: a repository slot's tree is cloned at its lease (`lifecycle.claim_mechanics`), never
+        # from the pass.
         # (2.9) Join the in-flight agents refresh, then drop the memo the execute arm latched, so the probes
         # and POST see the refreshed snapshot. Never raises.
         if agents_refresh is not None:
@@ -455,11 +366,18 @@ async def reconcile_pass(
             # Rides the same ~5s POST rather than a second node→CP path.
             host_metrics=host_metrics,
         )
-        # (7) The roster-driven cleanup of what a removed project left beyond its slots: its git mirrors.
+        # (7) Erase what the retired pool layout left (`legacy_layout`), each slot tree under its enactment lock,
+        # then the slot mirrors unused past their grace and an older daemon's per-project ones (`git_mirror.sweep`).
         try:
-            await asyncio.to_thread(sweep_pool_mirrors, pool_tick)
+            await migrate_legacy_layout(pool_tick)
+        except Exception as exc:  # noqa: BLE001 — a failed migration retries next pass; it must never fail this one
+            log.warning("reconcile: legacy-layout migration failed: %s", exc)
+        try:
+            removed = await asyncio.to_thread(git_mirror.sweep)
+            if removed:
+                log.info("reconcile: removed unused git mirrors: %s", ", ".join(removed))
         except Exception as exc:  # noqa: BLE001 — a failed sweep retries next pass; it must never fail this one
-            log.warning("reconcile: pool-mirror sweep failed: %s", exc)
+            log.warning("reconcile: git-mirror sweep failed: %s", exc)
 
     # Node-level stamps are written by the POST's own node-row write
     # (`app/fleet_observe.py::node_stamp_statement`) from the CP's receipt time.

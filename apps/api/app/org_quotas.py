@@ -43,7 +43,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import Session
 
-from app import db, plan_terms
+from app import plan_terms
 from app.models.orgs import Org
 from app.models.task_extras import TaskAttachment
 from app.ratelimit import SharedRateLimiter
@@ -184,20 +184,20 @@ def invalidate_budget(org_id: Optional[UUID] = None) -> None:
             _budget_cache.pop(org_id, None)
 
 
-def admit_agent_request(session: Session, org_id: Optional[UUID]) -> None:
-    """Count one agent call against `org_id`'s budget, or raise 429 when the window is full.
-
-    Called by the agent auth door with the org derived from the node token, before the request's scope is
-    bound; `orgs` is the tenancy axis itself, not a tenant-owned table, so the read needs no scope. Exempt
-    orgs and an unlimited budget cost nothing."""
+def agent_budget(session: Session, org_id: Optional[UUID]) -> int:
+    """The request budget an agent call by `org_id` is counted against: 0 when it is not counted (an exempt org, an
+    unlimited budget). The read half of admitting an agent call, for a caller on the event loop (`routes/agent/auth.py`),
+    which runs the counting half (`admit_agent_call`) off the loop, holding no connection. `orgs` is the tenancy axis
+    itself, not a tenant-owned table, so the read needs no scope."""
     if is_exempt(org_id):
-        return
-    budget = _agent_budget(session, org_id)
-    if budget <= 0:
-        return
-    # The limiter counts on its own pooled connection; hand the request's back first, or a burst of agent
-    # calls each holding one while waiting for a second exhausts the pool for the whole process.
-    db.release_connection(session)
+        return 0
+    return max(_agent_budget(session, org_id), 0)
+
+
+def admit_agent_call(org_id: UUID, budget: int) -> None:
+    """Count one agent call against `org_id`'s `budget` (from `agent_budget`), or raise 429 when the window is full.
+    The limiter counts on its own pooled connection, a blocking call: run it off the event loop, holding no other
+    connection."""
     if not _agent_limiter.allow(str(org_id), limit=budget):
         raise HTTPException(
             status_code=429,

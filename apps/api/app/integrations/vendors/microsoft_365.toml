@@ -1,0 +1,73 @@
+# Microsoft 365, through Microsoft Graph with delegated OAuth. Facts confirmed at the vendor's own docs: the v2
+# authorization-code flow (client secret in the body, PKCE recommended, offline_access for a refresh token)
+# https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow ; delegated permissions (none of
+# these needs admin consent) https://learn.microsoft.com/en-us/graph/permissions-reference ; /me
+# https://learn.microsoft.com/en-us/graph/api/user-get ; registration
+# https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app
+slug = "microsoft_365"
+label = "Microsoft 365"
+category = "productivity"
+vendor_docs_url = "https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow"
+summary = "Outlook mail and calendar, OneDrive, SharePoint and Teams chats through Microsoft Graph."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+pkce = true
+scopes = [
+  { name = "offline_access", label = "Stay connected: lets Jaah renew access without asking you again" },
+  { name = "User.Read", label = "Read your profile, so the connection shows whose it is" },
+  { name = "Calendars.ReadWrite", label = "Read your calendar and create events when a task asks for it", optional = true },
+  { name = "Mail.Read", label = "Read your mail, for tasks that work from your inbox", optional = true },
+  { name = "Mail.Send", label = "Send mail as you when a task asks for it", optional = true },
+  { name = "Files.Read.All", label = "Read OneDrive and shared files agents are pointed at", optional = true },
+  { name = "Sites.Read.All", label = "Read SharePoint sites, lists and documents", optional = true },
+  { name = "Chat.Read", label = "Read your Teams chats for context", optional = true },
+]
+jaah_app = true
+[auth.oauth.registration]
+console_url = "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade"
+steps = [
+  "Select New registration, enter the name Jaah, and under Supported account types choose Any Entra ID Tenant + Personal Microsoft accounts",
+  "Under Redirect URI choose the platform Web and enter the first redirect URI below, then select Register; add the second on the app's Authentication page under Web > Redirect URIs",
+  "Open Certificates & secrets > Client secrets > New client secret, describe it as Jaah and choose 24 months; copy its Value (not the Secret ID) at once - it is shown only once. Note the expiry date: renew it before then",
+  "Open API permissions > Add a permission > Microsoft Graph > Delegated permissions and add offline_access, User.Read, Calendars.ReadWrite, Mail.Read, Mail.Send, Files.Read.All, Sites.Read.All and Chat.Read. None of them needs admin consent, so leave Grant admin consent unselected",
+  "Open Branding & properties: set the logo, the home page, terms of service and privacy statement URLs to the Jaah website, its terms and its privacy policy, and the publisher domain jaah.ai",
+  "Complete publisher verification (Branding & properties > Publisher verification) with Jaah's Microsoft Partner Center account, so users of other organizations see a verified publisher and are not blocked from consenting",
+]
+review = "Publisher verification is needed for users in other organizations to consent without an admin; until it is done, their admins must grant consent for their tenant"
+
+[test]
+method = "GET"
+path = "https://graph.microsoft.com/v1.0/me?$select=displayName,mail,userPrincipalName"
+identity = [["mail"], ["userPrincipalName"], ["displayName"]]
+
+[docs]
+agent_uses = [
+  "Read your Outlook calendar to find free time, and create events, if you granted calendar access",
+  "Read or send Outlook mail for tasks that work from your inbox, if you granted mail access",
+  "Read a Word, Excel or PowerPoint file on OneDrive or SharePoint that a task links to",
+  "Read Teams chats for the context of a request, if you granted chat access",
+]
+prerequisites = [
+  "A Microsoft 365 work or school account, or a personal Microsoft account (Outlook.com, OneDrive)",
+  "If your organization requires admin approval for apps, an admin of your Microsoft Entra tenant to approve Jaah once (Enterprise applications > Admin consent requests)",
+]
+limitations = [
+  "Microsoft has no API keys for user data: you connect by signing in",
+  "Agents act as the signed-in user and see only that user's mail, calendar, files and chats",
+  "Teams chats (Chat.Read) and SharePoint (Sites.Read.All) need a work or school account; a personal account cannot grant them",
+  "Your organization's consent policy can require an admin to approve any of these permissions",
+]
+troubleshooting = [
+  { symptom = "Sign-in says Need admin approval", fix = "Your organization lets only admins consent to apps. Select Request approval, or ask an Entra admin to grant consent under Enterprise applications > Jaah > Permissions" },
+  { symptom = "Sign-in shows AADSTS50011 The redirect URI does not match", fix = "With your own app, add the redirect URI shown on this page, exactly, under Authentication > Web > Redirect URIs" },
+  { symptom = "Test says Microsoft 365 rejected the access token (401)", fix = "The grant was revoked or your password changed. Select Reconnect and sign in again" },
+  { symptom = "The secret shows Needs reconnect after about 90 days of no use", fix = "Microsoft refresh tokens expire when unused for 90 days or when an admin revokes sessions. Select Reconnect" },
+]
+faq = [
+  { q = "Can I connect a shared mailbox", a = "Agents reach what the signed-in user can open. Connect as a user with access to the shared mailbox" },
+  { q = "Can I give agents read-only access", a = "Yes. Untick Calendars.ReadWrite and Mail.Send on the Connect screen" },
+]

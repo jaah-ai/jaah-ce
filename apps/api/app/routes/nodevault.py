@@ -41,21 +41,25 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import Row, delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import after_commit, credential_consumers, email_unsubscribe, node_presence, nodevault_grants, nodevault_policy, pool_state
+from app import (
+    act_as, after_commit, credential_consumers, db_async, email_unsubscribe, node_presence, nodevault_grants,
+    nodevault_policy, pool_state,
+)
 from app.access import ORG_OWNER
 from app.auth import require_user
 from app.authz.catalog import Tenancy
 from app.authz.declarations import feature, org_admin
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller
 from app.credential_crypto import nodevault_key_hash as credential_key_hash
 from app.credential_keys import WRAP_ALGORITHM, nodevault_key_hash, nodevault_key_id, parse_nodevault_public_key
-from app.db import get_session
+from app.db_async import DbDep, on_session
 from app.durable import nodevault as durable_nodevault
 from app.models.credentials import (
     NV_GRANT_DELIVERED,
@@ -78,7 +82,7 @@ from app.models.credentials import (
 )
 from app.models.identity import AdminUser
 from app.models.nodes import Node
-from app.entity_shape import get_or_404
+from app.entity_shape import from_row, get_or_404, or_404, refused_as
 from app.models.orgs import Org
 from app.routes.credentials.credential_wire import SealKeyOut
 from app.user_activity import record_write
@@ -227,6 +231,15 @@ def _org(session: Session, user: AdminUser) -> Org:
     return org
 
 
+def _current_key(session: Session, org: Org, *, lock: bool = False) -> NodeVaultKey:
+    """The org's CURRENT NodeVault key row; 409 `NOT_SET_UP` without one. `lock` reads it FOR UPDATE."""
+    query = select(NodeVaultKey).where(NodeVaultKey.org_id == org.id, NodeVaultKey.state == NV_KEY_CURRENT)
+    current = session.scalar(query.with_for_update() if lock else query)
+    if current is None:
+        raise HTTPException(status_code=409, detail=NOT_SET_UP)
+    return current
+
+
 def _require_plan_or_setup(session: Session, org: Org) -> nodevault_policy.Status:
     """The §3.5 rows that stay allowed while `frozen`: refused unless `nodevault_policy.readable`."""
     status = nodevault_policy.status(session, org)
@@ -289,11 +302,22 @@ def _waiting_for_holder(
 
 @router.get("/api/nodevault", response_model=NodeVaultStatusOut)
 @org_admin(Tenancy.CALLER_PLANE)
-def get_nodevault(
-    user: AdminUser = Depends(require_user), session: Session = Depends(get_session),
-    principal: Optional[Principal] = Depends(current_principal),
+async def get_nodevault(
+    db: DbDep, caller: AsyncCaller = Depends(current_caller),
 ) -> NodeVaultStatusOut:
     """The whole Settings → NodeVault page in one read (§4.1)."""
+    out, running = await db.run_sync(_get_nodevault, caller.actor, caller.principal)
+    if running is not None:
+        # The workflow may die between the operation's commit and its start; the page's poll restarts it. DBOS is
+        # its own database: off the loop, with the read's connection returned first.
+        await db_async.release(db)
+        await run_in_threadpool(durable_nodevault.ensure_operation_started, *running)
+    return out
+
+
+def _get_nodevault(
+    session: Session, user: AdminUser, principal: Optional[Principal],
+) -> tuple[NodeVaultStatusOut, Optional[tuple[str, UUID]]]:
     org = _org(session, user)
     status = _require_plan_or_setup(session, org)
     keys = {
@@ -320,9 +344,7 @@ def get_nodevault(
         waiting = _waiting_for_holder(grant, keys, delivered, online)
         if waiting:
             waiting_keys.add(grant.key_hash)
-        by_node.setdefault(grant.node_id, []).append(GrantOut(
-            key_hash=grant.key_hash, state=grant.state, last_error=grant.last_error, waiting_for_holder=waiting,
-        ))
+        by_node.setdefault(grant.node_id, []).append(from_row(GrantOut, grant, waiting_for_holder=waiting))
 
     current = next((key for key in keys.values() if key.state == NV_KEY_CURRENT), None)
     counts = _credential_counts(session, org.id)
@@ -339,10 +361,8 @@ def get_nodevault(
         both = delivered.get(operation.key_hash, set()) & delivered.get(operation.prev_key_hash or "", set())
         if not any(str(node_id) in online for node_id in both):
             waiting_keys.add(operation.key_hash)
-    return NodeVaultStatusOut(
-        allowed=status.allowed,
-        frozen=status.frozen,
-        setup=status.setup,
+    return from_row(
+        NodeVaultStatusOut, status,
         current_key=CurrentKeyOut(hash=current.key_hash, created_at=current.created_at,
                                   credential_count=counts.get(current.key_hash, 0)) if current else None,
         previous_keys=[
@@ -361,15 +381,18 @@ def get_nodevault(
         operation=_operation_out(session, operation, grants, waiting_keys) if operation is not None else None,
         can_start_over=(current is not None and operation is None and _is_owner(principal)
                         and not _current_key_held(session, org.id, current.key_hash)),
-    )
+    ), _running_start(operation)
+
+
+def _running_start(operation: Optional[NodeVaultOperation]) -> Optional[tuple[str, UUID]]:
+    """`(kind, id)` of a running operation, whose workflow the read makes sure is started (`ensure_operation_started`,
+    after the read: DBOS is its own database)."""
+    return (operation.kind, operation.id) if operation is not None and operation.state == NV_OP_RUNNING else None
 
 
 def _operation_out(
     session: Session, operation: NodeVaultOperation, grants: list[Row], waiting_keys: set[str],
 ) -> OperationOut:
-    # The workflow may die between the operation's commit and its start; the page's poll restarts it.
-    if operation.state == NV_OP_RUNNING:
-        durable_nodevault.ensure_operation_started(operation.kind, operation.id)
     counts = {name: 0 for name in _COUNT_KEYS}
     counts.update({k: int(v) for k, v in (operation.counts or {}).items() if k in counts and isinstance(v, int)})
     # Read off the item rows, so the counts match the DB while the workflow is still writing them (AC-4.8).
@@ -379,11 +402,7 @@ def _operation_out(
         counts["nodes_pending"] = sum(
             1 for grant in grants if grant.key_hash == operation.key_hash and grant.state != settled
         )
-    return OperationOut(
-        id=operation.id, kind=operation.kind, state=operation.state, step=operation.step,
-        key_hash=operation.key_hash, prev_key_hash=operation.prev_key_hash,
-        waiting_for_holder=operation.key_hash in waiting_keys, counts=counts,
-    )
+    return from_row(OperationOut, operation, waiting_for_holder=operation.key_hash in waiting_keys, counts=counts)
 
 
 # ── GET /api/nodevault/seal-key ──────────────────────────────────────────────────────────────────────
@@ -391,9 +410,8 @@ def _operation_out(
 
 @router.get("/api/nodevault/seal-key", response_model=SealKeyOut)
 @feature("credentials", "edit", own_credential=True)
-def get_nodevault_seal_key(
-    user: AdminUser = Depends(require_user), session: Session = Depends(get_session),
-) -> SealKeyOut:
+@on_session
+def get_nodevault_seal_key(session: Session, user: AdminUser = Depends(require_user)) -> SealKeyOut:
     """The org's CURRENT NodeVault public key, for `credentialSeal.sealSecret` to seal a NodeVault
     credential's secrets in the browser. Public by construction. Refused while frozen: no new NodeVault
     credential is made once the plan no longer includes it (§3.5)."""
@@ -401,11 +419,7 @@ def get_nodevault_seal_key(
     status = nodevault_policy.status(session, org)
     if not status.allowed:
         raise HTTPException(status_code=403, detail=NOT_IN_PLAN)
-    current = session.scalar(
-        select(NodeVaultKey).where(NodeVaultKey.org_id == org.id, NodeVaultKey.state == NV_KEY_CURRENT)
-    )
-    if current is None:
-        raise HTTPException(status_code=409, detail=NOT_SET_UP)
+    current = _current_key(session, org)
     # Stored only after `credential_keys.parse_nodevault_public_key` admitted it, and its hash recomputed from it.
     return SealKeyOut(
         key_id=nodevault_key_id(current.key_hash), algorithm=WRAP_ALGORITHM, public_key=current.public_key,
@@ -417,23 +431,27 @@ def get_nodevault_seal_key(
 
 @router.post("/api/nodevault/grants/{node_id}/{key_hash}/retry", response_model=GrantRetryOut, status_code=202)
 @org_admin(Tenancy.CALLER_PLANE)
+@db_async.on_thread(actor=lambda user, **_: act_as.person(user))
 def retry_grant(
-    node_id: UUID, key_hash: str,
-    user: AdminUser = Depends(require_user), session: Session = Depends(get_session),
+    session: Session,
+    node_id: UUID, key_hash: str, user: AdminUser = Depends(require_user),
 ) -> GrantRetryOut:
     """A failed grant goes again: back to `waiting` — or `retire_pending` when its key is being retired or
     was abandoned — and `ensure_grants` restarts its workflow under a fresh generation (§3.3)."""
+    # Its workflow restarts on DBOS (`nodevault_grants.ensure_grants`), after the commit: DBOS is its own
+    # database, so the whole write runs on a worker thread.
     org = _org(session, user)
     _require_plan_or_setup(session, org)
     # The node row first, as `ensure_grants` and a node's dial lock it: one lock order.
     session.scalar(select(Node.id).where(Node.id == node_id, Node.org_id == org.id).with_for_update())
-    grant = session.scalar(
-        select(NodeVaultGrant).where(
-            NodeVaultGrant.org_id == org.id, NodeVaultGrant.node_id == node_id, NodeVaultGrant.key_hash == key_hash,
-        ).with_for_update()
+    grant = or_404(
+        session.scalar(
+            select(NodeVaultGrant).where(
+                NodeVaultGrant.org_id == org.id, NodeVaultGrant.node_id == node_id, NodeVaultGrant.key_hash == key_hash,
+            ).with_for_update()
+        ),
+        detail=GRANT_NOT_FOUND,
     )
-    if grant is None:
-        raise HTTPException(status_code=404, detail=GRANT_NOT_FOUND)
     if grant.state != NV_GRANT_FAILED:
         raise HTTPException(status_code=409, detail=GRANT_NOT_FAILED)
     state = durable_nodevault.reopen_failed_grant(session, grant)
@@ -447,8 +465,10 @@ def retry_grant(
 
 @router.post("/api/nodevault/nodes/{node_id}/reset-identity", response_model=ResetIdentityOut)
 @org_admin(Tenancy.CALLER_PLANE)
+@db_async.on_thread(actor=lambda user, **_: act_as.person(user))
 def reset_node_identity(
-    node_id: UUID, user: AdminUser = Depends(require_user), session: Session = Depends(get_session),
+    session: Session,
+    node_id: UUID, user: AdminUser = Depends(require_user),
 ) -> ResetIdentityOut:
     """Forget a node's identity key (§3.5): clears it, deletes the node's grants, cancels their workflows and
     runs the abandoned-key cleanup for each key it held a grant on. The node's next identity POST registers
@@ -456,6 +476,8 @@ def reset_node_identity(
 
     Sends the node nothing: a reset follows a wiped keystore (the identity changed because the keys went with
     it), and a key a node still holds after one is outside what the CP can see or revoke (D9)."""
+    # Its grant workflows are cancelled on DBOS (`_cancel`) inside the transaction: DBOS is its own database, so
+    # the whole write runs on a worker thread.
     org = _org(session, user)
     _require_plan_or_setup(session, org)
     node = get_or_404(session, Node, node_id, detail=NODE_NOT_FOUND, where=(Node.org_id == org.id,), lock=True)
@@ -606,15 +628,39 @@ def _org_operation(session: Session, org: Org, operation_id: UUID, *, lock: bool
     )
 
 
+def _lock_rerunnable_key(
+    session: Session, org: Org, key_hash: str,
+) -> tuple[Optional[NodeVaultKey], list[NodeVaultGrant]]:
+    """The key row for `key_hash` and its grants, each locked, for a setup or rotation that may be re-run with the
+    same key: `(None, [])` for a key the org never saw; else only a `pending` one a failed operation left, or an
+    `abandoned` one (§3.2) — any other state is in use (409). The grants come in node order, `ensure_grants`' lock
+    order; the caller has locked the nodes first."""
+    key = session.scalar(
+        select(NodeVaultKey).where(NodeVaultKey.org_id == org.id, NodeVaultKey.key_hash == key_hash).with_for_update()
+    )
+    if key is None:
+        return None, []
+    if key.state not in (NV_KEY_PENDING, NV_KEY_ABANDONED):
+        raise HTTPException(status_code=409, detail=KEY_IN_USE)
+    grants = list(session.scalars(select(NodeVaultGrant).where(
+        NodeVaultGrant.org_id == org.id, NodeVaultGrant.key_hash == key_hash,
+    ).order_by(NodeVaultGrant.node_id).with_for_update()))
+    return key, grants
+
+
 @router.post("/api/nodevault/setup", response_model=OperationStartedOut, status_code=202)
 @org_admin(Tenancy.CALLER_PLANE)
+@db_async.on_thread(actor=lambda user, **_: act_as.person(user))
 def start_nodevault_setup(
-    body: SetupIn, user: AdminUser = Depends(require_user), session: Session = Depends(get_session),
+    session: Session,
+    body: SetupIn, user: AdminUser = Depends(require_user),
 ):
     """Start Setup (§3.4 `nodevault-setup`): store the key `pending` (its hash recomputed here, never taken
     from the caller), one `node` grant per capable node carrying the browser's blob, and the operation; the
     deliveries and the operation's workflow start after the commit. The key becomes `current` only once a node
     has ACKNOWLEDGED it."""
+    # The deliveries and the operation start on DBOS after the commit: DBOS is its own database, so the whole
+    # write runs on a worker thread.
     org = _org(session, user)
     status = nodevault_policy.status(session, org)
     if not status.allowed:
@@ -626,10 +672,8 @@ def start_nodevault_setup(
         raise HTTPException(status_code=409, detail=ALREADY_SET_UP)
     if body.backup_confirmed is not True:
         raise HTTPException(status_code=422, detail=BACKUP_REQUIRED)
-    try:
+    with refused_as(422, ValueError):
         key_hash = nodevault_key_hash(parse_nodevault_public_key(body.public_key))
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
 
     # The nodes first, locked in one order, as `ensure_grants` and a node's dial lock them.
     capable = {
@@ -650,18 +694,11 @@ def start_nodevault_setup(
     if not online & set(capable):
         raise HTTPException(status_code=409, detail=NO_ONLINE_NODE)
 
-    key = session.scalar(
-        select(NodeVaultKey).where(NodeVaultKey.org_id == org.id, NodeVaultKey.key_hash == key_hash).with_for_update()
-    )
+    key, prior_grants = _lock_rerunnable_key(session, org, key_hash)
     grants: dict[str, NodeVaultGrant] = {}
     stale_workflows: list[str] = []
     if key is not None:
-        # A re-run with the same key: only a `pending` one a failed setup left, or an `abandoned` one (§3.2).
-        if key.state not in (NV_KEY_PENDING, NV_KEY_ABANDONED):
-            raise HTTPException(status_code=409, detail=KEY_IN_USE)
-        for grant in session.scalars(select(NodeVaultGrant).where(
-            NodeVaultGrant.org_id == org.id, NodeVaultGrant.key_hash == key_hash,
-        ).order_by(NodeVaultGrant.node_id).with_for_update()):
+        for grant in prior_grants:
             if str(grant.node_id) not in capable:
                 # No blob is asked for a node that can't hold the key; whatever it got before is taken off.
                 if grant.state != NV_GRANT_RETIRED:
@@ -685,25 +722,17 @@ def start_nodevault_setup(
         session.add(key)
     key.backup_confirmed_at = func.now()
     for node_id in capable:
-        grant = grants.get(node_id)
-        if grant is None:
-            grant = NodeVaultGrant(org_id=org.id, node_id=UUID(node_id), key_hash=key_hash,
-                                   state=NV_GRANT_WAITING, generation=0)
-            session.add(grant)
-        grant.blob, grant.blob_kind = body.blobs[node_id], "node"
+        node_grant = grants.get(node_id)
+        if node_grant is None:
+            node_grant = NodeVaultGrant(org_id=org.id, node_id=UUID(node_id), key_hash=key_hash,
+                                        state=NV_GRANT_WAITING, generation=0)
+            session.add(node_grant)
+        node_grant.blob, node_grant.blob_kind = body.blobs[node_id], "node"
     operation = NodeVaultOperation(org_id=org.id, kind=durable_nodevault.SETUP, step=durable_nodevault.STEP_DISTRIBUTE,
                                    key_hash=key_hash, counts={})
-    session.add(operation)
-    try:
-        session.flush()
-    except IntegrityError:
-        # Another setup won the one-running-operation index between the check and this insert.
-        session.rollback()
-        running = _running_operation(session, org.id)
-        if running is not None:
-            return _already_running(running)
-        raise
-    operation.workflow_id = durable_nodevault.operation_workflow_id(durable_nodevault.SETUP, operation.id)
+    refused = _flush_operation(session, org, operation)
+    if refused is not None:
+        return refused
     if stale_workflows:
         # The superseded generations' runs; after the commit, so a refused request cancels nothing.
         after_commit.on_commit(session, lambda: durable_nodevault.cancel_workflows(stale_workflows),
@@ -728,9 +757,8 @@ def start_nodevault_setup(
 
 @router.get("/api/nodevault/credentials", response_model=NodeVaultCredentialsOut)
 @org_admin(Tenancy.CALLER_PLANE)
-def list_nodevault_credentials(
-    user: AdminUser = Depends(require_user), session: Session = Depends(get_session),
-) -> NodeVaultCredentialsOut:
+@on_session
+def list_nodevault_credentials(session: Session, user: AdminUser = Depends(require_user)) -> NodeVaultCredentialsOut:
     """The Migrate step's list: every credential of the org that is or can be NodeVault, and every one that
     can't, with the reason (`credential_consumers` is the one home of eligibility). Reads tier 1 only."""
     org = _org(session, user)
@@ -742,10 +770,9 @@ def list_nodevault_credentials(
     ):
         config = credential.config or {}
         if credential.nodevault:
-            eligible.append(EligibleCredentialOut(
-                id=credential.id, name=credential.name, type=credential.type, state="nodevault",
-                key_hash=credential_key_hash(config),
-            ))
+            eligible.append(
+                from_row(EligibleCredentialOut, credential, state="nodevault", key_hash=credential_key_hash(config))
+            )
             continue
         word = durable_nodevault.ineligibility(session, credential)
         reason = None
@@ -754,13 +781,9 @@ def list_nodevault_credentials(
         elif word is not None:
             reason = ITEM_MESSAGES[word]
         if reason is None:
-            eligible.append(EligibleCredentialOut(
-                id=credential.id, name=credential.name, type=credential.type, state="kms", key_hash=None,
-            ))
+            eligible.append(from_row(EligibleCredentialOut, credential, state="kms", key_hash=None))
         else:
-            ineligible.append(IneligibleCredentialOut(
-                id=credential.id, name=credential.name, type=credential.type, reason=reason,
-            ))
+            ineligible.append(from_row(IneligibleCredentialOut, credential, reason=reason))
     return NodeVaultCredentialsOut(eligible=eligible, ineligible=ineligible)
 
 
@@ -792,13 +815,17 @@ def _record_choice(
 
 @router.post("/api/nodevault/migrations", response_model=OperationStartedOut, status_code=202)
 @org_admin(Tenancy.CALLER_PLANE)
+@db_async.on_thread(actor=lambda user, **_: act_as.person(user))
 def start_nodevault_migration(
-    body: MigrationIn, user: AdminUser = Depends(require_user), session: Session = Depends(get_session),
+    session: Session,
+    body: MigrationIn, user: AdminUser = Depends(require_user),
 ):
     """The admin's migrate choice. While the running setup waits at `migrate_choice` it is recorded on that
     operation (its items; the step moves on) and the workflow is woken; otherwise a standalone `migration`
     operation moves the chosen KMS credentials to the current key. `skip` only in the first case — and
     allowed even when frozen, so a frozen org can finish its setup (§3.5)."""
+    # The workflow is woken or started on DBOS after the commit: DBOS is its own database, so the whole write
+    # runs on a worker thread.
     if sum((body.credential_ids is not None, bool(body.all), bool(body.skip))) != 1:
         raise HTTPException(status_code=422, detail=CHOOSE_ONE)
     org = _org(session, user)
@@ -825,25 +852,14 @@ def start_nodevault_migration(
         raise HTTPException(status_code=422, detail=SKIP_ONLY_IN_SETUP)
     if not status.allowed:
         raise HTTPException(status_code=403, detail=NOT_IN_PLAN)
-    current = session.scalar(
-        select(NodeVaultKey).where(NodeVaultKey.org_id == org.id, NodeVaultKey.state == NV_KEY_CURRENT)
-    )
-    if current is None:
-        raise HTTPException(status_code=409, detail=NOT_SET_UP)
+    current = _current_key(session, org)
     operation = NodeVaultOperation(org_id=org.id, kind=durable_nodevault.MIGRATION,
                                    step=durable_nodevault.STEP_MIGRATING, key_hash=current.key_hash, counts={})
-    session.add(operation)
-    try:
-        session.flush()
-    except IntegrityError:
-        session.rollback()
-        running = _running_operation(session, org.id)
-        if running is not None:
-            return _already_running(running)
-        raise
+    refused = _flush_operation(session, org, operation)
+    if refused is not None:
+        return refused
     if _record_choice(session, org, operation, body) == 0:
         raise HTTPException(status_code=422, detail=NOTHING_TO_MIGRATE)
-    operation.workflow_id = durable_nodevault.operation_workflow_id(durable_nodevault.MIGRATION, operation.id)
     op_id = operation.id
     after_commit.on_commit(session, lambda: durable_nodevault.start_operation(durable_nodevault.MIGRATION, op_id),
                            key=f"nodevault-op:{op_id}")
@@ -853,11 +869,26 @@ def start_nodevault_migration(
 
 @router.get("/api/nodevault/operations/{operation_id}", response_model=OperationDetailOut)
 @org_admin(Tenancy.CALLER_PLANE)
-def get_nodevault_operation(
-    operation_id: UUID, user: AdminUser = Depends(require_user), session: Session = Depends(get_session),
+async def get_nodevault_operation(
+    operation_id: UUID, db: DbDep, user: AdminUser = Depends(require_user),
 ) -> OperationDetailOut:
     """One operation — running or closed — with its per-credential results: the Result step (AC-4.8). Counts
     are read off the rows; `nodes_holding`/`nodes_total` say how many of the org's nodes hold its key."""
+    out, running, unsettled = await db.run_sync(_get_nodevault_operation, operation_id, user)
+    if running is not None or unsettled:
+        # DBOS is its own database: off the loop, with the read's connection returned first.
+        await db_async.release(db)
+    if running is not None:
+        # The workflow may die between the operation's commit and its start; the page's poll restarts it.
+        await run_in_threadpool(durable_nodevault.ensure_operation_started, *running)
+    if unsettled:
+        await run_in_threadpool(durable_nodevault.ensure_item_retries_started, operation_id, unsettled)
+    return out
+
+
+def _get_nodevault_operation(
+    session: Session, operation_id: UUID, user: AdminUser,
+) -> tuple[OperationDetailOut, Optional[tuple[str, UUID]], list[UUID]]:
     org = _org(session, user)
     _require_plan_or_setup(session, org)
     operation = _org_operation(session, org, operation_id)
@@ -879,27 +910,28 @@ def get_nodevault_operation(
         .order_by(Credential.name, NodeVaultOperationItem.credential_id)
     ).all()
     items = [
-        ItemOut(credential_id=item.credential_id, name=name, phase=item.phase, state=item.state, reason=item.reason,
-                message=ITEM_MESSAGES.get(item.reason) if item.reason else None)
+        from_row(ItemOut, item, name=name, message=ITEM_MESSAGES.get(item.reason) if item.reason else None)
         for item, name in rows
     ]
+    unsettled: list[UUID] = []
     if operation.state != NV_OP_RUNNING:
         unsettled = [i.credential_id for i in items if i.state in (durable_nodevault.ITEM_PENDING,
                                                                      durable_nodevault.ITEM_SEALED)]
-        if unsettled:
-            durable_nodevault.ensure_item_retries_started(operation.id, unsettled)
-    return OperationDetailOut(**out.model_dump(), items=items)
+    return OperationDetailOut(**out.model_dump(), items=items), _running_start(operation), unsettled
 
 
 @router.post("/api/nodevault/operations/{operation_id}/items/{credential_id}/retry",
              response_model=OperationStateOut, status_code=202)
 @org_admin(Tenancy.CALLER_PLANE)
+@db_async.on_thread(actor=lambda user, **_: act_as.person(user))
 def retry_migration_item(
-    operation_id: UUID, credential_id: UUID,
-    user: AdminUser = Depends(require_user), session: Session = Depends(get_session),
+    session: Session,
+    operation_id: UUID, credential_id: UUID, user: AdminUser = Depends(require_user),
 ):
     """A failed credential goes again as `nodevault-migrate-item:{op}:{credential}:{n}` (AC-7.3). Refused while
     frozen (§3.5) and while ANOTHER operation runs."""
+    # The item's retry starts on DBOS after the commit: DBOS is its own database, so the whole write runs on a
+    # worker thread.
     org = _org(session, user)
     if not _require_plan_or_setup(session, org).allowed:
         raise HTTPException(status_code=403, detail=NOT_IN_PLAN)
@@ -913,12 +945,13 @@ def retry_migration_item(
         NodeVaultKey.org_id == org.id, NodeVaultKey.key_hash == operation.key_hash, NodeVaultKey.state == NV_KEY_CURRENT,
     )):
         raise HTTPException(status_code=409, detail=KEY_NOT_CURRENT)
-    item = session.scalar(select(NodeVaultOperationItem).where(
-        NodeVaultOperationItem.operation_id == operation.id, NodeVaultOperationItem.credential_id == credential_id,
-        NodeVaultOperationItem.phase == "migrate",
-    ).with_for_update())
-    if item is None:
-        raise HTTPException(status_code=404, detail=ITEM_NOT_FOUND)
+    item = or_404(
+        session.scalar(select(NodeVaultOperationItem).where(
+            NodeVaultOperationItem.operation_id == operation.id, NodeVaultOperationItem.credential_id == credential_id,
+            NodeVaultOperationItem.phase == "migrate",
+        ).with_for_update()),
+        detail=ITEM_NOT_FOUND,
+    )
     if item.state != durable_nodevault.ITEM_FAILED:
         raise HTTPException(status_code=409, detail=ITEM_NOT_FAILED)
     item.state, item.reason, item.staged = durable_nodevault.ITEM_PENDING, None, None
@@ -931,8 +964,10 @@ def retry_migration_item(
 
 @router.post("/api/nodevault/operations/{operation_id}/abandon", response_model=OperationStateOut, status_code=202)
 @org_admin(Tenancy.CALLER_PLANE)
+@db_async.on_thread(actor=lambda user, **_: act_as.person(user))
 def abandon_nodevault_operation(
-    operation_id: UUID, user: AdminUser = Depends(require_user), session: Session = Depends(get_session),
+    session: Session,
+    operation_id: UUID, user: AdminUser = Depends(require_user),
 ):
     """Abandon (§3.5), allowed whatever the plan. A SETUP or ROTATION before promotion: its new key →
     `abandoned` (never sealed under, never delivered again), every grant → `retire_pending` so the key is taken
@@ -942,6 +977,8 @@ def abandon_nodevault_operation(
     (the new key stays current). A RETIRE while some node may still hold the key: the key back to `previous`
     and re-delivered to every node it was taken off. The operation closes `failed`, and the abandon is
     audited."""
+    # Workflows are cancelled and started on DBOS after the commit: DBOS is its own database, so the whole write
+    # runs on a worker thread.
     org = _org(session, user)
     _require_plan_or_setup(session, org)
     operation = _org_operation(session, org, operation_id, lock=True)
@@ -1060,29 +1097,28 @@ def _flush_operation(session: Session, org: Org, operation: NodeVaultOperation) 
 
 @router.post("/api/nodevault/rotation", response_model=OperationStartedOut, status_code=202)
 @org_admin(Tenancy.CALLER_PLANE)
+@db_async.on_thread(actor=lambda user, **_: act_as.person(user))
 def start_nodevault_rotation(
-    body: RotationIn, user: AdminUser = Depends(require_user), session: Session = Depends(get_session),
+    session: Session,
+    body: RotationIn, user: AdminUser = Depends(require_user),
 ):
     """Start a rotation (§3.4 `nodevault-rotate`): store the new key `pending` (its hash recomputed here) with
     its chain blob, and enrol every capable node in it — a node holding the current key gets the chain blob, any
     other node a peer's wrap. The key becomes `current` only once every capable node online at the check has
     ACKNOWLEDGED it; the old key stays on every node as `previous` until an admin retires it."""
+    # The deliveries and the operation start on DBOS after the commit: DBOS is its own database, so the whole
+    # write runs on a worker thread.
     org = _org(session, user)
     if not nodevault_policy.status(session, org).allowed:
         raise HTTPException(status_code=403, detail=NOT_IN_PLAN)
     running = _running_operation(session, org.id)
     if running is not None:
         return _already_running(running)
-    current = session.scalar(select(NodeVaultKey).where(
-        NodeVaultKey.org_id == org.id, NodeVaultKey.state == NV_KEY_CURRENT).with_for_update())
-    if current is None:
-        raise HTTPException(status_code=409, detail=NOT_SET_UP)
+    current = _current_key(session, org, lock=True)
     if body.backup_confirmed is not True:
         raise HTTPException(status_code=422, detail=BACKUP_REQUIRED)
-    try:
+    with refused_as(422, ValueError):
         key_hash = nodevault_key_hash(parse_nodevault_public_key(body.public_key))
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
     # AC-6.2: the new private key reaches nodes only wrapped under the CURRENT key — never in a form the CP opens.
     if _blob_problem(body.chain_blob, nodevault_key_id(current.key_hash)):
         raise HTTPException(status_code=422, detail=NOT_ROTATED_BLOB)
@@ -1099,17 +1135,10 @@ def start_nodevault_rotation(
     if not {str(n) for n in capable} & holders & online:
         raise HTTPException(status_code=409, detail=NO_ONLINE_HOLDER)
 
-    key = session.scalar(
-        select(NodeVaultKey).where(NodeVaultKey.org_id == org.id, NodeVaultKey.key_hash == key_hash).with_for_update()
-    )
+    key, prior_grants = _lock_rerunnable_key(session, org, key_hash)
     stale_workflows: list[str] = []
     if key is not None:
-        # A re-run with the same key: only a `pending` one a failed operation left, or an `abandoned` one (§3.2).
-        if key.state not in (NV_KEY_PENDING, NV_KEY_ABANDONED):
-            raise HTTPException(status_code=409, detail=KEY_IN_USE)
-        for grant in session.scalars(select(NodeVaultGrant).where(
-            NodeVaultGrant.org_id == org.id, NodeVaultGrant.key_hash == key_hash,
-        ).order_by(NodeVaultGrant.node_id).with_for_update()):
+        for grant in prior_grants:
             stale_workflows += [
                 nodevault_grants.workflow_id(kind, grant.node_id, key_hash, grant.generation)
                 for kind in nodevault_grants.WORKFLOW_KINDS
@@ -1163,19 +1192,24 @@ def start_nodevault_rotation(
 
 @router.post("/api/nodevault/keys/{key_hash}/retire", response_model=OperationStartedOut, status_code=202)
 @org_admin(Tenancy.CALLER_PLANE)
+@db_async.on_thread(actor=lambda user, **_: act_as.person(user))
 def retire_nodevault_key(
-    key_hash: str, user: AdminUser = Depends(require_user), session: Session = Depends(get_session),
+    session: Session,
+    key_hash: str, user: AdminUser = Depends(require_user),
 ):
     """Retire an old key (§3.4 `nodevault-retire`, D8): refused unless it is `previous` and no credential is
     sealed under it (AC-6.7). The workflow takes it off every node — an offline one when it reconnects — and
     marks it `retired` only once every node confirmed. It cannot be undone once it completes."""
+    # The operation starts on DBOS after the commit: DBOS is its own database, so the whole write runs on a
+    # worker thread.
     org = _org(session, user)
     if not nodevault_policy.status(session, org).allowed:
         raise HTTPException(status_code=403, detail=NOT_IN_PLAN)
-    key = session.scalar(select(NodeVaultKey).where(
-        NodeVaultKey.org_id == org.id, NodeVaultKey.key_hash == key_hash).with_for_update())
-    if key is None:
-        raise HTTPException(status_code=404, detail=KEY_NOT_FOUND)
+    key = or_404(
+        session.scalar(select(NodeVaultKey).where(
+            NodeVaultKey.org_id == org.id, NodeVaultKey.key_hash == key_hash).with_for_update()),
+        detail=KEY_NOT_FOUND,
+    )
     if key.state != NV_KEY_PREVIOUS:
         raise HTTPException(status_code=409, detail=ONLY_OLD_KEYS)
     # The count before the running-operation check: mid-rotation the admin is told WHY (AC-6.7).
@@ -1201,22 +1235,27 @@ def retire_nodevault_key(
 
 @router.post("/api/nodevault/start-over", response_model=OperationStateOut)
 @org_admin(Tenancy.CALLER_PLANE)
+@db_async.on_thread(actor=lambda caller, **_: act_as.person(caller.actor))
 def start_nodevault_over(
-    user: AdminUser = Depends(require_user), session: Session = Depends(get_session),
-    principal: Optional[Principal] = Depends(current_principal),
+    session: Session,
+    caller: AsyncCaller = Depends(current_caller),
 ):
     """Start over (D4): the way out for an org whose current key no node holds. The org Owner only, and only
     while no node has the key delivered and no operation runs. The key goes `retired` and every grant of it
     `retire_pending` (each node's `retire-node` confirms it is gone), so the org is no longer set up and Setup
     can run with a fresh key. Credentials sealed under the key stay sealed — nothing can open them — and must be
     re-entered. Allowed whatever the plan, like abandon, so a frozen org is never stuck. Audited."""
-    org = _org(session, user)
+    # Workflows are cancelled and started on DBOS after the commit: DBOS is its own database, so the whole write
+    # runs on a worker thread.
+    org = _org(session, caller.actor)
     _require_plan_or_setup(session, org)
-    if not _is_owner(principal):
+    if not _is_owner(caller.principal):
         raise HTTPException(status_code=403, detail=OWNER_ONLY)
     running = _running_operation(session, org.id)
     if running is not None:
         return _already_running(running)
+    # The hash only, on purpose: loading the row here would hand the locked re-read below a cached copy
+    # (`populate_existing` is not set), and its state check would read a pre-lock snapshot.
     current = session.scalar(select(NodeVaultKey.key_hash).where(
         NodeVaultKey.org_id == org.id, NodeVaultKey.state == NV_KEY_CURRENT))
     if current is None:
@@ -1247,7 +1286,7 @@ def start_nodevault_over(
     for grant in grants:
         nodevault_grants.start_grant_workflow(session, grant)
     lost = len(durable_nodevault.credentials_on_key(session, org.id, current))
-    _audit(session, user, org, "nodevault.started_over", f"Started NodeVault over, retiring key {current[:12]}",
+    _audit(session, caller.actor, org, "nodevault.started_over", f"Started NodeVault over, retiring key {current[:12]}",
            {"key_hash": current, "credentials_lost": lost, "nodes": len(grants)})
     after_commit.on_commit(session, lambda: durable_nodevault.cancel_workflows(workflows),
                            key=f"nodevault-start-over:{current}")

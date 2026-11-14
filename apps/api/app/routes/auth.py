@@ -1,9 +1,10 @@
 """Session lifecycle endpoints."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime
 from functools import lru_cache
 from typing import Any, Literal, Optional, Union
 from urllib.parse import urlencode
@@ -18,12 +19,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Select, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app import (
     access,
     act_as,
     api_keys,
     ce_caps,
+    client_events,
     console_direct,
     edition_features,
     git_connections,
@@ -36,13 +39,14 @@ from app import (
     provider_auth_policy,
     tenant_defaults,
 )
+from app.clock import utcnow
 from app.operator_settings import defaults as settings_defaults, reads as settings_reads
 from app import (
     hipaa, identities, ip_allowlist, login_funnel, login_lockout, login_oauth, mfa, org_invitations, org_locate,
-    static_slots_policy,
 )
 from app.access_catalog import PROJECT_LEVEL_FEATURES, PROJECT_ROLE_ORG_KEYS
 from app.auth import (
+    adopt_user,
     COOKIE_NAME,
     clear_session_cookie,
     google_client_id,
@@ -57,14 +61,14 @@ from app.auth import (
     verify_session_token,
 )
 from app.authz.catalog import (
-    _FEATURE_LABELS, OWNER_KEYS, PERMISSION_CATALOG, UNHONOURED_PERMISSION_KEYS, Tenancy, permission_key,
+    _FEATURE_LABELS, OWNER_KEYS, PERMISSION_CATALOG, UNHONOURED_PERMISSION_KEYS, Tenancy,
 )
 from app.authz.declarations import always, session_only
 from app.authz.principal import effective_access, principal_for_user
 from app.authz.visibility import git_identity_select
 from app.credentials.registry import type_label
-from app.db import get_session
-from app.entity_shape import conflict_as_409, constraint_name
+from app.db_async import DbDep, defer_off_loop, on_session, release, run_deferring
+from app.entity_shape import conflict_as_409, constraint_name, from_row, names_of, or_404, refused_as
 from app.git_access import GIT_CREDENTIAL_TYPES, credential_root
 from app.login_oauth import ORG_DELETED, ORG_NOT_APPROVED, ORG_PENDING_REVIEW
 from app.models.access import Group, UserGroupMembership
@@ -72,20 +76,18 @@ from app.models.credentials import Credential
 from app.models.identity import AdminUser, UserIdentity, set_identity_fields
 from app.models.orgs import ORG_PENDING, ORG_REJECTED, Org
 from app.models.projects import Project
-from app.notify_targets import available_notification_methods
+from app.offload import run_cpu
+from app import notification_channels
 from app.preferences import (
     UserPreferences,
-    hold_unsubscribable_events,
     preferences_document,
     store_preferences,
     stored_preferences,
-    subscribable_events,
-    validate_notifications_preferences,
 )
 from app.routes.public import check_rate_limit
 from app.tenancy import seam
 from app.tenancy.copy import not_available
-from app.tenancy.ids import is_operator_plane, is_tenant_org
+from app.tenancy.ids import is_operator_user, is_tenant_org
 from app.tenancy.labels import OrgRef, org_ref_of, org_refs
 from app.user_activity import record_write
 from app.version import TOOL_VERSION
@@ -106,6 +108,8 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 catalog_router = APIRouter(tags=["auth"])
 # The Telegram link (cloud-only, included by `app/routers_cloud.py`), same `/api/auth` prefix.
 telegram_router = APIRouter(prefix="/api/auth", tags=["auth"])
+# Google sign-in (feature `oauth_signin`, cloud-only, included by `app/routers_cloud.py`), same `/api/auth` prefix.
+google_router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 log = logging.getLogger("cockpit-auth")
 
@@ -162,8 +166,9 @@ class PendingInvitationOut(BaseModel):
     created_at: datetime
 
 
-def _compliance_enabled(session: Session, org_id: Optional[UUID]) -> bool:
-    """Is Portfolio Compliance on for `org_id` (`app/governance/availability.py`)? False with no org, and in an
+def _governance_on(session: Session, org_id: Optional[UUID], check: Literal["enabled", "guard_enabled"]) -> bool:
+    """Is a governance feature on for `org_id`? `check` names its `app/governance/availability.py` predicate:
+    `enabled` (Portfolio Compliance) or `guard_enabled` (the Architectural Guard). False with no org, and in an
     edition without compliance."""
     if not edition_features.enabled("compliance"):
         return False
@@ -171,19 +176,8 @@ def _compliance_enabled(session: Session, org_id: Optional[UUID]) -> bool:
         return False
     from app.governance import availability
 
-    return availability.enabled(session, org_id)
-
-
-def _guard_enabled(session: Session, org_id: Optional[UUID]) -> bool:
-    """Is the Architectural Guard available for `org_id` (`availability.guard_enabled`)? False with no org, and in
-    an edition without compliance."""
-    if not edition_features.enabled("compliance"):
-        return False
-    if org_id is None:
-        return False
-    from app.governance import availability
-
-    return availability.guard_enabled(session, org_id)
+    predicate = {"enabled": availability.enabled, "guard_enabled": availability.guard_enabled}[check]
+    return predicate(session, org_id)
 
 
 def _membership_state(row: AdminUser, org: Org) -> str:
@@ -210,13 +204,12 @@ def _org_memberships(session: Session, user: AdminUser) -> list[OrgMembershipOut
     orgs = {org.id: org for org in session.scalars(
         select(Org).where(Org.id.in_({row.org_id for row in rows}), Org.deleted_at.is_(None))
     )}
-    parent_ids = {org.parent_org_id for org in orgs.values() if org.parent_org_id is not None}
-    parents = dict(session.execute(select(Org.id, Org.name).where(Org.id.in_(parent_ids))).tuples().all()) if parent_ids else {}
+    parents = names_of(session, Org, (org.parent_org_id for org in orgs.values()))
     out = [
         OrgMembershipOut(
             org_id=org.id, org_slug=org.slug, org_name=org.name, state=_membership_state(row, org),
             is_current=row.id == user.id, is_operator_plane=not is_tenant_org(org.id),
-            compliance_enabled=_compliance_enabled(session, org.id),
+            compliance_enabled=_governance_on(session, org.id, "enabled"),
             staging_of=parents.get(org.parent_org_id) if org.parent_org_id is not None else None,
         )
         for row in rows
@@ -300,39 +293,23 @@ class AdminOut(BaseModel):
     # (`identities.person_label`), so the client composes it from the pair below.
     id: UUID
     email: str
-    # Whether a Google, Microsoft or GitHub sign-in has proven `email` (`AdminUser.email_verified_at`):
-    # email notifications go only to a proven address.
+    # Whether `email` is proven (`AdminUser.email_verified_at`: a Google, Microsoft or GitHub sign-in, an emailed
+    # link or code, or an emailed invitation's link): email notifications go only to a proven address.
     email_verified: bool = False
     role: str = "admin"
     first_name: str | None = None
     last_name: str | None = None
     preferences: dict = Field(default_factory=dict)
-    #: The events this user may see and set in Profile > Alerts (`preferences.subscribable_events`).
-    notification_events: list[str] = Field(default_factory=list)
-    notification_methods_available: list[str] = Field(default_factory=list)
-    """WHICH NOTIFICATION METHOD TYPES THIS DEPLOYMENT CAN ACTUALLY DELIVER RIGHT NOW — the subset of
-    `preferences.NOTIFICATION_METHOD_TYPES` whose channel is configured.
-
-    A CAPABILITY OF THE DEPLOYMENT, NOT OF THIS USER, and it rides the identity payload for
-    `git_credential_id`'s stated reason: the one response every authenticated principal already gets, so
-    the shared Notifications panel can tell a user "Slack delivery is not configured — ask an operator"
-    WITHOUT `system:view`, which is what reading the operator-settings catalogue would require. Since
-    3176 the `slack` credential is designated once for the whole deployment (Settings), so
-    without this field the panel's only honest option would be to accept a member id and silently never
-    deliver to it — a user staring at a saved setting that does nothing.
-
-    CARRIES NOTHING OF THE CREDENTIAL — not its id, not its name, not its type label. A method type is
-    listed when a usable row is designated and absent when one is not, which is the whole of what the
-    panel needs and the least this can disclose to a zero-grant account."""
     git_credential_id: UUID | None = None
-    """WHICH CREDENTIAL THIS ACCOUNT'S RUNNERS PUSH WITH — their Git Access selection, or
-    null for "has connected nothing", which is a real and common state rather than a fault.
+    """WHICH CREDENTIAL THIS ACCOUNT'S RUNNERS PUSH WITH — their Git Access selection
+    (`git_connections.selected_credential_ids`: the github.com default connection, else their oldest
+    default elsewhere), or null for "has connected nothing", which is a real and common state rather than a fault.
 
-    A POINTER, NOT A CAPABILITY, and it rides the identity payload for the same reason
+    A PREFERENCE, NOT A CAPABILITY, and it rides the identity payload for the same reason
     `task_create_defaults` does: the one response every authenticated principal already gets, so the
     self-service Git Access control on /profile can render its current answer without a second route
     and without `credentials:view`. It names a `credentials.id` and carries NOTHING of the row —
-    `app/git_access.py` re-authorizes the pointer on every single resolution, so what a browser reads
+    `app/git_access.py` re-authorizes the selection on every single resolution, so what a browser reads
     here is a preference, never a grant, and a stale one costs a re-render rather than an access."""
     org: MeOrgRef | None = None
     """WHICH ORG THE SIGNED-IN OPERATOR IS — the viewer's own `admin_users.org_id` (`AdminUser` is
@@ -342,7 +319,7 @@ class AdminOut(BaseModel):
     IT RIDES THE IDENTITY PAYLOAD FOR `git_credential_id`'s REASON, one field up: the ONE response every
     authenticated principal already gets. Four of the ten tenant-owned console pages have no record of
     their own to point at — `/projects/new`, `/tasks/new` and `/tasks/new-chat` have created nothing yet,
-    and `/clients` is a placeholder with no rows — so their org indicator has no row to read a label off.
+    and `/customers` is a placeholder with no rows — so their org indicator has no row to read a label off.
     Off this field they can name the tenant with no second route and no permission key; the alternative
     is fetching the org roster, which is a capability a task-creating BA has no business holding in order
     to draw a badge about themselves.
@@ -367,6 +344,9 @@ class AdminOut(BaseModel):
     `org_refs` refuses at the source. `app/tenancy/labels.py` is the single home for that rule."""
     version: str = TOOL_VERSION
     is_superadmin: bool = False
+    client_telemetry: bool = False
+    """This session's console reports its errors and stalls to `POST /api/client-events`: the membership's
+    switch or its org's (`app/client_events.py::is_flagged`)."""
     is_operator: bool = False
     """`is_superadmin` AND a member of the operator plane (`app/tenancy/ids.py::is_operator_plane`).
 
@@ -456,7 +436,7 @@ class AdminOut(BaseModel):
     know must not 500 the identity payload, and the browser's rule (`web/src/lib/colorScheme.ts`) falls back."""
     playbooks_enabled: bool = False
     """WHETHER PLAYBOOKS ARE ON THIS PRINCIPAL'S ORG'S PLAN — the Playbooks plan switch
-    (`app/plan_terms.py::playbooks_enabled`); False with no org. The console's offer only (the Playbook depth,
+    (`app/plan_terms.py`'s `playbooks_enabled` switch); False with no org. The console's offer only (the Playbook depth,
     the Playbooks tab): the playbook paths re-read the switch for the PROJECT's org and refuse there."""
     org_templates_enabled: bool = False
     """WHETHER THIS PRINCIPAL'S ORG MAY AUTHOR ITS OWN TASK TEMPLATES (`app/plan_terms.py::ORG_TEMPLATES`); False with
@@ -468,11 +448,14 @@ class AdminOut(BaseModel):
     `acp:*`; `lib/providerGrid.ts::agentsOn`)."""
     microvm_allowed: bool = False
     """WHETHER MICROVM NODES ARE ON THIS PRINCIPAL'S ORG'S PLAN — the MicroVM plan switch
-    (`app/plan_terms.py::microvm_allowed`); False with no org. The console's offer only: `app/microvm_mode.py`
+    (`app/plan_terms.py::microvm_allowed_term`); False with no org. The console's offer only: `app/microvm_mode.py`
     refuses the flip on its own whatever this says."""
+    node_vm_allowed: bool = False
+    """WHETHER WHOLE-NODE VM NODES ARE ON THIS PRINCIPAL'S ORG'S PLAN (`app/plan_terms.py::node_vm_allowed_term`);
+    False with no org. The console's offer only: `app/node_shape.py` refuses on its own whatever this says."""
     # WHICH SELF-HOSTED NODE TYPES ARE ON THIS PRINCIPAL'S ORG'S PLAN — the three node-type plan switches
     # (`app/plan_terms.py::NODE_OS_SWITCHES`); False with no org. The node wizard's OS choices only:
-    # `app/routes/nodes/cloud.py` and `app/routes/node_orders.py` refuse on their own whatever this says.
+    # `app/routes/node_orders.py` refuses on its own whatever this says.
     ubuntu_nodes_allowed: bool = False
     macos_nodes_allowed: bool = False
     windows_nodes_allowed: bool = False
@@ -511,6 +494,29 @@ class AdminOut(BaseModel):
     tenant_email_allowed: bool = False
     """WHETHER THIS PRINCIPAL'S ORG'S PLAN LETS IT CONNECT ITS OWN GMAIL (`app/plan_terms.py::TENANT_EMAIL`); False
     with no org. The console's offer only: `routes/org_email.py` refuses on its own."""
+    intelligent_routing: bool = False
+    """WHETHER INTELLIGENT ROUTING IS ON THIS PRINCIPAL'S ORG'S PLAN (`app/plan_terms.py::INTELLIGENT_ROUTING`); False
+    with no org. The console's offer only: `routes/orgs.py` and `routes/projects.py` refuse on their own."""
+    production_qa: bool = False
+    """WHETHER PRODUCTION QA IS ON THIS PRINCIPAL'S ORG'S PLAN (`app/plan_terms.py::PRODUCTION_QA`) — its pages and its
+    behaviour; False with no org. The console's offer only: `routes/production_qa.py` refuses a tenant 403 and a
+    project's opt-in 409 on their own (`routes/projects.py`)."""
+    benchmark_mode: bool = False
+    """WHETHER THE OUTCOME LEDGER MAY SAMPLE THIS PRINCIPAL'S ORG'S OPTED-IN PROJECTS' CODER TASKS INTO SHADOW DUELS
+    (`app/plan_terms.py::BENCHMARK_MODE`, `app/outcome_ledger/benchmark.py`); False with no org. OFF on every plan; an
+    operator's org override turns it on."""
+    agent_performance: bool = False
+    """WHETHER THE OUTCOME LEDGER'S SURFACES ARE ON THIS PRINCIPAL'S ORG'S PLAN (`app/plan_terms.py::AGENT_PERFORMANCE`);
+    False with no org. The console's offer only: `routes/outcomes.py` and `routes/outcome_links.py` refuse on their own."""
+    webhooks_enabled: bool = False
+    """WHETHER OUTGOING WEBHOOKS ARE ON THIS PRINCIPAL'S ORG'S PLAN (`app/plan_terms.py::WEBHOOKS`); False with no org.
+    The console's offer only: `routes/webhooks.py` refuses on its own."""
+    pipeline_custom_enabled: bool = False
+    """WHETHER CUSTOM PIPELINES ARE ON THIS PRINCIPAL'S ORG'S PLAN (`app/plan_terms.py::PIPELINE_CUSTOM`); False with no
+    org. The console's offer only: a project's `GET …/pipeline/basic` answers for its own org."""
+    placement_groups_allowed: bool = False
+    """WHETHER NODE GROUPS ARE ON THIS PRINCIPAL'S ORG'S PLAN (`app/plan_terms.py::PLACEMENT_GROUPS`); False with no
+    org. The console's offer only: every node-group write refuses on its own."""
     compliance_enabled: bool = False
     """WHETHER PORTFOLIO COMPLIANCE EXISTS FOR THIS PRINCIPAL'S ORG — the Compliance plan parameter, read
     through its only reader `app/governance/availability.py` (pinned contract S7). The sidebar and the route
@@ -545,10 +551,9 @@ class AdminOut(BaseModel):
     """THE NON-BAA SURFACES THIS PRINCIPAL'S ORG IS WARNED ABOUT (`app/hipaa.py::org_warnings`), each with whether an
     org admin acknowledged it; empty while HIPAA is off. Here, not only on the org row, because every member sees the
     warning at the point of use and only an admin may read the org. Presentation only: nothing is ever blocked."""
-    static_slots: Optional[int] = 0
-    """HOW MANY STATIC WORKTREES THIS PRINCIPAL'S ORG'S PLAN LETS A PROJECT HOLD ON ONE NODE — 0 = none, None = no
-    cap (the operator plane), read through `app/static_slots_policy.py`. At 0 the console hides every control that
-    adds a static slot; the writes refuse on their own whatever this says."""
+    users_cap: Optional[int] = None
+    """THIS PRINCIPAL'S ORG'S USERS CAP (`plan_terms.caps`), None for unlimited or no org. At 1 a Jaah-managed project's
+    page draws no Access tab (`ProjectEditPage`): there is nobody else to grant."""
 
 
 def _load_memberships(session: Session, user_id: UUID) -> list[MembershipOut]:
@@ -559,11 +564,7 @@ def _load_memberships(session: Session, user_id: UUID) -> list[MembershipOut]:
         .order_by(UserGroupMembership.id)
     ).all()
     return [
-        MembershipOut(
-            id=membership.id, group=group_name,
-            resource_type=membership.resource_type, resource_id=membership.resource_id,
-            is_everyone=bool(is_everyone),
-        )
+        from_row(MembershipOut, membership, group=group_name, is_everyone=bool(is_everyone))
         for membership, group_name, is_everyone in rows
     ]
 
@@ -639,20 +640,17 @@ def _admin_out_bound(user: AdminUser, session: Session, cron_runtime) -> AdminOu
         first_name=user.first_name, last_name=user.last_name,
         # The document shape `preferences_to_store` writes.
         preferences=preferences_document(UserPreferences.from_stored(stored_preferences(user))),
-        notification_events=subscribable_events(session, user),
-        notification_methods_available=available_notification_methods(user.org_id),
-        git_credential_id=user.git_credential_id,
+        git_credential_id=git_connections.selected_credential_ids(session, [user.id]).get(user.id),
         # Through the shared resolver (`app/tenancy/labels.py`), which decides that an unknown or NULL id is
         # None, not the default org. The one `AdminOut` constructor, so every auth response carries it.
         org=_me_org_ref(session, user.org_id),
         is_superadmin=user.is_superadmin,
-        is_operator=is_operator_plane(user.org_id, user.is_superadmin),
+        client_telemetry=client_events.is_flagged(session, user),
+        is_operator=is_operator_user(user),
         tenant=is_tenant_org(user.org_id),
         memberships=_org_memberships(session, user),
         pending_invitations=[
-            PendingInvitationOut(
-                id=row.id, org_name=row.org_name, invited_by_name=row.invited_by_name, created_at=row.created_at,
-            )
+            from_row(PendingInvitationOut, row)
             for row in org_invitations.pending_for(session, user.identity_id)
         ],
         group_memberships=_load_memberships(session, user.id),
@@ -679,11 +677,11 @@ def _admin_out_bound(user: AdminUser, session: Session, cron_runtime) -> AdminOu
             provider_auth_policy.encoded(provider_auth_policy.allowed(session, user.org_id))
             if user.org_id is not None else []
         ),
-        compliance_enabled=_compliance_enabled(session, user.org_id),
-        guard_enabled=_guard_enabled(session, user.org_id),
+        compliance_enabled=_governance_on(session, user.org_id, "enabled"),
+        guard_enabled=_governance_on(session, user.org_id, "guard_enabled"),
         nodelink_enabled=user.org_id is not None and tenant_defaults.shared_store_allowed(session, user.org_id),
         nodevault_enabled=_nodevault_enabled(session, user.org_id),
-        static_slots=static_slots_policy.cap(session, user.org_id),
+        users_cap=_users_cap(session, user.org_id),
         org_hipaa=hipaa.org_is_on(session, user.org_id),
         hipaa_warnings=[
             HipaaSurfaceOut(surface=surface, acknowledged=acked)
@@ -693,6 +691,12 @@ def _admin_out_bound(user: AdminUser, session: Session, cron_runtime) -> AdminOu
             org_ref_of(org_refs(session, [user.org_id]), user.org_id) if act_as.operator_org(user) is not None else None
         ),
     )
+
+
+def _users_cap(session: Session, org_id: Optional[UUID]) -> Optional[int]:
+    """`AdminOut.users_cap`: the org's Users cap, None when unlimited or there is no org."""
+    org = session.get(Org, org_id) if org_id is not None else None
+    return plan_terms.caps(session, org)["users"].value if org is not None else None
 
 
 def _nodevault_enabled(session: Session, org_id: Optional[UUID]) -> bool:
@@ -714,10 +718,16 @@ def _revoke_direct_console_grants(admin_id: UUID, retired_epoch: int) -> None:
 
     The epoch passed is the retired one — see `revoke_for_admin_session`, the single home for that
     rule and its call sites. Called on both `session_epoch` bumps here (logout, password change).
-    Synchronous (via `revoke_for_admin_session_sync`) so callers stay `def` and bcrypt stays off the
-    event loop.
+    Synchronous (via `revoke_for_admin_session_sync`): an async route calls it on a worker thread
+    (`_revoke_ended`), where that bridge to the loop runs.
     """
     console_direct.revoke_for_admin_session_sync(node_bus.registry, admin_id, retired_epoch)
+
+
+async def _revoke_ended(ended: list[tuple[UUID, int]]) -> None:
+    """`_revoke_direct_console_grants` for each retired `(member_id, epoch)`, from an async route after its commit."""
+    for member_id, epoch in ended:
+        await run_in_threadpool(_revoke_direct_console_grants, member_id, epoch)
 
 
 @lru_cache(maxsize=1)
@@ -743,22 +753,65 @@ _CHALLENGES = {"mfa_required": "verify", "enrol_required": "enrol"}
 @router.post("/login", response_model=Union[AdminOut, MfaChallengeOut], dependencies=[Depends(check_rate_limit)])
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def login(
-    body: LoginRequest, request: Request, response: Response, session: Session = Depends(get_session)
+async def login(
+    db: DbDep,
+    body: LoginRequest,
+    request: Request,
+    response: Response,
 ):
-    # The PERSON first (`app/identities.py`), then which of their memberships this sign-in opens
-    # (`login_funnel.pick_membership`, under its identity escape: the route is `@always(Tenancy.BOOTSTRAP)`).
-    # `_admin_out` binds the chosen membership's org afterwards.
+    checked_hash, lockout = await db.run_sync(_login_reads, body, request)
+    password_ok = False
+    if lockout != login_lockout.LOCKED:
+        # The one bcrypt compare every unlocked arm pays (`_login`), off the loop and holding no connection.
+        await release(db)
+        password_ok = await run_cpu(_password_matches, body.password, checked_hash)
+    return await db.run_sync(_login, body, request, response, lockout, checked_hash, password_ok)
+
+
+def _login_reads(
+    session: Session, body: LoginRequest, request: Request
+) -> tuple[Optional[str], login_lockout.State]:
+    """`login`'s reads before its bcrypt compare: the hash to compare against (None: the dummy's) and the lockout,
+    keyed on the row's own email when there is one. A locked identifier tests no password at all."""
+    person = identities.by_email(session, body.email)
+    if person is not None and identities.is_system(session, person):
+        person = None
+    key = person.email if person is not None else body.email
+    lockout = login_lockout.state(session, key, login_funnel.source_ip(request))
+    return (person.password_hash if person is not None else None), lockout
+
+
+def _password_matches(password: str, password_hash: Optional[str]) -> bool:
+    """One bcrypt compare: against `password_hash`, or the dummy when there is none (always False)."""
+    return verify_password(password, password_hash or _dummy_password_hash())
+
+
+def _login(
+    session: Session,
+    body: LoginRequest,
+    request: Request,
+    response: Response,
+    lockout: login_lockout.State,
+    checked_hash: Optional[str],
+    password_ok: bool,
+):
+    """`login`'s body, over the route's async session (`run_sync`). `password_ok`: `body.password` against
+    `checked_hash` (`_login_reads`), compared before this ran; a hash changed since counts as a wrong password."""
     person = identities.by_email(session, body.email)
     if person is not None and identities.is_system(session, person):
         person = None
     # None with a person: they hold no membership any more, refused `disabled` once the password is right.
     admin = login_funnel.pick_membership(session, person, "password", request=request) if person is not None else None
     # Three arms have no hash to check: an unknown email, the system actor (`entity_shape.SYSTEM_ACTOR_ID`,
-    # never a login identity) and a Google-only invitee. Each still pays one bcrypt compare against the dummy
-    # before the same 401, so response timing cannot enumerate which emails have an account.
+    # never a login identity) and a Google-only invitee. Each still paid one bcrypt compare against the dummy
+    # (`login`) before the same 401, so response timing cannot enumerate which emails have an account.
     loginable = person is not None
+    password_matches = password_ok and loginable and person.password_hash == checked_hash
     attributed = admin
+    # Read again after the compare: the failures a concurrent burst committed while this one's bcrypt ran count
+    # (`login_lockout.state`'s overshoot); the stricter of the two reads answers.
+    key = person.email if person is not None else body.email
+    lockout = login_lockout.worse(lockout, login_lockout.state(session, key, login_funnel.source_ip(request)))
 
     def refuse(status: int, detail, reason: str) -> HTTPException:
         login_funnel.record_login_failure(
@@ -766,10 +819,7 @@ def login(
         )
         return HTTPException(status_code=status, detail=detail)
 
-    # The lockout answers first, keyed on the row's own email when there is one, and the same whether or not
-    # the email has an account: a locked identifier tests no password at all.
-    key = person.email if loginable else body.email
-    lockout = login_lockout.state(session, key, login_funnel.source_ip(request))
+    # The lockout answers first (`_login_reads`), the same whether or not the email has an account.
     if lockout == login_lockout.LOCKED:
         raise refuse(403, {"code": login_lockout.LOCKED}, login_lockout.LOCKED)
     # The step-up binds only an account that HAS a confirmed authenticator (an unknown email is treated as
@@ -788,11 +838,10 @@ def login(
         return refuse(401, step_up_refusal if stepped_up else detail, reason)
 
     if not loginable or person.password_hash is None:
-        verify_password(body.password, _dummy_password_hash())
         raise denied("invalid credentials", "unknown_identifier" if not loginable else "no_password")
     if admin is None:
         # No membership left (R7): the account is deactivated — said only to a caller who knows the password.
-        if not verify_password(body.password, person.password_hash):
+        if not password_matches:
             raise denied("invalid credentials", "bad_password")
         if stepped_up:
             # Under the step-up a right password is never confirmed alone.
@@ -803,10 +852,9 @@ def login(
         # Refused whatever was typed, after the same bcrypt cost: answering only a RIGHT password with this
         # 403 would make the door an oracle for the passwords of rows with no password door (a superadmin by
         # PRD D7, or one an operator shut — `auth.password_refusal`).
-        verify_password(body.password, _dummy_password_hash())
         raise refuse(403, {"code": password_refused}, password_refused)
-    _refuse_sso_member_password(session, request, admin, body.password)
-    if not verify_password(body.password, person.password_hash):
+    _refuse_sso_member_password(session, request, admin)
+    if not password_matches:
         raise denied("invalid credentials", "bad_password")
     second_factor = None
     if stepped_up:
@@ -825,11 +873,14 @@ def login(
 _SWITCH_NOT_FOUND = "not found"
 
 
-@router.post("/google", response_model=Union[AdminOut, MfaChallengeOut], dependencies=[Depends(check_rate_limit)])
+@google_router.post("/google", response_model=Union[AdminOut, MfaChallengeOut], dependencies=[Depends(check_rate_limit)])
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def google_login(
-    body: GoogleLoginRequest, request: Request, response: Response, session: Session = Depends(get_session)
+async def google_login(
+    db: DbDep,
+    body: GoogleLoginRequest,
+    request: Request,
+    response: Response,
 ):
     """Alternative login via a Google Sign-In ID token — invite-only, but for a registered email domain.
 
@@ -843,11 +894,25 @@ def google_login(
     Such a stale link is released and the email arm decides, as for a never-linked account.
     """
     try:
-        idinfo = verified_google_idinfo(body.credential)
+        # Google's keys are fetched over HTTP: on a thread, before any connection is held.
+        idinfo = await asyncio.to_thread(verified_google_idinfo, body.credential)
     except HTTPException as exc:
         if exc.status_code == 401:
-            login_funnel.record_login_failure(session, request, None, method="google", reason="bad_credential")
+            await db.run_sync(
+                login_funnel.record_login_failure, request, None, method="google", reason="bad_credential"
+            )
         raise
+    return await run_deferring(db, _google_login, body, request, response, idinfo)
+
+
+def _google_login(
+    session: Session,
+    body: GoogleLoginRequest,
+    request: Request,
+    response: Response,
+    idinfo: dict,
+):
+    """`google_login`'s body, over the route's async session (`run_sync`), on the claims Google verified."""
     try:
         admin, challenge = google_sign_in(session, request, response, idinfo, switch_to=body.switch_to)
     except HTTPException as exc:
@@ -884,7 +949,7 @@ def verified_google_idinfo(credential: str) -> dict:
             credential, google_requests.Request(), client_id
         )
     except (ValueError, GoogleAuthError):
-        raise HTTPException(status_code=401, detail="invalid Google credential")
+        raise HTTPException(status_code=401, detail="invalid Google credential") from None
     # `is not True`: a sign-in may now CREATE an account, so a stringly `"false"` must not pass.
     if idinfo.get("email_verified") is not True:
         raise HTTPException(status_code=401, detail="Google email not verified")
@@ -929,11 +994,9 @@ def google_sign_in(
         # Before the link write below: a refused sign-in leaves nothing behind.
         _refuse_unapproved(session, request, admin, "google")
         if person.google_sub and person.google_sub != sub:
-            raise HTTPException(
-                status_code=409, detail="account already linked to another Google identity"
-            )
+            raise HTTPException(status_code=409, detail="account already linked to another Google identity")
         if stale_link is not None:
-            identities.set_fields(session, stale_link, google_sub=None)
+            identities.set_fields(stale_link, google_sub=None)
             session.flush()  # `google_sub` is unique: the release must reach the DB before the relink
         set_identity_fields(admin, google_sub=sub)
         with conflict_as_409(session, "Google identity already linked"):
@@ -964,9 +1027,7 @@ def _picked(
         )
         raise HTTPException(status_code=403, detail={"code": login_oauth.ACCOUNT_DISABLED})
     if switch_to is not None:
-        admin = login_funnel.switch_target(session, admin, switch_to)
-        if admin is None:
-            raise HTTPException(status_code=404, detail=_SWITCH_NOT_FOUND)
+        admin = or_404(login_funnel.switch_target(session, admin, switch_to), detail=_SWITCH_NOT_FOUND)
     return admin
 
 
@@ -1004,21 +1065,19 @@ def finish_first_factor(
     raise HTTPException(status_code=403, detail=f"sign-in refused ({outcome.reason or outcome.kind})")
 
 
-def _refuse_sso_member_password(session: Session, request: Request, admin: AdminUser, password: str) -> None:
+def _refuse_sso_member_password(session: Session, request: Request, admin: AdminUser) -> None:
     """403 a password sign-in by a member of an SSO-only org (`app/sso_policy.py`) or a Require-SSO one
     (`app/org_sso.py`): neither has a password door, so it is refused whatever was typed, after the same bcrypt
-    cost (a refusal only a RIGHT password earned would make the door an oracle). An edition without single sign-on
-    has neither."""
+    cost, paid before (`login`; a refusal only a RIGHT password earned would make the door an oracle). An edition
+    without single sign-on has neither."""
     if not edition_features.enabled("sso"):
         return
     from app import org_sso, sso_policy
 
     if sso_policy.sso_org(session, admin) is not None:
-        verify_password(password, _dummy_password_hash())
         sso_policy.refuse(session, request, admin, "password")
         raise HTTPException(status_code=403, detail={"code": login_oauth.SSO_REQUIRED})
     if org_sso.sso_enforced_policy(session, request, admin, admin.email, "password", None) is not None:
-        verify_password(password, _dummy_password_hash())
         raise HTTPException(status_code=403, detail={"code": login_oauth.SSO_ENFORCED})
 
 
@@ -1073,7 +1132,7 @@ def _join_by_domain(
         session.commit()
         raise HTTPException(status_code=403, detail="no Jaah account for this Google email")
     if stale_link is not None:
-        identities.set_fields(session, stale_link, google_sub=None)
+        identities.set_fields(stale_link, google_sub=None)
         session.flush()  # `google_sub` is unique: the release must reach the DB before the new row takes it
     # The org the verified domain decided; this route binds nothing, and the rows below are that org's.
     with seam.bound_to(org_id):
@@ -1083,7 +1142,7 @@ def _join_by_domain(
                 first_name=idinfo.get("given_name"), last_name=idinfo.get("family_name"),
             )
             # Created FROM the Google-verified email, so it is proven from the start.
-            set_identity_fields(user, google_sub=sub, email_verified_at=datetime.now(timezone.utc))
+            set_identity_fields(user, google_sub=sub, email_verified_at=utcnow())
             access.bind_default_role(session, user)
             record_write(
                 session, access.system_actor(org_id), "user_domain_join",
@@ -1097,7 +1156,7 @@ def _join_by_domain(
         except IntegrityError:
             # A concurrent first sign-in for the same email or Google identity won the unique key.
             session.rollback()
-            raise HTTPException(status_code=409, detail="Sign-in conflicted with another. Try again.")
+            raise HTTPException(status_code=409, detail="Sign-in conflicted with another. Try again.") from None
         except HTTPException as exc:
             # The org's Users cap (`create_org_user`): said to the person signing in, not the buyer.
             if exc.status_code != 409:
@@ -1109,20 +1168,34 @@ def _join_by_domain(
     # Committed: the org's `user_registered` triggers hear of the join.
     from app import trigger_user_registered
 
-    trigger_user_registered.on_member_joined(user.id, org_id, via=trigger_user_registered.VIA_DOMAIN_JOIN)
+    # Its own sessions: off the loop on the async route (`defer_off_loop`).
+    defer_off_loop(session, trigger_user_registered.on_member_joined, user.id, org_id, via=trigger_user_registered.VIA_DOMAIN_JOIN)
     return user
 
 
 @router.post("/logout", dependencies=[Depends(check_rate_limit)])
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def logout(
+async def logout(
+    db: DbDep,
     request: Request,
     response: Response,
-    session: Session = Depends(get_session),
 ):
     """End this session — bump the IDENTITY epoch (which ends this person's cookie in every org, on every
     device) and clear it."""
+    ended = await db.run_sync(_logout, request, response)
+    # After the commit: a rolled-back retirement must never revoke a session that is still live.
+    await _revoke_ended(ended)
+    return {"ok": True}
+
+
+def _logout(
+    session: Session,
+    request: Request,
+    response: Response,
+) -> list[tuple[UUID, int]]:
+    """`logout`'s body, over the route's async session (`run_sync`): the sessions it retired."""
+    ended: list[tuple[UUID, int]] = []
     admin_id = verify_session_token(request.cookies.get(COOKIE_NAME))
     if admin_id is not None:
         # Identity escape, for `app/auth.py::_session_user`'s reason: unbound, the lookup finds nothing and the
@@ -1132,11 +1205,8 @@ def logout(
         if user is not None:
             ended = identities.end_every_session(session, user)
             session.commit()
-            # After the commit: a rolled-back retirement must never revoke a session that is still live.
-            for member_id, epoch in ended:
-                _revoke_direct_console_grants(member_id, epoch)
     clear_session_cookie(response)
-    return {"ok": True}
+    return ended
 
 
 class SwitchIn(BaseModel):
@@ -1168,12 +1238,13 @@ _SWITCH_START_DOORS = frozenset({"github", "microsoft"})
 )
 @always(Tenancy.BOOTSTRAP)
 @session_only
+@on_session
 def switch_org(
+    session: Session,
     body: SwitchIn,
     request: Request,
     response: Response,
     admin: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ):
     """Act as another of the caller's own orgs from now on, in every tab of this browser session (R2/R4):
     the session cookie is re-minted for the person's membership in `org_id` once that org's sign-in policy
@@ -1181,6 +1252,7 @@ def switch_org(
     membership in (unknown, not theirs, or disabled — one answer for all); 409 `org_pending` /
     `org_not_approved` for an org that may not be signed into, and `ip_not_allowed` (with `ip`) when its IP
     allowlist leaves out this address. Not audited (PRD §5)."""
+    admin = adopt_user(session, admin)
     claims = read_session(request.cookies.get(COOKIE_NAME))
     if claims is None:
         raise HTTPException(status_code=401, detail="unauthorized")
@@ -1214,42 +1286,47 @@ class LocatedOut(BaseModel):
 @router.get("/locate/{object_type}/{object_id}", response_model=LocatedOut, dependencies=[Depends(check_rate_limit)])
 @always(Tenancy.BOOTSTRAP)
 @session_only
+@on_session
 def locate_object(
+    session: Session,
     object_type: str,
     object_id: str,
     admin: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> LocatedOut:
     """Which of the caller's OTHER orgs holds this object (`object_type` is an `authz.OBJECT_SPECS` name), so
     a detail page that 404s under the active org can offer "This belongs to B — Switch to B" (R9/AC13). 200
     only when a live, switchable membership of the caller's person could open it there; everything else is
     the same 404 as a missing id. `BOOTSTRAP` like `switch_org`: the answer is about orgs the session is not
     bound to, each entered for its own probe (`app/org_locate.py`)."""
-    org = org_locate.locate(session, admin, object_type, object_id)
-    if org is None:
-        raise HTTPException(status_code=404, detail="not found")
+    admin = adopt_user(session, admin)
+    org = or_404(org_locate.locate(session, admin, object_type, object_id), detail="not found")
     return LocatedOut(org_id=org.id, org_name=org.name)
 
 
 @router.get("/me", response_model=AdminOut)
 @always(Tenancy.BOOTSTRAP)
+@on_session
 def me(
+    session: Session,
     request: Request,
     admin: AdminUser = Depends(require_user_or_signed_out),
-    session: Session = Depends(get_session),
 ):
+    admin = adopt_user(session, admin)
     out = _admin_out(admin, session)
     key = api_keys.of(request)
     if key is not None:
-        return _narrowed_to_key(out, key)
+        # On the route's session: `api_keys.summary` reaches the loop from a foreign thread, and this is on it.
+        return _narrowed_to_key(out, key, api_keys._summary_in(session, key))
     claims = read_session(request.cookies.get(COOKIE_NAME))
     return out.model_copy(update={"terms_pending": True}) if claims is not None and claims.terms else out
 
 
-def _narrowed_to_key(out: AdminOut, key: api_keys.ApiKeyContext) -> AdminOut:
+def _narrowed_to_key(
+    out: AdminOut, key: api_keys.ApiKeyContext, summary: tuple[str, Optional[datetime], frozenset[int]]
+) -> AdminOut:
     """`/me` for a request made with an API key: the owner's permission fields cut to the key's (`api_keys.narrow`'s
-    rule) and the key itself named."""
-    display, expires_at, hidden = api_keys.summary(key)
+    rule) and the key itself named. `summary`: the key's `api_keys.summary`."""
+    display, expires_at, hidden = summary
     return out.model_copy(update={
         "permissions": sorted(set(out.permissions) & key.keys),
         "project_permissions": {
@@ -1270,28 +1347,28 @@ class InvitationAcceptedOut(BaseModel):
 @router.post("/invitations/{invitation_id}/accept", response_model=InvitationAcceptedOut)
 @always(Tenancy.BOOTSTRAP)
 @session_only
+@on_session(deferring=True)
 def accept_invitation(
+    session: Session,
     invitation_id: UUID,
     admin: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> InvitationAcceptedOut:
     """Join the org that invited this PERSON (R5): their new membership there (never `is_superadmin`), the
     invitation's grant applied, the org now in `/api/auth/me`'s `memberships`. The session keeps acting as
     the membership it was. `BOOTSTRAP` like `/me`: the invitation is in another org than the caller's, found
     by person, and written under `bound_to` its own org (`app/org_invitations.py`). 404 unless it is the
     caller's own pending invitation; 409 when they are a member there already or the org is full."""
+    admin = adopt_user(session, admin)
     return InvitationAcceptedOut(org_id=org_invitations.accept(session, admin, invitation_id))
 
 
 @router.post("/invitations/{invitation_id}/decline", status_code=204)
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def decline_invitation(
-    invitation_id: UUID,
-    admin: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-) -> Response:
+@on_session
+def decline_invitation(session: Session, invitation_id: UUID, admin: AdminUser = Depends(require_user)) -> Response:
     """Turn an invitation down: marked declined, no membership made. 404 as `accept_invitation`."""
+    admin = adopt_user(session, admin)
     org_invitations.decline(session, admin, invitation_id)
     return Response(status_code=204)
 
@@ -1320,48 +1397,60 @@ class SlackLinkStatusOut(BaseModel):
 @router.post("/me/slack-link-code", response_model=SlackLinkCodeOut)
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def issue_slack_link_code(
+async def issue_slack_link_code(
+    db: DbDep,
     admin: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ):
     """Self-service only: the code connects whoever sends it to THIS account, so it is issued to the
     signed-in user and shown only to them. A new code replaces any pending one."""
+    code, expires_at, org_id = await db.run_sync(_issue_slack_link_code, admin)
+    # After the commit, on a thread: the link asks Slack (`auth.test`).
+    url = await asyncio.to_thread(slack_link.open_url, org_id)
+    return SlackLinkCodeOut(code=code, expires_at=expires_at, url=url)
+
+
+def _issue_slack_link_code(
+    session: Session,
+    admin: AdminUser,
+) -> tuple[str, datetime, Optional[UUID]]:
+    """`issue_slack_link_code`'s body, over the route's async session (`run_sync`): the code, its expiry and
+    the caller's org."""
+    admin = adopt_user(session, admin)
     if not edition_features.enabled("slack"):
-        raise HTTPException(status_code=404, detail=ce_caps.NOT_IN_CE)
+        raise ce_caps.not_in_edition()
     # Identity escape, as in `update_me`: unbound, this re-read of the caller's own row would 401.
     with seam.identity_scope():
         user = session.get(AdminUser, admin.id)
         if user is None:
             raise HTTPException(status_code=401, detail="unauthorized")
         org_id = user.org_id
-        try:
+        with refused_as(409, slack_link.SlackNotConnected, chain=True):
             code, expires_at = slack_link.issue_code(session, user)
-        except slack_link.SlackNotConnected as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
         session.commit()
-    return SlackLinkCodeOut(code=code, expires_at=expires_at, url=slack_link.open_url(org_id))
+    return code, expires_at, org_id
 
 
 @router.get("/me/slack-link-code", response_model=SlackLinkStatusOut)
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def slack_link_status(
-    admin: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-):
+@on_session
+def slack_link_status(session: Session, admin: AdminUser = Depends(require_user)):
+    admin = adopt_user(session, admin)
     if not edition_features.enabled("slack"):
-        raise HTTPException(status_code=404, detail=ce_caps.NOT_IN_CE)
+        raise ce_caps.not_in_edition()
     with seam.identity_scope():
         user = session.get(AdminUser, admin.id)
         if user is None:
             raise HTTPException(status_code=401, detail="unauthorized")
         # A fresh read: the bot's redeem commits on another session.
         session.refresh(user)
-        method = UserPreferences.from_stored(user.preferences).notifications.method_for("slack")
+        channel = notification_channels.slack_dm(session, user)
         return SlackLinkStatusOut(
             state=slack_link.link_state(user),
-            slack_user_id=(method.user_id or None) if method is not None else None,
-            slack_display_name=(method.display_name or None) if method is not None else None,
+            slack_user_id=(channel.slack_target_id or None) if channel is not None else None,
+            slack_display_name=(
+                channel.name if channel is not None and channel.name != channel.slack_target_id else None
+            ),
         )
 
 
@@ -1369,37 +1458,46 @@ def slack_link_status(
 
 
 class TelegramLinkCodeOut(BaseModel):
-    """A fresh code and the deep link that carries it to the bot."""
+    """A fresh code and the deep links that carry it to the bot: `url` for a private chat, `group_url` to add the
+    bot to a group (`telegram_link.deep_links`)."""
 
     code: str
     expires_at: datetime
     url: str
+    group_url: str
 
 
 class TelegramLinkOut(BaseModel):
-    """The caller's person's link (`telegram_link.link_state`); the console polls this while a link is shown."""
+    """The caller's person's code and links (`telegram_link.link_state`); the console polls this while a code is
+    shown, and a redeemed code reads `linked`."""
 
     state: Literal["none", "pending", "linked", "expired"]
+    #: The newest linked chat's link time and name (`@username`, a name, or a group's title).
     linked_at: Optional[datetime] = None
-    #: Who Telegram says is linked (`@username` or a name), so the person can tell it is their own account.
     linked_as: Optional[str] = None
     bot_username: Optional[str] = None
 
 
 def _telegram_off(admin: AdminUser) -> str:
     """Only the operator is told where (`app/tenancy/copy.py` never serves "Settings" to a tenant)."""
-    where = " in Settings > Integrations > Telegram" if is_operator_plane(admin.org_id, admin.is_superadmin) else ""
+    where = " in Settings > Integrations > Telegram" if is_operator_user(admin) else ""
     return f"Telegram is not set up here. An operator picks a bot{where}."
 
 
-def _telegram_link_out(session: Session, user: AdminUser) -> TelegramLinkOut:
-    link = telegram_link.link_for(session, user)
+def _telegram_bot_username() -> Optional[str]:
+    """The designated bot's @username, or None. Blocking (the credential, Telegram's `getMe`): on a thread."""
     token, _ = telegram_bot.bot_token()
+    return telegram_bot.bot_username(token) if token else None
+
+
+def _telegram_link_out(session: Session, user: AdminUser, bot_username: Optional[str]) -> TelegramLinkOut:
+    links = telegram_link.links_of(session, user)
+    newest = links[-1] if links else None
     return TelegramLinkOut(
-        state=telegram_link.link_state(link),
-        linked_at=link.linked_at if link is not None else None,
-        linked_as=link.chat_label if link is not None and link.chat_id is not None else None,
-        bot_username=telegram_bot.bot_username(token) if token else None,
+        state=telegram_link.link_state(telegram_link.pending_for(session, user), bool(links)),
+        linked_at=newest.linked_at if newest is not None else None,
+        linked_as=newest.chat_label if newest is not None else None,
+        bot_username=bot_username,
     )
 
 
@@ -1413,72 +1511,63 @@ def _own_row(session: Session, admin: AdminUser) -> AdminUser:
 @telegram_router.post("/me/telegram-link-code", response_model=TelegramLinkCodeOut)
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def issue_telegram_link_code(
+async def issue_telegram_link_code(
+    db: DbDep,
     admin: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ):
     """Self-service only, as Slack's: the link connects whoever opens it to THIS person. No plan gates it."""
-    token, _ = telegram_bot.bot_token()
+    # The credential and Telegram's `getMe` block: on a thread, before any connection is held.
+    token, _ = await asyncio.to_thread(telegram_bot.bot_token)
     if token is None:
         raise HTTPException(status_code=409, detail=_telegram_off(admin))
-    username = telegram_bot.bot_username(token)
+    username = await asyncio.to_thread(telegram_bot.bot_username, token)
     if username is None:
         raise HTTPException(
             status_code=409,
             detail="Telegram did not answer for the bot. Try again; if it persists, an operator re-checks the "
                    "bot credential.",
         )
+    return await db.run_sync(_issue_telegram_link_code, admin, username)
+
+
+def _issue_telegram_link_code(
+    session: Session,
+    admin: AdminUser,
+    username: str,
+):
+    """`issue_telegram_link_code`'s body, over the route's async session (`run_sync`), for the bot `username`."""
+    admin = adopt_user(session, admin)
     with seam.identity_scope():
         user = _own_row(session, admin)
         if user.identity_id is None or user.invitation_id is not None:
             raise HTTPException(status_code=409, detail="Accept the invitation to this organization first.")
         code, expires_at = telegram_link.issue_code(session, user)
         session.commit()
-    return TelegramLinkCodeOut(code=code, expires_at=expires_at, url=f"https://t.me/{username}?start={code}")
+    url, group_url = telegram_link.deep_links(username, code)
+    return TelegramLinkCodeOut(code=code, expires_at=expires_at, url=url, group_url=group_url)
 
 
 @telegram_router.get("/me/telegram-link", response_model=TelegramLinkOut)
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def telegram_link_status(
+async def telegram_link_status(
+    db: DbDep,
     admin: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ):
+    bot_username = await asyncio.to_thread(_telegram_bot_username)
+    return await db.run_sync(_telegram_link_status, admin, bot_username)
+
+
+def _telegram_link_status(
+    session: Session,
+    admin: AdminUser,
+    bot_username: Optional[str],
+):
+    """`telegram_link_status`'s body, over the route's async session (`run_sync`)."""
+    admin = adopt_user(session, admin)
     with seam.identity_scope():
         # The webhook's redeem commits on another session; this request's session has read nothing yet.
-        return _telegram_link_out(session, _own_row(session, admin))
-
-
-@telegram_router.post("/me/telegram-link/enable", response_model=TelegramLinkOut)
-@always(Tenancy.BOOTSTRAP)
-@session_only
-def enable_telegram_here(
-    admin: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-):
-    """Turn Telegram on for this membership with the chat the person already linked (in any org): one click on
-    Profile, no new code. 409 when nothing is linked."""
-    with seam.identity_scope():
-        user = _own_row(session, admin)
-        if not telegram_link.turn_on(session, user):
-            raise HTTPException(status_code=409, detail="Connect Telegram first.")
-        session.commit()
-        return _telegram_link_out(session, user)
-
-
-@telegram_router.delete("/me/telegram-link", response_model=TelegramLinkOut)
-@always(Tenancy.BOOTSTRAP)
-@session_only
-def unlink_telegram(
-    admin: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-):
-    """Delete the person's link (every org stops sending) and turn Telegram off on this membership."""
-    with seam.identity_scope():
-        user = _own_row(session, admin)
-        telegram_link.unlink(session, user)
-        session.commit()
-        return _telegram_link_out(session, user)
+        return _telegram_link_out(session, _own_row(session, admin), bot_username)
 
 
 # ── Git Access: the credential a person's runners push with ────────────────────────────
@@ -1525,28 +1614,16 @@ def selectable_git_credentials(
         stmt.order_by(Credential.created_at.desc(), Credential.id.desc())
     )
     return [
-        GitCredentialOut(
-            id=row.id, name=row.name, type=row.type, type_label=type_label(row.type)
-        )
+        from_row(GitCredentialOut, row, type_label=type_label(row.type))
         for row in rows
         if root is None or credential_root(row) == root
     ]
 
 
-def validated_git_credential_id(
-    session: Session, subject: AdminUser, credential_id: UUID | None
-) -> UUID | None:
-    """`credential_id` if `subject` may genuinely select it, else a 422 SAYING WHICH of the two it is.
-
-    None ("connected nothing") passes through: clearing is how a person disconnects.
-
-    Two refusals with separate fixes: an unreachable row (deleted credential or revoked grant) versus a
-    wrong type (a Jira row in a git field). A 422 either way — a bad value in a well-formed body.
-
-    Not trusted later: `git_access.resolve_for_user` re-runs the scope on every resolution, so a revoked
-    grant stops serving without cleanup."""
-    if credential_id is None:
-        return None
+def git_credential_or_422(session: Session, subject: AdminUser, credential_id: UUID) -> Credential:
+    """The credential `subject` may select as a git identity (`git_credential_scope`), else a 422 SAYING WHICH
+    of the two refusals it is: an unreachable row (deleted credential or revoked grant) versus a wrong type (a
+    Jira row in a git field). One home for the self-service Git Access write and the per-root connections."""
     credential = session.scalars(
         git_credential_scope(session, subject).where(Credential.id == credential_id)
     ).first()
@@ -1566,6 +1643,29 @@ def validated_git_credential_id(
                 "authenticate a git remote. Pick a GitHub, GitLab, Bitbucket or Azure DevOps credential "
                 "instead."
             ),
+        )
+    return credential
+
+
+def validated_git_credential_id(
+    session: Session, subject: AdminUser, credential_id: UUID | None
+) -> UUID | None:
+    """`credential_id` if `subject` may genuinely select it, else a 422 SAYING WHICH of the two it is.
+
+    None ("connected nothing") passes through: clearing is how a person disconnects.
+
+    Two refusals with separate fixes: an unreachable row (deleted credential or revoked grant) versus a
+    wrong type (a Jira row in a git field). A 422 either way — a bad value in a well-formed body.
+
+    Not trusted later: `git_access.resolve_for_user` re-runs the scope on every resolution, so a revoked
+    grant stops serving without cleanup."""
+    if credential_id is None:
+        return None
+    credential = git_credential_or_422(session, subject, credential_id)
+    if credential_root(credential) is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"'{credential.name}' names no git host. Fix its URL, then pick it again.",
         )
     return credential_id
 
@@ -1595,16 +1695,42 @@ class MeUpdate(BaseModel):
 @router.put("/me", response_model=AdminOut)
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def update_me(
+async def update_me(
+    db: DbDep,
     body: MeUpdate,
     request: Request,
     response: Response,
     admin: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ):
-    """Stays `def` deliberately: `hash_password` is bcrypt (~180ms CPU) and a sync endpoint runs in a
-    worker thread; `async` would stall the event loop's node-bus heartbeats and relay frames."""
-    # Identity escape, as in `logout`: unbound, this re-read of the caller's own row would 401.
+    """`hash_password` is bcrypt (~180ms CPU): hashed on the CPU pool before any connection is held, so it never
+    stalls the event loop's node-bus heartbeats and relay frames."""
+    # Only a password the length rule admits (the body's own check refuses the rest, 422, before writing anything).
+    password_hash = (
+        await run_cpu(hash_password, body.password)
+        if body.password is not None and password_problem(body.password, None) is None
+        else None
+    )
+    owed: list[tuple[UUID, int]] = []
+    try:
+        return await db.run_sync(_update_me, body, request, response, admin, password_hash, owed)
+    finally:
+        # After the commit, so a rolled-back rotation never revokes grants whose session is still valid; and
+        # whatever happens after it — the answer failing, the request cancelled — the retired sessions are revoked.
+        await asyncio.shield(_revoke_ended(owed))
+
+
+def _update_me(
+    session: Session,
+    body: MeUpdate,
+    request: Request,
+    response: Response,
+    admin: AdminUser,
+    password_hash: Optional[str],
+    owed: list[tuple[UUID, int]],
+) -> AdminOut:
+    """`update_me`'s body, over the route's async session (`run_sync`). `password_hash`: `body.password`'s, hashed
+    before this ran. The sessions it retired go to `owed` the moment their commit lands, for the route to revoke."""
+    admin = adopt_user(session, admin)
     with seam.identity_scope():
         user = session.get(AdminUser, admin.id)
     if user is None:
@@ -1625,8 +1751,7 @@ def update_me(
         # Bound to the caller's own org: this route binds nothing, and an unbound `Credential` read is
         # `false()`, which refused every row the (org-bound) roster offers.
         with seam.bound_to(user.org_id):
-            # Through the connection store, so the github.com/gitlab.com row follows the pointer.
-            git_connections.select_pointer(
+            git_connections.select_credential(
                 session, user, user, validated_git_credential_id(session, user, body.git_credential_id)
             )
     if body.first_name is not None:
@@ -1635,26 +1760,14 @@ def update_me(
         set_identity_fields(user, last_name=body.last_name or None)
     ended: list[tuple[UUID, int]] = []
     if body.password is not None:
-        set_identity_fields(user, password_hash=hash_password(body.password))
+        set_identity_fields(user, password_hash=password_hash)
         ended = identities.end_every_session(session, user)
         # A new password also forgets every trusted device: a stolen one must not keep skipping the code.
         mfa.revoke_trusted_devices(session, user)
     if body.preferences is not None:
-        # R2.6/R2.6a: the only write path a non-superadmin has, so it uses the same shared validator as
-        # PATCH /api/users/{id}. Only when `notifications` changed: the Settings tab re-submits the whole
-        # document, and an untouched block referencing a deleted credential must not block unrelated saves.
-        body.preferences = hold_unsubscribable_events(
-            body.preferences, stored_preferences(user), subscribable_events(session, user)
-        )
-        stored_notifications = UserPreferences.from_stored(user.preferences).notifications
-        if (
-            "notifications" in body.preferences.model_fields_set
-            and body.preferences.notifications.model_dump() != stored_notifications.model_dump()
-        ):
-            # `target=user` equals `actor` here; passed because the validator's rule is stated in both terms.
-            validate_notifications_preferences(body.preferences, actor=admin, target=user)
-        # The shared store helper (`app/preferences.py`), never a bare `model_dump()`: it carries the
-        # task rail fields forward when this body never mentioned them.
+        # Alerts are not set here any more (`routes/notification_channels.py`): an older bundle's `notifications`
+        # block is a retired key and dropped. The shared store helper (`app/preferences.py`), never a bare
+        # `model_dump()`: it carries the task rail fields forward when this body never mentioned them.
         store_preferences(user, body.preferences)
     try:
         session.commit()
@@ -1666,15 +1779,13 @@ def update_me(
         # (`identities_email_key`); other violations keep the generic sentence. This is the only door a tenant
         # can hit that constraint from (`routes/users.py` is `@superadmin_only(Tenancy.OPERATOR)`).
         constraint = constraint_name(exc)
-        if constraint == "identities_email_key" and not is_operator_plane(admin.org_id, admin.is_superadmin):
-            raise HTTPException(status_code=409, detail=not_available("email"))
-        raise HTTPException(status_code=409, detail="email already exists")
+        if constraint == "identities_email_key" and not is_operator_user(admin):
+            raise HTTPException(status_code=409, detail=not_available("email")) from exc
+        raise HTTPException(status_code=409, detail="email already exists") from exc
+    owed.extend(ended)
     session.refresh(user)
     if body.password is not None:
         login_funnel.reissue_session(request, response, user)
-    # After the commit, so a rolled-back rotation never revokes grants whose session is still valid.
-    for member_id, epoch in ended:
-        _revoke_direct_console_grants(member_id, epoch)
     # An acting tab is answered as the seat it acts as, like `/me` (`act_as.seat_user`).
     seated = act_as.operator_org(admin) is not None and admin.org_id is not None
     return _admin_out(act_as.seat_user(user, admin.org_id) if seated else user, session)
@@ -1698,7 +1809,7 @@ class PermissionOut(BaseModel):
 
 @catalog_router.get("/api/permissions", response_model=list[PermissionOut])
 @always(Tenancy.BOOTSTRAP)
-def list_permissions():
+async def list_permissions():
     """The permission catalog, in catalog order — the vocabulary every grant screen renders.
 
     `@always`, not superadmin-gated: a fixed constant from `app.authz.PERMISSION_CATALOG` that reveals
@@ -1708,8 +1819,8 @@ def list_permissions():
     Order is the catalog's (feature, then action), so the matrix lines up with the seeded rows. No
     session and no auth dependency — it reads a module constant."""
     return [
-        PermissionOut(
-            key=spec.key, feature=spec.feature, action=spec.action, description=spec.description,
+        from_row(
+            PermissionOut, spec,
             feature_label=_FEATURE_LABELS[spec.feature], honoured=spec.key not in UNHONOURED_PERMISSION_KEYS,
         )
         for spec in PERMISSION_CATALOG

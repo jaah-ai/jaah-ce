@@ -45,14 +45,10 @@ A turn refused by 0001's usage-limit error carries no tokens. Replay: `test_clos
 
 - **pi-acp bump:** regenerate each patch against the new tarball's file (`dist/index.js`, `package.json`;
   `npm pack pi-acp@<v>`, edit, `diff -u` with `a/` and `b/` paths), regenerate the lock
-  (`runner_cli_pins.py lock pi-acp`), rerun the recorder, and run `test_runner_cli_pins_table.py`,
-  which applies every patch to its pinned tarball.
+  (`runner_cli_pins.py lock pi-acp`), re-record its fixture (`test_runner_cli_pins_table.py record pi-acp`), rerun the replay recorder, and run `test_runner_cli_pins_table.py`,
+  which applies every patch to the pinned tarball's recorded lines.
 - **Drop each on its own condition:** 0001 when an upstream release surfaces the final error (re-record the
   fixtures), 0002 when one declares zod 4, 0003 when one reports cost and per-turn tokens — remove its file and its entry in `patches`. Only once all are gone
   do this directory and the `patches` line go.
-- **Upstream:** pi-acp issue [svkozak/pi-acp#135](https://github.com/svkozak/pi-acp/issues/135) asks for exactly
-  this patch's behaviour (a JSON-RPC error on `stopReason: "error"` instead of `end_turn`), and PR
-  [svkozak/pi-acp#136](https://github.com/svkozak/pi-acp/pull/136) implements it; it does not yet carry the
-  `_meta["jaah.ai"]` usage-limit class and reset, so check `classify_error` against its error shape before dropping
-  the patch. PR [svkozak/pi-acp#143](https://github.com/svkozak/pi-acp/pull/143) forwards pi's stderr, which would
+- **Upstream:** before dropping the patch, check `classify_error` against upstream's error shape (a JSON-RPC error on `stopReason: "error"`, and the `_meta["jaah.ai"]` usage-limit class and reset). Upstream forwarding pi's stderr would
   make `agents/pi_rpc.py`'s stderr relay (`JAAH_ENGINE_STDERR`, `acp/host.py`) redundant for pi.

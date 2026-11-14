@@ -1,0 +1,72 @@
+# Calendly. Facts confirmed at the vendor's own docs: OAuth app creation, PKCE S256 required, scopes chosen on the
+# app (not sent on authorize) https://developer.calendly.com/docs/authentication/creating-an-oauth-app.md and
+# https://developer.calendly.com/docs/authentication/scopes.md ; token call with HTTP Basic
+# https://developer.calendly.com/api-docs/calendly-o-auth/o-auth/post-oauth-refresh-token.md ; personal access tokens
+# https://developer.calendly.com/docs/authentication/how-to-authenticate-with-personal-access-tokens.md
+slug = "calendly"
+label = "Calendly"
+category = "productivity"
+vendor_docs_url = "https://developer.calendly.com/docs/authentication/creating-an-oauth-app"
+summary = "Read event types, availability and booked meetings, and share scheduling links."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+# Calendly scopes live on the app registration, not in the authorize request, so no `scopes` are sent here.
+authorize_url = "https://auth.calendly.com/oauth/authorize"
+token_url = "https://auth.calendly.com/oauth/token"
+pkce = true
+basic_auth = true
+jaah_app = true
+[auth.oauth.registration]
+console_url = "https://calendly.com/app/developer?tab=oauth_apps"
+app_scopes = [
+  { name = "users:read", label = "Read the connected user's profile, so the connection shows whose it is" },
+  { name = "event_types:read", label = "List event types, to hand out the right scheduling link" },
+  { name = "scheduled_events:read", label = "Read booked meetings and their invitees" },
+  { name = "availability:read", label = "Read free time before proposing a slot" },
+  { name = "organizations:read", label = "Find the organization's members, for owner and admin accounts" },
+]
+steps = [
+  "In the Create OAuth app form choose the environment type Production and paste the redirect URI for this environment from the redirect step below: Calendly takes exactly one per app",
+  "Select Next and tick the scopes listed below, and no others: Calendly fixes scopes on the app, not at sign-in",
+  "Select Create. Calendly shows the client ID, client secret and webhook signing key only once",
+]
+review = "Not required: a Production Calendly OAuth app works for every Calendly user once created. It allows one redirect URI, so dev and prod are two apps"
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "Personal access token", kind = "secret", required = true, placeholder = "eyJraWQi...", help = "Calendly > your profile menu > Developer > Personal access tokens > Generate new token: name it Jaah, tick users:read, event_types:read, scheduled_events:read, availability:read and organizations:read, then copy the token - Calendly shows it once" },
+]
+
+[test]
+method = "GET"
+path = "https://api.calendly.com/users/me"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+identity = [["resource", "email"], ["resource", "name"]]
+
+[docs]
+agent_uses = [
+  "List your event types and hand out the right scheduling link in a message or a report",
+  "Read upcoming and past booked meetings, with invitee names and answers, to prepare or follow up",
+  "Check free time before proposing a meeting slot",
+]
+prerequisites = [
+  "A Calendly account. The API is open to every plan, but organization-wide reads need an owner or admin account",
+]
+limitations = [
+  "Jaah asks for read access only: agents cannot book, cancel or reschedule meetings or change event types",
+  "Agents see the connected user's events; another member's events are visible only to an owner or admin account",
+  "Calendly scopes are fixed on the app: with your own OAuth app, the scopes you ticked there are what agents get",
+]
+troubleshooting = [
+  { symptom = "Test says Calendly rejected the personal access token (401)", fix = "The token was revoked, expired or mistyped. Generate a new one under Developer > Personal access tokens and select Replace on the secret" },
+  { symptom = "Agents get 403 Permission Denied on a read", fix = "The token or app lacks that scope. Generate a token with the scopes listed above, or add them to your own OAuth app and reconnect" },
+  { symptom = "Consent fails with invalid redirect URI", fix = "Calendly allows one redirect URI per app and it must match exactly. With your own app, set it to the redirect URI shown on this page" },
+  { symptom = "The secret shows Needs reconnect", fix = "The user disconnected Jaah in Calendly or the grant was revoked. Select Reconnect" },
+]
+faq = [
+  { q = "Can agents book meetings for me", a = "No. Jaah connects with read-only scopes; agents share your scheduling link instead" },
+  { q = "Does a token from the old Integrations page work", a = "Yes, but a token from Developer > Personal access tokens lets you choose its scopes, which is safer" },
+]

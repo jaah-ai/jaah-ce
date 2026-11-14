@@ -9,7 +9,9 @@
  *   · the switching tab posts on `BroadcastChannel('jaah-session')`, so the others learn at once instead
  *     of on their next request.
  * Either one raises `ORG_SWITCHED_EVENT`, which `components/StaleTabDialog.tsx` turns into a blocking
- * "reload" dialog.
+ * "reload" dialog, and marks the tab LEFT BEHIND (`tabLeftBehind`): the choke point (`net/send.ts`) then sends
+ * nothing more and holds every request — the refused one included — until the session acts as this tab's org
+ * again (switched back) or the tab reloads, so no page ever shows the refusal as its own error.
  *
  * The pin comes ONLY from a live identity answer (`auth.tsx`), never the localStorage snapshot: the
  * snapshot is shared by every tab, so after a switch it already names the NEW org. Until the first live
@@ -32,9 +34,17 @@ export const ORG_SWITCHED = 'org_switched'
 /** Who the session acts as now, as the API's 409 or the switching tab's broadcast names it. */
 export type ActiveOrg = { id: string; name: string }
 
-type SessionMessage = { type: typeof ORG_SWITCHED; org: ActiveOrg }
+/** Another tab of this browser now holds a different signed-in identity (`auth.tsx`). */
+export const SESSION_CHANGED = 'session_changed'
+export const SESSION_CHANGED_EVENT = 'jaah:session-changed'
+
+type SessionMessage = { type: typeof ORG_SWITCHED; org: ActiveOrg } | { type: typeof SESSION_CHANGED }
 
 const tabOrgId = createExternalStore<string | null>(null)
+/** The org the session now acts as, while it is not this tab's own; null while this tab is current. */
+const switchedTo = createExternalStore<ActiveOrg | null>(null)
+/** Bumped by every org-switch signal: a refusal sent before the latest one may name an org the session has left. */
+let switchSignals = 0
 let channel: BroadcastChannel | null = null
 
 export const tabOrg = (): string | null => tabOrgId.get()
@@ -43,6 +53,7 @@ export const tabOrg = (): string | null => tabOrgId.get()
 export function pinTabOrg(orgId: string | null | undefined): void {
   listen()
   tabOrgId.set(orgId || null)
+  if (switchedTo.get()?.id === orgId) switchedTo.set(null)
 }
 
 /** The pinned org as React state: a stream opened before the pin reopens with `?org=` once it lands. */
@@ -78,15 +89,44 @@ export function withOrgParam(path: string): string {
  *  listener closes its dialog rather than opens it — compare against `tabOrg()`. */
 export function raiseOrgSwitched(org: ActiveOrg): void {
   if (typeof window === 'undefined' || tabOrgId.get() === null) return
+  switchSignals += 1
+  switchedTo.set(org.id === tabOrgId.get() ? null : org)
   window.dispatchEvent(new CustomEvent<ActiveOrg>(ORG_SWITCHED_EVENT, { detail: org }))
 }
 
-/** Read a 409 body; raises the event when it is the stale-tab refusal. */
-export function noticeOrgSwitched(status: number, body: unknown): void {
-  if (status !== 409 || !body || typeof body !== 'object') return
+/** The org a 409 body names when it is the stale-tab refusal, else null. Read by the choke point alone
+ *  (`net/send.ts`), which raises it unless a newer signal came first (`switchSignalCount`). */
+export function orgSwitchRefusal(status: number, body: unknown): ActiveOrg | null {
+  if (status !== 409 || !body || typeof body !== 'object') return null
   const { detail, active_org: active } = body as { detail?: unknown; active_org?: unknown }
-  if (detail !== ORG_SWITCHED || !isActiveOrg(active)) return
-  raiseOrgSwitched(active)
+  return detail === ORG_SWITCHED && isActiveOrg(active) ? active : null
+}
+
+/** How many org-switch signals this tab has heard: compared across a request, it says whether a newer one landed. */
+export const switchSignalCount = (): number => switchSignals
+
+/** Has an org switch in another tab left this one behind (module header)? */
+export const tabLeftBehind = (): boolean => switchedTo.get() !== null
+
+/** `tabLeftBehind` as React state: the event stream closes while it holds and reopens once it does not. */
+export function useTabLeftBehind(): boolean {
+  return useExternalStore(switchedTo, org => org !== null)
+}
+
+/** Resolves once this tab is current (at once when it is); rejects with `signal`'s reason if it aborts first. */
+export function whenTabCurrent(signal?: AbortSignal | null): Promise<void> {
+  if (!tabLeftBehind()) return Promise.resolve()
+  if (signal?.aborted) return Promise.reject(signal.reason)
+  return new Promise((resolve, reject) => {
+    const onAbort = () => { stop(); reject(signal?.reason) }
+    const stop = switchedTo.subscribe(() => {
+      if (tabLeftBehind()) return
+      stop()
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    })
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 /** The switching tab's half: every OTHER tab of this browser hears it (a channel never echoes to its poster). */
@@ -101,6 +141,18 @@ export function announceOrgSwitch(org: OrgRef | ActiveOrg): void {
   }
 }
 
+/** The tab whose signed-in identity just changed tells the others: their relay socket holds the old cookie
+ *  (`net/relay.ts`). */
+export function announceSessionChanged(): void {
+  try {
+    const out = new BroadcastChannel(SESSION_CHANNEL)
+    out.postMessage({ type: SESSION_CHANGED } satisfies SessionMessage)
+    out.close()
+  } catch {
+    /* No BroadcastChannel: nothing to tell. */
+  }
+}
+
 function listen(): void {
   if (channel || typeof BroadcastChannel === 'undefined') return
   try {
@@ -109,8 +161,9 @@ function listen(): void {
     return
   }
   channel.onmessage = (evt: MessageEvent<unknown>) => {
-    const data = evt.data as Partial<SessionMessage> | null
+    const data = evt.data as { type?: unknown; org?: unknown } | null
     if (data?.type === ORG_SWITCHED && isActiveOrg(data.org)) raiseOrgSwitched(data.org)
+    if (data?.type === SESSION_CHANGED && typeof window !== 'undefined') window.dispatchEvent(new Event(SESSION_CHANGED_EVENT))
   }
 }
 
@@ -124,6 +177,8 @@ function isActiveOrg(v: unknown): v is ActiveOrg {
 /** Test seam: forget the pin and the channel. */
 export function resetTabOrgForTest(): void {
   tabOrgId.reset()
+  switchedTo.reset()
+  switchSignals = 0
   channel?.close()
   channel = null
 }

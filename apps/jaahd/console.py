@@ -20,6 +20,7 @@ try:
 except ImportError:  # Windows: the console bridge is ConPTY (console_pty)
     fcntl = None
 import functools
+import glob
 import json
 import logging
 import os
@@ -31,8 +32,10 @@ import re
 import secrets
 import shlex
 import shutil
+import stat
 import struct
 import subprocess
+import tempfile
 import sys
 try:
     import termios
@@ -169,6 +172,20 @@ _FRAME_TYPE_PASTE_DATA = 3
 # "Copy pane text", empty payload: the daemon captures the pane's history as plain text and has tmux hand it
 # to THIS PTY's client as OSC 52 (`_copy_pane_to_client`), which the browser's clipboard addon already reads.
 _FRAME_TYPE_COPY_PANE = 4
+# The pane's keepalive (a zero-length INPUT frame) and this daemon's answer to it on a BROWSER-facing socket: the
+# same empty binary frame the CP relay sends (`apps/api/app/console_relay/server.py::KEEPALIVE_ACK`), so a direct
+# pane that hears nothing for its silence bound knows the socket is dead. Advertised in the direct hello's ack
+# (`console_direct.py`, `"acks"`), so a pane never watches a daemon that predates it. A relay-facing socket gets
+# none: the relay answers the browser itself.
+KEEPALIVE_FRAME = bytes([_FRAME_TYPE_INPUT, 0, 0])
+KEEPALIVE_ACK = b""
+# The CP relay's probe of a RELAY-facing socket: its server sends no WebSocket pings, so it asks in-band after 20s of
+# silence and drops the leg when no answer comes (`apps/api/app/console_relay/server.py::RELAY_PING_FRAME`). A
+# zero-length frame of its own type, answered with KEEPALIVE_ACK (the relay drops empty node frames) and NEVER applied
+# to the PTY or its activity clock, so probing a leg keeps no idle session alive. A daemon that predates it never
+# answers, and the relay never arms its watch for one.
+_FRAME_TYPE_RELAY_PING = 5
+RELAY_PING_FRAME = bytes([_FRAME_TYPE_RELAY_PING, 0, 0])
 # How long a PTY's size must hold still before its client is redrawn (`_redraw_client`). The browser
 # already debounces its refits (ConsoleTerminal.tsx's PANEL_REFIT_DEBOUNCE_MS); this coalesces what is left.
 _RESIZE_SETTLE_SECONDS = 0.3
@@ -603,14 +620,6 @@ def console_config_dir(raw: object) -> str | None:
     return stripped or None
 
 
-def console_securestorage_dir(raw: object) -> str | None:
-    """THE ONE READING of a control-plane frame's `securestorage_dir` — the CP's view of the account's token
-    store — for both transports. Forwarded to `clauded_wt.py`, which no longer reads it: the node resolves
-    the store itself (`shared_storage.securestorage_dir`). Delegates, so the two fields cannot disagree on
-    normalisation; blank reads as absent."""
-    return console_config_dir(raw)
-
-
 def console_provider(raw: object) -> str | None:
     """THE ONE READING of a frame's `provider` (`accounts.provider` of the account a create runs on), for
     both transports. Absent (an older CP) is None, and `clauded_wt.py` then opens the catalogue default;
@@ -697,7 +706,6 @@ def resolve_or_create_console_target(
     # only. Every production caller passes it explicitly.
     create: bool = False,
     node_id: str = "", config_dir: str | None = None, session: str | None = None,
-    securestorage_dir: str | None = None,
     provider: str | None = None, api_key_account: str | None = None, bedrock: str | None = None,
     path: str | None = None, guard_project: int | None = None,
 ) -> tuple[str | None, str | None, bool]:
@@ -713,9 +721,9 @@ def resolve_or_create_console_target(
     call off the event loop. Always a live tmux query (never the cached `tmux_target`), and a FAILED query
     is INDETERMINATE_ERROR, never "no live session". `node_id` scopes the slot lookup to this node.
     `config_dir` is the account a create runs on (the CP names it; refused without one), unread on
-    attach. `securestorage_dir` is the CP's view of its token store, forwarded and unread
-    (`console_securestorage_dir`). `api_key_account` is the other kind of account: its slug, standing in for
-    `config_dir` (an API-key account has none), and `provider` is whose CLI the tab opens; both the CP's.
+    attach (`clauded_wt.py` resolves its token store itself). `api_key_account` is the other kind of
+    account: its slug, standing in for `config_dir` (an API-key account has none), and `provider` is whose
+    CLI the tab opens; both the CP's.
     `bedrock` is the third kind: the Jaah-account block (`console_bedrock`), standing in for both.
     `path` is the slot's path as the CP sent it in `console_open`; absent, it is looked up from the CP.
     `guard_project` is the Architectural Guard stanza's project (`console_guard`): a create then writes the rule
@@ -768,8 +776,7 @@ def resolve_or_create_console_target(
         # ── CREATE, WITHOUT TAKING A HOLD ──────────────────────────────────────────────────────────
         # Only the CP may lease, release or command a slot. Any slot, free or held — the operator's call. The claim
         # that protects the tree is made CP-side before this frame (`routes/console.py::
-        # _claim_slot_for_console_user`); the release is the tab's `role="user"` `/exit` hook
-        # (`clauded_wt.py`). ACCEPTED RESIDUAL: an agent whose window is outside the fleet session reads
+        # _claim_slot_for_console_user`); the tab itself releases nothing. ACCEPTED RESIDUAL: an agent whose window is outside the fleet session reads
         # as absent, so a first dial spawns a second; `attach_only` on reconnect keeps it to one click.
         if not config_dir and not api_key_account and not bedrock:
             # The CP named no account: refuse rather than open on the unauthenticated default.
@@ -789,13 +796,11 @@ def resolve_or_create_console_target(
             )
             return None, "too many sessions opened in this worktree recently — try again later", False
         # A new session starts here, so a multi-repo slot converges to the project's repositories first
-        # (`slot_repos.converge_for_console`: free or user-held slots only; never raises).
+        # (`slot_repos.converge_for_console`: free slots only; never raises).
         import slot_repos  # noqa: PLC0415 — deferred: only a create converges
 
         slot_repos.converge_for_console(project, number, node_id)
         launcher = str(repo_root / "apps" / "jaahd" / "clauded_wt.py")
-        # The CP's view of the token store, forwarded and unread (`clauded_wt.py` resolves it); never empty.
-        secure_flag = ("--securestorage-dir", securestorage_dir) if securestorage_dir else ()
         # The account: a config dir, or an API-key account's slug (whose key the tab's `apiKeyHelper`
         # fetches per request). The provider rides along only when named, so an older CP's argv is unchanged.
         account_flag = (("--bedrock-plan", bedrock) if bedrock
@@ -807,13 +812,8 @@ def resolve_or_create_console_target(
         guard_flag = ("--guard-env", json.dumps(guard_env, sort_keys=True)) if guard_env else ()
         # `sys.executable`, not a bare "python3", so the launcher cannot land on a different python.
         # `--session` carries the session RESOLVED ABOVE; the launcher must not re-derive it.
-        argv = (
-            (sys.executable, launcher, *account_flag, *secure_flag, *provider_flag, *guard_flag,
-             "--session", fleet_session, project)
-            if str(number) == "0" else
-            (sys.executable, launcher, *account_flag, *secure_flag, *provider_flag, *guard_flag,
-             "--session", fleet_session, project, str(number))
-        )
+        argv = (sys.executable, launcher, *account_flag, *provider_flag, *guard_flag,
+                "--session", fleet_session, project, str(number))
         # A Jaah tab may converge its home's managed layer first (`clauded_wt.py`), whose offline pass has
         # its own longer budget; every other tab keeps the old one.
         created = _console_run(*argv, timeout=90 if bedrock else 20)
@@ -833,7 +833,8 @@ def resolve_or_create_console_target(
 # coupled. The slot console attaches through one too (`_create_console_session`).
 
 # `prefix None` IS LOAD-BEARING: without it `C-b n` re-points a tile's session at another window and
-# resizes fight through TIOCSWINSZ. `prefix`/`prefix2` are SESSION options, so nothing else is affected.
+# resizes fight through TIOCSWINSZ — and `C-b :` is a command prompt on the fleet server (`_VIEW_LOCK_OPTIONS`).
+# `prefix`/`prefix2`/`key-table` are SESSION options, so nothing else is affected.
 
 # Deliberately no `resize-window`/`refresh-client -C`/`window-size`: that would resize for EVERY viewer. A
 # plain `refresh-client -t <client>` only redraws one client (`_redraw_client`).
@@ -1100,6 +1101,8 @@ def _create_grouped_session(
         return None, None, _create_failure(
             created, f"could not open {label}", what="tmux new-session -t",
         )
+    if any(option == "key-table" for option, _ in fatal_options):
+        _install_view_key_table(socket)
     for option, value in fatal_options:
         result = _console_run(
             *session_user.tmux_cmd(socket, "set-option", "-t", name, option, value), timeout=10,
@@ -1116,7 +1119,7 @@ def _create_grouped_session(
         if applied["exit_code"] != 0:
             log.warning(
                 "console: could not set %s on %s (%s) — the attach proceeds without it; what each one "
-                "costs is at `_TILE_OPTIONS` / `_CONSOLE_OPTIONS`",
+                "costs is at `_TILE_OPTIONS`",
                 option, name, applied["stderr"].strip() or "no stderr",
             )
     target = f"{name}:{window}"
@@ -1128,11 +1131,91 @@ def _create_grouped_session(
             selected, f"could not select window {window} — it may have just closed",
             what="tmux select-window",
         )
+    if any(option == "key-table" for option, _ in fatal_options):
+        _guard_view_session(socket, name, target)
     return name, target, None
 
 
-# A TILE's presentation. The prefix is FATAL: a working `C-b n` would re-point the tile's session.
-_TILE_FATAL_OPTIONS = (("prefix", "None"), ("prefix2", "None"))
+# THE VIEWER LOCK. A browser viewer's keys and clicks reach tmux through the DAEMON's own client, and tmux
+# runs what a binding names AS THAT CLIENT: the default tables give anyone at the keyboard `C-b :` (a command
+# prompt on the fleet server: `send-keys` into another runner's window, `run-shell`, `detach-client -E <cmd>`)
+# and right-click menus (kill/respawn/split). So every session a viewer attaches through — slot console, tile,
+# layout grid — runs `prefix`/`prefix2` None and its own `key-table`: tmux looks a key up there instead of
+# `root`, and a key the table does not bind goes to the pane. The table is server-global by NAME but only
+# sessions that set `key-table` to it use it, so the fleet session and `jaah tmux` operators keep root/prefix.
+# It binds the mouse only, nothing that opens a prompt, menu, shell or another session: click to focus a pane
+# (the grid forwards it to the tile), click/wheel on the status line to switch window (a tile's window list),
+# drag and wheel into copy-mode (the browser's drag-to-copy and scroll ride it). Copy-mode's own tables stay
+# tmux's: shared with operators, and their prompts are fixed `send-keys -X` templates whose input tmux quotes.
+# The pane modes with NO key table (tree, client, buffer, customize — an operator's `C-b w`) hand every key
+# to the mode with the viewer's client, so `:` there is a prompt and Enter a `switch-client` onto the live-
+# prefix session: `_VIEW_MODE_GUARD` cancels such a mode on any pane a viewer is looking at.
+VIEW_KEY_TABLE = "jaah-view"
+_IN_APP_OR_MODE = "#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}"
+# The pane modes with no key table of their own (see `_VIEWED_KEYLESS_MODE`).
+_KEYLESS_MODE = "#{m/r:^(tree|client|buffer|options)-mode$,#{pane_mode}}"
+_VIEW_KEY_BINDINGS = (
+    # Clicking a pane left in a key-table-less mode cancels the mode before it can take the viewer's keys.
+    ("MouseDown1Pane", ("if-shell", "-F", "-t", "=", _KEYLESS_MODE,
+                        "copy-mode -q -t = ; select-pane -t =", "select-pane -t = ; send-keys -M")),
+    ("MouseDown1Status", ("switch-client", "-t", "=")),
+    ("WheelUpStatus", ("previous-window",)),
+    ("WheelDownStatus", ("next-window",)),
+    ("MouseDrag1Pane", ("if-shell", "-F", _IN_APP_OR_MODE, "send-keys -M", "copy-mode -M")),
+    ("WheelUpPane", ("if-shell", "-F", _IN_APP_OR_MODE, "send-keys -M", "copy-mode -e")),
+)
+# FATAL on every viewer session: an attach without them is the open command prompt above.
+_VIEW_LOCK_OPTIONS = (("prefix", "None"), ("prefix2", "None"), ("key-table", VIEW_KEY_TABLE))
+# True on a pane in a key-table-less mode that a viewer session is showing; `copy-mode -q` cancels any mode
+# (a `send-keys q` from outside a hook does not reach a tree mode).
+# `_VIEW_MODE_HOOKS` catch a mode opened under a viewer or a moded pane turning active,
+# `session-window-changed` (the view session's own) a viewer clicking onto a window, `MouseDown1Pane` a
+# viewer clicking a moded pane, and the create a viewer arriving. The cost: `C-b w` on a window a browser is
+# showing closes at once; operators keep `C-b n`/`p`/digits and the status line.
+_VIEWED_KEYLESS_MODE = (
+    f"#{{&&:{_KEYLESS_MODE},#{{m:*{EPHEMERAL_VIEW_SESSION_PREFIX}*,#{{window_active_sessions_list}}}}}}"
+)
+_VIEW_MODE_GUARD = ("if-shell", "-F", _VIEWED_KEYLESS_MODE, "copy-mode -q")
+# Server-wide, each in its own array slot so a host hook survives: a mode opened on a viewed window's active
+# pane, and a pane left in one becoming the active pane (the viewer's own click is `MouseDown1Pane`'s).
+_VIEW_MODE_HOOKS = ("pane-mode-changed[7]", "window-pane-changed[7]")
+
+
+def _install_view_key_table(socket: str) -> None:
+    """(Re)define `VIEW_KEY_TABLE` and the server-wide `_VIEW_MODE_GUARD` hook on `socket`'s server: one
+    chain, idempotent, the table emptied first so it holds exactly `_VIEW_KEY_BINDINGS`. Best-effort — a table
+    that failed to install is EMPTY, which forwards every key to the pane and loses only the mouse."""
+    first_key, first_command = _VIEW_KEY_BINDINGS[0]
+    argv: list[str] = [
+        # `unbind-key -a` on a table that does not exist yet aborts the chain, so one binding creates it.
+        "bind-key", "-T", VIEW_KEY_TABLE, first_key, *first_command, ";",
+        "unbind-key", "-a", "-T", VIEW_KEY_TABLE, ";",
+    ]
+    for hook in _VIEW_MODE_HOOKS:
+        argv += [";", "set-hook", "-g", hook, shlex.join(_VIEW_MODE_GUARD)]
+    for key, command in _VIEW_KEY_BINDINGS:
+        argv += [";", "bind-key", "-T", VIEW_KEY_TABLE, key, *command]
+    result = _console_run(*session_user.tmux_cmd(socket, *argv), timeout=10)
+    if result["exit_code"] != 0:
+        log.warning("console: could not install the %s key table on %s (%s) — viewers keep keys, lose the "
+                    "mouse", VIEW_KEY_TABLE, socket or "(default socket)", result["stderr"].strip() or "no stderr")
+
+
+def _guard_view_session(socket: str, name: str, target: str) -> None:
+    """The per-session half of `_VIEW_MODE_GUARD`: the hook for a viewer switching window, and one check now
+    for a viewer arriving on a pane already in such a mode. Best-effort, like the server-wide hook."""
+    result = _console_run(*session_user.tmux_cmd(
+        # Indexed: an unindexed `set-hook` replaces the whole array, so it would drop `_CONSOLE_PIN_HOOK`.
+        socket, "set-hook", "-t", name, "session-window-changed[0]", shlex.join(_VIEW_MODE_GUARD),
+        ";", "if-shell", "-F", "-t", target, _VIEWED_KEYLESS_MODE, f"copy-mode -q -t {shlex.quote(target)}",
+    ), timeout=10)
+    if result["exit_code"] != 0:
+        log.warning("console: could not guard %s against key-table-less pane modes (%s)",
+                    name, result["stderr"].strip() or "no stderr")
+
+
+# A TILE's presentation: the viewer lock (a working `C-b n` would also re-point the tile's session).
+_TILE_FATAL_OPTIONS = _VIEW_LOCK_OPTIONS
 
 # THE DRIFT CHANNEL, best-effort: a grouped session's pointer can MOVE (window killed, renamed,
 # `switch-client`), and `set-titles` pushes `#{window_id} #{window_name}` as OSC 0 on the PTY stream the
@@ -1144,9 +1227,27 @@ _TILE_OPTIONS = (
     ("status-left", ""),
 )
 
-# A SLOT CONSOLE's: the prefix STAYS (a full terminal; on its own session `C-b` moves only this viewer),
-# `set-titles` stays off (the browser labels a console from its slot), `status-left` blanked as above.
-_CONSOLE_OPTIONS = (("status-left", ""),)
+# A SLOT CONSOLE's presentation: the viewer lock (`_VIEW_LOCK_OPTIONS`) and the pin below, both fatal;
+# `set-titles` stays off (the browser labels a console from its slot).
+#
+# THE SLOT PIN. A slot console's grouped session shares the node's WHOLE window list, so its status line
+# would show (and, under `mouse on`, click or wheel onto) every runner's window on the node — another
+# project's included. A slot console is granted ONE window: `status off` is fatal (no list to read or
+# click), and `_pin_console_window` detaches the viewer the moment the session lands on any other window
+# (its window closed, or a switch from outside), which ends the PTY. Tiles keep their status line: their
+# window list is what the viewer was authorised for.
+_CONSOLE_PIN_OPTIONS = (("status", "off"),)
+# Its own slot of the `session-window-changed` array: `_guard_view_session` holds slot 0, indexed too.
+_CONSOLE_PIN_HOOK = "session-window-changed[1]"
+
+
+def _pin_console_window(socket: str, name: str, window: str) -> dict:
+    """Detach every client of console session `name` once its current window is not `window`. Returns the
+    `set-hook` result. Blocking — executor only."""
+    detach = shlex.join(("detach-client", "-s", f"={name}"))
+    guard = shlex.join(("if-shell", "-F", f"#{{!=:#{{window_id}},{window}}}", detach))
+    return _console_run(*session_user.tmux_cmd(socket, "set-hook", "-t", name, _CONSOLE_PIN_HOOK, guard),
+                        timeout=10)
 
 
 def _create_view_session(
@@ -1166,38 +1267,97 @@ def _create_view_session(
 def _create_console_session(
     socket: str, base: str, name: str, window: str,
 ) -> tuple[str | None, str | None, str | None]:
-    """The grouped session ONE SLOT CONSOLE attaches through — see `_CONSOLE_OPTIONS` for what it does
-    NOT set, and `_create_grouped_session` for what being on its own session buys the viewer.
+    """The grouped session ONE SLOT CONSOLE attaches through, locked and pinned to `window` — see
+    `_CONSOLE_PIN_OPTIONS`, and `_create_grouped_session` for what being on its own session buys the viewer.
 
     `base` is the session the target RESOLVED to, never the node default: a CP-named session can have a
     pre-switch copy on the daemon's own server, and a default base would attach a different window."""
-    return _create_grouped_session(
-        socket, base, name, window, label=f"an isolated attach to {window}",
-        best_effort_options=_CONSOLE_OPTIONS,
+    label = f"an isolated attach to {window}"
+    created, target, error = _create_grouped_session(
+        socket, base, name, window, label=label,
+        fatal_options=_VIEW_LOCK_OPTIONS + _CONSOLE_PIN_OPTIONS,
     )
+    if error is not None:
+        return created, target, error
+    # After the select, so the session is on `window` before the pin starts watching it.
+    pinned = _pin_console_window(socket, name, window)
+    if pinned["exit_code"] != 0:
+        _kill_view_session(socket, name)
+        return None, None, _create_failure(pinned, f"could not pin {label}", what="tmux set-hook")
+    return created, target, None
+
+
+# The grid's own server when the fleet server is isolated (`session_user.fleet_isolated`): a tile pane runs a
+# nested CLIENT of the fleet server, and on the fleet server a pane is `jaah`, which it no longer admits. So
+# the grid lives on a server of the DAEMON's own, its panes are the daemon's nested clients, and
+# `console-grid-tmux.conf` takes every key binding away from the viewer — no prefix, no command prompt, no
+# menu, only the mouse forwarded — so the grid never runs a command for them. Its socket is in a private
+# directory under the sticky temp dir, never under `TMUX_TMPDIR`: that one is group-writable by the session
+# user, who could put a server of its own where the daemon connects (and a server can make its client read and
+# write files as the daemon).
+_GRID_SOCKET_NAME = "console-grid"
+_GRID_DIR_PREFIX = "jaah-console-grid-"
+_GRID_TMUX_CONF = str(Path(__file__).resolve().parent / "console-grid-tmux.conf")
+_GRID_DIR: list[str] = []
+
+
+def _grid_socket(fleet: str) -> str:
+    """Where a layout's grid lives: FLEET itself unless the fleet server is isolated, else the daemon's own
+    grid server, in a 0700 directory this process made (`_GRID_DIR`)."""
+    if not session_user.fleet_isolated():
+        return fleet
+    if not _GRID_DIR:
+        _GRID_DIR.append(tempfile.mkdtemp(prefix=_GRID_DIR_PREFIX))
+    return os.path.join(_GRID_DIR[0], _GRID_SOCKET_NAME)
+
+
+def _grid_sockets() -> list[str]:
+    """Every grid server socket this uid owns — this process's and an earlier daemon's — for the reaper. A
+    directory counts only when it is this uid's and closed to others."""
+    found = []
+    for directory in glob.glob(os.path.join(tempfile.gettempdir(), f"{_GRID_DIR_PREFIX}*")):
+        try:
+            info = os.lstat(directory)
+        except OSError:
+            continue
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o077:
+            path = os.path.join(directory, _GRID_SOCKET_NAME)
+            if os.path.exists(path):
+                found.append(path)
+    return found
+
+
+def _client_socket(session: "_Session") -> str | None:
+    """The server this PTY's own client is attached to: a layout's grid server, else `view_socket`."""
+    return session.grid_socket if session.grid_socket is not None else session.view_socket
 
 
 def _layout_pane_command(socket: str, tile_session: str) -> str:
     """The shell command one tile's PANE runs: a nested tmux client on that tile's grouped session.
 
     `env -u TMUX` is not optional: tmux refuses `attach` when `$TMUX` is set, which it is in every pane."""
-    return shlex.join(["env", "-u", "TMUX", *session_user.tmux_cmd(socket, "attach", "-t", f"={tile_session}")])
+    return shlex.join(["env", "-u", "TMUX", *session_user.tmux_attach_cmd(socket, "attach", "-t", f"={tile_session}")])
 
 
 def _create_layout_session(
     socket: str, tree: _LayoutNode, tile_sessions: dict[str, str], name: str, *, rows: int, cols: int,
+    grid_socket: str | None = None,
 ) -> tuple[str | None, str | None]:
     """(attach_target, error) — build the tmux window whose PANES are this layout's tiles.
 
     Nothing here touches `fleet`. `-l <n>%` sizes the pane tmux CREATES (the second child), so the model's
     first-child share is inverted exactly here. `remain-on-exit on` guards the layout: an exited pane
-    would otherwise be removed and tmux would re-flow the grid. Blocking — executor only."""
+    would otherwise be removed and tmux would re-flow the grid. The grid is built on GRID_SOCKET (default
+    SOCKET, the tiles' server; `_grid_socket`). Blocking — executor only."""
     windows = layout_windows(tree)
+    tiles, socket = socket, (socket if grid_socket is None else grid_socket)
+    # A grid server of its own starts with the locked-down configuration (ignored by a running server).
+    config = ("-f", _GRID_TMUX_CONF) if socket != tiles else ()
     first = _console_run(
         *session_user.tmux_cmd(
-            socket, "new-session", "-d", "-s", name, "-n", _LAYOUT_WINDOW,
+            socket, *config, "new-session", "-d", "-s", name, "-n", _LAYOUT_WINDOW,
             "-x", str(cols), "-y", str(rows), "-P", "-F", "#{pane_id}",
-            _layout_pane_command(socket, tile_sessions[windows[0]]),
+            _layout_pane_command(tiles, tile_sessions[windows[0]]),
         ),
         timeout=10,
     )
@@ -1218,10 +1378,11 @@ def _create_layout_session(
         _kill_view_session(socket, name)
         return None, "tmux reported the layout grid was created but named no pane"
 
+    _install_view_key_table(socket)
     for option, value, fatal in (
-        # Fatal: a live prefix would let `C-b "` split a tile into something no stored layout describes.
-        ("prefix", "None", True),
-        ("prefix2", "None", True),
+        # Fatal: the viewer lock (`_VIEW_LOCK_OPTIONS`) — and a live prefix would let `C-b "` split a tile
+        # into something no stored layout describes.
+        *((option, value, True) for option, value in _VIEW_LOCK_OPTIONS),
         # The outer status bar would print the session token over the grid; tiles carry their own.
         ("status", "off", False),
         # Mouse at both layers: the outer selects the tile and forwards (`send-keys -M`) to the inner.
@@ -1244,7 +1405,7 @@ def _create_layout_session(
             option, name, result["stderr"].strip() or "no stderr",
         )
 
-    error = _build_layout_panes(socket, tree, root_pane, tile_sessions)
+    error = _build_layout_panes(socket, tree, root_pane, tile_sessions, tiles=tiles)
     if error is not None:
         _kill_view_session(socket, name)
         return None, error
@@ -1262,7 +1423,7 @@ def _create_layout_session(
 
 
 def _build_layout_panes(
-    socket: str, node: _LayoutNode, pane: str, tile_sessions: dict[str, str],
+    socket: str, node: _LayoutNode, pane: str, tile_sessions: dict[str, str], *, tiles: str | None = None,
 ) -> str | None:
     """Split `pane` — which currently occupies exactly `node`'s rectangle — until the tree is realized.
     Returns None on success, or the error to report.
@@ -1272,12 +1433,13 @@ def _build_layout_panes(
     if isinstance(node, _LayoutTile):
         return None
     window = layout_windows(node.second)[0]
+    tiles = socket if tiles is None else tiles
     created = _console_run(
         *session_user.tmux_cmd(
             socket, "split-window", "-t", pane,
             "-h" if node.horizontal else "-v",
             "-l", f"{100 - node.percent}%", "-d", "-P", "-F", "#{pane_id}",
-            _layout_pane_command(socket, tile_sessions[window]),
+            _layout_pane_command(tiles, tile_sessions[window]),
         ),
         timeout=10,
     )
@@ -1288,10 +1450,10 @@ def _build_layout_panes(
     new_pane = created["stdout"].strip()
     if not new_pane:
         return f"tmux split the grid for {window} but named no pane"
-    error = _build_layout_panes(socket, node.first, pane, tile_sessions)
+    error = _build_layout_panes(socket, node.first, pane, tile_sessions, tiles=tiles)
     if error is not None:
         return error
-    return _build_layout_panes(socket, node.second, new_pane, tile_sessions)
+    return _build_layout_panes(socket, node.second, new_pane, tile_sessions, tiles=tiles)
 
 
 class _ViewSessionReaper:
@@ -1340,7 +1502,8 @@ class _ViewSessionReaper:
         now = time.monotonic()
         killed: list[str] = []
         seen: set[str] = set()
-        for socket in session_user.manage_sockets():
+        sockets = session_user.manage_sockets()
+        for socket in [*sockets, *(grid for grid in _grid_sockets() if grid not in sockets)]:
             result = _console_run(
                 *session_user.tmux_cmd(socket, "list-sessions", "-F", "#{session_name}\t#{session_attached}"),
                 timeout=5, stdout_limit=None,
@@ -1385,10 +1548,40 @@ def _attach_command(tmux_target: str, socket: str | None = None, read_only: bool
     sockets = [socket] if socket is not None else session_user.manage_sockets()
     flags = ("-r",) if read_only else ()
     attaches = [
-        shlex.join(session_user.tmux_cmd(each, "attach", *flags, "-t", tmux_target))
+        shlex.join(session_user.tmux_attach_cmd(each, "attach", *flags, "-t", tmux_target))
         for each in sockets
     ]
     return " || ".join([*attaches[:-1], f"exec {attaches[-1]}"])
+
+
+# Run as a script, never imported here: it is POSIX-only (termios, fcntl) and this module imports on Windows.
+_CLIENT_RELAY_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "console_client_relay.py")
+
+
+def _client_relay_argv(tmux_target: str, socket: str | None, read_only: bool) -> list[str] | None:
+    """The PTY child's argv when the viewer's tmux client must not be this daemon (`console_client_relay`), or
+    None for the plain attach.
+
+    Decided PER SOCKET: the attach is relayed when it may land on the session user's own server
+    (`legacy_fleet_socket` — the fleet server when not isolated, the draining one when isolated), since every
+    process of that uid can connect and send `detach-client -E`, which execs as the client's uid. The isolated
+    socket admits no session-user process, and the daemon's own (grid) server is its own uid.
+
+    Fails closed: with no session gid to hand the pty to, the spawn is refused rather than attached as us."""
+    if not session_user.switch_needed():
+        return None
+    reachable = session_user.legacy_fleet_socket()
+    sockets = [socket] if socket is not None else session_user.manage_sockets()
+    if not reachable or reachable not in sockets:
+        return None
+    gid = session_user.session_gid()
+    if gid is None:
+        raise OSError(f"cannot relay the console client on {reachable}: no group for {session_user.session_user()!r}")
+    config = {
+        "sockets": sockets, "relay_socket": reachable, "target": tmux_target, "read_only": read_only,
+        "group": gid, "new_session": session_user.new_session_cmd(),
+    }
+    return [sys.executable, "-I", _CLIENT_RELAY_SCRIPT, json.dumps(config)]
 
 
 def _spawn_console_pty(
@@ -1397,19 +1590,24 @@ def _spawn_console_pty(
     """Fork a child running `tmux attach -t <tmux_target>` on a new PTY. Returns (pid, master_fd).
 
     `pty.fork` is what gives `_close_session` an fd to close and a pid to `waitpid` — the mechanics
-    detach-never-kill is built on — so the attaching CLIENT runs as `jaahd` while everything behind the
-    attach was forked by the `jaah`-owned server. `_start_stdout_pump` owns the blocking mode.
+    detach-never-kill is built on. On a server the session user can reach the child is only a byte pump and the
+    attaching CLIENT runs as that server's uid (`_client_relay_argv`); elsewhere the child is the client.
+    `_start_stdout_pump` owns the blocking mode.
 
     Windows has no pty: `_spawn_console_conpty` returns `(pid, -1)` and parks the attach for `_Session`; the
     attach client itself runs in a relay pane of the fleet server (`console_pty.TmuxRelay`)."""
     if host_platform.is_windows():
         return _spawn_console_conpty(tmux_target, rows, cols, socket, read_only)
+    relay_argv = _client_relay_argv(tmux_target, socket, read_only)
+    env = _tmux_safe_env()
+    env.setdefault("TERM", "xterm-256color")
     pid, master_fd = pty.fork()
     if pid == 0:   # child
-        env = _tmux_safe_env()
-        env.setdefault("TERM", "xterm-256color")
-        os.execvpe("bash", ["bash", "-lc", _attach_command(tmux_target, socket, read_only)], env)
-        os._exit(127)   # pragma: no cover — execvpe only returns on failure
+        if relay_argv:
+            os.execve(relay_argv[0], relay_argv, env)
+        else:
+            os.execvpe("bash", ["bash", "-lc", _attach_command(tmux_target, socket, read_only)], env)
+        os._exit(127)   # pragma: no cover — exec only returns on failure
     _set_winsize(master_fd, rows, cols)
     return pid, master_fd
 
@@ -1470,7 +1668,7 @@ def _spawn_console_conpty(
     env = _tmux_safe_env()
     env.setdefault("TERM", "xterm-256color")
     attach = console_pty.ConPtyAttach.spawn(
-        session_user.tmux_cmd(sock, "attach", *flags, "-t", tmux_target), rows, cols, env,
+        session_user.tmux_attach_cmd(sock, "attach", *flags, "-t", tmux_target), rows, cols, env,
         max_pending=_STDIN_MAX_PENDING_BYTES,
     )
     _PENDING_CONPTY[attach.pid] = attach
@@ -1489,7 +1687,7 @@ def _spawn_windows_vm_console(vm_id: str, rows: int, cols: int, read_only: bool)
     command = ["env", *(f"{k}={v}" for k, v in windows.WSL_ENV.items()), console_pty._msys(windows.wsl_exe()),
                *microvm_bridge.console_argv(vm_id, read_only)]
     attach = console_pty.ConPtyAttach.spawn(
-        [*session_user.tmux_cmd(sock), console_pty.RUN, *command], rows, cols, env,
+        [*session_user.tmux_attach_cmd(sock), console_pty.RUN, *command], rows, cols, env,
         max_pending=_STDIN_MAX_PENDING_BYTES,
     )
     _PENDING_CONPTY[attach.pid] = attach
@@ -1547,19 +1745,6 @@ def _redraw_client(pid: int, view_socket: str | None) -> None:
         log.debug("console: refresh-client %s exited %s: %s", tty, result["exit_code"], result["stderr"].strip())
 
 
-def _tmux_bytes(socket: str, *args: str, stdin: bytes | None = None) -> subprocess.CompletedProcess | None:
-    """`tmux` with BYTES in and out — pane text is UTF-8 whatever this daemon's locale says, which
-    `_console_run`'s text mode would decode with. None when it could not run at all."""
-    try:
-        return subprocess.run(
-            session_user.tmux_cmd(socket, *args), input=stdin, capture_output=True, timeout=30,
-            env=_tmux_safe_env(),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.warning("console: tmux %s could not run: %s", args[0], exc)
-        return None
-
-
 def _capture_pane_tail(socket: str, pane: str) -> bytes | None:
     """The pane's whole history as text, keeping only its last `_COPY_PANE_MAX_BYTES` (plus a line's slack)
     while reading — a wide pane's 50000 lines would otherwise be held whole before the cap. None on failure."""
@@ -1590,7 +1775,8 @@ def _capture_pane_tail(socket: str, pane: str) -> bytes | None:
     return bytes(tail[-keep:]) if returncode == 0 else None
 
 
-def _copy_pane_to_client(pid: int, view_socket: str | None, layout: bool) -> str | None:
+def _copy_pane_to_client(pid: int, view_socket: str | None, layout: bool,
+                         tile_socket: str | None = None) -> str | None:
     """Put the pane this console shows on its viewer's clipboard as plain text, history included. Returns
     why it could not, or None.
 
@@ -1598,21 +1784,24 @@ def _copy_pane_to_client(pid: int, view_socket: str | None, layout: bool) -> str
     history of an inline-redrawing CLI is not. `load-buffer -w -t <client>` has tmux send the text as OSC 52
     to that one client, in order on the stream the browser already reads (`set-clipboard on`), so nothing
     is spliced into the PTY output mid-sequence. A LAYOUT's active pane is a nested client: one hop down to
-    the tile it shows. The buffer is deleted again; the clipboard keeps the copy. Blocking — executor only."""
+    the tile it shows (on TILE_SOCKET when the grid has its own server, `_grid_socket`). The buffer is deleted
+    again; the clipboard keeps the copy. Blocking — executor only."""
     client = _pty_client(pid, view_socket)
     if client is None:
         return "no tmux client is attached to this console"
     socket, tty = client
+    shown = socket
     pane = _console_run(*session_user.tmux_cmd(socket, "display-message", "-p", "-c", tty, "#{pane_id}"),
                         timeout=10)["stdout"].strip()
     if pane and layout:
         tile_tty = _console_run(*session_user.tmux_cmd(socket, "display-message", "-p", "-t", pane, "#{pane_tty}"),
                                 timeout=10)["stdout"].strip()
-        pane = _console_run(*session_user.tmux_cmd(socket, "display-message", "-p", "-c", tile_tty, "#{pane_id}"),
+        shown = socket if tile_socket is None else tile_socket
+        pane = _console_run(*session_user.tmux_cmd(shown, "display-message", "-p", "-c", tile_tty, "#{pane_id}"),
                             timeout=10)["stdout"].strip() if tile_tty else ""
     if not pane:
         return "could not find the pane this console shows"
-    captured = _capture_pane_tail(socket, pane)
+    captured = _capture_pane_tail(shown, pane)
     if captured is None:
         return "could not read the pane"
     text = captured.rstrip() + b"\n"
@@ -1620,8 +1809,10 @@ def _copy_pane_to_client(pid: int, view_socket: str | None, layout: bool) -> str
         text = text[-_COPY_PANE_MAX_BYTES:]
         text = text[text.find(b"\n") + 1:]   # start on a whole line
     buffer = f"_jaah_copy_{secrets.token_hex(4)}"
-    loaded = _tmux_bytes(socket, "load-buffer", "-w", "-b", buffer, "-t", tty, "-", stdin=text)
-    _tmux_bytes(socket, "delete-buffer", "-b", buffer)
+    # BYTES in: pane text is UTF-8 whatever this daemon's locale says, which text mode would decode with.
+    loaded = session_user.tmux_run(socket, "load-buffer", "-w", "-b", buffer, "-t", tty, "-",
+                                   input=text, text=False, timeout=30)
+    session_user.tmux_run(socket, "delete-buffer", "-b", buffer, timeout=30)
     if loaded is None or loaded.returncode != 0:
         return "could not hand the text to the console"
     return None
@@ -1683,6 +1874,9 @@ class _Session:
     # FIRST — killing it detaches the per-tile sessions — then one per tile. `_close_session` tears down all.
     owned_sessions: tuple[str, ...] = ()
     view_socket: str | None = None
+    # A LAYOUT whose grid has its own server (`_grid_socket`, when the fleet server is isolated): the grid —
+    # the first owned session — and this PTY's client live there; the tiles stay on `view_socket`.
+    grid_socket: str | None = None
     # Whether this PTY's client attached `-r`. Fixed at attach time and the PTY is shared, so a `-r`
     # session would swallow a later edit user's keys; the reverse is `_handle_stdin`'s drop.
     read_only: bool = False
@@ -1887,6 +2081,11 @@ class ConsoleBridge:
             key[0] == project and key[1] == number for key in self._opening
         )
 
+    def has_any_session(self) -> bool:
+        """Whether any Console/Term session is attached or being opened on this node — a person at work here,
+        which keeps the node's polling at its fast pace (`poll_pace`)."""
+        return bool(self._sessions) or bool(self._opening)
+
     async def stop(self) -> None:
         if self._sweep_task is not None:
             self._sweep_task.cancel()
@@ -1970,7 +2169,7 @@ class ConsoleBridge:
         if kind != "clauded":
             # `clauded` is the only kind; `routes/console.py::CONSOLE_KINDS` mirrors this set.
             return {"error": "unknown console kind"}
-        # `is None`, not `or ""`: slot 0 arrives as the integer 0. Absent is still refused.
+        # `is None`, not `or ""`: a number 0 is falsy. Absent is still refused.
         project = "" if req.get("project") is None else str(req.get("project"))
         number = "" if req.get("number") is None else str(req.get("number"))
         if not project or not number:
@@ -2030,8 +2229,6 @@ class ConsoleBridge:
                     key, rows=rows, cols=cols, attach_only=attach_only, read_only=read_only,
                     # The CP's account choice, off the frame through the shared reader.
                     config_dir=console_config_dir(req.get("config_dir")),
-                    # Its token store when SHARED; an older CP omits it, same as non-shared.
-                    securestorage_dir=console_securestorage_dir(req.get("securestorage_dir")),
                     # Whose CLI, and the API-key account standing in for `config_dir`; same readers.
                     provider=console_provider(req.get("provider")),
                     api_key_account=console_api_key_account(req.get("api_key_account")),
@@ -2079,7 +2276,6 @@ class ConsoleBridge:
     async def _resolve_session(
         self, key: ConsoleKey, *, rows: int, cols: int, attach_only: bool, read_only: bool = False,
         config_dir: str | None = None, session_name: str | None = None,
-        securestorage_dir: str | None = None,
         provider: str | None = None, api_key_account: str | None = None, bedrock: str | None = None,
         path: str | None = None, guard_project: int | None = None,
     ) -> _Session:
@@ -2142,7 +2338,6 @@ class ConsoleBridge:
                     session = await self._open_worktree_pty(
                         key, rows=rows, cols=cols, attach_only=attach_only, read_only=read_only,
                         config_dir=config_dir, session_name=session_name,
-                        securestorage_dir=securestorage_dir,
                         provider=provider, api_key_account=api_key_account, bedrock=bedrock, path=path,
                         **_guard_kw(guard_project),
                     )
@@ -2153,13 +2348,12 @@ class ConsoleBridge:
     async def _open_worktree_pty(
         self, key: ConsoleKey, *, rows: int, cols: int, attach_only: bool, read_only: bool = False,
         config_dir: str | None = None, session_name: str | None = None,
-        securestorage_dir: str | None = None,
         provider: str | None = None, api_key_account: str | None = None, bedrock: str | None = None,
         path: str | None = None, guard_project: int | None = None,
     ) -> _Session:
         """This worktree's own console PTY — resolve-or-create.
 
-        `config_dir`, `session_name` and `securestorage_dir` are the CP's choices (from the frame or the
+        `config_dir` and `session_name` are the CP's choices (from the frame or the
         direct GRANT), never the browser's."""
         project, number, kind, _ = key
         if read_only and not attach_only:
@@ -2179,7 +2373,6 @@ class ConsoleBridge:
                 self._repo_root, project, number, kind,
                 create=not attach_only,
                 node_id=self._node_id or "", config_dir=config_dir, session=session_name,
-                securestorage_dir=securestorage_dir,
                 provider=provider, api_key_account=api_key_account, bedrock=bedrock, path=path,
                 **_guard_kw(guard_project),
             ),
@@ -2198,49 +2391,51 @@ class ConsoleBridge:
                 config_dir or api_key_account or ("Jaah account" if bedrock else None),
             )
         # A grouped session, not `tmux attach -t <target>` (see `_create_grouped_session` for the
-        # coupling cost). `owned_sessions`/`view_socket` let `_close_session` tear it down; empty if unavailable.
+        # coupling cost). `owned_sessions`/`view_socket` let `_close_session` tear it down.
         isolated = await self._grouped_console_attach(target, rows=rows, cols=cols, read_only=read_only)
-        pid: int | None = None if isolated is None else isolated[0]
+        if isolated is None:
+            # Only the grouped session carries the viewer lock (`_VIEW_LOCK_OPTIONS`) and the slot pin
+            # (`_CONSOLE_PIN_OPTIONS`): a typing client on the plain attach would hold `C-b :` on the fleet server,
+            # and even a read-only (`-r`) one shares the fleet session's current window, so it would watch
+            # whichever runner's window any other client of that session moved to.
+            raise _ConsoleOpenError(
+                "could not open a locked console session for this worktree",
+                retryable=bool(_window_id_of(target)),
+            )
+        pid, master_fd, grouped, socket = isolated
         try:
-            if isolated is None:
-                pid, master_fd = await _spawn_console(target, rows, cols, read_only=read_only)
-                owned: tuple[str, ...] = ()
-                socket: str | None = None
-            else:
-                pid, master_fd, grouped, socket = isolated
-                owned = (grouped,)
             session = _Session(
                 # The RESOLVED session and window, never the grouped session's name: later opens and
                 # `_close_vanished_windows` ask about the window the viewer sees.
                 key=key, master_fd=master_fd, pid=pid, tmux_session=target.rsplit(":", 1)[0],
-                tmux_window=_window_id_of(target), owned_sessions=owned, view_socket=socket,
+                tmux_window=_window_id_of(target), owned_sessions=(grouped,), view_socket=socket,
                 read_only=read_only,
             )
         except BaseException:
             await _discard_pending_conpty(pid)
             raise
-        log.info("console attached %s (target=%s, isolated=%s)", key, target, isolated is not None)
+        log.info("console attached %s (target=%s, socket=%s)", key, target, socket)
         return session
 
     async def _grouped_console_attach(
         self, target: str, *, rows: int, cols: int, read_only: bool,
     ) -> tuple[int, int, str, str] | None:
         """(pid, master_fd, owned session, socket) for an ISOLATED attach to console target `target` — or
-        None when this node cannot give this console its own session and the caller must attach plainly.
+        None when this node cannot give this console its own session.
 
-        DEGRADES, NEVER FAILS: isolation is a latency property, so an unanswering tmux costs the
-        coupling back, not the console. The reservation spans create→attach: in between the session has
+        None REFUSES the console, read-only or not: the grouped session is what carries the viewer lock and
+        the slot pin. The reservation spans create→attach: in between the session has
         zero clients, the reaper's kill criterion."""
         loop = asyncio.get_event_loop()
         base, window = target.rsplit(":", 1)[0], _window_id_of(target)
         if not window:
-            # No `@id`: nothing to select and no liveness key; plain attach rather than a guess.
+            # No `@id`: nothing to select or pin to, and no liveness key.
             return None
         socket = await loop.run_in_executor(None, functools.partial(_console_window_socket, target))
         if socket is None:
             log.warning(
-                "console: could not name the tmux socket holding %s — attaching as a client of %s "
-                "instead, which couples this viewer's window and size to every other one", target, base,
+                "console: could not name the tmux socket holding %s — refusing rather than attaching as a "
+                "client of %s, whose window list is every runner's", target, base,
             )
             return None
         name = f"{EPHEMERAL_VIEW_SESSION_PREFIX}{secrets.token_hex(8)}"
@@ -2251,7 +2446,7 @@ class ConsoleBridge:
                     None, functools.partial(_create_console_session, socket, base, name, window),
                 )
                 if created is None or attach_target is None:
-                    log.warning("console: %s — attaching to %s without isolation",
+                    log.warning("console: %s — refusing %s rather than attaching without isolation",
                                 err or "no grouped session", target)
                     return None
                 try:
@@ -2326,7 +2521,7 @@ class ConsoleBridge:
             listed = await loop.run_in_executor(
                 None, functools.partial(microvm_client.request, "list", timeout=5.0))
         except (microvm_client.SupervisorError, OSError) as exc:
-            raise _ConsoleOpenError(f"this node's VM supervisor did not answer: {exc}", retryable=True)
+            raise _ConsoleOpenError(f"this node's VM supervisor did not answer: {exc}", retryable=True) from exc
         state = next((str(row.get("state")) for row in listed.get("vms") or []
                       if isinstance(row, dict) and row.get("vm_id") == vm_id), None)
         if state != "running":
@@ -2378,6 +2573,7 @@ class ConsoleBridge:
             raise _ConsoleOpenError(
                 err or "no such window on this node", retryable=err == INDETERMINATE_ERROR,
             )
+        grid_socket = await loop.run_in_executor(None, _grid_socket, socket)
         grid_name = f"{EPHEMERAL_LAYOUT_SESSION_PREFIX}{secrets.token_hex(8)}"
         tile_names = {window: f"{EPHEMERAL_VIEW_SESSION_PREFIX}{secrets.token_hex(8)}" for window in windows}
         pid: int | None = None
@@ -2405,6 +2601,7 @@ class ConsoleBridge:
                         None,
                         functools.partial(
                             _create_layout_session, socket, tree, tile_names, grid_name, rows=rows, cols=cols,
+                            grid_socket=grid_socket,
                         ),
                     )
                     if target is None:
@@ -2412,16 +2609,17 @@ class ConsoleBridge:
                             err or "could not build the layout grid", retryable=err == INDETERMINATE_ERROR,
                         )
                     built.insert(0, grid_name)   # the grid leads, so teardown kills the panes first
-                    pid, master_fd = await _spawn_console(target, rows, cols, socket, read_only=read_only)
+                    pid, master_fd = await _spawn_console(target, rows, cols, grid_socket, read_only=read_only)
                 except BaseException:
                     for owned in built:
                         await loop.run_in_executor(
-                            None, functools.partial(_kill_view_session, socket, owned),
+                            None, functools.partial(
+                                _kill_view_session, grid_socket if owned == grid_name else socket, owned),
                         )
                     raise
             session = _Session(
                 key=key, master_fd=master_fd, pid=pid, owned_sessions=tuple(built), view_socket=socket,
-                read_only=read_only,
+                grid_socket=grid_socket if grid_socket != socket else None, read_only=read_only,
             )
         except BaseException:
             await _discard_pending_conpty(pid)
@@ -2458,14 +2656,13 @@ class ConsoleBridge:
     async def attach_direct_viewer(
         self, key: ConsoleKey, ws, *, rows: int, cols: int, attach_only: bool, read_only: bool = False,
         session_name: str | None = None, before_attach=None, config_dir: str | None = None,
-        securestorage_dir: str | None = None,
         provider: str | None = None, api_key_account: str | None = None, bedrock: str | None = None,
         guard_project: int | None = None,
     ) -> str:
         """Establish a console for a socket THIS daemon accepted (`console_direct.py`) and return its vid.
 
         Authentication is the CALLER's: redeem the grant BEFORE calling (this can create a PTY).
-        `session_name`, `read_only`, `config_dir`, `securestorage_dir` come from the REDEEMED GRANT, never
+        `session_name`, `read_only`, `config_dir` come from the REDEEMED GRANT, never
         the hello — a client that could set `read_only` could clear it (no CP in the path).
         `before_attach` runs between resolve and attach, so the ack neither trails output nor over-promises."""
         # Normalised here too (`_normalize_view`). Reserves the SLOT, as `_open_for_viewer` does.
@@ -2474,7 +2671,6 @@ class ConsoleBridge:
             session = await self._resolve_session(
                 key, rows=rows, cols=cols, attach_only=attach_only, read_only=read_only,
                 session_name=session_name, config_dir=config_dir,
-                securestorage_dir=securestorage_dir,
                 provider=provider, api_key_account=api_key_account, bedrock=bedrock,
                 **_guard_kw(guard_project),
             )
@@ -2492,7 +2688,7 @@ class ConsoleBridge:
                     raise _ConsoleOpenError(
                         "the client went away before the session was acknowledged ({})".format(exc),
                         retryable=True,
-                    )
+                    ) from exc
             return await self._attach_viewer(session, ws, browser_facing=True, read_only=read_only)
 
     async def _read_viewer(self, key: ConsoleKey, vid: str, viewer: _Viewer, session: _Session) -> None:
@@ -2502,7 +2698,15 @@ class ConsoleBridge:
         one this viewer was REGISTERED on, for `_drop_viewer`."""
         try:
             async for frame in viewer.ws:
-                self._handle_stdin(key, frame.encode() if isinstance(frame, str) else frame, viewer)
+                data = frame.encode() if isinstance(frame, str) else frame
+                # Before the read-only drop in `_handle_stdin`, as on the relay: a watcher's socket dies too.
+                if viewer.browser_facing and data == KEEPALIVE_FRAME:
+                    # `ws` is typed `object` (either transport's socket), as at the stdout pump's send.
+                    await viewer.ws.send(KEEPALIVE_ACK)  # type: ignore[attr-defined]
+                if not viewer.browser_facing and data == RELAY_PING_FRAME:
+                    await viewer.ws.send(KEEPALIVE_ACK)  # type: ignore[attr-defined]
+                    continue   # a liveness probe, not a keystroke: no PTY write, no activity
+                self._handle_stdin(key, data, viewer)
         except Exception as exc:
             log.debug("console: viewer stream for %s ended (%s)", key, exc)
         finally:
@@ -2580,11 +2784,13 @@ class ConsoleBridge:
             session.redraw_timer.cancel()
         session.redraw_timer = asyncio.get_event_loop().call_later(
             _RESIZE_SETTLE_SECONDS, self._run_client_job,
-            functools.partial(_redraw_client, session.pid, session.view_socket), f"redrawing {session.key}")
+            functools.partial(_redraw_client, session.pid, _client_socket(session)), f"redrawing {session.key}")
 
     def _copy_pane(self, session: _Session) -> None:
         try:
-            error = _copy_pane_to_client(session.pid, session.view_socket, layout=session.key[3].startswith(_LAYOUT_KEY_PREFIX))
+            error = _copy_pane_to_client(session.pid, _client_socket(session),
+                                         layout=session.key[3].startswith(_LAYOUT_KEY_PREFIX),
+                                         tile_socket=session.view_socket)
         finally:
             session.copy_in_flight = False   # a plain store, read only on the loop thread's next frame
         if error:
@@ -2875,11 +3081,12 @@ class ConsoleBridge:
             # In order — a layout's grid first, so the nested clients die before their tile sessions. In
             # an executor and guarded, so an unanswering tmux cannot block the viewer notices; leaks go
             # to the reaper.
-            for owned in session.owned_sessions:
+            for index, owned in enumerate(session.owned_sessions):
+                owner = session.grid_socket if index == 0 and session.grid_socket is not None else session.view_socket
                 try:
                     await asyncio.get_event_loop().run_in_executor(
                         None,
-                        functools.partial(_kill_view_session, session.view_socket, owned),
+                        functools.partial(_kill_view_session, owner, owned),
                     )
                 except Exception:
                     log.exception("console: tearing down view session %s failed", owned)

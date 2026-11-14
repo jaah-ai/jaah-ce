@@ -24,12 +24,12 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
 import httpx
 
 from app import edition_features, http_bounded, node_platform
+from app.clock import utcnow
 from app.config import get_settings
 from app.node_liveness import parse_version
 from app.operator_settings import reads as settings_reads
@@ -162,7 +162,7 @@ def _send(target: _Target, method: str, key: str) -> Optional[tuple[int, bytes]]
             region=target.region,
             service="s3",
             credentials=target.credentials,
-            amz_date=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+            amz_date=utcnow().strftime("%Y%m%dT%H%M%SZ"),
             expires_seconds=60,
         )
         with http_bounded.client(_TIMEOUT_SECONDS) as client:

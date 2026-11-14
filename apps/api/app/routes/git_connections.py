@@ -1,22 +1,23 @@
-"""Git Access per forge: a person's git connections, one per forge root.
+"""Git Access per forge: a person's git connections — any number of accounts per forge root, one the default.
 
 `GET/PUT/DELETE /api/users/{user_id}/git-connections[/{root}]` and `POST …/{root}/pat`. `{root}` is the
-URL-encoded `forges.RepoRef.root`. `GET /api/git-repos` lists the repositories those connections reach, for
+URL-encoded `forges.RepoRef.root`; DELETE takes `?credential_id=` to disconnect one account. `GET /api/git-repos` lists the repositories those connections reach, for
 the Repo URL lookup (`app/forge_repos.py`), and `GET /api/git-repos/default-branch` one repository's default
 branch, for the Integration branch prefill, and whether it is empty; `GET /api/git-repos/owners` what a new
 repository can be created in. The create wizard's two writes — `POST
 /api/git-repos` (a new private repository) and `POST /api/git-repos/initialize` (main and develop for an empty
 one) — go through the same connection (`app/forge_repo_init.py`). Store and overlap rules: `app/git_connections.py`; resolution:
 `app/git_access.py`. SELF-SERVICE ONLY: a person reads and writes their own connections, exactly as the
-Profile Git Access pointer is theirs (`routes/auth.py::MeUpdate.git_credential_id`); another user's id is
+Profile Git Access pick is theirs (`routes/auth.py::MeUpdate.git_credential_id`); another user's id is
 a 404. Every route declares `own_credential` over a `credentials:*` key, whose only enforcement is the
-handler's own narrowing: the self check below, and `git_credential_scope` for the credential a PUT names.
+handler's own narrowing: the self check below, and `routes/auth.git_credential_or_422` for the credential a PUT names.
 
 The PAT body carries a live token, so `app/user_activity.py` stores no body for these paths, and the
 body is read as plain JSON so a malformed field is refused without echoing it (pydantic's 422 would).
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import urllib.parse
 from typing import Any, Literal, Optional
@@ -28,18 +29,20 @@ from sqlalchemy.orm import Session
 
 from app import forge_repo_init, forge_repos, forges, git_access, git_connections, git_probe
 from app.actors import stamp_actor
+from app import db_async
 from app.auth import require_user
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, current_caller
 from app.credentials.registry import type_label
 from app.credentials.testers import AZURE_DEVOPS_KINDS, BITBUCKET_KINDS, new_deadline
-from app.db import get_session
+from app.db_async import on_session
+from app.entity_shape import from_row
 from app.forges import FORGE_LABELS
 from app.models.credentials import Credential
 from app.models.identity import AdminUser
-from app.routes.auth import GitCredentialOut, git_credential_scope
+from app.routes.auth import GitCredentialOut, git_credential_or_422
 from app.routes.forge_connect import connect_offer
-from app.routes.git_connect import install_url
+from app.routes.git_connect import install_url, joined_user
 
 log = logging.getLogger("app.routes.git_connections")
 
@@ -65,6 +68,9 @@ class GitConnectionOut(BaseModel):
     forge_label: str
     self_managed: bool
     state: Literal["connected", "needs_reconnect", "not_connected"]
+    # The root's default account: used for a repository no other account's owners reach. Always true for a
+    # root's only account.
+    is_default: bool = True
     # Why the root is not usable, in resolution's own words (names forge, root, person and the fix).
     detail: Optional[str] = None
     credential: Optional[GitCredentialOut] = None
@@ -77,6 +83,8 @@ class GitConnectionListOut(BaseModel):
 
 class GitConnectionIn(BaseModel):
     credential_id: UUID
+    # Make it the root's default account (a new account is the default only when it is the root's first).
+    make_default: bool = False
 
 
 def _self_or_404(user_id: UUID, user: AdminUser) -> AdminUser:
@@ -105,16 +113,13 @@ def _root_or_422(root: str) -> tuple[str, str]:
 def _out(entry: git_connections.ConnectionState, user: AdminUser) -> GitConnectionOut:
     credential = entry.credential
     available, reason = connect_offer(entry.root, user)
-    return GitConnectionOut(
-        root=entry.root,
-        forge=entry.forge,
+    return from_row(
+        GitConnectionOut, entry,
         forge_label=FORGE_LABELS[entry.forge],
         self_managed=entry.root not in forges.FIXED_ROOTS,
         state=entry.status,
-        detail=entry.detail,
         credential=(
-            GitCredentialOut(id=credential.id, name=credential.name, type=credential.type,
-                             type_label=type_label(credential.type))
+            from_row(GitCredentialOut, credential, type_label=type_label(credential.type))
             if credential is not None else None
         ),
         connect=GitConnectOffer(available=available, reason=reason),
@@ -123,14 +128,17 @@ def _out(entry: git_connections.ConnectionState, user: AdminUser) -> GitConnecti
 
 @router.get(_PREFIX, response_model=GitConnectionListOut)
 @feature("credentials", "view", own_credential=True)
+@db_async.on_thread(actor="user")
 def list_git_connections(
+    session: Session,
     user_id: UUID,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> GitConnectionListOut:
-    """The four fixed roots plus each self-managed GitLab the person connected, with each one's state:
-    `connected`, `needs_reconnect` (the forge reported the token revoked, D-A14 — stale connections are
+    """The four fixed roots plus each self-managed GitLab the person connected — one entry per connected account,
+    the root's default first — with each one's state: `connected`, `needs_reconnect` (the forge reported the token revoked, D-A14 — stale connections are
     re-checked here, in parallel, under one 5 s bound) or `not_connected`."""
+    # The stale re-check calls the forge from inside the read (`git_connections.connection_states`), and the
+    # Connect offer reads the app setting on a session of its own: a worker thread, never the loop.
     subject = _self_or_404(user_id, user)
     states = git_connections.connection_states(session, subject)
     return GitConnectionListOut(connections=[_out(entry, subject) for entry in states])
@@ -138,58 +146,46 @@ def list_git_connections(
 
 @router.put(_PREFIX + "/{root:path}", response_model=GitConnectionOut)
 @feature("credentials", "edit", own_credential=True)
+@db_async.on_thread(actor="user")
 def put_git_connection(
+    session: Session,
     user_id: UUID,
     root: str,
     body: GitConnectionIn,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> GitConnectionOut:
-    """Connect an existing credential for `root`: one the person may push as (`git_credential_scope`, the
+    """Connect an existing credential as one more account on `root` — or, with `make_default`, make it (a new
+    or already connected one) the root's default: one the person may push as (`git_credential_scope`, the
     Git Access dropdown's rule), of a git type, that authenticates exactly this root."""
+    # The answer reads the account's owners at its forge (`_entry_for`): a worker thread, never the loop.
+    user = joined_user(session, user)
     subject = _self_or_404(user_id, user)
     root, _forge = _root_or_422(root)
-    credential = session.scalars(
-        git_credential_scope(session, subject).where(Credential.id == body.credential_id)
-    ).first()
-    if credential is None:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "That credential is not available to this account — it does not exist, or the grant "
-                "on it was revoked. Pick one of the credentials offered here."
-            ),
-        )
-    if credential.type not in git_access.GIT_CREDENTIAL_TYPES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"'{credential.name}' is a {type_label(credential.type)} credential and cannot "
-                   "authenticate a git remote.",
-        )
+    credential = git_credential_or_422(session, subject, body.credential_id)
     credential_root = git_access.credential_root(credential)
     if credential_root != root:
-        raise HTTPException(
-            status_code=422,
-            detail=f"'{credential.name}' authenticates {credential_root}, not {root}.",
-        )
-    git_connections.set_connection(session, subject, user, root, credential)
+        raise HTTPException(status_code=422, detail=f"'{credential.name}' authenticates {credential_root}, not {root}.")
+    git_connections.set_connection(session, subject, user, root, credential, make_default=body.make_default)
     session.commit()
-    return _entry_for(session, subject, root)
+    return _entry_for(session, subject, root, credential.id)
 
 
 @router.delete(_PREFIX + "/{root:path}", status_code=204)
 @feature("credentials", "edit", own_credential=True)
+@on_session
 def delete_git_connection(
+    session: Session,
     user_id: UUID,
     root: str,
+    credential_id: Optional[UUID] = None,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> Response:
-    """Disconnect `root` alone; every other forge's connection is untouched. The credential itself is
-    kept (it may be selected elsewhere); delete it under Directory > Secrets."""
+    """Disconnect the account `credential_id` on `root` (every account on `root` when omitted); every other
+    account is untouched, and the root's next one becomes its default. The credential itself is kept (it
+    may be selected elsewhere); delete it under Directory > Secrets."""
     subject = _self_or_404(user_id, user)
     root, _forge = _root_or_422(root)
-    git_connections.delete_connection(session, subject, root)
+    git_connections.delete_connection(session, subject, root, credential_id)
     session.commit()
     return Response(status_code=204)
 
@@ -224,17 +220,22 @@ def _pat_config(forge: str, root: str, raw: dict[str, Any]) -> dict[str, Any]:
 
 @router.post(_PREFIX + "/{root:path}/pat", response_model=GitConnectionOut, status_code=201)
 @feature("credentials", "create", own_credential=True)
+@db_async.on_thread(actor=lambda caller, **_: caller.actor)
 def post_git_connection_pat(
+    session: Session,
     user_id: UUID,
     root: str,
     raw: Any = Body(default=None),
-    user: AdminUser = Depends(require_user),
-    principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> GitConnectionOut:
     """Connect `root` with a pasted token: tested against the forge first, and refused with the tester's
     own reason (422) when the forge does not accept it. On success the token is stored as the person's
-    OWN credential (re-pasting for the same root replaces that row's token) and connected."""
+    OWN credential (re-pasting for the same forge account replaces that row's token; another account's
+    token adds an account beside it) and connected."""
+    # The forge test, a legacy row's account read inside the row lookup (`own_row_for_root`), the token's KMS
+    # seal at the flush and the owners read after (`_entry_for`) are all blocking I/O around the one
+    # transaction: a worker thread, never the loop.
+    user = joined_user(session, caller.actor)
     subject = _self_or_404(user_id, user)
     root, forge = _root_or_422(root)
     if not isinstance(raw, dict):
@@ -252,7 +253,7 @@ def post_git_connection_pat(
 
     label = FORGE_LABELS[forge]
     credential = git_connections.own_row_for_root(
-        session, subject, principal, forge, root, grant=False, account=result.identity
+        session, subject, caller.principal, forge, root, grant=False, account=result.identity
     )
     if credential is None:
         name = git_connections.free_name(
@@ -274,23 +275,19 @@ def post_git_connection_pat(
     git_connections.set_connection(session, subject, user, root, credential)
     session.commit()
     log.info("git-connections: user=%s connected %s with credential id=%s", subject.id, root, credential.id)
-    return _entry_for(session, subject, root)
+    return _entry_for(session, subject, root, credential.id)
 
 
-def _entry_for(session: Session, user: AdminUser, root: str) -> GitConnectionOut:
-    """One root's state after a write, without re-checking it at the forge (it was just tested or
-    chosen)."""
-    ref = git_connections.root_ref(root)
-    assert ref is not None  # narrowing: the route validated `root`
-    try:
-        credential = git_access.resolve_for_user(session, user.id, ref, retry="then reload this page")
-        entry = git_connections.ConnectionState(root, "connected", credential, None)
-    except git_access.GitAccessNeedsReconnect as exc:
-        entry = git_connections.ConnectionState(
-            root, "needs_reconnect", git_connections._selected(session, user, ref), str(exc)
-        )
-    except git_access.GitAccessError as exc:
-        entry = git_connections.ConnectionState(root, "not_connected", None, str(exc))
+def _entry_for(session: Session, user: AdminUser, root: str, credential_id: UUID) -> GitConnectionOut:
+    """One account's state after a write, without re-checking it at the forge (it was just tested or
+    chosen), and its owners recorded for resolution (`forge_repos.remember_owners`)."""
+    forge_repos.refresh_owners(session, user, root, credential_id)
+    connection = next(
+        (c for c in git_access.root_connections(session, user, root) if c.credential_id == credential_id), None
+    )
+    entry = git_connections.connection_state(
+        session, user, root, credential_id, is_default=connection is None or connection.is_default
+    )
     return _out(entry, user)
 
 
@@ -325,18 +322,20 @@ class GitReposOut(BaseModel):
 
 @router.get("/api/git-repos", response_model=GitReposOut)
 @feature("credentials", "view", own_credential=True)
+@db_async.on_thread(actor="user")
 def list_git_repos(
+    session: Session,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> GitReposOut:
     """Every repository the signed-in person's own git connections reach, across every connected forge
     root and every org/workspace in it. Takes no user id: like Git Access it is self-service only. DB reads
     first, then the transaction is released before the forge reads (`app/db.py`)."""
+    # Planning may renew a token (`git_access.token_for`) and the reads are forge HTTP: a worker thread.
     plans, failed = forge_repos.plan_reads(session, user)
     session.rollback()
     sources = failed + forge_repos.list_repos(plans)
     return GitReposOut(
-        repos=[GitRepoOut(**vars(repo)) for source in sources for repo in source.repos],
+        repos=[GitRepoOut(**vars(repo)) for repo in forge_repos.unique_repos(sources)],
         sources=[_source_out(s) for s in sources],
     )
 
@@ -374,13 +373,15 @@ class GitRepoOwnersOut(BaseModel):
 
 @router.get("/api/git-repos/owners", response_model=GitRepoOwnersOut)
 @feature("credentials", "view", own_credential=True)
+@db_async.on_thread(actor="user")
 def list_git_repo_owners(
+    session: Session,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> GitRepoOwnersOut:
     """Every owner the signed-in person's own git connections can create a repository in — their own account and
     every org, group, workspace or Azure project they may create in, with or without repositories
     (`forge_repos.list_owners`). Self-service only, read as `GET /api/git-repos` is."""
+    # As `list_git_repos`, plus the app settings read on sessions of their own: a worker thread.
     plans, failed = forge_repos.plan_reads(session, user)
     session.rollback()
     sources = failed + forge_repos.list_owners(plans)
@@ -394,6 +395,11 @@ def list_git_repo_owners(
                               create_url=_github_new_url(owner)
                               if s.root == "github.com" and owner in s.handoff and owner not in s.blocked else None)
               for s in sources for owner in s.owners]
+    # Two accounts on one root often share an owner: listed once, as the first (default) account reads it.
+    unique: dict[tuple[str, str], GitRepoOwnerOut] = {}
+    for listed in owners:
+        unique.setdefault((listed.root, listed.owner), listed)
+    owners = list(unique.values())
     return GitRepoOwnersOut(
         owners=owners,
         sources=[_source_out(s) for s in sources],
@@ -423,8 +429,7 @@ def _app_install_url() -> Optional[str]:
 
 
 def _source_out(s: forge_repos.Source) -> GitRepoSourceOut:
-    return GitRepoSourceOut(root=s.root, forge=s.forge, forge_label=FORGE_LABELS[s.forge], state=s.state,
-                            detail=s.detail, truncated=s.truncated)
+    return from_row(GitRepoSourceOut, s, forge_label=FORGE_LABELS[s.forge])
 
 
 class GitDefaultBranchOut(BaseModel):
@@ -435,14 +440,16 @@ class GitDefaultBranchOut(BaseModel):
 
 @router.get("/api/git-repos/default-branch", response_model=GitDefaultBranchOut)
 @feature("credentials", "view", own_credential=True)
+@db_async.on_thread(actor="user")
 def git_repo_default_branch(
+    session: Session,
     url: str,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> GitDefaultBranchOut:
     """`url`'s default branch and whether it has no branch at all, read through the signed-in person's own
     connection for its root; null for a URL that does not parse, a root they have not connected, or a forge read
     that fails — the form keeps its seed then."""
+    # As `list_git_repos`: planning may renew a token, the reads are forge HTTP — a worker thread.
     ref = _parsed_repo_url(url)
     if ref is None:
         return GitDefaultBranchOut()
@@ -484,17 +491,21 @@ class GitRepoInitializeOut(BaseModel):
 
 @router.post("/api/git-repos/initialize", response_model=GitRepoInitializeOut)
 @feature("projects", "create")
+@db_async.on_thread(actor="user")
 def initialize_git_repo(
+    session: Session,
     body: GitRepoInitializeIn,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> GitRepoInitializeOut:
     """Give an EMPTY repository (no branch, zero commits) `main` — README.md and .gitignore — and `develop`, through
     the signed-in person's own connection; a repository with any branch is left alone. The create wizard calls it
-    on Create, before the project's POST."""
+    on its Repository step's Next, so a refusal shows there."""
+    # Learning owners reads the forge between its DB reads and writes (`forge_repos.learn_owner`), and the write
+    # is forge HTTP: a worker thread, never the loop.
     ref = _parsed_repo_url(body.url)
     if ref is None:
         raise HTTPException(status_code=422, detail="This is not a repository URL Jaah can use.")
+    forge_repos.learn_owner(session, user, ref)
     plan = forge_repos.plan_read(session, user, ref)
     session.rollback()
     if plan is None:
@@ -523,22 +534,27 @@ class GitRepoCreatedOut(GitRepoOut):
 
 @router.post("/api/git-repos", response_model=GitRepoCreatedOut, status_code=201)
 @feature("projects", "create")
+@db_async.on_thread(actor="user")
 def create_git_repo(
+    session: Session,
     body: GitRepoCreateIn,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> GitRepoCreatedOut:
     """Create the private repository `owner/name` on `root` through the signed-in person's own connection, then
-    give it `main` and `develop` (`forge_repo_init`). The create wizard's "Create a new repository", on Create.
+    give it `main` and `develop` (`forge_repo_init`). The create wizard's "Create a new repository", on its Repository step's Next.
     A refused create is a 422; a created repository whose initialization failed is still a 201, naming why."""
+    # As `initialize_git_repo`: a worker thread, never the loop.
     root_ref = git_connections.root_ref(body.root)
     if root_ref is None:
         raise HTTPException(status_code=422, detail="Pick an owner from the list.")
-    plan = forge_repos.plan_read(session, user, root_ref)
+    owner, name = body.owner.strip(), body.name.strip()
+    # Through the account that reaches `owner` (`git_access.pick_connection`), learning owners first if none does.
+    target = dataclasses.replace(root_ref, path=f"{owner}/{name}")
+    forge_repos.learn_owner(session, user, target)
+    plan = forge_repos.plan_read(session, user, target)
     session.rollback()
     if plan is None:
         raise _not_connected(root_ref.forge)
-    owner, name = body.owner.strip(), body.name.strip()
     init_error = None
     try:
         ref = forge_repo_init.create(plan, owner, name)

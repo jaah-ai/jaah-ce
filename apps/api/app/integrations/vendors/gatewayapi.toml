@@ -1,0 +1,41 @@
+slug = "gatewayapi"
+label = "GatewayAPI"
+category = "messaging"
+vendor_docs_url = "https://gatewayapi.com/docs/apis/rest/"
+summary = "Send SMS worldwide through GatewayAPI's REST API."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "base_url", label = "Platform", kind = "url", required = true, default = "https://gatewayapi.com", help = "https://gatewayapi.com for an account you sign in to at gatewayapi.com; https://gatewayapi.eu for an account on the EU platform at gatewayapi.eu" },
+  { key = "api_token", label = "API token", kind = "secret", required = true, help = "GatewayAPI dashboard > Settings > API Keys: select Create API Key (or an existing key) and copy its Token" },
+]
+
+[test]
+method = "GET"
+path = "{base_url}/rest/me"
+auth = { field = "api_token", header = "Authorization", prefix = "Token" }
+identity = [["id"]]
+identity_phrase = "as account"
+
+[docs]
+agent_uses = [
+  "Send an SMS to one or many recipients, for example a status alert or a verification code",
+  "Check the account's remaining credit before a large send",
+  "Look up the delivery status of messages sent earlier",
+]
+prerequisites = [
+  "A GatewayAPI account with credit, at gatewayapi.com or on the EU platform at gatewayapi.eu",
+  "A sender name or number allowed in the destination countries (GatewayAPI's dashboard lists each country's sender rules)",
+]
+limitations = [
+  "A token from one platform does not work on the other: pick the Platform you sign in to",
+  "Every SMS is charged from the account's credit; Jaah does not cap what agents send",
+]
+troubleshooting = [
+  { symptom = "Test says GatewayAPI rejected the API token (401)", fix = "Check the Platform: a gatewayapi.eu token is rejected by gatewayapi.com and the other way round. Otherwise copy the token again from Settings > API Keys and select Replace on the secret" },
+  { symptom = "Messages are rejected for the sender", fix = "Some countries do not allow alphanumeric sender names. Use a number as sender for them, as the dashboard's country rules describe" },
+]
+faq = [
+  { q = "Does GatewayAPI need a username as well?", a = "No. The token alone authenticates; Jaah sends it as Authorization: Token" },
+]

@@ -1,51 +1,60 @@
-import { Suspense, lazy, startTransition, useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
+import { Suspense, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
+import { lazyRetry } from '../lib/lazyRetry'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { replaceEqualDeep, useQuery, useQueryClient } from '@tanstack/react-query'
+import { keepPreviousData, replaceEqualDeep, useIsRestoring, useQuery, useQueryClient } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Typography from '@mui/material/Typography'
-import { apiDetail, get, getPage, post } from '../api'
-import { useAuth, useCan } from '../auth'
+import type { Theme } from '@mui/material/styles'
+import { ApiError, apiDetail, get, getPage, put } from '../api'
+import { useAuth, useCan, useCanOnProject } from '../auth'
 import { useViewerMode } from '../lib/viewerMode'
 import Banner from '../ui/Banner'
 import { useConfirm, type ConfirmOptions } from '../components/ConfirmDialog'
 import { useBusyIds } from '../hooks/useBusyIds'
+import { useTaskPins } from '../hooks/useTaskPins'
+import { slotConsoleRequest } from '../hooks/useWorktreeAccess'
 import { useDebouncedCallback } from '../hooks/useDebouncedCallback'
-import { listWorktrees, useProjects } from '../hooks/useRosters'
+import { useProjects, useWorktrees, WORKTREES_KEY } from '../hooks/useRosters'
+import { useTagGroups } from '../hooks/useTagGroups'
+import { CATALOGUE_STALE_MS } from '../lib/cachedRead'
 import { useConsoleDock } from '../components/ConsoleDock'
-import { DISPATCH_ROUTES, startBody, startIntentFor, type ForceStartBody, type StartIntent } from '../components/tasks/controls'
+import type { StartIntent } from '../components/tasks/controls'
 import { useDeleteTask, useTaskActions } from '../components/tasks/useTaskActions'
-import { useOtherOrgOf } from '../ui/OrgIndicator'
-import MoveToFeatureDialog from '../components/tasks/MoveToFeatureDialog'
-import WaitOnCustomerDialog from '../components/tasks/WaitOnCustomerDialog'
-import PriorityDialog from '../components/tasks/PriorityDialog'
-import PreemptDialog, { preemptForecast } from '../components/tasks/PreemptDialog'
+import { ActingForNotice, useOrgVisible, useOtherOrgOf } from '../ui/OrgIndicator'
+import { readHiddenColumns, TASK_COLUMNS, toggledHiddenColumns } from '../lib/taskColumns'
 import { loadTaskDetailPage } from './loadTaskDetailPage'
 import PaneHeader from '../components/tasks/pane/PaneHeader'
 import {
   ACTION_ICON,
   buildTagCountsUrl,
+  buildTaskAssigneesUrl,
   buildTaskCreatorsUrl,
   buildTasksUrl,
   displayTitle,
   type ExpandedEntry,
+  drawnExpandedIds,
+  drawnPendingIds,
   isArchiveRow,
   LIVE_STATES,
   TASK_ACTIONS,
   TASK_LIST_MAX,
   TASK_PAGE_SIZE,
-  readTaskSources,
+  TASK_SOURCES_URL,
   actAsNeededFor,
 } from '../components/tasks/shared'
 import { enterActAs, useActAsRows } from '../lib/actAs'
 import type { TaskTreeGrouping } from '../components/tasks/taskTree'
 import ActivityFeedView from '../components/tasks/listViews/ActivityFeedView'
 import type { PaneSelection, TaskListCreate, TaskListStateGrouping } from '../components/tasks/listViews/types'
-import FeatureHeader from '../components/tasks/pane/FeatureHeader'
+import FeatureDescription from '../components/tasks/pane/FeatureDescription'
 import { PANE_QUERY_KEY, forgetDeletedTasks } from '../components/tasks/pane/queryKeys'
 import { paneCountsUrl, type PaneFilters } from '../components/tasks/pane/boardCounts'
 import { boardRowsEpoch, rememberBoardRows } from '../lib/taskPageSeed'
-import { readMuted } from '../lib/taskMute'
+import { readTaskListSeed, saveTaskListSeed } from '../lib/taskListSeed'
+import { TASK_SEEN } from '../lib/taskSeen'
+import { TASK_PINS_SAVED } from '../lib/taskPin'
+import { muteExclusionParams, readMuted } from '../lib/taskMute'
 import { STREAM_DOWN_POLL_MS, useLiveRefetch } from '../hooks/useLiveRefetch'
 import { useEventStream } from '../hooks/useEventStream'
 import { useBulkRuns } from '../hooks/useBulkRuns'
@@ -57,6 +66,7 @@ import { clearPicks, createPickStore, togglePick, usePicking, usePicks, type Pic
 import { FORM_ACTION_BAR_ATTR } from '../ui/FormActionBar'
 import { countOf } from '../lib/humanize'
 import { scrollingAncestor } from '../lib/scrollWithinPane'
+import { useLoadMoreSentinel } from '../hooks/useLoadMoreSentinel'
 import {
   useCanCreateChats,
   useCanCreateTasks,
@@ -72,6 +82,8 @@ import { clearTaskDraft, inlineTaskDraftStorageKey, loadInlineTaskDraft } from '
 import { INLINE_TASK_PREFIXES, readInlinePrefixLine } from '../components/tasks/inlineTaskPrefix'
 import type { FilingTarget } from '../components/tasks/featureFiling'
 import {
+  DEFAULT_GROUP_BY,
+  GROUP_BY_PROJECT,
   GROUP_BY_STATE,
   GROUP_PARAM,
   groupParamValue,
@@ -88,15 +100,19 @@ import {
   TASK_DEEP_LINK_PROJECT_PARAM,
   taskRowElementId,
 } from '../lib/taskDeepLink'
+import { isSavedReturn, SAVED_RETURN_STATE, savedReturnStage, type SavedReturn } from '../lib/taskReturn'
 import {
   expandedTasksStorageKey,
   loadExpandedTaskIds,
   saveExpandedTaskIds,
 } from '../lib/taskExpandStorage'
-import { resolveDateRangeBounds, type TaskDateRangeId } from '../lib/taskDateRange'
+import { instantWindowBounds, resolveDateRangeBounds, type TaskDateRangeId } from '../lib/taskDateRange'
 import { useOfficialDayStart, useOfficialZone } from '../lib/officialZone'
-import { orderCreators } from '../lib/taskCreators'
-import { loadTaskFilters, saveTaskFilters, taskFiltersStorageKey } from '../lib/taskFilterStorage'
+import { orderAssignees } from '../lib/taskAssignees'
+import {
+  loadTaskFilters, rememberedFingerprint, rememberedViewKey, restoreKeepingStage, restoreRememberedView, saveRememberedView,
+  saveTaskFilters, taskFiltersStorageKey,
+} from '../lib/taskFilterStorage'
 import {
   clearTaskUrlFilters,
   hasTaskUrlFilters,
@@ -104,14 +120,13 @@ import {
   writeTaskUrlFilters,
   type TaskUrlFilters,
 } from '../lib/taskUrlFilters'
-import { hasLiveSession, resolveTitle, runnerWorktreeFor, worktreeForTask } from '../lib/worktree'
+import { runnerWorktreeFor, worktreeForTask } from '../lib/worktree'
 import { publishBoardScope } from '../lib/boardScope'
 import {
   ALL_SCOPE,
   SCOPE_PARAM,
   locateScope,
   parseScope,
-  scopeHref,
   scopeKey,
   scopeProjectId,
   scopeToListParams,
@@ -119,28 +134,58 @@ import {
   type TaskScope,
 } from '../lib/taskScope'
 import { TASK_TREE_QUERY_KEY, useTaskTree } from '../hooks/useTaskTree'
-import { useFocusedProjectId } from '../hooks/useFocusedProjectId'
-import { focusedLandingScope } from '../lib/focusedProject'
 import { FOCUS_COMPOSER_STATE } from '../components/tasks/rail/TaskTree'
 import { ABOVE_PHONE, SHELL_FILL_ATTR, TASK_BOARD_CONTAINER_SX } from '../ui/listStyles'
 import QueuedOverCap from './ce/QueuedOverCap'
+import StageStrip, { StageTotals, type StripPick } from '../components/pipeline/StageStrip'
+import PipelineSections from '../components/pipeline/PipelineSections'
+import ReleaseStep from '../components/pipeline/ReleaseStep'
+import { HEALTH_POLL_MS } from '../components/pipeline/HealthDot'
+import ReleasePick from '../components/pipeline/ReleasePick'
+import { FrozenNowBanner, stepFrom } from '../components/pipeline/WaitChip'
+import { hasDeadline } from '../lib/waitReasons'
+import { releaseKey } from '../lib/releases'
+import {
+  ONLY_PARAM,
+  PIPELINE_ALL_ITEMS_KEY,
+  PIPELINE_TOTALS_KEY,
+  RELEASE_ONLY,
+  releaseRunTo,
+  STAGE_PARAM,
+  BUCKETS,
+  isBucket,
+  refreshPipelineItems,
+  getAllStageItems,
+  getPipelineTotals,
+  isUnfiltered,
+  getPipelineView,
+  pipelineAllItemsKey,
+  pipelineTotalsKey,
+  pipelineViewKey,
+  stageTasksAcross,
+  totalsStage,
+  attentionStage,
+  AUTO_STAGE_STATE,
+  type ItemFilters,
+} from '../lib/pipelineBoard'
 import { STARTER_MAX_TASKS } from './templates/sections'
 import { LAUNCHER_CLEARANCE_PX, useLauncherYield } from '../ui/launcherSeat'
+import { grid } from '../theme'
+import { useOutageCovers, useRecoveries } from '../net/reachability'
 import type {
-  DispatchForecast,
   OrgRef,
   PipelineTask,
   Project,
   TagCounts,
   TagGroup,
-  TaskCreator,
+  TaskAssignee,
   TaskSourceOption,
   TaskTreeCounts,
   Worktree,
 } from '../types'
 
 /* The board's starters — the setup diagram, then Most popular templates (`TemplateStarters`): their own chunk. */
-const TemplateStarters = lazy(() => import('./templates/TemplateStarters'))
+const TemplateStarters = lazyRetry(() => import('./templates/TemplateStarters'))
 
 // AC1c.3: the create/edit form lives on the standalone page (`/tasks/new`, `/tasks/:id`); this route neither
 // imports its ~500 KB TipTap chunk nor holds any modal state. It only PREFETCHES that page's chunk once mounted
@@ -148,16 +193,34 @@ const TemplateStarters = lazy(() => import('./templates/TemplateStarters'))
 
 const METERED_REFETCH_MIN_MS = 60_000
 
-/* The board's own floor between live refetches. Each one re-reads the list, every expanded row's detail,
-   worktrees and both counts (hundreds of KB on a big board), and the shared debounce bounds a burst only while
+/* The board's own floor between live refetches. Each one re-reads the list, every drawn expanded row's detail
+   and both counts (hundreds of KB on a big board), and the shared debounce bounds a burst only while
    it stays dense: events a second apart, as one busy chat parking and resuming every turn, re-read the whole
    board for every open tab once a second. The first event still refetches at once. */
 const TASKS_LIVE_REFETCH_MIN_MS = 5_000
 
+/* THE BOARD'S EXPANDED-ROW READ: the row's `children` and their costs, none of the detail page's own fields
+   (`routes/tasks/read.py::get_task`, `view=rollup`) — the board draws the parent from its list row. */
+const expandedDetailUrl = (id: number) => `/api/tasks/${id}?view=rollup`
+
+/* The console events that move the worktree set the row actions join on (`WORKTREES_KEY`). */
+const WORKTREE_EVENT_ENTITIES = new Set(['worktree', 'runner'])
+
+/* The worktree set's own floor on `task` events (a lease edge), apart from the board's: a busy board re-read the
+   whole pool on every transition. */
+const WORKTREES_TASK_REFETCH_MIN_MS = 30_000
+
 const NO_PROJECTS: Project[] = []
+const NO_WORKTREES: Worktree[] = []
+const NO_TAG_GROUPS: TagGroup[] = []
+const NO_ASSIGNEES: TaskAssignee[] = []
+const NO_SOURCES: TaskSourceOption[] = []
+const NO_TASKS: PipelineTask[] = []
+/** The longest a return from Save holds the list while it looks the landing stage up. */
+const STAGE_LOOKUP_MAX_MS = 5000
 
 /* A quiet hint above the list; colour from the `caption` variant. */
-const NOTE_SX = { color: 'text.secondary', mb: '0.5rem' } as const
+const NOTE_SX = { color: 'text.secondary', mb: 1 } as const
 
 // The `/tasks` page — the operator's console over the epic/`persona` Task pipeline. A thin container:
 // list/expanded state, fetch + live-refetch + poll fallback, and writes; rendering is `components/tasks/*`.
@@ -175,10 +238,7 @@ function focusComposerSoon(): () => void {
   return () => clearInterval(timer)
 }
 
-/* THE /tasks PAGE HUGS THE SIDEBAR: above the phone band it cancels all but 8px of `.app-main`'s 2rem
-   left inset (`App.tsx`'s layout contract), so the header and the list's status discs sit just
-   clear of the sidebar instead of 37px off it. The phone keeps the shell's 1rem: no sidebar sits beside it there.
-   It is also the BOARD's query container: the header's one line and the activity row's drop order follow its
+/* THE /tasks PAGE is the BOARD's query container: the header's one line and the activity row's drop order follow its
    width, which the docked console narrows without the window changing (`ui/listStyles.ts`'s `BOARD_*`).
    ABOVE THE PHONE IT FILLS THE SHELL: a column of the header, the list's OWN scroll region and the bulk dock
    under it (`SHELL_FILL_ATTR`, so `.app-main` keeps its plain bottom inset). The dock used to stick to `.app-main`'s
@@ -186,17 +246,17 @@ function focusComposerSoon(): () => void {
    shell's scroll (its bottom nav and onboarding bar are sized against `.app-main`). */
 const TASKS_PAGE_SX = {
   ...TASK_BOARD_CONTAINER_SX,
-  [ABOVE_PHONE]: { ml: 'calc(8px - 2rem)', height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column' },
+  [ABOVE_PHONE]: { height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column' },
 } as const
 
 /* The list's scroll region above the phone (see `TASKS_PAGE_SX`). Its bottom inset is the Help launcher's clearance
-   less the shell's own 1.75rem, so the last row's `⋯` scrolls clear of the orb; with the dock up the orb is hidden
-   (`useLauncherYield`). Its scrollport clips sideways too, so it reaches 4px back into the page's inset and pads it
+   (`LAUNCHER_CLEARANCE_PX`, 88px) less the shell's own bottom inset (~1.75rem), so the last row's `⋯` scrolls clear of the orb; with the dock up the orb is hidden
+   (`useLauncherYield`). Its scrollport clips sideways too, so it reaches 3px back into the page's inset and pads it
    in again: a selected disc's ring, which overhangs the row by 1px, stays whole. */
 const LIST_SCROLL_SX = {
   [ABOVE_PHONE]: {
-    flex: 1, minHeight: 0, overflowY: 'auto', ml: '-4px', pl: '4px',
-    pb: `calc(${LAUNCHER_CLEARANCE_PX}px - 1.75rem)`,
+    flex: 1, minHeight: 0, overflowY: 'auto', ml: -0.5, pl: 0.5,
+    pb: (t: Theme) => `calc(${t.spacing(LAUNCHER_CLEARANCE_PX / 6)} - ${grid(5)})`,
   },
 } as const
 
@@ -266,13 +326,23 @@ function TaskBulkDock({ store, actionsFor, onClear, runs, reports }: {
   )
 }
 
-export default function Tasks() {
+/* THE PIPELINE'S OWN LIVE FLOOR (architecture §4): a `pipeline.changed` burst re-reads the strip and the items at
+   most once per 2 s, and every 10 s while the stream is down or a step is in flight. */
+const PIPELINE_LIVE_MIN_MS = 2_000
+const PIPELINE_POLL_MS = 10_000
+
+/** The board. `pipeline` (the `/tasks` route, `pages/pipeline/PipelinePage.tsx`) puts the stage strip above search
+ *  and, on one project, lists its stages' items in sections (`components/pipeline/`); the Live Cast viewer omits it. */
+export default function Tasks({ pipeline = false }: { pipeline?: boolean } = {}) {
   // "New task" and a row's Edit are NAVIGATIONS to the standalone page.
   const navigate = useNavigate()
   const viewer = useViewerMode()
   const [tasks, setTasks] = useState<PipelineTask[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  // What the list read threw: an unanswered read is the outage notice's to say, not this page's banner.
+  const [errorCause, setErrorCause] = useState<unknown>(null)
+  const outageCoversError = useOutageCovers(errorCause)
   const [expanded, setExpanded] = useState<Record<number, ExpandedEntry>>({})
   const [fetching, setFetching] = useState<Set<number>>(new Set())
   const [submitting, withBusy] = useBusyIds<number>()
@@ -291,31 +361,24 @@ export default function Tasks() {
     })
   // Every PROJECT this operator may see, fetched once: the delivery join (`projectNameById` — a task's worktree
   // repo keys off `task.project_id`) and the create rows' roster. Seeing a project is not being able to file into it: every create
-  // rung also asks the grant map (`resolveCreateProject` in `components/tasks/shared.tsx`). Independent of the
-  // list so it never blocks it.
-  // Not awaited by fetchTasks; failure costs name lookups and the create row shows its no-project hint.
-  const projectsQuery = useProjects()
+  // rung also asks the grant map (`resolveCreateProject` in `components/tasks/shared.tsx`). Read after the list,
+  // never ahead of it (`listLanded`); failure costs name lookups and the create row shows its no-project hint.
+  /* THE LIST GOES FIRST: the reads the rows do not wait on (assignees, sources, tag groups, worktrees, the project
+     roster) start once the first list read has settled, so on a cold load they do not queue ahead of it on the API.
+     Each still paints from the persisted cache meanwhile where it has one. Flips once, never back. */
+  const [listLanded, setListLanded] = useState(false)
+  const projectsQuery = useProjects({ enabled: listLanded })
   const allProjects = Array.isArray(projectsQuery.data) ? projectsQuery.data : NO_PROJECTS
   // Did that fetch ANSWER: `[]` alone is pending, failed or a new org with no project (the create row tells them apart).
   const projectsAnswered = Array.isArray(projectsQuery.data)
-  // R5: the live worktree set, refreshed on the list's live-refetch/poll paths so a freshly dispatched task
-  // links to its worktree. Independent of the list.
-  const [worktrees, setWorktrees] = useState<Worktree[]>([])
-
   /* ── TAG GROUPING ──────────────────────────────────────────────────────────
      THE CATALOG IS FETCHED, not derived from loaded rows (which would reshuffle sections while scrolling):
-     `GET /api/tags/groups` serves ACTIVE groups in `position` order. Once, on mount (groups change on Settings).
-     THE MARKER RECORDS *WHOSE* CATALOG WE HOLD, because the reconciliation below DELETES a stored selection:
-       · `undefined` = nothing answered yet, INCLUDING A FAILED FETCH — "no active groups" and "unreachable" look
-         alike, and one transient 500 must not delete a chosen grouping (meanwhile the board renders ungrouped);
-       · the ADMIN ID it was fetched for, so an admin switch never reconciles B's selection against A's catalog. */
-  const [tagGroups, setTagGroups] = useState<TagGroup[]>([])
-  const [tagCatalogAdminId, setTagCatalogAdminId] = useState<string | null | undefined>(undefined)
-
-  /* THE SECTION TOTALS COME FROM THE SERVER (`GET /api/tasks/tag-counts`, same row set as the list): a count over
-     the lazy 50-row window would lie. Refetched on the list's own events. `null` until it lands — no number
-     rather than an unbacked zero. */
-  const [tagCounts, setTagCounts] = useState<TagCounts | null>(null)
+     `hooks/useTagGroups.ts`, after the list. The reconciliation below DELETES a stored selection, so it runs only
+     against a catalog THIS admin was answered (`isSuccess`, keyed on the admin there): a failed fetch is not an
+     answer, and meanwhile the board renders ungrouped. */
+  // Re-read on every board visit: Settings › Tags edits the catalog without invalidating the key.
+  const tagGroupsQuery = useTagGroups({ enabled: listLanded, refetchOnMount: 'always' })
+  const tagGroups = tagGroupsQuery.data ?? NO_TAG_GROUPS
 
   /* FOLDED SECTIONS, keyed by TAG ID (`''` = Untagged), held HERE: sentinel appends can change the section set
      (index keys would move folds), and a remounted child would re-open. In memory only. */
@@ -325,22 +388,27 @@ export default function Tasks() {
   // `admin` is available this early (`auth.tsx` seeds from the persisted snapshot); the restore effect below
   // covers a late or changed id.
   const { admin, updatePreferences } = useAuth()
+  const { isPinned, onTogglePin } = useTaskPins()
   const filtersStorageKey = taskFiltersStorageKey(admin?.id ?? null)
   // ONE read at mount (lazy initializer).
   const [restoredFilters] = useState(() => loadTaskFilters(filtersStorageKey))
 
   /* ── AND THE ROW-REMOVING FILTERS, WHICH ARE THE URL'S ───────────────────────────────────────────
-     Search, period, creator picks and Hidden are read from and written to the query string
+     Search, period, assignee picks and Hidden are read from and written to the query string
      (`lib/taskUrlFilters.ts` is the single home): a narrowed board is a link one operator sends another. One
      owner per value. `useSearchParams` answers on the FIRST render, so the first request still carries them;
-     a bare `/tasks` opens unfiltered (operator's call).
+     a URL naming no filter opens with its selection's remembered ones (THE REMEMBERED FILTERS, below).
      DECLARED ONCE, above every reader: the deep-link consumer below shares it (two calls = two writers). */
   const [searchParams, setSearchParams] = useSearchParams()
-  /* Memoised on the router-memoised params, so the object and creator ARRAY keep identity for effect keys. */
+  /* Memoised on the router-memoised params, so the object and assignee ARRAY keep identity for effect keys. */
   const urlFilters = useMemo(() => readTaskUrlFilters(searchParams), [searchParams])
-  const { q, showHidden, dateRange, dateFrom, dateTo, creatorIds, sources, state: stateFilter } = urlFilters
+  const {
+    q, showHidden, dateRange, dateFrom, dateTo, assigneeIds, creatorIds, sources, state: stateFilter, persona, windowAfter,
+    windowBefore,
+  } = urlFilters
   /* A SCALAR for the fetch effects' deps: non-filter URL changes (the deep-link strip) hand back a fresh array
      with identical contents. Same idiom as `expandedIdsKey`. */
+  const assigneeKey = assigneeIds.join(' ')
   const creatorKey = creatorIds.join(' ')
   const sourceKey = sources.join(' ')
 
@@ -349,7 +417,7 @@ export default function Tasks() {
      `setSearchParams` DOES NOT COMPOSE: react-router's functional form resolves against THIS RENDER's params
      and navigates immediately (react-router-dom 6.30), so two patches in one gesture lose the first silently.
      That is the Clear gesture (four filters in one press, `clearFilters` below), which otherwise left
-     the URL and board narrowed. Effect closures (the creator reconcile) are stale the same way, hence a ref.
+     the URL and board narrowed. Effect closures (the assignee reconcile) are stale the same way, hence a ref.
      RE-SYNCED WHEN THE LOCATION LANDS, so a stale base cannot resurrect the stripped `?task=`. */
   const liveParamsRef = useRef(searchParams)
   useEffect(() => { liveParamsRef.current = searchParams }, [searchParams])
@@ -374,23 +442,18 @@ export default function Tasks() {
      survives a reload and a shared link, and Back walks it. ABSENT (or junk, or a retired key), the board opens
      on All projects. No other param narrows it: an unknown one such as a retired filter is simply not read. The
      row set is `scopeToListParams`. */
-  const { tree: taskTree } = useTaskTree(true)
+  const { tree: taskTree, failed: taskTreeFailed } = useTaskTree(true)
   const rawScope = searchParams.get(SCOPE_PARAM)
-  /* THE FOCUSED PROJECT (`lib/focusedProject.ts`): a `/tasks` with no `?scope=` — opening Jaah, `/` redirects
-     here — lands on it. Read as the selection at once (so the first fetch is the focused project's, not All
-     projects') and written into the URL, REPLACED so Back does not bounce through All projects. A `?task=` deep
-     link moves the selection itself (below) and wins. */
-  const focusedProjectId = useFocusedProjectId()
-  /* A bare `?project=N` (no `?task=`, no `?scope=`) names the project to open on, and wins over the focus: left
-     unread, the board — and ⤢'s editor after it — opened on some other project. */
+  /* A bare `?project=N` (no `?task=`, no `?scope=`) names the project to open on: read as the selection at once
+     (so the first fetch is that project's, not All projects') and written into the URL as its `?scope=`,
+     REPLACED so Back does not bounce through All projects. A `?task=` deep link moves the selection itself
+     (below) and wins. */
   const linkedProjectId = rawScope === null && !searchParams.has(TASK_DEEP_LINK_PARAM)
     ? parseTaskDeepLinkProjectParam(searchParams.get(TASK_DEEP_LINK_PROJECT_PARAM))
     : null
-  const landingScope = searchParams.has(TASK_DEEP_LINK_PARAM)
-    ? null
-    : linkedProjectId !== null
-      ? scopeKey({ kind: 'project', projectId: linkedProjectId })
-      : focusedLandingScope(rawScope, focusedProjectId, taskTree?.projects.map(p => p.id))
+  const landingScope = linkedProjectId !== null
+    ? scopeKey({ kind: 'project', projectId: linkedProjectId })
+    : null
   const effectiveRawScope = landingScope ?? rawScope
   const scope: TaskScope = useMemo(() => parseScope(effectiveRawScope), [effectiveRawScope])
   useEffect(() => {
@@ -400,27 +463,69 @@ export default function Tasks() {
     next.delete(TASK_DEEP_LINK_PROJECT_PARAM)
     writeUrl(next, { replace: true })
   }, [landingScope])
+  /* THE REMEMBERED FILTERS (`lib/taskFilterStorage.ts::restoreRememberedView`), per selection in this browser: a
+     selection landed on with no filter in its URL gets back the ones it last had — search and the stage strip's pick
+     included — and switching selection swaps the carried filters for the new one's (dropping the old stage pick).
+     REPLACED, so Back does not walk it. A deep link waits until it is consumed (`?task=` stripped), so a return from
+     a task lands on its filters. A LAYOUT effect reading this render's params, so the remembered board paints first.
+     Only a change of the filters after that is remembered: `pendingViewRef` holds the save until our own write lands. */
+  const viewKey = rememberedViewKey(admin?.id ?? null, landingScope ?? rawScope)
+  const restoredViewRef = useRef<string | null>(null)
+  const viewSeenRef = useRef<string | null>(null)
+  const pendingViewRef = useRef<string | null>(null)
+  /* The stage a return from the task editor's Save landed on (`lib/taskReturn.ts`): the restore keeps it over the
+     remembered pick. Held from the landing location, which the deep-link strip replaces before the restore runs. */
+  const landingLocation = useLocation()
+  const handedStageRef = useRef<string | null>(null)
+  useLayoutEffect(() => {
+    const ret = (landingLocation.state as Record<string, unknown> | null)?.[SAVED_RETURN_STATE]
+    if (isSavedReturn(ret) && ret.stage !== null) handedStageRef.current = ret.stage
+  }, [landingLocation.key]) // eslint-disable-line react-hooks/exhaustive-deps
+  useLayoutEffect(() => {
+    if (restoredViewRef.current === viewKey || searchParams.has(TASK_DEEP_LINK_PARAM)) return
+    const switching = restoredViewRef.current !== null
+    restoredViewRef.current = viewKey
+    const handed = handedStageRef.current
+    handedStageRef.current = null
+    const next = handed !== null && searchParams.get(STAGE_PARAM) === handed
+      ? restoreKeepingStage(viewKey, searchParams, handed, switching)
+      : restoreRememberedView(viewKey, searchParams, { switching })
+    viewSeenRef.current = rememberedFingerprint(next ?? searchParams)
+    pendingViewRef.current = next === null ? null : viewSeenRef.current
+    if (next !== null) writeUrl(next, { replace: true, resetWindow: false })
+  }, [viewKey, searchParams])
+  useEffect(() => {
+    if (restoredViewRef.current !== viewKey || searchParams.has(TASK_DEEP_LINK_PARAM)) return
+    const seen = rememberedFingerprint(searchParams)
+    if (pendingViewRef.current !== null) {
+      if (seen === pendingViewRef.current) pendingViewRef.current = null
+      return
+    }
+    if (seen === viewSeenRef.current) return
+    viewSeenRef.current = seen
+    saveRememberedView(viewKey, searchParams)
+  }, [searchParams, viewKey])
   /* THE ONE PROJECT the selection lives in — what new tasks are filed into and what the create ladder calls the
      board's project — or null for All projects or a feature the tree has not named yet. */
   const boardProjectId = scopeProjectId(scope, taskTree)
-  /* A feature scope's feature, for the inline create rows to file into. A SHIPPED one is carried too: the API
-     refuses filing into it, so the rows file to its project and say so (`resolveCreateTarget`). */
+  /* ── THE PIPELINE (`pipeline` only) ── one project's stages: the strip's read, the pick in the URL. */
+  const pipelineProjectId = pipeline && !viewer ? boardProjectId : null
+  const stagePick: StripPick = { stage: searchParams.get(STAGE_PARAM), only: searchParams.get(ONLY_PARAM) }
+  /* A feature scope's feature, for the inline create rows to file into (`resolveCreateTarget`). */
   const scopedFeatureLocation = scope.kind === 'feature' ? locateScope(scope, taskTree) : {}
   /* Memoised on its four facts, so the create bundle (`listCreate`) keeps its identity across a refetch. */
   const scopedFeatureId = scopedFeatureLocation.feature?.id
   const scopedFeatureName = scopedFeatureLocation.feature?.name
-  const scopedFeatureStatus = scopedFeatureLocation.feature?.status
   const scopedFeatureProjectId = scopedFeatureLocation.project?.id
   const scopedFeature = useMemo(
-    () => scopedFeatureId !== undefined && scopedFeatureName !== undefined && scopedFeatureStatus !== undefined &&
-      scopedFeatureProjectId !== undefined
-      ? { id: scopedFeatureId, name: scopedFeatureName, projectId: scopedFeatureProjectId, status: scopedFeatureStatus }
+    () => scopedFeatureId !== undefined && scopedFeatureName !== undefined && scopedFeatureProjectId !== undefined
+      ? { id: scopedFeatureId, name: scopedFeatureName, projectId: scopedFeatureProjectId }
       : undefined,
-    [scopedFeatureId, scopedFeatureName, scopedFeatureProjectId, scopedFeatureStatus],
+    [scopedFeatureId, scopedFeatureName, scopedFeatureProjectId],
   )
-  /* WHAT ⤢ HANDS `/tasks/new` BESIDE THE PROJECT: the scope's ACTIVE feature, so the editor files where the row
-     said it would (`TaskDetailPage` re-validates it against the tree). */
-  const boardFeatureId = scopedFeature?.status === 'active' ? scopedFeature.id : null
+  /* WHAT ⤢ HANDS `/tasks/new` BESIDE THE PROJECT: the scope's feature, so the editor files where the row said it
+     would (`TaskDetailPage` re-validates it against the tree). */
+  const boardFeatureId = scopedFeature?.id ?? null
   /* `/tasks/new`'s navigation state: the board's project and feature, so ▶ and ⤢ file into the same place. */
   const newTaskState: NewTaskNavState = { boardProjectId, boardFeatureId }
   /* The create row's project pick (`useInlineTaskCreate`'s picker), held HERE so ⤢ and ＋ file where the row says.
@@ -441,21 +546,13 @@ export default function Tasks() {
     clearTaskDraft(key)
     return body.trim()
   }
-  /* The row menu's two filing dialogs ("Move…", "Waiting…"), page-mounted like
-     `confirmDialog` so a refetch re-keying the rows cannot unmount an open one. */
-  const [filingTask, setFilingTask] = useState<PipelineTask | null>(null)
-  const [waitingTask, setWaitingTask] = useState<PipelineTask | null>(null)
-  /* The row menu's "Priority…", and the preempt it may offer after: the deleted Queue style's bump that
-     sorts ahead of running work asked the forecast, rather than leaving the row silently queued. */
-  const [priorityTask, setPriorityTask] = useState<PipelineTask | null>(null)
-  const [priorityPreempt, setPriorityPreempt] = useState<{ task: PipelineTask; forecast: DispatchForecast } | null>(null)
   /* The task page's chunk, fetched once the board is up. A failed prefetch is silent: the row press's own
-     `lazy()` load asks again and reports there. */
+     `lazyRetry()` load asks again and reports there. */
   useEffect(() => {
     loadTaskDetailPage().catch(() => {})
   }, [])
   /* THE USER'S MUTES (`lib/taskMute.ts`): the muted nodes above the scope leave its row set. A STRING for memo
-     and effect deps, as `creatorKey`. */
+     and effect deps, as `assigneeKey`. */
   const mutedKey = readMuted(admin?.preferences).join(' ')
   const muted = useMemo(() => (mutedKey === '' ? [] : mutedKey.split(' ')), [mutedKey])
   const listScope = scopeToListParams(scope, muted)
@@ -465,7 +562,7 @@ export default function Tasks() {
   // MOSTLY SYSTEM ROWS, NOT ONLY: a Runner cron's `hidden` tick (`app/cron_activity_runner.py`) files the
   // operator's own maintenance hidden. Both classes land in the board's FINISHED half (a hidden row asking a
   // question is on the board anyway, unfinished)
-  // (`routes/tasks/listing.py::_TASK_LIST_COMPLETED_GROUP`, client half `isCompletedRow`), so ticking this never
+  // (`routes/tasks/listing.py::_TASK_LIST_COMPLETED_GROUP` orders the response), so ticking this never
   // displaces live work — at the cost of sorting an active maintenance run with finished business.
   // `buildTasksUrl` in `components/tasks/shared.tsx` is the single home for what it sends
   // (`include_hidden` + `include_archived`). The value is the URL's (`urlFilters`).
@@ -495,55 +592,267 @@ export default function Tasks() {
   /* RESOLVED AT REQUEST TIME, never memoised on the controls: `Today`'s floor depends on the CLOCK, so a memo
      would send yesterday's window (and stale section totals) after midnight. It is cheap. */
   function dateBounds() {
-    return resolveDateRangeBounds(dateRange, dateFrom, dateTo, zone)
+    /* A link's exact window of instants (`?after=`/`?before=`) wins over the Period choice while present. */
+    return instantWindowBounds(windowAfter, windowBefore) ?? resolveDateRangeBounds(dateRange, dateFrom, dateTo, zone)
   }
 
-  /* WHOSE ROWS — creator ids, EMPTY for everybody. A real filter, the URL's. Two surfaces drive it (the header's
-     avatar strip and the menu's Creator page, operator's call) and share one setter and one roster. */
-  /* THE ROSTER (`GET /api/tasks/creators`): people with top-level tasks in the CURRENT PROJECT SCOPE. Fetched,
-     never derived from the lazy window (as `tagGroups`). Fire-and-forget: a failure costs only the picker. */
-  const [creators, setCreators] = useState<TaskCreator[]>([])
+  /* WHOSE ROWS — assignee ids, EMPTY for everybody. A real filter, the URL's. Two surfaces drive it (the header's
+     avatar strip and the menu's Assignee page, operator's call) and share one setter and one roster. */
+  /* THE ROSTER (`GET /api/tasks/assignees`): people with top-level tasks in the CURRENT PROJECT SCOPE. Fetched,
+     never derived from the lazy window (as `tagGroups`). Refetched on what changes WHO HAS ROWS (project scope,
+     Show hidden) and NOT on the period or the pick — the picker must keep offering the people it filters away
+     (`buildTaskAssigneesUrl` is the single home for the roster URL's params). Read once the list has landed.
+     KEYED ON THE ADMIN TOO: the roster always carries the caller's own row, so an in-place admin switch must
+     refetch. The last roster stays on screen while the next loads. The board never depends on it: a failed read
+     costs this visit the picker, keeps the filter. */
+  const assigneesUrl = buildTaskAssigneesUrl(listScope, showHidden)
+  const assigneesQuery = useQuery({
+    queryKey: ['task-assignees', assigneesUrl, admin?.id ?? null],
+    queryFn: () => get<TaskAssignee[]>(assigneesUrl).then(roster => (Array.isArray(roster) ? roster : [])),
+    enabled: listLanded,
+    placeholderData: keepPreviousData,
+    meta: { persist: false },
+  })
+  const assignees = assigneesQuery.data ?? NO_ASSIGNEES
+  /* RECONCILES THE RESTORED PICK ONLY ON SUCCESS (`dataUpdatedAt` moves on each answer, never on a failure or a
+     held placeholder): an id with no rows in the new scope is an invisible narrowing, but a FAILED fetch is not that
+     answer (a transient 500 must not widen a chosen filter) — as the tag catalog. */
+  useEffect(() => {
+    if (assigneesQuery.isSuccess && !assigneesQuery.isPlaceholderData) {
+      keepKnown('assigneeIds', new Set(assigneesQuery.data.map(assignee => assignee.id)))
+    }
+  }, [assigneesQuery.dataUpdatedAt])
+  /* THE CREATOR ROSTER (`GET /api/tasks/creators`): the assignee roster's twin — same scope, same refetch keys,
+     same success-only reconciliation — whose "System" entry covers every row no human filed. */
+  const creatorsUrl = buildTaskCreatorsUrl(listScope, showHidden)
+  const creatorsQuery = useQuery({
+    queryKey: ['task-creators', creatorsUrl, admin?.id ?? null],
+    queryFn: () => get<TaskAssignee[]>(creatorsUrl).then(roster => (Array.isArray(roster) ? roster : [])),
+    enabled: listLanded,
+    placeholderData: keepPreviousData,
+    meta: { persist: false },
+  })
+  const creators = creatorsQuery.data ?? NO_ASSIGNEES
+  useEffect(() => {
+    if (creatorsQuery.isSuccess && !creatorsQuery.isPlaceholderData) {
+      keepKnown('creatorIds', new Set(creatorsQuery.data.map(creator => creator.id)))
+    }
+  }, [creatorsQuery.dataUpdatedAt])
   /* THE SOURCE VOCABULARY (`GET /api/tasks/sources`): codes and the server's labels, which are never spelled
-     here. Fire-and-forget like the roster: a failure costs only the picker and the chips' words. */
-  const [taskSources, setTaskSources] = useState<TaskSourceOption[]>([])
+     here. Fixed per deploy, so one read shared with the triggers' labels (`readTaskSources`, the same key).
+     Reconciled as the assignee pick is, and only on success: a code the server does not know is an invisible
+     narrowing with no word for its chip. A failure costs only the picker and the chips' words. */
+  const sourcesQuery = useQuery({
+    queryKey: ['task-sources'],
+    // The cache holds the RAW answer (`cachedRead`'s contract on this key); shaped on read.
+    queryFn: () => get<TaskSourceOption[]>(TASK_SOURCES_URL),
+    enabled: listLanded,
+    staleTime: CATALOGUE_STALE_MS,
+  })
+  const taskSources = useMemo(
+    () => (Array.isArray(sourcesQuery.data) ? sourcesQuery.data : NO_SOURCES),
+    [sourcesQuery.data],
+  )
+  useEffect(() => {
+    if (sourcesQuery.isSuccess) keepKnown('sources', new Set(taskSources.map(source => source.value)))
+  }, [sourcesQuery.dataUpdatedAt])
 
   /* ── THE VIEW: GROUP BY ──────────
-     The URL's (`?group=`), so a link reproduces the view; State by default. `effectiveGroupBy` is what this
-     selection can honour (`resolveGroupBy`): Project only across projects, a tag group only while the catalog
-     holds it. */
-  const groupBy = parseGroupParam(searchParams.get(GROUP_PARAM))
+     The URL's (`?group=`), so a link reproduces the view; State by default — Project on the pipeline page's All
+     projects. `effectiveGroupBy` is what this selection can honour (`resolveGroupBy`): Project only
+     across projects, a tag group only while the catalog holds it. */
+  const defaultGroupBy = pipeline && !viewer && scope.kind === 'all' ? GROUP_BY_PROJECT : DEFAULT_GROUP_BY
+  const groupBy = parseGroupParam(searchParams.get(GROUP_PARAM), defaultGroupBy)
   const groupByOptions = useMemo(() => offeredGroupBys(scope.kind === 'all', tagGroups), [scope.kind, tagGroups])
-  const effectiveGroupBy = resolveGroupBy(groupBy, groupByOptions, tagCatalogAdminId !== undefined)
+  const effectiveGroupBy = resolveGroupBy(groupBy, groupByOptions, tagGroupsQuery.isSuccess, defaultGroupBy)
   /* Sectioning by State reads the server's counts (`stateGrouping` below). */
   const feedStateGrouped = effectiveGroupBy === GROUP_BY_STATE
   /* The Live Cast viewer has no preferences to keep the fold in, and a visitor came to see finished work: Done
      opens there by default, and the fold lives for the page. */
   const [viewerDoneExpanded, setViewerDoneExpanded] = useState(true)
   const doneExpanded = viewer ? viewerDoneExpanded : admin?.preferences?.task_done_expanded === true
+  /* THE VIEWER'S COLUMNS (Filter & view > Columns, `lib/taskColumns.ts`): stored on the account. Organization is
+     offered only to whoever sees it (`useOrgVisible`). The set is memoized: the feed's row cache keys on it. */
+  const orgVisible = useOrgVisible()
+  const offeredColumns = useMemo(() => TASK_COLUMNS.filter(column => column.key !== 'org' || orgVisible), [orgVisible])
+  /* Keyed on a STRING, as `mutedKey`: every preferences save hands back a new array, which would rebuild every row. */
+  const hiddenKey = viewer ? '' : readHiddenColumns(admin?.preferences).join(' ')
+  const hiddenColumns = useMemo(() => (hiddenKey === '' ? [] : hiddenKey.split(' ')), [hiddenKey])
+  const hiddenColumnSet = useMemo(() => new Set(hiddenColumns), [hiddenColumns])
   /* THE STATE BOARD'S WINDOW in the order it is drawn (`buildTasksUrl` says how): a folded Done costs no row. */
   /* AN EXPLICIT STATE: DONE FILTER OPENS DONE: folded, the window sent `state=done&exclude_done=true` — no
      row — while Select all named the counts' total, and a pick under a fold is dropped (`onDrawn`). */
   const doneOpen = doneExpanded || stateFilter === 'done'
   const windowShape = { sectionOrder: feedStateGrouped, excludeDone: feedStateGrouped && !doneOpen }
   const queryClient = useQueryClient()
+  /* The pipeline's view and items read take the board's filters, the scope's feature and
+     the persona: every count on the strip and the sections is the listed rows'. */
+  const pipelineBounds = dateBounds()
+  const pipelineFeature = scope.kind === 'feature' ? scope.featureId : null
+  // The user's hidden nodes above the scope leave the strip's counts and the stage lists, as they leave the feed's.
+  const pipelineExclusions = muteExclusionParams(scope, muted)
+  const pipelineExclusionsKey = pipelineExclusions.join(' ')
+  const pipelineFilters: ItemFilters = useMemo(() => ({
+    q, assigneeIds, creatorIds, sources, state: stateFilter, focus, showHidden, persona,
+    after: pipelineBounds.updatedAfter ?? null, before: pipelineBounds.updatedBefore ?? null,
+    featureId: pipelineFeature, exclusions: pipelineExclusions,
+  // Keyed on the values: `dateBounds()` and the id arrays are fresh each render.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [q, assigneeKey, creatorKey, sourceKey, stateFilter, focus, showHidden, persona, pipelineBounds.updatedAfter,
+    pipelineBounds.updatedBefore, pipelineFeature, pipelineExclusionsKey])
+  const pipelineViewQuery = useQuery({
+    queryKey: pipelineViewKey(pipelineProjectId ?? 0, pipelineFilters),
+    queryFn: () => getPipelineView(pipelineProjectId!, pipelineFilters),
+    enabled: pipelineProjectId !== null,
+    placeholderData: (prev, prevQuery) => (prevQuery?.queryKey[1] === pipelineProjectId ? prev : undefined),
+    // Re-read while something moves, or while a wait counts down to a moment (soak, timeout, hours, freeze); while a
+    // stage shows a health dot, once a minute, so the dot stays live (the read keeps its stages checked every minute).
+    refetchInterval: query => (query.state.data?.steps.some(step => step.in_flight > 0 || hasDeadline(step.reasons))
+      ? PIPELINE_POLL_MS : query.state.data?.stages.some(stage => stage.health) ? HEALTH_POLL_MS : false),
+    meta: { persist: false },
+  })
+  const pipelineView = pipelineProjectId !== null ? pipelineViewQuery.data : undefined
+  /* All projects (secondary, D7): the totals under the list's filters; pressing one picks that stage (`?stage=` its
+     name) and the list then holds that stage's tasks across projects — each project's first page. */
+  const allProjectsPipeline = pipeline && !viewer && scope.kind === 'all'
+  const pipelineTotalsQuery = useQuery({
+    queryKey: pipelineTotalsKey(pipelineFilters),
+    queryFn: () => getPipelineTotals(pipelineFilters),
+    enabled: allProjectsPipeline,
+    placeholderData: prev => prev,
+    meta: { persist: false },
+  })
+  const pipelineTotals = pipelineTotalsQuery.data
+  /* The picked stage, as the totals name it, once they hold it (a project's stage id carried over, a stale link, a
+     total not read yet: no pick). */
+  const allStageName = allProjectsPipeline && pipelineTotals && stagePick.stage !== null
+    ? totalsStage(pipelineTotals.totals, stagePick.stage)
+    : null
+  const allStageQuery = useQuery({
+    queryKey: pipelineAllItemsKey(allStageName ?? '', pipelineFilters),
+    queryFn: ({ signal }) => getAllStageItems(allStageName!, pipelineFilters, signal),
+    enabled: allStageName !== null,
+    meta: { persist: false },
+  })
+  const allStage = useMemo(
+    () => (allStageQuery.data ? stageTasksAcross(allStageQuery.data.projects) : undefined),
+    [allStageQuery.data],
+  )
+  /* Only this project's events re-read its pipeline (the event's id is the project's); across projects, the totals
+     and a picked stage's tasks. */
+  useLiveRefetch(useEventStream(), () => {
+    if (pipelineProjectId === null) {
+      void queryClient.invalidateQueries({ queryKey: PIPELINE_TOTALS_KEY })
+      void queryClient.invalidateQueries({ queryKey: PIPELINE_ALL_ITEMS_KEY })
+      return
+    }
+    void queryClient.invalidateQueries({ queryKey: ['pipeline-view', pipelineProjectId] })
+    refreshPipelineItems(queryClient, pipelineProjectId)
+    void queryClient.invalidateQueries({ queryKey: releaseKey(pipelineProjectId) })
+  }, pipeline ? PIPELINE_POLL_MS : null, {
+    entity: 'pipeline',
+    minIntervalMs: PIPELINE_LIVE_MIN_MS,
+    match: event => pipelineProjectId === null || String(event.id) === String(pipelineProjectId),
+  })
+  /* A pick is a push (Back walks it); a new pick drops the group a step's count chose. Picking the current pick keeps
+     it (a press selects, never toggles off). `replace`: the rail's opening pick, which Back skips. */
+  function pickStage(next: StripPick, { replace = false } = {}) {
+    const params = new URLSearchParams(liveParamsRef.current)
+    if (next.stage) params.set(STAGE_PARAM, next.stage)
+    else params.delete(STAGE_PARAM)
+    if (next.only) params.set(ONLY_PARAM, next.only)
+    else params.delete(ONLY_PARAM)
+    if (params.toString() === liveParamsRef.current.toString()) return
+    writeUrl(params, { replace, resetWindow: false })
+  }
+  /* A PROJECT OPENED FROM THE RAIL (`AUTO_STAGE_STATE`, its scope key) opens on the stage that needs someone
+     (`attentionStage`): questions, then failures, then stopped tasks, the rightmost first; else Ideas. Held until that
+     project's strip is read AFTER the click (never a cached one) — the remembered-view restore replaces the URL (and
+     its state) before then. It takes over the restore's pending save. */
+  const railLocation = useLocation()
+  const autoStageRef = useRef<{ key: string; scope: string; at: number } | null>(null)
+  const railScope = (railLocation.state as Record<string, unknown> | null)?.[AUTO_STAGE_STATE]
+  useEffect(() => {
+    if (typeof railScope === 'string') autoStageRef.current = { key: railLocation.key, scope: railScope, at: Date.now() }
+  }, [railLocation.key]) // eslint-disable-line react-hooks/exhaustive-deps
+  const autoStageView = pipelineViewQuery.isPlaceholderData ? undefined : pipelineView
+  const autoStageReadAt = pipelineViewQuery.dataUpdatedAt
+  useEffect(() => {
+    const pending = autoStageRef.current
+    if (!pending || pending.scope !== rawScope || !autoStageView) return
+    if (autoStageReadAt < pending.at) {
+      void pipelineViewQuery.refetch()
+      return
+    }
+    autoStageRef.current = null
+    pendingViewRef.current = null
+    pickStage({ stage: attentionStage(autoStageView), only: null }, { replace: true })
+  }, [autoStageView, autoStageReadAt, rawScope, railLocation.key]) // eslint-disable-line react-hooks/exhaustive-deps
+  /* A RETURN FROM THE TASK EDITOR'S SAVE (`SAVED_RETURN_STATE`) opens on the saved row's stage (`lib/taskReturn.ts`):
+     held like the rail's (the deep-link strip and the restore drop the state), resolved once the board's one project
+     is known, and dropped if the operator moved to another scope or stage, or left, before it answered. */
+  const savedReturnRef = useRef<SavedReturn | null>(null)
+  const savedReturn = (railLocation.state as Record<string, unknown> | null)?.[SAVED_RETURN_STATE]
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
+  /* Looked up only when the link carries no stage; the list shows loading meanwhile, never every stage. */
+  const looksUpStage = pipeline && isSavedReturn(savedReturn) && savedReturn.stage === null
+  const [stageLookup, setStageLookup] = useState(looksUpStage)
+  useEffect(() => {
+    if (!looksUpStage) return
+    savedReturnRef.current = savedReturn
+    setStageLookup(true)
+  }, [railLocation.key]) // eslint-disable-line react-hooks/exhaustive-deps
+  // A backstop: a lookup that never answers must not hold the list for good.
+  useEffect(() => {
+    if (!stageLookup) return
+    const giveUp = window.setTimeout(() => setStageLookup(false), STAGE_LOOKUP_MAX_MS)
+    return () => window.clearTimeout(giveUp)
+  }, [stageLookup])
+  useEffect(() => {
+    const ret = savedReturnRef.current
+    // Wait for the deep link to settle `?scope=` (a tab with no earlier board lands on the row's project).
+    if (!ret || searchParams.has(TASK_DEEP_LINK_PARAM)) return
+    if (scope.kind !== 'all' && boardProjectId === null) {
+      // A feature the loaded tree does not place names no project: nothing to look up, so the list shows.
+      if (taskTree !== undefined || taskTreeFailed) {
+        savedReturnRef.current = null
+        setStageLookup(false)
+      }
+      return
+    }
+    savedReturnRef.current = null
+    const scopeAtStart = effectiveRawScope
+    const stageAtStart = liveParamsRef.current.get(STAGE_PARAM)
+    void savedReturnStage(ret, scope, boardProjectId).then(stage => {
+      if (!mountedRef.current) return
+      setStageLookup(false)
+      const live = liveParamsRef.current
+      if (stage === null || live.get(SCOPE_PARAM) !== scopeAtStart) return
+      if (live.get(STAGE_PARAM) !== stageAtStart) return // the operator picked a stage meanwhile
+      pendingViewRef.current = null
+      pickStage({ stage, only: null }, { replace: true })
+    })
+  }, [railLocation.key, scope, boardProjectId, searchParams, taskTree, taskTreeFailed]) // eslint-disable-line react-hooks/exhaustive-deps
   // The lazy-load window: rows ASKED for, growing a page at a time via the sentinel and reset on filter change.
   // `shared.tsx`'s `buildTasksUrl` doc says why the window GROWS rather than stitching offset pages.
   const [limit, setLimit] = useState(TASK_PAGE_SIZE)
-  /* A NEW SELECTION RESETS THE WINDOW, whoever moved it — the sidebar's (and the phone dropdown's) links navigate
-     without `writeUrl`. Reset DURING RENDER, so the fetch sees the reset limit: one request per change. */
-  const windowScopeKey = scopeKey(scope)
-  const [limitScopeKey, setLimitScopeKey] = useState(windowScopeKey)
-  if (limitScopeKey !== windowScopeKey) {
-    setLimitScopeKey(windowScopeKey)
-    setLimit(TASK_PAGE_SIZE)
-  }
   // Expand state is persisted to `localStorage` under ADMIN-SCOPED keys (`lib/taskExpandStorage.ts` owns the
   // storage shape); this page owns only when to read and write.
   const can = useCan()
   const canReadWorktrees = can('worktrees:view')
+  /* R5: the live worktree set, read after the list and re-read on the events that move it (below) so a freshly
+     dispatched task links to its worktree; a failure keeps the prior set (no link, never a broken page). Keyed on
+     the capability: the shell renders from the persisted permission snapshot, so `worktrees:view` may arrive
+     late — and without it, one refused request per poll cycle forever. */
+  const worktrees = useWorktrees({ enabled: canReadWorktrees && listLanded }).data ?? NO_WORKTREES
   // The three task WRITE keys: `tasks:view` implies none, so a rendered row or board is no evidence of any
   // write. `hooks/useTaskAccess.ts` single-homes which key covers which verb; hence one `undefined` per affordance.
   const canEditTasks = useCanEditTasks()
+  const canOnProject = useCanOnProject()
   const canDeleteTasks = useCanDeleteTasks()
   const canCreateTasks = useCanCreateTasks()
   /* The narrower CHAT answer — `tasks:create` AND `worktrees:edit` (the operator must type back into the
@@ -560,6 +869,13 @@ export default function Tasks() {
   // Write-through ARMED only once the restore for the current key settled — else the empty mount state would
   // overwrite the outline being restored.
   const restoredExpandedKeyRef = useRef<string | null>(null)
+  // Remembered expansions the board has not drawn yet (see the restore effect), and the restore's generation: an
+  // admin switch mid-read discards the previous outline's answers.
+  const pendingRestoreRef = useRef<Set<number>>(new Set())
+  // …and those claimed by a restore read not yet applied (in flight, or failed for a reason that is not "gone"):
+  // still remembered, and a user's own toggle meanwhile wins over the read's answer.
+  const restoreHeldRef = useRef<Set<number>>(new Set())
+  const restoreGenRef = useRef(0)
   // The filters' arming gate, seeded with the MOUNT key (restored synchronously): armed from the first render
   // (a no-op re-save); a late or changed admin id hands the restore effect the job.
   const restoredFiltersKeyRef = useRef(filtersStorageKey)
@@ -632,11 +948,33 @@ export default function Tasks() {
   const paintedListUrlRef = useRef<string | null>(null)
   const latestListUrlRef = useRef<string | null>(null)
   const detailFetchGenRef = useRef(0)
-  // A third for section totals: a fast A→B scope switch could otherwise leave A's totals over B's rows.
-  const countsFetchGenRef = useRef(0)
 
   function listUrl(size: number) {
-    return buildTasksUrl(listScope, showHidden, size, dateBounds(), creatorIds, focus, q, sources, windowShape, stateFilter)
+    return buildTasksUrl({
+      scopeFilter: listScope, showHidden, limit: size, bounds: dateBounds(), assigneeIds, focus, q, sources,
+      ...windowShape, state: stateFilter, persona, creatorIds,
+    })
+  }
+
+  /* A NEW SELECTION RESETS THE WINDOW, whoever moved it — the sidebar's (and the phone dropdown's) links navigate
+     without `writeUrl`. Reset DURING RENDER, so the fetch sees the reset limit: one request per change.
+     AND ITS ROWS: the last scope's rows under the new scope's section counts read as that scope's (a "Waiting 2"
+     over no row) until the list landed. The new scope paints its own last first page (`lib/taskListSeed.ts`) at
+     once, else the skeleton; a failed read then clears it, as on a reload. The left scope's tag totals and failure
+     go with its rows. */
+  const windowScopeKey = scopeKey(scope)
+  /* A NEW SELECTION DROPS THE STAGE PICK (a stage id is one project's): THE REMEMBERED FILTERS, above, do it. */
+  const [limitScopeKey, setLimitScopeKey] = useState(windowScopeKey)
+  if (limitScopeKey !== windowScopeKey) {
+    setLimitScopeKey(windowScopeKey)
+    setLimit(TASK_PAGE_SIZE)
+    const seeded = readTaskListSeed(queryClient, listUrl(TASK_PAGE_SIZE))
+    setTasks(seeded ?? [])
+    setLoading(seeded === undefined)
+    setNextCursor(null)
+    setError('')
+    setErrorCause(null)
+    paintedListUrlRef.current = null
   }
 
   async function fetchTasks(reuse = false) {
@@ -652,28 +990,58 @@ export default function Tasks() {
       paintedListUrlRef.current = url
       setTasks(prev => keepUnchangedRows(prev, data))
       rememberBoardRows(data, epoch)
+      // The first window only: it is what a reload asks for first (`lib/taskListSeed.ts`).
+      if (limit === TASK_PAGE_SIZE) saveTaskListSeed(queryClient, url, data, epoch)
       setNextCursor(next)
       setError('')
+      setErrorCause(null)
       setLoading(false)
-    } catch {
+    } catch (err) {
       if (gen !== listFetchGenRef.current) return // stale failure — a newer fetch owns the state
+      // Rows painted from the last visit's seed are not an answer: a refusal must not leave them on screen.
+      if (paintedListUrlRef.current === null) setTasks([])
       setError('Failed to load tasks')
+      setErrorCause(err)
     } finally {
       // Only the latest fetch clears the initial loading state.
       if (gen === listFetchGenRef.current) setLoading(false)
+      setListLanded(true)
     }
   }
 
-  // Refetch expanded parents' details so their rollups stay live. Both guards needed (R6): the generation
-  // stamp, and `id in prev` so a detail collapsed mid-fetch is never resurrected.
+  /* THE API IS BACK after an outage that covered the list's failure: read again at once, rather than leave an empty
+     board with no message until the stream reopens or the down-poll fires. Only a covered failure — one that went
+     `down` — so a route's own 503 the probe answered never loops here. */
+  const recovered = useRecoveries()
+  useEffect(() => {
+    if (recovered > 0 && outageCoversError) void fetchTasks()
+  }, [recovered])
+
+  /* A RELOAD PAINTS THE LAST FIRST PAGE while the list's own read is in flight (`lib/taskListSeed.ts`), once the
+     persisted cache is restored and only while no answer has been painted. No cursor: the next page waits for the
+     live answer's. */
+  const restoringCache = useIsRestoring()
+  useEffect(() => {
+    if (restoringCache || paintedListUrlRef.current !== null) return
+    const seeded = readTaskListSeed(queryClient, listUrl(limit))
+    if (seeded === undefined) return
+    setTasks(prev => (prev.length === 0 ? seeded : prev))
+    setLoading(false)
+  }, [restoringCache])
+
+  // Refetch expanded parents' details so their rollups stay live — only those the board DRAWS
+  // (`drawnExpandedIds` over `displayTasks`, the pinned row included): a remembered expansion out of the window
+  // refreshes on the first event after it is drawn again. Only ever CALLED after render (events, polls), so
+  // `displayTasks`, declared below, is initialised. Both guards needed (R6): the generation stamp, and
+  // `id in prev` so a detail collapsed mid-fetch is never resurrected.
   async function refetchExpandedDetails() {
-    const ids = Object.keys(expanded).map(Number)
+    const ids = drawnExpandedIds(displayTasks, expanded)
     if (ids.length === 0) return
     const gen = ++detailFetchGenRef.current
     await Promise.all(
       ids.map(async id => {
         try {
-          const detail = await get<PipelineTask>(`/api/tasks/${id}`)
+          const detail = await get<PipelineTask>(expandedDetailUrl(id))
           if (gen !== detailFetchGenRef.current) return // superseded batch — discard
           setExpanded(prev => (id in prev ? { ...prev, [id]: detail } : prev))
         } catch {
@@ -684,118 +1052,53 @@ export default function Tasks() {
     )
   }
 
-  // The tag-group catalog: fire-and-forget. The marker is stamped ONLY on success, with its admin (a failure
-  // is not an answer — see the state declaration).
-  async function fetchTagGroups() {
-    const forAdminId = admin?.id ?? null
-    try {
-      const data = await get<TagGroup[]>('/api/tags/groups')
-      setTagGroups(Array.isArray(data) ? data : [])
-      setTagCatalogAdminId(forAdminId)
-    } catch {
-      // Keep the held catalog and the marker; nothing reconciles against a catalog that never arrived.
-    }
-  }
-
   /* The feed's State totals (`feedStateCounts`) on the live/poll paths only: a filter change moves the query's
-     key, which fetches by itself — invalidating there too would cancel and repeat that request. */
+     key, which fetches by itself — invalidating there too would cancel and repeat that request. A read still in
+     flight is JOINED (`cancelRefetch: false`), as the tree's: on a slow API every event cancelled the last one. */
   function refetchFeedStateCounts() {
-    if (feedStateGrouped) void queryClient.invalidateQueries({ queryKey: [...PANE_QUERY_KEY, 'counts'] })
+    if (feedStateGrouped) void queryClient.invalidateQueries({ queryKey: [...PANE_QUERY_KEY, 'counts'] }, { cancelRefetch: false })
   }
 
-  // Section totals, SKIPPED while Group by is None (this runs every refetch and poll). Error-tolerant: a
-  // missing count renders a header without a number.
-  async function fetchTagCounts() {
-    // A TAG group only: recency sections rows already held and needs no server count.
-    if (!isTagGroupBy(effectiveGroupBy)) return
-    const gen = ++countsFetchGenRef.current
-    try {
-      // Through the shared builder (`shared.tsx`): totals must count the SAME row set as the list, and the
-      // counting route must NOT take `limit`.
-      const data = await get<TagCounts>(
-        buildTagCountsUrl(listScope, showHidden, dateBounds(), creatorIds, focus, q, sources, stateFilter),
-      )
-      if (gen !== countsFetchGenRef.current) return // superseded by a newer fetch — discard
-      setTagCounts(data)
-    } catch {
-      // Keep the last-known totals.
-    }
+  /* THE SECTION TOTALS COME FROM THE SERVER (`GET /api/tasks/tag-counts`): a count over the lazy 50-row window
+     would lie. Through the shared builder (`shared.tsx`): totals must count the SAME row set as the list, and the
+     counting route must NOT take `limit` (the window never changes what is counted). The URL is the key: every
+     filter — `zone` included, else a total on yesterday's calendar sits beside today's rows — refetches by itself,
+     the newest read wins, and a failure keeps the last-known totals. A TAG group only (recency sections rows
+     already held): ungrouped, this would be a useless request per refetch and poll. `undefined` until it lands —
+     no number rather than an unbacked zero; a filter change keeps the last totals meanwhile, a scope change does
+     not (the left scope's go with its rows). */
+  const tagCountsUrl = buildTagCountsUrl({
+    scopeFilter: listScope, showHidden, bounds: dateBounds(), assigneeIds, focus, q, sources, state: stateFilter, persona, creatorIds,
+  })
+  const tagCounts = useQuery({
+    queryKey: ['task-tag-counts', listScopeKey, tagCountsUrl],
+    queryFn: () => get<TagCounts>(tagCountsUrl),
+    enabled: isTagGroupBy(effectiveGroupBy),
+    placeholderData: (previous, previousQuery) => (previousQuery?.queryKey[1] === listScopeKey ? previous : undefined),
+    meta: { persist: false },
+  }).data
+
+  /* R5: the worktree set on the events that move it (below); its read and its guard are `useWorktrees` above. */
+  function refetchWorktrees() {
+    void queryClient.invalidateQueries({ queryKey: WORKTREES_KEY })
   }
 
-  // R5: the live worktree set, fire-and-forget (failure keeps the prior set — no link, never a broken page).
-  // Skipped without `worktrees:view`, else one refused request per poll cycle forever.
-  async function fetchWorktrees() {
-    if (!canReadWorktrees) return
-    try {
-      const data = await listWorktrees()
-      const next = Array.isArray(data) ? data : []
-      /* An unchanged pool keeps its identity: the row actions' worktree joins key on it, and every
-         `task` event re-reads it. A few dozen slots — the comparison costs less than one row's render. */
-      setWorktrees(prev => (JSON.stringify(prev) === JSON.stringify(next) ? prev : next))
-    } catch {
-      // Keep the last-known set.
-    }
+  /* A CORRECTION of one URL pick against the vocabulary just fetched: never pushed (a response, not the operator,
+     drove it) and never written when there is nothing to correct (an equal write is still a router commit, and
+     the assignee one runs on every scope change). */
+  function keepKnown(filter: 'assigneeIds' | 'creatorIds' | 'sources', known: ReadonlySet<string>): void {
+    const base = liveParamsRef.current
+    const current = readTaskUrlFilters(base)
+    const kept = current[filter].filter(id => known.has(id))
+    if (kept.length === current[filter].length) return
+    const written = writeTaskUrlFilters({ ...current, [filter]: kept }, base)
+    liveParamsRef.current = written
+    setSearchParams(written, { replace: true })
   }
-
-  /* THE CREATOR ROSTER. Refetched on what changes WHO HAS ROWS (project scope, Show hidden) and NOT on the period
-     or the pick — the picker must keep offering the people it filters away (`buildTaskCreatorsUrl` is the single
-     home for the roster URL's params). Declared above the list fetch so the cheap request fires first.
-     RECONCILES THE RESTORED PICK ONLY ON SUCCESS: an id with no rows in the new scope is an invisible narrowing,
-     but a FAILED fetch is not that answer (a transient 500 must not widen a chosen filter) — as the tag catalog.
-     KEYED ON THE ADMIN TOO: the roster always carries the caller's own row, so an in-place admin switch must refetch. */
-  useEffect(() => {
-    let cancelled = false
-    void get<TaskCreator[]>(buildTaskCreatorsUrl(listScope, showHidden))
-      .then(roster => {
-        if (cancelled) return
-        const known = Array.isArray(roster) ? roster : []
-        setCreators(known)
-        const ids = new Set(known.map(creator => creator.id))
-        /* A CORRECTION: never pushed (a response, not the operator, drove it) and never written when there is
-           nothing to correct (an equal write is still a router commit, and this runs on every scope change). */
-        const base = liveParamsRef.current
-        const current = readTaskUrlFilters(base)
-        const kept = current.creatorIds.filter(id => ids.has(id))
-        if (kept.length !== current.creatorIds.length) {
-          const written = writeTaskUrlFilters({ ...current, creatorIds: kept }, base)
-          liveParamsRef.current = written
-          setSearchParams(written, { replace: true })
-        }
-      })
-      .catch(() => {
-        // The board never depends on the roster: this visit loses the picker, keeps the filter.
-      })
-    return () => { cancelled = true }
-  }, [listScopeKey, showHidden, admin?.id])
-
-  /* THE SOURCE VOCABULARY, once: it is fixed per deploy. Reconciled as the creator pick is, and only on success:
-     a code the server does not know is an invisible narrowing with no word for its chip. */
-  useEffect(() => {
-    let cancelled = false
-    void readTaskSources()
-      .then(data => {
-        if (cancelled) return
-        const known = Array.isArray(data) ? data : []
-        setTaskSources(known)
-        const codes = new Set(known.map(source => source.value))
-        const base = liveParamsRef.current
-        const current = readTaskUrlFilters(base)
-        const kept = current.sources.filter(code => codes.has(code))
-        if (kept.length !== current.sources.length) {
-          const written = writeTaskUrlFilters({ ...current, sources: kept }, base)
-          liveParamsRef.current = written
-          setSearchParams(written, { replace: true })
-        }
-      })
-      .catch(() => {
-        // The board never depends on the vocabulary: this visit loses the picker, keeps the filter.
-      })
-    return () => { cancelled = true }
-  }, [])
 
   // Initial load + refetch whenever a filter or the lazy window changes. `limit` is a dep (growing the window
   // IS a refetch), and `patchUrlFilters` resets it in the same batched render, so one request per change.
-  // `creatorKey`, not `creatorIds` (see its declaration). `zone` because it is half of what the date window
+  // `assigneeKey`, not `assigneeIds` (see its declaration). `zone` because it is half of what the date window
   // MEANS: a changed or late-answering timezone setting changes the request.
   // The window's shape too (`windowShape`): Group by State on or off, Done folded or not, is another row set.
   useEffect(() => {
@@ -806,36 +1109,26 @@ export default function Tasks() {
     appendedLimitRef.current = null
     void fetchTasks(true)
   }, [
-    listScopeKey, showHidden, dateRange, dateFrom, dateTo, zone, dayStart, creatorKey, sourceKey, focus, limit, q,
-    stateFilter, windowShape.sectionOrder, windowShape.excludeDone,
+    listScopeKey, showHidden, dateRange, dateFrom, dateTo, zone, dayStart, assigneeKey, creatorKey, sourceKey, focus, limit,
+    q, stateFilter, persona, windowAfter, windowBefore, windowShape.sectionOrder, windowShape.excludeDone,
   ])
-
-  /* KEYED ON THE ADMIN: a tag group is a reference a principal may not be able to read, so an in-place admin switch
-     must not keep the previous vocabulary or reconcile against it (as `fetchWorktrees` with `canReadWorktrees`). */
-  useEffect(() => {
-    void fetchTagGroups()
-  }, [admin?.id])
-
-  // The counts answer to the list's filters plus `groupBy` (which turns the fetch on for TAG groups). NOT
-  // `limit` (the window never changes what is counted). `zone` as for the list — else a total on yesterday's
-  // calendar sits beside today's rows.
-  useEffect(() => {
-    void fetchTagCounts()
-  }, [effectiveGroupBy, listScopeKey, showHidden, dateRange, dateFrom, dateTo, zone, dayStart, creatorKey, sourceKey, focus, q, stateFilter])
-
-  /* THE SELECTION MOVES — a create's landing. A push (Back walks it); the filters, grouping and
-     view ride along untouched. */
-  function navigateScope(next: TaskScope) {
-    const params = new URLSearchParams(liveParamsRef.current)
-    params.set(SCOPE_PARAM, scopeKey(next))
-    writeUrl(params)
-  }
 
   /* CLEAR ALL — every badge-counted filter plus Search, the URL's in one push (so Back undoes them in one step).
      NOT Focus: it has no chip and no badge count, so clearing it was a change nothing on screen announced; its own
      toggle turns it off. */
   function clearFilters() {
-    if (hasTaskUrlFilters(urlFilters)) patchUrlFilters({ showHidden: false, dateRange: 'all', creatorIds: [], sources: [], state: '', q: '' })
+    /* A picked bucket is the toolbar's Show filter (badge-counted): Clear drops it in the same push. A stage pick stays. */
+    const bucket = isBucket(liveParamsRef.current.get(STAGE_PARAM))
+    if (!hasTaskUrlFilters(urlFilters) && !bucket) return
+    const base = new URLSearchParams(liveParamsRef.current)
+    if (bucket) {
+      base.delete(STAGE_PARAM)
+      base.delete(ONLY_PARAM)
+    }
+    writeUrl(writeTaskUrlFilters({
+      ...readTaskUrlFilters(base),
+      showHidden: false, dateRange: 'all', assigneeIds: [], creatorIds: [], sources: [], state: '', q: '', persona: '', windowAfter: '', windowBefore: '',
+    }, base))
   }
 
   function changeShowHidden(next: boolean) {
@@ -850,27 +1143,35 @@ export default function Tasks() {
   }
 
   /* The period's setters; the window reset is `patchUrlFilters`'s. Picking `exact` KEEPS the endpoints; an `exact`
-     with none resolves to no bounds (`lib/taskDateRange.ts`), never an empty board. */
+     with none resolves to no bounds (`lib/taskDateRange.ts`), never an empty board. A Period pick REPLACES a link's
+     exact window, which would otherwise win over it (`dateBounds`) and leave the pick doing nothing. */
   function changeDateRange(next: TaskDateRangeId) {
-    patchUrlFilters({ dateRange: next })
+    patchUrlFilters({ dateRange: next, windowAfter: '', windowBefore: '' })
   }
 
   function changeDateFrom(next: string) {
-    patchUrlFilters({ dateFrom: next })
+    patchUrlFilters({ dateFrom: next, windowAfter: '', windowBefore: '' })
   }
 
   function changeDateTo(next: string) {
-    patchUrlFilters({ dateTo: next })
+    patchUrlFilters({ dateTo: next, windowAfter: '', windowBefore: '' })
   }
 
-  /* THE ROSTER, ORDERED ONCE — current user first (`lib/taskCreators.ts`) — for both surfaces, so the eight-cap
+  /* THE ROSTER, ORDERED ONCE — current user first (`lib/taskAssignees.ts`) — for both surfaces, so the eight-cap
      strip and the panel never disagree on who shows. */
-  const orderedCreators = useMemo(
-    () => orderCreators(creators, admin?.id ?? null),
-    [creators, admin?.id],
+  const orderedAssignees = useMemo(
+    () => orderAssignees(assignees, admin?.id ?? null),
+    [assignees, admin?.id],
   )
 
   /* One setter for both surfaces, so neither holds a pick the other cannot see. */
+  function changeAssigneeIds(next: string[]) {
+    patchUrlFilters({ assigneeIds: next })
+  }
+
+  /* The Creator roster in the same order rule (the caller first). */
+  const orderedCreators = useMemo(() => orderAssignees(creators, admin?.id ?? null), [creators, admin?.id])
+
   function changeCreatorIds(next: string[]) {
     patchUrlFilters({ creatorIds: next })
   }
@@ -881,6 +1182,16 @@ export default function Tasks() {
 
   function changeStateFilter(next: string) {
     patchUrlFilters({ state: next })
+  }
+
+  /* Persona and the exact window arrive on a link (the command center's counts) and leave by their chips; no
+     menu control sets them. */
+  function clearPersona() {
+    patchUrlFilters({ persona: '' })
+  }
+
+  function clearWindow() {
+    patchUrlFilters({ windowAfter: '', windowBefore: '' })
   }
 
   /* THE SEARCH TERM, committed once per typing pause by the header's box (`pane/TaskSearchBox.tsx`). STORED
@@ -898,7 +1209,7 @@ export default function Tasks() {
      away scrolled pages for nothing. */
   function changeGroupBy(next: string) {
     const params = new URLSearchParams(liveParamsRef.current)
-    const value = groupParamValue(next)
+    const value = groupParamValue(next, defaultGroupBy)
     if (value === null) params.delete(GROUP_PARAM)
     else params.set(GROUP_PARAM, value)
     writeUrl(params, { resetWindow: false })
@@ -924,53 +1235,40 @@ export default function Tasks() {
     setSectionCollapsed(prev => (prev[landing] ? { ...prev, [landing]: false } : prev))
   }
 
-  // R5: load worktrees on mount, keyed on the capability too: the shell renders from the persisted permission
-  // snapshot, so `worktrees:view` may arrive late.
-  useEffect(() => {
-    void fetchWorktrees()
-  }, [canReadWorktrees])
-
   // RESTORE the saved outline on mount and whenever the admin changes (`setExpanded({})` drops the previous
-  // admin's rows). Only IDS are stored, so each is REFETCHED (never yesterday's snapshot as current) — NOT via
-  // `refetchExpandedDetails`, whose `id in prev` guard would discard every restored id. A failing id is stale and
-  // dropped silently (no spinner left).
+  // admin's rows). Only IDS are stored; they wait in `pendingRestoreRef` until the board DRAWS their row, and only
+  // then is each REFETCHED (`restoreDrawnExpansions` below) — a remembered row off the window costs no read.
   // ABOVE the deep-link effect, so the reset lands before `revealTask` expands its ancestor.
-  // Both gates are armed from a PROMISE CONTINUATION, never inline: the write-through effects run in this flush
-  // with OLD values and would save an empty map (or the previous admin's ids under the new key).
+  // The write-through gate is armed from a PROMISE CONTINUATION, never inline: the write-through effect runs in this
+  // flush with OLD values and would save the previous admin's ids under the new key.
   useEffect(() => {
     let cancelled = false
+    const gen = ++restoreGenRef.current
     setExpanded({})
-    const ids = loadExpandedTaskIds(expandedStorageKey)
-    void Promise.all(
-      ids.map(async id => {
-        try {
-          const detail = await get<PipelineTask>(`/api/tasks/${id}`)
-          // Merged, not assigned: a deep link or a quick click may have expanded a row meanwhile.
-          if (!cancelled) setExpanded(prev => ({ ...prev, [id]: detail }))
-        } catch {
-          // A non-resolving id is forgotten; the write-through prunes it on the next expand/collapse.
-        }
-      }),
-    ).then(() => {
-      // Armed only once the WHOLE batch settled, or a mid-batch write would persist a subset.
-      if (!cancelled) restoredExpandedKeyRef.current = expandedStorageKey
+    pendingRestoreRef.current = new Set(loadExpandedTaskIds(expandedStorageKey))
+    restoreHeldRef.current = new Set()
+    void Promise.resolve().then(() => {
+      if (!cancelled && gen === restoreGenRef.current) restoredExpandedKeyRef.current = expandedStorageKey
     })
     return () => { cancelled = true }
   }, [expandedStorageKey])
 
   // WRITE THROUGH on changes to the expanded ID SET (ascending, stable `Object.keys`), so detail refetches
-  // rewriting VALUES cost no storage write. The save's result is ignored: failing to remember must never cost the
-  // expansion (`saveExpandedTaskIds` swallows blocked-storage throws).
+  // rewriting VALUES cost no storage write. Remembered ids not yet restored ride along FIRST, so the cap
+  // (`MAX_STORED_EXPANDED_IDS`) drops them before a live expansion. The save's result is ignored: failing to
+  // remember must never cost the expansion (`saveExpandedTaskIds` swallows blocked-storage throws).
   const expandedIdsKey = Object.keys(expanded).join(',')
   useEffect(() => {
     if (restoredExpandedKeyRef.current !== expandedStorageKey) return
-    saveExpandedTaskIds(expandedStorageKey, Object.keys(expanded).map(Number))
+    const held = Object.keys(expanded).map(Number)
+    const waiting = [...pendingRestoreRef.current, ...restoreHeldRef.current].filter(id => !(id in expanded))
+    saveExpandedTaskIds(expandedStorageKey, [...waiting, ...held])
   }, [expandedIdsKey, expandedStorageKey])
 
   // RE-restore the stored Focus when the bucket changes (a late admin id, or an in-place admin switch). A
   // NO-OP on mount (the ref holds the mount key), so the first fetch is the only fetch.
   // …AND IT CLEARS THE URL FILTERS: they are keyed on nobody, so the incoming operator would inherit the outgoing
-  // one's creator picks. Guarded, since an unconditional write is a router commit on every snapshot→server
+  // one's assignee picks. Guarded, since an unconditional write is a router commit on every snapshot→server
   // handoff. `limit` resets (a different row set).
   // Armed from a PROMISE CONTINUATION, as the outline's restore: inline, the write-through in this flush would
   // save the OUTGOING admin's values under the INCOMING key.
@@ -1007,11 +1305,38 @@ export default function Tasks() {
   useLiveRefetch(useEventStream(), () => {
     void fetchTasks()
     void refetchExpandedDetails()
-    void fetchWorktrees()
-    // Section totals ride the same events: a header must never disagree with its own rows.
-    void fetchTagCounts()
+    // Section totals ride the same events: a header must never disagree with its own rows (a filter change moves
+    // the counts' key, which fetches by itself).
+    void queryClient.invalidateQueries({ queryKey: ['task-tag-counts'] })
     refetchFeedStateCounts()
+    void queryClient.invalidateQueries({ queryKey: PIPELINE_ALL_ITEMS_KEY })
   }, STREAM_DOWN_POLL_MS, { entity: 'task', minIntervalMs: TASKS_LIVE_REFETCH_MIN_MS })
+  /* THE WORKTREE SET on what moves it — a slot's or a runner's event (a node's observation, a lease, a session
+     starting) — not on every `task` event: a busy board re-read the whole pool per transition. Polls with the
+     stream down, as the board does. */
+  useLiveRefetch(useEventStream(), refetchWorktrees, STREAM_DOWN_POLL_MS, {
+    match: event => WORKTREE_EVENT_ENTITIES.has(event.entity),
+  })
+  /* A task this viewer just opened loses its "not yet seen" halo here, with no re-read (`lib/taskSeen.ts`). */
+  useEffect(() => {
+    const seen = (event: Event) => {
+      const id = (event as CustomEvent<number>).detail
+      setTasks(prev => prev.map(t => (t.id === id && t.done_unseen ? { ...t, done_unseen: false } : t)))
+    }
+    window.addEventListener(TASK_SEEN, seen)
+    return () => window.removeEventListener(TASK_SEEN, seen)
+  }, [])
+  /* A saved pin change re-reads the rows: the server orders the page pins-first (`lib/taskPin.ts`). */
+  useEffect(() => {
+    const repin = () => void latest.current.fetchTasks()
+    window.addEventListener(TASK_PINS_SAVED, repin)
+    return () => window.removeEventListener(TASK_PINS_SAVED, repin)
+  }, [])
+  /* …and, at most once per `WORKTREES_TASK_REFETCH_MIN_MS`, on `task` events: a control-plane lease or release
+     (dispatch, Reset, Delete) emits only a `task` event, and a slot whose node saw nothing move emits no other. */
+  useLiveRefetch(useEventStream(), refetchWorktrees, null, {
+    entity: 'task', minIntervalMs: WORKTREES_TASK_REFETCH_MIN_MS,
+  })
   /* A running task's `metered` usage (the Tokens/Cost cells) re-reads only the rows, at most once a minute: one
      event per runner every few minutes would otherwise re-read the whole board each time. The figures already
      trail by minutes, so the throttle costs nothing a reader could see. */
@@ -1021,6 +1346,9 @@ export default function Tasks() {
   }, null, { entity: 'task', actions: ['metered'], minIntervalMs: METERED_REFETCH_MIN_MS })
 
   async function toggleExpand(id: number) {
+    // The user's own toggle settles a remembered row: a restore read still in flight is dropped on arrival.
+    restoreHeldRef.current.delete(id)
+    pendingRestoreRef.current.delete(id)
     if (id in expanded) {
       setExpanded(prev => {
         const next = { ...prev }
@@ -1031,7 +1359,7 @@ export default function Tasks() {
     }
     setFetching(prev => withAdded(prev, id))
     try {
-      const detail = await get<PipelineTask>(`/api/tasks/${id}`)
+      const detail = await get<PipelineTask>(expandedDetailUrl(id))
       setExpanded(prev => ({ ...prev, [id]: detail }))
     } catch {
       setExpanded(prev => ({ ...prev, [id]: { error: 'Failed to load task detail' } }))
@@ -1233,7 +1561,7 @@ export default function Tasks() {
      quiet stream. Delete refetches too. The dialog echoes the clicked verb. */
   const {
     start: startTask, stop: stopTask, reset: resetTask, complete: completeTask, confirmDelete: deleteTask,
-    askPushIdentity, preemptDialog,
+    discard: discardTask, preemptDialog,
   } = useTaskActions({
     confirm,
     run: rowWrite,
@@ -1253,31 +1581,14 @@ export default function Tasks() {
     onDeleted: fetchTasks,
   })
 
-  /* A PRIORITY BUMP THAT SORTS AHEAD OF RUNNING WORK (the deleted Queue style's): the row is replaced in
-     place, then — while it is still queued — the forecast is asked, and a capacity-blocked bump opens `PreemptDialog`
-     (never on a pending org, whose force-start the API refuses too). No client-side "sorts ahead of a running row"
-     pre-check: the Queue read the whole running set, but the board holds only its page and filters, so the forecast
-     (null when no preempt applies) decides. "Just queue it" leaves it queued: the PATCH already moved it. A failed
-     forecast is a null. */
-  async function priorityChanged(updated: PipelineTask) {
-    replaceTaskEverywhere(updated)
-    if (updated.state !== 'ready' || awaitingApproval) return
-    const forecast = await preemptForecast(updated.id)
-    if (forecast) setPriorityPreempt({ task: updated, forecast })
-  }
-
-  // An acting operator is asked whom to push as first, as every Start door asks; Cancel posts nothing.
-  async function priorityForceStart(task: PipelineTask, stopTaskId: number) {
-    setPriorityPreempt(null)
-    const pushAs = await askPushIdentity({ projectId: task.project_id, title: task.title, assigneeId: task.assigned_to_id })
-    if (!pushAs) return
-    void rowWrite(task, 'Failed to force-start task', async () => {
-      const body: ForceStartBody = {
-        stop_task_id: stopTaskId,
-        ...startBody(startIntentFor(task, task.parent_task_id === null ? 'root' : 'leaf'), pushAs),
-      }
-      await post<PipelineTask>(DISPATCH_ROUTES.forceStart(task.id), body)
-      await fetchTasks()
+  /* REASSIGN IN PLACE — the row's Creator → Assignee cell (`components/tasks/TaskPeople.tsx`). A partial `PUT`
+     (the one door that validates the member, `_validated_assignee`); the answer replaces the row. Under an Assignee
+     filter the row may no longer belong, and the totals moved: the board refetches instead. */
+  function assignTask(task: PipelineTask, assigneeId: string) {
+    void rowWrite(task, 'Failed to reassign task', async () => {
+      const updated = await put<PipelineTask>(`/api/tasks/${task.id}`, { assigned_to_id: assigneeId })
+      if (assigneeIds.length > 0) void fetchTasks()
+      else replaceTaskEverywhere(updated)
     })
   }
 
@@ -1308,22 +1619,12 @@ export default function Tasks() {
     [projectNameById, worktrees],
   )
 
-  // Opens the dock console on a slot; a row passes only one already gated (`rowActions.tsx`).
+  // Opens the dock console on a slot; a row passes only one already gated (`rowActions.tsx`). The request
+  // (the server's `may_edit` verdict, Title, session snapshot) is `hooks/useWorktreeAccess.ts::slotConsoleRequest`.
+  // This board gates the console on the TASK's state, so a dead runner's task still offers it; the pane
+  // reads `hadLiveSession` to say "empty slot" rather than a glitch-like message.
   function openConsole(wt: Worktree) {
-    openDockConsole({
-      project: wt.project,
-      projectId: wt.project_id,
-      number: wt.number,
-      nodeId: wt.node_uuid,
-      // Same server verdict and fail-closed default as `components/WorktreePool.tsx`'s.
-      mayEdit: wt.may_edit,
-      // The opener's title snapshot; the dock refines it from the live `['worktrees']` cache.
-      title: resolveTitle(wt),
-      // Whether the row showed a session when clicked: this board gates the console on the TASK's state, so a dead
-      // runner's task still offers it; the pane uses this to say "empty slot" rather than a glitch-like message
-      // (`ConsolePane.tsx`'s SLOT_EMPTY_REASON).
-      hadLiveSession: hasLiveSession(wt),
-    })
+    openDockConsole(slotConsoleRequest(wt))
   }
 
   // BA R9: the rendered rows — the loaded window plus the deep link's top-level ancestor pinned in front WHEN THE
@@ -1335,12 +1636,44 @@ export default function Tasks() {
     pinnedTask !== null &&
     taskInScope(scope, pinnedTask) &&
     !tasks.some(t => t.id === pinnedTask.id)
+  /* A stage picked across projects draws that stage's tasks instead (`allStage`, above). */
+  const stageTasks = allStageName === null ? null : allStage?.tasks ?? NO_TASKS
   const displayTasks = useMemo(
-    () => (pinnedIsMerged && pinnedTask ? [pinnedTask, ...tasks] : tasks),
-    [tasks, pinnedTask, pinnedIsMerged],
+    () => stageTasks ?? (pinnedIsMerged && pinnedTask ? [pinnedTask, ...tasks] : tasks),
+    [stageTasks, tasks, pinnedTask, pinnedIsMerged],
   )
+  /* RESTORE WHAT THE BOARD DRAWS: each remembered id whose row is on screen (`drawnPendingIds` — top level, the
+     pinned row, or a child of a drawn expansion, so a nested outline restores level by level) is claimed and read
+     once. An id the server no longer shows (404/403) is forgotten; any other failure keeps it remembered for the
+     next visit. An id off the window waits. */
+  useEffect(() => {
+    const pending = pendingRestoreRef.current
+    if (pending.size === 0) return
+    const ids = drawnPendingIds(displayTasks, expanded, pending)
+    if (ids.length === 0) return
+    const gen = restoreGenRef.current
+    const held = restoreHeldRef.current
+    for (const id of ids) {
+      pending.delete(id)
+      held.add(id)
+    }
+    for (const id of ids) {
+      void get<PipelineTask>(expandedDetailUrl(id))
+        .then(detail => {
+          // Only while still held: a toggle by the user meanwhile (`toggleExpand`) has the last word. Merged, not
+          // assigned: a deep link may have expanded another row meanwhile.
+          if (gen !== restoreGenRef.current || !held.delete(id)) return
+          setExpanded(prev => ({ ...prev, [id]: detail }))
+        })
+        .catch(error => {
+          if (gen === restoreGenRef.current && error instanceof ApiError && (error.status === 404 || error.status === 403)) {
+            held.delete(id)
+          }
+        })
+    }
+  }, [displayTasks, expanded])
   /* Another org's rows on the board (an operator's cross-org view) — every row drawn, the pinned one and an
-     expanded epic's stage tasks included: each row's verbs — Start, Stop, Reset, Complete, Priority…, Waiting… — go as
+     expanded epic's stage tasks included: each row's verbs — Start, Stop, Reset, Complete — go as
      its org for the one request (`lib/actAs.ts::useActAsRows`). */
   const heldRows: { path: string; org: OrgRef | null }[] = []
   const holdRows = (rows: readonly PipelineTask[] | null | undefined) => {
@@ -1352,6 +1685,14 @@ export default function Tasks() {
   }
   holdRows(displayTasks)
   holdRows(Object.values(expanded).filter((entry): entry is PipelineTask => !('error' in entry)))
+  /* Another org's pipeline: its step verbs (Release, Approve, Go…) go as the project's org, as Project settings'
+     do, so the API answers them as the `can_*` flags it read (`app/releases/access.py::as_writer`). */
+  /* The project's org from the tree, else the project roster; `undefined` while neither has the project yet, when the
+     release step waits rather than offer a verb that would go unheld. */
+  const pipelineOrgRef = pipelineProjectId === null ? null
+    : (locateScope(scope, taskTree).project?.org ?? allProjects.find(p => p.id === pipelineProjectId)?.org)
+  const pipelineOrg = pipelineOrgRef ? otherOrgOf(pipelineOrgRef) : null
+  if (pipelineOrg) heldRows.push({ path: `/api/projects/${pipelineProjectId}`, org: pipelineOrg })
   useActAsRows(heldRows)
 
   // ── Lazy load on scroll ─────────────────────────────────────────
@@ -1388,33 +1729,10 @@ export default function Tasks() {
       setLoadingMore(false)
     }
   }
-  // The observer below is armed once per (canLoadMore, limit); it calls the LATEST render's loader.
-  const loadNextPageRef = useRef(loadNextPage)
-  loadNextPageRef.current = loadNextPage
-  const sentinelRef = useRef<HTMLDivElement | null>(null)
+  // The sentinel (`hooks/useLoadMoreSentinel`) is re-armed each time `canLoadMore` turns true: a page landed.
+  const sentinelRef = useLoadMoreSentinel(canLoadMore, loadNextPage)
   // The list's scroll region (`LIST_SCROLL_SX`): the rows' scrollport above the phone, a plain box on it.
   const listScrollRef = useRef<HTMLDivElement | null>(null)
-
-  // An IntersectionObserver on a sentinel BELOW the list, not a scroll handler: the scrollport is the shell's
-  // (a different element at ≤480px). Re-armed on every (canLoadMore, limit) change, so a viewport tall enough for
-  // two pages loads both without waiting for a scroll.
-  useEffect(() => {
-    if (!canLoadMore) return
-    const node = sentinelRef.current
-    if (!node) return
-    const observer = new IntersectionObserver(
-      entries => {
-        if (!entries.some(entry => entry.isIntersecting)) return
-        void loadNextPageRef.current()
-      },
-        // A page of runway, so scrolling never stops dead at the last row.
-      // Rooted at the rows' own scrollport (the list region above the phone, `.app-main` on it): the runway must be
-      // measured there, since a nested scroller clips the sentinel before the viewport's margin could see it.
-      { root: scrollingAncestor(node), rootMargin: '400px' },
-    )
-    observer.observe(node)
-    return () => observer.disconnect()
-  }, [canLoadMore, limit])
 
   /* What the flattener needs to SECTION the board, or `undefined` for None (rows byte-identical to the ungrouped
      board). `undefined` also covers a selection the catalog cannot match yet — a half-grouped board is worse than
@@ -1448,8 +1766,11 @@ export default function Tasks() {
 
   // The board's filters as one memoized value: the State counts' query keys on it.
   const paneFilters = useMemo<PaneFilters>(
-    () => ({ showHidden, bounds: dateBounds(), creatorIds, sources, state: stateFilter, focus, q, muted }),
-    [showHidden, dateRange, dateFrom, dateTo, zone, dayStart, creatorKey, sourceKey, stateFilter, focus, q, muted],
+    () => ({ showHidden, bounds: dateBounds(), assigneeIds, creatorIds, sources, state: stateFilter, persona, focus, q, muted }),
+    [
+      showHidden, dateRange, dateFrom, dateTo, windowAfter, windowBefore, zone, dayStart, assigneeKey, creatorKey, sourceKey,
+      stateFilter, persona, focus, q, muted,
+    ],
   )
 
   /* GROUP BY STATE: the section totals are `GET /api/tasks/counts` (so a header agrees with the rail — AC-6.5) and
@@ -1492,8 +1813,8 @@ export default function Tasks() {
      prop on each poll or `task` event, so no row could skip its render. A handler reads THIS render's closure
      through `latest` (it runs on a press, never during render); only what a row DRAWS from — the gates, the
      worktree joins, the roster and the pick — re-keys the bundle. */
-  const latest = useRef({ navigate, startTask, stopTask, resetTask, completeTask, deleteTask, openConsole, unfoldSectionFor, fetchTasks, expandState })
-  latest.current = { navigate, startTask, stopTask, resetTask, completeTask, deleteTask, openConsole, unfoldSectionFor, fetchTasks, expandState }
+  const latest = useRef({ navigate, startTask, stopTask, resetTask, completeTask, deleteTask, discardTask, openConsole, unfoldSectionFor, fetchTasks, expandState, assignTask })
+  latest.current = { navigate, startTask, stopTask, resetTask, completeTask, deleteTask, discardTask, openConsole, unfoldSectionFor, fetchTasks, expandState, assignTask }
 
   /* THE CREATE BUNDLE the Activity feed hands its create row (ladder: `resolveCreateProject` in
      `components/tasks/shared.tsx`). Withheld without `tasks:create`. */
@@ -1537,26 +1858,26 @@ export default function Tasks() {
       ? (...args: Parameters<typeof completeTask>) => latest.current.completeTask(...args)
       : undefined,
     onDelete: canDeleteTasks || canCreateTasks ? (task: PipelineTask) => void latest.current.deleteTask(task) : undefined,
+    onDiscard: canDeleteTasks || canCreateTasks ? (task: PipelineTask) => void latest.current.discardTask(task) : undefined,
     onDuplicate: canCreateTasks
       ? (task: PipelineTask) => duplicateTask(task, otherOrgOf(task.org), latest.current.navigate)
       : undefined,
-    /* Filing and the waiting reason are `tasks:edit` writes; `canRunRow` narrows each row. */
-    onMoveToFeature: canEditTasks ? setFilingTask : undefined,
-    onWaitOnCustomer: canEditTasks ? setWaitingTask : undefined,
     canEditRow,
     canDeleteRow,
     canRunRow,
     /* A pending org starts nothing (the API 403s it): every Start renders disabled with the reason. */
     startBlockedReason: awaitingApproval,
-    onSetPriority: canEditTasks ? setPriorityTask : undefined,
+    onAssign: canEditTasks ? (task: PipelineTask, id: string) => latest.current.assignTask(task, id) : undefined,
     /* Another org's row: a read-only note and Act as lead its ⋯; its Duplicate copies into that org. */
     otherOrgOf,
     worktreeFor,
     consoleWorktreeFor,
     onOpenConsole: (wt: Worktree) => latest.current.openConsole(wt),
+    /* This user's pins (`hooks/useTaskPins.ts`); none on the Live Cast viewer, which has no user to keep them. */
+    ...(viewer ? {} : { isPinned, onTogglePin }),
   }), [
     canEditTasks, canCreateTasks, canDeleteTasks, canEditRow, canDeleteRow, canRunRow, otherOrgOf, awaitingApproval,
-    worktreeFor, consoleWorktreeFor,
+    worktreeFor, consoleWorktreeFor, viewer, isPinned, onTogglePin,
   ])
 
   /* ── BULK DELETE OF DRAFTS, BULK ARCHIVE OF FINISHED ROWS ──────────────────────────
@@ -1571,8 +1892,8 @@ export default function Tasks() {
      Now the new list's draw prunes it like any other draw, and a draw that drops picks SAYS SO (`pickNote`) —
      the dock may vanish with them, so the note is the only trace of the change. */
   /* THE PICK LIVES IN A STORE, NOT PAGE STATE (`lib/pickStore.ts`): a tick re-renders itself and the
-     dock, never the board. The page re-renders when the pick empties or fills (`picking`: every tick's reveal and
-     the age slot follow it), and once more when the clicking pauses (`PICK_ECHO_DELAY_MS`, at low priority) so the
+     dock, never the board. The page re-renders when the pick empties or fills (`picking`: the dock
+     follows it), and once more when the clicking pauses (`PICK_ECHO_DELAY_MS`, at low priority) so the
      ⋯ menus' Select/Deselect catch up without a burst of clicks ever waiting on a whole-board render. */
   const [pickStore] = useState(() => createPickStore<PipelineTask>())
   const picking = usePicking(pickStore)
@@ -1615,7 +1936,6 @@ export default function Tasks() {
       !viewer && mayDelete
         ? {
             store: pickStore,
-            picking,
             isSelectable: isPickable,
             onToggle: task => {
               if (pickNoteRef.current !== null) setPickNote(null)
@@ -1640,7 +1960,7 @@ export default function Tasks() {
             },
           }
         : undefined,
-    [viewer, mayDelete, pickStore, picking, isPickable],
+    [viewer, mayDelete, pickStore, isPickable],
   )
   /* NO `onBatchClean`: it drops the WHOLE pick, and a clean Delete must not drop the finished rows still waiting
      for Archive. Each verb instead unpicks the rows it landed (`runBulkVerb`); a refused row stays picked for a
@@ -1752,8 +2072,11 @@ export default function Tasks() {
       if (!(focused instanceof HTMLElement) || !page.contains(focused) || dock.contains(focused)) return
       const hidden = focused.getBoundingClientRect().bottom - dock.getBoundingClientRect().top
       if (hidden <= 0) return
-      if (pane) pane.scrollTop += hidden
-      else window.scrollBy(0, hidden)
+      // Whole pixels, rounded up: a scroll position is quantised, so a fractional lift (a sub-pixel row height above
+      // the list) rounded away and left the row under the dock.
+      const by = Math.ceil(hidden)
+      if (pane) pane.scrollTop += by
+      else window.scrollBy(0, by)
     }
     lift()
     // jsdom has no ResizeObserver; the first lift and the focus listener still run there.
@@ -1826,13 +2149,59 @@ export default function Tasks() {
       ]
   }
 
+  /* A pick this pipeline does not hold (another project's stage, a stale link) reads as All. */
+  const pickHeld = pipelineView === undefined || stagePick.stage === null || isBucket(stagePick.stage) ||
+    pipelineView.stages.some(stage => stage.id === stagePick.stage)
+  const livePick: StripPick = pickHeld && stagePick.stage !== null ? stagePick : { stage: null, only: null }
+  /* THE RELEASE STEP PICKED (`?only=release` on its source stage): the list is what waits there, with every release
+     action atop it (`ReleasePick`) — a pick like any other, so another pick or Back leaves it. */
+  const releaseFrom = pipelineProjectId !== null && livePick.only === RELEASE_ONLY ? livePick.stage : null
+
   return (
     <Box data-testid="tasks-page" {...{ [SHELL_FILL_ATTR]: '' }} sx={TASKS_PAGE_SX}>
+      {/* THE STAGE STRIP, ABOVE SEARCH (AC-4): one project's stages, or the totals across projects. */}
+      {pipelineProjectId !== null && (
+        <Box sx={{ flexShrink: 0 }}>
+          <ActingForNotice org={pipelineOrg} testId="pipeline-acting-for" />
+          {pipelineView && (
+            <StageStrip
+              view={pipelineView}
+              pick={livePick}
+              onPick={pickStage}
+              settingsHref={`/projects/${pipelineProjectId}?tab=customize&section=ci-pipeline`}
+              projectId={pipelineProjectId}
+              onRolledBack={() => {
+                void queryClient.invalidateQueries({ queryKey: ['pipeline-view', pipelineProjectId] })
+                refreshPipelineItems(queryClient, pipelineProjectId)
+                void queryClient.invalidateQueries({ queryKey: releaseKey(pipelineProjectId) })
+              }}
+              /* The Release step's one mark; pressing it picks the step. */
+              releaseSlot={(step, from) => pipelineOrgRef === undefined ? null : (
+                <ReleaseStep
+                  projectId={pipelineProjectId}
+                  fromStageId={from.id}
+                  toStageId={step.to_stage_id}
+                  run={step.release?.run ?? null}
+                  pressed={releaseFrom === from.id}
+                  onRelease={fromId => pickStage({ stage: fromId, only: RELEASE_ONLY })}
+                />
+              )}
+            />
+          )}
+        </Box>
+      )}
+      {/* Mounted before the totals answer, so the phone row holds its height and the header never drops (a failed
+          read: no row). */}
+      {allProjectsPipeline && (pipelineTotals || !pipelineTotalsQuery.isError) && (
+        <Box sx={{ flexShrink: 0 }}>
+          <StageTotals totals={pipelineTotals?.totals} unfiltered={isUnfiltered(pipelineFilters)} pick={allStageName}
+            onPick={name => pickStage({ stage: name, only: null })} />
+        </Box>
+      )}
       <PaneHeader
         scope={scope}
         tree={taskTree}
-        onNavigate={navigateScope}
-        creators={orderedCreators}
+        assignees={orderedAssignees}
         currentUserId={admin?.id ?? null}
         selectAll={chipSelectAll}
         toolbar={{
@@ -1844,10 +2213,13 @@ export default function Tasks() {
           q,
           onQChange: changeQ,
           onQClear: clearQ,
-          /* THE CREATOR FILTER'S SECOND SURFACE — the same filter as the avatar strip (same roster, ids, "(you)",
-             setter); the menu's Creator page is the narrow-viewport path and what the badge counts. */
-          creators: orderedCreators,
+          /* THE ASSIGNEE FILTER'S SECOND SURFACE — the same filter as the avatar strip (same roster, ids, "(you)",
+             setter); the menu's Assignee page is the narrow-viewport path and what the badge counts. */
+          assignees: orderedAssignees,
           currentUserId: admin?.id ?? null,
+          assigneeIds,
+          onAssigneeIdsChange: changeAssigneeIds,
+          creators: orderedCreators,
           creatorIds,
           onCreatorIdsChange: changeCreatorIds,
           taskSources,
@@ -1855,9 +2227,32 @@ export default function Tasks() {
           onSourcesChange: changeSources,
           stateFilter,
           onStateFilterChange: changeStateFilter,
+          /* A project pipeline's buckets (Not started, Done, Archived) — the strip's stages are its default. */
+          listing: pipelineProjectId !== null && pipelineView
+            ? {
+                value: isBucket(livePick.stage) ? livePick.stage : '',
+                options: [
+                  { value: '', label: 'Stages' },
+                  ...BUCKETS.map(([id, label]) => ({ value: id, label: `${label} ${pipelineView[id]}` })),
+                ],
+                // Stages over a stage pick changes nothing: the pick is the strip's.
+                onPick: (value: string) => { if (value || isBucket(livePick.stage)) pickStage({ stage: value || null, only: null }) },
+              }
+            : undefined,
+          persona,
+          onPersonaClear: clearPersona,
+          windowAfter,
+          windowBefore,
+          onWindowClear: clearWindow,
           groupBy: effectiveGroupBy,
           onGroupByChange: changeGroupBy,
           groupByOptions,
+          columns: offeredColumns,
+          hiddenColumns,
+          onToggleColumn: viewer
+            ? undefined
+            : (key: string) =>
+                void updatePreferences(prefs => ({ task_hidden_columns: toggledHiddenColumns(readHiddenColumns(prefs), key) })),
           dateRange,
           dateFrom,
           dateTo,
@@ -1892,7 +2287,8 @@ export default function Tasks() {
         }}
       />
 
-      {error && <Banner severity="error">{error}</Banner>}
+      {error && !outageCoversError && <Banner severity="error">{error}</Banner>}
+      {pipelineProjectId !== null && <FrozenNowBanner view={pipelineView} />}
       <QueuedOverCap />
       {actionError && (
         <Banner severity="error" testId="task-action-error" onDismiss={() => setActionError(null)}>
@@ -1902,37 +2298,8 @@ export default function Tasks() {
 
       {confirmDialog}
 
-      {/* Both refetch on success: the row may leave this scope (a filing) or change section (a wait). The rail's
-          counts are the dialogs' own invalidation. */}
-      <MoveToFeatureDialog
-        task={filingTask}
-        tree={taskTree}
-        onClose={() => setFilingTask(null)}
-        onMoved={() => void fetchTasks()}
-      />
-      <WaitOnCustomerDialog
-        task={waitingTask}
-        onClose={() => setWaitingTask(null)}
-        onDone={() => void fetchTasks()}
-      />
-
       {/* THE PREEMPT DIALOG, PAGE-mounted like `confirmDialog` (`useTaskActions`). */}
       {preemptDialog}
-      <PriorityDialog
-        task={priorityTask}
-        onClose={() => setPriorityTask(null)}
-        onDone={updated => void priorityChanged(updated)}
-      />
-      {priorityPreempt && (
-        <PreemptDialog
-          open
-          target={priorityPreempt.task}
-          forecast={priorityPreempt.forecast}
-          onForceStart={stopId => void priorityForceStart(priorityPreempt.task, stopId)}
-          onQueue={() => setPriorityPreempt(null)}
-          onCancel={() => setPriorityPreempt(null)}
-        />
-      )}
 
       {/* BA R9/AC9.2: a deep link that cannot reach its target SAYS SO. Dismiss stays a NAMED button (the suite
           drives "Dismiss"), not `Banner`'s ✕. */}
@@ -1947,6 +2314,36 @@ export default function Tasks() {
         </Banner>
       )}
 
+      {pipelineProjectId !== null && releaseFrom !== null ? (
+        <ReleasePick
+          key={releaseFrom}
+          projectId={pipelineProjectId}
+          fromStageId={releaseFrom}
+          runOf={toStageId => releaseRunTo(pipelineView, toStageId)}
+          stepOf={toStageId => pipelineView?.steps.find(s => s.to_stage_id === toStageId)}
+          arrivalOf={stageId => pipelineView?.stages.find(s => s.id === stageId)?.arrival}
+          reasons={stepFrom(pipelineView, releaseFrom)?.reasons}
+          canEdit={!viewer && canOnProject('projects:edit', pipelineProjectId)}
+          customPipeline={allProjects.find(p => p.id === pipelineProjectId)?.pipeline_mode === 'custom'}
+          filters={pipelineFilters}
+          /* The pick stays: its list turns into the deploy in progress (`ReleasePick`). */
+          onDone={() => {
+            void queryClient.invalidateQueries({ queryKey: releaseKey(pipelineProjectId) })
+            void queryClient.invalidateQueries({ queryKey: ['pipeline-view', pipelineProjectId] })
+            refreshPipelineItems(queryClient, pipelineProjectId)
+          }}
+          listSx={LIST_SCROLL_SX}
+          tree={taskTree}
+          actions={rowActions}
+          submitting={submitting}
+          expanded={expanded}
+          fetching={fetching}
+          focus={focus}
+          onToggleTask={id => void toggleExpand(id)}
+          deepLinkedId={deepLinkedId}
+          hiddenColumns={hiddenColumnSet}
+        />
+      ) : (<>
       {/* THE LIST'S OWN SCROLL REGION above the phone (`LIST_SCROLL_SX`); on the phone a plain box in `.app-main`'s
           scroll. Everything that scrolls with the rows sits in it; the header above and the dock below do not. */}
       <Box
@@ -1954,19 +2351,11 @@ export default function Tasks() {
         data-testid="tasks-list-scroll"
         sx={LIST_SCROLL_SX}
       >
-      {/* THE FEATURE HEADER (AC-5.4): the selection is one feature, whichever style draws its rows. */}
-      {scope.kind === 'feature' && (
-        <FeatureHeader
-          featureId={scope.featureId}
-          counts={scopedFeatureLocation.feature?.counts}
-          treeName={scopedFeatureLocation.feature?.name}
-          // Its tasks are now the project's own: land there.
-          onDeleted={projectId => navigate(scopeHref({ kind: 'project', projectId }), { replace: true })}
-        />
-      )}
+      {/* The selected feature's description, whichever style draws its rows. */}
+      {scope.kind === 'feature' && <FeatureDescription featureId={scope.featureId} />}
 
       {/* Explains the pinned-in epic row above a filtered-looking list. */}
-      {pinnedIsMerged && pinnedTask && (
+      {pipelineProjectId === null && pinnedIsMerged && pinnedTask && (
         <Typography variant="caption" component="div" role="status" data-testid="list-truncation-note" sx={NOTE_SX}>
           Task #{pinnedTask.id} is outside the loaded list — pinned to the top.
         </Typography>
@@ -1974,23 +2363,63 @@ export default function Tasks() {
 
       {/* R4: never truncate silently — only when the window hit the server's ceiling with rows behind it; points at
           the filters. */}
-      {!loading && limit >= TASK_LIST_MAX && nextCursor !== null && (
+      {pipelineProjectId === null && allStageName === null && !loading && limit >= TASK_LIST_MAX && nextCursor !== null && (
         <Typography variant="caption" component="div" role="status" data-testid="list-truncation-note" sx={NOTE_SX}>
           Showing the first {TASK_LIST_MAX} tasks — some may be hidden. Pick a project to narrow the
           list.
         </Typography>
       )}
+      {allStageName !== null && allStage !== undefined && allStage.left > 0 && (
+        <Typography variant="caption" component="div" role="status" data-testid="list-truncation-note" sx={NOTE_SX}>
+          {allStage.left} more in {allStageName} — open a project to see them all.
+        </Typography>
+      )}
+      {allStageName !== null && allStageQuery.isError && <Banner severity="error">Failed to load this stage</Banner>}
 
+      {/* A stage picked across projects, its totals not read yet: never the whole list in the meantime. */}
+      {stageLookup || (allProjectsPipeline && stagePick.stage !== null && pipelineTotals === undefined &&
+        !pipelineTotalsQuery.isError) ? (
+        <ActivityFeedView tasks={NO_TASKS} loading />
+      ) : pipelineProjectId !== null ? (
+        <PipelineSections
+          projectId={pipelineProjectId}
+          view={pipelineView}
+          stepVerbs={pipelineOrgRef !== undefined}
+          stage={livePick.stage}
+          only={livePick.only}
+          filters={pipelineFilters}
+          groupBy={effectiveGroupBy}
+          grouping={grouping}
+          onToggleSection={toggleSection}
+          tree={taskTree}
+          actions={rowActions}
+          submitting={submitting}
+          expanded={expanded}
+          fetching={fetching}
+          focus={focus}
+          filtered={hasTaskUrlFilters({ ...urlFilters, showHidden: false }) || focus}
+          onToggleTask={id => void toggleExpand(id)}
+          deepLinkedId={deepLinkedId}
+          hiddenColumns={hiddenColumnSet}
+          create={listCreate}
+          canEdit={!viewer && canEditTasks}
+          canDelete={!viewer && canDeleteTasks}
+          confirm={confirm}
+          onChanged={() => void fetchTasks()}
+        />
+      ) : (<>
       <ActivityFeedView
         tasks={displayTasks}
-        loading={loading}
+        /* A failed stage read shows its banner, never an empty list that reads as "nothing there". */
+        loading={allStageName === null ? loading : allStageQuery.isPending || allStageQuery.isError}
         deepLinkedId={deepLinkedId}
         groupBy={effectiveGroupBy}
         /* THE HOST'S MEMOIZED OBJECT, never a fresh literal: the feed memoizes sectioning on it and the recency cut
            reads `Date.now()`. The section toggle rides as its own prop. */
         grouping={grouping}
         onToggleSection={toggleSection}
-        stateGrouping={stateGrouping}
+        /* A picked stage's tasks are not the feed's: its State totals would not count them. */
+        stateGrouping={allStageName === null || !stateGrouping ? stateGrouping : { ...stateGrouping, counts: undefined }}
         tree={taskTree}
         actions={rowActions}
         submitting={submitting}
@@ -2003,12 +2432,14 @@ export default function Tasks() {
         onToggleTask={id => void toggleExpand(id)}
         create={listCreate}
         selection={boardSelection}
+        hiddenColumns={hiddenColumnSet}
       />
+      </>)}
 
       {/* Under the unfiltered board, a young org (at most `STARTER_MAX_TASKS` tasks, which `TemplateStarters` checks
           against the org-wide count itself; more rows on screen already rule it out) gets the setup diagram, then the
           Most popular templates; any filter keeps the ordinary list. */}
-      {!loading && displayTasks.length <= STARTER_MAX_TASKS && !hasTaskUrlFilters({ ...urlFilters, showHidden: false }) && !focus && (
+      {pipelineProjectId === null && allStageName === null && !loading && displayTasks.length <= STARTER_MAX_TASKS && !hasTaskUrlFilters({ ...urlFilters, showHidden: false }) && !focus && (
         <Suspense fallback={null}>
           <TemplateStarters />
         </Suspense>
@@ -2017,7 +2448,7 @@ export default function Tasks() {
       {/* THE LAZY-LOAD SENTINEL: a zero-height div after the list; in view (with 400px of runway) the window grows a
           page. Rendered only while more is plausible. A div, not the last row: the list must not carry this page's
           fetch policy. `aria-hidden` + `role="presentation"`. */}
-      {canLoadMore && (
+      {canLoadMore && pipelineProjectId === null && allStageName === null && (
         <Box
           ref={sentinelRef}
           data-testid="tasks-load-more-sentinel"
@@ -2027,11 +2458,12 @@ export default function Tasks() {
         />
       )}
       </Box>
+      </>)}
 
       {/* THE BULK BAR, STUCK TO THE BOTTOM of the scrollport: drafts sit low on a State board, and a bar above the
           list would be out of sight while the operator picks them. Marked as a bottom bar so the Help launcher
           sits level with it, past its right end (`FORM_ACTION_BAR_ATTR`). */}
-      {(bulkDockShown || pickNote !== null) && (
+      {pipelineProjectId === null && (bulkDockShown || pickNote !== null) && (
         <Box ref={bulkDockRef} data-testid="tasks-bulk-dock" {...{ [FORM_ACTION_BAR_ATTR]: '' }} sx={BULK_DOCK_SX}>
           {/* What the last draw dropped from the pick, where the operator was looking for the pick. */}
           {pickNote !== null && (

@@ -101,7 +101,7 @@ def org_for(*, is_system: bool, author_org: "UUID | None") -> "UUID | None":
 # `tests/test_cron_updated_at_provenance.py` detects drift when a `crons` column is added.
 # `created_by_task_id` (revision 0331) is written only at INSERT; its one UPDATE is the `ON DELETE SET
 # NULL` cascade from a deleted task, which must not read as an edit (`project_env_vars.credential_id`'s
-# reason, `202610251700_baseline.py::_NARROWED_ENTITY_TRIGGERS`). `automation_id` (revision 0417) is the parent link the
+# reason, `202611130100_baseline.py::_NARROWED_ENTITY_TRIGGERS`). `automation_id` (revision 0417) is the parent link the
 # migration's backfill wrote onto rows nobody edited.
 CRON_MACHINERY_COLUMNS: tuple[str, ...] = (
     "last_tick_at", "last_fired_at", "consecutive_skips", "schedule_anchor_at", "last_succeeded_at",
@@ -118,11 +118,15 @@ SKIP_DISABLED = "disabled"
 # A row saved before its org's minimum cron period was raised, fired again inside it
 # (`app/cron_min_period.py`). Not always recorded: a 1s row under a 1h minimum skips 3599 times an hour.
 SKIP_BELOW_MIN_PERIOD = "below_min_period"
+# Postgres refused the database credential while taking the run lock, inside the rotation grace window
+# (`app/cron_runtime.py::CREDENTIAL_ROTATION_GRACE_SECONDS`): an RDS rotation, not a broken cron.
+SKIP_CREDENTIAL_ROTATING = "credential_rotating"
 SKIP_REASONS: tuple[str, ...] = (
     SKIP_ALREADY_RUNNING,
     SKIP_PREVIOUS_TASK_OPEN,
     SKIP_DISABLED,
     SKIP_BELOW_MIN_PERIOD,
+    SKIP_CREDENTIAL_ROTATING,
 )
 
 # Always recorded whatever the retention mode: firings that did not work for a reason nobody chose.
@@ -130,6 +134,7 @@ SKIP_REASONS: tuple[str, ...] = (
 ALWAYS_RECORDED_SKIP_REASONS: tuple[str, ...] = (
     SKIP_ALREADY_RUNNING,
     SKIP_PREVIOUS_TASK_OPEN,
+    SKIP_CREDENTIAL_ROTATING,
 )
 
 

@@ -7,6 +7,7 @@ import type { Theme } from '@mui/material/styles'
 import { get } from '../../api'
 import type { PipelineTask, TaskBodyVersion } from '../../types'
 import { useApiRead } from '../../hooks/useApiRead'
+import { countOf } from '../../lib/humanize'
 import { absoluteTime } from '../../lib/relativeTime'
 import { takeTaskPageSeed } from '../../lib/taskPageSeed'
 import { useLandedTaskPart } from '../../hooks/useLandedTaskPart'
@@ -15,20 +16,20 @@ import FeedList from '../../ui/feed/FeedList'
 import TextDiffDialog from '../../ui/TextDiffDialog'
 import type { FeedRowSpec } from '../../ui/feed/types'
 import { CodeBlock } from '../../ui/CodeBlock'
+import { LINE_HEIGHT, RADIUS, grid } from '../../theme'
+import Tip from '../../ui/Tip'
 
 // The Versions subtab: a READ-ONLY audit surface over a Task's `body` history. No restore route exists,
 // hence no `readOnly` prop. This is the console's ONLY reader of `GET /api/tasks/{id}/body-versions`,
 // so every field of a row is shown rather than summarised.
 
 // How each snapshot was written. Live writers: `manual` (`update_task`), `agent_filed_edit`
-// (`edit_agent_filed_draft`), `runner_break_refresh` (apps/api/app/runner_breaks.py),
-// `system_dedup_refresh` (apps/api/app/routes/agent/task_reads.py). `restore` and `chat` are legacy tokens with
-// rows still in the table.
+// (`edit_agent_filed_draft`), `system_dedup_refresh` (apps/api/app/routes/agent/task_reads.py). `restore` and `chat`
+// are legacy tokens with rows still in the table.
 const SOURCE_LABELS: Record<string, string> = {
   manual: 'manual edit',
   restore: 'restored',
   chat: 'chat edit',
-  runner_break_refresh: 'runner break refresh',
   system_dedup_refresh: 'system dedup refresh',
 }
 
@@ -44,18 +45,21 @@ function formatSource(source: string): string {
 // inset: the block sits under its row's title.
 function detailPreSx(theme: Theme) {
   return {
-    ml: '30px',
+    ml: 5,
     mb: 0.5,
-    padding: '1rem 1.25rem 1rem 1.625rem',
-    borderRadius: 0,
+    pt: 2.5,
+    pr: 3,
+    pb: 2.5,
+    pl: 4,
+    borderRadius: RADIUS.none,
     color: 'text.secondary',
     borderTop: '1px solid',
     borderTopColor: 'divider',
-    borderLeft: '3px solid',
+    borderLeft: `${grid(0.5)} solid`,
     borderLeftColor: alpha(theme.palette.primary.main, 0.3),
-    lineHeight: 1.65,
+    lineHeight: LINE_HEIGHT.normal,
     // Nested in a narrow row-detail the padding stacks with the panel gutters; trimmed at <=480px.
-    [theme.breakpoints.down(481)]: { ml: '22px', padding: '0.625rem 0.75rem' },
+    [theme.breakpoints.down(481)]: { ml: 3.5, py: 1.5, px: 2 },
   }
 }
 
@@ -63,19 +67,32 @@ function detailPreSx(theme: Theme) {
 const NEWEST_GLYPH = '●'
 const EARLIER_GLYPH = '○'
 
-export default function TaskVersions({ task }: { task: PipelineTask }) {
-  const { data: versions, error, loading } = useApiRead(
+/* The one `…/body-versions` read, offered to the page's remount across the split width once it lands. The task page
+   holds it (the Details strip needs to know whether Versions has anything to show) and hands it to this panel as
+   `read`, so the panel mounting never reads twice. `null` holds it. */
+export function useTaskBodyVersions(task: PipelineTask | null) {
+  const read = useApiRead(
     // Keyed on `updated_at` too: saving the description writes a snapshot server-side, and the host's
     // fresher task is the only signal that it exists.
-    ['task-versions', task.id, task.updated_at],
+    ['task-versions', task?.id, task?.updated_at],
     async () => {
-      const data = takeTaskPageSeed<TaskBodyVersion[]>(task.id, 'body_versions')
-        ?? await get<TaskBodyVersion[]>(`/api/tasks/${task.id}/body-versions`)
+      const id = task?.id ?? 0
+      const data = takeTaskPageSeed<TaskBodyVersion[]>(id, 'body_versions')
+        ?? await get<TaskBodyVersion[]>(`/api/tasks/${id}/body-versions`)
       return Array.isArray(data) ? data : []
     },
     'Failed to load version history',
+    { enabled: task !== null },
   )
-  useLandedTaskPart(task.id, 'body_versions', loading || error || !versions ? undefined : versions)
+  useLandedTaskPart(task?.id, 'body_versions', read.loading || read.error || !read.data ? undefined : read.data)
+  return read
+}
+
+export type TaskBodyVersionsRead = ReturnType<typeof useTaskBodyVersions>
+
+export default function TaskVersions({ task, read }: { task: PipelineTask; read?: TaskBodyVersionsRead }) {
+  const own = useTaskBodyVersions(read ? null : task)
+  const { data: versions, error } = read ?? own
   /* Explicit open/shut choices by id; default is newest open, the rest shut.
    * Every snapshot is in the DOM at first paint, shut or not (this is the only body-history reader, so
    * find-in-page must reach it): `detailKeepMounted` keeps it mounted and findable, where `hidden` would
@@ -112,17 +129,18 @@ export default function TaskVersions({ task }: { task: PipelineTask }) {
       /* The instant is the row's identity. `dateTime`/`title` carry the raw ISO: an audit surface must answer
        * "exactly when", which a localised string rounds away. */
       title: (
-        <Box component="time" dateTime={v.created_at} title={v.created_at}>
+        <Tip title={v.created_at}><Box component="time" dateTime={v.created_at}>
           {when}
-        </Box>
+        </Box></Tip>
       ),
       titleText: when,
+      href: null,
       /* The disc is decorative once this is set (`ui/feed/types.ts`). */
       ariaLabel: `${newest ? 'Most recent' : 'Earlier'} snapshot, ${when}, ${source}`,
       slots: [
         {
           key: 'compare',
-          width: 84,
+          width: grid(14),
           align: 'right',
           node: (
             <Button
@@ -138,7 +156,7 @@ export default function TaskVersions({ task }: { task: PipelineTask }) {
         },
         {
           key: 'source',
-          width: 132,
+          width: grid(22),
           /* Ungated: the only fact saying HOW the snapshot came to exist. */
           align: 'right',
           dim: true,
@@ -148,17 +166,17 @@ export default function TaskVersions({ task }: { task: PipelineTask }) {
       ],
       detailKeepMounted: true,
       detail: (
-        <CodeBlock maxHeight={150} sx={detailPreSx}>{v.body}</CodeBlock>
+        <CodeBlock maxHeight={grid(25)} sx={detailPreSx}>{v.body}</CodeBlock>
       ),
     }
   })
 
   return (
-    <Box data-testid="task-versions" sx={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+    <Box data-testid="task-versions" sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
       {/* The count, not a title (the tab already says Versions); suppressed at zero. */}
       {versions.length > 0 && (
         <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-          {versions.length} previous {versions.length === 1 ? 'version' : 'versions'}
+          {countOf(versions.length, 'previous version')}
         </Typography>
       )}
 

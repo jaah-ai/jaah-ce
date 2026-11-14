@@ -3,7 +3,7 @@ import Typography from '@mui/material/Typography'
 import { apiDetail } from '../../api'
 import CloudUpsell from '../../components/CloudUpsell'
 import { useCeLimits } from '../../lib/communityEdition'
-import { absoluteTime, relativeAge } from '../../lib/relativeTime'
+import RelativeTime from '../../ui/RelativeTime'
 import Banner from '../../ui/Banner'
 import LoadingState from '../../ui/LoadingState'
 import StatusDot from '../../ui/StatusDot'
@@ -23,9 +23,7 @@ export default function ThisMachineSection() {
         <Typography variant="body2" data-testid="this-machine-status">
           {node.online ? 'Online' : 'Offline'}
         </Typography>
-        <Typography variant="body2" sx={{ color: 'text.secondary' }} title={absoluteTime(node.last_seen)} data-testid="this-machine-last-seen">
-          · last seen {relativeAge(node.last_seen)}
-        </Typography>
+        <RelativeTime iso={node.last_seen} prefix="· last seen" variant="body2" sx={{ color: 'text.secondary' }} testId="this-machine-last-seen" />
       </Box>
       <Typography variant="body2" data-testid="this-machine-agents">
         {agents.running} of {agents.cap} agents running{agents.queued > 0 && `, ${agents.queued} queued`}

@@ -107,15 +107,9 @@ def assets_of(session: Session, *, template_id: Optional[UUID], org_template_id:
 
 def _copy_onto(source: AnyAsset, **subject: object) -> TaskAttachment:
     """A tenant row sharing `source`'s object. A global image's uploader is the operator's user, never shown to an
-    org, so its copy names none."""
-    is_global = isinstance(source, TaskTemplateAsset)
-    return TaskAttachment(
-        kind=ATTACHMENT_KIND_FILE, filename=source.filename, content_type=source.content_type,
-        size_bytes=source.size_bytes, s3_key=source.s3_key, s3_bucket=source.s3_bucket,
-        etag=None if is_global else source.etag, uploaded_at=source.uploaded_at,
-        uploaded_by_id=None if is_global else source.uploaded_by_id,
-        **subject,
-    )
+    org, so its copy names none (nor the operator-side etag)."""
+    unnamed = {"etag": None, "uploaded_by_id": None} if isinstance(source, TaskTemplateAsset) else {}
+    return TaskAttachment.copy_of(source, kind=ATTACHMENT_KIND_FILE, **subject, **unnamed)
 
 
 def copy_template_assets(

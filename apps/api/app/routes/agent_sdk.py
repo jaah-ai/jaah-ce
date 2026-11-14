@@ -10,8 +10,9 @@ which carry no MCP tool, so a built-in runner's model never sees them (N9).
   be asked (`dispatch_compose.directives.FULL_AUTO_BLOCKER_HEADERS`), and at most four rounds are open at once.
 * `GET  .../question-batch` — the rounds' resolutions, read back by the still-running agent: nothing is
   pasted into a pane (`tasks._deliver_answer_to_live_runner`'s SDK arm resumes the task instead).
-* `POST .../notify` — an informational message to the task's channel (`task_notify.announce_agent_message`),
-  capped per task per hour off its own alert rows, posted in-request under a task lock so the cap holds.
+* `POST .../notify` — an informational message, recorded on the task's own Activity (`task_note:agent_message`) and
+  sent to nobody: an agent's status post is no notification (PRD R9, `notification_catalog.REMOVED_KINDS`). Kept so
+  an older agent's call still succeeds; it answers 429 past the cap the org notify door spends.
 
 Auth is `routes/agent/auth.py::_check_token_for_live_task` (`@infra`; the token, bound to the declared caller task). Every
 route refuses with a 409 a task the caller's node does not hold a live lease on (`agent._require_live_hold`)
@@ -30,9 +31,11 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import agent_runs, forges, node_credentials, secret_redact, slot_allocation, task_notify
+from app.pipeline_gates import full_gate
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
-from app.db import SessionLocal, get_session
+from app.db_async import on_session, on_thread
+from app.entity_shape import from_row, or_404
 from app.dispatch_compose.directives import security_gate
 from app.models.projects import Project
 from app.models.tasks import Task, TaskQuestion
@@ -119,17 +122,21 @@ def out_of_scope(body: Optional[str]) -> Optional[str]:
 
 @router.get("/tasks/{task_id}/agent-context", response_model=AgentContextOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_thread
 def agent_context(
+    session: Session,
     task_id: int,
     caller: node_credentials.AgentCaller = Depends(_check_token_for_live_task),
-    session: Session = Depends(get_session),
 ) -> AgentContextOut:
     """What an SDK agent needs to do its task: the task, its project's delivery rules, itself, and the gate.
     409 for a task the caller's node does not hold, or one run by a built-in."""
+    # `agent_runs.run_agent` reads the catalog on a sync fleet session of its own: the phase runs on a sync
+    # session in a worker thread, never on the loop.
     task = _sdk_task_or_409(session, caller, task_id)
-    agent = agent_runs.run_agent(task.org_id, task.run_agent_id, task.run_agent_commit)
-    if agent is None:
-        raise HTTPException(status_code=404, detail=f"task {task_id} names an agent its org cannot run")
+    agent = or_404(
+        agent_runs.run_agent(task.org_id, task.run_agent_id, task.run_agent_commit),
+        detail=f"task {task_id} names an agent its org cannot run",
+    )
     project = session.scalars(select(Project).where(Project.id == task.project_id)).one()
     repo = forges.repo_ref_or_none(project)
     return AgentContextOut(
@@ -137,11 +144,10 @@ def agent_context(
             id=task.id, title=task.title, body=task.body or "", persona=task.persona,
             autonomous=bool(task.autonomous), out_of_scope=out_of_scope(task.body),
         ),
-        project=AgentContextProject(
-            name=project.name, repo=repo.path if repo is not None else None,
-            integration_branch=project.integration_branch, branch_prefix=project.branch_prefix,
-            gate_quick_cmd=project.gate_quick_cmd, gate_full_cmd=project.gate_full_cmd,
-            push_enabled=project.push_enabled, has_repo=slot_allocation.task_has_repo(session, task),
+        project=from_row(
+            AgentContextProject, project,
+            repo=repo.path if repo is not None else None, has_repo=slot_allocation.task_has_repo(session, task),
+            gate_full_cmd=full_gate.full_gate_command(session, project),
         ),
         agent=AgentContextAgent(
             id=str(agent.id), display_name=agent.display_name, version=agent.version, commit=agent.commit,
@@ -190,12 +196,10 @@ def _stored_options(question: BatchQuestionIn) -> Optional[list[dict]]:
 
 @router.post("/tasks/{task_id}/question-batch", status_code=201, response_model=QuestionBatchOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def ask_question_batch(
-    task_id: int,
-    body: QuestionBatchIn,
-    background: BackgroundTasks,
+    session: Session, task_id: int, body: QuestionBatchIn, background: BackgroundTasks,
     caller: node_credentials.AgentCaller = Depends(_check_token_for_live_task),
-    session: Session = Depends(get_session),
 ) -> QuestionBatchOut:
     """Raise one to four questions as open rounds. The first parks the task `awaiting_response`; each is
     announced to Slack like a runner's. 409 when no run is live or more than four rounds would be open; 422
@@ -230,11 +234,6 @@ def ask_question_batch(
     ]
     session.commit()
     ids = [row.id for row in rows]
-    # After the commit (`create_task_question`'s reasons); never raises.
-    from app.durable.question_plain_queue import enqueue_plain
-
-    for question_id in ids:
-        enqueue_plain(task_id, question_id)
     # Per round, off the request and after the commit — `create_task_question`'s reasons.
     for question_id in ids:
         background.add_task(_announce_question_round_in_task_scope, task_id, question_id, seam.current_scope())
@@ -319,11 +318,12 @@ def _round_out(row: TaskQuestion) -> RoundOut:
 
 @router.get("/tasks/{task_id}/question-batch", response_model=AnswersOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def read_question_batch(
+    session: Session,
     task_id: int,
     ids: str = Query(..., max_length=2000),
     caller: node_credentials.AgentCaller = Depends(_check_token_for_live_task),
-    session: Session = Depends(get_session),
 ) -> AnswersOut:
     """The named rounds of this task, as they stand. Read-only: an id that is not a visible round of this task
     is a 404, never an invented round. `all_resolved` is false until every named round is answered or
@@ -342,9 +342,7 @@ def read_question_batch(
     }
     missing = [question_id for question_id in wanted if question_id not in rows]
     if missing:
-        raise HTTPException(
-            status_code=404, detail=f"no round {', '.join(map(str, missing))} on task {task_id}"
-        )
+        raise HTTPException(status_code=404, detail=f"no round {', '.join(map(str, missing))} on task {task_id}")
     rounds = [_round_out(rows[question_id]) for question_id in wanted]
     return AnswersOut(rounds=rounds, all_resolved=all(r.status != "open" for r in rounds))
 
@@ -355,27 +353,26 @@ class NotifyIn(BaseModel):
 
 
 class NotifyOut(BaseModel):
-    # Handed to the task's channel; delivery is best-effort.
+    # Always true: kept so an older agent's client reads the shape it expects; nothing is sent anywhere.
     queued: bool
 
 
 @router.post("/tasks/{task_id}/notify", status_code=202, response_model=NotifyOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_thread
 def notify(
+    session: Session,
     task_id: int,
     body: NotifyIn,
     caller: node_credentials.AgentCaller = Depends(_check_token_for_live_task),
-    session: Session = Depends(get_session),
 ) -> NotifyOut:
-    """Post an informational message to the task's channel (no answer expected). 429 past
+    """Record an informational message on the task's Activity (no answer expected); nobody is notified. 429 past
     `AGENT_MESSAGES_PER_HOUR` in the last hour."""
     task = _sdk_task_or_409(session, caller, task_id)
     if not body.message.strip():
         raise HTTPException(status_code=422, detail="message is empty")
     if task.state not in _RUNNER_RUNNING_STATES:
         raise HTTPException(status_code=409, detail=f"task {task_id} is {task.state!r}; only a running agent may post")
-    # Held until this request ends, so the next post counts this one's alert row: the post runs in-request.
-    session.execute(select(Task.id).where(Task.id == task.id).with_for_update())
     posted = task_notify.agent_messages_last_hour(session, task.id)
     if posted >= task_notify.AGENT_MESSAGES_PER_HOUR:
         raise HTTPException(
@@ -385,25 +382,10 @@ def notify(
                 f"({task_notify.AGENT_MESSAGES_PER_HOUR}); try again later"
             ),
         )
-    # The task's own record of the post, under the agent's name (`routes/tasks/activity.py::_note_label`); redacted, as the
-    # feed is read at `tasks:view` — and the same redacted text goes to Slack. Written whatever happens to the
-    # Slack leg.
+    # The task's own record of the post, under the agent's name (`routes/tasks/activity.py::_note_label`); redacted, as
+    # the feed is read at `tasks:view`. Not a notification: no alert row, no channel, no bell.
     message = secret_redact.redact(body.message)[0]
     agent = agent_runs.run_agent_name(task)
     record_task_note(session, task.id, "agent_message", message, {"agent": agent} if agent else {})
-    _announce_message_in_task_scope(task.id, message)
     session.commit()
     return NotifyOut(queued=True)
-
-
-def _announce_message_in_task_scope(task_id: int, message: str) -> None:
-    """`task_notify.announce_agent_message` under the org of the task, on sessions of its own (`bind_from`, as
-    `agent._announce_question_round_in_task_scope`). In-request, under the route's task lock, so the cap's
-    count sees every earlier post. The route has already refused a caller that does not hold the task."""
-    try:
-        with SessionLocal() as session, seam.detached(), seam.bind_from(session, Task, task_id):
-            # Release the pooled connection before the Slack relay; the scope is a ContextVar region.
-            session.rollback()
-            task_notify.announce_agent_message(task_id, message)
-    except seam.TenancyRowMissing:
-        log.warning("agent-sdk: task %s no longer exists — its agent's message was not posted", task_id)

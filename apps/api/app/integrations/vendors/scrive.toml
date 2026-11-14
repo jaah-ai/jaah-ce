@@ -1,0 +1,80 @@
+slug = "scrive"
+label = "Scrive"
+category = "hr_other"
+vendor_docs_url = "https://apidocs.scrive.com/"
+summary = "E-signing: agents prepare documents, send them for signature and check their status through the Scrive eSign API."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://oauth2.scrive.com/oauth2/auth"
+token_url = "https://oauth2.scrive.com/oauth2/token"
+pkce = false
+jaah_app = true
+scopes = [
+  { name = "doc:check", label = "Read and list your documents", why = "Agents check who has signed, read document details and download signed files" },
+  { name = "doc:create", label = "Create and update documents", why = "Agents prepare documents from a PDF or template and add the signing parties", optional = true },
+  { name = "doc:send", label = "Start documents", why = "Agents send a prepared document out for signature", optional = true },
+  { name = "offline_access", label = "Stay connected", why = "Lets Jaah renew the one-hour access token, so you do not sign in again every hour" },
+]
+
+[auth.oauth.registration]
+console_url = "https://scrive.com/new/integrations"
+steps = [
+  "Scrive's form lives under Integration settings (scrive.com/new/integrations) for a company admin. If it shows no OAuth 2.0 clients section, ask Scrive support or your account manager to register the client instead, giving them the name Jaah, both redirect URIs and the scopes below, and wait for the client ID and secret they send",
+  "Scrive calls the redirect URI the callback URL",
+]
+review = "Scrive registers OAuth 2.0 clients per client name, callback URL and scopes; its API documentation describes no public app review."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_client_id", label = "Client credentials identifier", kind = "text", required = true, help = "In Scrive, open Account > Integration settings (scrive.com/new/integrations), and under Personal access credentials select Generate (or Show if they exist). Copy Client credentials identifier" },
+  { key = "api_client_secret", label = "Client credentials secret", kind = "secret", required = true, help = "Shown beside the identifier under Personal access credentials, in Account > Integration settings" },
+  { key = "api_token_id", label = "Token credentials identifier", kind = "text", required = true, help = "Shown under Personal access credentials, in Account > Integration settings" },
+  { key = "api_token_secret", label = "Token credentials secret", kind = "secret", required = true, help = "Shown under Personal access credentials, in Account > Integration settings. Generating new personal credentials replaces all four values" },
+]
+
+[test]
+method = "GET"
+path = "https://scrive.com/api/v2/documents/list?max=1"
+auth = { field = "api_token_secret", header = "Authorization", template = 'oauth_signature_method="PLAINTEXT",oauth_consumer_key="{api_client_id}",oauth_token="{api_token_id}",oauth_signature="{api_client_secret}&{api_token_secret}"' }
+list_field = "documents"
+
+[docs]
+agent_uses = [
+  "Create a document from a PDF or a template, add signing parties and send it for signature",
+  "Check a document's status: who has signed, who has not, and when it expires",
+  "Download signed documents and their evidence attachments",
+  "Send reminders to parties who have not signed, or cancel a document that is no longer needed",
+]
+prerequisites = [
+  "A Scrive eSign account on a plan that includes API access",
+  "For an API key: access to your account's Integration settings to generate personal access credentials",
+]
+limitations = [
+  "Personal access credentials act as you, with everything your Scrive user can do (a sign-in is limited to the scopes you approve); there is one set per user, and generating new ones invalidates the old set",
+  "Signed-in agents can read, prepare and send documents; cancelling a document or sending reminders needs personal access credentials, which carry full access",
+  "This integration reaches Scrive's production service at scrive.com (not scrive.eu); the API testbed (api-testbed.scrive.com) needs its own account and is not connected here",
+  "Sending a document for signature is real: signing invitations go out to the parties at once",
+]
+
+[[docs.troubleshooting]]
+symptom = "Test says Scrive rejected the token credentials secret (401 or 403)"
+fix = "One of the four personal access credentials was mistyped, or they were regenerated since you copied them. Open Account > Integration settings, copy all four values again, and select Replace on the secret"
+
+[[docs.troubleshooting]]
+symptom = "Test says Scrive rejected the access token and asks you to reconnect"
+fix = "The sign-in has ended: Scrive's refresh token lasts 30 days without use, and an admin may have removed the OAuth client. Select Reconnect on the secret and sign in to Scrive again"
+
+[[docs.troubleshooting]]
+symptom = "Integration settings or Personal access credentials are missing in Scrive"
+fix = "Your plan or your user role does not include API access. Ask your Scrive company admin to enable it, or contact Scrive support"
+
+[[docs.faq]]
+q = "Should I sign in or use personal access credentials?"
+a = "Sign in with Connect Scrive when it is available: you never copy a key, and you can end access from Scrive at any time. Use personal access credentials for a dedicated integration user or when the Jaah app is not configured"
+
+[[docs.faq]]
+q = "Will agents send documents without asking?"
+a = "Agents do what the task tells them. Sending starts signing invitations right away, so say in the task whether the agent should only prepare a draft for you to send"

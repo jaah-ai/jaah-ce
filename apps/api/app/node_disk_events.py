@@ -15,7 +15,7 @@ A pass with no disk reading (an older daemon, an implausible block) decides noth
 its CI runners stop or restart now rather than on the node's next 60s pass; a pause also raises one operator
 alert through the existing channel (`alert_record.record_alert`).
 
-What the gate stops: runner launches (`app/launch_disk.py`, the one home of "may a runner launch here,
+What the gate stops: runner launches (`app/launch_gates.py`, the one home of "may a runner launch here,
 disk-wise") and CI jobs (`served_gha_state`: the agent desired endpoint serves a running pool as `paused`, so
 the existing drain stops only idle runners; a running job finishes). The operator's own `desired_state` is
 never written: an operator pause outlives a disk recovery, and the gate resumes only what it paused.
@@ -197,10 +197,10 @@ def after_commit(transition: Optional[GateTransition]) -> None:
     if transition is None:
         return
     from app import alert_record
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.models.node_groups import GhaRunnerPool
 
-    session = SessionLocal()
+    session = BridgedSession()
     try:
         project_id = session.scalar(
             select(GhaRunnerPool.project_id).where(GhaRunnerPool.node_id == transition.node_id)

@@ -39,7 +39,7 @@ from app.triggers import (
     PREFLIGHT_NONE,
     PREFLIGHTING,
     RECEIVED,
-    SOURCE_KINDS as TRIGGER_SOURCE_KINDS,
+    SCHEMA_SOURCE_KINDS as TRIGGER_SOURCE_KINDS,
     TASK_TRIGGERS_TABLE,
     TRIGGER_DEDUP_TABLE,
     TRIGGER_DELIVERIES_TABLE,
@@ -491,12 +491,15 @@ class TriggerDelivery(OrgScoped, Base):
     # The target items a queued delivery still owes (the fire engine writes it). NULL
     # when it owes nothing, and on a delivery queued before the engine (it owes its trigger's one project).
     owed_targets: Mapped[Optional[list[Any]]] = mapped_column(JSONB, nullable=True)
+    # A `held` delivery's release time (quiet hours, `app/production_qa/`); NULL on every other row.
+    not_before: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
 
 
 class TriggerDedup(OrgScoped, Base):
     """One item a trigger has already acted on, keyed by item id or the event's natural id (R9). Reserved
     inside the filing transaction (`INSERT … ON CONFLICT DO NOTHING`), so filing is exactly-once per key; a
-    reservation survives only for a `dispatched` or `queued` delivery. The owner may delete a row ("clear") to
+    reservation survives only for a `dispatched` or `queued` delivery, or one a record-only trigger recorded
+    (`filtered`/`recorded`, `trigger_intake._Processor._record`). The owner may delete a row ("clear") to
     let the item file again. Kept 90 days (A5). Bookkeeping, so no entity shape."""
 
     __tablename__ = TRIGGER_DEDUP_TABLE
@@ -514,13 +517,13 @@ class TriggerDedup(OrgScoped, Base):
 
 
 class TriggerNotice(UuidPkMixin, OrgScoped, Base):
-    """One thing a trigger's owner is told (architecture §3.1/§6): the moment a trigger went Failed
-    (`trigger_failed`), or their daily digest (`trigger_digest`). The bell derives its two trigger kinds from
-    these rows, as `billing` derives from `billing_notices` — there is no general notifications table (G6).
+    """One thing a person is told on the bell (architecture §3.1/§6): the moment a trigger went Failed
+    (`trigger_failed`), their daily digest (`trigger_digest`, no longer written), an automation failing or stalling
+    (`automation_alert`), or a node failure or AI login alert (`system_alert`). The bell derives these kinds from these rows, as `billing` derives from `billing_notices` — there is no general notifications table (G6).
 
     `summary` is display data only (names, counts, health text, links), never a secret. A digest carries
     `summary.day` (the UTC date it covers), and `uq_trigger_notices_daily` makes it one per owner, org and day.
-    `read_at` is the owner's bell read stamp. Written only by `app/trigger_notices.py`, in the trigger's org.
+    `read_at` is the owner's bell read stamp. Written by `app/trigger_notices.py`, `app/automation_alerts.py` and `app/alert_record.py`, in the row's org.
     Machine-written, so no entity shape."""
 
     __tablename__ = TRIGGER_NOTICES_TABLE

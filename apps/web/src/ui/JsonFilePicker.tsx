@@ -4,7 +4,7 @@ import { tapTargetSx } from './listStyles'
 import { VISUALLY_HIDDEN } from './visuallyHidden'
 
 /* ONE JSON key-file picker for the app (an account export, `pages/credentials/AccountTransfer.tsx`; a service-account
- * key, `pages/settings/email/ServiceAccountDialog.tsx`): the labelled button over a hidden file input, and the hook
+ * key, `pages/settings/email/ServiceAccountNewPage.tsx`): the labelled button over a hidden file input, and the hook
  * that reads what was picked. */
 
 /** The file's text through `FileReader`, which every browser (and jsdom) has; `Blob.text()` is newer. */

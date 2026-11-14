@@ -1,0 +1,44 @@
+# Ref (ref.tools): hosted MCP server for searching technical documentation. Facts confirmed at
+# https://docs.ref.tools/install (one endpoint; an API key goes in an x-ref-api-key header or apiKey query, which the
+# project link cannot carry) and the server's own OAuth metadata (api.ref.tools/.well-known/oauth-protected-resource/mcp:
+# authorization server ref.scalekit.com with Dynamic Client Registration, PKCE S256). Probed 2026-11-10: initialize
+# without a token answers 401, so Connect signs in.
+slug = "ref"
+label = "Ref"
+category = "mcp"
+vendor_docs_url = "https://docs.ref.tools/install"
+summary = "Search public and your team's private technical documentation through the Ref MCP server."
+
+[[auth]]
+kind = "mcp"
+
+[mcp]
+url = "https://api.ref.tools/mcp"
+url_editable = false
+transport = "streamable_http"
+auth = "oauth_dcr"
+
+[docs]
+agent_uses = [
+  "Search documentation for an API, library or service before writing code against it",
+  "Read the exact documentation page a search found, trimmed to what the task needs",
+  "Search your team's private documentation that was added to Ref",
+]
+prerequisites = [
+  "A Ref account (https://ref.tools); its plan decides how many searches agents may run",
+  "An Org Owner or Admin adds the secret and selects Connect to sign in to Ref once, then links it on each project's MCP tab",
+]
+limitations = [
+  "Ref counts every search against the signed-in account's plan",
+  "Agents act as the signed-in Ref user and see only the private documentation that user can see",
+  "Agents get Ref only in the projects the secret is linked to",
+]
+troubleshooting = [
+  { symptom = "Test says Ref rejected the token (401)", fix = "The sign-in expired or was revoked. Select Reconnect on the secret and sign in to Ref again" },
+  { symptom = "The secret shows Needs reconnect", fix = "Ref ended the grant. Select Reconnect on the secret and sign in to Ref again" },
+  { symptom = "New tasks on the project have no Ref tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with, and an agent marked Not supported on that tab cannot load MCP servers" },
+]
+faq = [
+  { q = "Can I paste a Ref API key instead of signing in", a = "No. Ref takes its API key in its own header, which a linked MCP connection does not send; signing in gives the same access" },
+  { q = "What does Test do", a = "It opens an MCP session with Ref's server and lists its tools, then closes the session. It reads and changes nothing in your Ref account" },
+]

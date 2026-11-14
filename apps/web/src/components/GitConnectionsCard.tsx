@@ -1,23 +1,21 @@
-import { type KeyboardEvent, useEffect, useState } from 'react'
+import { type KeyboardEvent, useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link as RouterLink } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import MenuItem from '@mui/material/MenuItem'
+import Link from '@mui/material/Link'
 import Stack from '@mui/material/Stack'
-import TableBody from '@mui/material/TableBody'
-import TableCell from '@mui/material/TableCell'
-import TableHead from '@mui/material/TableHead'
-import TableRow from '@mui/material/TableRow'
-import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import { apiDetail, ApiError } from '../api'
+import { useAuth } from '../auth'
 import { useApiRead } from '../hooks/useApiRead'
+import { useBusyIds } from '../hooks/useBusyIds'
 import { useSubmit } from '../hooks/useSubmit'
-import { navigateExternal } from '../lib/externalNavigate'
-import { safeHref } from '../lib/safeHref'
+import { leaveForAuthorize } from '../lib/leaveForAuthorize'
+import { connectForgeInPopup, openConnectPopup } from './projects/githubOAuthPopup'
 import {
   deleteGitConnection,
-  listGitConnections,
+  gitConnectionsQuery,
   listGitCredentialsForRoot,
   postGitConnectionPat,
   putGitConnection,
@@ -26,28 +24,60 @@ import {
   type GitCredential,
   type GitPatBody,
 } from '../pages/credentials/api'
+import { integrationPath } from '../pages/credentials/integrations/api'
 import Banner from '../ui/Banner'
 import { credentialMark } from '../ui/credentialMarks'
-import DataTable from '../ui/DataTable'
-import FormField from '../ui/FormField'
+import type { Explain } from '../ui/explain'
+import FeedList from '../ui/feed/FeedList'
+import type { FeedRowSpec, OverflowItem } from '../ui/feed/types'
 import FormTextField from '../ui/FormTextField'
-import { fieldTapTargetSx, monoSx, ROW_ACTION_SX } from '../ui/listStyles'
+import { ROW_ACTION_SX } from '../ui/listStyles'
 import LoadingState from '../ui/LoadingState'
+import SectionHeader from '../ui/SectionHeader'
+import { monoSx } from '../ui/listStyles'
+import StatusChip from '../ui/StatusChip'
 import { FORGE_LABELS, type Forge } from '../types'
 import { isEnabled } from '../lib/editionFeatures'
+import { FONT_SIZE, FONT_WEIGHT, SIZE } from '../theme'
+import Tip from '../ui/Tip'
 
 /* Whether a forge's sign-in (its OAuth app) is offered. Never without forge Connect (D22): no Jaah OAuth app to
    sign in through, so every forge takes a pasted token. */
 const connectOffered = (row: GitConnection): boolean => isEnabled('forge_connect') && row.connect.available
 
-/* ── PROFILE > GIT ACCOUNTS: A TABLE OF WHAT IS CONNECTED, PLUS ONE ADD FORM ──────────────
+/* Where an operator sets up a forge's sign-in app: its Settings > Integrations section, mirroring the server's
+   `ForgeOAuthSpec.settings_section` (apps/api/app/forge_oauth.py) until `connect` carries it. */
+const CONNECT_SETUP_SECTION: Readonly<Record<string, string>> = {
+  github: 'github', gitlab: 'gitlab', bitbucket: 'bitbucket', azure_devops: 'microsoft',
+}
+
+/** The Method hint while a forge's sign-in is not set up. Everyone else reads the server's one line (ask an
+ *  operator); the operator reads one short line linking to the setting, the server's full why on hover. */
+function ConnectUnavailableHint({ target }: { target: GitConnection }) {
+  const { admin } = useAuth()
+  const reason = target.connect.reason
+  if (!reason) return null
+  const section = CONNECT_SETUP_SECTION[target.forge]
+  if (admin?.is_operator !== true || !section) return <>{reason}</>
+  return (
+    <Tip title={reason}>
+      <Box component="span" data-testid="git-add-connect-setup">
+        Sign-in is not set up.{' '}
+        <Link component={RouterLink} to={`/settings?area=integrations&section=${section}`}>Set it up</Link>
+      </Box>
+    </Tip>
+  )
+}
+
+/* ── PROFILE > GIT ACCOUNTS: A LIST OF WHAT IS CONNECTED, PLUS ONE ADD FORM ──────────────
  *
  * The server's `GET /api/users/{id}/git-connections` is the whole model: the four fixed roots plus each
- * self-managed GitLab the person connected, each with its state and whether Connect works. The TABLE lists
- * only the roots that hold an account (connected or needing a reconnect) — a forge nobody connected is not
- * a row (operator decision: no itemised "Not connected" list). The `+` in the table head opens ONE form:
- * pick the type, then how (Connect, paste a token, an existing credential). Rows offer Reconnect and
- * Disconnect only.
+ * self-managed GitLab the person connected — one entry per connected account (any number per root, one of
+ * them the root's default) — each with its state and whether Connect works. The LIST (`ui/feed/FeedList`) holds
+ * only the accounts (connected or needing a reconnect) — a forge nobody connected is not a row (operator decision:
+ * no itemised "Not connected" list). The `+` in the header opens ONE form: pick the type (any forge, again
+ * for another account), then how (Connect, paste a token, an existing credential). A row's ⋯ offers Reconnect and
+ * Disconnect, and Make default on a root holding several accounts.
  *
  * Every rule — which credential fits which root, whether a token works — is the server's, so a write's
  * refusal is shown where it was made, in the server's words.
@@ -71,13 +101,10 @@ export function accountName(connection: GitConnection): string | null {
   return name.startsWith(prefix) && name.endsWith(')') ? name.slice(prefix.length, -1) : name
 }
 
-/** The mark column plus its gap: the cell's text starts under the forge name, not under the mark. */
-const MARK_GAP_PX = 8
+/** Wrap anywhere rather than overflow: a deep sub-path host has no spaces. */
+const WRAP_SX = { overflowWrap: 'anywhere', whiteSpace: 'normal', minWidth: 0 } as const
 
-/** Wrap anywhere rather than overflow: a 40-character account or a deep sub-path host has no spaces. */
-const WRAP_SX = { overflowWrap: 'anywhere', minWidth: 0 } as const
-
-/** The add form's and the Reconnect panel's frame: a flat column under the table. */
+/** The add form's and the Reconnect panel's frame: a flat column under the list. */
 const FORM_SX = { display: 'flex', flexDirection: 'column', gap: 1.5, pt: 0.5 } as const
 
 /** `host[/sub-path]` from what a person types (`https://git.example.org/gitlab/` → `git.example.org/gitlab`),
@@ -88,6 +115,10 @@ export function selfManagedRoot(baseUrl: string): string {
 
 /** A root holding an account — the table's rows. `not_connected` is the add form's, never a row. */
 const isListed = (row: GitConnection) => row.state !== 'not_connected'
+
+/** One account's identity among the rows: its credential (a `not_connected` entry, the root itself). */
+const rowKey = (row: GitConnection) => row.credential?.id ?? row.root
+
 
 /* The card renders INSIDE the page's one form (`ProfilePage`), so its own forms are not `<form>`s: a nested
  * form's submit bubbles to the page's Save. Enter in one of these inputs runs the form's own action instead,
@@ -100,18 +131,22 @@ function enterRuns(action: () => void) {
   }
 }
 
-/** Start a forge's OAuth Connect and leave for its authorize page; a non-http link is refused, not followed.
- *  Every forge comes back to Profile (`routes/forge_connect.py`); the create wizard's popup names its own
- *  return (`components/projects/githubOAuthPopup.ts`). */
-async function beginConnect(forge: string, label: string): Promise<void> {
-  const started = await startForgeConnect(forge)
-  const href = safeHref(started.authorize_url)
-  if (!href) throw new Error(`The ${label} authorization link the server returned is not a usable URL.`)
-  navigateExternal(href)
+/** The catalog vendor Connect screen a fixed root signs in through, or null where the forge has no catalog card
+ *  (Bitbucket, Azure DevOps) and the card starts Connect itself. A self-managed GitLab is never one. */
+function catalogConnectPath(row: GitConnection): string | null {
+  if (row.self_managed || (row.forge !== 'github' && row.forge !== 'gitlab')) return null
+  return integrationPath(row.forge, '/profile')
 }
 
-/** The return leg of a Connect round trip, read off `?git_connect=` by the page. */
-export type ConnectReturn = { result: 'connected' | 'error'; reason: string; forge: string }
+/** Start Connect for a forge with no catalog card and leave for its authorize page; a non-http link is refused,
+ *  not followed. It comes back to Profile (`routes/forge_connect.py`). */
+async function beginConnect(forge: string, label: string): Promise<void> {
+  const started = await startForgeConnect(forge)
+  leaveForAuthorize(started.authorize_url, `The ${label} authorization link the server returned is not a usable URL.`)
+}
+
+/** The return leg of a Connect round trip, read off `?git_connect=` by the page (`hooks/useConnectReturn`). */
+export type ConnectReturn = { connected: boolean; reason: string; forge: string }
 
 /* The callbacks' closed slug vocabularies (`routes/git_connect.py`, `routes/forge_connect.py::_ERRORS`),
  * worded per forge. `Object.create(null)`: the key comes off the URL (`?reason=__proto__`). KEEP IT
@@ -150,7 +185,8 @@ export default function GitConnectionsCard({
   userId,
   ownGitCredentials,
   returned = null,
-  addRequest = 0,
+  addOnly = false,
+  onCancel,
   onChanged,
 }: {
   /** The signed-in person (the routes are self-service). */
@@ -159,53 +195,80 @@ export default function GitConnectionsCard({
   ownGitCredentials: readonly GitCredential[]
   /** The Connect round trip's outcome, if this page load is its return. */
   returned?: ConnectReturn | null
-  /** Bumped to open the Add Git account form (`lib/gitAddLink.ts`'s deep link); 0 asks nothing. */
-  addRequest?: number
-  /** After any write lands (the page re-reads what depends on it: the account, its roster, GitHub reach). */
-  onChanged?: () => void
+  /** The Git account New page (`pages/GitAccountNewPage`): only the Add form, its Cancel `onCancel` (none without
+   *  one), and Connect in a popup (`components/projects/githubOAuthPopup.ts::connectForgeInPopup`) instead of leaving
+   *  the page — a full-page authorize would reload it and lose the opener's draft (`hooks/useNestedCreate.ts`). */
+  addOnly?: boolean
+  onCancel?: () => void
+  /** After any write lands (the page re-reads what depends on it: the account, its roster, GitHub reach); `next` is
+   *  the account a save returned (none after a popup Connect or a Disconnect). */
+  onChanged?: (next?: GitConnection) => void
 }) {
   const queryClient = useQueryClient()
-  const queryKey = ['git-connections', userId]
-  const query = useQuery({ queryKey, queryFn: async () => (await listGitConnections(userId)).connections })
+  const { queryKey } = gitConnectionsQuery(userId)
+  const query = useQuery(gitConnectionsQuery(userId))
   const connections = query.data ?? null
   const loadError = query.isError ? apiDetail(query.error, 'Git accounts could not load. Reload the page.') : ''
   const setConnections = (update: (rows: GitConnection[] | undefined) => GitConnection[]) =>
     queryClient.setQueryData<GitConnection[]>(queryKey, update)
-  const [adding, setAdding] = useState(addRequest > 0)
-  useEffect(() => {
-    if (addRequest > 0) setAdding(true)
-  }, [addRequest])
+  const [adding, setAdding] = useState(false)
+  /* The rows' own state, keyed by `rowKey`: which row's token form is open (one at a time), the row a write
+   * refused (shown under it, in the server's words), and the rows with a write in flight. */
+  const [tokenFor, setTokenFor] = useState<string | null>(null)
+  const [rowError, setRowError] = useState<{ key: string; text: string } | null>(null)
+  const [busyRows, withBusy] = useBusyIds<string>()
+  const act = (key: string, fallback: string, write: () => Promise<void>) => withBusy(key, async () => {
+    setRowError(null)
+    try {
+      await write()
+    } catch (err) {
+      setRowError({ key, text: apiDetail(err, fallback) })
+    }
+  })
 
-  /** A write's answer replaces its own row (or joins the list: a new self-managed root). */
+  /** A write's answer replaces its own account's row, or joins the list after its root's others (a root's
+   *  `not_connected` entry gives way to it); a new default takes the flag from its root's others. */
   const replaceRow = (next: GitConnection) => {
     setConnections(rows => {
-      const list = rows ?? []
-      return list.some(row => row.root === next.root)
-        ? list.map(row => (row.root === next.root ? next : row))
-        : [...list, next]
+      const list = (rows ?? [])
+        .filter(row => !(row.root === next.root && !isListed(row)))
+        .map(row => (row.root === next.root && next.is_default && rowKey(row) !== rowKey(next)
+          ? { ...row, is_default: false } : row))
+      const at = list.findIndex(row => rowKey(row) === rowKey(next))
+      if (at >= 0) return list.map((row, i) => (i === at ? next : row))
+      const last = list.map(row => row.root).lastIndexOf(next.root)
+      return last >= 0 ? [...list.slice(0, last + 1), next, ...list.slice(last + 1)] : [...list, next]
     })
-    onChanged?.()
+    onChanged?.(next)
   }
 
-  /* Shown gone at once, then re-read: the pointer and the root's connect offer are the server's to say. */
-  const afterDisconnect = async (root: string) => {
-    setConnections(rows => (rows ?? []).flatMap(row => (
-      row.root !== root ? [row]
-        : row.self_managed ? []
-          : [{ ...row, state: 'not_connected' as const, detail: null, credential: null }]
-    )))
+  /* Shown gone at once, then re-read: the next default, the pointer and the root's connect offer are the
+   * server's to say. */
+  const afterDisconnect = async (gone: GitConnection) => {
+    setConnections(rows => {
+      const rest = (rows ?? []).filter(row => rowKey(row) !== rowKey(gone))
+      return gone.self_managed || rest.some(row => row.root === gone.root) ? rest
+        : [...rest, { ...gone, state: 'not_connected' as const, detail: null, credential: null }]
+    })
     onChanged?.()
     await query.refetch()
+  }
+
+  /* A popup Connect stored the account server-side: read the list again, and the form gives way to its row. */
+  const afterPopupConnect = async () => {
+    setAdding(false)
+    await query.refetch()
+    onChanged?.()
   }
 
   // `hasOwn`: the forge is a URL parameter, so `constructor` must not read a prototype member.
   const returnLabel = returned ? (Object.hasOwn(FORGE_LABELS, returned.forge) ? FORGE_LABELS[returned.forge as Forge] : 'GitHub') : ''
   /* Gated on the RECORD, not the URL (anyone can send `?git_connect=connected`): only a row the server
    * reports connected for that forge makes the claim. */
-  const returnConfirmed = returned?.result === 'connected'
+  const returnConfirmed = returned?.connected === true
     && (connections ?? []).some(row => row.forge === returned.forge && !row.self_managed && row.state === 'connected')
 
-  const returnError = returned?.result === 'error' ? connectReturnError(returned.reason, returnLabel) : null
+  const returnError = returned && !returned.connected ? connectReturnError(returned.reason, returnLabel) : null
 
   const listed = (connections ?? []).filter(isListed)
   /* The "+" names what it offers (the add form's types): "Connect GitHub, GitLab, Bitbucket or Azure DevOps". */
@@ -213,6 +276,88 @@ export default function GitConnectionsCard({
   const addTitle = forgeLabels.length > 1
     ? `Connect ${forgeLabels.slice(0, -1).join(', ')} or ${forgeLabels[forgeLabels.length - 1]}`
     : forgeLabels.length === 1 ? `Connect ${forgeLabels[0]}` : 'Add Git account'
+
+  /** One connected account's row: the forge, then who it is and its root in full under the name (the root is
+   *  what tells two self-managed hosts apart, so it never truncates), Default where its root holds
+   *  several (`shared`), and in its ⋯ Reconnect, Disconnect, and Make default on a shared root — the default
+   *  serves every repository no other account's owners reach. Reconnect re-runs Connect for an account that
+   *  came from Connect; a token row (`accountName` null), a self-managed GitLab, or a forge with no app
+   *  configured opens a token form under the row instead — a tenant that blocks the app connected with a
+   *  token for a reason, and sending it back to sign-in would fail. */
+  const connectionRow = (connection: GitConnection): FeedRowSpec => {
+    const key = rowKey(connection)
+    const shared = listed.some(other => other.root === connection.root && rowKey(other) !== key)
+    const { root, forge, forge_label: label, state } = connection
+    const account = accountName(connection)
+    /* A root's only account is addressed by the root; one of several by its credential too. */
+    const testId = shared && connection.credential
+      ? `git-connection-${root}-${connection.credential.id}` : `git-connection-${root}`
+    /* Which account a verb acts on, said only where the root holds several. */
+    const name = shared && account ? `${label} ${account}` : label
+    const canConnect = !connection.self_managed && connectOffered(connection) && account !== null
+    const connectPath = canConnect ? catalogConnectPath(connection) : null
+    const tokenOpen = tokenFor === key
+    const error = rowError?.key === key ? rowError.text : ''
+    const needsReconnect = state === 'needs_reconnect'
+
+    const reconnect = () => {
+      if (canConnect) void act(key, `Could not start the ${label} connection`, () => beginConnect(forge, label))
+      else { setRowError(null); setTokenFor(open => (open === key ? null : key)) }
+    }
+    const disconnect = () => act(key, `Could not disconnect ${name}`, async () => {
+      await deleteGitConnection(userId, root, connection.credential?.id)
+      await afterDisconnect(connection)
+    })
+    const makeDefault = () => act(key, `Could not make ${name} the default`, async () => {
+      if (connection.credential) replaceRow(await putGitConnection(userId, root, connection.credential.id, true))
+    })
+
+    return {
+      key,
+      data: { connection: testId, state },
+      indicator: needsReconnect
+        // One line; the forge's own why (e.g. the token was revoked) is its hover.
+        ? { tone: 'warning', glyph: '!', label: 'Needs reconnect', title: connection.detail ?? undefined, tapTitle: true }
+        : { tone: 'success', glyph: '✓', label: 'Connected' },
+      title: (
+        <>
+          <Box component="span" sx={{ display: 'inline-flex', alignItems: 'center', gap: 0.5 }}>{label}{credentialMark(forge, label)}</Box>
+          <Box component="span" sx={[WRAP_SX, { display: 'block', fontWeight: FONT_WEIGHT.regular }]} data-testid={`${testId}-state`}
+            title={needsReconnect ? connection.detail ?? undefined : account ?? undefined}>
+            {needsReconnect ? <StatusChip label="Needs reconnect" tone="warning" />
+              : account === null ? 'Connected with a token'
+                : <Box component="strong" sx={{ fontWeight: FONT_WEIGHT.semibold }}>{account}</Box>}
+          </Box>
+          <Box component="span" sx={[WRAP_SX, monoSx, { display: 'block', color: 'text.secondary', fontSize: FONT_SIZE.sm }]}>{root}</Box>
+        </>
+      ),
+      titleText: label,
+      href: null,
+      titleLines: 'all',
+      markers: shared && connection.is_default ? [{
+        key: 'default', glyph: '★', label: 'Default', title: 'Used for repositories no other account reaches',
+        testId: `${testId}-default`, hug: true, word: { text: 'Default' },
+      }] : undefined,
+      busy: busyRows.has(key),
+      actions: [
+        ...(shared && !connection.is_default && connection.credential
+          ? [{ key: 'default', label: 'Make default', ariaLabel: `Make ${name} the default`, onClick: () => void makeDefault() } as OverflowItem] : []),
+        connectPath
+          ? { key: 'reconnect', label: 'Reconnect', ariaLabel: `Reconnect ${name}`, to: connectPath }
+          : { key: 'reconnect', label: 'Reconnect', ariaLabel: `Reconnect ${name}`, onClick: reconnect },
+        { key: 'disconnect', label: 'Disconnect', ariaLabel: `Disconnect ${name}`, danger: true, onClick: () => void disconnect() },
+      ],
+      detail: tokenOpen || error ? (
+        <Box sx={[FORM_SX, { pl: 3, pb: 1 }]}>
+          {error && <Banner severity="error" testId={`${testId}-error`}>{error}</Banner>}
+          {tokenOpen && (
+            <PatForm connection={connection} userId={userId} onError={text => setRowError({ key, text })}
+              onSaved={next => { setTokenFor(null); setRowError(null); replaceRow(next) }} />
+          )}
+        </Box>
+      ) : undefined,
+    }
+  }
 
   return (
     <Stack spacing={1} data-testid="git-connections">
@@ -223,152 +368,44 @@ export default function GitConnectionsCard({
       {loadError && <Banner severity="error">{loadError}</Banner>}
       {connections === null && !loadError ? (
         <LoadingState rows={2} />
-      ) : connections !== null && (
-        <DataTable ariaLabel="Git accounts" testId="git-accounts-table">
-          <TableHead>
-            <TableRow>
-              <TableCell>Account</TableCell>
-              <TableCell align="right" sx={{ width: '1%' }}>
-                <Button
-                  type="button"
-                  variant="outlined"
-                  color="inherit"
-                  aria-label="Add Git account"
-                  title={addTitle}
-                  aria-expanded={adding}
-                  data-testid="git-account-add"
-                  onClick={() => setAdding(open => !open)}
-                  sx={[...ROW_ACTION_SX, { fontSize: '1rem', fontWeight: 600, minWidth: 44 }]}
-                >
-                  +
-                </Button>
-              </TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {listed.length === 0 ? (
-              <TableRow>
-                <TableCell colSpan={2} sx={{ color: 'text.secondary' }}>
-                  None
-                </TableCell>
-              </TableRow>
-            ) : listed.map(row => (
-              <ConnectionRow
-                key={row.root}
-                userId={userId}
-                connection={row}
-                onSaved={replaceRow}
-                onDisconnected={afterDisconnect}
-              />
-            ))}
-          </TableBody>
-        </DataTable>
+      ) : connections !== null && !addOnly && (
+        <>
+          <SectionHeader
+            action={
+              <Tip title={addTitle}><Button
+                type="button"
+                variant="outlined"
+                color="inherit"
+                aria-label="Add Git account"
+                aria-expanded={adding}
+                data-testid="git-account-add"
+                onClick={() => setAdding(open => !open)}
+                sx={[...ROW_ACTION_SX, { fontSize: FONT_SIZE.lg, fontWeight: FONT_WEIGHT.semibold, minWidth: SIZE.tapTarget }]}
+              >
+                +
+              </Button></Tip>
+            }
+          />
+          <FeedList
+            ariaLabel="Git accounts"
+            testId="git-accounts-table"
+            emptyMessage="None"
+            sections={listed.length === 0 ? [] : [{ key: 'accounts', rail: false, rows: listed.map(connectionRow) }]}
+          />
+        </>
       )}
-      {connections !== null && adding && (
+      {connections !== null && (adding || addOnly) && (
         <AddForm
           userId={userId}
           connections={connections}
           ownGitCredentials={ownGitCredentials}
+          inPopup={addOnly}
           onSaved={next => { setAdding(false); replaceRow(next) }}
-          onCancel={() => setAdding(false)}
+          onConnected={afterPopupConnect}
+          onCancel={addOnly ? onCancel : () => setAdding(false)}
         />
       )}
     </Stack>
-  )
-}
-
-/** One connected root: who it is connected as, and Reconnect / Disconnect. Reconnect re-runs Connect for
- *  an account that came from Connect; a token row (`accountName` null), a self-managed GitLab, or a forge
- *  with no app configured gets a token field instead — a tenant that blocks the app connected with a token
- *  for a reason, and sending it back to sign-in would fail. */
-function ConnectionRow({
-  userId,
-  connection,
-  onSaved,
-  onDisconnected,
-}: {
-  userId: string
-  connection: GitConnection
-  onSaved: (next: GitConnection) => void
-  onDisconnected: (root: string) => Promise<void>
-}) {
-  const [tokenOpen, setTokenOpen] = useState(false)
-  const { busy, formError: error, setFormError: setError, run } = useSubmit()
-  const { root, forge, forge_label: label, state } = connection
-  const account = accountName(connection)
-  const testId = `git-connection-${root}`
-  const canConnect = !connection.self_managed && connectOffered(connection) && account !== null
-
-  const handleReconnect = () => {
-    if (canConnect) void run(`Could not start the ${label} connection`, () => beginConnect(forge, label))
-    else { setError(''); setTokenOpen(open => !open) }
-  }
-
-  const handleDisconnect = () => run(`Could not disconnect ${label}`, async () => {
-    await deleteGitConnection(userId, root)
-    await onDisconnected(root)
-  })
-
-  const expanded = tokenOpen || Boolean(error)
-
-  return (
-    <>
-      <TableRow data-testid={testId} data-state={state}
-        sx={expanded ? { '& > td': { borderBottom: 'none' } } : undefined}>
-        <TableCell sx={WRAP_SX}>
-          <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: `${MARK_GAP_PX}px` }}>
-            <Box sx={{ pt: '2px', flexShrink: 0, display: 'flex' }}>{credentialMark(forge, label)}</Box>
-            <Box sx={WRAP_SX}>
-              <Typography variant="subtitle2" component="h3" sx={WRAP_SX}>{label}</Typography>
-              <Box data-testid={`${testId}-state`} sx={WRAP_SX}>
-                {/* One line; the forge's own why (e.g. the token was revoked) is its tooltip. */}
-                {state === 'needs_reconnect' ? (
-                  <Typography variant="body2" title={connection.detail ?? undefined}
-                    sx={[WRAP_SX, { color: 'warning.main', fontWeight: 600 }]}>
-                    Needs reconnect
-                  </Typography>
-                ) : (
-                  <Typography variant="body2" sx={WRAP_SX}>
-                    {account === null ? 'Connected with a token' : (
-                      <Box component="strong" sx={{ fontWeight: 600 }}>{account}</Box>
-                    )}
-                  </Typography>
-                )}
-              </Box>
-              <Typography variant="caption" sx={[WRAP_SX, { color: 'text.secondary', display: 'block' }, monoSx]}>
-                {root}
-              </Typography>
-            </Box>
-          </Box>
-        </TableCell>
-        <TableCell align="right" sx={{ verticalAlign: 'top' }}>
-          <Box sx={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 1 }}>
-            <Button type="button" variant="outlined" color="inherit" sx={ROW_ACTION_SX} disabled={busy}
-              aria-expanded={canConnect ? undefined : tokenOpen} aria-label={`Reconnect ${label}`}
-              onClick={handleReconnect}>
-              Reconnect
-            </Button>
-            <Button type="button" variant="outlined" color="error" sx={ROW_ACTION_SX} disabled={busy}
-              aria-label={`Disconnect ${label}`} onClick={() => void handleDisconnect()}>
-              Disconnect
-            </Button>
-          </Box>
-        </TableCell>
-      </TableRow>
-      {expanded && (
-        <TableRow>
-          <TableCell colSpan={2} sx={{ pt: 0 }}>
-            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-              {error && <Banner severity="error" testId={`${testId}-error`}>{error}</Banner>}
-              {tokenOpen && (
-                <PatForm connection={connection} userId={userId} onError={setError}
-                  onSaved={next => { setTokenOpen(false); setError(''); onSaved(next) }} />
-              )}
-            </Box>
-          </TableCell>
-        </TableRow>
-      )}
-    </>
   )
 }
 
@@ -378,25 +415,35 @@ const SELF_MANAGED = 'self-managed'
 type Method = 'connect' | 'pat' | 'pick'
 
 /** The one add form: Type first, then how (Connect / token / existing credential), then that method's
- *  fields. A fixed forge that already holds an account is offered disabled — its row's Reconnect is the
- *  way to change it (one account per root, the server's model). */
+ *  fields. Every forge is offered, one already holding an account too: what is added is another account
+ *  beside it (a root holds any number; the server keeps the first the default). */
 function AddForm({
   userId,
   connections,
   ownGitCredentials,
+  inPopup,
   onSaved,
+  onConnected,
   onCancel,
 }: {
   userId: string
   connections: readonly GitConnection[]
   ownGitCredentials: readonly GitCredential[]
+  /** Connect in a popup and stay (`addOnly`), not via the catalog screen or a full-page authorize. Also drops
+   *  the form's own heading: `addOnly` is the New Git account page, whose title already names it. */
+  inPopup: boolean
+  /** After a popup Connect lands: the account is the server's to list. */
+  onConnected: () => Promise<void>
   onSaved: (next: GitConnection) => void
-  onCancel: () => void
+  /** None: the form cannot be put away. */
+  onCancel?: () => void
 }) {
-  const fixed = connections.filter(row => !row.self_managed)
-  const [type, setType] = useState(() => fixed.find(row => !isListed(row))?.root ?? SELF_MANAGED)
-  /* A type that got an account while the form was open (a row's Reconnect saved) falls back to self-managed. */
-  const target = fixed.find(row => row.root === type && !isListed(row)) ?? null
+  /* One entry per fixed root (its first: the connect offer is the root's, whichever account carries it). */
+  const fixed = connections.filter((row, i) => !row.self_managed
+    && connections.findIndex(other => other.root === row.root) === i)
+  /* GitHub first, connected or not (a second GitHub account is the common add); then the list's first root. */
+  const [type, setType] = useState(() => (fixed.find(row => row.forge === 'github') ?? fixed[0])?.root ?? SELF_MANAGED)
+  const target = fixed.find(row => row.root === type) ?? null
   const methodFor = (row: GitConnection | null): Method => (row && connectOffered(row) ? 'connect' : 'pat')
   const [method, setMethod] = useState<Method>(() => methodFor(target))
   const { busy, formError: error, setFormError: setError, run } = useSubmit()
@@ -407,40 +454,57 @@ function AddForm({
     setMethod(methodFor(fixed.find(row => row.root === next) ?? null))
   }
 
+  const connectPath = target && !inPopup ? catalogConnectPath(target) : null
+
   const handleConnect = async () => {
     if (!target) return
-    await run(`Could not start the ${target.forge_label} connection`, () => beginConnect(target.forge, target.forge_label))
+    const { forge, forge_label: label } = target
+    if (!inPopup) {
+      await run(`Could not start the ${label} connection`, () => beginConnect(forge, label))
+      return
+    }
+    // Opened in the click, before any await: a popup opened later is blocked.
+    const popup = openConnectPopup()
+    await run(`Could not connect ${label}`, async () => {
+      await connectForgeInPopup(popup, forge, label, `Press Connect ${label} to try again.`)
+      await onConnected()
+    })
   }
 
   return (
     <Box role="group" aria-label="Add Git account" data-testid="git-account-add-form" sx={[FORM_SX, { pt: 1 }]}>
-      <Typography variant="subtitle2" component="h3">Add Git account</Typography>
-      <FormField label="Type">
-        <TextField id="git-add-type" select sx={fieldTapTargetSx} value={type}
-          onChange={e => pickType(e.target.value)} disabled={busy}>
-          {fixed.map(row => (
-            <MenuItem key={row.root} value={row.root} disabled={isListed(row)}>
-              {isListed(row) ? `${row.forge_label} (already added)` : row.forge_label}
-            </MenuItem>
-          ))}
-          <MenuItem value={SELF_MANAGED}>Self-managed GitLab</MenuItem>
-        </TextField>
-      </FormField>
+      {/* On its own page the title already says it. */}
+      {!inPopup && <Typography variant="subtitle2" component="h3">Add Git account</Typography>}
+      <FormTextField
+        label="Type"
+        help={{ tip: 'The Git host this account connects to.', docs: 'console-reference/help-and-profile/profile' }}
+        id="git-add-type"
+        value={type}
+        onChange={pickType}
+        disabled={busy}
+        options={[
+          ...fixed.map(row => ({ value: row.root, label: row.forge_label })),
+          { value: SELF_MANAGED, label: 'Self-managed GitLab' },
+        ]}
+      />
 
       {target && (
-        <FormField
+        <FormTextField
           label="Method"
-          hint={isEnabled('forge_connect') && !target.connect.available && target.connect.reason ? target.connect.reason : undefined}
-        >
-          <TextField id="git-add-method" select sx={fieldTapTargetSx} value={method}
-            onChange={e => { setError(''); setMethod(e.target.value as Method) }} disabled={busy}>
-            {connectOffered(target) && (
-              <MenuItem value="connect">Sign in with {target.forge_label}</MenuItem>
-            )}
-            <MenuItem value="pat">Paste a token</MenuItem>
-            <MenuItem value="pick">Use a credential I already added</MenuItem>
-          </TextField>
-        </FormField>
+          help={{ tip: 'How Jaah gets access to this account.', docs: 'console-reference/help-and-profile/profile' }}
+          hint={isEnabled('forge_connect') && !target.connect.available ? <ConnectUnavailableHint target={target} /> : undefined}
+          id="git-add-method"
+          value={method}
+          onChange={v => { setError(''); setMethod(v as Method) }}
+          disabled={busy}
+          options={[
+            ...(connectOffered(target)
+              ? [{ value: 'connect', label: `Sign in with ${target.forge_label}`, help: 'Signs you in on the host; no token to paste.' }]
+              : []),
+            { value: 'pat', label: 'Paste a token', help: 'Connects with a token you create on the host.' },
+            { value: 'pick', label: 'Use a credential I already added', help: 'Reuses a Git credential already in Secrets.' },
+          ]}
+        />
       )}
 
       {error && <Banner severity="error" testId="git-account-add-error">{error}</Banner>}
@@ -449,10 +513,16 @@ function AddForm({
         <SelfManagedForm userId={userId} onSaved={onSaved} />
       ) : method === 'connect' ? (
         <Box>
-          <Button type="button" variant="contained" sx={ROW_ACTION_SX} disabled={busy}
-            onClick={() => void handleConnect()}>
-            Connect {target.forge_label}
-          </Button>
+          {connectPath ? (
+            <Button component={RouterLink} to={connectPath} variant="contained" sx={ROW_ACTION_SX} disabled={busy}>
+              Connect {target.forge_label}
+            </Button>
+          ) : (
+            <Button type="button" variant="contained" sx={ROW_ACTION_SX} disabled={busy}
+              onClick={() => void handleConnect()}>
+              Connect {target.forge_label}
+            </Button>
+          )}
         </Box>
       ) : method === 'pat' ? (
         <PatForm key={target.root} connection={target} userId={userId} onSaved={onSaved} onError={setError} />
@@ -461,23 +531,26 @@ function AddForm({
           onSaved={onSaved} onError={setError} />
       )}
 
-      <Box>
-        <Button type="button" variant="text" color="inherit" sx={ROW_ACTION_SX} disabled={busy} onClick={onCancel}>
-          Cancel
-        </Button>
-      </Box>
+      {onCancel && (
+        <Box>
+          <Button type="button" variant="text" color="inherit" sx={ROW_ACTION_SX} disabled={busy} onClick={onCancel}>
+            Cancel
+          </Button>
+        </Box>
+      )}
     </Box>
   )
 }
 
-/** The token fields each forge's `_pat_config` takes, with the one line a person needs to make it. */
-function patHint(forge: string): string {
-  if (forge === 'bitbucket') return 'An Atlassian API token with Bitbucket scopes. App passwords are not accepted.'
+/** The token field's explanation per forge's `_pat_config`: its effect, then the one line a person needs to make it. */
+function patHint(forge: string): Explain {
+  const tip = 'Tasks clone and push with this token.'
+  if (forge === 'bitbucket') return { tip, more: 'An Atlassian API token with Bitbucket scopes. App passwords are not accepted.' }
   if (forge === 'azure_devops') {
-    return 'Create it for “All accessible organizations”: a PAT scoped to one organization reaches only that one.'
+    return { tip, more: 'Create it for “All accessible organizations”: a PAT scoped to one organization reaches only that one.' }
   }
-  if (forge === 'gitlab') return 'A personal access token with read_repository and write_repository.'
-  return 'A personal access token with repository read and write.'
+  if (forge === 'gitlab') return { tip, more: 'A personal access token with read_repository and write_repository.' }
+  return { tip, more: 'A personal access token with repository read and write.' }
 }
 
 function PatForm({
@@ -499,6 +572,9 @@ function PatForm({
   // The tester's reason (422) is the row's banner, not this form's.
   useEffect(() => { if (formError) onError(formError) }, [formError, onError])
   const idBase = `git-pat-${root}`
+  // Opened from the row's ⋯, which cannot announce it: focus lands on the form's first field instead.
+  const formRef = useRef<HTMLDivElement>(null)
+  useEffect(() => { formRef.current?.querySelector('input')?.focus() }, [])
 
   /* Every field the forge's `_pat_config` requires, so its "`<field>` is required" never reaches a person. */
   const complete = Boolean(token.trim())
@@ -515,13 +591,14 @@ function PatForm({
   }
 
   return (
-    <Box role="group" onKeyDown={enterRuns(() => void submit())} aria-label={`${label} token`} sx={FORM_SX}>
+    <Box ref={formRef} role="group" onKeyDown={enterRuns(() => void submit())} aria-label={`${label} token`} sx={FORM_SX}>
       {forge === 'bitbucket' && (
-        <FormTextField label="Atlassian email" id={`${idBase}-username`} type="email" autoComplete="off"
+        <FormTextField label="Atlassian email" help="Bitbucket checks the API token against this account."
+          id={`${idBase}-username`} type="email" autoComplete="off"
           value={username} onChange={setUsername} disabled={saving} />
       )}
       {forge === 'azure_devops' && (
-        <FormTextField label="Organization"
+        <FormTextField label="Organization" help="The token is tested against this Azure DevOps organization."
           id={`${idBase}-org`} autoComplete="off" placeholder="acme"
           value={testOrg} onChange={setTestOrg} disabled={saving} />
       )}
@@ -588,16 +665,18 @@ function PickForm({
   }
   return (
     <Box role="group" aria-label={`${label} existing credential`} sx={FORM_SX}>
-      <FormField label="Credential" help={ownOnly ? 'Only credentials you added are listed.' : undefined}>
-        <TextField id={`git-pick-${root}`} select sx={fieldTapTargetSx} value={choice}
-          onChange={e => setChoice(e.target.value)} disabled={saving}>
-          {options.map(row => (
-            <MenuItem key={row.id} value={row.id} sx={{ whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
-              {row.name}
-            </MenuItem>
-          ))}
-        </TextField>
-      </FormField>
+      <FormTextField
+        label="Credential"
+        help={{ tip: 'Connects this host with a credential already stored.', more: ownOnly ? 'Only credentials you added are listed.' : undefined }}
+        id={`git-pick-${root}`}
+        value={choice}
+        onChange={setChoice}
+        disabled={saving}
+        options={options.map(row => ({ value: row.id, label: row.name }))}
+      >
+        {/* A native select with no matching value shows its first option as picked without a change event. */}
+        {choice === '' && <option value="" disabled>Choose…</option>}
+      </FormTextField>
       <Box>
         <Button type="button" variant="contained" sx={ROW_ACTION_SX} disabled={saving || !choice}
           onClick={() => void submit()}>
@@ -625,7 +704,7 @@ function SelfManagedForm({ userId, onSaved }: { userId: string; onSaved: (next: 
     <Box role="group" onKeyDown={enterRuns(() => void submit())} aria-label="Self-managed GitLab"
       data-testid="git-add-self-managed" sx={FORM_SX}>
       {error && <Banner severity="error">{error}</Banner>}
-      <FormTextField label="Base URL" id="git-self-managed-url" type="url" autoComplete="off"
+      <FormTextField label="Base URL" help="Repositories under this address use this account." id="git-self-managed-url" type="url" autoComplete="off"
         placeholder="https://git.example.org" value={baseUrl} onChange={setBaseUrl} disabled={saving} />
       <FormTextField label="Token" help={patHint('gitlab')} id="git-self-managed-token" type="password"
         autoComplete="off" value={token} onChange={setToken} disabled={saving} />

@@ -35,6 +35,7 @@ from sqlalchemy import Text, Uuid, any_, exists, literal, select, type_coerce
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import InstrumentedAttribute, Session
 
+from app.integrations import catalog as integration_catalog
 from app.credential_keys import NodeVaultUnavailable
 from app.models.automations import TaskTrigger
 from app.models.control_plane import SystemState
@@ -44,14 +45,18 @@ from app.models.credentials import (
     Credential,
     NodeVaultOperationItem,
     ProjectCredential,
+    ProjectMcpLink,
     UserGitConnection,
 )
 from app.models.identity import AdminUser
 from app.models.node_groups import GhaRunnerPool, NodeGroup
 from app.models.nodelinks import OrgSharedStore
 from app.models.nodes import Node
+from app.models.notifications import SlackInstallation
 from app.models.orgs import OrgSsoConnection, OrgSetting
-from app.models.projects import Project, ProjectEnvVar
+from app.models.projects import ProjectEnvVar
+from app.models.tenant_email import GmailConnection
+from app.models.trackers import TrackerConnection
 
 __all__ = [
     "NodeVaultUnavailable",
@@ -66,7 +71,6 @@ __all__ = [
 # Labels: what an operator reads in a refusal ("<label>: NodeVault credential — not available to Jaah") and
 # in the form's eligibility list. Constants, so a write door and the registry cannot spell one differently.
 GIT_ACCESS = "Git access"
-PROJECT_JIRA = "Project Jira integration"
 AGENT_ACCOUNT = "Agent account"
 CLOUD_NODE_DEFAULTS = "Cloud connections"
 CLOUD_NODE_TAILNET = "Cloud node tailnet"
@@ -77,6 +81,9 @@ SHARED_STORAGE = "Shared storage"
 TRIGGER_PREFLIGHT = "Trigger model preflight"
 SLACK_APP = "Slack app connection"
 SSO = "SSO"
+SLACK_WORKSPACE = "Slack workspace"
+GMAIL_MAILBOX = "Gmail mailbox"
+TRACKER_CONNECTION = "Tracker connection"
 
 #: The reason an OAuth2 type is never eligible (D7): the control plane must open the row to refresh its tokens.
 #: Exact text pinned by AC tests.
@@ -91,9 +98,7 @@ class FkConsumer:
 
 #: Every FK to `credentials.id` that the CONTROL PLANE opens. (table, column) is what the census matches.
 FK_CONSUMERS: tuple[FkConsumer, ...] = (
-    FkConsumer(AdminUser.git_credential_id, GIT_ACCESS),
     FkConsumer(UserGitConnection.credential_id, GIT_ACCESS),
-    FkConsumer(Project.jira_credential_id, PROJECT_JIRA),
     FkConsumer(Account.credential_id, AGENT_ACCOUNT),
     FkConsumer(CloudConnection.credential_id, CLOUD_NODE_DEFAULTS),
     FkConsumer(NodeGroup.credential_id, NODE_GROUP),
@@ -101,22 +106,32 @@ FK_CONSUMERS: tuple[FkConsumer, ...] = (
     FkConsumer(OrgSharedStore.credential_id, SHARED_STORAGE),
     FkConsumer(TaskTrigger.preflight_credential_id, TRIGGER_PREFLIGHT),
     FkConsumer(OrgSsoConnection.oidc_credential_id, SSO),
+    # The integration catalog's links (revision 202611031500): the control plane posts and sends as these rows.
+    FkConsumer(SlackInstallation.credential_id, SLACK_WORKSPACE),
+    FkConsumer(GmailConnection.credential_id, GMAIL_MAILBOX),
+    # A tracker connection (`trackers.connections.connect`): the control plane writes back to the tracker as this row.
+    FkConsumer(TrackerConnection.credential_id, TRACKER_CONNECTION),
 )
 
 #: FKs to `credentials.id` that are NOT a control-plane consumer, each with why. The census requires every
 #: FK to be in one of the two tuples, so adding an FK forces this decision.
 NODE_SIDE_FKS: Mapping[tuple[str, str], str] = {
     ("project_credentials", "credential_id"): "a grant: the runner fetch hands the credential to a node",
+    ("project_mcp_links", "credential_id"): "an opt-in: the project's runners reach the MCP connection on a node",
     ("project_env_vars", "credential_id"): "resolves as unavailable for NodeVault (AC-5.4), never refused",
     ("nodevault_operation_items", "credential_id"): "NodeVault's own migration bookkeeping",
+    ("admin_users", "git_credential_id"): "the retiring Git Access pointer: an authorization grandfather only, "
+    "never the row a push opens (that is a `user_git_connections` row's)",
 }
 
 #: `NODE_SIDE_FKS` as columns, each in operator words: a row one points at cannot change org, or the pointer would
 #: cross tenants (`references_of` refuses it; no database key does). A census test keeps the two in step.
 NODE_SIDE_REFERENCES: tuple[FkConsumer, ...] = (
     FkConsumer(ProjectCredential.credential_id, "Project access"),
+    FkConsumer(ProjectMcpLink.credential_id, "Project MCP connection"),
     FkConsumer(ProjectEnvVar.credential_id, "Project env var"),
     FkConsumer(NodeVaultOperationItem.credential_id, "NodeVault migration"),
+    FkConsumer(AdminUser.git_credential_id, "Git access (retiring pointer)"),
 )
 
 #: Every operator-settings knob that names a credential (`Knob.credential_type`), in operator words. The
@@ -128,6 +143,7 @@ KNOB_LABELS: Mapping[str, str] = {
     "cloud_node_tailscale_credential_id": CLOUD_NODE_TAILNET,
     "git_app_credential_id": "GitHub OAuth App",
     "git_github_app_credential_id": "GitHub App",
+    "easy_mode_github_credential_id": "Easy Mode GitHub admin",
     "compliance_github_credential_id": "Compliance evidence",
     "gitlab_app_credential_id": "GitLab app",
     "bitbucket_app_credential_id": "Bitbucket app",
@@ -135,12 +151,15 @@ KNOB_LABELS: Mapping[str, str] = {
     "notifications_slack_credential_id": "Slack notifications",
     "notifications_telegram_credential_id": "Telegram notifications",
     "tenant_gmail_oauth_credential_id": "Gmail OAuth client",
+    "figma_app_credential_id": "Figma app",
     "email_unsubscribe_credential_id": "Email unsubscribe links",
     "site_enquiry_recaptcha_credential_id": "Site enquiry reCAPTCHA",
     "site_enquiry_hubspot_credential_id": "Site enquiry HubSpot",
     "support_llm_credential_id": "Support assistant model",
     "memory_llm_credential_id": "Project memory model",
     "trigger_preflight_llm_credential_id": "Trigger preflight platform model",
+    # The catalog's derived `oauth_app.<slug>` knobs (`operator_settings/catalog_integrations.py::catalog_app_knobs`).
+    **{spec.app_knob: f"{spec.label} OAuth app" for spec in integration_catalog.listed() if spec.app_knob},
 }
 
 #: `Node.infra` keys holding a credential id the control plane signs or provisions with

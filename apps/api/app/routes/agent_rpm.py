@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse
+from starlette.concurrency import run_in_threadpool
 from app import node_credentials
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
@@ -28,9 +29,6 @@ from app.routes.agent.auth import _check_token
 # No `prefix=`: the public/private ALB split test reads each `@infra` path off the decorator.
 router = APIRouter(tags=["agent-rpm"])
 
-
-# Under the apt prefix, so the CP task role's existing `apt/*` grant covers it.
-RPM_KEY_PREFIX = f"{agent_apt.APT_KEY_PREFIX}rpm/"
 
 _RPM_KEY = re.compile(r"apt/rpm/(x86_64|aarch64)/(repodata/[^/]+|Packages/[^/]+\.rpm)")
 
@@ -49,7 +47,7 @@ def _rpm_key(object_path: str, raw_path: str) -> str | None:
 
 @router.get(f"{RPM_PATH}/{{object_path:path}}", status_code=307)
 @infra(Tenancy.OPERATOR)
-def serve_rpm_object(
+async def serve_rpm_object(
     object_path: str,
     request: Request,
     # Order is the contract: the translation runs first so `_check_token` sees the header.
@@ -57,8 +55,7 @@ def serve_rpm_object(
     caller: node_credentials.AgentCaller = Depends(_check_token),
 ) -> RedirectResponse:
     """Redirect one authenticated node to a short-lived presigned GET for one dnf repository object."""
-    key = _rpm_key(object_path, agent_apt._raw_path(request))
-    if key is None:
-        # Before any config read, so a hostile path gets the same 404 whether or not a channel exists.
-        raise HTTPException(status_code=404, detail="no such object")
-    return agent_apt.presigned_redirect(key, channel="rpm", caller=caller)
+    # Off the loop, as `agent_apt.serve_apt_object`: the presign reads a setting and fetches AWS credentials.
+    return await run_in_threadpool(
+        agent_apt.serve_object, _rpm_key(object_path, agent_apt._raw_path(request)), channel="rpm", caller=caller
+    )

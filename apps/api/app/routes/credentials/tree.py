@@ -34,11 +34,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import Grouping
 
 from app import keyset
-from app.auth import require_user
 from app.authz.declarations import feature
 from app.authz.object_access import OWNERSHIP_SYSTEM
-from app.authz.principal import Principal, current_principal
-from app.db import get_session
+from app.authz.principal import AsyncCaller, Principal, current_caller
+from app.db_async import on_session
+from app.entity_shape import names_of
 from app.models.credentials import Credential
 from app.models.identity import AdminUser
 from app.models.orgs import Org
@@ -377,9 +377,7 @@ def _home_labels_of(session: Session, keys: Sequence[str]) -> dict[str, str]:
         kind, _sep, ident = key.partition(":")
         by_kind.setdefault(kind, []).append(ident)
     orgs = org_refs(session, [UUID(i) for i in by_kind.get("o", [])])
-    projects = dict(session.execute(
-        select(Project.id, Project.name).where(Project.id.in_([int(i) for i in by_kind.get("p", [])]))
-    ).tuples().all()) if by_kind.get("p") else {}
+    projects = names_of(session, Project, (int(i) for i in by_kind.get("p", [])))
     emails = dict(session.execute(
         select(AdminUser.id, AdminUser.email).where(AdminUser.id.in_([UUID(i) for i in by_kind.get("u", [])]))
     ).tuples().all()) if by_kind.get("u") else {}
@@ -507,7 +505,9 @@ def _valid_path(path: str) -> str:
 # Included before `reads.router` in `main.py`: its `/api/credentials/{credential_id}` would swallow `/tree`.
 @router.get("/api/credentials/tree", response_model=CredentialTreeOut)
 @feature("credentials", "view", own_credential=True)
+@on_session
 def credential_tree(
+    session: Session,
     level: TreeLevel = Query(),
     org_id: Optional[UUID] = Query(default=None),
     home: Optional[str] = Query(default=None, max_length=64),
@@ -521,21 +521,19 @@ def credential_tree(
     mine: bool = Query(default=False),
     owner_id: list[UUID] = Query(default=[]),
     health: Optional[RosterHealth] = Query(default=None),
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CredentialTreeOut:
     """One level of the tree under the roster's filters (module docstring). `tenants` is the operator's root and a
     422 for anyone else; `homes` takes `org_id` (required of the operator); `folder` takes `home` and `path`."""
     filters = roster_filters_from_query(
         type_slug=type_, q=q, owner_ids=owner_id, secrets=secrets, health=health, mine=mine,
     )
-    where = roster_where(session, principal, filters)
+    where = roster_where(session, caller.principal, filters)
     # The walk's candidates: the caller's scope alone, so a filter never hides a child the dense branch counts.
-    scope = roster_where(session, principal, RosterFilters(mine=filters.mine))
+    scope = roster_where(session, caller.principal, RosterFilters(mine=filters.mine))
     filtered = _is_filtered(filters)
     # D1: only the operator plane lists tenants (`mine` or not); a tenant's root is its own org's homes.
-    operator = reads_as_operator(principal, RosterFilters())
+    operator = reads_as_operator(caller.principal, RosterFilters())
     if level == "tenants":
         if not operator:
             raise HTTPException(status_code=422, detail="level=tenants is the operator's; list homes instead")
@@ -553,5 +551,5 @@ def credential_tree(
     home, path = _valid_home(home), _valid_path(path)
     result = _result("folder", home, path, filters.digest())
     return _folder(
-        session, principal, home, path, scope=scope, where=where, filtered=filtered, cursor=cursor, result=result,
+        session, caller.principal, home, path, scope=scope, where=where, filtered=filtered, cursor=cursor, result=result,
     )

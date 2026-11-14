@@ -1,5 +1,6 @@
 import type { Theme } from '@mui/material/styles'
-import type { SidebarColors } from '../theme'
+import { visuallyHidden } from '@mui/utils'
+import { FONT_SIZE, LINE_HEIGHT, RADIUS, SIZE, grid, tint, type SidebarColors } from '../theme'
 
 /* The console's ONE list-page style vocabulary. A page imports these; it never re-spells them.
  *
@@ -14,8 +15,31 @@ import type { SidebarColors } from '../theme'
  * `theme.breakpoints.down(...)` because half the call sites have no theme in scope. */
 export const PHONE = '@media (max-width:480px)'
 
-/** The same query for `useMediaQuery`, so a page that must branch in JS reads the identical width. */
+/** THE SHELL'S INSET above the phone (9px, the grid step nearest the 8px the Tasks board used to hug the sidebar at): `.app-main`'s top, left and right padding (`App.tsx`'s layout contract).
+ *  One even, tight frame on every page; its bottom is the Help launcher's (`ui/launcherSeat.ts`). Anything that
+ *  bleeds past or sticks over that padding cancels this value, never a copy of it. */
+export const SHELL_INSET = grid(1.5)
+/** The same inset, negated: what a bleed or a sticky offset cancels. */
+export const SHELL_INSET_NEG = `calc(-1 * ${SHELL_INSET})`
+
+/** The same width for JS; read it through `hooks/usePhone` (the one `useMediaQuery` of it), not directly. */
 export const PHONE_QUERY = '(max-width:480px)'
+/** Under this width the onboarding dock starts minimized to its rail (`components/onboarding/OnboardingWidget.tsx`). */
+export const CRAMPED_QUERY = '(max-width: 1599px)'
+/** Under the console's desktop width (1024px) the open onboarding dock left the page too little room: its top
+ *  controls ran into each other at 520px. The dock is its rail there, whatever was stored, until restored. */
+export const DOCK_RAIL_QUERY = '(max-width: 1023.95px)'
+
+/** A device with no hover, or a viewport under MUI's `sm`: a hover-only reveal shows always (`ui/OrgScopeControl`). */
+export const HOVERLESS_OR_NARROW = '@media (hover: none), (max-width: 600px)'
+
+/** Wide enough for `ui/FactsGrid`'s `fit` `columns` count. */
+export const STAT_GRID_WIDE = '@media (min-width:1100px)'
+
+/** The container `ui/gallery/CardGrid` names around its rows, and the query that stacks a row inside a narrow one —
+ *  the gallery's own width (a phone, or a narrow list/detail pane), not the viewport's. */
+export const GALLERY_CONTAINER = 'gallery'
+export const GALLERY_NARROW = `@container ${GALLERY_CONTAINER} (max-width: 760px)`
 
 /** The phone's fixed bottom navigation bar (`components/Sidebar.tsx`): what page content must keep clear of. */
 export const BOTTOM_NAV_HEIGHT = 60
@@ -81,10 +105,32 @@ export const AUDIT_NO_ACTOR = `@container ${AUDIT_LIST_CONTAINER} (max-width:549
    move into the Filters menu a phone uses (`pages/audit/PagedLogView.tsx`). */
 export const AUDIT_FOLD_FILTERS = `@container ${AUDIT_LIST_CONTAINER} (max-width:699.95px)`
 
+/* A playbook stage card's own width (`pages/playbooks/StageCard.tsx`): below 600px its row buttons drop their
+   labels for glyphs. */
+export const STAGE_CARD_CONTAINER = 'stage-card'
+export const STAGE_CARD_NARROW = `@container ${STAGE_CARD_CONTAINER} (max-width:599.95px)`
+/* The pipeline editor's steps (`components/projects/PipelineEditor.tsx`), by their own width: below 560px a template's
+   steps table restacks as one card per step (its columns crowd at ≈460px), and a project's step panel
+   (`components/projects/PipelineStepPanel.tsx`) gives each field the whole line. */
+export const PIPELINE_STEPS_CONTAINER = 'pipeline-steps'
+export const PIPELINE_STEPS_NARROW = `@container ${PIPELINE_STEPS_CONTAINER} (max-width:559.95px)`
+export const PIPELINE_STEPS_WIDE = `@container ${PIPELINE_STEPS_CONTAINER} not (max-width:559.95px)`
+/* Settings › Pipeline rules (`pages/settings/pipelineRules/PipelineRulesSection.tsx`) restacks as cards on its own width:
+   measured, a template open beside Settings at 1280px leaves it 330px, too narrow for three columns. */
+export const PIPELINE_RULES_CONTAINER = 'pipeline-rules'
+export const PIPELINE_RULES_NARROW = `@container ${PIPELINE_RULES_CONTAINER} (max-width:479.95px)`
+/* A schedule's summary line (`pages/cron/ScheduleEditor.tsx`): below 480px of its own width it wraps. */
+export const SCHEDULE_SUMMARY_CONTAINER = 'schedule-summary'
+export const SCHEDULE_SUMMARY_NARROW = `@container ${SCHEDULE_SUMMARY_CONTAINER} (max-width:479.95px)`
+
 /* MACHINES › CONNECTIONS' IMAGE SLOT (196px + 8px gap) — present from 1280px up. Measured: at 1024 the
    cluster (image, org, volume, credential, region, ⋯) left the connection's name no width at all; from 1280 the 256px
    more viewport gives it ~250. Below, the row's hover carries the image. */
 export const FEED_NO_CONNECTION_IMAGE = '@media (max-width:1279px)'
+
+/* THE OPERATOR DASHBOARD'S FILTER BAR — below 1280px (the 1024 floor beside the rail) only Project stays out of its
+   More filters menu: four selects wrapped the row onto a second line. A `useMediaQuery` string. */
+export const DASHBOARD_FILTERS_NARROW = '(max-width:1279px)'
 
 /* THE /tasks BOARD'S OWN WIDTH, AS A QUERY CONTAINER — for gates that must follow the BOARD, not
    the window. The supported desktop band is ≥1024px (the supported viewport widths), and
@@ -99,14 +145,33 @@ export const TASK_BOARD_CONTAINER = 'task-board'
 export const TASK_BOARD_CONTAINER_SX = { containerType: 'inline-size', containerName: TASK_BOARD_CONTAINER } as const
 
 /* THE TASK PAGE'S TRAIL, AS A QUERY CONTAINER: `pages/taskDetail/taskDetailConstants.ts` puts it on the header's lead
-   (basis 0, so its width never follows its content) — the trail, plus the org aside where one is drawn beside it; `components/tasks/TaskBreadcrumb.tsx` drops the System chip
+   (basis 0, so its width never follows its content) — the trail; `components/tasks/TaskBreadcrumb.tsx` drops the System chip
    on a narrow trail. */
 export const TASK_TRAIL_CONTAINER = 'task-trail'
 
-/* THE HEADER'S ONE LINE (`components/tasks/pane/PaneHeader.tsx`): search, the creator strip and the action
-   cluster share a row. As the board narrows the creator strip goes FIRST (it is a shortcut; the same filter is
+/* The task page's other size containers, each gating on its OWN width (a container query cannot read a CSS variable,
+   so these stay literal pixels here): the Details field grid (`pages/taskDetail/TaskSummaryPanel.tsx`) pins its columns;
+   the tabs row (`pages/taskDetail/taskDetailConstants.ts`) moves the rating. */
+/* `components/tasks/TaskSpecFields.tsx`: the width below which the one non-advanced line stops fitting its Jira lookup — MEASURED. Flex breaks on
+ * each member's hypothetical size: 116 + 24 + 116 + 24 + 272 = 552px (the two axes above 600px, 1.5rem gaps,
+ * the settings group's 17rem basis, measured with the since-removed help toggle). Plus the 212px sidebar and 24px column padding = 788px; 839 adds slack. Below
+ * it the lookup goes to `Advanced` and the Attachments cell off the group (`stowInAdvanced`); the lookup keeps a 13rem floor
+ * because narrower it stops reading as a field.
+ * Its own constant, not `PHONE_QUERY` (a shared 480px token four other surfaces read). */
+export const AXES_ROW_TIGHT_QUERY = '(max-width:839px)'
+
+export const TASK_FIELDS_CONTAINER = 'task-fields'
+export const TASK_FIELDS_NARROW = `@container ${TASK_FIELDS_CONTAINER} (max-width: 719px)`
+export const TASK_FIELDS_WIDE = `@container ${TASK_FIELDS_CONTAINER} (min-width: 1000px)`
+export const TASK_TABS_ROW_CONTAINER = 'task-tabs-row'
+export const TASK_TABS_ROW_NARROW = `@container ${TASK_TABS_ROW_CONTAINER} (max-width: 639px)`
+/* Below it the System chip is not drawn (`components/tasks/TaskBreadcrumb.tsx`'s `PICKER_ASIDE_SX` says why 290px). */
+export const TRAIL_NO_ASIDE = `@container ${TASK_TRAIL_CONTAINER} (max-width:289.95px)`
+
+/* THE HEADER'S ONE LINE (`components/tasks/pane/PaneHeader.tsx`): search, the assignee strip and the action
+   cluster share a row. As the board narrows the assignee strip goes FIRST (it is a shortcut; the same filter is
    in Filter & view), then the search box shrinks toward its floor. Measured: the full row needs ~700px. */
-export const BOARD_NO_CREATORS = `@container ${TASK_BOARD_CONTAINER} (max-width:719.95px)`
+export const BOARD_NO_ASSIGNEES = `@container ${TASK_BOARD_CONTAINER} (max-width:719.95px)`
 
 /* THE ACTIVITY ROW'S DROP ORDER (`components/tasks/listViews/feedRow.tsx`), operator's order: PERSONA first,
    then TOKENS, then COST, then RATING. With no console docked a 1024px window leaves a ~780px board, so the persona is
@@ -160,6 +225,27 @@ export const NODES_NO_HOSTING = `@container ${NODES_LIST_CONTAINER} (max-width:6
 export const NODES_NO_ENABLED = `@container ${NODES_LIST_CONTAINER} (max-width:544.95px)`
 export const NODES_NO_VERSION = `@container ${NODES_LIST_CONTAINER} (max-width:460.95px)`
 export const NODES_NO_LOAD = `@container ${NODES_LIST_CONTAINER} (max-width:396.95px)`
+
+/* THE PROJECT DETAIL TABS' OWN WIDTHS, AS QUERY CONTAINERS (components/projects/*): each tab sits in the project's side
+   pane as well as full width, so the tab's own width decides, not the window's. */
+/** Memory filters: one row from the width where Search (`grid(32)`) plus a `grid(21)` per select and the gaps fit. */
+export const MEMORY_FILTERS_CONTAINER = 'memory-filters'
+export const memoryFiltersOneRow = (count: number) =>
+  `@container ${MEMORY_FILTERS_CONTAINER} (min-width: ${12 + 8.5 * (count - 1)}rem)`
+/** Where a select's even share passes 10rem. */
+export const MEMORY_FILTERS_WIDE = `@container ${MEMORY_FILTERS_CONTAINER} (min-width: 60rem)`
+/** Merge lane subtabs: ONE ROW, as every detail strip — where the five subtabs and the lane's icons do not fit at
+ *  full padding (the project's side pane at a 1024px window, ~384px, where wrapping hung "Flakes" on a row of its own)
+ *  the tabs close up and take their short labels ("Certs"). This is the width the five need at full padding: ~465px
+ *  measured with "History 140" and "Certificates 57", plus headroom for longer counts; the icons' width is added. */
+export const MERGE_LANE_SUBTABS_FULL_PAD_PX = 560
+
+/** Node detail stats grid: three columns, then four, as the window widens. */
+export const NODE_STATS_THREE = '@media (min-width:1100px)'
+export const NODE_STATS_FOUR = '@media (min-width:1240px)'
+/** New repository fields (components/projects/NewRepoFields.tsx): under this row width the notes drop below. */
+export const NEW_REPO_ROW_CONTAINER = 'new-repo-row'
+export const NEW_REPO_NOTES_STACKED = `@container ${NEW_REPO_ROW_CONTAINER} (width < 29rem)`
 
 /* THE WORKFLOW-RUN LEDGER'S OWN WIDTH, AS A QUERY CONTAINER — the BOARD's reason above, on
    `pages/workflows/WorkflowRunsTab.tsx`: beside an open run (components/ListDetail.tsx) the ledger narrows to
@@ -235,12 +321,14 @@ export const PEOPLE_ADMIN_NARROW = 56
 /* DIRECTORY > PROJECTS' OWN WIDTH, AS A QUERY CONTAINER: beside an open project at a 1024px window
    the list is ~320px and the 128px org slot left the name 63px ("org-a-pr…"). At or below 419.95px the org
    leaves the cluster for the title, after the name (`pages/Projects.tsx`: one row height, and the
-   name ellipsises before the org). Above the phone
-   band only (`ui/feed/geometry.ts`'s `projectsOrg`): the phone's one-line row already reads its names. Inert
+   name ellipsises before the org), as it does on the phone (`ui/feed/geometry.ts`'s `projectsOrg`). Inert
    elsewhere. */
 export const PROJECTS_LIST_CONTAINER = 'projects-list'
 export const PROJECTS_LIST_CONTAINER_SX = { containerType: 'inline-size', containerName: PROJECTS_LIST_CONTAINER } as const
 export const PROJECTS_NO_ORG = `@container ${PROJECTS_LIST_CONTAINER} (max-width:419.95px)`
+/** Running and Queued leave a list narrower than this (beside an open project, a phone); Questions, the one that
+ *  asks for the viewer, stays on the phone and leaves with the org at `PROJECTS_NO_ORG` (`pages/Projects.tsx`). */
+export const PROJECTS_NO_TASKS = `@container ${PROJECTS_LIST_CONTAINER} (max-width:559.95px)`
 
 /* AUDIT > SESSIONS' OWN WIDTH, AS A QUERY CONTAINER: the container the Node slot's `cqw` cap reads
    (`pages/audit/SessionsTab.tsx`), so a long node name takes the row's spare width without crowding a narrowed list. */
@@ -255,6 +343,8 @@ export const CREDENTIALS_TYPE_UNDER = `@container ${CREDENTIALS_LIST_CONTAINER} 
 /* The same list under ~400px packs its filter strip compact (`pages/credentials/CredentialFilterStrip.tsx`):
    Search with Only mine and Flat/Tree on one line, the pickers three to the next. Its own decision, its own query. */
 export const CREDENTIALS_FILTERS_COMPACT = `@container ${CREDENTIALS_LIST_CONTAINER} (max-width:399.95px)`
+/* The same list under ~700px (beside an open secret on a desktop): Search takes a line of its own. */
+export const CREDENTIALS_FILTERS_NARROW = `@container ${CREDENTIALS_LIST_CONTAINER} (max-width:699.95px)`
 
 /* MACHINES › BRAINS' OWN WIDTH, AS A QUERY CONTAINER — the BOARD's reason above, on
    `pages/credentials/Accounts.tsx`: beside an open account at a 1024px window the roster is ~320px, its ~575px
@@ -303,7 +393,7 @@ export const EMAIL_SENDS_CONTAINER_SX = { containerType: 'inline-size', containe
 export const SENDS_NO_STATUS = `@container ${EMAIL_SENDS_CONTAINER} (max-width:719.95px)`
 export const SENDS_NO_SOURCE = `@container ${EMAIL_SENDS_CONTAINER} (max-width:599.95px)`
 
-/* AUTOMATION > SLOTS' OWN WIDTH, AS A QUERY CONTAINER — the BOARD's reason above, on
+/* AUDIT > SLOTS' OWN WIDTH, AS A QUERY CONTAINER — the BOARD's reason above, on
    `components/WorktreePool.tsx`: beside a docked console at a 1280px window the pool is ~330px against a flat
    row's ~460px cluster, the title (the slot's identity) went to 0px and the cluster overflowed the card's left
    edge. The node goes first, then the project (the flat row then prefixes it to the slot number, so the
@@ -367,9 +457,9 @@ export const ORG_HIDDEN_ON_MOBILE_SX = {
   '@media (max-width:1023px)': { display: 'none' },
 } as const
 
-/** A row's Select checkbox: `p: '2px'` puts the MUI root at 24x24 — the phone row height and WCAG 2.5.8's
- *  minimum. `ui/RowSelect.tsx` draws it; `components/tasks/listViews/feedRow.tsx` fits it to the feed's slot. */
-export const SELECT_BOX_SX = { p: '2px' } as const
+/** A row's Select checkbox: a 24x24 root around its icon — the phone row height and WCAG 2.5.8's minimum.
+ *  `ui/RowSelect.tsx` draws it; `components/tasks/listViews/feedRow.tsx` fits it to the feed's slot. */
+export const SELECT_BOX_SX = { p: 0, width: SIZE.iconLg, height: SIZE.iconLg } as const
 
 /* Truncate one line and say so with an ellipsis. `minWidth: 0` is the load-bearing half — without it a
  * flex or table child refuses to shrink below its min-content and the ellipsis never engages. */
@@ -380,9 +470,25 @@ export const ELLIPSIS_SX = {
   minWidth: 0,
 } as const
 
+/** The `<button>` reset for a clickable that must read as text. */
+export const UNSTYLED_BUTTON_SX = { border: 0, p: 0, background: 'none', font: 'inherit', color: 'inherit', cursor: 'pointer' } as const
+
+/** A line of text with its chips or buttons beside it, wrapping onto the next line when the width runs out. */
+export const WRAP_ROW_SX = { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 1 } as const
+
+/** A form's field grid: as many `grid(40)` columns as fit, one on a phone. */
+export const FIELD_GRID_SX = {
+  display: 'grid',
+  gap: 1.5,
+  gridTemplateColumns: `repeat(auto-fill, minmax(${grid(40)}, 1fr))`,
+  [PHONE]: { gridTemplateColumns: '1fr' },
+} as const
+
 /** A long token (a URL, an ARN, an issuer) wraps inside its column instead of widening it. */
 export const wrapSx = { minWidth: 0, overflowWrap: 'anywhere', wordBreak: 'break-word' } as const
 export const anywhereSx = { minWidth: 0, overflowWrap: 'anywhere' } as const
+/** Wraps between words only: a table column keeps its words whole instead of shrinking to break them mid-word. */
+export const wordsSx = { minWidth: 0, overflowWrap: 'break-word' } as const
 
 /** The mono stack for ids, ports, durations and quota numbers — `theme.typography.mono`, read once. */
 export const monoSx = (theme: Theme) => ({ fontFamily: theme.typography.mono.fontFamily })
@@ -395,6 +501,19 @@ export const ID_SX = [monoSx, { fontVariantNumeric: 'tabular-nums' }]
 export const tapTargetSx = (theme: Theme) => ({
   minHeight: { xs: theme.custom?.tapTargetPx ?? 44, sm: 'auto' },
 })
+
+/* The same floor for a mark that must STAY SMALL (a chip's ×, a thumbnail's corner badge): an invisible `::after`
+ * square of the floor's size, centred on the mark, at ≤480px. A tap on the pseudo-element lands on its owner, so
+ * the hit area grows while the visible mark and its row do not. The owner must be positioned (`relative` or
+ * `absolute`) and no ancestor between it and the row may clip (`overflow: hidden`), or the square is cut back. */
+export const phoneHitAreaSx = (theme: Theme) => {
+  const px = theme.custom?.tapTargetPx ?? 44
+  return {
+    [PHONE]: {
+      '&::after': { content: '""', position: 'absolute', top: '50%', left: '50%', width: px, height: px, transform: 'translate(-50%, -50%)' },
+    },
+  }
+}
 
 /* The same floor for a TEXT FIELD, which needs both halves.
  *
@@ -434,7 +553,7 @@ export const fieldTapTargetSx = (theme: Theme) => ({
  * NO `minWidth`: MUI's stock 64px applies, clearing 44 horizontally. An icon-only caller that strips it
  * owes its own `minWidth`. */
 export const ROW_ACTION_SX = [
-  { fontSize: '0.75rem', lineHeight: 1.5, py: '3px', px: 1, minHeight: 0 },
+  { fontSize: FONT_SIZE.sm, lineHeight: LINE_HEIGHT.normal, py: 0.5, px: 1, minHeight: 0 },
   tapTargetSx,
 ]
 
@@ -452,11 +571,11 @@ export const ROW_ACTION_SX = [
  * both carry `[PHONE]` silently drops the first one's block. */
 export const FULL_BLEED_SX = {
   [PHONE]: {
-    mx: '-1rem',
+    mx: -2.5,
     '& > .MuiTableContainer-root': {
       borderLeft: 0,
       borderRight: 0,
-      borderRadius: 0,
+      borderRadius: RADIUS.none,
       boxShadow: 'none',
     },
   },
@@ -483,7 +602,7 @@ export const PHONE_CARD_SX = {
       alignItems: 'center',
       columnGap: 1,
       px: 1,
-      py: 0.125,
+      py: 0,
       width: '100%',
       borderBottom: '1px solid',
       borderColor: 'divider',
@@ -498,7 +617,7 @@ export const PHONE_CARD_SX = {
       // line per column, per row.
       border: 0,
       px: 0,
-      py: 0.25,
+      py: 0,
     },
   },
 } as const
@@ -510,13 +629,19 @@ export function phoneCardSx(rules: Record<string, object>, row?: object) {
   return { [PHONE]: { ...card, ...(row && { '& tbody tr': { ...card['& tbody tr'], ...row } }), ...rules } }
 }
 
-/* THE JAAH AI TOKEN SECTIONS' PHONE CARD (`pages/clients/JaahTenantsUsageSection.tsx`, `JaahReconciliationSection.tsx`): the org cell takes the whole
- * first line, the rest wrap beneath it. `flexDirection: 'row'` undoes a right-aligned cell's `row-reverse`, so
- * each value's `CellLabel` leads it. */
-export const ORG_PHONE_CARD_SX = phoneCardSx({
-  '& tbody td': { ...PHONE_CARD_SX[PHONE]['& tbody td'], flexDirection: 'row' },
-  '& tbody td[data-col="org"]': { flex: '1 1 100%' },
-}, { py: 0.75, rowGap: 0.25 })
+/** The card's cells in READING order, each `'& tbody td[data-col="<col>"]': { order: <index>, ...rules }`:
+ *  `order`, not DOM moves, keeps the desktop DOM identical, and the array's position IS the `order`, so no
+ *  caller types one by hand (a typo there silently reshuffles the card). Selected by `data-col`, never
+ *  `nth-of-type` (a positional selector re-targets when a column is inserted). A bare string is a cell with
+ *  no rule of its own. Spread the result under the card's `[PHONE]` key or pass it to `phoneCardSx`. */
+export function phoneColumnOrder(cols: readonly (string | readonly [col: string, rules: object])[]): Record<string, object> {
+  return Object.fromEntries(
+    cols.map((col, order) => {
+      const [name, rules] = typeof col === 'string' ? [col, undefined] : col
+      return [`& tbody td[data-col="${name}"]`, { order, ...rules }]
+    }),
+  )
+}
 
 /* VISUALLY HIDDEN BUT STILL ANNOUNCED.
  *
@@ -529,18 +654,7 @@ export const ORG_PHONE_CARD_SX = phoneCardSx({
  * THE CALLER MUST GIVE IT A POSITIONED ANCESTOR: otherwise its containing block is the initial one, it
  * ESCAPES `.app-layout`'s `overflow: hidden`, and the document itself scrolls (the invariant
  * `e2e/app-shell-scroll.spec.ts` holds). `position: relative` on the owning cell fixes it. */
-export const SR_ONLY_SX = {
-  position: 'absolute',
-  width: '1px',
-  height: '1px',
-  p: 0,
-  m: '-1px',
-  border: 0,
-  overflow: 'hidden',
-  clip: 'rect(0 0 0 0)',
-  clipPath: 'inset(50%)',
-  whiteSpace: 'nowrap',
-} as const
+export const SR_ONLY_SX = { ...visuallyHidden, clip: 'rect(0 0 0 0)' }
 
 /* The rail's colour-scheme resolver. Lives here, not in `components/Sidebar.tsx`: this is the shared
    style vocabulary both `ui/` and `components/` compose from (`ui/**` must not import `components/**`). */
@@ -562,8 +676,8 @@ export function schemed(t: Theme, pick: (c: SidebarColors) => Record<string, str
    (components/ListDetail.tsx). A WASH, not a slot mark, so it survives every width; deepens its own hover.
    `ui/feed/FeedList.tsx` reads it. */
 export const ROW_MARKED_SX = {
-  bgcolor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.10)',
-  '&:hover': { bgcolor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.16)' },
+  bgcolor: tint('primary', 0.1),
+  '&:hover': { bgcolor: tint('primary', 0.16) },
 } as const
 
 /* A person's or an agent's own words as typed: line breaks kept, a long token broken anywhere rather than widening
@@ -576,8 +690,8 @@ export const PRE_WRAP_SX = { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', w
  * tab, so a wider button cut the last tab the fit kept (Directory beside a compact verb). */
 export const PHONE_TAB_STRIP_SX = {
   [PHONE]: {
-    '& .MuiTab-root': { paddingLeft: '6px', paddingRight: '6px', flex: '1 1 auto', whiteSpace: 'nowrap' },
-    '& .tabs-more': { paddingLeft: '6px', paddingRight: '6px' },
+    '& .MuiTab-root': { paddingLeft: 1, paddingRight: 1, flex: '1 1 auto', whiteSpace: 'nowrap' },
+    '& .tabs-more': { paddingLeft: 1, paddingRight: 1 },
   },
 } as const
 
@@ -595,3 +709,35 @@ export const TAB_STRIP_SX = {
 export const BILLING_LIST_CONTAINER = 'billing-list'
 export const BILLING_LIST_CONTAINER_SX = { containerType: 'inline-size', containerName: BILLING_LIST_CONTAINER } as const
 export const BILLING_NARROW = `@container ${BILLING_LIST_CONTAINER} (max-width:599.95px)`
+
+/* COMPONENT BREAKPOINTS — each moved here from its component (the one home of every media/container query).
+   Container names live beside their queries; the component puts the container on its root. */
+/** The act-as bar (`components/ActAsBar.tsx`) folds to one line under 520px of its own width. */
+export const ACT_AS_CONTAINER = 'act-as-bar'
+export const ACT_AS_NARROW = `@container ${ACT_AS_CONTAINER} (max-width: 519px)`
+/** Node health (`components/NodeHealth.tsx`): the clocks card's narrow form, and the panel's two-up grid. */
+export const HEALTH_CLOCKS_CONTAINER = 'health-clocks'
+export const HEALTH_CLOCKS_NARROW = `@container ${HEALTH_CLOCKS_CONTAINER} (max-width:449.95px)`
+export const HEALTH_PANEL_CONTAINER = 'node-health'
+export const HEALTH_TWO_UP = `@container ${HEALTH_PANEL_CONTAINER} (min-width:900px)`
+/** The rich-text toolbar (`components/richtext/RichTextEditor.tsx`): its full row needs ~760px; under that the
+ *  secondaries fold behind `⋯`, and under ~460px the primaries take their compact glyphs. */
+export const RTE_CONTAINER = 'rte'
+export const RTE_FOLD_SECONDARIES = `@container ${RTE_CONTAINER} (max-width: 759px)`
+export const RTE_COMPACT_PRIMARIES = `@container ${RTE_CONTAINER} (max-width: 459px)`
+/** The Sidebar's narrow band (`components/Sidebar.tsx`): above the phone, below 900px. */
+export const SIDEBAR_NARROW_QUERY = '(min-width:480.05px) and (max-width:899.95px)'
+/** A credential row composes its description in at ≥1280px (`lib/credentialRow.tsx`). */
+export const CREDENTIAL_DESCRIPTION_QUERY = '(min-width:1280px)'
+
+/* SETTINGS › NODEVAULT'S FLOW DIAGRAM — its row layout below 600px of the diagram's own width becomes the column
+   layout (`pages/settings/nodeVault/FlowDiagram.tsx` puts the container on the diagram). */
+export const NODEVAULT_FLOW_CONTAINER_SX = { containerType: 'inline-size' } as const
+export const NODEVAULT_FLOW_NARROW = '@container (max-width:599px)'
+
+/* SETTINGS' KNOB CARDS — a card's rows follow the CARD's width (`pages/settings/KnobSection.tsx` explains each
+   floor). KNOB_ROWS_WIDE: three columns; KNOB_ROWS_MID: two; KNOB_ROWS_MID_CHOICE: two for a select row, whose control needs more. */
+export const KNOB_SECTION_CONTAINER = 'knob-section'
+export const KNOB_ROWS_MID = `@container ${KNOB_SECTION_CONTAINER} (min-width:292px)`
+export const KNOB_ROWS_WIDE = `@container ${KNOB_SECTION_CONTAINER} (min-width:536px)`
+export const KNOB_ROWS_MID_CHOICE = `@container ${KNOB_SECTION_CONTAINER} (min-width:400px)`

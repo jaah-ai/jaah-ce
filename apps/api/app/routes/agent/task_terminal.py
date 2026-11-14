@@ -2,40 +2,45 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Annotated, Any, Literal, Optional
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Optional, Union
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from pydantic import BaseModel, Field, StrictBool, ValidationInfo, field_validator
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
+from sqlalchemy.util import await_only
+from starlette.concurrency import run_in_threadpool
 
 from app import (
     agent_resolution,
     agent_session_lifecycle,
+    blind_review,
     carryover,
     edition_features,
     fleet_verdicts,
     merge_lane_state,
     node_credentials,
-    node_identity,
     project_identity,
+    review_findings,
     runner_places,
     runner_terminations,
+    secret_redact,
     slot_state,
     task_notify,
     task_prs,
 )
+from app.clock import utcnow
 from app.agent_sessions import AGENT_KIND_SDK_AGENT
 from app.actors import task_actor_values
 # routes need one for a user who is NOT the caller (they carry no session cookie, only the node token).
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
-from app.db import SessionLocal, get_session
+from app import db_async
+from app.db_async import DbDep, on_session, run_blocking_in_session
 from app.events import emit_console_event
 from app.tenancy import seam
-from app.routes.commands import _SLUG_RE, _resolve_command_args, dispatch_and_audit_sync
+from app.routes.commands import _SLUG_RE
 # The Reset soft-delete watermark's ONE predicate — imported, never re-spelled here.
 from app.task_artifacts import visible_artifact_clause
 from app.dispatch_compose.directives import FULL_AUTO_BLOCKER_HEADERS
@@ -60,8 +65,8 @@ from app.task_settle import (
 )
 from app.url_validation import validated_http_url
 from app.node_clone import account_slug_from_dir
-from app.node_identity import node_id_or_none, resolve_node_id
-from app.entity_shape import get_or_404
+from app.node_identity import node_id_or_none
+from app.entity_shape import commit_row, get_or_404, or_404
 from app.models.audit import ActivityEvent
 from app.models.credentials import Account
 from app.models.projects import Project
@@ -79,19 +84,24 @@ from app.routes.tasks.policy import (
     MAX_TASK_TEXT_LEN,
     MERGED_PR_CRITERION_PERSONAS,
     NO_PR_CLOSE_REASONS,
+    fleet_dispatch_cap,
 )
+from app.routes import agent_peer_tasks
+from app.routes.tasks.dependencies import _gate_would_deadlock, _would_create_cycle, contains_task, stage_edge
 from app.routes.tasks.epics import _epic_filed_count, append_tasks, _maybe_roll_up_parent
-from app.persona_registry import SHAPE_FOLLOW_UP, SHAPE_TASKS
 from app.routes.tasks.qa_render import TaskQuestionOut, _task_question_out
 from app.routes.tasks.epic_finish import append_finish_follow_up, execute_finish_phase
 from app.routes.tasks.awaiting import (
     await_response_on_dispatched_task, resume_past_pending_answer_delivery, supersede_pending_answer_delivery,
     system_fail_dispatched_task,
 )
+from app.outcome_ledger import writer as outcome_writer
 from app.routes.tasks.runner_settle import (
     settle_analysis_child_on_artifact,
     settle_coder_no_pr,
+    settle_shadow_pr,
     settle_coder_on_merge,
+    end_attempt,
 )
 # State vocabulary and guard sets single-home in `app/task_lifecycle.py`.
 from app.task_lifecycle import (
@@ -99,6 +109,7 @@ from app.task_lifecycle import (
     AWAITING_RESPONSE,
     DONE,
     DRAFT,
+    PAUSED,
     SYSTEM_FAILED,
     _COMPLIANCE_CASCADE_TERMINALS,
     _COMPLIANCE_MIRROR_SETTLED_STATES,
@@ -111,7 +122,7 @@ from app.routes.agent.auth import (
     _check_token_for_task,
     _guard_task_creating_caller,
 )
-from app.routes.agent.task_reads import SystemTaskIn, create_system_task
+from app.routes.agent.task_reads import SystemTaskIn, create_system_task, open_question_id
 
 if TYPE_CHECKING:
     from app.lane_forge_auth import CredentialSource
@@ -126,7 +137,7 @@ log = logging.getLogger("agent-routes")
 # ── The compliance_fix GROUP Task and its per-cell mirrors ──────────────────────────────────────
 # A group `compliance_fix` Task (`compliance_path` set, `asset_id IS NULL`) is what a runner is
 # dispatched against; its per-cell mirror Tasks are the matrix's read surface. The (repo, path) slot lock
-# is `uq_tasks_compliance_slot`. The runner settles the group through `/settle`/`/fail`, and
+# is `uq_tasks_compliance_slot`. The runner settles the group through `/complete`/`/fail`, and
 # `_settle_compliance_group` cascades the terminal onto the mirrors.
 
 
@@ -145,13 +156,6 @@ def _compliance_group_mirrors(
     return list(session.scalars(stmt).all())
 
 
-def _compliance_group_repo(group_task: Task, session: Session) -> Optional[str]:
-    """The repo NAME a GROUP compliance_fix Task covers (its Project's name — the matrix/sensitivity gate
-    key), or None when the project row is gone."""
-    project = session.get(Project, group_task.project_id)
-    return project.name if project is not None else None
-
-
 def _settle_compliance_group(
     group_task: Optional[Task],
     terminal: str,
@@ -161,7 +165,7 @@ def _settle_compliance_group(
     reason: Optional[str] = None,
 ) -> None:
     """Cascade a group `compliance_fix` Task's terminal settle to its per-cell mirror Tasks
-    (`compliance_group_id`). Called after the group settles, from `/settle`, `/fail` and
+    (`compliance_group_id`). Called after the group settles, from `/complete`, `/fail` and
     `app/task_pipeline_cp.py::block_task`; a no-op for non-group rows.
 
       * `done` + `pr_url`  → `settle_coder_on_merge(mirror, pr_url)` + stamp `merged_at`.
@@ -169,14 +173,13 @@ def _settle_compliance_group(
       * `blocked`          → `await_response_on_dispatched_task(mirror, reason)`.
       * `failed`           → `system_fail_dispatched_task(mirror, reason)`.
 
-    Each mirror settle guards on `state == active`, so re-runs are no-ops. A `done` group also enqueues
-    one `sync_develop` for the repo's main clone.
+    Each mirror settle guards on `state == active`, so re-runs are no-ops.
     """
     if group_task is None or group_task.compliance_path is None:
         return
     if terminal not in _COMPLIANCE_CASCADE_TERMINALS:
         return
-    merged_at = group_task.merged_at or datetime.now(timezone.utc)
+    merged_at = group_task.merged_at or utcnow()
     for mirror in _compliance_group_mirrors(group_task, session, only_open=True):
         if terminal == DONE and pr_url:
             if settle_coder_on_merge(mirror.id, pr_url, session):
@@ -204,8 +207,7 @@ def _settle_compliance_group(
                 .returning(Task.id)
             ).first()
             if row is not None:
-                emit_console_event(session, entity="task", id=row[0], action=DONE)
-                session.commit()
+                emit_console_event(session, entity="task", id=row[0], action=DONE, commit=True)
         elif terminal == AWAITING_RESPONSE:
             await_response_on_dispatched_task(mirror.id, reason or "compliance fix blocked", session)
         elif terminal == SYSTEM_FAILED:
@@ -213,25 +215,10 @@ def _settle_compliance_group(
             system_fail_dispatched_task(
                 mirror.id, reason or "compliance fix failed", session, final=True
             )
-    if terminal == DONE:
-        repo = _compliance_group_repo(group_task, session)
-        if repo:
-            # Resync the fleet's local clone (number 0) after a fix PR lands. `_resolve_command_args` is required:
-            # it injects `base` and `path`, and `worktree_ops.sync_develop` fails closed without `base`.
-            # The CP's own node, by uuid (`node_identity.cp_node_id`: its `NODE_ID` may be a name).
-            own = node_identity.cp_node_id(session)
-            node_id = str(own) if own is not None else (resolve_node_id() or "local")
-            dispatch_and_audit_sync(
-                session, node_id, "sync_develop",
-                _resolve_command_args(
-                    "sync_develop", {"project_id": group_task.project_id, "number": 0}, session, node_id
-                ),
-                "system:compliance",
-            )
 
 
 # ── The unified settle: ONE terminal contract for every persona ────────────────
-# `POST /tasks/{id}/complete` (alias `/settle`) is the one terminal door. Totality: every (persona x state x
+# `POST /tasks/{id}/complete` is the one terminal door. Totality: every (persona x state x
 # terminal type) reaches a settle or a refusal naming its cause, never a silent 2xx that writes nothing. The finish
 # engine's only other caller is `sweep_finish_phases` (`app/task_pipeline_cp.py::finish`), in process.
 
@@ -294,6 +281,12 @@ class SettleIn(BaseModel):
     clarity_score: Optional[float] = None
     spec_verdict: Optional[str] = Field(default=None, max_length=32)
     critic_verdict: Optional[str] = Field(default=None, max_length=32)
+    # The review depth the change got (`review_findings.declare_tier`; the latest declaration wins): `tasks.review_tier`
+    # and attribution on the dispatch's outcome row, never its state. A tier outside the closed set is a 422.
+    review_tier: Optional[review_findings.ReviewTier] = None
+    # What the in-session review lanes found (`review_findings.record_in_session`). Advisory: never refuses the settle,
+    # so any entry is admitted (`FindingIn` names the shape) and `review_findings.parse_findings` drops a malformed one.
+    findings: Union[list[Union[review_findings.FindingIn, Any]], Any, None] = None
     recon_map: Optional[dict[str, Any]] = None
     # A merged PR's diff stats (`app/pr_stats.py`), stored on a `merged_pr` settle and ignored on any other. `Any`,
     # not a model: a payload of the wrong shape is stored as `not_captured`/`malformed`, never a 422 on the settle.
@@ -411,7 +404,8 @@ def _raise_manifest_incomplete_alert(
     """
     kinds = ", ".join(f"{kind} ({ARTIFACT_KIND_LABELS.get(kind, kind)})" for kind in missing)
     try:
-        out = create_system_task(
+        out = create_system_task.session_body(
+            session,
             body=SystemTaskIn(
                 persona=PERSONA_ADHOC,
                 project=project_identity.label(session, project_id),
@@ -433,8 +427,6 @@ def _raise_manifest_incomplete_alert(
             ),
             # The affirmative producer declaration the task-creation guard requires; no Task behind this call.
             x_agent_task_id=HOST_PRODUCER_CALLER,
-            _=None,
-            session=session,
         )
     except Exception as exc:  # noqa: BLE001 — best-effort by contract (docstring above)
         # Roll back first: some `create_system_task` branches re-raise without rolling back, and an aborted
@@ -451,7 +443,9 @@ def _raise_manifest_incomplete_alert(
     )
 
 
-def _settle_outcome_criterion_task(task_id: int, session: Session, *, no_repo: bool = False) -> bool:
+def _settle_outcome_criterion_task(
+    task_id: int, session: Session, *, no_repo: bool = False, review_tier: Any = None,
+) -> bool:
     """`active → done` for a persona whose done-criterion is its posted outcome; no shared helper exists.
 
     No anti-spoof floor: there is no merge record to forge. The `state == ACTIVE` guard is the idempotency
@@ -460,7 +454,7 @@ def _settle_outcome_criterion_task(task_id: int, session: Session, *, no_repo: b
     `no_repo`: a build task settling `outcome` in a folder slot. It also stamps
     `NO_REPO_OUTCOME_REASON` over the PR references, which is what the epic rollup floor and Finish read.
     """
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     stamp = (
         {"outcome_no_pr_reason": NO_REPO_OUTCOME_REASON, "outcome_pr_url": None, "outcome_no_pr_evidence": None}
         if no_repo else {}
@@ -476,10 +470,10 @@ def _settle_outcome_criterion_task(task_id: int, session: Session, *, no_repo: b
     ).first()
     if row is None:
         return False
+    outcome_writer.end_row(session, row[0], end_kind=outcome_writer.END_SETTLED, review_tier=review_tier)
     # A lane run's settle returns any row it still holds to the queue and re-files (L10).
     merge_lane_state.lane_task_left_active(session, row[0])
-    emit_console_event(session, entity="task", id=row[0], action=DONE)
-    session.commit()
+    emit_console_event(session, entity="task", id=row[0], action=DONE, commit=True)
     log.info(
         "task %s SETTLED active->done on its own settle call (outcome done-criterion; no merge to "
         "verify; github_synced_at=%s)", task_id, now,
@@ -508,6 +502,7 @@ def _delegate_settle(
             # `settle_sources`, the function step 5 gated on, not `PERSONA_SETTLE_STATES`: one spelling of the door's
             # decision, so a persona gaining `merged_pr` cannot be admitted and then match nothing.
             sources=settle_sources(persona, terminal_type),
+            review_tier=body.review_tier,
         )
     if persona == PERSONA_FINISH:
         # The finish engine computes the whole resolution report from the DB and flips the child `→ done`
@@ -517,10 +512,14 @@ def _delegate_settle(
     if persona in MERGED_PR_CRITERION_PERSONAS:
         if terminal_type == "outcome":
             # Only a folder build task is allowed `outcome` (step 3): its report is the deliverable.
-            settled = _settle_outcome_criterion_task(task_id, session, no_repo=True)
+            settled = _settle_outcome_criterion_task(task_id, session, no_repo=True, review_tier=body.review_tier)
+            pr_url = None
+        elif terminal_type == "shadow_pr":
+            # A benchmark shadow: done on its open draft PR, never a merge (`outcome_ledger/benchmark.py`).
+            settled = settle_shadow_pr(task_id, body.pr_url or "", session, review_tier=body.review_tier)
             pr_url = None
         elif terminal_type == "no_pr":
-            settled = settle_coder_no_pr(task_id, session)
+            settled = settle_coder_no_pr(task_id, session, review_tier=body.review_tier)
             if settled and task_prs.close_lane_rows_on_no_pr(session, task_id, str(body.no_pr_reason)):
                 session.commit()
             pr_url = None
@@ -538,6 +537,7 @@ def _delegate_settle(
                 pr_stats=body.pr_stats if describes_outcome else None,
                 pr_provenance=body.pr_provenance if describes_outcome else None,
                 attestation=attestation,
+                review_tier=body.review_tier,
             )
             pr_url = outcome_url
         if settled:
@@ -545,7 +545,7 @@ def _delegate_settle(
             _settle_compliance_group(session.get(Task, task_id), DONE, session, pr_url=pr_url)
         return settled
     if PERSONA_DONE_CRITERION.get(persona) == DONE_CRITERION_OUTCOME:
-        return _settle_outcome_criterion_task(task_id, session)
+        return _settle_outcome_criterion_task(task_id, session, review_tier=body.review_tier)
     # Unreachable (step 3 refuses personas with no terminal). False, not a raise, so a future persona's first
     # settle is a visible `settled: false`, not a 500.
     log.error("task %s (persona=%s) reached settle delegation with no helper", task_id, persona)
@@ -568,6 +568,35 @@ def _record_settle_memory_votes(session: Session, task: Task, wrong: list[str], 
     except Exception:  # noqa: BLE001 — a vote must never change the settle
         session.rollback()
         log.warning("task %s: settle memory votes dropped", task.id, exc_info=True)
+
+
+def _record_review(session: Session, task: Task, tier: Optional[str], raw_findings: Any) -> None:
+    """The declared review tier and the in-session findings, after the row moved: advisory (decision D2), so a failure
+    is logged and dropped, never a refusal of the call that carried them."""
+    if tier is None and not raw_findings:
+        return
+    try:
+        review_findings.declare_tier(session, task, tier)
+        parsed = review_findings.parse_findings(raw_findings)
+        ids = review_findings.record_in_session(session, task, parsed)
+        # The ledger's per-dispatch counts (metric #7) and how many entries were malformed: attribution only.
+        outcome_writer.add_findings(session, task.id, review_findings.security_by_lane(session, ids),
+                                    malformed=review_findings.malformed_count(raw_findings, len(parsed)))
+        session.commit()
+    except Exception:  # noqa: BLE001 — never fails the settle or the fail it rides
+        session.rollback()
+        log.exception("review: recording the tier and findings of task %s failed", task.id)
+
+
+def _record_blind_review(session: Session, task: Task, raw_findings: Any) -> None:
+    """A blind review child's findings, against the coder task it reviewed, after the row moved: advisory (D2), so a
+    failure is logged and dropped."""
+    try:
+        blind_review.record_findings(session, task, raw_findings)
+        session.commit()
+    except Exception:  # noqa: BLE001 — never fails the settle
+        session.rollback()
+        log.exception("blind review: recording the findings of task %s failed", task.id)
 
 
 def _log_memory_proposed(session: Session, task: Task, claimed: Optional[int]) -> None:
@@ -595,15 +624,17 @@ def _log_memory_proposed(session: Session, task: Task, claimed: Optional[int]) -
         log.warning("task %s: memory_proposed check dropped", task.id, exc_info=True)
 
 
-# `/settle` is the legacy alias of `/complete`, kept until the legacy-deletion task.
+# `/settle` is the legacy alias of `/complete`. The daemon's `task.complete` verb flipped to `/complete` on
+# 2026-10-30; the alias stays until every node runs a daemon posting to `/complete` (a two-release
+# retirement: a node behind its CP still settles). Pinned by `tests/test_route_aliases.py`.
 @router.post("/tasks/{task_id}/complete", status_code=200, response_model=None)
 @router.post("/tasks/{task_id}/settle", status_code=200, response_model=None)
 @infra(Tenancy.ORG_SCOPED)
-def settle_task(
+async def settle_task(
     task_id: int,
     body: SettleIn,
+    db: DbDep,
     caller: node_credentials.AgentCaller = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     """The one settle. A runner declares what it delivered and which ending it claims; the CP settles it or
     refuses with a reason naming its cause.
@@ -627,6 +658,15 @@ def settle_task(
     since the session may be gone by retry time. Do not change this. Response: `{"stored": true, "settled":
     <bool>, "state": ...}`; `settled: false` on an accepted call means the helper could not move the row.
     """
+    return await db.run_sync(_settle_task, task_id=task_id, body=body, caller=caller)
+
+
+def _settle_task(
+    session: Session,
+    task_id: int,
+    body: SettleIn,
+    caller: node_credentials.AgentCaller,
+) -> dict[str, Any]:
     # ── 1. the task itself, AND THAT IT IS THIS CALLER'S ──────────────────────
     # Bound to the node holding the slot: `task_id` is from the path, and this call now owns the
     # `active → done` edge, so without it any node could settle another node's task. Reuses
@@ -707,6 +747,13 @@ def settle_task(
                 f"{', '.join(carried_refs)} — nothing was recorded"
             ),
         )
+    if body.terminal_type == "review" and not isinstance(body.findings, list):
+        # A blind review's result IS its findings (`app/blind_review.py`): the list is required, empty allowed.
+        raise HTTPException(
+            status_code=422,
+            detail=(f"task {task_id}: terminal type 'review' requires findings — a list, [] when you found none; "
+                    "nothing was recorded"),
+        )
     if body.terminal_type == "no_pr" and body.no_pr_reason not in NO_PR_CLOSE_REASONS:
         # The anti-spoof floor's reason half (`NO_PR_CLOSE_REASONS`, `routes/tasks/policy.py`): only a sanctioned
         # terminal unlocks an epic rollup without a merge.
@@ -744,6 +791,16 @@ def settle_task(
             status_code=422,
             detail=f"task {task_id}: terminal type {body.terminal_type!r} does not carry pr_urls — nothing was recorded",
         )
+    # A benchmark shadow's `shadow_pr` must name a PR under this project's repo, like `merged_pr` (step 4b), but
+    # attests no merge: the PR stays an open draft until the duel's review closes it.
+    if body.terminal_type == "shadow_pr":
+        project_row = session.get(Project, task.project_id)
+        if project_row is None or not task_prs.names_primary_pr(session, project_row, body.pr_url or ""):
+            raise HTTPException(
+                status_code=422,
+                detail=f"task {task_id}: {body.pr_url!r} does not name a pull request under this task's project's primary repo "
+                       f"— nothing was recorded",
+            )
 
     # ── 5. a state this persona may settle from ───────────────────────────────
     # Rendered from the tuple, never hand-spelled. The set depends on the terminal: `merged_pr` also recovers
@@ -755,9 +812,7 @@ def settle_task(
             and resume_past_pending_answer_delivery(task_id, session)):
         session.refresh(task)
     if task.state not in sources:
-        raise HTTPException(
-            status_code=409, detail=_settle_state_refusal(task_id, persona, sources, task.state)
-        )
+        raise HTTPException(status_code=409, detail=_settle_state_refusal(task_id, persona, sources, task.state))
 
     # ── 5a. parent shape, carried over rather than re-derived ─────────────────
     # A `finish` with no epic parent would be a `settled: false` nothing ever moves.
@@ -818,22 +873,14 @@ def settle_task(
 
     # ── 6. a triage's settle-eligibility IS its answered Q&A trail ────────────
     # The invariant every settle door carries; visibility-filtered, since an invisible round cannot be cleared.
-    if persona == PERSONA_TRIAGE:
-        open_question = session.scalars(
-            select(TaskQuestion.id).where(
-                TaskQuestion.task_id == task_id,
-                TaskQuestion.status == "open",
-                visible_artifact_clause(TaskQuestion.created_at, task.artifacts_hidden_before),
-            )
-        ).first()
-        if open_question is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"task {task_id} is a triage task with open question(s) — resolve the Q&A trail "
-                    f"before settling; nothing was recorded"
-                ),
-            )
+    if persona == PERSONA_TRIAGE and open_question_id(session, task) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"task {task_id} is a triage task with open question(s) — resolve the Q&A trail "
+                f"before settling; nothing was recorded"
+            ),
+        )
 
     # ── the payload write, which BOTH the refusal and the accept path keep ────
     gate_fields = {
@@ -932,6 +979,10 @@ def settle_task(
     if fresh is not None:
         _record_settle_memory_votes(session, fresh, body.memory_wrong or [], body.summary or "")
         _log_memory_proposed(session, fresh, body.memory_proposed)
+        if body.terminal_type == "review":
+            _record_blind_review(session, fresh, body.findings)
+        else:
+            _record_review(session, fresh, body.review_tier, body.findings)
     # A settled task has left the live states: a carry-over ends with it (`app/carryover.py`).
     if fresh is not None and fresh.state not in carryover.LIVE_STATES and carryover.close(session, task_id=task_id):
         session.commit()
@@ -961,11 +1012,12 @@ class PrObservedIn(BaseModel):
 
 @router.post("/tasks/{task_id}/prs", status_code=200, response_model=None)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def record_task_pr(
+    session: Session,
     task_id: int,
     body: PrObservedIn,
     caller: node_credentials.AgentCaller = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     """`pull_request.observed`: upsert the PR the node daemon saw `jaah-forge pr create`/`pr view` return for this
     task (`app/task_prs.py::observe`). Bound to the node holding the task, as the settle is. 404 when `repo_id`
@@ -1003,6 +1055,37 @@ class FailTaskIn(BaseModel):
     # The merge lane's "this node cannot run me" (its gate fence will not start): honoured for that persona
     # only, it leaves the node out for the project's lane tasks (`app/launch_failures.py`).
     node_fault: bool = False
+    # As on `SettleIn`.
+    review_tier: Optional[review_findings.ReviewTier] = None
+    findings: Union[list[Union[review_findings.FindingIn, Any]], Any, None] = None
+
+
+class OutcomeHeadIn(BaseModel):
+    """`outcome.head_pushed`: one push the daemon's pre-push guard saw for this task's branch."""
+
+    head_sha: str = Field(pattern=r"^[0-9a-fA-F]{7,64}$")
+    ref: str = Field(default="", max_length=512)
+    # Every commit the push sent (`git rev-list <remote>..<local>`), the runner-commit set. The daemon sends at most
+    # 250; anything not a sha is dropped by the writer (`outcome_ledger.writer.add_head`).
+    pushed_shas: list[str] = Field(default_factory=list, max_length=1000)
+
+
+@router.post("/tasks/{task_id}/outcome-heads", status_code=200, response_model=None)
+@infra(Tenancy.ORG_SCOPED)
+@on_session
+def record_outcome_head(
+    session: Session,
+    task_id: int,
+    body: OutcomeHeadIn,
+    _: None = Depends(_check_token_for_task),
+) -> dict[str, Any]:
+    """Record a pushed head on the task's current dispatch row (`outcome_ledger.writer.add_head`). Best effort on
+    both sides: the daemon never blocks a push on it, and a task with no outcome row records nothing."""
+    # The token's task scope, not a live hold: a MicroVM run holds no slot, and a head only ever attributes commits on
+    # the caller's own dispatch row (never its state).
+    head = outcome_writer.add_head(session, task_id, body.head_sha, pushed_shas=body.pushed_shas, ref=body.ref or None)
+    session.commit()
+    return {"recorded": head is not None}
 
 
 def _refuse_a_persona_with_no_terminal_call(task_id: int, session: Session, *, verb: str) -> None:
@@ -1011,7 +1094,7 @@ def _refuse_a_persona_with_no_terminal_call(task_id: int, session: Session, *, v
     The three endings ask one question in one place. Such a persona's session may not move its row:
       · the block (`app/task_pipeline_cp.py::block_task`) would park it and leak the slot;
       · `/fail` spends an attempt and can land `system_failed`;
-      · `/settle` would record an unearned terminal.
+      · `/complete` would record an unearned terminal.
     The prompt forbids all three, but this persona reads untrusted material, so the prompt must not be the
     only control. Keyed on the criterion, not a persona literal.
     """
@@ -1051,11 +1134,11 @@ def _has_answered_blocker_round(session: Session, task_id: int) -> bool:
 
 @router.post("/tasks/{task_id}/fail", status_code=200, response_model=None)
 @infra(Tenancy.ORG_SCOPED)
-def fail_task(
+async def fail_task(
     task_id: int,
     body: FailTaskIn,
+    db: DbDep,
     _: None = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     """DB-direct runner failure: the runner cannot proceed and reports it DB-side.
 
@@ -1066,18 +1149,47 @@ def fail_task(
     last it lands `system_failed` and rolls up the epic — and at once after an answered blocker round
     (`_has_answered_blocker_round`). 404 unknown id; 409 not a dispatched `active` row.
     """
+    state, refused = await db.run_sync(_fail_task, task_id=task_id, body=body)
+    if edition_features.enabled("merge_lane"):
+        from app import lane_forge_auth
+
+        if state == SYSTEM_FAILED and refused is not None:
+            # The alert's mail and chat legs open sessions of their own and may wait on HTTP: a worker thread on its
+            # own session (`app/db_async.py::run_blocking_in_session`), after this one's work is committed.
+            await db.commit()
+            await run_blocking_in_session(lane_forge_auth.alert_credential_blocker, task_id, refused, route=db)
+    if state == SYSTEM_FAILED:
+        await db.run_sync(_fail_cascade, task_id=task_id, reason=body.reason)
+    return {"state": state}
+
+
+def _fail_cascade(session: Session, task_id: int, reason: str) -> None:
+    """Cascade to compliance_fix group mirrors only on `system_failed`: the cascade is terminal, and a retryable
+    failure is still queued."""
+    _settle_compliance_group(session.get(Task, task_id), SYSTEM_FAILED, session, reason=reason)
+
+
+def _fail_task(
+    session: Session,
+    task_id: int,
+    body: FailTaskIn,
+) -> "tuple[str, Optional[CredentialSource]]":
+    """The fail up to its alert: `(state, refused)`, where `refused` is the forge credential a lane run ended on."""
     _refuse_a_persona_with_no_terminal_call(task_id, session, verb="fail")
     cause, node = runner_terminations.CAUSE_REPORTED_FAILURE, None
-    lane_run = session.scalar(select(Task.persona).where(Task.id == task_id)) == merge_lane_state.LANE_PERSONA
+    from app.releases import executor as release_executor  # noqa: PLC0415  (the release package's chain stays out)
+
+    persona = session.scalar(select(Task.persona).where(Task.id == task_id))
+    lane_run = persona == merge_lane_state.LANE_PERSONA
     reason = body.reason
     # Every attempt's reason rides its termination note, redacted and capped: a retry discards `reason`
-    # (`end_attempt`), so the note is each attempt's only record. A lane run's is also what the Merge lane tab
+    # (`end_attempt`), so the note is each attempt's only record. A lane run's is also what Audit › Merge lanes
     # says it failed of.
     detail = merge_lane_state.run_failure_line(body.reason)
-    if lane_run:
-        # Redacted where it is stored too: a lane run is readable by every `tasks:view` holder on its project
-        # (`authz._lane_run_clause`), and its reason quotes gate and forge stderr.
-        reason = merge_lane_state.redacted_reason(body.reason)
+    if lane_run or persona == release_executor.PERSONA:
+        # Redacted where it is stored too: a lane run and a release run are readable by every `tasks:view` holder
+        # on their project (`authz._lane_run_clause`, `authz._release_run_clause`), and a reason quotes stderr.
+        reason = secret_redact.redacted(body.reason)
     if body.node_fault and lane_run:
         # The node the lane ran on, read before `end_attempt` kills the runner (the slot stays bound).
         hold = slot_state.task_hold(session, task_id)
@@ -1104,6 +1216,8 @@ def fail_task(
         # A live runner said it could not finish; `end_attempt` discards `reason` on the retryable branch, so this
         # row is the only record.
         cause=cause, node=node, note_detail=detail,
+        # The runner itself said it could not finish: its dispatch's outcome is `failed`, not `abandoned`.
+        outcome_end=outcome_writer.END_FAILED, review_tier=body.review_tier,
     )
     if state is None:
         raise HTTPException(
@@ -1114,18 +1228,158 @@ def fail_task(
                 + " — cannot fail"
             ),
         )
-    # Cascade to compliance_fix group mirrors only on `system_failed`: the cascade is terminal, and a
-    # retryable failure is still queued.
-    if edition_features.enabled("merge_lane"):
-        from app import lane_forge_auth
+    failed = session.get(Task, task_id)
+    if failed is not None:
+        _record_review(session, failed, body.review_tier, body.findings)
+    # `refused` is set only where the merge lane is (above); the alert, then the cascade, follow in `fail_task`.
+    return state, refused
 
-        if state == SYSTEM_FAILED and refused is not None:
-            lane_forge_auth.alert_credential_blocker(session, task_id, refused)
+
+# ── DB-direct wait ─────────────────────────────────────────────────
+# A runner whose work is owed only once ANOTHER task ships. A `/fail` would spend a retry (and, after an answered
+# Blocker round, land `system_failed`); this ends the attempt refunded and gates the task on that prerequisite, which
+# the dispatch gate (`routes/tasks/dispatch.py::_has_unmet_prerequisite`) already holds and the console shows as
+# Waiting. The slot stays bound (`end_attempt`), so the re-dispatch resumes the same worktree.
+class WaitTaskIn(BaseModel):
+    prerequisite_task_id: int
+    # One person-facing sentence: it rides the termination note the timeline renders.
+    reason: str = Field(min_length=1, max_length=500)
+    # As on `FailTaskIn`: fences the report to its attempt.
+    session_id: str = Field(default="", max_length=200)
+
+
+#: A task that has already waited this often since its last Reset spends an attempt on each further wait, so a runner
+#: that keeps waiting instead of working still reaches the retry ceiling.
+WAIT_REFUND_LIMIT = 3
+
+#: A prerequisite in one of these states will not reach `done` by itself: waiting on it would wedge this task.
+_NOT_MOVING_STATES: frozenset[str] = frozenset({DRAFT, PAUSED, SYSTEM_FAILED})
+
+
+@router.post("/tasks/{task_id}/wait", status_code=200, response_model=None)
+@infra(Tenancy.ORG_SCOPED)
+async def wait_task(
+    task_id: int,
+    body: WaitTaskIn,
+    db: DbDep,
+    caller: node_credentials.AgentCaller = Depends(_check_token_for_task),
+) -> dict[str, Any]:
+    """DB-direct runner wait: end this attempt (refunded) and make the task wait on `prerequisite_task_id`.
+
+    In this order: 409 not this session's dispatched `active` row (before anything about the prerequisite is read);
+    422 self; 404 a prerequisite the runner may not read as a peer (`agent_peer_tasks.visible_peer_or_404`: one
+    answer for absent, another project, hidden from the launcher or from a blind review); 409 a prerequisite already
+    delivered (continue instead) or not moving; 422 a cycle or a deadlocking edge."""
+    state = await db.run_sync(_wait_task, task_id=task_id, body=body, caller=caller)
     if state == SYSTEM_FAILED:
-        _settle_compliance_group(
-            session.get(Task, task_id), SYSTEM_FAILED, session, reason=body.reason
+        # Only a wait past `WAIT_REFUND_LIMIT` on its last attempt; terminal, so it cascades as a fail does.
+        await db.run_sync(_fail_cascade, task_id=task_id, reason=body.reason)
+    return {"state": state, "waiting_on": body.prerequisite_task_id}
+
+
+def _waits_since_reset(session: Session, task: Task) -> int:
+    """This task's `waiting_on_task` termination notes since its last Reset (`artifacts_hidden_before`)."""
+    return int(session.scalar(
+        select(func.count()).select_from(ActivityEvent).where(
+            ActivityEvent.kind == f"task_note:{runner_terminations.NOTE_ACTION}",
+            ActivityEvent.data["id"].astext == str(task.id),
+            ActivityEvent.data["cause"].astext == runner_terminations.CAUSE_WAITING_ON_TASK,
+            visible_artifact_clause(ActivityEvent.created_at, task.artifacts_hidden_before),
         )
-    return {"state": state}
+    ) or 0)
+
+
+def _wait_task(session: Session, task_id: int, body: WaitTaskIn, caller: node_credentials.AgentCaller) -> str:
+    _refuse_a_persona_with_no_terminal_call(task_id, session, verb="wait")
+    guards: tuple[Any, ...] = (Task.runner_session_id == body.session_id,) if body.session_id else ()
+    not_active = HTTPException(
+        status_code=409,
+        detail=(
+            f"task {task_id} is not a dispatched 'active' task"
+            + (f" running session {body.session_id!r}" if body.session_id else "")
+            + " — cannot wait"
+        ),
+    )
+    # The fence first, so a stale caller learns nothing about the task it names. A fenced runner parked only on an
+    # answer's delivery passes too: it is resumed below, as `_fail_task` does.
+    live = (ACTIVE, AWAITING_RESPONSE) if body.session_id else (ACTIVE,)
+    task = session.scalar(select(Task).where(Task.id == task_id, Task.state.in_(live), *guards))
+    if task is None:
+        raise not_active
+    prereq_id = body.prerequisite_task_id
+    if prereq_id == task_id:
+        raise HTTPException(status_code=422, detail=f"task {task_id} cannot wait on itself")
+    prereq = agent_peer_tasks.visible_peer_or_404(session, caller, task_id, prereq_id)
+    # The dispatch gate's "unmet" (`_has_unmet_prerequisite`): not `done` or still in the merge lane, and not archived.
+    unmet = prereq.archived_at is None and (
+        prereq.state != DONE or bool(merge_lane_state.awaiting_lane_merge(session, [prereq_id]))
+    )
+    if not unmet:
+        raise HTTPException(
+            status_code=409,
+            detail=f"task {prereq_id} is already done — there is nothing to wait for; continue the work instead",
+        )
+    if prereq.state in _NOT_MOVING_STATES:
+        raise HTTPException(
+            status_code=409, detail=f"task {prereq_id} is not moving — ask the operator instead of waiting",
+        )
+    if _would_create_cycle(task_id, prereq_id, session):
+        raise HTTPException(
+            status_code=422,
+            detail=f"task {prereq_id} already waits on task {task_id}, so task {task_id} cannot wait on it",
+        )
+    if contains_task(prereq_id, task_id, session):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"task {prereq_id} contains this task, so it can only finish after this one — waiting on it "
+                "would never end"
+            ),
+        )
+    if _gate_would_deadlock(task_id, prereq_id, session):
+        raise HTTPException(
+            status_code=422,
+            detail=f"task {prereq_id} sits under task {task_id}, so it could never finish while task {task_id} waits",
+        )
+    refund = _waits_since_reset(session, task) < WAIT_REFUND_LIMIT
+    cap = fleet_dispatch_cap(org=task.org_id)
+    if refund and task.dispatch_attempts - 1 >= cap:
+        # The operator lowered the retry cap below what this task already spent: even refunded, its end would land
+        # `system_failed`. A refunded wait never does; the row is left as it is, for the operator.
+        raise HTTPException(
+            status_code=409, detail=f"task {task_id} has used all its retries, so it cannot wait — ask the operator",
+        )
+    # Every check is behind us: the writes start here, and every refusal below rolls them back.
+    stage_edge(session, task_id, prereq_id, "wait")
+    # As in `_fail_task`: an answer stuck in delivery never refuses the runner's own wait (fenced callers only).
+    if body.session_id:
+        resume_past_pending_answer_delivery(task_id, session, session_id=body.session_id)
+    end_guards = guards
+    if refund:
+        # Refund the attempt this dispatch charged at `ready → active`, ahead of `end_attempt` so its ceiling reads
+        # the refunded count (`node_capacity.return_to_queue`, `slot_allocation.requeue_after_destroy`).
+        refunded = session.scalar(
+            update(Task)
+            .where(Task.id == task_id, Task.state == ACTIVE, *guards)
+            .values(dispatch_attempts=func.greatest(Task.dispatch_attempts - 1, 0), **task_actor_values(session))
+            .returning(Task.id)
+            .execution_options(synchronize_session=False)
+        )
+        if refunded is None:
+            session.rollback()
+            raise not_active
+        # Under the retry cap too (checked above; this guard closes the race), so a refunded wait can only land
+        # `ready`, never `system_failed`.
+        end_guards = (*guards, Task.dispatch_attempts < cap)
+    state = end_attempt(
+        task_id, session, guards=end_guards,
+        cause=runner_terminations.CAUSE_WAITING_ON_TASK,
+        note_detail=merge_lane_state.run_failure_line(body.reason),
+    )
+    if state is None:
+        session.rollback()
+        raise not_active
+    return state
 
 
 # ── task_questions: write ─────────────────────────────────────────────────────
@@ -1150,7 +1404,7 @@ class TaskQuestionIn(BaseModel):
     guard_context: Optional[dict[str, Any]] = None
 
 
-def _announce_question_round_in_task_scope(
+async def _announce_question_round_in_task_scope(
     task_id: int, question_id: int, caller_scope: "UUID | object | None"
 ) -> None:
     """Announce one question round under the org of the task, on a session of this function's own.
@@ -1158,7 +1412,7 @@ def _announce_question_round_in_task_scope(
     `bind_from`, not `operator_scope()`: this is per-task notification state. It re-derives rather than
     inheriting the request's bind (hence `seam.detached()`): the question belongs to the task's org, and
     `bind_from` would raise `TenancyScopeConflict` on fleet-wide arms inside a background task with no error
-    surface. Its own `SessionLocal()`, since the request's is closed; it only resolves the org, as in
+    surface. Its own async session, since the request's is closed; it only resolves the org, as in
     `durable/task_notify_queue.py::deliver_task_notification`. Never raises (`announce_question_round`
     swallows its own failures); a deleted task is logged and returned.
 
@@ -1169,8 +1423,18 @@ def _announce_question_round_in_task_scope(
     both known orgs differ. Residual: on `cp_self`/`insecure` arms `create_task_question`'s bare
     `session.get` still writes the row; this guarantees only that the announce stays in the caller's tenant.
     """
+    with seam.detached():
+        async with db_async.async_session() as db:
+            await db.run_sync(_announce_in_task_org, task_id, question_id, caller_scope)
+
+
+def _announce_in_task_org(
+    session: Session, task_id: int, question_id: int, caller_scope: "UUID | object | None"
+) -> None:
+    """`_announce_question_round_in_task_scope`'s body, run in the session's greenlet so the `bind_from` region
+    (a ContextVar, shared with the awaiting task) spans the announce, which runs off the loop in the threadpool."""
     try:
-        with SessionLocal() as session, seam.detached(), seam.bind_from(session, Task, task_id) as org:
+        with seam.bind_from(session, Task, task_id) as org:
             # The entitlement check the composition removed. `OPERATOR` is entitled to every org; anything else must
             # match. Refuses only when both sides are known (`app/automation_fire.py::_owner_or_reason`): `org is not None`
             # is unreachable now (`tasks.org_id` NOT NULL, 0192) but kept as the bind's own `None` arm;
@@ -1190,9 +1454,10 @@ def _announce_question_round_in_task_scope(
                 )
                 return
             # Release the pooled connection before the up-to-25s Slack relay; the scope is a ContextVar region,
-            # unaffected (precedent: `durable/task_notify_queue.py::deliver_task_notification`).
+            # unaffected (precedent: `durable/task_notify_queue.py::deliver_task_notification`). The relay is
+            # blocking, so it runs in the threadpool (which copies the bound scope), awaited from this greenlet.
             session.rollback()
-            task_notify.announce_question_round(task_id, question_id)
+            await_only(run_in_threadpool(task_notify.announce_question_round, task_id, question_id))
     except seam.TenancyRowMissing:
         log.warning(
             "task-notify: task %s no longer exists — question round %s was recorded but not announced",
@@ -1272,16 +1537,14 @@ def record_question_round(
     return row
 
 
-# `/questions` is the legacy alias of `/input-requests`, kept until the legacy-deletion task.
+# `/questions` is the legacy alias of `/input-requests`, retired together with `/settle` above.
 @router.post("/tasks/{task_id}/input-requests", status_code=201, response_model=TaskQuestionOut)
 @router.post("/tasks/{task_id}/questions", status_code=201, response_model=TaskQuestionOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def create_task_question(
-    task_id: int,
-    body: TaskQuestionIn,
-    background: BackgroundTasks,
+    session: Session, task_id: int, body: TaskQuestionIn, background: BackgroundTasks,
     _: None = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> TaskQuestionOut:
     """Insert an open `task_questions` row for a runner's blocking question — the multi-round triage writer.
     404 on a missing Task; the row is always `status='open'`. Each question is a new round; a human answers
@@ -1296,22 +1559,7 @@ def create_task_question(
         session, task, question=body.question, options=body.options,
         multi_select=body.multi_select, header=body.header, guard_context=body.guard_context,
     )
-    session.commit()
-    session.refresh(row)
-    # After the commit, so the workflow finds the row; never raises. Deferred: the queue module pulls `dbos`.
-    from app.durable.question_plain_queue import enqueue_plain
-
-    enqueue_plain(task_id, row.id)
-    # Announce per round: the transition fires only for a batch's first round (guarded on `ACTIVE`), so it
-    # would drop later rounds. Queued through `_announce_question_round_in_task_scope` (see its docstring).
-    # The caller's scope is captured here, the only frame where `seam.current_scope()` still answers "who
-    # asked"; the wrapper uses it as the entitlement conjunct.
-    background.add_task(
-        _announce_question_round_in_task_scope, task_id, row.id, seam.current_scope()
-    )
-    # Off the request: a Slack post can take 25s against a 30s CP-hop budget, and inline announcing could get
-    # a batch killed mid-way. Queued after `commit()` so the announcer sees the row.
-
+    commit_row(session, row)
     # Read-time round: the post-insert count of visible questions (this row is the newest). Visible only, to
     # match the console's numbering (`app/routes/tasks/qa_render.py::_load_task_questions_out`).
     round_index = session.scalar(
@@ -1321,7 +1569,17 @@ def create_task_question(
         )
     ) or 1
     # `resolved_by=None` is a fact: the row was just inserted `open`.
-    return _task_question_out(row, round_index, resolved_by=None)
+    out = _task_question_out(row, round_index, resolved_by=None)
+    # Announce per round: the transition fires only for a batch's first round (guarded on `ACTIVE`), so it
+    # would drop later rounds. Queued through `_announce_question_round_in_task_scope` (see its docstring).
+    # The caller's scope is captured here, the only frame where `seam.current_scope()` still answers "who
+    # asked"; the wrapper uses it as the entitlement conjunct.
+    background.add_task(
+        _announce_question_round_in_task_scope, task_id, out.id, seam.current_scope()
+    )
+    # Off the request: a Slack post can take 25s against a 30s CP-hop budget, and inline announcing could get
+    # a batch killed mid-way. Queued after `commit()` so the announcer sees the row.
+    return out
 
 
 # ── The runner binding: which session, in which worktree ──────────────────────
@@ -1377,7 +1635,7 @@ def record_runner_start(
     log's `runner_session` note, the agentic session row (`agent_session_lifecycle.note_start`) and the Jaah
     account's session link. Does not commit.
 
-    Two callers: the node's runner-session callback below (a static slot's runner, after it launched), and
+    Two callers: the node's runner-session callback below (a worktree's runner, after it launched), and
     `microvm_placement.admit`, which minted the id itself and binds it right after the claim — a VM task
     has no slot, so it names the VM's `node_id` (`node_for_task` reads a slot)."""
     task_id = task.id
@@ -1413,6 +1671,8 @@ def record_runner_start(
             # fail the dispatch.
             resolve=facts,
         )
+        # The dispatch's outcome row learns its session and when it went active.
+        outcome_writer.attach_session(session, task_id, runner_session_id, None)
     # A run on the Jaah account: the session row it was dispatched under names this runner from now on.
     if edition_features.enabled("jaah_ai_credit"):
         from app.jaah_routing import sessions as jaah_sessions
@@ -1422,11 +1682,12 @@ def record_runner_start(
 
 @router.post("/tasks/{task_id}/runner-session", status_code=204, response_model=None)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def set_task_runner_session(
+    session: Session,
     task_id: int,
     body: RunnerSessionIn,
     _: None = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> None:
     """Bind a Task to the runner executing it — its `claude --resume` session id and pool worktree. 404 on a
     missing Task.
@@ -1512,12 +1773,13 @@ class AppendTasksResult(BaseModel):
     "/tasks/{task_id}/append-tasks", response_model=AppendTasksResult
 )
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def append_tasks_route(
+    session: Session,
     task_id: int,
     body: AppendTasksIn,
     x_agent_task_id: str = Header(default=""),
     _: None = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> AppendTasksResult:
     """Append coder Tasks to an epic from its plan child's breakdown. The plan runner posts it as
     its work while `active`, then emits stage-complete. Rows and edges come from `append_tasks`
@@ -1526,15 +1788,12 @@ def append_tasks_route(
 
     Every call is an atomic replace: current coder and finish children are archived and the new breakdown
     created in one transaction, so retries converge and re-plans land. `active` children are left alone. A
-    bad `depends_on` aborts the whole append. A self-declared Task caller needs a `SHAPE_TASKS` licence
-    (the `plan` persona); `append_tasks` checks whose breakdown it is.
+    bad `depends_on` aborts the whole append. A Task caller must declare the plan child itself (`SHAPE_TASKS`,
+    `_refuse_another_tasks_door`); `append_tasks` checks whose breakdown it is.
     """
-    _guard_task_creating_caller(x_agent_task_id, session, shape=SHAPE_TASKS)
+    _refuse_another_tasks_door(_guard_task_creating_caller(x_agent_task_id, session), task_id)
     if not body.tasks:
-        raise HTTPException(
-            status_code=422,
-            detail="tasks must be non-empty — a plan append needs at least one coder",
-        )
+        raise HTTPException(status_code=422, detail="tasks must be non-empty — a plan append needs at least one coder")
     plan_child = get_task_or_404(task_id, session)
     result = append_tasks(
         plan_child,
@@ -1542,6 +1801,23 @@ def append_tasks_route(
         session,
     )
     return AppendTasksResult(**result)
+
+
+def _refuse_another_tasks_door(caller: Optional[Task], task_id: int) -> None:
+    """403 unless a Task caller declares the path's own task: every persona may use these shapes
+    (`persona_registry.TASK_CREATION_LICENCE`), so the bound that a coder cannot rewrite its epic's breakdown,
+    or file another finish phase's follow-ups, is that only the plan or finish child itself acts on its own
+    path. `host` (None) is the producers' channel and passes."""
+    if caller is None or caller.id == task_id:
+        return
+    log.warning("epic door refused: task %s declared itself at task %s's door", caller.id, task_id)
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"task {caller.id} may act only on its own epic stage, not task {task_id}'s. Record anything else "
+            "as a deferred follow-up in your report."
+        ),
+    )
 
 
 # ── finish → follow-up coder (the finisher's LAST SHOT rule) ────
@@ -1574,25 +1850,26 @@ class FinishFollowUpOut(BaseModel):
 
 @router.post("/tasks/{task_id}/follow-up", response_model=FinishFollowUpOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def file_finish_follow_up(
+    session: Session,
     task_id: int,
     body: FinishFollowUpIn,
     x_agent_task_id: str = Header(default=""),
     _: None = Depends(_check_token_for_task),
-    session: Session = Depends(get_session),
 ) -> FinishFollowUpOut:
     """File a Finish-phase follow-up as a visible coder of `task_id`'s epic. `task_id` is the calling finish
     child's own id: authority is path-scoped, checked by the writer. 404 when it is not a live `finish` child
     of a live epic (archived, undispatched, abandoned, settled), since nothing would sequence the follow-up.
 
     Idempotent on `dedup_key` (`created=false`, nothing written). The `X-Agent-Task-Id` guard asks who is
-    filing (`SHAPE_FOLLOW_UP`, the `finish` licence); the path asks whose finish phase.
+    filing (`SHAPE_FOLLOW_UP`) and that it is the path's own finish child (`_refuse_another_tasks_door`); the path
+    asks whose finish phase.
     """
-    _guard_task_creating_caller(x_agent_task_id, session, shape=SHAPE_FOLLOW_UP)
+    _refuse_another_tasks_door(_guard_task_creating_caller(x_agent_task_id, session), task_id)
     finish = session.get(Task, task_id)
-    result = (
-        append_finish_follow_up(finish, body.model_dump(), session) if finish is not None else None
+    result = or_404(
+        append_finish_follow_up(finish, body.model_dump(), session) if finish is not None else None,
+        detail=f"finish task {task_id} not found",
     )
-    if result is None:
-        raise HTTPException(status_code=404, detail=f"finish task {task_id} not found")
     return FinishFollowUpOut(**result)

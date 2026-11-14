@@ -1,4 +1,4 @@
-import { get } from '../api'
+import { get, withQuery } from '../api'
 import type { Page } from '../hooks/useListPage'
 import type { ManagedUser } from '../types'
 import type { LookupOption } from '../ui/AsyncLookup'
@@ -19,16 +19,15 @@ export type UserStatus = (typeof USER_STATUSES)[number]
 
 /** What a picker may offer. `enabled`: only accounts that can sign in (no admin disable, not held by an
  *  invitation) — applied by the SERVER (`?enabled=true`), so a prefix whose first matches are disabled still
- *  fills the page with working ones. */
-export type UserSearchOpts = { enabled?: boolean }
+ *  fills the page with working ones. `org`: one org's members only (`?org=`), for the operator picking inside a
+ *  customer's org; a tenant's read is its own org already. */
+export type UserSearchOpts = { enabled?: boolean; org?: string }
 
 /** Up to `USER_SEARCH_PER` people matching `q` (empty = the first page by address). `signal` is
  *  `ui/AsyncLookup`'s, so a superseded keystroke is aborted. */
 export async function searchUsers(q: string, signal?: AbortSignal, opts: UserSearchOpts = {}): Promise<ManagedUser[]> {
-  const params = new URLSearchParams({ per: String(USER_SEARCH_PER) })
-  if (q.trim()) params.set('q', q.trim())
-  if (opts.enabled) params.set('enabled', 'true')
-  const page = await get<Page<ManagedUser>>(`/api/users?${params}`, signal ? { signal } : undefined)
+  const path = withQuery('/api/users', { per: USER_SEARCH_PER, q: q.trim(), enabled: opts.enabled, org: opts.org })
+  const page = await get<Page<ManagedUser>>(path, signal ? { signal } : undefined)
   return page.items
 }
 

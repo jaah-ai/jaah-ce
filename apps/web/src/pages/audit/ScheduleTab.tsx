@@ -2,8 +2,9 @@ import { useCallback, useMemo, useState } from 'react'
 import Box from '@mui/material/Box'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
-import { FilterRow, FilterSelect, vocabularyOptions, withUnmatched } from '../../ui/FilterRow'
+import { FilterRow, vocabularyOptions, withUnmatched } from '../../ui/FilterRow'
 import { usePagedList } from '../../hooks/usePagedList'
+import { usePhone } from '../../hooks/usePhone'
 import { useUrlFilters } from '../../hooks/useUrlFilters'
 import { useOfficialZone } from '../../lib/officialZone'
 import { toggled } from '../../lib/sets'
@@ -13,13 +14,16 @@ import NoMatchesState from '../../ui/NoMatchesState'
 import FeedList from '../../ui/feed/FeedList'
 import FilterBar from '../../ui/FilterBar'
 import PagedList from '../../ui/PagedList'
+import { SelectFilters } from '../../ui/SelectFilters'
 import StatusChip from '../../ui/StatusChip'
 import { cronRunRow } from '../cron/cronRunRow'
 import { formatZoned } from '../../lib/zonedTime'
+import { countOf } from '../../lib/humanize'
 import { OUTCOME_EXPLANATION } from '../cron/vocabulary'
 import { listFleetCronRuns, type FleetCronRun } from './scheduleApi'
 import { foldMissed, missedSentence, type ScheduleLine } from './scheduleFold'
 import type { FeedRowSpec } from '../../ui/feed/types'
+import { FONT_WEIGHT, SIZE } from '../../theme'
 
 /* AUDIT > WORKFLOWS > SCHEDULE — every firing of every cron on this control plane, newest first.
  *
@@ -31,7 +35,7 @@ import type { FeedRowSpec } from '../../ui/feed/types'
  * THE ROW: cron + sentence as title, outcome as state mark, duration / filed task / age as the cluster. A stretch
  * of consecutive missed firings is one expandable row (`./scheduleFold.ts`).
  * NOT ONE WORD OF THE VOCABULARY IS DECIDED HERE: `pages/cron/vocabulary.ts::readRun`,
- * `OUTCOME_TONE` and `readSpans` are the single home.
+ * `OUTCOME` and `readSpans` are the single home.
  *
  * ORG-ADMIN-ONLY at the route (`App.tsx`) and strip (`AuditPage.tsx`); the boundary is
  * `GET /api/crons/runs`' own gate (`apps/api/app/routes/crons.py` says why).
@@ -49,6 +53,7 @@ export default function ScheduleTab({ enabled = true }: {
 }) {
   /* THE FILTERS LIVE IN THE URL (`hooks/useUrlFilters`); the mounted Runs tab owns `?workflow=`/`?status=`/`?q=`
      on the same location. */
+  const phone = usePhone()
   const [searchParams, setFilters] = useUrlFilters()
   const cronFilter = searchParams.get('cron') ?? ''
   const outcomeFilter = searchParams.get('outcome') ?? ''
@@ -89,7 +94,7 @@ export default function ScheduleTab({ enabled = true }: {
   const runRow = (run: FleetCronRun) => cronRunRow(run, {
     zone,
     testIdPrefix: 'schedule-run',
-    cron: { id: run.cron_id, name: run.cron_name },
+    cron: { automationId: run.automation_id, name: run.cron_name },
   })
   /* A FOLD IS ITS NEWEST FIRING'S ROW (state mark, age), retitled and counted; it opens to every firing it folds. */
   const lineRow = (line: ScheduleLine): FeedRowSpec => {
@@ -150,30 +155,23 @@ export default function ScheduleTab({ enabled = true }: {
 
       <FilterBar>
         <FilterRow>
-          <FilterSelect
-            label="Cron"
-            ariaLabel="Filter firings by cron"
-            value={cronFilter}
-            onChange={next => setFilters({ cron: next })}
-            allLabel="All crons"
-            options={cronSelectOptions}
-            minWidth={200}
-          />
-          <FilterSelect
-            label="Outcome"
-            ariaLabel="Filter firings by outcome"
-            value={outcomeFilter}
-            onChange={next => setFilters({ outcome: next })}
-            allLabel="Any outcome"
-            options={outcomeSelectOptions}
-            minWidth={160}
+          <SelectFilters
+            narrowings={[
+              { key: 'cron', label: 'Cron', ariaLabel: 'Filter firings by cron', allLabel: 'All crons', options: cronSelectOptions, testId: 'schedule-filter-cron', minWidth: SIZE.fieldMd },
+              { key: 'outcome', label: 'Outcome', ariaLabel: 'Filter firings by outcome', allLabel: 'Any outcome', options: outcomeSelectOptions, testId: 'schedule-filter-outcome', minWidth: SIZE.fieldMd },
+            ]}
+            values={{ cron: cronFilter, outcome: outcomeFilter }}
+            onChange={(key, value) => setFilters({ [key]: value })}
+            onClear={keys => setFilters(Object.fromEntries(keys.map(k => [k, ''])))}
+            phone={phone}
+            menuName="Filter firings"
           />
         </FilterRow>
       </FilterBar>
 
       {explained.map(([outcome, text]) => (
         <Typography key={outcome} variant="caption" sx={{ color: 'text.secondary' }} data-testid={`schedule-legend-${outcome}`}>
-          <Box component="span" sx={{ fontWeight: 600, textTransform: 'capitalize' }}>{outcome}</Box>
+          <Box component="span" sx={{ fontWeight: FONT_WEIGHT.semibold, textTransform: 'capitalize' }}>{outcome}</Box>
           {`: ${text}`}
         </Typography>
       ))}
@@ -190,7 +188,7 @@ export default function ScheduleTab({ enabled = true }: {
         loadMoreTestId="schedule-runs-load-more"
         caption={paging.hasMore
           ? `${runs.length} most recent firings.`
-          : `${runs.length} firing${runs.length === 1 ? '' : 's'}.`}
+          : `${countOf(runs.length, 'firing')}.`}
       >
         {/* `schedule-runs-table` is what `e2e/audit-tabs.spec.ts` reads. */}
         <FeedList

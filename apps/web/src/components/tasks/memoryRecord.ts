@@ -1,6 +1,6 @@
 import type { PipelineTask } from '../../types'
 
-// Where a task's memory arm came from (`app/project_memory/vocabulary.py::ARM_SOURCES`), as the task view says it.
+// Where a task's memory arm came from (`app/models/tasks.py::MEMORY_ARM_SOURCES`), as the task view says it.
 const ARM_SOURCE_LABELS: Record<string, string> = {
   task: 'set on task',
   epic: 'from epic',

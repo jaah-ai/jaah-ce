@@ -5,45 +5,37 @@ import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Card from '@mui/material/Card'
 import CardContent from '@mui/material/CardContent'
-import IconButton from '@mui/material/IconButton'
-import SvgIcon from '@mui/material/SvgIcon'
-import InputBase from '@mui/material/InputBase'
 import Link from '@mui/material/Link'
-import TextField from '@mui/material/TextField'
+import ExternalLink from '../ui/ExternalLink'
 import Typography from '@mui/material/Typography'
 import { Mono } from '../ui/DetailFields'
 import { ApiError, apiDetail, del, get, post } from '../api'
-import { useCommitOnBlurEdit } from '../hooks/useCommitOnBlurEdit'
 import { usePoll } from '../hooks/usePoll'
 import { listProjects, useWorktrees } from '../hooks/useRosters'
 import type { RowSelection } from '../hooks/useRowSelection'
 import { useSubmit } from '../hooks/useSubmit'
-import { useAuth, useCan } from '../auth'
+import { useCan } from '../auth'
 import { useIsOrgAdmin } from '../hooks/useIsOrgAdmin'
 import { useOtherOrgOf } from '../ui/OrgIndicator'
 import { enterActAs } from '../lib/actAs'
 import type { NewTaskNavState } from '../lib/taskDuplicate'
 import { useCommand } from './CommandButton'
-import { useConfirm } from './ConfirmDialog'
+import { danger, useConfirm } from './ConfirmDialog'
 import { useConsoleDock, useConsoleNav } from './ConsoleDock'
-import { useAgentProviders } from '../hooks/useAgentProviders'
-import { offeredOnPlan } from '../lib/providerCatalogue'
 import { useDebouncedCallback } from '../hooks/useDebouncedCallback'
 import { useEventStream } from '../hooks/useEventStream'
 import { useEventsSinceSeen } from '../hooks/useLiveRefetch'
-import { useCanDriveWorktreeSession, useCanEditWorktrees } from '../hooks/useWorktreeAccess'
+import { slotConsoleRequest, useCanDriveWorktreeSession, useCanEditWorktrees } from '../hooks/useWorktreeAccess'
 import { refusalMessage, releaseLiveSessionRefusal } from '../lib/erase'
-import { withAdded, withRemoved } from '../lib/sets'
+import { countOf } from '../lib/humanize'
 import { releaseConfirmMessage, releasedNotice, releaseSlot } from '../lib/slotRelease'
 import { fmtModelBrief } from '../lib/models'
 import { isAuthRejected, isQuotaHigh } from '../lib/quota'
 import { safeHref } from '../lib/safeHref'
 import { briefTimestamp, fmtTimestamp } from '../lib/relativeTime'
-import { canOpenConsoleOn, hasLiveSession, isFolderSlot, resolveTitle } from '../lib/worktree'
-import { FREE_TITLE, saveSlotDescription, saveSlotTitle, titleEditorSeed, titleShown, type TitleNotice } from '../lib/slotTitle'
+import { FREE_TITLE, hasLiveSession, isFolderSlot, resolveTitle, titleShown } from '../lib/worktree'
 import {
   AWAITING_ANSWER_WORDS,
-  MAIN_CLONE_NUMBER,
   type SlotSignal,
   type SlotTone,
   DESTROY_STUCK_HOURS,
@@ -53,7 +45,6 @@ import {
   isAwaitingAnswer,
   isHeld,
   isProtected,
-  isUserOwned,
   poolRollup,
   poolSlotState,
   retiringHours,
@@ -67,11 +58,10 @@ import {
   stackWords,
   stateSignal,
   stateTone,
-  userOwnerLabel,
 } from '../lib/poolSlot'
 import { taskDeepLinkPath } from '../lib/taskDeepLink'
 import { matchesWorktreeFilters, type WorktreeFilters } from '../lib/worktreeFilters'
-import { VM_START_POLL_MS } from '../lib/vmStartPoll'
+import { VM_START_POLL_MS } from '../lib/pollIntervals'
 import {
   GROUP_BY_FLAT,
   buildWorktreeRows,
@@ -82,19 +72,19 @@ import {
 import { OrgQualifier } from '../lib/projectLabel'
 /* Type-only (erased; no module cycle). The shape is the contract with the host page, documented there. */
 import type { WorktreePoolView } from '../pages/Worktrees'
-import type { ClaudeAccount, ClaudeResources, Command, NodeRecord, Project, SlotDeleteResult, Worktree } from '../types'
+import type { ClaudeAccount, Command, NodeRecord, Project, SlotDeleteResult, Worktree } from '../types'
+import { getResources, RESOURCES_KEY } from '../pages/credentials/api'
 import Banner from '../ui/Banner'
 import CloneOwnerControl from './CloneOwnerControl'
 import { CopyButton } from '../ui/CopyButton'
 import EmptyState from '../ui/EmptyState'
 import NoMatchesState from '../ui/NoMatchesState'
 import LoadingState from '../ui/LoadingState'
-import FeedList from '../ui/feed/FeedList'
-import { ACTIONS_SLOT } from '../ui/feed/geometry'
+import FeedList, { ACTIONS_SPACER_SX } from '../ui/feed/FeedList'
 import type { FeedMarker, FeedRowSpec, FeedSection, FeedSlot, OverflowItem } from '../ui/feed/types'
 import { KeyValue, KeyValueList } from '../ui/KeyValueList'
 import {
-  ELLIPSIS_SX, FEED_NO_META, PHONE, POOL_LIST_CONTAINER_SX, POOL_NO_PROJECT, fieldTapTargetSx, monoSx,
+  ELLIPSIS_SX, FEED_NO_META, PHONE, POOL_LIST_CONTAINER_SX, POOL_NO_PROJECT, monoSx,
   tapTargetSx,
 } from '../ui/listStyles'
 import { OverflowMenu } from '../ui/OverflowMenu'
@@ -105,6 +95,8 @@ import SideDrawer from '../ui/SideDrawer'
 import PageHeader from '../ui/PageHeader'
 import StatusChip, { type Tone } from '../ui/StatusChip'
 import { TONE_COLOR } from '../ui/statusTone'
+import { FONT_SIZE, FONT_WEIGHT, grid, LINE_HEIGHT, RADIUS } from '../theme'
+import Tip from '../ui/Tip'
 
 /* ══ THE FLEET'S WORKTREE POOL ═════════════════════════════════════════════════════════════════════
  *
@@ -145,7 +137,7 @@ import { TONE_COLOR } from '../ui/statusTone'
 
 /** The slot number leading the title. Not `FeedRowSpec.lead`, which is gated at `FEED_NO_ID`: many
  *  titles are `free`, so a phone list without numbers is identical rows. */
-const SLOT_NUMBER_SX = { mr: 0.75, color: 'text.disabled' } as const
+const SLOT_NUMBER_SX = { mr: 0.5, color: 'text.disabled' } as const
 
 /* The flat row's project, prefixed to the slot number wherever the Project slot drops (its window gate or
    `POOL_NO_PROJECT`, `ui/feed/geometry.ts`'s `poolProject`), so a narrow pool still reads `acme#1`, not a bare
@@ -156,9 +148,7 @@ const SLOT_PROJECT_PREFIX_SX = {
     content: 'attr(data-project-prefix)',
     display: 'none',
     maxWidth: '40%',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
+    ...ELLIPSIS_SX,
     verticalAlign: 'bottom',
   },
   [FEED_NO_META]: { '&::before': { display: 'inline-block' } },
@@ -168,12 +158,12 @@ const SLOT_PROJECT_PREFIX_SX = {
 /* The row's destroy tag (`destroySignals`): a WORD in a hairline box, never a colour alone (AC2.1). */
 const DESTROY_TAG_SX = {
   display: 'inline-block',
-  mr: 0.75,
+  mr: 0.5,
   px: 0.5,
   border: 1,
-  borderRadius: 0.5,
-  fontSize: '0.6875rem',
-  lineHeight: 1.45,
+  borderRadius: RADIUS.sm,
+  fontSize: FONT_SIZE.xs,
+  lineHeight: LINE_HEIGHT.snug,
   verticalAlign: 'text-bottom',
   whiteSpace: 'nowrap',
 } as const
@@ -211,35 +201,17 @@ function needsDestroyHand(slot: Worktree): boolean {
   return !!slot.retiring && (destroyNodeError(slot) !== null || isDestroyStuck(slot))
 }
 
-/* Material's `PushPin` path, inlined: `@mui/icons-material` is not a dependency (`ui/InfoTip`). */
-const PIN_PATH = 'M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z'
-const PIN_SX = { fontSize: '0.875rem', mr: 0.5, verticalAlign: 'text-bottom', color: 'text.secondary' } as const
-
-/** What the slot IS: a pin for one kept between tasks, nothing for one made for a task and destroyed
- *  once freed. A missing `kind` (a cached row from before the field) is kept, the only kind there was. */
-function PinMark({ slot }: { slot: Worktree }) {
-  if (slot.kind === 'dynamic') return null
-  return (
-    <SvgIcon data-testid="slot-pin" titleAccess="Pinned — kept between tasks" sx={PIN_SX}>
-      <path d={PIN_PATH} />
-    </SvgIcon>
-  )
-}
-
 function SlotMarks({ slot }: { slot: Worktree }) {
   return (
     <>
-      <PinMark slot={slot} />
       {destroySignals(slot).map(signal => (
-        <Box
-          key={signal.key}
+        <Tip key={signal.key} title={signal.title}><Box
           component="span"
           data-testid={`slot-${signal.key}-tag`}
-          title={signal.title}
           sx={{ ...DESTROY_TAG_SX, color: TONE_COLOR[signal.tone], borderColor: 'currentColor' }}
         >
           {signal.label}
-        </Box>
+        </Box></Tip>
       ))}
     </>
   )
@@ -265,7 +237,7 @@ const POOL_HEADING_GROUP_SX = {
   flexWrap: 'wrap',
   alignItems: 'baseline',
   columnGap: 1,
-  rowGap: 0.25,
+  rowGap: 0,
   minWidth: 0,
 } as const
 
@@ -307,7 +279,7 @@ const SELECT_ALL_SX = {
   alignItems: 'center',
   gap: 1,
   pr: 0.5,
-  fontSize: '0.6875rem',
+  fontSize: FONT_SIZE.xs,
   /* NOT `text.disabled`: 2.7:1 on the light card, under AA at 11px. */
   color: 'text.secondary',
   [PHONE]: { gap: 0.5 },
@@ -320,16 +292,8 @@ const SELECT_ALL_COLUMN_SX = {
   justifyContent: 'center',
 } as const
 
-/** The ⋯ column, reserved and empty. */
-const SELECT_ALL_ACTIONS_SPACER_SX = {
-  flex: '0 0 auto',
-  width: ACTIONS_SLOT,
-  [PHONE]: { width: 24 },
-} as const
-
-/* No Sync All here: `lib/worktreeGrouping.ts::buildWorktreeRows` OMITS folded rows, so a fan-out by
- * mounted rows would skip them. The bulk verbs act on the page's SELECTION (`ui/BulkActionBar`) via the
- * exported per-slot runners below. `isSyncEligible` is exported so the bulk bar asks the same question. */
+/* The bulk verbs act on the page's SELECTION (`ui/BulkActionBar`) via the exported per-slot runners below:
+ * `lib/worktreeGrouping.ts::buildWorktreeRows` OMITS folded rows, so a fan-out by mounted rows would skip them. */
 /** The `/api/stream` entities whose events can change this panel: slots, their runners, and the
  *  accounts the drawer joins for quota rows. */
 const LIVE_ENTITIES = new Set(['worktree', 'runner', 'account'])
@@ -356,11 +320,6 @@ async function runSlotCommand(slot: Worktree, commandType: string): Promise<void
   if (cmd.status === 'done') return
   const reason = cmd.result && typeof cmd.result['reason'] === 'string' ? cmd.result['reason'] : cmd.status
   throw new Error(`${slotIdentity(slot)}: ${reason}`)
-}
-
-/** Rebase ONE slot onto its project's integration branch — the Git cell's ⟳ and the drawer's Sync Git. */
-export function syncSlotGit(slot: Worktree): Promise<void> {
-  return runSlotCommand(slot, 'sync_develop')
 }
 
 /** Take ONE slot's stack down — the drawer's Stop. Data volumes are kept; see `stackWords`. */
@@ -418,16 +377,6 @@ export function forgetSlot(slot: Worktree): Promise<void> {
   )
 }
 
-/* Which rows a sync can move — the ⟳ gate and the bulk Sync Git's per-row question.
- * Behind AND `dirty === false` (null/unmeasured is ineligible: fail-safe) AND `may_edit` (the command
- * route refuses otherwise). `dirty` counts untracked files though the executor does not — chosen; do not
- * narrow the shared column (it keeps the CP's park/free invariant from freeing new-file-only slots).
- * A folder slot (no repository) never is.
- */
-export function isSyncEligible(slot: Worktree): boolean {
-  return !isFolderSlot(slot) && (slot.behind ?? 0) > 0 && slot.dirty === false && slot.may_edit
-}
-
 /* The ⚠ beside a slot's identity: running something AND its account near a quota wall. Deliberately
  * narrower than quota alone: a row mark means "this slot is spending the quota running out". The full
  * reading is in the drawer. */
@@ -448,19 +397,15 @@ function chipTone(tone: SlotTone): Tone {
 }
 
 /* The occupancy hover sentence, single-homed for the row, the drawer chip and the drawer detail row.
-   `lease()` refuses `number = 0` (A9), so the main clone reads `free`; the number check is wording only.
-   `task`/`user` in `state` say WHO holds it; whether a runner is alive is `sessionSignal`'s question. */
+   Whether a runner is alive is `sessionSignal`'s question. */
 function occupancyHint(slot: Worktree): string {
-  if (slot.number === MAIN_CLONE_NUMBER) return 'the project’s main clone — never leasable'
   if (!isHeld(slot)) return 'free'
   /* The task arm names the hold's reason: an unanswered question is the reader's to act on;
      wording single-homed in `AWAITING_ANSWER_WORDS`. Not "fleet task": a tenant renders this panel
      (`test/tenantCopy.ts`, `ui-copy-standards.md` §"Copy a tenant reads"). */
-  const base = isUserOwned(slot)
-    ? `held by ${userOwnerLabel(slot)}`
-    : isAwaitingAnswer(slot)
-      ? `held by a task that is ${AWAITING_ANSWER_WORDS}`
-      : 'held by a task'
+  const base = isAwaitingAnswer(slot)
+    ? `held by a task that is ${AWAITING_ANSWER_WORDS}`
+    : 'held by a task'
   return isProtected(slot)
     ? `${base} — protected: dispatch never touches it`
     : base
@@ -574,33 +519,30 @@ function SignalText({ testId, signal }: { testId: string; signal: SlotSignal }) 
 }
 
 /** `flex-end`: an inline-flex box hugs the left of a right-aligned cell otherwise. */
-const GIT_ROW_SX = { display: 'inline-flex', justifyContent: 'flex-end', gap: '0.3rem', width: '100%' } as const
+const GIT_ROW_SX = { display: 'inline-flex', justifyContent: 'flex-end', gap: 0.5, width: '100%' } as const
 
 /* The GIT slot. Four states: `—` (never scanned) and `✓` (in sync) differ, explained on `title`
-   (`gitWords`). `dirty` rides alongside on its own three-valued axis. Its ⟳ verb lives in the ⋯
-   (`Sync Git`), gated on `may_edit` AND a reachable node AND behind. */
+   (`gitWords`). `dirty` rides alongside on its own three-valued axis. */
 function GitCell({ slot }: { slot: Worktree }) {
   const summary = gitSummary(slot)
   /* Three answers: `true` is `✎`; `false` renders nothing; `null` (probe failed) gets the dimmed `?`
      "not measured" mark — never "clean" for an unexamined slot, and receding next to a real `✎`. */
   const dirty = summary.dirty === true ? (
-    <Box
+    <Tip title="uncommitted work"><Box
       component="span"
       data-testid="slot-git-dirty"
-      title="uncommitted work"
-      sx={{ color: 'warning.main', fontWeight: 600 }}
+      sx={{ color: 'warning.main', fontWeight: FONT_WEIGHT.semibold }}
     >
       ✎
-    </Box>
+    </Box></Tip>
   ) : summary.dirty === null ? (
-    <Box
+    <Tip title="not measured"><Box
       component="span"
       data-testid="slot-git-dirty-unknown"
-      title="not measured"
       sx={{ color: 'text.disabled' }}
     >
       ?
-    </Box>
+    </Box></Tip>
   ) : null
   if (summary.kind === 'unscanned') {
     // Nothing measured is one dimmed `—`, not `— ?`; real dirt (`✎`) still shows beside it.
@@ -610,7 +552,6 @@ function GitCell({ slot }: { slot: Worktree }) {
           component="span"
           data-testid="slot-git-none"
           sx={{ color: 'text.disabled' }}
-          title="not scanned"
         >
           —
         </Box>
@@ -621,18 +562,16 @@ function GitCell({ slot }: { slot: Worktree }) {
   return (
     <Box component="span" data-testid="slot-git" sx={GIT_ROW_SX}>
       {summary.kind === 'sync' ? (
-        <Box component="span" data-testid="slot-git-sync" sx={{ color: 'success.main' }} title="in sync">
+        <Box component="span" data-testid="slot-git-sync" sx={{ color: 'success.main' }}>
           ✓
         </Box>
       ) : (
         <>
           {summary.ahead > 0 && (
-            <Box component="span" data-testid="slot-git-ahead" sx={{ color: 'success.main', fontWeight: 600 }}
-              title={`${summary.ahead} ahead`}>↑{summary.ahead}</Box>
+            <Box component="span" data-testid="slot-git-ahead" sx={{ color: 'success.main', fontWeight: FONT_WEIGHT.semibold }}>↑{summary.ahead}</Box>
           )}
           {summary.behind > 0 && (
-            <Box component="span" data-testid="slot-git-behind" sx={{ color: 'warning.main', fontWeight: 600 }}
-              title={`${summary.behind} behind`}>↓{summary.behind}</Box>
+            <Box component="span" data-testid="slot-git-behind" sx={{ color: 'warning.main', fontWeight: FONT_WEIGHT.semibold }}>↓{summary.behind}</Box>
           )}
         </>
       )}
@@ -657,13 +596,37 @@ function slotMark(slot: Worktree, nodeOffline: boolean, nodeLabel: string): Slot
     return { tone: 'info', glyph: '●', label: `live session (${slot.session_status})` }
   }
   if (isHeld(slot)) {
-    return {
-      tone: 'warning',
-      glyph: '◆',
-      label: isUserOwned(slot) ? `held by ${userOwnerLabel(slot)}` : 'held by a task',
-    }
+    return { tone: 'warning', glyph: '◆', label: 'held by a task' }
   }
   return { tone: 'success', glyph: '○', label: 'free' }
+}
+
+/* A drawer verb that does not go through `useCommand` (the lease and destroy verbs the parent runs): one
+   `Button` shape, the aria-label naming the act on this slot. */
+function SlotVerb({ label, testId, ariaLabel, onClick, disabled, variant, color, size }: {
+  label: string
+  testId: string
+  ariaLabel: string
+  onClick: () => void
+  disabled: boolean
+  variant: 'outlined' | 'contained'
+  color?: 'inherit' | 'error'
+  size?: 'small'
+}) {
+  return (
+    <Button
+      size={size}
+      variant={variant}
+      color={color}
+      data-testid={testId}
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={ariaLabel}
+      sx={tapTargetSx}
+    >
+      {label}
+    </Button>
+  )
 }
 
 /* ── One driving control in the drawer's Actions block ─────────────────────────────────────────────
@@ -688,19 +651,18 @@ function SlotCommandButton({ slot, commandType, label, icon, destructive = false
 
   if (phase === 'submitting' || phase === 'done' || phase === 'failed') {
     return (
-      <Typography
+      <Tip title={errMsg || undefined}><Typography
         component="span"
         variant="caption"
         data-testid="slot-action-status"
         data-command={commandType}
-        title={errMsg || undefined}
         sx={{
           alignSelf: 'center',
           color: phase === 'failed' ? 'error.main' : phase === 'done' ? 'success.main' : 'text.secondary',
         }}
       >
         {phase === 'submitting' ? `${label}…` : phase === 'done' ? `${label} ✓` : `${label} — ${errMsg || 'failed'}`}
-      </Typography>
+      </Typography></Tip>
     )
   }
 
@@ -725,79 +687,12 @@ function SlotCommandButton({ slot, commandType, label, icon, destructive = false
         if (destructive) setPhase('confirming')
         else void submit()
       }}
-      title={`${label} — ${slotIdentity(slot)}`}
       sx={tapTargetSx}
     >
       <Box component="span" aria-hidden="true" sx={{ mr: 0.5 }}>{icon}</Box>{label}
     </Button>
   )
 }
-
-/* ── An editable drawer field (Title, Description) — both `PUT …/title` (`lib/slotTitle.ts`) ──────────
- * The editing contract (Enter commits, Escape cancels, blur commits, unchanged not sent, closes when `canEdit`
- * drops) is `hooks/useCommitOnBlurEdit.ts`'s; this draws it.
- */
-const EDIT_LINE_SX = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1 } as const
-
-function EditableDetailRow({ label, value, seed, editLabel, canEdit, onSave }: {
-  label: string
-  value: ReactNode
-  seed: string
-  editLabel: string
-  canEdit: boolean
-  onSave: (value: string) => void
-}) {
-  const editor = useCommitOnBlurEdit({ canEdit, onSave })
-
-  if (editor.editing) {
-    return (
-      <KeyValue testId="slot-detail-row" label={label}>
-        <InputBase
-          autoFocus
-          data-testid={`slot-${label.toLowerCase()}-input`}
-          inputProps={{ 'aria-label': editLabel }}
-          value={editor.draft}
-          onChange={e => editor.setDraft(e.target.value)}
-          onKeyDown={editor.onKeyDown}
-          onBlur={editor.onBlur}
-          /* 16px at phone width is the iOS-Safari auto-zoom floor (it zooms and never zooms back). Not a
-             style choice; `fieldTapTargetSx` does not supply it. */
-          sx={[
-            fieldTapTargetSx,
-            { fontSize: '0.875rem', border: '1px solid', borderColor: 'divider', borderRadius: 1, px: 0.5 },
-            { [PHONE]: { fontSize: '16px' } },
-          ]}
-        />
-      </KeyValue>
-    )
-  }
-
-  const edit = canEdit && (
-    <IconButton
-      size="small"
-      data-testid={`slot-${label.toLowerCase()}-edit`}
-      onClick={() => editor.open(seed)}
-      aria-label={editLabel}
-      title={editLabel}
-      /* The target overhangs its line rather than growing it, so an editable row is as tall as a read-only one
-         (a 32px button in a 20px line on desktop). On a phone the 44px target reaches a few px into the row
-         above, which holds no control at that x. */
-      sx={[tapTargetSx, { my: -1, [PHONE]: { my: -2 } }]}
-    >
-      <span aria-hidden="true">✎</span>
-    </IconButton>
-  )
-  /* The ✎ rides the row's right edge, beside the value (the drawer keeps label-beside-value at every width). */
-  return (
-    <KeyValue testId="slot-detail-row" label={label}>
-      <Box sx={EDIT_LINE_SX}>
-        <Box sx={{ minWidth: 0 }}>{value}</Box>
-        {edit}
-      </Box>
-    </KeyValue>
-  )
-}
-
 
 /* ── The detail drawer ─────────────────────────────────────────────────────────────────────────────
  * A right-anchored MUI `Drawer`: Escape/backdrop close,
@@ -807,8 +702,7 @@ function EditableDetailRow({ label, value, seed, editLabel, canEdit, onSave }: {
  */
 function SlotDetail({
   slot, nodeLabel, nodeOffline, account, onClose, onDelete, onRelease, onRetryDestroy, onForget, busy, canDelete,
-  canEdit, canDriveSession, onRun, onConfirmSync, onOpenConsole, onSaveTitle, onSaveDescription,
-  canSetCloneOwner,
+  canEdit, canDriveSession, onRun, onOpenConsole, canSetCloneOwner,
 }: {
   slot: Worktree
   /* This slot's node, already resolved to a name; commands read `slot.node_id` themselves. */
@@ -828,17 +722,12 @@ function SlotDetail({
   busy: boolean
   canDelete: boolean
   /* The command-bus tier — `worktrees:edit` OR `system:create` (what `POST /api/commands` accepts). Governs
-     Sync, stack commands, Logs, Finder, Cursor. */
+     stack commands, Logs, Finder, Cursor. */
   canEdit: boolean
-  /* The session tier — `worktrees:edit` alone: the console keyboard and `PUT …/title` editors. See
-     `hooks/useWorktreeAccess.ts`. */
+  /* The session tier — `worktrees:edit` alone: Release. See `hooks/useWorktreeAccess.ts`. */
   canDriveSession: boolean
   onRun: () => void
-  onConfirmSync: (slot: Worktree) => Promise<boolean>
-  /* `provider`: a catalogue value for a NEW session's account; absent = Any (the CP's Auto-assign pick). */
-  onOpenConsole: (slot: Worktree, provider?: string) => void
-  onSaveTitle: (slot: Worktree, value: string) => void
-  onSaveDescription: (slot: Worktree, value: string) => void
+  onOpenConsole: (slot: Worktree) => void
   /* Superadmin only, like declaring (`PUT /api/worktrees/{project}/clone-owner`). */
   canSetCloneOwner: boolean
 }) {
@@ -867,15 +756,8 @@ function SlotDetail({
      An offline node is NOT: the CP write commits first, and a dead box's hold is what this clears. */
   const canRelease = maySession && slot.state !== 'free'
   const quota = account?.quota
-  /* A live session to attach to, or permission to create one (`lib/worktree.ts::canOpenConsoleOn`). An
-     offline node overrides both. */
-  const canConsole = !nodeOffline && canOpenConsoleOn(slot, { mayCreate: maySession })
-  /* The provider choice matters only when opening CREATES a session (no live one to attach to). No
-     catalogue ⇒ no select: Any is implicit. '' = Any. The provider grid narrows it (`offeredOnPlan`). */
-  const { rows: catalogue } = useAgentProviders()
-  const providers = offeredOnPlan(catalogue, useAuth().admin)
-  const [provider, setProvider] = useState('')
-  const offerProvider = canConsole && !hasLiveSession(slot) && providers.length > 0
+  /* The console only ATTACHES to a live session; nothing opens one on a slot. An offline node withholds it. */
+  const canConsole = !nodeOffline && hasLiveSession(slot)
 
   /* ── The two ways a slot leaves the operator's hands ─────────
      Both are offered on a held slot. What separates them is the TREE: Release ends the
@@ -885,39 +767,20 @@ function SlotDetail({
      Styled by severity: Release (the tree stays) is neutral, Delete (irreversible) is the one filled red. */
   const leaveActions = (canRelease || canDelete) ? (
     <Box data-testid="slot-detail-leave" sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+      {/* No captions: what Release leaves and ends, and what Delete destroys, each confirm states once. */}
       {canRelease && (
-        <>
-          {/* No caption: what Release leaves and ends is stated once, in its confirm. */}
-          <Button
-            variant="outlined"
-            color="inherit"
-            data-testid="slot-action-release"
-            onClick={() => onRelease(slot)}
-            disabled={busy}
-            aria-label={`Release ${slotIdentity(slot)}`}
-            title={`Release ${slotIdentity(slot)}`}
-            sx={tapTargetSx}
-          >
-            Release slot
-          </Button>
-        </>
+        <SlotVerb
+          label="Release slot" testId="slot-action-release" ariaLabel={`Release ${slotIdentity(slot)}`}
+          onClick={() => onRelease(slot)} disabled={busy}
+          variant="outlined" color="inherit"
+        />
       )}
       {canDelete && (
-        <>
-          {/* No caption: what Delete destroys is stated once, in its confirm. */}
-          <Button
-            variant="contained"
-            color="error"
-            data-testid="slot-action-delete"
-            onClick={() => onDelete(slot)}
-            disabled={busy}
-            aria-label={`Delete ${slotIdentity(slot)}`}
-            title={`Delete ${slotIdentity(slot)}`}
-            sx={tapTargetSx}
-          >
-            Delete slot
-          </Button>
-        </>
+        <SlotVerb
+          label="Delete slot" testId="slot-action-delete" ariaLabel={`Delete ${slotIdentity(slot)}`}
+          onClick={() => onDelete(slot)} disabled={busy}
+          variant="contained" color="error"
+        />
       )}
     </Box>
   ) : undefined
@@ -925,14 +788,14 @@ function SlotDetail({
   return (
     <SideDrawer
       testId="slot-detail-drawer"
-      /* Names the node: `acme#main` exists on every machine. */
+      /* Names the node: `acme#1` exists on every machine. */
       label={`Slot details — ${identity} on ${nodeLabel}`}
-      width={460}
+      width={{ xs: '100%', sm: grid(76.5) }}
       pad={1.5}
       onClose={onClose}
       closeLabel="Dismiss slot details"
       footer={leaveActions}
-      title={<><PinMark slot={slot} /><Mono>{identity}</Mono></>}
+      title={<Mono>{identity}</Mono>}
       subtitle={
         <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
           {/* A retiring slot shows its destroy state alone: `Declared`/`Ready` beside Destroying/Stuck contradicts it. */}
@@ -950,7 +813,7 @@ function SlotDetail({
           {/* The drawer's one occupancy surface (`state`): no `Occupancy` row repeats it. Dropped
               while retiring, like the lifecycle chip: who holds a slot being removed says nothing. */}
           {!slot.retiring && (
-            <StatusChip label={slot.state} tone={chipTone(stateTone(slot.state))} title={occupancyHint(slot)} />
+            <StatusChip label={slot.state} tone={stateTone(slot.state)} title={occupancyHint(slot)} />
           )}
           {destroySignals(slot).map(signal => (
             <StatusChip key={signal.key} label={signal.label} tone={signal.tone} title={signal.title} />
@@ -983,29 +846,14 @@ function SlotDetail({
           waits on the same node the destroy is stuck on. */}
       {canDelete && needsDestroyHand(slot) && (
         <Box data-testid="slot-destroy-actions" sx={{ mb: 1, display: 'flex', flexWrap: 'wrap', gap: 1 }}>
-          <Button
-            size="small"
-            variant="outlined"
-            data-testid="slot-action-retry-destroy"
-            onClick={() => onRetryDestroy(slot)}
-            disabled={busy}
-            aria-label={`Retry destroy of ${identity}`}
-            sx={tapTargetSx}
-          >
-            Retry
-          </Button>
-          <Button
-            size="small"
-            variant="outlined"
-            color="error"
-            data-testid="slot-action-forget"
-            onClick={() => onForget(slot)}
-            disabled={busy}
-            aria-label={`Forget ${identity}`}
-            sx={tapTargetSx}
-          >
-            Forget
-          </Button>
+          <SlotVerb
+            label="Retry" testId="slot-action-retry-destroy" ariaLabel={`Retry destroy of ${identity}`}
+            onClick={() => onRetryDestroy(slot)} disabled={busy} variant="outlined" size="small"
+          />
+          <SlotVerb
+            label="Forget" testId="slot-action-forget" ariaLabel={`Forget ${identity}`}
+            onClick={() => onForget(slot)} disabled={busy} variant="outlined" color="error" size="small"
+          />
         </Box>
       )}
       {/* `Declared` is the one lifecycle state explained inline (it makes Add look like it did nothing);
@@ -1018,8 +866,8 @@ function SlotDetail({
           sx={{
             mb: 1,
             p: 1,
-            borderRadius: 1,
-            borderLeft: '3px solid',
+            borderRadius: RADIUS.sm,
+            borderLeft: `${grid(0.5)} solid`,
             borderColor: 'divider',
             backgroundColor: 'action.hover',
           }}
@@ -1030,7 +878,7 @@ function SlotDetail({
 
       {/* ── ACTIONS ─────────────────────────────────────────────────────────────────────────────────
           Above the fact list, so the drawer's verbs show on open: below it, a 800px-tall drawer opened with
-          the row under the sticky footer. Order: read, then repair — Session, Sync, stack
+          the row under the sticky footer. Order: read, then repair — Session, stack
           lifecycle (coarsest first), Logs / Finder / Cursor, then clipboard items; the leaving verbs stay in
           the footer. Each control renders only when it could run (hidden, not disabled), except the
           offline-node and no-stack cases, which get a sentence. */}
@@ -1047,62 +895,18 @@ function SlotDetail({
               {nodeLabel} is offline — the console and every node command are withheld.
             </Typography>
           )}
-          {/* `alignItems: center`, not the default stretch: a stretched row lets the taller Provider select pull its
-              line's buttons up to its height while a wrapped line keeps theirs. */}
           <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 1 }}>
             {canConsole && (
-              <Button
+              <Tip title={`Open the console on ${identity}`}><Button
                 size="small"
                 variant="outlined"
                 color="inherit"
                 data-testid="slot-action-session"
-                onClick={() => onOpenConsole(slot, offerProvider && provider ? provider : undefined)}
-                title={`Open the console on ${identity}`}
+                onClick={() => onOpenConsole(slot)}
                 sx={tapTargetSx}
               >
                 <Box component="span" aria-hidden="true" sx={{ mr: 0.5 }}>🪟</Box>Session
-              </Button>
-            )}
-            {offerProvider && (
-              <TextField
-                id="slot-console-provider"
-                select
-                size="small"
-                value={provider}
-                onChange={e => setProvider(e.target.value)}
-                /* No floating label: an outlined label pokes above the row and stands the select taller than the
-                   buttons beside it. The first option says what the field picks; `aria-label` names it. Button
-                   height above the phone floor (`fieldTapTargetSx` owns the phone), and the small buttons' type
-                   size, so the cluster reads level. `field-sizing: content` fits the box to the chosen option, not
-                   the longest one (a browser without it keeps the longest-option width). */
-                sx={[
-                  theme => ({
-                    // The theme's dense field margin would sit it 2px off the row's centre line.
-                    m: 0,
-                    maxWidth: '100%',
-                    '& .MuiInputBase-root': { fontSize: theme.typography.pxToRem(13) },
-                    '& select': { fieldSizing: 'content' },
-                    [theme.breakpoints.up('sm')]: { '& .MuiInputBase-input': { py: '6px' } },
-                  }),
-                  fieldTapTargetSx,
-                ]}
-                slotProps={{
-                  select: { native: true },
-                  htmlInput: { 'data-testid': 'slot-console-provider', 'aria-label': 'Provider' },
-                }}
-              >
-                <option value="">Any provider</option>
-                {providers.map(p => (
-                  <option key={p.value} value={p.value}>{p.label}</option>
-                ))}
-              </TextField>
-            )}
-            {/* Same `confirmSyncSlot` guard as the row's ⟳. */}
-            {mayDrive && !nodeOffline && !isFolderSlot(slot) && (slot.behind ?? 0) > 0 && (
-              <SlotCommandButton
-                slot={slot} commandType="sync_develop" label="Sync" icon="⟳"
-                beforeRun={() => onConfirmSync(slot)} onRun={onRun}
-              />
+              </Button></Tip>
             )}
             {mayDrive && !nodeOffline && (stackUp ? (
               <>
@@ -1133,7 +937,6 @@ function SlotDetail({
                 target="_blank"
                 rel="noreferrer"
                 data-testid="slot-action-launch"
-                title={`Open ${webHref}`}
                 sx={tapTargetSx}
               >
                 <Box component="span" aria-hidden="true" sx={{ mr: 0.5 }}>🌐</Box>Launch
@@ -1141,10 +944,10 @@ function SlotDetail({
             )}
             {/* Ungated: copying a displayed string needs no permission. Only when there is a string. */}
             {slot.path && (
-              <CopyButton testId="slot-action-copy-path" label="Copy path" text={() => slot.path} title={`Copy ${slot.path}`} />
+              <CopyButton testId="slot-action-copy-path" label="Copy path" text={() => slot.path} />
             )}
             {stackUp && apiHref && (
-              <CopyButton testId="slot-action-copy-api-url" label="Copy API URL" text={() => apiHref} title={`Copy ${apiHref}`} />
+              <CopyButton testId="slot-action-copy-api-url" label="Copy API URL" text={() => apiHref} />
             )}
           </Box>
         </Box>
@@ -1152,31 +955,13 @@ function SlotDetail({
 
       {/* `stack={false}`: one-or-two-word labels, so a phone keeps label-beside-value as the desktop drawer does;
           stacked, every fact took two lines and doubled the drawer's height. */}
-      <KeyValueList labelWidth="92px" stack={false}>
-        {/* Editable here only: an inline Title editor would take the one unfixed-width column.
-            The seed is `titleEditorSeed`, not the rendered Title: a CP-composed title or `free` seeds an
-            empty box, and an empty commit is a deliberate CLEAR back to the composed form. */}
-        <EditableDetailRow
-          label="Title"
-          value={titleShown(slot.title)}
-          seed={titleEditorSeed(slot.title)}
-          editLabel={`Edit the Title of ${identity}`}
-          canEdit={maySession}
-          onSave={value => onSaveTitle(slot, value)}
-        />
-        {/* Rendered even when empty, so an operator can GIVE it content; `—` is the panel's one absence mark
-            and the ✎ is the affordance. */}
-        <EditableDetailRow
-          label="Description"
-          value={slot.description === '' ? '—' : slot.description}
-          seed={slot.description}
-          editLabel={`Edit the Description of ${identity}`}
-          canEdit={maySession}
-          onSave={value => onSaveDescription(slot, value)}
-        />
+      <KeyValueList labelWidth={grid(15)} stack={false}>
         {/* The CP's stored `name` (`<project>/<number>`), distinct from the client-side heading
-            (`slotIdentity`) and the composed Title. An absent value is `—` in the body font everywhere here:
+            (`slotIdentity`). An absent value is `—` in the body font everywhere here:
             a monospace face draws `—` one column wide, where it reads as `–`. */}
+        {/* The CP-composed Title, read only (`apps/api/app/slot_title.py`); the task names the slot. */}
+        <KeyValue testId="slot-detail-row" label="Title">{titleShown(slot.title)}</KeyValue>
+        {slot.description !== '' && <KeyValue testId="slot-detail-row" label="Description">{slot.description}</KeyValue>}
         {/* Not when it equals the Title: a slot titled by its own name drew one long string twice. */}
         {(slot.name ?? '').trim() !== titleShown(slot.title).trim() && (
           <KeyValue testId="slot-detail-row" label="Name" title={slot.name || undefined} mono={!!slot.name}>{slot.name || '—'}</KeyValue>
@@ -1202,8 +987,8 @@ function SlotDetail({
         {(webHref || apiHref) && (
           <KeyValue testId="slot-detail-row" label="URLs">
             <Box component="span" sx={{ display: 'inline-flex', flexWrap: 'wrap', gap: 1 }}>
-              {webHref && <Link href={webHref} target="_blank" rel="noreferrer">web</Link>}
-              {apiHref && <Link href={apiHref} target="_blank" rel="noreferrer">api</Link>}
+              {webHref && <ExternalLink href={webHref}>web</ExternalLink>}
+              {apiHref && <ExternalLink href={apiHref}>api</ExternalLink>}
             </Box>
           </KeyValue>
         )}
@@ -1240,8 +1025,6 @@ function SlotDetail({
             <Link component={RouterLink} to={taskDeepLinkPath(slot.task_id)}>an answer — task #{slot.task_id}</Link>
           </KeyValue>
         )}
-        {/* A person, not a task; mutually exclusive with `Task` per the server's CHECK constraint. */}
-        <KeyValue testId="slot-detail-row" label="Owner">{userOwnerLabel(slot) ?? '—'}</KeyValue>
         {/* `fmtModelBrief`: a full model id does not fit the label gutter. */}
         <KeyValue testId="slot-detail-row" label="Model" mono={!!slot.model}>{fmtModelBrief(slot.model)}</KeyValue>
         {/* `slot.account` is a config DIRECTORY (the join key); joined against `/api/resources` for the account's
@@ -1299,9 +1082,8 @@ function SlotDetail({
 
 // The pool-slot READ + WRITE surface for the whole fleet.
 //
-// A slot is keyed `(node_id, project, number)`. Slots come from ASSIGNMENTS (`lib/assignments.ts`): the
-// converge declares slot 0 and the assignment's static slots, the dispatcher leases the rest; the node's
-// reconcile materialises (`create_mechanics` refuses undictated ids). Nothing is declared here. Deleting is
+// A slot is keyed `(node_id, project, number)`. The dispatcher leases each slot on a node the project's node groups
+// allow, made for a task and destroyed once freed; the node's reconcile materialises (`create_mechanics` refuses undictated ids). Nothing is declared here. Deleting is
 // PHYSICAL.
 //
 // A delete commits the row FIRST; the node hop only reports. An orphan directory is a known
@@ -1358,19 +1140,13 @@ export default function WorktreePool({
      request. Set only via `releaseLiveSessionRefusal`, so no other failure can offer a Force. Release keeps
      its guard because the next lease will `git reset --hard` the tree unseen. Never retried automatically. */
   const [releaseRefusal, setReleaseRefusal] = useState<{ slot: Worktree; session: string } | null>(null)
-  /* A Title/Description edit's outcome, always shown. Severities and words are `lib/slotTitle.ts`'s; one
-     banner slot for both fields (same endpoint). */
-  const [titleNotice, setTitleNotice] = useState<TitleNotice | null>(null)
-  /* The typed value painted immediately; cleared when the CP's payload AGREES with it (see the effect). */
-  const [pendingTitles, setPendingTitles] = useState<Record<string, string>>({})
-  const [pendingDescriptions, setPendingDescriptions] = useState<Record<string, string>>({})
 
   /* Neither read is implied by the route (`/worktrees` is `worktrees:view`; `GET /api/projects` needs
      `projects:view`). Ask only what the account may read, and say plainly why a region is empty. */
   const can = useCan()
   const canReadWorktrees = can('worktrees:view')
   const canReadProjects = can('projects:view')
-  /* The writes are OPERATOR-ONLY: `.../erase` carries `require_pool_operator`
+  /* The writes are OPERATOR-ONLY: `.../erase` carries `require_operator_acting`
      (`app.auth.require_operator`, `apps/api/app/routes/pool_slots.py`), as this page is.
      The page's own gate already admits only the operator, who is an org admin, so `useIsOrgAdmin` here only
      keeps a wide `worktrees:delete` holder from being offered a Delete that 403s. The verdict is read off the
@@ -1445,8 +1221,8 @@ export default function WorktreePool({
      quota badges. No imperative refetch exists except the gated one below. */
   const canReadResources = can('system:view')
   const resourcesQuery = useQuery({
-    queryKey: ['resources'],
-    queryFn: () => get<ClaudeResources>('/api/resources'),
+    queryKey: RESOURCES_KEY,
+    queryFn: getResources,
     refetchInterval: streamState === 'down' ? 10000 : false,
     enabled: canReadResources,
   })
@@ -1496,23 +1272,6 @@ export default function WorktreePool({
     if (overrun || events.some(event => LIVE_ENTITIES.has(event.entity))) refetchSlots()
   })
 
-  /* An optimistic edit clears when the CP AGREES (value comparison against `slot.title`; nothing the node
-     reports can confirm a CP→node value). A cleared Title resolves to the composed form or `free`. The
-     Description compares against the raw column, `''` included. */
-  useEffect(() => {
-    if (slots === null) return
-    setPendingTitles(prev => {
-      const next = { ...prev }
-      for (const slot of slots) if (next[slot.id] === slot.title) delete next[slot.id]
-      return next
-    })
-    setPendingDescriptions(prev => {
-      const next = { ...prev }
-      for (const slot of slots) if (next[slot.id] === slot.description) delete next[slot.id]
-      return next
-    })
-  }, [slots])
-
   // The open drawer follows the live row; a row that has gone closes it.
   useEffect(() => {
     if (detail === null || slots === null) return
@@ -1524,7 +1283,7 @@ export default function WorktreePool({
   /* Nothing clears `nodeWarning` on a downgrade: it records a write that already happened. It clears at
      the next Add or Delete, like `notice` and `actionError`.
      The capability, mirrored in a ref so an AWAITED continuation reads the value current at resume (see
-     `confirmAndDelete`). */
+     `confirmSlot`). */
   const canDeleteRef = useRef(canDeleteSlots)
   useEffect(() => {
     canDeleteRef.current = canDeleteSlots
@@ -1554,15 +1313,6 @@ export default function WorktreePool({
           (result.holder_ended
             ? ` It was held by ${result.holder_ended}, and that hold was ended with it: the session ledger ` +
               'is closed and a teardown was minted at its runner.'
-            : '') +
-          (slot.number === MAIN_CLONE_NUMBER
-            // Commands resolve their path from this row, so the main clone is unaddressable until the next
-            // converge of an assigned project declares slot 0 again (`lib/assignments.ts`); that re-declares
-            // the row only — the clone itself comes back when a numbered slot under it is next created or leased.
-            ? ' The console can no longer address that clone (Sync, sessions) until slot 0 returns with ' +
-              'the next converge of an assigned project — assign the project to the node, or save its ' +
-              'assignment again. That re-declares the row only; the clone itself comes back when a ' +
-              'numbered slot under it is next created or leased.'
             : ''),
         )
         /* The node's own words, naming slot and host: the next move is on that machine and the slot no longer
@@ -1586,13 +1336,24 @@ export default function WorktreePool({
     })
   }
 
-  // The confirm (`components/ConfirmDialog`), now the only friction: the delete is physical and
-  // unconditional.
-  // Gated at the CONTINUATION, not at render: `useConfirm` settles only when its HOST unmounts
-  // (`ConfirmDialog.tsx`), so removing just the dialog would hang the await. Read through a REF, since
-  // this resumes after an await with a stale captured `canDeleteSlots`.
+  /* The slot confirms' one shape (`components/ConfirmDialog`): the identity in mono (`slotIdentity`, as in
+     the heading — not a second spelling), Yes/No, destructive. `verb` is Delete's and
+     Forget's capability gate, at the CONTINUATION, not at render: `useConfirm` settles only when its HOST
+     unmounts (`ConfirmDialog.tsx`), so removing just the dialog would hang the await; read through the REF,
+     since this resumes after an await with a stale captured `canDeleteSlots`; and said rather than returned
+     quietly (silence would read as a delete that happened). Release passes none: its route re-evaluates the
+     capability on every request (`handleRelease`). */
+  async function confirmSlot(slot: Worktree, title: string, message: string, verb?: 'Delete' | 'Forget'): Promise<boolean> {
+    if (!await slotConfirm(danger('Yes', { title, identity: <Mono>{slotIdentity(slot)}</Mono>, message, cancelLabel: 'No' }))) return false
+    if (verb && !canDeleteRef.current) {
+      setActionError(`${verb} was not attempted — this account may no longer delete pool slots.`)
+      return false
+    }
+    return true
+  }
+
+  // The confirm, now the only friction: the delete is physical and unconditional.
   async function confirmAndDelete(slot: Worktree) {
-    /* `slotIdentity` (slot 0 is `acme#main`, as in the heading), not a second spelling. */
     const key = slotIdentity(slot)
     /* Names what is inside: the route ends the holder, and this dialog is the last warning.
        Withheld on a free slot. */
@@ -1600,25 +1361,12 @@ export default function WorktreePool({
       ? ` It is ${occupancyHint(slot)}, and that hold is ENDED by this — the runner or session in the tree` +
         ' is torn down.'
       : ''
-    const ok = await slotConfirm({
-      title: 'Delete pool slot',
-      identity: <Mono>{key}</Mono>,
-      // Names the ROW's node, and states the best-effort half: the row goes whatever the node manages.
-      message:
-        `Delete ${key}? The slot is de-declared and its directory on ${nodeLabelFor(slot.node_uuid)} is ` +
-        `deleted.${holder} Unpushed work is lost. The row goes regardless; the directory stays only if the ` +
-        'node cannot be reached — you will be told. This cannot be undone; re-declaring the ' +
-        'slot gives you a fresh clone, not this tree.',
-      confirmLabel: 'Yes',
-      cancelLabel: 'No',
-      destructive: true,
-    })
-    if (!ok) return
-    // Says so rather than returning quietly (silence would read as a delete that happened).
-    if (!canDeleteRef.current) {
-      setActionError('Delete was not attempted — this account may no longer delete pool slots.')
-      return
-    }
+    // Names the ROW's node, and states the best-effort half: the row goes whatever the node manages.
+    if (!(await confirmSlot(slot, 'Delete pool slot',
+      `Delete ${key}? The slot is de-declared and its directory on ${nodeLabelFor(slot.node_uuid)} is ` +
+      `deleted.${holder} Unpushed work is lost. The row goes regardless; the directory stays only if the ` +
+      'node cannot be reached — you will be told. This cannot be undone; re-declaring the ' +
+      'slot gives you a fresh clone, not this tree.', 'Delete'))) return
     await handleDelete(slot)
   }
 
@@ -1644,19 +1392,9 @@ export default function WorktreePool({
     const key = slotIdentity(slot)
     const where = nodeLabelFor(slot.node_uuid)
     // Names the slot and what stays: Forget never reaches the node, unlike Delete.
-    const ok = await slotConfirm({
-      title: 'Forget pool slot',
-      identity: <Mono>{key}</Mono>,
-      message: `Forget ${key}? It leaves the console and its destroy is cancelled. Nothing is sent to ${where}: its files there are not removed.`,
-      confirmLabel: 'Yes',
-      cancelLabel: 'No',
-      destructive: true,
-    })
-    if (!ok) return
-    if (!canDeleteRef.current) {
-      setActionError('Forget was not attempted — this account may no longer delete pool slots.')
-      return
-    }
+    if (!(await confirmSlot(slot, 'Forget pool slot',
+      `Forget ${key}? It leaves the console and its destroy is cancelled. Nothing is sent to ${where}: its files there are not removed.`,
+      'Forget'))) return
     await run('Failed to forget the slot', async () => {
       try {
         setNotice('')
@@ -1685,17 +1423,18 @@ export default function WorktreePool({
       try {
         setReleaseRefusal(null)
         setNotice('')
-        await releaseSlot(slot, force)
+        // Another org's slot goes as that org, for this one request (`releaseSlot`'s `asOrg`).
+        await releaseSlot(slot, force, otherOrgOf(slot.org))
         setNotice(releasedNotice(slot, nodeLabelFor(slot.node_uuid), force))
         setDetail(null)
         await loadSlots()
       } catch (err) {
         /* Both readers: `refusalMessage` keeps the live-session refusal's structured paragraph intact;
-           `apiDetail` reads string details (404, the main clone's 409). */
+           `apiDetail` reads string details (404, 409). */
         const message = refusalMessage(err) || apiDetail(err, 'Failed to release the slot')
         setActionError(message)
         /* Retry offered on the refusal's `reason`, NEVER its status (`lib/erase.ts::releaseLiveSessionRefusal`):
-           the main clone also 409s and no force resolves it. The drawer closes (the Modal would hide the
+           a 409 a force cannot resolve gets none. The drawer closes (the Modal would hide the
            banner from assistive tech); the banner names its slot. */
         const live = force ? null : releaseLiveSessionRefusal(err)
         if (live) {
@@ -1707,49 +1446,8 @@ export default function WorktreePool({
   }
 
   async function confirmAndRelease(slot: Worktree) {
-    const key = slotIdentity(slot)
-    const ok = await slotConfirm({
-      title: 'Release pool slot',
-      identity: <Mono>{key}</Mono>,
-      message: releaseConfirmMessage(slot, nodeLabelFor(slot.node_uuid)),
-      confirmLabel: 'Yes',
-      cancelLabel: 'No',
-      destructive: true,
-    })
-    if (!ok) return
+    if (!(await confirmSlot(slot, 'Release pool slot', releaseConfirmMessage(slot, nodeLabelFor(slot.node_uuid))))) return
     await handleRelease(slot)
-  }
-
-  /* The ⟳'s verb — the same request as the drawer's and the bulk Sync Git (`syncSlotGit`); here only the
-     banner and re-read. Readers in `pages/Worktrees.tsx`'s order: a node refusal is a plain `Error`; a CP
-     refusal is an `ApiError` whose sentence may be structured (else a bare `HTTP 409`). */
-  /* Which slots are mid-rebase: the ⋯ closes on press, so reopening would offer a second `sync_develop`
-     on the same clone. A SET, so one slot syncing does not disable every row. */
-  const [syncing, setSyncing] = useState<ReadonlySet<Worktree['id']>>(new Set())
-
-  async function runSyncGit(slot: Worktree) {
-    const id = slot.id
-    // The guard, not merely the indicator: a second press is dropped here.
-    if (syncing.has(id)) return
-    setSyncing(prev => withAdded(prev, id))
-    setActionError('')
-    setNotice('')
-    try {
-      await syncSlotGit(slot)
-      setNotice(`Synced ${slotIdentity(slot)} onto its integration branch.`)
-    } catch (err) {
-      const said = refusalMessage(err)
-      setActionError(
-        said ? `${slotIdentity(slot)}: ${said}`
-        : err instanceof ApiError ? `${slotIdentity(slot)}: ${apiDetail(err, 'the sync was refused')}`
-        : err instanceof Error && err.message ? err.message
-        : `Failed to sync ${slotIdentity(slot)}`,
-      )
-    } finally {
-      // `finally`, so a refusal releases the row for retry.
-      setSyncing(prev => withRemoved(prev, id))
-    }
-    refreshSoon()
   }
 
   /* Memoised: a fresh `[]` would re-fire the view report, which the page answers with `setState` — a
@@ -1816,20 +1514,6 @@ export default function WorktreePool({
      ROWS, never the roster (which may be unreadable, and includes slotless nodes). */
   const nodeSpan = useMemo(() => new Set(all.map(s => s.node_id)).size, [all])
 
-  /* The single-slot sync guard, owned by the panel so the ⟳ and the drawer ask the same question: a
-     non-blocking warning before rebasing a slot with a LIVE session (the rebase can disrupt it). Never a
-     block: `apps/jaahd/worktree_ops.py::sync_develop` is clean-rebase-only. Bulk sync skips it (rows already
-     picked, action non-destructive). */
-  const confirmSyncSlot = useCallback(
-    async (slot: Worktree) => !hasLiveSession(slot) || slotConfirm({
-      title: 'Sync over a live session',
-      identity: <Mono>{`${slot.project}#${slot.number} (${slot.session_status})`}</Mono>,
-      message: 'This slot has a LIVE session. The sync rebases it, which may disrupt the running session.',
-      confirmLabel: 'Sync anyway',
-    }),
-    [slotConfirm],
-  )
-
   /* ── The console, and the order its chevrons step through ────────────────────────────────────────
      Only this table knows "next", so `useConsoleNav` is registered by the page owning the slot list.
      Live-session slots only (a free one has nothing to attach to), taken off the EMITTED rows so the
@@ -1844,24 +1528,9 @@ export default function WorktreePool({
         s.project_id === consoleRequest.projectId && s.number === consoleRequest.number && s.node_uuid === consoleRequest.nodeId)
     : -1
 
-  const openSlotConsole = useCallback((slot: Worktree, provider?: string) => {
-    openConsole({
-      project: slot.project,
-      projectId: slot.project_id,
-      number: slot.number,
-      nodeId: slot.node_uuid,
-      kind: 'clauded',
-      /* The server's verdict for this slot; the console ANDs it with its key predicate (read-only otherwise). */
-      mayEdit: slot.may_edit,
-      // The resolved title at open time, in-flight rename included.
-      title: pendingTitles[slot.id] ?? slot.title,
-      /* `hasLiveSession`, which is narrower than the `canOpenConsoleOn` offer; the pane uses it for wording
-         only (an empty slot's 4502, `ConsolePane.tsx`'s SLOT_EMPTY_REASON). */
-      hadLiveSession: hasLiveSession(slot),
-      // Absent = Any; only the drawer's provider choice sets it.
-      ...(provider ? { provider } : {}),
-    })
-  }, [openConsole, pendingTitles])
+  const openSlotConsole = useCallback((slot: Worktree) => {
+    openConsole({ ...slotConsoleRequest(slot), kind: 'clauded' })
+  }, [openConsole])
 
   function jumpConsole(delta: number) {
     if (!consoleRequest || consoleIndex === -1) return
@@ -1883,70 +1552,39 @@ export default function WorktreePool({
     hasNext: consoleIndex !== -1 && consoleIndex < consoleOrder.length - 1,
   })
 
-  /* ── Title and Description ───────────────────────────────────────────────────────────────────────
-     Request, outcomes and `node_id` addressing are `lib/slotTitle.ts`'s; this panel owns only the
-     optimistic paint and where the notice appears. `title === null` = never landed: drop the paint. A
-     successful clear returns RESOLVED, so the response value is painted, not the typed one. */
-  async function saveTitle(slot: Worktree, value: string) {
-    setTitleNotice(null)
-    if (value) setPendingTitles(prev => ({ ...prev, [slot.id]: value }))
-    const { title, notice } = await saveSlotTitle(
-      { project: slot.project, projectId: slot.project_id, number: slot.number, nodeId: slot.node_uuid }, value,
-    )
-    if (title === null) setPendingTitles(prev => { const next = { ...prev }; delete next[slot.id]; return next })
-    else setPendingTitles(prev => ({ ...prev, [slot.id]: title }))
-    setTitleNotice(notice)
-    refreshSoon()
-  }
-
-  /* Same PUT and banner. An empty Description is painted like any value (there is no resolved fallback). */
-  async function saveDescription(slot: Worktree, value: string) {
-    setTitleNotice(null)
-    setPendingDescriptions(prev => ({ ...prev, [slot.id]: value }))
-    const { description, notice } = await saveSlotDescription(
-      { project: slot.project, projectId: slot.project_id, number: slot.number, nodeId: slot.node_uuid }, value,
-    )
-    if (description === null) setPendingDescriptions(prev => { const next = { ...prev }; delete next[slot.id]; return next })
-    else setPendingDescriptions(prev => ({ ...prev, [slot.id]: description }))
-    setTitleNotice(notice)
-    refreshSoon()
-  }
-
-  /* ── New session on a project with no repository, or on a MicroVM node ─────────────────
-     Such a project holds no declared slot, so there is no row to open a console from: the CP makes a folder
-     slot held for this person, or a VM on a MicroVM node whatever the repository
-     (`routes/console.py::console_new_session`), and the console opens on it. The declare bar
-     (`canDeclareSlots`) AND the typing tier (`canDriveSession`), since the open is two-way. */
-  const folderProjects = useMemo(
-    () => (projects ?? []).filter(p => p.has_repo === false || p.on_microvm === true), [projects])
+  /* ── New session on a MicroVM node ─────────────────
+     The CP starts a VM for this person (`routes/console.py::console_new_session`) and the console opens on it;
+     no slot is held. The declare bar (`canDeclareSlots`) AND the typing tier (`canDriveSession`), since the
+     open is two-way. */
+  const vmProjects = useMemo(() => (projects ?? []).filter(p => p.on_microvm === true), [projects])
 
   /* The new session's VM, until it runs (the console opens) or ends (its node's sentence, in operator words). One
      wait at a time: a newer session replaces it, and an answer about the replaced VM is dropped (`vmStartRef`). */
-  const [vmStart, setVmStart] = useState<{ made: NewSession; name: string } | null>(null)
+  const [vmStart, setVmStart] = useState<{ made: NewSession & { vm_id: string }; name: string } | null>(null)
   const vmStartRef = useRef(vmStart)
   vmStartRef.current = vmStart
 
-  function openNewSession(made: NewSession) {
+  function openNewSession(made: NewSession & { vm_id: string }) {
     openConsole({
       project: made.project, projectId: made.project_id, number: made.number, nodeId: made.node_uuid, kind: 'clauded',
       // A VM session holds no slot: the relay attaches its VM by `view` (number 0), as a task VM's
       // (`routes/console.py::_task_vm_console`'s opener arm), and the VM's own session is already running.
-      ...(made.vm_id ? { view: `vm:${made.vm_id}`, hadLiveSession: true } : { hadLiveSession: false }),
-      // The caller holds the slot (or opened the VM), so it is theirs to drive (`authz.worktree_editable_clause`'s
-      // owner arm).
+      view: `vm:${made.vm_id}`, hadLiveSession: true,
+      // The caller opened the VM, so it is theirs to drive (`authz.worktree_editable_clause`'s owner arm).
       mayEdit: true,
     })
   }
 
-  async function startFolderSession(projectId: number, name: string) {
+  async function startVmSession(projectId: number, name: string) {
     await run(`Failed to start a session in ${name}`, async () => {
       setNotice('')
       setVmStart(null)
       const made = await post<NewSession>(`/api/console/${projectId}/new-session`, {})
       await loadSlots()
       // A VM session opens once its VM runs: a pane opened before then could only say no session is there.
-      if (made.vm_id) setVmStart({ made, name })
-      else openNewSession(made)
+      if (made.vm_id) setVmStart({ made: { ...made, vm_id: made.vm_id }, name })
+      // No VM free on the project's nodes: the console only attaches, so nothing is opened.
+      else setActionError(`No MicroVM node has room for a session in ${name}.`)
     })
   }
 
@@ -1957,7 +1595,7 @@ export default function WorktreePool({
     const stillWaiting = () => vmStartRef.current?.made.vm_id === made.vm_id
     try {
       const vm = await get<{ state: string; reason: string | null }>(
-        `/api/console/${made.project_id}/vms/${encodeURIComponent(made.vm_id ?? '')}`)
+        `/api/console/${made.project_id}/vms/${encodeURIComponent(made.vm_id)}`)
       if (!stillWaiting() || vm.state === 'provisioning') return
       setVmStart(null)
       if (vm.state === 'running') openNewSession(made)
@@ -1970,7 +1608,7 @@ export default function WorktreePool({
     }
   }, vmStart ? VM_START_POLL_MS : null)
 
-  const newSessionControl = canDeclareSlots && canDriveSession && folderProjects.length > 0 ? (
+  const newSessionControl = canDeclareSlots && canDriveSession && vmProjects.length > 0 ? (
     <OverflowMenu
       button={{ label: 'New session', variant: 'outlined' }}
       size="small"
@@ -1981,7 +1619,7 @@ export default function WorktreePool({
          (`authz/enforce.py::OtherOrgDenial`), and this page is the operator's alone, so the org's seat cannot reach
          it. One press goes where that seat can: this tab acts as the org and opens a new chat on the
          project — the session that org's own people would start. The label names the switch before the press. */
-      items={folderProjects.map(p => {
+      items={vmProjects.map(p => {
         const otherOrg = otherOrgOf(p.org)
         if (otherOrg) {
           const label = `${p.name} — chat as ${otherOrg.name}`
@@ -1995,7 +1633,7 @@ export default function WorktreePool({
         }
         return {
           key: String(p.id), label: p.name, ariaLabel: p.name, testId: 'pool-new-session-project',
-          onClick: () => void startFolderSession(p.id, p.name),
+          onClick: () => void startVmSession(p.id, p.name),
         }
       })}
     />
@@ -2007,18 +1645,11 @@ export default function WorktreePool({
        · The Title link is the only link.
        · `disclosure` qualifies `slotIdentity` (which repeats across nodes) with the node. Specs address rows
          by `[aria-label^="<identity> — "]`, so the identity stays the PREFIX. */
-  /* `node|project` pairs holding a task slot (number ≥1). A main clone alone runs no task: its row says so.
-     Over every slot, not the filtered view. */
-  const taskSlotPairs = useMemo(
-    () => new Set((slots ?? []).filter(s => s.number !== MAIN_CLONE_NUMBER).map(s => `${s.node_uuid}|${s.project_id}`)),
-    [slots],
-  )
-
   function slotRow(slot: Worktree): FeedRowSpec {
     const identity = slotIdentity(slot)
     const nodeLabel = nodeLabelFor(slot.node_uuid)
     const disclosure = `${identity} — on ${nodeLabel}`
-    const rowTitle = resolveTitle(slot, pendingTitles[slot.id])
+    const rowTitle = resolveTitle(slot)
     const account = accountFor(slot)
     const quotaWarned = showQuotaBadge(slot, account)
     const quotaWords = `${account?.name || account?.email || 'this slot’s account'} is near a quota limit`
@@ -2035,18 +1666,15 @@ export default function WorktreePool({
     // The offline verdict is per ROW: neighbours can be on different machines.
     const rowOffline = isOffline(slot.node_uuid)
     const mark = slotMark(slot, rowOffline, nodeLabel)
-    const mayDrive = canEdit && slot.may_edit
-    const canConsole = !rowOffline
-      && canOpenConsoleOn(slot, { mayCreate: canDriveSession && slot.may_edit })
-    /* `may_edit` is the CP's verdict on THIS slot, so a pool admin is not offered a sync that 403s. */
-    const canSync = mayDrive && !rowOffline && !isFolderSlot(slot) && (slot.behind ?? 0) > 0
+    // Attach only: a console opens on a live session, never a new one.
+    const canConsole = !rowOffline && hasLiveSession(slot)
     // An address is not a running server, and an unreachable node has none.
     const webHref = slot.stack_state === 'up' && !rowOffline ? slotWebHref(slot) : undefined
     const picked = selected.has(slot.id)
-    /* Two denials, two sentences (node down vs no grant), on the Session slot's `title`. */
+    /* Two denials, two sentences (node down vs nothing to attach to), on the Session slot's `title`. */
     const consoleDenial = rowOffline
       ? `${nodeLabel} is offline`
-      : 'no session is running, and this account may not open one here'
+      : 'no session is running'
 
     /* Markers, not slots (each is rare): `◌` lifecycle (declared, not built), `⚠` quota, `!` a hold
        awaiting the reader. Announced via `ariaLabel`. */
@@ -2129,7 +1757,7 @@ export default function WorktreePool({
     slots.push(selectSlot('col-slot-select',
       <SelectRowBox testId="slot-select" checked={picked} onChange={() => toggleSelected(slot.id)} name={disclosure} />))
 
-    /* The ⋯, ordered as reached for: look (Details, console), repair (Sync), leave (Launch), then Select.
+    /* The ⋯, ordered as reached for: look (Details, console), leave (Launch), then Select.
        Stack commands, Logs, Finder, Cursor, clipboard, Release and Delete stay in the drawer. */
     const actions: OverflowItem[] = [
       {
@@ -2149,16 +1777,6 @@ export default function WorktreePool({
         onClick: () => openSlotConsole(slot),
       })
     }
-    if (canSync) {
-      actions.push({
-        key: 'sync',
-        icon: '⟳',
-        label: 'Sync',
-        ariaLabel: `Sync ${disclosure} with the integration branch`,
-        // The same guard as the drawer's Sync Git.
-        onClick: () => void confirmSyncSlot(slot).then(ok => { if (ok) void runSyncGit(slot) }),
-      })
-    }
     if (webHref) {
       actions.push({
         key: 'launch',
@@ -2169,8 +1787,6 @@ export default function WorktreePool({
         href: webHref,
       })
     }
-    // A node holding only the main clone has no task slot: its note says so (a task leases one when it runs).
-    const noTaskSlot = slot.number === MAIN_CLONE_NUMBER && !taskSlotPairs.has(`${slot.node_uuid}|${slot.project_id}`)
     actions.push({
       key: 'select',
       icon: picked ? '☑' : '☐',
@@ -2191,8 +1807,6 @@ export default function WorktreePool({
 
     return {
       key: slot.id,
-      /* In flight: `RowActionsOverflow` stands the sheet's items down; `runSyncGit` guards again. */
-      busy: syncing.has(slot.id),
       indicator: {
         tone: mark.tone,
         glyph: mark.glyph,
@@ -2205,16 +1819,14 @@ export default function WorktreePool({
       },
       title: (
         <>
-          <Box
+          <Tip title={identity}><Box
             component="span"
             data-testid="slot-id-text"
-            title={identity}
-            /* `slotNumberLabel` spells slot 0 `main`, so its prefix carries the `#` (`acme#main`). */
-            {...(flatColumns && { 'data-project-prefix': slot.number === MAIN_CLONE_NUMBER ? `${slot.project}#` : slot.project })}
+            {...(flatColumns && { 'data-project-prefix': slot.project })}
             sx={[monoSx, SLOT_NUMBER_SX, SLOT_PROJECT_PREFIX_SX]}
           >
             {slotNumberLabel(slot)}
-          </Box>
+          </Box></Tip>
           <SlotMarks slot={slot} />
           {/* `—` is ink only: the accessible name keeps `free`, the one place the disc's occupancy is said aloud. */}
           {titleShown(rowTitle)}
@@ -2223,14 +1835,13 @@ export default function WorktreePool({
       titleText: `${disclosure} — ${rowTitle === FREE_TITLE ? rowTitle : titleShown(rowTitle)}`,
       ariaLabel,
       /* The Title is CP-owned and arrives resolved (`apps/api/app/slot_title.py`); a live task makes the naming
-         region the deep link. The optimistic title is shown here too, not the raw `slot.title`. */
-      href: slot.task_active && slot.task_id !== null ? taskDeepLinkPath(slot.task_id) : undefined,
+         region the deep link. */
+      href: slot.task_active && slot.task_id !== null ? taskDeepLinkPath(slot.task_id) : null,
       markers,
       slots,
       actions,
       onRowClick: () => setDetail(slot),
       rowClickLabel: `Show slot details for ${disclosure}`,
-      notes: noTaskSlot ? [{ key: 'no-task-slot', tone: 'muted', text: 'No task slot' }] : undefined,
       // The row's own oracles.
       data: {
         slot: slot.id,
@@ -2302,14 +1913,14 @@ export default function WorktreePool({
           shown={`${onScreen.length} slot(s) shown`}
         />
       </Box>
-      <Box aria-hidden="true" sx={SELECT_ALL_ACTIONS_SPACER_SX} />
+      <Box aria-hidden="true" sx={ACTIONS_SPACER_SX} />
     </Box>
   ) : null
 
   return (
     <Card variant="outlined">
       <CardContent sx={CARD_CONTENT_SX}>
-        {/* The page's verbs ride the Automation strip's action slot after the page's toolbar, the primary
+        {/* The page's verbs ride the page header after the page's toolbar, the primary
             filled, as on Brains and Projects; `PageHeader` portals them. Both portals append to the
             strip, so this one lands after `pages/Worktrees.tsx`'s toolbar because that header mounts first and
             never unmounts (`e2e/worktrees-mobile.spec.ts` pins the order). */}
@@ -2324,7 +1935,7 @@ export default function WorktreePool({
           <Box sx={POOL_HEADING_GROUP_SX}>
             {hasSlots && (
               <Typography data-testid="pool-rollup" variant="caption" component="span" sx={{ color: 'text.secondary' }}>
-                {rollup} · on {nodeSpan} node{nodeSpan === 1 ? '' : 's'}
+                {rollup} · on {countOf(nodeSpan, 'node')}
               </Typography>
             )}
           </Box>
@@ -2344,10 +1955,6 @@ export default function WorktreePool({
           </Banner>
         )}
         {slotsError && <Banner severity="error">{slotsError}</Banner>}
-        {/* The last Title/Description edit's outcome; one slot for both fields and severities. */}
-        {titleNotice && (
-          <Banner severity={titleNotice.kind === 'error' ? 'error' : 'info'}>{titleNotice.text}</Banner>
-        )}
         {projectsError && <Banner severity="error">{projectsError}</Banner>}
         {actionError && <Banner severity="error">{actionError}</Banner>}
         {/* A successful write's node consequence: Delete — the directory survived; Add — the clone will
@@ -2416,14 +2023,9 @@ export default function WorktreePool({
         )}
         {detail && (
           <SlotDetail
-            /* Keyed per slot: a provider picked for one slot must never ride into another's console. */
+            /* Keyed per slot, so one slot's drawer state never carries into another's. */
             key={detail.id}
-            /* The optimistic overlay, applied once here; the pending maps clear when a payload agrees. */
-            slot={{
-              ...detail,
-              title: pendingTitles[detail.id] ?? detail.title,
-              description: pendingDescriptions[detail.id] ?? detail.description,
-            }}
+            slot={detail}
             nodeLabel={nodeLabelFor(detail.node_uuid)}
             nodeOffline={isOffline(detail.node_uuid)}
             account={accountFor(detail)}
@@ -2437,12 +2039,9 @@ export default function WorktreePool({
             canEdit={canEdit}
             canDriveSession={canDriveSession}
             onRun={refreshSoon}
-            onConfirmSync={confirmSyncSlot}
             /* The console opens beside the page, and a drawer left open over it hid its header controls: the drawer
                hands over to it. */
-            onOpenConsole={(s, provider) => { setDetail(null); openSlotConsole(s, provider) }}
-            onSaveTitle={(s, v) => void saveTitle(s, v)}
-            onSaveDescription={(s, v) => void saveDescription(s, v)}
+            onOpenConsole={s => { setDetail(null); openSlotConsole(s) }}
             canSetCloneOwner={canDeclareSlots}
           />
         )}

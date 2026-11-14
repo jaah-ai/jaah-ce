@@ -15,6 +15,15 @@ type Target = { path: string; state?: unknown; replace?: boolean; popped?: boole
 
 const NO_KEYS: readonly string[] = []
 
+/** The mounted guards now holding unsaved work, one entry per dirty `useLeaveGuard`. */
+const dirtyGuards = new Set<string>()
+
+/** True while any mounted page holds unsaved work: what the update auto-reload (`components/UpdateBanner.tsx`)
+ *  must not throw away. */
+export function hasUnsavedWork(): boolean {
+  return dirtyGuards.size > 0
+}
+
 /** `/settings/` and `/settings` are one page. */
 const samePath = (a: string, b: string) => a.replace(/\/+$/, '') === b.replace(/\/+$/, '')
 
@@ -37,7 +46,9 @@ const stays = (next: URL, pathname: string, search: string, keys: readonly strin
  * pop). The blocker is registered on the router itself rather than through `useBlocker`, which throws outside a data
  * router (a test's `MemoryRouter`, the Live Cast viewer): there only links and `navigate()` are gated. The router
  * keeps ONE blocker: mount one dirty guard per page.
- * `save` resolves true when the write LANDED; only then does Save leave. */
+ * `save` resolves true when the write LANDED; only then does Save leave. `leaveNow` is the page's own way OFF this page
+ * that must not ask (its Save landed, its row was deleted): it passes the gate as the dialog's own leave does, until
+ * the page is gone. */
 export function useLeaveGuard(
   dirty: boolean,
   save: () => Promise<boolean>,
@@ -86,6 +97,12 @@ export function useLeaveGuard(
       window.removeEventListener('beforeunload', onBeforeUnload)
     }
   }, [dirty, navigator, pathname, search, searchKeys])
+
+  useEffect(() => {
+    if (!dirty) return
+    dirtyGuards.add(blockerKey)
+    return () => { dirtyGuards.delete(blockerKey) }
+  }, [dirty, blockerKey])
 
   useEffect(() => {
     if (!dirty || !router) return
@@ -143,5 +160,27 @@ export function useLeaveGuard(
     }
   }, [target, saving, save, leave, settlePop])
 
-  return { open: target !== null, saving, onChoose, leaveTo }
+  const leaveNow = useCallback((path: string, opts?: { replace?: boolean; state?: unknown }) => {
+    passing.current = true
+    navigate(path, opts)
+  }, [navigate])
+
+  return { open: target !== null, saving, onChoose, leaveTo, leaveNow }
+}
+
+/* The edit pages' Save and gate as one: `saveNow` is the form's submit (false when `canSave` says there is nothing
+ * to write or the write was refused — the page shows why), and the same `saveNow` is what the leave dialog's Save
+ * runs. `write` resolves once the mutation landed. */
+export function useSaveOrLeaveGuard(dirty: boolean, canSave: boolean, write: () => Promise<unknown>) {
+  const saveNow = async (): Promise<boolean> => {
+    if (!canSave) return false
+    try {
+      await write()
+      return true
+    } catch {
+      return false
+    }
+  }
+  const leave = useLeaveGuard(dirty, saveNow)
+  return { saveNow, leave }
 }

@@ -8,7 +8,7 @@
 
 import { useState } from 'react'
 import { NAME_PATH_SEPARATOR } from './nameTree'
-import { readJsonObject, writeJson } from './safeStorage'
+import { adminScopedKey, readJsonObject, writeJson } from './safeStorage'
 import { readExpandedPaths, readTreeMode, type TreeViewMode } from './treeViewStorage'
 
 export type ListView = {
@@ -25,7 +25,7 @@ export type ListViewRoster = 'playbooks' | 'automations'
 export const DEFAULT_LIST_VIEW: ListView = { q: '', mode: 'flat', expanded: [] }
 
 export function listViewStorageKey(roster: ListViewRoster, adminId: string | null): string {
-  return `cockpit.${roster}.view:${adminId ?? 'anon'}`
+  return adminScopedKey(`cockpit.${roster}.view`, adminId)
 }
 
 /** The view before this viewer ever changed it. `fallback` lets a roster open in Tree mode (Automations, whose

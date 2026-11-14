@@ -1,0 +1,60 @@
+# Slack, over the `slack_workspace` type and the registered `slack` provider (adopted, AS3: nothing of either
+# changes). Connect is the workspace install: `slack_workspaces.on_grant` writes the org's system-owned
+# `slack_workspace` row and its routing (`routes/slack_connect.py::CONNECT_HOOKS`). The operator-plane `slack` app
+# type is never offered here. Facts confirmed at the vendor's own docs: OAuth v2 install (comma-separated bot scopes,
+# no PKCE) https://docs.slack.dev/authentication/installing-with-oauth ; bot scopes https://docs.slack.dev/reference/scopes
+slug = "slack"
+label = "Slack"
+category = "messaging"
+credential_type = "slack_workspace"
+vendor_docs_url = "https://docs.slack.dev/authentication/installing-with-oauth"
+summary = "Install Jaah in your Slack workspace: questions, task updates and replies in Slack."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+# The registered provider's endpoints, bot scopes and separator (the conflict guard compares the endpoints).
+authorize_url = "https://slack.com/oauth/v2/authorize"
+token_url = "https://slack.com/api/oauth.v2.access"
+pkce = false
+scope_separator = ","
+scopes = [
+  { name = "chat:write", label = "Post task questions, updates and results in channels Jaah is in" },
+  { name = "im:write", label = "Open a direct message with a person to ask them a question" },
+  { name = "im:history", label = "Read replies in those direct messages, so an answer reaches the task" },
+  { name = "app_mentions:read", label = "See when someone mentions @Jaah, to start or answer a task" },
+  { name = "links:read", label = "See Jaah links posted in Slack, to unfurl them" },
+  { name = "links:write", label = "Show a preview of a Jaah task under its link" },
+  { name = "users:read", label = "Match Slack members to Jaah members, so the right person is asked" },
+  { name = "channels:read", label = "List the public channels, so an Owner or Admin can pick one for alerts" },
+  { name = "groups:read", label = "List the private channels Jaah was invited to, for the same choice" },
+  { name = "chat:write.public", label = "Post alerts in a public channel Jaah was not invited to" },
+]
+
+[docs]
+agent_uses = [
+  "Ask a person a question in Slack when a task needs a human answer, and carry the reply back to the task",
+  "Post task updates and results to the channel you choose",
+  "Start or answer work when someone mentions @Jaah",
+  "Show a preview card under Jaah task links pasted in Slack",
+]
+prerequisites = [
+  "Permission to install apps in the Slack workspace (a Workspace Owner or Admin, or a member where the workspace lets members install apps)",
+  "A Jaah plan that includes Slack, and the Jaah Owner or Admin role in your org",
+]
+limitations = [
+  "One Slack workspace per Jaah org. Connecting another workspace replaces the first",
+  "Jaah only sees channels it is invited to: type /invite @Jaah in a channel to add it",
+  "The Slack install is the org's: its bot token is held by Jaah for messaging and is never handed to agents",
+  "Enterprise Grid orgs install per workspace, and an org admin may need to approve the app first",
+]
+troubleshooting = [
+  { symptom = "Slack says the app is not approved or requires admin approval", fix = "Your workspace restricts app installs. Ask a Slack admin to approve Jaah (Slack admin > Manage apps), then select Connect Slack again" },
+  { symptom = "Jaah does not answer in a channel", fix = "Jaah is not in that channel. Type /invite @Jaah in it" },
+  { symptom = "Add channel says Reconnect Slack in Settings to add channels", fix = "Your workspace was connected before Jaah could list channels. An Owner or Admin selects Reconnect on the org's Slack tab and approves the app again" },
+  { symptom = "Test says Slack rejected the bot token (invalid_auth or token_revoked)", fix = "Jaah was uninstalled from the workspace. Select Connect Slack again to reinstall it" },
+]
+faq = [
+  { q = "Do I need my own Slack app", a = "No. Connect Slack installs Jaah's own Slack app in your workspace" },
+  { q = "Can agents read my Slack channels", a = "No. The install lets Jaah post, read replies to its own direct messages and mentions of @Jaah; it does not read channel history, and the token never reaches an agent" },
+]

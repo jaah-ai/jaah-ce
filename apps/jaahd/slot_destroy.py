@@ -5,15 +5,17 @@ ack does to the row and the task) is the CP's (`app/slot_allocation.py::retire`,
 Three steps, in this order, each reported on the ack's `report`:
 
 1. `scan_unpushed` — what would be lost: commits on the tree's checked-out HEAD and on the task's own
-   `fleet/task-<id>` branch that no `origin` ref contains, read BEFORE the erase. Scoped to those two refs
-   because `refs/heads` is clone-wide: every other local branch belongs to a sibling slot, or to no slot.
+   `fleet/task-<id>` branch that no `origin` ref contains, read BEFORE the erase. Informational only: nothing
+   is backed up (D8).
 2. `compose_down` — `docker compose -p <compose_project> down -v --rmi local --remove-orphans`, volumes and
    built images included. Not `stack_ops.stop_stack`, which refuses `-v` on purpose (its idle stop keeps
    data); a destroyed slot's data is the thing being destroyed. What still carries the project's label is
-   removed after it. A node with no docker (rc 127) has no stack: the step is skipped, not failed.
-3. `erase_tree` — `worktree_ops.worktree_erase`: `git worktree remove --force` and prune, the slot's scratch
-   dirs, an already-absent tree counted erased. It never refuses for what the tree holds; its containment
-   checks (the path is not this slot's) are the ack's `refused`.
+   removed after it. A node with no docker (rc 127), or docker without its compose plugin, has no stack: the
+   step is skipped, not failed.
+3. `erase_tree` — `worktree_ops.worktree_erase`: `rm -rf` of the slot's standalone clone and of every other
+   repository directory of the slot (`slot_repos.release_slot_repos`), its scratch dirs, an already-absent tree
+   counted erased. It never refuses for what the tree holds; its containment checks (the path is not this
+   slot's) are the ack's `refused`.
 
 The `_shell`/`_erase` seams are module globals so a test substitutes docker and the erase handler without
 touching git."""
@@ -48,8 +50,8 @@ def compose_project_for(payload: dict, project_id: int | None, number: str) -> s
 def scan_unpushed(cwd: str, *, head: bool, task_branch: str) -> list[dict] | dict:
     """`[{"branch", "shas"}]` for each looked-at ref with commits on no `origin` ref, or
     `{"unknown": True, "reason"}` when git could not answer — "nobody could look" never reads as "nothing
-    lost". `head` adds the tree's own checkout (absent once the tree is gone); `task_branch` (`""` = none)
-    is read from the clone, where it outlives the tree."""
+    lost". `head` adds the tree's own checkout; `task_branch` (`""` = none) is the task's own branch in the
+    same clone."""
     from worktree_mechanics.core import _git  # noqa: PLC0415 — deferred, as every git caller in this package
 
     refs: list[tuple[str, str]] = []
@@ -72,6 +74,7 @@ def scan_unpushed(cwd: str, *, head: bool, task_branch: str) -> list[dict] | dic
 
 
 NO_DOCKER = "docker not installed: no stack to stop"
+NO_COMPOSE = "docker compose not installed: no stack to stop"
 
 
 def _docker_missing() -> bool:
@@ -101,6 +104,10 @@ def compose_down(compose_project: str, cwd: str) -> tuple[bool, str]:
                    "--remove-orphans"], cwd)
     if down.get("exit_code") == 127:
         return True, NO_DOCKER
+    if down.get("exit_code") != 0 and _shell(["docker", "compose", "version"], cwd).get("exit_code") != 0:
+        # docker without its compose plugin parses `compose -p` as its own flags ("unknown shorthand flag: 'p'"):
+        # no compose, so no compose stack. Failing here parked every destroy and filled the node's slot cap.
+        return True, NO_COMPOSE
     if down.get("exit_code") != 0:
         why = (down.get("stderr") or down.get("stdout") or "").strip()[:500]
         return False, f"docker compose -p {compose_project} down -v failed (rc={down.get('exit_code')}): {why}"

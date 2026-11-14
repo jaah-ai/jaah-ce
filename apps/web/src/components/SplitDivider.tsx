@@ -3,9 +3,12 @@
 // pane (the artifacts chooser, components/tasks/TaskArtifacts.tsx). 8px of hit area with a 1px rule,
 // FOCUSABLE with arrow keys (`separator` + `aria-valuenow` means "resizable split" to a screen reader).
 // It owns the gesture only; what a position MEANS is the caller's `onMove`.
-import { useEffect, useRef, useState } from 'react'
+// NO HOVER TOOLTIP: a tip on a full-height strip opens past the viewport's edge, grows the page a scrollbar,
+// shifts the strip from under the pointer and closes — a loop that shook the page every ~0.5s.
+import { useState } from 'react'
 import Box from '@mui/material/Box'
 import { DIVIDER_PX } from '../lib/splitPane'
+import { useWindowDrag } from '../hooks/useWindowDrag'
 
 /** 24px ≈ 3 terminal columns (or one list row) per arrow press. */
 const KEY_STEP_PX = 24
@@ -37,30 +40,18 @@ export default function SplitDivider({
 }) {
   const horizontal = orientation === 'horizontal'
   const [dragging, setDragging] = useState(false)
-  // Window listeners, not `setPointerCapture` (unimplemented in jsdom), and they keep tracking when the
-  // pointer leaves the 8px strip.
-  const teardownRef = useRef<(() => void) | null>(null)
-  useEffect(() => () => teardownRef.current?.(), [])
+  const attachDrag = useWindowDrag()
 
   const startDrag = (e: React.PointerEvent) => {
-    // A drag already owns the listeners; overwriting `teardownRef` would orphan them (second pointer, a
-    // swallowed `pointerup`).
-    if (e.button !== 0 || teardownRef.current) return
-    e.preventDefault()
-    setDragging(true)
+    if (e.button !== 0) return
     // Grab offset, so the strip stays under the finger.
     const rect = e.currentTarget.getBoundingClientRect()
     const grabOffset = horizontal ? e.clientY - rect.top : e.clientX - rect.left
     const onPointerMove = (ev: PointerEvent) => onMove(horizontal ? ev.clientY : ev.clientX, grabOffset)
-    const onPointerUp = () => {
-      window.removeEventListener('pointermove', onPointerMove)
-      window.removeEventListener('pointerup', onPointerUp)
-      teardownRef.current = null
-      setDragging(false)
-    }
-    window.addEventListener('pointermove', onPointerMove)
-    window.addEventListener('pointerup', onPointerUp)
-    teardownRef.current = onPointerUp
+    // Refused while a drag owns the listeners (second pointer, a swallowed `pointerup`).
+    if (!attachDrag(onPointerMove, () => setDragging(false))) return
+    e.preventDefault()
+    setDragging(true)
   }
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -79,8 +70,7 @@ export default function SplitDivider({
       role="separator"
       aria-orientation={orientation}
       aria-label={ariaLabel}
-      /* The only affordance for the double-click reset. */
-      title="Double-click to reset"
+      aria-description="Double-click or Home to reset"
       aria-valuenow={Math.round(valueNow)}
       aria-valuemin={0}
       aria-valuemax={100}
@@ -89,7 +79,9 @@ export default function SplitDivider({
       onDoubleClick={onReset}
       onKeyDown={onKeyDown}
       sx={{
-        flex: `0 0 ${DIVIDER_PX}px`,
+        flexGrow: 0,
+        flexShrink: 0,
+        flexBasis: DIVIDER_PX,
         alignSelf: 'stretch',
         cursor: horizontal ? 'row-resize' : 'col-resize',
         position: 'relative',
@@ -104,10 +96,10 @@ export default function SplitDivider({
         '&::after': {
           content: '""',
           position: 'absolute',
-          bgcolor: 'divider',
+          borderColor: 'divider',
           ...(horizontal
-            ? { left: 0, right: 0, top: '50%', height: '1px', transform: 'translateY(-50%)' }
-            : { top: 0, bottom: 0, left: '50%', width: '1px', transform: 'translateX(-50%)' }),
+            ? { left: 0, right: 0, top: '50%', height: 0, borderTop: 1, transform: 'translateY(-50%)' }
+            : { top: 0, bottom: 0, left: '50%', width: 0, borderLeft: 1, transform: 'translateX(-50%)' }),
         },
       }}
     />

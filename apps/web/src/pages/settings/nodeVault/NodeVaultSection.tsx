@@ -3,23 +3,27 @@ import { Link as RouterLink } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Link from '@mui/material/Link'
+import ExternalLink from '../../../ui/ExternalLink'
 import Typography from '@mui/material/Typography'
-import { ApiError, apiDetail } from '../../../api'
+import { ApiError } from '../../../api'
 import { useAuth } from '../../../auth'
-import { useConfirm } from '../../../components/ConfirmDialog'
+import { danger, useConfirm } from '../../../components/ConfirmDialog'
+import { useApiRead } from '../../../hooks/useApiRead'
 import { useRowActions } from '../../../hooks/useBusyIds'
-import { usePoll } from '../../../hooks/usePoll'
 import { useUrlFilters } from '../../../hooks/useUrlFilters'
+import { FONT_WEIGHT } from '../../../theme'
 import Banner from '../../../ui/Banner'
 import LoadingState from '../../../ui/LoadingState'
 import { KeyValue, KeyValueList } from '../../../ui/KeyValueList'
+import { countOf } from '../../../lib/humanize'
 import { shortHash } from '../../../lib/nodeVaultKeys'
 import { planSwitchOn } from '../../../lib/planSwitches'
-import { shortDay } from '../../../lib/relativeTime'
+import { shortDate } from '../../../lib/relativeTime'
 import { usePublicSettings } from '../../authEntry'
 import { getNodeVault, NODEVAULT_AUDIT_URL, retireKey, startOver, type NodeVaultStatus } from './api'
 import KeyStepper from './KeyStepper'
 import NodeGrantList from './NodeGrantList'
+import Tip from '../../../ui/Tip'
 
 /* Settings → NodeVault. Org Owner/Admin only — `Settings.tsx`
  * mounts it for an org-admin seat and every route is `@org_admin`; the API is the boundary. One read,
@@ -38,6 +42,8 @@ const POLL_BUSY_MS = 4000
 const POLL_IDLE_MS = 30000
 const RESULT_PARAM = 'nvop'
 const ROTATION_PARAM = 'nvrot'
+/** The read's answer for an org the API refuses (403): an answer, not a failure — nothing is drawn (AC-1.2). */
+const NOT_IN_PLAN = 'not-in-plan'
 
 const KIND_WORDS: Record<string, string> = {
   rotation: 'A key rotation is running.',
@@ -50,7 +56,7 @@ export function keysInUse(count: number): string {
   return count === 1 ? '1 credential still uses this key' : `${count} credentials still use this key`
 }
 
-const nodesWord = (n: number) => (n === 1 ? '1 node' : `${n} nodes`)
+const nodesWord = (n: number) => countOf(n, 'node')
 
 /** What Start over loses, named: the credentials sealed under the key no node holds. */
 export function startOverMessage(count: number, frozen: boolean): string {
@@ -74,9 +80,9 @@ function NodeVaultIntro(): JSX.Element {
       {docsUrl && (
         <>
           {' '}
-          <Link href={`${docsUrl.replace(/\/+$/, '')}${HOW_IT_WORKS_PATH}`} target="_blank" rel="noopener noreferrer" sx={{ whiteSpace: 'nowrap' }}>
+          <ExternalLink href={`${docsUrl.replace(/\/+$/, '')}${HOW_IT_WORKS_PATH}`} sx={{ whiteSpace: 'nowrap' }}>
             How NodeVault works
-          </Link>
+          </ExternalLink>
         </>
       )}
     </Typography>
@@ -88,9 +94,6 @@ export default function NodeVaultSection(): JSX.Element {
   const orgId = admin?.org?.id ?? ''
   // An org the API would refuse (`nodevault_enabled` off) draws nothing, without a read that can only 403.
   const readable = planSwitchOn(admin, 'nodevault_enabled')
-  const [status, setStatus] = useState<NodeVaultStatus | null>(null)
-  const [notInPlan, setNotInPlan] = useState(false)
-  const [loadError, setLoadError] = useState('')
   const [setupOpen, setSetupOpen] = useState(false)
   const [rotateOpen, setRotateOpen] = useState(false)
   const { busy: retiring, error: retireError, run } = useRowActions()
@@ -101,29 +104,51 @@ export default function NodeVaultSection(): JSX.Element {
   const rotationOp = searchParams.get(ROTATION_PARAM)
   const setResultOp = useCallback((id: string) => setParam({ [RESULT_PARAM]: id }), [setParam])
 
-  // Only the newest read lands: a poll that left before an Abandon must not put the abandoned setup back.
-  const seq = useRef(0)
-  const load = useCallback(async () => {
-    const mine = ++seq.current
-    try {
-      const next = await getNodeVault()
-      if (mine !== seq.current) return
-      setStatus(next)
-      setNotInPlan(false)
-      setLoadError('')
-      // Remember a running setup, so its Result can be shown after it closes (and after a reload).
-      if (next.operation?.kind === 'setup' && next.operation.id !== resultOp) setResultOp(next.operation.id)
-      if (next.operation?.kind === 'rotation' && next.operation.id !== rotationOp) setParam({ [ROTATION_PARAM]: next.operation.id })
-    } catch (err) {
-      if (mine !== seq.current) return
-      if (err instanceof ApiError && err.status === 403) setNotInPlan(true)
-      else setLoadError(apiDetail(err, 'Couldn’t load NodeVault. Reload the page.'))
-    }
-  }, [resultOp, setResultOp, rotationOp, setParam])
+  /* One react-query read, polled faster while an operation runs or a stepper is open. The 403 is caught INTO
+     the answer rather than left to the error banner: the panel's own says-nothing branch below, not
+     `useApiRead`'s banner, is what a refused org gets. */
+  const stepping = setupOpen || rotateOpen || resultOp !== null || rotationOp !== null
+  const { data, error: loadError, refresh: load } = useApiRead<NodeVaultStatus | typeof NOT_IN_PLAN>(
+    ['nodevault'],
+    () => getNodeVault().catch((err: unknown) => {
+      if (err instanceof ApiError && err.status === 403) return NOT_IN_PLAN
+      throw err
+    }),
+    'Couldn’t load NodeVault. Reload the page.',
+    {
+      enabled: readable,
+      refetchInterval: s => stepping || (s !== null && s !== NOT_IN_PLAN && s.operation != null) ? POLL_BUSY_MS : POLL_IDLE_MS,
+    },
+  )
+  const notInPlan = data === NOT_IN_PLAN
+  const status = data === NOT_IN_PLAN ? null : data
 
-  const busy = setupOpen || rotateOpen || status?.operation != null || resultOp !== null || rotationOp !== null
-  useEffect(() => { if (readable) void load() }, [load, busy, readable])
-  usePoll(load, readable ? (busy ? POLL_BUSY_MS : POLL_IDLE_MS) : null)
+  /* Remember a running setup or rotation, so its Result can be shown after it closes (and after a reload).
+     Written only when an ANSWER names an operation this mount has not seen (`seenOp`), never because the param
+     changed: Abandon clears the param while the cached answer still names the operation, and that answer must
+     not write it back — the one re-read `exit` asks for then lands with no operation. A poll that left before
+     the Abandon is dropped by that re-read (react-query cancels the fetch a `refetch` overtakes), and even one
+     that landed would name the id already seen. */
+  const seenOp = useRef<string | null>(null)
+  useEffect(() => {
+    const op = status?.operation ?? null
+    const id = op?.id ?? null
+    if (id === seenOp.current) return
+    seenOp.current = id
+    if (op?.kind === 'setup') setResultOp(op.id)
+    if (op?.kind === 'rotation') setParam({ [ROTATION_PARAM]: op.id })
+  }, [status, setResultOp, setParam])
+
+  // Opening a stepper re-reads at once: the first fresh status must not wait a poll interval.
+  function openSetup() {
+    setSetupOpen(true)
+    void load()
+  }
+
+  function openRotation() {
+    setRotateOpen(true)
+    void load()
+  }
 
   function exit() {
     setSetupOpen(false)
@@ -138,26 +163,17 @@ export default function NodeVaultSection(): JSX.Element {
   }
 
   async function retire(hash: string) {
-    const ok = await confirm({
+    if (!await confirm(danger('Retire', {
       title: 'Retire key?',
       identity: <Box component="span" sx={{ fontFamily: 'monospace' }}>{shortHash(hash)}</Box>,
       message: 'It is deleted from every node. This can’t be undone. No credential uses it.',
-      confirmLabel: 'Retire',
-      destructive: true,
-    })
-    if (!ok) return
+    }))) return
     await run(hash, 'Couldn’t retire the key. Try again.', () => retireKey(hash))
     void load()
   }
 
   async function startAfresh(count: number) {
-    const ok = await confirm({
-      title: 'Start NodeVault over?',
-      message: startOverMessage(count, status?.frozen ?? false),
-      confirmLabel: 'Start over',
-      destructive: true,
-    })
-    if (!ok) return
+    if (!await confirm(danger('Start over', { title: 'Start NodeVault over?', message: startOverMessage(count, status?.frozen ?? false) }))) return
     await run('start-over', 'Couldn’t start over. Try again.', () => startOver())
     void load()
   }
@@ -181,7 +197,7 @@ export default function NodeVaultSection(): JSX.Element {
       ) : !status.setup ? (
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, alignItems: 'flex-start' }}>
           <NodeVaultIntro />
-          <Button variant="contained" disabled={!status.allowed || !orgId} onClick={() => setSetupOpen(true)}>Set up</Button>
+          <Button variant="contained" disabled={!status.allowed || !orgId} onClick={openSetup}>Set up</Button>
           {!status.allowed && <Typography variant="caption" sx={{ color: 'text.secondary' }}>{FROZEN}</Typography>}
         </Box>
       ) : (
@@ -196,10 +212,10 @@ export default function NodeVaultSection(): JSX.Element {
             <KeyValue label="Current key">
               {status.current_key ? (
                 <>
-                  <Box component="span" sx={{ fontFamily: 'monospace', fontWeight: 600 }} title={status.current_key.hash} data-testid="nodevault-current-key">
+                  <Tip title={status.current_key.hash}><Box component="span" sx={{ fontFamily: 'monospace', fontWeight: FONT_WEIGHT.semibold }} data-testid="nodevault-current-key">
                     {shortHash(status.current_key.hash)}
-                  </Box>
-                  <Typography component="span" variant="body2" sx={{ color: 'text.secondary' }}> · since {shortDay(status.current_key.created_at)}</Typography>
+                  </Box></Tip>
+                  <Typography component="span" variant="body2" sx={{ color: 'text.secondary' }}> · since {shortDate(status.current_key.created_at)}</Typography>
                 </>
               ) : '—'}
             </KeyValue>
@@ -218,12 +234,12 @@ export default function NodeVaultSection(): JSX.Element {
                         key={k.hash}
                         data-testid="nodevault-previous-key"
                         data-key={k.hash}
-                        sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 1.5, rowGap: 0.25, py: 0.25 }}
+                        sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 1.5, rowGap: 0, py: 0 }}
                       >
                         <Typography variant="body2" component="span">
-                          <Box component="span" sx={{ fontFamily: 'monospace' }} title={k.hash}>{shortHash(k.hash)}</Box>
+                          <Tip title={k.hash}><Box component="span" sx={{ fontFamily: 'monospace' }}>{shortHash(k.hash)}</Box></Tip>
                           <Typography component="span" variant="body2" sx={{ color: 'text.secondary' }}>
-                            {' · '}{k.credential_count === 1 ? '1 credential' : `${k.credential_count} credentials`}
+                            {' · '}{countOf(k.credential_count, 'credential')}
                           </Typography>
                         </Typography>
                         {k.state === 'retiring' ? (
@@ -261,7 +277,7 @@ export default function NodeVaultSection(): JSX.Element {
           ) : (
             <>
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap' }}>
-                <Button variant="outlined" disabled={!status.allowed || !orgId || op !== null} onClick={() => setRotateOpen(true)}>
+                <Button variant="outlined" disabled={!status.allowed || !orgId || op !== null} onClick={openRotation}>
                   Rotate key
                 </Button>
                 {status.can_start_over && status.current_key && (
@@ -273,7 +289,7 @@ export default function NodeVaultSection(): JSX.Element {
                 <Link component={RouterLink} to={NODEVAULT_AUDIT_URL} variant="body2">Audit</Link>
               </Box>
               <Box>
-                <Typography variant="body2" sx={{ fontWeight: 600, mb: 1 }}>Nodes</Typography>
+                <Typography variant="body2" sx={{ fontWeight: FONT_WEIGHT.semibold, mb: 1 }}>Nodes</Typography>
                 <NodeGrantList nodes={status.nodes} keyHash={status.current_key?.hash ?? null} onChanged={() => void load()} />
               </Box>
             </>

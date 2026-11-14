@@ -3,7 +3,9 @@
 // the server, the org's subscription, and its caps with their live usage. No purchase flow yet.
 
 import { get, post } from '../api'
-import { priceTagText, shortDate } from './billing'
+import { priceTagText } from './billing'
+import { DAY_MS, shortDate } from './relativeTime'
+import { countOf } from './humanize'
 import type { MeOrgRef } from '../types'
 
 /** A plan's monthly price. `amount` is in the currency's minor unit (cents). */
@@ -52,6 +54,8 @@ export type OrgPlan = {
   /** A priced plan chosen at sign-up, awaiting checkout. Optional for fixtures. */
   pending_plan_key?: string | null
   pending_plan_name?: string | null
+  /** The agent count chosen at sign-up for that pending plan; null = none (the plan minimum). Optional for fixtures. */
+  pending_agents?: number | null
   /** A pending org's sign-up plan, applied when the org is approved. Optional for
    *  fixtures. */
   applied_plan_key?: string | null
@@ -73,15 +77,17 @@ export const ORG_PLAN_QUERY = 'org-plan'
 export const getOrgPlan = () => get<OrgPlan>('/api/org/plan')
 export const chooseOrgPlan = (plan: string) => post<OrgPlan>('/api/org/plan/choose', { plan })
 
-/** A per-agent plan's free trial as the sidebar meter shows it: the most agents
- *  wanted at once this trial (`peak`) against those bought (`signed_up`). `trialing` false = no meter, every other
- *  field null. */
+/** A per-agent plan's agents as the sidebar throttle shows them, on a trial or the paid plan after it: the most agents
+ *  wanted at once since the trial started (`peak`), those running now (`running`) and those bought (`signed_up`).
+ *  `peak` null = no meter (not a per-agent plan), every other field null and `trialing` false. */
 export type TrialAgents = {
+  /** A live trial; `trial_end` is set only then. */
   trialing: boolean
   peak: number | null
+  running: number | null
   signed_up: number | null
   trial_end: string | null
-  /** The trial's lifted agent cap. */
+  /** The agent cap in force: the trial's lifted one, else the agents bought. */
   trial_cap: number | null
   /** The agent range a change may pick; `max_agents` null = no upper bound. */
   min_agents: number | null
@@ -126,37 +132,35 @@ export function offerPriceText(price: PlanPrice, { perAgent = false, yearly = nu
   return yearly ? `${one(price)} · ${one(yearly)}` : one(price)
 }
 
-/** What a purchase of `option` costs per unit (agent, or the plan itself) on `interval`: the yearly price when
- *  yearly is asked for and sold, else the monthly one. Null for a plan with no price. */
-export function unitPrice(option: OrgPlanOption, interval: 'month' | 'year'): PlanPrice | null {
-  return interval === 'year' && option.yearly ? option.yearly : option.price
+
+/** A per-agent plan's range of agents it sells: "3–9", "3+" (no upper bound), or "3". */
+export function agentRange(min: number, max: number | null): string {
+  return max === null ? `${min}+` : min === max ? `${min}` : `${min}–${max}`
 }
 
-/** A price's monthly equivalent in cents: a yearly price over 12, rounded to the cent. */
-export const monthlyCents = (price: PlanPrice): number => (price.interval === 'year' ? Math.round(price.amount / 12) : price.amount)
+/** A per-agent plan's count is a choice (the agent stepper shows) only when its range holds more than one count. */
+export const countPickable = (min: number, max: number | null): boolean => max === null || max > min
 
-/** The one figure a plan card shows: the lowest monthly-equivalent, per agent for a per-agent plan, `*` when that
- *  is the yearly price ("billed annually", the list's one footnote). "Free" for $0; null with no price. */
-export function fromPriceText(option: OrgPlanOption): string | null {
-  const price = unitPrice(option, 'year')
-  if (!price) return null
-  if (price.amount === 0) return 'Free'
-  const star = option.yearly ? '*' : ''
-  return `${priceTagText(monthlyCents(price), price.currency)}/${option.per_agent ? 'agent' : 'month'}${star}`
-}
-
-/** "3–9 agents", "3 or more agents", "1 agent". */
+/** `agentRange` with its noun: "3–9 agents", "3+ agents", "1 agent". */
 export function agentRangeText(min: number, max: number | null): string {
-  if (max === null) return `${min} or more agents`
-  return max === min ? `${min} agent${min === 1 ? '' : 's'}` : `${min}–${max} agents`
+  return max === min ? agentsText(min) : `${agentRange(min, max)} agents`
 }
+
+/** "1 agent", "5 agents". */
+export const agentsText = (n: number): string => countOf(n, 'agent')
 
 /** The Contact us composer's prefill: the current plan and every cap, so nobody has to retype them. */
 export const CONTACT_SUBJECT = 'Plan and limits'
 
+/** What Contact us hands the New ticket page (`pages/support/NewTicketPage.tsx`'s prefill), from any surface that offers it. */
+export function contactPrefill(plan: OrgPlan): { title: string; description: string } {
+  return { title: CONTACT_SUBJECT, description: contactMessage(plan) }
+}
+
 export function contactMessage(plan: OrgPlan): string {
   const lines = plan.limits.map(limit => `- ${limit.label}: ${usageText(limit)}`)
-  return [`Current plan: ${plan.plan_label}`, 'Limits (used / allowed):', ...lines, '', 'I would like to talk about: '].join('\n')
+  // Markdown (the New ticket page's editor): a blank line keeps the plan and the limits list as separate paragraphs.
+  return [`Current plan: ${plan.plan_label}`, '', 'Limits (used / allowed):', ...lines, '', 'I would like to talk about: '].join('\n')
 }
 
 /** A plan held without Stripe, in words: "Current plan" and, when it has an end, "Ends <date>"; once past, "Plan ended".
@@ -169,10 +173,8 @@ export function heldPlanWords(ended: boolean, endsAt: string | null): { state: s
 
 // The same window as the server's Keep offer on a plan's included nodes (`plan_bundles.py::ENDING_AHEAD`).
 const SOON_DAYS = 3
-const DAY_MS = 86_400_000
 
-/* Which plan notice the org's state calls for, if any: `PlanEndedBanner`'s, and `NamePromptBanner` waits while one
-   shows. Here, not with the banner, which the community edition's tree leaves out (`billing`). */
+/* Which plan notice the org's state calls for, if any: `PlanEndedBanner`'s. Here, not with the banner, which the community edition's tree leaves out (`billing`). */
 export function planNotice(org: MeOrgRef | null | undefined, now: Date): 'ended' | 'ending' | null {
   if (!org) return null
   if (org.plan_ended) return 'ended'

@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 from uuid import UUID
 
 from sqlalchemy import select
@@ -29,7 +29,12 @@ from app.credentials.registry import secret_keys
 from app.tenancy.seam import TenancyScopeConflict
 from app.models.credentials import Credential
 from app.models.identity import AdminUser
-from app.models.projects import PROJECT_ENV_VAR_NAME_RE, PROJECT_ENV_VAR_SOURCE_CREDENTIAL, ProjectEnvVar
+from app.models.projects import (
+    PROJECT_ENV_VAR_NAME_RE,
+    PROJECT_ENV_VAR_SOURCE_CREDENTIAL,
+    PROJECT_ENV_VAR_SOURCE_PORT,
+    ProjectEnvVar,
+)
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +53,9 @@ REASON_FIELD_ABSENT = "field_absent"
 #: `credential_field` is a secret sealed under the org's NodeVault key, which only its nodes open (AC-5.4):
 #: unavailable to the control plane, so the variable is omitted rather than resolved here.
 REASON_NODEVAULT = "nodevault"
+
+#: A Port row's `RowStatus.detail`: it has no value here, the node writes one per slot.
+PORT_DETAIL = "assigned by the node on each lease"
 
 #: The whole vocabulary; consumers render from this tuple.
 OMISSION_REASONS: tuple[str, ...] = (
@@ -105,6 +113,44 @@ class RowStatus:
     winning: bool
 
 
+@dataclass(frozen=True)
+class PortSpec:
+    """One port variable of a project: a Port row's name and its preferred host port (None = auto)."""
+
+    name: str
+    preferred: Optional[int]
+
+
+def port_specs_by_project(session: Session, project_ids: Sequence[int]) -> dict[int, list[PortSpec]]:
+    """`{project_id: [PortSpec, …]}` (by name) for every project of `project_ids` with a Port row, in one query —
+    THE source of a project's port vars (the pool tick, the lease band, the warned names, the project read).
+    Project-tier rows only: `ck_project_env_vars_port_tier` admits no other."""
+    out: dict[int, list[PortSpec]] = {}
+    if not project_ids:
+        return out
+    rows = session.execute(
+        select(ProjectEnvVar.project_id, ProjectEnvVar.name, ProjectEnvVar.port_preferred)
+        .where(
+            ProjectEnvVar.project_id.in_(list(project_ids)),
+            ProjectEnvVar.source == PROJECT_ENV_VAR_SOURCE_PORT,
+            ProjectEnvVar.user_id.is_(None),
+        )
+        .order_by(ProjectEnvVar.project_id, ProjectEnvVar.name)
+    )
+    for project_id, name, preferred in rows:
+        out.setdefault(project_id, []).append(PortSpec(name=name, preferred=preferred))
+    return out
+
+
+def port_specs(session: Session, project_id: int) -> list[PortSpec]:
+    """One project's port vars (`port_specs_by_project`)."""
+    return port_specs_by_project(session, [project_id]).get(project_id, [])
+
+
+def _is_port(row: ProjectEnvVar) -> bool:
+    return row.source == PROJECT_ENV_VAR_SOURCE_PORT and row.user_id is None
+
+
 @dataclass(frozen=True, repr=False)
 class _Resolved:
     """One row's resolution, before it is projected into either public shape.
@@ -139,7 +185,10 @@ def resolve_for_slot(
     `SQLAlchemyError` and `TenancyScopeConflict` propagate by design (the session is the caller's; two
     deciding scopes is a defect)."""
     resolver = _Resolver(session, project_id)
-    winners = _winners(_rows(session, project_id), user_id)
+    # A Port row is never a value here: the node writes its port into the slot's `.env` after this env.
+    winners = {
+        name: row for name, row in _winners(_rows(session, project_id), user_id).items() if not _is_port(row)
+    }
     # Primed on the winners only: each identity costs several queries and other users' overrides are
     # invisible here (priming them would also decrypt their credentials needlessly).
     resolver.prime(winners.values())
@@ -175,15 +224,20 @@ def resolve_rows(
     winners = _winners(rows, viewer_id)
     out: dict[UUID, RowStatus] = {}
     for row in rows:
-        resolved = resolver.resolve(row)
+        # A Port row resolves to no value here; it is `ok` because the node always writes one.
+        status, detail = (STATUS_OK, PORT_DETAIL) if _is_port(row) else _status_of(resolver.resolve(row))
         out[row.id] = RowStatus(
-            status=resolved.status,
-            detail=resolved.detail,
+            status=status,
+            detail=detail,
             # IDENTITY, not equality on `user_id`: `_winners` returns rows from this very list, and two
             # rows of one project can share a name across the two tiers.
             winning=winners.get(row.name) is row,
         )
     return out
+
+
+def _status_of(resolved: _Resolved) -> tuple[str, Optional[str]]:
+    return resolved.status, resolved.detail
 
 
 def _rows(session: Session, project_id: int) -> list[ProjectEnvVar]:
@@ -204,14 +258,16 @@ def _rows(session: Session, project_id: int) -> list[ProjectEnvVar]:
 def _winners(rows: list[ProjectEnvVar], user_id: Optional[UUID]) -> dict[str, ProjectEnvVar]:
     """R4, the one place it is spelled: per name, `user_id`'s own override, else the project default.
 
-    Another user's override is not a candidate at all. The two partial unique indexes make this
-    deterministic."""
+    Another user's override is not a candidate at all, and a Port row is never overridden (the node writes it
+    last). The two partial unique indexes make this deterministic."""
     winners: dict[str, ProjectEnvVar] = {}
     for row in rows:
         if row.user_id is not None and row.user_id != user_id:
             continue
         current = winners.get(row.name)
-        if current is None or (current.user_id is None and row.user_id is not None):
+        if current is None or _is_port(row) or (
+            current.user_id is None and not _is_port(current) and row.user_id is not None
+        ):
             winners[row.name] = row
     return winners
 

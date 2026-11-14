@@ -51,6 +51,7 @@ import {
   POOL_NO_NODE,
   POOL_NO_PROJECT,
   PROJECTS_NO_ORG,
+  PROJECTS_NO_TASKS,
   RUNS_NO_ID,
   RUNS_NO_WORKFLOW,
   FEED_NO_AUDIT_ORG,
@@ -96,12 +97,33 @@ export const rowPadLeft = (depth: number) => ({
   [PHONE]: { pl: `${RAIL_X_PHONE + ROW_PAD_L_PHONE + phoneIndent(depth)}px` },
 })
 
+/* A control centred on the rail in a row with no disc (the create row's tick-all), over the rows' own ticks. */
+export const RAIL_CENTRED_SX = {
+  position: 'absolute',
+  top: '50%',
+  left: `${RAIL_X}px`,
+  transform: 'translate(-50%, -50%)',
+  [PHONE]: { left: `${RAIL_X_PHONE}px` },
+} as const
+
 /* Depth 0: disc centred on the rail to mask the thread, so priced off rail x and disc diameter. Depth 1
  * steps clear of the rail so the child reads as a branch. */
 export const nodeLeft = (depth: number) => ({
   left: `${RAIL_X - NODE / 2 + depth * CHILD_INDENT}px`,
   [PHONE]: { left: `${RAIL_X_PHONE - NODE_PHONE / 2 + phoneIndent(depth)}px` },
 })
+
+/* A nested section heading's indent: the caret box's centre lands on the rail, deeper levels step by the indent. */
+export const headPadLeft = (depth: number) => ({
+  pl: `${RAIL_X - 4.5 + (depth - 1) * CHILD_INDENT}px`,
+  [PHONE]: { pl: `${RAIL_X_PHONE - 4.5 + (depth - 1) * CHILD_INDENT_PHONE}px` },
+})
+
+/* A loading skeleton line starts where a depth-0 row's first cell does. */
+export const skeletonInset = {
+  ml: `${RAIL_X + ROW_PAD_L}px`,
+  [PHONE]: { ml: `${RAIL_X_PHONE + ROW_PAD_L_PHONE}px` },
+} as const
 
 /* Fixed slots, reserved on every row even when empty, so values line up down the list. */
 export const AGE_SLOT = 28
@@ -117,21 +139,21 @@ export const DISCLOSURE_TOUCH_MIN = 24
 /** Gate a slot on the band that can afford it: `meta` drops at ≤899px, `id` at ≤767px, `phone` at ≤480px,
  *  `squeeze` in the MIDDLE band (>480px and ≤1023px), `wide` at ≤1023px (phone band included: no org name on mobile),
  *  absent = never. Order window-gated slots meta, id, phone, ungated, so they fall off the LEFT and survivors stay flush right.
- *  `wide`/`squeeze`, `meta` and `id` also drop by the LIST's own width, in that order (`./fit`): a narrow column in a
- *  wide window drops them rather than clip the row.
+ *  `wide`/`squeeze`, `meta` and `id` also drop by the LIST's own width, in that order, then every other gate, then the
+ *  ungated slots (`./fit`): a narrow column in a wide window drops them rather than clip the row or its name.
  *  `boardPersona` / `boardTokens` / `boardCost` / `boardRating` follow the /tasks BOARD's width, not the window
  *  (`ui/listStyles.ts`'s `BOARD_NO_*`, container queries — inert where no board container encloses the row); they drop in the order
  *  `components/tasks/listViews/feedRow.tsx`'s trailing-cluster comment gives, not by position.
  *  `nodes*` / `host*` / `group*` follow the /nodes roster's width the same way (`NODES_NO_*`), on top of
  *  their window gates — by priority, not position: the rightmost Enabled drops before load and version, the
  *  same width on every row, so columns still line up.
- *  `people*` / `projectsOrg` follow Directory's People and Projects lists the same way (`PEOPLE_NO_*`, `PROJECTS_NO_ORG`);
+ *  `people*` / `projectsOrg` / `projectsTasks` / `projectsQuestions` follow Directory's People and Projects lists the same way (`PEOPLE_NO_*`, `PROJECTS_NO_ORG`, `PROJECTS_NO_TASKS`);
  *  `groups*` Directory's Groups list (`GROUPS_NO_*`; not /nodes' `group*`);
  *  `peopleAdmin` narrows instead of dropping (the toggle has no ⋯ fallback); `credentialsType` Secrets' Type
  *  (`CREDENTIALS_TYPE_UNDER`, on the name's hover there); `credentialsHealthColumns` / `credentialsHealth` Secrets'
  *  health as two columns or one folded cell (`CREDENTIALS_HEALTH_*`, complements: place the folded one beside the tail); `acct*` Agents › Agents' roster (`ACCOUNTS_*`);
  *  `artifact*` the task Artifacts list (`ARTIFACTS_NO_*`); `laneId` the merge lane's Runs (`LANE_NO_ID`);
- *  `personas*` Audit › Personas' roster (`PERSONAS_NO_*`); `pool*` Automation › Slots (`POOL_NO_*`);
+ *  `personas*` Audit › Personas' roster (`PERSONAS_NO_*`); `pool*` Audit › Slots (`POOL_NO_*`);
  *  `automationsMeta` the Automations roster (`AUTOMATIONS_NO_META`); `templatesMeta` the template manage list (`TEMPLATES_NO_META`); `audit*` Audit › Activity (`AUDIT_NO_*`);
  *  `sends*` a Gmail connection's Sent list (`SENDS_NO_*`). */
 export type SlotGate =
@@ -177,6 +199,8 @@ export type SlotGate =
   | 'groupsBindings'
   | 'groupsBindingsWithOrg'
   | 'projectsOrg'
+  | 'projectsTasks'
+  | 'projectsQuestions'
   | 'credentialsType'
   | 'credentialsHealthColumns'
   | 'credentialsHealth'
@@ -228,8 +252,7 @@ export const GATE_SX: Record<SlotGate, Record<string, GateRule | Record<string, 
   boardAuthor: { [FEED_NO_ID]: { display: 'none' }, [BOARD_NO_AUTHOR]: { display: 'none' } },
   /* The age leaves WITH the author, the provenance pair: at a 1024px window the split sits at its pane floor
      and the board at ~350px, where the 28px age cost the title four characters. Above the phone only: the phone keeps its one
-     time cue. The task page's Subtasks list (its own board container) follows the same rule in a split. A pickable
-     row drops this gate while a pick is in progress (`feedRow.tsx`), since the bulk tick rides the age slot. */
+     time cue. The task page's Subtasks list (its own board container) follows the same rule in a split. */
   boardAge: { [ABOVE_PHONE]: { [BOARD_NO_AUTHOR]: { display: 'none' } } },
   /* The task id lead leaves with them too: beside an open task at a 1280px window the board is ~388px and its
      34px went to a title that wraps to two lines there (`titleWrapAt`). The id stays in the row's link (its URL), its
@@ -282,9 +305,15 @@ export const GATE_SX: Record<SlotGate, Record<string, GateRule | Record<string, 
   groupsBindings: { [FEED_NO_ID]: { display: 'none' }, [GROUPS_NO_BINDINGS]: { display: 'none' } },
   /* …sooner beside the Org column (All orgs). */
   groupsBindingsWithOrg: { [FEED_NO_ID]: { display: 'none' }, [GROUPS_NO_BINDINGS_WITH_ORG]: { display: 'none' } },
-  /* Directory › Projects' org: `squeeze` by window, and off a narrow list ABOVE the phone band (beside an open
-     project), where `pages/Projects.tsx` draws it in the title after the name instead. The phone keeps its one-line row. */
-  projectsOrg: { [ABOVE_PHONE]: { ...SIDEBAR_SQUEEZE_SX[ABOVE_PHONE], [PROJECTS_NO_ORG]: { display: 'none' } } },
+  /* Directory › Projects' org: off the phone and a narrow list above it (beside an open project), where
+     `pages/Projects.tsx` draws it in the title after the name instead; `squeeze` by window between. */
+  projectsOrg: { [PHONE]: { display: 'none' }, [ABOVE_PHONE]: { ...SIDEBAR_SQUEEZE_SX[ABOVE_PHONE], [PROJECTS_NO_ORG]: { display: 'none' } } },
+  /* Directory › Projects' Running and Queued, off a list narrower than ~560px (`PROJECTS_NO_TASKS`): the phone and
+     the list beside an open project keep Questions alone. */
+  projectsTasks: { [PROJECTS_NO_TASKS]: { display: 'none' } },
+  /* Its Questions, off with the org slot beside an open project (`PROJECTS_NO_ORG`, above the phone), where the name
+     needs its width and the rail beside it carries each project's question pill. The phone keeps it. */
+  projectsQuestions: { [ABOVE_PHONE]: { [PROJECTS_NO_ORG]: { display: 'none' } } },
   /* Directory › Secrets' Type, off a list narrower than ~400px, where `lib/credentialRow.tsx` puts it on the name's hover. */
   credentialsType: { [CREDENTIALS_TYPE_UNDER]: { display: 'none' } },
   /* Secrets' Last used and Last test columns, from 1440px; below it, the one folded cell (its complement) stands in. */
@@ -312,7 +341,7 @@ export const GATE_SX: Record<SlotGate, Record<string, GateRule | Record<string, 
      window gate too. */
   personasFocus: { [FEED_NO_META]: { display: 'none' }, [PERSONAS_NO_FOCUS]: { display: 'none' } },
   personasLead: { [FEED_NO_ID]: { display: 'none' }, [PERSONAS_NO_LEAD]: { display: 'none' } },
-  /* Automation › Slots (`ui/listStyles.ts`'s `POOL_NO_*`): node, project, the git/stack pair, then the session —
+  /* Audit › Slots (`ui/listStyles.ts`'s `POOL_NO_*`): node, project, the git/stack pair, then the session —
      each on its window gate too (`meta`, or `id` for the session). */
   poolNode: { [FEED_NO_META]: { display: 'none' }, [POOL_NO_NODE]: { display: 'none' } },
   poolProject: { [FEED_NO_META]: { display: 'none' }, [POOL_NO_PROJECT]: { display: 'none' } },

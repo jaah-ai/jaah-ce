@@ -1,0 +1,42 @@
+slug = "brevo"
+label = "Brevo"
+category = "messaging"
+vendor_docs_url = "https://developers.brevo.com/docs/getting-started"
+summary = "Send transactional email and SMS and manage contacts in Brevo."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "Brevo > your profile menu (top right) > SMTP & API > API keys tab > Generate a new API key. Name it, then copy the key, which starts with xkeysib- and is shown only once" },
+]
+
+[test]
+method = "GET"
+path = "https://api.brevo.com/v3/account"
+auth = { field = "api_key", header = "api-key" }
+identity = [["email"], ["companyName"]]
+
+[docs]
+agent_uses = [
+  "Send a transactional email, from a Brevo template or with its own HTML",
+  "Add, update or tag contacts and manage lists",
+  "Send a transactional SMS",
+  "Read delivery events and campaign statistics",
+]
+prerequisites = [
+  "A Brevo account",
+  "A sender address or domain verified under Brevo > Senders, Domains & Dedicated IPs, so mail is delivered",
+]
+limitations = [
+  "The API key reaches the whole Brevo account; Brevo has no per-key scopes",
+  "If Brevo's API key IP restriction is on (Security > Authorised IPs), calls from Jaah's agents are refused until their addresses are allowed or the restriction is turned off",
+  "Sending counts against the account's plan limits",
+]
+troubleshooting = [
+  { symptom = "Test says Brevo rejected the API key (401)", fix = "Use an API key from the API keys tab, not the SMTP key (an SMTP key starts with xsmtpsib- and works only for SMTP). Generate a new API key and select Replace on the secret" },
+  { symptom = "Calls fail with unrecognised IP address", fix = "Brevo blocks keys used from unknown IP addresses. Open Security > Authorised IPs and allow the address in Brevo's email, or deactivate the blocking" },
+  { symptom = "Emails are accepted but land in spam", fix = "Authenticate the sending domain with the DKIM and DMARC records Brevo shows under Senders, Domains & Dedicated IPs > Domains" },
+]
+faq = [
+  { q = "Is this the same as Sendinblue?", a = "Yes. Sendinblue was renamed Brevo; keys created before the rename keep working" },
+]

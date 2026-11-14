@@ -2,30 +2,38 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useParams } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import CircularProgress from '@mui/material/CircularProgress'
 import IconButton from '@mui/material/IconButton'
 import Typography from '@mui/material/Typography'
-import type { KeyboardEvent, ReactNode } from 'react'
-import { apiFetch, apiHref, getText, noticeRefusal, useApiRewriterVersion } from '../../api'
+import type { KeyboardEvent, MouseEvent } from 'react'
+import { send, getText, noticeRefusal, useApiRewriterVersion } from '../../api'
+import { apiDownloadProps, ApiFrame, ApiImg, apiLinkHref } from '../../net/href'
 import type { Artifact } from '../../types'
 import { Banner } from '../../ui/Banner'
 import { DownloadGlyph } from '../../ui/DownloadGlyph'
 import { formatBytes } from '../../lib/formatBytes'
-import { ARTIFACT_PARAM, parseArtifactParam } from '../../lib/taskArtifactLink'
+import { countOf } from '../../lib/humanize'
+import { ARTIFACT_PARAM } from '../../lib/taskArtifactLink'
+import { parseTaskDeepLinkParam } from '../../lib/taskDeepLink'
 import FeedList from '../../ui/feed/FeedList'
 import type { FeedRowSpec } from '../../ui/feed/types'
 import { StatusChip } from '../../ui/StatusChip'
 import { ABOVE_PHONE, ARTIFACTS_LIST_CONTAINER_SX, PHONE, monoSx, tapTargetSx } from '../../ui/listStyles'
-import { absoluteTime, compactAge, relativeAge } from '../../lib/relativeTime'
+import { absoluteTime, compactAge } from '../../lib/relativeTime'
+import RelativeTime from '../../ui/RelativeTime'
 import RichTextRenderer from '../richtext/RichTextRenderer'
-import { type ArtifactRenderMode, artifactKindLabel, artifactRenderMode, isDownloadArtifactKind } from './artifactKinds'
-import { CodeBlock } from '../../ui/CodeBlock'
+import { type ArtifactRenderMode, artifactKindLabel, artifactRenderMode, browserShowsPdf, isDownloadArtifactKind, PDF_DOWNLOADS_ONLY_NOTE } from './artifactKinds'
+import { downloadLinkProps, TextBody } from './AttachmentViewer'
+import { MediaPlayer } from './MediaPlayer'
 import SplitDivider from '../SplitDivider'
 import { usePersistedState } from '../../hooks/usePersistedState'
 import { useApiRead } from '../../hooks/useApiRead'
 import { useUrlFilters } from '../../hooks/useUrlFilters'
 import { readJson, writeJson } from '../../lib/safeStorage'
 import { ROW_H } from '../../ui/feed/geometry'
+import LoadingState from '../../ui/LoadingState'
+import { FONT_SIZE, FONT_WEIGHT, LETTER_SPACING, LINE_HEIGHT, RADIUS, SIZE, grid } from '../../theme'
+import type { Theme } from '@mui/material/styles'
+import Tip from '../../ui/Tip'
 
 /* ── THE ARTIFACTS TAB'S VIEWER ───────────────────────────────────────────────────────────────────
  *
@@ -109,33 +117,33 @@ function countRowsBelow(list: HTMLElement): number {
 /* The version badge (`v2`), in the row and the viewer strip: set like the row's size · age metadata (11px mono),
    with a clear gap before the filename it qualifies. Dim, never faint: `text.secondary`, not the metadata's
    `text.disabled` — the number is how same-named rows differ, so it keeps readable contrast. */
-const VERSION_SX = [monoSx, { color: 'text.secondary', fontSize: '0.6875rem', mr: 1 }]
+const VERSION_SX = [monoSx, { color: 'text.secondary', fontSize: FONT_SIZE.xs, mr: 1 }]
 /* The selected disc's 3px ring (`FeedList`'s `MARKED_NODE_SX`) ended 1px short of the name in this lead-less row:
    one half-step (3px) more puts the name ~7px off the disc, clear of the ring in both bands. */
 const TITLE_INSET_SX = { ml: 0.5 } as const
-const earlierLabel = (n: number) => `${n} earlier ${n === 1 ? 'version' : 'versions'}`
+const earlierLabel = (n: number) => countOf(n, 'earlier version')
 
 /* Fades the list's last 28px. A MASK, not a gradient over it: it fades into whatever ground the tab sits on. */
 const LIST_FADE_SX = {
-  maskImage: 'linear-gradient(to bottom, #000 calc(100% - 28px), transparent)',
-  WebkitMaskImage: 'linear-gradient(to bottom, #000 calc(100% - 28px), transparent)',
+  maskImage: (t: Theme) => `linear-gradient(to bottom, ${t.palette.common.black} calc(100% - ${grid(4.5)}), transparent)`,
+  WebkitMaskImage: (t: Theme) => `linear-gradient(to bottom, ${t.palette.common.black} calc(100% - ${grid(4.5)}), transparent)`,
 } as const
 
 const MORE_PILL_SX = {
   position: 'absolute',
-  bottom: 2,
+  bottom: 0,
   left: '50%',
   transform: 'translateX(-50%)',
-  px: 1.25,
-  py: 0.25,
+  px: 1,
+  py: 0,
   border: '1px solid',
   borderColor: 'divider',
-  borderRadius: 999,
+  borderRadius: RADIUS.round,
   bgcolor: 'background.paper',
   color: 'text.secondary',
   fontFamily: 'inherit',
-  fontSize: '0.75rem',
-  lineHeight: 1.4,
+  fontSize: FONT_SIZE.sm,
+  lineHeight: LINE_HEIGHT.snug,
   cursor: 'pointer',
   boxShadow: 1,
   '&:hover': { color: 'text.primary' },
@@ -162,10 +170,10 @@ const ARTIFACT_FRAME_SX = {
   display: 'block',
   minWidth: 0,
   border: 0,
-  borderRadius: 1,
+  borderRadius: RADIUS.sm,
   flex: '1 1 auto',
   // Floor it: a short laptop tab would squeeze the document unreadable; the panel scrolls instead.
-  minHeight: 480,
+  minHeight: grid(80),
 } as const
 
 export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; artifacts: Artifact[] }) {
@@ -176,7 +184,7 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
      pick wins over newer ones. An ID, not an index: the host's list grows and shrinks. */
   const [searchParams, setFilters] = useUrlFilters()
   const rawPick = searchParams.get(ARTIFACT_PARAM)
-  const pickedId = parseArtifactParam(rawPick)
+  const pickedId = parseTaskDeepLinkParam(rawPick)
   /* `replace` (`hooks/useUrlFilters`), as `hooks/useUrlTab.ts`: picking is browsing within the tab, not a page
      Back should replay. Other keys (`tab`, …) are kept. */
   const setPickedId = useCallback(
@@ -203,10 +211,10 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
      clickable row, so only a counter in the deps can re-run the fetch. */
   const [retryToken, setRetryToken] = useState(0)
 
-  /* The image branch's runtime escape hatch: a `.png` that fails to decode demotes to `download` (the
+  /* The image and media branches' runtime escape hatch: a `.png` or `.mp4` that fails to decode demotes to `download` (the
      table's own fallback). Held here so the identity strip's suppression reads it too. The artifact's
      ID, not a boolean: a flag would need clearing in the effect whose deps read it, looping forever. */
-  const [imageFailedId, setImageFailedId] = useState<number | null>(null)
+  const [renderFailedId, setRenderFailedId] = useState<number | null>(null)
 
   /* A frame cannot report its own load: a failed read is framed as the error page, which the API's default
      `frame-ancestors 'none'` blanks to a white box. So the frame branch PROBES the same URL and swaps in the
@@ -286,8 +294,8 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
     next.scrollIntoView?.({ block: 'nearest' })
   }, [setPickedId])
 
-  /* The frame's address, fixed per artifact (`apiHref`, rewritten on the live host): a re-render must not reload a
-     frame the visitor is reading. */
+  /* The frame's API path, fixed per artifact (`ApiFrame` rewrites it on the live host): a re-render must not reload
+     a frame the visitor is reading. */
   const frameSrc = useMemo(
     () => (selectedId === null ? '' : artifactContentUrl(taskId, selectedId, false)),
     [taskId, selectedId],
@@ -295,8 +303,13 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
   /* ONE VALUE DRIVES EVERY BRANCH — viewer, strip suppression and fetch allow-list — so no third condition
      can disagree with the other two. */
   const routedMode: ArtifactRenderMode = selected ? artifactRenderMode(selected) : 'download'
+  // A browser set to download PDFs blocks a framed one (`browserShowsPdf`): the card offers it instead.
+  const pdfDownloadsOnly = routedMode === 'pdf' && !browserShowsPdf()
   const mode: ArtifactRenderMode =
-    routedMode === 'image' && imageFailedId === selectedId ? 'download' : routedMode
+    ((routedMode === 'image' || routedMode === 'audio' || routedMode === 'video') && renderFailedId === selectedId)
+      || pdfDownloadsOnly
+      ? 'download'
+      : routedMode
   // The two byte-pulling branches, as a positive set (see the effect).
   const needsBody = mode === 'markdown' || mode === 'text'
 
@@ -323,7 +336,7 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
     const controller = new AbortController()
     void (async () => {
       try {
-        const resp = await apiFetch(artifactContentUrl(taskId, selectedId, false), { credentials: 'same-origin', signal: controller.signal })
+        const resp = await send(artifactContentUrl(taskId, selectedId, false), { credentials: 'same-origin', signal: controller.signal })
         if (!resp.ok) {
           setFrameFailedId(selectedId)
           await noticeRefusal(resp)
@@ -382,6 +395,7 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
         </Box>
       ),
       titleText: artifact.filename,
+      href: null,
       /* The earlier versions fold under the live row: the count is the row's hover note, the toggle a ⋯ item,
         and opened they are its children. */
       ...(earlier.length > 0
@@ -410,7 +424,7 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
       slots: [
         {
           key: 'kind',
-          width: 124,
+          width: grid(20.5),
           gate: 'artifactKind',
           align: 'right',
           dim: true,
@@ -420,7 +434,7 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
         },
         {
           key: 'currency',
-          width: 78,
+          width: grid(13),
           gate: 'artifactCurrency',
           align: 'right',
           dim: true,
@@ -432,7 +446,7 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
         {
           key: 'meta',
           /* 106px = the widest composed string, 16 chars at ~6.6px. */
-          width: 106,
+          width: grid(17.5),
           align: 'right',
           mono: true,
           dim: true,
@@ -451,13 +465,14 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
       actions: [
         {
           /* The glyph's second home (lets the slot gate off phones). `download` attribute not needed: the
-             route sends `Content-Disposition: attachment` (`app/routes/attachments.py::artifact_content`). */
+             route sends `Content-Disposition: attachment` (`app/routes/attachments.py::artifact_content`).
+             A plain click saves through the choke point (`overflowDownload`). */
           key: 'download',
           icon: '⤓',
           label: 'Download',
           // A superset of the visible "Download" (WCAG 2.5.3), naming the file.
           ariaLabel: `Download ${artifact.filename}`,
-          href: artifactContentUrl(taskId, artifact.id, true),
+          ...overflowDownload(artifactContentUrl(taskId, artifact.id, true)),
         },
         ...(earlier.length > 0
           ? [{
@@ -504,7 +519,7 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
               component="button"
               type="button"
               data-testid="task-artifacts-more"
-              aria-label={`Scroll to ${hiddenBelow} more ${hiddenBelow === 1 ? 'artifact' : 'artifacts'}`}
+              aria-label={`Scroll to ${countOf(hiddenBelow, 'more artifact')}`}
               onClick={() => listRef.current?.scrollBy({ top: listRef.current.clientHeight - ROW_H, behavior: 'smooth' })}
               sx={MORE_PILL_SX}
             >
@@ -535,11 +550,11 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
         {mode !== 'download' && (
           /* On a phone one line: the name wraps within itself and Download is an icon beside it. */
           <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: 1, minWidth: 0, [PHONE]: { flexWrap: 'nowrap' } }}>
-            <Typography variant="caption" sx={{ color: 'text.secondary', letterSpacing: '0.04em', textTransform: 'uppercase', flexShrink: 0 }}>
+            <Typography variant="caption" sx={{ color: 'text.secondary', letterSpacing: LETTER_SPACING.caps, textTransform: 'uppercase', flexShrink: 0 }}>
               {artifactKindLabel(selected.kind)}
             </Typography>
             {/* Never truncated: the differing tail (`prd-v2.md` vs `prd-v2-final.md`) is the identity. */}
-            <Typography variant="body2" sx={{ fontWeight: 600, minWidth: 0, overflowWrap: 'anywhere' }}>
+            <Typography variant="body2" sx={{ fontWeight: FONT_WEIGHT.semibold, minWidth: 0, overflowWrap: 'anywhere' }}>
               {selected.filename}
             </Typography>
             {/* Which of the same-named versions is on screen, as its row spells it. */}
@@ -570,19 +585,15 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
         )}
 
         {mode === 'download' ? (
-          <FileDownloadCard taskId={taskId} artifact={selected} />
-        ) : mode === 'markdown' ? (
-          <MarkdownView
-            markdown={markdown}
-            loading={loading}
-            failed={loadFailed}
-            onRetry={() => setRetryToken(t => t + 1)}
+          <FileDownloadCard
+            taskId={taskId}
+            artifact={selected}
+            note={pdfDownloadsOnly ? PDF_DOWNLOADS_ONLY_NOTE : undefined}
           />
-        ) : mode === 'text' ? (
-          /* Same bytes and states as markdown, but NEVER through `RichTextRenderer` (a `#` log line would
-             become a heading). Monospace, preserved whitespace, no parse. */
-          <PlainTextView
-            text={markdown}
+        ) : mode === 'markdown' || mode === 'text' ? (
+          <FetchedBodyView
+            body={markdown}
+            markdown={mode === 'markdown'}
             loading={loading}
             failed={loadFailed}
             onRetry={() => setRetryToken(t => t + 1)}
@@ -591,7 +602,19 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
           <ArtifactImageView
             taskId={taskId}
             artifact={selected}
-            onDecodeFailure={() => setImageFailedId(selected.id)}
+            onDecodeFailure={() => setRenderFailedId(selected.id)}
+          />
+        ) : mode === 'audio' || mode === 'video' ? (
+          <MediaPlayer
+            key={`artifact-${mode}-${selected.id}`}
+            kind={mode}
+            src={apiLinkHref(frameSrc)}
+            name={selected.filename}
+            testId={`task-artifact-${mode}`}
+            onError={() => setRenderFailedId(selected.id)}
+            sx={mode === 'video'
+              ? { display: 'block', maxWidth: '100%', maxHeight: grid(106.5), [PHONE]: { maxHeight: grid(70) }, borderRadius: RADIUS.sm, backgroundColor: 'common.black' }
+              : { display: 'block', width: '100%', maxWidth: grid(80) }}
           />
         ) : mode === 'pdf' ? (
           /* ── THE ONE FRAME WITHOUT `sandbox`, AND THE MEASUREMENT THAT PUT IT HERE ───────────────
@@ -605,14 +628,12 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
               or pop up on one click; a form annotation can beacon. Phishing/telemetry, never the session.
               SPECIFIC TO A FORMAT THE HTML ENGINE NEVER PARSES — never reuse it for another
               `INLINE_FILE_CONTENT_TYPES` member; the `.html` branch keeps its `sandbox`. */
-          <Box
-            component="iframe"
-            key={`artifact-pdf-${selected.id}`}
+          <Tip key={`artifact-pdf-${selected.id}`} title={`${artifactKindLabel(selected.kind)}: ${selected.filename}`}><Box
+            component={ApiFrame}
             data-testid="task-artifact-pdf"
             src={frameSrc}
-            title={`${artifactKindLabel(selected.kind)}: ${selected.filename}`}
             sx={{ ...ARTIFACT_FRAME_SX, backgroundColor: 'action.hover' }}
-          />
+          /></Tip>
         ) : frameFailedId === selected.id ? (
           <FetchFailedBanner onRetry={() => setRetryToken(t => t + 1)} />
         ) : (
@@ -630,52 +651,24 @@ export default function TaskArtifacts({ taskId, artifacts }: { taskId: number; a
               unreachable until `prd`/`architecture` uploads exist. The banned APIs are named only in
               `TaskArtifacts.test.tsx`, which greps comment-stripped source.
               `key` = artifact id so switching REPLACES the frame (a `src` swap keeps scroll and history). */
-          <Box
-            component="iframe"
+          <Tip key={`artifact-${selected.id}-${retryToken}`} title={`${artifactKindLabel(selected.kind)}: ${selected.filename}`}><Box
+            component={ApiFrame}
             // The retry token too, so Retry reloads the frame along with its probe.
-            key={`artifact-${selected.id}-${retryToken}`}
             data-testid="task-artifact-frame"
             src={frameSrc}
             sandbox="allow-scripts allow-forms"
             // The accessible name distinguishes frames.
-            title={`${artifactKindLabel(selected.kind)}: ${selected.filename}`}
             sx={{
               ...ARTIFACT_FRAME_SX,
               // Explicit paper: a report may declare no background, and transparent on the dark surface
               // is unreadable. (PDF and markdown branches need none.)
-              backgroundColor: '#ffffff',
+              backgroundColor: 'common.white',
             }}
-          />
+          /></Tip>
         )}
       </Box>
     </Box>
   )
-}
-
-/** The two states every fetched body owes (failure, loading), or `null` when the caller renders the
- *  body. A helper, not a wrapper: order matters, and a blank document over a failed read would claim
- *  "the agent wrote nothing". */
-function fetchedBodyState({
-  body,
-  loading,
-  failed,
-  onRetry,
-}: {
-  body: string | null
-  loading: boolean
-  failed: boolean
-  onRetry: () => void
-}): ReactNode | null {
-  if (failed) return <FetchFailedBanner onRetry={onRetry} />
-  if (loading || body === null) {
-    // A spinner, not a skeleton of a document we may never get. No `aria-live`: the operator clicked.
-    return (
-      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', py: 4, minHeight: 120 }}>
-        <CircularProgress size={24} aria-label="Loading artifact" />
-      </Box>
-    )
-  }
-  return null
 }
 
 /** A read that failed, for every branch that reads the bytes (the fetched bodies, the report frame's probe). */
@@ -701,88 +694,52 @@ const BODY_SURFACE_SX = {
   overflowX: 'auto',
   border: '1px solid',
   borderColor: 'divider',
-  borderRadius: 1,
+  borderRadius: RADIUS.sm,
   px: 2,
   py: 1.5,
-  [PHONE]: { px: 1.25 },
+  [PHONE]: { px: 1 },
 } as const
 
-/* The markdown viewer, for markdown kinds and a free-form `.md` alike — one set of typographic decisions. */
-function MarkdownView({
+/* ── THE FETCHED-BODY VIEWER — markdown kinds and a free-form `.md`, or plain text (`.log`, `.json`, `.csv`) ──
+ * Failure first, then loading, then the body: a blank document over a failed read would claim "the agent wrote
+ * nothing". Markdown renders through `RichTextRenderer` with one set of typographic decisions; plain text NEVER
+ * does (a `#` log line would become a heading) — it is byte-for-byte what the runner wrote (`CodeBlock`'s
+ * `pre-wrap` preserves whitespace yet wraps), scrolling in its own box, capped (the frame's 480 floor read as a
+ * max) so a 2MB log cannot own the page. */
+function FetchedBodyView({
+  body,
   markdown,
   loading,
   failed,
   onRetry,
 }: {
-  markdown: string | null
+  body: string | null
+  markdown: boolean
   loading: boolean
   failed: boolean
   onRetry: () => void
 }) {
-  const pending = fetchedBodyState({ body: markdown, loading, failed, onRetry })
-  if (pending) return pending
-  // Narrowed by `fetchedBodyState`, which TypeScript cannot see through.
-  const body = markdown as string
+  if (failed) return <FetchFailedBanner onRetry={onRetry} />
+  if (loading || body === null) {
+    // A spinner, not a skeleton of a document we may never get. No `aria-live`: the operator clicked.
+    return (
+      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', py: 4, minHeight: grid(20) }}>
+        <LoadingState label="Loading artifact" />
+      </Box>
+    )
+  }
   return (
     <Box
-      data-testid="task-artifact-markdown"
-      sx={{
-        ...BODY_SURFACE_SX,
+      data-testid={markdown ? 'task-artifact-markdown' : 'task-artifact-text'}
+      sx={markdown
         // An 80ch measure on the PROSE, not the box, so the border still frames the panel.
-        '& .rte-content': { maxWidth: '80ch', overflowWrap: 'anywhere' },
-      }}
-    >
-      {body.trim() === '' ? (
-        /* Known-empty, distinct from a failed read. */
-        <Typography variant="body2" sx={{ color: 'text.secondary', fontStyle: 'italic' }}>
-          This artifact is empty.
-        </Typography>
-      ) : (
-        <RichTextRenderer content={body} />
-      )}
-    </Box>
-  )
-}
-
-/* ── THE PLAIN-TEXT VIEWER — a `.log`, a `.json`, a `.csv`, a `.txt` ──────────────────────────────
- * Byte-for-byte what the runner wrote: `pre-wrap` preserves whitespace yet wraps (`pre` would scroll every
- * long line), `anywhere` handles unbroken tokens. Scrolls in its own box, capped (the frame's 480 floor
- * read as a max) so a 2MB log cannot own the page. The bytes are React children, never markup: a
- * `<script>` renders as its characters. */
-function PlainTextView({
-  text,
-  loading,
-  failed,
-  onRetry,
-}: {
-  text: string | null
-  loading: boolean
-  failed: boolean
-  onRetry: () => void
-}) {
-  const pending = fetchedBodyState({ body: text, loading, failed, onRetry })
-  if (pending) return pending
-  const body = text as string
-  return (
-    <Box
-      data-testid="task-artifact-text"
-      sx={{
-        ...BODY_SURFACE_SX,
-        maxHeight: 640,
-        overflowY: 'auto',
+        ? { ...BODY_SURFACE_SX, '& .rte-content': { maxWidth: '80ch', overflowWrap: 'anywhere' } }
         // Respelled: this key replaces the surface's phone inset rather than merging.
-        [PHONE]: { px: 1.25, maxHeight: 440 },
-      }}
+        : { ...BODY_SURFACE_SX, maxHeight: grid(106.5), overflowY: 'auto', [PHONE]: { px: 1, maxHeight: grid(73) } }}
     >
-      {body.trim() === '' ? (
-        /* Known-empty, as in the markdown branch. */
-        <Typography variant="body2" sx={{ color: 'text.secondary', fontStyle: 'italic' }}>
-          This artifact is empty.
-        </Typography>
-      ) : (
-        // `text.primary`: this is the document, and a dimmed log is unreadable.
-        <CodeBlock tone="plain" size="medium" sx={{ color: 'text.primary' }}>{body}</CodeBlock>
-      )}
+      <TextBody text={body} empty="This artifact is empty.">
+        {markdown ? <RichTextRenderer content={body} /> : undefined}
+      </TextBody>
     </Box>
   )
 }
@@ -815,14 +772,14 @@ function ArtifactImageView({
         overflow: 'auto',
         border: '1px solid',
         borderColor: 'divider',
-        borderRadius: 1,
+        borderRadius: RADIUS.sm,
         backgroundColor: 'action.hover',
         p: 2,
         [PHONE]: { p: 1 },
       }}
     >
       <Box
-        component="img"
+        component={ApiImg}
         // `key` so switching REPLACES the element (else the previous image shows under the new name).
         key={`artifact-image-${artifact.id}`}
         src={artifactContentUrl(taskId, artifact.id, false)}
@@ -833,10 +790,10 @@ function ArtifactImageView({
           display: 'block',
           // A ceiling in both axes; `height: 'auto'` keeps the aspect ratio.
           maxWidth: '100%',
-          maxHeight: 640,
+          maxHeight: grid(106.5),
           height: 'auto',
-          [PHONE]: { maxHeight: 420 },
-          borderRadius: 0.5,
+          [PHONE]: { maxHeight: grid(70) },
+          borderRadius: RADIUS.sm,
         }}
       />
     </Box>
@@ -846,38 +803,38 @@ function ArtifactImageView({
 /* ── THE FALLBACK CARD — the branch that renders no bytes at all, and is reached LAST ─────────────
  * For formats with no viewer (a spreadsheet, an archive). A frame is not a fallback: an unrenderable
  * frame paints an empty box. The card carries, once: name, kind, size, when, and one action. Not a
- * warning tone (nothing failed); same border vocabulary as `MarkdownView`. Capped at 480px and hugging
+ * warning tone (nothing failed); same border vocabulary as `FetchedBodyView`. Capped at 480px and hugging
  * its content, or it reads as a banner or a failed load.
  */
 const DOWNLOAD_CARD_SX = {
   width: '100%',
-  maxWidth: 480,
+  maxWidth: grid(80),
   minWidth: 0,
   border: '1px solid',
   borderColor: 'divider',
-  borderRadius: 1,
+  borderRadius: RADIUS.sm,
   px: 2,
-  py: 1.75,
-  [PHONE]: { px: 1.25 },
+  py: 1.5,
+  [PHONE]: { px: 1 },
 } as const
 
 /* The type cue is the filename's EXTENSION, not an icon set (no icon package under `src`; see
    `TaskToolbar`) — true for every format. Theme tokens for ground and ring. */
 const EXTENSION_PLATE_SX = {
   flexShrink: 0,
-  width: 44,
-  height: 44,
+  width: grid(7),
+  height: grid(7),
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
   border: '1px solid',
   borderColor: 'divider',
-  borderRadius: 1,
+  borderRadius: RADIUS.sm,
   backgroundColor: 'action.hover',
   color: 'text.primary',
-  fontSize: '0.625rem',
-  fontWeight: 700,
-  letterSpacing: '0.04em',
+  fontSize: FONT_SIZE.xxs,
+  fontWeight: FONT_WEIGHT.bold,
+  letterSpacing: LETTER_SPACING.caps,
   overflow: 'hidden',
 } as const
 
@@ -922,12 +879,19 @@ function fileExtensionTag(filename: string): string {
   return /^[a-z0-9]{1,5}$/i.test(ext) ? ext.toUpperCase() : 'FILE'
 }
 
-/** The URL for an artifact's bytes — the one place `?download=1` is spelled (on the live host, its viewer URL:
- *  `apiHref`). The flag only flips the
+/** The overflow menu's Download for API `path`: the same anchor it always was, a plain click saved through the
+ *  choke point (`net/href.tsx::apiDownloadProps`). */
+function overflowDownload(path: string): { href: string; onFollow: (e: MouseEvent<HTMLElement>) => void } {
+  const { href, onClick } = apiDownloadProps(path)
+  return { href, onFollow: onClick }
+}
+
+/** The API path of an artifact's bytes — the one place `?download=1` is spelled (the browser fetches it through
+ *  `net/href.tsx`, which rewrites it on the live host). The flag only flips the
  *  disposition header (`app/routes/attachments.py::artifact_content`), same row, same guard. Every
  *  download control passes `true`: the route answers `inline` for renderable free-form types. */
 function artifactContentUrl(taskId: number, artifactId: number, download: boolean): string {
-  return apiHref(`/api/tasks/${taskId}/artifacts/${artifactId}/content${download ? '?download=1' : ''}`)
+  return `/api/tasks/${taskId}/artifacts/${artifactId}/content${download ? '?download=1' : ''}`
 }
 
 /** The identity strip's Download — the only route to the bytes for kinds rendered in place. `?download=1`
@@ -937,24 +901,19 @@ function ArtifactDownloadButton({ taskId, artifact }: { taskId: number; artifact
   return (
     <Button
       component="a"
-      href={artifactContentUrl(taskId, artifact.id, true)}
-      download={artifact.filename}
-      // `noopener`: the house default on hand-built links.
-      rel="noopener"
+      {...downloadLinkProps(artifactContentUrl(taskId, artifact.id, true), artifact.filename)}
       /* Shares `FileDownloadCard`'s testid, safe only because this strip is suppressed beside the card; lift
          that and they need separate handles. */
       data-testid="task-artifact-download"
       variant="outlined"
       size="small"
       startIcon={<DownloadGlyph />}
-      /* "Download <filename>" is a superset of the visible word (WCAG 2.5.3). */
-      aria-label={`Download ${artifact.filename}`}
       /* `ml: 'auto'` pushes it trailing; `alignSelf: 'center'` opts out of the strip's baseline alignment. On a
          phone it is the glyph alone (the name stays its `aria-label`), so it fits beside the filename. */
       sx={[
         { ml: 'auto', alignSelf: 'center', flexShrink: 0 },
         tapTargetSx,
-        { [PHONE]: { minWidth: 44, px: 0, '& .MuiButton-startIcon': { m: 0 } } },
+        { [PHONE]: { minWidth: SIZE.tapTarget, px: 0, '& .MuiButton-startIcon': { m: 0 } } },
       ]}
     >
       <Box component="span" sx={{ [PHONE]: { display: 'none' } }}>Download</Box>
@@ -970,20 +929,15 @@ function ArtifactRowDownload({ taskId, artifact }: { taskId: number; artifact: A
   return (
     <IconButton
       component="a"
-      href={artifactContentUrl(taskId, artifact.id, true)}
-      download={artifact.filename}
-      // `noopener`: the house default on hand-built links.
-      rel="noopener"
+      {...downloadLinkProps(artifactContentUrl(taskId, artifact.id, true), artifact.filename)}
       data-testid={`task-artifact-row-download-${artifact.id}`}
-      /* Icon-only, so the filename is its only name. */
-      aria-label={`Download ${artifact.filename}`}
       size="small"
       sx={{
         // Recedes at rest (never below `text.secondary`), full strength on hover and focus.
         color: 'text.secondary',
         p: 0,
-        width: 22,
-        height: 22,
+        width: grid(3.5),
+        height: grid(3.5),
         '&:hover': { color: 'text.primary', backgroundColor: 'action.hover' },
         '&:focus-visible': { color: 'text.primary' },
       }}
@@ -993,13 +947,12 @@ function ArtifactRowDownload({ taskId, artifact }: { taskId: number; artifact: A
   )
 }
 
-function FileDownloadCard({ taskId, artifact }: { taskId: number; artifact: Artifact }) {
+function FileDownloadCard({ taskId, artifact, note }: { taskId: number; artifact: Artifact; note?: string }) {
   /* Same helper URL (same-origin, so the cookie rides it). `download` and the route's
      `Content-Disposition: attachment` agree on the name. NOT THE SECURITY BOUNDARY: an `evil.html` stays
      inert through two server-side headers (`app/task_manifest.py::FREEFORM_KINDS`); `download` governs
      only this click. A link, not a `fetch` + Blob (as `pages/audit/SessionsTab.tsx` argues): the browser
      streams to disk natively. */
-  const contentUrl = artifactContentUrl(taskId, artifact.id, true)
   return (
     <Box data-testid="task-artifact-download-card" sx={DOWNLOAD_CARD_SX}>
       <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1.5, minWidth: 0 }}>
@@ -1011,19 +964,14 @@ function FileDownloadCard({ taskId, artifact }: { taskId: number; artifact: Arti
           <Typography
             variant="subtitle2"
             component="div"
-            sx={{ fontWeight: 700, lineHeight: 1.35, minWidth: 0, overflowWrap: 'anywhere' }}
+            sx={{ fontWeight: FONT_WEIGHT.bold, lineHeight: LINE_HEIGHT.snug, minWidth: 0, overflowWrap: 'anywhere' }}
           >
             {artifact.filename}
           </Typography>
-          {/* What · how big · when; `title` keeps the absolute timestamp (`lib/relativeTime`). */}
-          <Typography
-            variant="caption"
-            component="div"
-            sx={{ color: 'text.secondary', mt: 0.25 }}
-            title={absoluteTime(artifact.created_at)}
-          >
+          {/* What · how big · when; the age keeps the absolute timestamp on hover. */}
+          <Typography variant="caption" component="div" sx={{ color: 'text.secondary', mt: 0 }}>
             {contentTypeName(artifact.content_type)} · {formatBytes(artifact.size_bytes)} ·{' '}
-            {relativeAge(artifact.created_at)}
+            <RelativeTime iso={artifact.created_at} />
           </Typography>
           {artifact.region_label && (
             <Typography variant="caption" component="div" data-testid="task-artifact-region" sx={{ color: 'text.secondary' }}>
@@ -1033,22 +981,18 @@ function FileDownloadCard({ taskId, artifact }: { taskId: number; artifact: Arti
         </Box>
       </Box>
 
-      {/* One sentence, no apology (nothing failed), about THIS FORMAT — some files are previewed now. */}
-      <Typography variant="body2" sx={{ color: 'text.secondary', mt: 1.5 }}>
-        No preview — download to open.
+      {/* One sentence, no apology (nothing failed), about THIS FORMAT — some files are previewed now — or why
+          this browser does not preview a format that is (`note`). */}
+      <Typography variant="body2" data-testid="task-artifact-download-note" sx={{ color: 'text.secondary', mt: 1.5 }}>
+        {note ?? 'No preview — download to open.'}
       </Typography>
 
       <Button
         component="a"
-        href={contentUrl}
-        download={artifact.filename}
-        // `noopener`: the house default on hand-built links.
-        rel="noopener"
+        {...downloadLinkProps(artifactContentUrl(taskId, artifact.id, true), artifact.filename)}
         data-testid="task-artifact-download"
         variant="contained"
         startIcon={<DownloadGlyph />}
-        /* "Download <filename>" is a superset of the visible word (WCAG 2.5.3). */
-        aria-label={`Download ${artifact.filename}`}
         sx={[{ mt: 2 }, tapTargetSx]}
       >
         Download

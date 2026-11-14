@@ -24,6 +24,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app import cp_peers
+from app.db import excluded_of
 from app.models.control_plane import CpPeer
 from app.models.nodes import NodeBusSocket
 
@@ -46,14 +47,15 @@ def record_connected(session: Session, node_id: str, socket_id: Optional[uuid.UU
         node_id=node_id, peer_id=cp_peers.self_id(), socket_id=socket_id,
         connected_at=func.now(), last_seen_at=func.now(),
     )
+    excluded = excluded_of(NodeBusSocket.__table__)
     session.execute(
         stmt.on_conflict_do_update(
             index_elements=[NodeBusSocket.node_id],
             set_={
-                "peer_id": stmt.excluded.peer_id,
-                "socket_id": stmt.excluded.socket_id,
-                "connected_at": stmt.excluded.connected_at,
-                "last_seen_at": stmt.excluded.last_seen_at,
+                "peer_id": excluded.peer_id,
+                "socket_id": excluded.socket_id,
+                "connected_at": excluded.connected_at,
+                "last_seen_at": excluded.last_seen_at,
             },
         )
     )
@@ -62,7 +64,7 @@ def record_connected(session: Session, node_id: str, socket_id: Optional[uuid.UU
 def reassert_connected(session: Session, node_id: str, socket_id: uuid.UUID) -> None:
     """Put back the row for a socket this peer still holds, without evicting a newer holder.
 
-    The peer heartbeat calls this for every local socket (`cp_peers.heartbeat_tick`): a peer pruned as
+    The peer heartbeat calls this for every local socket (`cp_peers.housekeeping`): a peer pruned as
     dead during a DB outage had its rows cascaded away, and nothing else re-creates them while the
     socket lives. The upsert wins only over a row this peer wrote or a row whose peer is no longer live —
     a node that meanwhile redialled onto another live peer keeps that newer row."""
@@ -70,6 +72,7 @@ def reassert_connected(session: Session, node_id: str, socket_id: uuid.UUID) -> 
         node_id=node_id, peer_id=cp_peers.self_id(), socket_id=socket_id,
         connected_at=func.now(), last_seen_at=func.now(),
     )
+    excluded = excluded_of(NodeBusSocket.__table__)
     # CORRELATED to the conflicting row BY NAME. Naming `NodeBusSocket.peer_id` here puts `node_bus_sockets`
     # in the subquery's own FROM (and `.correlate()` does not reach into an INSERT's ON CONFLICT clause),
     # so the EXISTS asked "does ANY socket row sit on ANY live peer" — true whenever a second node is
@@ -82,9 +85,9 @@ def reassert_connected(session: Session, node_id: str, socket_id: uuid.UUID) -> 
         stmt.on_conflict_do_update(
             index_elements=[NodeBusSocket.node_id],
             set_={
-                "peer_id": stmt.excluded.peer_id,
-                "socket_id": stmt.excluded.socket_id,
-                "last_seen_at": stmt.excluded.last_seen_at,
+                "peer_id": excluded.peer_id,
+                "socket_id": excluded.socket_id,
+                "last_seen_at": excluded.last_seen_at,
             },
             where=or_(NodeBusSocket.peer_id == cp_peers.self_id(), ~exists(live_holder)),
         )
@@ -126,6 +129,12 @@ def record_disconnected(session: Session, node_id: str, socket_id: Optional[uuid
     )
     result = session.execute(delete(NodeBusSocket).where(NodeBusSocket.node_id == node_id, owned))
     return result.rowcount > 0
+
+
+def forget(session: Session, node_id: str) -> bool:
+    """Delete on an unregistered node (`routes/nodes/delete.py::_forget_presence`): every presence row for `node_id`,
+    whichever peer holds it. The socket is not closed, so a node still dialling shows again. True iff a row went."""
+    return session.execute(delete(NodeBusSocket).where(NodeBusSocket.node_id == node_id)).rowcount > 0
 
 
 def touch(session: Session, node_id: str) -> None:
@@ -185,9 +194,9 @@ def snapshot(session: Session) -> list[dict[str, Any]]:
 
 def _committed(fn: Callable[..., Any], *args: Any) -> Any:
     """Run one sync function in its own committed session (a worker thread's whole unit of work)."""
-    from app.db import SessionLocal
+    from app.db import BridgedSession
 
-    with SessionLocal() as session:
+    with BridgedSession() as session:
         result = fn(session, *args)
         session.commit()
         return result

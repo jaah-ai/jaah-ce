@@ -12,6 +12,8 @@ import Banner from '../ui/Banner'
 import InterstitialPanel from '../ui/InterstitialPanel'
 import LoadingState from '../ui/LoadingState'
 import SwitchCodeForm from './account/SwitchCodeForm'
+import { ELLIPSIS_SX } from '../ui/listStyles'
+import { SIZE } from '../theme'
 
 /* The deep-link interstitial (multi-org R9/AC13). A detail page whose object 404s under the ACTIVE org renders
  * this in place of its not-found: it asks `GET /api/auth/locate/<type>/<id>` which of the caller's OTHER orgs
@@ -148,9 +150,9 @@ export function SwitchOrgPrompt({ org, title }: { org: Located; title?: string }
             onClick={() => void switchOrg()}
             disabled={busy}
             data-testid="other-org-switch"
-            sx={{ minHeight: 44, alignSelf: 'flex-start', maxWidth: '100%', textTransform: 'none' }}
+            sx={{ minHeight: SIZE.tapTarget, alignSelf: 'flex-start', maxWidth: '100%', textTransform: 'none' }}
           >
-            <Box component="span" sx={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <Box component="span" sx={ELLIPSIS_SX}>
               Switch to {org.org_name}
             </Box>
           </Button>

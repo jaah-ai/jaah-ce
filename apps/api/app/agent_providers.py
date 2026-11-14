@@ -40,9 +40,6 @@ account_layer = _NODE.account_layer
 implied_on_wire = _NODE.implied_on_wire
 Capabilities = _NODE.Capabilities
 MODES: tuple[str, ...] = _NODE.MODES
-VOCABULARY_SPELLINGS: tuple[tuple[str, str], ...] = _NODE.VOCABULARY_SPELLINGS
-VOCABULARY_SNAPSHOT_KEY: str = _NODE.VOCABULARY_SNAPSHOT_KEY
-CURRENT_VOCABULARY: str = _NODE.CURRENT_VOCABULARY
 
 
 #: The provider a Jaah-account (Bedrock) run launches: the default one, the one CLI Bedrock is wired for
@@ -57,8 +54,8 @@ SUBSCRIPTION_SURFACES: dict[str, str] = {"claude_subscription": "anthropic_consu
 
 def _authorize_url_anchor(value: str) -> tuple[str, bool] | None:
     """`value`'s `(prefix, exact)` anchor (`Capabilities.authorize_url_anchor`), None for no opinion or an unknown
-    value. The control plane's own second anchor on an authorize URL a node scraped (the console's `safeHref` admits
-    any http(s) URL; cf. `routes/commands.py::_oauth_url_from_reply`)."""
+    value. The anchor the browser applies to the authorize link it unseals (the console's `safeHref` admits any
+    http(s) URL on its own); served as `AgentProviderOut.authorize_url_prefix` + `authorize_url_exact`."""
     caps = capabilities_of(value)
     return caps.authorize_url_anchor if caps is not None else None
 
@@ -67,45 +64,35 @@ def authorize_url_prefix(value: str) -> str | None:
     """What `value`'s authorize URL must start with, or None when this provider declares no constant one.
 
     None is "no opinion" (a provider whose host varies, or a value from a newer build): the caller publishes the
-    URL it holds. The decision itself is `authorize_url_admits`; this returns the expected string for diagnostics."""
+    URL it holds. The browser decides with it: an exact provider's link must equal it, any other's must start with it."""
     anchor = _authorize_url_anchor(value)
     return anchor[0] if anchor is not None else None
 
 
 def authorize_url_exact(value: str) -> bool:
     """Whether `value`'s authorize URL must EQUAL its prefix (a constant verification page), False
-    for a prefix match or no opinion. Served to the browser beside the prefix (`AgentProviderOut`), since
-    it now anchors the link; the decision here stays `authorize_url_admits`."""
+    for a prefix match or no opinion. Served to the browser beside the prefix (`AgentProviderOut`), which
+    anchors the link: equality refuses a prefilled `?user_code=` tail or a suffix glued onto a constant page."""
     anchor = _authorize_url_anchor(value)
     return anchor[1] if anchor is not None else False
-
-
-def authorize_url_admits(value: str, url: str) -> bool | None:
-    """Whether `url` is one this roster will let `value` publish -- None when it has no opinion.
-
-    None: publish the URL already held (a varying host's login may not move). False: fail closed as "no URL",
-    never a raise or substituted URL. An exact provider compares with `==`, refusing prefilled
-    `user_code`, suffix-glued and `/../` tails."""
-    anchor = _authorize_url_anchor(value)
-    if anchor is None:
-        return None
-    prefix, exact = anchor
-    return url == prefix if exact else url.startswith(prefix)
 
 
 # How an API-key account's key is checked before the account is written: ONE `GET` of the row's
 # `capabilities.api_key_probe_url` carrying the key in a header (`routes/accounts.py::_probe_api_key`). The
 # header is the ENDPOINT's convention, keyed by its host: Google reads its key from `x-goog-api-key` (never a
-# query string); every other endpoint takes `Authorization: Bearer`. CP-only: the node never probes.
+# query string), Anthropic from `x-api-key` (no scheme); every other endpoint takes `Authorization: Bearer`.
+# Any further header (Anthropic's `anthropic-version`, its workspace) comes from the key's registry
+# `KeyTestSpec`, read by the prober. CP-only: the node never probes.
 _KEY_HEADER_BY_HOST: dict[str, tuple[str, str]] = {
     "generativelanguage.googleapis.com": ("x-goog-api-key", ""),
+    "api.anthropic.com": ("x-api-key", ""),
 }
 _BEARER: tuple[str, str] = ("Authorization", "Bearer")
 
 
 def api_key_probe(value: str) -> tuple[str, str, str] | None:
     """`(url, header, scheme)` that `value`'s API key is verified with at registration and rotation, or None
-    when nothing is probed (Anthropic: the Credentials page's own tester checks its key)."""
+    when nothing is probed (a row declaring no `api_key_probe_url`)."""
     caps = capabilities_of(value)
     url = caps.api_key_probe_url if caps is not None else None
     if not url:
@@ -128,5 +115,3 @@ def provider_of_model(model: str) -> str | None:
 #: The env var the node exports a runner's account home in (`ResolvedAccount.config_dir`): empty or absent, the
 #: legacy-runtime CLI opens its default, unauthenticated home.
 CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
-#: The env var that moves a SHARED OAuth account's token store (`ResolvedAccount.securestorage_dir`).
-SECURESTORAGE_DIR_ENV = "CLAUDE_SECURESTORAGE_CONFIG_DIR"

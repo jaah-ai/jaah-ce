@@ -17,16 +17,19 @@ import hmac
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import NamedTuple, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import PlainTextResponse, Response
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app import edition_features, ce_caps, node_credentials, node_platform
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
-from app.db import get_session
+from app.clock import utcnow
+from app.db_async import DbDep, release, run_blocking_in_session
 from app.events import emit_console_event
 from app.models.nodes import Node, NodeOrder
 from app.entity_shape import get_or_404
@@ -67,10 +70,10 @@ _DIST_PLATFORM = {node_platform.OS_MACOS: MACOS_PLATFORM}
 
 @router.get(BOOTSTRAP_PATH, response_class=PlainTextResponse)
 @infra(Tenancy.ORG_SCOPED)
-def serve_node_bootstrap(
+async def serve_node_bootstrap(
     request: Request,
+    db: DbDep,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
     former_node: uuid.UUID | None = Query(None, alias=FORMER_NODE_PARAM),
     dist: str | None = Query(None, alias=DIST_PARAM),
 ) -> Response:
@@ -87,6 +90,38 @@ def serve_node_bootstrap(
     The derived-identity check is the whole authorization: an arm with no node identity (CP loopback,
     local-dev bypass) has nothing to be served, so `is_derived` refuses rather than falls back.
     """
+    served = await db.run_sync(
+        _serve_node_bootstrap, request=request, caller=caller, former_node=former_node, dist=dist
+    )
+    if isinstance(served, _DistFetch):
+        await release(db)
+        # Off the loop: the presign reads a setting and fetches AWS credentials (`agent_apt.serve_object`).
+        return await run_in_threadpool(agent_apt.serve_object, served.key, channel="dist", caller=caller)
+    if isinstance(served, _Render):
+        await release(db)
+        # Off the loop, on a sync session of its own: the render mints a tailnet key (a DBOS workflow it waits on,
+        # headscale over HTTP) under the re-enrolment's row lock, which lives on that thread's connection.
+        return await run_blocking_in_session(_render_bootstrap, request=request, caller=caller, route=db)
+    return served
+
+
+class _DistFetch(NamedTuple):
+    """The `?dist=` answer's allowlisted key (None: a 404), signed after the DB phase (`_dist_key`)."""
+
+    key: Optional[str]
+
+
+class _Render(NamedTuple):
+    """The bootstrap itself is to be rendered (`_render_bootstrap`), off the loop."""
+
+
+def _serve_node_bootstrap(
+    session: Session,
+    request: Request,
+    caller: node_credentials.AgentCaller,
+    former_node: uuid.UUID | None,
+    dist: str | None,
+) -> Response | _DistFetch | _Render:
     if not edition_features.enabled("cloud_nodes"):
         # An edition without it renders no bootstrap: the community edition's one node is provisioned by its boot
         # (`app/ce_bootstrap.py`), never by this line.
@@ -104,12 +139,19 @@ def serve_node_bootstrap(
     row = get_or_404(session, Node, caller.node_id, detail="this node no longer exists")
 
     if dist is not None:
-        return _dist_redirect(request, row, caller)
+        return _DistFetch(_dist_key(request, row))
 
     if former_node is not None:
         answer = "present" if _node_exists_anywhere(session, former_node) else "absent"
         log.info("agent-bootstrap: node=%s asked about its box's former node: %s", row.name, answer)
         return PlainTextResponse(answer, headers={"Cache-Control": "no-store"})
+
+    return _Render()
+
+
+def _render_bootstrap(session: Session, request: Request, caller: node_credentials.AgentCaller) -> Response:
+    """The render, rationed mint included, in `run_blocking_in_session`'s sync session; it commits as it spends."""
+    row = get_or_404(session, Node, caller.node_id, detail="this node no longer exists")
 
     # The plaintext comes off the request (the column holds a digest); `_check_token` proved it hashes
     # to this row's credential.
@@ -200,7 +242,7 @@ def _stamp_fetched(session: Session, row: Node) -> None:
     """The install command ran: its machine fetched the script. A host page waiting on a machine that never did says
     the command has not run (`BOOTSTRAP_FETCHED_KEY`) — e.g. EC2 user-data with no `#!` line, which cloud-init skips.
     The order awaiting this machine is told at once: its progress dialog swaps the command for the install's bar."""
-    row.infra = {**(row.infra or {}), BOOTSTRAP_FETCHED_KEY: datetime.now(timezone.utc).isoformat()}
+    row.infra = {**(row.infra or {}), BOOTSTRAP_FETCHED_KEY: utcnow().isoformat()}
     for order in session.scalars(select(NodeOrder).where(
         NodeOrder.host_node_id == row.id, NodeOrder.stage == "waiting_for_machine",
     )):
@@ -208,8 +250,9 @@ def _stamp_fetched(session: Session, row: Node) -> None:
     session.commit()
 
 
-def _dist_redirect(request: Request, row: Node, caller: node_credentials.AgentCaller) -> RedirectResponse:
-    """The `?dist=` answer: 409 for an OS with no dist fetch here, 404 for a name `agent_dist` would refuse."""
+def _dist_key(request: Request, row: Node) -> Optional[str]:
+    """The `?dist=` answer's key: 409 for an OS with no dist fetch here, None (a 404) for a name `agent_dist` would
+    refuse."""
     platform = _DIST_PLATFORM.get(row.os)
     if platform is None:
         raise HTTPException(
@@ -219,10 +262,7 @@ def _dist_redirect(request: Request, row: Node, caller: node_credentials.AgentCa
     # The raw query value, not the decoded one: a version's literal `+` would decode to a space, and passing it
     # as `raw_path` keeps `agent_dist`'s refusal of any `%`.
     raw = next((v for k, _, v in (p.partition("=") for p in request.url.query.split("&")) if k == DIST_PARAM), "")
-    key = agent_dist._dist_key(platform, raw, raw)
-    if key is None:
-        raise HTTPException(status_code=404, detail="no such object")
-    return agent_apt.presigned_redirect(key, channel="dist", caller=caller)
+    return agent_dist._dist_key(platform, raw, raw)
 
 
 def _node_exists_anywhere(session: Session, node_id: uuid.UUID) -> bool:
@@ -281,7 +321,7 @@ def _may_mint_a_tailnet_key(session: Session, row: Node, *, presented_token: str
         )
     if issued.tzinfo is None:  # a column written before the tz-aware default; treat as UTC
         issued = issued.replace(tzinfo=timezone.utc)
-    if datetime.now(timezone.utc) - issued <= ENROLMENT_WINDOW:
+    if utcnow() - issued <= ENROLMENT_WINDOW:
         return True
     raise HTTPException(
         status_code=409,
@@ -300,7 +340,7 @@ def open_tailnet_reenrolment(row: Node) -> datetime:
 
     The caller (`routes/nodes/register.py::reenrol_node_on_tailnet`) re-issues the token in the same transaction, so
     the key can only reach whoever runs the command that response carries. Does not commit."""
-    row.tailnet_reenrol_until = datetime.now(timezone.utc) + ENROLMENT_WINDOW
+    row.tailnet_reenrol_until = utcnow() + ENROLMENT_WINDOW
     return row.tailnet_reenrol_until
 
 
@@ -328,7 +368,7 @@ def _reenrolment_is_open(session: Session, row: Node, presented_token: str) -> b
         return False
     if until.tzinfo is None:
         until = until.replace(tzinfo=timezone.utc)
-    if datetime.now(timezone.utc) < until:
+    if utcnow() < until:
         return True
     raise HTTPException(
         status_code=409,

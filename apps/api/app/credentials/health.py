@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Mapping, Optional
 from uuid import UUID
 
@@ -23,7 +23,7 @@ from sqlalchemy import func, or_, text, update
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import Executable
 
-from app.clock import as_utc
+from app.clock import as_utc, epoch_ms_or_none, utcnow
 from app.credentials.registry import CREDENTIAL_TYPES, secret_keys
 from app.entity_shape import is_blank
 from app.models.credentials import Credential
@@ -32,7 +32,13 @@ log = logging.getLogger("credential-health")
 
 #: The columns the stamps write: outside the `updated_at` trigger's column list (revision 202610232200), so a
 #: stamp is not an edit. `tests/test_credential_health_stamps.py` holds the installed trigger to the rest.
-MACHINERY_COLUMNS: tuple[str, ...] = ("last_used_at", "last_tested_at", "last_test_ok")
+MACHINERY_COLUMNS: tuple[str, ...] = (
+    "last_used_at", "last_tested_at", "last_test_ok", "last_test_message", "needs_reconnect_at",
+    "needs_reconnect_reason",
+)
+
+#: The longest test sentence kept in `last_test_message` (a tester's sentences are short; this bounds a hook's).
+_TEST_MESSAGE_MAX = 500
 
 #: `record_use` writes a row at most this often (R3): every other fetch in the window is a no-op UPDATE.
 USE_STAMP_EVERY = timedelta(hours=1)
@@ -57,11 +63,17 @@ def record_use(session: Session, ids: Iterable[Optional[UUID]]) -> None:
     ).values(last_used_at=func.now()))
 
 
-def record_test(session: Session, credential_id: UUID, ok: bool) -> None:
-    """Stamp a saved credential's last connection test (`POST /api/credentials/test`'s saved-row arm only: a test
-    of unsaved form values names no row). Commits `session`."""
+def record_test(session: Session, credential_id: UUID, ok: bool, message: Optional[str] = None) -> None:
+    """Stamp a saved credential's last connection test: its time, verdict and sentence (`POST /api/credentials/test`'s
+    saved-row arm, and the Test a one-click Connect runs; a test of unsaved form values names no row). It never
+    clears Needs reconnect: a Test may run on unsaved form values or a still-cached token, so only a new secret
+    clears it (`models/credentials.py::Credential.config`). Commits `session`."""
+    values: dict[str, Any] = {
+        "last_tested_at": func.now(), "last_test_ok": ok,
+        "last_test_message": (message or "")[:_TEST_MESSAGE_MAX] or None,
+    }
     _stamp(session, "test", update(Credential.__table__).where(Credential.__table__.c.id == credential_id).values(
-        last_tested_at=func.now(), last_test_ok=ok,
+        **values
     ))
 
 
@@ -102,7 +114,7 @@ def expires_at(type_slug: str, config: Mapping[str, Any]) -> Optional[datetime]:
     secrets = secret_keys(type_slug, config)
     dead_at = config.get("grant_dead_at")
     if "grant_dead_at" not in secrets and not is_blank(dead_at):
-        return _instant(dead_at) or datetime.now(timezone.utc)
+        return _instant(dead_at) or utcnow()
     if not is_blank(config.get("refresh_token")):
         return None
     spec = CREDENTIAL_TYPES.get(type_slug)
@@ -114,21 +126,11 @@ def expires_at(type_slug: str, config: Mapping[str, Any]) -> Optional[datetime]:
 def _instant(value: Any) -> Optional[datetime]:
     """An ISO-8601 string or epoch milliseconds (number or digit string) as an aware UTC instant; None for
     anything else. A naive ISO value is read as UTC (only a hand edit writes one)."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, str):
-        value = value.strip()
-        if value.isdigit():
-            value = int(value)
-    if isinstance(value, (int, float)):
-        try:
-            return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            return None
-    if not isinstance(value, str) or not value:
-        return None
+    stamp = epoch_ms_or_none(value)
+    if stamp is not None or not isinstance(value, str) or not value.strip():
+        return stamp
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
     except ValueError:
         return None
     return as_utc(parsed)

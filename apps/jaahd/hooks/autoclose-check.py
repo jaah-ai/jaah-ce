@@ -44,6 +44,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -64,9 +65,11 @@ _bc_spec.loader.exec_module(break_cause)
 _JAAHD_DIR = str(_SELF_DIR.parent)
 if _JAAHD_DIR not in sys.path:
     sys.path.append(_JAAHD_DIR)
+import host_platform  # the pane-root walk (`_pane_root`) — the OS seam, same append
 import agent_config_dirs
 import agent_providers  # the probe's argv (`_AGENTS_PROBE_ARGV`) — a stdlib-only leaf, same append
 import environment  # the hooks' log dir, `hook_log_dir` — same stdlib-only leaf, same append
+import file_io  # the transcript tail read, `read_tail` — likewise
 import runner_env
 
 try:
@@ -94,18 +97,7 @@ def _cp_reads_authenticated() -> bool:
 
 def _ac_log(*parts: str) -> None:
     """Durable, low-noise decision log (instrumentation only — NEVER gates the close decision)."""
-    log_dir = environment.hook_log_dir()
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return
-    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    pane = os.environ.get("TMUX_PANE", "no-pane")
-    try:
-        with open(log_dir / "autoclose-check.log", "a") as f:
-            f.write(f"{stamp} [{pane}] {' '.join(parts)}\n")
-    except OSError:
-        pass
+    environment.hook_log("autoclose-check.log", f"[{os.environ.get('TMUX_PANE', 'no-pane')}]", *parts)
 
 
 def _decline(reason: str) -> bool:
@@ -124,12 +116,8 @@ def _last_record_ts(path: str) -> float | None:
     Not mtime: a parked transcript keeps being rewritten with no new content, so mtime reported a
     finished runner as live and held its slot. Only the tail is read; undateable lines are skipped. None
     means fall back to mtime — the conservative direction, since mtime is never older than the last append."""
-    try:
-        with open(path, "rb") as f:
-            if os.fstat(f.fileno()).st_size > _TRANSCRIPT_TAIL_BYTES:
-                f.seek(-_TRANSCRIPT_TAIL_BYTES, os.SEEK_END)
-            tail = f.read()
-    except OSError:
+    tail = file_io.read_tail(path, _TRANSCRIPT_TAIL_BYTES)
+    if tail is None:
         return None
     for line in reversed(tail.splitlines()):
         try:
@@ -227,8 +215,8 @@ def _same_path(a: str, b: str) -> bool:
 
 def _occupant_state(cwd: str) -> str:
     """The CP's `worktrees.state` for `cwd`'s pool slot — `"free"`/`"dispatching"`/`"live"`/`"parked"` —
-    or `_OCCUPANT_NOT_A_SLOT` when `cwd` is not a pool worktree (occupancy does not apply: a main clone or
-    an ad-hoc dir is not a slot), or `_OCCUPANT_UNKNOWN` when `cwd` DOES resolve to a slot but no row
+    or `_OCCUPANT_NOT_A_SLOT` when `cwd` is not a pool worktree (occupancy does not apply: an ad-hoc dir
+    is not a slot), or `_OCCUPANT_UNKNOWN` when `cwd` DOES resolve to a slot but no row
     could be matched to it.
 
     Resolved BY PATH against `worktrees.path`, not a `(project, number)` guess: `slot_of`'s project half
@@ -521,12 +509,54 @@ def _check_impl(sentinel: str, linger: int, on_kill: str = "") -> tuple[bool, bo
         subprocess.run(["bash", "-c", on_kill], capture_output=True)
 
     # (b) Targeted self-exit: a parked runner never self-exits. Safe because it fires only after the full
-    #     idle ladder.
-    if shutil.which("tmux"):
-        killed = subprocess.run(["tmux", "kill-pane", "-t", tmux_pane], capture_output=True)
-        if killed.returncode != 0:
-            subprocess.run(["tmux", "kill-window", "-t", tmux_pane], capture_output=True)
+    #     idle ladder. An isolated fleet server takes no command from a pane, so the pane's own root process
+    #     is the last resort.
+    if not _tmux_self_exit(tmux_pane) and not _signal_pane_root(os.environ.get(PANE_ROOT_ENV, "")):
+        _ac_log(f"check self-exit failed pane={tmux_pane} — neither tmux nor the pane's root process took it")
     return True, False
+
+
+def _tmux_self_exit(tmux_pane: str) -> bool:
+    """`kill-pane`, else `kill-window` (a window's last pane refuses the first). True when tmux took one."""
+    if not shutil.which("tmux"):
+        return False
+    if subprocess.run(["tmux", "kill-pane", "-t", tmux_pane], capture_output=True).returncode == 0:
+        return True
+    return subprocess.run(["tmux", "kill-window", "-t", tmux_pane], capture_output=True).returncode == 0
+
+
+# The pane this runner lives in, by its ROOT process: `<pid>:<start ticks>`, recorded by `arm` while the hook
+# is still its descendant (the detached checker is not). `_signal_pane_root` hangs it up as `kill-pane` would.
+PANE_ROOT_ENV = "AUTOCLOSE_PANE_ROOT"
+def _pane_root() -> str:
+    """`<pid>:<start ticks>` of this process's pane root — the ancestor whose parent is the tmux server —
+    or "" when there is none to find (no process table to walk, not inside tmux)."""
+    pid = os.getpid()
+    for _ in range(64):
+        parent = host_platform.parent_of(pid)
+        if parent is None or parent <= 1:
+            return ""
+        argv = host_platform.cmdline_args(parent) or [b""]
+        if os.path.basename(argv[0].decode(errors="replace")).startswith("tmux"):
+            started = host_platform.start_time(pid)
+            return f"{pid}:{started}" if started is not None else ""
+        pid = parent
+    return ""
+
+
+def _signal_pane_root(recorded: str) -> bool:
+    """Hang up the pane root RECORDED names, and its process group (tmux makes it the group's leader) — the
+    signal `kill-pane` sends. Refuses a pid that has since been reused (start time differs). True when sent."""
+    pid, _, ticks = recorded.partition(":")
+    if not pid.isdigit() or not ticks:
+        return False
+    if str(host_platform.start_time(int(pid))) != ticks:
+        return False
+    try:
+        os.killpg(int(pid), signal.SIGHUP)
+    except OSError:
+        return False
+    return True
 
 
 def check(sentinel: str, linger: int, on_kill: str = "") -> bool:
@@ -577,24 +607,20 @@ def arm(sentinel: str, linger: int, on_kill: str = "") -> None:
     session_path = _sentinel_session_path(sentinel)
     root = break_cause.worktree_root()
     try:
-        tmp_path = f"{session_path}.tmp{os.getpid()}"
-        with open(tmp_path, "w") as f:
-            f.write(_own_transcript_at_arm(root))
-        os.replace(tmp_path, session_path)
-    except OSError:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+        import env_helpers
+
+        env_helpers.atomic_write_text(Path(session_path), _own_transcript_at_arm(root), mode=None)
+    except Exception:  # noqa: BLE001 — a missing sibling or an unwritable sidecar must never block arming
+        pass
     _ac_log(f"arm sentinel={sentinel} linger={linger} retries={retries} armed_at={armed_at} on_kill={'set' if on_kill else ''}")
     # Detach fully (stdio to devnull, new session) so the sleeper never holds the Stop hook's pipes.
-    # cwd="/": a live process cwd'd in a worktree makes `worktree_mechanics.reset.reset_to_base` refuse it, so a
+    # cwd="/": a live process cwd'd in a worktree reads as a live occupant (`worktree_mechanics.processes`), so a
     # sleeping checker would pin its own slot. `PWD` is re-pinned to the resolved root so the child cannot
     # disagree with arm()'s baseline; `JAAH_WORKTREE` rides the environment copy unchanged (asserted by
     # test on the on-kill `bash -c` child's env).
     # Windows ignores `start_new_session`: there its own process group keeps the hook console's Ctrl+C off it.
     devnull = subprocess.DEVNULL
-    child_env = {**os.environ, "PWD": root}
+    child_env = {**os.environ, "PWD": root, PANE_ROOT_ENV: _pane_root()}
     posix = hasattr(os, "setsid")
     subprocess.Popen(
         [sys.executable, str(Path(__file__).resolve()), "_armloop", sentinel, str(linger),

@@ -1,0 +1,47 @@
+slug = "dbt_semantic_layer"
+label = "dbt Semantic Layer"
+category = "data"
+vendor_docs_url = "https://docs.getdbt.com/docs/dbt-cloud-apis/sl-graphql"
+summary = "Lets agents list dbt metrics and dimensions and query governed metrics through the dbt Semantic Layer APIs."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "base_url", label = "Semantic Layer URL", kind = "url", required = true, placeholder = "https://semantic-layer.cloud.getdbt.com", help = "By your dbt region: https://semantic-layer.cloud.getdbt.com (North America), https://semantic-layer.emea.dbt.com (EMEA), https://semantic-layer.au.dbt.com (APAC); a cell-based account adds semantic-layer to its Access URL, such as https://ab123.semantic-layer.us1.dbt.com (Account settings > Account information > Access URL)" },
+  { key = "environment_id", label = "Environment ID", kind = "text", required = true, placeholder = "123456", help = "dbt > Deploy > Environments > the environment the Semantic Layer is configured on (usually production): the number after /environments/ in the address bar" },
+  { key = "service_token", label = "Service token", kind = "secret", required = true, help = "dbt > Account settings > Service tokens > + Create service token, with the Semantic Layer Only and Metadata Only permission sets on the project; copy it when it is shown" },
+]
+
+[test]
+method = "POST"
+path = "{base_url}/api/graphql"
+body = '{"query":"{ environmentInfo(environmentId: {environment_id}) { dialect } }"}'
+auth = { field = "service_token", header = "Authorization", prefix = "Bearer" }
+identity = [["data", "environmentInfo", "dialect"]]
+identity_phrase = "on"
+host_suffixes = ["dbt.com", "getdbt.com"]
+
+[docs]
+agent_uses = [
+  "List the metrics, dimensions, entities and saved queries defined in the dbt project",
+  "Query governed metrics, grouped and filtered by dimensions, through the GraphQL API",
+  "Compile a metric query to the SQL it runs, to explain or check a number",
+]
+prerequisites = [
+  "A dbt platform account on the Starter, Enterprise or Enterprise+ plan with the Semantic Layer configured for an environment: Account settings > Projects > your project > Semantic Layer",
+  "At least one successful job run in that environment with metrics defined in the project",
+  "An Account Admin with a Developer licence to create the service token",
+]
+limitations = [
+  "The Semantic Layer serves metrics from the one environment it was configured on (usually production)",
+  "A wrong Environment ID can still pass the Test with no warehouse named in the result; check it reads Connected to dbt Semantic Layer on your warehouse",
+  "Accounts that restrict API access by IP address must allow Jaah's outbound addresses",
+]
+troubleshooting = [
+  { symptom = "Test says dbt Semantic Layer rejected the service token (401)", fix = "The token is wrong or was revoked, or the Semantic Layer URL is for another region. Pick the URL for your region and create a new service token in Account settings > Service tokens" },
+  { symptom = "Test says dbt Semantic Layer rejected the service token (403)", fix = "The token lacks the Semantic Layer Only permission set on this project, or your account's IP restrictions block Jaah (account_access_denied). Edit the service token's permission sets, or allow Jaah's addresses in Account settings > IP restrictions" },
+  { symptom = "Agents' metric queries fail with environment not configured", fix = "The Semantic Layer is not set up for that Environment ID. Configure it in Account settings > Projects > your project > Semantic Layer, and use that environment's ID" },
+]
+faq = [
+  { q = "Do I need dbt Core or the dbt platform?", a = "The Semantic Layer APIs are part of the dbt platform (dbt Cloud). A dbt Core project alone has no hosted Semantic Layer to connect to" },
+]

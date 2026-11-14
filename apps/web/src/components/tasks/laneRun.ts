@@ -28,3 +28,22 @@ export function latestGateLog<A extends { id: number; kind: string; filename: st
   }
   return latest
 }
+
+/** A lane run's own numbers (`TaskOut.lane_run`, `app/merge_lane_state.py::lane_run_view`): gates run, wall time
+ *  in seconds (a live run's elapsed so far), and whether it is past the stall bound. */
+export type LaneRunStats = { gates: number; wall_s: number; slow: boolean }
+
+/** A run's wall time, short and whole: `45s`, `72m` (minutes up to two hours, so a long gate reads exactly), then
+ *  `2h 05m`. */
+export function laneWallLabel(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds))
+  if (s < 60) return `${s}s`
+  const minutes = Math.floor(s / 60)
+  if (minutes < 120) return `${minutes}m`
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`
+}
+
+/** `9 gates · 72m`: the run's facts as one short line. */
+export function laneRunLabel(run: Pick<LaneRunStats, 'gates' | 'wall_s'>): string {
+  return `${run.gates} ${run.gates === 1 ? 'gate' : 'gates'} · ${laneWallLabel(run.wall_s)}`
+}

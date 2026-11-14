@@ -8,6 +8,7 @@ from uuid import UUID
 
 from fastapi import Depends, HTTPException
 from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 from starlette.requests import HTTPConnection
 
@@ -17,18 +18,22 @@ from app.auth import (
     SESSION_IDLE_TIMEOUT_DETAIL,
     TERMS_PENDING_PATHS,
     TERMS_REQUIRED,
+    note_verified_row,
     require_user,
     read_session,
     session_idled_out,
     session_row_is_live,
 )
-from app.db import IdentitySessionLocal, get_session
+from app import db_async
+from app.db_async import DbDep
 from app.models.access import UserGroupMembership
 from app.models.identity import AdminUser
 from app.tenancy import seam
 from app.tenancy.copy import administrator_changes
 from app.tenancy.ids import is_operator_plane, is_tenant_org
 from app.clock import utcnow as _now
+from app.access_catalog import MEMBER_KEYS
+from app.org_invitations import held_by_invitation
 from app.authz.catalog import OWNER_KEYS, PERMISSION_KEYS
 
 
@@ -101,9 +106,10 @@ class Principal:
 
     acting: bool = False
     """True when this is an operator's tab acting as `org_id`'s Owner seat (`owner_seat`, `app/act_as.py`):
-    `user_id` is still the operator, everything else is the seat. Read for attribution, never to admit — with four
-    exceptions: naming a stand-in starter (`routes/tasks/dispatch.py::_push_identity_or_422`), since the operator is no
-    member to be stamped; `authz/visibility.py::edits_any_credential`, so an acting operator edits any of the
+    `user_id` is still the operator, everything else is the seat. Read for attribution, never to admit — with five
+    exceptions: `jaah_repos.operator_caller`, so an acting operator still edits a Jaah-managed project's settings;
+    naming a stand-in starter (`routes/tasks/dispatch.py::_push_identity_or_422`), since the operator is no member to
+    be stamped; `authz/visibility.py::edits_any_credential`, so an acting operator edits any of the
     org's credentials, personal and system rows included; `authz/visibility.py::_hidden_gate`, so an acting
     operator reads and writes the org's hidden tasks, as the operator itself does; and
     `governance/pack_admin.py::is_pack_operator`, so an acting operator's console tab edits the managed compliance
@@ -179,9 +185,21 @@ class RevokedSession(HTTPException):
 def effective_access(
     session: Session, user_id: UUID, *, now: datetime | None = None
 ) -> tuple[tuple[access.EffectiveBinding, ...], access.Expansion]:
-    """The user's live bindings and what they confer — the one resolution every reader derives from."""
+    """The user's live bindings and what they confer — the one resolution every reader derives from.
+
+    A live member of a tenant org also holds `MEMBER_KEYS` on the floor, so the guard, `GET /api/auth/me`
+    and the users page agree on it. A row waiting on its invitation (disabled until the accept) counts too:
+    the users page then reads it as a brand-new account's row, so an admin cannot tell an existing person
+    from a new one (an admin's own disable of it counts as any disable: no keys); no session reaches a
+    disabled row, and `principal_for_user` grants it nothing."""
     bindings = access.effective_bindings(session, user_id, now=now or _now())
-    return bindings, access.expand(bindings, vocabulary=PERMISSION_KEYS)
+    expansion = access.expand(bindings, vocabulary=PERMISSION_KEYS)
+    # A scoped select, not `session.get`: the caller's own bound org (or `identity_scope`) answers.
+    seat = session.scalars(select(AdminUser).where(AdminUser.id == user_id)).first()
+    live = seat is not None and (seat.disabled_at is None or held_by_invitation(seat))
+    if live and is_tenant_org(seat.org_id):
+        expansion = replace(expansion, member_keys=MEMBER_KEYS)
+    return bindings, expansion
 
 
 def effective_permissions(session: Session, user_id: UUID) -> list[str]:
@@ -191,66 +209,84 @@ def effective_permissions(session: Session, user_id: UUID) -> list[str]:
     return sorted(effective_access(session, user_id)[1].permissions)
 
 
-def _resolve_principal(conn: HTTPConnection) -> Principal | None:
+#: How long a foreign thread waits on the serving loop for an identity read (`db_async.run_on_loop`): past the
+#: async pool's checkout bound (10s) plus the read itself.
+IDENTITY_READ_TIMEOUT_SECONDS = 30.0
+
+
+async def _resolve_principal(conn: HTTPConnection) -> Principal | None:
     """Verify this connection's session cookie and build its `Principal`, or None when there is no
     session user (the agent/infrastructure principal).
 
     Verifies the cookie directly and never reads `conn.state.admin_id`: `SessionAuthMiddleware` sets it only
     on http scopes, so WebSockets would resolve None. The `session_epoch` comparison is load-bearing —
-    without it a logged-out or password-rotated cookie is accepted."""
+    without it a logged-out or password-rotated cookie is accepted.
+
+    An identity read on the async pool (`app/db_async.py`, `identity=True`), completed and released before the
+    route session's first statement: no request holds two connections."""
     raw = conn.cookies.get(COOKIE_NAME)
     if raw is None:
         key = api_keys.of(conn)
         if key is not None:
-            return key_principal(key)
+            return await db_async.run_in_session(_key_principal_in, key, identity=True)
         # No cookie and no key — the only genuine agent/infrastructure principal.
         return None
     claims = read_session(raw)
     if claims is None:
         raise RevokedSession("session cookie did not verify")
-    # The identity lane (`app/db.py`): a guarded route already holds its route session's connection here, so
-    # a second checkout from the request pool is the hold-and-wait that starved it.
-    with IdentitySessionLocal() as session:
-        # This read discovers the org, so it cannot be filtered by one (`seam.identity_scope`).
-        with seam.identity_scope():
-            user = session.get(AdminUser, claims.admin_id)
-            if not session_row_is_live(user, claims.epoch, claims.iepoch):
-                # A signature-valid cookie for a deleted or disabled user, or a retired epoch: deny.
-                raise RevokedSession("session has been revoked")
-        # The Terms gate on every scope: a WebSocket never met `SessionAuthMiddleware`, and a cookie read under a
-        # `PUBLIC_PREFIXES` path (the SSO test) skipped it.
-        if claims.terms is not None and (conn.scope["type"] == "websocket" or conn.url.path not in TERMS_PENDING_PATHS):
-            raise RevokedSession(TERMS_REQUIRED["code"])
-        if conn.scope["type"] == "websocket":
-            # The org's IP allowlist; an http request met it in `SessionAuthMiddleware` already.
-            from app import ip_allowlist
+    return await db_async.run_in_session(_cookie_principal_in, conn, claims, identity=True)
 
-            org_id = None if ip_allowlist.exempt(user) else user.org_id
-            refused = ip_allowlist.refusal(session, org_id, conn.client.host if conn.client else None)
-            if refused is not None:
-                raise RevokedSession(refused)
-        # Outside the escape: `orgs` is not tenant-owned, and the escape declares exactly what it reads.
-        if session_idled_out(conn, session, user, claims.issued_at):
-            raise RevokedSession(SESSION_IDLE_TIMEOUT_DETAIL)
-        target = act_as.target_org(session, user, act_as.requested(conn.headers))
-        with seam.identity_scope():
-            principal = principal_for_user(session, user)
-        return owner_seat(principal, target) if target is not None else principal
+
+def _cookie_principal_in(session: Session, conn: HTTPConnection, claims: Any) -> Principal:
+    """`_resolve_principal`'s cookie arm over `session` (sync ORM code, run over the async connection)."""
+    # This read discovers the org, so it cannot be filtered by one (`seam.identity_scope`).
+    with seam.identity_scope():
+        user = session.get(AdminUser, claims.admin_id)
+        if not session_row_is_live(user, claims.epoch, claims.iepoch):
+            # A signature-valid cookie for a deleted or disabled user, or a retired epoch: deny.
+            raise RevokedSession("session has been revoked")
+    # The Terms gate on every scope: a WebSocket never met `SessionAuthMiddleware`, and a cookie read under a
+    # `PUBLIC_PREFIXES` path (the SSO test) skipped it.
+    if claims.terms is not None and (conn.scope["type"] == "websocket" or conn.url.path not in TERMS_PENDING_PATHS):
+        raise RevokedSession(TERMS_REQUIRED["code"])
+    if conn.scope["type"] == "websocket":
+        # The org's IP allowlist; an http request met it in `SessionAuthMiddleware` already.
+        from app import ip_allowlist
+
+        org_id = None if ip_allowlist.exempt(user) else user.org_id
+        refused = ip_allowlist.refusal(session, org_id, conn.client.host if conn.client else None)
+        if refused is not None:
+            raise RevokedSession(refused)
+    # Outside the escape: `orgs` is not tenant-owned, and the escape declares exactly what it reads.
+    if session_idled_out(conn, session, user, claims.issued_at):
+        raise RevokedSession(SESSION_IDLE_TIMEOUT_DETAIL)
+    # Live and not idled out: `require_user` reuses this row rather than reading it again (`auth._session_user`).
+    note_verified_row(conn, claims, user)
+    target = act_as.target_org(session, user, act_as.requested(conn.headers))
+    with seam.identity_scope():
+        principal = principal_for_user(session, user)
+    return owner_seat(principal, target) if target is not None else principal
 
 
 def key_principal(key: "api_keys.ApiKeyContext") -> Principal:
     """The owner's principal — an acting key's: the org's Owner seat (`owner_seat`) — narrowed to an API key
     (`api_keys.narrow`). The middleware verified the key moments ago; a disabled owner is refused here too (the cookie
-    arm's `session_row_is_live`)."""
-    with IdentitySessionLocal() as session:
-        with seam.identity_scope():
-            user = session.scalar(select(AdminUser).where(AdminUser.id == key.owner_id))
-            if user is None or user.disabled_at is not None:
-                raise RevokedSession("api key owner is disabled")
-            principal = principal_for_user(session, user)
+    arm's `session_row_is_live`). Blocking, for a caller on a foreign thread: the read runs on the serving loop."""
+    return db_async.run_on_loop(
+        db_async.run_in_session(_key_principal_in, key, identity=True), timeout=IDENTITY_READ_TIMEOUT_SECONDS
+    )
+
+
+def _key_principal_in(session: Session, key: "api_keys.ApiKeyContext") -> Principal:
+    """`key_principal` over `session` (sync ORM code, run over the async connection)."""
+    with seam.identity_scope():
+        user = session.scalar(select(AdminUser).where(AdminUser.id == key.owner_id))
+        if user is None or user.disabled_at is not None:
+            raise RevokedSession("api key owner is disabled")
+        principal = principal_for_user(session, user)
     if key.acting:
         principal = owner_seat(principal, key.org_id)
-    return api_keys.narrow(principal, key)
+    return api_keys.narrow(principal, key, session)
 
 
 def owner_seat(principal: Principal, org_id: UUID) -> Principal:
@@ -299,6 +335,7 @@ def principal_for_user(session: Session, user: AdminUser) -> Principal:
                 select(UserGroupMembership.group_id)
                 .where(UserGroupMembership.user_id == user.id)
                 .distinct()
+                .order_by(UserGroupMembership.group_id)  # equal principals compare equal (`task_tree` cache key)
             ).all()
         )
         # Read inside the escape: on the Slack path an expired `user` would refresh under the caller's org.
@@ -349,7 +386,20 @@ def current_principal(conn: HTTPConnection) -> Principal | None:
     cached = getattr(conn.state, _PRINCIPAL_CACHE_ATTR, _UNRESOLVED)
     if cached is not _UNRESOLVED and not _expired(cached):
         return cached  # type: ignore[return-value]
-    principal = _resolve_principal(conn)
+    # On a foreign thread (a sync dependency, the guard's decision): the read runs on the serving loop. The guard
+    # resolves it on the loop first (`current_principal_async`), so a guarded request finds it cached here.
+    principal = db_async.run_on_loop(_resolve_principal(conn), timeout=IDENTITY_READ_TIMEOUT_SECONDS)
+    setattr(conn.state, _PRINCIPAL_CACHE_ATTR, principal)
+    return principal
+
+
+async def current_principal_async(conn: HTTPConnection) -> Principal | None:
+    """`current_principal` on the event loop, sharing its per-request memo: the guard's first step, so the identity
+    read never takes a thread."""
+    cached = getattr(conn.state, _PRINCIPAL_CACHE_ATTR, _UNRESOLVED)
+    if cached is not _UNRESOLVED and not _expired(cached):
+        return cached  # type: ignore[return-value]
+    principal = await _resolve_principal(conn)
     setattr(conn.state, _PRINCIPAL_CACHE_ATTR, principal)
     return principal
 
@@ -365,41 +415,60 @@ def _expired(principal: Any) -> bool:
 class Caller:
     """What a guarded handler needs of its caller, resolved once: the acting seat (`require_user`), the
     principal — never None, the route's guard resolved one before the handler ran — and the request
-    session. `caller: Caller = Depends(current_caller)` is the one-line form of that triple."""
+    session: the `Caller` that sync service code takes (`AsyncCaller.on`)."""
 
     actor: AdminUser
     principal: Principal
     session: Session
 
 
-def current_caller(
+@dataclass(frozen=True)
+class AsyncCaller:
+    """`Caller` for an `async def` route: the same triple with the route's `AsyncSession`. `on(session)` is the
+    `Caller` the sync service code inside `await caller.db.run_sync(...)` takes."""
+
+    actor: AdminUser
+    principal: Principal
+    db: AsyncSession
+
+    def on(self, session: Session) -> Caller:
+        return Caller(actor=self.actor, principal=self.principal, session=session)
+
+
+async def current_caller(
+    db: DbDep,
     actor: AdminUser = Depends(require_user),
-    principal: "Principal | None" = Depends(current_principal),
-    session: Session = Depends(get_session),
-) -> Caller:
+    principal: "Principal | None" = Depends(current_principal_async),
+) -> AsyncCaller:
+    """The acting seat, the principal and the route's session, resolved once."""
     if principal is None:  # pragma: no cover - a guarded route always resolves one
         raise HTTPException(status_code=403, detail="no principal")
-    return Caller(actor=actor, principal=principal, session=session)
+    return AsyncCaller(actor=actor, principal=principal, db=db)
 
 
-def org_admin_writer(subject: str) -> Callable[..., AdminUser]:
+def org_admin_bar(subject: str, user: AdminUser, principal: "Principal | None") -> AdminUser:
+    """`org_admin_writer`'s bar."""
+    if is_tenant_org(user.org_id):
+        if principal is not None and principal.is_org_admin:
+            return user
+        raise HTTPException(status_code=403, detail=administrator_changes(subject))
+    # A 403, not `require_superadmin`'s hidden 404: the door is shared, the console shows it to staff.
+    if not user.is_superadmin:
+        raise HTTPException(status_code=403, detail="superadmin required")
+    return user
+
+
+def org_admin_writer(subject: str) -> Callable[..., Any]:
     """A dependency for a write only a tenant ADMINISTRATOR makes, on a route whose key a project role may
     also carry: in a tenant org, `Principal.is_org_admin` (anyone else reads who can act,
     `administrator_changes(subject)`); on the operator plane, a superadmin (403 otherwise: the door is shared). The one home
     for that bar (`routes/accounts.py`, `routes/pool_slots.py`, `routes/port_grid.py`)."""
 
-    def _require(
+    async def _require(
         user: AdminUser = Depends(require_user),
-        principal: "Principal | None" = Depends(current_principal),
+        principal: "Principal | None" = Depends(current_principal_async),
     ) -> AdminUser:
-        if is_tenant_org(user.org_id):
-            if principal is not None and principal.is_org_admin:
-                return user
-            raise HTTPException(status_code=403, detail=administrator_changes(subject))
-        # A 403, not `require_superadmin`'s hidden 404: the door is shared, the console shows it to staff.
-        if not user.is_superadmin:
-            raise HTTPException(status_code=403, detail="superadmin required")
-        return user
+        return org_admin_bar(subject, user, principal)
 
     return _require
 

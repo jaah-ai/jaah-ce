@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -25,6 +24,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import alert_relay, comment_mentions, comment_notify, notify_targets, org_names, support_access
+from app.clock import utcnow
 from app.durable import notify_outbox
 from app.identities import display_name
 from app.models.identity import AdminUser
@@ -92,7 +92,7 @@ def add(session: Session, comment: TaskComment, user: AdminUser, emoji: str) -> 
                     org_id=comment.org_id,
                     # Born read unless it is news: your own comment's reaction never is, nor a second emoji
                     # from someone the author already heard from — one bell item per reactor, as one DM.
-                    read_at=datetime.now(timezone.utc) if mine or user.id == comment.author_id else None,
+                    read_at=utcnow() if mine or user.id == comment.author_id else None,
                 )
             )
     except IntegrityError:
@@ -112,7 +112,7 @@ def remove(session: Session, comment: TaskComment, user: AdminUser, emoji: str) 
         )
     )
     if row is not None:
-        row.removed_at = datetime.now(timezone.utc)
+        row.removed_at = utcnow()
 
 
 # ── The Slack half ────────────────────────────────────────────────────────────────────────────────
@@ -143,8 +143,8 @@ def notify_author(
                 author = None
         if author is None:
             return False
-        target, reason = notify_targets.target_for_user(session, author, event="reaction")
-        if target is None:
+        targets, reason = notify_targets.targets_for_user(session, author, event="reaction")
+        if not targets:
             log.debug("reaction not relayed to %s (comment=%s reason=%s)", author.id, comment.id, reason)
             return False
         glyph = SLACK_SHORTCODES[emoji]
@@ -156,7 +156,10 @@ def notify_author(
         ) if ticket is not None else _task_event(
             session, task, comment, reactor, glyph, quoted
         )
-        return bool(notify_outbox.slack(event, target))
+        sent = False
+        for target in targets:
+            sent = bool(notify_outbox.slack(event, target)) or sent
+        return sent
     except alert_relay.AlertRelayError:
         log.warning("reaction DM failed (comment=%s)", comment.id)
     except Exception:  # noqa: BLE001 — a Slack or lookup failure must never fail the reaction.
@@ -183,8 +186,6 @@ def _ticket_author(ticket: Ticket, comment: TaskComment) -> Optional[AdminUser]:
 def _task_event(
     session: Session, task: Task, comment: TaskComment, reactor: AdminUser, glyph: str, quoted: str
 ) -> dict:
-    from app.task_external_comment import _console_task_url
-
     project_name = session.scalar(select(Project.name).where(Project.id == task.project_id))
     # The task headline ("… : Reacted") from trusted fields; the body slot says who and what.
     return alert_relay.message("reaction", issue=str(task.id), payload={
@@ -195,23 +196,17 @@ def _task_event(
         "org": org_names.org_name(session, task.org_id),
         "actor": display_name(reactor),
         "question_body": f"{alert_relay.inert_mrkdwn(display_name(reactor))} {glyph} {quoted}",
-        "console_url": f"{_console_task_url(task.id)}?tab=comments#comment-{comment.id}",
+        "console_url": comment_notify.task_comment_console_url(task.id, comment.id),
     })
 
 
 def _ticket_event(
     ticket: Ticket, comment: TaskComment, actor: str, glyph: str, quoted: str, org_name: Optional[str] = None
 ) -> dict:
-    return alert_relay.message(
-        "reaction",
-        f"{org_names.org_lead(org_name)}{actor} reacted {glyph} to your comment on ticket #{ticket.id} "
-        f"{alert_relay.inert_mrkdwn(ticket.title)}: {quoted}",
-        payload={
-            "ticket_id": ticket.id,
-            "comment_id": comment.id,
-            "actor": actor,
-            "console_url": comment_notify.ticket_console_url(ticket.id, comment.id),
-        },
+    return comment_notify.ticket_dm(
+        "reaction", ticket, comment, actor,
+        f"{actor} reacted {glyph} to your comment on ticket #{ticket.id} {alert_relay.inert_mrkdwn(ticket.title)}: {quoted}",
+        org_name,
     )
 
 
@@ -277,3 +272,17 @@ def _notices_of(user_id: UUID) -> list:
         TaskCommentReaction.comment_id.in_(select(TaskComment.id).where(TaskComment.author_id == user_id)),
         TaskCommentReaction.user_id != user_id,
     ]
+
+
+def notify_author_on_own_session(task_id: int, comment_id: int, reactor_id: UUID, emoji: str) -> bool:
+    """`notify_author` for a task comment, on a session of its own (`comment_notify.task_rows_on_own_session`) — a
+    route on the event loop runs it on a worker thread. Never raises."""
+    try:
+        session, task, comment, users = comment_notify.task_rows_on_own_session(task_id, comment_id, [reactor_id])
+        with session:
+            if task is None or comment is None or reactor_id not in users:
+                return False
+            return notify_author(session, task=task, comment=comment, reactor=users[reactor_id], emoji=emoji)
+    except Exception:  # noqa: BLE001 — the reaction is committed; its DM is a courtesy
+        log.exception("reaction DM for comment %s could not be sent", comment_id)
+        return False

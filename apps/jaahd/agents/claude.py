@@ -13,12 +13,22 @@ Daemon imports are in-function: `fleet_launch` imports this package (cycle), and
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
+import sys
 
+import account_auth  # the ONE home of the workspace-id shape (`is_valid_workspace_id`): it rides a header line
 import agent_providers  # the provider catalogue: the ONE home of each provider's binary name
 import host_platform  # the OS seam: Windows reads the charter from its file (`exec_line`)
 
 from .base import (
+    MODEL_SWITCH_BUSY,
+    MODEL_SWITCH_POLL_SECS,
+    MODEL_SWITCH_POLLS,
+    MODEL_SWITCH_RETRY,
+    MODEL_SWITCH_UNSUPPORTED,
+    MODEL_SWITCHED,
     AcpLaunch,
     AcpLaunchContext,
     ConsentDialog,
@@ -29,16 +39,22 @@ from .base import (
     TokenCounts,
     WINDOWS_HOOK_SHELL_UNESCAPING_BASH,
     CLAUDE_CONTROL_SERVER_NAME,
-    AdapterDefaults,
+    AgentAdapter,
+    McpConnection,
     adapter_env,
     chain_hook_groups,
-    control_mcp_server,
+    remote_mcp_servers,
     host_hook_commands,
 )
 
 # The base invocation every visible runner execs. The binary comes from the catalogue — the name
 # `runner_clis.py` attests on PATH — so this can never launch a binary the node did not attest.
+log = logging.getLogger("jaahd.agents.claude")
+
 _BASE: tuple[str, ...] = (agent_providers.CLAUDE.binary, "--dangerously-skip-permissions")
+
+#: The CLI's own variable for extra request headers (one `Name: value` per line).
+_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
 
 # The startup consents Claude Code can raise before a runner's first turn, each pre-seeded elsewhere
 # (`vis_trust`, `plugin_repair`'s managed-settings consent, `skipDangerousModePermissionPrompt`,
@@ -81,7 +97,7 @@ ACP_BINARY = agent_providers.CLAUDE.acp_binary
 _ACP_SETTING_SOURCES = ("user", "project", "local")
 
 
-class ClaudeAdapter(AdapterDefaults):
+class ClaudeAdapter(AgentAdapter):
     """The `claude` CLI. Stateless — the registry holds one instance."""
 
     provider = "claude"
@@ -99,6 +115,9 @@ class ClaudeAdapter(AdapterDefaults):
     #: `prompt_input_exit` alone: Claude Code's `SessionEnd` enum already separates a prompt quit from
     #: `clear`, `resume`, `logout` and `other` (verified on 2.1.251 by typing `/exit`).
     quit_sig = QuitSignature(reason="prompt_input_exit")
+    #: `""`: `register_mcp` registers nothing — the control-plane MCP server ships in the `jaah` plugin, which
+    #: `plugin_repair.py` converges onto every account's config dir.
+    mcp_binary = ""
 
     def exec_line(
         self, *, sys_file: str, task_file: str, settings_flag: str,
@@ -129,15 +148,51 @@ class ClaudeAdapter(AdapterDefaults):
             f"  \"$(cat {shq(task_file)})\"",
         ]
 
+    def model_switch(self):
+        """`/model <id>` on an idle composer (`switch_model_on`); DeepSeek runs this TUI and inherits it."""
+        return switch_model_on
+
     def consent_dialogs(self) -> tuple[ConsentDialog, ...]:
         """Claude Code's startup consents (`_CONSENT_DIALOGS`)."""
         return _CONSENT_DIALOGS
 
-    def api_key_settings(self, helper: str) -> dict:
+    def api_key_settings(self, helper: str, workspace_id: str = "") -> dict:
         """`apiKeyHelper`, because a key in the environment meets the CLI's first-run "use this API key?"
         prompt; `skipDangerousModePermissionPrompt`, because an API-key runner's home may not be converged yet
-        (or may be `~/.claude`), so no account template is sure to answer the bypass-mode prompt. Either prompt parks an unattended runner forever."""
-        return {"apiKeyHelper": helper, "skipDangerousModePermissionPrompt": True}
+        (or may be `~/.claude`), so no account template is sure to answer the bypass-mode prompt. Either prompt parks an unattended runner forever.
+
+        `workspace_id` (the account's, `cred_broker.account_workspace_id`): an UNSCOPED key is refused with a 400
+        unless every request names its workspace, so it rides `env.ANTHROPIC_CUSTOM_HEADERS` — the settings `env`
+        block reaches every request the CLI makes. A value not shaped like a workspace id is dropped with a warning,
+        never written: the run then fails with Anthropic's own sentence (`break_cause.WORKSPACE_REQUIRED`)."""
+        settings: dict = {"apiKeyHelper": helper, "skipDangerousModePermissionPrompt": True}
+        if workspace_id and account_auth.is_valid_workspace_id(workspace_id):
+            settings["env"] = {_CUSTOM_HEADERS_ENV: f"anthropic-workspace-id: {workspace_id}"}
+        elif workspace_id:  # its length only: a mis-pasted value may be the key itself
+            print(f"claude adapter: ignoring a workspace id not shaped like `wrkspc_…` ({len(workspace_id)} chars) — "
+                  "the run sends no anthropic-workspace-id header", file=sys.stderr)
+        return settings
+
+    def runner_settings(self) -> dict:
+        """`switchModelsOnFlag: true`: when a model's safeguards flag a message, the CLI switches to its fallback
+        model and carries on. Left to the account, an unset key asks once ("Switch to … and keep going whenever this
+        happens?") and `false` asks every time ("Switch to … / Edit prompt and retry with …"); either question parks
+        an unattended runner with nobody able to do anything but switch. A `--settings` (flag) value outranks the
+        account's `settings.json` — the CLI's source order is user, project, local, flag, policy (read from the 2.1.318
+        binary) — so this holds whatever the account chose."""
+        return {"switchModelsOnFlag": True}
+
+    def legacy_mcp_config(self, connections: "tuple[McpConnection, ...]", *,
+                          config_path: str, guest: bool = False) -> "tuple[str, tuple[str, ...]] | None":
+        """`--mcp-config <config_path>`, the file holding one `mcp_<name>` stdio server per connection — the same
+        bridge entries the ACP launch gets (`remote_mcp_servers`). No `--strict-mcp-config`: the `jaah` plugin's
+        `control` server stays."""
+        if not connections:
+            return None
+        servers = {entry["name"]: {"type": "stdio", "command": entry["command"], "args": list(entry["args"]),
+                                   "env": {}}
+                   for entry in remote_mcp_servers(connections, guest=guest)}
+        return json.dumps({"mcpServers": servers}, indent=2) + "\n", ("--mcp-config", config_path)
 
     def additional_dirs_settings(self, dirs: "tuple[str, ...]") -> dict:
         """`permissions.additionalDirectories`: the CLI's file tools and search reach each of DIRS."""
@@ -180,17 +235,21 @@ class ClaudeAdapter(AdapterDefaults):
         holds, minus the chains the host now does itself — `fleet_launch.guard_chains`); the account home as
         `CLAUDE_CONFIG_DIR` with every `settingSources`, so the plugin layer and managed settings load as they
         do in the CLI; the model as `ANTHROPIC_MODEL`, the one spelling the agent never overrides. The charter
-        is the host's (`systemPrompt` append), `--add-dir` is ACP's `additionalDirectories`, and resume is ACP's
-        `session/load`. Prompt suggestions stay off, as `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` keeps them
+        is the host's (`systemPrompt` append) and `--add-dir` is ACP's `additionalDirectories`. Prompt suggestions stay off, as `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` keeps them
         on the legacy path: the agent turns them on unless told."""
         import fleet_launch  # in-function: fleet_launch imports this package (see the header)
-        from .agent_layer import jaah_mcp_command
+        from .agent_layer import control_server
 
         content, _ = self.render_hooks(settings_path="", chains=fleet_launch.guard_chains(ctx.worktree,
                                                                                          guard=ctx.guard))
         settings = json.loads(content) if content else {}
         if ctx.key_helper:
-            settings.update(self.api_key_settings(ctx.key_helper))
+            key_settings = self.api_key_settings(ctx.key_helper, ctx.workspace_id)
+            # `env` merged, not replaced: the hook settings may already carry one.
+            env = {**settings.get("env", {}), **key_settings.pop("env", {})}
+            settings.update(key_settings)
+            if env:
+                settings["env"] = env
         if ctx.bedrock is not None:
             # The legacy `--settings` file's Jaah-account keys (`with_bedrock_settings`): `awsCredentialExport` is
             # the broker COMMAND, and `env` the plan's non-secret pairs; no AWS secret is ever written here.
@@ -198,20 +257,22 @@ class ClaudeAdapter(AdapterDefaults):
 
             settings.update(bedrock_launch.settings(ctx.bedrock, fleet_launch.shq))
             settings["env"] = {**settings.get("env", {}), **dict(bedrock_launch.env_pairs(ctx.bedrock))}
+        settings.update(self.runner_settings())
         options: dict = {"settingSources": list(_ACP_SETTING_SOURCES), "promptSuggestions": False,
                          "settings": settings}
         env = self.env(config_dir=ctx.config_dir, worktree=ctx.worktree)
         if ctx.model:
             env["ANTHROPIC_MODEL"] = ctx.model
-        command = jaah_mcp_command()
         # Workspace trust as on the legacy path (`prepare`): the account home the agent loads is the CLI's own.
         def seed_trust() -> None:
             self.prepare(worktree=ctx.worktree, config_dir=ctx.config_dir, project=ctx.project)
 
         # Under the plugin's spelling, which replaces the plugin's own server (`CLAUDE_CONTROL_SERVER_NAME`).
-        server = control_mcp_server(command[0], command[1:], {}, name=CLAUDE_CONTROL_SERVER_NAME)
+        server = control_server(CLAUDE_CONTROL_SERVER_NAME)
+        # The project's linked remote MCP servers, one bridge each, on this session only (`remote_mcp_servers`).
         return AcpLaunch(argv=(ACP_BINARY,), env=env, session_meta={"claudeCode": {"options": options}},
-                         mcp_servers=(server,), prepare=seed_trust)
+                         mcp_servers=(server, *remote_mcp_servers(ctx.mcp_connections, guest=ctx.guest)),
+                         prepare=seed_trust)
 
     # ── Hooks ──────────────────────────────────────────────────────────────────────────────────────
 
@@ -239,11 +300,6 @@ class ClaudeAdapter(AdapterDefaults):
             return (None, "")
         return (json.dumps(rendered, indent=2), f"--settings {shq(settings_path)}")
 
-    def register_mcp(self, *, config_dir: str) -> None:
-        """No-op: the control-plane MCP server ships in the `jaah` plugin, which `plugin_repair.py`
-        converges onto every account's config dir."""
-        return None
-
     # ── Session identity + ingest ──────────────────────────────────────────────────────────────────
 
     def session_binding(self) -> str:
@@ -251,10 +307,7 @@ class ClaudeAdapter(AdapterDefaults):
         return SESSION_ASSIGN
 
     # `turn_error` stays None: Claude Code's own `StopFailure` hook reports an API-error turn.
-
-    def discover_session_id(self, *, config_dir: str, worktree: str, since: float) -> str | None:
-        """Never called for an ASSIGN vendor; None rather than a guess off the transcript filename."""
-        return None
+    # `discover_session_id` stays None: never called for an ASSIGN vendor, and no guess off the transcript filename.
 
     def credential_state(self, *, config_dir: str) -> str:
         """Delegates to `agent_config_dirs.creds_state` (three-state read, shared-store redirect), which
@@ -280,10 +333,8 @@ class ClaudeAdapter(AdapterDefaults):
         ingest uses the narrower `break_cause.project_dir`."""
         return os.path.join(config_dir, "projects")
 
-    def session_members(self, *, config_dir: str, transcript: str) -> list[tuple[str, str]]:
-        """`[]`: uncalled for this adapter — the sweep reads Claude's `<session>/subagents/` itself
-        (`session_sweep.subagent_members`)."""
-        return []
+    # `session_members` stays `[]`: uncalled here — the sweep reads Claude's `<session>/subagents/` itself
+    # (`session_sweep.subagent_members`).
 
     def read_usage(self, line: bytes) -> TokenCounts | None:
         """One transcript line's spend, or None when the line reports none.
@@ -369,3 +420,119 @@ CLI_REFRESH_LOCK_STALE_SECONDS = 60.0
 #: The model family in a model id, read as the CP's `canonical_model` reads it
 #: (`apps/api/app/model_prices.py::_CLAUDE_FAMILY_RE`): the LAST `claude`-adjacent family wins. Lower-case input.
 MODEL_FAMILY_PATTERN = r"(?<![a-z0-9])claude[.\-_/ ]?(?:\d[\d.\- ]*[.\-_ ]?)?(sonnet|haiku|fable|opus)(?![a-z])"
+
+
+# ── The in-place model switch (`ClaudeAdapter.model_switch`) ────────────────────────────────────────────────
+# Measured on 2.1.316: `/model <id>` + Enter on the composer switches with no picker and prints
+# `Set model to <Display> and saved as your default for new sessions` — it WRITES `"model"` into the account's
+# `$CLAUDE_CONFIG_DIR/settings.json`, shared by every run of that account on the node. So the value before the
+# switch is put back after it: the operator switched one run, not the account.
+# Also measured (2.1.316):
+# - Once the conversation has history, the command first opens a `Switch model?` dialog (`❯ 1. Yes, switch to
+#   <Display>` highlighted, `2. No, go back`); `Enter` on that highlighted row confirms.
+# - Submitted MID-TURN (a tool running) it is NOT queued: it runs at once, its dialog covering the composer while the
+#   turn goes on, and its result is a transient notice above the composer (gone within ~7s) — the command itself is
+#   never echoed into the transcript. So a NEW result line is counted against the screen before the command, not
+#   only looked for after its echo.
+# - An unknown id prints `Model '<id>' not found` (the same two spellings: echoed reply, or notice) and writes nothing.
+_MODEL_SET = "Set model to"
+_MODEL_CONFIRM = "Switch model?"
+_MODEL_CONFIRM_YES = re.compile(r"\u276f\s*1\.\s+Yes, switch to")
+_ABSENT = object()
+
+
+def _settings_model(config_dir: str) -> object:
+    """`settings.json`'s `"model"` in CONFIG_DIR, `_ABSENT` when the key (or the file) is absent."""
+    import file_io  # noqa: PLC0415 — daemon import, in-function as the module's others
+
+    settings = file_io.read_json_or(os.path.join(config_dir, "settings.json"), None)
+    return settings.get("model", _ABSENT) if isinstance(settings, dict) else _ABSENT
+
+
+def _restore_settings_model(config_dir: str, before: object) -> None:
+    """Put `settings.json`'s `"model"` back to BEFORE (the key removed when it was absent), every other key as the
+    CLI left it; an atomic replace keeping the file's mode. Best effort, logged."""
+    from pathlib import Path  # noqa: PLC0415
+
+    import env_helpers  # noqa: PLC0415
+    import file_io  # noqa: PLC0415
+
+    path = Path(config_dir) / "settings.json"
+    settings = file_io.read_json_or(path, None)
+    if not isinstance(settings, dict) or settings.get("model", _ABSENT) == before:
+        return
+    if before is _ABSENT:
+        settings.pop("model", None)
+    else:
+        settings["model"] = before
+    try:
+        env_helpers.atomic_write_json(path, settings, mode=path.stat().st_mode & 0o777, indent=2)
+    except OSError as exc:
+        log.warning("model-switch: could not restore the account default model in %s (%s)", path, exc)
+
+
+def _shown_since(screen: str, line: str, baseline: int, command: str) -> bool:
+    """Has LINE appeared since the command was typed: more copies than the BASELINE count, or one after the
+    command's own echo (the older copies may have scrolled away)."""
+    return screen.count(line) > baseline or screen.rfind(line) > screen.rfind(command) >= 0
+
+
+def _confirm_dialog_up(screen: str) -> bool:
+    """Is the `Switch model?` dialog the live screen: its header, its `Yes` row highlighted after it, no composer."""
+    import answer_delivery  # noqa: PLC0415
+
+    at = screen.rfind(_MODEL_CONFIRM)
+    return (at >= 0 and bool(_MODEL_CONFIRM_YES.search(screen, at))
+            and not answer_delivery.composer_prompt_present(screen))
+
+
+def switch_model_on(pane, model: str, *, config_dir: str, sleep_fn, saved=None) -> tuple[str, str]:
+    """Type `/model <id>` into PANE's composer, confirm its `Switch model?` dialog, verify a NEW `Set model to`; and,
+    once the command is typed, ALWAYS put the account's saved default back (`_restore_settings_model`, in a
+    `finally`) — the original as SAVED recorded it for the account (`model_switch.SavedDefault`), so a
+    re-served attempt after a late write still restores the true one. `(status, reason)` as
+    `AgentAdapter.model_switch`.
+
+    Only into an IDLE composer: its exact prompt on screen (`composer_prompt_present`) holding nothing. A question
+    picker (AskUserQuestion — a switch can follow a bare answer on an awaiting task) covers the composer, so there is
+    no prompt, and its highlighted row would take the `Enter`; a composer holding anyone's text would get our command
+    appended. Either is `busy` (an uncharged wait), with nothing typed. A working runner's composer IS idle here: the
+    command runs mid-turn (measured). An unknown id is `unsupported`. A dialog still open on a `retry` exit is
+    dismissed with `Escape`, so the next attempt finds the composer."""
+    import answer_delivery  # noqa: PLC0415 — the pane primitives' home; a daemon module
+
+    screen = pane.capture()
+    if not answer_delivery.composer_prompt_present(screen) or answer_delivery.composer_text(screen):
+        return MODEL_SWITCH_BUSY, "the composer is not idle"
+    command = f"/model {model}"
+    # Measured `Model '<id>' not found`; matched on its fixed tail with the id quoted, so no other line passes for it.
+    rejected = f"Model '{model}' not found"
+    set_before, rejected_before = screen.count(_MODEL_SET), screen.count(rejected)
+    before = _ABSENT
+    if config_dir:
+        before = _settings_model(config_dir)
+        if saved is not None:
+            present, value = saved.first(before is not _ABSENT, None if before is _ABSENT else before)
+            before = value if present else _ABSENT
+    else:
+        log.warning("model-switch: %s names no config dir — the account's saved default model is not restored",
+                    pane.label)
+    try:
+        if not answer_delivery._submit_on(pane, command, sleep_fn, require_composer=True):
+            return MODEL_SWITCH_RETRY, "the /model command was not submitted"
+        confirmed = False
+        for _ in range(MODEL_SWITCH_POLLS):
+            screen = pane.capture()
+            if _shown_since(screen, _MODEL_SET, set_before, command):
+                return MODEL_SWITCHED, ""
+            if _shown_since(screen, rejected, rejected_before, command):
+                return MODEL_SWITCH_UNSUPPORTED, "this CLI does not know that model"
+            if not confirmed and _confirm_dialog_up(screen):
+                confirmed = pane.key("Enter")
+            sleep_fn(MODEL_SWITCH_POLL_SECS)
+        if _confirm_dialog_up(pane.capture()):
+            pane.key("Escape")
+        return MODEL_SWITCH_RETRY, "the CLI did not confirm the switch"
+    finally:
+        if config_dir:
+            _restore_settings_model(config_dir, before)

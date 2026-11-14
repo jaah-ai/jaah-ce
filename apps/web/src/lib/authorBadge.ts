@@ -5,7 +5,7 @@
  * lazy-loaded window changes the author set as you scroll); a fixed three letters only moves the
  * collision. Colour is never the only channel: the accessible name and `title` carry the full name.
  * Pure of React so it is unit-testable without a render. */
-import { firstCodepoints } from './strings'
+import { initials } from './strings'
 
 /* The PERSON a label names: an operator acting as an org reads their colleagues' writes as "Debug Admin, acting
  * as Acme Corp" (`apps/api/app/actors.py::_acting_labels`); badge it as Debug Admin — `DA`, in Debug Admin's hue —
@@ -14,22 +14,10 @@ export function personOf(name: string): string {
   return name.split(', acting as ')[0]
 }
 
-/**
- * A creator's display name → two upper-case letters; `''` for null/absent/whitespace (caller draws its
- * own placeholder).
- * Two+ words: first letters of the first and LAST word ("Ada B. Lovelace" → `AL`). One word: its first
- * two (`System` must not read as a truncated `S`).
- * Capped at two AFTER upper-casing: a ligature upper-cases into two chars (`'ﬁnance'` → `'FI'` + `'N'`).
- */
+/** A creator's display name → `strings.initials` of the person it names; `''` for null/absent/whitespace
+ *  (caller draws its own placeholder). */
 export function authorInitials(name: string | null | undefined): string {
-  if (typeof name !== 'string') return ''
-  const words = personOf(name).trim().split(/\s+/).filter(word => word !== '')
-  if (words.length === 0) return ''
-  const letters =
-    words.length === 1
-      ? firstCodepoints(words[0], 2)
-      : `${firstCodepoints(words[0], 1)}${firstCodepoints(words[words.length - 1], 1)}`
-  return firstCodepoints(letters.toUpperCase(), 2)
+  return typeof name === 'string' ? initials(personOf(name)) : ''
 }
 
 /** One author hue: the literal light/dark pair the badge paints in each colour scheme. */
@@ -38,16 +26,16 @@ export type AuthorHue = { light: string; dark: string }
 /* Literal hex, not palette families: every semantic family already means a task state on this row, and
  * an author's hue must mean nothing. Each entry carries its dark twin because under `cssVariables` a
  * single literal in `sx` freezes at the rendering scheme; the badge applies it via
- * `theme.applyStyles('dark', …)`. Light ~600-step (on `#ffffff`), dark ~300-step (on `#1e293b`). */
+ * `theme.applyStyles('dark', …)`. Light ~700/800-step (4.5:1 on a selected row's tint), dark ~300-step (on `#1e293b`). */
 export const AUTHOR_HUES: readonly AuthorHue[] = [
   { light: '#1d4ed8', dark: '#93b4fd' }, // blue
-  { light: '#047857', dark: '#6ee7b7' }, // emerald
-  { light: '#b45309', dark: '#fcd34d' }, // amber
+  { light: '#065f46', dark: '#6ee7b7' }, // emerald
+  { light: '#92400e', dark: '#fcd34d' }, // amber
   { light: '#a21caf', dark: '#f0abfc' }, // fuchsia
-  { light: '#0e7490', dark: '#67e8f9' }, // cyan
-  { light: '#c2410c', dark: '#fdba74' }, // orange
+  { light: '#155e75', dark: '#67e8f9' }, // cyan
+  { light: '#9a3412', dark: '#fdba74' }, // orange
   { light: '#6d28d9', dark: '#c4b5fd' }, // violet
-  { light: '#4d7c0f', dark: '#bef264' }, // lime
+  { light: '#3f6212', dark: '#bef264' }, // lime
 ] as const
 
 /**

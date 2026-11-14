@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, Response
+from starlette.concurrency import run_in_threadpool
 
 from app import attachment_storage, edition
 from app.authz.catalog import Tenancy
@@ -52,10 +53,11 @@ async def put_object(key: str, request: Request) -> Response:
     length = request.query_params.get("length", "")
     if not length.isdigit() or request.headers.get("content-length", "") != length:
         raise HTTPException(status_code=403, detail=_WRONG_SIZE)
-    upload = attachment_storage.LocalUpload(where, key)
+    # File I/O off the serving loop: the scratch file's open, each chunk's write, and the swap-in.
+    upload = await run_in_threadpool(attachment_storage.LocalUpload, where, key)
     try:
         async for chunk in request.stream():
-            upload.write(chunk)
+            await run_in_threadpool(upload.write, chunk)
             if upload.size > int(length):
                 raise HTTPException(status_code=403, detail=_WRONG_SIZE)
         if upload.size != int(length):
@@ -63,16 +65,16 @@ async def put_object(key: str, request: Request) -> Response:
     except BaseException:
         upload.abort()
         raise
-    return Response(status_code=200, headers={"ETag": upload.commit()})
+    return Response(status_code=200, headers={"ETag": await run_in_threadpool(upload.commit)})
 
 
 @router.get("/{key:path}")
 @always(Tenancy.BOOTSTRAP)
-def get_object(key: str, request: Request):
+async def get_object(key: str, request: Request):
     """The object at `key`, typed and named as signed. Served from the console's own origin, so it is sandboxed
     and never sniffed: agent-authored HTML must not run as the console."""
     _, path = _checked(request, "GET", key, _GET_SIGNED)
-    if not path.is_file():
+    if not await run_in_threadpool(path.is_file):
         raise HTTPException(status_code=404, detail="Not Found")
     params = request.query_params
     return FileResponse(

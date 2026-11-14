@@ -1,4 +1,6 @@
-import { apiFetch, get } from '../../api'
+import { useEffect, useMemo, useRef } from 'react'
+import { ApiError, get, getBlob } from '../../api'
+import { withRetryParam } from '../../net/href'
 import type { Attachment } from '../../types'
 
 // `attachment:<token>` → displayable `blob:` URL via the user-session content route
@@ -87,6 +89,54 @@ export function releasePaintedUrl(url: string): void {
   if (url.startsWith('blob:')) URL.revokeObjectURL(url)
 }
 
+/* ONE PAINT CACHE PER FORM, for the images it staged (token → File, read through `lookup`): the task form, the
+ * automation spec fields and the new-ticket page each paint pasted images before any row exists. The PROMISE of
+ * the URL is cached, set before it settles, so two resolves of one token mint one URL and a release finds it
+ * pending. STAGED-FIRST: `RichTextEditor`'s `insertImageFiles` inserts the node optimistically, so resolving an
+ * own-staged token off the server raced the upload and latched "⚠ image unavailable" (permanently, via
+ * `listPromise`'s cache); only a token the form did NOT stage goes to `fallback`. `resolve` is ONE identity reading
+ * `lookup`/`fallback` through refs: tiptap reads the resolver once (`attachmentImage`'s `addNodeView()`), so a
+ * later identity never reaches the node view. Every URL is released on unmount, or each pins its File for the
+ * tab's lifetime (the task form is re-keyed on every Save). */
+export function useStagedImagePaint(
+  lookup: (token: string) => File | undefined,
+  fallback?: AttachmentResolver,
+): { resolve: AttachmentResolver; release: (token: string) => void } {
+  const lookupRef = useRef(lookup)
+  lookupRef.current = lookup
+  const fallbackRef = useRef(fallback)
+  fallbackRef.current = fallback
+  const paintedRef = useRef<Map<string, Promise<string>>>(new Map())
+  useEffect(() => () => {
+    for (const url of paintedRef.current.values()) void url.then(releasePaintedUrl, () => {})
+    paintedRef.current.clear()
+  }, [])
+  return useMemo(() => ({
+    resolve: async (token: string) => {
+      const painted = paintedRef.current
+      const cached = painted.get(token)
+      if (cached) return cached
+      const file = lookupRef.current(token)
+      if (file) {
+        // Inert even for the uploader's own file (M9): `paintableImageUrl`.
+        const url = paintableImageUrl(file, file.type)
+        painted.set(token, url)
+        return url
+      }
+      const fallback = fallbackRef.current
+      if (!fallback) throw new Error(`no staged image for token: ${token}`)
+      return fallback(token)
+    },
+    /** Drop one token's paint (a failed upload stored nothing under it). */
+    release: (token: string) => {
+      const url = paintedRef.current.get(token)
+      if (!url) return
+      void url.then(releasePaintedUrl, () => {})
+      paintedRef.current.delete(token)
+    },
+  }), [])
+}
+
 /** The STORED file behind a resolved image — what a "save this" control needs and a `blob:` URL lacks. */
 export interface StoredAttachment {
   /** The content route; same-origin, so the cookie rides a plain anchor. */
@@ -122,26 +172,58 @@ export function createAttachmentResolver(taskId: number): AttachmentResolver {
     return listPromise
   }
 
-  return async function resolve(token: string): Promise<string> {
-    const cached = blobUrlCache.get(token)
-    if (cached) return cached
-
+  /* One attempt: the list (cached once it answers), then the bytes. `attempt` 1 asks with `ApiImg`'s cache-busting
+   * `?_r=1` (`net/href.tsx::withRetryParam`), a new request on a fresh connection. */
+  async function resolveOnce(token: string, attempt: number): Promise<string> {
     const attachments = await listAttachments()
     const match = attachments.find(a => a.filename === token)
-    if (!match) throw new Error(`attachment not found for token: ${token}`)
+    if (!match) throw new AttachmentNotFoundError(token)
 
     const contentUrl = `/api/tasks/${taskId}/attachments/${match.id}/content`
     const stored = { contentUrl, filename: match.filename }
     // The STORED type decides (the bucket answers with it too); refused before any fetch, since a
     // non-image is never painted. A row with no stored type falls back to the response's.
     if (match.content_type && !imageKind(match.content_type)) throw new NotAnImageError(stored)
-    const resp = await apiFetch(contentUrl, { credentials: 'same-origin' })
-    if (!resp.ok) throw new Error(`failed to fetch attachment content: ${token}`)
-    const blob = await resp.blob()
+    const blob = await getBlob(withRetryParam(contentUrl, attempt)).catch(err => {
+      throw new Error(`failed to fetch attachment content: ${token}`, { cause: err })
+    })
     const url = await paintableImageUrl(blob, match.content_type || blob.type, stored)
-    blobUrlCache.set(token, url)
     // The one place the numeric id is known; recorded so the node view offers the STORED file.
     storedByObjectUrl.set(url, stored)
     return url
   }
+
+  return async function resolve(token: string): Promise<string> {
+    const cached = blobUrlCache.get(token)
+    if (cached) return cached
+    /* The same ONE automatic retry an `<img>` of an API path gets (`net/href.tsx::useRetriedUrl`): a dropped
+     * connection on the first request must not latch "⚠ image unavailable". A refusal that asking again cannot
+     * change (`isFinal`) is not retried. */
+    let url: string
+    try {
+      url = await resolveOnce(token, 0)
+    } catch (err) {
+      if (isFinal(err)) throw err
+      url = await resolveOnce(token, 1)
+    }
+    blobUrlCache.set(token, url)
+    return url
+  }
+}
+
+/** No stored attachment carries the token's filename. */
+class AttachmentNotFoundError extends Error {
+  constructor(token: string) {
+    super(`attachment not found for token: ${token}`)
+    this.name = 'AttachmentNotFoundError'
+  }
+}
+
+/** A failure a second request would only repeat: not an image, no such attachment, or a 4xx answer other than
+ *  408/429 (a timeout or a rate limit can pass). */
+function isFinal(err: unknown): boolean {
+  if (err instanceof NotAnImageError || err instanceof AttachmentNotFoundError) return true
+  const cause = err instanceof ApiError ? err : err instanceof Error ? err.cause : undefined
+  return cause instanceof ApiError && cause.status >= 400 && cause.status < 500
+    && cause.status !== 408 && cause.status !== 429
 }

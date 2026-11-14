@@ -5,12 +5,15 @@ import Menu from '@mui/material/Menu'
 import MenuItem from '@mui/material/MenuItem'
 import MuiTab from '@mui/material/Tab'
 import MuiTabs, { tabsClasses } from '@mui/material/Tabs'
-import useMediaQuery from '@mui/material/useMediaQuery'
-import type { Theme } from '@mui/material/styles'
+import type { SxProps, Theme } from '@mui/material/styles'
 import { FORM_BAR_STUCK_ATTR, scrollportOf, useStuck } from '../ui/FormActionBar'
 import { ACT_AS_OVERLAP_VAR } from './ActAsBar'
-import { PHONE, PHONE_QUERY, SR_ONLY_SX, TAP_FLOOR_DOWN } from '../ui/listStyles'
-import { paperGround } from '../theme'
+import { usePhone } from '../hooks/usePhone'
+import { PHONE, PHONE_TAB_STRIP_SX, SR_ONLY_SX, TAP_FLOOR_DOWN } from '../ui/listStyles'
+import { FONT_WEIGHT, LINE_HEIGHT, SIZE, grid, paperGround } from '../theme'
+import type { Tone } from '../ui/StatusChip'
+import { TONE_COLOR } from '../ui/statusTone'
+import StatusDot from '../ui/StatusDot'
 
 /** A sticky strip's fill: the page's ground, or its paper's (`theme.ts`'s `paperGround`, lighter on elevated dark paper). */
 const groundOfSticky = (theme: Theme, sticky: 'default' | 'paper'): string =>
@@ -24,22 +27,25 @@ const groundOfSticky = (theme: Theme, sticky: 'default' | 'paper'): string =>
 
 /* `short`: the tab's name below the strip's `shortBelow` width, where the full names and the verb outrun one row
    (Billing's Payments is "Bills" at 390px). Its accessible name follows what is drawn. */
-/* `cue`: something on this tab wants the reader without taking them there (the task page's question that arrived
-   mid-typing) — a dot after the name, and these words for a screen reader. */
-export type TabDef<Id extends string> = { id: Id; label: string; short?: string; cue?: string }
+/* `cue`: something on this tab wants the reader without taking them there (a pack update waiting, a task's unanswered
+   question) — a dot after the name, and these words for a screen reader. `cueTone` colours the dot (default primary);
+   the task page's Q&A takes `warning`, the console's "asking" hue. */
+export type TabDef<Id extends string> = { id: Id; label: string; short?: string; cue?: string; cueTone?: Tone }
 
-const CUE_SX = {
-  display: 'inline-block', width: '0.5rem', height: '0.5rem', borderRadius: '50%', bgcolor: 'primary.main', ml: '0.375rem',
-  verticalAlign: 'middle',
-} as const
+const CUE_SX = { ml: 1, verticalAlign: 'middle' } as const
 const CUED_NAME_SX = { display: 'inline-flex', alignItems: 'center', position: 'relative' } as const
 
 /* A tab's drawn name: `label`, or `short` while the viewport is narrower than `shortBelow`. Both spans are in the
    DOM, CSS shows one, so the strip never re-renders on a resize. */
-function tabName(t: { label: string; short?: string; cue?: string }, shortBelow: number | undefined): ReactNode {
+function tabName(t: { label: string; short?: string; cue?: string; cueTone?: Tone }, shortBelow: number | undefined): ReactNode {
   const cue = t.cue === undefined ? null : (
     <>
-      <Box component="span" aria-hidden sx={CUE_SX} data-testid="tab-cue" />
+      <StatusDot
+        color={t.cueTone === undefined ? 'primary.main' : TONE_COLOR[t.cueTone]}
+        sx={CUE_SX}
+        data-testid="tab-cue"
+        data-tone={t.cueTone}
+      />
       <Box component="span" sx={SR_ONLY_SX}>{`, ${t.cue}`}</Box>
     </>
   )
@@ -62,8 +68,8 @@ function tabName(t: { label: string; short?: string; cue?: string }, shortBelow:
 const MORE_SX = {
   typography: 'button',
   textTransform: 'none',
-  fontWeight: 500,
-  lineHeight: 1.25,
+  fontWeight: FONT_WEIGHT.medium,
+  lineHeight: LINE_HEIGHT.snug,
   whiteSpace: 'nowrap',
   color: 'text.secondary',
   alignSelf: 'stretch',
@@ -72,29 +78,28 @@ const MORE_SX = {
 /* The More button standing in for the selected tab it hides: the same underline the wrapped strip draws. */
 const SELECTED_MORE_SX = {
   color: 'primary.main',
-  boxShadow: (theme: Theme) => `inset 0 -2px 0 ${theme.palette.primary.main}`,
+  boxShadow: (theme: Theme) => `inset 0 -2px 0 ${(theme.vars ?? theme).palette.primary.main}`,
 } as const
 
 const WRAP_SX = {
   '& .MuiTabs-list': { flexWrap: 'wrap' },
   '& .MuiTabs-scrollButtons, & .MuiTabs-indicator': { display: 'none' },
-  '& .MuiTab-root.Mui-selected': { boxShadow: (theme: Theme) => `inset 0 -2px 0 ${theme.palette.primary.main}` },
+  '& .MuiTab-root.Mui-selected': { boxShadow: (theme: Theme) => `inset 0 -2px 0 ${(theme.vars ?? theme).palette.primary.main}` },
 } as const
 
 /* Wrapped at phone width, rows are what a strip costs (44px each): 6px sides fit nine Project tabs in two rows at
    390px where 14px took three. Wrapped tabs keep a 12px gap and the selected tab's underline. */
-const PHONE_TAB_PX = '6px'
-const PHONE_WRAP_SX = { ...WRAP_SX, '& .MuiTab-root': { px: PHONE_TAB_PX } } as const
+const PHONE_WRAP_SX = { ...WRAP_SX, '& .MuiTab-root': { px: 1 } } as const
 
 /* Wrapped on a phone, More sits at the end of the last row, which the fit left room for: in the flow it would
    take a row of its own under the wrapped strip. */
-const PHONE_MORE_SX = { position: 'absolute', right: 0, bottom: 0, height: 44, px: PHONE_TAB_PX } as const
+const PHONE_MORE_SX = { position: 'absolute', right: 0, bottom: 0, height: SIZE.tapTarget, px: 1 } as const
 
 /* Shared by the strip's tabs, the More button and their hidden width probes, so a probe measures what renders.
 `minWidth: 0` drops MUI's 90px per-tab floor, which five tabs exceed at 390px. `padding` is load-bearing:
-`minHeight: 36` derives from it (8 + 8 + 20px line box); MUI's `12px 16px` makes 42px content in a 36px strip,
+`minHeight: 36` bounds it (6 + 6 + 20px line box); MUI's `12px 16px` makes 42px content in a 36px strip,
 a rogue inner scrollport (`e2e/task-detail-fit.spec.ts`). */
-const TAB_SX = { minWidth: 0, minHeight: { xs: 44, sm: 36 }, padding: '8px 14px', flexShrink: 0 } as const
+const TAB_SX = { minWidth: 0, minHeight: { xs: SIZE.tapTarget, sm: grid(6) }, py: 1, px: 2, flexShrink: 0 } as const
 const MORE_GLYPH = ' ▾'
 /* A fitted strip in a narrow room takes the phone's sides: the project page beside the Directory list at a 1024px
    window (~320px) fitted only General and Access before More at 14px, and Governance and Slots at 6px.
@@ -102,7 +107,7 @@ const MORE_GLYPH = ' ▾'
 const NARROW_FIT_PX = 480
 const NARROW_FIT_SX = {
   containerType: 'inline-size',
-  [`@container (max-width: ${NARROW_FIT_PX}px)`]: { '& .MuiTab-root, & [data-testid="tabs-more"]': { px: PHONE_TAB_PX } },
+  [`@container (max-width: ${NARROW_FIT_PX}px)`]: { '& .MuiTab-root, & [data-testid="tabs-more"]': { px: 1 } },
 } as const
 /* Sub-pixel widths round up in the scroller: a strip filled to the pixel would overflow by one and grow chevrons. */
 const FIT_SLACK = 2
@@ -158,8 +163,8 @@ const CUE_MARK_SX = {
   position: 'absolute',
   top: '50%',
   zIndex: 1,
-  width: 6,
-  height: 6,
+  width: grid(1),
+  height: grid(1),
   borderTop: '2px solid',
   borderRight: '2px solid',
   borderColor: 'text.secondary',
@@ -171,14 +176,14 @@ const CUE_MARK_SX = {
 export function edgeMaskSx(scroller: string) {
   return {
     [scroller]: {
-      maskImage: 'linear-gradient(to right, transparent var(--tabs-cut-start, 0px), '
-        + '#000 var(--tabs-cut-start, 0px), #000 calc(100% - var(--tabs-cut-end, 0px)), '
-        + 'transparent calc(100% - var(--tabs-cut-end, 0px)))',
+      maskImage: `linear-gradient(to right, transparent var(--tabs-cut-start, ${grid(0)}), `
+        + `black var(--tabs-cut-start, ${grid(0)}), black calc(100% - var(--tabs-cut-end, ${grid(0)})), `
+        + `transparent calc(100% - var(--tabs-cut-end, ${grid(0)})))`,
     },
     [TAP_FLOOR_DOWN]: {
       position: 'relative',
-      '&::before': { ...CUE_MARK_SX, left: 3, transform: 'translateY(-50%) rotate(-135deg)', opacity: 'var(--tabs-more-start, 0)' },
-      '&::after': { ...CUE_MARK_SX, right: 3, transform: 'translateY(-50%) rotate(45deg)', opacity: 'var(--tabs-more-end, 0)' },
+      '&::before': { ...CUE_MARK_SX, left: grid(0.5), transform: 'translateY(-50%) rotate(-135deg)', opacity: 'var(--tabs-more-start, 0)' },
+      '&::after': { ...CUE_MARK_SX, right: grid(0.5), transform: 'translateY(-50%) rotate(45deg)', opacity: 'var(--tabs-more-end, 0)' },
     },
   } as const
 }
@@ -195,15 +200,15 @@ export function markEdgeCuts(host: HTMLElement, scroller: HTMLElement, items: re
   // How much of the item straddling each edge shows: that fragment is masked out.
   const cutStart = boxes.find(b => b.left < view.left - 1 && b.right > view.left + 1)
   const cutEnd = boxes.find(b => b.left < view.right - 1 && b.right > view.right + 1)
-  host.style.setProperty('--tabs-cut-start', start && cutStart ? `${cutStart.right - view.left}px` : '0px')
-  host.style.setProperty('--tabs-cut-end', end && cutEnd ? `${view.right - cutEnd.left}px` : '0px')
+  host.style.setProperty('--tabs-cut-start', start && cutStart ? `${cutStart.right - view.left}px` : grid(0))
+  host.style.setProperty('--tabs-cut-end', end && cutEnd ? `${view.right - cutEnd.left}px` : grid(0))
   host.style.setProperty('--tabs-more-start', start ? '1' : '0')
   host.style.setProperty('--tabs-more-end', end ? '1' : '0')
 }
 
 /** On a sticky strip's parent, so the panels beside it inherit it: how far down the scrollport the stuck strip ends
  *  (the scrollport's top padding, the strip's own `top`, its height). A panel's in-page scroll target sets its
- *  `scroll-margin-top` from it, so a jump never lands under the strip (`components/NotificationsPanel.tsx`). */
+ *  `scroll-margin-top` from it, so a jump never lands under the strip. */
 export const STICKY_TABS_HEIGHT_VAR = '--sticky-tabs-height'
 
 /** Keeps `STICKY_TABS_HEIGHT_VAR` current on `row`'s parent while `active`: re-measured when the row resizes, the window
@@ -268,7 +273,7 @@ export function Tabs<Id extends string>({
      outweighs panels starting at one y across tabs. */
   compactActions?: boolean
   /* At ≤480px the tabs WRAP onto a second line instead of scrolling, so every tab is visibly present. For a
-     strip whose labels overflow a phone and whose tabs are all equally likely picks (Dashboard, Agents). With
+     strip whose labels overflow a phone and whose tabs are all equally likely picks (Agents). With
      `overflowMenu` it wraps to at most two rows and More takes the rest (`PHONE_ROWS`). */
   wrapOnPhone?: boolean
   /* `wrapOnPhone` at EVERY width: for a strip too long for a desktop too, or for a side pane. */
@@ -284,7 +289,7 @@ export function Tabs<Id extends string>({
   sticky?: 'default' | 'paper'
 }) {
   // `noSsr`: read on the first render, so a phone never draws More for a frame first.
-  const phoneWrap = useMediaQuery(PHONE_QUERY, { noSsr: true }) && wrapOnPhone
+  const phoneWrap = usePhone({ noSsr: true }) && wrapOnPhone
   // `overflowMenu`: one row, or `PHONE_ROWS` wrapped on a phone (`wrapOnPhone` above).
   const fitted = overflowMenu
   const rows = phoneWrap ? PHONE_ROWS : 1
@@ -481,7 +486,9 @@ export function Tabs<Id extends string>({
       /* None beside More: the fit keeps the strip from overflowing, and MUI keeps chevrons it drew before the
          first fit (80px gone) since dropping tabs does not re-measure it. None while every tab fits (`overflows`). */
       scrollButtons={fitted || !overflows ? false : 'auto'}
-      selectionFollowsFocus
+      /* No `selectionFollowsFocus`: the arrow keys select through `moveTo`, and a click through `onChange`. MUI's
+         prop selects on ANY focus, a closed dialog's restored focus included — with a leave guard open on the tab
+         just clicked, Cancel re-selected it and re-asked, forever. */
       /* 36px, not MUI's 48px: chrome height above the first row is a measured criterion (AC5). Concrete, not
       `0`: the scroller is a stretch flex item, and a zero floor collapses the strip to 0px (caught by
       `task-detail-fit.spec.ts`). 44px below `sm` is the tap floor
@@ -492,7 +499,7 @@ export function Tabs<Id extends string>({
            the project pane's 65px at 1024px), and tabs grown to the pixel overflowed the scroller by a sub-pixel,
            which the edge mask cut a whole tab for. */
         {
-          minHeight: { xs: 44, sm: 36 },
+          minHeight: { xs: SIZE.tapTarget, sm: grid(6) },
           flex: fitted && !phoneWrap ? '0 1 auto' : '1 1 auto',
           minWidth: 0,
           /* A disabled chevron is only transparent in MUI (40px kept), so a strip scrolled to its start opened 40px
@@ -532,8 +539,8 @@ export function Tabs<Id extends string>({
           // Under the act-as bar (`components/ActAsBar.tsx`, 3), which also sticks at the head and must stay readable.
           position: 'sticky', zIndex: 2, bgcolor: (theme: Theme) => groundOfSticky(theme, sticky),
           // Below the act-as bar's reach, while it is drawn: it would cover the strip's top ~10px.
-          top: `var(${ACT_AS_OVERLAP_VAR}, 0px)`,
-          /* Sticky offsets count from the scrollport's padding edge (`.app-main`'s 1.75rem, a phone's 0.75rem, the side
+          top: `var(${ACT_AS_OVERLAP_VAR}, ${grid(0)})`,
+          /* Sticky offsets count from the scrollport's padding edge (`.app-main`'s `SHELL_INSET`, a phone's 0.75rem, the side
              pane's 4px), so content scrolled through that band showed above the stuck strip. Its ground reaches up
              over the band, clipped by the scrollport, only while stuck: in the flow it would cover the page title
              above it. */
@@ -606,7 +613,7 @@ export function Tabs<Id extends string>({
           <MuiTabs ref={probesRef} value={false} aria-hidden="true" tabIndex={-1}
             sx={{
               position: 'absolute', top: 0, left: 0, width: 0, height: 0, minHeight: 0, overflow: 'hidden', visibility: 'hidden',
-              ...(phoneWrap && { '& .MuiTab-root': { px: PHONE_TAB_PX } }),
+              ...(phoneWrap && { '& .MuiTab-root': { px: 1 } }),
             }}>
             {tabs.map(t => <MuiTab key={t.id} value={t.id} tabIndex={-1} label={tabName(t, shortBelow)} sx={TAB_SX} />)}
             {/* More as each name it can take; the widest is the room it needs. */}
@@ -642,7 +649,7 @@ export function Tabs<Id extends string>({
             // Responsive like the rule it overrides: a plain value loses to its `xs` media query.
             flex: { xs: '0 0 auto' },
             /* Level with the first row of a wrapped strip, a verb's slot one tap target wide. */
-            [PHONE]: { alignSelf: 'flex-start', minWidth: 44, minHeight: 44, pb: 0 },
+            [PHONE]: { alignSelf: 'flex-start', minWidth: SIZE.tapTarget, minHeight: SIZE.tapTarget, pb: 0 },
           }]}
         >
           {actions}
@@ -654,12 +661,15 @@ export function Tabs<Id extends string>({
 
 // Every panel stays mounted; inactive ones carry `hidden`. Switching tabs then costs zero refetches,
 // and in-progress typing (a gate answer, an unsaved edit) survives a trip to another tab.
+// `lazy` (opt-in): the panel's CONTENT mounts on its first activation and stays mounted after, so a tab never opened
+// costs nothing while a visited one keeps both properties. The panel element itself is always drawn (ARIA pairing).
 export function TabPanel<Id extends string>({
   id,
   current,
   idPrefix,
   label,
   className,
+  lazy = false,
   children,
 }: {
   id: Id
@@ -668,8 +678,13 @@ export function TabPanel<Id extends string>({
   /** Names the panel directly, for a host that draws no strip — there is no tab to be labelled by. */
   label?: string
   className?: string
+  /** Mount the content on first activation, then keep it (see above). A host resets it by keying the panel. */
+  lazy?: boolean
   children: ReactNode
 }) {
+  // Latched during render, at the activation itself: an effect would commit one empty frame first.
+  const [everShown, setEverShown] = useState(current === id)
+  if (current === id && !everShown) setEverShown(true)
   return (
     <div
       role="tabpanel"
@@ -679,7 +694,65 @@ export function TabPanel<Id extends string>({
       hidden={current !== id}
       className={className}
     >
-      {children}
+      {(!lazy || everShown) && children}
     </div>
+  )
+}
+
+/* THE TABBED-PAGE SCAFFOLD: one strip over one panel per tab, the selection held by the caller (`hooks/useUrlTab`).
+ * `TabbedPanels` is the whole; its halves serve a page that draws something between them or whose strip navigates. */
+
+type TabsProps<Id extends string> = Parameters<typeof Tabs<Id>>[0]
+
+export type StripWrap = { phone?: boolean; sx?: SxProps<Theme>; testId?: string }
+
+/** A panel's body; `active` lets a body mount with its tab only. */
+export type PanelRender<T> = (tab: T, active: boolean) => ReactNode
+
+/* Phone density on a wrapper (`components/Tabs` takes no `sx`); unshrinkable because the density's `flex: 1 1 auto`
+ * let every tab "fit" by its padding alone and the labels ran together. */
+const PHONE_STRIP_SX = [PHONE_TAB_STRIP_SX, { [PHONE]: { '& .MuiTab-root': { flexShrink: 0 } } }] as const
+
+/** `components/Tabs`, in its wrapper when one is asked for; bare otherwise. */
+export function TabStrip<Id extends string>({ phone = false, sx, testId, ...tabs }: TabsProps<Id> & StripWrap) {
+  const strip = <Tabs {...tabs} />
+  if (!phone && sx === undefined && testId === undefined) return strip
+  return (
+    <Box data-testid={testId} sx={[...(phone ? PHONE_STRIP_SX : []), ...(Array.isArray(sx) ? sx : [sx])]}>
+      {strip}
+    </Box>
+  )
+}
+
+/** One `TabPanel` per tab, in strip order; `labelled` names each panel itself when no strip draws (one tab offered). */
+export function TabPanels<Id extends string, T extends TabDef<Id> = TabDef<Id>>({ tabs, tab, idPrefix, labelled = false, children }: {
+  tabs: readonly T[]
+  tab: Id
+  idPrefix: string
+  labelled?: boolean
+  children: PanelRender<T>
+}) {
+  return (
+    <>
+      {tabs.map(t => (
+        <TabPanel key={t.id} id={t.id} current={tab} idPrefix={idPrefix} label={labelled ? t.label : undefined}>
+          {children(t, tab === t.id)}
+        </TabPanel>
+      ))}
+    </>
+  )
+}
+
+/** The strip and its panels. `strip={false}` draws no strip (a lone tab offers no choice) and labels the panels. */
+export function TabbedPanels<Id extends string, T extends TabDef<Id> = TabDef<Id>>({ strip, children, ...props }: Omit<TabsProps<Id>, 'tabs'> & {
+  tabs: readonly T[]
+  strip?: StripWrap | false
+  children: PanelRender<T>
+}) {
+  return (
+    <>
+      {strip !== false && <TabStrip {...props} {...strip} />}
+      <TabPanels tabs={props.tabs} tab={props.tab} idPrefix={props.idPrefix} labelled={strip === false}>{children}</TabPanels>
+    </>
   )
 }

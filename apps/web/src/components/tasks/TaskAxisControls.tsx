@@ -8,15 +8,12 @@ import ListItemIcon from '@mui/material/ListItemIcon'
 import ListItemText from '@mui/material/ListItemText'
 import Menu from '@mui/material/Menu'
 import MenuItem from '@mui/material/MenuItem'
-import ToggleButton from '@mui/material/ToggleButton'
-import ToggleButtonGroup from '@mui/material/ToggleButtonGroup'
-import Tooltip from '@mui/material/Tooltip'
-import type { SxProps, Theme } from '@mui/material/styles'
+import type { Theme } from '@mui/material/styles'
 import { listPlaybooks, PLAYBOOKS_KEY, type PlaybookOut } from '../../pages/playbooks/api'
-import { AUTOMATION_TAB_PATHS } from '../../routeGroups'
+import { CUSTOMIZE_TAB_PATHS } from '../../routeGroups'
 import type { TaskPlaybookRef } from '../../types'
 import { Icon } from '../../ui/icons'
-import { AXIS_TRACK_GROUND, AXIS_TRACK_RADIUS } from './axisTrackLook'
+import SegmentedControl, { SEGMENT_TRACK_GROUND } from '../../ui/SegmentedControl'
 import ChatGlyph from './ChatGlyph'
 import {
   ADVISOR_PERSONA,
@@ -24,14 +21,18 @@ import {
   isEpicPersona,
   PROTOTYPER_PERSONA,
 } from './taskPersona'
+import { ELLIPSIS_SX } from '../../ui/listStyles'
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, RADIUS, SIZE, grid } from '../../theme'
+import Tip from '../../ui/Tip'
 
 /* ── The task form's two axes: Depth (sketch · task · epic) and Involvement (unattended · guided · chat) ──
  * The hierarchy is Depth → Involvement → Persona → Model, and a press writes only what is below it:
  * Depth seeds all three; Involvement writes `autonomous` (and, at `task` depth, the advisor persona);
  * Persona seeds only Model. No upward edge.
  * Nothing is disabled; only `epic` hides the persona and model selects (an epic is never dispatched).
- * Wordless by operator instruction: positions are drawn glyphs, with every word in a tooltip and
- * accessible name from the same table, so the row fits one line down to 320px.
+ * Wordless below `md` by operator instruction: positions are drawn glyphs, with every word in a tooltip and
+ * accessible name from the same table, so the row fits one line down to 320px; from `md` each word shows beside
+ * its glyph (`DESKTOP_LABEL_SX`).
  * Glyphs are drawn `<svg>`: `@mui/icons-material` may not become a dependency (`RatingBadge`'s note),
  * and an emoji ignores `color`, losing the selected tint. Chat reuses `ChatGlyph`.
  */
@@ -41,7 +42,7 @@ import {
  * `aria-hidden`: the button carries the accessible name. */
 function Glyph({ children, testId }: { children: ReactNode, testId: string }): JSX.Element {
   return (
-    <Icon size="1.125em" testId={testId} sx={{ display: 'block', flex: '0 0 auto' }}>
+    <Icon size={SIZE.iconXs} testId={testId} sx={{ display: 'block', flex: '0 0 auto' }}>
       {children}
     </Icon>
   )
@@ -109,7 +110,7 @@ function PlaybookGlyph(): JSX.Element {
 /* The pill's open-menu mark: a small chevron, the same stroke family. */
 function CaretGlyph(): JSX.Element {
   return (
-    <Icon size="0.75em" sx={{ display: 'block', flex: '0 0 auto', opacity: 0.7 }}>
+    <Icon size={grid(1.5)} sx={{ display: 'block', flex: '0 0 auto', opacity: 0.7 }}>
       <path
         d="M4 6.2 8 10l4-3.8"
         fill="none"
@@ -224,7 +225,7 @@ export const TASK_INVOLVEMENTS: readonly {
     label: 'Chat',
     hint: 'talk it through with an advisor.',
     // The console's chat mark, shared with New Chat and the inline create rows.
-    Icon: () => <ChatGlyph size="1.125em" />,
+    Icon: () => <ChatGlyph size={SIZE.iconXs} />,
   },
 ]
 
@@ -264,101 +265,48 @@ export function involvementForTask(persona: string, autonomous: boolean): TaskIn
 }
 
 
-/* ── The segmented control's metrics ──
- * A recessed pill track with a raised paper chip, not MUI's stock outlined group (its ~12% wash is hard
- * to see). Three selected signals: paper fill, shadow, glyph colour step.
+/* ── The axes' metrics on the shared track (`ui/SegmentedControl`) ──
  * Content-sized and shrinkable (`flex: 0 1 auto`, segments `minWidth: 0`), since everything outside
  * `Advanced` shares one line; at 320px the glyph cells are the only free give.
- * Tap floor on height only: 2rem on pointer devices, 44px at ≤sm.
- * Colours use the channel form (`--mui-palette-*Channel`), not `alpha(theme.palette.…)`, which freezes
- * the light literal.
+ * Tap floor on height only: `SIZE.thumb` on pointer devices, 44px at ≤sm. The chip sits inset in the track.
  */
-const GROUP_SX = (theme: Theme) => ({
-  display: 'inline-flex',
-  padding: '0.1875rem',
-  gap: '0.125rem',
-  borderRadius: AXIS_TRACK_RADIUS,
-  backgroundColor: AXIS_TRACK_GROUND,
-  border: `1px solid ${theme.vars.palette.divider}`,
-})
-/* A locked axis (a read-only task, a submit in flight). On the group by prop: MUI marks only the buttons
- * `Mui-disabled`, never the group, so a `&.Mui-disabled` rule here never matched and a locked row looked live.
- * The selected segment keeps its paper fill, so the value still reads, but drops the primary tint. */
-const DISABLED_GROUP_SX = (theme: Theme) => ({
-  opacity: 0.6,
-  '& .MuiToggleButton-root.Mui-selected': { color: theme.vars.palette.text.secondary, boxShadow: 'none' },
-})
-
-/* The segment's flex cell is the span, not the button. `1 1 auto`: in a content-sized group a zero basis
- * collapses the positions to their padding. */
-const SEGMENT_WRAP_SX = { flex: '1 1 auto', minWidth: 0, display: 'flex' } as const
+const AXIS_TRACK_SX = { p: 0.5, gap: 0 } as const
 
 const SEGMENT_SX = (theme: Theme) => ({
-  width: '100%',
-  minWidth: 0,
-  minHeight: '2rem',
-  px: '0.625rem',
-  py: '0.25rem',
-  border: 0,
-  borderRadius: '999px !important',
-  color: theme.vars.palette.text.secondary,
-  transition: 'background-color 140ms, color 140ms, box-shadow 140ms',
-  [theme.breakpoints.down('sm')]: { minHeight: theme.custom.tapTargetPx, px: '0.5rem' },
+  border: 0, // every pixel of the one-line row is spoken for
+  minHeight: SIZE.thumb,
+  px: 1.5,
+  py: 0.5,
+  fontSize: FONT_SIZE.md,
+  [theme.breakpoints.down('sm')]: { minHeight: theme.custom.tapTargetPx, px: 1 },
   /* The squeezed band: the 212px sidebar appears at 481px, collapsing the form column to ~245px (narrower
-  than at 320px) until ~560px. At 0.5rem padding the row needed 276px and the ⓘ wrapped. Taken from
+  than at 320px) until ~560px, where the row's last member (the 44px Attach paperclip) wrapped. Taken from
   padding only; the glyph and 44px height stay. */
-  [theme.breakpoints.between(481, 'sm')]: { px: '0.3125rem' },
-  '&:hover': { backgroundColor: 'rgba(var(--mui-palette-common-onBackgroundChannel, 0 0 0) / 0.04)' },
-  '&.Mui-selected': {
-    backgroundColor: theme.vars.palette.background.paper,
-    color: theme.vars.palette.primary.main,
-    boxShadow: '0 1px 2px rgba(0,0,0,0.16)',
-    '&:hover': { backgroundColor: theme.vars.palette.background.paper },
-  },
-  '&.Mui-disabled': { border: 0 },
+  [theme.breakpoints.between(481, 'sm')]: { px: 0.5 },
 })
 
-/* A fourth Depth segment costs ~36px at phone padding, and the row had 20px spare at 320px (two 104px axes,
- * the 44px ⓘ, 0.75rem gaps in a 296px column). Taken from padding again, never the glyph or the 44px height:
- * 0.3125rem below 481px puts the four at ~112px (row ≈ 284px); the squeezed band (~245px column) needs
- * 0.1875rem (row ≈ 242px). */
+/* A fourth Depth segment costs a cell; in the squeezed band it is taken from padding again, never the glyph or the
+ * 44px height. */
 const COMPACT_SEGMENT_SX = (theme: Theme) => ({
-  [theme.breakpoints.down(481)]: { px: '0.3125rem' },
-  [theme.breakpoints.between(481, 'sm')]: { px: '0.1875rem' },
+  [theme.breakpoints.between(481, 'sm')]: { px: 0.5 },
 })
 
 /* Labelled segments (`showLabels`): each one icon plus its word, never ellipsized, so the track wraps onto a
  * second line rather than clipping a label; a wrapped pill reads as two pills, hence the softer radius. */
-const LABELLED_GROUP_SX = { flexWrap: 'wrap', borderRadius: '1rem', maxWidth: '100%' } as const
-const LABELLED_WRAP_SX = { flex: '0 0 auto' } as const
+const LABELLED_TRACK_SX = { flexWrap: 'wrap', borderRadius: RADIUS.md, '& > span': { flex: '0 0 auto' } } as const
 const LABELLED_SEGMENT_SX = {
-  gap: '0.3125rem',
+  gap: 1,
   whiteSpace: 'nowrap',
-  textTransform: 'none',
-  fontSize: '0.8125rem',
-  lineHeight: 1.2,
+  fontSize: FONT_SIZE.md,
+  lineHeight: LINE_HEIGHT.snug,
 } as const
 
-/** A segment's tooltip, out of the way once used: it closes on a click and on the pointer leaving (not
- *  interactive, so hovering the tip does not hold it), and opens ABOVE, clear of the row below (the form's
- *  Advanced toggle, which an open tip under Involvement covered). */
-function SegmentTooltip({ title, sx, children }: { title: string, sx: SxProps<Theme>, children: ReactNode }): JSX.Element {
-  const [open, setOpen] = useState(false)
-  return (
-    <Tooltip
-      title={title}
-      open={open}
-      onOpen={() => setOpen(true)}
-      onClose={() => setOpen(false)}
-      placement="top"
-      disableInteractive
-    >
-      <Box component="span" sx={sx} onClickCapture={() => setOpen(false)} onPointerLeave={() => setOpen(false)}>
-        {children}
-      </Box>
-    </Tooltip>
-  )
-}
+/* Wordless segments (`!showLabels`) show their word too from `md` up, where the row has the room: "Epic" is found
+ * without hovering. Below `md` the word is `display: none`, so the 320px row keeps its one line. From `md` the axis
+ * keeps its width (`0 0 auto`): the row wraps a member rather than clip a word. */
+const DESKTOP_LABEL_SX = { display: { xs: 'none', md: 'inline' } } as const
+const DESKTOP_LABEL_SEGMENT_SX = (theme: Theme) => ({ [theme.breakpoints.up('md')]: { gap: 1, whiteSpace: 'nowrap' } })
+const DESKTOP_LABEL_AXIS_SX = (theme: Theme) => ({ [theme.breakpoints.up('md')]: { flex: '0 0 auto' } })
 
 /** One axis: its positions, drawn. */
 function AxisControl<T extends string>({
@@ -386,40 +334,31 @@ function AxisControl<T extends string>({
   /** Each segment shows its label beside the icon; the tooltip keeps the hint. */
   showLabels?: boolean
 }): JSX.Element {
-  // Unlabelled, the exact shape it always had: the regular task form's DOM is pinned by a snapshot.
-  const plainSx = compact ? [SEGMENT_SX, COMPACT_SEGMENT_SX] : SEGMENT_SX
-  const segmentSx = showLabels ? [SEGMENT_SX, ...(compact ? [COMPACT_SEGMENT_SX] : []), LABELLED_SEGMENT_SX] : plainSx
   return (
-    <Box ref={rootRef} data-testid={testId} data-role={testId} sx={{ minWidth: 0, flex: '0 1 auto' }}>
-      <ToggleButtonGroup
-        exclusive
-        size="small"
+    <Box ref={rootRef} data-testid={testId} data-role={testId} sx={[{ minWidth: 0, flex: '0 1 auto' }, !showLabels && DESKTOP_LABEL_AXIS_SX]}>
+      <SegmentedControl<T>
         value={value}
         disabled={disabled}
-        aria-label={axis}
-        sx={[GROUP_SX, showLabels && LABELLED_GROUP_SX, disabled && DISABLED_GROUP_SX]}
-        /* MUI passes `null` when the selected segment is clicked; swallowed, as there is no "no answer" state. */
-        onChange={(_e, next: T | null) => { if (next !== null) onChange(next) }}
-      >
-        {/* Tooltip-wrapped buttons are safe in MUI v9: the group publishes its props through React context, not
-        `cloneElement` on direct children.
-        The `<span>` is load-bearing: a disabled button fires no pointer events, so the tooltip (the only
-        label) listens on the wrapper and survives a locked form. */}
-        {options.map(o => (
-          <SegmentTooltip key={o.value} title={`${o.label} — ${o.hint}`} sx={showLabels ? [SEGMENT_WRAP_SX, LABELLED_WRAP_SX] : SEGMENT_WRAP_SX}>
-            <ToggleButton
-              value={o.value}
-              sx={segmentSx}
-              data-testid={`${testId}-${o.value}`}
-              /* The whole explanation, label first. Needed because the visible content is an unnamed `<svg>`. */
-              aria-label={`${o.label} — ${o.hint}`}
-            >
+        ariaLabel={axis}
+        onChange={onChange}
+        sx={[AXIS_TRACK_SX, showLabels && LABELLED_TRACK_SX]}
+        buttonSx={[SEGMENT_SX, compact && COMPACT_SEGMENT_SX, showLabels ? LABELLED_SEGMENT_SX : DESKTOP_LABEL_SEGMENT_SX]}
+        /* The whole explanation, label first, is the name and the tooltip: the visible content is an unnamed `<svg>`. */
+        options={options.map(o => ({
+          value: o.value,
+          testId: `${testId}-${o.value}`,
+          ariaLabel: `${o.label} — ${o.hint}`,
+          help: `${o.label} — ${o.hint}`,
+          label: (
+            <>
               <o.Icon />
-              {showLabels && <span data-testid={`${testId}-${o.value}-label`}>{o.label}</span>}
-            </ToggleButton>
-          </SegmentTooltip>
-        ))}
-      </ToggleButtonGroup>
+              {showLabels
+                ? <span data-testid={`${testId}-${o.value}-label`}>{o.label}</span>
+                : <Box component="span" data-testid={`${testId}-${o.value}-label`} sx={DESKTOP_LABEL_SX}>{o.label}</Box>}
+            </>
+          ),
+        }))}
+      />
     </Box>
   )
 }
@@ -439,53 +378,54 @@ const PLAYBOOK_OPTION = {
 
 export const PLAYBOOK_FIXED_HINT = 'Playbook is fixed after save'
 
-/* The pill: the segment track (`GROUP_SX`) holding one raised chip (the selected segment's look), so it reads
+/* The pill: the segment track (`ui/SegmentedControl`'s look) holding one raised chip (the selected segment's look), so it reads
  * as the same control in its fourth state. Content-sized up to 14rem and shrinkable (`minWidth: 0`), so the
  * name ellipsizes only when the row has run out of room — never on a fixed per-band cap, which clipped
  * "OAM Feature" to five letters at 320px beside free space. */
 const PILL_SX = (theme: Theme) => ({
-  ...GROUP_SX(theme),
+  display: 'inline-flex',
+  p: 0.5,
+  borderRadius: RADIUS.round,
+  backgroundColor: SEGMENT_TRACK_GROUND,
+  outline: `1px solid ${theme.vars.palette.divider}`,
+  outlineOffset: -1,
   flex: '0 1 auto',
   minWidth: 0,
-  maxWidth: '14rem',
+  maxWidth: grid(37),
 })
 
 const PILL_CHIP_SX = (theme: Theme) => ({
   display: 'flex',
   alignItems: 'center',
-  gap: '0.3125rem',
+  gap: 0.5,
   minWidth: 0,
   width: '100%',
-  minHeight: '2rem',
-  px: '0.625rem',
-  py: '0.25rem',
-  borderRadius: '999px',
-  fontSize: '0.8125rem',
-  fontWeight: 500,
-  lineHeight: 1.2,
+  minHeight: SIZE.thumb,
+  px: 1.5,
+  py: 0.5,
+  borderRadius: RADIUS.round,
+  fontSize: FONT_SIZE.md,
+  fontWeight: FONT_WEIGHT.medium,
+  lineHeight: LINE_HEIGHT.snug,
   backgroundColor: theme.vars.palette.background.paper,
   color: theme.vars.palette.primary.main,
-  boxShadow: '0 1px 2px rgba(0,0,0,0.16)',
+  boxShadow: 1,
   transition: 'box-shadow 140ms',
-  '&:hover': { boxShadow: '0 1px 3px rgba(0,0,0,0.24)' },
+  '&:hover': { boxShadow: 2 },
   '&.Mui-focusVisible': { outline: `2px solid ${theme.vars.palette.primary.main}`, outlineOffset: '1px' },
   '&.Mui-disabled': { color: theme.vars.palette.text.secondary, boxShadow: 'none' },
-  [theme.breakpoints.down('sm')]: { minHeight: theme.custom.tapTargetPx, px: '0.5rem' },
-  [theme.breakpoints.between(481, 'sm')]: { px: '0.375rem', gap: '0.25rem' },
+  [theme.breakpoints.down('sm')]: { minHeight: theme.custom.tapTargetPx, px: 1 },
+  [theme.breakpoints.between(481, 'sm')]: { px: 1, gap: 0.5 },
 })
 
 /* Two lines per playbook (name, then its description or why it cannot run), each one line with ellipsis; the
  * full text rides `title`. Capped at the viewport less the 16px gutters. */
-const MENU_PAPER_SX = { minWidth: '15rem', maxWidth: 'min(22rem, calc(100vw - 2rem))' } as const
+const MENU_PAPER_SX = { minWidth: grid(40), maxWidth: `min(${grid(58.5)}, calc(100vw - ${grid(5)}))` } as const
 const MENU_TEXT_SX = {
   my: 0,
-  '& .MuiListItemText-primary, & .MuiListItemText-secondary': {
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-  },
+  '& .MuiListItemText-primary, & .MuiListItemText-secondary': ELLIPSIS_SX,
 } as const
-const MENU_ICON_SX = { minWidth: '1.75rem !important', color: 'text.secondary' } as const
+const MENU_ICON_SX = { minWidth: `${grid(4.5)} !important`, color: 'text.secondary' } as const
 
 /** The org's own playbooks as menu rows, in served order. */
 function playbookItems(
@@ -507,7 +447,7 @@ function playbookItems(
       <MenuItem
         key="create"
         component={RouterLink}
-        to={AUTOMATION_TAB_PATHS.playbooks}
+        to={CUSTOMIZE_TAB_PATHS.playbooks}
         dense
         data-testid={`${testId}-playbook-create`}
       >
@@ -519,12 +459,10 @@ function playbookItems(
     const runnable = pb.runnable !== false
     const secondary = runnable ? pb.description : (pb.not_runnable_reason ?? 'Can’t run yet')
     return (
-      <MenuItem
-        key={pb.id}
+      <Tip key={pb.id} title={secondary ? `${pb.name} — ${secondary}` : pb.name}><MenuItem
         selected={pb.id === selectedId}
         disabled={!runnable}
         onClick={() => onPick(pb)}
-        title={secondary ? `${pb.name} — ${secondary}` : pb.name}
         data-testid={`${testId}-playbook-${pb.id}`}
       >
         <ListItemIcon sx={MENU_ICON_SX}><PlaybookGlyph /></ListItemIcon>
@@ -533,7 +471,7 @@ function playbookItems(
           secondary={secondary || undefined}
           sx={MENU_TEXT_SX}
         />
-      </MenuItem>
+      </MenuItem></Tip>
     )
   })
 }
@@ -641,7 +579,7 @@ export function TaskDepthControl({
     const tip = playbookFixed ? `${playbook.name} — ${PLAYBOOK_FIXED_HINT}` : `Playbook — ${playbook.name}`
     return (
       <Box ref={anchorRef} data-testid={testId} data-role={testId} sx={PILL_SX}>
-        <Tooltip title={tip}>
+        <Tip describeChild={false} title={tip}>
           {/* The `<span>` keeps the tooltip on a disabled chip (see `AxisControl`). */}
           <Box component="span" sx={{ display: 'flex', minWidth: 0, width: '100%' }}>
             <ButtonBase
@@ -657,14 +595,14 @@ export function TaskDepthControl({
               <Box
                 component="span"
                 data-testid={`${testId}-playbook-name`}
-                sx={{ minWidth: 0, flex: '0 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                sx={{ ...ELLIPSIS_SX, flex: '0 1 auto' }}
               >
                 {playbook.name}
               </Box>
               {!pillLocked && <CaretGlyph />}
             </ButtonBase>
           </Box>
-        </Tooltip>
+        </Tip>
         {!pillLocked && menu}
       </Box>
     )

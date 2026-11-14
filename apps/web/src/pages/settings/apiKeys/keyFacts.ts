@@ -4,32 +4,17 @@
 import type { ConfirmOptions } from '../../../components/ConfirmDialog'
 import { personOf } from '../../../lib/authorBadge'
 import { countOf } from '../../../lib/humanize'
-import { NO_VALUE, relativeAge } from '../../../lib/relativeTime'
-import type { Tone } from '../../../ui/StatusChip'
+import { DAY_MS, HOUR_MS, NO_VALUE, relativeAge } from '../../../lib/relativeTime'
+import { MINUTE_MS } from '../../../hooks/useNow'
+import type { Presentation } from '../../../ui/statusTone'
 import type { ApiKey, ApiKeyStatus, RotateOverlap } from './api'
 
-export const STATUS_LABEL: Record<ApiKeyStatus, string> = {
-  active: 'Active',
-  expiring: 'Expiring soon',
-  expired: 'Expired',
-  revoked: 'Revoked',
-  suspended: 'Owner suspended',
-}
-
-export const STATUS_TONE: Record<ApiKeyStatus, Tone> = {
-  active: 'success',
-  expiring: 'warning',
-  expired: 'neutral',
-  revoked: 'error',
-  suspended: 'warning',
-}
-
-export const STATUS_GLYPH: Record<ApiKeyStatus, string> = {
-  active: '●',
-  expiring: '!',
-  expired: '○',
-  revoked: '✕',
-  suspended: '‖',
+export const STATUS: Record<ApiKeyStatus, Presentation> = {
+  active: { label: 'Active', tone: 'success', glyph: '●' },
+  expiring: { label: 'Expiring soon', tone: 'warning', glyph: '!' },
+  expired: { label: 'Expired', tone: 'neutral', glyph: '○' },
+  revoked: { label: 'Revoked', tone: 'error', glyph: '✕' },
+  suspended: { label: 'Owner suspended', tone: 'warning', glyph: '‖' },
 }
 
 /** The owner as the list shows them: the person alone (an acting operator's ", acting as <org>" goes, `personOf`),
@@ -42,10 +27,6 @@ export function ownerName(label: string): string {
   return name.length > 0 && name.length < words.length ? name.join(' ') : words.join(' ')
 }
 
-const MINUTE = 60_000
-const HOUR = 60 * MINUTE
-const DAY = 24 * HOUR
-
 /** "Never", "Expires in 3 days", "Expired" — or a dash once revoked (its expiry no longer matters). */
 export function expiryText(key: Pick<ApiKey, 'expires_at' | 'status'>, now: Date = new Date()): string {
   if (key.status === 'revoked') return NO_VALUE
@@ -53,11 +34,11 @@ export function expiryText(key: Pick<ApiKey, 'expires_at' | 'status'>, now: Date
   const left = Date.parse(key.expires_at) - now.getTime()
   if (Number.isNaN(left)) return NO_VALUE
   if (left <= 0) return 'Expired'
-  const days = Math.round(left / DAY)
+  const days = Math.round(left / DAY_MS)
   if (days >= 1) return `Expires in ${countOf(days, 'day')}`
-  const hours = Math.round(left / HOUR)
+  const hours = Math.round(left / HOUR_MS)
   if (hours >= 1) return `Expires in ${countOf(hours, 'hour')}`
-  return `Expires in ${countOf(Math.max(1, Math.round(left / MINUTE)), 'minute')}`
+  return `Expires in ${countOf(Math.max(1, Math.round(left / MINUTE_MS)), 'minute')}`
 }
 
 /** "4m ago · 203.0.113.7", or "Never used". */

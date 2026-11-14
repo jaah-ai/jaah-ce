@@ -64,7 +64,10 @@ import stat
 import subprocess
 import sys
 import time
+from pathlib import Path
 
+from file_io import read_json_or
+from host_platform import _posix, _types
 from host_platform._types import absent, UNKNOWN_PEER, Paths, Peer, Service, metrics_sample
 
 OS = "windows"
@@ -96,9 +99,7 @@ DAEMON_SERVICE = "jaahd"
 
 log = logging.getLogger("jaahd.host_platform.windows")
 
-
-def machine() -> str:
-    return _platform.machine()
+machine = _types.machine
 
 
 def os_version() -> str:
@@ -464,20 +465,20 @@ def _anchor_path() -> str:
 
 
 def _load_anchor() -> tuple[int, int] | None:
+    data = read_json_or(_anchor_path(), None, expect=dict)
+    if data is None:
+        return None
     try:
-        with open(_anchor_path(), encoding="ascii") as fh:
-            data = json.load(fh)
         return int(data["pid"]), int(data["created"])
-    except (OSError, ValueError, KeyError, TypeError):
+    except (KeyError, TypeError, ValueError):
         return None
 
 
 def _store_anchor(anchor: tuple[int, int]) -> None:
     path = _anchor_path()
+    import env_helpers  # noqa: PLC0415 — env_helpers imports this package
     try:
-        with open(path + ".tmp", "w", encoding="ascii") as fh:
-            json.dump({"pid": anchor[0], "created": anchor[1]}, fh)
-        os.replace(path + ".tmp", path)
+        env_helpers.atomic_write_json(Path(path), {"pid": anchor[0], "created": anchor[1]}, mode=0o644)
     except OSError as exc:
         log.warning("fleet server anchor: could not persist %s (%s) — a daemon restart re-verifies it, "
                     "which fails once the jaah-runner service has restarted", path, exc)
@@ -538,10 +539,9 @@ def attest_fleet_server(socket: str, pid: int) -> None:
     created = start_time(pid)
     if created is None:
         raise OSError(errno.ESRCH, f"the fleet tmux server (pid {pid}) cannot be dated")
-    path = fleet_server_attestation_path(socket)
-    with open(path + ".tmp", "w", encoding="ascii") as fh:
-        json.dump({"pid": int(pid), "created": created}, fh)
-    os.replace(path + ".tmp", path)
+    import env_helpers  # noqa: PLC0415 — env_helpers imports this package
+    env_helpers.atomic_write_json(Path(fleet_server_attestation_path(socket)), {"pid": int(pid), "created": created},
+                                  mode=0o644)
 
 
 def _attests(table: dict, server: int, attested: tuple[int, int] | None) -> bool:
@@ -894,10 +894,7 @@ def path_key(path: str) -> str:
 
 def is_under(path: str, root: str) -> bool:
     """Whether `path` is `root` or inside it, whichever spelling (MSYS or Windows) each uses."""
-    p, r = path_key(path), path_key(root)
-    if not p or not r:
-        return False
-    return p == r or p.startswith(r.rstrip("\\") + "\\")
+    return _posix.is_under(path, root, key=path_key, sep="\\")
 
 
 # ── Win32 constants ─────────────────────────────────────────────────────────────────────────────────
@@ -1076,20 +1073,17 @@ class MemoryStatusEx(ctypes.Structure):
 
 def _native_create_pipe(name: str, sddl: str, first: bool) -> int:
     """One overlapped, local-only, byte-mode server instance of pipe `name`, guarded by `sddl`."""
-    k32, adv = _win()
-    sd, size = ctypes.c_void_p(), ctypes.c_ulong()
-    if not adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(sd),
-                                                                     ctypes.byref(size)):
-        raise _last_error("ConvertStringSecurityDescriptorToSecurityDescriptorW")
-    try:
+    k32, _ = _win()
+
+    def create(sd):
         sa = SecurityAttributes(ctypes.sizeof(SecurityAttributes), sd, 0)
         open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | (FILE_FLAG_FIRST_PIPE_INSTANCE if first else 0)
         handle = k32.CreateNamedPipeW(
             name, open_mode, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_UNLIMITED_INSTANCES, _PIPE_BUFFER, _PIPE_BUFFER, 0, ctypes.byref(sa))
-        failure = _last_error(f"CreateNamedPipeW({name})")   # captured before LocalFree can overwrite it
-    finally:
-        k32.LocalFree(sd)
+        return handle, _last_error(f"CreateNamedPipeW({name})")   # captured before LocalFree can overwrite it
+
+    handle, failure = _with_sd(sddl, create)
     if handle in (None, _INVALID_HANDLE):
         raise failure
     return int(handle)
@@ -1116,18 +1110,15 @@ def runner_output_sddl(daemon_sid: str, runner_sid: str) -> str:
 
 def _native_create_file(path: str, sddl: str) -> None:
     """Create `path` (CREATE_NEW: never an existing file) under `sddl`. Raises `OSError`."""
-    k32, adv = _win()
-    sd, size = ctypes.c_void_p(), ctypes.c_ulong()
-    if not adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(sd),
-                                                                     ctypes.byref(size)):
-        raise _last_error("ConvertStringSecurityDescriptorToSecurityDescriptorW")
-    try:
+    k32, _ = _win()
+
+    def create(sd):
         sa = SecurityAttributes(ctypes.sizeof(SecurityAttributes), sd, 0)
         handle = k32.CreateFileW(path, _GENERIC_WRITE, 0, ctypes.byref(sa), _CREATE_NEW, _FILE_ATTRIBUTE_NORMAL,
                                  None)
-        failure = _last_error(f"CreateFileW({path})")
-    finally:
-        k32.LocalFree(sd)
+        return handle, _last_error(f"CreateFileW({path})")
+
+    handle, failure = _with_sd(sddl, create)
     if handle in (None, _INVALID_HANDLE):
         raise failure
     k32.CloseHandle(handle)
@@ -1491,19 +1482,24 @@ def _native_client_pid(handle: int) -> int:
     return int(pid.value)
 
 
-def _native_pipe_owner(handle: int) -> str:
-    """The owner SID of the pipe behind `handle` (`GetSecurityInfo`, needs READ_CONTROL). Raises `OSError`."""
+def _owner_sid(query: str, subject: object, object_type: int, filename: str | None = None) -> str:
+    """The owner SID advapi32's `query` (`GetSecurityInfo` on a handle, `GetNamedSecurityInfoW` on a path)
+    reports for `subject`. Raises `OSError` (EACCES for a refused read)."""
     k32, adv = _win()
     owner, sd = ctypes.c_void_p(), ctypes.c_void_p()
-    err = adv.GetSecurityInfo(handle, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, ctypes.byref(owner),
+    err = getattr(adv, query)(subject, object_type, OWNER_SECURITY_INFORMATION, ctypes.byref(owner),
                               None, None, None, ctypes.byref(sd))
     if err:
-        raise OSError(errno.EACCES if err == ERROR_ACCESS_DENIED else errno.EIO, "GetSecurityInfo failed",
-                      None, err)
+        raise OSError(errno.EACCES if err == ERROR_ACCESS_DENIED else errno.EIO, f"{query} failed", filename, err)
     try:
         return _sid_string(owner)
     finally:
         k32.LocalFree(sd)
+
+
+def _native_pipe_owner(handle: int) -> str:
+    """The owner SID of the pipe behind `handle` (`GetSecurityInfo`, needs READ_CONTROL). Raises `OSError`."""
+    return _owner_sid("GetSecurityInfo", handle, SE_KERNEL_OBJECT)
 
 
 SE_FILE_OBJECT = 1
@@ -1514,34 +1510,13 @@ _FINAL_PATH_PREFIX = "\\\\?\\"
 def _native_file_owner(fd: int) -> str:
     """The owner SID of the file open on CRT descriptor `fd` (`GetSecurityInfo` on its handle). Raises
     `OSError`."""
-    k32, adv = _win()
-    handle = _msvcrt().get_osfhandle(fd)
-    owner, sd = ctypes.c_void_p(), ctypes.c_void_p()
-    err = adv.GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, ctypes.byref(owner),
-                              None, None, None, ctypes.byref(sd))
-    if err:
-        raise OSError(errno.EACCES if err == ERROR_ACCESS_DENIED else errno.EIO, "GetSecurityInfo failed",
-                      None, err)
-    try:
-        return _sid_string(owner)
-    finally:
-        k32.LocalFree(sd)
+    return _owner_sid("GetSecurityInfo", _msvcrt().get_osfhandle(fd), SE_FILE_OBJECT)
 
 
 def _native_path_owner(path: str) -> str:
     """The owner SID of the file or directory at `path` (`GetNamedSecurityInfoW`). A final reparse point
     is followed, so a caller judging a directory resolves it first. Raises `OSError`."""
-    k32, adv = _win()
-    owner, sd = ctypes.c_void_p(), ctypes.c_void_p()
-    err = adv.GetNamedSecurityInfoW(path, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, ctypes.byref(owner),
-                                    None, None, None, ctypes.byref(sd))
-    if err:
-        raise OSError(errno.EACCES if err == ERROR_ACCESS_DENIED else errno.EIO,
-                      "GetNamedSecurityInfoW failed", path, err)
-    try:
-        return _sid_string(owner)
-    finally:
-        k32.LocalFree(sd)
+    return _owner_sid("GetNamedSecurityInfoW", path, SE_FILE_OBJECT, filename=path)
 
 
 def _native_final_path(fd: int) -> str:
@@ -1614,12 +1589,6 @@ def _token_sids(process: int) -> tuple[str, frozenset]:
         return user, frozenset(_sid_string(entry.Sid) for entry in entries)
     finally:
         k32.CloseHandle(token)
-
-
-def _native_pin_process(pid: int) -> int | None:
-    """A handle on process `pid`, or None when it cannot be opened. While it is open Windows cannot reuse
-    the pid. Best effort: a native process of another account usually refuses even this."""
-    return _open_process(pid)
 
 
 class _UnicodeString(ctypes.Structure):
@@ -1751,8 +1720,9 @@ def _native_service_process(name: str) -> tuple[int, str] | None:
         adv.CloseServiceHandle(scm)
 
 
-def _native_toolhelp_ppid(pid: int) -> int | None:
-    """`th32ParentProcessID` of `pid` from a Toolhelp32 process snapshot, or None when `pid` is absent."""
+def _native_process_entry(pid: int) -> ProcessEntry32W | None:
+    """`pid`'s entry in a Toolhelp32 process snapshot, or None when `pid` is absent. Needs no right on the
+    process."""
     k32, _ = _win()
     snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if snap in (None, _INVALID_HANDLE):
@@ -1763,31 +1733,24 @@ def _native_toolhelp_ppid(pid: int) -> int | None:
         ok = k32.Process32FirstW(snap, ctypes.byref(entry))
         while ok:
             if entry.th32ProcessID == pid:
-                return int(entry.th32ParentProcessID)
+                return entry
             ok = k32.Process32NextW(snap, ctypes.byref(entry))
         return None
     finally:
         k32.CloseHandle(snap)
+
+
+def _native_toolhelp_ppid(pid: int) -> int | None:
+    """`th32ParentProcessID` of `pid` from a Toolhelp32 process snapshot, or None when `pid` is absent."""
+    entry = _native_process_entry(pid)
+    return None if entry is None else int(entry.th32ParentProcessID)
 
 
 def _native_image_name(pid: int) -> str | None:
     """`szExeFile` (the image's file name) of `pid` from a Toolhelp32 process snapshot, or None when `pid` is
-    absent. Needs no right on the process."""
-    k32, _ = _win()
-    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snap in (None, _INVALID_HANDLE):
-        return None
-    try:
-        entry = ProcessEntry32W()
-        entry.dwSize = ctypes.sizeof(entry)
-        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
-        while ok:
-            if entry.th32ProcessID == pid:
-                return "".join(map(chr, entry.szExeFile)).split("\0", 1)[0]
-            ok = k32.Process32NextW(snap, ctypes.byref(entry))
-        return None
-    finally:
-        k32.CloseHandle(snap)
+    absent."""
+    entry = _native_process_entry(pid)
+    return None if entry is None else "".join(map(chr, entry.szExeFile)).split("\0", 1)[0]
 
 
 def _native_current_sid() -> str:
@@ -1926,7 +1889,9 @@ _create_pipe = _native_create_pipe
 _create_file = _native_create_file
 _client_pid = _native_client_pid
 _pipe_owner = _native_pipe_owner
-_pin_process = _native_pin_process
+# A handle on process `pid` (`_open_process`), or None when it cannot be opened. While it is open Windows
+# cannot reuse the pid. Best effort: a native process of another account usually refuses even this.
+_pin_process = _open_process
 _impersonated_sid = _native_impersonated_sid
 _process_table = _native_process_table
 _service_process = _native_service_process
@@ -2141,6 +2106,16 @@ def daemon_sid() -> str:
     return sid
 
 
+# The runner account and its password, one per line, readable by SYSTEM, Administrators and the daemon only (it
+# inherits etc's list, as node.env does): what a jailed tmux command client logs on as (`tmux_jail`). The
+# installer rewrites it with every new password (`node_bootstrap.py`, "the runner account's logon").
+RUNNER_LOGON_FILE = "runner-logon"
+
+
+def runner_logon_file() -> str:
+    return ntpath.join(paths().etc_dir, RUNNER_LOGON_FILE)
+
+
 def runner_sid() -> str:
     """The runner account's SID — machine-qualified, and required to be a LOCAL USER, so a domain user or
     group that happens to be called `jaah` is never the one granted the pipe. Raises `OSError`."""
@@ -2306,7 +2281,7 @@ def start_time(pid: int) -> int | None:
 
 # No mount namespaces here; the console names its tmux client by pid, so no stdin tty; only the Linux fleet
 # server's recycle asks for children.
-mount_namespace = stdin_tty = child_pids = absent
+mount_namespace = stdin_tty = child_pids = socket_holders = ptrace_scope = absent
 
 
 def parent_of(pid: int) -> int | None:

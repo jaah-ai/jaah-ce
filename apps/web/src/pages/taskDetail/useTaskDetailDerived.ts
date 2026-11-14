@@ -3,13 +3,28 @@ import { useMemo } from 'react'
 import { useConsoleChatTask } from '../../components/ConsoleDock'
 import { LANE_PERSONA, laneArtifactHref, latestGateLog } from '../../components/tasks/laneRun'
 import { isEnabled } from '../../lib/editionFeatures'
-import { useMinuteTick } from '../../hooks/useMinuteTick'
+import { capitalize } from '../../lib/humanize'
+import { useNow } from '../../hooks/useNow'
 import { runnerWorktreeFor, UNSIGHTED_RUNNER_WARN_MS, unsightedRunnerAgeMs, worktreeForTask } from '../../lib/worktree'
-import { consoleStateLive } from '../../components/tasks/rowActions'
+import { consoleStateLive, IN_PROGRESS_STATES } from '../../components/tasks/rowActions'
 import type { Artifact, OrgRef, PipelineTask, Project, Worktree } from '../../types'
 import type { ActivityLogEntry } from './ActivityLog'
 
 export type TaskDetailDerived = ReturnType<typeof useTaskDetailDerived>
+
+/** The words of `summary` that open the page where the fix is made (`placement_grants.PlacementRefusal.link`). */
+export interface FixLink { text: string; href: string }
+/** `details`: what followed the first paragraph of a stored reason (a log tail), shown folded; '' when none. */
+export interface FailureCause { label: string; summary: string; link: FixLink | null; details?: string }
+
+/* A note's `data.link`, narrowed: only an in-console path is followed. */
+function fixLink(raw: unknown): FixLink | null {
+  if (typeof raw !== 'object' || raw === null) return null
+  const { text, href } = raw as Record<string, unknown>
+  return typeof text === 'string' && text !== '' && typeof href === 'string' && /^\/(?![/\\])/.test(href)
+    ? { text, href }
+    : null
+}
 
 /* ── The note kinds that carry a task's TERMINAL REASON ───────────────────────────────────────────────
    Full stored kinds, byte-identical to the writer: `task_note:placement_refused` is written only by
@@ -17,9 +32,6 @@ export type TaskDetailDerived = ReturnType<typeof useTaskDetailDerived>
    `category`/`action` so the two sides stay one grep apart. Add future terminal causes HERE only; never
    widen to note kinds in general (every content row would hoist into the banner). See `terminalCause`. */
 const TERMINAL_CAUSE_NOTE_KINDS: ReadonlySet<string> = new Set(['task_note:placement_refused'])
-
-// A5/R5: the worktree link shows only while a dispatched runner holds one.
-const IN_PROGRESS_STATES = new Set(['ready', 'active', 'awaiting_response'])
 
 export function useTaskDetailDerived({ task, activity, artifacts, projects, worktrees, isCreate, deleting, otherOrg }: {
   task: PipelineTask | null
@@ -60,7 +72,7 @@ export function useTaskDetailDerived({ task, activity, artifacts, projects, work
   }, [task, runnerProjectName, worktrees])
 
   /* A coarse clock for the age threshold: 30s against 5 minutes. */
-  const nowTick = useMinuteTick(30_000)
+  const nowTick = useNow(30_000)
 
   /* ── A LAUNCHED RUNNER THAT HAS NEVER REPORTED ─────────────────────────────────────────────
      A `ready` task holding a slot = a runner was LAUNCHED (leasing happens only at dispatch) and never
@@ -128,12 +140,19 @@ export function useTaskDetailDerived({ task, activity, artifacts, projects, work
   /* The banner's content: the feed note when one matched (it carries the server's label), else the reason
      the failure itself stored (`failure_reason`, served only on `system_failed`) — the one copy every
      failure path writes, so a first-time owner never meets a bare "Failed" chip. One banner, never two:
-     a placement refusal stores the note's own sentence as its reason. */
-  const failureCause = useMemo(() => {
-    if (terminalCause !== null) return terminalCause
+     the placement refusal note matches first, its one-line form being the stored reason. */
+  const failureCause = useMemo((): FailureCause | null => {
+    if (terminalCause !== null) {
+      return { label: terminalCause.label, summary: terminalCause.summary, link: fixLink(terminalCause.data.link) }
+    }
     const reason = task?.state === 'system_failed' ? task.failure_reason?.trim() : undefined
+    if (!reason) return null
+    // The first paragraph is the agent's sentence for a person; anything after a blank line is detail, folded.
+    const cut = reason.search(/\n\s*\n/)
+    const head = cut < 0 ? reason : reason.slice(0, cut).trim()
+    const details = cut < 0 ? '' : reason.slice(cut).trim()
     // Writers store a clause (`end_attempt`'s reasons start lower-case); a banner shows a sentence.
-    return reason ? { label: 'Why it failed', summary: reason.charAt(0).toUpperCase() + reason.slice(1) } : null
+    return { label: 'Why it failed', summary: capitalize(head), link: null, details }
   }, [task, terminalCause])
 
   return {

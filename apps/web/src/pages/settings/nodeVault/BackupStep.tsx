@@ -1,14 +1,14 @@
 import { useEffect, useState, type JSX } from 'react'
 import Box from '@mui/material/Box'
-import Checkbox from '@mui/material/Checkbox'
-import FormControlLabel from '@mui/material/FormControlLabel'
 import Typography from '@mui/material/Typography'
 import BusyButton from '../../../ui/BusyButton'
 import Banner from '../../../ui/Banner'
 import FormTextField from '../../../ui/FormTextField'
+import SettingCheckbox from '../../../ui/SettingCheckbox'
 import { useSubmit } from '../../../hooks/useSubmit'
 import { downloadText } from '../../../lib/downloadText'
 import { createBackup, MIN_PASSPHRASE_LENGTH, passphraseAcceptable, type NodeVaultKey } from '../../../lib/nodeVaultKeys'
+import { grid } from '../../../theme'
 
 /* The mandatory Backup step (AC-4.3, D4). Reused by Setup and Rotation. The file is encrypted IN THE
  * BROWSER under the passphrase (entered twice, at least `MIN_PASSPHRASE_LENGTH`) and handed to the browser's
@@ -57,12 +57,17 @@ export default function BackupStep({
     }, { mapError: (_err, fallback) => fallback })
 
   return (
-    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, maxWidth: 420 }} data-testid="nodevault-backup-step">
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, maxWidth: grid(70) }} data-testid="nodevault-backup-step">
       <Typography variant="body2" sx={{ color: 'text.secondary' }}>
         Jaah keeps no copy of this key. Lose every node and this file, and NodeVault secrets are gone.
       </Typography>
       <FormTextField
         label="Passphrase" error={tooShort ? `At least ${MIN_PASSPHRASE_LENGTH} characters` : undefined}
+        help={{
+          tip: 'Encrypts the backup file in this browser; never sent.',
+          more: 'Uploading the backup later asks for it. Jaah cannot reset it: lose it and the backup cannot be opened.',
+          docs: 'using-jaah/credentials/set-up-nodevault',
+        }}
         type="password"
         autoComplete="new-password"
         value={passphrase}
@@ -71,6 +76,7 @@ export default function BackupStep({
       />
       <FormTextField
         label="Repeat passphrase" error={mismatch ? 'Passphrases don’t match' : undefined}
+        help="Catches a typo before the backup is encrypted."
         type="password"
         autoComplete="new-password"
         value={again}
@@ -83,9 +89,14 @@ export default function BackupStep({
         </BusyButton>
         {downloaded && <Typography variant="body2" sx={{ color: 'success.main' }} data-testid="nodevault-backup-downloaded">Downloaded</Typography>}
       </Box>
-      <FormControlLabel
-        control={<Checkbox checked={confirmed} onChange={e => setConfirmed(e.target.checked)} />}
+      <SettingCheckbox
+        name="nodevault-backup-confirmed"
         label={BACKUP_CONFIRM}
+        help="With the backup downloaded, this enables Next."
+        checked={confirmed}
+        onChange={setConfirmed}
+        labelPlacement="end"
+        testId="nodevault-backup-confirm"
       />
       {error && <Banner severity="error">{error}</Banner>}
     </Box>

@@ -1,0 +1,40 @@
+# Microsoft Learn: Microsoft's hosted MCP server over its official documentation. Facts confirmed at
+# https://learn.microsoft.com/en-us/training/support/mcp (one endpoint, Streamable HTTP, free, no authentication).
+# Probed 2026-11-10: initialize without auth answers 200; tools microsoft_docs_search, microsoft_code_sample_search and
+# microsoft_docs_fetch.
+slug = "microsoft_learn"
+label = "Microsoft Learn"
+category = "mcp"
+vendor_docs_url = "https://learn.microsoft.com/en-us/training/support/mcp"
+summary = "Search and read Microsoft's official documentation and code samples through the Microsoft Learn MCP server."
+
+[[auth]]
+kind = "mcp"
+
+[mcp]
+url = "https://learn.microsoft.com/api/mcp"
+url_editable = false
+transport = "streamable_http"
+auth = "none"
+
+[docs]
+agent_uses = [
+  "Search Microsoft Learn for current Azure, .NET, Microsoft 365 and Windows documentation",
+  "Fetch a full Learn article when a task needs its exact steps or limits",
+  "Find official code samples for a Microsoft SDK or service",
+]
+prerequisites = [
+  "Nothing to sign up for: the server is free and open. An Org Owner or Admin adds the secret once, then links it on each project's MCP tab",
+]
+limitations = [
+  "Covers content published on Microsoft Learn only",
+  "Agents get Microsoft Learn only in the projects the secret is linked to",
+]
+troubleshooting = [
+  { symptom = "Test cannot complete the MCP handshake", fix = "The server is unreachable or changed its endpoint. Check https://learn.microsoft.com/en-us/training/support/mcp and try again later" },
+  { symptom = "New tasks on the project have no Microsoft Learn tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with, and an agent marked Not supported on that tab cannot load MCP servers" },
+]
+faq = [
+  { q = "Why add a secret for a server with no key", a = "The secret is the connection a project links. It holds no key here, but it decides which projects' agents get Microsoft Learn's tools" },
+  { q = "What does Test do", a = "It opens an MCP session with the Microsoft Learn server and lists its tools, then closes the session" },
+]

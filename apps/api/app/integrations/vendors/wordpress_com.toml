@@ -1,0 +1,68 @@
+slug = "wordpress_com"
+label = "WordPress.com"
+category = "cms"
+vendor_docs_url = "https://developer.wordpress.com/docs/oauth2/"
+summary = "A site hosted on WordPress.com: agents draft, publish and manage posts, pages and media for the site you choose."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://public-api.wordpress.com/oauth2/authorize"
+token_url = "https://public-api.wordpress.com/oauth2/token"
+pkce = false
+jaah_app = true
+account_url = "https://public-api.wordpress.com/rest/v1.1/me"
+account_field = "username"
+
+[auth.oauth.registration]
+console_url = "https://developer.wordpress.com/apps/new/"
+steps = [
+  "In the Create an Application form, enter a Description such as: Jaah agents draft and publish content on the sites you connect",
+  "Under Website URL enter the public homepage of the company that runs this Jaah (its https address)",
+  "Put the redirect URI in the Redirect URLs field",
+  "Leave Javascript Origins empty, set Type to Web, answer the anti-spam question and select Create",
+  "The Client ID and Client Secret are on the application's page (developer.wordpress.com/apps) under OAuth Information",
+]
+review = "WordPress.com applications need no review; they work for any WordPress.com account once created."
+
+[test]
+method = "GET"
+path = "https://public-api.wordpress.com/rest/v1.1/me"
+identity = [["display_name"], ["username"]]
+
+[docs]
+agent_uses = [
+  "Draft, edit, schedule and publish posts and pages on the site you choose when connecting",
+  "Upload images and files to the site's media library",
+  "Manage categories, tags and comments",
+  "Read the site's content and stats to answer questions or plan new content",
+]
+prerequisites = [
+  "A WordPress.com account that is an administrator or editor of the site agents should work on",
+  "For a self-hosted WordPress site (not on WordPress.com), use the WordPress integration instead",
+]
+limitations = [
+  "One connection reaches one site: WordPress.com asks you to pick the site while you approve. Connect again (as another secret) for each further site",
+  "Agents can do what your WordPress.com role on that site allows; WordPress.com does not let Jaah ask for narrower access",
+  "WordPress.com issues no refresh token: when the grant ends (you revoke it, or change your password), select Reconnect",
+]
+
+[[docs.troubleshooting]]
+symptom = "Test says WordPress.com rejected the access token and asks you to reconnect"
+fix = "The grant was revoked, or your password or two-step settings changed. Select Reconnect on the secret and approve Jaah again for the site"
+
+[[docs.troubleshooting]]
+symptom = "The site I want is not offered while I approve"
+fix = "WordPress.com lists only sites where your account is an administrator or editor. Ask the site owner to raise your role under Users on the site's dashboard, then connect again"
+
+[[docs.troubleshooting]]
+symptom = "An agent gets 403 for a different site"
+fix = "Each connection covers only the site you picked when approving. Connect again, choose that site, and tell the agent to use the new secret"
+
+[[docs.faq]]
+q = "How do I revoke Jaah's access in WordPress.com?"
+a = "Open wordpress.com/me/security/connected-applications and disconnect Jaah. The secret then shows Needs reconnect after its next test"
+
+[[docs.faq]]
+q = "My site runs on WordPress but not on WordPress.com. Which integration do I use?"
+a = "The WordPress integration, which connects any self-hosted site with an application password"

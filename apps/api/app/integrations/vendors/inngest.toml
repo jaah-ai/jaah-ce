@@ -1,0 +1,48 @@
+# Inngest. Facts confirmed at the vendor's own docs: REST API authentication with an environment's signing key as
+# a Bearer https://api-docs.inngest.com/authentication ; signing keys per environment
+# https://www.inngest.com/docs/platform/signing-keys ; event keys https://www.inngest.com/docs/events/creating-an-event-key
+# Probed 2026-11-03: GET https://api.inngest.com/v1/events?limit=1 with a bad key answers 401.
+slug = "inngest"
+label = "Inngest"
+category = "dev_tools"
+vendor_docs_url = "https://api-docs.inngest.com/authentication"
+summary = "Send Inngest events and inspect function runs from agent work."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "signing_key", label = "Signing key", kind = "secret", required = true, placeholder = "signkey-prod-...", help = "Inngest dashboard > pick the environment (Production or a branch) in the top bar > Manage > Signing Key > copy the current key. Each environment has its own key" },
+  { key = "event_key", label = "Event key", kind = "secret", required = false, help = "Optional, for agents to send events: Inngest dashboard > the same environment > Manage > Event Keys > Create Event Key (name it Jaah) > copy the key" },
+]
+
+[test]
+method = "GET"
+path = "https://api.inngest.com/v1/events?limit=1"
+auth = { field = "signing_key", header = "Authorization", prefix = "Bearer" }
+list_field = "data"
+
+[docs]
+agent_uses = [
+  "List recent events and look up the function runs one triggered, to debug a failed workflow",
+  "Read a run's status, output and errors",
+  "Send an event to start an Inngest function, when you add an event key",
+  "Cancel or replay runs through the REST API",
+]
+prerequisites = [
+  "An Inngest account with access to the environment agents should reach",
+  "An app already synced to that environment, if agents should trigger functions",
+]
+limitations = [
+  "A signing key reaches one environment only: connect each environment (Production, staging branches) separately",
+  "The signing key also verifies requests Inngest sends to your app: rotating it in Inngest means updating both your app and this secret",
+  "Agents can send events and manage runs; they cannot change your functions' code",
+]
+troubleshooting = [
+  { symptom = "Test says Inngest rejected the signing key (401)", fix = "The key was rotated, mistyped, or belongs to another environment than you meant. Copy the current key from Manage > Signing Key and select Replace" },
+  { symptom = "Agents send events but nothing runs", fix = "The event key is from a different environment than your synced app, or no function listens for that event name. Check the environment in the Inngest dashboard" },
+  { symptom = "Test passes but runs from another environment are missing", fix = "Each environment has its own signing key. Add a secret for that environment" },
+]
+faq = [
+  { q = "Signing key or event key", a = "The signing key reads events and runs through the REST API and is what Jaah tests. The event key only sends events, and is optional" },
+  { q = "Does this work with the Inngest Dev Server", a = "No. Jaah reaches Inngest Cloud at api.inngest.com; a local Dev Server is not reachable from Jaah" },
+]

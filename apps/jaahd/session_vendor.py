@@ -146,40 +146,8 @@ def launch_floor(note: dict) -> float:
     return _finite(note.get("launched_at")) or 0.0
 
 
-def usage_floor(note: dict) -> float:
-    """A note's `usage_floor` as a usable epoch, or 0.0 (no floor) — the instant before which a line's
-    spend is not this session's.
-
-    Set only on a console hand-off's RESUMED session (`record(..., usage_floor=True)`): the vendor
-    transcript it resumes also holds the chat front's turns, which the control plane already counted from
-    that front's own ACP events, so the node folds this row only from its launch on. Read through `_finite`
-    for `launch_floor`'s reason: a NaN would erase the floor while looking like one.
-    """
-    return _finite(note.get("usage_floor")) or 0.0
-
-
-def usage_ceiling(note: dict) -> float:
-    """A note's `usage_ceiling` as a usable epoch, or 0.0 (none) — the instant from which a line's spend is
-    no longer this session's. Set when a console hand-off moved the session's conversation to another front
-    (`close_usage_window`): that front resumes the SAME vendor transcript and appends its own turns, which
-    the control plane counts on that front's row."""
-    return _finite(note.get("usage_ceiling")) or 0.0
-
-
-def close_usage_window(session_id: str, at: Optional[float] = None) -> bool:
-    """Stamp `usage_ceiling` (`at`, else now) on `session_id`'s note, once its front has handed the
-    conversation on and is gone. True when it landed; False when the session has no note (an ACP front,
-    counted from its events) or it could not be written. First stamp wins, like the pin."""
-    note = read(session_id)
-    if not note or usage_ceiling(note):
-        return False
-    stamp = _finite(at) if at is not None else time.time()
-    note["usage_ceiling"] = stamp or time.time()
-    return _write(session_id, note)
-
-
 def record(session_id: str, *, provider: str, config_dir: str, worktree: str,
-           launched_at: Optional[float] = None, usage_floor: bool = False) -> bool:
+           launched_at: Optional[float] = None) -> bool:
     """Note that `session_id` was dispatched as `provider`, and where. True when it landed.
 
     BEST EFFORT BY CONTRACT, and the return value is for a test and a log line rather than for a caller
@@ -231,9 +199,6 @@ def record(session_id: str, *, provider: str, config_dir: str, worktree: str,
         "worktree": worktree or "",
         "launched_at": stamp,
     }
-    if usage_floor:
-        # The same instant as `launched_at`: the resumed transcript's turns before it are the chat front's.
-        payload["usage_floor"] = stamp
     return _write(session_id, payload)
 
 
@@ -518,6 +483,4 @@ def _prune_windows(older_than: float, stamp: float) -> int:
     return gone
 
 
-__all__ = ["record", "pin_vendor_session", "read", "prune", "launch_floor", "usage_floor", "usage_ceiling",
-           "close_usage_window",
-           "PRUNE_AFTER_SECONDS"]
+__all__ = ["record", "pin_vendor_session", "read", "prune", "launch_floor", "PRUNE_AFTER_SECONDS"]

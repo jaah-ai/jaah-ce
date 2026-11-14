@@ -1,6 +1,7 @@
 import type { JSX, ReactNode } from 'react'
 import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, RADIUS, SIZE, grid, tint } from '../../theme'
 
 /* ONE PICKABLE OPTION — a native radio inside a label, so a group of them is one tab stop with arrow-key moves
  * and a real checked state for assistive tech, with no keyboard code of our own.
@@ -38,6 +39,7 @@ export function ChoiceCard({
   children,
   testId,
   variant = 'card',
+  icon,
 }: {
   /** The radio group's name: one per group. */
   name: string
@@ -53,8 +55,11 @@ export function ChoiceCard({
   children?: ReactNode
   testId?: string
   variant?: 'card' | 'row'
+  /** A card's picture (`ui/icons.tsx`), in a tile left of the title and body; the tile turns primary when picked. */
+  icon?: ReactNode
 }): JSX.Element {
   const row = variant === 'row'
+  const pictured = !row && icon !== undefined
   const textColor = disabled ? 'text.secondary' : 'text.primary'
   return (
     <Box
@@ -65,9 +70,9 @@ export function ChoiceCard({
       sx={{
         position: 'relative',
         display: 'flex',
-        flexDirection: row ? 'row' : 'column',
-        alignItems: row ? 'flex-start' : undefined,
-        gap: row ? 1.5 : 0.75,
+        flexDirection: row || pictured ? 'row' : 'column',
+        alignItems: row || pictured ? 'flex-start' : undefined,
+        gap: pictured ? 2 : row ? 1.5 : 0.5,
         height: row ? undefined : '100%',
         boxSizing: 'border-box',
         p: row ? 1.25 : 2,
@@ -80,7 +85,7 @@ export function ChoiceCard({
           boxShadow: theme => (checked ? `inset 0 0 0 1px ${theme.palette.primary.main}` : 'none'),
         }),
         // A primary tint in the channel form: `alpha(theme.palette.…)` cannot parse a CSS variable and freezes at light.
-        bgcolor: disabled && !row ? 'action.hover' : checked ? 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' : 'background.paper',
+        bgcolor: disabled && !row ? 'action.hover' : checked ? tint('primary', 0.08) : 'background.paper',
         cursor: disabled ? 'not-allowed' : 'pointer',
         transition: 'border-color 120ms, background-color 120ms',
         '&:hover': disabled || checked ? {} : row ? { bgcolor: 'action.hover' } : { borderColor: 'text.secondary' },
@@ -102,37 +107,57 @@ export function ChoiceCard({
           aria-hidden="true"
           sx={{
             flexShrink: 0,
-            mt: '3px',
-            width: 18,
-            height: 18,
-            borderRadius: '50%',
+            mt: 0,
+            width: SIZE.iconSm,
+            height: SIZE.iconSm,
+            borderRadius: RADIUS.round,
             boxSizing: 'border-box',
             border: 2,
-            // Dashed when disabled: a ring that cannot be filled, beside the words that say why.
-            borderStyle: disabled ? 'dashed' : 'solid',
-            borderColor: disabled ? 'text.disabled' : checked ? 'primary.main' : 'text.secondary',
+            // Disabled is MUI's own disabled radio: a solid ring in `action.disabled` (a dashed one read as a spinner).
+            borderStyle: 'solid',
+            borderColor: disabled ? 'action.disabled' : checked ? 'primary.main' : 'text.secondary',
             display: 'grid',
             placeItems: 'center',
             '&::after': {
               content: '""',
-              width: 8,
-              height: 8,
-              borderRadius: '50%',
+              width: grid(1),
+              height: grid(1),
+              borderRadius: RADIUS.round,
               bgcolor: checked ? 'primary.main' : 'transparent',
             },
           }}
         />
       )}
-      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75, minWidth: 0, flex: '1 1 auto' }}>
+      {pictured && (
+        <Box
+          aria-hidden="true"
+          data-testid={testId ? `${testId}-icon` : undefined}
+          sx={{
+            flexShrink: 0,
+            width: { xs: grid(7), sm: grid(8) },
+            height: { xs: grid(7), sm: grid(8) },
+            borderRadius: RADIUS.md,
+            display: 'grid',
+            placeItems: 'center',
+            fontSize: SIZE.iconLg,
+            bgcolor: checked ? 'primary.main' : 'action.hover',
+            color: checked ? 'primary.contrastText' : disabled ? 'text.disabled' : 'text.secondary',
+            transition: 'background-color 120ms, color 120ms',
+          }}
+        >
+          {icon}
+        </Box>
+      )}
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, minWidth: 0, flex: '1 1 auto', alignSelf: pictured ? 'center' : undefined }}>
         <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1.5, flexWrap: row ? 'wrap' : undefined }}>
           <Typography
             component="span"
             sx={{
               flex: row ? '0 1 auto' : '1 1 auto',
               minWidth: 0,
-              fontWeight: 600,
-              fontSize: '0.9375rem',
-              lineHeight: 1.35,
+              fontWeight: FONT_WEIGHT.semibold,
+              fontSize: FONT_SIZE.base,
+              lineHeight: LINE_HEIGHT.snug,
               overflowWrap: 'anywhere',
               color: textColor,
             }}
@@ -148,7 +173,7 @@ export function ChoiceCard({
                 ml: row ? 'auto' : undefined,
                 textAlign: 'right',
                 fontVariantNumeric: 'tabular-nums',
-                fontWeight: 600,
+                fontWeight: FONT_WEIGHT.semibold,
                 whiteSpace: 'nowrap',
                 color: textColor,
               }}
@@ -159,7 +184,7 @@ export function ChoiceCard({
         </Box>
         {!row && badge}
         {children && (
-          <Box sx={{ color: 'text.secondary', fontSize: '0.875rem', lineHeight: 1.45 }}>{children}</Box>
+          <Box sx={{ color: 'text.secondary', fontSize: FONT_SIZE.base, lineHeight: LINE_HEIGHT.snug }}>{children}</Box>
         )}
       </Box>
     </Box>
@@ -179,7 +204,7 @@ export const CHOICE_GRID_SX = {
 export const CHOICE_LIST_SX = {
   display: 'flex',
   flexDirection: 'column',
-  gap: 0.25,
+  gap: 0,
 } as const
 
 export default ChoiceCard

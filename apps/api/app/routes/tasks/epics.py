@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import HTTPException
@@ -10,10 +10,11 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, aliased
 
 from app import actors, merge_lane_state
+from app.clock import utcnow
 from app.events import emit_console_event
 from app.models.audit import ActivityEvent
 from app.models.projects import Project
-from app.models.tasks import Task, TaskDependency
+from app.models.tasks import Task
 from app.short_title import short_title
 from app.task_ancestry import executor_user_id
 from app import playbook_engine
@@ -41,7 +42,7 @@ from app.routes.tasks.policy import (
     epic_fanout_cap,
     project_default_persona,
 )
-from app.routes.tasks.dependencies import _would_create_cycle
+from app.routes.tasks.dependencies import stage_edge
 from app.routes.tasks.create import _new_stage_child, _playbooks_on_or_422, _wire_stage_edges
 
 log = logging.getLogger(__name__)
@@ -103,7 +104,7 @@ def archive_epic_children_for_plan(task: Task, session: Session) -> list[int]:
     if ids:
         session.execute(
             update(Task).where(Task.id.in_(ids))
-            .values(archived_at=datetime.now(timezone.utc), **actors.task_actor_values(session))
+            .values(archived_at=utcnow(), **actors.task_actor_values(session))
         )
         log.info("plan %s starting: archived %s stale epic child(ren) %s", task.id, len(ids), ids)
         # An archived child is not live, so a stale `system_failed` one must stop holding its epic failed; only
@@ -283,7 +284,7 @@ def append_tasks(
 
     # ACTIVE-CHILD RULE (see docstring): a live runner is LEFT ALONE and everything else is archived. Its
     # work landing twice is a non-issue — a Task is idempotent, so a duplicate in the new set converges.
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     archived_ids = [c.id for c in current if c.state != ACTIVE]
     if archived_ids:
         # ARCHIVED, NOT DESTROYED: only `archived_at` is written, so the row stays queryable evidence of
@@ -327,6 +328,7 @@ def append_tasks(
             # INHERITED, for `_create_analysis_children`'s reason — an epic kept off the board does not
             # get to fan out onto it.
             hidden=epic.hidden,
+            language=epic.language,
             is_plannable=False,
             # Validated against `EPIC_BUILD_PERSONAS` at the route; when the planner names none, the project's
             # default if it is a build persona, else `coder`.
@@ -337,7 +339,7 @@ def append_tasks(
             priority=epic.priority,
             phase_index=proposal.get("phase_index"),
             phase_name=proposal.get("phase_name"),
-            # Owner: the plan child's executor (above). NULL stays NULL.
+            # Owner: the plan child's executor (above); none is the system actor's (`actors.py` listener).
             created_by_id=executor_id,
             # THE ADDRESSEE — the epic's own column, one hop: a coder child is a stage of the epic's work
             # item and is filed under whoever the epic is.
@@ -352,75 +354,9 @@ def append_tasks(
     # prerequisite, never a dependent of a just-created sibling, so this cannot cycle; the guard is a
     # defensive assertion reusing the existing invariant, matching `_create_epic_with_children`.
     for row in created:
-        if _would_create_cycle(row.id, plan_child.id, session):
-            session.rollback()
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"coder {row.id} -> plan {plan_child.id} would create a cycle "
-                    "(unexpected for a fresh append — aborting)"
-                ),
-            )
-        session.add(TaskDependency(task_id=row.id, depends_on_task_id=plan_child.id))
-
-    # Inter-impl edges from the planner's proposed ordering (a proposal's `depends_on` = 0-based
-    # indices into `proposals`). Every edge is cycle-guarded; ANY bad edge aborts the whole append.
-    for idx, proposal in enumerate(proposals):
-        for dep_idx in proposal.get("depends_on") or []:
-            if not isinstance(dep_idx, int) or dep_idx == idx or not (0 <= dep_idx < len(created)):
-                session.rollback()
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        f"proposal {idx} declares an invalid inter-coder dependency index {dep_idx!r} "
-                        f"(must be a distinct 0-based index in [0, {len(created)}))"
-                    ),
-                )
-            task_row, dep_row = created[idx], created[dep_idx]
-            # A duplicate index within one build is a harmless no-op (idempotent, like add_task_dependency).
-            if session.get(
-                TaskDependency, {"task_id": task_row.id, "depends_on_task_id": dep_row.id}
-            ) is not None:
-                continue
-            if _would_create_cycle(task_row.id, dep_row.id, session):
-                session.rollback()
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        f"inter-coder dependency {task_row.id} -> {dep_row.id} (proposal {idx} -> "
-                        f"{dep_idx}) would create a dependency cycle — aborting append"
-                    ),
-                )
-            session.add(TaskDependency(task_id=task_row.id, depends_on_task_id=dep_row.id))
-
-    # Phase-DAG cross-phase edges: every phase k+1 child depends on every phase k child, reusing the gate.
-    # Wired from the sorted set of `phase_index` values present in this append.
-    phases: dict[int, list[Task]] = {}
-    for row, proposal in zip(created, proposals):
-        phase_index = proposal.get("phase_index")
-        if phase_index is not None:
-            phases.setdefault(phase_index, []).append(row)
-    ordered_phase_indices = sorted(phases)
-    for prev_phase, next_phase in zip(ordered_phase_indices, ordered_phase_indices[1:]):
-        for child_row in phases[next_phase]:
-            for prereq_row in phases[prev_phase]:
-                # Already wired above as an explicit inter-coder edge — do not double-insert (composite PK).
-                if session.get(
-                    TaskDependency, {"task_id": child_row.id, "depends_on_task_id": prereq_row.id}
-                ) is not None:
-                    continue
-                if _would_create_cycle(child_row.id, prereq_row.id, session):
-                    session.rollback()
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            f"phase edge {child_row.id} (phase {next_phase}) -> {prereq_row.id} "
-                            f"(phase {prev_phase}) would create a dependency cycle — aborting append"
-                        ),
-                    )
-                session.add(
-                    TaskDependency(task_id=child_row.id, depends_on_task_id=prereq_row.id)
-                )
+        stage_edge(session, row.id, plan_child.id, "plan edge")
+    # Then the planner's own ordering among the coders (`depends_on` indices + the phase DAG).
+    _wire_item_edges(session, created, proposals)
 
     # One terminal `persona=finish` child after every coder, on the same edge machinery; no finish→plan edge
     # (transitive). Always created: the prior finish child was archived in this batch.
@@ -428,6 +364,7 @@ def append_tasks(
         project_id=epic.project_id,
         parent_task_id=epic_id,
         source=task_source.source_for(epic, task_source.AGENT),
+        language=epic.language,
         is_plannable=False,
         persona=PERSONA_FINISH,
         state=DRAFT,
@@ -453,27 +390,26 @@ def append_tasks(
     session.flush()   # assign finish_child.id for the dependency edges below
     emit_console_event(session, entity="task", id=finish_child.id, action=DRAFT)
     for row in created:
-        if _would_create_cycle(finish_child.id, row.id, session):
-            session.rollback()
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"finish {finish_child.id} -> coder {row.id} would create a cycle "
-                    "(unexpected for a fresh append — aborting)"
-                ),
-            )
-        session.add(TaskDependency(task_id=finish_child.id, depends_on_task_id=row.id))
+        stage_edge(session, finish_child.id, row.id, "finish edge")
 
-    # One durable `task_note:plan_fanout` row on the EPIC, not the plan child — this is the
-    # epic-level "fan-out happened" moment, keyed like every other task_note so it reads back on the epic's
-    # own activity feed. Names the archived predecessors too, so a re-plan shows as a REPLACE, not an add.
+    return _fanout_noted(session, epic_id, plan_child, created, archived_ids, "coder child(ren)", "child(ren)")
+
+
+def _fanout_noted(
+    session: Session, epic_id: int, plan_child: Task, created: list[Task], archived_ids: list[int],
+    added: str, archived: str,
+) -> dict[str, Any]:
+    """Commit a fan-out and answer it: one durable `task_note:plan_fanout` row on the EPIC, not the plan
+    child — this is the epic-level "fan-out happened" moment, keyed like every other task_note so it reads
+    back on the epic's own activity feed. Names the archived predecessors too, so a re-plan shows as a
+    REPLACE, not an add. `added`/`archived` are the nouns of the note (coders or stages)."""
     record_task_note(
         session,
         epic_id,
         "plan_fanout",
         # The counts only — the label already says "Plan fan-out".
-        f"{len(created)} coder child(ren) added"
-        + (f" ({len(archived_ids)} prior child(ren) archived)" if archived_ids else ""),
+        f"{len(created)} {added} added"
+        + (f" ({len(archived_ids)} prior {archived} archived)" if archived_ids else ""),
         extra={
             "created_ids": [c.id for c in created],
             "archived_ids": archived_ids,
@@ -511,7 +447,7 @@ def _append_playbook_stages(
     if archived_ids:
         session.execute(
             update(Task).where(Task.id.in_(archived_ids))
-            .values(archived_at=datetime.now(timezone.utc), **actors.task_actor_values(session))
+            .values(archived_at=utcnow(), **actors.task_actor_values(session))
         )
         if any(row.state == SYSTEM_FAILED for row in current if row.state != ACTIVE):
             _reevaluate_epic_child_failure(epic.id, session)
@@ -560,34 +496,13 @@ def _append_playbook_stages(
         if playbook_engine.runs_per_item(snap["stages"][index]):
             _wire_item_edges(session, rows_by_index[index], proposals)
 
-    record_task_note(
-        session,
-        epic.id,
-        "plan_fanout",
-        f"{len(created)} stage task(s) added"
-        + (f" ({len(archived_ids)} prior task(s) archived)" if archived_ids else ""),
-        extra={
-            "created_ids": [c.id for c in created],
-            "archived_ids": archived_ids,
-            "plan_child_id": plan_child.id,
-        },
-    )
-    session.commit()
-    return {"created": [c.id for c in created], "archived": archived_ids}
+    return _fanout_noted(session, epic.id, plan_child, created, archived_ids, "stage task(s)", "task(s)")
 
 
 def _wire_item_edges(session: Session, rows: list[Task], proposals: list[dict[str, Any]]) -> None:
     """A per-item stage's ordering among its own rows: each proposal's `depends_on` indices and the
-    phase DAG (phase k+1 waits on phase k), the rules `append_tasks` applies to coders. Any bad index or
-    cycle rolls the whole append back (422)."""
-    def edge(row: Task, prereq: Task, what: str) -> None:
-        if session.get(TaskDependency, {"task_id": row.id, "depends_on_task_id": prereq.id}) is not None:
-            return
-        if _would_create_cycle(row.id, prereq.id, session):
-            session.rollback()
-            raise HTTPException(status_code=422, detail=f"{what} {row.id} -> {prereq.id} would create a cycle")
-        session.add(TaskDependency(task_id=row.id, depends_on_task_id=prereq.id))
-
+    phase DAG (phase k+1 waits on phase k), shared by `append_tasks`'s coders. Any bad index or cycle
+    rolls the whole append back (422)."""
     for idx, proposal in enumerate(proposals):
         for dep_idx in proposal.get("depends_on") or []:
             if not isinstance(dep_idx, int) or dep_idx == idx or not (0 <= dep_idx < len(rows)):
@@ -599,16 +514,16 @@ def _wire_item_edges(session: Session, rows: list[Task], proposals: list[dict[st
                         f"(must be a distinct 0-based index in [0, {len(rows)}))"
                     ),
                 )
-            edge(rows[idx], rows[dep_idx], "item dependency")
+            stage_edge(session, rows[idx].id, rows[dep_idx].id, "item dependency")
     phases: dict[int, list[Task]] = {}
     for row in rows:
         if row.phase_index is not None:
             phases.setdefault(row.phase_index, []).append(row)
     ordered = sorted(phases)
-    for prev_phase, next_phase in zip(ordered, ordered[1:]):
+    for prev_phase, next_phase in zip(ordered, ordered[1:], strict=False):
         for row in phases[next_phase]:
             for prereq in phases[prev_phase]:
-                edge(row, prereq, "phase edge")
+                stage_edge(session, row.id, prereq.id, "phase edge")
 
 
 def _child_rollup_ready(
@@ -710,8 +625,7 @@ def _reevaluate_epic_child_failure(epic_id: Optional[int], session: Session) -> 
     Called only from sites that just took a child out of `system_failed` (Complete, Reset, delete,
     archive, done-on-artifact, Start); that is the guard against reopening an epic failed by
     `record_fanout_attempt_failed`, which has no failed child. Such an epic can still be cleared here if
-    one of its children later fails and recovers; the next fan-out sweep re-fails it. `runner_breaks.
-    archive` only touches system personas, never epic children.
+    one of its children later fails and recovers; the next fan-out sweep re-fails it.
 
     Lock-then-write: the refresh arm's list is a pre-read, and under READ COMMITTED the clear arm's
     EXISTS uses the statement snapshot, so a sibling failing while it waited could be missed. Taking the
@@ -889,7 +803,7 @@ def scan_stuck_epics(session: Session) -> list[dict[str, Any]]:
         since = _epic_all_children_done_since(epic_id, non_finish_child_ids, session)
         if since is None:
             continue
-        stuck_seconds = (datetime.now(timezone.utc) - since).total_seconds()
+        stuck_seconds = (utcnow() - since).total_seconds()
         out.append({
             "epic_id": epic_id, "project": project_name, "reason": reason,
             "stuck_seconds": max(stuck_seconds, 0.0),

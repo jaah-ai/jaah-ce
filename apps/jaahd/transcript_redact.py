@@ -18,7 +18,7 @@ import re
 from typing import Dict, Iterable, Mapping, Tuple
 
 # Records WHICH list ran. Bumped when a pattern or its replacement changes — never for a comment.
-PATTERNS_VERSION = 11
+PATTERNS_VERSION = 13
 
 # `<`/`>` appear in no pattern's value, so a second pass matches nothing (idempotent); JSON-safe — it
 # introduces no quote or backslash, so a `.jsonl` line stays parseable.
@@ -55,10 +55,11 @@ _LEAD = r"(^|[^A-Za-z0-9_])"
 # IMMEDIATELY after the key, and `_` or `-` is none. Pinned by
 # `test_a_hyphenated_flag_that_is_not_a_secret_still_survives`.
 # `MCP_SERVER_URL`/`WEBHOOK_URL` for the same parity reason (Zapier's): each URL embeds the capability itself.
+# `TOTP_SEED` for Generic login's `totp_seed`: the seed mints every second-factor code.
 _SECRETISH_KEY = (
     r"(?:SECRET[_-]?ACCESS[_-]?KEY|SECRET[_-]?KEY|SESSION[_-]?TOKEN|REFRESH[_-]?TOKEN|BEARER[_-]?TOKEN|SECRET|TOKEN"
-    r"|PASS(?:WD|WORD)|API[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIALS?|ACCESS[_-]?KEY|AUTH[_-]?KEY|SERVICE[_-]?KEY"
-    r"|CLIENT[_-]?ID|MCP[_-]?SERVER[_-]?URL|WEBHOOK[_-]?URL|SERVICE[_-]?ACCOUNT[_-]?JSON)"
+    r"|PASS(?:WD|WORD)|API[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIALS?|ACCESS[_-]?KEY|AUTH[_-]?KEY|SERVICE[_-]?KEY|APP[_-]?KEY"
+    r"|CLIENT[_-]?ID|MCP[_-]?SERVER[_-]?URL|WEBHOOK[_-]?URL|SERVICE[_-]?ACCOUNT[_-]?JSON|TOTP[_-]?SEED)"
 )
 
 # A key must END at the secretish word (refusing `--max-tokens=8192`, `SSH_PRIVATE_KEY_PATH=/tmp/k`).
@@ -256,6 +257,16 @@ _PATTERNS: Tuple[Tuple[str, "re.Pattern", str], ...] = (
         re.compile(
             r"(?i)\b(authorization)(" + _ASSIGN + r")(?:((?:bearer|basic|token|digest)\s+)"
             + _VALUE + r"{8,}|()" + _VALUE + r"{20,})"
+        ),
+        r"\1\2\3" + REDACTED,
+    ),
+    (
+        # A TOTP seed is shown, and pasted, in groups of four (`2FA Seed: GEZD GNBV …`); the key arms below stop at the
+        # first space, so the grouped form needs its own. Runs first so they never bite one group off.
+        "totp_seed_grouped",
+        re.compile(
+            r"(?i)" + _LEAD + r"(" + _KEY_PREFIX + r"(?:TOTP|2FA)[_ -]?SEED)" + _KEY_TAIL + r"(" + _ASSIGN + r")"
+            r"[A-Z2-7]{4}(?:[ -]{1,3}[A-Z2-7]{4})+=*"
         ),
         r"\1\2\3" + REDACTED,
     ),

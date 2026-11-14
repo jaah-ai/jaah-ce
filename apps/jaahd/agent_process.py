@@ -41,15 +41,17 @@ import logging
 import os
 import re
 import secrets
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING
 
 import account_auth
 import env_helpers
 import file_io
 import session_user
+
+if TYPE_CHECKING:
+    import agents  # heavy, so imported lazily at runtime (`acp_launch`); named here for the annotations
 
 log = logging.getLogger("jaahd.agent_process")
 
@@ -263,19 +265,13 @@ UNPACK_CAP_BYTES = 400 * 1024 * 1024
 ARCHIVE_NAME = "bundle.tar.gz"
 
 
-def _sh(script: str, env: dict, *, timeout: float = _STAGE_TIMEOUT_S) -> tuple[int, str]:
-    """Run a fixed shell script as the session user (paths ride the env, never the script)."""
-    return _as_session_user(["/bin/sh", "-c", script], env, timeout=timeout)
-
-
 def _as_session_user(argv: list[str], env: dict, *, timeout: float = _STAGE_TIMEOUT_S) -> tuple[int, str]:
-    if session_user.switch_needed():
-        proc = session_user.run_as_session_user(argv, env=env, timeout=timeout)
-    elif os.geteuid() == 0:
+    """`(rc, stderr)` of ARGV as the session user; a fixed `/bin/sh -c` script's paths ride ENV, never the
+    script."""
+    if not session_user.switch_needed() and os.geteuid() == 0:
         # A root daemon with no session user to switch to: tenant bytes are never handled as root.
         return 1, "this node has no session user to stage an agent as (refusing to do it as root)"
-    else:
-        proc = subprocess.run(argv, env={**os.environ, **env}, capture_output=True, text=True, timeout=timeout)
+    proc = session_user.run_as_session_user_or_here(argv, env=env, timeout=timeout)
     return proc.returncode, (proc.stderr or "").strip()
 
 
@@ -361,14 +357,14 @@ def ensure_bundle(launch: AgentLaunch, task_id: object) -> Path:
     except Exception as exc:  # noqa: BLE001 — the spool or the delegation broke
         err = str(exc) or type(exc).__name__
     if failure or err:
-        _sh('rm -f -- "$A"', {"A": str(staged)})
+        _as_session_user(["/bin/sh", "-c", 'rm -f -- "$A"'], {"A": str(staged)})
         if failure:
             raise failure[0]
         raise launch.unavailable(f"could not write it to {root}: {err}")
     # A rename over the name: a concurrent stager's archive is the same bytes, so the last rename wins safely.
-    rc, out = _sh('mv -f -- "$S" "$A"', {"S": str(staged), "A": str(archive)})
+    rc, out = _as_session_user(["/bin/sh", "-c", 'mv -f -- "$S" "$A"'], {"S": str(staged), "A": str(archive)})
     if rc != 0 or not _verified(archive, launch):
-        _sh('rm -f -- "$S"', {"S": str(staged)})
+        _as_session_user(["/bin/sh", "-c", 'rm -f -- "$S"'], {"S": str(staged)})
         raise launch.unavailable(f"could not keep it in {root} ({out or f'exit {rc}'})")
     return archive
 
@@ -392,7 +388,7 @@ def stage(launch: AgentLaunch, task_id: object) -> StagedAgent:
 
     run_dir = new_run_dir(task_id)
     agent_dir = run_dir / "agent"
-    rc, out = _sh('mkdir -p -- "$R/agent" && chmod 0700 -- "$R"', {"R": str(run_dir)})
+    rc, out = _as_session_user(["/bin/sh", "-c", 'mkdir -p -- "$R/agent" && chmod 0700 -- "$R"'], {"R": str(run_dir)})
     if rc != 0:
         raise RuntimeError(f"could not prepare the agent run dir {run_dir}: {out or f'exit {rc}'}")
     failure = ""
@@ -429,7 +425,7 @@ def stage(launch: AgentLaunch, task_id: object) -> StagedAgent:
 
 def discard(staged: StagedAgent) -> None:
     """Remove a staged run that will not launch (a refused claim, a failed input). Best effort."""
-    rc, out = _sh('rm -rf -- "$R"', {"R": staged.run_dir})
+    rc, out = _as_session_user(["/bin/sh", "-c", 'rm -rf -- "$R"'], {"R": staged.run_dir})
     if rc != 0:
         log.warning("could not remove the unlaunched agent run dir %s: %s", staged.run_dir, out)
 
@@ -453,16 +449,15 @@ def acp_launch(staged: StagedAgent) -> "agents.AcpLaunch":
     it starts the command (`acp_runtime_extras`' `deps`); a registry install names no engine here: the host installs
     it first (`acp_runtime_extras`) and runs what that returns."""
     import agents  # noqa: PLC0415 — deferred: the adapter package is heavy and this kind is rare
-    from agents import agent_layer, base  # noqa: PLC0415
+    from agents import agent_layer  # noqa: PLC0415
 
     launch = staged.launch
-    command, *args = agent_layer.jaah_mcp_command()
     return agents.AcpLaunch(
         argv=() if launch.registry else acp_argv(launch, staged.agent_dir),
         env=dict(launch.env),
         session_meta={"agent_id": launch.agent_id, "agent_version": launch.version, "agent_commit": launch.commit,
                       "inputs_path": staged.inputs_path},
-        mcp_servers=(base.control_mcp_server(command, args, {}),),
+        mcp_servers=(agent_layer.control_server(),),
     )
 
 

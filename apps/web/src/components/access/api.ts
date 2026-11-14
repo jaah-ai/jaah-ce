@@ -3,11 +3,26 @@
 // `apps/api/app/routes/credentials/` (a credential's access + project attach/detach) — those modules
 // own what each field means; this one owns only the request and response shapes the web reads.
 
-import { del, get, post } from '../../api'
+import { del, get, post, withQuery } from '../../api'
+import type { Page } from '../../hooks/useListPage'
+import { countOf } from '../../lib/humanize'
+import { oneOrgRead } from '../../lib/orgScope'
+import { isReservedGroupName, type GroupSummary } from '../../types'
+import type { LookupOption } from '../../ui/AsyncLookup'
 
-/** The scope types a binding can name (`app/access.py::SCOPES`). A project id is an integer, the rest
- *  uuids — carried as strings here, since both are only ever interpolated. */
+/** The scope types a binding can name (`app/access.py::SCOPES`). A project id is an integer, the rest uuids —
+ *  carried as strings. */
 export type ScopeType = 'org' | 'project' | 'account'
+
+/** Every scope type, in the picker's order (`ScopePicker.tsx`). */
+export const SCOPE_TYPES: readonly ScopeType[] = ['org', 'project', 'account']
+
+/** A scope type's label (`ScopePicker.tsx`). */
+export const SCOPE_TYPE_LABELS: Record<ScopeType, string> = {
+  org: 'Organization',
+  project: 'Project',
+  account: 'Account',
+}
 
 export type AccessScope = { type: ScopeType; id: string }
 
@@ -45,6 +60,20 @@ export type PickerEntry = {
   name: string
   email?: string | null
   member_count?: number | null
+}
+
+/** A picker entry as `ui/AsyncMultiLookup` lists it. The key carries the principal (`principalOf` reads it back);
+ *  the hint is a group's size or a user's email — not again when a nameless user's name IS its email. */
+export const toLookupOption = ({ kind, id, name, email, member_count }: PickerEntry): LookupOption => ({
+  key: `${kind}:${id}`,
+  label: name,
+  hint: kind === 'group' ? `Group · ${countOf(member_count ?? 0, 'member')}` : email && email !== name ? email : undefined,
+})
+
+/** The principal a picked option names: `toLookupOption`'s key, split at its first `:` (ids are uuids). */
+export const principalOf = ({ key }: LookupOption): { kind: PrincipalKind; id: string } => {
+  const at = key.indexOf(':')
+  return { kind: key.slice(0, at) as PrincipalKind, id: key.slice(at + 1) }
 }
 
 /** `GET /api/credentials/{id}/access`: who owns the credential and which projects it is attached to. */
@@ -102,6 +131,11 @@ export const detachCredential = (projectId: number | string, credentialId: strin
 
 /** The role the Add dialog starts on (the DM1 path): Project Developer, where the scope carries it. */
 export const DEFAULT_ROLE_SLUG = 'project_developer'
+
+/** Developer where the scope carries it, else the WEAKEST role on offer (the list is highest rank first):
+ *  a default must never be the most powerful choice, e.g. Org Owner at org scope. */
+export const defaultRole = (roles: AccessRole[]) =>
+  roles.find(r => r.slug === DEFAULT_ROLE_SLUG)?.slug ?? roles[roles.length - 1]?.slug ?? ''
 
 // ── The principal side: what a user reaches, Check access, and a group's members ────────────────────
 
@@ -174,6 +208,23 @@ export type CatalogAction = {
 }
 
 export const listActions = () => get<CatalogAction[]>('/api/permissions')
+
+/** One page of the groups a person may be ADDED to, by server search (`GET /api/groups?q=&per=20`, the Groups
+ *  roster's own route). Two are never offered, as the server refuses both: the org's Everyone group (its
+ *  membership is the system's, 409) and the reserved bypass group (`isReservedGroupName`, 400). `orgId` narrows an
+ *  operator's read to that org (`oneOrgRead`): a membership never crosses one. */
+export async function searchJoinableGroups(q: string, signal: AbortSignal, orgId?: string | null): Promise<GroupSummary[]> {
+  const page = await get<Page<GroupSummary>>(withQuery('/api/groups', { per: 20, q }), { signal, ...(orgId ? oneOrgRead(orgId) : {}) })
+  return page.items.filter(g => !g.is_everyone && !isReservedGroupName(g.name))
+}
+
+/** `POST /api/users/{id}/memberships`: by group NAME, resolved in the user's own org (`routes/users.py::add_membership`). */
+export const addUserMembership = (userId: string, group: string) =>
+  post<unknown>(`/api/users/${encodeURIComponent(userId)}/memberships`, { group })
+
+/** `DELETE /api/users/{id}/memberships/{membershipId}` (a `user_group_memberships` row id, an integer). */
+export const removeUserMembership = (userId: string, membershipId: number) =>
+  del(`/api/users/${encodeURIComponent(userId)}/memberships/${membershipId}`)
 
 export const addGroupMember = (groupId: string, userId: string) =>
   post<unknown>(`/api/groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(userId)}`, {})

@@ -1,0 +1,42 @@
+# Tally. Facts confirmed at the vendor's own docs: API keys and bearer auth https://developers.tally.so/api-reference/introduction
+# and https://developers.tally.so/api-reference/api-keys ; users/me (401 on a bad key)
+# https://developers.tally.so/api-reference/endpoint/users/me
+slug = "tally"
+label = "Tally"
+category = "productivity"
+vendor_docs_url = "https://developers.tally.so/api-reference/introduction"
+summary = "Read your Tally forms and their submissions."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, placeholder = "tly-...", help = "Tally > Settings > API keys (tally.so/settings/api-keys) > Create API key: name it Jaah and copy it - Tally shows it once" },
+]
+
+# `users/me` without its `timezone` parameter, which would write the user's stored timezone.
+[test]
+method = "GET"
+path = "https://api.tally.so/users/me"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+identity = [["email"], ["fullName"]]
+
+[docs]
+agent_uses = [
+  "List your forms and read their questions",
+  "Read new submissions, for example sign-ups or feedback, and act on them in a task",
+  "Summarise a form's responses into a report",
+]
+prerequisites = [
+  "A Tally account. API keys belong to one user and reach the workspaces that user belongs to",
+]
+limitations = [
+  "A Tally API key carries the full access of the user who created it: Tally has no read-only keys, so connect a user whose access you are happy for agents to have",
+  "Tally rate-limits the API to about 100 requests a minute",
+]
+troubleshooting = [
+  { symptom = "Test says Tally rejected the API key (401)", fix = "The key was deleted or mistyped. Create a new key under Settings > API keys and select Replace on the secret" },
+  { symptom = "Agents cannot see a form", fix = "The form is in a workspace the key's user is not a member of. Invite the user to that workspace in Tally" },
+]
+faq = [
+  { q = "Does Tally offer a sign-in button for Jaah", a = "No. Tally's API uses API keys only, so you paste a key" },
+]

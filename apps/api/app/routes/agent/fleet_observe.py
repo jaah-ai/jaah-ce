@@ -1,16 +1,18 @@
 """Fleet observation the node reports: observe passes, alerts and run telemetry."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, TypeAdapter, ValidationError, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app import (
     alert_record,
@@ -25,10 +27,13 @@ from app import (
     task_notify,
     task_wake,
 )
+from app.agent_router.review_lanes import ReviewLaneIn
 # routes need one for a user who is NOT the caller (they carry no session cookie, only the node token).
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
-from app.db import get_session
+from app.db import excluded_of
+from app.db_async import DbDep, on_session, on_thread
+from app.entity_shape import from_row
 from app.events import emit_console_event
 from app.tenancy import seam
 from app.node_identity import node_id_or_none, node_org
@@ -38,7 +43,7 @@ from app.models.projects import Project
 from app.models.tasks import Task
 # Task transitions go through the watermark-gated helpers; the state machine single-homes in routes/tasks/.
 from app.routes.tasks.slots import kill_intents_for_settled_holds, send_minted_intents
-from app.routes.agent.auth import _CALLER_TASK_ID_RE, _check_token, require_caller_task
+from app.routes.agent.auth import _CALLER_TASK_ID_RE, AgentDoor, _check_token, require_caller_task
 
 if edition_features.enabled("cloud_nodes"):
     from app import node_orders
@@ -89,10 +94,10 @@ def _run_settled_hold_kill_pass(session: Session, node_id: str) -> None:
 
 @router.post("/fleet/observe", response_model=fleet_observe.ObservationOut)
 @infra(Tenancy.ORG_SCOPED)
-def fleet_observe_route(
+async def fleet_observe_route(
     body: fleet_observe.ObservationIn,
+    db: DbDep,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> fleet_observe.ObservationOut:
     """One pass's whole observation, in ONE transaction.
 
@@ -101,6 +106,57 @@ def fleet_observe_route(
     snapshot. Emits ONE console event per moved family, then runs the settled-hold kill pass and the
     sighting pass (`fleet_observe.mark_sighted_slots`) after the commit, each in its own transaction.
     """
+    result = await db.run_sync(_fleet_observe_route, body=body)
+    # A runner vanished: wake the reclaimers now (task transitions already wake `task-pipeline`; an
+    # observation change does not). After the commit; best effort and safe to over-fire (`runner_verdict`
+    # holds on UNKNOWN; `crons.min_gap_seconds` floors bursts).
+    if result.runner_lost_task_ids:
+        log.info(
+            "fleet-observe: %s reports the runner gone for task(s) %s — waking the reclaimers "
+            "rather than waiting out the task-pipeline cadence",
+            body.node_id, sorted(result.runner_lost_task_ids),
+        )
+        # The off-loop form; same enqueue as a transition's wake, never raises.
+        await cron_runtime.fire_now_activity(task_wake.PIPELINE_ACTIVITY)
+    # The two post-commit halves at once: the response waits for the slower, not their sum. They share nothing —
+    # the alert producers open their own sessions in the threadpool (after the commit, so they never alert on a
+    # rolled-back reading, and off the loop), while `_after_observation` runs on the route's session. Only the
+    # alerts move to a task of their own: `_after_observation` stays in the request's task, where its checkout is
+    # still counted by request admission (`app/db_async.py::RequestAdmission`, keyed on the request's task).
+    alerts = asyncio.ensure_future(run_in_threadpool(_post_commit_alerts, body, result))
+    try:
+        await db.run_sync(_after_observation, body=body, caller=caller, result=result)
+    finally:
+        # Awaited on every path, so the alerts never outlive the request; a raise here wins over theirs.
+        alerts_failed = await asyncio.gather(alerts, return_exceptions=True)
+    if isinstance(alerts_failed[0], BaseException):
+        raise alerts_failed[0]
+    return result
+
+
+def _post_commit_alerts(body: fleet_observe.ObservationIn, result: fleet_observe.ObservationOut) -> None:
+    """The pass's post-commit alerts, in the threadpool: each producer uses its own sessions, never the route's."""
+    # Post-commit, so a rolled-back reading is never logged (`fleet_observe.vanished_hold_statement`). A log line, not
+    # an alert: the fleet's own bookkeeping is no notification (PRD R9).
+    for hold in result.vanished_task_holds:
+        log.warning(
+            "fleet-observe: slot %s-%s was held for task %s with no runner attached when node %s reported its tree "
+            "gone — the hold survives and the slot will be rebuilt empty, but any unlanded work in it is lost",
+            hold["project"], hold["number"], hold["task_id"], body.node_id,
+        )
+    # Same post-commit, own-session rule; one alert per login expiry, never raises.
+    fleet_observe.emit_login_expiry_alerts(body.node_id, body.accounts)
+    # The disk gate's effects (the pause alert, the gha poke): post-commit like the two above, so a
+    # deadlock retry's rolled-back decision never alerts; never raises.
+    node_disk_events.after_commit(result._disk_transition)
+    # The /tmp inode alarm, the same post-commit rule; never raises.
+    node_tmp_inode_alarm.after_commit(result._tmp_inode_crossing)
+
+
+def _fleet_observe_route(
+    session: Session,
+    body: fleet_observe.ObservationIn,
+) -> fleet_observe.ObservationOut:
     if not body.node_id:
         raise HTTPException(
             status_code=422,
@@ -138,57 +194,6 @@ def fleet_observe_route(
                     session, entity="account", id=0, action="upserted", org_id=observed_org,
                 )
             session.commit()
-            # After the commit: `emit_vanished_hold_alerts` uses its own sessions and must not alert on a
-            # rolled-back reading (`fleet_observe.vanished_hold_statement`).
-            if result.vanished_task_holds:
-                fleet_observe.emit_vanished_hold_alerts(body.node_id, result.vanished_task_holds)
-            # Same post-commit, own-session rule; one alert per login expiry, never raises.
-            fleet_observe.emit_login_expiry_alerts(body.node_id, body.accounts)
-            # The disk gate's effects (the pause alert, the gha poke): post-commit like the two above, so a
-            # deadlock retry's rolled-back decision never alerts; never raises.
-            node_disk_events.after_commit(result._disk_transition)
-            # The /tmp inode alarm, the same post-commit rule; never raises.
-            node_tmp_inode_alarm.after_commit(result._tmp_inode_crossing)
-            # A runner vanished: wake the reclaimers now (task transitions already wake `task-pipeline`; an
-            # observation change does not). After the commit; best effort and safe to over-fire (`runner_verdict`
-            # holds on UNKNOWN; `crons.min_gap_seconds` floors bursts).
-            if result.runner_lost_task_ids:
-                log.info(
-                    "fleet-observe: %s reports the runner gone for task(s) %s — waking the reclaimers "
-                    "rather than waiting out the task-pipeline cadence",
-                    body.node_id, sorted(result.runner_lost_task_ids),
-                )
-                # The sync form (this route is sync); same enqueue as a transition's wake, never raises.
-                cron_runtime.fire_now_activity_sync(task_wake.PIPELINE_ACTIVITY)
-            _run_settled_hold_kill_pass(session, body.node_id)
-            # A self-hosted macOS/Windows machine's Add-node order is ready on its first observe. After the
-            # commit, own transaction; best effort — the next pass retries. The community edition has no node orders.
-            if edition_features.enabled("cloud_nodes"):
-                try:
-                    # The credential's own node where it names one: a node only finishes its own order.
-                    observed = caller.node_id or node_id_or_none(session, body.node_id)
-                    if observed is not None:
-                        node_orders.on_machine_seen(session, observed)
-                except Exception as exc:  # noqa: BLE001 — never fail the response
-                    session.rollback()
-                    log.warning("fleet-observe: %s node-order pass failed (%s), retrying next pass", body.node_id, exc)
-            # AFTER THE COMMIT: `mark_seen_live` commits internally (`slot_state`'s rule) so it cannot run
-            # inside `apply_observation`. Best-effort — the next pass (~5s) catches a missed sighting.
-            try:
-                # The pass's own resolution, one per request; a pass that resolved none (an
-                # unregistered reporter) resolves here as before.
-                project_ids = (
-                    result._project_ids if result._project_ids is not None
-                    else fleet_observe.resolve_project_ids(session, body)
-                )
-                fleet_observe.mark_sighted_slots(session, body.node_id, body, project_ids)
-            except Exception as exc:  # noqa: BLE001 — see the comment above: never fail the response
-                session.rollback()
-                log.warning(
-                    "fleet-observe: %s sighting pass failed (%s) — last_seen_live not advanced, retrying "
-                    "next pass",
-                    body.node_id, exc,
-                )
             return result
         except IntegrityError:
             session.rollback()
@@ -203,6 +208,48 @@ def fleet_observe_route(
                 body.node_id, state, attempt + 1,
             )
     raise HTTPException(status_code=503, detail="fleet/observe exhausted its deadlock retries")
+
+
+def _after_observation(
+    session: Session,
+    body: fleet_observe.ObservationIn,
+    caller: node_credentials.AgentCaller,
+    result: fleet_observe.ObservationOut,
+) -> None:
+    """The pass's post-commit DB work, each step in its own transaction and best effort."""
+    _run_settled_hold_kill_pass(session, body.node_id)
+    # A self-hosted macOS/Windows machine's Add-node order is ready on its first observe. After the
+    # commit, own transaction; best effort — the next pass retries. The community edition has no node orders.
+    if edition_features.enabled("cloud_nodes"):
+        try:
+            # The credential's own node where it names one: a node only finishes its own order.
+            observed = caller.node_id or node_id_or_none(session, body.node_id)
+            if observed is not None:
+                node_orders.on_machine_seen(session, observed)
+                # The node said whether it can run VMs (stored by the pass above): the MicroVM shape its
+                # order asked for is applied now, or it stays Legacy (`app/node_shape.py`).
+                if body.platform is not None and body.platform.kvm is not None and edition_features.enabled("microvm"):
+                    node_orders.on_node_capability(session, observed)
+        except Exception as exc:  # noqa: BLE001 — never fail the response
+            session.rollback()
+            log.warning("fleet-observe: %s node-order pass failed (%s), retrying next pass", body.node_id, exc)
+    # AFTER THE COMMIT: `mark_seen_live` commits internally (`slot_state`'s rule) so it cannot run
+    # inside `apply_observation`. Best-effort — the next pass (~5s) catches a missed sighting.
+    try:
+        # The pass's own resolution, one per request; a pass that resolved none (an
+        # unregistered reporter) resolves here as before.
+        project_ids = (
+            result._project_ids if result._project_ids is not None
+            else fleet_observe.resolve_project_ids(session, body)
+        )
+        fleet_observe.mark_sighted_slots(session, body.node_id, body, project_ids)
+    except Exception as exc:  # noqa: BLE001 — see the comment above: never fail the response
+        session.rollback()
+        log.warning(
+            "fleet-observe: %s sighting pass failed (%s) — last_seen_live not advanced, retrying "
+            "next pass",
+            body.node_id, exc,
+        )
 
 
 # ── Alerts: the notify subject plus its dedup window, as a row and a unique key (AC6) ────────────────
@@ -303,11 +350,11 @@ def _caller_task_repo(session: Session, x_agent_task_id: str) -> Optional[str]:
 
 @router.post("/alerts", response_model=AlertOut)
 @infra(Tenancy.OPERATOR)
+@on_thread
 def create_alert(
+    session: Session,
     body: AlertIn,
-    caller: node_credentials.AgentCaller = Depends(_check_token),
-    x_agent_task_id: str = Header(default=""),
-    session: Session = Depends(get_session),
+    door: AgentDoor,
 ) -> AlertOut:
     """Record one alert, then relay it to the operator channel. The unique key is the dedup window.
 
@@ -317,6 +364,9 @@ def create_alert(
     Bound to its caller: node from the credential, `repo` from `_caller_task_repo`. A caller deriving no
     node gets a 422 (`alerts.org_id` is NOT NULL); CP producers call `record_alert` in-process.
     """
+    # In a worker thread on a session of its own: `record_alert` interleaves its writes with the relay's sends
+    # (the outbox enqueue, a mail destination's own read). The route's session has run nothing yet.
+    caller, x_agent_task_id = door
     if caller.node_id is None:
         raise HTTPException(
             status_code=422,
@@ -336,15 +386,13 @@ def create_alert(
         test=body.test,
         payload=body.payload,
     )
-    return AlertOut(
-        delivered=outcome.delivered,
-        relayed=outcome.relayed,
-        relay_failed=outcome.relay_failed,
-        window_start=outcome.window_start.isoformat(),
-    )
+    return from_row(AlertOut, outcome, window_start=outcome.window_start.isoformat())
 
 
 # ── Telemetry: the stream becomes an INSERT (AC7) ────────────────────────────────────────────────────
+
+
+_REVIEW_LANES = TypeAdapter(list[ReviewLaneIn])
 
 
 class TelemetryIn(BaseModel):
@@ -355,14 +403,28 @@ class TelemetryIn(BaseModel):
     task_id: Optional[str] = None
     payload: dict[str, Any] = {}
 
+    @field_validator("payload")
+    @classmethod
+    def _review_lanes(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        """`review_lanes`, when present, is the in-session review lanes the run actually ran
+        (`agent_router.review_lanes.ReviewLaneIn` each): a malformed one is a 422. Every other key passes as sent."""
+        if payload.get("review_lanes") is None:
+            # Absent, or null for "ran none": stored as sent.
+            return payload
+        try:
+            lanes = _REVIEW_LANES.validate_python(payload["review_lanes"])
+        except ValidationError as exc:
+            raise ValueError(f"review_lanes: {exc.errors(include_url=False, include_input=False)}") from None
+        return {**payload, "review_lanes": [lane.model_dump() for lane in lanes]}
+
 
 @router.post("/telemetry", status_code=204, response_model=None)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def ingest_telemetry(
+    session: Session,
     body: TelemetryIn,
-    x_agent_task_id: str = Header(default=""),
-    caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
+    door: AgentDoor,
 ) -> Response:
     """One run's telemetry, as a row.
 
@@ -371,6 +433,7 @@ def ingest_telemetry(
     """
     # The run's task, when it names one, must be the caller's (`require_caller_task`); unattributed passes.
     # A carried-over call must name its task: an unattributed row would land in the task's new org.
+    caller, x_agent_task_id = door
     if body.task_id is not None or carryover.request_task() is not None:
         require_caller_task(session, caller, x_agent_task_id, body.task_id or "")
     # A node credential derives the node, so the row is attributed to the caller whatever the body claims
@@ -407,7 +470,7 @@ def ingest_telemetry(
                 "task_id": body.task_id,
                 # A fill, never a repoint: a row with an org keeps it (redelivered node names are self-reported); a NULL
                 # row is repaired by the next publish.
-                "org_id": func.coalesce(RunTelemetry.org_id, telemetry.excluded.org_id),
+                "org_id": func.coalesce(RunTelemetry.org_id, excluded_of(RunTelemetry.__table__).org_id),
             },
         )
     )

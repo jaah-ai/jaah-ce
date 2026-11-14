@@ -33,10 +33,6 @@ export type TaskTreeGrouping =
       isCollapsed: (sectionId: string) => boolean
     }
 
-/** The two arms, named, so a caller meaning one axis says which without spelling `Extract<>`. */
-export type TagAxisGrouping = Extract<TaskTreeGrouping, { axis: 'tag' }>
-export type ProjectAxisGrouping = Extract<TaskTreeGrouping, { axis: 'project' }>
-
 /* ── One membership rule for a tag group's sections ────────────────────────────────────────────────
    Generic over the item (the caller passes an accessor).
      · One section per tag in the group's `position` order (server order, never re-sorted).

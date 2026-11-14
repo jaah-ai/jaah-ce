@@ -2,8 +2,8 @@
 (the daemon is the sole node-local authority and the reconciler the one writer of observed state).
 
 HOLDS NO NODE CREDENTIAL. It runs as user `jaah`: the READ half (`worktrees`) names a verb on
-the daemon's local socket, which makes the authenticated call; the MUTATE half (`release`/`retire`/
-`set-title`/`create`/`reconcile`) rides the operator's own console cookie session
+the daemon's local socket, which makes the authenticated call; the MUTATE half (`release`/
+`create`/`reconcile`) rides the operator's own console cookie session
 (`_console_session_api`, the hub `.env`'s ADMIN_*), so the CP's permission keys, arg resolver and audit
 row are the gate. A node without that `.env` fails loudly — never deploy ADMIN_* to a node. The daemon's
 socket carries no pool mutation (`agent_vocabulary` answers `unknown_verb`).
@@ -17,11 +17,6 @@ Usage:
         # prints one JSON array of this node's pool-slot records to stdout.
     python3 apps/jaahd/ctl.py release <project> <N> [--force]
         # --force reaps a slot even with a LIVE session in its worktree (otherwise refused).
-        # N=0 (the main clone) is unleasable, so releasing it acts on an already-free slot.
-    python3 apps/jaahd/ctl.py retire <project> <N>
-        # retire a RESOLVED slot: detach the tree to a fresh base (branch ref kept), free it.
-        # Live-session-guarded; does NOT set `merged`.
-    python3 apps/jaahd/ctl.py set-title <project> <N> [title]   # empty/omitted title clears the override
     python3 apps/jaahd/ctl.py create <project> [--quiet]
         # materializes a slot the control plane already declares; the node never mints a slot row.
     python3 apps/jaahd/ctl.py reconcile --project <name> --number <n>
@@ -57,9 +52,7 @@ async def _fetch_worktrees() -> list[dict]:
 
     The verb name and stdout field names are a WIRE CONTRACT; every consumer couples by rendered argv:
       1. the monorepo's pool-port checker — reads `_project`, `_number`, `stack`.
-      2. the monorepo's worktree-agents snapshot — reads `path`, `session`. FAIL-OPEN, and its caller KILLS
-         PROCESSES: any failure degrades the snapshot to `[]`, which reads as "no live session".
-      3. `apps/jaahd/clauded_wt.py` — reads `_project`, `_number`, `title`.
+      2. `apps/jaahd/clauded_wt.py` — reads `_project`, `_number`, `title`.
     Only the failure half is pinned (`tests/test_ctl_worktrees_contract.py`)."""
     node_id = jaahd_main.resolve_node_id()
     # Omitted when empty: an empty value would become a literal `?node_id=`; omitted means "no filter".
@@ -80,7 +73,7 @@ def _wire_record(rec: dict) -> dict:
     """One `AgentWorktreeOut` payload rendered in the wire shape this verb's consumers parse.
 
     Only `stack` is restored (the endpoint spells it `stack_state`); a missing value fails closed to
-    `"unknown"` in `check_pool_ports`. `title` passes through as the CP resolved it
+    `"unknown"`. `title` passes through as the CP resolved it
     (`app/slot_title.py`) — never add a node-side fallback: the CP is its one author."""
     out = dict(rec)
     out["stack"] = rec.get("stack_state")
@@ -97,7 +90,7 @@ def cmd_worktrees() -> int:
     return 0
 
 
-# ── MUTATE surface (T5/T6): release / retire / set-title / create / reconcile ──────────
+# ── MUTATE surface (T5/T6): release / create / reconcile ──────────
 class MutationError(RuntimeError):
     """A mutation could not be delivered or the daemon refused/failed it — surfaced as a loud nonzero
     exit with a stderr diagnostic, never a silent no-op."""
@@ -109,7 +102,7 @@ def _cp_request(
 ) -> dict:
     """Dispatch one pool command to `node_id` through the console's `POST /api/commands` and return its
     reply as `{"status": ..., "result": ...}`. Raises `MutationError` on any transport failure, refusal or
-    malformed reply. Serves `retire`/`set_title`/`create`/`reconcile`; `release` is `cmd_release`.
+    malformed reply. Serves `create`/`reconcile`; `release` is `cmd_release`.
 
     The operator's session, not a node credential (`_console_session_api`): the CP runs the permission key,
     slot probe, arg resolver and audit row. The `command_type`s sent are pinned against
@@ -487,19 +480,6 @@ def main(argv: list[str] | None = None) -> int:
         "refusal too",
     )
 
-    p_retire = sub.add_parser(
-        "retire",
-        help="retire a RESOLVED fleet-issue slot via the daemon (closed-duplicate: detach the tree to a "
-        "fresh base, leave the fleet/task-<id> branch intact, free the slot) — thin client",
-    )
-    p_retire.add_argument("project")
-    p_retire.add_argument("number")
-
-    p_set_title = sub.add_parser("set-title", help="set a slot's sticky title via the daemon (thin client)")
-    p_set_title.add_argument("project")
-    p_set_title.add_argument("number")
-    p_set_title.add_argument("title", nargs="?", default="")
-
     p_create = sub.add_parser("create", help="create the next free worktree slot via the daemon (thin client)")
     p_create.add_argument("project")
     p_create.add_argument("--quiet", action="store_true")
@@ -596,20 +576,6 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_worktrees()
     if args.cmd == "release":
         return cmd_release(args.project, args.number, force=bool(args.force))
-    if args.cmd == "retire":
-        return _mutate(
-            "retire",
-            {"project": args.project, "number": args.number},
-            print_path=False, quiet=False,
-        )
-    if args.cmd == "set-title":
-        # Forward the resolved title as an empty string (not None) when clearing — `_mutate` drops None
-        # args, but the daemon's `_set_title` must still receive title="" to write the null override.
-        return _mutate(
-            "set_title",
-            {"project": args.project, "number": args.number, "title": args.title or ""},
-            print_path=False, quiet=False,
-        )
     if args.cmd == "create":
         return _mutate("create", {"project": args.project}, print_path=True, quiet=args.quiet)
     if args.cmd == "reconcile":

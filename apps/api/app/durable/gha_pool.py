@@ -19,6 +19,7 @@ from typing import Any, Optional
 from dbos import DBOS, SetWorkflowID
 
 from app import edition_features
+from app.clock import utcnow
 from app.durable import runtime
 from app.durable.runtime import enqueue_or_warn
 
@@ -199,6 +200,9 @@ def probe_runner_admin(project_id: int, credential_id: str) -> dict[str, Any]:
 
     from sqlalchemy import select
 
+    from types import SimpleNamespace
+
+    from app import gha_pool_credential
     from app.models.credentials import Credential
     from app.models.projects import Project
     from app.tenancy import seam
@@ -212,6 +216,15 @@ def probe_runner_admin(project_id: int, credential_id: str) -> dict[str, Any]:
         credential = session.scalar(
             select(Credential).where(Credential.id == UUID(str(credential_id)))
         )
+        if project is not None and credential is None:
+            # The operator's own personal credential lent to this org's node lives on the operator plane
+            # (`app/gha_pool_credential.py`); minted there, with the repository read here first.
+            repo = SimpleNamespace(id=project.id, repo_url=project.repo_url)
+            session.rollback()
+            with gha_pool_credential.operator_plane_row(UUID(str(credential_id))) as (op, lent):
+                if lent is not None:
+                    op.rollback()  # no pooled connection held across the GitHub round trip
+                    return probe_with(op, repo, lent)
         if project is None or credential is None:
             # Deleted between save and run: reported as the configuration arm, not raised — the
             # remedy is picking another row, and a raise would spend recovery on nothing.
@@ -256,7 +269,7 @@ def dispatch_apply(node_id: str, actor_email: str) -> bool:
     """
     if not edition_features.enabled("gha_runners"):
         return False  # The community edition has no GHA runners.
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.models.nodes import Node
     from app.routes.gha_runners import _APPLY_COMMAND, dispatch_and_audit_sync
     from app.tenancy import exclusion_log, seam
@@ -265,13 +278,13 @@ def dispatch_apply(node_id: str, actor_email: str) -> bool:
         try:
             # Bound off the node, not the project: the bus key and audit row are the node's
             # (`app/tenancy/manifest.py`).
-            with SessionLocal() as session, seam.bind_from(session, Node, node_id):
+            with BridgedSession() as session, seam.bind_from(session, Node, node_id):
                 row = session.get(Node, node_id)
                 if row is None:  # pragma: no cover - `bind_from` has already refused this case
                     return False
                 # `session.get` is fine here: this is the row `bind_from` just resolved. Read before the
                 # rollback, which would expire it and force a round trip.
-                # Release the pooled connection before the network hop (`app/db.py::_pool_kwargs`);
+                # Release the pooled connection before the network hop (`app/db_async.py`: never held across a non-DB wait);
                 # `dispatch_and_audit_sync` opens its own transaction. Addressed by uuid: names repeat across orgs.
                 session.rollback()
                 dispatch_and_audit_sync(session, str(node_id), _APPLY_COMMAND, {}, actor_email)
@@ -388,10 +401,9 @@ def enqueue_apply(project_id: Any, node_id: Any, node_name: str, actor_email: st
     applies it anyway. False tells `_trigger` to dispatch inline (e.g. under `TestClient`).
     `node_name` is for the log line only; the work is enqueued with ids.
     """
-    from datetime import datetime, timezone
 
     workflow_id = apply_workflow_id(
-        project_id, node_id, datetime.now(timezone.utc).isoformat()
+        project_id, node_id, utcnow().isoformat()
     )
     return enqueue_or_warn(
         GHA_POOL_QUEUE, workflow_id, converge_gha_pool, project_id, str(node_id), None, actor_email,

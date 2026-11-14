@@ -10,7 +10,7 @@ lifecycle value. */
 export const AWAITING_APPROVAL = 'Available after approval'
 
 /** The shell's persistent notice while pending (`components/PendingOrgBanner.tsx`). It names only what the guided
-    setup lets a pending org do: Connect Git and Add a project wait behind Add node there (`components/onboarding`). */
+    setup lets a pending org do: AI account and Add a project wait behind Add node there (`components/onboarding`). */
 export const PENDING_ORG_BANNER =
   'Your organization is awaiting approval — you can choose a plan and invite your team meanwhile.'
 

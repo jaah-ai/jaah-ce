@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Iterable, Iterator, Optional
 from uuid import UUID
 
@@ -35,6 +35,8 @@ from sqlalchemy import case, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from app import write_origin
+from app.clock import utcnow
 from app.models.notifications import (
     EMAIL_DELIVERY_STATUSES, EMAIL_SUPPRESSION_REASONS, EmailDelivery, EmailSuppression,
 )
@@ -70,12 +72,13 @@ def redacted(subject: str, secrets: Iterable[str]) -> str:
 
 
 @contextlib.contextmanager
-def _session() -> Iterator[Any]:
-    """A fresh operator-plane session, out of any caller scope: the row is org zero's whoever sends."""
-    from app.db import SessionLocal
+def operator_session() -> Iterator[Any]:
+    """A fresh operator-plane session, out of any caller scope: the row is org zero's whoever sends (also
+    `app/hosted_apps/mail.py`'s, which admits a relayed message on it)."""
+    from app.db import BridgedSession
     from app.tenancy import seam
 
-    with seam.detached(), seam.operator_scope(), SessionLocal() as session:
+    with seam.detached(), seam.operator_scope(), BridgedSession() as session:
         yield session
 
 
@@ -88,22 +91,38 @@ def delivery_org() -> UUID:
 
 def create(
     *, recipient: str, subject: str, mail_type: str, essential: bool, recipient_user_id: Optional[UUID] = None,
+    ref: Optional[str] = None,
 ) -> UUID:
-    """Write one `queued` row and return its id (the `delivery_id` SES tags the message with). Raises on a DB fault."""
-    with _session() as session:
+    """Write one `queued` row and return its id (the `delivery_id` SES tags the message with). `ref`: what the email
+    was about (`EmailDelivery.ref`). Raises on a DB fault."""
+    with operator_session() as session:
         delivery_id = session.execute(
             insert(EmailDelivery).values(
                 org_id=delivery_org(), recipient=recipient, subject=subject[:DETAIL_MAX], mail_type=mail_type,
-                essential=essential, recipient_user_id=recipient_user_id, status="queued",
+                essential=essential, recipient_user_id=recipient_user_id, status="queued", ref=ref,
+                origin=write_origin.current(),
             ).returning(EmailDelivery.id)
         ).scalar_one()
         session.commit()
     return delivery_id
 
 
+def latest_by_ref(prefix: str) -> dict[str, tuple[str, datetime]]:
+    """Each `ref` starting with `prefix` → its newest row's `(status, created_at)`. Raises on a DB fault."""
+    escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    with operator_session() as session:
+        rows = session.execute(
+            select(EmailDelivery.ref, EmailDelivery.status, EmailDelivery.created_at)
+            .where(EmailDelivery.ref.like(f"{escaped}%", escape="\\"))
+            .order_by(EmailDelivery.ref, EmailDelivery.created_at.desc())
+            .distinct(EmailDelivery.ref)
+        ).all()
+    return {ref: (status, at) for ref, status, at in rows}
+
+
 def load(delivery_id: UUID) -> Optional[EmailDelivery]:
     """The row, detached from its session, or None when it is gone (swept)."""
-    with _session() as session:
+    with operator_session() as session:
         row = session.get(EmailDelivery, delivery_id)
         if row is not None:
             session.expunge(row)
@@ -112,7 +131,7 @@ def load(delivery_id: UUID) -> Optional[EmailDelivery]:
 
 def attempted(delivery_id: UUID) -> None:
     """Count one try at the send."""
-    with _session() as session:
+    with operator_session() as session:
         session.execute(
             update(EmailDelivery).where(EmailDelivery.id == delivery_id).values(attempts=EmailDelivery.attempts + 1)
         )
@@ -128,7 +147,7 @@ def record(
         raise ValueError(f"unknown delivery status {status!r}")
     values: dict[str, Any] = {"status": status, "status_detail": detail[:DETAIL_MAX] if detail else None}
     if status == "sent":
-        values["sent_at"] = datetime.now(timezone.utc)
+        values["sent_at"] = utcnow()
         values["provider_message_id"] = provider_message_id
         # An SES event (`advance`) may already have moved the row past `sent`: never back.
         values["status"] = case((EmailDelivery.status == "queued", "sent"), else_=EmailDelivery.status)
@@ -137,7 +156,7 @@ def record(
             (EmailDelivery.status == "queued", detail[:DETAIL_MAX] if detail else None), else_=EmailDelivery.status_detail
         )
     try:
-        with _session() as session:
+        with operator_session() as session:
             session.execute(update(EmailDelivery).where(EmailDelivery.id == delivery_id).values(**values))
             session.commit()
     except Exception:
@@ -147,13 +166,14 @@ def record(
 def claim_fallback(delivery_id: UUID, expected_detail: Optional[str], detail: str) -> bool:
     """Claim the still-`queued`, unsent row for its one Gmail fallback send: `status_detail` becomes `FALLBACK_PENDING`
     + `detail` (SES's reason) only while it still reads `expected_detail`. True when this call made the claim, so at
-    most one caller ever sends. Unlike `record`, a DB fault RAISES: no claim, no send."""
-    with _session() as session:
+    most one caller ever sends. A hosted app's row (`hosted_app_id`) is never claimed: app mail never leaves from an
+    operator mailbox (`app/hosted_apps/mail.py`). Unlike `record`, a DB fault RAISES: no claim, no send."""
+    with operator_session() as session:
         claimed = session.execute(
             update(EmailDelivery)
             .where(
                 EmailDelivery.id == delivery_id, EmailDelivery.status == "queued",
-                EmailDelivery.provider_message_id.is_(None),
+                EmailDelivery.provider_message_id.is_(None), EmailDelivery.hosted_app_id.is_(None),
                 EmailDelivery.status_detail.is_not_distinct_from(expected_detail),
             )
             .values(status_detail=f"{FALLBACK_PENDING}{detail}"[:DETAIL_MAX])
@@ -203,7 +223,7 @@ def apply_event(
 ) -> tuple[bool, int]:
     """One SES event (`app/ses_events.py`) in one committed transaction: `advance` its row, then `suppress` each
     `(address, reason, detail)` in `hits`. `(a row was found, addresses newly suppressed)`. Raises on a DB fault."""
-    with _session() as session:
+    with operator_session() as session:
         row = advance(
             session, delivery_id=delivery_id, message_id=message_id, status=status, detail=detail, event=event, at=at,
         )
@@ -245,7 +265,7 @@ def suppress(
 def suppressed(address: str) -> bool:
     """Whether system mail to `address` is suppressed: the send path's pre-check."""
     key = normalised(address)
-    with _session() as session:
+    with operator_session() as session:
         return session.execute(
             select(EmailSuppression.id).where(EmailSuppression.address == key, EmailSuppression.cleared_at.is_(None))
         ).first() is not None
@@ -253,7 +273,7 @@ def suppressed(address: str) -> bool:
 
 def suppressions() -> list[EmailSuppression]:
     """Every active suppression, newest first, detached."""
-    with _session() as session:
+    with operator_session() as session:
         rows = list(session.execute(
             select(EmailSuppression).where(EmailSuppression.cleared_at.is_(None))
             .order_by(EmailSuppression.created_at.desc(), EmailSuppression.address)
@@ -269,7 +289,7 @@ def clear_suppression(address: str, *, by: UUID) -> bool:
     from app import edition_features, system_mail
 
     key = normalised(address)
-    with _session() as session:
+    with operator_session() as session:
         active = session.execute(
             select(EmailSuppression.id).where(EmailSuppression.address == key, EmailSuppression.cleared_at.is_(None))
         ).scalar_one_or_none()
@@ -281,11 +301,11 @@ def clear_suppression(address: str, *, by: UUID) -> bool:
 
         if system_mail.configured():
             ses.delete_suppressed(key)
-    with _session() as session:
+    with operator_session() as session:
         cleared = session.execute(
             update(EmailSuppression)
             .where(EmailSuppression.id == active, EmailSuppression.cleared_at.is_(None))
-            .values(cleared_at=datetime.now(timezone.utc), cleared_by=by)
+            .values(cleared_at=utcnow(), cleared_by=by)
         ).rowcount
         session.commit()
     return bool(cleared)
@@ -293,20 +313,36 @@ def clear_suppression(address: str, *, by: UUID) -> bool:
 
 def deliveries(
     *, recipient: Optional[str] = None, status: Optional[str] = None, before: Optional[datetime] = None,
-    limit: int = PAGE_SIZE,
+    hosted_app_id: Optional[UUID] = None, limit: int = PAGE_SIZE,
 ) -> list[EmailDelivery]:
     """One page of the log, newest first, detached: `recipient` matches any part of the address (any case),
-    `status` one status, `before` pages on from the last row's `created_at`."""
+    `status` one status, `hosted_app_id` one hosted app's mail, `before` pages on from the last row's `created_at`."""
     query = select(EmailDelivery)
+    if hosted_app_id is not None:
+        query = query.where(EmailDelivery.hosted_app_id == hosted_app_id)
     if recipient:
         query = query.where(EmailDelivery.recipient.icontains(recipient, autoescape=True))
     if status:
         query = query.where(EmailDelivery.status == status)
     if before is not None:
         query = query.where(EmailDelivery.created_at < before)
-    with _session() as session:
+    with operator_session() as session:
         rows = list(session.execute(
             query.order_by(EmailDelivery.created_at.desc(), EmailDelivery.id.desc()).limit(limit)
         ).scalars())
         session.expunge_all()
         return rows
+
+
+def sending_apps() -> list[tuple[UUID, str, str]]:
+    """`(id, name, slug)` of every hosted app with a row in the log, by name: the log's app filter. An app gone from
+    `hosted_apps` (its rows outlive it) is left out."""
+    from app.models.hosted_apps import HostedApp
+
+    with operator_session() as session:
+        tagged = select(EmailDelivery.hosted_app_id).where(EmailDelivery.hosted_app_id.is_not(None)).distinct()
+        rows = session.execute(
+            select(HostedApp.id, HostedApp.name, HostedApp.slug).where(HostedApp.id.in_(tagged))
+            .order_by(HostedApp.name, HostedApp.slug)
+        ).all()
+    return [(row.id, row.name, row.slug) for row in rows]

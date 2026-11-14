@@ -1,28 +1,31 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { JSX } from 'react'
-import Autocomplete from '@mui/material/Autocomplete'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import IconButton from '@mui/material/IconButton'
-import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
-import { apiDetail, get, post, put } from '../../api'
-import { useApiRead } from '../../hooks/useApiRead'
+import { apiDetail, post, put } from '../../api'
+import { useTagGroups } from '../../hooks/useTagGroups'
+import { countOf } from '../../lib/humanize'
+import { useSubmit } from '../../hooks/useSubmit'
 import { useConfirm } from '../ConfirmDialog'
 import { Banner } from '../../ui/Banner'
-import { OPTION_ROW_SX, highlight } from '../../ui/AsyncLookup'
-import { ELLIPSIS_SX, PHONE, fieldTapTargetSx, tapTargetSx } from '../../ui/listStyles'
+import type { LookupOption } from '../../ui/AsyncLookup'
+import { AsyncMultiLookup, CHIP_SX, CHIP_TEXT_SX } from '../../ui/AsyncMultiLookup'
+import { PHONE, tapTargetSx } from '../../ui/listStyles'
+import { FONT_WEIGHT, grid } from '../../theme'
 import type { Tag, TagGroup, TagRef } from '../../types'
-import { NO_AUTOFILL_INPUT } from '../../ui/noAutofill'
+import type { Explain } from '../../ui/explain'
+import HelpLabel, { ExplainMoreButton } from '../../ui/HelpLabel'
+import Tip from '../../ui/Tip'
 
-// The task DETAILS tab's TAG EDITOR — ONE autocomplete entry box across every ACTIVE tag group, plus
-// Re-tag.
+// The task DETAILS tab's TAG EDITOR — ONE `ui/AsyncMultiLookup` entry box across every ACTIVE tag group, plus
+// Re-tag. The box owns the chips, ✕, Backspace, rows and field; this file owns the catalogue and the writes.
 //
 // Operator decisions: the box holds badges for the WHOLE catalog, each suggestion showing its group as a
 // dim hint. A badge reads the tag's `tag` CODE ("feature"), never its `name` ("Features") — the name is
 // the board's group-by SECTION HEADING. CREATING A TAG IS
 // NOT OFFERED (it needs a group, name and classifier description): Settings › Tasks › Tags.
-// Not inside a `<form>` any more, but every control keeps `type="button"` so it stays form-safe.
+// Every control is `type="button"`, so the panel is safe inside a `<form>`.
 //
 // THE CATALOG IS FETCHED (`GET /api/tags/groups`, active-only, `position` order); THE SELECTION is the
 // `tags` prop off the page's task payload. `TaskDetailPage` refetches on every `task` SSE event (both
@@ -37,16 +40,23 @@ import { NO_AUTOFILL_INPUT } from '../../ui/noAutofill'
 /** What both writes answer with: the resulting refs only (see the server's `TaskTagsOut`). */
 type TaskTagsResponse = { tags: TagRef[] }
 
-/** One offerable tag with its group — the provenance the hint, the single-select rule and the ✕'s name
- *  read. */
-type TagOption = { tag: Tag; group: TagGroup }
+/** One offerable tag with its group — the provenance the hint, the single-select rule and the hover read —
+ *  and the box's row for it (`key` the id, `label` the code, `hint` the group). */
+type TagOption = { tag: Tag; group: TagGroup; lookup: LookupOption }
 
 /** The full-replace payload as a SET: sorted, de-duplicated, so pick order does not change the body. */
 const tagIdsOf = (ids: Iterable<string>): string[] => [...new Set(ids)].sort()
 
 /* The Details tab's section frame and heading; `TaskDependencies` is the other section on it. */
-export const PANEL_SX = { display: 'flex', flexDirection: 'column', gap: '0.5rem' } as const
-export const HEADING_SX = { fontWeight: 600, color: 'text.primary' } as const
+export const PANEL_SX = { display: 'flex', flexDirection: 'column', gap: 1 } as const
+export const HEADING_SX = { fontWeight: FONT_WEIGHT.semibold, color: 'text.primary' } as const
+
+/* The heading's explanation: the section is the setting. */
+const TAGS_HELP: Explain = {
+  tip: 'Labels that group the board; Re-tag reclassifies it.',
+  more: 'Tags come from the tag groups published in Settings. Re-tag classifies the task again from its description and outcome, and asks first when that would replace tags set by hand.',
+  docs: 'console-reference/tasks/task-detail',
+}
 
 /* THE HEADING IS A BAR: `Tags` left, Re-tag right, instead of a row of its own — it put the Details tab
    back inside `.app-main`'s scrollport (`e2e/task-detail-fit.spec.ts`; 123px -> 79px at 1280x800). */
@@ -54,7 +64,8 @@ const HEADING_ROW_SX = {
   display: 'flex',
   alignItems: 'center',
   flexWrap: 'wrap',
-  gap: '0.25rem 0.75rem',
+  rowGap: 0.5,
+  columnGap: 2,
   minWidth: 0,
   /* Under 480px the bar dissolves into the panel's column, so Re-tag can follow what it acts on. */
   [PHONE]: { display: 'contents' },
@@ -63,53 +74,15 @@ const RETAG_SX = {
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'flex-end',
-  flex: '1 1 20rem',
+  flex: `1 1 ${grid(53)}`,
   minWidth: 0,
   /* On a phone the button comes LAST, after the box or the sentence (`order`; DOM order is unchanged).
-     `0 0 auto` first: in the column, the `1 1 20rem` basis would be a 320px HEIGHT. */
+     `0 0 auto` first: in the column, the `1 1 grid(53)` basis would be a 318px HEIGHT. */
   [PHONE]: { order: 1, flex: '0 0 auto', justifyContent: 'flex-start' },
 } as const
 
-/* THE ENTRY BOX IS CAPPED: full-width reads as a paragraph field. 44rem holds ~8 badges. */
-const BOX_SX = { maxWidth: '44rem' } as const
-
-/* A tag BADGE inside the entry box — a second, deliberately different size from the board's
-   `TAG_CHIP_SX` (field type size vs a 176px cell). Not `ui/StatusChip`: it never shrinks, and an
-   unbounded operator-authored code would hard-clip mid-character. */
-const BADGE_SX = {
-  display: 'inline-flex',
-  alignItems: 'center',
-  gap: '0.125rem',
-  maxWidth: '100%',
-  minWidth: 0,
-  pl: '6px',
-  border: '1px solid',
-  borderColor: 'divider',
-  borderRadius: 1,
-  bgcolor: 'action.hover',
-} as const
-
-const BADGE_TEXT_SX = {
-  ...ELLIPSIS_SX,
-  fontSize: '0.75rem',
-  fontWeight: 600,
-  lineHeight: 1.6,
-  color: 'text.secondary',
-} as const
-
-/* The ✕ on a badge. DELIBERATELY NOT `tapTargetSx`'s 44px phone floor: inside a text field it would make
-   the field ~52px. Removal also has Backspace and arrow-onto-badge + Delete, so this is never the only
-   way. */
-const BADGE_REMOVE_SX = {
-  p: '2px',
-  fontSize: '0.875rem',
-  lineHeight: 1,
-  color: 'text.secondary',
-} as const
-
-/* A suggestion row (`OPTION_ROW_SX`): code left, group dim on the RIGHT EDGE. */
-const OPTION_CODE_SX = { ...ELLIPSIS_SX, fontSize: '0.8125rem', color: 'text.primary' } as const
-const OPTION_GROUP_SX = { fontSize: '0.75rem', color: 'text.secondary', flex: '0 0 auto' } as const
+/* THE ENTRY BOX IS CAPPED: full-width reads as a paragraph field. grid(117) (702px) holds ~8 badges. */
+const BOX_SX = { maxWidth: grid(117) } as const
 
 /** What an untagged task reads for a READER. An EDITOR sees the box's placeholder instead. */
 const UNTAGGED = 'Untagged'
@@ -123,33 +96,26 @@ const NO_TAGS_HINT_EDITABLE = `${NO_TAGS_HINT} Add them in Settings › Tasks �
 const INPUT_LABEL = 'Add a tag'
 
 /** Match on the CODE or the NAME: an operator who knows "Features" must find `feature`. */
-function matches(option: TagOption, query: string): boolean {
-  return (
-    option.tag.tag.toLowerCase().includes(query) || option.tag.name.toLowerCase().includes(query)
-  )
-}
-
-function startsWith(option: TagOption, query: string): boolean {
-  return (
-    option.tag.tag.toLowerCase().startsWith(query) || option.tag.name.toLowerCase().startsWith(query)
-  )
-}
+const searchedOf = (option: TagOption): string[] => [option.tag.tag.toLowerCase(), option.tag.name.toLowerCase()]
 
 /* WHAT THE POPUP SHOWS: PREFIX MATCHES FIRST, then the rest, each in the catalog's `position` order —
-   never re-sorted alphabetically over the operator's order. */
-function filterTagOptions(options: TagOption[], state: { inputValue: string }): TagOption[] {
-  const query = state.inputValue.trim().toLowerCase()
-  if (!query) return options
-  const hits = options.filter(option => matches(option, query))
-  return [...hits.filter(o => startsWith(o, query)), ...hits.filter(o => !startsWith(o, query))]
+   never re-sorted alphabetically over the operator's order. The empty query matches every tag. */
+function filterTagOptions(options: TagOption[], typed: string): TagOption[] {
+  const query = typed.toLowerCase()
+  const prefix = (option: TagOption) => searchedOf(option).some(text => text.startsWith(query))
+  const hits = options.filter(option => searchedOf(option).some(text => text.includes(query)))
+  return [...hits.filter(prefix), ...hits.filter(option => !prefix(option))]
 }
 
 export function TaskTags({
   taskId,
+  orgId,
   tags,
   readOnly = false,
 }: {
   taskId: number
+  /** The task's own org: the catalogue read is that org's (`useTagGroups`'s `orgId`), never the viewer's. */
+  orgId: string | null
   /** The task's CURRENT active-group tags, off the task payload the page already holds. */
   tags: TagRef[]
   /* READ-ONLY IS ABSENCE, NOT DISABLEMENT (`TaskDependsOn`'s `readOnly` contract): a `tasks:view` admin
@@ -161,12 +127,11 @@ export function TaskTags({
   const [stored, setStored] = useState<Set<string>>(() => new Set(tags.map(ref => ref.id)))
   const [selected, setSelected] = useState<Set<string>>(() => new Set(tags.map(ref => ref.id)))
   const [busy, setBusy] = useState(false)
-  const [retagging, setRetagging] = useState(false)
+  const { busy: retagging, formError: actionError, setFormError: setActionError, run: runRetag } = useSubmit()
   /* SEPARATE FROM `retagging`: the button is dead while its confirm is open but not yet "Re-tagging…".
      Without it a second press supersedes the dialog and the first `retag()` silently returns
      (`useConfirm`'s contract). */
   const [confirming, setConfirming] = useState(false)
-  const [actionError, setActionError] = useState('')
   const [confirm, confirmDialog] = useConfirm()
   /* WHICH WRITE IS ALLOWED TO ANSWER: overlapping PUTs could land an earlier selection last; only the
      newest response applies. */
@@ -176,17 +141,17 @@ export function TaskTags({
   const storedRef = useRef(stored)
   storedRef.current = stored
 
-  /* THE CATALOG, fetched once on mount; its order decides badge and suggestion order. The `state` filter
-     is applied HERE AS WELL: "a DRAFTED group's tags are never offerable" is this panel's guarantee
-     (pinned by its test), independent of the route's default. */
-  const { data: groups, error: groupsError } = useApiRead(['task-tag-groups'], async () => {
-    const rows = await get<TagGroup[]>('/api/tags/groups')
-    /* NORMALISED ONCE: only the top level is shape-checked, so a null `tags` would throw later (as
-       `pages/Tasks.tsx` handles too). */
-    return Array.isArray(rows)
-      ? rows.filter(group => group.state === 'active').map(group => ({ ...group, tags: group.tags ?? [] }))
-      : []
-  }, 'Failed to load tag groups')
+  /* THE CATALOG (`hooks/useTagGroups.ts`, the board's read); its order decides badge and suggestion order. The
+     `state` filter is applied HERE AS WELL: "a DRAFTED group's tags are never offerable" is this panel's guarantee
+     (pinned by its test), independent of the route's default. A null `tags` would throw later, so `?? []`.
+     THE TASK'S ORG'S catalogue, never the viewer's: an operator on another org's task is offered only tags its
+     write can resolve. */
+  const groupsQuery = useTagGroups({ orgId })
+  const groupsError = groupsQuery.error ? apiDetail(groupsQuery.error, 'Failed to load tag groups') : ''
+  const active = useMemo<TagGroup[]>(
+    () => (groupsQuery.data ?? []).filter(group => group.state === 'active').map(group => ({ ...group, tags: group.tags ?? [] })),
+    [groupsQuery.data],
+  )
 
   /* RE-SEED FROM THE PROP ONLY WHEN THE SERVER'S SET CHANGES, keyed on ids not array identity. This is
      what shows a runner's own tag write without a reload; our own writes are already applied. */
@@ -197,14 +162,13 @@ export function TaskTags({
     setSelected(new Set(next))
   }, [propSelectionKey])
 
-  const active = groups ?? []
-
   /* EVERY OFFERABLE TAG, FLATTENED, in the operator's order — which also orders the badges (`picked`
      reads it), so a newly added tag does not jump to the end. */
   const options = useMemo<TagOption[]>(
-    () => active.flatMap(group => group.tags.map(tag => ({ tag, group }))),
+    () => active.flatMap(group => group.tags.map(tag => ({ tag, group, lookup: { key: tag.id, label: tag.tag, hint: group.name } }))),
     [active],
   )
+  const byId = useMemo(() => new Map(options.map(option => [option.tag.id, option])), [options])
 
   const picked = useMemo(() => options.filter(option => selected.has(option.tag.id)), [options, selected])
 
@@ -254,8 +218,9 @@ export function TaskTags({
     }
   }
 
-  function commit(next: TagOption[]) {
-    void write(tagIdsOf([...resolveSingleSelect(next), ...unresolved]))
+  function commit(next: LookupOption[]) {
+    const resolved = next.flatMap(lookup => byId.get(lookup.key) ?? [])
+    void write(tagIdsOf([...resolveSingleSelect(resolved), ...unresolved]))
   }
 
   async function retag() {
@@ -267,7 +232,7 @@ export function TaskTags({
         title: 'Re-tag this task?',
         message:
           `The classifier replaces this task's tags in every active group. ` +
-          `${picked.length} tag${picked.length === 1 ? '' : 's'} set now ` +
+          `${countOf(picked.length, 'tag')} set now ` +
           `(${picked.map(option => option.tag.tag).join(', ')}) will be replaced by its choice.`,
         confirmLabel: 'Re-tag',
       })
@@ -276,22 +241,16 @@ export function TaskTags({
          not change under them. The write classifies against server truth. */
       if (!ok) return
     }
-    setRetagging(true)
-    setActionError('')
-    /* CLAIMS THE WRITE SEQUENCE BEFORE THE REQUEST, so an in-flight pick cannot land over it. */
-    writeSeq.current++
-    try {
+    /* THE SERVER'S `detail`, VERBATIM, in an inline Banner (409 no active group / catalogue changed,
+       503 unconfigured, 504 timeout, 502 unusable verdict). No toasts in this app. */
+    await runRetag('Re-tag failed', async () => {
+      /* CLAIMS THE WRITE SEQUENCE BEFORE THE REQUEST, so an in-flight pick cannot land over it. */
+      writeSeq.current++
       const result = await post<TaskTagsResponse>(`/api/tasks/${taskId}/retag`)
       const settled = new Set((result?.tags ?? []).map(ref => ref.id))
       setStored(settled)
       setSelected(new Set(settled))
-    } catch (err) {
-      /* THE SERVER'S `detail`, VERBATIM, in an inline Banner (409 no active group / catalogue changed,
-         503 unconfigured, 504 timeout, 502 unusable verdict). No toasts in this app. */
-      setActionError(apiDetail(err, 'Re-tag failed'))
-    } finally {
-      setRetagging(false)
-    }
+    })
   }
 
   // A failed catalog read costs the whole editor, so it says so.
@@ -307,7 +266,7 @@ export function TaskTags({
   }
   // Not loaded yet: render nothing (`TaskDependsOn`'s posture). No active group: nothing to show or
   // re-tag into (the server 409s), so no card either; Settings › Tasks › Tags is where groups are made.
-  if (groups === null || groups.length === 0) return null
+  if (groupsQuery.data === undefined || active.length === 0) return null
 
   /* FROZEN BY A CLASSIFICATION, NOT BY A PICK: Re-tag REPLACES the selection, so a mid-classification
      pick would be overwritten. */
@@ -317,8 +276,9 @@ export function TaskTags({
     <Box sx={PANEL_SX} data-testid="task-tags">
       <Box sx={HEADING_ROW_SX}>
         <Typography variant="body2" sx={HEADING_SX}>
-          Tags
+          <HelpLabel label="Tags" help={TAGS_HELP} />
         </Typography>
+        <ExplainMoreButton label="Tags" help={TAGS_HELP} />
         {/* RE-TAG RENDERS WHATEVER THE CATALOG SAYS (at least one active group, or there is no card). */}
         {!readOnly && (
           <Box sx={RETAG_SX}>
@@ -349,109 +309,41 @@ export function TaskTags({
       ) : readOnly ? (
         /* A READER GETS THE BADGES ONLY, not a disabled box. */
         picked.length > 0 ? (
-          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: '0.375rem', minWidth: 0 }}>
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', minWidth: 0 }}>
             {picked.map(option => (
-              <Box
-                key={option.tag.id}
-                component="span"
-                title={`${option.tag.name} · ${option.group.name}`}
-                sx={{ ...BADGE_SX, px: '6px' }}
-              >
+              <Tip key={option.tag.id} title={hoverOf(option)}><Box component="span" sx={{ ...CHIP_SX, px: 1 }}>
                 {/* The test id sits on the TEXT node in both renders. */}
-                <Box component="span" data-testid="task-tag-chip" sx={BADGE_TEXT_SX}>
+                <Box component="span" data-testid="task-tag-chip" sx={CHIP_TEXT_SX}>
                   {option.tag.tag}
                 </Box>
-              </Box>
+              </Box></Tip>
             ))}
           </Box>
         ) : (
           <Untagged />
         )
       ) : (
-        <Autocomplete
-          multiple
-          id={`task-tags-input-${taskId}`}
-          options={options}
-          value={picked}
-          disabled={frozen}
-          sx={BOX_SX}
-          /* A PICKED TAG LEAVES THE LIST (removal is the ✕ and Backspace). */
-          filterSelectedOptions
-          /* THE FIRST MATCH IS PRE-HIGHLIGHTED, so type-then-Enter works. */
-          autoHighlight
-          openOnFocus
-          /* NO GLOBAL CLEAR ✕: wiping every group's tags has no undo. */
-          disableClearable
-          isOptionEqualToValue={(a, b) => a.tag.id === b.tag.id}
-          getOptionLabel={option => option.tag.tag}
-          filterOptions={filterTagOptions}
-          noOptionsText="No matching tag"
-          onChange={(_event, next) => commit(next)}
-          renderValue={(value, getItemProps) =>
-            value.map((option, index) => {
-              /* `key` out (React 19 spread-key warning), `disabled` out (invalid on a `<span>`); the rest is
-                 what MUI's arrow-key/Backspace handling addresses badges by. */
-              const { key, onDelete, disabled, ...itemProps } = getItemProps({ index })
-              return (
-                <Box
-                  key={key}
-                  {...itemProps}
-                  component="span"
-                  title={`${option.tag.name} · ${option.group.name}`}
-                  sx={BADGE_SX}
-                >
-                  <Box component="span" data-testid="task-tag-chip" sx={BADGE_TEXT_SX}>
-                    {option.tag.tag}
-                  </Box>
-                  <IconButton
-                    // `type="button"` (see the file header).
-                    type="button"
-                    aria-label={`Remove tag ${option.tag.tag} from ${option.group.name}`}
-                    disabled={disabled}
-                    onClick={onDelete}
-                    sx={BADGE_REMOVE_SX}
-                  >
-                    <Box component="span" aria-hidden="true" sx={{ lineHeight: 1 }}>
-                      ×
-                    </Box>
-                  </IconButton>
-                </Box>
-              )
-            })
-          }
-          renderOption={(props, option, state) => {
-            const { key, ...rest } = props
-            return (
-              <Box component="li" key={key} {...rest}>
-                <Box sx={OPTION_ROW_SX}>
-                  <Box component="span" sx={OPTION_CODE_SX}>
-                    {highlight(option.tag.tag, state.inputValue)}
-                  </Box>
-                  {/* THE GROUP, dim, on the right — the only thing saying which vocabulary a code is from. */}
-                  <Box component="span" sx={OPTION_GROUP_SX}>
-                    {option.group.name}
-                  </Box>
-                </Box>
-              </Box>
-            )
-          }}
-          renderInput={params => (
-            <TextField
-              {...params}
-              /* `margin="none"`, against the theme's `MuiTextField` dense margin: `PANEL_SX`'s `gap` owns
-                 the spacing (it cost the Details tab 12px). */
-              margin="none"
-              sx={fieldTapTargetSx}
-              placeholder={picked.length === 0 ? `${INPUT_LABEL}…` : ''}
-              slotProps={{
-                ...params.slotProps,
-                /* WCAG 2.5.3: the accessible name contains the visible prompt. No visible `<label>`: the
-                   heading already says Tags. */
-                htmlInput: { ...params.slotProps.htmlInput, ...NO_AUTOFILL_INPUT, 'aria-label': INPUT_LABEL },
-              }}
-            />
-          )}
-        />
+        <Box sx={BOX_SX}>
+          <AsyncMultiLookup
+            id={`task-tags-input-${taskId}`}
+            value={picked.map(option => option.lookup)}
+            onChange={commit}
+            /* The cached catalogue, filtered here: the box's `filterOptions` passes rows through untouched. */
+            fetchOptions={query => Promise.resolve(filterTagOptions(options, query).map(option => option.lookup))}
+            fetchOnFocus
+            disabled={frozen}
+            noOptionsText="No matching tag"
+            /* WCAG 2.5.3: the accessible name contains the visible prompt. No visible `<label>`: the heading
+               already says Tags. */
+            ariaLabel={INPUT_LABEL}
+            placeholder={`${INPUT_LABEL}…`}
+            itemNoun="tag"
+            chipTitle={lookup => { const option = byId.get(lookup.key); return option ? hoverOf(option) : lookup.label }}
+            chipTestId="task-tag-chip"
+            /* Against the theme's dense margin: `PANEL_SX`'s `gap` owns the spacing (it cost the Details tab 12px). */
+            margin="none"
+          />
+        </Box>
       )}
 
       {actionError && <Banner severity="error">{actionError}</Banner>}
@@ -459,6 +351,9 @@ export function TaskTags({
     </Box>
   )
 }
+
+/** A badge's hover: the reader's only route to the display name and group. */
+const hoverOf = (option: TagOption): string => `${option.tag.name} · ${option.group.name}`
 
 /** What an untagged task reads for a reader: one string in one register. */
 function Untagged(): JSX.Element {

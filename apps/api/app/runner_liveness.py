@@ -13,14 +13,14 @@ costs latency or a withheld refund, never a live runner.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any, NamedTuple, Optional
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from app import edition_features, slot_state
-from app.db import SessionLocal
+from app.db import BridgedSession
 from app.task_lifecycle import ACTIVE, AWAITING_RESPONSE, READY
 
 log = logging.getLogger("cockpit-scheduler")
@@ -78,6 +78,7 @@ _RUNNER_STATE_SQL = text(
     SELECT w.task_id, w.acked_at, w.launch_session_id, w.session_id, w.session_status,
            w.pid, w.pid_start_time, w.session_pid, w.session_proc_started_at,
            (w.probes->>'agents_ok') AS agents_ok,
+           (w.probes->>'launched_pane') AS launched_pane,
            (w.probes->>'session_cwd') AS session_cwd,
            t.state                                           AS task_state,
            (t.question_runner_stopped_at IS NOT NULL)        AS runner_stopped_on_question,
@@ -153,6 +154,12 @@ class RunnerState(NamedTuple):
     # Seconds since the node last observed this task's slot (`worktrees.observed_at`), None when unread. With
     # `node_spoke_secs` it tells a starved node (heartbeats, stopped observing) from a merely unproven launch.
     observed_secs: Optional[float] = None
+    # The node's last observation of this slot says its session list could NOT be read (`probes.agents_ok`
+    # false: on a starved node the probe times out) and a runner may still be there. Fresh observations with a
+    # blind probe judge nothing, so the caller treats the node as starved as it does a stale observation. Not
+    # set when the node also said it holds NO launched pane in the slot (`probes.launched_pane` false): that
+    # runner is gone whatever the list says (a node whose CLI is broken, not starved), so the normal grace runs.
+    probe_blind: bool = False
 
 
 def _verdict_from_row(row: Any) -> tuple[str, Optional[float]]:
@@ -262,7 +269,7 @@ def _read_node_slots(task_id: str, session: Optional[Session]) -> Optional[list[
         params = {"task_id": int(task_id), "free": slot_state.FREE}
         if session is not None:
             return list(session.execute(_RUNNER_STATE_SQL, params).all())
-        with SessionLocal() as own:
+        with BridgedSession() as own:
             return list(own.execute(_RUNNER_STATE_SQL, params).all())
     except Exception as exc:  # noqa: BLE001 — fail CLOSED
         log.warning("runner-liveness: runner-state read failed for task %s (%s) — UNKNOWN", task_id, exc)
@@ -289,7 +296,7 @@ def _live_vm_state(task_id: str, session: Optional[Session]) -> Optional[RunnerS
         if session is not None:
             row = session.execute(_LIVE_VM_SQL, params).first()
         else:
-            with SessionLocal() as own:
+            with BridgedSession() as own:
                 row = own.execute(_LIVE_VM_SQL, params).first()
     except Exception as exc:  # noqa: BLE001 — fail CLOSED
         log.warning("runner-liveness: MicroVM read failed for task %s (%s) — UNKNOWN", task_id, exc)
@@ -362,7 +369,7 @@ def runner_verdict(task_id: str, session: Optional[Session] = None) -> RunnerSta
         # No slot carries this task: no runner to wait for, and no node to count peers on.
         return RunnerState(DEAD, None, 0, 0)
 
-    mine: Optional[tuple[str, Optional[float], Optional[float], Optional[float]]] = None
+    mine: Optional[tuple[str, Optional[float], Optional[float], Optional[float], bool]] = None
     dead_peers = 0
     judged_peers = 0
     wanted = int(task_id)
@@ -375,14 +382,15 @@ def runner_verdict(task_id: str, session: Optional[Session] = None) -> RunnerSta
             if verdict in (DEAD, ALIVE):
                 judged_peers += 1
         if row.task_id == wanted:
-            mine = (verdict, unknown_for, _secs(row.since_node_spoke), _secs(row.since_observed))
+            mine = (verdict, unknown_for, _secs(row.since_node_spoke), _secs(row.since_observed),
+                    row.agents_ok == "false" and row.launched_pane != "false")
     if mine is None:
         # Unreachable (the subquery and scan share one snapshot), kept as a floor. DEAD, not UNKNOWN: an
         # UNKNOWN with no age would make `_runner_held` hold forever.
         log.warning("runner-liveness: task %s resolved a node but not its own slot — treating as DEAD",
                     task_id)
         return RunnerState(DEAD, None, dead_peers, judged_peers)
-    return RunnerState(mine[0], mine[1], dead_peers, judged_peers, mine[2], mine[3])
+    return RunnerState(mine[0], mine[1], dead_peers, judged_peers, mine[2], mine[3], mine[4])
 
 
 def node_wide_runner_loss(task_id: str, session: Optional[Session] = None) -> bool:
@@ -405,76 +413,33 @@ def node_wide_runner_loss(task_id: str, session: Optional[Session] = None) -> bo
     return state.dead_peers >= NODE_WIDE_LOSS_SHARE * state.judged_peers
 
 
-# The task's held slot as the reclaim path reports it: whether its launch was ever sighted, and who ran it.
-_RUNNER_FACTS_SQL = text(
+# Whether the task's held slot's launch was acked but never sighted running.
+_LAUNCH_NEVER_SIGHTED_SQL = text(
     """
     SELECT (w.acked_at IS NOT NULL
-            AND (w.last_seen_live IS NULL OR w.last_seen_live <= w.acked_at)) AS never_sighted,
-           n.name AS node_name, n.id AS node_id, (n.org_id = t.org_id) AS own_node,
-           a.name AS account_name, t.runner_session_id,
-           w.dispatch_id, w.generation, COALESCE(w.acked_at, t.github_synced_at) AS launch_at,
-           pane.pane_log_written_at
+            AND (w.last_seen_live IS NULL OR w.last_seen_live <= w.acked_at)) AS never_sighted
       FROM worktrees w
-      JOIN nodes n ON n.id = w.node_id
-      LEFT JOIN accounts a ON a.id = w.leased_account_id
-      LEFT JOIN tasks t ON t.id = w.task_id
-      -- The session the incident's pane log is read from: the runner's own, else the task's newest. Pinned to
-      -- the task's org, as `routes/tasks/runner_settle._vanished_trace` reads it.
-      LEFT JOIN LATERAL (
-            SELECT s.pane_log_written_at
-              FROM sessions s
-             WHERE s.task_id = t.id AND s.org_id = t.org_id
-             ORDER BY (s.agent_session_id = t.runner_session_id) IS TRUE DESC, s.started_at DESC, s.id DESC
-             LIMIT 1
-      ) pane ON true
      WHERE w.task_id = :task_id AND w.state <> :free
      LIMIT 1
     """
 )
 
 
-class RunnerFacts(NamedTuple):
-    """What the reclaim path records about a lost runner, read BEFORE `end_attempt` clears the task's binding.
-    `never_sighted`: its launch was acked and the node never saw it running (`last_seen_live` never passed the
-    ack) — the `launch_failed` cause rather than `vanished`. An un-acked launch is not one: the node never
-    started it, which `tasks.charge_unannounced_launch` already ends as `launch_unannounced`.
-
-    `launch` is the slot's `"<dispatch_id> gen <generation>"`; `launch_at` that launch's ack, else the task's
-    latest transition stamp; `pane_log_written_at` the last write of the pane log the incident's session
-    carries. `own_node`: the node is the task's org's, so its name may ride a body that org reads."""
-
-    never_sighted: bool = False
-    node: str = ""
-    account: str = ""
-    session_id: str = ""
-    node_id: str = ""
-    own_node: bool = False
-    launch: str = ""
-    launch_at: Optional[datetime] = None
-    pane_log_written_at: Optional[datetime] = None
-
-
-def runner_facts(task_id: str, session: Session) -> RunnerFacts:
-    """`RunnerFacts` for the slot carrying TASK_ID, or the empty one (no slot, a MicroVM task, a failed read).
-    Best-effort evidence for an incident: never raises, and a failed read rolls back as `_read_node_slots` does."""
+def launch_never_sighted(task_id: str, session: Session) -> bool:
+    """True when TASK_ID's slot launch was acked and the node never saw it running (`last_seen_live` never passed
+    the ack) — the `launch_failed` cause rather than `vanished`. Read BEFORE `end_attempt` clears the binding. An
+    un-acked launch is not one: the node never started it, which `tasks.charge_unannounced_launch` already ends as
+    `launch_unannounced`. False when there is no slot (a MicroVM task) or the read fails; a failed read rolls back
+    as `_read_node_slots` does and never raises."""
     try:
         row = session.execute(
-            _RUNNER_FACTS_SQL, {"task_id": int(task_id), "free": slot_state.FREE}
+            _LAUNCH_NEVER_SIGHTED_SQL, {"task_id": int(task_id), "free": slot_state.FREE}
         ).first()
-    except Exception as exc:  # noqa: BLE001 — evidence only; the reclaim proceeds without it
-        log.warning("runner-liveness: runner-facts read failed for task %s (%s)", task_id, exc)
+    except Exception as exc:  # noqa: BLE001 — the reclaim proceeds, inferring `vanished`
+        log.warning("runner-liveness: launch-sighted read failed for task %s (%s)", task_id, exc)
         try:
             session.rollback()
         except Exception:  # noqa: BLE001 — nothing left to salvage
             pass
-        return RunnerFacts()
-    if row is None:
-        return RunnerFacts()
-    return RunnerFacts(
-        bool(row.never_sighted), row.node_name or "", row.account_name or "", row.runner_session_id or "",
-        node_id=str(row.node_id) if row.node_id is not None else "",
-        own_node=bool(row.own_node),
-        launch=f"{row.dispatch_id} gen {row.generation}" if row.dispatch_id else "",
-        launch_at=row.launch_at,
-        pane_log_written_at=row.pane_log_written_at,
-    )
+        return False
+    return bool(row and row.never_sighted)

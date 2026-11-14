@@ -1,0 +1,45 @@
+# n8n, over the hand-written `n8n` type (adopted, AS3: its fields and Test, GET /api/v1/workflows?limit=1 with
+# X-N8N-API-KEY, are unchanged). Facts confirmed at the vendor's own docs: API keys and the public REST API
+# https://docs.n8n.io/api/authentication/ ; https://docs.n8n.io/api/api-reference/
+# Its hosted MCP server takes its own sign-in or token, which this adopted type cannot hold: reached today as a
+# Custom MCP server (a limitation below); a card-level MCP block needs a second credential on one card.
+slug = "n8n"
+label = "n8n"
+category = "dev_tools"
+credential_type = "n8n"
+vendor_docs_url = "https://docs.n8n.io/api/authentication/"
+summary = "List, run and debug your n8n workflows and executions from agent work."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "base_url", label = "Base URL", kind = "url", required = true, placeholder = "https://YOUR-NAME.app.n8n.cloud", help = "Your n8n instance's address as you open it in the browser: https://your-name.app.n8n.cloud for n8n Cloud, or your self-hosted n8n's https address, with nothing after it" },
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "n8n > Settings > n8n API > Create an API key: name it Jaah, set an expiry (and scopes on Enterprise), select Save, then copy it - n8n shows it once" },
+]
+
+[docs]
+agent_uses = [
+  "List workflows and read a workflow's nodes and settings",
+  "Read executions and their errors to debug a failing automation",
+  "Activate or deactivate a workflow, or update it from a task",
+  "Manage tags, variables and credentials metadata through the n8n API",
+]
+prerequisites = [
+  "An n8n Cloud plan or self-hosted instance with the public API enabled (it is on by default; the free trial of n8n Cloud has no API)",
+  "An n8n account allowed to create API keys",
+]
+limitations = [
+  "n8n's hosted MCP server needs its own sign-in or token, which this secret does not hold: to give agents its tools, add a Custom MCP server secret with your instance's MCP Server URL (Settings > Instance-level MCP; it ends in /mcp-server/http) and its MCP token, and link it to the project",
+  "An API key acts as the user who created it, with that user's access to workflows",
+  "Self-hosted n8n must be reachable from the internet over https for Jaah's Test and agents",
+  "n8n's public API does not run a workflow on demand; trigger a webhook workflow instead",
+]
+troubleshooting = [
+  { symptom = "Test says the API key was rejected (401)", fix = "The key expired, was deleted or mistyped. Create a new key in Settings > n8n API and select Replace" },
+  { symptom = "Test cannot reach n8n or answers 404", fix = "Base URL is not your instance's root, or the public API is disabled (N8N_PUBLIC_API_DISABLED). Use the address you sign in at, with nothing after it" },
+  { symptom = "There is no n8n API item in Settings", fix = "Your plan has no API access (for example the Cloud trial). Upgrade, or use a self-hosted instance" },
+]
+faq = [
+  { q = "Can agents trigger a workflow", a = "Through a workflow's Webhook trigger URL, which agents can call. The n8n API itself manages workflows and executions" },
+  { q = "Does it work with self-hosted n8n", a = "Yes, when the instance is reachable over https from the internet" },
+]

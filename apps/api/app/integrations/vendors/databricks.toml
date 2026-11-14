@@ -1,0 +1,47 @@
+# Databricks: a workspace personal access token; the Test reads the token's own user (SCIM Me).
+slug = "databricks"
+label = "Databricks"
+category = "data"
+vendor_docs_url = "https://docs.databricks.com/aws/en/dev-tools/auth/pat"
+summary = "Let agents query your Databricks lakehouse and manage jobs and notebooks in a workspace."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "workspace_url", label = "Workspace URL", kind = "url", required = true, placeholder = "https://dbc-a1b2c3d4-e5f6.cloud.databricks.com", help = "Open your workspace in the browser and copy the address up to the first slash, for example https://dbc-a1b2c3d4-e5f6.cloud.databricks.com or https://adb-1234567890123456.7.azuredatabricks.net" },
+  { key = "token", label = "Personal access token", kind = "secret", required = true, help = "In the workspace, select your user name (top right) > Settings > Developer > Access tokens > Manage > Generate new token; set a comment and lifetime, then copy the token (it starts with dapi and is shown once)" },
+  { key = "warehouse_id", label = "SQL warehouse ID", kind = "text", required = false, placeholder = "1234567890abcdef", help = "SQL > SQL Warehouses > your warehouse > Connection details > HTTP path; the ID is the part after /sql/1.0/warehouses/" },
+]
+
+[test]
+method = "GET"
+path = "{workspace_url}/api/2.0/preview/scim/v2/Me"
+auth = { field = "token", header = "Authorization", prefix = "Bearer" }
+identity = [["userName"], ["displayName"]]
+
+[docs]
+agent_uses = [
+  "Run SQL on a SQL warehouse through the Statement Execution API to answer data questions",
+  "List catalogs, schemas and tables in Unity Catalog before writing a query or a pipeline change",
+  "Check the state of a job run and read its error when a nightly pipeline fails",
+  "Trigger an existing job after a code change has merged",
+]
+prerequisites = [
+  "A Databricks workspace where personal access tokens are enabled (an admin can turn them off under Settings > Advanced > Personal access tokens).",
+  "A user or service principal for agents, with the workspace permissions and Unity Catalog grants they need, and CAN USE on the SQL warehouse.",
+]
+limitations = [
+  "Jaah tests by reading the token's own user. That proves the token and workspace URL are right, not that it may use a given warehouse or table.",
+  "The Databricks SQL Statement Execution API (rather than a `SELECT 1`) is what agents use to query. It needs the SQL warehouse ID, so fill it in for SQL work.",
+  "Personal access tokens expire on the lifetime chosen when they were made (workspace admins may cap it). OAuth machine-to-machine sign-in is not offered here yet.",
+  "One secret reaches one workspace. Add a secret per workspace.",
+]
+troubleshooting = [
+  { symptom = "Test says Databricks rejected the personal access token (401 or 403)", fix = "Generate a new token: it may have expired, been revoked, or belong to a different workspace than the URL. An admin may also have disabled tokens for your user" },
+  { symptom = "Test says the workspace cannot be reached", fix = "Use the workspace's own address (such as dbc-a1b2c3d4-e5f6.cloud.databricks.com or adb-1234567890123456.7.azuredatabricks.net), not accounts.cloud.databricks.com. A workspace behind IP access lists must allow Jaah's address" },
+  { symptom = "A query fails with PERMISSION_DENIED on the warehouse", fix = "Give the token's user CAN USE on the SQL warehouse under SQL Warehouses > Permissions" },
+]
+faq = [
+  { q = "Should I use my own token?", a = "Prefer a service principal's token, so the access does not end when a person leaves and its grants can be kept narrow" },
+  { q = "Does it work on Azure and Google Cloud?", a = "Yes. Paste that workspace's URL; the API is the same on every cloud" },
+]

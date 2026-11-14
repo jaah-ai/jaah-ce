@@ -22,6 +22,7 @@ Per-vnode layout for token `t`, slot `k`:
   tmpfs          `/run/jaah-vn/<t>/` — the vnode's own copy of the host's `/run/jaah` subtree.
   config         `/etc/jaah-vn/<t>/{node.env,jaahd.env,resolv.conf}`.
   network        netns `vn<t>`; veth `vnh<t>` (host) <-> `vnp<t>` (ns) on a /31 of 198.51.100.0/24.
+  node VM        housing "vm" only: `<root>/nodevm/`, tap `jnv0` in the netns, unit `jaah-nodevm@<t>`.
 
 The unit files spell the same paths as text (`%i` = the token); a units test
 pins them against the functions below. Stdlib only, no import-time side effects (the boot rebuild imports
@@ -68,6 +69,9 @@ HOST_JAAHD_ENV = "/etc/jaah/jaahd.env"
 
 # ── the per-vnode trees ──────────────────────────────────────────────────────────────────────────────
 VN_ROOT = "/var/lib/jaah-vn"
+# The slice every vnode unit and vnode user's `user@` manager runs in (the packaged jaahvnodes.slice unit: the
+# memory ceiling that keeps the host's own agents out of a vnode-made OOM). The templates spell it as text.
+VNODES_SLICE = "jaahvnodes.slice"
 VN_RUN_ROOT = "/run/jaah-vn"
 VN_ETC_ROOT = "/etc/jaah-vn"
 NETNS_ROOT = "/run/netns"
@@ -365,7 +369,8 @@ def nodelinks_cache(v: Vnode) -> str:
 
 def nodelink_staging_root(v: Vnode) -> str:
     """`0700 root:root` — where the helper mounts each of the vnode's NodeLink access points before binding
-    it into the vnode tree (`nodelinks.py`); no vnode principal can even traverse to it."""
+    it into the vnode tree (`nodelinks.py`); no vnode principal can even traverse to it. A Whole-node VM's is
+    `0750 root:vn<t>-jaahd` instead: never bound, each is exported from here by its virtiofsd (`nodevm_fs.py`)."""
     return f"{NODELINK_STAGING_ROOT}/{_token(v)}"
 
 
@@ -385,8 +390,8 @@ def netns_path(v: Vnode) -> str:
 
 def netns_etc_dir(v: Vnode) -> str:
     """iproute2's per-netns `/etc` overrides — where a vnode's resolv.conf lived before it moved to
-    `resolv_conf`. No longer created; a leftover is removed at start and rebuild, so `/etc/netns` lists
-    no vnode and can be hidden from vnode units."""
+    `resolv_conf`. Never created: `/etc/netns` lists no vnode and is hidden from vnode units, and the
+    fence listing reports it absent (`verify_destroyed`'s `netns_etc`)."""
     return f"{NETNS_ETC_ROOT}/{netns_name(v)}"
 
 
@@ -467,6 +472,122 @@ def microvm_grants(v: Vnode) -> tuple[tuple[str, str], ...]:
     return ((MICROVM_VIRTIOFSD, f"u:{daemon_uid(v)}:rx"),)
 
 
+#: A Whole-node VM's size bounds, `{field: (min, max)}`: what the helper's wire accepts (`protocol.VM_BOUNDS`) and what
+#: `nodevm.py` re-checks its spec against. Here, stdlib-only, so the daemon's own import of `nodevm` never pulls the
+#: root helper's operations (and their POSIX-only imports) into a platform bundle.
+NODEVM_SIZE_BOUNDS = {"vcpus": (1, 512), "ram_mib": (512, 4_194_304), "disk_gib": (8, 65_536)}
+
+# ── the Whole-node VM (housing "vm") ───────────────────────────────────────────────────────────────────
+# A vnode housed in ONE long-lived Cloud Hypervisor VM (`nodevm.py`, `jaah-nodevm@`): the node's own jaahd and
+# every session run in the guest; the vnode's netns, veth, host table and tailscaled stay as for any vnode.
+HOUSING_HOST = "host"
+HOUSING_VM = "vm"
+HOUSINGS = (HOUSING_HOST, HOUSING_VM)
+# The public Ubuntu cloud image every node VM's disk is an overlay on, ROOT-owned and shared by every vnode
+# (`0755` dirs, `0644` image): never under `STATE_ROOT`, which `Store.save` keeps `0700`, since each vnode's
+# CH reads it as that vnode's daemon uid.
+NODEVM_ROOT = "/var/lib/jaah-nodevm"
+NODEVM_IMAGES = f"{NODEVM_ROOT}/images"
+# The guest's one NIC: a tap in the vnode's netns. The /30 is the SAME in every netns — each netns is its own
+# network, and the guest leaves it only masqueraded (`nft.render_namespace(forward=True)`) — inside
+# 198.18.0.0/15 (RFC 2544, never routed), clear of the per-session MicroVM taps' 198.19.N.0/30 and the
+# vnode link's TEST-NET-2.
+NODEVM_TAP = "jnv0"
+NODEVM_HOST_ADDR = "198.18.0.1"
+NODEVM_GUEST_ADDR = "198.18.0.2"
+NODEVM_PREFIX = 30
+# Locally administered (0x02 bit), so it collides with no vendor's; one per netns, so one constant.
+NODEVM_GUEST_MAC = "02:6a:61:61:68:02"
+# Link-local, the instance-metadata endpoint included: the guest's forwarded packets never reach it.
+IMDS_CIDR = "169.254.0.0/16"
+
+
+# The node VM dir's files: the disk (a qcow2 overlay on the shared cloud image, `0600 vn<t>-jaahd`); the NoCloud
+# CIDATA seed (`0600 vn<t>-jaahd`: its user-data carries the node token, so it is removed once the guest has
+# reported, `vnode.seed_done`); the spec `nodevm.py` builds CH's argv from (root `0644`, no secret).
+NODEVM_DISK = "disk.qcow2"
+NODEVM_SEED = "seed.img"
+NODEVM_SPEC = "spec.json"
+# The NodeLinks the guest is given (`nodevm_fs.py`): root `0644`, `{"nodelinks": [<id>, …]}` — the ones whose
+# virtiofsd runs, which `nodevm.py` cold-plugs at boot; a live change is hot-plugged.
+NODEVM_FS = "fs.json"
+# A virtio-fs tag holds at most 36 bytes: the prefix and a UUID's 32 hex digits. Twin:
+# `nodelink_mount.virtiofs_tag` (the guest's side; pinned equal by tests/test_nodevm_fs.py).
+NODEVM_FS_TAG_PREFIX = "nl-"
+_NODELINK_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+
+
+def nodelink_id(value: object) -> str:
+    """A NodeLink id as it arrives from a file (`fs.json`): a canonical lower-case UUID — else ValueError."""
+    if not isinstance(value, str) or not _NODELINK_ID.match(value):
+        raise ValueError("a NodeLink id is a canonical lower-case UUID")
+    return value
+
+
+def nodevm_fs_tag(nodelink_id: str) -> str:
+    """The virtio-fs tag — and the CH device id — NodeLink `nodelink_id` is exported to the guest under."""
+    return NODEVM_FS_TAG_PREFIX + nodelink_id.replace("-", "")
+
+
+def nodevm_dir_of(token: str) -> str:
+    """`nodevm_dir` by a unit's `%i` alone — what `nodevm.py run <token>` knows (no slot)."""
+    return f"{VN_ROOT}/{parse_token(token)}/nodevm"
+
+
+def nodevm_dir(v: Vnode) -> str:
+    """The node VM's own tree: `0700 vn<t>-jaahd` — its disk, seed, CH's api socket, serial and log files.
+    Under `vnode_root`, so `vnode.destroy` takes it with the vnode."""
+    return nodevm_dir_of(_token(v))
+
+
+def nodevm_disk(v: Vnode) -> str:
+    return f"{nodevm_dir(v)}/{NODEVM_DISK}"
+
+
+def nodevm_seed(v: Vnode) -> str:
+    return f"{nodevm_dir(v)}/{NODEVM_SEED}"
+
+
+def nodevm_spec(v: Vnode) -> str:
+    return f"{nodevm_dir(v)}/{NODEVM_SPEC}"
+
+
+def nodevm_fs(v: Vnode) -> str:
+    """The guest's copy (`nodevm.py` reads it at boot) — in a dir its daemon uid owns, so never read by root."""
+    return f"{nodevm_dir(v)}/{NODEVM_FS}"
+
+
+def nodevm_fs_record(v: Vnode) -> str:
+    """Root's own record of the same set, in the root-only staging dir: what `nodevm_fs.read_exported` reads."""
+    return f"{nodevm_staging(v)}/{NODEVM_FS}"
+
+
+def nodevm_fs_socket_of(vmdir: str, nodelink_id: str) -> str:
+    """NodeLink `nodelink_id`'s virtiofsd socket in a node VM dir — where CH's landlock already grants it. Spelled
+    by its id, as the export unit's `%i` spells it (`nodevm_fs.template_body`)."""
+    return f"{vmdir}/nl-{nodelink_id}.sock"
+
+
+NODEVM_FS_UNIT_PREFIX = "jaah-nodevm-fs-"
+
+
+def nodevm_fs_template(v: Vnode) -> str:
+    """The vnode's export template unit (`nodevm_fs.template_body`), written by the helper: one instance per NodeLink."""
+    return f"{SYSTEMD_ETC}/{NODEVM_FS_UNIT_PREFIX}{_token(v)}@.service"
+
+
+def nodevm_fs_unit(v: Vnode, nodelink_id: str) -> str:
+    """NodeLink `nodelink_id`'s virtiofsd for the vnode's VM — an instance of `nodevm_fs_template`."""
+    return f"{NODEVM_FS_UNIT_PREFIX}{_token(v)}@{nodelink_id}.service"
+
+
+def nodevm_staging(v: Vnode) -> str:
+    """`0700 root`: where the helper writes the disk and seed before renaming them into `nodevm_dir` — never
+    written in place in a directory the daemon uid owns, where it could plant a link for root to follow.
+    Under `vnode_root`, so the rename never crosses a filesystem."""
+    return f"{vnode_root(v)}/.nodevm-staging"
+
+
 # ── units ────────────────────────────────────────────────────────────────────────────────────────────
 
 def tailscaled_unit(v: Vnode) -> str:
@@ -513,6 +634,17 @@ def microvm_converge_unit(v: Vnode) -> str:
 def microvmd_unit(v: Vnode) -> str:
     """The vnode's MicroVM supervisor (`microvmd.py serve`), as its daemon user in its netns."""
     return f"jaah-microvmd@{_token(v)}.service"
+
+
+def nodevm_unit(v: Vnode) -> str:
+    """The vnode's node VM (`nodevm.py run`), as its daemon user in its netns — a Whole-node VM's one unit
+    besides its tailscaled."""
+    return f"jaah-nodevm@{_token(v)}.service"
+
+
+def vm_units(v: Vnode) -> tuple[str, ...]:
+    """`units` for a Whole-node VM: its tailscaled, then the VM — everything else runs in the guest."""
+    return tailscaled_unit(v), nodevm_unit(v)
 
 
 def units(v: Vnode) -> tuple[str, ...]:

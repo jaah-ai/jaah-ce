@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { isPageHidden } from './useHiddenDeferral'
+import { isPollingPaused, onPollingResumed } from '../lib/pollGate'
 
 /* A fixed-interval pass over an IMPERATIVE async that is not a query's refetch (a query polls through
    `useApiRead`'s `refetchInterval`): `fn` every `intervalMs`, none while `null`. `fn` is read at fire time (latest
@@ -8,9 +8,9 @@ import { isPageHidden } from './useHiddenDeferral'
    previous pass is still out is dropped, so a slow read never overlaps the next — and a pass that never
    settles holds the poll for good, so `fn` must always settle. A rejected pass is the caller's to report
    (each catches its own); here it only frees the next tick.
-   A HIDDEN TAB polls nothing, like React Query's `refetchInterval` (`useHiddenDeferral`): its ticks are
-   skipped, and ONE catch-up pass runs when the tab is shown again — only if a tick was skipped meanwhile. A
-   background tab on the queue re-read the whole fleet's queue every tick for nobody. */
+   A PAUSED PAGE polls nothing (`lib/pollGate.ts`: hidden, idle or rate-limited), like React Query's
+   `refetchInterval`: its ticks are skipped, and ONE catch-up pass runs when polling resumes — only if a tick was
+   skipped meanwhile. A background tab on the queue re-read the whole fleet's queue every tick for nobody. */
 export function usePoll(fn: () => unknown, intervalMs: number | null): void {
   const fnRef = useRef(fn)
   fnRef.current = fn
@@ -27,17 +27,15 @@ export function usePoll(fn: () => unknown, intervalMs: number | null): void {
       return true
     }
     const timer = setInterval(() => {
-      if (isPageHidden()) skipped = true
+      if (isPollingPaused()) skipped = true
       else if (pass()) skipped = false
     }, intervalMs)
-    const onVisibility = () => {
-      if (isPageHidden() || !skipped) return
-      if (pass()) skipped = false
-    }
-    document.addEventListener('visibilitychange', onVisibility)
+    const unsubscribe = onPollingResumed(() => {
+      if (skipped && pass()) skipped = false
+    })
     return () => {
       clearInterval(timer)
-      document.removeEventListener('visibilitychange', onVisibility)
+      unsubscribe()
     }
   }, [intervalMs])
 }

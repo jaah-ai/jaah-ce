@@ -1,16 +1,17 @@
-import type { JSX, ReactNode } from 'react'
+import { useState, type JSX, type ReactNode } from 'react'
 import Box from '@mui/material/Box'
-import { firstCodepoints } from '../lib/strings'
+import { initials } from '../lib/strings'
 import { Icon } from './icons'
 
 /* The vendor mark for a credential type — the one slug→mark table for every surface.
  * 1. Bundled inline `<svg>`, never fetched: no URL, no icon package, renders offline.
  * 2. Monochrome from `currentColor`: theme-correct without branches; no brand colours at 18px.
- * 3. Total: an unknown slug (the registry is the server's) gets the monogram.
+ * 3. Total: an unknown slug (the registry is the server's) gets the vendor's logo from the API when the caller has
+ *    its URL (`CredentialTypeSpec.logo_url`, the catalog's), else the monogram; a logo that fails to load monograms.
  * 4. `aria-hidden`; every consumer renders the type's label beside it.
  * Drawn: `github`, `github_app`, `gitlab`, `slack`, `jira`, `aws`, `google`, `anthropic_api_key`. The
  * rest monogram by design (no vendor, or marks that do not survive one colour at 18px). The eight are a
- * floor (`DRAWN_MARK_SLUGS`): a monogram-only build would pass every constraint above.
+ * floor (`credentialMarks.test.tsx` renders each): a monogram-only build would pass every constraint above.
  * Licensing: hand-authored simplifications, nominative use beside the vendor's name; no brand-kit files.
  * New mark: one `MARKS` entry, `0 0 24 24` viewBox, `currentColor` only; if it fails at 18px, omit it. */
 
@@ -128,31 +129,23 @@ const MARKS: Readonly<Record<string, () => JSX.Element>> = {
   ),
 }
 
-/**
- * A type's label → one or two upper-case monogram letters. From the label, never the slug (the UI shows
- * `type_label`). Two+ words: first and last initials; one word: first two letters. Capped after
- * upper-casing (a ligature can upper-case into two). `''` for a blank label.
- */
+/** A type's label → its monogram letters (`strings.initials`). From the label, never the slug (the UI shows
+ *  `type_label`). */
 export function credentialMonogram(label: string): string {
-  const words = label.trim().split(/\s+/).filter(word => word !== '')
-  if (words.length === 0) return ''
-  const letters =
-    words.length === 1
-      ? firstCodepoints(words[0], 2)
-      : `${firstCodepoints(words[0], 1)}${firstCodepoints(words[words.length - 1], 1)}`
-  return firstCodepoints(letters.toUpperCase(), 2)
+  return initials(label)
 }
 
 /* Fallback tile: outlined square holding the letters. No `lib/authorBadge.ts` hues — slugs are distinct,
    so colour would carry no fact. */
-function MonogramTile({ label }: { label: string }): JSX.Element {
+function MonogramTile({ label, size = CREDENTIAL_MARK_SIZE }: { label: string; size?: number }): JSX.Element {
   const letters = credentialMonogram(label)
+  const scale = size / CREDENTIAL_MARK_SIZE
   return (
     <Box
       aria-hidden="true"
       sx={{
-        width: CREDENTIAL_MARK_SIZE,
-        height: CREDENTIAL_MARK_SIZE,
+        width: size,
+        height: size,
         flexShrink: 0,
         display: 'flex',
         alignItems: 'center',
@@ -161,7 +154,7 @@ function MonogramTile({ label }: { label: string }): JSX.Element {
         border: '1px solid currentColor',
         boxSizing: 'border-box',
         /* Two letters fit inside the rule; negative tracking keeps the pair centred. */
-        fontSize: letters.length > 1 ? '9px' : '11px',
+        fontSize: `${Math.round((letters.length > 1 ? 9 : 11) * scale)}px`,
         fontWeight: 700,
         letterSpacing: '-0.03em',
         lineHeight: 1,
@@ -174,13 +167,46 @@ function MonogramTile({ label }: { label: string }): JSX.Element {
 }
 
 /**
- * A credential type's mark. Total: an unknown slug monograms. `label` is used only for the monogram;
- * pass the server's `type_label`.
+ * A catalog vendor's logo (`/api/integrations/logos/<slug>.svg`) at `size` px; no URL, or one that fails to load,
+ * draws the monogram in the same box — never a broken-image glyph. Decorative: the label is beside it.
  */
-export function credentialMark(slug: string, label: string): ReactNode {
-  const drawn = Object.prototype.hasOwnProperty.call(MARKS, slug) ? MARKS[slug] : undefined
-  return drawn ? drawn() : <MonogramTile label={label} />
+export function VendorLogo({ url, label, size = CREDENTIAL_MARK_SIZE, tile = false }: {
+  url: string | null | undefined
+  label: string
+  size?: number
+  /** On a light rounded tile: a brand logo is drawn for a light page, and a dark one vanishes on the dark theme. */
+  tile?: boolean
+}): JSX.Element {
+  // The URL that failed, not a flag: a new `url` gets its own try.
+  const [failed, setFailed] = useState<string | null>(null)
+  if (!url || failed === url) return <MonogramTile label={label} size={size} />
+  const img = (
+    <Box
+      component="img"
+      src={url}
+      alt=""
+      aria-hidden="true"
+      loading="lazy"
+      onError={() => setFailed(url)}
+      data-testid="vendor-logo"
+      sx={{ width: size, height: size, flexShrink: 0, display: 'block', objectFit: 'contain' }}
+    />
+  )
+  if (!tile) return img
+  const pad = Math.round(size * 0.2)
+  return (
+    <Box sx={{ p: `${pad}px`, borderRadius: `${pad}px`, bgcolor: '#fff', flexShrink: 0, display: 'flex', boxShadow: 1 }}>
+      {img}
+    </Box>
+  )
 }
 
-/** Slugs with a drawn mark, pinned by a test so one cannot drop silently. */
-export const DRAWN_MARK_SLUGS: readonly string[] = Object.keys(MARKS)
+/**
+ * A credential type's mark: the drawn glyph, else the vendor's logo when `logoUrl` is given, else the monogram.
+ * `label` is used only for the monogram; pass the server's `type_label`.
+ */
+export function credentialMark(slug: string, label: string, logoUrl?: string | null): ReactNode {
+  const drawn = Object.prototype.hasOwnProperty.call(MARKS, slug) ? MARKS[slug] : undefined
+  if (drawn) return drawn()
+  return logoUrl ? <VendorLogo url={logoUrl} label={label} /> : <MonogramTile label={label} />
+}

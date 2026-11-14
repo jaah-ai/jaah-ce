@@ -1,0 +1,44 @@
+# Argo CD: the API token a pipeline stage's Argo CD deploy target syncs with.
+# Facts confirmed at https://argo-cd.readthedocs.io/en/stable/user-guide/commands/argocd_account_generate-token/ and
+# https://argo-cd.readthedocs.io/en/stable/developer-guide/api-docs/ (Bearer token on /api/v1). The server address
+# lives on the stage's target, not here, so the Test checks the token's shape only (a JWT).
+slug = "argocd"
+label = "Argo CD"
+category = "dev_tools"
+vendor_docs_url = "https://argo-cd.readthedocs.io/en/stable/user-guide/commands/argocd_account_generate-token/"
+summary = "Lets a pipeline stage deploy by syncing an Argo CD application to the change's commit."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "token", label = "API token", kind = "secret", required = true, help = "Give an Argo CD account the apiKey capability in argocd-cm and an RBAC role that may get and sync the application, then run argocd account generate-token with that account, or open Settings > Accounts, select the account, then Tokens > Generate New in the Argo CD UI, and copy the token" },
+]
+
+[test]
+kind = "format"
+patterns = { token = "[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+" }
+
+[docs]
+agent_uses = [
+  "Sync a stage's Argo CD application to the commit that just landed on the stage's branch",
+  "Wait until Argo CD reports the application synced at that commit and Healthy, then mark the stage arrived",
+  "Read the application's external URL as the stage's address",
+]
+prerequisites = [
+  "An Argo CD server reachable over https from the internet",
+  "An Argo CD account with the apiKey capability and permission to get and sync the stage's application",
+  "A deploy target set to Argo CD on the stage in Settings > Pipeline, naming the server, the application and this secret",
+]
+limitations = [
+  "An Argo CD server reachable only on a private network cannot be used: use a script deploy target instead",
+  "The Test checks the token's shape only; the first deploy is the live check",
+  "Jaah waits up to 60 minutes for the application to report Healthy at the commit",
+]
+troubleshooting = [
+  { symptom = "The deploy fails with Argo CD refused the sync: HTTP 401", fix = "The token expired or was revoked. Generate a new one for the account and select Replace on the secret" },
+  { symptom = "The deploy fails with Argo CD refused the sync: HTTP 403", fix = "The account's RBAC role may not sync this application. Grant it applications, sync and get on the application's project" },
+  { symptom = "The deploy fails with This address is not public", fix = "The Argo CD server resolves to a private address. Expose it over https, or use a script deploy target that runs argocd app sync from the node" },
+]
+faq = [
+  { q = "Does Jaah change the application's settings", a = "No. It asks Argo CD to sync the application to one commit and reads its status; nothing else is changed" },
+]

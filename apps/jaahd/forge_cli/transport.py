@@ -183,11 +183,16 @@ class Client:
             where = self.repo or self.host
             fix = (f"no {self.label} credential of the task starter's can write to it: {self._write_problem}"
                    if self._write_problem else "a person must grant it access or reconnect it")
-            raise CredentialRefused(
+            refused = CredentialRefused(
                 f"{self.label} refused this login for {where} ({method} {_short(path)}: HTTP {resp.status}: "
                 f"{' '.join(message.split())[:FORGE_ERROR_CAP]}) — the task starter's {self.label} connection "
-                f"cannot act on {where}; {fix}")
-        raise ForgeError(f"{self.label} {method} {_short(path)}: HTTP {resp.status}: {message}")
+                f"cannot act on {where}; {fix}", status=resp.status)
+            refused.detail = message
+            raise refused
+        error = ForgeError(f"{self.label} {method} {_short(path)}: HTTP {resp.status}: {message}", status=resp.status,
+                           rate_limited=_rate_limited(resp, message))
+        error.detail = message
+        raise error
 
     def json(self, method: str, path: str, **kwargs):
         resp = self.raw(method, path, **kwargs)
@@ -213,7 +218,13 @@ def _refuses_the_login(method: str, resp: Response, message: str) -> bool:
         return True
     if resp.status != 403 or method == "GET":
         return False
-    return resp.headers.get("x-ratelimit-remaining") != "0" and "rate limit" not in message.lower()
+    return not _rate_limited(resp, message)
+
+
+def _rate_limited(resp: Response, message: str) -> bool:
+    """A 403/429 that is the forge's rate limit (GitHub's primary or secondary one), not a refusal."""
+    return resp.status == 429 or (resp.status == 403 and (resp.headers.get("x-ratelimit-remaining") == "0"
+                                                          or "rate limit" in message.lower()))
 
 
 def _short(path: str) -> str:

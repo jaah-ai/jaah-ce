@@ -61,12 +61,12 @@ NOTIFICATION_EVENT_POLICY: dict = {
     "ask-user-question": {"enabled": True},
 }
 
-# Mirrors the two Claude MCP plugins (`plugin_repair.MCP_PLUGINS`): context7@claude-plugins-official is an
-# http server with an optional CONTEXT7_API_KEY bearer; playwright is `npx @playwright/mcp@latest`.
+# Mirrors the Claude playwright plugin (`plugin_repair.MCP_PLUGINS`): `npx @playwright/mcp@latest`.
 COMPANION_MCP_SERVERS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("context7", ("--url", "https://mcp.context7.com/mcp", "--bearer-token-env-var", "CONTEXT7_API_KEY")),
     ("playwright", ("--", "npx", "@playwright/mcp@latest")),
 )
+# Codex's side of `plugin_repair.RETIRED_PLUGINS`: removed from config.toml wherever still registered.
+RETIRED_COMPANION_MCP: tuple[str, ...] = ("context7",)
 
 _NPM_TIMEOUT_S = 600.0   # two cold pinned installs (pack + `npm ci`); it never waits on the prefix lock
 _SETUP_TIMEOUT_S = 120.0  # measured ~1s; generous for a first run
@@ -158,11 +158,21 @@ def companion_mcp_argvs(binary: str = "codex") -> list[list[str]]:
 
 
 def register_companion_mcp(config_dir: str, run, *, binary: str = "codex") -> dict:
-    """`codex mcp add` each companion server into `config_dir`'s config.toml.
-    `{"registered": [names], "failed": {name: stderr tail}}`; never raises."""
+    """`codex mcp add` each companion server into `config_dir`'s config.toml, and `codex mcp remove` each
+    `RETIRED_COMPANION_MCP` one `codex mcp get` still finds.
+    `{"registered": [names], "removed": [names], "failed": {name: stderr tail}}`; never raises."""
     registered: list[str] = []
+    removed: list[str] = []
     failed: dict[str, str] = {}
     env = _env_for(config_dir)
+    for name in RETIRED_COMPANION_MCP:
+        if _call(run, [binary, "mcp", "get", name], env=env, timeout=_MCP_TIMEOUT_S).get("exit_code") != 0:
+            continue
+        res = _call(run, [binary, "mcp", "remove", name], env=env, timeout=_MCP_TIMEOUT_S)
+        if res.get("exit_code") == 0:
+            removed.append(name)
+        else:
+            failed[name] = _tail(res.get("stderr")) or f"exit {res.get('exit_code')}"
     for argv in companion_mcp_argvs(binary):
         name = argv[3]
         res = _call(run, argv, env=env, timeout=_MCP_TIMEOUT_S)
@@ -170,7 +180,7 @@ def register_companion_mcp(config_dir: str, run, *, binary: str = "codex") -> di
             registered.append(name)
         else:
             failed[name] = _tail(res.get("stderr")) or f"exit {res.get('exit_code')}"
-    return {"registered": registered, "failed": failed}
+    return {"registered": registered, "removed": removed, "failed": failed}
 
 
 # ── hooks.json (pure; the adapter owns the file) ──────────────────────────────────────────────────

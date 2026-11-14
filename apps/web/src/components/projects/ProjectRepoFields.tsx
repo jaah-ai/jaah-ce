@@ -1,20 +1,20 @@
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import { type ReactNode, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { OrgRef } from '../../types'
-import FieldRow from '../../ui/FieldRow'
 import { type GitRepo } from '../../ui/RepoUrlLookup'
-import ProjectReposTable, { ROW_ACTION_SX, RepoRowFields, type RepoErrorFields, withoutFieldErrors } from './ProjectReposTable'
+import ProjectRepoLine from './ProjectRepoLine'
+import { ROW_ACTION_SX, RepoRowFields, type RepoErrorFields, withoutFieldErrors } from './repoEditing'
 import { blankRepoFields, newRepoDraft, repoName, type ProjectFormState, type RepoDraft, type RepoRowErrors } from './projectForm'
 
-/* The repository fields — the Repositories table (`ProjectReposTable`) — shared by the create wizard's Repository step
- * and the edit page's General tab. No row with a URL is a project with no repository (`projectForm.ts::formHasRepo`).
- * The props are where the two differ. `single` (the wizard): while there is one repository, its fields stand bare —
- * no table, no Done/Cancel (Next commits them) — and "Add another repository" opens the table. With `canCreate`,
+/* The repository fields of the create wizard's Repository step: the Repository line (`ProjectRepoLine.tsx`, the edit
+ * page's too). No row with a URL is a project with no repository (`projectForm.ts::formHasRepo`).
+ * `single` (the wizard): while there is one repository, its fields stand bare — no line, no Done/Cancel (Next commits
+ * them) — and "Add another repository" opens the line. With `canCreate`,
  * any new row, the first or an added one, may be "Create a new repository" (`RepoRowFields`). */
 export default function ProjectRepoFields({
   form, patch, repoErrors, onRepoErrorsChange, primaryBranchLocked, storedBranch,
-  flipLocked = false, nameCell, nameFromRepo, single = false, initEmpty = false, canCreate = false, org = null,
+  nameFromRepo, single = false, initEmpty = false, canCreate = false, org = null,
 }: {
   form: ProjectFormState
   patch: (next: Partial<ProjectFormState>) => void
@@ -23,16 +23,12 @@ export default function ProjectRepoFields({
   onRepoErrorsChange: (next: RepoRowErrors) => void
   /** The viewer may not author governance, so the primary's branch (the integration branch) stays as stored. */
   primaryBranchLocked: boolean
-  /** The project's stored integration branch (`ProjectReposTable.storedBranch`). */
+  /** The project's stored integration branch (`useRepoEditing`). */
   storedBranch: string
-  /** The viewer may not connect the first repository or remove the last (`ProjectReposTable.flipLocked`). */
-  flipLocked?: boolean
-  /* A cell on its own row before the table (the edit page's Name). */
-  nameCell?: ReactNode
   /* Picking a listed repo, or typing its URL, for the primary names the project after it (the create wizard) — while
      Name is empty, or still the name an earlier pick gave it; a typed Name is never replaced. */
   nameFromRepo?: boolean
-  /* One repository shows as bare fields, not a table (the create wizard). */
+  /* One repository shows as bare fields, not the line (the create wizard). */
   single?: boolean
   /* Create or Save initializes an empty repository (`RepoRowFields.initEmpty`). */
   initEmpty?: boolean
@@ -70,7 +66,6 @@ export default function ProjectRepoFields({
     }
     return (
       <Box data-testid="project-repo-single">
-        {nameCell && <FieldRow rowGap="0.75rem">{nameCell}</FieldRow>}
         <RepoRowFields
           row={row}
           index={0}
@@ -82,7 +77,9 @@ export default function ProjectRepoFields({
           canCreate={canCreate}
           onNewName={name => newName(name, row)}
           org={org}
-          /* Only once the row is whole: the table opens a filled row closed, and a closed row must not hide a blank field. */
+          // The wizard's bare row stands in a one-column form: its URL is as wide as the fields around it.
+          fill
+          /* Only once the row is whole: the line opens a filled row closed, and a closed row must not hide a blank field. */
           actions={blankRepoFields([row])[row.key] === undefined && (
             <Button
               type="button"
@@ -91,7 +88,7 @@ export default function ProjectRepoFields({
               id="project-repo-add"
               data-testid="project-repo-add"
               onClick={() => {
-                patch({ repos: [...repos, newRepoDraft(false)] })
+                patch({ repos: [...repos, newRepoDraft(false, row)] })
                 focusField('project-repo-1-url')
               }}
               sx={ROW_ACTION_SX}
@@ -103,29 +100,22 @@ export default function ProjectRepoFields({
       </Box>
     )
   }
+  if (repos === null) return null
   return (
-    <>
-      {nameCell && <FieldRow rowGap="0.75rem">{nameCell}</FieldRow>}
-      {/* `mb`: the table ends flush, so the field after it (the edit page's Default agent) needs the form's row gap. */}
-      {form.repos !== null && (
-        <Box sx={{ mb: 1.5 }}>
-          <ProjectReposTable
-            repos={form.repos}
-            onChange={repos => patch({ repos })}
-            errors={repoErrors}
-            onErrorsChange={onRepoErrorsChange}
-            primaryBranchLocked={primaryBranchLocked}
-            storedBranch={storedBranch}
-            flipLocked={flipLocked}
-            onPick={pickRepo}
-            initEmpty={initEmpty}
-            canCreate={canCreate}
-            onNewName={newName}
-            org={org}
-          />
-        </Box>
-      )}
-    </>
+    <ProjectRepoLine
+      repos={repos}
+      onChange={next => patch({ repos: next })}
+      errors={repoErrors}
+      onErrorsChange={onRepoErrorsChange}
+      primaryBranchLocked={primaryBranchLocked}
+      storedBranch={storedBranch}
+      onPick={pickRepo}
+      initEmpty={initEmpty}
+      canCreate={canCreate}
+      onNewName={newName}
+      org={org}
+      projectPolicy={{ branch_prefix: form.branch_prefix, push_enabled: form.push_enabled }}
+    />
   )
 }
 

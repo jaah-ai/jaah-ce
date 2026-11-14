@@ -359,7 +359,8 @@ def install(prefix: Path, names: list[str], *, npm: str = "npm", path: Path | No
     install_specs(names, path)  # an unreadable table, or an unpinned name not marked `--unpinned`, refuses
     prefix.mkdir(parents=True, exist_ok=True)
     done: list[str] = []
-    with _prefix_lock(prefix, wait=wait):
+    with _install_lock(prefix / NPM_LOCK_FILE, what="prefix lock", wait=wait,
+                       busy=f"{prefix}: another installer holds {NPM_LOCK_FILE}"):
         _recover_stages(prefix / "lib" / "node_modules")
         install_specs(names, path)  # re-read under the lock (a package upgrade may have landed meanwhile)
         pins = load_npm(path)
@@ -380,26 +381,41 @@ def install(prefix: Path, names: list[str], *, npm: str = "npm", path: Path | No
     return done
 
 
+def _open_lock_file(path: Path) -> int:
+    """`path` opened read-only (flock needs no write: these locks live on local disks, `/run/lock` and the account's
+    own prefix, never NFS), created 0644 when absent; a symlink planted there is refused where the platform has
+    O_NOFOLLOW (Windows has neither it nor O_CLOEXEC, and the open must not die of an AttributeError)."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        return os.open(path, flags)
+    except FileNotFoundError:
+        try:
+            return os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:  # another installer created it first: theirs is as good
+            return os.open(path, flags)
+
+
 @contextlib.contextmanager
-def _prefix_lock(prefix: Path, *, wait: bool = True):
-    """`prefix/.jaah-npm.lock`, LOCK_EX. A prefix that cannot be locked (no flock on this platform or
-    filesystem, a symlinked lock file) installs unlocked and says so: npm's own install lock is the fallback."""
+def _install_lock(path: Path, *, what: str, wait: bool = True, busy: str = ""):
+    """`path`, LOCK_EX — waited for, or with `wait` False refused at once as `PrefixBusy(busy)`. A lock that cannot
+    be taken (no flock on this platform or filesystem, a symlink planted at `path`) installs unlocked and says so:
+    the prefix lock falls back on npm's own install lock, the host lock keeps its headroom check and loses only
+    the cross-user race guard."""
     fd = None
     try:
         import fcntl
 
-        # No O_NOFOLLOW where the platform has none (Windows): the open must not die of an AttributeError.
-        fd = os.open(prefix / NPM_LOCK_FILE, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        fd = _open_lock_file(path)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(fd)
-            raise PrefixBusy(f"{prefix}: another installer holds {NPM_LOCK_FILE}") from None
+            raise PrefixBusy(busy) from None
     except (ImportError, OSError) as exc:
         if fd is not None:
             os.close(fd)
         fd = None
-        print(f"runner_cli_pins: installing without the prefix lock ({exc})", file=sys.stderr)
+        print(f"runner_cli_pins: installing without the {what} ({exc})", file=sys.stderr)
     try:
         yield
     finally:
@@ -440,7 +456,7 @@ def _fetch_verified(pin: NpmPin, npm: str, stage: Path, patches: list[bytes] | N
     if len(tops) != 1 or not (tops[0] / "package.json").is_file():
         raise InstallError(f"{pin.spec}: the tarball holds no single package directory")
     package = tops[0]
-    for name, patch in zip(pin.patches, read_patches(pin) if patches is None else patches):
+    for name, patch in zip(pin.patches, read_patches(pin) if patches is None else patches, strict=False):
         apply_patch(package, patch, f"{pin.spec}: {name}")
     # The lock covers what a dependency install resolves, so devDependencies leave package.json too: `npm
     # ci` then finds the two in sync. A vendor's own shrinkwrap would outrank the lock, so it goes.
@@ -727,31 +743,6 @@ def agy_acp_stale(home: Path, pin: AgyAcpPin) -> bool:
                 and _file_sha256(build / AGY_ACP_MEMBERS[0]) == pin.bin_sha256)
 
 
-@contextlib.contextmanager
-def _host_lock(path: Path):
-    """`path`, LOCK_EX, waited for. One that cannot be taken (no `/run/lock`, a symlink planted there) installs
-    unlocked and says so: the headroom check still runs, only the cross-user race is unguarded."""
-    fd = None
-    try:
-        import fcntl
-
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        except FileNotFoundError:
-            fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-    except (ImportError, OSError) as exc:
-        if fd is not None:
-            os.close(fd)
-        fd = None
-        print(f"runner_cli_pins: installing without the host install lock ({exc})", file=sys.stderr)
-    try:
-        yield
-    finally:
-        if fd is not None:
-            os.close(fd)
-
-
 def agy_acp_install(home: Path, pin: AgyAcpPin, *, curl: str = "curl") -> bool:
     """Install `pin` under `home`; False when it is already there. Raises InstallError naming what failed.
 
@@ -763,7 +754,7 @@ def agy_acp_install(home: Path, pin: AgyAcpPin, *, curl: str = "curl") -> bool:
     swept first, then the install refuses without `AGY_ACP_MIN_FREE` free under `home`."""
     if not agy_acp_stale(home, pin):
         return False
-    with _host_lock(AGY_ACP_HOST_LOCK):
+    with _install_lock(AGY_ACP_HOST_LOCK, what="host install lock"):
         # Again under the lock: an install that waited behind another for this home finds it done.
         return agy_acp_stale(home, pin) and _agy_acp_install_locked(home, pin, curl=curl)
 

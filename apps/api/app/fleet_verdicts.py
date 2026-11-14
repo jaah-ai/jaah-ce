@@ -16,9 +16,11 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
-from sqlalchemy import and_, delete, func, or_, select, text, update
+from sqlalchemy import and_, delete, func, literal_column, or_, select, text, update
 
 from app import agent_providers, intent_rail, project_identity, secret_redact
+from app.clock import capped_doubling
+from app.entity_shape import iso_or_none
 from app.models.nodes import Node
 from app.models.projects import Project
 from app.models.worktrees import SlotIntent
@@ -47,7 +49,7 @@ CONSOLE_NOT_ATTACHED = "not_attached"
 # retired; `release_slot` carrying the hold's `session_id` is the one ending verb, and
 # `purge_unexecutable_intents` arm 2 disposes of orphaned rows.
 VERB_RESET_TO_BASE = "reset_to_base"
-# Take the slot and launch a runner: account dir, port band, base, task, and the lease generation that
+# Take the slot and launch a runner: account dir, base, task, and the lease generation that
 # fences the ack.
 VERB_LEASE_SLOT = "lease_slot"
 # End a hold the CP has already freed; the node tears the session down and catches its record up. The
@@ -85,24 +87,32 @@ VERB_ERASE_TREE = "erase_tree"
 # session alone (`apps/jaahd/reconcile/enact_signal.py::_enact_runtime_control`). Minted only by
 # `app/routes/console_runtime.py::post_console_runtime` (`build_runtime_control_intent`).
 VERB_RUNTIME_CONTROL = "runtime_control"
+# Switch a WORKING runner's model in place (`/model` in a TUI, an ACP `set_model` control), so an operator's model
+# edit reaches the run that is already going; the payload is `{task_id, session_id, model}`, the model already
+# resolved to the concrete id for the run's provider. Executor: `apps/jaahd/reconcile/enact_signal.py::_enact_switch_model`.
+# Minted only by `app/live_task_edits.py` (`build_switch_model_intent`).
+VERB_SWITCH_MODEL = "switch_model"
+# The detail a node leads with when it retires a `switch_model` `done` without switching (the node twin:
+# `apps/jaahd/reconcile/vocab.py::NOT_SWITCHED_PREFIX`): the runner still runs its old model, so no view is stamped.
+NOT_SWITCHED_PREFIX = "not switched: "
 
 SLOT_INTENT_VERBS = (
     VERB_RESET_TO_BASE, VERB_LEASE_SLOT, VERB_RELEASE_SLOT,
     VERB_KILL_RUNNER, VERB_STOP_STACK, VERB_DELIVER_ANSWER, VERB_DELIVER_MESSAGE, VERB_DESTROY_SLOT,
-    VERB_ERASE_TREE, VERB_RUNTIME_CONTROL,
+    VERB_ERASE_TREE, VERB_RUNTIME_CONTROL, VERB_SWITCH_MODEL,
 )
 
 # The verbs whose still-pending predecessors on the same slot a new mint retires, applied by
 # `issue_intents` before its insert. Invariant: clearing a precondition produces at most one launch.
 # `deliver_answer` is excluded: nothing re-mints a superseded human answer. `deliver_message` is
 # included: a newer report for the slot's runner makes a still-pending older one stale (it is unstamped, so the
-# hazard below cannot apply). Hazard: a duplicate
+# hazard below cannot apply); `switch_model` likewise — only the newest model edit is owed. Hazard: a duplicate
 # on `uq_slot_intents_slot_verb_observed_at` is swallowed, so re-minting a stamping verb on an unchanged
 # observation supersedes and inserts nothing. Unstamped mints cannot collide; `stop_stack` relies on
 # `app.idle_stacks.stop_idle_stacks`' pending set. A new stamping verb here needs its own suppression.
 SUPERSEDING_VERBS = frozenset({
     VERB_LEASE_SLOT, VERB_KILL_RUNNER, VERB_RELEASE_SLOT, VERB_STOP_STACK, VERB_RESET_TO_BASE,
-    VERB_DESTROY_SLOT, VERB_DELIVER_MESSAGE,
+    VERB_DESTROY_SLOT, VERB_DELIVER_MESSAGE, VERB_SWITCH_MODEL,
 })
 
 # Verbs whose payload must carry a composed `prompt_bundle`: minted with one or not at all
@@ -123,6 +133,10 @@ OUTCOME_FAILED = "failed"
 # The loop-breaker: the node has no executor for this verb. Retires the intent though nothing was
 # enacted; the CP must read it as "still something to do about this slot".
 OUTCOME_UNSUPPORTED_VERB = "unsupported_verb"
+# The slot's clone at lease was refused (auth, not found): no runner launched, and re-serving the same order
+# clones under the same login again. Retires the intent and ends the task's attempt
+# (`routes/agent/slot_intents.py::_end_attempt_on_clone_refusal`); never a launch.
+OUTCOME_CLONE_REFUSED = "clone_refused"
 # ── The two CP-AUTHORED outcomes ────────────────────────────────────────────────────────────
 # Authored by the CP about a row the node never finished with; only the issuer can retire a refusal.
 # Members of `SLOT_INTENT_OUTCOMES`; the ack route validates against `NODE_AUTHORED_OUTCOMES`, which is
@@ -136,17 +150,18 @@ OUTCOME_PARKED = "parked"
 
 SLOT_INTENT_RETIRING_OUTCOMES = (
     OUTCOME_DONE, OUTCOME_ACCEPTED, OUTCOME_UNSUPPORTED_VERB, OUTCOME_SUPERSEDED, OUTCOME_PARKED,
+    OUTCOME_CLONE_REFUSED,
 )
 # The column's full vocabulary, node- and CP-authored, which the node's drift test compares against.
 SLOT_INTENT_OUTCOMES = (
     OUTCOME_DONE, OUTCOME_ACCEPTED, OUTCOME_REFUSED_STALE, OUTCOME_REFUSED_PRECONDITION, OUTCOME_FAILED,
-    OUTCOME_UNSUPPORTED_VERB, OUTCOME_SUPERSEDED, OUTCOME_PARKED,
+    OUTCOME_UNSUPPORTED_VERB, OUTCOME_SUPERSEDED, OUTCOME_PARKED, OUTCOME_CLONE_REFUSED,
 )
 # What an ack may say: strictly narrower, so the CP-authored outcomes stay evidence of the CP's own
 # supersede/budget logic rather than something a node could self-assert.
 NODE_AUTHORED_OUTCOMES = (
     OUTCOME_DONE, OUTCOME_ACCEPTED, OUTCOME_REFUSED_STALE, OUTCOME_REFUSED_PRECONDITION, OUTCOME_FAILED,
-    OUTCOME_UNSUPPORTED_VERB,
+    OUTCOME_UNSUPPORTED_VERB, OUTCOME_CLONE_REFUSED,
 )
 
 # ── The retry bound on a row the node keeps refusing ───────────────────────────────────────────────────
@@ -191,9 +206,7 @@ def refusal_backoff_secs(refusals: int) -> float:
     1-based: 1→5s, 2→10s, 3→20s, 4→40s. Zero or less is a caller bug and collapses to the base rather than
     returning 0 and hot-looping.
     """
-    if refusals <= 1:
-        return REFUSAL_BACKOFF_BASE_SECS
-    return min(REFUSAL_BACKOFF_BASE_SECS * (2 ** (refusals - 1)), REFUSAL_BACKOFF_CAP_SECS)
+    return capped_doubling(refusals - 1, REFUSAL_BACKOFF_BASE_SECS, REFUSAL_BACKOFF_CAP_SECS)
 
 
 # ── What of a node's refusal prose may reach a TENANT-VISIBLE surface ─────────────────────────────────
@@ -341,11 +354,9 @@ def build_lease_intent(
     generation: int,
     dispatch_id: str,
     config_dir: Optional[str] = None,
-    securestorage_dir: Optional[str] = None,
     api_key_account: str = "",
     provider: str = agent_providers.DEFAULT_PROVIDER,
     git_author: Optional[dict[str, str]] = None,
-    ports: Optional[dict[str, int]] = None,
     prompt: Optional[dict[str, Any]] = None,
     env_vars: Optional["SlotEnv"] = None,
     resume: bool = False,
@@ -356,18 +367,20 @@ def build_lease_intent(
     launch: Optional[dict[str, Any]] = None,
     guard: Optional[dict[str, Any]] = None,
     runtime: str = "legacy",
-    handoff: Optional[dict[str, Any]] = None,
+    blind_apply: Optional[dict[str, Any]] = None,
+    shadow: bool = False,
+    mcp_connections: Optional[list[dict[str, str]]] = None,
 ) -> dict[str, Any]:
     """The `lease_slot` intent: every decision the node used to make for one dispatch, in one row.
 
-    Fields: `config_dir` (account pick), `ports` (the slot's port band; the node keeps `apply_port_band`), `base`
+    Fields: `config_dir` (account pick), `ports` (always `{}`: the node picks slot ports; spelled only because an
+    older jaahd refuses a lease without it, removed with the retired column's drop), `base`
     (`integration_branch`), `generation`/`dispatch_id` (fence the ack), `prompt_bundle` (composed at issue
-    time). No branch: the runner creates its own `{branch_prefix}fleet/task-<id>`.
+    time). No branch: the runner creates its own task branch (`app/task_branch.py`).
 
-    `securestorage_dir`: a shared account's credential store (`CLAUDE_SECURESTORAGE_CONFIG_DIR`), independent
-    of `config_dir`. `api_key_account`: an account slug, never the key; the node fetches the secret over its
-    own socket (`app/account_auth.py::node_credential_name`). Both always spelled (`None`/`""` included):
-    `apps/jaahd` ships independently. `resume`: the tree holds this task's previous attempt; do
+    `api_key_account`: an account slug, never the key; the node fetches the secret over its own socket
+    (`app/account_auth.py::NODE_CREDENTIAL_PREFIX`), always spelled (`""` included): `apps/jaahd` ships
+    independently. Where an OAuth account's token is, is the node's to resolve (`apps/jaahd/shared_storage.py`). `resume`: the tree holds this task's previous attempt; do
     not reset it. `env_vars` (`_env_vars_payload`) is the one key carrying plaintext secrets: scrubbed on ack
     and by purge arm 5, never logged, never on `routes/nodes/intents.py::IntentRow`. `memory`: the project-memory
     ids for an ON task (`project_memory/select.py::lease_memory`, §4.4) — never unit text. `launch`: an SDK
@@ -375,9 +388,10 @@ def build_lease_intent(
     model dispatch's intent byte-for-byte what it was. `guard`: `{"project_id"}` when the Architectural Guard
     is available for the project's org (`governance/guard_runtime.py::lease_stanza`), else None. `runtime`: `acp` or
     `legacy`, the operator's runtime switch resolved for this dispatch's account (`app/acp_runtime.py`).
-    `handoff`: `{"to", "native_session_ref", "from_session_id"}` on a console view switch's resume lease
-    (`routes/console_runtime.py::post_console_handoff`): the node closes the old front, then resumes the engine's
-    own session on the other one. None on every other dispatch.
+    `shadow`: the task is a benchmark shadow (`app/outcome_ledger/benchmark.py`); the node exports
+    `JAAH_TASK_SHADOW=1`, which the PR guard reads to deny merging, readying or auto-merging its PR.
+    `mcp_connections`: the task's linked remote MCP servers (`routes/fleet.py::McpConnectionOut`, no secret); the
+    node adds one bridged server per entry (`apps/jaahd/reconcile/enact_launch.py`).
     """
     return build_slot_intent(
         VERB_LEASE_SLOT, project_id, project, number,
@@ -393,8 +407,7 @@ def build_lease_intent(
             "generation": int(generation),
             "dispatch_id": dispatch_id,
             "config_dir": config_dir,
-            "securestorage_dir": securestorage_dir,
-            # Always spelled, `""` included, for `securestorage_dir`'s skew reason.
+            # Always spelled, `""` included: `apps/jaahd` ships independently and reads absence as OAuth.
             "api_key_account": api_key_account or "",
             # Which vendor's CLI this dispatch is for, resolved off the leased account's `accounts.provider`
             # (`lease_drain._resolve_account`); without it every node launched the default vendor. Always
@@ -406,7 +419,7 @@ def build_lease_intent(
             # the node exports GIT_AUTHOR_*/GIT_COMMITTER_* and treats absent or malformed as "leave it to git
             # config" (`apps/jaahd/git_env.py`).
             "git_author": dict(git_author) if git_author else None,
-            "ports": dict(ports or {}),
+            "ports": {},
             # An agent launch carries no prompt at all; a model launch always spells its bundle.
             **({"launch": dict(launch)} if launch else {"prompt_bundle": dict(prompt or {})}),
             # The one conditional key (see `_env_vars_payload`): spread rather than spelled, because here an
@@ -422,6 +435,10 @@ def build_lease_intent(
             # Project memory (§4.4), only for an ON task: spread like `bedrock`, so an OFF intent is byte-for-byte
             # what it was, and the node launches exactly as before (`apps/jaahd/project_memory_bundle.py`).
             **({"memory": dict(memory)} if memory else {}),
+            # A blind review child's tree (`app/blind_review.py::lease_blind_apply`; the node's
+            # `apps/jaahd/blind_checkout.py::BlindApply`): spread like `memory`, so every other intent is byte-for-byte
+            # what it was.
+            **({"blind_apply": dict(blind_apply)} if blind_apply else {}),
             # The Architectural Guard (§5.1), only where it is available: spread like `memory`, so an org without
             # it gets an intent byte-for-byte what it was, and its node fetches no bundle.
             **({"guard": dict(guard)} if guard else {}),
@@ -429,9 +446,12 @@ def build_lease_intent(
             # legacy dispatch is byte-for-byte what it was, and the node reads an absent key as legacy (as an older
             # node reads every intent).
             **({"runtime": runtime} if runtime == "acp" else {}),
-            # A console view switch (D-CON-1), only on that resume lease: spread like `runtime`, so an ordinary
-            # dispatch is byte-for-byte what it was.
-            **({"handoff": dict(handoff)} if handoff else {}),
+            # A benchmark shadow, only on one: spread like `runtime`, so every other intent is byte-for-byte what it
+            # was; the node reads an absent key as false.
+            **({"shadow": True} if shadow else {}),
+            # The linked MCP servers, only when there are some: spread like `shadow`, so every other intent is
+            # byte-for-byte what it was; the node reads an absent key as none (`agents.mcp_connections_from_wire`).
+            **({"mcp_connections": [dict(item) for item in mcp_connections]} if mcp_connections else {}),
         },
     )
 
@@ -604,6 +624,9 @@ def build_deliver_answer_intent(
     sender_id: Optional[UUID] = None,
     question_ids: Optional[list[int]] = None,
     bare: bool = False,
+    dismiss: bool = False,
+    runner_view: Optional[dict[str, Any]] = None,
+    dismissed_ids: Optional[list[int]] = None,
 ) -> dict[str, Any]:
     """The `deliver_answer` intent: hand a human's gate answer to the live runner blocked in this slot.
 
@@ -622,7 +645,11 @@ def build_deliver_answer_intent(
 
     `question_ids` are the rounds the answer resolves, which `supersede_pending_answer_delivery` re-arms (the
     node ignores them). `bare` asks the node to send `answer` as the whole message, with no `Answer: ` frame
-    (the ignored-round wake word); an older node frames it, which still names no question.
+    (the ignored-round wake word); an older node frames it, which still names no question. `dismiss` (a task
+    edit reaching a parked runner, `app/live_task_edits.py`) asks the node to Escape the open dialog and never
+    type into its write-in row; `dismissed_ids` are the rounds that edit closed, reopened should the row retire
+    undelivered (`live_task_edits.reopen_undelivered_dismissal`; the node ignores them). `runner_view` is what the CP stamps on `tasks.runner_view` at this row's `done`
+    ack (`live_task_edits.stamp_delivered_view`); the node ignores it.
     """
     return build_slot_intent(
         VERB_DELIVER_ANSWER, project_id, project, number,
@@ -635,6 +662,9 @@ def build_deliver_answer_intent(
             **({"sender_id": str(sender_id)} if sender_id is not None else {}),
             **({"question_ids": [int(qid) for qid in question_ids]} if question_ids else {}),
             **({"bare": True} if bare else {}),
+            **({"dismiss": True} if dismiss else {}),
+            **({"dismissed_question_ids": [int(qid) for qid in dismissed_ids]} if dismiss and dismissed_ids else {}),
+            **({"runner_view": runner_view} if runner_view else {}),
             **({"attachments": attachments, "attachments_dir": attachments_dir}
                if attachments and attachments_dir else {}),
         },
@@ -651,6 +681,7 @@ def build_deliver_message_intent(
     session_id: str,
     text: str,
     sender: str,
+    runner_view: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """The `deliver_message` intent: type TEXT into the live runner of this slot WITHOUT `Escape` and
     whatever the task's state — the recipient is WORKING, not parked on a question.
@@ -662,12 +693,46 @@ def build_deliver_message_intent(
         <excerpt>
         Fix it, push, and report the new head with pull_request_enqueue.
 
-    `sender` names the CP part speaking, for the task page's message list; the node ignores it.
+    `sender` names the CP part speaking, for the task page's message list, and scopes supersession
+    (`issue_intents`); the node ignores it, and `runner_view` (as in `build_deliver_answer_intent`).
     """
     return build_slot_intent(
         VERB_DELIVER_MESSAGE, project_id, project, number,
         reason=deliver_message_reason(task_id),
-        payload={"task_id": int(task_id), "session_id": session_id, "text": text, "sender": sender},
+        payload={"task_id": int(task_id), "session_id": session_id, "text": text, "sender": sender,
+                 **({"runner_view": runner_view} if runner_view else {})},
+        precondition_fields=DELIVER_ANSWER_PRECONDITIONS,
+    )
+
+
+def switch_model_reason(task_id: int) -> str:
+    """The `reason` a `switch_model` intent carries, shown on the Slot Intents page: the event and the task, never
+    the model or who edited it. Censused by `tests/test_tenant_system_rows.py`."""
+    return f"switch_model for task {task_id}"
+
+
+def build_switch_model_intent(
+    project_id: int,
+    project: str,
+    number: int,
+    *,
+    task_id: int,
+    session_id: str,
+    model: str,
+    runner_view: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """The `switch_model` intent: switch the live runner of this slot to MODEL in place, the recipient WORKING.
+
+    `session_id` is the fence exactly as in `build_deliver_answer_intent`; the node refuses any mismatch. `model`
+    is the concrete id for the run's provider (`app/live_task_edits.py` resolves it as a dispatch would), never a
+    tier: the node types or sends it as given. Unstamped and superseding, like `build_deliver_message_intent`;
+    `runner_view` as there.
+    """
+    return build_slot_intent(
+        VERB_SWITCH_MODEL, project_id, project, number,
+        reason=switch_model_reason(task_id),
+        payload={"task_id": int(task_id), "session_id": session_id, "model": model,
+                 **({"runner_view": runner_view} if runner_view else {})},
         precondition_fields=DELIVER_ANSWER_PRECONDITIONS,
     )
 
@@ -750,14 +815,6 @@ def intent_columns(intent: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in intent.items() if k not in DISPLAY_ONLY_INTENT_KEYS}
 
 
-def _settle(session, commit: bool) -> None:
-    """Commit, or merely flush when the caller owns the transaction: `app/intent_rail.py::settle`.
-
-    Kept under this name because comments here cite it; the rule lives in the rail.
-    """
-    intent_rail.settle(session, commit)
-
-
 def push_frame_intent(intent: dict[str, Any], persisted: dict[str, Any]) -> dict[str, Any]:
     """One newly-inserted intent, in the shape the node's parser already knows.
 
@@ -774,11 +831,11 @@ def push_frame_intent(intent: dict[str, Any], persisted: dict[str, Any]) -> dict
         "number": intent["number"],
         "verb": intent["verb"],
         "decided_on_version": intent.get("decided_on_version"),
-        "decided_on_observed_at": intent_rail.iso(persisted.get("decided_on_observed_at")),
+        "decided_on_observed_at": iso_or_none(persisted.get("decided_on_observed_at")),
         "preconditions": intent.get("preconditions") or {},
         "payload": intent.get("payload") or {},
         "reason": intent.get("reason"),
-        "created_at": intent_rail.iso(persisted.get("created_at")),
+        "created_at": iso_or_none(persisted.get("created_at")),
     }
 
 
@@ -786,12 +843,11 @@ def _persist_kwargs(resolved_node) -> dict[str, Any]:
     """Everything rail-specific about a `slot_intents` INSERT, as kwargs for `app/intent_rail.py::persist`:
     the `ON CONFLICT` target, the `RETURNING` columns, duplicate logging, and the org derivation.
 
-    One home for `issue_intents` and `_persist_intents`, so production and seeding cannot diverge. The table
+    One home for `issue_intents` and `app/slot_destroy.py`'s persist, so the two cannot diverge. The table
     has two uniques and a statement gets one `ON CONFLICT` (`uq_slot_intents_slot_verb_version`); the
     observation-stamp tuple raises and the rail's SAVEPOINT reports it as already recorded. `org_id` is a
     scalar subquery on the node (`SlotIntent` is `Derived(parent=Node)`), since most minters run fleet-wide
-    with no bound org; a separate read would also desync `tests/test_fleet_verdicts_reap_notify.py`'s
-    `_FakeSession`.
+    with no bound org.
     """
     def _duplicate(intent: dict[str, Any]) -> None:
         log.info(
@@ -810,34 +866,6 @@ def _persist_kwargs(resolved_node) -> dict[str, Any]:
         "returning": (SlotIntent.id, SlotIntent.created_at, SlotIntent.decided_on_observed_at),
         "on_duplicate": _duplicate,
     }
-
-
-def _persist_intents(
-    session, resolved_node, intents: Iterable[dict[str, Any]], *, commit: bool
-) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    """The persist step on its own: `app/intent_rail.py::persist` with `_persist_kwargs`' configuration.
-
-    Not the mint's path (`issue_intents` uses the rail's `issue`); used by `record_intents` for seeding.
-    """
-    return intent_rail.persist(
-        session, intents=intents, commit=commit, **_persist_kwargs(resolved_node)
-    )
-
-
-def record_intents(session, node_id: str, intents: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Persist newly-decided intents, idempotently. Returns the ones that were actually inserted.
-
-    No production caller: this is the test seeding entry point (resolves a node uuid and commits). New
-    production call sites belong on `issue_intents`; this skips the supersede and the push.
-
-    `node_id` is the node uuid, resolved eagerly here: a `node_ref` subquery yielding NULL would
-    raise an `IntegrityError` that `_persist_intents`' SAVEPOINT reads as a duplicate, silently dropping an
-    unregistered node's intents. A dispatch must fail closed and loudly (contract rule 6).
-    """
-    resolved_node = node_id_or_404(session, node_id)
-    return [intent for intent, _persisted in _persist_intents(
-        session, resolved_node, intents, commit=True
-    )]
 
 
 # The mint's result (`app/intent_rail.py`'s class), aliased so `isinstance` holds across rails and there
@@ -873,7 +901,8 @@ def issue_intents(
 
     The mechanism is `app/intent_rail.py::issue`; this function decides which verbs supersede
     (`SUPERSEDING_VERBS`) and which rows count as predecessors (pending rows of the same verb on the same
-    `(node, project, slot)`). Predecessors are superseded before the insert, the retry budget is
+    `(node, project, slot)`; for `deliver_message`, of the same payload `sender` too — a task edit never drops
+    the merge lane's message, nor the reverse). Predecessors are superseded before the insert, the retry budget is
     carried forward, then rows go in, then frames go out.
 
     `node_id` is the node uuid (a name resolves nothing: names repeat across orgs), resolved here once; the
@@ -892,6 +921,7 @@ def issue_intents(
             number=intent["number"],
             verbs=(intent["verb"],),
             reason=_supersession_reason(intent),
+            sender=(intent.get("payload") or {}).get("sender") if intent["verb"] == VERB_DELIVER_MESSAGE else None,
         )
 
     def _frame(intent: dict[str, Any], row: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -914,10 +944,18 @@ def issue_intents(
 # `app.idle_stacks.stop_idle_stacks` and `app.lease_drain._release_finished`, which must agree with
 # pool-tick (`routes/tasks/`'s kill suppression deliberately differs). `outcome IS NULL` is explicit
 # because `NOT IN` over NULL is NULL.
+def _not_done():
+    """`ix_slot_intents_pending`'s own predicate, for the planner: a read that states it is an index read of the few
+    live rows, where without it each read seq-scanned the fleet's whole intent history (~30K rows, ~1 scan/s on
+    production). A literal, not a bind: a generic plan cannot prove a partial index's predicate from a
+    parameter."""
+    return SlotIntent.outcome.is_distinct_from(literal_column(f"'{OUTCOME_DONE}'"))
+
+
 def still_pending():
     # `app/intent_rail.py::still_pending` holds the shape; the retiring vocabulary stays here and is passed
-    # in.
-    return intent_rail.still_pending(SlotIntent, SLOT_INTENT_RETIRING_OUTCOMES)
+    # in. `_not_done` changes no answer (`done` retires) and lets the read use the pending index.
+    return and_(_not_done(), intent_rail.still_pending(SlotIntent, SLOT_INTENT_RETIRING_OUTCOMES))
 
 
 def own_unanswered_lease_since():
@@ -953,7 +991,12 @@ def predecessor_gone():
     `observed_at` is newer than every one AND it reports no `session`. No new timeout: a kill refused forever
     retires by the refusal park, and a silent node is its staleness handling's. Compares the CP's
     `created_at` with the node's own `observed_at`, so clock skew shifts the wait by the skew. Read again
-    at the take (`lease_drain._take_for_dispatch`) for a stop landing after the plan."""
+    at the take (`lease_drain._take_for_dispatch`) for a stop landing after the plan.
+
+    Only kills minted since this row was created count: kills are keyed on (node, project, number), which a
+    dynamic worktree re-created at a reused number shares with every earlier row there. A row the node has never
+    observed and never claimed or acked a launch into has no runner: a retired kill there blocks nothing (a
+    hold whose launch order was lost, or whose clone was refused, would otherwise wait forever)."""
     from app.models.worktrees import Worktree
 
     blocking_kill = (
@@ -963,7 +1006,15 @@ def predecessor_gone():
             SlotIntent.project_id == Worktree.project_id,
             SlotIntent.number == Worktree.number,
             SlotIntent.verb == VERB_KILL_RUNNER,
-            or_(still_pending(), Worktree.observed_at.is_(None), SlotIntent.created_at >= Worktree.observed_at),
+            SlotIntent.created_at >= Worktree.created_at,
+            or_(
+                still_pending(),
+                # A launch claimed (`slot_state.claim_launch`, set before the spawn and never reset) or acked
+                # into a row the node has not reported yet may still have a dying runner.
+                and_(Worktree.observed_at.is_(None),
+                     or_(Worktree.acked_at.isnot(None), Worktree.launch_claimed_generation.isnot(None))),
+                SlotIntent.created_at >= Worktree.observed_at,
+            ),
         )
         .correlate(Worktree)
         .exists()
@@ -1045,9 +1096,11 @@ def retire_released_lease(
 
 def _supersede_kwargs(
     session, *, node_id: str, project_id: int, number: int, verbs: tuple[str, ...], reason: str,
+    sender: Optional[str] = None,
 ) -> dict[str, Any]:
     """The static rail's contribution to a supersession, as kwargs for `app/intent_rail.py::supersede`: the
-    doomed predicate, the outcome, and the retirement's name.
+    doomed predicate, the outcome, and the retirement's name. SENDER narrows it to rows whose payload names
+    that `sender` (`deliver_message`).
 
     A dict so `issue_intents` can pass it to the rail's `issue`.
     """
@@ -1057,7 +1110,7 @@ def _supersede_kwargs(
         SlotIntent.number == int(number),
         SlotIntent.verb.in_(verbs),
         still_pending(),
-    )
+    ) + ((SlotIntent.payload["sender"].astext == sender,) if sender is not None else ())
 
     def _describe(superseded: list[tuple[Any, str, Optional[str]]], changed: int) -> None:
         # The slot named, not id'd; one bulk read so the rail's select keeps its row multiplicity.
@@ -1084,6 +1137,14 @@ def _supersede_kwargs(
 # working hour.
 UNEXECUTABLE_INTENT_MAX_AGE_SECS = 3600.0
 
+# The detail a node leads a `switch_model` refusal with while its runner cannot take the switch yet (a turn still
+# running, a question picker up): an uncharged wait (`routes/agent/slot_intents.py::_is_uncharged`), the node twin
+# `apps/jaahd/reconcile/vocab.py::RUNNER_BUSY_PREFIX`. A turn can outlast the hour above, so a row whose last answer
+# was this wait is exempt from purge arm 3 until `RUNNER_BUSY_SWITCH_MAX_AGE_SECS`.
+RUNNER_BUSY_PREFIX = "runner-busy: "
+# A working day: past it the runner has been busy (or parked on a question) so long the edit is stale anyway.
+RUNNER_BUSY_SWITCH_MAX_AGE_SECS = 24 * 3600.0
+
 
 def purge_unexecutable_intents(session) -> int:
     """DELETE every pending intent that can never execute, whatever the reason. Returns how many went.
@@ -1091,7 +1152,9 @@ def purge_unexecutable_intents(session) -> int:
     The only scheduled pruner of this table. Arms:
       1. a bundle-bearing verb with no bundle and no `launch` (un-acked);
       2. a verb this CP no longer issues (un-acked);
-      3. a row refused past the age bound (`acked_at` proves it was tried; `created_at` measures age);
+      3. a row refused past the age bound (`acked_at` proves it was tried; `created_at` measures age) — a
+         `switch_model` waiting on a busy runner past `RUNNER_BUSY_SWITCH_MAX_AGE_SECS` instead, logged as a dropped
+         edit; an undelivered task-edit dismissal reopens the rounds it closed;
       4. a CP-retired (`superseded`/`parked`) row past the same bound, or the table and its partial index
          would never shrink.
     Logged with the slot named. Arm 5 deletes nothing: it scrubs the resolved environment off never-acked
@@ -1119,6 +1182,13 @@ def purge_unexecutable_intents(session) -> int:
     #
     # `acked_at IS NOT NULL` stays as the attempt bound: proof the node answered, so a fresh order not yet
     # drained is never deleted. It is the CP's own record, preferred over the wire-supplied `outcome`.
+    # A `switch_model` whose last answer was a busy runner is waiting, not refusing: it keeps the longer bound.
+    # `reason IS NOT NULL` keeps the test two-valued, so a NULL reason can never null out the arm.
+    busy_switch = and_(
+        SlotIntent.verb == VERB_SWITCH_MODEL,
+        SlotIntent.reason.is_not(None),
+        SlotIntent.reason.startswith(RUNNER_BUSY_PREFIX),
+    )
     stuck_refusing = and_(
         SlotIntent.acked_at.is_not(None),
         SlotIntent.created_at < func.now() - text(
@@ -1126,6 +1196,12 @@ def purge_unexecutable_intents(session) -> int:
         ),
         SlotIntent.outcome.is_not(None),
         SlotIntent.outcome.notin_(SLOT_INTENT_RETIRING_OUTCOMES),
+        or_(
+            ~busy_switch,
+            SlotIntent.created_at < func.now() - text(
+                f"make_interval(secs => {RUNNER_BUSY_SWITCH_MAX_AGE_SECS})"
+            ),
+        ),
     )
     # Arm 4: CP-retired rows sit outside arm 3 but inside `ix_slot_intents_pending` (`outcome IS DISTINCT FROM
     # 'done'`), which would otherwise grow with every superseded dispatch.
@@ -1135,21 +1211,55 @@ def purge_unexecutable_intents(session) -> int:
             f"make_interval(secs => {UNEXECUTABLE_INTENT_MAX_AGE_SECS})"
         ),
     )
-    doomed = or_(bundleless, retired_verb, stuck_refusing, retired_by_the_cp)
+    # `_not_done` changes no answer — arms 1-2 are un-acked and a `done` row is always acked (the node's own ack
+    # writes both), arms 3-4 exclude `done` — and makes both statements below index reads.
+    # Arm 3's `deliver_answer` rows go only through the DELETE … RETURNING below, which re-arms what it takes: one
+    # turning stuck between the two statements waits for the next pass rather than going un-re-armed.
+    doomed = and_(_not_done(), or_(
+        bundleless, retired_verb, and_(stuck_refusing, SlotIntent.verb != VERB_DELIVER_ANSWER), retired_by_the_cp,
+    ))
+    # A `deliver_answer` that never landed, in this purge's commit: a task edit's `dismiss` reopens the rounds it
+    # closed (`live_task_edits.reopen_undelivered_dismissal`); an operator's answer is re-armed for the next
+    # delivery (`awaiting.rearm_undelivered_answer`). Arm 3 only — a superseded row's successor, or the park itself
+    # (`routes/agent/slot_intents.py`), already decided the rounds. Deleted first and only what the DELETE took is
+    # acted on: a `done` ack landing in between keeps its row, and its delivered rounds stay delivered.
+    from app import live_task_edits  # noqa: PLC0415 — it imports this module
+    from app.routes.tasks import awaiting  # noqa: PLC0415 — it imports this module
+
+    undelivered = session.execute(
+        delete(SlotIntent)
+        .where(_not_done(), stuck_refusing, SlotIntent.verb == VERB_DELIVER_ANSWER)
+        .returning(SlotIntent.id, SlotIntent.payload, SlotIntent.number, SlotIntent.outcome)
+        .execution_options(synchronize_session=False)
+    ).all()
+    for row in undelivered:
+        live_task_edits.reopen_undelivered_dismissal(session, row.payload)
+        awaiting.rearm_undelivered_answer(session, row.payload)
+        log.warning(
+            "fleet-verdicts: retiring unexecutable intent %s (deliver_answer on slot #%s, last outcome %r) — "
+            "it was refused until its age bound", row.id, row.number, row.outcome,
+        )
     # Read before delete for the log; the DELETE's WHERE is authoritative, so a race can only over-log.
     for row in session.execute(
         # The node as its name for the log (`nodes.id` is a uuid); `name_expr` avoids another join.
         select(SlotIntent.id, SlotIntent.verb, Project.name.label("project"), SlotIntent.number,
-               name_expr(SlotIntent.node_id).label("node_id"), SlotIntent.outcome)
+               name_expr(SlotIntent.node_id).label("node_id"), SlotIntent.outcome, SlotIntent.reason)
         .join(Project, Project.id == SlotIntent.project_id)
         .where(doomed)
     ).all():
+        if row.verb == VERB_SWITCH_MODEL and (row.reason or "").startswith(RUNNER_BUSY_PREFIX):
+            log.warning(
+                "fleet-verdicts: dropping switch_model intent %s on %s#%s (node %s) — its runner stayed busy for "
+                "%ss, so the model edit never reached it; it applies at the next dispatch",
+                row.id, row.project, row.number, row.node_id, RUNNER_BUSY_SWITCH_MAX_AGE_SECS,
+            )
+            continue
         log.warning(
             "fleet-verdicts: retiring unexecutable intent %s (%s on %s#%s, node %s, last outcome %r) — "
             "it can never execute and was being re-served on every pool tick",
             row.id, row.verb, row.project, row.number, row.node_id, row.outcome,
         )
-    removed = session.execute(delete(SlotIntent).where(doomed)).rowcount
+    removed = session.execute(delete(SlotIntent).where(doomed)).rowcount + len(undelivered)
     # ── ARM 5 — SCRUB, NEVER DELETE: a `lease_slot` row NOBODY EVER ACKED, past the same age bound ──────
     # Resolved environment is plaintext on the payload until an ack scrubs it; a valid never-acked
     # `lease_slot` falls through arms 1-4. Deleting it would cancel a real dispatch to a node that is merely

@@ -1,0 +1,43 @@
+# Excalidraw+: hosted MCP server. Facts confirmed at https://plus.excalidraw.com/docs/mcp/getting-started (one endpoint, API key as a Bearer token, Streamable HTTP).
+slug = "excalidraw_plus"
+label = "Excalidraw+"
+category = "mcp"
+vendor_docs_url = "https://plus.excalidraw.com/docs/mcp/getting-started"
+summary = "Read and draw Excalidraw+ scenes and collections through the Excalidraw+ MCP server."
+
+[[auth]]
+kind = "mcp"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "In Excalidraw+, open your workspace settings and create an API key with read or full permissions (read gives agents no drawing tools). A personal key reaches your private collections but a workspace admin must allow personal keys first; a workspace key cannot reach private collections" },
+]
+
+[mcp]
+url = "https://api.excalidraw.com/api/v1/mcp"
+url_editable = false
+transport = "streamable_http"
+auth = "bearer_field:api_key"
+
+[docs]
+agent_uses = [
+  "List the scenes in a collection and read a scene's elements and text",
+  "Draw an architecture or flow diagram from a task's description into a new scene",
+  "Update an existing scene with the changes a task made",
+]
+prerequisites = [
+  "An Excalidraw+ workspace (the paid plan; the free excalidraw.com editor has no API)",
+  "Permission in that workspace to create API keys",
+]
+limitations = [
+  "The Excalidraw+ MCP server is in public beta: Excalidraw says its tools may change while it stabilizes",
+  "The tools an agent sees follow the key's permissions: a read-only key offers no drawing tools",
+  "There is no sign-in button: Excalidraw+ connects with an API key only",
+]
+troubleshooting = [
+  { symptom = "Test says Excalidraw+ rejected the token (401)", fix = "The key was deleted, expired or mistyped. Create a new key in your workspace settings and select Replace on the secret" },
+  { symptom = "Agents see fewer tools than expected", fix = "The key has read permissions only, or is a workspace key that cannot see private collections. Create a full-permission key of the right type, then Replace" },
+  { symptom = "New tasks on the project have no Excalidraw+ tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with, and an agent marked Not supported on that tab cannot load MCP servers" },
+]
+faq = [
+  { q = "Is this the open-source Excalidraw MCP server", a = "No. This card is Excalidraw+'s hosted server at api.excalidraw.com, which needs an Excalidraw+ API key. The open-source server is a different project" },
+  { q = "What does Test do", a = "It opens an MCP session with Excalidraw+'s server and lists its tools, then closes the session. It reads and changes nothing in your Excalidraw+ account" },
+]

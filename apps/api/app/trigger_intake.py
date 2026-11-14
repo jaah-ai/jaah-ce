@@ -39,36 +39,41 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from email.utils import parseaddr
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
 from uuid import UUID
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import delete, event, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import edition_features, trigger_health, trigger_secrets
-from app.operator_settings import reads as settings_reads
-from app.db import SessionLocal
+from app.clock import utcnow
+from app.db import BridgedSession
 from app.entity_shape import readable_error
 from app.models.automations import AutomationRunTarget, TaskTrigger, TriggerDedup, TriggerDelivery
 from app.models.identity import AdminUser
 from app.models.notifications import InboundEmail
-from app.models.projects import Project
 from app.models.tasks import Task
 from app.one_line import one_line
+from app.production_qa import adapters as production_qa_adapters, events as production_qa_events, recorder
+from app.production_qa.events import RaiseIntent
+from app.production_qa.vocabulary import REASON_RECORD_ERROR, REASON_RECORDED
 from app.ratelimit import SharedRateLimiter
 from app.inbound_sender import DAILY_ROUTED_LIMIT, aligned, from_domain
 from app.automations import MODE_SPECIFIC, TARGET_PROJECTS
 from app.task_lifecycle import ACTIVE, _EPIC_SETTLED_STATES
 from app.tenancy import seam
 from app.tenancy.ids import ORG_ZERO_ID
-from app.trigger_template import render, render_title
 from app.triggers import (
+    ADAPTER_SOURCE_KINDS,
     AUTH_API_KEY,
+    AUTH_BITBUCKET,
     AUTH_GITHUB,
+    AUTH_GITLAB,
+    BITBUCKET_REQUEST_HEADER,
     DEDUPED,
     DELIVERY_ID_HEADER,
     DISPATCHED,
@@ -76,21 +81,29 @@ from app.triggers import (
     FILING,
     FILTERED,
     GITHUB_DELIVERY_HEADER,
+    GITLAB_IDEMPOTENCY_HEADER,
     GITHUB_EVENT_HEADER,
+    GITHUB_SIGNATURE_HEADER,
+    HELD,
     HTTP_SOURCE_KINDS,
+    INCIDENT_SOURCE_KINDS,
     INTAKE_ACTIVITY,
     MAX_BODY_BYTES,
     MAX_DEDUP_KEY_CHARS,
     MAX_PREFLIGHT_OUTPUT_BYTES,
     MAX_PREVIEW_BYTES,
+    MAX_RECORD_ONLY_GITHUB_BODY_BYTES,
     MAX_STATE_BYTES,
+    MONITOR_SOURCE_KINDS,
     PREFLIGHT_NONE,
     PREFLIGHTING,
     QUEUED,
     RATE_CAPPED,
     RECEIVED,
     SKIPPED,
+    SOURCE_BITBUCKET,
     SOURCE_GITHUB,
+    SOURCE_GITLAB,
     SOURCE_GMAIL,
     SOURCE_SLACK,
     SOURCE_USER_REGISTERED,
@@ -115,7 +128,7 @@ def fleet_session() -> Iterator[Session]:
     (a public route, nothing bound), "which triggers have work?" (the processor) and "does another org's Slack
     trigger hold this channel?" (a save). Only ids leave it; every read and write about a trigger then runs in
     `trigger_session`."""
-    with seam.detached(), seam.operator_scope(), SessionLocal() as session:
+    with seam.detached(), seam.operator_scope(), BridgedSession() as session:
         yield session
 
 
@@ -124,7 +137,7 @@ def trigger_session(trigger_id: UUID) -> Iterator[tuple[Session, UUID]]:
     """A fresh session bound to `trigger_id`'s own org (derived from the row), and that org. Every write this
     module makes — a delivery row, a counter, a filed Task — happens in one of these, so it lands in the
     trigger's org and can reach nothing outside it."""
-    with SessionLocal() as session, seam.detached(), seam.bind_from(session, TaskTrigger, trigger_id) as org:
+    with BridgedSession() as session, seam.detached(), seam.bind_from(session, TaskTrigger, trigger_id) as org:
         yield session, org
 
 # ── Preflight seam (§3.6) ─────────────────────────────────────────────────────────────────────────────
@@ -158,11 +171,6 @@ class PreflightUnavailable(Exception):
     """The preflight's venue could not be reached. Retried, not counted, until `UNAVAILABLE_WINDOW` passes."""
 
 
-class PreflightPreparing(PreflightUnavailable):
-    """The venue is preparing to run it — a node's first clone of the project's mirror. Retried, not counted,
-    until `preparing_window()` passes: that clone may run for the whole operator clone budget."""
-
-
 PreflightRunner = Callable[[Session, TaskTrigger, PreflightInput], PreflightResult]
 PREFLIGHT_RUNNERS: dict[str, PreflightRunner] = {}
 
@@ -186,15 +194,6 @@ CLAIM_SLACK = timedelta(seconds=60)
 SEEN_KEYS_LIMIT = 1000
 # A preflight that returns more items than this is broken, not busy.
 MAX_ITEMS = 100
-
-
-PREPARING_REASON = "preflight preparing, retrying: "
-
-
-def preparing_window() -> timedelta:
-    """How long a `PreflightPreparing` row keeps retrying: the node's clone budget, then the usual window for the
-    preflight that follows it."""
-    return timedelta(seconds=settings_reads.get_int("node_clone_timeout_secs")) + UNAVAILABLE_WINDOW
 
 
 def parse_preflight_output(text: str) -> PreflightResult:
@@ -245,7 +244,10 @@ def parse_preflight_output(text: str) -> PreflightResult:
 # ── Ingest helpers ────────────────────────────────────────────────────────────────────────────────────
 
 _DROPPED_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie", "set-cookie"})
-_DROPPED_HEADER_PREFIXES = ("x-hub-signature", "x-jaah-signature")
+_DROPPED_HEADER_PREFIXES = (
+    "x-hub-signature", "x-jaah-signature", "sentry-hook-signature", "x-pagerduty-signature", "x-jaah-token",
+    "x-gitlab-token",
+)
 
 
 def redact_headers(headers: Mapping[str, str]) -> dict[str, str]:
@@ -289,15 +291,24 @@ def dedup_key_for(value: Any) -> str:
     return "sha256:" + hashlib.sha256(key.encode()).hexdigest()
 
 
-def natural_dedup_key(raw: bytes, headers: Mapping[str, str], auth: str = "hmac") -> str:
-    """An HTTP delivery's natural id (A13): GitHub's `X-GitHub-Delivery` for a GitHub trigger (its Redeliver
-    resends the same id, AC-5.2), else the sender's `X-Jaah-Delivery-Id`; failing either, the body's SHA-256."""
+def natural_dedup_key(raw: bytes, headers: Mapping[str, str], auth: str = "hmac", *,
+                      hash_body: bool = True) -> Optional[str]:
+    """An HTTP delivery's natural id (A13): the vendor's own delivery id where it sends one — GitHub's
+    `X-GitHub-Delivery` (its Redeliver resends the same id, AC-5.2), GitLab's `Idempotency-Key`, Bitbucket's `X-Request-UUID`, a monitor adapter's (`adapters.delivery_id`:
+    Sentry's `Request-ID`, Datadog's `$ID`, PagerDuty's `event.id`, SNS's message id) — else the sender's
+    `X-Jaah-Delivery-Id`; failing either, the body's SHA-256 unless `hash_body` is False (a monitor: the same body
+    twice is the incident happening twice, never a duplicate)."""
     lowered = {str(k).lower(): v for k, v in headers.items()}
-    header = GITHUB_DELIVERY_HEADER if auth == AUTH_GITHUB else DELIVERY_ID_HEADER
+    if auth in ADAPTER_SOURCE_KINDS:
+        vendor = production_qa_adapters.delivery_id(auth, headers, raw)
+        if vendor:
+            return dedup_key_for(vendor)
+    header = {AUTH_GITHUB: GITHUB_DELIVERY_HEADER, AUTH_GITLAB: GITLAB_IDEMPOTENCY_HEADER,
+              AUTH_BITBUCKET: BITBUCKET_REQUEST_HEADER}.get(auth, DELIVERY_ID_HEADER)
     delivery_id = str(lowered.get(header, "")).strip()
     if delivery_id:
         return dedup_key_for(delivery_id)
-    return "sha256:" + hashlib.sha256(raw).hexdigest()
+    return "sha256:" + hashlib.sha256(raw).hexdigest() if hash_body else None
 
 
 # ── The webhook route's body (`routes/public.py::trigger_ingress`) ──────────────────────────────────
@@ -307,10 +318,15 @@ _TOKEN_LIMITER = SharedRateLimiter(limit=120, window=60.0, bucket="trigger-ingre
 _IP_LIMITER = SharedRateLimiter(limit=600, window=60.0, bucket="trigger-ingress-ip")
 
 REASON_OVERSIZE = "body over 1 MiB"
+_MIB = 1024 * 1024
+# The shape of GitHub's body signature: what a delivery must carry before it is offered the larger cap.
+_GITHUB_SIGNATURE = re.compile(r"sha256=[0-9a-f]{64}")
 REASON_BAD_SIGNATURE = "invalid signature"
 REASON_BAD_KEY = "invalid API key"
 REASON_KEY_ADDRESS = "API key not allowed from this address"
 REASON_KEY_LACKS_CREATE = "API key lacks tasks:create"
+# A record-only trigger (`app/production_qa/recorder.py::records_only`) has no automation and files nothing.
+REASON_RECORDS_ONLY = "this trigger only records — it files no task"
 
 
 @dataclass(frozen=True)
@@ -328,9 +344,10 @@ class KeyRefusal:
     reason: str
 
 
-def _resolve_token(token: str) -> Optional[tuple[UUID, str]]:
-    """(trigger id, auth scheme) for an HTTP trigger's ingress token, read fleet-wide (nothing is bound on a
-    public route, and the token is what tells us the org). A `github` trigger's scheme is GitHub's own."""
+def _resolve_token(token: str) -> Optional[tuple[UUID, str, bool]]:
+    """(trigger id, auth scheme, records monitor occurrences) for an HTTP trigger's ingress token, read fleet-wide
+    (nothing is bound on a public route, and the token is what tells us the org). A `github` trigger's scheme is
+    GitHub's own, a monitor adapter's its kind (`production_qa.adapters`)."""
     if not token or len(token) > 128:
         return None
     with fleet_session() as session:
@@ -342,8 +359,39 @@ def _resolve_token(token: str) -> Optional[tuple[UUID, str]]:
     if row is None:
         return None
     if row.source_kind == SOURCE_GITHUB:
-        return row.id, AUTH_GITHUB
-    return row.id, trigger_secrets.webhook_auth(row.source_config)
+        return row.id, AUTH_GITHUB, False
+    if row.source_kind == SOURCE_GITLAB:
+        return row.id, AUTH_GITLAB, False
+    if row.source_kind == SOURCE_BITBUCKET:
+        return row.id, AUTH_BITBUCKET, False
+    if row.source_kind in ADAPTER_SOURCE_KINDS:
+        # A deploy recorder's same body twice is a duplicate; a monitor's is the incident happening twice.
+        return row.id, row.source_kind, row.source_kind in MONITOR_SOURCE_KINDS
+    incident = (row.source_config or {}).get("shape") == "incident"
+    return row.id, trigger_secrets.webhook_auth(row.source_config), incident
+
+
+def body_limit(token: str, headers: Mapping[str, str]) -> int:
+    """The most body bytes the ingress reads for this delivery, decided from the token and headers BEFORE any of the
+    body is read: `MAX_RECORD_ONLY_GITHUB_BODY_BYTES` for a record-only `github` trigger
+    (`production_qa.recorder.source_records_only`) when the delivery carries a GitHub signature of the right shape,
+    else `MAX_BODY_BYTES`. An unknown token or an unsigned delivery never earns more than 1 MiB of buffering; the
+    signature itself is verified over the whole body in `ingest_http`, before the body is parsed."""
+    if not _GITHUB_SIGNATURE.fullmatch(_Headers(headers).get(GITHUB_SIGNATURE_HEADER).strip()):
+        return MAX_BODY_BYTES
+    if not token or len(token) > 128:
+        return MAX_BODY_BYTES
+    with fleet_session() as session:
+        row = session.execute(
+            select(TaskTrigger.source_kind, TaskTrigger.source_config).where(TaskTrigger.ingress_token == token)
+        ).first()
+    if row is None or not recorder.source_records_only(row.source_kind, row.source_config):
+        return MAX_BODY_BYTES
+    return MAX_RECORD_ONLY_GITHUB_BODY_BYTES if row.source_kind == SOURCE_GITHUB else MAX_BODY_BYTES
+
+
+def _oversize_reason(limit: int) -> str:
+    return REASON_OVERSIZE if limit == MAX_BODY_BYTES else f"body over {limit // _MIB} MiB"
 
 
 def _log_delivery(trigger_id: UUID, *, state: str, reason: Optional[str], event: Optional[dict] = None,
@@ -354,7 +402,7 @@ def _log_delivery(trigger_id: UUID, *, state: str, reason: Optional[str], event:
     Never writes the trigger row: the processor holds that row's lock while it files, and an ingest must neither
     wait on it nor make the processor skip the trigger. `last_delivery_at` is stamped by the processor and served
     from the deliveries themselves (`routes/triggers.py`)."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     with trigger_session(trigger_id) as (session, org):
         row = TriggerDelivery(
             trigger_id=trigger_id,
@@ -374,8 +422,9 @@ def _log_delivery(trigger_id: UUID, *, state: str, reason: Optional[str], event:
 
 
 def ingest_http(token: str, raw: Optional[bytes], headers: Mapping[str, str], query: Mapping[str, str],
-                client_ip: str) -> IngressAnswer:
-    """§3.4's checks, in this exact order. `raw` is None when the body was over `MAX_BODY_BYTES`.
+                client_ip: str, limit: int = MAX_BODY_BYTES) -> IngressAnswer:
+    """§3.4's checks, in this exact order. `raw` is None when the body was over `limit` (`body_limit`'s answer for
+    this delivery; `MAX_BODY_BYTES` unless a record-only GitHub trigger's signed delivery).
 
     1. size → 413 (logged `skipped` when the token resolves and its budget allows)
     2. token → 404, nothing logged
@@ -385,15 +434,16 @@ def ingest_http(token: str, raw: Optional[bytes], headers: Mapping[str, str], qu
     5. paused or failed → 202 + a `skipped` row
     6. accept → a `received` row, commit, fire the processor early → 202 `{delivery_id}`
     """
-    if raw is None or len(raw) > MAX_BODY_BYTES:
+    if raw is None or len(raw) > limit:
         resolved = _resolve_token(token)
+        reason = _oversize_reason(limit)
         if resolved is not None and _TOKEN_LIMITER.allow(token):
-            _log_delivery(resolved[0], state=SKIPPED, reason=REASON_OVERSIZE)
-        return IngressAnswer(413, {"detail": "The body is over 1 MiB."})
+            _log_delivery(resolved[0], state=SKIPPED, reason=reason)
+        return IngressAnswer(413, {"detail": f"The body is over {limit // _MIB} MiB."})
     resolved = _resolve_token(token)
     if resolved is None:
         return IngressAnswer(404, {"detail": "Not found."})
-    trigger_id, auth = resolved
+    trigger_id, auth, monitor = resolved
     if not _TOKEN_LIMITER.allow(token) or not _IP_LIMITER.allow(client_ip or "unknown"):
         return IngressAnswer(429, {"detail": "Too many requests."})
     verdict = _verify(trigger_id, auth, raw, headers)
@@ -419,7 +469,8 @@ def ingest_http(token: str, raw: Optional[bytes], headers: Mapping[str, str], qu
     # items carry their own ids.
     delivery_id = _log_delivery(
         trigger_id, state=RECEIVED, reason=None, event=event,
-        dedup_key=None if preflighted else natural_dedup_key(raw, headers, auth), api_key_id=api_key_id,
+        dedup_key=None if preflighted else natural_dedup_key(raw, headers, auth, hash_body=not monitor),
+        api_key_id=api_key_id,
     )
     fire_intake()
     return IngressAnswer(202, {"delivery_id": delivery_id})
@@ -428,15 +479,19 @@ def ingest_http(token: str, raw: Optional[bytes], headers: Mapping[str, str], qu
 def _verify(trigger_id: UUID, auth: str, raw: bytes, headers: Mapping[str, str]
             ) -> Optional[tuple[bool, Optional[str], bool, UUID]]:
     """(authentic, stopped reason, has a preflight, org) for the request, or None when the trigger is gone. The secret
-    is opened, compared in constant time and dropped inside this function; it never leaves it. An `api_key` trigger
-    has no secret (never authentic here): its key is `_key_verdict`'s."""
+    is opened, compared in constant time and dropped inside this function (a monitor adapter's `verify` opens and drops
+    it itself); it never leaves it. An `api_key` trigger has no secret (never authentic here): its key is
+    `_key_verdict`'s."""
     try:
         with trigger_session(trigger_id) as (session, org):
             trigger = session.scalar(select(TaskTrigger).where(TaskTrigger.id == trigger_id))
             if trigger is None:
                 return None
             authentic = False
-            if auth != AUTH_API_KEY:
+            if auth in ADAPTER_SOURCE_KINDS:
+                adapter = production_qa_adapters.adapter_for(trigger)
+                authentic = adapter is not None and adapter.verify(trigger, headers, raw)
+            elif auth != AUTH_API_KEY:
                 try:
                     secret = trigger_secrets.open_secret(trigger)
                 except ValueError:
@@ -518,7 +573,7 @@ SLACK_UNLINKED_REPLY = (
 )
 SLACK_RATE_CAPPED_REPLY = "I didn't file a Task: this channel's trigger has reached its hourly limit."
 SLACK_NOT_FILED_REPLY = (
-    "I didn't file a Task — an org admin can see why in the trigger's deliveries under Automation › Triggers."
+    "I didn't file a Task — an org admin can see why in the trigger's deliveries under Audit › Automations."
 )
 
 
@@ -595,11 +650,11 @@ def slack_channel_held_by_another_org(channels: list[str], org_id: UUID) -> Opti
 def _log_unmatched(*, preview: dict[str, Any], slack_event_id: str) -> int:
     """An `unmatched` row in org zero: the Slack app is deployment-global, so a mention no trigger takes is
     the operator's to see (`GET /api/triggers/unmatched`). Bodiless: nothing will ever render it."""
-    with SessionLocal() as session, seam.detached(), seam.bound_to(ORG_ZERO_ID):
+    with BridgedSession() as session, seam.detached(), seam.bound_to(ORG_ZERO_ID):
         row = TriggerDelivery(
             trigger_id=None, state=UNMATCHED, reason=REASON_NO_SLACK_TRIGGER,
             preview=preview_of(preview), slack_event_id=slack_event_id,
-            processed_at=datetime.now(timezone.utc),
+            processed_at=utcnow(),
         )
         session.add(row)
         session.commit()
@@ -834,7 +889,7 @@ def _route_email(email_id: UUID, org_id: UUID, trigger_id: Optional[UUID] = None
     so the delivery row and the `trigger_routed_at` stamp land together, and a retry never routes it twice. A
     rejected message is logged unmatched with its reason and reaches no trigger; `trigger_id` pins a tenant
     address to one trigger (seam S5)."""
-    with SessionLocal() as session, seam.detached(), seam.bound_to(org_id):
+    with BridgedSession() as session, seam.detached(), seam.bound_to(org_id):
         email = session.scalar(
             select(InboundEmail)
             .where(InboundEmail.id == email_id, InboundEmail.trigger_routed_at.is_(None))
@@ -857,7 +912,7 @@ def _route_email(email_id: UUID, org_id: UUID, trigger_id: Optional[UUID] = None
                  and email_matches(t.source_config, email)),
                 None,
             )
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         event = _email_event(email)
         if trigger is None:
             # Bodiless, like an unmatched Slack mention: who sent it and what about is enough to see it was missed,
@@ -887,8 +942,8 @@ def _route_email(email_id: UUID, org_id: UUID, trigger_id: Optional[UUID] = None
 def unrouted_emails(now: Optional[datetime] = None) -> list[tuple[UUID, UUID]]:
     """Every org's messages stored within `ROUTE_RETRY_WINDOW` that no routing pass has stamped, oldest first, as
     (id, org) pairs: system mail, hosted-address mail and tenant Gmail alike (each is routed in its own org)."""
-    since = (now or datetime.now(timezone.utc)) - ROUTE_RETRY_WINDOW
-    with seam.operator_scope(), SessionLocal() as session:
+    since = (now or utcnow()) - ROUTE_RETRY_WINDOW
+    with seam.operator_scope(), BridgedSession() as session:
         return [(row.id, row.org_id) for row in session.execute(
             select(InboundEmail.id, InboundEmail.org_id)
             .where(InboundEmail.trigger_routed_at.is_(None), InboundEmail.stored_at >= since)
@@ -965,15 +1020,22 @@ def ingest_platform_signup(event: dict[str, Any], *, moment: str, dedup_key: str
     """A self-service sign-up's `event` (`trigger_user_registered`, after its commit) to the OPERATOR's platform
     triggers at `moment`. Org zero by the kind's own rule, as Gmail routing is: a sign-up belongs to no tenant
     yet, and the platform scope can only be created there (`routes/triggers.py::_source_allowed_or_refuse`)."""
-    with SessionLocal() as session, seam.detached(), seam.bound_to(ORG_ZERO_ID):
+    with BridgedSession() as session, seam.detached(), seam.bound_to(ORG_ZERO_ID):
         triggers = _user_triggers(session, scope=USER_SCOPE_PLATFORM, moment=moment, org=ORG_ZERO_ID)
+    return _ingest_user_rows(triggers, event, dedup_key)
+
+
+def ingest_incident(triggers: list[TaskTrigger], event: dict[str, Any], dedup_key: str) -> dict[str, int]:
+    """An incident transition's `event` (`production_qa.events.flush`, after the recording committed) to every trigger
+    of its kind on the incident's project — read by the caller under that project's org. The registration rule: one
+    row per trigger, `skipped` when the trigger is stopped."""
     return _ingest_user_rows(triggers, event, dedup_key)
 
 
 def ingest_member_joined(event: dict[str, Any], org: UUID, *, dedup_key: str) -> dict[str, int]:
     """A new member's `event` (`trigger_user_registered`, after the join committed) to the org-scope triggers of
     `org` — the org the caller just wrote the membership under, never a request field."""
-    with SessionLocal() as session, seam.detached(), seam.bound_to(org):
+    with BridgedSession() as session, seam.detached(), seam.bound_to(org):
         triggers = _user_triggers(session, scope=USER_SCOPE_ORG, moment=USER_MOMENT_APPLIED, org=org)
     return _ingest_user_rows(triggers, event, dedup_key)
 
@@ -1002,16 +1064,26 @@ class PassSummary:
     # `time.monotonic()` past which the pass files nothing more; `out_of_time` says it stopped there.
     deadline: float = field(default_factory=lambda: time.monotonic() + PASS_BUDGET_SECONDS)
     out_of_time: bool = False
+    # Tracker write-backs posted this pass (`trackers.writeback.sweep`).
+    writebacks: int = 0
 
     def count(self, outcome: str) -> None:
         self.rows += 1
         self.outcomes[outcome] = self.outcomes.get(outcome, 0) + 1
 
     def detail(self) -> str:
-        if not self.rows:
-            return ""
-        parts = ", ".join(f"{n} {state}" for state, n in sorted(self.outcomes.items()))
-        return f"processed {self.rows} deliveries of {self.triggers} trigger(s): {parts}"
+        said = []
+        if self.rows:
+            parts = ", ".join(f"{n} {state}" for state, n in sorted(self.outcomes.items()))
+            said.append(f"processed {self.rows} deliveries of {self.triggers} trigger(s): {parts}")
+        if self.writebacks:
+            said.append(f"posted {self.writebacks} tracker write-back(s)")
+        return "; ".join(said)
+
+
+def due_clause(now: datetime):
+    """A row's `not_before` has passed, or it has none."""
+    return TriggerDelivery.not_before.is_(None) | (TriggerDelivery.not_before <= now)
 
 
 def triggers_with_work(session: Session, now: datetime) -> list[UUID]:
@@ -1021,13 +1093,15 @@ def triggers_with_work(session: Session, now: datetime) -> list[UUID]:
     preflight first, so a slow model never delays a plain webhook."""
     filed = TriggerDelivery.state == DISPATCHED
     settled = Task.state.in_(_EPIC_SETTLED_STATES)
+    # A `held` row waits for the production-qa cron to release it; a received one waits out its `not_before`.
     rows = session.execute(
         select(TriggerDelivery.trigger_id, TaskTrigger.preflight_kind)
         .join(TaskTrigger, TaskTrigger.id == TriggerDelivery.trigger_id)
         .outerjoin(Task, Task.id == TriggerDelivery.task_id)
         .where(
             or_(
-                TriggerDelivery.state.in_((RECEIVED, QUEUED)),
+                (TriggerDelivery.state == RECEIVED) & due_clause(now),
+                TriggerDelivery.state == QUEUED,
                 TriggerDelivery.state.in_((PREFLIGHTING, FILING)) & (TriggerDelivery.claimed_until < now),
                 filed & settled & TriggerDelivery.outcome_counted.is_(False),
                 filed
@@ -1044,7 +1118,7 @@ def run_pass(*, now: Optional[datetime] = None) -> PassSummary:
     """One processor pass over every trigger with work (the `trigger-intake` activity's body)."""
     summary = PassSummary()
     with fleet_session() as session:
-        trigger_ids = triggers_with_work(session, now or datetime.now(timezone.utc))
+        trigger_ids = triggers_with_work(session, now or utcnow())
     for trigger_id in trigger_ids:
         if time.monotonic() >= summary.deadline:
             summary.out_of_time = True
@@ -1053,6 +1127,16 @@ def run_pass(*, now: Optional[datetime] = None) -> PassSummary:
             process_trigger(trigger_id, summary)
         except Exception:  # noqa: BLE001 — one trigger's fault must not starve the rest
             log.exception("trigger-intake: trigger %s failed this pass", trigger_id)
+    if not summary.out_of_time:
+        # After the filing, so a tracker task filed this pass is acknowledged in it (`trackers.writeback`).
+        from app.trackers import writeback
+
+        try:
+            summary.writebacks = writeback.sweep(deadline=summary.deadline)
+        except writeback.SweepOutOfTime as stopped:
+            summary.writebacks, summary.out_of_time = stopped.sent, True
+        except Exception:  # noqa: BLE001 — the write-back never fails the intake
+            log.exception("trigger-intake: the tracker write-back sweep failed")
     if summary.out_of_time:
         # The run lock is ours until we return; the dropped fire earns this pass's follow-up.
         fire_intake()
@@ -1065,6 +1149,15 @@ def process_trigger(trigger_id: UUID, summary: Optional[PassSummary] = None) -> 
     summary.triggers += 1
     with trigger_session(trigger_id) as (session, org):
         _Processor(session, trigger_id, org, summary).run()
+
+
+# The stop a trigger owned from another org earns at its first filing; taking ownership clears it
+# (`automation_service.take_ownership`).
+REASON_TRIGGER_OWNER_OTHER_ORG = "the trigger's owner is in another organization — an Owner or Admin takes ownership of it"
+# The same stop as worded before; a trigger still carrying it is cleared by taking ownership too.
+LEGACY_REASONS_TRIGGER_OWNER_OTHER_ORG = (
+    "the trigger's owner is in another organization — re-create it as a member of this one",
+)
 
 
 def trigger_owner(session: Session, trigger: TaskTrigger) -> Optional[AdminUser]:
@@ -1084,12 +1177,18 @@ class _Processor:
         self.org = org
         self.summary = summary
         self.skip: set[int] = set()
+        # Task-raising intents a recording returned: pending until the row's transaction commits (dropped if it rolls
+        # back), then flushed by `_flush_intents`.
+        self.pending_intents: list[RaiseIntent] = []
+        self.intents: list[RaiseIntent] = []
+        event.listen(session, "after_commit", self._intents_committed)
+        event.listen(session, "after_rollback", self._intents_rolled_back)
 
     # ── the loop ──
 
     def run(self) -> None:
         session = self.session
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         # A crashed replica's preflight returns to the queue once its claim expires.
         session.execute(
             update(TriggerDelivery)
@@ -1125,7 +1224,28 @@ class _Processor:
             if row is None:
                 session.commit()
                 return
-            self._handle(trigger, row)
+            try:
+                self._handle(trigger, row)
+            finally:
+                self._flush_intents()
+
+    def _intents_committed(self, _session: Session) -> None:
+        self.intents.extend(self.pending_intents)
+        self.pending_intents.clear()
+
+    def _intents_rolled_back(self, _session: Session) -> None:
+        # The recording they describe was undone with the transaction: raising them would point at nothing.
+        self.pending_intents.clear()
+
+    def _flush_intents(self) -> None:
+        """Hand the recorded intents to `events.flush`, after the row's commit, in its own session; never raises."""
+        intents, self.intents = self.intents, []
+        if not intents:
+            return
+        try:
+            production_qa_events.flush(intents)
+        except Exception:  # noqa: BLE001 — the recording stands; a lost raise must not stop the pass
+            log.exception("trigger %s: could not raise %d production QA intent(s)", self.trigger_id, len(intents))
 
     def _lock(self) -> Optional[TaskTrigger]:
         """This trigger's row, locked for this transaction; None when another replica holds it (it is processing
@@ -1140,7 +1260,7 @@ class _Processor:
         return self.session.scalar(
             select(TriggerDelivery.id).where(
                 TriggerDelivery.trigger_id == self.trigger_id, TriggerDelivery.state == FILING,
-                TriggerDelivery.claimed_until >= datetime.now(timezone.utc),
+                TriggerDelivery.claimed_until >= utcnow(),
             ).limit(1)
         ) is not None
 
@@ -1155,13 +1275,13 @@ class _Processor:
             base = base.where(TriggerDelivery.id.not_in(self.skip))
         if trigger_health.is_enabled(trigger):
             stale = session.scalar(
-                base.where(TriggerDelivery.state == FILING, TriggerDelivery.claimed_until < datetime.now(timezone.utc))
+                base.where(TriggerDelivery.state == FILING, TriggerDelivery.claimed_until < utcnow())
                 .order_by(TriggerDelivery.id).limit(1).with_for_update(skip_locked=True)
             )
             if stale is not None:
                 return stale
             automation = self._automation(trigger)
-            queued = session.scalars(
+            queued = [] if automation is None else session.scalars(
                 base.where(TriggerDelivery.state == QUEUED)
                 .order_by(TriggerDelivery.id)
                 .limit(MAX_QUEUED_SCAN)
@@ -1171,7 +1291,7 @@ class _Processor:
                 if automation_fire.owed_ready(session, automation, row, trigger.concurrency_cap):
                     return row
         return session.scalar(
-            base.where(TriggerDelivery.state == RECEIVED)
+            base.where(TriggerDelivery.state == RECEIVED, due_clause(utcnow()))
             .order_by(TriggerDelivery.id)
             .limit(1)
             .with_for_update(skip_locked=True)
@@ -1183,6 +1303,9 @@ class _Processor:
         # A queued row, or a crashed firing's, is drained only while the trigger is enabled (`_next_row`), so only
         # received rows meet the health gate here.
         resuming = row.state in (QUEUED, FILING)
+        # Production QA measures before every gate and cap (`app/production_qa/recorder.py`).
+        if not resuming and recorder.handles(trigger, row) and self._record(trigger, row):
+            return
         if not resuming:
             stopped = trigger_health.stopped_reason(trigger)
             if stopped is not None:
@@ -1202,6 +1325,17 @@ class _Processor:
                 if unwanted is not None:
                     self._finish(trigger, row, FILTERED, unwanted)
                     return
+            if trigger.source_kind in INCIDENT_SOURCE_KINDS and row.parent_delivery_id is None:
+                # Production QA's gate, filters, quiet hours and a resolve meanwhile (`production_qa/events.py`).
+                verdict = production_qa_events.admission(self.session, trigger, row, utcnow())
+                if verdict is not None:
+                    if verdict.state == HELD:
+                        # Waits, uncounted, for the `release_held` cron job; its event stays to be filed.
+                        row.not_before = verdict.not_before
+                        self._finish(trigger, row, HELD, verdict.reason, counted=False)
+                    else:
+                        self._finish(trigger, row, verdict.state, verdict.reason)
+                    return
             if trigger.source_kind == SOURCE_USER_REGISTERED and row.parent_delivery_id is None:
                 from app.trigger_user_registered import user_filter_reason
 
@@ -1214,8 +1348,9 @@ class _Processor:
         if refusal is not None:
             from app import automation_fire
 
-            if row.api_key_id is None:
-                # A refused API key is its delivery's fault, not the trigger's: other keys still file.
+            if row.api_key_id is None and not recorder.records_only(trigger):
+                # A refused API key is its delivery's fault, not the trigger's: other keys still file. A record-only
+                # trigger is never stopped for filing nothing (architecture A-12).
                 trigger_health.mark_failed(self.session, trigger, refusal)
             if resuming:
                 automation_fire.close_owed(self.session, row, refusal)
@@ -1235,6 +1370,32 @@ class _Processor:
             return
         self._admit(trigger, row)
 
+    def _record(self, trigger: TaskTrigger, row: TriggerDelivery) -> bool:
+        """Record the delivery's fact in a savepoint; True when the delivery is settled here. A failure rolls the
+        savepoint back (no partial rows) and settles `failed`/`record_error`; a record-only trigger's success settles
+        `filtered`/`recorded`. Any other trigger's row goes on as every delivery does — adopting an automation if it
+        has none, as before — its recording in the same transaction."""
+        only = recorder.records_only(trigger)
+        # A vendor's retry (the same delivery id) is recorded once: a record-only trigger dedups before recording, as
+        # any other dedups before filing (`_admit`).
+        if only and self._deduped(trigger, row):
+            return True
+        try:
+            with self.session.begin_nested():
+                intents = recorder.record(self.session, trigger, row)
+        except Exception:  # noqa: BLE001 — any recording fault is this delivery's, logged with its trace
+            log.exception("trigger %s delivery %s: recording failed", self.trigger_id, row.id)
+            # Its dedup key goes free again: a retry of a delivery that failed to record must be recorded.
+            self._release_reservation(row)
+            # Health auto-pause never stops a record-only trigger: it files nothing (architecture A-12).
+            self._finish(trigger, row, FAILED, REASON_RECORD_ERROR, may_pause=not only)
+            return True
+        self.pending_intents.extend(intents)
+        if not only:
+            return False
+        self._finish(trigger, row, FILTERED, REASON_RECORDED)
+        return True
+
     def _authority_refusal(self, trigger: TaskTrigger, row: TriggerDelivery) -> Optional[str]:
         """Why the filer may not file at all now, or None: the trigger's owner, or the owner of the API key `row`
         arrived with (`automation_fire.key_filer`). Re-asked at every filing (R2), the way a cron's firing asks
@@ -1244,6 +1405,8 @@ class _Processor:
         from app.authz.principal import principal_for_user
 
         automation = self._automation(trigger)
+        if automation is None:
+            return REASON_RECORDS_ONLY
         if row.api_key_id is not None:
             filer = automation_fire.key_filer(self.session, row.api_key_id, trigger.org_id)
             if isinstance(filer, str):
@@ -1255,10 +1418,8 @@ class _Processor:
             owner = trigger_owner(self.session, trigger)
             if owner is None:
                 return "the trigger's owner no longer exists — re-create the trigger as a current member"
-            if owner.org_id is not None and owner.org_id != trigger.org_id:
-                # A filing runs under its owner's licence and git access; it must not cross the tenancy boundary,
-                # as a cron's firing must not (`automation_fire._owner_or_reason`).
-                return "the trigger's owner is in another organization — re-create it as a member of this one"
+            if automation_fire.owner_outside_org(owner.org_id, trigger.org_id):
+                return REASON_TRIGGER_OWNER_OTHER_ORG
             if automation.target_kind is None:
                 # An action with no Target files no Task (Send email): the engine asks its own rule, an org admin
                 # (`automation_fire._owner_or_reason`).
@@ -1281,9 +1442,10 @@ class _Processor:
         return None
 
     def _finish(self, trigger: TaskTrigger, row: TriggerDelivery, state: str, reason: Optional[str], *,
-                counted: bool = True) -> None:
-        """Log `row`'s outcome, apply the counter rule, and commit."""
-        now = datetime.now(timezone.utc)
+                counted: bool = True, may_pause: bool = True) -> None:
+        """Log `row`'s outcome, apply the counter rule (and, unless `may_pause` is False, the auto-pause), and
+        commit."""
+        now = utcnow()
         slack_thread = _slack_thread(trigger, row.event)
         row.state = state
         row.reason = reason
@@ -1295,7 +1457,8 @@ class _Processor:
             row.event = None
         if counted:
             trigger_health.apply_outcome(trigger, state, reason=reason, now=now)
-            trigger_health.auto_pause_if_due(self.session, trigger, now=now)
+            if may_pause:
+                trigger_health.auto_pause_if_due(self.session, trigger, now=now)
         self.summary.count(state)
         self.session.commit()
         if state != DEDUPED:
@@ -1315,7 +1478,19 @@ class _Processor:
     def _admit(self, trigger: TaskTrigger, row: TriggerDelivery) -> None:
         """Steps 4-6: dedup, rate, concurrency/queue; then file."""
         session = self.session
-        now = datetime.now(timezone.utc)
+        now = utcnow()
+        if self._deduped(trigger, row):
+            return
+        if filings_in_last_hour(session, self.trigger_id, now) >= trigger.rate_limit_per_hour:
+            self._release_reservation(row)
+            self._finish(trigger, row, RATE_CAPPED, f"Rate capped: {trigger.rate_limit_per_hour}/hour reached")
+            return
+        # The concurrency cap and the queue are per target: the fire engine queues a target at its cap (§4.3).
+        self._file(trigger, row)
+
+    def _deduped(self, trigger: TaskTrigger, row: TriggerDelivery) -> bool:
+        """Reserve `row`'s dedup key; True when another delivery holds it (this one is settled `deduped`)."""
+        session = self.session
         if row.dedup_key:
             reserved = session.execute(
                 pg_insert(TriggerDedup)
@@ -1337,22 +1512,20 @@ class _Processor:
                     first_state = self.session.scalar(
                         select(TriggerDelivery.state).where(TriggerDelivery.id == first.delivery_id))
                     reason = (f"duplicate of delivery #{first.delivery_id}" if first_state == DISPATCHED
+                              else f"duplicate of delivery #{first.delivery_id}, already recorded"
+                              if first_state == FILTERED
                               else f"duplicate of delivery #{first.delivery_id}, which is queued")
                 else:
                     reason = "duplicate of an item already received"
                 self._finish(trigger, row, DEDUPED, reason)
-                return
-        if filings_in_last_hour(session, self.trigger_id, now) >= trigger.rate_limit_per_hour:
-            self._release_reservation(row)
-            self._finish(trigger, row, RATE_CAPPED, f"Rate capped: {trigger.rate_limit_per_hour}/hour reached")
-            return
-        # The concurrency cap and the queue are per target: the fire engine queues a target at its cap (§4.3).
-        self._file(trigger, row)
+                return True
+        return False
 
     def _automation(self, trigger: TaskTrigger):
         """The trigger's parent automation. Every current writer links one; a trigger with none (written by a
         release without automations and never delivered since) is adopted here, in this transaction
-        (`automation_service.sync_trigger`, the backfill's own mapping)."""
+        (`automation_service.sync_trigger`, the backfill's own mapping) — except a record-only one, which files
+        nothing and so has none (None)."""
         from app import automation_service
         from app.models.automations import Automation
 
@@ -1417,7 +1590,7 @@ class _Processor:
             elif result.state not in (QUEUED, DEDUPED):
                 _reply_in_slack(slack_thread, _slack_reply_for(result.state))
             return
-        from app.task_external_comment import _console_task_url
+        from app.trackers.writeback import task_url as _console_task_url
 
         try:
             links = ", ".join(f"<{_console_task_url(task_id)}|Task #{task_id}>" for task_id in result.task_ids)
@@ -1431,7 +1604,7 @@ class _Processor:
         """Move `row` to `preflighting` under a fresh claim and hand it to the pool. A second row of the same
         trigger cannot be claimed (the partial unique index): it stays `received` for a later pass."""
         session = self.session
-        claim = datetime.now(timezone.utc) + timedelta(seconds=trigger.preflight_timeout_seconds) + CLAIM_SLACK
+        claim = utcnow() + timedelta(seconds=trigger.preflight_timeout_seconds) + CLAIM_SLACK
         try:
             with session.begin_nested():
                 session.execute(
@@ -1480,6 +1653,8 @@ def file_task(session: Session, trigger: TaskTrigger, row: TriggerDelivery, org:
         automation = session.scalar(select(Automation).where(Automation.id == trigger.automation_id))
     if automation is None:
         automation = automation_service.sync_trigger(session, trigger)
+    if automation is None:
+        raise ValueError(REASON_RECORDS_ONLY)
     # The engine stops at its bound less its slack; aimed at the pass's own deadline when there is one.
     bound = None if deadline is None else (deadline - time.monotonic()) + automation_fire.DEADLINE_SLACK_SECONDS
     return automation_fire.fire(session, automation, cause=automation_fire.CAUSE_EVENT, delivery=row,
@@ -1543,7 +1718,7 @@ def apply_preflight_result(
     """Apply a preflight's outcome ONLY while the claim it ran under still stands — a compare-and-swap on
     `(id, state='preflighting', claimed_until=claim)`. A stale worker (its claim expired and the row was
     re-claimed or processed) writes NOTHING: no outcome, no state document. True when it applied."""
-    now = now or datetime.now(timezone.utc)
+    now = now or utcnow()
     with trigger_session(trigger_id) as (session, org):
         trigger = session.scalar(select(TaskTrigger).where(TaskTrigger.id == trigger_id).with_for_update())
         row = session.scalar(
@@ -1560,14 +1735,10 @@ def apply_preflight_result(
             return False
         row.claimed_until = None
         if isinstance(outcome, PreflightUnavailable):
-            # Once preparing, the row keeps the longer window: the preflight right after the clone may still
-            # meet a busy or briefly absent node. The reason carries the mark between attempts.
-            preparing = isinstance(outcome, PreflightPreparing) or (row.reason or "").startswith(PREPARING_REASON)
-            if now - row.received_at < (preparing_window() if preparing else UNAVAILABLE_WINDOW):
+            if now - row.received_at < UNAVAILABLE_WINDOW:
                 row.state = RECEIVED
                 row.attempts = (row.attempts or 0) + 1
-                prefix = PREPARING_REASON if preparing else "preflight unavailable, retrying: "
-                row.reason = f"{prefix}{readable_error(outcome)}"
+                row.reason = f"preflight unavailable, retrying: {readable_error(outcome)}"
                 session.commit()
                 return True
             outcome = PreflightError(readable_error(outcome))

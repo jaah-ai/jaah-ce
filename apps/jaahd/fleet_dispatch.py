@@ -22,13 +22,12 @@ import re
 import secrets
 import shutil
 import stat
-import subprocess
 import sys
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import account_auth
 import acp_runtime  # the runtime switch's node half: legacy launch or `jaah-acp-host`
@@ -56,7 +55,9 @@ import runner_registry
 import session_user
 import session_vendor  # the node's own note of which vendor transcript a session has
 import shared_storage
-from acp.launch import NATIVE_REF_KEY  # launch.json's resume target (`session_meta`), read by `acp/host.py`
+
+if TYPE_CHECKING:
+    import agent_process  # imported lazily at runtime (the SDK ACP launch only), named here for the annotations
 
 log = logging.getLogger("jaahd.fleet_dispatch")
 # The Architectural Guard (the `compliance` feature's): None where this tree does not carry it.
@@ -82,6 +83,24 @@ META_DIR_MODE = 0o2750
 META_FILE_MODE = 0o640
 # `launch.sh` needs the execute bit; it carries no credential. Group write is what matters.
 META_EXEC_MODE = 0o750
+
+
+# The whole `_meta` tree is written AS THE SESSION USER (the runner must read and `bash` it; daemon-owned
+# copies were a measured cleanup burden). A refused write aborts the launch loudly, `label` naming the launcher.
+def _write_meta(label: str, path: str, content: str, mode: int = META_FILE_MODE) -> None:
+    err = session_user.write_file_as_session_user(path, content, mode=mode)
+    if err:
+        raise RuntimeError(f"{label}: could not write {path}: {err}")
+
+
+def _ensure_meta(label: str, worktree: str) -> str:
+    """The slot's `_meta` dir beside `worktree`, created as the session user; the path."""
+    meta = os.path.join(os.path.dirname(worktree), "_meta")
+    # Explicit mode: the seam's default is the session umask (`0775`); see `META_DIR_MODE`.
+    err = session_user.ensure_dir_as_session_user(meta, mode=META_DIR_MODE)
+    if err:
+        raise RuntimeError(f"{label}: could not create {meta}: {err}")
+    return meta
 
 # ── The rendered report's staging root ────────────────────────────────────────────────────────────────
 # Every runner renders its `artifact.upload` here, never in the worktree (it would show in `git status`).
@@ -446,20 +465,6 @@ def _delegated_account_env() -> dict:
     return {plugin_repair_mod.CONSENT_HASH_ENV: seed} if seed else {}
 
 
-def _run_as_account_owner(argv: list[str], *, timeout: float, env: dict | None = None):
-    """`argv` as the OWNER of the auth tree — user `jaah` — or directly when this process already is it.
-    `env` is added to the delegated key.
-
-    Never as the daemon: a root/`jaahd` write leaves files the runner user cannot repair. Without a
-    switch (already the session user), a plain `subprocess.run` inherits this process's env."""
-    delegated = {**_delegated_account_env(), **(env or {})}
-    if session_user.switch_needed():
-        return session_user.run_as_session_user(argv, timeout=timeout, env=delegated)
-    # No switch: inherit this process's env PLUS the delegated key, which the tick may hold and env not.
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
-                          env={**os.environ, **delegated})
-
-
 def converge_account_layer(account_dir: object, *, now: float = 0.0, run=None) -> dict:
     """Converge this node's managed layer for `account_dir`, immediately before a runner launches into it.
 
@@ -474,11 +479,14 @@ def converge_account_layer(account_dir: object, *, now: float = 0.0, run=None) -
     if not cfg.is_dir():
         return result
     import provision_accounts  # lazy, per this module's import-direction note at the top
-    runner = run or _run_as_account_owner
+    # As the OWNER of the auth tree — user `jaah` — or directly when this process already is it, never as
+    # the daemon: a root/`jaahd` write leaves files the runner user cannot repair. `_delegated_account_env`
+    # is handed over on both arms: in-process it is added to this process's env, which may lack it.
+    runner = run or session_user.run_as_session_user_or_here
     # Phase 1 — the managed settings block + the registry re-rooting, synchronously.
     try:
         done = runner(provision_accounts.converge_argv(str(cfg), offline=True),
-                      timeout=_ACCOUNT_LAYER_OFFLINE_TIMEOUT_S)
+                      timeout=_ACCOUNT_LAYER_OFFLINE_TIMEOUT_S, env=_delegated_account_env())
         result["phase1"] = getattr(done, "returncode", None)
         if result["phase1"]:
             log.warning("fleet_dispatch: account layer phase 1 for %s exited %s: %s", cfg,
@@ -512,7 +520,7 @@ def converge_account_layer(account_dir: object, *, now: float = 0.0, run=None) -
     # The detached form is the script's own, so this and the first-sight converge cannot drift.
     try:
         runner(provision_accounts.detached_command(str(cfg)),
-               timeout=_ACCOUNT_LAYER_OFFLINE_TIMEOUT_S)
+               timeout=_ACCOUNT_LAYER_OFFLINE_TIMEOUT_S, env=_delegated_account_env())
         result["phase2"] = "spawned"
         log.warning("fleet_dispatch: %s is not fully provisioned (%s) — a detached converge was "
                     "started; THIS runner launches without it, and holds no control MCP tools at all if "
@@ -547,14 +555,14 @@ def converge_accounts_on_upgrade(version: str | None, *, stamp_dir: Path, run=No
     import provision_accounts  # lazy, per this module's import-direction note at the top
     # Spelled out, as `accounts.py`'s delegated publish does: a delegated script gets no inherited env
     # (`session_user.run_as_session_user`), and the converge resolves its accounts from these.
-    env: dict = {}
+    env: dict = _delegated_account_env()
     for name in (environment.POOL_ROOT_ENV, environment.SHARED_ACCOUNTS_ROOT_ENV):
         value = env_get(name)
         if value:
             env[name] = value
     try:
-        done = (run or _run_as_account_owner)(provision_accounts.detached_command(None), env=env,
-                                              timeout=_ACCOUNT_LAYER_OFFLINE_TIMEOUT_S)
+        done = (run or session_user.run_as_session_user_or_here)(
+            provision_accounts.detached_command(None), env=env, timeout=_ACCOUNT_LAYER_OFFLINE_TIMEOUT_S)
         if getattr(done, "returncode", 0):
             raise RuntimeError(f"the start exited {done.returncode}: "
                                f"{(getattr(done, 'stderr', '') or '').strip()[-400:]}")
@@ -752,17 +760,17 @@ def proc_started_at(pid: object) -> str:
 
 
 def _slot_number(worktree: str) -> str:
-    """The slot component of a worktree path — a bare `N`/`main` under the computed
-    `<jaah_home>/repos/<project id>/{main,N}` layout, or the whole `<repo>-N` basename under the legacy
+    """The slot component of a worktree path — a bare `N` under the computed
+    `<jaah_home>/repos/<project id>/N` layout, or the whole `<repo>-N` basename under the legacy
     sibling-suffix one. Both shapes are what `slot_window_name` takes as its `number`."""
     return os.path.basename(worktree.rstrip("/"))
 
 
 def _worktree_ref(project: str, worktree: str) -> str:
-    """The pool-slot identity for a worktree path — `project` for the main clone, else `<project>-N` —
-    matching `worktree_mechanics.ports.apply_stack_identity`'s naming. Not the basename alone: under the
-    computed layout that is a bare "N"/"main" that collides across projects. Delegated to
-    `fleet_launch.slot_ref`, shared with the window-name composer."""
+    """The pool-slot identity for a worktree path — `<project>-N` — matching
+    `worktree_mechanics.ports.apply_stack_identity`'s naming. Not the basename alone: under the computed
+    layout that is a bare "N" that collides across projects. Delegated to `fleet_launch.slot_ref`, shared
+    with the window-name composer."""
     return fleet_launch.slot_ref(project, _slot_number(worktree))
 
 
@@ -824,16 +832,40 @@ def api_key_helper_command(provider: str, api_key_account: str) -> str:
     return f"{fleet_launch.shq(account_auth.CREDENTIAL_HELPER)} {fleet_launch.shq(cred_name)}"
 
 
+def api_key_workspace_id(key_helper: str, api_key_account: str) -> str:
+    """The vendor workspace an API-key launch names on every request (`cred_broker.account_workspace_id`), or
+    `""`. Fetched only when the launch keys through a helper (`api_key_helper_command`: the adapters whose settings
+    file carries the header). NEVER fails a launch: an unreachable CP or a refusal is said on stderr and the run
+    starts without the header — the key pre-flight (`api_key_preflight_lines`) is what guards the key itself, and
+    an unscoped key then fails with a cause that names the fix (`break_cause.WORKSPACE_REQUIRED_DETAIL`)."""
+    if not key_helper or not api_key_account:
+        return ""
+    import cred_broker  # noqa: PLC0415 — the daemon's broker, needed only on an API-key launch
+
+    try:
+        return cred_broker.account_workspace_id(api_key_account)
+    except Exception as exc:  # noqa: BLE001 — see the docstring: a launch never fails on this read
+        print(f"fleet_dispatch: could not read API-key account {api_key_account!r}'s workspace id "
+              f"({type(exc).__name__}) — launching without a workspace header", file=sys.stderr)
+        return ""
+
+
 def with_api_key_settings(
     content: Optional[str], settings_flag: str, *, provider: str, key_helper: str, settings_path: str,
+    workspace_id: str = "",
 ) -> tuple[Optional[str], str]:
-    """`(settings JSON, --settings flag)` with the adapter's `api_key_settings(key_helper)` merged in, or both
-    unchanged when there is no helper. The one merge the runner, the env runner and an API-key console tab
-    share: the key rides `apiKeyHelper` in the SAME settings file as the hooks (`api_key_helper_command`)."""
+    """`(settings JSON, --settings flag)` with the adapter's `api_key_settings(key_helper, workspace_id)` merged
+    in, or both unchanged when there is no helper. The one merge the runner, the env runner and an API-key console
+    tab share: the key rides `apiKeyHelper` in the SAME settings file as the hooks (`api_key_helper_command`), and
+    an unscoped key's workspace its `env` block (merged, never replacing one already there)."""
     if not key_helper:
         return content, settings_flag
     rendered = json.loads(content) if content is not None else {}
-    rendered.update(agents.get_adapter(provider).api_key_settings(key_helper))
+    key_settings = agents.get_adapter(provider).api_key_settings(key_helper, workspace_id)
+    env = {**rendered.get("env", {}), **key_settings.pop("env", {})}
+    rendered.update(key_settings)
+    if env:
+        rendered["env"] = env
     return (json.dumps(rendered, indent=2),
             settings_flag or f"--settings {fleet_launch.shq(settings_path)}")
 
@@ -847,11 +879,18 @@ def with_additional_dirs(
     extra = agents.get_adapter(provider).additional_dirs_settings(tuple(dirs)) if dirs else {}
     if not extra:
         return content, settings_flag
-    rendered = json.loads(content) if content is not None else {}
-    for key, value in extra.items():
-        rendered[key] = {**rendered.get(key, {}), **value} if isinstance(value, dict) else value
-    return (json.dumps(rendered, indent=2),
-            settings_flag or f"--settings {fleet_launch.shq(settings_path)}")
+    return _merged_settings(content, settings_flag, extra, settings_path, deep=True)
+
+
+def with_runner_settings(
+    content: Optional[str], settings_flag: str, *, provider: str, settings_path: str,
+) -> tuple[Optional[str], str]:
+    """`with_api_key_settings`' twin for a task run: the adapter's `runner_settings()` merged into the same settings
+    file, or both unchanged when the CLI needs none. Never applied to a console tab."""
+    extra = agents.get_adapter(provider).runner_settings()
+    if not extra:
+        return content, settings_flag
+    return _merged_settings(content, settings_flag, extra, settings_path)
 
 
 def api_key_preflight_lines(key_helper: str) -> list[str]:
@@ -878,8 +917,16 @@ def with_bedrock_settings(
     unchanged when there is no plan. Shared by the runner and a Jaah console tab."""
     if bedrock is None:
         return content, settings_flag
+    return _merged_settings(content, settings_flag, bedrock_launch.settings(bedrock, fleet_launch.shq), settings_path)
+
+
+def _merged_settings(content: Optional[str], settings_flag: str, extra: dict, settings_path: str, *,
+                     deep: bool = False) -> tuple[str, str]:
+    """`extra` merged over the settings JSON `content` (`deep`: a dict value merges into the dict already under its
+    key), and the `--settings` flag the file needs if there is none yet — the three twins above share this leg."""
     rendered = json.loads(content) if content is not None else {}
-    rendered.update(bedrock_launch.settings(bedrock, fleet_launch.shq))
+    for key, value in extra.items():
+        rendered[key] = {**rendered.get(key, {}), **value} if deep and isinstance(value, dict) else value
     return (json.dumps(rendered, indent=2),
             settings_flag or f"--settings {fleet_launch.shq(settings_path)}")
 
@@ -894,6 +941,7 @@ def build_auth_lines(
     memory_env: "dict[str, str] | None" = None,
     advertise_nodelinks: bool = False,
     guard_env: "dict[str, str] | None" = None,
+    shadow: bool = False,
 ) -> list[str]:
     """The `export` lines every dispatched runner's launch.sh sources:
     OMC_SKIP_HOOKS/OMC_PYTHON_LSP + COCKPIT_AGENT_BASE/CONTROL_TASK_ID (names `compose_env_guard` never
@@ -907,6 +955,8 @@ def build_auth_lines(
     `api_key_account` is the OTHER kind of account (`apps/api/app/account_auth.py`): its SLUG, never
     its key; no securestorage export, and the key fetched into the adapter's own variable
     (`api_key_env`) — nothing when the adapter takes it from a helper instead (`api_key_helper_command`).
+    `shadow`: a benchmark shadow task (the lease payload's `"shadow": true`) adds `JAAH_TASK_SHADOW=1` right
+    after `CONTROL_TASK_ID`; the PR guard hook (family 0c) reads it to deny merging or readying its PR.
     Empty defaults keep other callers' lines byte-identical. `COCKPIT_AGENT_BASE` must come from
     `resolve_control_plane_api_base()`, never an inlined loopback that points at the wrong CP."""
     shq = fleet_launch.shq
@@ -925,6 +975,8 @@ def build_auth_lines(
         f"export COCKPIT_AGENT_BASE={shq(control_plane_api.resolve_control_plane_api_base())}",
     ]
     lines.append(f"export CONTROL_TASK_ID={shq(str(task_id))}")
+    if shadow:
+        lines.append("export JAAH_TASK_SHADOW=1")
     # Where this node installed the standard, so the Stop-hook gate and the pre-commit hook find the gate
     # runner (`run_gate.py`) off Linux and the control MCP server finds the daemon tree (`runner_env.LIB_ROOT_ENV`).
     # Omitted at the package path, every reader's default, so a packaged node's launch.sh stays byte-identical.
@@ -1029,8 +1081,8 @@ def build_auth_lines(
     # Last, and nothing at all when OFF, so an OFF launch.sh is byte-identical to one from before memory.
     for name, value in (memory_env or {}).items():
         lines.append(f"export {name}={shq(value)}")
-    # ── THE ARCHITECTURAL GUARD, ONLY WITH ITS STANZA (`guard_bundle.env_for`) ────────────────────────────
-    # After memory, and nothing at all without the stanza, so an unguarded launch.sh is byte-identical.
+    # ── THE ARCHITECTURAL GUARD'S EXPORTS, OR THE HOOKS REDIRECT ALONE (`guard_bundle.env_for`/`hooks_redirect`) ──
+    # After memory; nothing at all when neither applies (a folder slot, no hook stubs).
     for name, value in (guard_env or {}).items():
         lines.append(f"export {name}={shq(value)}")
     if guard_env and guard_bundle.redirects_hooks(guard_env):
@@ -1106,16 +1158,7 @@ def _launch_no_model(
     log, the `runner_registry` record under `provider` and `runtime` (leased `api_key_account`, a registry agent's
     bound key account, when set), and the `ready → active` claim. Returns the ack facts."""
     shq = fleet_launch.shq
-
-    def _write(path: str, content: str, mode: int = META_FILE_MODE) -> None:
-        err = session_user.write_file_as_session_user(path, content, mode=mode)
-        if err:
-            raise RuntimeError(f"launch_no_model: could not write {path}: {err}")
-
-    meta = os.path.join(os.path.dirname(worktree), "_meta")
-    err = session_user.ensure_dir_as_session_user(meta, mode=META_DIR_MODE)
-    if err:
-        raise RuntimeError(f"launch_no_model: could not create {meta}: {err}")
+    meta = _ensure_meta("launch_no_model", worktree)
     pane_dir = env_helpers.log_dir("runner")
     err = session_user.ensure_dir_as_session_user(str(pane_dir))
     if err:
@@ -1130,7 +1173,7 @@ def _launch_no_model(
     lines = tuple(exec_lines(runner_session_id))
     _record_runner_binding(task_id, runner_session_id, worktree, project, None)
     launch_path = os.path.join(meta, f"{ref_key}.launch.sh")
-    _write(launch_path, fleet_launch.build_launch_sh(
+    _write_meta("launch_no_model", launch_path, fleet_launch.build_launch_sh(
         auth_line=auth_line, hub_root=str(HUB_ROOT), worktree=worktree, settings_flag="", sys_file="",
         task_file="", exec_lines=lines,
     ), mode=META_EXEC_MODE)
@@ -1144,7 +1187,7 @@ def _launch_no_model(
                            report_dir=report_dir, provider=provider, api_key_account=api_key_account,
                            runtime=runtime, dispatch_id=dispatch_id, generation=generation)
     # The same `ready → active` claim `launch_runner` makes at launch.
-    control_plane_api.claim_task_active(task_id)
+    control_plane_api.claim_task_active(task_id, session_id=runner_session_id)
     os_pid = host_platform.pane_os_pid(pid) if host_platform.is_windows() else pid
     log.info("launch_no_model: task %s runs %s in %s (pane pid %s)", task_id, what, worktree, os_pid)
     return {"session_id": runner_session_id, "pid": os_pid or "", "started_at": proc_started_at(os_pid)}
@@ -1300,9 +1343,10 @@ def launch_runner(
     agent: "agent_process.StagedAgent | None" = None,
     extra_dirs: "tuple[str, ...]" = (),
     runtime: str = acp_runtime.RUNTIME_LEGACY,
-    resume_ref: str = "",
     dispatch_id: str = "",
     generation: "int | None" = None,
+    shadow: bool = False,
+    mcp_connections: "tuple[agents.McpConnection, ...]" = (),
 ) -> dict:
     """Spawn ONE runner into an already-decided worktree, and return the ack facts:
     `{"session_id", "pid", "started_at"}`.
@@ -1336,10 +1380,17 @@ def launch_runner(
     written beside `<ref_key>.sys` and three exports join `launch.sh` (`project_memory_bundle`). None changes
     nothing.
 
+    `mcp_connections`: the remote MCP servers the task's project linked (`agents.McpConnection`): an adapter that
+    supports them adds one `mcp_bridge` stdio server each to THIS session — on the ACP launch through its
+    `mcp_servers`, on the legacy launch through a per-session config file beside the prompts
+    (`<ref_key>.mcp.json`, the adapter's `legacy_mcp_config`). Neither holds a token.
+
     `guard`: the lease payload's Architectural Guard stanza (`{"project_id"}`), present only where the guard is
     available for the org: the rule bundle is fetched and written into `_meta`, refreshed every 60 s, and the
     `JAAH_GUARD_*` exports join `launch.sh` (`guard_bundle`) — BEFORE the hook settings are built, which are told
-    `guard=` explicitly. `integration_branch` (the slot's base) becomes `JAAH_GUARD_BASE`. None changes nothing.
+    `guard=` explicitly. `integration_branch` (the slot's base) becomes `JAAH_GUARD_BASE`. None still gives a git
+    worktree the hooks redirect alone (`guard_bundle.hooks_redirect`): its pre-push reports the runner's pushes to the
+    outcome ledger; nothing else changes, and the settings are told `guard=False`.
 
     `runtime`: the dispatch fact (`acp_runtime.wire_runtime`). `acp` with an adapter that has an `acp_launch` (and
     no Jaah-account plan) starts `jaah-acp-host --launch <ref_key>.launch.json` as the pane root instead of the
@@ -1347,16 +1398,11 @@ def launch_runner(
     does those jobs over ACP (the account layer is still converged: an engine's plugins live there). Anything else
     is the legacy launch, byte for byte.
 
-    `resume_ref`: the engine's own session id, set only for a console hand-off (`reconcile.enact_launch._launch_into_slot`,
-    the lease payload's `handoff`): the new front reopens that conversation instead of starting the task. Under
-    ACP it rides launch.json's `session_meta` (`NATIVE_REF_KEY`), which the host opens with `session/resume` or
-    `session/load`; on the legacy path the pane runs the adapter's `resume_exec_line` (a CLI answering None
-    raises — the CP offers a hand-off only for a provider whose catalogue `console.toggle` is set), with no task
-    prompt pasted, and a `SESSION_DISCOVER` CLI's vendor session is pinned to `resume_ref` at once (no discovery:
-    the session is already known). Empty changes nothing.
-
     `dispatch_id`/`generation`: the CP dispatch launching this runner (`lease_slot`'s fence), recorded with its pane
     in one `runner_registry.record` entry.
+
+    `shadow`: a benchmark shadow task (the lease payload's `"shadow": true`) — passed only to `build_auth_lines`
+    (`JAAH_TASK_SHADOW=1`, which the PR guard reads). False changes nothing.
 
     `has_repo` False: `worktree` is an empty FOLDER slot. The launch is otherwise identical; the
     runner's env and its tmux window carry `GIT_CEILING_DIRECTORIES` (`folder_git_env`).
@@ -1409,22 +1455,11 @@ def launch_runner(
         log.info("launch_runner: provider %s does not use the managed (omc) account layer — leaving "
                  "%s to its own adapter's prepare()", provider, account_dir or "(no account)")
     shq = fleet_launch.shq
-    # The whole `_meta` tree is written AS THE SESSION USER (the runner must read and `bash` it; daemon-
-    # owned copies were a measured cleanup burden). A refused write aborts the launch loudly.
-    def _write(path: str, content: str, mode: int = META_FILE_MODE) -> None:
-        err = session_user.write_file_as_session_user(path, content, mode=mode)
-        if err:
-            raise RuntimeError(f"launch_runner: could not write {path}: {err}")
-
-    meta = os.path.join(os.path.dirname(worktree), "_meta")
-    # Explicit mode: the seam's default is the session umask (`0775`); see `META_DIR_MODE`.
-    err = session_user.ensure_dir_as_session_user(meta, mode=META_DIR_MODE)
-    if err:
-        raise RuntimeError(f"launch_runner: could not create {meta}: {err}")
+    meta = _ensure_meta("launch_runner", worktree)
     sys_file = os.path.join(meta, f"{ref_key}.sys")
     task_file = os.path.join(meta, f"{ref_key}.task")
-    _write(sys_file, fleet_launch.node_naming(system_prompt))
-    _write(task_file, fleet_launch.node_naming(task_prompt))
+    _write_meta("launch_runner", sys_file, fleet_launch.node_naming(system_prompt))
+    _write_meta("launch_runner", task_file, fleet_launch.node_naming(task_prompt))
 
     # Minted before build_auth_lines so it rides into the runner's env as CONTROL_RUNNER_SESSION_ID —
     # the id the binding stamps and the runner's hooks report, which the CP's end_attempt fence checks.
@@ -1433,6 +1468,8 @@ def launch_runner(
     report_dir = ensure_report_dir(task_id, meta)
     # The same helper on either runtime: under ACP the engine is told it through its `AcpLaunch`, never this env.
     key_helper = api_key_helper_command(provider, api_key_account or "")
+    # Once per launch, read by both runtimes below (the ACP context and the legacy settings file).
+    workspace_id = api_key_workspace_id(key_helper, api_key_account or "")
     git_ceiling = folder_git_ceiling(worktree, has_repo)
     # Project memory (ON only): the bundle beside the prompts, refreshed every 60s; a miss is an empty bundle.
     memory_env = (
@@ -1447,13 +1484,20 @@ def launch_runner(
                                     base=integration_branch, worktree=worktree)
         if guard and guard_bundle is not None else None
     )
+    # Unguarded: the hooks redirect alone (launch step 5), so the runner's pushes still reach the outcome ledger
+    # (`guard_bundle.hooks_redirect`). Exported like the guard's, but never read as "guarded" (`guard=` below).
+    redirect_env = guard_env or (
+        guard_bundle.hooks_redirect(meta=meta, ref_key=ref_key, mode=META_FILE_MODE, worktree=worktree)
+        if guard_bundle is not None and has_repo else None
+    )
     # The ACP launch, when the dispatch fact and the adapter both allow one (`acp_runtime.acp_launch`); None is
     # the legacy path. After the key helper and the guard: the launch carries both, and a Jaah-account plan's
     # credential export and env (the default adapter's `settings`).
     acp = acp_runtime.acp_launch(adapter, runtime, agents.AcpLaunchContext(
         task_id=str(task_id), session_id=runner_session_id, worktree=worktree, config_dir=account_dir or "",
         project=project, model=model, api_key_account=api_key_account, additional_dirs=tuple(extra_dirs),
-        key_helper=key_helper, guard=bool(guard_env), bedrock=bedrock))
+        key_helper=key_helper, workspace_id=workspace_id, guard=bool(guard_env), bedrock=bedrock,
+        mcp_connections=tuple(mcp_connections)))
 
     # Anything this CLI needs on disk before it is exec'd (git hooks, trust record, MCP registration) —
     # before the hook file and the spawn, since the CLI reads them at startup. Exactly one `prepare` per launch,
@@ -1472,7 +1516,7 @@ def launch_runner(
         api_key_account="" if key_helper or acp is not None else api_key_account, provider=provider,
         git_author=git_author,
         bedrock=bedrock, git_ceiling=git_ceiling, memory_env=memory_env, advertise_nodelinks=True,
-        guard_env=guard_env,
+        guard_env=redirect_env, shadow=shadow,
     ), *api_key_preflight_lines(key_helper),
         *(bedrock_launch.preflight_lines(bedrock, fleet_launch.shq) if bedrock is not None else ()),
         # Launch step 4 (ON only): the node helper, started in the pane so its calls are this task's.
@@ -1522,10 +1566,7 @@ def launch_runner(
             auth_kind=acp_runtime.auth_kind_of(api_key_account, bedrock=bedrock is not None),
             additional_dirs=tuple(extra_dirs),
             worktree=worktree, charter_path=sys_file, prompt_path=task_file)
-        if resume_ref:
-            # The host's own key beside the agent's `_meta`: it opens this conversation instead of a new one.
-            document["session_meta"] = {**document["session_meta"], NATIVE_REF_KEY: resume_ref}
-        _write(launch_json, acp_runtime.launch_json_text(document))
+        _write_meta("launch_runner", launch_json, acp_runtime.launch_json_text(document))
         acp_runtime.register_session(session_id=runner_session_id, task_id=task_id, provider=provider,
                                      key_sign_in=acp.authenticate is not None)
         launch_sh = fleet_launch.build_launch_sh(
@@ -1534,27 +1575,30 @@ def launch_runner(
             exec_lines=acp_runtime.exec_lines(launch_json))
     else:
         settings_path = os.path.join(meta, f"{ref_key}.settings.json")
-        # `project_name=project`: the CP's `projects.name`, not one re-derived from the path (which carries
-        # the repo name). `mode=META_FILE_MODE` is decided here, the only layer that knows it is a `_meta` file.
+        # `mode=META_FILE_MODE` is decided here, the only layer that knows it is a `_meta` file.
         settings_kwargs = dict(
             extra="true", worktree=worktree, role="runner", hooks_dir=str(HOOKS_DIR), account_dir=account_dir,
-            project_name=project, autoclose=autoclose, securestorage_dir=securestorage_dir, provider=provider,
+            autoclose=autoclose, securestorage_dir=securestorage_dir, provider=provider,
             guard=bool(guard_env),
             # Spread: every other runner's chain is byte-for-byte what it was (`tests/test_agent_adapters.py` goldens).
             **({"lane": True} if lane else {}),
         )
-        # Only a CLI with a setting for them takes this branch for `extra_dirs` alone: every other one keeps its
-        # adapter's own `write_settings` (which may write more than this file).
+        # Only a CLI with a setting for them takes this branch for `extra_dirs` alone, and a CLI with
+        # `runner_settings()` always: every other one keeps its adapter's own `write_settings`
+        # (which may write more than this file).
         dirs_settings = adapter.additional_dirs_settings(tuple(extra_dirs)) if extra_dirs else {}
-        if key_helper or bedrock is not None or dirs_settings:
+        if key_helper or bedrock is not None or dirs_settings or adapter.runner_settings():
             # The API key rides `apiKeyHelper`, a Jaah session's credentials `awsCredentialExport`, and a
-            # multi-repo slot's other repositories `permissions.additionalDirectories`, in this same settings file
-            # (`api_key_helper_command`, `with_bedrock_settings`, `with_additional_dirs`).
-            content, settings_flag = with_additional_dirs(*with_bedrock_settings(*with_api_key_settings(
-                *fleet_launch.build_settings(settings_path, **settings_kwargs),
-                provider=provider, key_helper=key_helper, settings_path=settings_path),
+            # multi-repo slot's other repositories `permissions.additionalDirectories`, and a task run's own keys,
+            # in this same settings file (`api_key_helper_command`, `with_bedrock_settings`, `with_additional_dirs`,
+            # `with_runner_settings`).
+            content, settings_flag = with_runner_settings(*with_additional_dirs(*with_bedrock_settings(
+                *with_api_key_settings(
+                    *fleet_launch.build_settings(settings_path, **settings_kwargs),
+                    provider=provider, key_helper=key_helper, settings_path=settings_path, workspace_id=workspace_id),
                 bedrock=bedrock, settings_path=settings_path),
-                provider=provider, dirs=extra_dirs, settings_path=settings_path)
+                provider=provider, dirs=extra_dirs, settings_path=settings_path),
+                provider=provider, settings_path=settings_path)
             err = session_user.write_file_as_session_user(settings_path, content, mode=META_FILE_MODE)
             if err:
                 raise RuntimeError(f"write_settings: could not write {settings_path}: {err}")
@@ -1563,34 +1607,26 @@ def launch_runner(
 
         # An API-key launch's own argv (`api_key_argv`) rides with the model flag: both are quoted CLI options.
         model_args = (("--model", model) if model else ()) + (adapter.api_key_argv() if api_key_account else ())
-        # A hand-off reopens the engine's session in the TUI — refused BEFORE the binding below when this CLI's
-        # terminal cannot, so a refused resume leaves no binding to a runner that never existed.
-        resume_lines = None
-        if resume_ref:
-            resume_lines = adapter.resume_exec_line(sys_file=sys_file, settings_flag=settings_flag,
-                                                    model_args=model_args, native_ref=resume_ref)
-            if resume_lines is None:
-                raise RuntimeError(f"launch_runner: the {adapter.provider} CLI's terminal cannot resume a "
-                                   "session; no hand-off to it")
+        # The project's linked remote MCP servers: this session's own config file, beside its prompts, so two
+        # sessions never share one (`legacy_mcp_config`; bridge commands only, never a token).
+        mcp_path = os.path.join(meta, f"{ref_key}.mcp.json")
+        if legacy_mcp := adapter.legacy_mcp_config(tuple(mcp_connections), config_path=mcp_path):
+            mcp_content, mcp_args = legacy_mcp
+            _write_meta("launch_runner", mcp_path, mcp_content)
+            model_args += mcp_args
 
         # Bind the Task to this runner BEFORE the spawn (worktree, session, account — the dispatcher alone
         # holds all three), so the binding outlives a failed launch; a CP hiccup costs attribution, not a run.
         # A Jaah home is no account: the CP attributes the run by its `jaah_sessions` row, not a config dir.
         _record_runner_binding(task_id, runner_session_id, worktree, project,
                                account_dir if bedrock is None else None)
-        if resume_lines is not None:
-            # No `session_args`: the resumed session keeps its own id.
-            launch_sh = fleet_launch.build_launch_sh(
-                auth_line=auth_line, hub_root=str(HUB_ROOT), worktree=worktree, settings_flag=settings_flag,
-                sys_file=sys_file, task_file=task_file, provider=provider, exec_lines=tuple(resume_lines))
-        else:
-            session_args = session_args_for(adapter, runner_session_id)
-            launch_sh = fleet_launch.build_launch_sh(
-                auth_line=auth_line, hub_root=str(HUB_ROOT), worktree=worktree, settings_flag=settings_flag,
-                sys_file=sys_file, task_file=task_file, model_args=model_args, session_args=session_args,
-                provider=provider,
-            )
-    _write(launch_path, launch_sh, mode=META_EXEC_MODE)
+        session_args = session_args_for(adapter, runner_session_id)
+        launch_sh = fleet_launch.build_launch_sh(
+            auth_line=auth_line, hub_root=str(HUB_ROOT), worktree=worktree, settings_flag=settings_flag,
+            sys_file=sys_file, task_file=task_file, model_args=model_args, session_args=session_args,
+            provider=provider,
+        )
+    _write_meta("launch_runner", launch_path, launch_sh, mode=META_EXEC_MODE)
 
     # Composed by the ONE composer (`fleet_launch.slot_window_name`) over the pinned Title format
     # (`task_slot_title`), byte-identical to the CP's `worktrees.title`; tmux's format bounds the length.
@@ -1644,7 +1680,7 @@ def launch_runner(
                            dispatch_id=dispatch_id, generation=generation)
     # `ready → active` the moment the runner exists, as `_launch_no_model` does: the runner's SessionStart
     # claim is a second, idempotent try, and a launched runner is never left looking unstarted.
-    control_plane_api.claim_task_active(task_id)
+    control_plane_api.claim_task_active(task_id, session_id=runner_session_id)
     if bedrock is not None and acp is None:
         # Live metering starts with the pane: the tail reads this runner's transcript from here on. Under ACP the
         # hub registers it once the host names the agent's session (`set_jaah_account` above).
@@ -1657,12 +1693,7 @@ def launch_runner(
     # ACP: the host streams the session's events, so no vendor transcript is looked for.
     if acp is None:
         session_vendor.record(runner_session_id, provider=provider, config_dir=account_dir or "",
-                              worktree=worktree, launched_at=launched_at,
-                              usage_floor=bool(resume_ref))
-        # A resume's vendor session is known, not discovered: pinned now (discovery after `launched_at` would
-        # find nothing new, or name another runner's rollout).
-        if resume_ref and adapter.session_binding() == agents.SESSION_DISCOVER:
-            session_vendor.pin_vendor_session(runner_session_id, resume_ref)
+                              worktree=worktree, launched_at=launched_at)
     # Mark the agents cache dirty so the next tick re-probes this account; never probe inline (a Node
     # cold start on the dispatch path, and too early to see the new session). An API-key runner has no
     # home (`api_key_account_dir` failed): its session then registers in the session user's own CLI home.
@@ -1682,8 +1713,7 @@ def launch_runner(
     # every other intent. Nothing recovers a lost race — the runner never has a turn, so autoclose is
     # never armed, and its SessionStart already claimed the task — so the thread kills the window
     # instead (a dead runner on an active task is recoverable). The stable window id, not `win`.
-    # Never on a resume: the reopened conversation already holds the task, and a paste would restart it.
-    if acp is None and not resume_ref and adapter.task_delivery() == agents.TASK_TMUX_PASTE:
+    if acp is None and adapter.task_delivery() == agents.TASK_TMUX_PASTE:
         threading.Thread(
             target=_deliver_task_prompt,
             args=(spawn.get("window_id") or win, task_prompt, worktree, adapter, task_id,

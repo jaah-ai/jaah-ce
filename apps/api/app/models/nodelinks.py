@@ -31,9 +31,8 @@ class OrgSharedStore(EntityMixin, OrgScoped, Base):
     each named (`uq_org_shared_stores_org_name`), chosen per NodeLink in its editor's Storage tab.
 
     Created by the control plane in the org's own AWS account, or an existing file system (`adopted`).
-    Keyed off its AWS credential like `CloudConnection` (CASCADE). A store has no access point of its own:
-    `access_point_id`/`access_point_arn` are legacy columns nothing reads or writes (each NodeLink carries
-    its own). A store left with no NodeLink is deleted, the row only (`app/nodelinks.py`), unless Jaah made its cloud
+    Keyed off its AWS credential like `CloudConnection` (CASCADE). A store has no access point of its own
+    (each NodeLink carries its own). A store left with no NodeLink is deleted, the row only (`app/nodelinks.py`), unless Jaah made its cloud
     object and it bills on its own: the admin deletes that one (`routes/org_shared_store.py`). No `slug`.
 
     `managed_location` set: the operator plane's Jaah-managed store for that node location, on which tenant
@@ -84,9 +83,6 @@ class OrgSharedStore(EntityMixin, OrgScoped, Base):
     security_group_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     mount_target_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     mount_target_ip: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # Legacy (the store's own access point, before each NodeLink chose its own): never read or written.
-    access_point_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    access_point_arn: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(
         Text, nullable=False, default="pending", server_default="pending"
     )
@@ -109,11 +105,6 @@ class OrgSharedStore(EntityMixin, OrgScoped, Base):
     )
 
 
-#: A legacy column's domain (`nodelinks.kind`): rows made before every NodeLink was ordinary say `accounts`
-#: for the one at `{jaah-home}/auth/.shared`. Nothing reads it; new rows are written `general`.
-NODELINK_KINDS = ("accounts", "general")
-
-
 #: A NodeLink's lifecycle. `provisioning` = its access point or policy is not settled yet (re-run);
 #: `deleting` = the two-phase delete is waiting for nodes to unmount, or its AWS step failed (Retry).
 NODELINK_STATUSES = ("pending", "provisioning", "ready", "failed", "deleting")
@@ -129,18 +120,15 @@ class NodeLink(EntityMixin, OrgScoped, Base):
     access point's own root (`access_point_adopted`: never deleted in AWS). `in_policy`: the last
     file-system policy written to the store admits this access point (`ready` requires it).
     `pending_unmount_node_ids` (no FKs) are the nodes a delete is still waiting on, since `deleting_since`.
-    `kind` is legacy (`NODELINK_KINDS`)."""
+    The database still carries a legacy `kind` column (unmapped; `migrations/env.py::_RETIRING_COLUMNS`)."""
 
     __tablename__ = "nodelinks"
     __table_args__ = (
         org_unique(__tablename__),
         UniqueConstraint("org_id", "slug", name="uq_nodelinks_org_slug"),
         UniqueConstraint("org_id", "name", name="uq_nodelinks_org_name"),
-        CheckConstraint(in_domain_sql("kind", NODELINK_KINDS), name="ck_nodelinks_kind"),
         CheckConstraint(in_domain_sql("status", NODELINK_STATUSES), name="ck_nodelinks_status"),
         CheckConstraint("mount_path LIKE '{jaah-home}/%'", name="ck_nodelinks_mount_path"),
-        # Legacy: at most one `accounts` row per org (harmless; new rows are `general`).
-        Index("uq_nodelinks_org_accounts", "org_id", unique=True, postgresql_where=text("kind = 'accounts'")),
         Index("ix_nodelinks_store_id", "store_id"),
     )
 
@@ -148,7 +136,6 @@ class NodeLink(EntityMixin, OrgScoped, Base):
     store_id: Mapped[Optional[UUID]] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("org_shared_stores.id", ondelete="CASCADE"), nullable=True
     )
-    kind: Mapped[str] = mapped_column(Text, nullable=False, default="general", server_default="general")
     mount_path: Mapped[str] = mapped_column(Text, nullable=False)
     root_directory: Mapped[str] = mapped_column(Text, nullable=False)
     access_point_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

@@ -1,6 +1,6 @@
 """Per-model token rates and the token→dollar arithmetic — the single home for both.
 
-Separate from `routes/model_prices.py` so `migrations/versions/202610251700_baseline.py` (which seeds the table
+Separate from `routes/model_prices.py` so `migrations/versions/202611130100_baseline.py` (which seeds the table
 without the ORM) and `app/task_run_metrics.py` need not import a route. `SEED_PRICES` is plain data.
 
 Five token classes because Anthropic prices input five ways across a 40× spread; conflating them is wrong
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal
+from functools import lru_cache
 from typing import Any, Iterable, Mapping, Optional
 
 from app.provider_model_prices import official_prices
@@ -83,8 +84,10 @@ LONG_CONTEXT_1M_MULTIPLIER = Decimal(2)
 HAIKU_LONG_CONTEXT_MULTIPLIER = Decimal(5)
 
 
+@lru_cache(maxsize=4096)
 def canonical_model(name: str) -> str:
     """One model id → the family it belongs to, or the id unchanged when it belongs to none. The join key.
+    Pure over this module's constants, so memoised: a dashboard year folds the same few ids ~10^5 times.
 
     An unrecognized name passes through verbatim, finds no rate row, and `cost_usd` reports it by name as
     unpriced; guessing a family would bill spend at a rate nobody chose. `routes/model_prices.py::
@@ -357,3 +360,23 @@ def lock_capture_costs(metrics: dict[str, Any], prices: Mapping[str, Mapping[str
         if usage:
             metrics[COST_BY_MODEL] = lock_costs(usage, prices)
     return metrics
+
+
+# ── Cost bands (the marketplace) ────────────────────────────────────────────────────────────────────
+#: A provider's band by its dearest model's output rate ($/MTok): up to the first bound is `$`, up to the second
+#: `$$`, above it `$$$`. Output, because it dominates a coding run's bill; the dearest, so a band never undersells.
+COST_BAND_BOUNDS: tuple[Decimal, Decimal] = (Decimal(5), Decimal(20))
+
+
+def cost_band(provider: str, prices: Mapping[str, Mapping[str, Decimal]]) -> Optional[dict[str, Any]]:
+    """`{band, low_usd, high_usd}` — the cheapest and dearest output $/MTok among `provider`'s priced models — or
+    None when none of its models has a price. Tier rows (`name@tier`) are surcharges, not models, and are skipped."""
+    from app import agent_providers
+
+    rates = [rate["output"] for name, rate in prices.items()
+             if "@" not in name and agent_providers.provider_of_model(name) == provider]
+    if not rates:
+        return None
+    low, high = min(rates), max(rates)
+    band = "$" if high <= COST_BAND_BOUNDS[0] else "$$" if high <= COST_BAND_BOUNDS[1] else "$$$"
+    return {"band": band, "low_usd": float(low), "high_usd": float(high)}

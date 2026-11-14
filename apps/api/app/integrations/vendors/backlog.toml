@@ -1,0 +1,84 @@
+# Backlog (Nulab). Facts confirmed at the vendor's own docs: API keys (Personal settings > API, sent as the
+# Backlog-API-Key header or the apiKey query parameter) and the space hosts <space>.backlog.com, .backlog.jp and
+# .backlogtool.com https://developer.nulab.com/docs/backlog/getting-started/ ; OAuth 2.0 authorization code on the
+# space's own host (/OAuth2AccessRequest.action, token at /api/v2/oauth2/token, client pair in the form body, 1 h access
+# tokens with a rotating refresh token, no scopes) https://developer.nulab.com/docs/backlog/auth/ ; one application
+# registered at the Nulab developer site serves every space on all three domains
+# https://nulab.com/backlog/developer/applications/ ; the identity call https://developer.nulab.com/docs/backlog/api/2/get-own-user/
+slug = "backlog"
+label = "Backlog"
+category = "dev_tools"
+vendor_docs_url = "https://developer.nulab.com/docs/backlog/auth/"
+summary = "Read, create and update Backlog issues, comments, wikis and pull requests from agent work."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+# The endpoints live on each customer's space, so `{origin}` is filled from the row's space URL, pinned to Nulab's
+# three domains. Backlog documents no PKCE and no scopes: the grant is the user's full access to the space.
+authorize_url = "{origin}/OAuth2AccessRequest.action"
+token_url = "{origin}/api/v2/oauth2/token"
+account_url = "{origin}/api/v2/users/myself"
+account_field = "name"
+origin_field = "base_url"
+origin_hosts = ["backlog.com", "backlog.jp", "backlogtool.com"]
+pkce = false
+jaah_app = true
+[auth.oauth.registration]
+console_url = "https://backlog.com/developer/applications/signin"
+steps = [
+  "Sign in to the Nulab developer site with the company's Nulab account (the console URL above) and select Register a new application",
+  "Fill in Application name Jaah, the Jaah website as the application URL, and a one-line description",
+  "Set Redirect URI to this environment's redirect URI: Backlog matches exactly one per application, so dev and prod are two applications",
+  "Save, then copy the Client ID and Client Secret",
+]
+review = "Not required: an application registered at the Nulab developer site works for users of every Backlog space on backlog.com, backlog.jp and backlogtool.com as soon as it is saved"
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "base_url", label = "Space URL", kind = "url", required = true, placeholder = "https://yourspace.backlog.com", help = "The address you open Backlog at, such as https://yourspace.backlog.com or https://yourspace.backlog.jp, with no path after it" },
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "Backlog > your avatar > Personal settings > API > enter a memo such as Jaah > Submit, then copy the key" },
+]
+
+[test]
+method = "GET"
+path = "{base_url}/api/v2/users/myself"
+auth = { field = "api_key", header = "Backlog-API-Key" }
+host_suffixes = ["backlog.com", "backlog.jp", "backlogtool.com"]
+identity = [["name"], ["userId"]]
+
+[docs]
+agent_uses = [
+  "Start a task from a Backlog issue: assign it to your Jaah user, mention that user in a comment or add the jaah category (Settings > Integrations > Issue trackers > Add tracker)",
+  "Read the Backlog issue a Jaah task names: its description, status, assignee, milestones and comments",
+  "Create follow-up issues in the right project when an agent finds more work",
+  "Comment on an issue with progress, a summary or a pull request link, and change its status when the work lands",
+  "Read and update wiki pages, and list a project's open issues to plan or report on work",
+  "Read Backlog Git repositories' pull requests and comment on them",
+]
+prerequisites = [
+  "A Backlog account that is a member of the projects agents should reach",
+  "Your space URL: the address you open Backlog at, on backlog.com, backlog.jp or backlogtool.com",
+  "To connect with a sign-in: nothing else - approve Jaah on Backlog's consent screen",
+  "To connect with an API key: permission to create one in Personal settings > API (a space admin can turn API keys off for the space)",
+]
+limitations = [
+  "Agents act as the account that connected: issues, comments and wiki edits they make are attributed to that person",
+  "Backlog has no scopes: a sign-in or an API key grants everything that account can do in the space",
+  "One connection reaches one space; add another connection for each extra space",
+  "Backlog Enterprise installed on your own servers is not supported, only spaces Nulab hosts",
+  "Backlog rate-limits API calls per user; very large bulk edits can be slowed or refused",
+]
+troubleshooting = [
+  { symptom = "Test says Backlog rejected the API key (401)", fix = "The key was deleted or mistyped, or belongs to another space. Create a new key in Personal settings > API and select Replace on the secret" },
+  { symptom = "Test says the Space URL is refused", fix = "Enter only the space address, such as https://yourspace.backlog.com, with no path. Spaces on other domains cannot be connected" },
+  { symptom = "Backlog shows an error about the redirect URI on the sign-in screen", fix = "You are using your own OAuth application and its Redirect URI is not the one on this page. Set it exactly and try again" },
+  { symptom = "The secret shows Needs reconnect", fix = "The sign-in was revoked in Backlog or the account left the space. Select Reconnect and approve Jaah again" },
+]
+faq = [
+  { q = "Can a Backlog issue start a Jaah task", a = "Yes. Add the space under Settings > Integrations > Issue trackers > Add tracker with the secret of a dedicated Backlog user named Jaah; assigning an issue to that user, mentioning it or adding the jaah category then starts a task, and Jaah posts its progress on the issue" },
+  { q = "Which account do agents act as", a = "The Backlog account that approved the sign-in or created the API key. Use a dedicated Backlog member for agents if you want their work attributed separately" },
+  { q = "Does the connection expire", a = "A sign-in renews itself: Jaah refreshes the one-hour access token automatically. An API key lasts until you delete it" },
+  { q = "Can agents use Backlog's MCP server", a = "Not through Jaah yet: Nulab offers its MCP server only as software you run yourself, and Jaah links hosted MCP servers. Agents call Backlog's API with this connection instead" },
+]

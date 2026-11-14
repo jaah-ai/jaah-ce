@@ -4,7 +4,9 @@ import Typography from '@mui/material/Typography'
 import { Children, Fragment, isValidElement, type JSX, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { useTabActionsSlot } from '../components/TabActionsSlot'
+import { PaneWindowSlot } from '../components/PaneWindowSlot'
 import { PHONE } from './listStyles'
+import { FONT_WEIGHT, LINE_HEIGHT, grid } from '../theme'
 
 /* The console's ONE page header.
  *
@@ -24,7 +26,8 @@ import { PHONE } from './listStyles'
  * STYLING HOOKS: a host that reshapes the header (`components/tasks/pane/PaneHeader.tsx`) selects these
  * `data-slot`s, never its DOM nesting or MUI class names — `page-header` (the row), `lead` (the row's leading
  * group: the heading column, or the trail and aside beside it), `title-row` (the title or trail with its aside
- * beside it; only with an aside), `heading` (the heading column inside a title-less `title-row`) and `actions`.
+ * beside it; only with an aside), `heading` (the heading column inside a title-less `title-row`), `actions` and
+ * `pane-window` (the split pane's window buttons, last on the row).
  */
 export function PageHeader({
   title,
@@ -49,13 +52,13 @@ export function PageHeader({
 }): JSX.Element | null {
   const tabSlot = useTabActionsSlot()
   if (tabSlot !== null && title == null && breadcrumb == null && subtitle == null && titleAside == null) {
-    return actions && tabSlot ? createPortal(<span data-testid={testId} style={{ display: 'contents' }}>{actions}</span>, tabSlot) : null
+    return actions && tabSlot ? createPortal(<Box component="span" data-testid={testId} sx={{ display: 'contents' }}>{actions}</Box>, tabSlot) : null
   }
   /* A header with nothing to show takes no space. */
   if (title == null && breadcrumb == null && !subtitle && titleAside == null && !actions) return null
 
   const titleText = title != null && (
-    <Typography variant="h6" component="h1" sx={{ fontWeight: 600, lineHeight: 1.25, minWidth: 0 }}>
+    <Typography variant="h6" component="h1" sx={{ fontWeight: FONT_WEIGHT.semibold, lineHeight: LINE_HEIGHT.snug, minWidth: 0 }}>
       {title}
     </Typography>
   )
@@ -80,23 +83,24 @@ export function PageHeader({
      lone small button wrapped to a line of its own. With exactly one action the lead takes a `10rem` basis on the
      phone (the aside's trick above) and the title wraps beside the button; a wide one still wraps. */
   const oneAction = actionCount(actions) === 1
-  const leadPhone = oneAction ? { [PHONE]: { flex: '1 1 10rem' } } : null
+  const leadPhone = oneAction ? { [PHONE]: { flexGrow: 1, flexShrink: 1, flexBasis: grid(26.5) } } : null
   const titleColumn = (slot?: string) => (
     <Box
       data-slot={slot}
       sx={{
         flex: asideBeside ? '0 1 auto' : '1 1 auto',
-        ...(asideBeside ? { [PHONE]: { flex: '1 1 10rem' } } : slot === 'lead' ? leadPhone : null),
+        ...(asideBeside ? { [PHONE]: { flexGrow: 1, flexShrink: 1, flexBasis: grid(26.5) } } : slot === 'lead' ? leadPhone : null),
         minWidth: 0,
         display: 'flex',
         flexDirection: 'column',
-        gap: 0.25,
+        gap: 0,
       }}
     >
       {breadcrumb}
       {titled ? asideRow(titleText) : titleText}
+      {/* A div, not the body2 default `<p>`: a subtitle carries chips and boxes (block content). */}
       {subtitle && (
-        <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+        <Typography variant="body2" component="div" sx={{ color: 'text.secondary' }}>
           {subtitle}
         </Typography>
       )}
@@ -134,6 +138,8 @@ export function PageHeader({
           {actions}
         </Stack>
       )}
+      {/* The split pane's Maximize and Close, on this row instead of a row of their own (`components/PaneWindowSlot`). */}
+      <PaneWindowSlot />
     </Box>
   )
 }

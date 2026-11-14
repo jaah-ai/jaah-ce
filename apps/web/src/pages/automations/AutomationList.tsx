@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useQueries, useQuery, type UseQueryResult } from '@tanstack/react-query'
+import { useLocation } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import { apiDetail, get } from '../../api'
 import { useAuth } from '../../auth'
 import { useChangeOrgAction } from '../../components/ChangeOrgDialog'
-import { useConfirm, type ConfirmOptions } from '../../components/ConfirmDialog'
+import { type ConfirmOptions, danger, useConfirm } from '../../components/ConfirmDialog'
 import { deleteItem, type OverflowItem } from '../../components/tasks/rowActions'
 import { ACTION_ICON } from '../../components/tasks/shared'
 import PaneModeToggle from '../../components/tasks/pane/PaneModeToggle'
@@ -14,11 +15,11 @@ import { useRowActions } from '../../hooks/useBusyIds'
 import { useUrlFilters } from '../../hooks/useUrlFilters'
 import { loadListView, saveListView, usePersistedListView, type ListView } from '../../lib/listViewStorage'
 import { buildNameTree, type NameTreeKind, type NameTreeNode } from '../../lib/nameTree'
-import { NO_REFILING_DEPS, nameTreeRows } from '../../lib/nameTreeRows'
-import { compactAge, compactSpan, NO_VALUE } from '../../lib/relativeTime'
+import { nameTreeRows } from '../../lib/nameTreeRows'
+import { compactAge, compactSpan, NO_VALUE, relativeAge } from '../../lib/relativeTime'
 import { formatZoned } from '../../lib/zonedTime'
 import Banner from '../../ui/Banner'
-import ToolbarMenu, { filterRadioPage } from '../../ui/ToolbarMenu'
+import { SelectFilters, type SelectNarrowing } from '../../ui/SelectFilters'
 import LoadFailedState from '../../ui/LoadFailedState'
 import ListStates from '../../ui/feed/ListStates'
 import { contentSlotWidth } from '../../ui/feed/geometry'
@@ -33,7 +34,9 @@ import type { Tone } from '../../ui/StatusChip'
 import {
   removedSuffix,
   summarizeTarget,
+  targetRosterKey,
   type TargetDangling,
+  type TargetId,
   type TargetItem,
   type TargetKind,
   type TargetRule,
@@ -53,6 +56,7 @@ import {
   pauseAutomation,
   previewTarget,
   releaseAutomation,
+  takeAutomationOwnership,
   resumeAutomation,
   runAutomation,
   RUNS_REREAD_MS,
@@ -60,13 +64,12 @@ import {
 } from './api'
 import {
   lastRunOutcome,
-  STATUS_GLYPH,
-  STATUS_LABELS,
-  STATUS_TONE,
+  STATUS,
   unrecordedOutcome,
   whenShort,
   whenSummary,
 } from './vocabulary'
+import { SIZE, grid } from '../../theme'
 
 /* AUTOMATION — every automation this viewer may manage, one feed row each (`ui/feed/FeedList`, the console's
  * one list), in THE STANDARD LIST SHAPE Playbooks draws (`pages/playbooks/PlaybooksPage.tsx`): the Flat/Tree
@@ -111,7 +114,7 @@ const WHEN_SLOT = 100
 /** At most this percent of the list's width (`cqw`). */
 const WHEN_MAX_CQW = 20
 /** Fits "acme-shop · Coder" (~18ch at 11px). */
-const FACTS_SLOT = 120
+const FACTS_SLOT = SIZE.fieldSm
 /** At most this percent of the list's width (`cqw`). */
 const FACTS_MAX_CQW = 24
 /** An all-system roster, whose column is mostly functions' descriptions (`factsShown`), sizes it to what it shows
@@ -120,18 +123,17 @@ const FACTS_MAX_CQW = 24
 const DESCRIPTIONS_MAX_CQW = 40
 /** ...and never past what leaves the Name column ~220px ("Evidence: Security Hub findings" on one line) beside the
  *  status mark, When, Last and ⋯: at 1024px the share alone wrapped a third of the names. */
-const DESCRIPTIONS_NAME_ROOM = 500
+const DESCRIPTIONS_NAME_ROOM = grid(83)
 
 /** The Target · Action width on an all-system roster (`DESCRIPTIONS_MAX_CQW`, `DESCRIPTIONS_NAME_ROOM`). */
 function descriptionsWidth(texts: readonly string[]): number | string {
   const fit = contentSlotWidth(texts, FACTS_SLOT, DESCRIPTIONS_MAX_CQW)
-  return typeof fit === 'number' ? fit : `min(${fit}, max(${FACTS_SLOT}px, 100cqw - ${DESCRIPTIONS_NAME_ROOM}px))`
+  return typeof fit === 'number' ? fit : `min(${fit}, max(${grid(FACTS_SLOT / 6)}, 100cqw - ${DESCRIPTIONS_NAME_ROOM}))`
 }
 
-/** Tree mode's vocabulary; `nameMax` only bounds drags, and this roster offers none. */
+/** Tree mode's vocabulary. */
 const AUTOMATION_TREE_KIND: NameTreeKind = {
   noun: { one: 'automation', many: 'automations' },
-  nameMax: null,
   idPrefix: 'automation',
   groupMark: false,
 }
@@ -148,36 +150,37 @@ const NOUNS: Record<TargetKind, { one: string; many: string }> = {
 type Roster = { state: 'loading' | 'error' | 'ready'; items: TargetItem[] }
 const rosterKey = (kind: string, orgId: string) => `${kind}\u0000${orgId}`
 
-/** One read per distinct (kind, org) the list's targets name — never one per row. */
+/** One read per distinct (kind, org) the list's targets name — never one per row: react-query's `useQueries`
+ *  under `ui/TargetSelector`'s roster key (one cache entry per pair, whichever surface reads it first), re-read
+ *  once per mount as the hand-rolled read was. The Map's identity is `combine`'s, memoised on the pairs: it moves
+ *  only when an answer or the pair set does, so `useDangling` re-runs only then. */
 function useRosters(rows: Automation[]): Map<string, Roster> {
   const pairs = useMemo(() => {
     const seen = new Map<string, { kind: TargetKind; orgId: string }>()
     for (const row of rows) {
       if (row.target) seen.set(rosterKey(row.target.kind, row.org_id), { kind: row.target.kind, orgId: row.org_id })
     }
-    return seen
+    return [...seen.entries()]
   }, [rows])
-  const [rosters, setRosters] = useState<Map<string, Roster>>(new Map())
-
-  useEffect(() => {
-    let live = true
-    for (const [key, { kind, orgId }] of pairs) {
-      if (rosters.has(key)) continue
-      setRosters(prev => new Map(prev).set(key, { state: 'loading', items: [] }))
-      get<{ items: TargetItem[]; total: number }>(
+  const combine = useCallback((results: UseQueryResult<{ items: TargetItem[]; total: number }>[]) =>
+    new Map<string, Roster>(results.map((result, i) => [
+      pairs[i][0],
+      result.isSuccess ? { state: 'ready', items: result.data.items ?? [] }
+        : result.isError ? { state: 'error', items: [] }
+        : { state: 'loading', items: [] },
+    ])), [pairs])
+  return useQueries({
+    queries: pairs.map(([, { kind, orgId }]) => ({
+      queryKey: targetRosterKey(kind, orgId),
+      queryFn: () => get<{ items: TargetItem[]; total: number }>(
         `/api/automations/targets/${kind}?org_id=${encodeURIComponent(orgId)}`,
-      ).then(
-        data => live && setRosters(prev => new Map(prev).set(key, { state: 'ready', items: data.items ?? [] })),
-        () => live && setRosters(prev => new Map(prev).set(key, { state: 'error', items: [] })),
-      )
-    }
-    return () => {
-      live = false
-    }
-    // `rosters` is read only to skip pairs already asked for; re-running on it would re-ask nothing.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pairs])
-  return rosters
+      ),
+      staleTime: Infinity,
+      refetchOnMount: 'always' as const,
+      meta: { persist: false },
+    })),
+    combine,
+  })
 }
 
 /** A stored id the roster does not hold is named by the server's preview,
@@ -289,11 +292,19 @@ const IDLE_OUTCOMES = new Set(['noop', 'skipped', 'missed'])
 /** Past this, a never-run schedule's first run is overdue rather than due now. */
 const OVERDUE_MS = 2 * 60_000
 
+/** A run of skipped or failed runs at the org's alert threshold outranks the newest run's own mark. */
+const PROBLEM_STREAK = { glyph: '⚠', tone: 'warning' as Tone }
+
+/** "4 skipped or failed in a row" ("50+ …" past the server's count). */
+function streakWords(streak: { count: number; more: boolean }): string {
+  return `${streak.count}${streak.more ? '+' : ''} skipped or failed in a row`
+}
+
 /** "last did work 3h ago", for an idle run's hover; null where no work is on record. */
 function lastWork(row: Automation): string | null {
   if (!row.last_acted_at) return null
-  const age = compactAge(row.last_acted_at)
-  return `last did work ${age === 'now' ? 'just now' : `${age} ago`}`
+  const age = relativeAge(row.last_acted_at)
+  return `last did work ${age === 'now' ? 'just now' : age}`
 }
 
 /** The last run as its outcome and age ("✓ 3h"), the words on hover ("Filed Oct 11, 2026, 05:01 EDT") and for a
@@ -323,14 +334,16 @@ function lastRunSlot(row: Automation): FeedSlot {
   if (!outcome) return { ...base, node: age, title: said('Ran'), data: { outcome: 'unknown' } }
   const word = unrecorded ?? lastRunOutcome(outcome)
   const work = IDLE_OUTCOMES.has(outcome) ? lastWork(row) : null
+  const streak = row.problem_streak ? streakWords(row.problem_streak) : null
+  const shown = streak ? { ...PROBLEM_STREAK, label: `${word.label} · ${streak}` } : word
   return {
     ...base,
-    title: work ? `${said(word.label)} · ${work}` : said(word.label),
-    data: { outcome },
+    title: [said(word.label), streak, work].filter(Boolean).join(' · '),
+    data: { outcome, ...(row.problem_streak ? { streak: row.problem_streak.count } : null) },
     node: (
       <>
-        <Box component="span" aria-hidden="true" sx={toneSx(word.tone)}>{word.glyph}</Box>
-        <Box component="span" sx={VISUALLY_HIDDEN}>{word.label}</Box>
+        <Box component="span" aria-hidden="true" sx={toneSx(shown.tone)}>{shown.glyph}</Box>
+        <Box component="span" sx={VISUALLY_HIDDEN}>{shown.label}</Box>
         {' '}
         {age}
       </>
@@ -352,7 +365,9 @@ function factsShown(row: Automation, facts: string): string {
   return row.description.trim() || 'System'
 }
 
-function automationRow(row: Automation, { when, whenFull, target, action, actionBrief, widths, showSystem, menu, busy, templateProblem }: {
+function automationRow(row: Automation, { href, when, whenFull, target, action, actionBrief, widths, showSystem, menu, busy, templateProblem }: {
+  /** The row's link. */
+  href: string
   /** The compact When, the slot's text. */
   when: string
   /** The full sentence, the slot's hover. */
@@ -370,7 +385,8 @@ function automationRow(row: Automation, { when, whenFull, target, action, action
   /** "Template deleted" / "Template unavailable": the Task action's template no longer resolves. */
   templateProblem: string | null
 }): FeedRowSpec {
-  const label = STATUS_LABELS[row.status] ?? row.status
+  const status = STATUS[row.status]
+  const label = status?.label ?? row.status
   const reason = row.status_reason
   const next = nextRun(row)
   const plain = factsText(target, actionBrief)
@@ -381,9 +397,9 @@ function automationRow(row: Automation, { when, whenFull, target, action, action
   return {
     key: row.id,
     indicator: {
-      tone: STATUS_TONE[row.status] ?? 'neutral',
+      tone: status?.tone ?? 'neutral',
       // `○`, not `?`: the feed's `?` means "needs input".
-      glyph: STATUS_GLYPH[row.status] ?? '○',
+      glyph: status?.glyph ?? '○',
       label,
       title: reason ? `${label}: ${reason}` : label,
       data: { status: row.status },
@@ -391,7 +407,7 @@ function automationRow(row: Automation, { when, whenFull, target, action, action
     title: row.name,
     titleText: row.name,
     titleLines: 'all',
-    href: `/automations/${encodeURIComponent(row.id)}`,
+    href,
     muted: row.paused,
     busy,
     data: { id: row.id, status: row.status },
@@ -401,6 +417,11 @@ function automationRow(row: Automation, { when, whenFull, target, action, action
       ...(templateProblem ? [{
         key: 'template', glyph: '⚠', label: templateProblem, tone: 'warning' as const, hug: true,
         word: { text: templateProblem }, testId: 'automation-template-status',
+      }] : []),
+      // An owner outside the org is the whole failure, and the fix is Take ownership: said on the row, not a bare ✕.
+      ...(row.foreign_owner && row.status === 'failing' && row.status_cause ? [{
+        key: 'owner', glyph: '⚠', label: reason ?? row.status_cause, tone: 'error' as const, hug: true,
+        word: { text: row.status_cause }, testId: 'automation-owner-status',
       }] : []),
     ],
     /* Window-gated first, so the survivors stay flush right (`ui/feed/geometry.ts::SlotGate`). */
@@ -469,7 +490,7 @@ const WHEN_OPTIONS = [
   { value: 'schedule', label: 'Schedule' },
   { value: 'event', label: 'Event' },
 ]
-const STATUS_OPTIONS = ['active', 'paused', 'failing'].map(value => ({ value, label: STATUS_LABELS[value] }))
+const STATUS_OPTIONS = ['active', 'paused', 'failing'].map(value => ({ value, label: STATUS[value].label }))
 /** An operator's narrowing: the platform's rows, or the orgs'. Not "Mine": a teammate's row is not. */
 const ORIGIN_OPTIONS = [
   { value: 'system', label: 'System' },
@@ -495,14 +516,12 @@ export function noMatchesTitle({ q, status, origin, whenKind }: { q: string; sta
 }
 
 /** Delete's confirm — one home for the list's ⋯ and the detail page's Delete button. */
-export const deleteAutomationConfirm = (row: Automation): ConfirmOptions => ({
+export const deleteAutomationConfirm = (row: Automation): ConfirmOptions => danger('Delete automation', {
   title: 'Delete automation',
   identity: row.name,
   message: row.when.kind === 'event'
     ? 'Its URL stops accepting events, and its run history is deleted. Filed tasks stay.'
     : 'It stops running, and its run history is deleted. Filed tasks stay.',
-  confirmLabel: 'Delete automation',
-  destructive: true,
 })
 
 /** A paused schedule whose run is still held — the cause the pause hides (`automation_service.is_stuck`) — as its
@@ -523,7 +542,40 @@ export function runNowBlocked(row: Automation): string | null {
   return row.stuck ? 'Release it first' : null
 }
 
-export default function AutomationList() {
+/** A project's or node's own Automations tab (`ProjectEditPage`, `NodeDetailPage`): the rows that apply to it. */
+export type AutomationScope = {
+  kind: TargetKind
+  id: TargetId
+  /** The project's or node's org: the operator reads every org's automations, and only its own org's can reach it. */
+  orgId?: string | null
+}
+
+/** Whether `row` applies to `scope`'s project or node: its Target names it (All, picked, or not excepted). A system
+ *  row is the platform's, never shown there; a row with no Target runs in no node, so it shows on projects only. */
+export function appliesTo(row: Pick<Automation, 'is_system' | 'target'> & Partial<Pick<Automation, 'org_id'>>, scope: AutomationScope): boolean {
+  if (row.is_system) return false
+  if (scope.orgId && row.org_id !== undefined && row.org_id !== scope.orgId) return false
+  const rule = row.target
+  if (rule === null) return scope.kind === 'projects'
+  if (rule.kind !== scope.kind) return false
+  const listed = rule.ids.some(id => String(id) === String(scope.id))
+  return rule.mode === 'all' || (rule.mode === 'specific' ? listed : !listed)
+}
+
+const SCOPE_EMPTY: Record<TargetKind, string> = {
+  projects: 'No automations for this project',
+  nodes: 'No automations for this machine',
+}
+
+/** A scoped list's filters: local, since the host page's address is its own (`?tab=`). Empty keys dropped. */
+function useLocalFilters(): [URLSearchParams, (changes: Record<string, string>) => void] {
+  const [filters, setLocal] = useState<Record<string, string>>({})
+  const params = useMemo(() => new URLSearchParams(Object.entries(filters).filter(([, v]) => v !== '')), [filters])
+  const set = useCallback((changes: Record<string, string>) => setLocal(prev => ({ ...prev, ...changes })), [])
+  return [params, set]
+}
+
+export default function AutomationList({ scope }: { scope?: AutomationScope } = {}) {
   /* `refetchOnMount: 'always'`: the edit page's writes land before it navigates back here, so every visit
      re-reads (cached rows paint meanwhile). A Change-org move invalidates every query, this one included. */
   const query = useQuery({ queryKey: AUTOMATIONS_KEY, queryFn: () => listAutomations(), refetchOnMount: 'always' })
@@ -610,21 +662,39 @@ export default function AutomationList() {
         label: 'View failure',
         ariaLabel: `View why ${row.name} is failing`,
         testId: 'automation-view-failure',
-        to: `/automations/${encodeURIComponent(row.id)}?tab=runs`,
+        to: withFrom(`/automations/${encodeURIComponent(row.id)}?tab=runs`),
+      })
+    }
+    // An owner outside the org is the one failure a click repairs, so its repair leads the menu, above View failure.
+    if (row.foreign_owner) {
+      items.unshift({
+        key: 'take-ownership',
+        icon: ACTION_ICON.reset,
+        label: 'Take ownership',
+        ariaLabel: `Take ownership of ${row.name}`,
+        testId: 'automation-take-ownership',
+        onClick: () => void rowVerb(row, () => takeAutomationOwnership(row.id), 'Couldn’t take ownership.'),
       })
     }
     const move = row.is_system ? null : changeOrg.menuItem({
       id: row.id,
       name: row.name,
       org: { id: row.org_id, name: '', slug: '' },
-      href: `/automations/${encodeURIComponent(row.id)}`,
+      href: withFrom(`/automations/${encodeURIComponent(row.id)}`),
     })
     if (move) items.push(move)
     items.push(deleteItem(row.name, () => void confirmAndDelete(row)))
     return items
   }
-  const [searchParams, setFilters] = useUrlFilters()
-  const gone = searchParams.get('gone') === '1'
+  /* Scoped, the filters are local and a row opens with `?from=` this page, so the editor's Close comes back here
+     (`lib/listDetail.ts::safeReturnPath`). */
+  const location = useLocation()
+  const fromHere = `from=${encodeURIComponent(`${location.pathname}${location.search}`)}`
+  const withFrom = (href: string) => (scope ? `${href}${href.includes('?') ? '&' : '?'}${fromHere}` : href)
+  const urlFilters = useUrlFilters()
+  const localFilters = useLocalFilters()
+  const [searchParams, setFilters] = scope ? localFilters : urlFilters
+  const gone = !scope && searchParams.get('gone') === '1'
 
   /* ── The view (search, Flat/Tree, open folders), restored at mount and written through on each change. The
      When, Status and Owner selects are the URL's (`?when=`, `?status=`, `?owner=`), a link's narrowing, not the
@@ -632,15 +702,16 @@ export default function AutomationList() {
      search: its `?q=`, else none, so a remembered search never hides what `/automations?when=event` asked for.
      Typing and every select keep the address in step (`hooks/useUrlFilters`). */
   const firstVisit = useRef(false)
-  const linked = LINK_KEYS.some(key => searchParams.has(key))
+  const linked = !scope && LINK_KEYS.some(key => searchParams.has(key))
   const urlQ = linked ? (searchParams.get('q') ?? '') : null
+  // Scoped, the view is the page's alone: a first visit's each time, never stored over the org-wide list's.
   const { view, patchView, toggleGroup } = usePersistedListView(
     () => {
-      const stored = loadListView('automations', admin?.id ?? null, FIRST_VIEW)
+      const stored = scope ? FIRST_VIEW : loadListView('automations', admin?.id ?? null, FIRST_VIEW)
       firstVisit.current = stored === FIRST_VIEW
       return urlQ === null ? stored : { ...stored, q: urlQ }
     },
-    next => saveListView('automations', admin?.id ?? null, next),
+    next => { if (!scope) saveListView('automations', admin?.id ?? null, next) },
   )
   const search = (q: string) => {
     patchView({ q })
@@ -655,20 +726,39 @@ export default function AutomationList() {
   const filterSetter = (key: string) => (value: string) => setFilters({ [key]: value, q: view.q })
   /* A value no picker offers is no filter. Owner is an operator's alone, who is the only one shown its select; the
      community edition has one org, so it has no Owner filter. */
-  const ownerFilter = isOperator && isEnabled('multi_org_tenancy')
+  const ownerFilter = !scope && isOperator && isEnabled('multi_org_tenancy')
   const whenKind = urlOption(searchParams.get('when'), WHEN_OPTIONS)
   const status = urlOption(searchParams.get('status'), STATUS_OPTIONS)
   const origin = ownerFilter ? urlOption(searchParams.get('owner'), ORIGIN_OPTIONS) : ''
-  const setWhenKind = filterSetter('when')
   const setStatus = filterSetter('status')
-  const setOrigin = filterSetter('owner')
+  /* When and Owner, drawn by `ui/SelectFilters`: a select each on a wide list, one Filters menu on a narrow one. */
+  const narrowing = (key: 'when' | 'owner', label: string, options: typeof WHEN_OPTIONS): SelectNarrowing<'when' | 'owner'> =>
+    ({ key, label, allLabel: 'All', options, testId: `automation-filter-${key}`, ariaLabel: `Filter by ${key}`, minWidth: SIZE.fieldSm })
+  const narrowings = [narrowing('when', 'When', WHEN_OPTIONS), ...(ownerFilter ? [narrowing('owner', 'Owner', ORIGIN_OPTIONS)] : [])]
+  const selects = (shown: typeof narrowings, phone = false) => (
+    <SelectFilters
+      narrowings={shown}
+      values={{ when: whenKind, owner: origin }}
+      onChange={(key, value) => filterSetter(key)(value)}
+      onClear={() => setFilters({ when: '', owner: '', q: view.q })}
+      phone={phone}
+      menuName="Filter automations"
+    />
+  )
   const treeMode = view.mode === 'tree'
   /* A FIRST VISIT opens every folder: drawn open from the first paint (`expanded` below), and persisted as the
      open set once the rows say which folders exist, so the next visit opens the same way. A search typed before
      the rows land does not forfeit it; the viewer's first toggle is what ends it. */
   const [openAll, setOpenAll] = useState(() => firstVisit.current)
 
-  const rows = useMemo(() => data?.items ?? [], [data])
+  const scopeKind = scope?.kind
+  const scopeId = scope?.id
+  const scopeOrg = scope?.orgId
+  const rows = useMemo(() => {
+    const items = data?.items ?? []
+    return scopeKind === undefined || scopeId === undefined
+      ? items : items.filter(row => appliesTo(row, { kind: scopeKind, id: scopeId, orgId: scopeOrg }))
+  }, [data, scopeKind, scopeId, scopeOrg])
   const rosters = useRosters(rows)
   const dangling = useDangling(rows, rosters)
   const templateRefsById = useTemplateRefs(rows)
@@ -719,6 +809,7 @@ export default function AutomationList() {
     when: contentSlotWidth(rows.map(row => whenShort(row.when, sourceLabel)), WHEN_SLOT, WHEN_MAX_CQW),
   }
   const rowOf = (row: Automation, busy: boolean): FeedRowSpec => automationRow(row, {
+    href: withFrom(`/automations/${encodeURIComponent(row.id)}`),
     when: whenShort(row.when, sourceLabel),
     whenFull: whenSummary(row.when, sourceLabel),
     target: targetOf(row),
@@ -732,14 +823,11 @@ export default function AutomationList() {
       ? templateRefProblem(templateRefsById.get(row.action.params.template_id)) : null,
   })
 
-  /* Flat, or Tree mode's folders (`lib/nameTreeRows`) with re-filing off — `dragging: null` is its whole off
-     switch; a row's busy state is the page's set, not the tree's one `busyId`. */
+  /* Flat, or Tree mode's folders (`lib/nameTreeRows`); a row's busy state is the page's set either way. */
   const listRows: FeedRowSpec[] = treeMode
     ? nameTreeRows(buildNameTree(shown), {
-        ...NO_REFILING_DEPS,
         kind: AUTOMATION_TREE_KIND,
         leafRow: row => rowOf(row, busyIds.has(row.id)),
-        busyId: null,
         expanded: new Set(openAll ? groupPaths(buildNameTree(shown)) : view.expanded),
         onToggleGroup: toggleGroup,
       })
@@ -760,7 +848,11 @@ export default function AutomationList() {
               value={treeMode ? 'hierarchy' : 'flat'}
               onChange={next => patchView({ mode: next === 'hierarchy' ? 'tree' : 'flat' })}
             />
-            <NewButton label="New automation" to="/automations/new" testId="automation-new" />
+            <NewButton
+              label="New automation"
+              to={scope ? `/automations/new?target=${scope.kind}:${encodeURIComponent(String(scope.id))}&${fromHere}` : '/automations/new'}
+              testId="automation-new"
+            />
           </>
         }
       />
@@ -769,18 +861,8 @@ export default function AutomationList() {
 
       <FilterBar>
         <FilterRow>
-          <FilterSearch value={view.q} onChange={search} placeholder="Name" ariaLabel="Search automations" minWidth={120} />
-          <Box sx={UNFOLDED_SX}>
-            <FilterSelect
-              label="When"
-              ariaLabel="Filter by when"
-              value={whenKind}
-              onChange={setWhenKind}
-              allLabel="All"
-              options={WHEN_OPTIONS}
-              minWidth={120}
-            />
-          </Box>
+          <FilterSearch value={view.q} onChange={search} placeholder="Name" ariaLabel="Search automations" minWidth={SIZE.fieldSm} />
+          <Box sx={UNFOLDED_SX}>{selects(narrowings.filter(n => n.key === 'when'))}</Box>
           <FilterSelect
             label="Status"
             ariaLabel="Filter by status"
@@ -788,36 +870,10 @@ export default function AutomationList() {
             onChange={setStatus}
             allLabel="All"
             options={STATUS_OPTIONS}
-            minWidth={120}
+            minWidth={SIZE.fieldSm}
           />
-          {ownerFilter && (
-            <Box sx={UNFOLDED_SX}>
-              <FilterSelect
-                label="Owner"
-                ariaLabel="Filter by owner"
-                value={origin}
-                onChange={setOrigin}
-                allLabel="All"
-                options={ORIGIN_OPTIONS}
-                minWidth={120}
-              />
-            </Box>
-          )}
-          <Box sx={FOLDED_SX}>
-            <ToolbarMenu
-              name="Filter automations"
-              heading="Filters"
-              hint="Filters"
-              badgeCount={[whenKind, origin].filter(Boolean).length}
-              items={[
-                filterRadioPage('automation-filter-when', 'when', 'When', 'All', WHEN_OPTIONS, whenKind, setWhenKind),
-                ...(ownerFilter
-                  ? [filterRadioPage('automation-filter-owner', 'owner', 'Owner', 'All', ORIGIN_OPTIONS, origin, setOrigin)]
-                  : []),
-              ]}
-              onClear={() => setFilters({ when: '', owner: '', q: view.q })}
-            />
-          </Box>
+          {ownerFilter && <Box sx={UNFOLDED_SX}>{selects(narrowings.filter(n => n.key === 'owner'))}</Box>}
+          <Box sx={FOLDED_SX}>{selects(narrowings, true)}</Box>
         </FilterRow>
       </FilterBar>
 
@@ -836,7 +892,7 @@ export default function AutomationList() {
             onClear={filtered ? clearFilters : undefined}
           />
         )}
-        emptyTitle="No automations yet"
+        emptyTitle={scope ? SCOPE_EMPTY[scope.kind] : 'No automations yet'}
         emptyScoped
         feed={{
           ariaLabel: 'Automations',
@@ -847,7 +903,7 @@ export default function AutomationList() {
       />
 
       {/* Inbound mail arrives through SES or a tenant Gmail, neither of which the community edition has. */}
-      {isOperator && isEnabled('tenant_mail') && <UnmatchedEmails />}
+      {!scope && isOperator && isEnabled('tenant_mail') && <UnmatchedEmails />}
       {changeOrg.dialog}
       {confirmDialog}
     </Box>

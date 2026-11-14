@@ -56,14 +56,16 @@ class OutcomeReview(UuidPkMixin, OrgScoped, Base):
 
 
 class InsightDigest(UuidPkMixin, OrgScoped, Base):
-    """One week's AI-written digest of what changed on the operator dashboard and why (R7b).
+    """One week's AI-written digest of what changed on a dashboard and why (R7b), for one org.
 
-    `app/operator_dashboard/digest.py` owns the one writer (the weekly `insight-digest` cron) and the reader
-    (`/api/operator/dashboard/digests`). One row per covered week (`week_start`, a Monday; the week is
-    `[week_start, week_start + 7d)`). `bullets` is `[{text, metric, slice}]`, at most DIGEST_MAX_BULLETS, each
-    text at most DIGEST_BULLET_MAX_CHARS, validated before it is stored. `failed` carries `error` and no bullets.
-    `usage_by_model` is every call the week's runs paid for, counted in the dashboard's system AI cost. Operator
-    content (it names tenants), so it lives in the Operator org. Machine-written, so no entity shape."""
+    `app/operator_dashboard/digest.py` owns the one writer (the weekly `insight-digest` cron) and the readers
+    (`read`: `/api/operator/dashboard/digests`; `org_digest`: a tenant org's latest). One row per org and covered
+    week (`UNIQUE (org_id, week_start)`; `week_start` a Monday, the week `[week_start, week_start + 7d)`). The
+    Operator org's row covers the whole system and names tenants; a tenant org's row is built from that org's data
+    only. `bullets` is `[{text, metric, slice}]`, at most DIGEST_MAX_BULLETS, each text at most
+    DIGEST_BULLET_MAX_CHARS, validated before it is stored. `failed` carries `error` and no bullets.
+    `usage_by_model` is every call the week's runs paid for, counted in the dashboard's system AI cost.
+    Machine-written, so no entity shape."""
 
     __tablename__ = INSIGHT_DIGESTS_TABLE
     __table_args__ = (
@@ -75,7 +77,7 @@ class InsightDigest(UuidPkMixin, OrgScoped, Base):
             f"jsonb_typeof(bullets) = 'array' AND jsonb_array_length(bullets) <= {DIGEST_MAX_BULLETS}",
             name="ck_insight_digests_bullets",
         ),
-        UniqueConstraint("week_start", name="uq_insight_digests_week_start"),
+        UniqueConstraint("org_id", "week_start", name="uq_insight_digests_org_id_week_start"),
         # The dashboard's cost read, by generation day.
         Index("ix_insight_digests_generated_at", "generated_at"),
     )

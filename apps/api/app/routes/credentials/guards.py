@@ -21,6 +21,7 @@ from app.credentials.registry import (
 )
 from app import credential_consumers, nodevault_policy
 from app.credential_reseal import stored_secret_envelope_exists
+from app.entity_shape import or_404
 from app.credential_crypto import (
     NodeVaultInvariantError,
     SealedSecret,
@@ -28,7 +29,7 @@ from app.credential_crypto import (
     is_nodevault_key_id,
 )
 from app import http_bounded
-from app.credentials.oauth_wizards import ConnectProviderSpec
+from app.oauth_providers import OAuthProvider
 from app.models.credentials import Credential
 from app.models.orgs import Org
 
@@ -196,13 +197,12 @@ def _scoped_row_or_404(
                 # Verb-neutral (PATCH, DELETE, connect): names the key, not the act.
                 detail=f"{key} required — you can read this credential but not change it; ask an operator",
             )
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"unknown credential {credential_id}")
-    return row
+    return or_404(row, detail=f"unknown credential {credential_id}")
 
 
 def _refuse_a_caller_supplied_endpoint_without_the_edit_key(
-    provider: ConnectProviderSpec, token_endpoint: str, principal: Principal | None
+    provider: OAuthProvider, token_endpoint: str, principal: Principal | None,
+    config: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Refuse a connect whose token endpoint came off the row when it fails the destination rule, or when
     the caller lacks `credentials:edit`.
@@ -221,6 +221,13 @@ def _refuse_a_caller_supplied_endpoint_without_the_edit_key(
     # Org-wide (`has_org`): a key held on one project does not let its holder aim the CP's egress.
     if principal is None or principal.has_org(_EDIT_KEY):
         return
+    # A custom connector's connection: the endpoints are the connector's, which an Org Owner/Admin chose and the
+    # define step vetted, so the member connecting did not choose the host (`integrations/custom.py`).
+    if config is not None:
+        from app.integrations import custom as custom_connectors  # deferred: it imports the testers
+
+        if custom_connectors.connector_vouches_for(config):
+            return
     # The capability refusal, operator plane only; worded for both readers.
     raise HTTPException(
         status_code=403,

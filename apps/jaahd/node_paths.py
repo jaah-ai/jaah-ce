@@ -15,7 +15,6 @@ from host_platform import linux as _linux
 ETC = _linux.paths().etc_dir
 RUN = _linux.paths().run_dir
 LIB = _linux.paths().lib_root
-DAEMON_ENV = f"{ETC}/jaahd.env"
 
 # ── units: kind -> name; `{}` is the template instance ──────────────────────────────────────────────────
 _UNITS: dict[str, str] = {

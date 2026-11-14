@@ -21,6 +21,7 @@ import { dropPersistedQueries, queryClient } from '../queryClient'
 import type { Org, OrgRef } from '../types'
 import { createExternalStore, useExternalStore } from './externalStore'
 import { readJson, writeJson } from './safeStorage'
+import { splitList } from './strings'
 
 export const ORG_SCOPE_HEADER = 'X-Jaah-Org-Scope'
 export const ORG_SCOPE_PARAM = 'orgs'
@@ -120,11 +121,16 @@ export function withOrgScope(headers: HeadersInit | undefined, method: string | 
  *  filter — an operator setting's credential, which lives in org zero. Ignored for a non-operator. */
 export const UNFILTERED_READ: RequestInit = { headers: { [ORG_SCOPE_HEADER]: '' } }
 
+/** The init of ONE read narrowed to `orgId` whatever the filter: a record's own org's catalogue (the task tag
+ *  editor's, `hooks/useTagGroups.ts`), so the options are ones that record's org-bound write can resolve. Ignored
+ *  server-side for a non-operator, whose reads are already their own org's. */
+export const oneOrgRead = (orgId: string): RequestInit => ({ headers: { [ORG_SCOPE_HEADER]: orgId } })
+
 /** The slugs `?orgs=` names, `[]` for an explicit All (`?orgs=`), or `null` when the parameter is absent. */
 export function readScopeParam(search: string): string[] | null {
   const raw = new URLSearchParams(search).get(ORG_SCOPE_PARAM)
   if (raw === null) return null
-  return [...new Set(raw.split(',').map(slug => slug.trim()).filter(Boolean))]
+  return [...new Set(splitList(raw))]
 }
 
 /** `search` with `?orgs=` naming `next` — empty for All, so the address says All rather than "whatever was

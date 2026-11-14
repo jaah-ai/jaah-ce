@@ -24,7 +24,8 @@ export function useBusyIds<K = string>(): [
 /* A list page's row actions: `useBusyIds` plus the ONE action error shown over the list. `run` clears the
  * error (and the notice), marks the row busy, runs the write, and routes a rejection through `apiDetail` to
  * `error` (it never rejects). Given `done`, a landed write's result names the success `notice` (`setNotice('')`
- * dismisses it). `run` is stable across renders. A write whose refusal goes elsewhere (a notice, a form) keeps `withBusy`. */
+ * dismisses it). `run` is stable across renders. A write whose refusal goes elsewhere (a notice, a form) keeps `withBusy`.
+ * `confirmRun` is `run` behind a confirm's answer: a declined one writes nothing and leaves the banner as it was. */
 export function useRowActions<K = string>(): {
   busy: ReadonlySet<K>
   withBusy: (id: K, fn: () => Promise<void>) => Promise<void>
@@ -33,6 +34,7 @@ export function useRowActions<K = string>(): {
   notice: string
   setNotice: (message: string) => void
   run: <T>(id: K, fallback: string, write: () => Promise<T>, done?: (result: T) => string) => Promise<void>
+  confirmRun: <T>(confirmed: Promise<boolean>, id: K, fallback: string, write: () => Promise<T>) => Promise<void>
 } {
   const [busy, withBusy] = useBusyIds<K>()
   const [error, setError] = useState('')
@@ -49,6 +51,9 @@ export function useRowActions<K = string>(): {
         setError(apiDetail(err, fallback))
       }
     }), [withBusy])
+  const confirmRun = useCallback(async <T>(confirmed: Promise<boolean>, id: K, fallback: string, write: () => Promise<T>) => {
+    if (await confirmed) await run(id, fallback, write)
+  }, [run])
 
-  return { busy, withBusy, error, setError, notice, setNotice, run }
+  return { busy, withBusy, error, setError, notice, setNotice, run, confirmRun }
 }

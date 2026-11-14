@@ -1,0 +1,67 @@
+# LinkedIn through its OpenID Connect sign-in and Share on LinkedIn products. Self-serve apps get 60-day access
+# tokens and no refresh token ("programmatic refresh tokens are available for a limited set of partners"), so the
+# provider stores an expiring grant (`expiring_grant_ok`) and the row asks for a reconnect when it lapses.
+# Confirmed 2026-11-03 at the vendor_docs_url page and the authorization-code-flow page
+# (https://learn.microsoft.com/en-us/linkedin/shared/authentication/authorization-code-flow); a made-up token on
+# /v2/userinfo answers 401 INVALID_ACCESS_TOKEN. PKCE is documented for native apps only, so it is not sent.
+slug = "linkedin"
+label = "LinkedIn"
+category = "marketing"
+vendor_docs_url = "https://learn.microsoft.com/en-us/linkedin/consumer/integrations/self-serve/sign-in-with-linkedin-v2"
+summary = "Post updates and read your profile on LinkedIn as the connected member."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://www.linkedin.com/oauth/v2/authorization"
+token_url = "https://www.linkedin.com/oauth/v2/accessToken"
+pkce = false
+expiring_grant_ok = true
+account_url = "https://api.linkedin.com/v2/userinfo"
+account_field = "name"
+scopes = [
+  { name = "openid", label = "Identify the LinkedIn member who connected, so the secret shows whose account it is" },
+  { name = "profile", label = "Read the member's name and photo, which agents use to sign or attribute posts" },
+  { name = "email", label = "Read the member's primary email address, shown on the secret to tell accounts apart", optional = true },
+  { name = "w_member_social", label = "Create, edit and delete posts, comments and reactions as the member, when a task asks agents to publish", optional = true },
+]
+jaah_app = true
+[auth.oauth.registration]
+console_url = "https://www.linkedin.com/developers/apps/new"
+steps = [
+  "Under App name enter Jaah. Under LinkedIn Page pick Jaah's company page (LinkedIn requires one; create it first at linkedin.com/company/setup/new if it does not exist). Under Privacy policy URL enter the privacy policy page of the company that runs this Jaah, upload the Jaah logo, tick the legal agreement and select Create app",
+  "On the app's Settings tab select Verify next to the LinkedIn Page, send the verification link to an admin of that page, and wait until it shows Verified",
+  "On the Products tab select Request access for Sign In with LinkedIn using OpenID Connect, then for Share on LinkedIn. Both are self-serve and are granted at once",
+  "The redirect URIs (added in a step below) go on the Auth tab, under OAuth 2.0 settings > Authorized redirect URLs for your app: select the pencil there to add them",
+  "On the Auth tab, check that OAuth 2.0 scopes lists openid, profile, email and w_member_social. The client ID and Primary Client Secret are on the same tab",
+]
+review = "Not required for Sign In with LinkedIn using OpenID Connect and Share on LinkedIn: both are self-serve products, available to every member once the app's company page is verified. Refresh tokens are not issued to self-serve apps, so members reconnect every 60 days"
+
+[test]
+method = "GET"
+path = "https://api.linkedin.com/v2/userinfo"
+identity = [["name"], ["email"]]
+
+[docs]
+revoke_at = "LinkedIn > Settings & Privacy > Data privacy > Permitted services"
+agent_uses = [
+  "Publish a text post, an article link or an image post on the connected member's feed, when a task asks for it",
+  "Comment on or react to a post as the member",
+  "Read the member's name and photo to sign a post or a message",
+]
+prerequisites = ["A LinkedIn member account. Posting goes out under that member's name, so connect the account that should be the author"]
+limitations = [
+  "LinkedIn grants last 60 days and LinkedIn issues no refresh token to self-serve apps. After 60 days the Test reports the token expired: select Reconnect",
+  "Posting to a company page, reading analytics or messaging needs LinkedIn's partner programs (Community Management API, Marketing API), which this connection does not request",
+  "Agents cannot read the member's connections, feed or inbox: LinkedIn does not offer those to self-serve apps",
+]
+troubleshooting = [
+  { symptom = "Test says The LinkedIn access token has expired - press Connect to reauthorize", fix = "LinkedIn tokens last 60 days and cannot be renewed automatically. Select Reconnect and approve again" },
+  { symptom = "Test says LinkedIn rejected the access token (401)", fix = "The member removed Jaah under LinkedIn Settings > Data privacy > Permitted services, or changed the password. Select Reconnect" },
+  { symptom = "Connect stops with unauthorized_scope_error", fix = "The OAuth app lacks a product. In the LinkedIn developer portal open the app's Products tab and request Sign In with LinkedIn using OpenID Connect and Share on LinkedIn; or untick the optional scopes" },
+  { symptom = "An agent's post fails with 403 ACCESS_DENIED", fix = "The w_member_social scope was unticked at Connect. Select Reconnect and keep that scope ticked" },
+]
+faq = [
+  { q = "Can agents post to our company page", a = "Not with this connection. Company page posting needs LinkedIn's Community Management API, which LinkedIn approves per company" },
+  { q = "Will posts say they came from Jaah", a = "LinkedIn shows posts as the member's own. Review what a task will post before you let an agent publish" },
+]

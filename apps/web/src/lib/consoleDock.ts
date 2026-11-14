@@ -49,9 +49,7 @@ export type ConsoleView = 'docked' | 'floating' | 'maximized'
  */
 export type ConsolePresentation = ConsoleView | 'modal'
 
-/** Mirrors the payload pages already build (`components/WorktreePool.tsx`'s `openSlotConsole` etc.).
- *  `provider`: a catalogue value (`GET /api/accounts/providers`) for the account a NEW session runs on;
- *  absent = Any, the server's Auto-assign pick. */
+/** Mirrors the payload pages already build (`components/WorktreePool.tsx`'s `openSlotConsole` etc.). */
 /** `view`: a MicroVM task's `vm:<vm_id>` (with `number` 0). Such a target has no slot: attach-only, no
  *  saved layouts, no direct transport. */
 export type ConsoleTarget = {
@@ -61,7 +59,6 @@ export type ConsoleTarget = {
   number: number
   nodeId?: string
   kind?: 'clauded' | 'term'
-  provider?: string
   view?: string
 }
 

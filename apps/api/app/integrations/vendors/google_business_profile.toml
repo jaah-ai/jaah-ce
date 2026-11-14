@@ -1,0 +1,65 @@
+# Google Business Profile through the Business Profile APIs (account management, business information,
+# reviews). OAuth only. Confirmed 2026-11-03 at the vendor_docs_url page (accounts.list, scope) and the
+# prerequisites page (API access is by application: https://developers.google.com/my-business/content/prereqs).
+slug = "google_business_profile"
+label = "Google Business Profile"
+category = "marketing"
+vendor_docs_url = "https://developers.google.com/my-business/reference/accountmanagement/rest/v1/accounts/list"
+summary = "Read and update your Google Business Profile locations, hours, posts and reviews."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+authorize_extra = { access_type = "offline", prompt = "consent" }
+scopes = [
+  { name = "https://www.googleapis.com/auth/business.manage", label = "Read and manage the business locations the account can see: details, hours, posts and replies to reviews. Google offers no read-only scope for these APIs" },
+]
+jaah_app = true
+[auth.oauth.registration]
+console_url = "https://console.cloud.google.com/auth/clients"
+steps = [
+  "Start with the Business Profile API access application, because approval takes days: open https://support.google.com/business/contact/api_default, choose Application for Basic API Access, and enter the Google Cloud project number of jaah-integrations. Google requires a Business Profile verified and active for over 60 days and a website for that business; approval can take several days",
+  "In the Google Cloud console project picker, select or create the project named jaah-integrations. Every Jaah Google integration can share this project and its one OAuth client",
+  "Open APIs & Services > Library and enable My Business Account Management API, My Business Business Information API and Google My Business API",
+  "Open Google Auth Platform > Branding. Set App name to Jaah, the user support email to the shared support mailbox, Application home page to the public homepage of the company that runs this Jaah (its https address), Privacy policy and Terms of service to that company's privacy policy and terms pages, and add its domain under Authorized domains. Select Save",
+  "Open Google Auth Platform > Audience. Choose External, then select Publish app so the app is In production rather than Testing",
+  "Open Google Auth Platform > Data access, select Add or remove scopes, tick .../auth/business.manage and select Update, then Save",
+  "Open Google Auth Platform > Clients, select Create client, choose Application type Web application and name it Jaah. This client is the OAuth app: the redirect URIs (a later step) go under its Authorized redirect URIs, then select Create",
+  "Confirm approval: open APIs & Services > Enabled APIs > My Business Account Management API > Quotas. 0 requests per minute means not approved yet; 300 means approved",
+]
+review = "Two reviews. Business Profile API access must be approved by Google (quota 0 QPM until then; every call fails with 429 or 403). The business.manage scope also appears under Data access; if Google marks it sensitive, submit the app in Google Auth Platform > Verification Center"
+
+[test]
+method = "GET"
+path = "https://mybusinessaccountmanagement.googleapis.com/v1/accounts"
+identity = [["accounts", 0, "accountName"]]
+identity_phrase = "with account"
+
+[docs]
+revoke_at = "your Google Account > Security > Your connections to third-party apps & services (myaccount.google.com/connections)"
+agent_uses = [
+  "List the business accounts and locations the connected Google account manages",
+  "Read a location's name, address, phone, categories and opening hours, and update them when you ask",
+  "Read new reviews and draft or post a reply",
+  "Set special hours for a holiday or a temporary closure",
+]
+prerequisites = [
+  "A Google account that is an owner or manager of the Business Profile (business.google.com > Business Profile settings > People and access)",
+  "For a Jaah-owned app or your own app: Google must have approved Business Profile API access for the app's Google Cloud project",
+]
+limitations = [
+  "The only scope Google offers is business.manage, which allows changes. Tell agents in the task what they may change; Google keeps a history of edits on the profile",
+  "Google may hold an edit for review before it shows on Maps and Search",
+  "Insights and performance reports come from the separate Business Profile Performance API, subject to the same approval",
+]
+troubleshooting = [
+  { symptom = "Test says Google Business Profile rejected the access token (401)", fix = "The grant was revoked or the Google password changed. Select Reconnect and approve again" },
+  { symptom = "Test says Google Business Profile returned HTTP 429, or rejected the access token (403), right after a Connect that worked", fix = "A fresh grant that is refused at once means the OAuth app's Google Cloud project has not been approved for Business Profile API access, so its quota is 0; reconnecting will not help. Apply at support.google.com/business/contact/api_default, or connect with your own approved app" },
+  { symptom = "Test passes but an agent sees no locations", fix = "The connected account manages no profile. In Business Profile open People and access and add the account as a Manager" },
+]
+faq = [
+  { q = "Why does Jaah ask to manage my profile and not just read it", a = "Google offers one scope, business.manage, for both. Agents only change what a task asks them to" },
+  { q = "Can an agent reply to reviews as my business", a = "Yes, if a task asks it to. The reply appears under the business name on Google" },
+]

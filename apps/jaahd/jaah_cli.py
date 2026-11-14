@@ -22,6 +22,7 @@ The token is read from STDIN, never argv (D12: a secret on argv lands in `ps` an
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import http.client
 import json
@@ -31,12 +32,13 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from types import ModuleType
+from typing import NamedTuple
 
 try:
     import grp
@@ -186,8 +188,8 @@ _PLAINTEXT_OK_HOSTS = ("127.0.0.1", "localhost", "::1")
 def _unsafe_for_the_credential(base_url: str) -> str:
     """Why BASE_URL must not be sent this node's `NODE_TOKEN`, or "" when it may.
 
-    One home for both places the credential leaves the node (`verify_token`, `resolve_node_name`, the latter
-    unattended on every install). Neither TLS nor loopback is refused, never upgraded — rewriting to
+    One home for every place the credential leaves the node (`_cp_request`, under `verify_token`,
+    `resolve_node_name` — unattended on every install — and `_post_with_token`). Neither TLS nor loopback is refused, never upgraded — rewriting to
     `https` would send the token to a host nobody declared. `--no-verify` is the pre-CP escape."""
     parts = urllib.parse.urlsplit(base_url)
     if parts.scheme == "https":
@@ -198,30 +200,62 @@ def _unsafe_for_the_credential(base_url: str) -> str:
             f"loopback (fix JAAH_CP_BASE_URL in {jaahd_env_path()})")
 
 
+class _CpAnswer(NamedTuple):
+    """What one pre-enrolment probe got back. `failure` is the one sentence for "no answer came" (a refused base,
+    or a transport failure), else `status` is the CP's own (an HTTP error status is an ANSWER, never raised,
+    its `reason` the server's phrase and `body` empty) and `body` its bytes."""
+    url: str
+    status: int
+    body: bytes
+    reason: str
+    failure: str
+
+
+def _cp_request(base_url: str, path: str, token: str, *, method: str = "GET") -> _CpAnswer:
+    """The ONE transport under `verify_token`, `resolve_node_name` and `_post_with_token`: `path` under `base_url`
+    with a CANDIDATE `token` (the enrolment's, not yet this node's — never `control_plane_api`, whose client
+    substitutes the on-disk token and feeds its revocation watch).
+
+    The body read is CAPPED (`_IDENTITY_BODY_CAP`): the timeout bounds time, not size, and this runs as root
+    inside `postinst`, where an unbounded read of a hostile CP's answer could OOM a live apt transaction."""
+    unsafe = _unsafe_for_the_credential(base_url)
+    if unsafe:
+        return _CpAnswer("", 0, b"", "", unsafe)
+    url = base_url.rstrip("/") + path
+    req = urllib.request.Request(url, data=b"" if method == "POST" else None, method=method,
+                                 headers={"X-Agent-Token": token})
+    try:
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:
+            return _CpAnswer(url, resp.status, resp.read(_IDENTITY_BODY_CAP), "", "")
+    except urllib.error.HTTPError as exc:
+        return _CpAnswer(url, exc.code, b"", str(exc.reason), "")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        reason = getattr(exc, "reason", None) or exc
+        return _CpAnswer(url, 0, b"", "", f"control plane unreachable at {url}: {reason}")
+    except http.client.HTTPException as exc:
+        # By name: `BadStatusLine`/`LineTooLong` subclass neither `ValueError` nor `OSError`.
+        return _CpAnswer(url, 0, b"", "", f"malformed answer from {url}: {exc}")
+
+
+def _unexpected_status(answer: _CpAnswer) -> str:
+    """The one wording for a status no probe expected, the server's phrase after it when there is one."""
+    return f"unexpected HTTP {answer.status} from {answer.url}" + (f": {answer.reason}" if answer.reason else "")
+
+
 def verify_token(base_url: str, token: str) -> tuple[str, str]:
     """Check TOKEN against the control plane: `("ok" | "rejected" | "error", detail)`.
 
     Only an explicit 401 is "rejected"; every transport failure or other status (including the CP's 503) is
     a don't-know, or a network hiccup would refuse a valid credential."""
-    unsafe = _unsafe_for_the_credential(base_url)
-    if unsafe:
-        # "error", not "rejected": the CP never saw the credential.
-        return "error", unsafe
-    url = base_url.rstrip("/") + _VERIFY_PATH
-    req = urllib.request.Request(url, headers={"X-Agent-Token": token})
-    try:
-        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:
-            status = resp.status
-    except urllib.error.HTTPError as exc:
-        if exc.code == 401:
-            return "rejected", f"the control plane at {base_url} rejected this token (HTTP 401)"
-        return "error", f"unexpected HTTP {exc.code} from {url}: {exc.reason}"
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        reason = getattr(exc, "reason", None) or exc
-        return "error", f"control plane unreachable at {url}: {reason}"
-    if 200 <= status < 300:
+    answer = _cp_request(base_url, _VERIFY_PATH, token)
+    if answer.failure:
+        # A refused base is "error", not "rejected": the CP never saw the credential.
+        return "error", answer.failure
+    if answer.status == 401:
+        return "rejected", f"the control plane at {base_url} rejected this token (HTTP 401)"
+    if 200 <= answer.status < 300:
         return "ok", ""
-    return "error", f"unexpected HTTP {status} from {url}"
+    return "error", _unexpected_status(answer)
 
 
 def resolve_node_name(base_url: str, token: str, node_id: str) -> tuple[str, str]:
@@ -232,27 +266,18 @@ def resolve_node_name(base_url: str, token: str, node_id: str) -> tuple[str, str
     credential is already verified."""
     if not base_url:
         return "", "JAAH_CP_BASE_URL is not set"
-    unsafe = _unsafe_for_the_credential(base_url)
-    if unsafe:
-        return "", unsafe
-    url = base_url.rstrip("/") + _IDENTITY_PATH + "?" + urllib.parse.urlencode({"node_id": node_id})
-    req = urllib.request.Request(url, headers={"X-Agent-Token": token})
+    answer = _cp_request(base_url, _IDENTITY_PATH + "?" + urllib.parse.urlencode({"node_id": node_id}), token)
+    if answer.failure:
+        return "", answer.failure
+    if answer.status == 404:
+        return "", (f"the control plane at {base_url} does not know node {node_id!r} - register it "
+                    f"in the console first, and check NODE_ID is this node's uuid")
+    if not 200 <= answer.status < 300:
+        return "", _unexpected_status(answer)
     try:
-        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:
-            # CAPPED: the timeout bounds time, not size, and this runs as root inside `postinst`, where an
-            # unbounded read of a hostile CP's answer could OOM a live apt transaction.
-            body = json.loads(resp.read(_IDENTITY_BODY_CAP).decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return "", (f"the control plane at {base_url} does not know node {node_id!r} - register it "
-                        f"in the console first, and check NODE_ID is this node's uuid")
-        return "", f"unexpected HTTP {exc.code} from {url}: {exc.reason}"
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        reason = getattr(exc, "reason", None) or exc
-        return "", f"control plane unreachable at {url}: {reason}"
-    except (ValueError, http.client.HTTPException) as exc:
-        # `http.client` by name: `BadStatusLine`/`LineTooLong` subclass neither `ValueError` nor `OSError`.
-        return "", f"malformed answer from {url}: {exc}"
+        body = json.loads(answer.body.decode("utf-8"))
+    except ValueError as exc:
+        return "", f"malformed answer from {answer.url}: {exc}"
     if not isinstance(body, dict) or body.get("id") != node_id:
         # The answer must name the row we asked about, or a CP/cache answering for another row would have
         # this node adopt a neighbour's name and rename its live session onto it.
@@ -270,31 +295,29 @@ def resolve_node_name(base_url: str, token: str, node_id: str) -> tuple[str, str
 
 # ── node.env writing ────────────────────────────────────────────────────────────────────────────────
 
-def _write_node_env(path: str, node_id: str, token: str, name: str = "") -> None:
-    """Write PATH with exactly `NODE_ID=`, `NODE_NAME=` and `NODE_TOKEN=`, atomically, mode 0640.
+def _replace_file(path: str, text: str, *, mode: int, owner: tuple[int | str, int | str]) -> None:
+    """Write TEXT over PATH atomically (`agents/staged_write.replace_file`, loaded from the bundle: this CLI is
+    installed alone at /usr/bin on Linux), mode set BEFORE the rename so the path never exists wider. `owner`
+    (`(user, group)`, names or ids) is applied only as root — chown is skipped under the non-root test seam, and
+    Windows has no owners to set: the file inherits its directory's access list (the installer's,
+    `apps/api/app/node_bootstrap.py::render_windows_body`), and the rename keeps that."""
+    uid = gid = None
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        # A name that does not resolve raises LookupError, and that propagates: see each caller.
+        uid = pwd.getpwnam(owner[0]).pw_uid if isinstance(owner[0], str) else owner[0]
+        gid = grp.getgrnam(owner[1]).gr_gid if isinstance(owner[1], str) else owner[1]
+    _load_bundled("apps/jaahd/agents/staged_write.py", "jaah_staged_write").replace_file(
+        path, text, mode=mode, uid=uid, gid=gid)
 
-    Temp file + `os.replace`, mode set BEFORE the rename so the path never exists wider. root:jaahd when
-    root; chown skipped under the non-root test seam. An unknown name is OMITTED, never written empty:
-    `env_helpers.default_tmux_session` distinguishes "no name yet" from "named the empty string"."""
-    dirname = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(dir=dirname, prefix=".node.env.")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            name_line = f"NODE_NAME={name}\n" if name else ""
-            fh.write(f"NODE_ID={node_id}\n{name_line}NODE_TOKEN={token}\n")
-        os.chmod(tmp, _NODE_ENV_MODE)
-        # Windows has no owners to set: the file inherits its directory's access list (the installer's,
-        # `apps/api/app/node_bootstrap.py::render_windows_body`), and `os.replace` keeps that.
-        if hasattr(os, "geteuid") and os.geteuid() == 0:
-            # LookupError (no jaahd group) propagates: the package's sysusers step did not run.
-            shutil.chown(tmp, user="root", group=_NODE_ENV_GROUP)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+
+def _write_node_env(path: str, node_id: str, token: str, name: str = "") -> None:
+    """Write PATH with exactly `NODE_ID=`, `NODE_NAME=` and `NODE_TOKEN=`, atomically (`_replace_file`), mode
+    0640, root:jaahd. An unknown name is OMITTED, never written empty: `env_helpers.default_tmux_session`
+    distinguishes "no name yet" from "named the empty string"."""
+    name_line = f"NODE_NAME={name}\n" if name else ""
+    # LookupError (no jaahd group) propagates: the package's sysusers step did not run.
+    _replace_file(path, f"NODE_ID={node_id}\n{name_line}NODE_TOKEN={token}\n",
+                  mode=_NODE_ENV_MODE, owner=("root", _NODE_ENV_GROUP))
 
 
 # ── picking the new credential up ───────────────────────────────────────────────────────────────────
@@ -394,19 +417,8 @@ def _post_with_token(base_url: str, path: str, token: str) -> tuple[int, bytes, 
     """POST an empty body to PATH under TOKEN: `(status, body, "")`, or `(0, b"", why no answer came)`.
 
     An HTTP error status is an ANSWER (returned, never raised); only a transport failure is a don't-know."""
-    unsafe = _unsafe_for_the_credential(base_url)
-    if unsafe:
-        return 0, b"", unsafe
-    url = base_url.rstrip("/") + path
-    req = urllib.request.Request(url, data=b"", method="POST", headers={"X-Agent-Token": token})
-    try:
-        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:
-            return resp.status, resp.read(_IDENTITY_BODY_CAP), ""
-    except urllib.error.HTTPError as exc:
-        return exc.code, b"", ""
-    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
-        reason = getattr(exc, "reason", None) or exc
-        return 0, b"", f"control plane unreachable at {url}: {reason}"
+    answer = _cp_request(base_url, path, token, method="POST")
+    return answer.status, answer.body, answer.failure
 
 
 def _sync_apt_auth(token: str) -> list[str]:
@@ -429,20 +441,7 @@ def _sync_apt_auth(token: str) -> list[str]:
         if rewritten == text:
             continue
         st = os.stat(path)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".jaah-auth.")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(rewritten)
-            os.chmod(tmp, stat.S_IMODE(st.st_mode))
-            if hasattr(os, "geteuid") and os.geteuid() == 0:
-                os.chown(tmp, st.st_uid, st.st_gid)
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        _replace_file(path, rewritten, mode=stat.S_IMODE(st.st_mode), owner=(st.st_uid, st.st_gid))
         changed.append(path)
     return changed
 
@@ -615,23 +614,34 @@ def _run_line(argv: list[str]) -> str:
     return f"unknown (exit {proc.returncode}{': ' + err[0] if err else ''})"
 
 
-# `infra/jaah/pkgmgr.py`, the one home of "apt or dnf". This file is installed ALONE at /usr/bin on Linux, so it
-# loads it from the bundle by absolute path; beside it on Windows and in the dev tree (the relative layout).
-_PKGMGR_PATHS = (Path(__file__).resolve().parents[2] / "infra" / "jaah" / "pkgmgr.py",
-                 Path("/usr/lib/jaahd/infra/jaah/pkgmgr.py"))
+# The bundle this CLI borrows from: on Linux this file is installed ALONE at /usr/bin, so the package path;
+# beside it on macOS, Windows and in the dev tree (the relative layout).
+_BUNDLE_ROOTS = (Path(__file__).resolve().parents[2], Path("/usr/lib/jaahd"))
+
+
+@functools.lru_cache(maxsize=None)
+def _load_bundled(rel: str, name: str) -> ModuleType:
+    """`<bundle>/<rel>` executed once as the module `name`; RuntimeError (its message naming the gap) when the
+    bundle lacks it. The daemon's `path_module` is itself one of the files only the bundle has."""
+    path = next((root / rel for root in _BUNDLE_ROOTS if (root / rel).is_file()), None)
+    if path is None:
+        raise RuntimeError(f"no {rel}: the bundle is broken")
+    import importlib.util  # noqa: PLC0415 — only the write and `node status` paths pay for it
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"{path} is not loadable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _installed_jaah_version() -> str:
-    """The installed `jaah` package version (apt or dnf), or a human-readable reason there is none."""
-    path = next((p for p in _PKGMGR_PATHS if p.is_file()), None)
-    if path is None:
-        return "unknown (no infra/jaah/pkgmgr.py: the bundle is broken)"
-    import importlib.util  # noqa: PLC0415 — only `node status` pays for it
-    spec = importlib.util.spec_from_file_location("jaah_pkgmgr", path)
-    if spec is None or spec.loader is None:
-        return f"unknown ({path} is not loadable)"
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    """The installed `jaah` package version (apt or dnf, `infra/jaah/pkgmgr.py`), or a human-readable reason
+    there is none."""
+    try:
+        module = _load_bundled("infra/jaah/pkgmgr.py", "jaah_pkgmgr")
+    except RuntimeError as exc:
+        return f"unknown ({exc})"
     if module.kind() is None:
         return "unknown (no apt or dnf on this host)"
     return module.installed_version("jaah") or "unknown (not installed)"
@@ -661,6 +671,9 @@ _SESSION_OWNERS = ("jaahd", "jaah")
 # Fallback only; the `jaahd.service` unit is the authority. Sanctioned copy of
 # `environment.TMUX_TMPDIR_DEFAULT`.
 _TMUX_TMPDIR_FALLBACK = f"{_RUN_ROOT}/tmux"
+# The isolated fleet socket systemd binds for the daemon (the jaah-fleet-tmux.socket unit's `ListenStream=`;
+# sanctioned copy of `session_user.isolated_socket` on a host). Only the daemon user may connect to it.
+_ISOLATED_FLEET_SOCKET = f"{_RUN_ROOT}/fleet/default"
 # A node's tmux session is named after its NAME. Sanctioned copy of
 # `env_helpers.default_tmux_session` and its `SESSION_NAME_RE`, pinned by `tests/test_jaah_cli_tmux.py`.
 # The node's uuid (computed per node) is a retired name kept only to feed `_rename_outgoing_sessions`.
@@ -727,15 +740,18 @@ def _as_owner(owner: str, uid: int, home: str, argv: list[str]) -> list[str]:
 _SOCKET_PROBE = (
     'for s in "$1"/tmux-"$(id -u)"/*; do [ -S "$s" ] && echo "$s"; done\n'
     '[ -n "$2" ] && for s in "$2"/run/tmux-*; do [ -S "$s" ] && echo "$s"; done\n'
+    '[ -n "$3" ] && [ -S "$3" ] && [ -w "$3" ] && echo "$3"\n'
     'exit 0\n'
 )
 
 
 def _sockets_for(owner: str, uid: int, home: str, tmpdir: str, jaah_home: str) -> list[str]:
     """Live tmux sockets owned by OWNER: `tmux-<uid>/` under the daemon's TMUX_TMPDIR, plus any `-S`
-    socket under $JAAH_HOME/run (the console's adopt-server)."""
+    socket under $JAAH_HOME/run (the console's adopt-server), plus — for the daemon, the only user it
+    admits — the isolated fleet socket, where every runner window lives once isolation is on."""
+    isolated = _ISOLATED_FLEET_SOCKET if owner == _SESSION_OWNERS[0] else ""
     argv = _as_owner(owner, uid, home,
-                     ["sh", "-c", _SOCKET_PROBE, "jaah-tmux", tmpdir, jaah_home])
+                     ["sh", "-c", _SOCKET_PROBE, "jaah-tmux", tmpdir, jaah_home, isolated])
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=_TMUX_TIMEOUT_S)
     except (FileNotFoundError, subprocess.TimeoutExpired):

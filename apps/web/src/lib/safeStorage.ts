@@ -2,7 +2,19 @@
 // throw is an absence. Storage is named, not passed, so the `localStorage`/`sessionStorage` access itself
 // is inside the try: private-mode Safari and blocked storage throw on ACCESS, not only on write.
 
+import { isRecord } from './records'
+
 export type StorageName = 'local' | 'session'
+
+/**
+ * A view-preference key scoped to the signed-in admin's id: one browser profile can be shared (`auth.tsx` clears
+ * the query cache on an admin switch), and an inherited outline, filter or draft would leak another person's view
+ * state — or their prose, one Start press from being filed under this operator's name. `null` gets its own `anon`
+ * bucket. `stem` must stay unchanged so stored preferences survive releases.
+ */
+export function adminScopedKey(stem: string, adminId: string | null): string {
+  return `${stem}:${adminId ?? 'anon'}`
+}
 
 function storage(name: StorageName): Storage {
   return name === 'local' ? localStorage : sessionStorage
@@ -21,9 +33,7 @@ export function readJson(name: StorageName, key: string): unknown {
 /** `readJson`, narrowed to a plain (non-array) object — the payload shape a per-field reader indexes. */
 export function readJsonObject(name: StorageName, key: string): Record<string, unknown> | null {
   const parsed = readJson(name, key)
-  return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-    ? (parsed as Record<string, unknown>)
-    : null
+  return isRecord(parsed) ? parsed : null
 }
 
 /** Store `value` as JSON under `key`. Returns whether the write landed (quota, blocked storage). */

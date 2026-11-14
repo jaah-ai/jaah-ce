@@ -1,0 +1,47 @@
+# Twitch Helix with an access token (a user or app token) plus the app's client ID, which Helix requires on every
+# call as `Client-Id`. The Test is Twitch's own token check, `GET id.twitch.tv/oauth2/validate` with
+# `Authorization: OAuth <token>`: free, and 401 for a bad token. Confirmed 2026-11-03 at the vendor_docs_url page.
+slug = "twitch"
+label = "Twitch"
+category = "marketing"
+vendor_docs_url = "https://dev.twitch.tv/docs/authentication/validate-tokens/"
+summary = "Read Twitch channels, streams, clips and videos through the Helix API."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "client_id", label = "Client ID", kind = "text", required = true, help = "dev.twitch.tv/console > Applications > your application > Manage > Client ID. Register one under Register Your Application if you have none" },
+  { key = "access_token", label = "Access token", kind = "secret", required = true, help = "A token minted for that same application: an app access token from the client credentials grant (POST id.twitch.tv/oauth2/token), or a user token from the Twitch CLI command twitch token -u -s followed by the scopes agents need, such as channel:read:subscriptions. Paste the token alone, without OAuth or Bearer" },
+]
+
+[test]
+method = "GET"
+path = "https://id.twitch.tv/oauth2/validate"
+auth = { field = "access_token", header = "Authorization", prefix = "OAuth" }
+identity = [["login"], ["client_id"]]
+# A token minted for another app passes validate, then every Helix call fails 401: its client_id must be this row's.
+require_equal = { path = ["client_id"], field = "client_id" }
+
+[docs]
+agent_uses = [
+  "Look up channels, users and whether a stream is live, with its title, game and viewer count",
+  "List a channel's recent videos, clips and schedule",
+  "Search categories and channels",
+  "With a user token and the matching scopes, update the connected channel's title or category",
+]
+prerequisites = ["A Twitch account with two-factor authentication on, and an application registered in the Twitch developer console (dev.twitch.tv/console)"]
+limitations = [
+  "Twitch access tokens expire (app tokens after about 60 days, user tokens after about 4 hours unless refreshed). Jaah does not renew a pasted token: replace it when the Test fails",
+  "What agents can do is bounded by the token's scopes; an app access token reads public data only",
+  "Helix applies a per-app rate limit (about 800 points a minute); a busy agent can hit it",
+]
+troubleshooting = [
+  { symptom = "Test says Twitch rejected the access token (401)", fix = "The token expired or was revoked. Mint a new one for the same application and select Replace on the secret" },
+  { symptom = "Test fails: the access token belongs to another client ID", fix = "The token was minted for another application. Mint it with this secret's Client ID, or change the Client ID to the token's application" },
+  { symptom = "An agent gets 401 Client ID and OAuth token do not match", fix = "The token was minted for another application. Mint it with this secret's Client ID, or change the Client ID to the token's application" },
+  { symptom = "An agent gets 401 Missing scope", fix = "The user token lacks the scope that call needs (for example channel:manage:broadcast). Mint a new token with it" },
+]
+faq = [
+  { q = "App token or user token", a = "An app token for public data such as streams and clips; a user token when agents must act on your own channel" },
+  { q = "Does the Test call Helix", a = "No. It calls Twitch's free token check, which also tells Jaah the token's application and login" },
+]

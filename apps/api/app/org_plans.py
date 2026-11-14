@@ -50,7 +50,6 @@ if TYPE_CHECKING:
 #: The default billing interval (a plan may also sell yearly, `Plan.yearly`) and the one currency we sell in (PRD §6).
 INTERVAL: Final = "month"
 YEARLY: Final = "year"
-INTERVALS: Final = (INTERVAL, YEARLY)
 #: Annual billing off (`yearly_on`): no purchase is billed yearly and no subscription switches to yearly; a yearly
 #: subscription keeps its interval and may still switch to monthly.
 YEARLY_OFF_TEXT: Final = "Annual billing is off. Choose Monthly."
@@ -101,31 +100,31 @@ class Plan:
     max_agents: Optional[int] = None
 
 
-def priced_on(row: BillingPlan, account: Optional[state.Account]) -> Optional[Price]:
-    """`row`'s mirrored Price when it was made on `account`; None when unpriced, or priced elsewhere."""
+def _mirrored_price(
+    row: BillingPlan, account: Optional[state.Account], price_id: Optional[str], unit_amount: Optional[int], interval: str,
+) -> Optional[Price]:
+    """The Price mirrored on `row` as `price_id`/`unit_amount` when it was made on `account`; None when unpriced, or
+    priced elsewhere."""
     if (
         account is None
-        or row.stripe_price_id is None
-        or row.price_unit_amount is None
+        or price_id is None
+        or unit_amount is None
         or row.stripe_account_id != account.account_id
         or row.livemode is not account.livemode
     ):
         return None
-    return Price(amount=row.price_unit_amount, currency=row.currency or CURRENCY, interval=INTERVAL)
+    return Price(amount=unit_amount, currency=row.currency or CURRENCY, interval=interval)
+
+
+def priced_on(row: BillingPlan, account: Optional[state.Account]) -> Optional[Price]:
+    """`row`'s mirrored Price when it was made on `account`; None when unpriced, or priced elsewhere."""
+    return _mirrored_price(row, account, row.stripe_price_id, row.price_unit_amount, INTERVAL)
 
 
 def yearly_priced_on(row: BillingPlan, account: Optional[state.Account]) -> Optional[Price]:
     """`row`'s mirrored yearly Price when it was made on `account` (the row's own account: a yearly Price is pushed
     only beside a monthly one there, `app/billing/plans.py::push_price`)."""
-    if (
-        account is None
-        or row.yearly_stripe_price_id is None
-        or row.yearly_price_unit_amount is None
-        or row.stripe_account_id != account.account_id
-        or row.livemode is not account.livemode
-    ):
-        return None
-    return Price(amount=row.yearly_price_unit_amount, currency=row.currency or CURRENCY, interval=YEARLY)
+    return _mirrored_price(row, account, row.yearly_stripe_price_id, row.yearly_price_unit_amount, YEARLY)
 
 
 def kept_price(row: BillingPlan, defaults: bool, interval: str = INTERVAL) -> Optional[Price]:

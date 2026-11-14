@@ -12,7 +12,7 @@
 // `content_type` and filename.
 
 // Generated from the Python constant; see the header.
-import { MAX_PROXY_BYTES } from '../../generated/inlinePreviewTypes'
+import { MAX_PROXY_BYTES, MEDIA_SUFFIX_TYPES } from '../../generated/inlinePreviewTypes'
 
 export const ARTIFACT_KIND_LABELS: Readonly<Record<string, string>> = {
   report: 'Report',
@@ -39,10 +39,6 @@ export const NO_BUILD_REASON = 'no_build'
 export function isReportOutcome(reason: string | null | undefined): boolean {
   return reason === NO_REPO_REASON || reason === NO_BUILD_REASON
 }
-
-/** The four kinds that become rows — `app/task_manifest.py::DOCUMENT_KINDS`, IN THE SERVER'S ORDER (the
- *  exact-set test polices sequence too). */
-export const DOCUMENT_KINDS: readonly string[] = ['report', 'prd', 'architecture', 'file']
 
 /* ── THE TWO PREDICATES BELOW PARTITION THE KINDS, BOTH ON THE KIND ──
  *
@@ -100,7 +96,7 @@ export function artifactKindLabel(kind: string): string {
  *
  *  `frame` AND `pdf` ARE BOTH IFRAMES BUT TWO MODES: `frame` carries `sandbox` and `pdf` must not.
  *  Named apart so it can never collapse to a ternary; see `TaskArtifacts.tsx`'s branches. */
-export type ArtifactRenderMode = 'frame' | 'pdf' | 'image' | 'markdown' | 'text' | 'download'
+export type ArtifactRenderMode = 'frame' | 'pdf' | 'image' | 'markdown' | 'text' | 'audio' | 'video' | 'download'
 
 /** THE CEILING ON BYTES THIS TAB WILL DECODE INTO A JS STRING, for the `markdown` and `text` inspected
  *  branches. The upload cap is 100MB; decoding a large log into component state wastes memory for an
@@ -140,6 +136,17 @@ function contentTypeEssence(contentType: string | null): string {
   return essence === 'application/octet-stream' ? '' : essence
 }
 
+/** `audio` or `video` when the browser's own player takes this NAME (`MEDIA_SUFFIX_TYPES`, generated from the
+ *  server's table), else `null`. Keyed on the name, as the server's `media_redirect` is, so the two always agree:
+ *  the content route answers such a name with a signed `inline` storage URL at any size, which a media element
+ *  streams and seeks by Range — so neither `MAX_PROXY_BYTES` nor `TEXT_PREVIEW_MAX_BYTES` applies to it. */
+export function mediaPreviewMode(filename: string): 'audio' | 'video' | null {
+  const ext = artifactExtension(filename)
+  const served = ext ? MEDIA_SUFFIX_TYPES[`.${ext}`] : undefined
+  if (served === undefined) return null
+  return served.startsWith('video/') ? 'video' : 'audio'
+}
+
 /** The renderer for a free-form row, by the table above. */
 function freeFormRenderMode(filename: string, contentType: string | null, sizeBytes: number): ArtifactRenderMode {
   const ext = artifactExtension(filename)
@@ -172,6 +179,17 @@ function freeFormRenderMode(filename: string, contentType: string | null, sizeBy
   return 'download'
 }
 
+/** Whether this browser shows a PDF inside the page. `false` when the visitor set it to download PDFs instead
+ *  (Chrome's "PDF documents" site setting, or a managed policy): a framed PDF then paints the browser's
+ *  "This page has been blocked" page whatever the response headers say, so a PDF view offers the download in
+ *  its place. A browser that does not say counts as showing. */
+export function browserShowsPdf(): boolean {
+  return typeof navigator === 'undefined' || navigator.pdfViewerEnabled !== false
+}
+
+/** What a PDF view says in place of the file when `browserShowsPdf()` is false. */
+export const PDF_DOWNLOADS_ONLY_NOTE = 'Your browser downloads PDFs — download to open.'
+
 /** THE VIEWER'S WHOLE SWITCH, pure so it is testable without React and has one copy.
  *
  *  THE FORMAT-PINNED KINDS SHORT-CIRCUIT and are never inspected: a PRD named `requirements.html` is
@@ -190,6 +208,11 @@ export function artifactRenderMode(artifact: {
   // `'download'` before any `src` or `fetch`. It sits above the markdown arm specifically: a pinned `prd`
   // never enters `freeFormRenderMode`, so `TEXT_PREVIEW_MAX_BYTES` cannot cover it.
   // `>` AND NOT `>=`, matching `attachments.py::artifact_content`: exactly MAX_PROXY_BYTES is proxied.
+  // MEDIA IS THE EXCEPTION, and only on the free-form kind: it is never proxied, so the ceiling says nothing about it.
+  if (isDownloadArtifactKind(artifact.kind)) {
+    const media = mediaPreviewMode(artifact.filename)
+    if (media) return media
+  }
   if (artifact.size_bytes > MAX_PROXY_BYTES) return 'download'
   if (isMarkdownArtifactKind(artifact.kind)) return 'markdown'
   if (!isDownloadArtifactKind(artifact.kind)) return 'frame'

@@ -11,7 +11,7 @@ from __future__ import annotations
 import sys
 
 from app import auth, edition_features, identities
-from app.db import SessionLocal
+from app.db import BridgedSession
 from app.dev_bypass import is_fixture_env
 from app.tenancy import seam
 
@@ -24,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     if not is_fixture_env():
         print("fixture_session: refused — APP_ENV is not local, ci or test", file=sys.stderr)
         return 2
-    with seam.identity_scope(), SessionLocal() as session:
+    with seam.identity_scope(), BridgedSession() as session:
         user = identities.first_membership(session, args[0])
         if user is None or user.is_system or user.disabled_at is not None:
             print(f"fixture_session: no loginable user {args[0]!r}", file=sys.stderr)

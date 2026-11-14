@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 
@@ -12,6 +12,7 @@ from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.orm import Session
 
 from app import actors, merge_lane_state
+from app.clock import utcnow
 from app.entity_shape import iso_or_none
 from app.events import emit_console_event
 from app.models.audit import ActivityEvent
@@ -19,7 +20,9 @@ from app.models.task_extras import ATTACHMENT_KIND_REPORT, TaskAttachment
 from app.models.tasks import Task, TaskDependency
 from app.short_title import short_title
 from app.task_ancestry import executor_user_id
-from app.task_artifacts import activity_row_is_visible, uploaded_clause, visible_artifact_clause
+from app.task_artifacts import (
+    activity_row_is_visible, not_app_access_clause, uploaded_clause, visible_artifact_clause,
+)
 from app import task_prs
 from app.task_lifecycle import (
     DONE,
@@ -44,7 +47,7 @@ from app.routes.tasks.policy import (
     epic_fanout_cap,
 )
 from app.routes.tasks.task_wire import _SETTLED_OUTPUT_NOTE_KINDS, _has_settled_output_body, _prs_out
-from app.routes.tasks.dependencies import _would_create_cycle
+from app.routes.tasks.dependencies import stage_edge
 
 log = logging.getLogger(__name__)
 
@@ -180,6 +183,8 @@ def _publish_epic_final_report(
         .where(
             TaskAttachment.task_id == epic.id,
             TaskAttachment.kind == ATTACHMENT_KIND_REPORT,
+            # The app's access report (`app/hosted_apps/admin.py`) is not a copy to replace: it stays beside.
+            not_app_access_clause(),
         )
         .order_by(TaskAttachment.id.desc())
     ).first()
@@ -209,21 +214,8 @@ def _publish_epic_final_report(
     # `uploaded_by_id` is the source's: the finish runner's executor. The object is shared, only the key copied (S3 keys
     # are never rewritten; `s3_key` is deliberately non-unique). Objects may be deleted only behind
     # `app/attachment_storage.py::reap_unreferenced_object`'s no-other-reference guard, never from here or
-    # `_drop_epic_report_published_by`. `uploaded_at` is copied: it confirms bytes confirmed once, on the source.
-    published = TaskAttachment(
-        task_id=epic.id,
-        kind=ATTACHMENT_KIND_REPORT,
-        filename=source.filename,
-        content_type=source.content_type,
-        # The source row's own `size_bytes`, stamped by `complete_attachment` from what S3 actually received.
-        size_bytes=source.size_bytes,
-        s3_key=source.s3_key,
-        s3_bucket=source.s3_bucket,
-        uploaded_at=source.uploaded_at,
-        etag=source.etag,
-        uploaded_by_id=source.uploaded_by_id,
-        source_task_id=child.id,
-    )
+    # `_drop_epic_report_published_by`.
+    published = TaskAttachment.copy_of(source, task_id=epic.id, kind=ATTACHMENT_KIND_REPORT, source_task_id=child.id)
     session.add(published)
     session.flush()
     log.info(
@@ -588,7 +580,7 @@ def execute_finish_phase(finish_id: int, session: Session) -> Optional[dict[str,
 
     report = {
         "finish_task_id": finish.id,
-        "computed_at": datetime.now(timezone.utc).isoformat(),
+        "computed_at": utcnow().isoformat(),
         "verify": verify,
         "acceptance": acceptance,
         "time": time_metrics,
@@ -612,6 +604,9 @@ def execute_finish_phase(finish_id: int, session: Session) -> Optional[dict[str,
         .values(state=DONE, **dispatch._RUNNER_BINDING_CLEARED, **actors.task_actor_values(session))
     )
     if result.rowcount > 0:
+        from app.outcome_ledger import writer as outcome_writer
+
+        outcome_writer.end_row(session, finish.id, end_kind=outcome_writer.END_SETTLED)
         emit_console_event(session, entity="task", id=finish.id, action=DONE)
         # The finisher's own last word (a no-op when it filed a follow-up). Re-read `finish`: the guarded UPDATE
         # changed its `state` underneath, and the publisher checks `child.state != DONE`. Same transaction.
@@ -713,6 +708,7 @@ def append_finish_follow_up(
         project_id=epic.project_id,
         parent_task_id=epic.id,
         source=task_source.source_for(epic, task_source.AGENT),
+        language=epic.language,
         is_plannable=False,
         persona=PERSONA_CODER,
         # READY, not DRAFT: the fan-out sweep enumerates only `active` epics, and the epic may be about to stop
@@ -735,16 +731,7 @@ def append_finish_follow_up(
     # The follow-up depends on the finisher, plus any sibling follow-ups it named, so `dispatchable_tasks`
     # holds it until each is `done`. A fresh row cannot cycle; the guard is defensive.
     for prereq_id in (finish_child.id, *prerequisites):
-        if _would_create_cycle(row.id, prereq_id, session):
-            session.rollback()
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"follow-up {row.id} -> {prereq_id} would create a cycle "
-                    "(unexpected for a fresh filing — aborting)"
-                ),
-            )
-        session.add(TaskDependency(task_id=row.id, depends_on_task_id=prereq_id))
+        stage_edge(session, row.id, prereq_id, "follow-up")
     emit_console_event(session, entity="task", id=row.id, action=READY)
     # On the epic, like `plan_fanout`: it explains why the epic outlived its finisher.
     record_task_note(

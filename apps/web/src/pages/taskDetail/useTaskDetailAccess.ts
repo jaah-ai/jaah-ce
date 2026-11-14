@@ -18,7 +18,8 @@ export function useTaskDetailAccess(task: PipelineTask | null) {
   /* ── ANOTHER ORG'S ROW ─────────────────────────────────────────────────────────────────
      An operator edits another org's task on that org's behalf: every write below the row — each panel's, the ⋯'s,
      the answer, comments, attachments — goes as its org for the one request (`lib/actAs.ts::useActAsRows`), and the
-     page's `ActingForNotice` says so. A new feature filed from Move… is that org's too (`MoveToFeatureDialog`). A picker
+     page's `ActingForNotice` says so. The feature crumb's "New feature…" opens another page, whose create acts as the
+     project's org itself (`FeatureEditPage`). A picker
      offers only rows a write may target: the operator's own org's projects, or on another org's row that org's. */
   const otherOrg = useOtherOrg(task?.org)
   useActAsRows(task === null ? [] : [{ path: `/api/tasks/${task.id}`, org: otherOrg }])

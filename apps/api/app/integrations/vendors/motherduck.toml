@@ -1,0 +1,43 @@
+# MotherDuck: an access token for its DuckDB wire protocol; no driver on the CP, so the Test is a format check.
+slug = "motherduck"
+label = "MotherDuck"
+category = "data"
+vendor_docs_url = "https://motherduck.com/docs/key-tasks/authenticating-and-connecting-to-motherduck/authenticating-to-motherduck/"
+summary = "Let agents query your MotherDuck databases with DuckDB."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "token", label = "Access token", kind = "secret", required = true, help = "In the MotherDuck app, select your organization name (bottom of the left sidebar) > Settings > Integrations > Access Tokens > Create token; pick Read/Write (or Read Scaling for read-only work), then copy the token (it is shown once)" },
+  { key = "database", label = "Database", kind = "text", required = false, placeholder = "my_db", help = "The database agents open by default, as listed in the MotherDuck app's left sidebar; blank opens your default database" },
+]
+
+[test]
+kind = "format"
+patterns = { token = "[A-Za-z0-9._-]{20,}", database = "[A-Za-z_][A-Za-z0-9_]*" }
+
+[docs]
+agent_uses = [
+  "Query your MotherDuck databases with DuckDB SQL from the task's environment, for example to answer a data question",
+  "Join a MotherDuck table with a local CSV or Parquet file the agent produced",
+  "List databases and tables and read their schemas before writing a query",
+  "Load a result set into a MotherDuck table for others to use",
+]
+prerequisites = [
+  "A MotherDuck account and a database in it.",
+  "DuckDB available where the agent runs (the duckdb Python package or the duckdb command line); the agent connects with md:DATABASE_NAME and the token in the motherduck_token environment variable.",
+]
+limitations = [
+  "Jaah cannot call MotherDuck to test: it speaks DuckDB's own protocol and Jaah adds no database drivers. Test checks only the token's shape. The first real check is the agent's first query.",
+  "A Read Scaling token can only read. Use a Read/Write token if agents must write.",
+  "A token acts as the user who created it, with all of that user's databases. MotherDuck has no per-database token.",
+]
+troubleshooting = [
+  { symptom = "Test says the access token is not in the format MotherDuck uses", fix = "Copy the whole token from Create token, with no quotes, spaces or the motherduck_token= prefix" },
+  { symptom = "The agent's query fails with 'Invalid token' or 'Unauthorized'", fix = "The token was revoked or has expired. Create a new one under Settings > Integrations > Access Tokens and select Replace on the secret" },
+  { symptom = "The agent's write fails with 'read-only'", fix = "The token is a Read Scaling token. Create a Read/Write token instead" },
+]
+faq = [
+  { q = "Do I need DuckDB installed?", a = "The agent's environment needs DuckDB. Most agents install the duckdb Python package themselves when the task asks for it" },
+  { q = "Why does Test say MotherDuck was not called?", a = "MotherDuck has no simple web endpoint to check a token, and Jaah does not run database drivers. So Test checks the shape only" },
+]

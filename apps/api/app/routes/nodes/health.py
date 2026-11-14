@@ -10,13 +10,11 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import node_liveness, node_log_findings, platform_release, pool_state
-from app.auth import require_user
 from app.authz.catalog import Tenancy
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
-from app.db import get_session
+from app.authz.principal import AsyncCaller, current_caller
+from app.db_async import on_session
 from app.entity_shape import iso_or_none
-from app.models.identity import AdminUser
 from app.models.nodes import Node
 from app.models.worktrees import Worktree
 from app.tenancy.ids import is_tenant_org
@@ -104,6 +102,11 @@ _FINDING_MEANINGS = {
         "A daemon step has been running far longer than its interval and is skipping its runs; the daemon "
         "keeps heartbeating, so look at what that step waits on."
     ),
+    node_log_findings.SESSION_USER_STALLED: (
+        "Commands the daemon runs on this node keep hitting their time limit, usually because the machine is short "
+        "of memory or disk I/O. Runners and slot updates stall, and live runners can look gone. Give the machine "
+        "more memory or fewer slots; on a Multi-Node Host, check the host's jaahvnodes.slice."
+    ),
     node_log_findings.OOM_KILL: (
         "The machine ran out of memory and the kernel killed a process; the job or service it belonged to "
         "failed. Find what filled memory on the node's runners and stacks."
@@ -130,6 +133,17 @@ _FINDING_MEANINGS = {
         "The daemon cannot tie the fleet tmux server to the jaah-runner service, so it refuses every runner on this "
         "Windows node as not_a_runner. It replaces a server left from before a jaah-runner restart by itself; if "
         "this stays, restart jaah-runner, then the node."
+    ),
+    node_log_findings.TMUX_UNJAILED: (
+        "The daemon's tmux command clients run without a jail here, so a runner on this node can arm the shared "
+        "tmux server to read or write a file, or run a command, as the daemon's account. The detail says why: on "
+        "Linux, boot a kernel with Landlock (5.13 or later, landlock in the lsm= list); on macOS, /usr/bin/sandbox-exec "
+        "must exist; Windows has no jail yet."
+    ),
+    node_log_findings.PANE_SENSOR_DOWN: (
+        "A runner is live here but the daemon cannot reach the tmux server it runs in, so answers and messages to "
+        "tasks on this node are refused and stay undelivered. Check the node's tmux server (the jaah-runner "
+        "service) and the daemon's log for the tmux sensor line."
     ),
     node_log_findings.TMP_INODES_HIGH: (
         "/tmp is running out of inodes, usually from files left behind by tests or scripts. At 100% every "
@@ -176,13 +190,14 @@ class NodeHealthOut(BaseModel):
 # ── The health read's own helpers ─────────────────────────────────────────────────────────────────
 
 
-# The five stamps a node writes, in reading order: on the bus, observing, occupancy trustworthy, runner
-# enumeration current, config report current. Each carries its own bound: `last_seen`/`observed_at` take
+# The four stamps a node writes on a cadence, in reading order: on the bus, observing, occupancy trustworthy, runner
+# enumeration current. Each carries its own bound: `last_seen`/`observed_at` take
 # `node_liveness.STALE_AFTER_SECONDS` (the sweep's conditions); the enumeration stamps take the
-# operator-tunable `pool_state.max_observation_age_secs()`, the real dispatch gate (`app/pool_state.py`);
-# `config_reported_at` takes the liveness bound as a reading aid only (it advances on content change).
+# operator-tunable `pool_state.max_observation_age_secs()`, the real dispatch gate (`app/pool_state.py`).
+# NOT `config_reported_at`: it advances only when the config CONTENT changes, so its age judged against any bound
+# read "stale" on every quiet node while saying nothing.
 def _clocks(row: Optional[Node], now: datetime, *, withhold_operator_bound: bool) -> list[HealthClock]:
-    """The five reporting clocks with DB-measured ages. Empty for a presence-only node (no row, and five
+    """The four reporting clocks with DB-measured ages. Empty for a presence-only node (no row, and four
     "never" rows would misreport it as broken).
 
     `withhold_operator_bound` blanks the two enumeration clocks' bound on the payload only (see
@@ -225,12 +240,6 @@ def _clocks(row: Optional[Node], now: datetime, *, withhold_operator_bound: bool
             "The last COMPLETE runner enumeration, gated on its own completeness flag exactly as pool "
             "occupancy is. Stale here means the runners this node reports are a partial list.",
         ),
-        (
-            "config_reported_at", "Config snapshot", row.config_reported_at, liveness_bound,
-            "When the daemon last published its effective config. It advances only when the config "
-            "CONTENT changes, so age here is NOT by itself a fault — it is the age of the evidence the "
-            "drift check is decided on.",
-        ),
     )
     clocks: list[HealthClock] = []
     for key, label, stamp, bound, meaning in spec:
@@ -254,11 +263,11 @@ def _clocks(row: Optional[Node], now: datetime, *, withhold_operator_bound: bool
 
 @router.get("/api/nodes/{node_id}/health", response_model=NodeHealthOut)
 @feature("nodes", "view", tenancy=Tenancy.CALLER_PLANE)
+@on_session
 def get_node_health(
+    session: Session,
     node_id: str,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> NodeHealthOut:
     """This node's internal queues and reporting clocks: the read that says whether it is in trouble.
 
@@ -269,10 +278,10 @@ def get_node_health(
     rows would race it); this route's own property is no non-`read` event and every touched row unchanged.
 
     The clock is the DB's `now()`, read once in the same session as the rows, never the browser's."""
-    _presence, row = _readable_node_or_404(session, principal, node_id)
+    _presence, row = _readable_node_or_404(session, caller.principal, node_id)
     now = session.scalar(select(func.now()))
     # `is_tenant_org` on the caller's own org: the withholding is about which plane reads.
-    clocks = _clocks(row, now, withhold_operator_bound=is_tenant_org(user.org_id))
+    clocks = _clocks(row, now, withhold_operator_bound=is_tenant_org(caller.actor.org_id))
     drift = node_liveness.config_drift(
         dict(row.config_desired) if row and row.config_desired else {},
         row.config_snapshot if row else None,
@@ -288,7 +297,7 @@ def get_node_health(
         )
     ages = {c.key: c.age_seconds for c in clocks}
     slots = session.scalar(
-        select(func.count()).select_from(Worktree).where(Worktree.node_id == row.id, Worktree.number > 0)
+        select(func.count()).select_from(Worktree).where(Worktree.node_id == row.id)
     ) or 0
     generation = _reported_generation(row)
     # Against what this node's platform can install (`app/platform_release.py`), as the Nodes list places it.
@@ -319,15 +328,16 @@ def get_node_health(
             select(func.count()).select_from(Worktree).where(Worktree.node_id == row.id)
         ) or 0),
         generation=generation,
-        generation_reported_age=ages.get("config_reported_at"),
+        # The config report's age is no served clock (see `_clocks`), but the release verdict still reads it.
+        generation_reported_age=(now - row.config_reported_at).total_seconds() if row.config_reported_at else None,
         placement=placement,
         drift=drift,
     )
     verdicts = node_liveness.verdicts_for(liveness_row, release_grace_active=release_grace_active)
     # Read below (served verdicts, clocks, drift rows); reuse these names. A tenant administrator keeps the
     # config fields `_narrow_for_tenant` serves them; the release verdict is withheld from every tenant.
-    tenant = is_tenant_org(user.org_id)
-    config_withheld = tenant and not _administers_own_hosts(user, principal)
+    tenant = is_tenant_org(caller.actor.org_id)
+    config_withheld = tenant and not _administers_own_hosts(caller.actor, caller.principal)
     if tenant and node_liveness.VERDICT_STALE_RELEASE in verdicts:
         # STALE-RELEASE is `generation_placement: behind` through another door, which `_narrow_for_tenant`
         # blanks, so it is dropped from the served list for tenants (computed from the full row; an emptied list
@@ -337,18 +347,22 @@ def get_node_health(
             node_liveness.VERDICT_LIVE
         ]
     hosting, _hosted_on, host_org_id = _hosting_of(row, _hosting_facts(session, [row.id]).get(row.id))
-    pressure = (
-        [] if _on_a_foreign_host(user, hosting, host_org_id) else node_log_findings.pressure(session, row.id, now)
-    )
+    foreign_host = _on_a_foreign_host(caller.actor, hosting, host_org_id)
+    pressure = [] if foreign_host else node_log_findings.pressure(session, row.id, now)
+    # Counts every org's runners on the node, so withheld on another org's host like the host series.
+    pane = [] if foreign_host else node_log_findings.pane_sensor_down(session, row.id, now)
     # A tenant is told only its own org's sessions (task ids are another org's otherwise).
-    storm = node_log_findings.relaunch_storm(session, row.id, now, org_id=user.org_id if tenant else None)
+    storm = node_log_findings.relaunch_storm(session, row.id, now, org_id=caller.actor.org_id if tenant else None)
     findings = [
         HealthFinding(
             kind=kind, label=node_log_findings.LABELS[kind], detail=str(f.get("detail") or ""),
             first_at=f.get("first_at"), last_at=f["last_at"], meaning=_FINDING_MEANINGS[kind],
             task_ids=f.get("task_ids") or [], count=f.get("count"),
         )
-        for kind, f in [*pressure, *storm, *node_log_findings.active(row.log_findings, now)]
+        for kind, f in [
+            *pressure, *storm, *pane,
+            *node_log_findings.active(row.log_findings, now),
+        ]
     ]
     recent_findings = [
         HealthFinding(
@@ -368,14 +382,9 @@ def get_node_health(
         healthy=not findings and verdicts in ([node_liveness.VERDICT_LIVE], [node_liveness.VERDICT_DISABLED]),
         stale_bound_seconds=node_liveness.STALE_AFTER_SECONDS,
         # The drift rows are the two fields `_narrow_for_tenant` blanks for a non-superadmin tenant, side by
-        # side; that reader gets the CONFIG_DRIFT verdict but none of the rows, and the `config_reported_at`
-        # clock is dropped (not blanked, which would render a permanently stale accusation). Verdicts were
-        # computed from the full clocks, so a tenant's verdicts equal the operator's less STALE_RELEASE.
-        clocks=(
-            [c for c in clocks if c.key != "config_reported_at"]
-            if config_withheld
-            else clocks
-        ),
+        # side; that reader gets the CONFIG_DRIFT verdict but none of the rows. A tenant's verdicts equal the
+        # operator's less STALE_RELEASE.
+        clocks=clocks,
         config_drift=(
             []
             if config_withheld

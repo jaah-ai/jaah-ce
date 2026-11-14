@@ -19,7 +19,7 @@ with its bytes too (`reap_unclaimed_images`, the hourly `comment-image-reap` cro
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Callable, Literal, Optional
 from uuid import UUID
 
@@ -29,7 +29,8 @@ from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 
 from app import attachment_storage, comment_mentions
-from app.entity_shape import get_or_404, iso_or_none, RefOut
+from app.clock import utcnow
+from app.entity_shape import get_or_404, iso_or_none, RefOut, from_row
 from app.identities import label_expr
 from app.models.identity import AdminUser
 from app.models.task_extras import (
@@ -108,15 +109,10 @@ class CommentImageOut(BaseModel):
     content_type: Optional[str] = None
 
 
-class CommentOut(BaseModel):
-    """One task comment, as the tab draws it.
-
-    No author id: the badge derives from the display name and nothing navigates to a person.
-    `author_is_me` is the server's "may I edit this", since the caller's identity is not on the wire.
-    """
+class _CommentOut(BaseModel):
+    """What a task comment and a ticket comment say alike; the published models are the two below."""
 
     id: int
-    task_id: int
     body: str
     author_name: str
     author_is_me: bool
@@ -128,24 +124,28 @@ class CommentOut(BaseModel):
     mentions: list[MentionOut] = Field(default_factory=list)
     # Only the emoji someone chose, in palette order (`app/models/task_extras.py::REACTION_EMOJIS`).
     reactions: list[ReactionOut] = Field(default_factory=list)
+
+
+class CommentOut(_CommentOut):
+    """One task comment, as the tab draws it.
+
+    No author id: the badge derives from the display name and nothing navigates to a person.
+    `author_is_me` is the server's "may I edit this", since the caller's identity is not on the wire.
+    """
+
+    task_id: int
     images: list[CommentImageOut] = Field(default_factory=list)
 
 
-class TicketCommentOut(BaseModel):
+class TicketCommentOut(_CommentOut):
     """One ticket comment: `CommentOut` with `ticket_id` for `task_id`, and `visibility` (`internal`
     reaches operators only)."""
 
-    id: int
     ticket_id: int
     visibility: Literal["public", "internal"]
-    body: str
-    author_name: str
-    author_is_me: bool
-    may_delete: bool
-    created_at: Optional[str] = None
-    edited_at: Optional[str] = None
-    mentions: list[MentionOut] = Field(default_factory=list)
-    reactions: list[ReactionOut] = Field(default_factory=list)
+    #: The author is support staff (the operator's), not the ticket's org. Operators only (None, and left off the
+    #: wire, for everyone else): it marks the replies the requester is emailed (`app/support_mail.py`).
+    author_is_staff: Optional[bool] = None
 
 
 class CommentIn(BaseModel):
@@ -220,7 +220,7 @@ def reap_unclaimed_images(session: Session, *, older_than: timedelta = UNCLAIMED
     `_REAP_BATCH`, each deleted and committed, then its objects reaped behind the still-referenced check: a pass that
     dies orphans at most one batch's objects. Run fleet-wide by the `comment-image-reap` cron on the operator plane.
     Returns how many rows went."""
-    cutoff = datetime.now(timezone.utc) - older_than
+    cutoff = utcnow() - older_than
     reaped = 0
     while True:
         rows = session.execute(
@@ -286,9 +286,7 @@ def render(
         .where(TaskAttachment.comment_id.in_([comment.id for comment in comments]))
         .order_by(TaskAttachment.id)
     ).all():
-        images_by_comment.setdefault(image.comment_id, []).append(
-            CommentImageOut(id=image.id, filename=image.filename, content_type=image.content_type)
-        )
+        images_by_comment.setdefault(image.comment_id, []).append(from_row(CommentImageOut, image))
     wanted = (
         {comment.author_id for comment in comments}
         | {user_id for _c, user_id in mention_rows}
@@ -466,6 +464,6 @@ def edit(
             if image.id not in kept_ids:
                 session.delete(image)
     # Set on every edit, even one that changes nothing visible.
-    comment.edited_at = datetime.now(timezone.utc)
+    comment.edited_at = utcnow()
     session.flush()
     return comment_mentions.sync_mentions(session, comment, mentioned(comment), admits=admits)

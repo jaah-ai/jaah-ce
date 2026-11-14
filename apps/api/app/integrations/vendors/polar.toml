@@ -1,0 +1,39 @@
+# Polar: hosted MCP server. Facts confirmed at https://polar.sh/docs/integrate/mcp and the server's own OAuth metadata (mcp.polar.sh/.well-known/oauth-protected-resource/mcp/polar-mcp; Dynamic Client Registration at api.polar.sh/v1/oauth2/register).
+slug = "polar"
+label = "Polar"
+category = "mcp"
+vendor_docs_url = "https://polar.sh/docs/integrate/mcp"
+summary = "Manage Polar products, customers, orders and subscriptions through Polar's MCP server."
+
+[[auth]]
+kind = "mcp"
+
+[mcp]
+url = "https://mcp.polar.sh/mcp/polar-mcp"
+url_editable = false
+transport = "streamable_http"
+auth = "oauth_dcr"
+
+[docs]
+agent_uses = [
+  "List products and prices, and create a product or checkout link for a launch",
+  "Look up a customer's orders, subscriptions and license keys to answer a support question",
+  "Report revenue metrics for a period",
+]
+prerequisites = [
+  "A Polar organization (polar.sh) and a user who is a member of it",
+]
+limitations = [
+  "At consent you choose the Polar organization and the scopes; agents reach only those",
+  "This is Polar's production server: agents act on real customers and money. Polar's sandbox is not reachable from this card",
+]
+troubleshooting = [
+  { symptom = "Test says Polar rejected the token (401)", fix = "The grant expired or was revoked under Polar's Settings > Developers. Select Reconnect" },
+  { symptom = "An agent gets a permission error on writes", fix = "The consent was granted with read scopes only. Reconnect and approve the write scopes the work needs" },
+  { symptom = "The secret shows Needs reconnect", fix = "Polar ended the grant (a password change, a revoked connection or a long idle period). Select Reconnect on the secret and sign in to Polar again" },
+  { symptom = "New tasks on the project have no Polar tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with, and an agent marked Not supported on that tab cannot load MCP servers" },
+]
+faq = [
+  { q = "Does Jaah need an app registered at Polar", a = "No. Jaah registers itself with Polar's sign-in server the first time anyone connects, and every later connection reuses that registration" },
+  { q = "What does Test do", a = "It opens an MCP session with Polar's server and lists its tools, then closes the session. It reads and changes nothing in your Polar account" },
+]

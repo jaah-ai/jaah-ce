@@ -1,14 +1,14 @@
 /* The inbox's reads and writes, shared by the bell's tray (`components/MentionsBell.tsx`) and the Notifications page
  * (`pages/NotificationsPage.tsx`). Two feeds behind one switch, Unread | All (`GET /api/inbox?unread_only=`), each
  * cached per page size under the one `['inbox']` root, so every write patches every copy at once and anything that
- * invalidates `['inbox']` (`pages/Requests.tsx`) refreshes both.
- * Polls every 60s, not `useEventStream`: neither comments nor requests publish, so a subscription would refresh only
+ * invalidates `['inbox']` refreshes both.
+ * Polls every 60s, not `useEventStream`: comments do not publish, so a subscription would refresh only
  * on unrelated task events. When the server publishes, drop the interval, keep the query.
  * A failed fetch keeps the last good answer — emptying the list reads as someone having read them. Writes are
  * optimistic; a failed POST refetches, which puts the server's truth back. */
 import { useNavigate } from 'react-router-dom'
 import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query'
-import { getInbox, markSeen, markUnseen, type InboxItem } from '../../lib/accessRequests'
+import { getInbox, markSeen, markUnseen, type InboxItem } from '../../lib/inbox'
 import { canMarkRead, isCommentKind, itemTarget, keepsReadStamp } from './inboxItem'
 
 /** Delete when the server publishes (see header). */
@@ -86,8 +86,7 @@ export function useInboxActions() {
   }
 
   /** One request. Mentions and reactions: `all_mentions`/`all_reactions` = the API's "all unread", not the ids on
-   *  screen, which may be capped or stale. The other kinds: the ones listed here or in any cached Unread feed.
-   *  Pending requests stay — they are work, not news. */
+   *  screen, which may be capped or stale. The other kinds: the ones listed here or in any cached Unread feed. */
   function markAllRead(entries: InboxItem[]): void {
     const unread = [...entries, ...cachedUnread()].filter(canMarkRead)
       .filter((e, i, all) => all.findIndex(o => same(o, e)) === i)

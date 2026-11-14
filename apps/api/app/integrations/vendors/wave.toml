@@ -1,0 +1,75 @@
+# Wave: OAuth 2.0 (client in the token request's body; Wave rejects `offline_access` but always returns a refresh
+# token) or a personal full access token, both as a Bearer token to the public GraphQL API. A bad token is answered
+# 200 with an UNAUTHENTICATED GraphQL error, hence `rejected_when`.
+slug = "wave"
+label = "Wave"
+category = "payments"
+vendor_docs_url = "https://developer.waveapps.com/hc/en-us/articles/360019493652-OAuth-Guide"
+summary = "Read and create Wave invoices, customers, products and transactions for your Wave business."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://api.waveapps.com/oauth2/authorize/"
+token_url = "https://api.waveapps.com/oauth2/token/"
+pkce = false
+scopes = [
+  { name = "user:read", label = "Read who connected, so Test can name the account" },
+  { name = "business:read", label = "Read the businesses the account can reach, so agents pick the right one" },
+  { name = "customer:*", label = "Read and update customers when an invoice needs one", optional = true },
+  { name = "invoice:*", label = "Read, draft and send invoices", optional = true },
+  { name = "product:*", label = "Read and update the products and services invoices are built from", optional = true },
+  { name = "account:read", label = "Read the chart of accounts, needed to categorise transactions", optional = true },
+  { name = "transaction:*", label = "Record money transactions such as payments and expenses", optional = true },
+]
+jaah_app = true
+[auth.oauth.registration]
+console_url = "https://developer.waveapps.com/hc/en-us"
+steps = [
+  "Sign in with the Wave account that should own the app, then open Manage Applications from the developer portal's menu and select Create an application",
+  "Under Name enter Jaah and under Description enter: Lets the AI agents working Jaah tasks read and draft invoices, customers and transactions",
+  "Under Redirect URIs enter both redirect URIs (dev and prod, listed under Redirect URIs), one per line",
+  "Save, then open the application and copy its Client ID and Client Secret",
+  "To connect businesses other than the app owner's own, apply to Wave for production access from the application's page; until Wave approves it, only the owner's businesses can connect",
+]
+review = "Wave must approve the app before businesses other than the owner's own can connect, and each connected business needs an active Wave Pro or Wave Advisors plan"
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "full_access_token", label = "Full access token", kind = "secret", required = true, help = "Sign in at the Wave developer portal (developer.waveapps.com), open Manage Applications, select your application (create one named Jaah if you have none) and select Create token. Wave shows the token once. It reaches every business your Wave login can, so prefer the sign-in button for shared use" },
+]
+
+[test]
+method = "POST"
+path = "https://gql.waveapps.com/graphql/public"
+body = '{"query":"{ user { id defaultEmail } }"}'
+auth = { field = "full_access_token", header = "Authorization", prefix = "Bearer" }
+identity = [["data", "user", "defaultEmail"]]
+rejected_when = { path = ["errors", 0, "extensions", "code"], values = ["UNAUTHENTICATED"] }
+
+[docs]
+agent_uses = [
+  "List unpaid and overdue invoices and the customers who owe them",
+  "Draft an invoice from a task's line items for a person to review and send",
+  "Add or update customers and the products or services you sell",
+  "Record a payment or an expense against the right account",
+]
+prerequisites = [
+  "A Wave business on an active Wave Pro or Wave Advisors plan: Wave turns off API access for businesses on the free Starter plan",
+  "A Wave login that can reach the business agents should work in",
+]
+limitations = [
+  "When a business's Wave Pro plan lapses, Wave refuses to renew the connection and the secret shows Needs reconnect",
+  "A full access token reaches every business the Wave login can see; the sign-in lets you grant fewer scopes",
+  "Write scopes in Wave do not include reading: an agent that writes invoices also needs invoice:* rather than a write-only scope",
+]
+troubleshooting = [
+  { symptom = "Test says Wave rejected the access token (UNAUTHENTICATED)", fix = "The token expired, was revoked, or the business's Wave Pro plan lapsed. Select Reconnect, or create a new full access token and select Replace" },
+  { symptom = "Allow access is greyed out on Wave's sign-in screen", fix = "The business is on Wave's free Starter plan. Upgrade it to Wave Pro, then connect again" },
+  { symptom = "An agent cannot find the business it should work in", fix = "The connected Wave login is not a collaborator on that business. Invite it in Wave's Settings > Users, then reconnect" },
+]
+faq = [
+  { q = "Sign in or full access token", a = "Sign in for anything shared: it asks only for the scopes you tick and can be revoked from Wave. Use a full access token only for a quick personal test" },
+  { q = "Does Test change anything", a = "No. It reads the connected user's email address and nothing else" },
+]

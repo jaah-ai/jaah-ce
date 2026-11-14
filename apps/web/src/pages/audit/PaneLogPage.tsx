@@ -3,7 +3,6 @@ import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import MuiLink from '@mui/material/Link'
 import Typography from '@mui/material/Typography'
-import useMediaQuery from '@mui/material/useMediaQuery'
 import { useQuery } from '@tanstack/react-query'
 import { Link as RouterLink, useParams } from 'react-router-dom'
 import { ApiError, apiDetail, get } from '../../api'
@@ -13,9 +12,13 @@ import { formatZoned, viewerZone } from '../../lib/zonedTime'
 import Banner from '../../ui/Banner'
 import { CodeBlock } from '../../ui/CodeBlock'
 import { CopyButton } from '../../ui/CopyButton'
+import { FactsGrid } from '../../ui/FactsGrid'
 import LoadingState from '../../ui/LoadingState'
-import { PHONE, PHONE_QUERY, tapTargetSx } from '../../ui/listStyles'
+import { usePhone } from '../../hooks/usePhone'
+import { PHONE, tapTargetSx } from '../../ui/listStyles'
 import DetailPage, { DetailField } from '../../ui/detail/DetailPage'
+import LinkButton from '../../ui/LinkButton'
+import Tip from '../../ui/Tip'
 
 /* A DEAD RUN'S PANE TAIL (`/sessions/:sessionId/pane-log`): the last bytes its node's tmux pane wrote,
  * sent once by the node after an unexplained end. `GET /api/sessions/{id}/pane-log` asks `sessions:edit` (the
@@ -50,14 +53,13 @@ export type PaneLog = {
   text: string
 }
 
-/* The facts above the log: one wrapping row, each fact its own width, so five short values cost one line on a
- * desktop and two or three at 390px — never a column of five stacked rows pushing the log below the fold. The
- * phone's label floor (`DetailField`'s 4.5rem, which aligns a COLUMN of values) is dropped: in a row it only parted
- * "Node" from its value. */
+/* The facts above the log: a `ui/FactsGrid` line that stays a row on a phone too (the one exception to its
+ * phone stacking), so five short values cost one line on a desktop and two or three at 390px — never a column
+ * of five stacked rows pushing the log below the fold. The phone's label floor (`DetailField`'s 4.5rem, which
+ * aligns a COLUMN of values) is dropped: in a row it only parted "Node" from its value. */
 const FACTS_SX = {
-  display: 'flex', flexWrap: 'wrap', columnGap: 3, rowGap: 1, m: 0, pt: 1.5, pb: 0.5,
-  '& > *': { flex: '0 1 auto' },
-  [PHONE]: { '& dt': { minWidth: 0 } },
+  pt: 1.5, pb: 0.5,
+  [PHONE]: { flexDirection: 'row', '& dt': { minWidth: 0 } },
 } as const
 
 /** The fold mark `pane_logs.tidy` leaves on a retry countdown it folded to its last frame. */
@@ -79,7 +81,7 @@ export default function PaneLogPage(): JSX.Element {
   const data = log.data
   /* Columns matter on a desktop (tables, progress bars), so lines stay whole and scroll; on a phone a cause line
    * (a provider's refusal) would scroll off the box, so it wraps. Wrap flips either default. */
-  const phone = useMediaQuery(PHONE_QUERY, { noSsr: true })
+  const phone = usePhone({ noSsr: true })
   const [wrapChoice, setWrapChoice] = useState<boolean | null>(null)
   const wrap = wrapChoice ?? phone
   const status = log.error instanceof ApiError ? log.error.status : null
@@ -144,7 +146,7 @@ export default function PaneLogPage(): JSX.Element {
       )}
       {data && (
         <>
-          <Box component="dl" data-testid="pane-log-facts" sx={FACTS_SX}>
+          <FactsGrid line testId="pane-log-facts" sx={FACTS_SX}>
             <DetailField label="Node">
               {data.node_id ? (
                 <MuiLink component={RouterLink} to={`/nodes/${encodeURIComponent(data.node_id)}`} data-testid="pane-log-node">
@@ -161,9 +163,9 @@ export default function PaneLogPage(): JSX.Element {
               </DetailField>
             )}
             <DetailField label="End reason">
-              <Typography variant="body2" data-testid="pane-log-end-reason" title={data.end_reason ?? undefined}>
+              <Tip title={data.end_reason ?? undefined}><Typography variant="body2" data-testid="pane-log-end-reason">
                 {data.end_reason_label ?? data.end_reason ?? NO_VALUE}
-              </Typography>
+              </Typography></Tip>
             </DetailField>
             {ended === written ? (
               <DetailField label="Ended · last written">
@@ -179,7 +181,7 @@ export default function PaneLogPage(): JSX.Element {
                 </DetailField>
               </>
             )}
-          </Box>
+          </FactsGrid>
           {data.written_after_end && (
             <Banner severity="warning" testId="pane-log-later-run">Written after this run ended; may show a later run.</Banner>
           )}
@@ -194,10 +196,10 @@ export default function PaneLogPage(): JSX.Element {
             {cut && (
               <Box component="span" data-testid="pane-log-cut-note" sx={{ display: 'block' }}>
                 Long lines cut at the edge — scroll sideways or{' '}
-                <MuiLink component="button" type="button" variant="caption" onClick={() => setWrapChoice(true)}
+                <LinkButton variant="caption" onClick={() => setWrapChoice(true)}
                   sx={{ verticalAlign: 'baseline' }}>
                   Wrap
-                </MuiLink>.
+                </LinkButton>.
               </Box>
             )}
           </Typography>

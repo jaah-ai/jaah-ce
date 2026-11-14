@@ -1,0 +1,44 @@
+# Lexware Office (formerly lexoffice) Public API: an API key as a Bearer token, at api.lexware.io.
+slug = "lexware"
+label = "Lexware Office"
+category = "payments"
+vendor_docs_url = "https://developers.lexware.io/docs/"
+summary = "Read and create Lexware Office invoices, quotations, contacts, articles and vouchers."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "Sign in to Lexware Office and open https://app.lexware.de/addons/public-api (or the gear icon > Erweiterungen > Weitere Apps > Public API > Verwalten). Select API-Schlüssel erstellen (Create API key), choose the permissions agents need and copy the key: Lexware shows it only once" },
+]
+
+[test]
+method = "GET"
+path = "https://api.lexware.io/v1/profile"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+identity = [["companyName"]]
+
+[docs]
+agent_uses = [
+  "Find an invoice, quotation or credit note and report its status, amount and due date",
+  "Create draft invoices or quotations from a task's line items for a person to finalize",
+  "Look up or add customers and suppliers in the contacts list",
+  "List open receivables or vouchers for a period to support bookkeeping",
+]
+prerequisites = [
+  "A Lexware Office plan that includes the Public API (Lexware lists it in its XL plan)",
+  "A Lexware Office user allowed to create API keys (an administrator of the account)",
+]
+limitations = [
+  "Lexware allows 2 requests per second per key; agents that go faster get 429 and slow down",
+  "A key lasts at most 24 months, then must be created again",
+  "What a key can reach depends on the permissions chosen when it was created and on the contract's features; a key made before an endpoint existed (for example quotations) must be recreated to reach it",
+]
+troubleshooting = [
+  { symptom = "Test says Lexware Office rejected the API key (401)", fix = "The key expired, was deleted, or was mistyped. Create a new key at https://app.lexware.de/addons/public-api and select Replace" },
+  { symptom = "An agent's call fails with 403", fix = "The key was created without the permission that call needs. Create a key with that permission and replace the stored one" },
+  { symptom = "Agents report 429 Too Many Requests", fix = "Lexware allows 2 requests per second. Ask the agent to work in smaller batches; the limit clears by itself" },
+]
+faq = [
+  { q = "I used lexoffice before. Does that key still work", a = "Yes. lexoffice is now Lexware Office and existing keys keep working on the new address, api.lexware.io" },
+  { q = "Does Test change anything", a = "No. It reads your company profile and nothing else" },
+]

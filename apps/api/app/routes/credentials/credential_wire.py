@@ -25,8 +25,8 @@ from app.authz.object_access import (
 from app.authz.catalog import PROJECTS_VIEW_KEY
 from app.authz.principal import Principal, creates_org_rows
 from app.authz.visibility import scoped_project_select
-from app.config import get_settings
-from app.entity_shape import is_blank, iso_or_none, optional_uuid
+from app.config import console_url
+from app.entity_shape import from_row, is_blank, names_of, optional_uuid, or_404
 from app.credentials.registry import (
     CREDENTIAL_TYPES,
     FieldSpec,
@@ -43,7 +43,9 @@ from app.credential_crypto import (
     sealed_secret_from_wire,
 )
 from app.git_access import rest_username_problem
-from app.credentials.oauth_wizards import connect_for_type
+from app import oauth_providers
+from app.credentials.oauth_wizards import action_label, connect_for_type, provider_label
+from app.integrations import catalog as integration_catalog
 from app.credentials.testers import (
     _allowed_host_clause,
     _split_base_url,
@@ -65,6 +67,18 @@ _VALUE_MAX_LEN = 4096
 
 # ── Wire models ───────────────────────────────────────────────────────────────
 
+# The config keys a completed Connect writes (`connect.py::_store_connect_grant` and its `learned`). `scope` is
+# written only for a provider with a scope catalogue; any other provider READS it, so there it is an input.
+CONNECT_FILLED_KEYS = frozenset({"refresh_token", "access_token", "expiry_date", "account"})
+
+
+def connect_fills(field_key: str, connect: Optional["OAuthConnectOut"]) -> bool:
+    """Whether the served Connect (`_connect_out`) writes `field_key`, so the form need not draw it."""
+    if connect is None:
+        return False
+    return field_key in CONNECT_FILLED_KEYS or (field_key == "scope" and bool(connect.scopes))
+
+
 class FieldSpecOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -77,6 +91,19 @@ class FieldSpecOut(BaseModel):
     default: Optional[str] = None
     # Helper text under the input (`registry.FieldSpec.help`).
     help: Optional[str] = None
+    # Shown beside the required fields, not in Advanced (`registry.FieldSpec.outright`).
+    outright: bool = False
+    # The type's Connect writes this field (`connect_fills`): the form hides it.
+    connect_filled: bool = False
+
+
+class OAuthConnectScopeOut(BaseModel):
+    """One scope of a provider's consent catalogue (`oauth_providers.OAuthScope`). `optional` ones are the person's
+    to untick; the start route's body `scopes` names the optional ones kept."""
+
+    name: str
+    label: str
+    optional: bool
 
 
 class OAuthConnectOut(BaseModel):
@@ -94,6 +121,12 @@ class OAuthConnectOut(BaseModel):
     # (a mismatch surfaces as `exchange_failed` after consent). A deployment fact, served here because
     # this block renders the panel. Not a secret: the callback refuses anything without a signed cookie.
     redirect_uri: str
+    # The provider's scope catalogue, empty when it has none (the row's Scopes field, or a fixed scope, decides).
+    scopes: list[OAuthConnectScopeOut] = []
+    # Whether the client is the deployment's own app (an operator knob), not the row's client ID and secret; then
+    # `configured` says whether an operator has designated it (false: Connect answers 409). True for a row client.
+    platform_app: bool = False
+    configured: bool = True
 
 
 class SealKeyOut(BaseModel):
@@ -115,6 +148,8 @@ class CredentialTypeOut(BaseModel):
     # the key of the operator's host field (None for a fixed-host type) and the type's default host.
     host_field: Optional[str] = None
     default_base_url: Optional[str] = None
+    # The registry's flag: a url field saves as typed, so the form warns on an odd shape instead of refusing it.
+    free_form_url: bool = False
     # Why this type has no connection test, from the registry (`testers.py` pins the pairing); shown
     # before Test is pressed, and reaching the banner via `unsupported_result` after.
     untestable_reason: Optional[str] = None
@@ -125,6 +160,12 @@ class CredentialTypeOut(BaseModel):
     # The registry's `require_one_of` key groups (empty for most types): the form renders these OPTIONAL
     # fields outright, since a row saves only once one group is wholly filled.
     require_one_of: list[list[str]] = []
+    # The catalog vendor this type is (`app/integrations/catalog.py`), else None: its slug opens the vendor's
+    # Connect screen (`/credentials/new?integration=<slug>`), and its logo is the type's mark.
+    integration: Optional[str] = None
+    logo_url: Optional[str] = None
+    # True => a row of this type is an MCP connection a project may link (`app/mcp_links.py::is_mcp_type`).
+    mcp: bool = False
 
 
 class CredentialOut(BaseModel):
@@ -141,6 +182,9 @@ class CredentialOut(BaseModel):
     # Owner/Admin made it for), else its creator — `roster.ROSTER_OWNER`, the Owner filter's rule. `None` when
     # that user does not resolve.
     owner: Optional[str] = None
+    # A personal row's owner's user id (the owner picker's current value), on the by-id read and the owner
+    # move's echo only (`_with_owner_id`): a roster row carries names, never an actor id (N6). None otherwise.
+    owner_id: Optional[str] = None
     # The org pair: `org_id` verbatim and `org` the resolved label (`app/tenancy/labels.py::OrgRef`).
     # `(set, null)` is an id naming no `orgs` row (no FK, revision 0181), rendered as the id. `org_id` is
     # NOT NULL since revision 0200, so `(null, null)` cannot occur; the `Optional`s are kept for the wire
@@ -181,6 +225,9 @@ class CredentialOut(BaseModel):
     last_used_at: Optional[str] = None
     last_tested_at: Optional[str] = None
     last_test_ok: Optional[bool] = None
+    # The last test's sentence (`health.record_test`), and when the vendor refused the grant for good (Reconnect).
+    last_test_message: Optional[str] = None
+    needs_reconnect_at: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -274,9 +321,7 @@ def _validated_name(value: Any) -> str:
     if not cleaned:
         raise HTTPException(status_code=400, detail="name is required")
     if len(cleaned) > _NAME_MAX_LEN:
-        raise HTTPException(
-            status_code=400, detail=f"name must be at most {_NAME_MAX_LEN} characters"
-        )
+        raise HTTPException(status_code=400, detail=f"name must be at most {_NAME_MAX_LEN} characters")
     return cleaned
 
 
@@ -363,17 +408,14 @@ def _validated_home_project(
     if isinstance(value, bool) or not isinstance(value, int):
         raise HTTPException(status_code=400, detail="home_project_id must be an integer")
     if not org_row:
-        raise HTTPException(
-            status_code=400, detail="only an org credential can live in a project"
-        )
+        raise HTTPException(status_code=400, detail="only an org credential can live in a project")
     if org_id is None:
         # An unbound create (the operator plane): with no org the filter below would be skipped.
         raise HTTPException(status_code=400, detail="pick the org before a home project")
     stmt = scoped_project_select(principal, key=PROJECTS_VIEW_KEY).where(
         Project.id == value, Project.org_id == org_id
     )
-    if session.scalar(stmt.with_only_columns(Project.id)) is None:
-        raise HTTPException(status_code=404, detail="no such project")
+    or_404(session.scalar(stmt.with_only_columns(Project.id)), detail="no such project")
     return value
 
 
@@ -387,10 +429,7 @@ def _validated_description(value: Any) -> Optional[str]:
     if "\x00" in value:
         raise HTTPException(status_code=400, detail="description must not contain a NUL byte")
     if len(value) > _DESCRIPTION_MAX_LEN:
-        raise HTTPException(
-            status_code=400,
-            detail=f"description must be at most {_DESCRIPTION_MAX_LEN} characters",
-        )
+        raise HTTPException(status_code=400, detail=f"description must be at most {_DESCRIPTION_MAX_LEN} characters")
     return value
 
 
@@ -444,7 +483,8 @@ def _validated_value(
     Every kind is a string — except that a SECRET may arrive as a sealed envelope the browser produced
     (returned as a `SealedSecret`, stored as-is; the console never posts a plaintext secret) — so any
     other dict/list/number is malformed. A `url` field must carry an http(s)
-    scheme (not the SSRF check; stops `javascript:` links). `spec.require_https_base_url` is enforced
+    scheme (not the SSRF check; stops `javascript:` links) unless the type is `free_form_url`, whose url
+    fields take any text (never rendered as a link; a Test still needs http(s)). `spec.require_https_base_url` is enforced
     here too via `_split_base_url` (catches `HTTP://`), rejecting an unparseable value on flagged types
     only. NUL bytes are rejected (unstorable in `jsonb`; the failed INSERT would log parameters).
     `write_time_problem` applies the type's per-field rules from `testers.py`, so an untestable value
@@ -473,9 +513,7 @@ def _validated_value(
             detail=f"{field.key} must be sealed under the organization's NodeVault key, not sent in the clear",
         )
     if len(value) > _VALUE_MAX_LEN:
-        raise HTTPException(
-            status_code=400, detail=f"{field.key} must be at most {_VALUE_MAX_LEN} characters"
-        )
+        raise HTTPException(status_code=400, detail=f"{field.key} must be at most {_VALUE_MAX_LEN} characters")
     if "\x00" in value:
         raise HTTPException(status_code=400, detail=f"{field.key} must not contain a NUL byte")
     problem = write_time_problem(spec, field, value)
@@ -487,7 +525,7 @@ def _validated_value(
     if field.kind == "url":
         # Stored as validated, not as typed: the value checked must be the value kept.
         cleaned = value.strip()
-        if cleaned and not cleaned.lower().startswith(("http://", "https://")):
+        if cleaned and not spec.free_form_url and not cleaned.lower().startswith(("http://", "https://")):
             raise HTTPException(status_code=400, detail=f"{field.key} must be an http(s) URL")
         if cleaned and spec.require_https_base_url:
             base, _host = _split_base_url(cleaned)
@@ -530,10 +568,8 @@ def _merged_config(
         # An explicit `null` on an undeclared key deletes it, so a retired field's secret can always be
         # removed. Setting one stays rejected: unclassified, so nothing can say serving it is safe.
         if key not in declared and posted[key] is not None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"unknown field '{key}' for credential type '{spec.slug}'",
-            )
+            raise HTTPException(status_code=400, detail=f"unknown field '{key}' for credential type '{spec.slug}'")
+    _refuse_pasted_platform_grant(spec, posted)
     secrets = secret_keys(spec.slug, stored)
     merged: dict[str, Any] = {} if reset else dict(stored)
     for key, value in posted.items():
@@ -545,6 +581,28 @@ def _merged_config(
             continue
         merged[key] = checked
     return merged
+
+
+# The grant fields only Connect writes on a type whose provider runs on the deployment's own app.
+_CONNECT_WRITTEN = ("refresh_token", "access_token")
+
+
+def _refuse_pasted_platform_grant(spec: CredentialTypeSpec, posted: dict[str, Any]) -> None:
+    """400 on a pasted refresh or access token for a platform-app type (Figma): the control plane would refresh
+    whatever token sits on the row with the DEPLOYMENT's client, so a token leaked from one org, pasted into
+    another, would be renewed forever. Only Connect writes them there; blank and `null` (keep, delete) pass."""
+    provider = connect_for_type(spec.slug)
+    if provider is None or not provider.platform_app:
+        return
+    # A field the type's own key method asks a person to paste (HubSpot's private app token is `access_token`) stays
+    # theirs: without a refresh token beside it nothing renews it on the deployment's client.
+    pasted = integration_catalog.pasted_fields(spec.slug)
+    for key in (key for key in _CONNECT_WRITTEN if key not in pasted):
+        value = posted.get(key)
+        if isinstance(value, str) and value.strip():
+            raise HTTPException(
+                status_code=400, detail=f"{provider.label} tokens are set by Connect - press Connect instead.",
+            )
 
 
 def _require_one_of_choices(spec: CredentialTypeSpec) -> str:
@@ -564,10 +622,7 @@ def _require_declared_fields(spec: CredentialTypeSpec, config: dict[str, Any]) -
     if spec.require_one_of and not any(
         all(not is_blank(config.get(key)) for key in group) for group in spec.require_one_of
     ):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Fill {_require_one_of_choices(spec)}.",
-        )
+        raise HTTPException(status_code=400, detail=f"Fill {_require_one_of_choices(spec)}.")
     missing = rest_username_problem(spec.slug, config)
     if missing is not None:
         raise HTTPException(
@@ -592,10 +647,7 @@ def _scrubbed_write(session: Session, action: str, noun: str = "credential"):
             session.rollback()
         except (SQLAlchemyError, UnicodeError):
             pass
-        raise HTTPException(
-            status_code=500,
-            detail=f"could not {action} {noun} ({type(exc).__name__})",
-        ) from None
+        raise HTTPException(status_code=500, detail=f"could not {action} {noun} ({type(exc).__name__})") from None
 
 
 # ── Serialization ─────────────────────────────────────────────────────────────
@@ -631,11 +683,14 @@ def _connect_out(type_slug: str) -> Optional[OAuthConnectOut]:
     if provider is None:
         return None
     return OAuthConnectOut(
-        slug=provider.slug,
-        action_label=provider.action_label,
-        provider_label=provider.provider_label,
+        slug=provider.key,
+        action_label=action_label(provider),
+        provider_label=provider_label(provider),
         # The same function both legs call, so the advised URL is the one the exchange is bound to.
         redirect_uri=_connect_redirect_uri(),
+        scopes=[from_row(OAuthConnectScopeOut, scope) for scope in provider.scopes],
+        platform_app=provider.platform_app,
+        configured=not provider.platform_app or oauth_providers.platform_client_configured(provider),
     )
 
 
@@ -661,12 +716,9 @@ def _credential_out(
     # Declared secrets first in registry order, then unclassifiable ones sorted.
     declared_order = [field.key for field in spec.fields] if spec is not None else []
     secret_order = declared_order + sorted(set(config) - set(declared_order))
-    return CredentialOut(
-        id=row.id,
-        name=row.name,
-        type=row.type,
+    return from_row(
+        CredentialOut, row,
         type_label=type_label(row.type),
-        description=row.description,
         config={
             key: value
             for key, value in config.items()
@@ -675,29 +727,22 @@ def _credential_out(
         secrets_set=[
             key for key in secret_order if key in secrets and not is_blank(config.get(key))
         ],
-        created_at=iso_or_none(row.created_at),
-        updated_at=iso_or_none(row.updated_at),
         # `.get`, so a deleted actor renders absent; no map gives `None`.
         created_by=(actor_names or {}).get(row.created_by_id),
         updated_by=(actor_names or {}).get(row.updated_by_id),
         owner=(actor_names or {}).get(_owner_id_of(row)),
+        # Never on a roster row (N6): the one-row reads add it (`_with_owner_id`).
+        owner_id=None,
         # Both from `row.org_id`; see the pair's note on `CredentialOut`.
-        org_id=row.org_id,
         org=org_ref_of(org_labels, row.org_id),
         editable=editable,
         ownership=_ownership_of(row),
         nodevault=bool(row.nodevault),
         nodevault_key_hash=nodevault_key_hash(config),
-        home_project_id=row.home_project_id,
         home_project=(
             home_labels.projects.get(row.home_project_id) if row.home_project_id is not None else None
         ),
         home_path=_home_path(row, org_labels=org_labels, home_labels=home_labels),
-        has_stored_secret=row.has_stored_secret,
-        expires_at=iso_or_none(row.expires_at),
-        last_used_at=iso_or_none(row.last_used_at),
-        last_tested_at=iso_or_none(row.last_tested_at),
-        last_test_ok=row.last_test_ok,
     )
 
 
@@ -723,13 +768,16 @@ def _home_labels(session: Session, rows: Sequence[Credential]) -> _HomeLabels:
     query each, never per row."""
     project_ids = {row.home_project_id for row in rows if row.home_project_id is not None}
     owner_ids = {row.owner_id for row in rows if row.owner_id is not None}
-    projects = dict(
-        session.execute(select(Project.id, Project.name).where(Project.id.in_(project_ids))).tuples().all()
-    ) if project_ids else {}
+    projects = names_of(session, Project, project_ids)
     emails = dict(
         session.execute(select(AdminUser.id, AdminUser.email).where(AdminUser.id.in_(owner_ids))).tuples().all()
     ) if owner_ids else {}
     return _HomeLabels(projects=projects, emails=emails)
+
+
+def _with_owner_id(out: CredentialOut, row: Credential) -> CredentialOut:
+    """`out` carrying `row`'s owner id: for the one-row reads only (`CredentialOut.owner_id`)."""
+    return out.model_copy(update={"owner_id": str(row.owner_id) if row.owner_id is not None else None})
 
 
 def _owner_id_of(row: Credential) -> Optional[UUID]:
@@ -805,7 +853,7 @@ def _audit(
 def _connect_redirect_uri() -> str:
     """The callback URL, absolute — a binding on the exchange, not just a destination.
 
-    Built from `frontend_url`, never the request (as `git_connect._redirect_uri`): it must be byte
+    Built from `frontend_url`, never the request (as every Connect callback is): it must be byte
     identical on start and exchange, and proxy headers vary. The operator must register this exact URL.
     """
-    return f"{get_settings().frontend_url.rstrip('/')}/api/credentials/connect/callback"
+    return console_url("/api/credentials/connect/callback")

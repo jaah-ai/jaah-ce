@@ -1,0 +1,51 @@
+# Cloudflare API. Facts confirmed at the vendor's own docs: API tokens (My Profile > API Tokens, Bearer)
+# https://developers.cloudflare.com/fundamentals/api/get-started/create-token/ ; verify a user token
+# https://developers.cloudflare.com/api/resources/user/subresources/tokens/methods/verify/ .
+# Probed 2026-11-03: a malformed or bad token answers 400 (6003, invalid request headers) or 401.
+slug = "cloudflare"
+label = "Cloudflare"
+category = "cloud"
+vendor_docs_url = "https://developers.cloudflare.com/fundamentals/api/get-started/create-token/"
+summary = "Manage Cloudflare DNS, Workers, Pages, R2 and cache with a scoped API token."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_token", label = "API token", kind = "secret", required = true, help = "Cloudflare dashboard > your profile icon > My Profile > API Tokens > Create Token: start from a template (for example Edit zone DNS or Edit Cloudflare Workers) or Create Custom Token, limit it to the accounts and zones agents need, then Continue to summary > Create Token and copy it - Cloudflare shows it once" },
+  { key = "account_id", label = "Account ID", kind = "text", required = false, help = "Optional, so agents know which account to use: Cloudflare dashboard > Account home > the account's ... menu > Copy account ID (also shown on any zone's Overview page, right column)" },
+]
+
+[test]
+method = "GET"
+path = "https://api.cloudflare.com/client/v4/user/tokens/verify"
+auth = { field = "api_token", header = "Authorization", prefix = "Bearer" }
+rejected_statuses = [400, 401, 403]
+require_true = ["success"]
+accept = "application/json"
+
+[docs]
+agent_uses = [
+  "Add, change or remove DNS records for a zone",
+  "Deploy and inspect Workers and Pages projects, and read their logs",
+  "Purge the cache for a URL after a release",
+  "Read and write R2 buckets and KV namespaces",
+  "Read analytics and firewall events to investigate an incident",
+]
+prerequisites = [
+  "A Cloudflare account with permission to create API tokens (any member can create their own; account-owned tokens need Super Administrator)",
+]
+limitations = [
+  "Jaah's Test verifies user API tokens (My Profile > API Tokens). An account-owned token (Manage Account > Account API Tokens) works for agents but its Test is rejected - use a user token",
+  "A token can do exactly what its permission groups and zone or account resources allow; agents get 403 elsewhere",
+  "The legacy Global API Key is not supported: it cannot be scoped and Cloudflare advises against it",
+  "Cloudflare limits API calls to 1,200 per five minutes per user",
+]
+troubleshooting = [
+  { symptom = "Test says Cloudflare rejected the API token (400 or 401)", fix = "The token was rolled, deleted, expired, or is the Global API Key. Create an API token under My Profile > API Tokens and select Replace" },
+  { symptom = "Test says Cloudflare did not accept the API token", fix = "The token exists but is disabled or outside its allowed time window or IP filter. Check its status and Client IP Address Filtering in My Profile > API Tokens" },
+  { symptom = "Agents get 403 Authentication error on a zone", fix = "The token's Zone Resources do not include that zone, or it lacks the permission. Edit the token and add them" },
+]
+faq = [
+  { q = "Which template should I use", a = "The one closest to what agents should do, for example Edit zone DNS for DNS changes or Edit Cloudflare Workers for deploys. Add only the zones agents need" },
+  { q = "Does the token expire", a = "Only if you set a TTL when creating it. Jaah's Test fails once it has expired" },
+]

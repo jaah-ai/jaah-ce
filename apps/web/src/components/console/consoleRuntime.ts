@@ -18,7 +18,6 @@ export type ConsoleRuntime = {
   steer: RuntimeAbility
   interrupt: RuntimeAbility
   control: RuntimeAbility
-  toggle: RuntimeAbility
 }
 
 export type RuntimeControlType = 'steer' | 'interrupt' | 'answer' | 'close'
@@ -47,9 +46,9 @@ export function useConsoleRuntime(
     queryKey: consoleRuntimeKey(projectId, number, nodeId),
     queryFn: () => get<ConsoleRuntime>(runtimePath(projectId, number, nodeId)),
     enabled,
-    // A refusal (no such slot yet, a blip mid hand-off) shows no switch until the next read, never a retry storm.
+    // A refusal (no such slot yet) shows no controls until the next read, never a retry storm.
     retry: false,
-    // An error keeps the live cadence: a stopped poll hid the switch for the console's whole life.
+    // An error keeps the live cadence: a stopped poll hid the controls for the console's whole life.
     refetchInterval: q => (
       q.state.status !== 'error' && q.state.data?.task_id == null ? IDLE_RUNTIME_POLL_MS : RUNTIME_POLL_MS
     ),

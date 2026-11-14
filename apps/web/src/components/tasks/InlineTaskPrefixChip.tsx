@@ -3,6 +3,7 @@ import Chip from '@mui/material/Chip'
 import type { SxProps, Theme } from '@mui/material/styles'
 import type { InlineTaskPrefix } from './inlineTaskPrefix'
 import { SR_ONLY_SX } from '../../ui/listStyles'
+import Tip from '../../ui/Tip'
 
 /** DOM id of the hidden hint, for the create box's `aria-describedby`. One id is safe: the host mounts
  *  exactly one create row. */
@@ -29,7 +30,7 @@ export default function InlineTaskPrefixChip({
       {/* The escape in the accessibility tree (`title` reaches neither keyboard nor touch), via the create
           box's `aria-describedby`. */}
       <Box component="span" id={INLINE_PREFIX_HINT_ID} sx={SR_ONLY_SX}>{prefix.clearHint}</Box>
-      <Chip
+      <Tip title={prefix.clearHint}><Chip
         size="small"
         color="primary"
         data-testid="inline-new-task-prefix-chip"
@@ -39,9 +40,8 @@ export default function InlineTaskPrefixChip({
         onDelete={disabled ? undefined : onClear}
         /* Not a tab stop: it would sit between the row and its text box. */
         tabIndex={-1}
-        title={prefix.clearHint}
         sx={sx}
-      />
+      /></Tip>
     </>
   )
 }

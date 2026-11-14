@@ -15,6 +15,10 @@ actor_class` decides it). Two kinds of move share the one table:
     org_admin  any non-closed status → `closed`; a public reply moves like the requester's
     operator   any status → any other (reopening `closed` included); a reply moves nothing
 
+A customer's reply leaves an `in_progress` ticket where it is: staff are already on it. One move is nobody's
+act: a linked Task starting to run moves an `open` or `pending` ticket to `in_progress` (`task_running_target`,
+written by `app/support_activity.py::move_on_task_running`).
+
 Stdlib only at import: revision 0298 renders its CHECKs from here.
 """
 from __future__ import annotations
@@ -25,6 +29,7 @@ from types import MappingProxyType
 __all__ = [
     "CLOSED",
     "DEFAULT_PRIORITY",
+    "IN_PROGRESS",
     "OPEN",
     "OPERATOR",
     "ORG_ADMIN",
@@ -41,15 +46,17 @@ __all__ = [
     "may_set",
     "reply_target",
     "settable_targets",
+    "task_running_target",
 ]
 
 # ── Vocabularies ──────────────────────────────────────────────────────────────────────────────────
 OPEN = "open"
+IN_PROGRESS = "in_progress"  # staff are working on it (an operator's write, or a linked task running)
 PENDING = "pending"  # staff wait on the customer
 SOLVED = "solved"  # staff think it is done; a customer reply reopens it
 CLOSED = "closed"  # final for customers; only an operator reopens
 
-STATUSES: tuple[str, ...] = (OPEN, PENDING, SOLVED, CLOSED)
+STATUSES: tuple[str, ...] = (OPEN, IN_PROGRESS, PENDING, SOLVED, CLOSED)
 
 PRIORITIES: tuple[str, ...] = ("low", "normal", "high", "urgent")
 DEFAULT_PRIORITY = "normal"
@@ -73,8 +80,9 @@ def _rows() -> dict[tuple[str, str, str], str]:
         for target in STATUSES:
             if source != target:
                 rows[(OPERATOR, source, target)] = SET
-    for source in (OPEN, PENDING, SOLVED):
-        rows[(ORG_ADMIN, source, CLOSED)] = SET
+    for source in STATUSES:
+        if source != CLOSED:
+            rows[(ORG_ADMIN, source, CLOSED)] = SET
     for actor in (REQUESTER, ORG_ADMIN):
         for source in (PENDING, SOLVED):
             rows[(actor, source, OPEN)] = REPLY
@@ -83,6 +91,10 @@ def _rows() -> dict[tuple[str, str, str], str]:
 
 #: `(actor_class, from, to) -> SET | REPLY`. A triple absent here is not a move that actor may make.
 TRANSITIONS: Mapping[tuple[str, str, str], str] = MappingProxyType(_rows())
+
+#: The statuses a linked Task starting to run moves to `in_progress`. Not `solved`/`closed`: a task re-run on a
+#: finished ticket does not reopen it.
+TASK_RUNNING_SOURCES: tuple[str, ...] = (OPEN, PENDING)
 
 
 # ── The DDL the vocabularies render (the ORM and revision 0298 both read these, so they cannot drift) ─
@@ -127,6 +139,11 @@ def may_set(actor: str, source: str, target: str) -> bool:
 def settable_targets(actor: str) -> frozenset[str]:
     """Every status `actor` may ever write — the permission half (`support_access.can_set_status`)."""
     return frozenset(t for (a, _s, t), kind in TRANSITIONS.items() if a == actor and kind == SET)
+
+
+def task_running_target(status: str) -> str:
+    """The status a linked Task starting to run leaves a ticket in (`status` itself when it does not move)."""
+    return IN_PROGRESS if status in TASK_RUNNING_SOURCES else status
 
 
 def may_reply(actor: str, status: str) -> bool:

@@ -14,12 +14,18 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import threading
 from pathlib import Path
 from types import ModuleType
 
 #: The checkout root on a host run; in the image `/app/app` has no repo above it and the root is `/`.
 REPO = Path(__file__).resolve().parents[min(3, len(Path(__file__).resolve().parents) - 1)]
 SHARED = Path("/app/shared")
+#: Held across a load: `sys.modules` carries the module from BEFORE its execution, so an unlocked
+#: concurrent first call (sixteen support turns redacting at once) got a half-executed module.
+_LOCK = threading.RLock()
+#: The modules whose execution finished: the lock-free fast path reads only these.
+_LOADED: dict[str, ModuleType] = {}
 
 
 def candidates(filename: str, home: str) -> tuple[Path, ...]:
@@ -33,8 +39,15 @@ def load(
     """Execute the first of `paths` that exists as `module_name`, once. Registered in `sys.modules` BEFORE
     execution, as `spec_from_file_location` documents: `@dataclass` looks its module up by name. `consequence`
     ends the `missing` error's sentence: what the borrower refuses to do without the file."""
-    if module_name in sys.modules:
-        return sys.modules[module_name]
+    if (done := _LOADED.get(module_name)) is not None and sys.modules.get(module_name) is done:
+        return done
+    with _LOCK:
+        if module_name in sys.modules:
+            return sys.modules[module_name]
+        return _load_locked(module_name, paths, missing, consequence)
+
+
+def _load_locked(module_name: str, paths: tuple[Path, ...], missing: type[Exception], consequence: str) -> ModuleType:
     for path in paths:
         spec = importlib.util.spec_from_file_location(module_name, path) if path.is_file() else None
         if spec is None or spec.loader is None:
@@ -46,6 +59,7 @@ def load(
         except BaseException:
             del sys.modules[module_name]
             raise
+        _LOADED[module_name] = module
         return module
     raise missing(
         f"{paths[0].name} is at none of " + ", ".join(str(p) for p in paths)

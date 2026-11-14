@@ -15,8 +15,10 @@ import agent_socket  # apps/jaahd/agent_socket.py — the node vocabulary client
 from . import login as login_mod
 from . import policy
 from .adapters import for_login
-from .adapters.base import PAGE_MAX
-from .model import EXIT_FORGE, AlreadyMergeable, CliExit, Misuse, is_id, required_rollup, rollup
+from .adapters.base import MERGED_MAX, PAGE_MAX, parse_time
+from .adapters.gitlab import GATE_VARIABLE
+from .model import (EXIT_FORGE, FORGE_ERROR_CAP, AlreadyMergeable, CliExit, CredentialRefused, ForgeError, Misuse, is_id,
+                    required_rollup, rollup)
 from .transport import Transport
 
 MIN_INTERVAL_S = 60
@@ -27,6 +29,8 @@ _CLOSE_SYNONYMS = ("abandon", "decline")
 _AUTHOR = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+\-\[\]]*")
 # A full commit id: SHA-1 or SHA-256 object format. A prefix pins nothing a forge would compare.
 _SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+# `checks --sha`: a commit id or a prefix the forge resolves — it only reads.
+_ANY_SHA = re.compile(r"[0-9a-f]{7,64}")
 STATUS_STATES = ("pending", "success", "failure")
 # GitHub refuses a commit status description longer than this.
 STATUS_DESCRIPTION_MAX = 140
@@ -40,6 +44,11 @@ class _Parser(argparse.ArgumentParser):
         if message:
             sys.stderr.write(message)
         raise SystemExit(status)
+
+
+class _RefuseSecretValue(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        raise Misuse("a secret's value comes only from --value-file FILE (or - for stdin), never the command line")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -64,7 +73,8 @@ def _parser() -> argparse.ArgumentParser:
     checks.add_argument("--watch", action="store_true")
     checks.add_argument("--interval", type=int, default=MIN_INTERVAL_S)
     listing = pr.add_parser("list")
-    listing.add_argument("--state", choices=("open", "closed", "all"), default="open")
+    listing.add_argument("--state", choices=("open", "closed", "all", "merged"), default="open")
+    listing.add_argument("--since", metavar="ISO-8601", help="with --state merged (required there): merged at or after")
     listing.add_argument("--author")
     listing.add_argument("--head")
     listing.add_argument("--base")
@@ -73,7 +83,7 @@ def _parser() -> argparse.ArgumentParser:
     auto.add_argument("number", type=int)
     auto.add_argument("--disable", action="store_true",
                       help="disarm the PR's auto-merge instead (the merge lane takes sole ownership of a PR it queues)")
-    for name in ("ready", "stats"):
+    for name in ("ready", "stats", "provenance"):
         pr.add_parser(name).add_argument("number", type=int)
     merge = pr.add_parser("merge")
     merge.add_argument("number", type=int)
@@ -95,6 +105,8 @@ def _parser() -> argparse.ArgumentParser:
     comment.add_argument("number", type=int)
     comment.add_argument("--body-file", required=True)
 
+    groups.add_parser("checks").add_argument("--sha", required=True, help="the commit whose checks to list")
+
     ci = groups.add_parser("ci").add_subparsers(dest="verb", required=True, parser_class=_Parser)
     ci.add_parser("log").add_argument("check_id")
 
@@ -108,14 +120,109 @@ def _parser() -> argparse.ArgumentParser:
     rerun.add_argument("run_id")
     rerun.add_argument("--failed", action="store_true", help="re-run only the failed jobs")
     dispatch = run.add_parser("dispatch")
-    dispatch.add_argument("workflow", help="the workflow file (e.g. mirrors.yml)")
+    dispatch.add_argument("workflow", help="GitHub: the workflow file (e.g. mirrors.yml); GitLab: the job the run is "
+                          "judged on, `*` for the whole pipeline; Bitbucket: a custom pipeline; Azure: a pipeline id")
     dispatch.add_argument("--ref", required=True, help="the branch the run builds")
+    dispatch.add_argument("--sha", help="fail unless the started run builds this commit (the branch did not move); "
+                          "the run itself is left running")
     dispatch.add_argument("-f", dest="inputs", action="append", default=[], metavar="KEY=VALUE",
                           help="a workflow input (repeatable)")
 
     api = groups.add_parser("api").add_subparsers(dest="verb", required=True, parser_class=_Parser)
     api.add_parser("get", help="GET <path> under the forge's API base").add_argument("path")
+
+    for group in VARIABLE_KINDS:
+        kind = groups.add_parser(group).add_subparsers(dest="verb", required=True, parser_class=_Parser)
+        env_help = "a deployment environment's, not the repository's"
+        lister = kind.add_parser("list")
+        lister.add_argument("--env", help=env_help)
+        setter = kind.add_parser("set")
+        setter.add_argument("name")
+        setter.add_argument("--env", help=env_help)
+        if group == "var":
+            values = setter.add_mutually_exclusive_group(required=True)
+            values.add_argument("--value")
+            values.add_argument("--value-file", metavar="FILE|-")
+        else:  # a secret never rides the command line, where `ps` and the transcript would show it
+            setter.add_argument("--value-file", metavar="FILE|-", required=True)
+            # Declared so `--value` is refused outright, never read as an abbreviation of `--value-file`.
+            setter.add_argument("--value", action=_RefuseSecretValue, nargs="?", help=argparse.SUPPRESS)
+        deleter = kind.add_parser("delete")
+        deleter.add_argument("name")
+        deleter.add_argument("--env", help=env_help)
+        if group == "secret":
+            for verb in (lister, setter, deleter):
+                verb.add_argument("--dependabot", action="store_true",
+                                  help="the store Dependabot reads (GitHub only), not the CI's")
     return p
+
+
+# `var` / `secret` groups -> the adapter's `kind`.
+VARIABLE_KINDS = {"var": "variable", "secret": "secret"}
+# The one name shape every forge accepts (GitHub's is the narrowest: letters, digits, `_`, no leading digit).
+_VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,254}")
+_ENV_MAX = 255
+
+
+def _read_value(args) -> str:
+    """The value to set: `--value`, or `--value-file` (`-` = stdin) less ONE trailing newline (`echo` adds one)."""
+    if getattr(args, "value", None) is not None:
+        value = args.value
+    else:
+        try:
+            if args.value_file == "-":
+                value = sys.stdin.read()
+            else:
+                with open(args.value_file, encoding="utf-8") as handle:
+                    value = handle.read()
+        except OSError as exc:
+            # Never the path: a secret typed where its file belongs would land on stderr.
+            raise Misuse(f"cannot read --value-file: {exc.strerror or type(exc).__name__}") from None
+        value = value[:-2] if value.endswith("\r\n") else value[:-1] if value.endswith("\n") else value
+    if not value:
+        raise Misuse("the value is empty: no forge stores an empty variable or secret")
+    return value
+
+
+def _variables(args, ctx: "Context") -> None:
+    kind = VARIABLE_KINDS[args.group]
+    name = getattr(args, "name", None)
+    if name is not None and not _VARIABLE_NAME.fullmatch(name):
+        raise Misuse(f"{name!r} is not a variable name: letters, digits and `_`, not starting with a digit")
+    env = args.env
+    if env is not None and (not env.strip() or env != env.strip() or len(env) > _ENV_MAX):
+        raise Misuse(f"--env {env!r} is not an environment name")
+    if env == "*":
+        raise Misuse("--env '*' is every environment: omit --env for the repository level")
+    dependabot = getattr(args, "dependabot", False)
+    if dependabot and env is not None:
+        raise Misuse("--dependabot is the repository's Dependabot store, which has no environments: omit --env")
+    adapter = ctx.adapter()
+    if dependabot and adapter.login.forge != "github":
+        raise Misuse(f"secret --dependabot: Dependabot secrets are GitHub-only, not {adapter.login.label}")
+    value = _read_value(args) if args.verb == "set" else None
+    scope = "dependabot" if dependabot else f"environment:{env}" if env is not None else "repository"
+    store = {"dependabot": True} if dependabot else {}
+    rights = adapter.DEPENDABOT_RIGHTS if dependabot else adapter.VARIABLE_RIGHTS
+    try:
+        if args.verb == "list":
+            ctx.emit(adapter.variables(kind, env, **store))
+        elif args.verb == "set":
+            ctx.emit({"kind": kind, "name": name, "scope": scope,
+                      **adapter.set_variable(kind, name, value, env, **store)})
+        else:
+            ctx.emit({"kind": kind, "name": name, "scope": scope, "deleted": True,
+                      **adapter.delete_variable(kind, name, env, **store)})
+    except (ForgeError, CredentialRefused) as exc:
+        if exc.status != 403 or exc.rate_limited:
+            raise
+        # The forge refused the right, not the repository: say exactly which right a person must grant, and keep
+        # the forge's own words, which tell one missing grant from another.
+        said = " ".join((exc.detail or "").split())[:FORGE_ERROR_CAP]
+        raise CredentialRefused(
+            f"{adapter.login.label} refused this login's {kind}s on {adapter.login.repo_path} (HTTP 403"
+            f"{': ' + said if said else ''}). It needs {rights} — a person must grant that, "
+            f"then re-run") from None
 
 
 def _misuse_hint(argv: list[str]) -> "str | None":
@@ -143,8 +250,13 @@ class Context:
     """Everything a verb touches outside its arguments — the seams tests replace."""
 
     def __init__(self, *, environ=None, transport=None, governance=None, cwd=None, sleep=time.sleep,
-                 stdout=None, stderr=None) -> None:
+                 stdout=None, stderr=None, release_check=None) -> None:
         self.environ = os.environ if environ is None else environ
+        # `(head, base) -> answer`: the control plane's `release.authorize` (`_release_ok`); no base is the dispatch
+        # question, which says so (`policy.check_dispatch`).
+        self.release_check = release_check or (
+            lambda head, base: agent_socket.call("release.authorize", {"head": head, "base": base} if base
+                                                 else {"head": head, "purpose": "dispatch"}))
         self.transport = transport or Transport()
         self.governance = governance or policy.governance
         self.cwd = cwd or os.getcwd()
@@ -190,9 +302,41 @@ def _observe(ctx: Context, pr, *, opened: bool) -> None:
         print(f"jaah-forge: note: this PR was not recorded on the task ({type(exc).__name__})", file=ctx.stderr)
 
 
+def _release_ok(ctx: Context):
+    """`policy.check_branches`' release question, for a runner only: the control plane answers whether this task
+    carries an open release from `head` into `base` (`release.authorize`, `app/releases/runs.py::authorize`). Any
+    failure to ask is a no (fail closed)."""
+    def ask(head: str, base: str) -> bool:
+        if not ctx.environ.get("CONTROL_TASK_ID"):
+            return False
+        try:
+            return bool((ctx.release_check(head, base) or {}).get("ok"))
+        except Exception:  # noqa: BLE001 — an unanswered question refuses, never lets the PR through
+            return False
+    return ask
+
+
+# What a gate reports when the branch moved between the change it judges and the run the forge started.
+BRANCH_MOVED = "The branch moved before the run started"
+
+
+def _check_started(started, sha: str) -> None:
+    """`run dispatch --sha`: the started run must build `sha` — a forge starts a run on a branch's head, which may
+    have moved past the change being judged. Either id may be abbreviated (Bitbucket's), so a prefix matches."""
+    built = (started.head_sha or "").lower()
+    if len(built) < 7:
+        raise ForgeError(f"cannot tell whether the branch moved: the forge did not name the commit run "
+                         f"{started.id or '(unnamed)'} builds, so it cannot be matched to {sha}")
+    if not (built.startswith(sha) or sha.startswith(built)):
+        raise ForgeError(f"{BRANCH_MOVED}: run {started.id} builds {built}, not {sha}")
+
+
 def run(args, ctx: Context) -> None:
-    verb = f"{args.group} {args.verb}"
-    if verb == "pr create":
+    verb = " ".join(filter(None, (args.group, getattr(args, "verb", None))))  # `checks` is a group with no verb
+    policy.check_shadow(verb, args, ctx.environ)
+    if args.group in VARIABLE_KINDS:
+        _variables(args, ctx)
+    elif verb == "pr create":
         body = _read_body(args.body_file)
         head = _head(ctx, args.head)
         # The login (the local broker) names the repo whose rules apply; every refusal is decided before the
@@ -200,7 +344,7 @@ def run(args, ctx: Context) -> None:
         adapter = ctx.adapter()
         config = ctx.governance(ctx.cwd, adapter.login)
         base = args.base or config.integration_branch
-        policy.check_branches(config, head, base)
+        policy.check_branches(config, head, base, _release_ok(ctx))
         policy.check_text(config, adapter.login.forge, args.title, body, ctx.environ)
         pr = adapter.create(title=args.title, body=body, head=head, base=base, draft=args.draft)
         ctx.emit(pr.to_json())
@@ -241,14 +385,14 @@ def run(args, ctx: Context) -> None:
         if sha and not _SHA.fullmatch(sha):
             raise Misuse(f"--sha {args.sha!r} is not a full commit id")
         adapter = ctx.adapter()
-        if sha and adapter.login.forge == "bitbucket":
-            raise Misuse("--sha: Bitbucket's merge API takes no head commit, so a pinned merge is impossible there")
         config = ctx.governance(ctx.cwd, adapter.login)
         policy.check_push(config)
         pr = adapter.view(args.number)
-        policy.check_target(config, pr)
+        policy.check_target(config, pr, _release_ok(ctx))
         if verb == "pr merge":
             if sha:
+                # The full head commit: a forge whose view abbreviates it (Bitbucket) resolves it first.
+                pr = dataclasses.replace(pr, extra={**pr.extra, "head_sha": adapter.head_commit(pr)})
                 policy.check_head(config, pr, sha)
                 pr = dataclasses.replace(pr, extra={**pr.extra, "head_sha": sha})
             policy.check_mergeable(config, pr)
@@ -259,7 +403,7 @@ def run(args, ctx: Context) -> None:
             except AlreadyMergeable:
                 # Nothing left to wait for, so nothing to arm: merge now, under `pr merge`'s own checks.
                 pr = adapter.view(args.number)
-                policy.check_target(config, pr)
+                policy.check_target(config, pr, _release_ok(ctx))
                 policy.check_mergeable(config, pr)
                 ctx.stderr.write(f"jaah-forge: PR #{pr.number} can merge now, so it was merged instead of armed\n")
                 ctx.emit(adapter.merge(pr).to_json())
@@ -296,7 +440,7 @@ def run(args, ctx: Context) -> None:
         config = ctx.governance(ctx.cwd, adapter.login)
         policy.check_push(config)
         pr = adapter.view(args.number)
-        policy.check_target(config, pr)
+        policy.check_target(config, pr, _release_ok(ctx))
         if sha:
             policy.check_head(config, pr, sha)
         ctx.emit({"number": pr.number, **adapter.status(sha or pr.extra["head_sha"], state=args.state,
@@ -320,7 +464,30 @@ def run(args, ctx: Context) -> None:
         ctx.emit(adapter.close(pr.number).to_json())
     elif verb == "pr stats":
         ctx.emit(ctx.adapter().diff_stats(args.number).to_json())
+    elif verb == "pr provenance":
+        try:
+            ctx.emit(ctx.adapter().provenance(args.number).to_json())
+        except NotImplementedError:
+            raise Misuse("unsupported_forge: this forge reports no PR provenance") from None
+    elif verb == "checks":
+        sha = args.sha.lower()
+        if not _ANY_SHA.fullmatch(sha):
+            raise Misuse(f"--sha {args.sha!r} is not a commit id (7 to 64 hex digits)")
+        ctx.emit({"sha": sha, "checks": [c.to_json() for c in ctx.adapter().checks_for_sha(sha)]})
+    elif verb == "pr list" and args.state == "merged":
+        since = parse_time(args.since)
+        if args.since is None:
+            raise Misuse("--state merged needs --since <ISO-8601>: a merged list is a window, never the whole history")
+        if since is None:
+            raise Misuse(f"--since {args.since!r} is not an ISO-8601 time")
+        if not 1 <= args.limit <= MERGED_MAX:
+            raise Misuse(f"--limit must be 1..{MERGED_MAX} with --state merged")
+        if args.author is not None or args.head is not None or args.base is not None:
+            raise Misuse("--state merged takes no --author, --head or --base")
+        ctx.emit(ctx.adapter().merged_prs(since, args.limit))
     elif verb == "pr list":
+        if args.since is not None:
+            raise Misuse("--since needs --state merged")
         limit = _limit(args.limit)
         if args.author is not None and not _AUTHOR.fullmatch(args.author):
             raise Misuse(f"--author {args.author!r} is not a forge username")
@@ -347,8 +514,11 @@ def run(args, ctx: Context) -> None:
         ctx.emit({"id": new_id, "rerun_of": head.id, "branch": head.branch, "failed_only": args.failed})
     elif verb == "run dispatch":
         workflow = args.workflow.strip()
-        if not workflow or "/" in workflow or ".." in workflow:
-            raise Misuse(f"{args.workflow!r} is not a workflow file name (e.g. mirrors.yml)")
+        sha = (args.sha or "").lower()
+        if not workflow or ".." in workflow or any(ord(c) < 32 for c in workflow):
+            raise Misuse(f"{args.workflow!r} is not a workflow name (e.g. mirrors.yml)")
+        if sha and not _ANY_SHA.fullmatch(sha):
+            raise Misuse(f"--sha {args.sha!r} is not a commit id (7 to 64 hex digits)")
         if not policy.is_branch_name(args.ref):
             raise Misuse(f"--ref {args.ref!r} is not a branch name")
         inputs: dict[str, str] = {}
@@ -360,13 +530,19 @@ def run(args, ctx: Context) -> None:
                 raise Misuse(f"-f names input {key.strip()!r} twice")
             inputs[key.strip()] = value
         adapter = ctx.adapter()
-        if adapter.login.forge != "github":
-            raise Misuse(f"run dispatch: starting a workflow is GitHub-only so far, not {adapter.login.label}")
+        forge = adapter.login.forge
+        # A workflow file and a custom pipeline are names in a URL path or a selector, never a path of their own;
+        # a GitLab job name is a variable's value, so it may carry `/`.
+        if forge != "gitlab" and "/" in workflow:
+            raise Misuse(f"{args.workflow!r} is not a workflow name (e.g. mirrors.yml)")
+        if forge == "gitlab" and GATE_VARIABLE in inputs:
+            raise Misuse(f"-f {GATE_VARIABLE} is set from the workflow argument: drop it")
         policy.check_dispatch(ctx.governance(ctx.cwd, adapter.login), args.ref,
-                              ctx.environ.get("CONTROL_TASK_ID") or "")
-        new_id = adapter.dispatch(workflow, args.ref, inputs)
-        ctx.emit({"workflow": workflow, "ref": args.ref, "inputs": inputs, "dispatched": True,
-                  **({"id": new_id} if new_id else {})})
+                              ctx.environ.get("CONTROL_TASK_ID") or "", _release_ok(ctx))
+        started = adapter.dispatch(workflow, args.ref, inputs)
+        ctx.emit({"workflow": workflow, "ref": args.ref, "inputs": inputs, "dispatched": True, **started.to_json()})
+        if sha:
+            _check_started(started, sha)
     elif verb == "ci log":
         ctx.emit(ctx.adapter().ci_log(args.check_id))
     elif verb == "api get":

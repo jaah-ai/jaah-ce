@@ -61,6 +61,8 @@ MODELS: tuple[ModelChoice, ...] = (
     ),
 )
 
+#: With `INHERIT`, paired by position with `support_llm_model`'s `choice_help` (`app/operator_settings/catalog_integrations.py`):
+#: a new or reordered tier needs its line there, or the catalogue refuses to import.
 MODEL_IDENTIFIERS: tuple[str, ...] = tuple(choice.value for choice in MODELS)
 
 # The Claude aliases the tiers replaced, 1:1. Read on INPUT only — a client or a stored row from before the
@@ -72,6 +74,9 @@ LEGACY_ALIASES: Mapping[str, str] = {
     "sonnet": TIER_STANDARD,
     "haiku": TIER_LOW,
 }
+#: `LEGACY_ALIASES` inverted: each tier's model family (max → fable, high → opus, …) — what a Bedrock profile is
+#: keyed by, what a K2 slot is named after, what the outcome ledger folds a tier onto.
+TIER_FAMILY: Mapping[str, str] = {tier: family for family, tier in LEGACY_ALIASES.items()}
 
 # The sentinel, not a member of the set: empty means "do not pin" — defer to the stage default, then the
 # project card. Absence is not a state.

@@ -1,8 +1,8 @@
 """The relay's routes and byte pump (package docstring has the whole flow).
 
 Three doors, each accept-then-close on refusal (a close code needs an accepted connection):
-  * `BROWSER_PATH` — the browser's leg, authorized by its single-use ticket alone (the API checked the
-    viewer when it minted it).
+  * `BROWSER_PATH` — the browser's leg: its single-use ticket (the API checked the viewer when it minted it)
+    plus the viewer's own sign-in, the session cookie the dial carries (`tickets.claim`).
   * `NODE_PATH` — the node's dial-back: two factors, a fleet `NODE_TOKEN` and the node ticket, bound to
     the dialling node's id.
   * `OWNER_LEG_PATH` — another relay task handing over a leg it claimed for a session this task owns;
@@ -19,11 +19,14 @@ from fastapi import APIRouter, WebSocket
 from websockets.asyncio.client import connect as _ws_connect_following_redirects
 from websockets.exceptions import ConnectionClosed
 
-from app import cp_peers
+from app import cp_peers, edge_viewer
+from app.auth import session_ref as _session_ref
 from app.authz.catalog import Tenancy
 from app.authz.declarations import always, infra
 from app.console_relay import tickets
 from app.node_bus import resolve_caller_async
+from app import ws_keepalive
+from app.ws_keepalive import PING_TIMEOUT_SECONDS, Keepalive
 
 router = APIRouter(tags=["console"])
 log = logging.getLogger("app.console_relay")
@@ -50,8 +53,8 @@ _OWNER_DIAL_TIMEOUT = 5.0
 # Close codes a peer may SEND (RFC 6455 §7.4) — 1005/1006 are only ever received. Mirrors
 # `websockets.frames.Close.check()`; anything else is forwarded as 1000.
 _SENDABLE_CLOSE_CODES = frozenset({1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014})
-# The largest frame the proxy's client leg accepts: uvicorn's server-side `--ws-max-size` default
-# (16 MiB), so a proxied paste fits where a direct one does (`websockets`' client default is 1 MiB).
+# The largest frame the proxy's client leg accepts: 16 MiB, at least the server side's own WebSocket frame bound,
+# so a proxied paste fits where a direct one does (`websockets`' client default is 1 MiB).
 PROXY_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 
 
@@ -178,6 +181,24 @@ rendezvous = Rendezvous()
 # paste types are a person typing; resize is not, and neither is the pane's zero-length keepalive input.
 _FRAME_HEADER_BYTES = 3
 _KEYSTROKE_FRAME_TYPES = frozenset({0, 2, 3})
+# The pane's keepalive: a zero-length INPUT frame. The relay answers each one with KEEPALIVE_ACK, an EMPTY binary
+# frame, so a pane that hears nothing for its silence bound (`ConsolePane.tsx::SILENT_AFTER_MS`) knows the socket
+# is dead rather than the shell idle. Empty because the node never sends one (the pump drops empty node frames) and
+# a pane that predates the ack writes zero bytes to its terminal for it.
+_KEEPALIVE_FRAME = bytes([0, 0, 0])
+KEEPALIVE_ACK = b""
+# THE RELAY'S OWN HALF-OPEN CHECKS (`app/ws_keepalive.py`): its server sends no WebSocket pings, so it watches both legs
+# itself and ends a pair whose leg has gone silent as a broken transport (4503, which a live pane reconnects from).
+#   * BROWSER LEG: a pane cannot answer a server ping without a protocol change, so the pane's own keepalive IS the
+#     ping. Every browser frame proves the leg alive; after `BROWSER_SILENCE_SECONDS` plus `PING_TIMEOUT_SECONDS` of
+#     silence it is dead. Sized to a HIDDEN tab, whose keepalive the browser clamps to about once a minute
+#     (`ConsolePane.tsx::KEEPALIVE_INTERVAL_MS`) and can delay further, so a backgrounded console is not reaped.
+#   * NODE LEG: after `PING_INTERVAL_SECONDS` of node silence the relay sends `RELAY_PING_FRAME`, which the daemon
+#     answers with an empty frame (`apps/jaahd/console.py::RELAY_PING_FRAME`) and applies to neither the PTY nor its
+#     activity clock; no answer within `PING_TIMEOUT_SECONDS` ends the pair. ARMED BY THE FIRST ANSWER: a daemon that
+#     predates the probe never answers, and its leg is never ended for silence.
+BROWSER_SILENCE_SECONDS = 100.0
+RELAY_PING_FRAME = bytes([5, 0, 0])
 
 
 def _is_keystroke(data: bytes) -> bool:
@@ -194,6 +215,8 @@ async def _pump(pair: _Pair) -> None:
     when only the transport broke. Closing the node leg is this
     viewer's detach, never a kill."""
     browser, node = pair.legs[tickets.LEG_BROWSER], pair.legs[tickets.LEG_NODE]
+    # Both pumps send to the browser (output, the keepalive ack): one frame at a time.
+    browser_send = asyncio.Lock()
     relay_failed = False
     revoked = False
     idled = False
@@ -211,6 +234,34 @@ async def _pump(pair: _Pair) -> None:
         else:
             relay_failed = True
 
+    # Both pumps and the node-leg probe send to the node: one frame at a time.
+    node_send = asyncio.Lock()
+    browser_alive = Keepalive(interval=BROWSER_SILENCE_SECONDS, timeout=PING_TIMEOUT_SECONDS)
+
+    async def _ping_node() -> None:
+        async with node_send:
+            await node.send_bytes(RELAY_PING_FRAME)
+
+    node_alive = Keepalive(_ping_node, interval=ws_keepalive.PING_INTERVAL_SECONDS, timeout=PING_TIMEOUT_SECONDS)
+    node_answers = False   # armed by the daemon's first empty answer (see RELAY_PING_FRAME)
+
+    async def _browser_silent() -> None:
+        nonlocal relay_failed
+        await browser_alive.watch()
+        log.warning("console-relay: browser leg silent past its keepalive window — closing the half-open pair")
+        relay_failed = True
+
+    async def _node_silent() -> None:
+        nonlocal relay_failed
+        while True:
+            await node_alive.watch()
+            if node_answers:
+                log.warning("console-relay: node leg did not answer its keepalive — closing the half-open pair")
+                relay_failed = True
+                return
+            # A daemon that predates the probe: never ended for silence; stop probing it.
+            await asyncio.Event().wait()
+
     async def _browser_to_node() -> None:
         nonlocal relay_failed
         while True:
@@ -218,6 +269,7 @@ async def _pump(pair: _Pair) -> None:
                 message = await browser.receive()
             except (RuntimeError, OSError):
                 return   # the browser is already gone
+            browser_alive.seen()
             if message.get("type") == "websocket.disconnect":
                 return
             data = message.get("bytes")
@@ -229,17 +281,24 @@ async def _pump(pair: _Pair) -> None:
             # Before the read-only discard: a watcher typing is still a person at the console.
             if _is_keystroke(data):
                 pair.typed = True
+            if data == _KEEPALIVE_FRAME:
+                try:
+                    async with browser_send:
+                        await browser.send_bytes(KEEPALIVE_ACK)
+                except Exception:  # noqa: BLE001 — the browser is gone; its own read ends this pump
+                    return
             if pair.read_only:
                 continue
             try:
-                await node.send_bytes(data)
+                async with node_send:
+                    await node.send_bytes(data)
             except Exception as exc:  # noqa: BLE001 — the node leg died; reconnect
                 log.warning("console-relay: stdin to node failed, closing for reconnect: %s", exc)
                 relay_failed = True
                 return
 
     async def _node_to_browser() -> None:
-        nonlocal relay_failed
+        nonlocal relay_failed, node_answers
         while True:
             try:
                 message = await node.receive()
@@ -252,19 +311,24 @@ async def _pump(pair: _Pair) -> None:
                 if message.get("code") != tickets.NODE_CLOSE_SESSION_ENDED:
                     relay_failed = True
                 return
+            node_alive.seen()
             data = message.get("bytes")
             if data is None:
                 text = message.get("text")
                 data = text.encode() if isinstance(text, str) else None
             if not data:
+                if data == b"":
+                    node_answers = True   # the daemon's answer to RELAY_PING_FRAME
                 continue
             try:
-                await browser.send_bytes(data)
+                async with browser_send:
+                    await browser.send_bytes(data)
             except Exception:  # noqa: BLE001 — the browser is gone; nobody left to reconnect
                 return
 
     tasks = [asyncio.ensure_future(_browser_to_node()), asyncio.ensure_future(_node_to_browser()),
-             asyncio.ensure_future(_watch())]
+             asyncio.ensure_future(_watch()), asyncio.ensure_future(_browser_silent()),
+             asyncio.ensure_future(_node_silent())]
     try:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
@@ -362,10 +426,14 @@ async def _route(websocket: WebSocket, leg: str, claim: tickets.Claim) -> None:
 def client_address(websocket: WebSocket) -> str | None:
     """The browser's address as the API saw it at the mint (`request.client.host`, `app/ip_allowlist.py`). The
     relay has no nginx sidecar, so an ALB is its direct peer: the RIGHTMOST `X-Forwarded-For` entry is the one
-    the ALB appended — the address the API's uvicorn reads through nginx — and a client-forged prefix is never
-    read. Every header line is joined first, as uvicorn's `ProxyHeadersMiddleware` joins them for the API, so a
+    the ALB appended — the address the API reads through nginx (`app/proxy_headers.py`) — and a client-forged prefix
+    is never read. Every header line is joined first, as that middleware joins them for the API, so a
     second line cannot make the two disagree. With no header (the local stack's dev proxy, which forwards none
-    to either) it is the peer itself."""
+    to either) it is the peer itself. Through the CloudFront edge it is the viewer, as the API's
+    `EdgeViewerMiddleware` makes it at the mint (`app/edge_viewer.py`)."""
+    viewer = edge_viewer.viewer_address(websocket.headers.items())
+    if viewer is not None:
+        return viewer
     lines = websocket.headers.getlist("x-forwarded-for")
     if lines:
         return ", ".join(lines).rsplit(",", 1)[-1].strip() or None
@@ -381,6 +449,7 @@ async def browser_leg(websocket: WebSocket) -> None:
         claim = await asyncio.to_thread(
             tickets.claim, tickets.LEG_BROWSER, websocket.query_params.get("ticket"),
             self_address=cp_peers.self_address(), client_ip=client_address(websocket),
+            session_ref=_session_ref(websocket),
         )
     except Exception as exc:  # noqa: BLE001 — a DB fault: the pane re-opens, as for any broken transport
         log.warning("console-relay: claiming a browser leg failed (%s)", exc)
@@ -388,7 +457,8 @@ async def browser_leg(websocket: WebSocket) -> None:
         return
     if claim is None:
         log.warning(
-            "console-relay: refused a browser leg — unknown, expired, revoked or replayed ticket, or another address"
+            "console-relay: refused a browser leg — unknown, expired, revoked or replayed ticket, another sign-in, "
+            "or an address outside the org's IP allowlist"
         )
         await _refuse(websocket, BROWSER_CLOSE_RELAY_FAILED, "console ticket is not valid")
         return

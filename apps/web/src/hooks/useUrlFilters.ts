@@ -1,4 +1,4 @@
-import { useCallback } from 'react'
+import { useCallback, useMemo } from 'react'
 import { useSearchParams } from 'react-router-dom'
 
 /* Filters that live in the URL, READ-THROUGH: no second copy, a pasteable link, and Back undoes a filter
@@ -20,4 +20,22 @@ export function useUrlFilters(): [URLSearchParams, (changes: Record<string, stri
     }, { replace: !options?.push })
   }, [setSearchParams])
   return [searchParams, setFilters]
+}
+
+const SAME_KEYS = <F,>(patch: Partial<F>): Record<string, string> => patch as Record<string, string>
+
+/** A typed view over the URL filters for one strip: `read` parses the params (a value outside its vocabulary
+ *  reads as none), `patch` writes the fields it names, `clear` writes `empty`. `toParams` renames a strip's fields
+ *  to its URL keys where two strips share one address (the Hosts tab's `hq`/`hstate`); both it and `read` must be
+ *  module-level, or every render re-makes the setters. */
+export function useTypedUrlFilters<F extends Record<string, string>>(
+  read: (params: URLSearchParams) => F,
+  empty: F,
+  toParams: (patch: Partial<F>) => Record<string, string> = SAME_KEYS,
+): [F, (patch: Partial<F>) => void, () => void] {
+  const [params, setFilters] = useUrlFilters()
+  const filters = useMemo(() => read(params), [params, read])
+  const patch = useCallback((next: Partial<F>) => setFilters(toParams(next)), [setFilters, toParams])
+  const clear = useCallback(() => setFilters(toParams(empty)), [setFilters, toParams, empty])
+  return [filters, patch, clear]
 }

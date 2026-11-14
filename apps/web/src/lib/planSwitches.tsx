@@ -1,6 +1,9 @@
+import type { JSX } from 'react'
 import { Link, Navigate, Outlet, useLocation } from 'react-router-dom'
 import MuiLink from '@mui/material/Link'
+import Typography from '@mui/material/Typography'
 import ActAsOrgPicker from '../components/ActAsOrgPicker'
+import { FullPageDetail } from '../components/ListDetail'
 import InterstitialPanel from '../ui/InterstitialPanel'
 import { ApiError } from '../api'
 import { type Admin, useAuth } from '../auth'
@@ -20,9 +23,10 @@ import type { CloudProvider } from '../types'
 
 export type PlanSwitch =
   | GridGate | 'playbooks_enabled' | 'org_templates_enabled' | 'jaah_ai_enabled'
-  | 'nodelink_enabled' | 'nodevault_enabled' | 'microvm_allowed' | 'github_runners_allowed'
+  | 'nodelink_enabled' | 'nodevault_enabled' | 'microvm_allowed' | 'node_vm_allowed' | 'github_runners_allowed'
   | 'ubuntu_nodes_allowed' | 'macos_nodes_allowed' | 'windows_nodes_allowed' | 'project_memory_enabled'
-  | 'audit_enabled' | 'session_transcripts_enabled' | 'tenant_email_allowed' | CloudSwitch | EnterpriseSwitch
+  | 'audit_enabled' | 'session_transcripts_enabled' | 'tenant_email_allowed' | 'intelligent_routing'
+  | 'production_qa' | 'benchmark_mode' | 'agent_performance' | 'webhooks_enabled' | 'pipeline_custom_enabled' | 'custom_domains_allowed' | 'placement_groups_allowed' | CloudSwitch | EnterpriseSwitch
 
 /** Your Cloud per provider: whether the org may connect and launch on its own AWS, GCP or Azure. */
 export type CloudSwitch = 'aws_cloud_allowed' | 'gcp_cloud_allowed' | 'azure_cloud_allowed'
@@ -73,6 +77,15 @@ export function planSurfaceShown(admin: Admin | null | undefined, name: PlanSwit
   return admin?.is_operator === true || planSwitchOn(admin, name)
 }
 
+/** A component drawn only while `planSurfaceShown` says so (nothing drawn, nothing fetched, otherwise); `render`
+ *  gets the viewer beside its props. `render` is a plain call, not a component: it must not call hooks. */
+export function planSurface<P>(name: PlanSwitch, render: (admin: Admin | null, props: P) => JSX.Element): (props: P) => JSX.Element {
+  return function PlanSurface(props: P) {
+    const { admin } = useAuth()
+    return planSurfaceShown(admin, name) ? render(admin, props) : <></>
+  }
+}
+
 /** A plan-gated route's refusal: the 403 an API door answers while the org's plan leaves the feature out (e.g.
  *  the project memory routes). A query passes it to `retry` (never retried) and shows a calm notice, not an error. */
 export const offPlan = (err: unknown): boolean => err instanceof ApiError && err.status === 403
@@ -100,6 +113,7 @@ export const FEATURE_NAME: Record<PlanSwitch, string> = {
   nodelink_enabled: 'NodeLink',
   nodevault_enabled: 'NodeVault',
   microvm_allowed: 'MicroVM',
+  node_vm_allowed: 'Whole-node VM',
   github_runners_allowed: 'GitHub Runners',
   ubuntu_nodes_allowed: 'Ubuntu nodes',
   macos_nodes_allowed: 'macOS nodes',
@@ -108,6 +122,14 @@ export const FEATURE_NAME: Record<PlanSwitch, string> = {
   audit_enabled: 'Audit',
   session_transcripts_enabled: 'Session transcripts',
   tenant_email_allowed: 'Tenant email',
+  intelligent_routing: 'Intelligent routing',
+  production_qa: 'Production QA',
+  benchmark_mode: 'Benchmark mode',
+  agent_performance: 'Agent performance',
+  webhooks_enabled: 'Webhooks',
+  pipeline_custom_enabled: 'Custom pipelines',
+  custom_domains_allowed: 'Custom domains',
+  placement_groups_allowed: 'Node groups',
   aws_cloud_allowed: 'Your Cloud: AWS',
   gcp_cloud_allowed: 'Your Cloud: GCP',
   azure_cloud_allowed: 'Your Cloud: Azure',
@@ -154,9 +176,13 @@ export function RequirePlanSwitch({ name, to, operator = false }: { name: Roster
   if (!(operator ? planSurfaceShown(admin, name) : planSwitchOn(admin, name))) {
     if (resolving) return null
     if (to) return <Navigate to={to} replace state={offPlanState(name)} />
+    // Off the plan the note is the page: a pane opened beside an unguarded list (a release beside the Tasks board)
+    // asks for the full page (`FullPageDetail`), never a note beside a list. A no-op outside a split.
     // Without Multiple orgs the operator's one org is the only one: no other org to act as.
-    if (admin?.is_operator === true && !acting && isEnabled('multi_org_tenancy')) return <PlanOrgPicker name={name} />
-    return <NotOnPlan name={name} />
+    const note = admin?.is_operator === true && !acting && isEnabled('multi_org_tenancy')
+      ? <PlanOrgPicker name={name} />
+      : <NotOnPlan name={name} />
+    return <><FullPageDetail />{note}</>
   }
   return <Outlet />
 }
@@ -209,5 +235,21 @@ export function NotOnPlan({ name }: { name: PlanSwitch }) {
         </>
       }
     />
+  )
+}
+
+/* NotOnPlan's one-line form, under a control that stays disabled off the plan (a Customize section's checkbox): the
+   org admin's way out is a link to the Subscription page, anyone else's the same words as plain text. The community
+   edition has no plans to change: it says so instead. */
+export function UpgradeToActivate({ testId = 'upgrade-to-activate' }: { testId?: string }): JSX.Element {
+  const { admin } = useAuth()
+  return (
+    <Typography variant="body2" data-testid={testId} sx={{ color: 'text.secondary' }}>
+      {!isEnabled('billing')
+        ? 'Not in this edition'
+        : isOrgAdminSeat(admin)
+          ? <><MuiLink component={Link} to={SUBSCRIPTION_PAGE}>Upgrade subscription</MuiLink> to activate</>
+          : 'Ask an admin to upgrade the subscription to activate'}
+    </Typography>
   )
 }

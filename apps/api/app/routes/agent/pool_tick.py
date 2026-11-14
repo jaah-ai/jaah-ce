@@ -7,16 +7,16 @@ from typing import Any, Optional, Sequence
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer
 from sqlalchemy import false, func, or_, select
 from sqlalchemy.orm import Session
 
 from app import (
     carryover,
-    fleet_decide,
     fleet_verdicts,
     edition_features,
     forges,
+    jaah_repos,
     node_config,
     node_credentials,
     port_grid,
@@ -24,19 +24,19 @@ from app import (
     project_repos,
     slot_allocation,
 )
+from app.project_env import port_specs_by_project
 from app.operator_settings import reads as settings_reads
 # routes need one for a user who is NOT the caller (they carry no session cookie, only the node token).
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
-from app.db import get_session
-from app.node_clone import resolve_auth_dir, resolve_clone
+from app.db_async import on_session
+from app.node_clone import resolve_auth_dir, slot_path
 from app.node_identity import node_id_or_none, node_matches, node_org, node_ref
-from app.models.agent_sessions import FetchStamp
 from app.models.credentials import Account
 from app.models.nodes import Node
 from app.models.projects import Project
 from app.models.worktrees import SlotIntent, Worktree
-from app.entity_shape import iso_or_none
+from app.entity_shape import from_row, iso_or_none
 from app.routes.agent.auth import _check_token
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
@@ -57,29 +57,24 @@ SLOT_INTENT_VERBS = fleet_verdicts.SLOT_INTENT_VERBS
 SLOT_INTENT_OUTCOMES = fleet_verdicts.SLOT_INTENT_OUTCOMES
 
 
-SLOT_INTENT_RETIRING_OUTCOMES = fleet_verdicts.SLOT_INTENT_RETIRING_OUTCOMES
-
-
 NODE_AUTHORED_OUTCOMES = fleet_verdicts.NODE_AUTHORED_OUTCOMES
 
 
 class PoolTickSlot(BaseModel):
-    """One sweepable slot. The swept set comes from here, not a `0..N` range; `is_main` is a
-    roster attribute, not a `number == 0` test.
+    """One sweepable slot. The swept set comes from here, not a `0..N` range; `path` is the slot's own
+    directory (`node_clone.slot_path`), always sent.
 
     `config_dir` is checked by `fleet_decide.liveness_observed` against `probed_config_dirs`: a slot
     outside probe coverage has unobserved liveness and is never reclassified. `state` is the one occupancy
-    field (`slot_state.lease` refuses slot 0).
+    field.
     """
 
     number: int
     path: str
-    is_main: bool
     config_dir: Optional[str] = None
     state: str = "free"
-    # The port grid's band `{VAR: port}` (`fleet_decide.port_band`; parsed by
-    # `reconcile.tick_wire.port_band_from_wire`), the node's only grid-port source: `apply_port_band` refuses an absent
-    # band. A declared var the band omits is tier 2.
+    # Always `{}`: the node picks every slot port itself (`worktree_mechanics.ports.apply_auto_ports`). Still sent
+    # only because a node on an older jaahd refuses a slot with no `ports` key; removed with the retired column's drop.
     ports: dict[str, int] = {}
     # Raw timestamp rather than an age: authored by the mutation verbs, not sensed, and the CP never
     # receives a node timestamp to subtract.
@@ -90,11 +85,23 @@ class PoolTickSlot(BaseModel):
     # resolve the `destroy_slot` intent addressed to it (`reconcile.enact_signal._enact_destroy_slot`).
     kind: str = "static"
     retiring: bool = False
+    # The slot's own kind (`Worktree.has_repo`), sent only when it differs from its entry's `has_repo`: a folder
+    # slot in a git entry on a node that advertises `slot_allocation.FOLDER_SLOT`. Omitted otherwise, so the
+    # wire stays what it was; the node reads an absent key as its entry's kind.
+    has_repo: Optional[bool] = None
+
+    @model_serializer(mode="wrap")
+    def _omit_entry_kind(self, handler):
+        data = handler(self)
+        if data.get("has_repo") is None:
+            data.pop("has_repo", None)
+        return data
 
 
 class PoolTickRepo(BaseModel):
     """One of a git project's repositories, in display order. `id` is `project_repos.id`, the key the
-    node's slot manifest and its `repos` observation echo; `base` is that repo's own integration branch."""
+    node's slot manifest and its `repos` observation echo; `base` is that repo's own integration branch, and the
+    last three its own Branch policy (`models.ProjectRepo`), which a newly claimed clone's access guard starts with."""
 
     id: int
     clone_url: str
@@ -102,45 +109,47 @@ class PoolTickRepo(BaseModel):
     forge: str
     base: str
     primary: bool
+    branch_prefix: str
+    push_enabled: bool
+    allow_force_push: bool
 
 
 class PoolTickRosterEntry(BaseModel):
     """One enrolled project's slots plus the configuration the node does not discover — the roster is the
     one configuration source.
 
-    Every entry is usable: a project missing `clone_url`, `base` or `clone` is omitted whole, except a `draining`
-    one, which has no `clone_url`. The node reads
-    `clone_url`/`repo_path` (`app/forges.py::RepoRef`). `port_block`/`port_vars`/`range_start_by_var` are this
-    project's slice of the grid (`app/port_grid.py`); global scalars ride on `PoolTickOut.grid`.
+    Every entry is usable: a project missing `clone_url` or `base`, or rostered to a node with no recorded
+    `jaah_home`, is omitted whole, except a `draining` one, which has no `clone_url`. No `clone`: the node
+    derives its anchor from a slot's `path` (`apps/jaahd/worktree_mechanics/core.py::slot_anchor`), else its
+    own home. The node reads `clone_url`/`repo_path` (`app/forges.py::RepoRef`). `port_vars` names the vars the node gives a
+    free port at lease; the range it picks from rides on `PoolTickOut.grid`.
     """
 
     # `projects.id`, what `build_pool_roster` keys on: a roster keyed on the display name turns a rename
     # into a zeroed pool. `project` stays the display name the node uses for paths, tmux windows, logs.
     project_id: int
     project: str
-    clone: str
     base: str
     # The credential-free https remote, the forge, and the forge-native repo path.
     clone_url: str
     forge: str
     repo_path: str
     # `branch_prefix`, stored WITH its trailing slash (`sn/`) or `""`. Every ref the node creates or
-    # pushes is `{branch_prefix}fleet/task-<id>` and the push guard is keyed on the same prefix, so a ref
+    # pushes is `{branch_prefix}fleet/task-<id>` (`fleet/` once: `app/task_branch.py`) and the push guard is keyed on
+    # the same prefix, so a ref
     # rebuilt without it lands on a branch the node cannot push.
     branch_prefix: str = ""
-    port_block: Optional[int] = None
+    # The names of the project's Port variables (`app/project_env.py::port_specs`); `port_preferred` the port the
+    # node tries first for those that name one (`worktree_mechanics.ports.apply_auto_ports`).
     port_vars: list[str] = []
-    range_start_by_var: dict[str, int] = {}
+    port_preferred: dict[str, int] = {}
     slots: list[PoolTickSlot] = []
-    # Seconds since this node last fetched this project's base (write half: the observation POST's
-    # `fetched_projects`). Per PROJECT, not per slot. None = never fetched, read as "fetch now".
-    fetch_stamp_age_secs: Optional[int] = None
-    # False: a project with no repository, whose slots are empty folders; the node then needs only
-    # `clone`, and every git string is `""`. Defaulted true, so an entry that does not set it is a git
+    # False: a project with no repository, whose slots are empty folders; the node then needs only each
+    # slot's `path`, and every git string is `""`. Defaulted true, so an entry that does not set it is a git
     # project — the node reads an absent key the same way.
     has_repo: bool = True
     # True: a git pair whose project's last repository was removed. Its git worktrees are being
-    # destroyed (`slot_allocation._converge_assigned`), and with no repository there is no remote: `clone_url`,
+    # destroyed (`slot_allocation.converge`), and with no repository there is no remote: `clone_url`,
     # `forge` and `repo_path` are `""`, so the node serves only their teardown.
     draining: bool = False
     # Every repository of a git project, primary flagged; the top-level git fields stay the primary's. `[]` for a
@@ -150,8 +159,11 @@ class PoolTickRosterEntry(BaseModel):
     # folder project.
     stack_down_cmd: str = ""
     # `projects.push_enabled`: whether the node may push the integration branch it finds missing on origin
-    # (`apps/jaahd/worktree_mechanics/core.py::_create_missing_base`). False for a folder project; absent reads False.
+    # (`apps/jaahd/slot_clone.py::_ensure_base`). False for a folder project; absent reads False.
     push_enabled: bool = False
+    # `jaah_repos.jaah_repo_prefix` of the project's org: the push guard's `access-guard.jaah-repo-prefix` marker
+    # (`""` clears it). None for a folder project; the node reads None or absent as "leave the marker as it is".
+    jaah_repo_prefix: Optional[str] = None
 
 
 class PoolTickIntent(BaseModel):
@@ -170,7 +182,7 @@ class PoolTickIntent(BaseModel):
     # The SQL-native staleness token, compared against `PoolTickSlot.observed_at`.
     decided_on_observed_at: Optional[str] = None
     preconditions: dict[str, Any] = {}
-    # The CP's DECISION — account dir, port band, branch/base, task, plus the `generation` + `dispatch_id`
+    # The CP's DECISION — account dir, branch/base, task, plus the `generation` + `dispatch_id`
     # the ack must echo. `preconditions` is what the node may REFUSE on; this is what it must APPLY
     # (`app/fleet_verdicts.py::build_slot_intent`).
     payload: dict[str, Any] = {}
@@ -198,18 +210,20 @@ class PoolTickKnownSlot(BaseModel):
 
 
 class PoolTickGrid(BaseModel):
-    """The port grid, whole and fleet-global — the shape `GET /api/agent/port-grid` serves.
+    """The org's slot-port range (`app/port_grid.py`) — the shape `GET /api/agent/port-grid` serves, and the
+    range the node picks each slot's ports from (`worktree_mechanics.ports.apply_auto_ports`).
 
-    Rides the tick for `auto_port_floor`/`auto_port_ceiling` (the tier-2 range,
-    `worktree_mechanics.ports.apply_auto_ports`). `range_start_by_var` is unfiltered.
+    The last four fields are constant and read by nothing current: a node on an older jaahd refuses a grid
+    body without them (an empty `range_start_by_var` reads as "no fixed windows" there). Removed with the
+    retired column's drop.
     """
 
-    range_start_by_var: dict[str, int] = {}
-    block_size: int
-    stride: int
-    window: int
     auto_port_floor: int
     auto_port_ceiling: int
+    range_start_by_var: dict[str, int] = {}
+    block_size: int = 1
+    stride: int = 1
+    window: int = 1
 
 
 class PoolTickOut(BaseModel):
@@ -276,7 +290,6 @@ def node_slot_rows(session: Session, node_id: str) -> Sequence[Any]:
 def build_pool_roster(
     session: Session,
     node_id: str,
-    grid: Optional[port_grid.Grid] = None,
     rows: Optional[Sequence[Any]] = None,
     org: Optional[UUID] = None,
     node_row: Optional[Any] = None,
@@ -297,45 +310,35 @@ def build_pool_roster(
     kinds_by_project: dict[int, list[bool]] = {}
     # The wire field is a PATH: the node's `reconcile.accounts_probe._agent_config_dirs()` builds `probed_config_dirs`
     # from it. Derived for THIS node from the slug; `""` maps to `None`.
-    slot_home = (
-        session.scalar(select(Node.jaah_home).where(node_matches(node_id))) if node_row is None
-        else node_row.jaah_home
-    )
+    if node_row is None:
+        node_row = session.execute(
+            select(Node.jaah_home, Node.launch_kinds).where(node_matches(node_id))
+        ).first() or SimpleNamespace(jaah_home=None, launch_kinds=None)
+    slot_home = node_row.jaah_home
+    # A node that reads each slot's own kind holds git worktrees and folder slots in one entry.
+    mixes_kinds = slot_allocation.FOLDER_SLOT in (getattr(node_row, "launch_kinds", None) or ())
     for row in rows if rows is not None else node_slot_rows(session, node_id):
         slots_by_project.setdefault(row.project_id, []).append(
             PoolTickSlot(
-                number=row.number, path=row.path, is_main=row.number == 0,
+                number=row.number, path=row.path,
                 config_dir=resolve_auth_dir(slot_home, row.account_slug) or None, state=row.state,
                 last_used=iso_or_none(row.last_used),
                 observed_at=iso_or_none(row.observed_at),
                 kind=row.kind, retiring=row.retiring_at is not None,
+                has_repo=getattr(row, "has_repo", True),
             )
         )
-        if row.number >= 1:
-            kinds_by_project.setdefault(row.project_id, []).append(getattr(row, "has_repo", True))
-
-    # Per-project fetch-stamp ages, one read. Keyed on id: a missed lookup reads as "never fetched" —
-    # safe, but a per-tick `git fetch` on every slot forever.
-    fetch_ages: dict[int, int] = {
-        row.project_id: int(row.age_secs)
-        for row in session.execute(
-            select(
-                FetchStamp.project_id,
-                func.floor(
-                    func.extract("epoch", func.now() - FetchStamp.fetched_at)
-                ).label("age_secs"),
-            ).where(FetchStamp.node_id == node_ref(node_id))
-        ).all()
-    }
+        kinds_by_project.setdefault(row.project_id, []).append(getattr(row, "has_repo", True))
 
     roster: list[PoolTickRosterEntry] = []
     # THIS node's clone layout, so every entry names a directory that exists ON IT. `slot_home` above is
     # the same value: one read, deliberately not two (this was the CP's highest-volume query).
     jaah_home = slot_home
-    # One grid for the whole roster, passed in so roster and `grid` block are one snapshot. `org` feeds only
-    # the fallback arm and must be this node's (the grid is per org). No grid and no org → unstamped rows.
+    # A slot's `path` names its tree and anchors the node's clone; with no home the CP composes no path.
+    # True exactly when the home is non-empty after strip/rstrip("/") (`node_clone._project_root`).
+    has_home = bool(slot_path(jaah_home, 0, 1))
+    # `org` must be this node's. No org → unstamped rows.
     org = org if org is not None else node_org(session, node_id)
-    grid = grid or port_grid.grid(session, org)
     projects = session.scalars(
         select(Project)
         .where(Project.org_id == org)
@@ -343,42 +346,54 @@ def build_pool_roster(
     ).all()
     # Every project's repositories in one read, not one per project.
     repo_rows = project_repos.repos_by_project(session, [project.id for project in projects])
-    # A node is rostered its own org's projects only: `port_block` is unique per org, so cross-org rosters
-    # would band two block-0 projects onto one host and disclose tenants' projects. Not yet enforced for
-    # `worktrees` (the unkeyed-reference register); `apply_port_band` keeps it fail closed. An org-less
-    # node gets an empty roster (unreachable: registrations are stamped).
+    # And every project's Port variables (`app/project_env.py::port_specs_by_project`).
+    port_specs_by_project_id = port_specs_by_project(session, [project.id for project in projects])
+    # One org, so one prefix for every entry; read only when there is a project to send it with.
+    jaah_prefix = jaah_repos.jaah_repo_prefix(jaah_repos.org_slug_of(session, org)) if projects else ""
+    # A node is rostered its own org's projects only: a cross-org roster would disclose tenants' projects. Not
+    # yet enforced for `worktrees` (the unkeyed-reference register). An org-less node gets an empty roster
+    # (unreachable: registrations are stamped).
     for project in projects:
         ref = forges.repo_ref_or_none(project)
-        clone = resolve_clone(jaah_home, project.id)
-        # The node reads ONE kind per entry, so a pair still holding slots of the other kind keeps their kind
-        # until they are gone (`slot_allocation.kind_of_pair`); the planner makes none of the new kind meanwhile.
-        if not slot_allocation.kind_of_pair(project.has_repo, kinds_by_project.get(project.id, [])):
-            if not clone:
-                log.warning("pool-tick: project %s has no clone path on node %s — omitting its slots",
+        # A repo project is a git entry, its folder slots flagged one by one, on a node that mixes kinds — and on
+        # any node still holding one of its git worktrees: a node that stopped advertising `folder_slot` (a
+        # downgrade, a MicroVM mark) must never read a held git worktree as a folder. Otherwise a node reads ONE kind
+        # per entry, so a pair still holding slots of the other kind after the project's repository flipped keeps
+        # their kind until they are gone (`slot_allocation.kind_of_pair`); the planner makes none of the new kind
+        # meanwhile.
+        kinds = kinds_by_project.get(project.id, [])
+        entry_has_repo = (
+            True if project.has_repo and (mixes_kinds or True in kinds)
+            else slot_allocation.kind_of_pair(project.has_repo, kinds)
+        )
+        # Each slot carries its own kind only where it differs from its entry's: a pure pair's wire is unchanged,
+        # and a node that predates per-slot kinds ignores the key.
+        for slot in slots_by_project.get(project.id, []):
+            slot.has_repo = slot.has_repo if slot.has_repo != entry_has_repo else None
+        if not entry_has_repo:
+            if not has_home:
+                log.warning("pool-tick: project %s has no slot path on node %s (no jaah_home) — omitting its slots",
                             project.name, node_id)
                 continue
-            # A folder project: the node needs only `clone` to name each slot's directory. Every git
-            # string is `""`, and no port band — a folder runs no stack.
-            slots = slots_by_project.get(project.id, [])
-            for slot in slots:
-                slot.ports = {}
+            # A folder project: each slot's `path` names its directory. Every git
+            # string is `""`, and no port vars — a folder runs no stack.
             roster.append(PoolTickRosterEntry(
-                project_id=project.id, project=project.name, clone=clone, base="", clone_url="",
+                project_id=project.id, project=project.name, base="", clone_url="",
                 forge="", repo_path="", branch_prefix="",
-                port_block=project.port_block, port_vars=[], range_start_by_var={}, slots=slots,
-                fetch_stamp_age_secs=fetch_ages.get(project.id), has_repo=False,
+                port_vars=[], slots=slots_by_project.get(project.id, []),
+                has_repo=False,
             ))
             continue
         # A git pair of a project with no repository left: rostered only so its worktrees can be destroyed.
         draining = ref is None and not project.has_repo
-        if not clone or (ref is None and not draining):
+        if not has_home or (ref is None and not draining):
             log.warning(
-                "pool-tick: project %s is unusable on node %s (clone=%r clone_url=%r) — omitting its slots",
-                project.name, node_id, clone, ref.clone_url() if ref is not None else None,
+                "pool-tick: project %s is unusable on node %s (jaah_home=%r clone_url=%r) — omitting its slots",
+                project.name, node_id, jaah_home, ref.clone_url() if ref is not None else None,
             )
             continue
         # The base is the column. An empty `integration_branch` omits the project WHOLE, like a missing
-        # `clone`/`clone_url`, rather than silently becoming `develop`.
+        # `clone_url`, rather than silently becoming `develop`.
         base = (project.integration_branch or "").strip()
         if not base:
             log.warning(
@@ -387,43 +402,27 @@ def build_pool_roster(
                 project.name,
             )
             continue
-        port_vars = list(project.port_vars or [])
-        # Only the vars this project declares — a start for an undeclared var would band a port nobody
-        # promised. Hoisted because the per-slot band uses the same starts and the two must not disagree.
-        range_start_by_var = {
-            var: grid.range_start_by_var[var]
-            for var in port_vars
-            if var in grid.range_start_by_var
-        }
+        specs = port_specs_by_project_id.get(project.id, [])
+        port_vars = [spec.name for spec in specs]
+        port_preferred = {spec.name: spec.preferred for spec in specs if spec.preferred is not None}
         # BY ID — a name lookup here is how a rename ships an empty slot list.
         slots = slots_by_project.get(project.id, [])
-        # Stamp the band here: the slot rows come from a `worktrees` query with no project configuration
-        # in scope. `PoolTickSlot.ports` covers why an absent band is a node-side refusal.
-        for slot in slots:
-            slot.ports = fleet_decide.port_band(
-                project.port_block, slot.number, port_vars,
-                range_start_by_var=range_start_by_var,
-                block_size=grid.block_size,
-                stride=grid.stride,
-            )
         roster.append(
             PoolTickRosterEntry(
                 project_id=project.id,
                 project=project.name,
-                clone=clone,
                 base=base,
                 clone_url=ref.clone_url() if ref is not None else "",
                 forge=ref.forge if ref is not None else "",
                 repo_path=ref.path if ref is not None else "",
                 branch_prefix=project.branch_prefix or "",
-                port_block=project.port_block,
                 port_vars=port_vars,
-                range_start_by_var=range_start_by_var,
+                port_preferred=port_preferred,
                 slots=slots,
-                fetch_stamp_age_secs=fetch_ages.get(project.id),
                 repos=_roster_repos(project, repo_rows.get(project.id, [])),
                 stack_down_cmd=project.stack_down_cmd or "",
                 push_enabled=bool(project.push_enabled),
+                jaah_repo_prefix=jaah_prefix,
                 draining=draining,
             )
         )
@@ -442,7 +441,8 @@ def _roster_repos(project: Project, rows: Sequence[Any]) -> list[PoolTickRepo]:
             continue
         out.append(PoolTickRepo(
             id=row.id, clone_url=ref.clone_url(), repo_path=ref.path, forge=ref.forge,
-            base=row.integration_branch, primary=row.is_primary,
+            base=row.integration_branch, primary=row.is_primary, branch_prefix=row.branch_prefix,
+            push_enabled=row.push_enabled, allow_force_push=row.allow_force_push,
         ))
     return out
 
@@ -474,12 +474,11 @@ def build_known_slots(
 
 @router.get("/pool-tick", response_model=PoolTickOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_session
 def pool_tick(
-    # Bounded: a mismatch writes a WARNING carrying this value on every request, so an unbounded parameter
-    # is an unbounded log line a token holder can emit at will.
+    session: Session,
     node_id: str = Query(default="", max_length=200),
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> PoolTickOut:
     """Everything the node needs for one reconcile pass, except the verdicts (`GET /api/agent/worktrees`).
 
@@ -533,7 +532,7 @@ def pool_tick(
                 intent_node_is_the_caller,
                 *[
                     SlotIntent.outcome.is_distinct_from(outcome)
-                    for outcome in SLOT_INTENT_RETIRING_OUTCOMES
+                    for outcome in fleet_verdicts.SLOT_INTENT_RETIRING_OUTCOMES
                 ],
                 # THE BACKOFF: a refused row is withheld until `next_attempt_at`; NULL is "due now". Not
                 # in the partial index — it narrows a scan already reduced to one node's pending rows.
@@ -564,15 +563,11 @@ def pool_tick(
             unresolved, node_id,
         )
     intents = [
-        PoolTickIntent(
-            id=row.id,
-            project_id=row.project_id,
+        from_row(
+            PoolTickIntent, row,
             # An intent whose project resolved to nothing is NOT served: it names a directory the node
             # cannot construct, so it stays pending and visible rather than enacted on a guess.
             project=intent_project_names[row.project_id],
-            number=row.number,
-            verb=row.verb,
-            decided_on_version=row.decided_on_version,
             decided_on_observed_at=(
                 row.decided_on_observed_at.isoformat()
                 if row.decided_on_observed_at is not None
@@ -580,14 +575,12 @@ def pool_tick(
             ),
             preconditions=row.preconditions or {},
             payload=row.payload or {},
-            reason=row.reason,
-            created_at=iso_or_none(row.created_at),
         )
         for row in pending_intents
         if row.project_id in intent_project_names
     ]
     # This tick's org: `caller.org_id` is what the credential proved (`node_id` is unverified). A mismatch
-    # yields the caller's own grid over the named node's rows → empty slots, never another tenant's bands.
+    # yields the caller's own org over the named node's rows → empty slots, never another tenant's.
     # The node join and `known_slots` still trust `node_id` (debt recorded in `app/node_credentials.py`).
     org = caller.org_id if caller.org_id is not None else node_org(session, node_id)
     grid = port_grid.grid(session, org)
@@ -603,7 +596,7 @@ def pool_tick(
         microvm_intents = microvm_rail.pending_frames(session, microvm_intent_node)
     return PoolTickOut(
         node_id=node_id,
-        roster=build_pool_roster(session, node_id, grid, rows=slot_rows, org=org, node_row=node_row),
+        roster=build_pool_roster(session, node_id, rows=slot_rows, org=org, node_row=node_row),
         intents=intents,
         known_slots=build_known_slots(session, node_id, rows=slot_rows),
         grid=PoolTickGrid(**grid.wire()),
@@ -619,11 +612,13 @@ def pool_tick(
 
 
 def _tick_node_row(session: Session, node_id: str) -> Any:
-    """`nodes.jaah_home` and `nodes.microvm` for `?node_id=`, in one read — the row both `build_pool_roster`
-    and `_node_microvm` would read, with the same predicate. A row of Nones when no node answers, which each
-    reader takes exactly as its own empty read (`jaah_home` None, `microvm` False)."""
-    row = session.execute(select(Node.jaah_home, Node.microvm).where(node_matches(node_id))).first()
-    return row if row is not None else SimpleNamespace(jaah_home=None, microvm=None)
+    """`nodes.jaah_home`, `nodes.launch_kinds` and `nodes.microvm` for `?node_id=`, in one read — the row both
+    `build_pool_roster` and `_node_microvm` would read, with the same predicate. A row of Nones when no node answers,
+    which each reader takes exactly as its own empty read (`jaah_home` None, `microvm` False)."""
+    row = session.execute(
+        select(Node.jaah_home, Node.launch_kinds, Node.microvm).where(node_matches(node_id))
+    ).first()
+    return row if row is not None else SimpleNamespace(jaah_home=None, launch_kinds=None, microvm=None)
 
 
 def _node_microvm(session: Session, node_uuid: Optional[UUID]) -> bool:

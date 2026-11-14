@@ -7,11 +7,13 @@ import logging
 from typing import Awaitable, Callable
 
 import control_plane_api
-from reconcile import vocab, observe, enact_reset, enact_launch, enact_signal
+from jaah_env import env_number
+from reconcile import observe, enact_reset, enact_launch, enact_signal
 from reconcile.vocab import (
     OUTCOME_DONE, OUTCOME_FAILED, OUTCOME_REFUSED_PRECONDITION, OUTCOME_REFUSED_STALE, OUTCOME_UNSUPPORTED_VERB,
     VERB_DELIVER_ANSWER, VERB_DELIVER_MESSAGE, VERB_DESTROY_SLOT, VERB_ERASE_TREE, VERB_KILL_RUNNER,
-    VERB_LEASE_SLOT, VERB_RELEASE_SLOT, VERB_RESET_TO_BASE, VERB_RUNTIME_CONTROL, VERB_STOP_STACK, _UNSTAMPED_VERBS,
+    VERB_LEASE_SLOT, VERB_RELEASE_SLOT, VERB_RESET_TO_BASE, VERB_RUNTIME_CONTROL, VERB_STOP_STACK, VERB_SWITCH_MODEL,
+    _UNSTAMPED_VERBS,
 )
 from reconcile.tick_wire import RosterSlot, SlotIntent
 from reconcile.context import ReconcileContext
@@ -66,74 +68,9 @@ def observation_is_current(slot: RosterSlot, intent: SlotIntent) -> tuple[bool, 
     return True, ""
 
 
-# ── Hand-offs run off the pass ─────────────────────────────────────────────────────────────────────────
-# A console hand-off's lease waits up to `HANDOFF_CLOSE_WAIT_S` for its old front to close. Inside a pass that
-# wait held the pass's publish and every intent queued behind it, so `_execute_and_ack` starts it as a task
-# instead and answers `OUTCOME_IN_FLIGHT` (never acked: the row stays pending, and a re-serve finds the task).
-# The task acks its own outcome; a re-serve after it finished re-acks that outcome, never re-enacts it (a
-# second launch would open a second front beside the first). Keyed by intent id, per loop like `_slot_locks`.
+# An intent whose enactment is still running when the pass answers (`_enact_once`): never acked here — the row
+# stays pending, and a re-serve finds the enactment.
 OUTCOME_IN_FLIGHT = "in_flight"
-
-_HANDOFF_TASKS: "dict[object, asyncio.Task]" = {}
-
-_HANDOFF_TASKS_LOOP: "asyncio.AbstractEventLoop | None" = None
-
-
-# Finished hand-offs remembered for a re-serve that crossed their ack; oldest dropped past this.
-_HANDOFF_TASKS_KEPT = 256
-
-
-def _handoff_tasks() -> "dict[object, asyncio.Task]":
-    """The hand-off task table for the running loop, emptied if the loop changed."""
-    global _HANDOFF_TASKS, _HANDOFF_TASKS_LOOP
-    loop = asyncio.get_running_loop()
-    if loop is not _HANDOFF_TASKS_LOOP:
-        _HANDOFF_TASKS_LOOP = loop
-        _HANDOFF_TASKS = {}
-    return _HANDOFF_TASKS
-
-
-def _is_handoff_lease(intent: SlotIntent) -> bool:
-    return intent.verb == VERB_LEASE_SLOT and intent.payload.get("handoff") is not None
-
-
-def _handoff_progress(ctx: "ReconcileContext", slot: RosterSlot,
-                      intent: SlotIntent) -> "tuple[str, str, dict] | None":
-    """The hand-off `intent`'s finished `done` outcome, or None while it runs (started here on first sight, and
-    again on a re-serve after an attempt that did not end `done`)."""
-    tasks = _handoff_tasks()
-    task = tasks.get(intent.id)
-    if task is not None and task.done() and (task.cancelled() or task.result()[0] != OUTCOME_DONE):
-        # Only `done` retires the row: anything else was acked once and is re-served for a fresh attempt.
-        del tasks[intent.id]
-        task = None
-    if task is None:
-        while len(tasks) >= _HANDOFF_TASKS_KEPT:
-            oldest = next((key for key, t in tasks.items() if t.done()), None)
-            if oldest is None:
-                break
-            del tasks[oldest]
-        tasks[intent.id] = asyncio.get_running_loop().create_task(_handoff_then_ack(ctx, slot, intent))
-        return None
-    return task.result() if task.done() else None
-
-
-async def _handoff_then_ack(ctx: "ReconcileContext", slot: RosterSlot,
-                            intent: SlotIntent) -> "tuple[str, str, dict]":
-    """Close the old front (`_close_for_handoff`), enact the lease under the slot lock, ack. Never raises.
-
-    Enacted on `ctx.fresh()`: the pass that started this has published and moved on, and its snapshots predate
-    the old front's close, so they would show the tree as it stood before the wait."""
-    try:
-        handoff = intent.payload.get("handoff")
-        if isinstance(handoff, dict):
-            await enact_launch._close_for_handoff(slot, str(handoff.get("from_session_id") or ""), intent.payload.get("task_id"))
-        result = await execute_intent(ctx.fresh(), slot, intent)
-    except Exception as exc:  # noqa: BLE001 — a hand-off's failure is its own ack, never the loop's crash
-        log.warning("intent %s (hand-off %s #%s) failed: %s", intent.id, intent.project, intent.number, exc)
-        result = (OUTCOME_FAILED, f"the hand-off failed: {type(exc).__name__}: {exc}", {})
-    await _ack_intent(intent, *result)
-    return result
 
 
 # The executor table: one coroutine per verb, `(ctx, slot, intent, obs) -> (outcome, reason, ack_extras)`.
@@ -151,6 +88,7 @@ _INTENT_EXECUTORS: dict[str, Callable[..., Awaitable[tuple[str, str, dict]]]] = 
     VERB_DESTROY_SLOT: enact_signal._enact_destroy_slot,
     VERB_ERASE_TREE: enact_signal._enact_erase_tree,
     VERB_RUNTIME_CONTROL: enact_signal._enact_runtime_control,
+    VERB_SWITCH_MODEL: enact_signal._enact_switch_model,
 }
 
 
@@ -159,6 +97,7 @@ _INTENT_EXECUTORS: dict[str, Callable[..., Awaitable[tuple[str, str, dict]]]] = 
 # and `observe_slot` (they ignore its result). Their own fences are the whole fence.
 _PROJECTION_ADDRESSED_VERBS = frozenset({
     VERB_KILL_RUNNER, VERB_DELIVER_ANSWER, VERB_DELIVER_MESSAGE, VERB_ERASE_TREE, VERB_RUNTIME_CONTROL,
+    VERB_SWITCH_MODEL,
 })
 
 
@@ -304,6 +243,7 @@ async def execute_intents(
     intents: tuple[SlotIntent, ...],
     *,
     pushed: tuple[SlotIntent, ...] = (),
+    running: asyncio.Semaphore | None = None,
 ) -> dict[object, str]:
     """Execute every pending intent and ack each outcome. Runs before this pass publishes.
 
@@ -314,10 +254,12 @@ async def execute_intents(
 
     Independent chains run at once (`_intent_chains`, at most `_intent_concurrency()`), so a pass that
     leases N slots launches N runners together instead of one claim's git work after another; inside a chain
-    mint order holds. The network git ops stay serialized daemon-wide (`clone_identity.cloning`), and so do
-    tier-2 port picks (`worktree_mechanics.ports.apply_auto_ports`)."""
+    mint order holds. `running` is a bound SHARED across calls (the launch lane's, `main.NodeStatePublisher`), so
+    a batch pushed while another runs starts its chains as soon as a place frees instead of after the whole
+    earlier batch; absent, this call gets its own. The network git ops stay serialized daemon-wide
+    (`clone_identity.cloning`), and so do port picks (`worktree_mechanics.ports.apply_auto_ports`)."""
     outcomes: dict[object, str] = {}
-    running = asyncio.Semaphore(_intent_concurrency())
+    running = running if running is not None else asyncio.Semaphore(_intent_concurrency())
 
     async def run_chain(chain: list[SlotIntent]) -> None:
         async with running:
@@ -337,14 +279,15 @@ async def execute_intents(
     return outcomes
 
 
-# Lease chains in flight at once. 4: a claim is mostly a `git worktree add` checkout plus a launch, and more
-# at once only queues them on disk and on `clone_identity`'s one network-git lock.
+# Lease chains in flight at once. 4: a claim is mostly a clone or refresh plus a launch, and more
+# at once only queues them on disk and on the network.
 _INTENT_CONCURRENCY_DEFAULT = 4
 
 
 def _intent_concurrency() -> int:
-    """Intent chains executed at once, read per pass, floored at 1 (a bad value degrades to sequential)."""
-    return max(1, vocab._env_int("JAAHD_INTENT_CONCURRENCY", _INTENT_CONCURRENCY_DEFAULT))
+    """Intent chains executed at once, floored at 1 (a bad value degrades to sequential): read per call for a
+    pass's own bound, once for the launch lane's shared one (`main.NodeStatePublisher._launch_lane_slots`)."""
+    return max(1, env_number("JAAHD_INTENT_CONCURRENCY", _INTENT_CONCURRENCY_DEFAULT, parse=int))
 
 
 def _intent_chains(ordered: tuple[SlotIntent, ...]) -> list[list[SlotIntent]]:
@@ -389,12 +332,6 @@ async def _execute_and_ack(
         why = f"{intent.project} #{intent.number} is not in this pass's roster"
         log.warning("intent %s (%s): %s — refusing", intent.id, intent.verb, why)
         outcome = OUTCOME_REFUSED_PRECONDITION
-    elif _is_handoff_lease(intent):
-        # Off the pass (`_handoff_progress`): its own task acks it; a finished one is re-acked below.
-        finished = _handoff_progress(ctx, slot, intent)
-        if finished is None:
-            return OUTCOME_IN_FLIGHT
-        outcome, why, extras = finished
     elif intent.verb in _ENACT_ONCE_VERBS:
         enacted = await _enact_once(ctx, slot, intent)
         if enacted is None:
@@ -410,14 +347,14 @@ async def _execute_and_ack(
 # Verbs enacted at most once per intent id on this node (`_enact_once`): each can be served by two lanes at
 # once — a pushed copy in its fast lane (`orchestrate.launch_lane_intents`) and the projection pass's polled
 # twin. A second `lease_slot` kills the fresh runner; a second `deliver_answer`/`deliver_message` types the
-# same text into the pane twice.
-_ENACT_ONCE_VERBS = frozenset({VERB_LEASE_SLOT, VERB_DELIVER_ANSWER, VERB_DELIVER_MESSAGE})
+# same text into the pane twice; a second `switch_model` drives the CLI's picker twice.
+_ENACT_ONCE_VERBS = frozenset({VERB_LEASE_SLOT, VERB_DELIVER_ANSWER, VERB_DELIVER_MESSAGE, VERB_SWITCH_MODEL})
 
 # Each `_ENACT_ONCE_VERBS` intent this node enacted, by intent id, so a re-serve joins or re-acks it instead of
 # enacting it again. The row stays pending until the ack lands, so the projection pass (or a joined pool tick)
 # serves the copy a lane is enacting; a second enactment of a resume killed that fresh runner before its
-# launch-claim was refused, and every relaunch of the task died unsighted. Per loop and bounded, like
-# `_HANDOFF_TASKS`; lost on restart, where the CP's one-per-generation launch-claim is the backstop.
+# launch-claim was refused, and every relaunch of the task died unsighted. Per loop and bounded; lost on
+# restart, where the CP's one-per-generation launch-claim is the backstop.
 _ONCE_TASKS: "dict[object, asyncio.Task]" = {}
 
 _ONCE_TASKS_LOOP: "asyncio.AbstractEventLoop | None" = None

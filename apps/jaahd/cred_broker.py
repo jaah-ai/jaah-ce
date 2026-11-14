@@ -31,13 +31,15 @@ own control listener, which `jaah-microvmd` created and hands over tagged with t
 guest sends, no uid and no process ancestry is consulted for it. Git credential: a peer inside a runner gets its task's launcher's token
 (`/tasks/{id}/git-token`); a peer in NO runner gets the system arm (`/git-token?project=`), the credential
 of the human who declared that project's slots, with the project read from `clone_identity` (in-process,
-never the socket). A project may connect several repositories: a runner's login is for the
+never the socket). A daemon op acting for a "Repo script" trigger (`clone_identity.Acting`, kind `trigger`) gets the
+trigger owner's login for the grant the CP minted (`/trigger-preflights/git-token`, `_resolve_trigger`). A project may connect several repositories: a runner's login is for the
 repository of the checkout it works in (`_caller_repo_id`), judged by `slot_repos.checkout_repo_id` from where
 that checkout sits among its OWN slot's (the slot is the primary, `_repos/<rid>/<N>` repository `<rid>`); a caller
 cannot name a repository id, and the CP refuses one its task's project does not connect. A MicroVM guest's
 repository is the one its reported checkout sits in under `/jaah/repos/<rid>` (`_vm_repo_id`), admitted only
-among the repositories `vms.json` records the VM holding. The system arm requires positive proof via `clone_identity.is_delegated_op`;
-residual: a deployment running daemon and runners under one uid.
+among the repositories `vms.json` records the VM holding. The system arm admits this daemon's own uid only, and
+serves it what its op was registered under (`clone_identity.delegated_op_of`); residual: a deployment running
+daemon and runners under one uid.
 
 Cache: keyed by RESOLVED IDENTITY (`task:<id>:<run>` / `system:<project>`), never by name — a name key would hand
 the first runner's user's token to every other. A git identity caches its whole login once; each git name
@@ -60,6 +62,7 @@ import os
 import posixpath
 import secrets
 import stat
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -126,9 +129,11 @@ _GIT_CREDENTIAL = "git_credential"
 # The pinned `GitTokenOut` wire (`apps/api/app/routes/agent/task_secrets.py`), and the only fields `git_credential`
 # serves: an extra field the CP adds later is dropped here until it is argued for, never passed through.
 # `write_problem` is argued for: the CP's sentence naming why no credential of the starter's can write to the
-# repository, which `jaah-forge` appends to a refused write so the runner asks for exactly that.
+# repository, which `jaah-forge` appends to a refused write so the runner asks for exactly that. `jaah_repo_prefix` is
+# too: what a Jaah-org destination must start with (`git_credential_helper.jaah_prefix_refusal`), "" when unknown.
 _GIT_LOGIN_FIELDS = (
-    "scheme", "username", "token", "host", "root", "forge", "api_base", "repo_path", "web_url", "write_problem")
+    "scheme", "username", "token", "host", "root", "forge", "api_base", "repo_path", "web_url", "write_problem",
+    "jaah_repo_prefix")
 # The one home of the name's prefix (`apps/api/app/account_auth.py` borrows it from the same file by path).
 _ACCOUNT_API_KEY_PREFIX = account_auth.NODE_CREDENTIAL_PREFIX
 
@@ -139,6 +144,10 @@ _TASK_GIT_TOKEN_PATH = "/api/agent/tasks/{task_id}/git-token"
 # credential pointer), so the slug selects, never authorizes.
 _ACCOUNT_API_KEY_PATH = "/api/agent/accounts/{slug}/api-key"
 _CLONE_GIT_TOKEN_PATH = "/api/agent/git-token"
+# A "Repo script" trigger's preflight clone: the CP authorizes on the grant it minted (`clone_identity.Acting`).
+_TRIGGER_GIT_TOKEN_PATH = "/api/agent/trigger-preflights/git-token"
+# The grant rides a header (`apps/api/app/routes/agent/task_secrets.py::TRIGGER_GRANT_HEADER`), never the URL.
+_TRIGGER_GRANT_HEADER = "X-Trigger-Grant"
 # K3, a Jaah session's short-lived Bedrock credentials (`app/jaah_routing/credentials.py`). The CP
 # authorizes on the session row: this node, the runner's task (`X-Agent-Task-Id`), open, above the floor.
 _BEDROCK_CREDENTIALS_PATH = "/api/agent/bedrock-credentials"
@@ -182,7 +191,7 @@ _BEDROCK_EXPIRY_MARGIN_S = 300.0
 _GIT_TOKEN_TIMEOUT_S = 30.0
 
 # Doubles as the StreamReader limit, so an over-long line raises rather than buffers. Sized for the `call`
-# shape: `task.complete` carries up to 100 000 characters, and 256 KiB matches `agent_socket`'s reply cap.
+# shape: `task.complete` carries up to 100 000 characters. A request cap only: replies are written uncapped.
 _MAX_REQUEST_BYTES = 262144
 
 # A leak guard for a client that connects and says nothing; real clients write immediately.
@@ -205,8 +214,6 @@ _ERR_REJECTED = "rejected"
 
 # The only binding bound on a `rejected` detail (the upstream body keeps 8 KiB for parsing).
 _MAX_REJECTED_DETAIL = 300
-# Over the cap: told to come back, never queued — queueing turns a flood into a wedge.
-_ERR_BUSY = "busy"
 
 # A NodeVault credential this node cannot open (`_open_nodevault`). Each carries a fixed, locally authored
 # `detail` on the wire — the runner must learn WHY, and nothing in it comes from a caller or the CP.
@@ -222,12 +229,16 @@ _MAX_REFUSAL_DETAIL = 600
 # Mirror of `MAX_ATTACHMENT_SIZE` (`apps/api/app/routes/attachments.py`), enforced against the caller's own
 # descriptor before any transfer; the org's own, lower limit is the control plane's to refuse at the ticket.
 # 5 GiB is safe ONLY because `_upload_file_body` streams off the fd (`session_sweep.put_object`); buffered,
-# x `_MAX_INFLIGHT`, it would take the root daemon down.
+# x `_CALL_WORKERS`, it would take the root daemon down.
 _MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024
 
 # The multipart fallback's ceiling (taken only on a bucketless CP's 503): that door READS THE WHOLE FILE
 # into this process, so it keeps the pre-ticket number.
 _MAX_BUFFERED_UPLOAD_BYTES = 25 * 1024 * 1024
+# AS1 MEMORY bound on that door, not a concurrency cap: each buffered upload holds about two copies of its file
+# (the read and the multipart body), so `_CALL_WORKERS` at once would be ~3 GiB in the root daemon. Past four,
+# a buffered upload WAITS here for its turn; it is never refused.
+_BUFFERED_UPLOADS = threading.BoundedSemaphore(4)
 
 # The two `daemon_only` steps of a `file_body` verb, by name, so URLs stay in the vocabulary table.
 _ARTIFACT_TICKET_VERB = "artifact.upload_begin"
@@ -249,79 +260,35 @@ _O_BINARY = getattr(os, "O_BINARY", 0)
 
 # A dedicated executor, not `to_thread`'s shared default (8 workers on 4 cores, also serving credential
 # fetches), so a socket flood cannot starve git's credential helper or the daemon's own loops. The longest verb is
-# `artifact.upload` (400s).
-_MAX_INFLIGHT = 8
-_MAX_INFLIGHT_PER_PEER = 2
-# Accepted connections, separately: each holds a 256 KiB reader for up to `_READ_TIMEOUT`, so an unbounded
-# accept lets a dribbling peer grow memory and fds at will.
-_MAX_CONNECTIONS = 64
+# `artifact.upload` (400s). No per-caller or node-wide in-flight count is refused: a call past
+# the workers queues on the executor, it is never answered `busy`. Its size is a thread budget, not a cap.
+# Threads, not async httpx: every verb leaves by the synchronous credentialed opener
+# (`control_plane_api._agent_urlopen`) and an upload streams off a blocking fd (`session_sweep.put_object`).
+_CALL_WORKERS = 64
+# AS1 FILE-DESCRIPTOR bound, not a concurrency cap: each accepted connection holds one fd and a 256 KiB reader
+# for up to `_READ_TIMEOUT` (a parked wait for its whole poll), so an unbounded accept lets a dribbling peer
+# exhaust the root daemon's fds and memory. 1024 sits well under the unit's `LimitNOFILE` (65536, the jaahd
+# systemd units), which the bus, git pipes and state files share, and is over 10x the peak a node's runners hold.
+_MAX_CONNECTIONS = 1024
 _OPEN_CONNECTIONS = 0
 _CALL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=_MAX_INFLIGHT, thread_name_prefix="cred-broker-call")
-_INFLIGHT_BY_PEER: dict[str, int] = {}
+    max_workers=_CALL_WORKERS, thread_name_prefix="cred-broker-call")
 
 
 def _peer_key(uid: int, pid: int) -> str:
-    """The principal the in-flight cap is charged to — NOT the raw pid.
+    """The principal a caller is charged to in the journal and the wait lane's bookkeeping — NOT the raw pid.
 
-    `fork()` gives fresh pids, so a pid-keyed cap never binds. A runner's PANE pid is shared by its
-    descendants and unchoosable; a non-runner is charged as its uid."""
+    `fork()` gives fresh pids. A runner's PANE pid is shared by its descendants and unchoosable; a
+    non-runner is charged as its uid."""
     identity = runner_registry.resolve_peer(pid)
     return f"pane:{identity.pane_pid}" if identity else f"uid:{uid}"
 
 
-def _acquire_slot(key: str) -> bool:
-    """Charge one in-flight CP call to `key`, or refuse. On the event loop with no `await` between read and
-    write, so no lock."""
-    if _INFLIGHT_BY_PEER.get(key, 0) >= _MAX_INFLIGHT_PER_PEER:
-        return False
-    if sum(_INFLIGHT_BY_PEER.values()) >= _MAX_INFLIGHT:
-        return False
-    _INFLIGHT_BY_PEER[key] = _INFLIGHT_BY_PEER.get(key, 0) + 1
-    return True
-
-
-def _release_slot(key: str) -> None:
-    """Release one; popping at zero keeps the dict bounded by concurrent in-flight."""
-    remaining = _INFLIGHT_BY_PEER.get(key, 1) - 1
-    if remaining > 0:
-        _INFLIGHT_BY_PEER[key] = remaining
-    else:
-        _INFLIGHT_BY_PEER.pop(key, None)
-
-
 # The WAIT LANE: an ACP host's long polls (`LocalVerb.wait`, `acp/runtime.py`) are parked on the loop as
-# futures for up to `runtime.MAX_WAIT_S`, never on `_CALL_EXECUTOR` nor charged to `_INFLIGHT_BY_PEER` — a node
-# of parked hosts would otherwise hold every slot an ordinary verb needs. Their own caps: per principal (a
-# host holds two polls; one spare for a reconnect overlap), and node-wide, scaled to the live runners.
-_MAX_WAIT_PER_PEER = 3
-_WAIT_RUNNER_FLOOR = 8
+# futures for up to `runtime.MAX_WAIT_S`, never on `_CALL_EXECUTOR` — a node of parked hosts would otherwise
+# hold every worker an ordinary verb needs. No count of parked polls is refused; each is
+# counted per principal only so tests and the journal can see the lane.
 _WAIT_BY_PEER: dict[str, int] = {}
-
-
-# The node cap's runner count, re-read at most every `_WAIT_CAP_TTL_S` (it is on the loop, per wait).
-_WAIT_CAP_TTL_S = 5.0
-_WAIT_CAP_CACHE: dict[str, float] = {}
-
-
-def _wait_node_cap() -> int:
-    now = time.monotonic()
-    cached = _WAIT_CAP_CACHE.get("cap")
-    if cached is not None and now - _WAIT_CAP_CACHE.get("at", 0.0) < _WAIT_CAP_TTL_S:
-        return int(cached)
-    try:
-        live = len(runner_registry.live_runners())
-    except Exception as exc:  # noqa: BLE001 — an unreadable registry falls back to the floor
-        log.debug("cred-broker: live runner count unreadable (%s) — the wait cap uses its floor", exc)
-        live = 0
-    if host_platform.is_linux() and microvm_registry is not None:
-        try:  # a MicroVM's host speaks over its VM listener, not a registered pane: best effort
-            live += len(microvm_registry.load())
-        except Exception as exc:  # noqa: BLE001
-            log.debug("cred-broker: VM binding count unreadable (%s)", exc)
-    cap = 3 * max(_WAIT_RUNNER_FLOOR, live)
-    _WAIT_CAP_CACHE.update(cap=cap, at=now)
-    return cap
 
 
 def _host_fence(identity: runner_registry.RunnerIdentity | None, pid: int, vm: VmCaller | None,
@@ -362,8 +329,7 @@ async def _serve_wait(row: agent_vocabulary.LocalVerb, args: object, uid: int, p
                       peer_key: str, capability: object = "") -> tuple[str, dict]:
     """One wait verb, awaited on the loop → `(outcome, reply)`. Identity is the peer's (`_identity_of`); the
     hub fences the args to that identity's session. Never logs the result (operator words)."""
-    global _OPEN_CONNECTIONS
-    # The fence first: a caller that is not a host is refused before it is charged to any cap.
+    # The fence first: a caller that is not a host is refused before it is counted in the lane.
     try:
         identity = _host_fence(_identity_of(uid, pid, vm), pid, vm, row.name, capability)
     except agent_vocabulary.VerbRefused as refused:
@@ -375,14 +341,9 @@ async def _serve_wait(row: agent_vocabulary.LocalVerb, args: object, uid: int, p
     if identity is None:
         log.warning("cred-broker: uid=%s pid=%s refused: %s from no live runner", uid, pid, row.name)
         return agent_vocabulary.ERR_NOT_A_RUNNER, {"ok": False, "error": agent_vocabulary.ERR_NOT_A_RUNNER}
-    if _WAIT_BY_PEER.get(peer_key, 0) >= _MAX_WAIT_PER_PEER or sum(_WAIT_BY_PEER.values()) >= _wait_node_cap():
-        log.warning("cred-broker: uid=%s pid=%s over the wait cap (key=%s total=%s)",
-                    uid, pid, peer_key, sum(_WAIT_BY_PEER.values()))
-        return _ERR_BUSY, {"ok": False, "error": _ERR_BUSY}
     _WAIT_BY_PEER[peer_key] = _WAIT_BY_PEER.get(peer_key, 0) + 1
-    # A parked poll has finished reading, so it does not count against `_MAX_CONNECTIONS` (the guard against
-    # dribbling readers) — else parked hosts would lock every ordinary caller out at accept.
-    _OPEN_CONNECTIONS -= 1
+    # A parked poll still holds its fd, so it stays counted against the AS1 fd bound `_MAX_CONNECTIONS`: with no
+    # count cap on the lane, that bound is the one thing between a looping host and fd exhaustion.
     try:
         from acp import runtime  # noqa: PLC0415 — only an ACP host's call needs it
 
@@ -396,7 +357,6 @@ async def _serve_wait(row: agent_vocabulary.LocalVerb, args: object, uid: int, p
         log.warning("cred-broker: uid=%s pid=%s call %s failed: %s", uid, pid, row.name, type(exc).__name__)
         return _ERR_UNAVAILABLE, {"ok": False, "error": _ERR_UNAVAILABLE}
     finally:
-        _OPEN_CONNECTIONS += 1
         remaining = _WAIT_BY_PEER.get(peer_key, 1) - 1
         if remaining > 0:
             _WAIT_BY_PEER[peer_key] = remaining
@@ -594,13 +554,13 @@ def _fetch_git_login(
 # the only thing the `credential` shape reaches for git.
 
 
-def _fetch_account_api_key(slug: str, uid: int, pid: int) -> str:
-    """Ask the control plane for ONE API-key account's model key (Anthropic, OpenAI, ...). Returns it, or "" when the CP
-    answered with none.
+def _fetch_account_api_key_body(slug: str, uid: int, pid: int) -> dict:
+    """Ask the control plane for ONE API-key account's key record: `{api_key, workspace_id}` (Anthropic, OpenAI,
+    ...); `{}` when the CP answered with no JSON object.
 
     Not a name lookup: the slug selects an account and the CP authorizes on the row, answering an
     undisclosing 404 otherwise, so no other credential is reachable. No `X-Agent-Task-Id` — the account,
-    not a task, is the subject. A 4xx propagates (`rejected`). The value is a LIVE KEY: never logged or
+    not a task, is the subject. A 4xx propagates (`rejected`). The body holds a LIVE KEY: never logged or
     interpolated; the log line carries the slug. Synchronous; run on `_CALL_EXECUTOR`."""
     path = _ACCOUNT_API_KEY_PATH.format(slug=urllib.parse.quote(slug, safe=""))
     log.info("cred-broker: uid=%s pid=%s account api-key -> GET %s", uid, pid, path)
@@ -609,7 +569,13 @@ def _fetch_account_api_key(slug: str, uid: int, pid: int) -> str:
         headers=control_plane_api._agent_headers(), method="GET")
     raw = control_plane_api._agent_urlopen(req, timeout=_GIT_TOKEN_TIMEOUT_S)
     body = json.loads(raw) if raw else {}
-    api_key = body.get("api_key") if isinstance(body, dict) else None
+    return body if isinstance(body, dict) else {}
+
+
+def _fetch_account_api_key(slug: str, uid: int, pid: int) -> str:
+    """The model key of `_fetch_account_api_key_body`, or "" when the CP answered with none. A LIVE KEY: never
+    logged."""
+    api_key = _fetch_account_api_key_body(slug, uid, pid).get("api_key")
     return str(api_key) if api_key else ""
 
 
@@ -629,6 +595,16 @@ def account_api_key(slug: str) -> str:
     account's key to its CLI on stdin (`AcpLaunch.prepare`). "" when the CP has none; raises what the fetch
     raises. The value is a LIVE KEY: never logged."""
     return _fetch_account_api_key(slug, _daemon_uid(), os.getpid())
+
+
+def account_workspace_id(slug: str) -> str:
+    """The Anthropic workspace an UNSCOPED API key must name on every request (`anthropic-workspace-id`), from
+    the same CP record as the key; "" when the account has none or the CP predates the field. NON-secret (an id,
+    not a credential), so a launch may write it into a settings file; the key in that body is dropped unread.
+    Raises what the fetch raises — a launch site decides whether that fails it (it does not:
+    `fleet_dispatch.api_key_workspace_id`)."""
+    workspace_id = _fetch_account_api_key_body(slug, _daemon_uid(), os.getpid()).get("workspace_id")
+    return str(workspace_id) if workspace_id else ""
 
 
 def _identity_key(
@@ -772,21 +748,29 @@ async def _resolve_for(name: str, uid: int, pid: int, peer: runner_registry.Runn
     # ONE ancestry walk, used for both admission and the declaration served: a second walk could find the op
     # gone (git exited, the requester reparented) and fall through to another thread's live declaration.
     is_daemon = uid == _daemon_uid()
-    delegated = clone_identity.delegated_declaration(pid)
-    if peer is None and not console_slug and not vm_caller and not is_daemon and delegated is None:
+    delegated_op = clone_identity.delegated_op_of(pid)
+    delegated, acting = delegated_op if delegated_op is not None else (None, None)
+    if peer is None and not console_slug and not vm_caller and not is_daemon:
         # The system arm needs a POSITIVE proof, not an absent pane: a runner that double-forks loses its
         # ancestry (it cannot forge it) and would otherwise be promoted to the slot-declarer's credential.
         # The uid is the kernel's; runners are `jaah`, the daemon `jaahd` (Windows: the
-        # daemon's service SID, folded to `_daemon_uid()` by `_peer_identity`). The daemon's own
-        # delegated git ops pass via `clone_identity.is_delegated_op` — a registry of daemon-started ops,
-        # empty when none is in flight (see `clone_identity`). Not covered: a deployment running daemon and
-        # runners under ONE uid, which this fleet does not. `not_a_runner`, as the control tools say it: the
+        # daemon's service SID, folded to `_daemon_uid()` by `_peer_identity`). Only the daemon's uid passes:
+        # every credentialed git op runs as the daemon (`git_mirror`), never on the session user's tmux
+        # channel, so even a process descending from a registered op is refused on any other uid. Not
+        # covered: a deployment running daemon and runners under ONE uid, which this fleet does not. `not_a_runner`, as the control tools say it: the
         # git helper prints only this word, and `bad_request` hid the cause on a real PC.
         raise agent_vocabulary.VerbRefused(
             agent_vocabulary.ERR_NOT_A_RUNNER,
             f"pid {pid} is not a runner and is not this daemon, so it has no git identity to serve",
         )
     task_id = peer.task_id if peer else ""
+    # A daemon git op acting for a task (`clone_identity.acting_for`: a slot's clone or refresh at its lease) is
+    # served THAT task's login through the task arm, as its runner would be — never the system arm's declarer.
+    acting_run = ""
+    if peer is None and acting is not None:
+        if acting.kind == clone_identity.ACTING_TRIGGER:
+            return await _resolve_trigger(name, acting.id, uid, pid)
+        task_id, acting_run = acting.id, acting.run
     # The second name this shape serves: an account key is authorized by the CP on the ACCOUNT row, with
     # its own route, cache namespace and fetch — but it still borrows the identity proof above (only a live
     # runner or this daemon), so no `jaah` process can walk the roster. The CP also refuses a caller whose
@@ -833,20 +817,26 @@ async def _resolve_for(name: str, uid: int, pid: int, peer: runner_registry.Runn
         # one: another thread's `cloning` may hold it for a different project, and an undeclared op — or a
         # filter driver planted in this op's tree — would be handed that project's token.
         project, project_id, repo_id = delegated or ("", None, None)
+    elif peer is None and acting is not None:
+        # An acting op names its repository itself (`Acting.repo_id`): the slot's layout is being built.
+        project, project_id, repo_id = "", None, acting.repo_id
     else:
         # Off the loop: it reads session-user files, and a stalled read must stall one request, not the daemon.
         project, project_id = "", None
         repo_id = (None if account_slug else vm_repo_id if vm_caller
                    else await loop.run_in_executor(_CALL_EXECUTOR, _caller_repo_id, peer, _CALLER_CHECKOUT.get()))
+    run = peer.session_id if peer else acting_run
     identity = (
         _account_identity_key(account_slug) if account_slug
-        # The run's session (from launch). A task ask naming no
+        # The run's session (from launch), or the dispatch an acting op leases for. A task ask naming no
         # run is never cached (below): nothing would tell a restart apart from the run before it.
-        else _identity_key(task_id, project, peer.session_id if peer else "", project_id, repo_id))
-    cacheable = bool(account_slug) or not task_id or bool(peer and peer.session_id)
+        else _identity_key(task_id, project, run, project_id, repo_id))
+    cacheable = bool(account_slug) or not task_id or bool(run)
     now = time.monotonic()
     cached = _CACHE.get(identity)
-    if cached and cached[0] > now and (account_slug or not _CALLER_FRESH.get()):
+    # A system-arm login whose last op the forge refused (`clone_identity.take_refused_login`) is read past once.
+    refused = not task_id and not account_slug and clone_identity.take_refused_login((project, project_id, repo_id))
+    if cached and cached[0] > now and (account_slug or not _CALLER_FRESH.get()) and not refused:
         return _project(name, cached[1]), True, identity
     if account_slug:
         value = await loop.run_in_executor(_CALL_EXECUTOR, _fetch_account_api_key, account_slug, uid, pid)
@@ -860,6 +850,53 @@ async def _resolve_for(name: str, uid: int, pid: int, peer: runner_registry.Runn
         _CACHE[identity] = (
             now + (_ACCOUNT_KEY_TTL_S if account_slug else _GIT_CREDENTIAL_TTL_S), value)
     return _project(name, value), False, identity
+
+
+async def _resolve_trigger(name: str, grant: str, uid: int, pid: int) -> tuple["str | dict[str, str]", bool, str]:
+    """`_resolve` for a daemon op acting for a "Repo script" trigger (`worktree_ops.trigger_preflight`): the
+    trigger owner's git login, traded for the CP's `grant` at the trigger arm. A git login only — an account key
+    or anything else asked by such an op is refused. Cached under `trigger:<grant>`, never past the grant's own
+    expiry (the CP refuses it after that anyway)."""
+    if name != _GIT_CREDENTIAL:
+        raise agent_vocabulary.VerbRefused(
+            _ERR_BAD_REQUEST, f"pid {pid} acts for a trigger, which is served a git login only")
+    identity = f"trigger:{grant}"
+    now = time.monotonic()
+    cached = _CACHE.get(identity)
+    if cached and cached[0] > now and not _CALLER_FRESH.get():
+        return _project(name, cached[1]), True, identity
+    value = await asyncio.get_running_loop().run_in_executor(_CALL_EXECUTOR, _fetch_trigger_git_login, grant, uid, pid)
+    ttl = min(_GIT_CREDENTIAL_TTL_S, _grant_expiry(grant) - time.time())
+    if value and ttl > 0:
+        _prune_expired(now)
+        _CACHE[identity] = (now + ttl, value)
+    return _project(name, value), False, identity
+
+
+def _grant_expiry(grant: str) -> float:
+    """The `exp` a grant's body names (epoch seconds), read unverified — it only bounds this node's cache — or 0
+    when it names none, so nothing is cached."""
+    body = grant.partition(".")[0]
+    try:
+        exp = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))).get("exp")
+    except (ValueError, TypeError, AttributeError):
+        return 0.0
+    return float(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else 0.0
+
+
+def _fetch_trigger_git_login(grant: str, uid: int, pid: int) -> dict[str, str]:
+    """`_fetch_git_login` for the trigger arm: `GET /api/agent/trigger-preflights/git-token` with the grant in the
+    `X-Trigger-Grant` header — never the URL, which error logs here and access logs at the CP record. A 4xx
+    propagates (`rejected`)."""
+    log.info("cred-broker: uid=%s pid=%s git credential -> GET %s (trigger grant)", uid, pid, _TRIGGER_GIT_TOKEN_PATH)
+    req = urllib.request.Request(
+        f"{control_plane_api.resolve_control_plane_api_base()}{_TRIGGER_GIT_TOKEN_PATH}",
+        headers={**control_plane_api._agent_headers(), _TRIGGER_GRANT_HEADER: grant}, method="GET")
+    raw = control_plane_api._agent_urlopen(req, timeout=_GIT_TOKEN_TIMEOUT_S)
+    body = json.loads(raw) if raw else {}
+    if not isinstance(body, dict) or not body.get("token"):
+        return {}
+    return {field: str(body.get(field) or "") for field in _GIT_LOGIN_FIELDS}
 
 
 async def _resolve_bedrock(name: str, uid: int, pid: int) -> tuple[str, bool, str]:
@@ -939,10 +976,8 @@ def _is_inside(root_real: str, candidate: str) -> bool:
         return False
 
 
-def _refuse_upload(reason: str, detail: str) -> agent_vocabulary.VerbRefused:
-    """One constructor for every refusal below: `detail` (with the path) goes to the journal, `reason` to
-    the wire — echoing a path would answer "does `/etc/jaah/node.env` exist?" to any `jaah` process."""
-    return agent_vocabulary.VerbRefused(reason, detail)
+# Every upload refusal below is a `VerbRefused(reason, detail)`: `detail` (with the path) goes to the journal,
+# `reason` to the wire — echoing a path would answer "does `/etc/jaah/node.env` exist?" to any `jaah` process.
 
 
 def _fd_path(fd: int) -> str:
@@ -960,10 +995,10 @@ def _refuse_unless_runner_owned(fd: int, pid: int, candidate: str) -> None:
     try:
         owner, runner = windows.file_owner_sid(fd), windows.runner_sid()
     except OSError as exc:
-        raise _refuse_upload(agent_vocabulary.ERR_FORBIDDEN_ARG,
+        raise agent_vocabulary.VerbRefused(agent_vocabulary.ERR_FORBIDDEN_ARG,
                              f"pid {pid}: cannot confirm who owns {candidate} ({exc})") from None
     if owner != runner:
-        raise _refuse_upload(
+        raise agent_vocabulary.VerbRefused(
             agent_vocabulary.ERR_FORBIDDEN_ARG,
             f"pid {pid}: {candidate} is owned by {owner}, not the runner account — a report must be a "
             f"file the caller itself wrote")
@@ -989,7 +1024,7 @@ def _open_confined_upload(named: str, pid: int, uid: int, vm: VmCaller | None = 
     root = identity.report_dir if identity else ""
     if not root:
         # Absent must deny: an empty root would confine to "/" for a root reader.
-        raise _refuse_upload(agent_vocabulary.ERR_FORBIDDEN_ARG,
+        raise agent_vocabulary.VerbRefused(agent_vocabulary.ERR_FORBIDDEN_ARG,
                              f"pid {pid}: no report directory recorded for this caller, so no path is "
                              f"confinable")
     root_real = os.path.realpath(root)
@@ -998,10 +1033,10 @@ def _open_confined_upload(named: str, pid: int, uid: int, vm: VmCaller | None = 
     joined = os.path.join(root_real, named)
     base = os.path.basename(joined)
     if base in ("", ".", ".."):
-        raise _refuse_upload(_ERR_BAD_REQUEST, f"pid {pid}: {named!r} names no file")
+        raise agent_vocabulary.VerbRefused(_ERR_BAD_REQUEST, f"pid {pid}: {named!r} names no file")
     candidate = os.path.join(os.path.realpath(os.path.dirname(joined)), base)
     if not _is_inside(root_real, candidate):
-        raise _refuse_upload(
+        raise agent_vocabulary.VerbRefused(
             agent_vocabulary.ERR_FORBIDDEN_ARG,
             f"pid {pid}: {named!r} resolves to {candidate}, outside this runner's report directory {root_real}")
 
@@ -1013,15 +1048,15 @@ def _open_confined_upload(named: str, pid: int, uid: int, vm: VmCaller | None = 
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             # `O_NOFOLLOW` fired: a policy refusal, whatever the link points at.
-            raise _refuse_upload(agent_vocabulary.ERR_FORBIDDEN_ARG,
+            raise agent_vocabulary.VerbRefused(agent_vocabulary.ERR_FORBIDDEN_ARG,
                                  f"pid {pid}: {candidate} is a symlink; a report must be a real file") \
                 from None
-        raise _refuse_upload(_ERR_BAD_REQUEST, f"pid {pid}: cannot open {candidate}: {exc}") from None
+        raise agent_vocabulary.VerbRefused(_ERR_BAD_REQUEST, f"pid {pid}: cannot open {candidate}: {exc}") from None
     try:
         st = os.fstat(fd)
         # `fstat`, never a path stat, which could describe a different inode.
         if not stat.S_ISREG(st.st_mode):
-            raise _refuse_upload(agent_vocabulary.ERR_FORBIDDEN_ARG,
+            raise agent_vocabulary.VerbRefused(agent_vocabulary.ERR_FORBIDDEN_ARG,
                                  f"pid {pid}: {candidate} is not a regular file (mode {st.st_mode:#o})")
         # The inode must belong to the caller (`uid` is SO_PEERCRED): closes a cross-owner hard link
         # (`ln /etc/jaah/node.env $WT/report.html`), which `O_NOFOLLOW` admits. `fs.protected_hardlinks`
@@ -1031,14 +1066,14 @@ def _open_confined_upload(named: str, pid: int, uid: int, vm: VmCaller | None = 
             # runner can be is the runner account.
             _refuse_unless_runner_owned(fd, pid, candidate)
         elif st.st_uid != uid:
-            raise _refuse_upload(
+            raise agent_vocabulary.VerbRefused(
                 agent_vocabulary.ERR_FORBIDDEN_ARG,
                 f"pid {pid}: {candidate} is owned by uid {st.st_uid}, not the calling uid {uid} — a "
                 f"report must be a file the caller itself wrote")
         # Exactly one link: a same-uid hard link to a SIBLING runner's file would upload under this task.
         # Buys confinement and attribution, not anti-exfiltration (the caller could inline the bytes).
         if st.st_nlink != 1:
-            raise _refuse_upload(
+            raise agent_vocabulary.VerbRefused(
                 agent_vocabulary.ERR_FORBIDDEN_ARG,
                 f"pid {pid}: {candidate} has {st.st_nlink} links, so the name is not the inode's only "
                 f"one — a report must be a file this runner wrote inside its own report directory")
@@ -1047,16 +1082,16 @@ def _open_confined_upload(named: str, pid: int, uid: int, vm: VmCaller | None = 
             opened = _fd_path(fd)
         except OSError as exc:
             # Fail closed: an unanswerable containment question is a denial.
-            raise _refuse_upload(agent_vocabulary.ERR_FORBIDDEN_ARG,
+            raise agent_vocabulary.VerbRefused(agent_vocabulary.ERR_FORBIDDEN_ARG,
                                  f"pid {pid}: cannot confirm what fd {fd} opened ({exc})") from None
         if not _is_inside(root_real, opened):
-            raise _refuse_upload(
+            raise agent_vocabulary.VerbRefused(
                 agent_vocabulary.ERR_FORBIDDEN_ARG,
                 f"pid {pid}: {named!r} opened {opened}, outside this runner's report directory {root_real}")
         # Size from `fstat` — the inode about to be read; the CP's refusal would arrive only after the
         # whole transfer.
         if st.st_size > _MAX_UPLOAD_BYTES:
-            raise _refuse_upload(
+            raise agent_vocabulary.VerbRefused(
                 agent_vocabulary.ERR_FORBIDDEN_ARG,
                 f"pid {pid}: {opened} is {st.st_size} bytes, over the {_MAX_UPLOAD_BYTES} byte cap")
     except BaseException:
@@ -1076,7 +1111,7 @@ def _read_confined_upload(named: str, pid: int, uid: int, vm: VmCaller | None = 
     cap = min(_MAX_UPLOAD_BYTES, _MAX_BUFFERED_UPLOAD_BYTES)
     try:
         if size > cap:
-            raise _refuse_upload(
+            raise agent_vocabulary.VerbRefused(
                 agent_vocabulary.ERR_FORBIDDEN_ARG,
                 f"pid {pid}: {candidate} is {size} bytes, over the {cap} byte cap this control plane's "
                 f"buffered upload route may be handed — it has no object storage to stream to")
@@ -1086,7 +1121,7 @@ def _read_confined_upload(named: str, pid: int, uid: int, vm: VmCaller | None = 
         os.close(fd)
     if len(blob) > cap:
         # Grown since the `fstat`: bound on what was ACTUALLY read.
-        raise _refuse_upload(agent_vocabulary.ERR_FORBIDDEN_ARG,
+        raise agent_vocabulary.VerbRefused(agent_vocabulary.ERR_FORBIDDEN_ARG,
                              f"pid {pid}: {candidate} grew past the {cap} byte cap")
     return candidate, blob
 
@@ -1136,7 +1171,7 @@ def _multipart_body(
         f"Content-Type: {guessed}\r\n\r\n"
     ).encode()
     tail = f"\r\n--{boundary}--\r\n".encode()
-    # One allocation, not `head + blob + tail` (two more payload copies): with `_MAX_INFLIGHT` 8, this
+    # One allocation, not `head + blob + tail` (two more payload copies): with `_CALL_WORKERS` threads, this
     # process's peak memory is a correctness concern — its death takes the node's fleet with it.
     return b"".join((*field_parts, head, blob, tail)), f"multipart/form-data; boundary={boundary}"
 
@@ -1240,7 +1275,7 @@ def _upload_file_body(
             except session_sweep.UploadFailed as exc:
                 # `bad_request`, not `unavailable`: `UploadFailed` here means the runner changed its file's
                 # size mid-send, which no retry fixes (and each retry leaves a pending row).
-                raise _refuse_upload(
+                raise agent_vocabulary.VerbRefused(
                     _ERR_BAD_REQUEST,
                     f"pid {pid}: {verb.name} could not stream {candidate}: {exc}") from None
             log.info("cred-broker: uid=%s pid=%s streamed %s bytes of %s to attachment %s of task %s",
@@ -1249,13 +1284,15 @@ def _upload_file_body(
                 _ARTIFACT_CONFIRM_VERB, task_id, {}, attachment_id=attachment_id)
     finally:
         os.close(fd)
-    confined, blob = _read_confined_upload(named, pid, uid, vm)
-    data, content_type = _multipart_body(confined, blob, fields)
-    # Overwritten: `_agent_headers()` says `application/json`, which FastAPI's `File(...)` 422s.
-    headers["Content-Type"] = content_type
-    log.info("cred-broker: uid=%s pid=%s call=%s task=%s -> %s %s (buffered fallback)",
-             uid, pid, verb.name, agent_vocabulary.caller_task_header(task_id), verb.method, path)
-    return _send_to_cp(verb, f"{control_plane_api.resolve_control_plane_api_base()}{path}", headers, data)
+    with _BUFFERED_UPLOADS:  # the bytes live only inside this block
+        confined, blob = _read_confined_upload(named, pid, uid, vm)
+        data, content_type = _multipart_body(confined, blob, fields)
+        del blob
+        # Overwritten: `_agent_headers()` says `application/json`, which FastAPI's `File(...)` 422s.
+        headers["Content-Type"] = content_type
+        log.info("cred-broker: uid=%s pid=%s call=%s task=%s -> %s %s (buffered fallback)",
+                 uid, pid, verb.name, agent_vocabulary.caller_task_header(task_id), verb.method, path)
+        return _send_to_cp(verb, f"{control_plane_api.resolve_control_plane_api_base()}{path}", headers, data)
 
 
 # The verb a `Verb.attachment_paths` `{path}` entry is uploaded through, and the kind it lands as: the
@@ -1350,8 +1387,12 @@ _UNRESOLVED_FORGE_REJECTIONS: set[tuple[str, str]] = set()
 def _forge_auth_report(verb_name: str, args: object, identity: runner_registry.RunnerIdentity | None, uid: int,
                        pid: int, vm: VmCaller | None) -> object:
     """Forward a `forge_auth.*` report as `_call_as` does, dropping an `accepted` no refusal is open for."""
+    if identity is None:
+        # A daemon git op (a slot's clone at its lease) reports its own refusal on the lease's ack
+        # (`slot_clone.CloneFailed`); it is never a runner's forge-auth blocker (`lane_forge_auth`).
+        return {"skipped": "a daemon git op's refusal is reported by its lease, not as a runner's"}
     host = str(args.get("host") or "").lower() if isinstance(args, dict) else ""
-    key = (identity.task_id if identity else "", host)
+    key = (identity.task_id, host)
     if verb_name == _FORGE_AUTH_ACCEPTED and key not in _UNRESOLVED_FORGE_REJECTIONS:
         return {"skipped": "no refusal open for this task and host"}
     result = _call_as(verb_name, args, identity, uid, pid, vm)
@@ -1380,6 +1421,8 @@ def _answer_local(name: str, args: dict | None = None,
 
         # The answer is a LIVE KEY: the call is logged by name alone (`_perform_call`), never its answer.
         return runtime.hub().account_key(identity, args or {}, fetch=account_api_key)
+    if name == "pane.text":
+        return _own_pane_text(identity, args or {})
     if agent_vocabulary.LOCAL_VERBS[name].wait:
         raise agent_vocabulary.VerbRefused(agent_vocabulary.ERR_BAD_REQUEST, f"{name}: a wait verb off the wait lane")
     if name == "guard.refresh":
@@ -1398,6 +1441,19 @@ def _answer_local(name: str, args: dict | None = None,
     if name == "nodevault.keys":
         return {"keys": keystore.keys()}
     raise AssertionError(f"{name}: a LOCAL_VERBS row with no answer here")
+
+
+def _own_pane_text(identity: runner_registry.RunnerIdentity | None, args: dict) -> dict:
+    """`pane.text`: the visible text of the CALLER's own pane, found by its peer identity's tmux pane pid —
+    never by an argument, so no runner reads another's. `session_id` must be the caller's own attempt."""
+    if identity is None:
+        raise agent_vocabulary.VerbRefused(agent_vocabulary.ERR_NOT_A_RUNNER, "pane.text: the caller is not a live runner")
+    if str(args.get("session_id") or "") != identity.session_id:
+        raise agent_vocabulary.VerbRefused(agent_vocabulary.ERR_FORBIDDEN_ARG,
+                                           "pane.text: a caller may name only its own session")
+    import answer_delivery  # noqa: PLC0415 — tmux-side reads; only this verb needs them
+
+    return {"text": answer_delivery.pane_text_for_pid(identity.tmux_pane_pid)}
 
 
 def call_as_runner(verb_name: str, args: dict, identity: runner_registry.RunnerIdentity) -> object:
@@ -1795,14 +1851,6 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, vm
                     reply = {"ok": False, "error": _ERR_BAD_REQUEST}
                     log.warning("cred-broker: uid=%s pid=%s asked for %r, which this broker does not "
                                 "serve", uid, pid, name)
-                # Same cap as the `call` arm: failures are not cached, so a refused identity's flood would
-                # be a CP round trip each on the shared pool.
-                elif not _acquire_slot(peer_key):
-                    log.warning("cred-broker: uid=%s pid=%s over the in-flight cap on a credential ask",
-                                uid, pid)
-                    writer.write(json.dumps({"ok": False, "error": _ERR_BUSY}).encode() + b"\n")
-                    await writer.drain()
-                    return
                 else:
                     try:
                         # `vm` only when there is one: a pid caller's call keeps its three-argument shape.
@@ -1844,8 +1892,6 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, vm
                             # A 200 with no token: nothing the caller can fix → same word as a timeout.
                             outcome = _ERR_UNAVAILABLE
                             reply = {"ok": False, "error": _ERR_UNAVAILABLE}
-                    finally:
-                        _release_slot(peer_key)
             else:
                 name = str(payload.get("call"))
                 wait_row = _wait_row(payload)
@@ -1853,14 +1899,6 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, vm
                     outcome, reply = await _serve_wait(wait_row, payload.get("args"), uid, pid, vm, peer_key,
                                                        payload.get("capability", ""))
                 else:
-                    if not _acquire_slot(peer_key):
-                        outcome = _ERR_BUSY
-                        reply = {"ok": False, "error": _ERR_BUSY}
-                        log.warning("cred-broker: uid=%s pid=%s over the in-flight cap (key=%s total=%s)",
-                                    uid, pid, peer_key, sum(_INFLIGHT_BY_PEER.values()))
-                        writer.write(json.dumps(reply).encode() + b"\n")
-                        await writer.drain()
-                        return
                     try:
                         result = await asyncio.get_running_loop().run_in_executor(
                             _CALL_EXECUTOR, _perform_call, payload.get("call"), payload.get("args"), uid, pid,
@@ -1898,9 +1936,6 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, vm
                         outcome = "ok"
                         # `result` may be None (a 204), so the key is carried unconditionally.
                         reply = {"ok": True, "result": result}
-                    finally:
-                        # Released in EVERY arm: a leaked slot would permanently shrink this principal's budget.
-                        _release_slot(peer_key)
         log.info(
             "cred-broker: uid=%s pid=%s%s name=%s identity=%s outcome=%s cache_hit=%s",
             uid, pid, f" vm={vm.vm_id}" if vm is not None else "", name or "-", identity, outcome, cache_hit,
@@ -1919,10 +1954,11 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, vm
             pass
 
 
-# Open guest connections per VM: one guest must not hold the node-wide `_MAX_CONNECTIONS` and starve every
-# other VM and host caller. Touched only on the loop thread.
+# Open guest connections per VM: an AS1 FAIRNESS bound on the node-wide fd bound `_MAX_CONNECTIONS`, not a
+# runner concurrency cap — one guest must not hold every fd and starve every other VM and host
+# caller. A quarter of the node bound, far past any one runner's concurrent calls. Touched only on the loop thread.
 _VM_OPEN: dict[str, int] = {}
-_MAX_CONNECTIONS_PER_VM = 8
+_MAX_CONNECTIONS_PER_VM = 256
 
 
 async def serve_vm_connection(vm_id: str, sock) -> None:

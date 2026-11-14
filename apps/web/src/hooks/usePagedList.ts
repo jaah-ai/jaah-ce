@@ -4,8 +4,8 @@ import { apiDetail } from '../api'
 /* ── A "LOAD OLDER" LEDGER, ONE PAGE PER PRESS ── the state behind `ui/PagedList`.
  *
  * Not `useInfiniteQuery`: these ledgers must keep the last good rows under a failed refetch (a new key's
- * failure would drop them), `reload` restarts at page one (a refetch re-reads every loaded page), and their
- * suites step reads with `act` rather than the query client's timers.
+ * failure would drop them), `reload` restarts at page one (a refetch re-reads every loaded page; `refresh` is
+ * that walk, asked for), and their suites step reads with `act` rather than the query client's timers.
  *
  * THE CURSOR IS THE SERVER'S, ECHOED VERBATIM (`nextOf`); `null` = no further page. Never derived from
  * `rows.length`: an offset breaks on shared timestamps.
@@ -34,6 +34,8 @@ export type PagedListState<Row, Page> = {
   loaded: boolean
   /** Page one again, replacing the rows. Never throws. */
   reload: () => Promise<void>
+  /** The loaded rows again, as deep: the rows stay until every page has landed (a write's re-read). Never throws. */
+  refresh: () => Promise<void>
   loadMore: () => Promise<void>
   bodyRef: RefObject<HTMLDivElement | null>
 }
@@ -44,6 +46,7 @@ export function usePagedList<Row, Cursor, Page>({
   nextOf,
   errorFallback,
   enabled = true,
+  errorOf = apiDetail,
 }: {
   fetchPage: (cursor: Cursor | null) => Promise<Page>
   rowsOf: (page: Page) => Row[]
@@ -51,6 +54,8 @@ export function usePagedList<Row, Cursor, Page>({
   errorFallback: string
   /** Nothing is read until true (a hidden tab). Latch it false→true, so returning does not re-read. */
   enabled?: boolean
+  /** The words for a failed read; `apiDetail` unless a surface has its own (compliance's `complianceError`). */
+  errorOf?: (err: unknown, fallback: string) => string
 }): PagedListState<Row, Page> {
   const [rows, setRows] = useState<Row[]>([])
   const [lastPage, setLastPage] = useState<Page | null>(null)
@@ -65,27 +70,35 @@ export function usePagedList<Row, Cursor, Page>({
      inline lambdas are not a dependency. */
   const count = useRef(0)
   count.current = rows.length
-  const read = useRef({ rowsOf, nextOf, errorFallback })
-  read.current = { rowsOf, nextOf, errorFallback }
+  const read = useRef({ rowsOf, nextOf, errorFallback, errorOf })
+  read.current = { rowsOf, nextOf, errorFallback, errorOf }
 
-  const load = useCallback(async (from: Cursor | null) => {
+  /* One page from `from`, or (`depth`) the pages from the top until that many rows are read. */
+  const load = useCallback(async (from: Cursor | null, depth = 0) => {
     const mine = ++generation.current
+    const append = from !== null
     setLoading(true)
     setError('')
-    /* Page one drops the old cursor: kept under a failed reload, it would append the OLD list's next page. */
-    if (from === null) setCursor(null)
+    /* Page one drops the old cursor: kept under a failed reload, it would append the OLD list's next page.
+       A refresh keeps it: a failed one leaves the same list. */
+    if (!append && depth === 0) setCursor(null)
     try {
-      const page = await fetchPage(from)
-      if (mine !== generation.current) return
-      const next = read.current.rowsOf(page)
-      if (from !== null) setAppendedFrom(count.current)
-      setRows(prev => (from !== null ? [...prev, ...next] : next))
-      setCursor(read.current.nextOf(page))
+      let next: Row[] = []
+      let page: Page
+      do {
+        page = await fetchPage(from)
+        if (mine !== generation.current) return
+        next = [...next, ...read.current.rowsOf(page)]
+        from = read.current.nextOf(page)
+      } while (from !== null && next.length < depth)
+      if (append) setAppendedFrom(count.current)
+      setRows(prev => (append ? [...prev, ...next] : next))
+      setCursor(from)
       setLastPage(page)
       setLoaded(true)
     } catch (err) {
       if (mine !== generation.current) return
-      setError(apiDetail(err, read.current.errorFallback))
+      setError(read.current.errorOf(err, read.current.errorFallback))
     } finally {
       if (mine === generation.current) setLoading(false)
     }
@@ -105,7 +118,8 @@ export function usePagedList<Row, Cursor, Page>({
   }, [appendedFrom])
 
   const reload = useCallback(() => load(null), [load])
+  const refresh = useCallback(() => load(null, count.current), [load])
   const loadMore = useCallback(() => (cursor === null ? Promise.resolve() : load(cursor)), [cursor, load])
 
-  return { rows, lastPage, hasMore: cursor !== null, loading, error, loaded, reload, loadMore, bodyRef }
+  return { rows, lastPage, hasMore: cursor !== null, loading, error, loaded, reload, refresh, loadMore, bodyRef }
 }

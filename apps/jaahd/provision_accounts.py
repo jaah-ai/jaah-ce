@@ -94,12 +94,6 @@ PLUGIN_REPAIR = HERE / "plugin_repair.py"
 HARNESS_RECONCILE = HERE_ROOT / "infra" / "host" / "fleet-harness" / "reconcile.py"
 
 
-def _jaah_home() -> str:
-    """`$JAAH_HOME`, or "" (unset is a skip here, so the non-raising accessor). Passed explicitly:
-    the harness reconcile refuses to guess."""
-    return environment.pool_root_or_empty()
-
-
 # How long a detached converge is assumed still running, per account and process, so repeating
 # schedulers do not re-clone every tick. Matches postinst's `RuntimeMaxSec=900`.
 CONVERGE_COOLDOWN_SECONDS = 900.0
@@ -194,7 +188,8 @@ def converge_settings_layer(run=_run, *, provider_dirs: Sequence[tuple[str, str]
     one provider home leaves every other provider home on disk on the Claude lane."""
     if not HARNESS_RECONCILE.is_file():
         return {"layer": "settings", "status": "skipped", "detail": f"{HARNESS_RECONCILE} absent"}
-    home = _jaah_home()
+    # The non-raising accessor: unset is a skip here. Passed explicitly: the harness reconcile refuses to guess.
+    home = environment.pool_root_or_empty()
     if not home:
         return {"layer": "settings", "status": "skipped", "detail": "JAAH_HOME is not set"}
     # `{**os.environ, K: v}` so the var name comes from its single home.

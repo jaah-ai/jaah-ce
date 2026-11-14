@@ -1,0 +1,99 @@
+# Atlassian Jira and Confluence Cloud, over the hand-written `jira` type (adopted, AS3: its fields and Test,
+# GET /rest/api/3/myself with Basic email + API token, are unchanged). Facts confirmed at the vendor's own docs:
+# API tokens https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account/ ;
+# Basic auth for REST https://developer.atlassian.com/cloud/jira/platform/basic-auth-for-rest-apis/ .
+# Connect is Atlassian's OAuth 2.0 (3LO) sign-in https://developer.atlassian.com/cloud/jira/platform/oauth-2-3lo-apps/ ,
+# layered over the type (`catalog.extended_type`): the site the consent chose is read from accessible-resources
+# (`grant_hooks.atlassian_site`), its cloud ID kept, and every call goes to api.atlassian.com/ex/jira/<cloud ID>.
+slug = "jira"
+label = "Jira and Confluence"
+category = "dev_tools"
+credential_type = "jira"
+vendor_docs_url = "https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account/"
+summary = "Read and update Jira issues and Confluence pages on your Atlassian Cloud site."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://auth.atlassian.com/authorize"
+token_url = "https://auth.atlassian.com/oauth/token"
+# Atlassian documents no PKCE; `audience` names its API gateway and `prompt=consent` shows the site picker.
+pkce = false
+authorize_extra = { audience = "api.atlassian.com", prompt = "consent" }
+scopes = [
+  { name = "read:jira-work", label = "Read Jira issues, comments and projects" },
+  { name = "write:jira-work", label = "Create, comment on and transition Jira issues" },
+  { name = "read:jira-user", label = "Look up Jira users, to assign and mention them" },
+  { name = "read:confluence-content.all", label = "Read Confluence pages" },
+  { name = "write:confluence-content", label = "Create and update Confluence pages" },
+  { name = "search:confluence", label = "Search Confluence with CQL" },
+  { name = "read:me", label = "Know who signed in, so the secret shows whose it is" },
+  { name = "offline_access", label = "Stay connected: lets Jaah renew access without asking you to sign in again" },
+]
+account_url = "https://api.atlassian.com/me"
+account_field = "email"
+jaah_app = true
+on_grant_config = "app.integrations.grant_hooks:atlassian_site"
+grant_fields = ["cloud_id", "base_url"]
+fields = [
+  { key = "cloud_id", label = "Cloud ID", kind = "text", required = false, help = "Connect fills it: the ID of the Atlassian site the sign-in reaches. Agents call https://api.atlassian.com/ex/jira/ followed by it (Confluence: /ex/confluence/) with the access token" },
+]
+
+[auth.oauth.registration]
+console_url = "https://developer.atlassian.com/console/myapp/"
+steps = [
+  "Select Create, then OAuth 2.0 integration, name it Jaah, and accept the developer terms",
+  "Under Permissions add Jira API (the classic scopes read:jira-work, write:jira-work, read:jira-user), Confluence API (read:confluence-content.all, write:confluence-content, search:confluence) and User identity API (read:me)",
+  "Under Authorization, beside OAuth 2.0 (3LO), select Configure and enter the first redirect URI below as the Callback URL (an app takes one: create a second app named Jaah Dev for dev)",
+  "Under Distribution select Edit, choose Sharing, fill the vendor and privacy fields, and save, so sites other than your own can connect",
+  "Open Settings and copy the Client ID and Secret",
+]
+review = "Not required: a shared app works for any Atlassian Cloud site, and Atlassian shows people an unreviewed-app notice at consent; a Marketplace listing needs Atlassian's review"
+
+[[auth]]
+kind = "basic"
+fields = [
+  { key = "base_url", label = "Base URL", kind = "url", required = true, placeholder = "https://acme.atlassian.net", help = "Your Atlassian site's address, as in your browser when you open Jira: https://your-site.atlassian.net, with nothing after .net. Connect fills it" },
+  { key = "email", label = "Account email", kind = "email", required = true, help = "The email address of the Atlassian account the API token belongs to (Atlassian > your avatar > Manage account > Email)" },
+  { key = "api_token", label = "API token", kind = "secret", required = true, help = "id.atlassian.com/manage-profile/security/api-tokens > Create API token (or Create API token with scopes, choosing Jira and Confluence): name it Jaah, set an expiry, select Create, then Copy - Atlassian shows it once" },
+  { key = "project_key", label = "Project key", kind = "text", required = false, placeholder = "OAM", help = "Optional: the Jira project agents work in, the prefix of its issue keys (OAM in OAM-123). Leave blank for a site-wide connection several projects share" },
+]
+
+[test]
+# A Connect row's Test: the signed-in user, through the API gateway with the site's cloud ID. An API token keeps the
+# type's own Test (Basic, on the site's own address).
+path = "https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/myself"
+identity = [["displayName"]]
+
+[docs]
+agent_uses = [
+  "Read the Jira issue a task names: description, comments, status, sub-tasks and links",
+  "Create Jira issues for follow-up work, and comment with progress or pull request links",
+  "Move an issue through its workflow when the work is done",
+  "Read and update Confluence pages on the same site, such as a spec or a runbook",
+  "Search with JQL or CQL to find related work",
+  "Start a Jaah task when an issue is assigned to the Jaah account, mentions it or gets the jaah label, and report back on the issue (Settings > Integrations > Issue trackers > Add tracker)",
+]
+prerequisites = [
+  "An Atlassian Cloud site (https://your-site.atlassian.net) and an account with access to the Jira projects and Confluence spaces agents need",
+  "Your organization must allow API tokens: an admin can block them in admin.atlassian.com > Security > API token controls",
+]
+limitations = [
+  "A Connect secret reaches one site, the one picked at consent, and agents call it through https://api.atlassian.com/ex/jira/ followed by the secret's Cloud ID (Confluence: /ex/confluence/) rather than the site address. Connect again for another site",
+  "Issue tracking (Settings > Integrations > Issue trackers) still needs an API token secret",
+  "Jira Server and Data Center are not supported: they use personal access tokens, not Cloud API tokens",
+  "Agents act as the account that owns the token: issues and comments are attributed to it. Use a dedicated Atlassian account for agents if you want them separate",
+  "API tokens now expire after at most one year; create a new one before it expires",
+  "The token reaches every project and space its account can see; limit the account, or use a scoped token",
+]
+troubleshooting = [
+  { symptom = "Test says the credentials were rejected (401)", fix = "Account email does not match the token's account, or the token expired or was revoked. Create a new token at id.atlassian.com and select Replace" },
+  { symptom = "Test cannot reach the site or answers 404", fix = "Base URL is not your site's root. Use https://your-site.atlassian.net with nothing after it" },
+  { symptom = "Test passes but agents get 403 on a project", fix = "The account lacks Browse projects permission there. Ask a Jira admin to add it to the project" },
+  { symptom = "Test fails with 403 for every request", fix = "Your organization blocks API tokens or requires them from allowed IPs only. Ask an admin to check admin.atlassian.com > Security" },
+  { symptom = "Connect ends with no organisation or site for this sign-in", fix = "No site was chosen on Atlassian's consent page. Select Connect again and pick the site agents should reach" },
+]
+faq = [
+  { q = "Does one secret cover both Jira and Confluence", a = "Yes. An Atlassian API token works for every Cloud product on the site the account can use" },
+  { q = "Should I connect or use an API token", a = "Connect is quicker and renews itself. Use an API token for issue tracking, or when your organization blocks third-party apps" },
+]

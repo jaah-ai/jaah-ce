@@ -3,6 +3,9 @@ import Alert from '@mui/material/Alert'
 import AlertTitle from '@mui/material/AlertTitle'
 import Button from '@mui/material/Button'
 import Typography from '@mui/material/Typography'
+import { clip, reportClientEvent } from '../lib/clientTelemetry'
+import { isChunkLoadError, reloadForChunk } from '../lib/lazyRetry'
+import { grid } from '../theme'
 
 // Catches page render errors so one bad payload does not white-screen the app (React only lets a class
 // component do this). Wraps the routed <Outlet /> INSIDE AuthLayout, so the Sidebar survives a crash.
@@ -13,6 +16,12 @@ import Typography from '@mui/material/Typography'
 // wide: a crashed tab shell renders no tab strip, and the rail's rows for one shell all point at ONE
 // page (`/groups` → `/users` is a real navigation the key cannot see), so without it the crash screen
 // follows the operator onto a healthy address.
+//
+// A caught error is reported as `render_error` (`lib/clientTelemetry.ts`, a no-op unless the session is flagged). A
+// lazy chunk that never arrived (`lib/lazyRetry.ts::isChunkLoadError`) is latched by `React.lazy`: re-rendering
+// throws the same rejection again, so the boundary reloads the page BY ITSELF on catching one — at most once per
+// window (`lib/lazyRetry.ts::reloadForChunk`), so a file that is really gone cannot loop the page — and Retry on a
+// chunk error always reloads (an operator's click cannot loop).
 
 interface Props {
   children: ReactNode
@@ -45,9 +54,23 @@ export default class ErrorBoundary extends Component<Props, State> {
   componentDidCatch(error: Error, info: ErrorInfo): void {
     // The boundary swallows the throw, so log it for devtools triage.
     console.error('ErrorBoundary caught a render error', error, info.componentStack)
+    reportClientEvent('render_error', {
+      message: error.message || error.name,
+      detail: {
+        stack: clip(error.stack, 4096),
+        component_stack: clip(info.componentStack, 4096),
+        label: this.props.label ?? null,
+        chunk_load: isChunkLoadError(error),
+      },
+    })
+    if (isChunkLoadError(error)) reloadForChunk(window)
   }
 
   private handleRetry = (): void => {
+    if (isChunkLoadError(this.state.error)) {
+      window.location.reload()
+      return
+    }
     // Retry the child render; if the cause persists the boundary catches again.
     this.setState({ error: null })
   }
@@ -76,7 +99,7 @@ export default class ErrorBoundary extends Component<Props, State> {
             Retry
           </Button>
         }
-        sx={{ maxWidth: '32rem', mx: 'auto', my: 3, alignItems: 'center' }}
+        sx={{ maxWidth: grid(85), mx: 'auto', my: 3, alignItems: 'center' }}
       >
         <AlertTitle sx={{ mb: 0.5 }}>Something went wrong loading {surface}.</AlertTitle>
         <Typography variant="body2">

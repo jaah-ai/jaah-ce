@@ -9,11 +9,7 @@ export function useHasWidth(ref: RefObject<HTMLElement | null>): boolean {
   useLayoutEffect(() => {
     const el = ref.current
     if (!el || typeof ResizeObserver === 'undefined') return
-    const measure = () => setHas(el.getBoundingClientRect().width > 0)
-    measure()
-    const observer = new ResizeObserver(measure)
-    observer.observe(el)
-    return () => observer.disconnect()
+    return watchWidth(el, width => setHas(width > 0))
   }, [ref])
   return has
 }
@@ -28,11 +24,16 @@ export function useElementWidth(el: HTMLElement | null): number | null {
       setWidth(null)
       return
     }
-    const measure = () => setWidth(Math.round(el.getBoundingClientRect().width))
-    measure()
-    const observer = new ResizeObserver(measure)
-    observer.observe(el)
-    return () => observer.disconnect()
+    return watchWidth(el, width => setWidth(Math.round(width)))
   }, [el])
   return width
+}
+
+/** `el`'s width now and on every resize, to `onWidth`; returns the stop. */
+function watchWidth(el: HTMLElement, onWidth: (width: number) => void): () => void {
+  const measure = () => onWidth(el.getBoundingClientRect().width)
+  measure()
+  const observer = new ResizeObserver(measure)
+  observer.observe(el)
+  return () => observer.disconnect()
 }

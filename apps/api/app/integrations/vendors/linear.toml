@@ -1,0 +1,100 @@
+# Linear. Facts confirmed at the vendor's own docs: OAuth 2.0 (authorize, token, comma-separated scopes, PKCE S256,
+# 24 h access tokens with a rotating refresh token) https://linear.app/developers/oauth-2-0-authentication ;
+# personal API keys sent as `Authorization: <key>` and the GraphQL endpoint https://linear.app/developers/graphql .
+# Probed 2026-11-03: a bad key answers HTTP 401 with errors[0].extensions.code AUTHENTICATION_ERROR.
+# The MCP server (https://linear.app/docs/mcp: it takes an API key or an OAuth access token as a Bearer header;
+# metadata at mcp.linear.app/.well-known/oauth-protected-resource/mcp): the same connection's token, no second sign-in.
+# Agents (https://linear.app/developers/agents): `actor=app` installs Jaah as the workspace's app user, and the
+# `app:assignable` / `app:mentionable` scopes let people delegate issues to it and @mention it. Its webhooks (Agent
+# session events, Issues, Comments) reach the tracker intake (`apps/api/app/trackers/linear.py`), signed with the
+# app's webhook signing secret, kept on the same `oauth_app` secret as the client pair.
+slug = "linear"
+label = "Linear"
+category = "dev_tools"
+vendor_docs_url = "https://linear.app/developers/oauth-2-0-authentication"
+summary = "Read, create and update Linear issues, projects and comments from agent work."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://linear.app/oauth/authorize"
+token_url = "https://api.linear.app/oauth/token"
+pkce = true
+scope_separator = ","
+authorize_extra = { prompt = "consent", actor = "app" }
+scopes = [
+  { name = "read", label = "Read issues, projects, cycles, teams and comments, and see whose account is connected" },
+  { name = "issues:create", label = "Create issues when an agent finds follow-up work", optional = true },
+  { name = "comments:create", label = "Comment on issues with progress and pull request links", optional = true },
+  { name = "write", label = "Update issues: change status, assignee, labels and fields when work is done", optional = true },
+  { name = "app:assignable", label = "Let people delegate issues to Jaah, so a delegated issue starts a Jaah task", optional = true },
+  { name = "app:mentionable", label = "Let people @mention Jaah in issues and comments, so a mention starts or continues a Jaah task", optional = true },
+]
+jaah_app = true
+[auth.oauth.registration]
+console_url = "https://linear.app/settings/api/applications/new"
+steps = [
+  "Do this in a dedicated Linear workspace owned by the company: every admin of the workspace that owns the app can see and edit it",
+  "In Settings > API > OAuth applications select Create new (the console URL above opens the form directly)",
+  "Fill in Application name Jaah, Developer name Jaah, the Jaah website as Developer URL, and a one-line description",
+  "Under Callback URLs add the redirect URLs below, one per line",
+  "Turn on Public so members of every Linear workspace can authorize the app, and leave Client credentials off",
+  "Upload the Jaah logo as the application icon",
+  "Turn on Webhooks, set the Webhook URL to the environment's public hooks origin (the hooks host its trigger URLs use: a console that admits only an admin IP list, as dev's does, never receives Linear's posts), or its console origin where it has no hooks host, followed by /api/public/trackers/linear/events, and tick Agent session events, Issues and Comments. An app has one webhook URL, so dev and prod each need their own app: name the dev one Jaah Dev and give each only its own environment's redirect URI",
+  "Select Create, then copy the webhook signing secret Linear shows beside the webhook: it goes in the Webhook signing secret field of the OAuth app secret you create in Jaah below",
+]
+review = "Not required: a public Linear OAuth application works for any workspace as soon as it is created"
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "Personal API key", kind = "secret", required = true, placeholder = "lin_api_...", help = "Linear > Settings > Account > Security & access > Personal API keys > New API key: name it Jaah, choose Full access or only the teams and permissions agents need, select Create, then copy the key - Linear shows it once" },
+]
+
+[test]
+method = "POST"
+path = "https://api.linear.app/graphql"
+body = '{"query":"{ viewer { id name email } }"}'
+content_type = "application/json"
+auth = { field = "api_key", header = "Authorization" }
+identity = [["data", "viewer", "email"], ["data", "viewer", "name"]]
+rejected_when = { path = ["errors", 0, "extensions", "code"], values = ["AUTHENTICATION_ERROR"] }
+
+[mcp]
+url = "https://mcp.linear.app/mcp"
+url_editable = false
+transport = "streamable_http"
+auth = "bearer_field:api_key"
+
+[docs]
+agent_uses = [
+  "Through Linear's MCP server, once the secret is linked to a project, use Linear's ready-made tools to search and update issues",
+  "Read the Linear issue a Jaah task names: its description, status, labels, sub-issues and comments",
+  "Create follow-up issues in the right team when an agent finds more work",
+  "Comment on an issue with progress, a summary or a pull request link",
+  "Move an issue to In Review or Done and update its assignee or labels when the work lands, if you granted write access",
+  "List a project's or cycle's open issues to plan or report on work",
+  "Start a Jaah task when someone delegates an issue to Jaah, @mentions Jaah or adds the start label, once the secret is connected as an issue tracker (see Start tasks from Linear)",
+]
+prerequisites = [
+  "A Linear account that is a member of the teams agents should reach",
+  "To connect with a sign-in: a Linear workspace admin - the sign-in installs Jaah in the workspace as an app that people can delegate issues to and @mention",
+  "To connect with an API key: permission to create a personal API key. Admins can restrict API keys to admins only (Settings > API)",
+]
+limitations = [
+  "With a sign-in, agents act as the Jaah app: issues and comments they create show Jaah as the author. With an API key they act as the key's owner",
+  "A personal API key reaches every workspace team its owner can see, unless you limited it to some teams when you created it",
+  "Linear rate-limits API requests per user and per complexity; very large bulk edits can be slowed or refused",
+  "Linear's sign-in grants access to one workspace at a time; connect again for each extra workspace",
+]
+troubleshooting = [
+  { symptom = "Test says Linear rejected the personal API key (AUTHENTICATION_ERROR)", fix = "The key was revoked, mistyped or belongs to a deactivated user. Create a new key under Settings > Account > Security & access and select Replace on the secret" },
+  { symptom = "Test says Linear rejected the access token", fix = "The sign-in was revoked in Linear (Settings > Account > Security & access > Authorized applications) or the workspace removed the app. Select Reconnect" },
+  { symptom = "Linear shows Invalid redirect_uri on the sign-in screen", fix = "You are using your own OAuth app and its Callback URLs do not include the redirect URI on this page. Add it exactly and try again" },
+  { symptom = "Agents can read issues but cannot create or update them", fix = "The connection was approved without the write scopes. Reconnect and keep issues:create, comments:create and write ticked, or use a key with write access" },
+]
+faq = [
+  { q = "Which account do agents act as", a = "With a sign-in, the Jaah app installed in your workspace. With an API key, the Linear member who created the key" },
+  { q = "Can I limit agents to one team", a = "Yes, with an API key: when you create it in Linear, choose only that team. A sign-in grants what the account can see in the workspace" },
+  { q = "Does the connection expire", a = "A sign-in renews itself: Jaah refreshes the 24-hour access token automatically. An API key lasts until you revoke it" },
+]

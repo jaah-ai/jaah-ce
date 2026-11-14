@@ -13,10 +13,9 @@ import Box from '@mui/material/Box'
 import IconButton from '@mui/material/IconButton'
 import Link from '@mui/material/Link'
 import Skeleton from '@mui/material/Skeleton'
-import Tooltip from '@mui/material/Tooltip'
 import { Link as RouterLink } from 'react-router-dom'
-import type { Theme } from '@mui/material/styles'
-import { PHONE, ROW_MARKED_SX, SR_ONLY_SX, TAP_FLOOR_DOWN } from '../listStyles'
+import { keyframes, type Theme } from '@mui/material/styles'
+import { PHONE, ROW_MARKED_SX, SR_ONLY_SX, TAP_FLOOR_DOWN, UNSTYLED_BUTTON_SX, ELLIPSIS_SX } from '../listStyles'
 import { PRESS_SWAP_SX, PressSwap } from '../pressSwap'
 import { ProgressRing } from '../ProgressRing'
 import type { Tone } from '../StatusChip'
@@ -25,10 +24,9 @@ import { disclosureGlyph } from '../../components/ExpandToggleGlyph'
 import { RowActionsOverflow } from '../../components/tasks/rowActions'
 import { useOpenDetailPath } from '../../components/ListDetail'
 import { isOpenPath } from '../../lib/listDetail'
+import { FONT_SIZE, FONT_WEIGHT, LETTER_SPACING, LINE_HEIGHT, RADIUS, grid, tint } from '../../theme'
 import {
   ACTIONS_SLOT,
-  CHILD_INDENT,
-  CHILD_INDENT_PHONE,
   DISCLOSURE_SLOT,
   DISCLOSURE_TOUCH_MIN,
   GATE_SX,
@@ -38,44 +36,46 @@ import {
   RAIL_X_PHONE,
   ROW_H,
   ROW_H_PHONE,
-  ROW_PAD_L,
-  ROW_PAD_L_PHONE,
+  headPadLeft,
   monoFamily,
   nodeLeft,
   rowPadLeft,
+  skeletonInset,
   type SlotGate,
 } from './geometry'
-import { NO_DROPS, useFittedDrops } from './fit'
-import type { FeedColumn, FeedIndicator, FeedMarker, FeedNote, FeedRowSpec, FeedSection, FeedSlot, SortDir } from './types'
+import { useCopyFlash } from '../useCopyFlash'
+import { type FitDrop, isDropped, NAME_FLOOR, NO_DROPS, SPLIT_NAME_FLOOR, useFittedDrops } from './fit'
+import type { FeedColumn, FeedColumns, FeedIndicator, FeedMarker, FeedNote, FeedRowSpec, FeedSection, FeedSlot, SortDir } from './types'
+import Tip from '../Tip'
 
-/* `rgba(var(--mui-palette-*-mainChannel) / a)`: `alpha()` cannot parse `var(...)`. `neutral` uses the
+/* `tint()`: `alpha()` cannot parse `var(...)`. `neutral` uses the
    theme's translucent grey. */
 const TONE_TINT: Record<Tone, string> = {
   neutral: 'action.selected',
-  info: 'rgba(var(--mui-palette-info-mainChannel) / 0.18)',
-  success: 'rgba(var(--mui-palette-success-mainChannel) / 0.18)',
-  warning: 'rgba(var(--mui-palette-warning-mainChannel) / 0.18)',
-  error: 'rgba(var(--mui-palette-error-mainChannel) / 0.18)',
+  info: tint('info', 0.18),
+  success: tint('success', 0.18),
+  warning: tint('warning', 0.18),
+  error: tint('error', 0.18),
 }
 
 const CONTAINER_SX = { pb: 2, [PHONE]: { pb: 1 } } as const
 
-/* Sticky, backed by the page ground so rows slide UNDER it. 22px: a divider with a word on it. */
+/* Sticky, backed by the page ground so rows slide UNDER it. 21px: a divider with a word on it. */
 const HEAD_SX = {
   position: 'sticky',
   top: 0,
   zIndex: 1,
   display: 'flex',
   alignItems: 'center',
-  gap: 0.75,
-  height: 22,
+  gap: 0.5,
+  height: grid(3.5),
   bgcolor: 'background.default',
-  fontSize: '0.6875rem',
-  fontWeight: 700,
-  letterSpacing: '0.08em',
+  fontSize: FONT_SIZE.xs,
+  fontWeight: FONT_WEIGHT.bold,
+  letterSpacing: LETTER_SPACING.caps,
   textTransform: 'uppercase',
   color: 'text.disabled',
-  [PHONE]: { height: 18, fontSize: '0.625rem' },
+  [PHONE]: { height: grid(3), fontSize: FONT_SIZE.xxs },
 } as const
 
 /* `fontFamily`, NOT the `font` shorthand: spread after `HEAD_SX`, `font: inherit` reset the heading's
@@ -91,22 +91,20 @@ const HEAD_BUTTON_SX = {
   fontFamily: 'inherit',
   color: 'inherit',
   '&:hover': { color: 'text.secondary' },
-  [PHONE]: { minHeight: 18 },
+  [PHONE]: { minHeight: grid(3) },
 } as const
 
-const COUNT_SX = { fontWeight: 400, letterSpacing: '0.04em', opacity: 0.7, flex: '0 0 auto' } as const
+// The heading's colour, regular weight: a further opacity drops `text.disabled` under 4.5:1.
+const COUNT_SX = { fontWeight: FONT_WEIGHT.regular, letterSpacing: LETTER_SPACING.caps, flex: '0 0 auto' } as const
 /* The count's small print, in sentence case beside the capitals: it truncates first, before the label does. The
    dot keeps "4" and "2 failed" from reading as "42 failed". */
 const COUNT_NOTE_SX = {
   ...COUNT_SX,
   '&::before': { content: '"· "' },
   textTransform: 'none',
-  letterSpacing: 0,
+  letterSpacing: LETTER_SPACING.none,
   flex: '0 1 auto',
-  minWidth: 0,
-  overflow: 'hidden',
-  textOverflow: 'ellipsis',
-  whiteSpace: 'nowrap',
+  ...ELLIPSIS_SX,
 } as const
 
 /** Two pixels under its parent; both stay under the 24px an e2e case caps headings at. */
@@ -114,12 +112,7 @@ const HEAD_H_NESTED = 20
 const HEAD_H_NESTED_PHONE = 16
 
 /* Truncates like a row title; otherwise a long name widens the page. */
-const HEAD_LABEL_SX = {
-  overflow: 'hidden',
-  textOverflow: 'ellipsis',
-  whiteSpace: 'nowrap',
-  minWidth: 0,
-} as const
+const HEAD_LABEL_SX = ELLIPSIS_SX
 
 /* ── WHAT MAKES A NESTED HEADING READ AS NESTED ────────────────────────────────────────────────────
    Indent alone reads FLAT (measured on `/worktrees`), so the ladder spends INDENT, CASE and STRENGTH — none
@@ -131,22 +124,22 @@ const headLevel = (depth: number, nested: boolean) =>
     /* Air above a top-level heading, only in a NESTED outline, so groups do not run together. */
     ? (nested ? { mt: 1 } : null)
     : {
-        /* INDENT DERIVED FROM THE RAIL, NOT `CHILD_INDENT`: the 10px caret box put the label RIGHT of the row
+        ...headPadLeft(depth),
+        /* INDENT DERIVED FROM THE RAIL, NOT `CHILD_INDENT`: the caret box (9px) put the label RIGHT of the row
            titles it heads. At `RAIL_X - 5` the caret's centre lands on the rail (14.5 → 23.5 → 30). Deeper
-           levels step by `CHILD_INDENT`. */
-        pl: `${RAIL_X - 5 + (depth - 1) * CHILD_INDENT}px`,
+           levels step by `CHILD_INDENT` (`./geometry`'s `headPadLeft`). */
         /* Lower-case against the parent's caps: the strongest level signal without height, greyscale-safe;
            `textContent` unchanged for oracles. Hostnames also fit better (uppercase is ~12% wider). */
         textTransform: 'none' as const,
-        letterSpacing: '0.01em',
-        fontWeight: 600,
+        letterSpacing: LETTER_SPACING.none,
+        fontWeight: FONT_WEIGHT.semibold,
         /* A step DOWN in strength; placed after `HEAD_BUTTON_SX` (whose `color: 'inherit'` would win). NOT
            `text.disabled` (2.7:1, below AA). Quiet means SMALLER, never FAINTER. */
         color: 'text.secondary',
         '&:hover': { color: 'text.primary' },
         height: HEAD_H_NESTED,
         [PHONE]: {
-          pl: `${RAIL_X_PHONE - 5 + (depth - 1) * CHILD_INDENT_PHONE}px`,
+          ...headPadLeft(depth)[PHONE],
           height: HEAD_H_NESTED_PHONE,
           // Overrides `HEAD_BUTTON_SX`'s phone `minHeight` of 18.
           minHeight: HEAD_H_NESTED_PHONE,
@@ -157,13 +150,15 @@ const BODY_SX = { position: 'relative' } as const
 /* The thread, inset half a row at each end so it stops at the first and last node. */
 const RAIL_SX = {
   position: 'absolute',
-  left: `${RAIL_X}px`,
-  top: `${ROW_H / 2}px`,
-  bottom: `${ROW_H / 2}px`,
-  width: '1px',
-  bgcolor: 'divider',
+  left: RAIL_X,
+  top: ROW_H / 2,
+  bottom: ROW_H / 2,
+  /* A zero-width box drawing its 1px left edge: the thread. */
+  width: 0,
+  borderLeft: '1px solid',
+  borderColor: 'divider',
   pointerEvents: 'none',
-  [PHONE]: { left: `${RAIL_X_PHONE}px`, top: `${ROW_H_PHONE / 2}px`, bottom: `${ROW_H_PHONE / 2}px` },
+  [PHONE]: { left: RAIL_X_PHONE, top: ROW_H_PHONE / 2, bottom: ROW_H_PHONE / 2 },
 } as const
 
 const ROW_SX = {
@@ -173,7 +168,7 @@ const ROW_SX = {
   gap: 1,
   minHeight: ROW_H,
   pr: 0.5,
-  borderRadius: 1,
+  borderRadius: RADIUS.sm,
   /* Gap halves to 3px: with five slots, 6px gaps cost the title too much. */
   [PHONE]: { minHeight: ROW_H_PHONE, gap: 0.5 },
 } as const
@@ -196,11 +191,11 @@ const ROW_GRAB_SX = { cursor: 'grab' } as const
 const ROW_LIFTED_SX = { opacity: 0.45, cursor: 'grabbing' } as const
 /* WILL take the drag, shown during any drag. Faint: on a 200-row tree every accepting folder lights. */
 const ROW_DROP_ACCEPT_SX = {
-  bgcolor: 'rgba(var(--mui-palette-success-mainChannel) / 0.10)',
+  bgcolor: tint('success', 0.1),
 } as const
 /* Under the pointer: an outline, reading as a destination rather than a selection. */
 const ROW_DROP_OVER_SX = {
-  bgcolor: 'rgba(var(--mui-palette-success-mainChannel) / 0.22)',
+  bgcolor: tint('success', 0.22),
   outline: '2px solid',
   outlineColor: 'success.main',
   outlineOffset: '-2px',
@@ -209,8 +204,8 @@ const ROW_DROP_OVER_SX = {
    not a target at all passes no `drop` (tinting every non-folder red is noise). */
 const ROW_DROP_REJECT_SX = {
   cursor: 'not-allowed',
-  bgcolor: 'rgba(var(--mui-palette-error-mainChannel) / 0.10)',
-  '&:hover': { bgcolor: 'rgba(var(--mui-palette-error-mainChannel) / 0.14)' },
+  bgcolor: tint('error', 0.1),
+  '&:hover': { bgcolor: tint('error', 0.14) },
 } as const
 
 /* NO TEXT SELECTION WHILE A DRAG IS UP, on every row: press-and-move is also text selection, which would
@@ -221,25 +216,27 @@ const ROW_NO_SELECT_SX = { userSelect: 'none' } as const
 /* ONE WASH (`ROW_MARKED_SX`, ui/listStyles.ts) SERVES `deepLinked` AND `current`; only `current` spells
    `aria-current`. */
 const ROW_LIVE_SX = {
-  bgcolor: 'rgba(var(--mui-palette-info-mainChannel) / 0.07)',
-  '&:hover': { bgcolor: 'rgba(var(--mui-palette-info-mainChannel) / 0.13)' },
+  bgcolor: tint('info', 0.07),
+  '&:hover': { bgcolor: tint('info', 0.13) },
 } as const
 /* Weight, because colour alone is not a signal everyone receives. */
-const LIVE_TITLE_SX = { fontWeight: 600 } as const
+const LIVE_TITLE_SX = { fontWeight: FONT_WEIGHT.semibold } as const
+/* `FeedRowSpec.quiet`. */
+const QUIET_TITLE_SX = { color: 'text.secondary' } as const
 
 /* `color` is the tone (`currentColor` in the pulse). The disc MASKS THE RAIL where it crosses. */
 const NODE_SX = {
   position: 'absolute',
-  left: `${RAIL_X - NODE / 2}px`,
+  left: RAIL_X - NODE / 2,
   width: NODE,
   height: NODE,
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
-  borderRadius: '50%',
-  fontSize: '0.75rem',
-  fontWeight: 700,
-  lineHeight: 1,
+  borderRadius: RADIUS.round,
+  fontSize: FONT_SIZE.sm,
+  fontWeight: FONT_WEIGHT.bold,
+  lineHeight: LINE_HEIGHT.tight,
   pointerEvents: 'none',
   /* The disc shrinks, the glyph does not: at 10px » and ▸ were indistinguishable. `left` comes from
      `nodeLeft`. */
@@ -263,7 +260,7 @@ const LIVE_NODE_SX = {
     content: '""',
     position: 'absolute',
     inset: 0,
-    borderRadius: '50%',
+    borderRadius: RADIUS.round,
     border: '1px solid currentColor',
     opacity: 0,
     animation: 'feedPulse 1.8s ease-out infinite',
@@ -272,8 +269,28 @@ const LIVE_NODE_SX = {
   '@media (prefers-reduced-motion: reduce)': { '&::after': { animation: 'none' } },
 } as const
 
-/* A `<button>` reset to the disc. `pointerEvents: auto` reverses `NODE_SX`. Focus uses `outline`, not the
-   deep-link `boxShadow`, so both can show at once. */
+/* `FeedIndicator.attention`: a two-pixel ring breathing outward in the tone. Distinct from the live halo (a thin
+   ring that fades as it grows): this one stays near the disc and never vanishes, so "look at me" reads apart from
+   "running". `::before`, because `::after` is the live pulse. Reduced motion keeps the ring, still. */
+const ATTENTION_NODE_SX = {
+  '@keyframes feedAttention': {
+    '0%, 100%': { transform: 'scale(1.15)', opacity: 0.9 },
+    '50%': { transform: 'scale(1.55)', opacity: 0.35 },
+  },
+  '&::before': {
+    content: '""',
+    position: 'absolute',
+    inset: 0,
+    borderRadius: RADIUS.round,
+    border: '2px solid currentColor',
+    transform: 'scale(1.15)',
+    animation: 'feedAttention 1.6s ease-in-out infinite',
+  },
+  '@media (prefers-reduced-motion: reduce)': { '&::before': { animation: 'none' } },
+} as const
+
+/* A `<button>` reset to the disc. `pointerEvents: auto` reverses `NODE_SX`. Focus draws an outline ring; on a
+   deep-linked disc (`MARKED_NODE_SX`, the same ring) focus moves it out, so focus still shows on a marked disc. */
 const NODE_BUTTON_SX = {
   pointerEvents: 'auto',
   p: 0,
@@ -284,11 +301,48 @@ const NODE_BUTTON_SX = {
   '&:focus-visible': { outline: '2px solid', outlineColor: 'primary.main', outlineOffset: '1px' },
 } as const
 
-const UNCHECKED_NODE_SX = { boxShadow: 'inset 0 0 0 1.5px var(--mui-palette-text-disabled)' } as const
+/* After `NODE_BUTTON_SX` (its `border: 0`); inside the disc's box. */
+const UNCHECKED_NODE_SX = { border: '1px solid', borderColor: 'text.disabled' } as const
 
+/* `FeedRowSpec.pick`: the tick sits on the disc's centre (a box wider than the disc overhangs it evenly). Hidden is
+   `opacity`, never `display`, so the tick stays in the tab order and a reveal never reflows. */
+const PICK_HOST_SX = {
+  position: 'absolute',
+  width: NODE,
+  height: NODE,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  // The host itself never takes the pointer; only the box does, and only on a hover-capable pointer.
+  pointerEvents: 'none',
+  '& .feed-pick': { opacity: 0, pointerEvents: 'none' },
+  /* THE HIDDEN BOX IS THE DISC'S HOVER TARGET (a done row's disc is inert, so it has no `:hover` of its own): the
+     pointer arriving on the disc lands on the box and reveals it. A hover-less device keeps it inert, so a tap
+     reaches the disc's tap tip. */
+  '@media (hover: hover)': { '& .feed-pick': { pointerEvents: 'auto' } },
+  [PHONE]: { width: NODE_PHONE, height: NODE_PHONE },
+} as const
+const PICK_REVEALED_SX = {
+  '& .feed-pick': { opacity: 1, pointerEvents: 'auto' },
+  '& [data-testid="feed-node"]': { visibility: 'hidden' },
+} as const
+/* Revealed while the pointer is ON THE DISC (the box over it, `PICK_HOST_SX`) — never by hovering the rest of the
+   row, which flashed a box on every row the pointer crossed — on keyboard focus of the box itself (not
+   `:focus-within`, or the focus a click leaves on the box pins an unticked tick), and while the control says so. A
+   hover-less device never reveals by hover: the route's own way in (a ⋯ Select, a long-press) sets `data-revealed`. */
+const ROW_PICK_SX = {
+  '@media (hover: hover)': { '&:has(.feed-pick:hover)': PICK_REVEALED_SX },
+  '&:has(.feed-pick :focus-visible)': PICK_REVEALED_SX,
+  '&:has(.feed-pick[data-revealed="true"])': PICK_REVEALED_SX,
+} as const
+
+/* A 2px ring 1px off the disc: the gap shows the row's own ground. After `NODE_BUTTON_SX`, so its focus wins: focus
+   turns the ring to the text colour and pushes it a step out, a change of colour AND place (WCAG 2.4.7). */
 const MARKED_NODE_SX = {
-  boxShadow:
-    '0 0 0 1px var(--mui-palette-background-default), 0 0 0 3px var(--mui-palette-primary-main)',
+  outline: '2px solid',
+  outlineColor: 'primary.main',
+  outlineOffset: '1px',
+  '&:focus-visible': { outlineColor: 'text.primary', outlineOffset: grid(0.5) },
 } as const
 
 /* The rollup arc (`FeedIndicator.ring`). An `<svg>`, not a pseudo-element: `::after` is the pulse and
@@ -308,7 +362,7 @@ const LINK_SX = {
   minWidth: 0,
   display: 'flex',
   alignItems: 'baseline',
-  gap: 0.75,
+  gap: 0.5,
   textDecoration: 'none',
   color: 'inherit',
   '&:hover .feed-title': { textDecoration: 'underline' },
@@ -317,13 +371,10 @@ const LINK_SX = {
 /* THE TITLE TAKES EVERY PIXEL THE CLUSTER LEAVES AND ELLIPSISES — it never shrinks to fit. */
 const TITLE_SX = {
   flex: '1 1 auto',
-  minWidth: 0,
-  fontSize: '0.8125rem',
-  lineHeight: 1.3,
-  overflow: 'hidden',
-  textOverflow: 'ellipsis',
-  whiteSpace: 'nowrap',
-  [PHONE]: { fontSize: '0.75rem' },
+  ...ELLIPSIS_SX,
+  fontSize: FONT_SIZE.md,
+  lineHeight: LINE_HEIGHT.snug,
+  [PHONE]: { fontSize: FONT_SIZE.sm },
 } as const
 
 /* `FeedRowSpec.titleLines: 2` — wraps at word boundaries (a word wider than the box still breaks), then clamps. */
@@ -336,33 +387,32 @@ const TITLE_TWO_LINES_SX = {
 } as const
 
 /* `FeedRowSpec.titleLines: 'all'` — wraps and never clamps, for a title that IS the record (a history entry).
-   4px above and below: a wrapped title otherwise touches the next row. One line stays inside the row's
+   Half a unit above and below: a wrapped title otherwise touches the next row. One line stays inside the row's
    own floor (`ROW_H`/`ROW_H_PHONE`), so only a wrapped row grows. */
-const TITLE_ALL_LINES_SX = { whiteSpace: 'normal', overflowWrap: 'anywhere', py: '4px' } as const
+const TITLE_ALL_LINES_SX = { whiteSpace: 'normal', overflowWrap: 'anywhere', textOverflow: 'clip', py: 0.5 } as const
 
-const leadSx = (width: number, gate: SlotGate = 'id', align: 'left' | 'right' = 'right', drops: ReadonlySet<SlotGate> = NO_DROPS) => (theme: Theme) =>
+const leadSx = (width: number, gate: SlotGate = 'id', align: 'left' | 'right' = 'right', drops: ReadonlySet<FitDrop> = NO_DROPS) => (theme: Theme) =>
   ({
     ...GATE_SX[gate],
     ...(drops.has(gate) ? DROPPED_SX : null),
     flex: '0 0 auto',
     width,
     fontFamily: monoFamily(theme),
-    fontSize: '0.6875rem',
+    fontSize: FONT_SIZE.xs,
     color: 'text.disabled',
     textAlign: align,
     /* Truncates, or a long lead overspills and the title's ellipsis never engages. */
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
+    ...ELLIPSIS_SX,
   }) as const
 
 /* A fixed cell, centred: glyphs differ in advance (`▶` vs `?`), and a glyph-wide marker shifted every slot after it
    off its header. `minWidth`, so a wider glyph still shows whole. */
-const MARKER_SX = { flex: '0 0 auto', minWidth: '1.25em', textAlign: 'center', fontSize: '0.625rem', color: 'text.disabled' } as const
-/* `FeedMarker.hug`: the name's own gap, not a column's centring cell. */
-const MARKER_HUG_SX = { ml: 0.5 } as const
+const MARKER_SX = { flex: '0 0 auto', minWidth: grid(2), textAlign: 'center', fontSize: FONT_SIZE.xxs, color: 'text.disabled' } as const
+/* `FeedMarker.hug`: the name's own gap, not a column's centring cell; centred on the name's line, so an icon glyph
+   sits on it rather than on the text baseline. */
+const MARKER_HUG_SX = { ml: 0.5, display: 'inline-flex', alignItems: 'center', alignSelf: 'center' } as const
 /* `FeedMarker.word`: a hair after the glyph, in the marker's own size and tone. */
-const MARKER_WORD_SX = { ml: '2px', fontWeight: 600 } as const
+const MARKER_WORD_SX = { ml: 0, fontWeight: FONT_WEIGHT.semibold } as const
 
 /* `FeedRowSpec.titleWrapAt`: `TITLE_TWO_LINES_SX` inside the band(s), nested so several must all match. */
 function titleWrapSx(bands: string | readonly string[]): object {
@@ -395,14 +445,14 @@ const DISCLOSURE_SX = {
   flex: '0 0 auto',
   width: DISCLOSURE_SLOT,
   minWidth: DISCLOSURE_SLOT,
-  height: 22,
+  height: grid(3.5),
   p: 0,
-  borderRadius: 1,
-  fontSize: '0.875rem',
-  lineHeight: 1,
+  borderRadius: RADIUS.sm,
+  fontSize: FONT_SIZE.base,
+  lineHeight: LINE_HEIGHT.tight,
   color: 'text.secondary',
   [TAP_FLOOR_DOWN]: { minWidth: DISCLOSURE_TOUCH_MIN },
-  [PHONE]: { width: 18, minWidth: 18, height: 22, minHeight: 0, fontSize: '0.8125rem' },
+  [PHONE]: { width: DISCLOSURE_SLOT, minWidth: DISCLOSURE_SLOT, height: grid(3.5), minHeight: 0, fontSize: FONT_SIZE.md },
 } as const
 
 /* Reserves the disclosure's WIDTH and MUST NEVER set the row's height (it once made rows 44px). */
@@ -414,7 +464,7 @@ const DISCLOSURE_SPACER_SX = {
   height: 'auto',
   minHeight: 0,
   [TAP_FLOOR_DOWN]: { minWidth: DISCLOSURE_TOUCH_MIN },
-  [PHONE]: { width: 18, minWidth: 18, height: 'auto', minHeight: 0 },
+  [PHONE]: { width: DISCLOSURE_SLOT, minWidth: DISCLOSURE_SLOT, height: 'auto', minHeight: 0 },
 } as const
 
 /* The ⋯: narrower than 44px (a 30px row's scarce axis is width); a full 24x24 on phones (WCAG 2.5.8)
@@ -424,28 +474,25 @@ const ACTIONS_SX = {
   display: 'inline-flex',
   width: ACTIONS_SLOT,
   minWidth: ACTIONS_SLOT,
-  height: 24,
+  height: grid(4),
   justifyContent: 'center',
-  fontSize: '1rem',
-  lineHeight: 1,
-  borderRadius: 1,
-  [PHONE]: { width: 24, minWidth: 24, height: 24, minHeight: 0, fontSize: '0.875rem' },
+  fontSize: FONT_SIZE.lg,
+  lineHeight: LINE_HEIGHT.tight,
+  borderRadius: RADIUS.sm,
+  [PHONE]: { width: grid(4), minWidth: grid(4), height: grid(4), minHeight: 0, fontSize: FONT_SIZE.base },
 } as const
 
-/* Reserved, so a verbless row cannot shift every column above it. */
-const ACTIONS_SPACER_SX = {
+/* Reserved, so a verbless row cannot shift every column above it; the pool's select-all header
+ * (`components/WorktreePool.tsx`) reserves the same column. */
+export const ACTIONS_SPACER_SX = {
   flex: '0 0 auto',
   width: ACTIONS_SLOT,
-  [PHONE]: { width: 24 },
+  [PHONE]: { width: grid(4) },
 } as const
 
-const EMPTY_SX = { py: 6, textAlign: 'center', fontSize: '0.8125rem', color: 'text.disabled' } as const
+const EMPTY_SX = { py: 6, textAlign: 'center', fontSize: FONT_SIZE.md, color: 'text.disabled' } as const
 
-const SKELETON_ROW_SX = {
-  ml: `${RAIL_X + ROW_PAD_L}px`,
-  my: '9px',
-  [PHONE]: { ml: `${RAIL_X_PHONE + ROW_PAD_L_PHONE}px`, my: '6px' },
-} as const
+const SKELETON_ROW_SX = [skeletonInset, { my: 1.5, [PHONE]: { my: 1 } }] as const
 
 /* `FeedRowSpec.notes` on the disc's tap tooltip: one line per note, as on the native hover; an unbroken token (an
    address, a provider's ARN) wraps rather than overflow a phone. */
@@ -485,7 +532,7 @@ const TITLE_ACTION_SX = {
   '@media (hover: none)': { display: 'none' },
 } as const
 /* `FeedRowSpec.titleAside`: hugs the name like `titleAction`, but always drawn. */
-const TITLE_ASIDE_SX = { flex: '0 0 auto', display: 'inline-flex', alignItems: 'center', ml: 1, fontSize: '0.6875rem' } as const
+const TITLE_ASIDE_SX = { flex: '0 0 auto', display: 'inline-flex', alignItems: 'center', ml: 1, fontSize: FONT_SIZE.xs } as const
 const ROW_TITLE_ACTION_REVEAL_SX = { '&:hover .feed-title-action': { opacity: 1 } } as const
 
 /* THE DISC'S CELL DRAWS NO BOX: the disc is absolutely positioned (no flex `gap`), and a boxed wrapper would
@@ -495,6 +542,13 @@ const DISC_CELL_SX = { display: 'contents' } as const
 /* These cells replace their control as the flex item, so cluster arithmetic is unchanged; the control keeps
    its own `sx` (the tap-floor pullback must land on its class). */
 const CONTROL_CELL_SX = { flex: '0 0 auto', display: 'inline-flex' } as const
+/* `FeedDisclosure.onRail`: the control's cell sized and placed as the row's disc would be (`nodeLeft`), masking the
+   rail where it crosses as a disc does. */
+const RAIL_CONTROL_CELL_SX = {
+  position: 'absolute', top: '50%', transform: 'translateY(-50%)', display: 'inline-flex', alignItems: 'center',
+  justifyContent: 'center', width: NODE, height: NODE, borderRadius: RADIUS.round, bgcolor: 'background.default',
+  [PHONE]: { width: NODE_PHONE, height: NODE_PHONE },
+} as const
 /* `FeedRowSpec.titleMaxWidth`'s spare width. */
 const PUSH_END_SX = { ml: 'auto' } as const
 
@@ -523,21 +577,19 @@ const alignOf = (align: FeedSlot['align']) =>
 /* A gate the list's own width dropped (`./fit`): on top of its window rule, never instead of it. */
 const DROPPED_SX = { display: 'none' } as const
 
-function slotSx(slot: FeedSlot, drops: ReadonlySet<SlotGate>) {
+function slotSx(slot: FeedSlot, drops: ReadonlySet<FitDrop>, control: boolean) {
   const gate: Record<string, object> = slot.gate ? GATE_SX[slot.gate] : {}
-  const dropped = slot.gate !== undefined && drops.has(slot.gate)
+  const dropped = isDropped(drops, slot, control)
   return (theme: Theme) => withNarrowWidth(slot.narrowWidth, withPhoneWidth(slot.phoneWidth, {
       ...gate,
       flex: '0 0 auto',
       width: slot.width,
-      fontSize: slot.fontSize ?? '0.6875rem',
+      fontSize: slot.fontSize ?? FONT_SIZE.xs,
       ...(slot.mono ? { fontFamily: monoFamily(theme) } : null),
       color: slot.dim ? 'text.disabled' : 'text.secondary',
       textAlign: alignOf(slot.align),
-      overflow: 'hidden',
-      textOverflow: 'ellipsis',
-      whiteSpace: 'nowrap',
-      ...(slot.lines === 2 ? { ...TITLE_TWO_LINES_SX, lineHeight: 1.3 } : null),
+      ...ELLIPSIS_SX,
+      ...(slot.lines === 2 ? { ...TITLE_TWO_LINES_SX, lineHeight: LINE_HEIGHT.snug } : null),
       /* After `lines`, whose clamp sets its own `display`. */
       ...(dropped ? DROPPED_SX : null),
       /* The tap-floor pullback per `./geometry`'s `DISCLOSURE_TOUCH_MIN` block; `FeedSlot.compact` says when. MERGED
@@ -549,8 +601,8 @@ function slotSx(slot: FeedSlot, drops: ReadonlySet<SlotGate>) {
               '& .MuiIconButton-root, & .MuiButtonBase-root': {
                 minHeight: 0,
                 minWidth: 0,
-                width: 24,
-                height: 24,
+                width: grid(4),
+                height: grid(4),
               },
             },
             [PHONE]: {
@@ -558,8 +610,8 @@ function slotSx(slot: FeedSlot, drops: ReadonlySet<SlotGate>) {
               '& .MuiIconButton-root, & .MuiButtonBase-root': {
                 minHeight: 0,
                 minWidth: 0,
-                width: 24,
-                height: 24,
+                width: grid(4),
+                height: grid(4),
               },
             },
           }
@@ -649,8 +701,9 @@ function FeedDisc({
     nodeLeft(depth),
     { color: TONE_COLOR[tone], bgcolor: TONE_TINT[tone] },
     indicator.live ? LIVE_NODE_SX : null,
-    row.deepLinked || row.current ? MARKED_NODE_SX : null,
+    indicator.attention ? ATTENTION_NODE_SX : null,
     pressable ? NODE_BUTTON_SX : null,
+    row.deepLinked || row.current ? MARKED_NODE_SX : null,
     swap ? PRESS_SWAP_SX : null,
     // An unticked checkbox disc draws its edge, so it reads as a box to tick rather than a blank state.
     indicator.checked === false ? UNCHECKED_NODE_SX : null,
@@ -661,6 +714,8 @@ function FeedDisc({
   for (const [key, value] of Object.entries(indicator.data ?? {})) {
     if (value !== undefined) discData[`data-${key}`] = String(value)
   }
+  // The halo is a pseudo-element no oracle can select: the state rides the disc.
+  if (indicator.attention) discData['data-attention'] = 'true'
 
   const discBody = (
     <>
@@ -673,20 +728,19 @@ function FeedDisc({
 
   /* A PRESSABLE disc is announced by its VERB (`pressLabel`), not its state — a checkbox disc by its item. */
   const discBox = pressable ? (
-    <Box
+    <Tip title={pressTitle}><Box
       component="button"
       type="button"
       data-testid="feed-node"
       data-tone={tone}
       {...(indicator.checked === undefined ? {} : { role: 'checkbox', 'aria-checked': indicator.checked })}
       aria-label={indicator.pressLabel ?? indicator.label}
-      title={pressTitle}
       onClick={indicator.onPress}
       sx={discSx}
       {...discData}
     >
       {discBody}
-    </Box>
+    </Box></Tip>
   ) : (
     <Box
       component="span"
@@ -707,7 +761,7 @@ function FeedDisc({
   return (
     <Box role="cell" sx={DISC_CELL_SX}>
       {tapTip ? (
-        <Tooltip
+        <Tip
           title={tapTip}
           open={tipOpen}
           onOpen={() => setTipOpen(true)}
@@ -717,29 +771,93 @@ function FeedDisc({
           leaveTouchDelay={6000}
         >
           {discBox}
-        </Tooltip>
+        </Tip>
       ) : discBox}
     </Box>
   )
 }
 
 /** A trailing cell: a `FeedRowSpec.slots` entry, or the row's `control`. */
-function slotCell(slot: FeedSlot, drops: ReadonlySet<SlotGate>): JSX.Element {
+function slotCell(slot: FeedSlot, drops: ReadonlySet<FitDrop>, control = false): JSX.Element {
   const slotData: Record<string, string> = {}
   for (const [key, value] of Object.entries(slot.data ?? {})) {
     if (value !== undefined) slotData[`data-${key}`] = String(value)
   }
   return (
-    <Box
+    <Tip key={slot.key} title={slot.title}><Box
       component="span"
-      key={slot.key}
       role="cell"
       data-testid={slot.testId}
-      title={slot.title}
-      sx={slotSx(slot, drops)}
+      sx={slotSx(slot, drops, control)}
       {...slotData}
     >
       {slot.node}
+    </Box></Tip>
+  )
+}
+
+/* ── A LEAD THAT COPIES (`FeedRowSpec.lead.copy`) ── a click puts `copy.value()` on the clipboard; the id
+   pops and turns green (red on a refused clipboard) for `LEAD_FLASH_MS`. The text never changes: the cell is
+   34px, too narrow for a word. No tooltip: the flash is the answer, and the outcome is SAID in the live region;
+   the accessible name stays the verb, so a screen reader hears the outcome once. A button, so the row's
+   press and drag guards (`ROW_CONTROL_SELECTOR`, `DRAG_BLOCKING_SELECTOR`) leave the click to it. */
+const LEAD_FLASH_MS = 900
+const leadPop = keyframes`
+  0% { transform: scale(1); }
+  40% { transform: scale(1.25); }
+  100% { transform: scale(1); }
+`
+const LEAD_COPY_SX = {
+  ...UNSTYLED_BUTTON_SX,
+  maxWidth: '100%',
+  /* The span inside carries the pop: a transformed ellipsis cell would clip it. */
+  '& > span': { display: 'inline-block', transformOrigin: 'right center' },
+} as const
+/* The face per state, hover included: a click lands while hovering, so a hover-only colour would hide the flash. */
+const LEAD_STATE_COLOR = { idle: 'text.primary', copied: 'success.main', failed: 'error.main' } as const
+
+function FeedLead({
+  lead,
+  copy: { what, value },
+  drops,
+}: {
+  lead: NonNullable<FeedRowSpec['lead']>
+  copy: NonNullable<NonNullable<FeedRowSpec['lead']>['copy']>
+  drops: ReadonlySet<FitDrop>
+}): JSX.Element {
+  const [state, copy] = useCopyFlash(LEAD_FLASH_MS)
+  const said = state === 'copied' ? `Copied ${what}` : state === 'failed' ? 'Copy unavailable' : `Copy ${what}`
+  return (
+    <Box role="cell" sx={leadSx(lead.width ?? 40, lead.gate, lead.align, drops)}>
+      <Box
+        component="button"
+        type="button"
+        data-testid="feed-lead"
+        data-copy-state={state}
+        aria-label={`Copy ${what}`}
+        onClick={() => copy(value)}
+        sx={[
+          LEAD_COPY_SX,
+          state === 'idle'
+            ? { '&:hover, &:focus-visible': { color: LEAD_STATE_COLOR.idle } }
+            : { '&, &:hover, &:focus-visible': { color: LEAD_STATE_COLOR[state], fontWeight: FONT_WEIGHT.bold } },
+        ]}
+      >
+        <Box
+          component="span"
+          /* Keyed on state so the pop replays on every flash. */
+          key={state}
+          sx={{
+            animation: state === 'idle' ? undefined : `${leadPop} 260ms ease-out`,
+            '@media (prefers-reduced-motion: reduce)': { animation: 'none' },
+          }}
+        >
+          {lead.text}
+        </Box>
+      </Box>
+      <Box component="span" role="status" aria-live="polite" sx={SR_ONLY_SX}>
+        {state === 'idle' ? '' : said}
+      </Box>
     </Box>
   )
 }
@@ -749,7 +867,7 @@ function slotCell(slot: FeedSlot, drops: ReadonlySet<SlotGate>): JSX.Element {
  *  each time stalled typing in the create row. A route that hands back the SAME spec object for an unchanged row
  *  (`components/tasks/listViews/ActivityFeedView.tsx` caches them) skips that row's render entirely; a route
  *  that rebuilds every spec loses nothing but the saving. */
-const FeedRow = memo(function FeedRow({ row: spec, depth, actionsColumn, drops }: { row: FeedRowSpec; depth: number; actionsColumn: boolean; drops: ReadonlySet<SlotGate> }): JSX.Element {
+const FeedRow = memo(function FeedRow({ row: spec, depth, actionsColumn, drops }: { row: FeedRowSpec; depth: number; actionsColumn: boolean; drops: ReadonlySet<FitDrop> }): JSX.Element {
   /* THE EDITOR OPEN BESIDE THIS LIST (components/ListDetail.tsx) is what the surface shows now: its row is
      `current`, so every list marks the open record without passing anything. */
   const openInPane = isOpenPath(useOpenDetailPath(), spec.href)
@@ -762,25 +880,31 @@ const FeedRow = memo(function FeedRow({ row: spec, depth, actionsColumn, drops }
 
   /* No indicator: nothing on the rail, and nothing in the a11y tree (a container is named by its title). */
   const disc = indicator ? <FeedDisc row={row} indicator={indicator} depth={depth} named={named} /> : null
+  const pick = row.pick ? (
+    <Box role="cell" data-testid="feed-pick-host" sx={[PICK_HOST_SX, nodeLeft(depth)]}>{row.pick}</Box>
+  ) : null
 
+  const onRail = Boolean(row.disclosure && row.disclosure !== 'spacer' && row.disclosure.onRail)
   const disclosure =
     row.disclosure && row.disclosure !== 'spacer' ? (
-      <Box role="cell" sx={CONTROL_CELL_SX}>
-      <IconButton
-        data-testid="feed-disclosure"
-        aria-label={`${row.disclosure.expanded ? 'Collapse' : 'Expand'} ${row.disclosure.label ?? 'children'} of ${row.titleText}`}
-        aria-expanded={row.disclosure.expanded}
-        /* The glyph alone does not say what it folds: the tooltip names it (the label carries the row too). */
-        title={`${row.disclosure.expanded ? 'Collapse' : 'Expand'} ${row.disclosure.label ?? 'children'}`}
-        /* BUSY SHOWS, IT DOES NOT DISABLE: leaving the tab order mid-press strands a changed mind. */
-        onClick={row.disclosure.onToggle}
-        sx={DISCLOSURE_SX}
-      >
-        <Box component="span" aria-hidden="true">
-          {row.disclosure.busy ? '…' : disclosureGlyph(row.disclosure.expanded)}
+      <>
+        <Box role="cell" sx={onRail ? [RAIL_CONTROL_CELL_SX, nodeLeft(depth)] : CONTROL_CELL_SX}>
+        <IconButton
+          data-testid="feed-disclosure"
+          aria-label={`${row.disclosure.expanded ? 'Collapse' : 'Expand'} ${row.disclosure.label ?? 'children'} of ${row.titleText}`}
+          aria-expanded={row.disclosure.expanded}
+          /* The glyph alone does not say what it folds: the label names it and its row. */
+          /* BUSY SHOWS, IT DOES NOT DISABLE: leaving the tab order mid-press strands a changed mind. */
+          onClick={row.disclosure.onToggle}
+          sx={DISCLOSURE_SX}
+        >
+          <Box component="span" aria-hidden="true">
+            {row.disclosure.busy ? '…' : disclosureGlyph(row.disclosure.expanded)}
+          </Box>
+        </IconButton>
         </Box>
-      </IconButton>
-      </Box>
+        {onRail && <Box aria-hidden="true" sx={DISCLOSURE_SPACER_SX} />}
+      </>
     ) : row.disclosure === 'spacer' ? (
       <Box aria-hidden="true" sx={DISCLOSURE_SPACER_SX} />
     ) : null
@@ -788,20 +912,23 @@ const FeedRow = memo(function FeedRow({ row: spec, depth, actionsColumn, drops }
   /* THE LEAD SITS RIGHT AFTER THE DISC, before the disclosure — its own cell, outside the title link, so the id
      reads as the row's label beside its status rather than floating past the caret. */
   const lead = row.lead ? (
-    <Box
-      component="span"
-      data-testid="feed-lead"
-      title={row.lead.title ?? row.lead.text}
-      /* A named row already says its id (`ariaLabel`), so the lead is hidden there like the disc and markers. */
-      {...(named ? { 'aria-hidden': true as const } : { role: 'cell' as const })}
-      sx={leadSx(row.lead.width ?? 40, row.lead.gate, row.lead.align, drops)}
-    >
-      {row.lead.text}
-    </Box>
+    row.lead.copy ? (
+      <FeedLead lead={row.lead} copy={row.lead.copy} drops={drops} />
+    ) : (
+      <Tip title={row.lead.title ?? row.lead.text}><Box
+        component="span"
+        data-testid="feed-lead"
+        /* A named row already says its id (`ariaLabel`), so the lead is hidden there like the disc and markers. */
+        {...(named ? { 'aria-hidden': true as const } : { role: 'cell' as const })}
+        sx={leadSx(row.lead.width ?? 40, row.lead.gate, row.lead.align, drops)}
+      >
+        {row.lead.text}
+      </Box></Tip>
+    )
   ) : null
 
   const titleNode = (
-    <Box
+    <Tip title={row.drag?.drop === 'reject' ? undefined : withNotes(row.titleText, row.notes ?? [])}><Box
       component="span"
       className="feed-title"
       data-testid="feed-title"
@@ -810,13 +937,13 @@ const FeedRow = memo(function FeedRow({ row: spec, depth, actionsColumn, drops }
         row.titleLines === 2 ? TITLE_TWO_LINES_SX : row.titleLines === 'all' ? TITLE_ALL_LINES_SX : null,
         row.titleWrapAt && row.titleLines === undefined ? titleWrapSx(row.titleWrapAt) : null,
         indicator?.live ? LIVE_TITLE_SX : null,
+        row.quiet ? QUIET_TITLE_SX : null,
       ]}
       /* During a refused drag the row's `dropReason` wins over the truncation `title` (the inner title would
          otherwise win over the name). Restored when the drag ends. */
-      title={row.drag?.drop === 'reject' ? undefined : withNotes(row.titleText, row.notes ?? [])}
     >
       {row.title}
-    </Box>
+    </Box></Tip>
   )
 
   /* The `<a>` keeps its `link` role, so the cell WRAPS it. The name goes on the `<a>` where there is one,
@@ -839,11 +966,9 @@ const FeedRow = memo(function FeedRow({ row: spec, depth, actionsColumn, drops }
       if (value !== undefined) markerData[`data-${key}`] = String(value)
     }
     return (
-      <Box
+      <Tip key={marker.key} title={marker.title ?? marker.label}><Box
         component="span"
-        key={marker.key}
         data-testid={marker.testId}
-        title={marker.title ?? marker.label}
         {...(named
           ? { 'aria-hidden': true as const }
           : { role: marker.hug ? ('img' as const) : ('cell' as const), 'aria-label': marker.label })}
@@ -860,7 +985,7 @@ const FeedRow = memo(function FeedRow({ row: spec, depth, actionsColumn, drops }
             {marker.word.text}
           </Box>
         )}
-      </Box>
+      </Box></Tip>
     )
   }
   /* `FeedMarker.hug`: a column marker lands at the GROWING title cell's far end, which on a phone row
@@ -1008,7 +1133,7 @@ const FeedRow = memo(function FeedRow({ row: spec, depth, actionsColumn, drops }
 
   return (
     <>
-      <Box
+      <Tip title={drag?.drop === 'reject' ? drag.dropReason : undefined}><Box
         role="row"
         id={row.id}
         data-testid="feed-row"
@@ -1024,7 +1149,6 @@ const FeedRow = memo(function FeedRow({ row: spec, depth, actionsColumn, drops }
               }
             : undefined
         }
-        title={drag?.drop === 'reject' ? drag.dropReason : undefined}
         onPointerDown={pointerDown}
         onPointerMove={pressMove}
         onPointerUp={pressUp}
@@ -1074,10 +1198,12 @@ const FeedRow = memo(function FeedRow({ row: spec, depth, actionsColumn, drops }
           drag?.lifted ? ROW_LIFTED_SX : null,
           dragUp ? ROW_NO_SELECT_SX : null,
           onLongPress ? ROW_LONG_PRESS_SX : null,
+          pick ? ROW_PICK_SX : null,
         ]}
         {...data}
       >
         {disc}
+        {pick}
         {lead}
         {disclosure}
         {naming}
@@ -1092,9 +1218,9 @@ const FeedRow = memo(function FeedRow({ row: spec, depth, actionsColumn, drops }
           <Box aria-hidden="true" sx={[ACTIONS_SPACER_SX, row.titleMaxWidth ? PUSH_END_SX : null]} />
         ) : null}
         {row.control && (row.titleMaxWidth && !(row.actions && row.actions.length > 0)
-          ? <Box sx={[CONTROL_CELL_SX, PUSH_END_SX]}>{slotCell(row.control, drops)}</Box>
-          : slotCell(row.control, drops))}
-      </Box>
+          ? <Box sx={[CONTROL_CELL_SX, PUSH_END_SX]}>{slotCell(row.control, drops, true)}</Box>
+          : slotCell(row.control, drops, true))}
+      </Box></Tip>
       {/* Children and detail follow the disclosure; with NO disclosure children still render. The region is a
           one-cell ROW; `detailKeepMounted` keeps it findable (`KeepMountedDetail`). */}
       {row.detailKeepMounted ? (
@@ -1124,7 +1250,7 @@ const COLUMNS_ROW_SX = {
   display: 'flex',
   alignItems: 'stretch',
   gap: 1,
-  minHeight: 24,
+  minHeight: grid(4),
   pr: 0.5,
   borderBottom: '1px solid',
   borderColor: 'divider',
@@ -1135,15 +1261,15 @@ const COLUMN_CELL_SX = {
   display: 'flex',
   alignItems: 'center',
   minWidth: 0,
-  fontSize: '0.6875rem',
-  fontWeight: 600,
-  letterSpacing: '0.06em',
+  fontSize: FONT_SIZE.xs,
+  fontWeight: FONT_WEIGHT.semibold,
+  letterSpacing: LETTER_SPACING.caps,
   textTransform: 'uppercase',
-  lineHeight: 1,
+  lineHeight: LINE_HEIGHT.tight,
   color: 'text.secondary',
   whiteSpace: 'nowrap',
   /* 10px is the floor at 320px (`headLevel`'s budget note). */
-  [PHONE]: { fontSize: '0.625rem', letterSpacing: '0.04em' },
+  [PHONE]: { fontSize: FONT_SIZE.xxs, letterSpacing: LETTER_SPACING.caps },
 } as const
 
 const COLUMN_TITLE_SX = { flex: '1 1 auto' } as const
@@ -1159,20 +1285,15 @@ const COLUMN_TITLE_SX = { flex: '1 1 auto' } as const
 const COLUMN_BUTTON_SX = {
   display: 'flex',
   alignItems: 'center',
-  gap: '3px',
+  gap: 0.5,
   width: '100%',
   height: '100%',
   minWidth: 0,
   m: 0,
-  p: 0,
-  border: 0,
-  borderRadius: 0.5,
-  background: 'none',
-  cursor: 'pointer',
-  font: 'inherit',
+  ...UNSTYLED_BUTTON_SX,
+  borderRadius: RADIUS.sm,
   letterSpacing: 'inherit',
   textTransform: 'inherit',
-  color: 'inherit',
   transition: 'color 120ms ease-out',
   '&:hover': { color: 'text.primary' },
   '&:focus-visible': { outline: '2px solid', outlineColor: 'primary.main', outlineOffset: '-2px', color: 'text.primary' },
@@ -1186,18 +1307,18 @@ const COLUMN_LABEL_SX = { overflow: 'hidden', textOverflow: 'ellipsis', minWidth
 const COLUMN_LABEL_BOX_SX = { position: 'relative', display: 'flex', minWidth: 0, maxWidth: '100%' } as const
 
 /* Half the arrow's room (glyph plus margin), reserved after a sorted right-aligned label. */
-const COLUMN_ARROW_ROOM_SX = { mr: '5px', flexShrink: 0, maxWidth: 'none' } as const
+const COLUMN_ARROW_ROOM_SX = { mr: 0.5, flexShrink: 0, maxWidth: 'none' } as const
 
 /* Smaller than the label: a mark beside a word, not a second word. */
 const COLUMN_ARROW_SX = {
   position: 'absolute',
   top: '50%',
   transform: 'translateY(-50%)',
-  fontSize: '0.5625rem',
-  lineHeight: 1,
+  fontSize: grid(1.5),
+  lineHeight: LINE_HEIGHT.tight,
   pointerEvents: 'none',
   left: '100%',
-  ml: '2px',
+  ml: 0,
 } as const
 
 const justifyOf = (align: FeedSlot['align']) =>
@@ -1238,13 +1359,12 @@ function FeedColumnCell({
     </Box>
   )
   return (
-    <Box
+    <Tip title={hover}><Box
       role="columnheader"
       data-testid="feed-column"
       data-column={column.key}
       aria-sort={dir === 'asc' ? 'ascending' : dir === 'desc' ? 'descending' : undefined}
       aria-label={sortKey && onSort ? undefined : column.ariaLabel}
-      title={hover}
       sx={[COLUMN_CELL_SX, { justifyContent: justifyOf(align) }, active ? COLUMN_ACTIVE_SX : null, sx]}
     >
       {sortKey && onSort ? (
@@ -1258,7 +1378,7 @@ function FeedColumnCell({
           {body}
         </Box>
       ) : body}
-    </Box>
+    </Box></Tip>
   )
 }
 
@@ -1273,12 +1393,12 @@ function FeedColumnsRow({
   drops,
 }: {
   template: FeedRowSpec
-  columns: { title: FeedColumn; slots?: FeedColumn[] }
+  columns: FeedColumns
   sort?: { key: string | null; dir: SortDir }
   onSort?: (sortKey: string, firstDir?: SortDir) => void
   nested?: boolean
   actionsColumn: boolean
-  drops: ReadonlySet<SlotGate>
+  drops: ReadonlySet<FitDrop>
 }): JSX.Element {
   const byKey = new Map((columns.slots ?? []).map((column) => [column.key, column]))
   /* IN A NESTED OUTLINE the title header starts flush left, on the top-level headings' caret: inset to the rows'
@@ -1314,19 +1434,26 @@ function FeedColumnsRow({
             <Box key={slot.key} aria-hidden="true" sx={columnSlotSx(slot, drops)} />
           )
         })}
-        {actionsColumn && <Box aria-hidden="true" sx={[ACTIONS_SPACER_SX, template.titleMaxWidth ? PUSH_END_SX : null]} />}
+        {/* A list-wide control (`columns.actions`, e.g. the order menu) heads the ⋯ column; otherwise a blank. */}
+        {actionsColumn && (columns.actions ? (
+          <Box role="columnheader" sx={[ACTIONS_SPACER_SX, ACTIONS_HEAD_SX, template.titleMaxWidth ? PUSH_END_SX : null]}>{columns.actions}</Box>
+        ) : <Box aria-hidden="true" sx={[ACTIONS_SPACER_SX, template.titleMaxWidth ? PUSH_END_SX : null]} />)}
       </Box>
     </Box>
   )
 }
 
-/* A slot's footprint only — width and gate — so its header drops at the same width; the type is the header's. */
-const columnSlotSx = (slot: FeedSlot, drops: ReadonlySet<SlotGate>) => ({
+/* The ⋯ column's header control, centred over the ⋯ buttons. */
+const ACTIONS_HEAD_SX = { display: 'flex', alignItems: 'center', justifyContent: 'center' } as const
+
+/* A slot's footprint only — width (its phone and narrow widths too) and gate — so its header stays over its values
+   and drops at the same width; the type is the header's. */
+const columnSlotSx = (slot: FeedSlot, drops: ReadonlySet<FitDrop>) => withNarrowWidth(slot.narrowWidth, withPhoneWidth(slot.phoneWidth, {
   ...(slot.gate ? GATE_SX[slot.gate] : null),
-  ...(slot.gate !== undefined && drops.has(slot.gate) ? DROPPED_SX : null),
+  ...(isDropped(drops, slot) ? DROPPED_SX : null),
   flex: '0 0 auto',
   width: slot.width,
-})
+}))
 
 /** A section's heading row — a folding button when `onToggle` is given. */
 function FeedSectionHeading({
@@ -1370,15 +1497,15 @@ function FeedSectionHeading({
             sx={[HEAD_SX, HEAD_BUTTON_SX, headLevel(depth, nested), inset]}
           >
             {/* Pinned width: the carets differ in width, and a moving label reads as broken. */}
-            <Box component="span" aria-hidden="true" sx={{ width: 10 }}>{disclosureGlyph(!collapsed)}</Box>
-            <Box component="span" title={label} sx={HEAD_LABEL_SX}>{label}</Box>
+            <Box component="span" aria-hidden="true" sx={{ width: grid(1.5) }}>{disclosureGlyph(!collapsed)}</Box>
+            <Tip title={label}><Box component="span" sx={HEAD_LABEL_SX}>{label}</Box></Tip>
             {labelAside}
             {count != null && <Box component="span" sx={COUNT_SX}>{count}</Box>}
             {countNote && <Box component="span" data-testid="feed-section-note" sx={COUNT_NOTE_SX}>{countNote}</Box>}
           </Box>
         ) : (
           <Box data-testid="feed-bucket-head" sx={[HEAD_SX, headLevel(depth, nested), inset]}>
-            <Box component="span" title={label} sx={HEAD_LABEL_SX}>{label}</Box>
+            <Tip title={label}><Box component="span" sx={HEAD_LABEL_SX}>{label}</Box></Tip>
             {labelAside}
             {count != null && <Box component="span" sx={COUNT_SX}>{count}</Box>}
             {countNote && <Box component="span" data-testid="feed-section-note" sx={COUNT_NOTE_SX}>{countNote}</Box>}
@@ -1414,7 +1541,7 @@ export function FeedList({
   skeletonRows?: number
   /** A column header row over the rows: `slots[].key` names the `FeedSlot.key` each heads. Drawn only while
    *  there are rows to head. */
-  columns?: { title: FeedColumn; slots?: FeedColumn[] }
+  columns?: FeedColumns
   /** The sorted column (`hooks/useListPage`'s `sort`/`dir`); its header shows ▲/▼ and carries `aria-sort`. */
   sort?: { key: string | null; dir: SortDir }
   /** A sortable header's press: its `sortKey` and `firstDir` (`useListPage`'s `toggleSort`). */
@@ -1433,7 +1560,8 @@ export function FeedList({
   /* The slots this list's OWN width cannot afford (`./fit`), priced off the first row: every row shares one slot set. */
   const first = useMemo(() => sections.find((section) => section.rows.length > 0)?.rows[0], [sections])
   const rootRef = useRef<HTMLDivElement>(null)
-  const drops = useFittedDrops(rootRef, first)
+  // Beside an open record the name keeps ~12 characters (`./fit`'s `SPLIT_NAME_FLOOR`).
+  const drops = useFittedDrops(rootRef, first, useOpenDetailPath() === null ? NAME_FLOOR : SPLIT_NAME_FLOOR)
 
   return (
     <Box ref={rootRef} role="table" aria-label={ariaLabel} data-testid={testId} sx={CONTAINER_SX}>
@@ -1449,7 +1577,7 @@ export function FeedList({
           {/* Tapering: a uniform block reads as empty rows, a ragged one as content arriving. */}
           <Box role="cell">
             {Array.from({ length: skeletonRows }, (_, index) => (
-              <Skeleton key={index} variant="text" height={12} width={`${70 - index * 6}%`} sx={SKELETON_ROW_SX} />
+              <Skeleton key={index} variant="text" height={grid(2)} width={`${70 - index * 6}%`} sx={SKELETON_ROW_SX} />
             ))}
           </Box>
         </Box>

@@ -56,7 +56,7 @@ HYPERVISOR_VALUES: tuple[str, ...] = ("kvm", "kvm-wsl2", "vz")
 CAP_GHA_RUNNERS = "gha_runners"
 CAP_VNODE_HOST = "vnode_host"
 CAP_SHARED_ACCOUNTS = "shared_accounts"
-# Display only: the cloud door validates its own `os` (Ubuntu, or Windows on a `windows_capable` type).
+# Display only: a cloud order validates its own `os` (Ubuntu, or Windows on a `windows_capable` type).
 CAP_CLOUD_LAUNCH = "cloud_launch"
 #: Running a registered SDK agent (`app/agents.py`): the supervisor and its runtimes ship for Ubuntu only.
 CAP_SDK_AGENT = "sdk_agent"

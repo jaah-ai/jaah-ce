@@ -8,6 +8,7 @@ the caller may see (`visible_session_clause`) and belong to a task the caller ma
 other pair is the same 404."""
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any, Iterator, Optional
@@ -21,11 +22,12 @@ from sqlalchemy.orm import Session
 from app import data_access_events, hipaa
 from app import session_transcripts as transcripts
 from app import session_events
-from app.auth import require_user
+from app.auth import adopt_user
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller
 from app.authz.visibility import scoped_task_select, visible_session_clause
-from app.db import get_session
+from app.db_async import DbDep, on_session
+from app.entity_shape import or_404, refused_as
 from app.models.agent_sessions import AgentSession
 from app.models.identity import AdminUser
 from app.models.tasks import Task
@@ -49,19 +51,13 @@ class SessionEventsOut(BaseModel):
 def _session_row(
     session: Session, principal: Optional[Principal], task_id: int, agent_session_id: str
 ) -> AgentSession:
-    if principal is None:
-        raise HTTPException(status_code=404, detail="no such session on this task")
-    task = session.scalars(scoped_task_select(principal).where(Task.id == task_id)).first()
-    row = session.scalars(
-        select(AgentSession).where(
-            AgentSession.agent_session_id == agent_session_id,
-            AgentSession.task_id == task_id,
-            visible_session_clause(principal),
-        )
-    ).first()
-    if task is None or row is None:
-        raise HTTPException(status_code=404, detail="no such session on this task")
-    return row
+    principal = or_404(principal, detail="no such session on this task")
+    or_404(session.scalars(scoped_task_select(principal).where(Task.id == task_id)).first(),
+           detail="no such session on this task")
+    return or_404(session.scalars(select(AgentSession).where(
+        AgentSession.agent_session_id == agent_session_id, AgentSession.task_id == task_id,
+        visible_session_clause(principal),
+    )).first(), detail="no such session on this task")
 
 
 def _where(row: AgentSession) -> session_events.Where:
@@ -73,36 +69,29 @@ def _where(row: AgentSession) -> session_events.Where:
 
 @router.get("/{task_id}/sessions/{agent_session_id}/events", response_model=SessionEventsOut)
 @feature("sessions", "edit")
-def read_session_events(
+async def read_session_events(
+    db: DbDep,
     task_id: int,
     agent_session_id: str,
     request: Request,
     after: int = Query(default=0, ge=0, le=session_events.MAX_SEQ),
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> SessionEventsOut:
     """Events with `seq > after`, at most `session_events.READ_LIMIT`. A legacy session answers an empty page:
     it has no stream. In a HIPAA org every page that returns events is a PHI read (a person's unattended
     background poll excepted, as everywhere — `hipaa.stage_phi_read`)."""
-    row = _session_row(session, principal, task_id, agent_session_id)
-    status, runtime, last_seq, org_id = row.status, row.runtime, row.events_last_seq, row.org_id
-    if not last_seq or last_seq <= after:
+    status, runtime, last_seq, org_id, where = await db.run_sync(
+        _read_session_events, task_id, agent_session_id, after, caller.principal
+    )
+    if where is None:
         events: list[dict[str, Any]] = []
         more = False
     else:
-        where = _where(row)
-        # Release the connection before the S3 reads; the plain values above are all that is needed.
-        session.rollback()
-        try:
-            events, more = session_events.read(where, last_seq=last_seq, after=after)
-        except (session_events.EventStorageUnavailable, transcripts.KeyRefused) as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from None
+        with refused_as(503, session_events.EventStorageUnavailable, transcripts.KeyRefused):
+            # Off the loop, with no connection held: the chunks are S3 reads.
+            events, more = await asyncio.to_thread(session_events.read, where, last_seq=last_seq, after=after)
         if events:
-            hipaa.record_phi_read(
-                session, request, record_type="session_events", record_id=agent_session_id,
-                task_id=task_id, org_id=org_id, user=_user,
-            )
+            await db.run_sync(_record_events_read, request, agent_session_id, task_id, org_id, caller.actor)
     return SessionEventsOut(
         session_id=agent_session_id,
         status=status,
@@ -113,21 +102,52 @@ def read_session_events(
     )
 
 
+def _read_session_events(
+    session: Session,
+    task_id: int,
+    agent_session_id: str,
+    after: int,
+    principal: Principal | None,
+) -> tuple[str, str, Optional[int], Any, Optional[session_events.Where]]:
+    """`read_session_events`'s reads, over the route's async session (`run_sync`): the row's plain values, and where
+    its events are when there are any past `after` (None: an empty page)."""
+    row = _session_row(session, principal, task_id, agent_session_id)
+    status, runtime, last_seq, org_id = row.status, row.runtime, row.events_last_seq, row.org_id
+    if not last_seq or last_seq <= after:
+        return status, runtime, last_seq, org_id, None
+    where = _where(row)
+    # Release the connection before the S3 reads; the plain values above are all that is needed.
+    session.rollback()
+    return status, runtime, last_seq, org_id, where
+
+
+def _record_events_read(
+    session: Session, request: Request, agent_session_id: str, task_id: int, org_id: Any, _user: AdminUser
+) -> None:
+    """A page that returned events is a PHI read in a HIPAA org, over the route's async session (`run_sync`)."""
+    _user = adopt_user(session, _user)
+    hipaa.record_phi_read(
+        session, request, record_type="session_events", record_id=agent_session_id,
+        task_id=task_id, org_id=org_id, user=_user,
+    )
+
+
 @router.get(
     "/{task_id}/sessions/{agent_session_id}/events.jsonl", response_class=StreamingResponse, response_model=None
 )
 @feature("sessions", "edit")
+@on_session
 def download_session_events(
+    session: Session,
     task_id: int,
     agent_session_id: str,
     request: Request,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> StreamingResponse:
     """The whole stream, one §3.1 event per line — the same shape for every engine. Recorded as a data access
     (and a PHI read in a HIPAA org) before the first byte, as the transcript download is."""
-    row = _session_row(session, principal, task_id, agent_session_id)
+    _user = adopt_user(session, caller.actor)
+    row = _session_row(session, caller.principal, task_id, agent_session_id)
     if not row.events_last_seq:
         raise HTTPException(status_code=409, detail="This session has no event stream.")
     where = _where(row)

@@ -8,8 +8,7 @@ tmux console. Backs the shorthand "clauded {project} {worktree}".
                via the control-plane API: THIS node's worktree row (`/api/agent/worktrees` → `path`), falling
                back to the clone path computed LOCALLY from the project's `id` plus this node's
                own `JAAH_HOME` (`env_helpers.resolve_clone_root`) when the slot has no row.
-    N          worktree number -> the existing pool worktree (the `main` clone's numbered
-               sibling by convention). Omit -> the main clone itself.
+    N          worktree number -> the existing pool worktree. Required.
 
 Unlike a fleet task run, this attaches NO Stop hook: the session is interactive and parks at the
 prompt for you to drive. It only ever opens an EXISTING worktree — it never creates one (errors if the
@@ -93,12 +92,7 @@ def key_preflight(api_key_account: str) -> str:
 
     helper = (f"{shq_nested(account_auth.CREDENTIAL_HELPER)} "
               f"{shq_nested(account_auth.NODE_CREDENTIAL_PREFIX + api_key_account)}")
-    return (
-        f"n=0; until {helper} >/dev/null 2>&1; do n=$((n+1)); "
-        f"if [ $n -ge {_KEY_PREFLIGHT_TRIES} ]; then "
-        f"echo \"clauded-wt: the credential broker served no API key for this tab - not starting\" >&2; "
-        f"exit 1; fi; sleep {_KEY_PREFLIGHT_SLEEP}; done; "
-    )
+    return _preflight(helper, "API key")
 
 
 def bedrock_preflight(plan) -> str:
@@ -107,17 +101,21 @@ def bedrock_preflight(plan) -> str:
     import bedrock_launch
     from fleet_launch import shq_nested
 
-    helper = bedrock_launch.export_command(plan, shq_nested)
+    return _preflight(bedrock_launch.export_command(plan, shq_nested), "Bedrock credentials")
+
+
+def _preflight(helper: str, what: str) -> str:
+    """The two preflights' shared fragment: `helper` (already nested-quoted) retried `_KEY_PREFLIGHT_TRIES` times."""
     return (
         f"n=0; until {helper} >/dev/null 2>&1; do n=$((n+1)); "
         f"if [ $n -ge {_KEY_PREFLIGHT_TRIES} ]; then "
-        f"echo \"clauded-wt: the credential broker served no Bedrock credentials for this tab - not starting\" >&2; "
+        f"echo \"clauded-wt: the credential broker served no {what} for this tab - not starting\" >&2; "
         f"exit 1; fi; sleep {_KEY_PREFLIGHT_SLEEP}; done; "
     )
 
 
 def _write_bedrock_settings(plan, *, wt: str, name: str, with_hooks: bool, guard: bool) -> tuple[str, str]:
-    """`_write_api_key_settings`' Jaah-account twin: the tab's hooks (a numbered slot's) plus
+    """`_write_api_key_settings`' Jaah-account twin: the tab's hooks plus
     `bedrock_launch.settings` (`fleet_dispatch.with_bedrock_settings`), written as the session user."""
     import fleet_dispatch
 
@@ -126,21 +124,21 @@ def _write_bedrock_settings(plan, *, wt: str, name: str, with_hooks: bool, guard
 
 
 def _write_api_key_settings(provider: str, key_helper: str, *, wt: str, name: str,
-                            with_hooks: bool, guard: bool) -> tuple[str, str]:
-    """`(error, settings flag)` for an API-key tab: the `role="user"` hooks a numbered slot's tab carries
-    (the same `build_settings` call `ctl.py autoclose-flag` makes), plus the adapter's `api_key_settings`
-    (`fleet_dispatch.with_api_key_settings`), written as the session user into `_meta`. The main clone's
-    tab carries only the key setting."""
+                            with_hooks: bool, guard: bool, workspace_id: str = "") -> tuple[str, str]:
+    """`(error, settings flag)` for an API-key tab: the tab's hooks (the same `build_settings` call
+    `ctl.py autoclose-flag` makes), plus the adapter's `api_key_settings` (`fleet_dispatch.with_api_key_settings`,
+    with an unscoped key's `workspace_id` header), written as the session user into `_meta`."""
     import fleet_dispatch
 
     return _write_tab_settings(wt, name, with_hooks, guard, provider,
-                               fleet_dispatch.with_api_key_settings, provider=provider, key_helper=key_helper)
+                               fleet_dispatch.with_api_key_settings, provider=provider, key_helper=key_helper,
+                               workspace_id=workspace_id)
 
 
 def _write_tab_settings(wt: str, name: str, with_hooks: bool, guard: bool, hooks_provider: str,
                         compose: Callable[..., tuple[str, str]], **account) -> tuple[str, str]:
     """`(error, settings flag)` for one tab's `_meta/clauded-<slot>.settings.json`, written as the session user:
-    the `role="user"` hooks when `with_hooks`, composed with the account half by `compose(*hooks, settings_path=…,
+    the console tab's hooks when `with_hooks`, composed with the account half by `compose(*hooks, settings_path=…,
     **account)` (`fleet_dispatch.with_api_key_settings` / `with_bedrock_settings`)."""
     import fleet_dispatch
     import fleet_launch
@@ -151,8 +149,8 @@ def _write_tab_settings(wt: str, name: str, with_hooks: bool, guard: bool, hooks
         return f"could not create {meta}: {dir_err}", ""
     settings_path = os.path.join(meta, f"clauded-{os.path.basename(wt)}.settings.json")
     hooks = (fleet_launch.build_settings(
-        settings_path, "", wt, "user", hooks_dir=str(fleet_dispatch.HOOKS_DIR), autoclose=False,
-        project_name=name, provider=hooks_provider, guard=guard) if with_hooks else (None, ""))
+        settings_path, "", wt, "console", hooks_dir=str(fleet_dispatch.HOOKS_DIR), autoclose=False,
+        provider=hooks_provider, guard=guard) if with_hooks else (None, ""))
     content, flag = compose(*hooks, settings_path=settings_path, **account)
     err = session_user.write_file_as_session_user(settings_path, content, mode=fleet_dispatch.META_FILE_MODE)
     if err:
@@ -185,8 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     # Leading flags, any order, each the CP's decision: `--config-dir` (the credential account; absent
     # is refused below — no node-side fallback: the CP is the sole lease authority), `--session` (the tmux
-    # session; absent falls back to this node's default), `--securestorage-dir` (an older CP's view of the token store; accepted
-    # and unread — this node resolves the store itself, `shared_storage.securestorage_dir`), `--provider`
+    # session; absent falls back to this node's default), `--provider`
     # (`accounts.provider`; absent is the catalogue default, and `agents.get_adapter` raises for a
     # provider with no adapter rather than opening another binary), `--api-key-account` (an API-key
     # account's SLUG, in place of `--config-dir`: such an account has no config dir, and its key is served
@@ -197,11 +194,10 @@ def main(argv: list[str] | None = None) -> int:
     config_dir = ""
     api_key_account = ""
     bedrock_raw = ""
-    securestorage_dir = ""
     provider = agent_providers.DEFAULT_PROVIDER
     session_override = None
     guard_raw = ""
-    while argv[:1] and argv[0] in ("--config-dir", "--api-key-account", "--securestorage-dir", "--session",
+    while argv[:1] and argv[0] in ("--config-dir", "--api-key-account", "--session",
                                    "--provider", "--bedrock-plan", "--guard-env"):
         flag, argv = argv[0], argv[1:]
         if not argv:
@@ -212,8 +208,6 @@ def main(argv: list[str] | None = None) -> int:
             config_dir = value
         elif flag == "--api-key-account":
             api_key_account = value
-        elif flag == "--securestorage-dir":
-            securestorage_dir = value
         elif flag == "--provider":
             provider = value
         elif flag == "--bedrock-plan":
@@ -222,11 +216,11 @@ def main(argv: list[str] | None = None) -> int:
             guard_raw = value
         else:
             session_override = value
-    if not argv:
+    if len(argv) < 2:
         print(
             "usage: clauded_wt.py (--config-dir <dir> | --api-key-account <slug> | --bedrock-plan <json>) "
-            "[--securestorage-dir <dir>] [--session <name>] "
-            "[--provider <name>] [--guard-env <json>] <project> [worktree-number]",
+            "[--session <name>] "
+            "[--provider <name>] [--guard-env <json>] <project> <worktree-number>",
             file=sys.stderr,
         )
         return 2
@@ -235,8 +229,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"clauded-wt: --guard-env {guard_err}", file=sys.stderr)
         return 2
     project = argv[0]
-    number = argv[1] if len(argv) > 1 else ""
-    if number and not number.isdigit():
+    number = argv[1]
+    if not number.isdigit():
         print(f"worktree must be a number, got: {number}", file=sys.stderr)
         return 2
 
@@ -286,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
         # The base the push backstop measures a new branch from: the project row's integration branch, the
         # value a runner's slot carries as its `base`.
         guard_env[cloud_modules.load("guard_bundle").ENV_BASE] = str(proj["integration_branch"])
-    # THIS node's main clone, computed from its JAAH_HOME + the project's id (the API has no
+    # THIS node's clone root, computed from its JAAH_HOME + the project's id (the API has no
     # repo-root column). `""` when either input is unusable.
     clone = os.path.expanduser(resolve_clone_root(proj.get("id")))
     if not clone:
@@ -301,43 +295,40 @@ def main(argv: list[str] | None = None) -> int:
     # is only discoverable there). Node-scoped, since a slot is (node_id, project, number). No row falls
     # back to the derivation, so a transport blip is not a refusal.
     wt_record = control_plane_api.agent_api_worktree(
-        name, number or 0, control_plane_api.this_node_id(),
+        name, number, control_plane_api.this_node_id(),
         project_id=proj.get("id") if isinstance(proj.get("id"), int) else None,
     )
     row_path = os.path.expanduser((wt_record or {}).get("path") or "")
     # A FOLDER slot — only an explicit `has_repo: false` on the row, so an older CP's record (no
     # field) and a transport blip keep the git rules. It is opened as an empty folder, never a git tree.
-    folder = number not in ("", "0", None) and (wt_record or {}).get("has_repo") is False
+    folder = (wt_record or {}).get("has_repo") is False
 
-    # Pick the worktree: main clone when N is omitted; else pool worktree N.
-    if not number:
-        wt, tag = row_path or clone, "main"
-    else:
-        # Derived only when the row is missing; shape mirrored from `worktree_mechanics.core.PoolConfig.wt_path`:
-        # a `.../main` clone's slots are its numbered siblings. `<clone>-N` is the defensive fallback shape.
-        base = clone.rstrip("/")
-        derived = (
-            f"{os.path.dirname(base)}/{number}" if os.path.basename(base) == "main" else f"{base}-{number}"
-        )
-        wt, tag = row_path or derived, f"wt{number}"
-        if folder:
-            # A console's own folder slot is made here, empty, on first open: the CP minted the row for this
-            # session (`routes/console.py::console_new_session`) and nothing else materialises it.
-            from worktree_mechanics import core, lifecycle
+    # Pool worktree N.
+    # Derived only when the row is missing; shape mirrored from `worktree_mechanics.core.PoolConfig.wt_path`:
+    # a `.../main` clone's slots are its numbered siblings. `<clone>-N` is the defensive fallback shape.
+    base = clone.rstrip("/")
+    derived = (
+        f"{os.path.dirname(base)}/{number}" if os.path.basename(base) == "main" else f"{base}-{number}"
+    )
+    wt, tag = row_path or derived, f"wt{number}"
+    if folder:
+        # A console's own folder slot is made here, empty, on first open: the CP minted the row for this
+        # session (`routes/console.py::console_new_session`) and nothing else materialises it.
+        from worktree_mechanics import core, lifecycle
 
-            try:
-                lifecycle.ensure_folder(wt, name)
-            except core.ResetRefused as exc:
-                print(f"clauded-wt: {exc}", file=sys.stderr)
-                return 1
-        if not os.path.isdir(wt):
-            print(
-                f"no existing worktree #{number} for {name} at {wt} on node "
-                f"{control_plane_api.this_node_id() or '<unset NODE_ID>'} "
-                f"(create one: python3 apps/jaahd/ctl.py create {name})",
-                file=sys.stderr,
-            )
+        try:
+            lifecycle.ensure_folder(wt, name)
+        except core.ResetRefused as exc:
+            print(f"clauded-wt: {exc}", file=sys.stderr)
             return 1
+    if not os.path.isdir(wt):
+        print(
+            f"no existing worktree #{number} for {name} at {wt} on node "
+            f"{control_plane_api.this_node_id() or '<unset NODE_ID>'} "
+            f"(create one: python3 apps/jaahd/ctl.py create {name})",
+            file=sys.stderr,
+        )
+        return 1
     # A linked worktree's `.git` is a FILE. Accepted as it stands: asked through git, the daemon's uid is
     # refused the runner user's tree as "dubious ownership" (a macOS node), and trusting every
     # tree instead would let a slot's `.git/config` run code as the daemon.
@@ -347,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"not a git worktree: {wt}", file=sys.stderr)
             return 1
     # abspath, NOT realpath: must match bash's LOGICAL `pwd`, or prepare-trust derives a different key than
-    # set-title/the reconciler for a clone reached through a symlink.
+    # the reconciler for a clone reached through a symlink.
     wt = os.path.abspath(wt)
 
     # Window label via the one composer, `fleet_launch.slot_window_name`; the Title arrives already
@@ -362,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if wts.returncode == 0:
             for rec in json.loads(wts.stdout or "[]"):
-                if rec.get("_project") == name and rec.get("_number") == (number or "0"):
+                if rec.get("_project") == name and rec.get("_number") == number:
                     resolved_title = rec.get("title") or ""
                     break
     except Exception:
@@ -384,21 +375,16 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, bedrock_launch.PlanRefused) as refused:
             print(f"clauded-wt: --bedrock-plan cannot be launched: {refused}", file=sys.stderr)
             return 2
-        if (config_dir or api_key_account or securestorage_dir
+        if (config_dir or api_key_account
                 or adapter is not agents.get_adapter(agent_providers.DEFAULT_PROVIDER)):
             print("clauded-wt: --bedrock-plan names the Jaah account, which runs Claude alone — no other "
-                  "account, store or provider goes beside it", file=sys.stderr)
+                  "account or provider goes beside it", file=sys.stderr)
             return 2
     # The CP applied the quota/enabled gate when it chose the account. REFUSED WHEN ABSENT:
     # an unexported `CLAUDE_CONFIG_DIR` opens the session on the default, unauthenticated, ungated dir.
     if config_dir and api_key_account:
         print("clauded-wt: --config-dir and --api-key-account name two accounts — the control plane names "
               "one", file=sys.stderr)
-        return 2
-    if securestorage_dir and api_key_account:
-        # A token store holds an OAuth token; an API-key tab has none to relocate.
-        print("clauded-wt: --securestorage-dir belongs to an OAuth account, not --api-key-account",
-              file=sys.stderr)
         return 2
     if not config_dir and not api_key_account and bedrock is None:
         print(
@@ -410,7 +396,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     from fleet_launch import (
-        PROJECT_ID_ENV, PROJECT_NAME_ENV, RUNNER_PATH_PREFIX, bundle_bin, shq_nested, sources_compose_guard,
+        RUNNER_PATH_PREFIX, bundle_bin, shq_nested, sources_compose_guard,
         tmux_session,
     )
 
@@ -539,13 +525,13 @@ def main(argv: list[str] | None = None) -> int:
     # THE CONSOLE START PATH TAKES NO HOLD: opening never leases, claims or resets the tree —
     # `worktrees.state` moves only by the CP's decision (a dispatch lease, or `slot_state.claim_for_user`).
     # It opens a window to look through, which is needed when a runner wedges before registering a
-    # session. `role="user"` wires exactly one hook, the `SessionEnd` report (`user_session.ended`), and
-    # the CP decides whether to free a `user` hold; `build_settings` gates the runner-status hooks and
-    # StopFailure on `role == "runner"` strictly. VISIBLE_AUTOCLOSE=0 keeps the tab parked at the prompt.
+    # session. A console tab wires no lifecycle hook: `build_settings` gates the runner-status hooks and
+    # StopFailure on `role == "runner"` strictly, so its settings carry only the Architectural Guard when
+    # guarded. VISIBLE_AUTOCLOSE=0 keeps the tab parked at the prompt.
     settings_flag = ""
     if bedrock is not None:
         # The session's credentials ride `awsCredentialExport` in this tab's own settings file.
-        err, settings_flag = _write_bedrock_settings(bedrock, wt=wt, name=name, with_hooks=bool(number),
+        err, settings_flag = _write_bedrock_settings(bedrock, wt=wt, name=name, with_hooks=True,
                                                      guard=bool(guard_env))
         if err:
             print(err, file=sys.stderr)
@@ -554,11 +540,12 @@ def main(argv: list[str] | None = None) -> int:
         # The account's key rides `apiKeyHelper` in this tab's own settings file (the runner's rule,
         # `fleet_dispatch.launch_runner`), so the key never enters the pane's environment.
         err, settings_flag = _write_api_key_settings(
-            provider, key_helper, wt=wt, name=name, with_hooks=bool(number), guard=bool(guard_env))
+            provider, key_helper, wt=wt, name=name, with_hooks=True, guard=bool(guard_env),
+            workspace_id=fleet_dispatch.api_key_workspace_id(key_helper, api_key_account))
         if err:
             print(err, file=sys.stderr)
             return 1
-    elif number:
+    else:
         meta = os.path.join(os.path.dirname(wt), "_meta")
         # As the session user (this runs as the daemon; `session_user` owns the ownership contract). A
         # refusal aborts: the account exports live in that file. Mode from `fleet_dispatch.META_DIR_MODE`,
@@ -570,18 +557,11 @@ def main(argv: list[str] | None = None) -> int:
         if dir_err:
             print(f"could not create {meta}: {dir_err}", file=sys.stderr)
             return 1
-        # `PROJECT_NAME_ENV` carries the resolved `projects.name` into `build_settings` (the path only
-        # carries the repo name, which can differ). An env var because `autoclose-flag`'s positional argv
-        # is shared with the fleet path.
-        # `PROJECT_ID_ENV` beside it: the id the SessionEnd report addresses the slot by.
-        env_no_autoclose = {
-            **os.environ, "VISIBLE_AUTOCLOSE": "0", PROJECT_NAME_ENV: name,
-            **({PROJECT_ID_ENV: str(proj["id"])} if isinstance(proj.get("id"), int) else {}),
-        }
+        env_no_autoclose = {**os.environ, "VISIBLE_AUTOCLOSE": "0"}
         settings_flag = subprocess.run(
             [sys.executable, ctl, "autoclose-flag",
-             # Role "user": only the SessionEnd hook (see above).
-             os.path.join(meta, f"clauded-{os.path.basename(wt)}.settings.json"), "", wt, "user",
+             # Not "runner": no lifecycle hook (see above).
+             os.path.join(meta, f"clauded-{os.path.basename(wt)}.settings.json"), "", wt, "console",
              # Explicit, never read from the env: whether this tab's launch wrote a rule bundle.
              *(("--guard",) if guard_env else ())],
             capture_output=True, text=True, env=env_no_autoclose,

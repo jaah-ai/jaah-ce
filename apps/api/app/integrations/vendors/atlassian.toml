@@ -1,0 +1,42 @@
+# Atlassian: hosted MCP server. Facts confirmed at https://support.atlassian.com/atlassian-rovo-mcp-server/docs/getting-started-with-the-atlassian-remote-mcp-server/ and the server's own OAuth metadata (mcp.atlassian.com/.well-known/oauth-protected-resource/v2/mcp; Dynamic Client Registration at auth.atlassian.com).
+# The Rovo MCP server. Jira and Confluence API keys are the separate `jira` card; Loom rides this same server (`loom.toml`).
+slug = "atlassian"
+label = "Atlassian"
+category = "mcp"
+vendor_docs_url = "https://support.atlassian.com/atlassian-rovo-mcp-server/docs/getting-started-with-the-atlassian-remote-mcp-server/"
+summary = "Search and update Jira issues, Confluence pages and Compass components through Atlassian's Rovo MCP server."
+
+[[auth]]
+kind = "mcp"
+
+[mcp]
+url = "https://mcp.atlassian.com/v2/mcp"
+url_editable = false
+transport = "streamable_http"
+auth = "oauth_dcr"
+
+[docs]
+agent_uses = [
+  "Search Jira with JQL, read an issue with its comments, and create or transition issues",
+  "Find and read Confluence pages, and create or update a page with a summary of the work",
+  "Look up Compass components and their owners",
+]
+prerequisites = [
+  "An Atlassian Cloud site with Jira, Confluence or Compass (the server serves Atlassian Cloud)",
+  "If your site restricts which apps may connect, an organization admin must allow it in Atlassian Administration > your organization > Connectors > Atlassian MCP server, by allowing Atlassian-supported domains or adding this Jaah's domain",
+]
+limitations = [
+  "Agents act as the person who signed in, with that person's Jira and Confluence permissions",
+  "One connection reaches the sites the signed-in account chooses at consent; connect again for another account",
+  "Atlassian rate-limits the server per user; long bulk jobs may be slowed",
+]
+troubleshooting = [
+  { symptom = "Test says Atlassian rejected the token (401)", fix = "The grant expired or the app was removed under your Atlassian account's Connected apps. Select Reconnect and sign in again" },
+  { symptom = "The sign-in window says your organization does not allow this app", fix = "An organization admin opens Atlassian Administration > your organization > Connectors > Atlassian MCP server and adds this Jaah's domain to the allowed domains" },
+  { symptom = "The secret shows Needs reconnect", fix = "Atlassian ended the grant (a password change, a revoked connection or a long idle period). Select Reconnect on the secret and sign in to Atlassian again" },
+  { symptom = "New tasks on the project have no Atlassian tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with, and an agent marked Not supported on that tab cannot load MCP servers" },
+]
+faq = [
+  { q = "Does Jaah need an app registered at Atlassian", a = "No. Jaah registers itself with Atlassian's sign-in server the first time anyone connects, and every later connection reuses that registration" },
+  { q = "Should I use this or the Jira card", a = "Use this card for ready-made Jira and Confluence tools through MCP. Use the Jira card when a script needs the REST API with an API token" },
+]

@@ -2,6 +2,7 @@
 // href, `/tasks` (Tasks.tsx) consumes it, and the tree table emits the anchor for both row levels — so the
 // link never dead-ends (BA AC9.2). Targets the tasks LIST, not `/tasks/:id` (BA D8).
 
+import { STAGE_PARAM } from './pipelineBoard'
 import { SCOPE_PARAM } from './taskScope'
 
 // The param carrying the task to reveal.
@@ -14,13 +15,16 @@ export const TASK_DEEP_LINK_PROJECT_PARAM = 'project'
 /* `scope` (a `lib/taskScope.ts::scopeKey`) is the board selection to KEEP: the task editor returns to the
    scope the operator left, and `/tasks` then leaves `?scope=` alone — even when the task is not in
    it. It wins over `projectId`, which is the fallback when the tab has no earlier scope.
-   `projectId` and `scope` omitted or null → the bare link. */
-export function taskDeepLinkPath(taskId: number, projectId?: number | null, scope?: string | null): string {
+   `projectId` and `scope` omitted or null → the bare link. `stage` (a `lib/pipelineBoard.ts::STAGE_PARAM` value)
+   opens the board on that stage; `/tasks` keeps it, as it keeps `?scope=`. */
+export function taskDeepLinkPath(
+  taskId: number, projectId?: number | null, scope?: string | null, stage?: string | null,
+): string {
   const base = `/tasks?${TASK_DEEP_LINK_PARAM}=${taskId}`
-  if (scope) return `${base}&${SCOPE_PARAM}=${encodeURIComponent(scope)}`
-  return isPositiveInteger(projectId)
-    ? `${base}&${TASK_DEEP_LINK_PROJECT_PARAM}=${projectId}`
-    : base
+  const where = scope
+    ? `&${SCOPE_PARAM}=${encodeURIComponent(scope)}`
+    : isPositiveInteger(projectId) ? `&${TASK_DEEP_LINK_PROJECT_PARAM}=${projectId}` : ''
+  return stage ? `${base}${where}&${STAGE_PARAM}=${encodeURIComponent(stage)}` : `${base}${where}`
 }
 
 // The row's DOM id, emitted by every task row (distinct from the retired

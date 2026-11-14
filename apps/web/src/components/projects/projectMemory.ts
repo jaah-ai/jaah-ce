@@ -1,5 +1,6 @@
-import { del, get, post } from '../../api'
-import { countOf } from '../../lib/humanize'
+import { del, get, post, withQuery } from '../../api'
+import { capitalize, countOf } from '../../lib/humanize'
+import { shortSha } from '../../lib/shortSha'
 
 /* Project › Memory's wire shapes and calls (`/api/projects/{id}/memory/…`). The server owns every
  * verdict (visibility, counts, feed states); this file only names and words them. */
@@ -16,7 +17,7 @@ export const STATUS_HELD = 'held'
 export const MEMORY_STATUS_OPTIONS: { value: string; label: string }[] = [
   { value: STATUS_LIVE, label: 'Live' },
   { value: '', label: 'All' },
-  ...MEMORY_STATUSES.map(s => ({ value: s, label: s[0].toUpperCase() + s.slice(1) })),
+  ...MEMORY_STATUSES.map(s => ({ value: s, label: capitalize(s) })),
   { value: STATUS_HELD, label: 'Held' },
 ]
 /* The list's sort orders (`console.LIST_SORTS`): newest first, or one of the row's counts descending. */
@@ -81,14 +82,9 @@ export type MemoryFeedStatus = {
 export type UnitFilters = { q: string; kind: string; status: string; sort: MemorySort; repo?: string }
 
 export function listUnits(projectId: number, filters: UnitFilters): Promise<MemoryUnit[]> {
-  const params = new URLSearchParams()
-  if (filters.q.trim()) params.set('q', filters.q.trim())
-  if (filters.kind) params.set('kind', filters.kind)
-  if (filters.status) params.set('status', filters.status)
-  if (filters.sort !== 'newest') params.set('sort', filters.sort)
-  if (filters.repo) params.set('repo', filters.repo)
-  const query = params.toString()
-  return get<MemoryUnit[]>(`/api/projects/${projectId}/memory/units${query ? `?${query}` : ''}`)
+  return get<MemoryUnit[]>(withQuery(`/api/projects/${projectId}/memory/units`, {
+    q: filters.q.trim(), kind: filters.kind, status: filters.status, sort: filters.sort !== 'newest' ? filters.sort : undefined, repo: filters.repo,
+  }))
 }
 
 /* A code-map unit's directory and chunk, from the title the node writes:
@@ -121,6 +117,16 @@ export const memoryFeedsKey = (projectId: number) => ['project-memory-feeds', pr
 
 export const getFeedStatus = (projectId: number) =>
   get<MemoryFeedStatus>(`/api/projects/${projectId}/memory/feed-status`)
+
+/** Audit › Memory's row: a unit with its project (`GET /api/memory/units`). */
+export type OrgMemoryUnit = MemoryUnit & { project: { id: number; name: string } }
+export type OrgMemoryPage = { items: OrgMemoryUnit[]; next_cursor: string | null }
+
+/** One newest-first page of the units of every project the viewer may see on the plan, or of `projectId`'s. */
+export const listOrgUnits = (projectId: number | null, cursor: string | null) =>
+  get<OrgMemoryPage>(withQuery('/api/memory/units', {
+    project_id: projectId === null ? undefined : String(projectId), cursor: cursor ?? undefined,
+  }))
 
 export const retireUnit = (projectId: number, unitId: string) =>
   post<{ id: string; ref: string; status: string }>(`/api/projects/${projectId}/memory/units/${unitId}/retire`)
@@ -193,7 +199,7 @@ export function feedChips(status: MemoryFeedStatus): FeedChip[] {
   const codemap = chip('codemap', 'Code map', status.feeds.codemap.state)
   const sha = status.codemap_sha
   if (codemap.reason === null) {
-    codemap.state = sha ? sha.slice(0, 7) : 'not built'
+    codemap.state = shortSha(sha) ?? 'not built'
     // Nothing built is nothing served: not green until the first build lands.
     if (!sha) codemap.tone = 'neutral'
   }

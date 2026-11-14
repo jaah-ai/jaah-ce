@@ -15,6 +15,8 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
+from app.entity_shape import SYSTEM_ACTOR_NAME
+
 #: The operator's own vocabulary, never shown to a tenant — lower-case, matched on word boundaries.
 OPERATOR_CONSOLE_VOCABULARY: tuple[str, ...] = (
     "fleet",
@@ -39,7 +41,7 @@ def operator_vocabulary_in(
 def not_available(subject: str) -> str:
     """The one sentence a tenant reads for a fleet-unique value another org holds; never "already exists".
 
-    Columns like `accounts.slug`, `admin_users.email` are unique fleet-wide while their rows are
+    Columns like `accounts.slug`, `identities.email` are unique fleet-wide while their rows are
     org-scoped, so "already exists" would be a cross-org existence oracle. The operator keeps "already
     exists" on their own doors. `subject` is the caller's noun phrase for what collided. Project names are
     unique per org and node and host names not at all, so none collides across orgs or reaches this."""
@@ -120,7 +122,8 @@ def node_home_unrecorded(node_id: str, consequence: str) -> str:
 #: The label a tenant sees for an actor the read seam hides: a name, not a blank.
 #:
 #: `actor_names` joins `admin_users` under the caller's org, so a row an operator wrote into a tenant
-#: resolves to nothing there; "not known" would be false. Only an operator can write into another org,
-#: so Jaah's own staff is true and discloses no individual; it is the name the tenant's copy already uses for
-#: them ("Contact Jaah support to change"). Capitalised because it renders beside names like "System".
-WITHHELD_ACTOR = "Jaah support"
+#: resolves to nothing there; "not known" would be false. Only the platform's side can write into another org,
+#: so the system actor's own label is true and discloses no individual. Not the product's name: "Created by Jaah"
+#: on a record Jaah set up (a seeded group) reads as a person named Jaah, and every other machine-written row
+#: already reads "System".
+WITHHELD_ACTOR = SYSTEM_ACTOR_NAME

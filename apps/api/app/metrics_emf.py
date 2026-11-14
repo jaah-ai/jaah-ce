@@ -10,12 +10,19 @@ Two signals no AWS service measures for us, emitted once a minute by the `metric
   * NODE DISK — per node (by uuid) whose latest reading is fresh, free disk as a percentage of its total
     (`app/node_host_metrics.py::latest_map`), and `NodeDiskFreePercentMin`, the fleet's lowest.
 
-A third signal is written by every control-plane PROCESS rather than the cron, because a pool is per process:
+Two more are written by every control-plane PROCESS rather than the cron, because the pool and the loop are per
+process:
 
-  * DB POOL LANES — per connection lane (`app/db.py`: request, identity, background), each minute's peak
-    checked-out connections, peak overflow past `pool_size`, and checkout timeouts, plus on the request lane
-    the median cost of `release_after_endpoint`'s xid probe and COMMIT (`pool_lines`, called by
-    `app/pool_watch.py`'s sampler). Every task writes its own line; an alarm reads the `Maximum`/`Sum`.
+  * DB POOL — the process's one connection pool (`app/db_async.py`), dimension `Lane=async`: each minute's peak
+    checked-out connections, peak overflow past `pool_size`, checkout timeouts, sessions opened on the offline
+    engine while the loop served (`app/db.py::offline_while_serving`), and the median cost of
+    `release_route_connection`'s xid probe and COMMIT (`pool_line`, called by `app/pool_watch.py`'s sampler).
+    Every task writes its own line; an alarm reads the `Maximum`/`Sum`.
+  * SERVING LOOP — dimensionless (`loop_line`, written by `app/loop_watch.py`): each minute's mean and peak
+    event-loop lag (how late a timer on the serving loop fires: every request waits that long for its turn), and
+    the mean and peak wait of a request for its DB admission slot (`app/db_async.py::RequestAdmission`), with how
+    many requests were admitted; and the interval's garbage-collector pauses (`app/gc_watch.py`: collections,
+    peak and total pause), so a stall minute and its collector pause sit on one datapoint.
 
 EMF, NOT THE SDK: each line is one JSON object on stdout carrying an `_aws` directive. The awslogs driver
 ships it into the control plane's log group and CloudWatch extracts the metrics itself — no agent, no IAM
@@ -37,6 +44,8 @@ from datetime import datetime, tzinfo
 from typing import Optional
 
 from sqlalchemy import select, text
+
+from app.clock import to_epoch_ms
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -64,6 +73,20 @@ DB_POOL_CHECKED_OUT_MAX = "DbPoolCheckedOutMax"
 DB_POOL_OVERFLOW_MAX = "DbPoolOverflowMax"
 DB_POOL_CHECKOUT_TIMEOUTS = "DbPoolCheckoutTimeouts"
 DB_RELEASE_ROUND_TRIPS_P50 = "DbReleaseRoundTripsMsP50"
+DB_OFFLINE_WHILE_SERVING = "DbOfflineWhileServing"
+#: The pool's `Lane` dimension value (`app/pool_watch.py::ASYNC` is this one).
+POOL_LANE = "async"
+#: The serving loop's own figures (`app/loop_watch.py`), dimensionless so the alarm and the opt-in scale-out policy
+#: (the ECS module's autoscaling terraform) read the tasks' Average.
+EVENT_LOOP_LAG_MEAN = "EventLoopLagMsMean"
+EVENT_LOOP_LAG_MAX = "EventLoopLagMsMax"
+REQUEST_ADMISSION_WAIT_MEAN = "RequestAdmissionWaitMsMean"
+REQUEST_ADMISSION_WAIT_MAX = "RequestAdmissionWaitMsMax"
+REQUEST_ADMISSIONS = "RequestAdmissions"
+#: The collector's pauses in the same interval (`app/gc_watch.py`), on the same line as the lag they may explain.
+GC_COLLECTIONS = "GcCollections"
+GC_PAUSE_MAX = "GcPauseMsMax"
+GC_PAUSE_TOTAL = "GcPauseMsTotal"
 
 # Slack beyond a cron's own timeout before two missed firings count as starvation: a pass may legitimately
 # run up to its bound, and a deploy's task swap pauses every cron for about a minute.
@@ -209,23 +232,40 @@ def lines(namespace: str, timestamp_ms: int, report: Report) -> list[str]:
     return out
 
 
-def pool_lines(namespace: str, timestamp_ms: int, figures: dict[str, tuple[int, int, int]],
-               release_p50_ms: Optional[float] = None) -> list[str]:
-    """One EMF event per connection lane: `figures` is `{lane: (peak checked out, peak overflow, timeouts)}` over
-    one interval. Zeros included: an alarm needs to see the healthy value. `release_p50_ms`, the interval's
-    median cost of `release_after_endpoint`'s round trips (`app/db.py::release_costs`), rides the request lane's
-    event when the interval released anything."""
-    out = []
-    for lane, (checked_out, overflow, timeouts) in sorted(figures.items()):
-        metrics = {
-            DB_POOL_CHECKED_OUT_MAX: (float(checked_out), "Count"),
-            DB_POOL_OVERFLOW_MAX: (float(overflow), "Count"),
-            DB_POOL_CHECKOUT_TIMEOUTS: (float(timeouts), "Count"),
-        }
-        if lane == "request" and release_p50_ms is not None:
-            metrics[DB_RELEASE_ROUND_TRIPS_P50] = (round(release_p50_ms, 3), "Milliseconds")
-        out.append(line(namespace, timestamp_ms, {LANE_DIMENSION: lane}, metrics))
-    return out
+def pool_line(namespace: str, timestamp_ms: int, checked_out: int, overflow: int, timeouts: int, *,
+              release_p50_ms: Optional[float] = None, offline_while_serving: Optional[int] = None) -> str:
+    """The pool's EMF event for one interval, dimension `Lane=async`: peak checked out, peak overflow and checkout
+    timeouts, zeros included (an alarm needs to see the healthy value). `release_p50_ms`, the interval's median cost
+    of `release_route_connection`'s round trips (`app/db.py::release_costs`), rides along when the interval released
+    anything; `offline_while_serving`, the interval's sessions on the offline engine, when given."""
+    metrics = {
+        DB_POOL_CHECKED_OUT_MAX: (float(checked_out), "Count"),
+        DB_POOL_OVERFLOW_MAX: (float(overflow), "Count"),
+        DB_POOL_CHECKOUT_TIMEOUTS: (float(timeouts), "Count"),
+    }
+    if release_p50_ms is not None:
+        metrics[DB_RELEASE_ROUND_TRIPS_P50] = (round(release_p50_ms, 3), "Milliseconds")
+    if offline_while_serving is not None:
+        metrics[DB_OFFLINE_WHILE_SERVING] = (float(offline_while_serving), "Count")
+    return line(namespace, timestamp_ms, {LANE_DIMENSION: POOL_LANE}, metrics)
+
+
+def loop_line(namespace: str, timestamp_ms: int, *, lag_mean_ms: float, lag_max_ms: float,
+              admission_mean_ms: float, admission_max_ms: float, admissions: int, gc_collections: int, gc_pause_max_ms: float,
+              gc_pause_total_ms: float) -> str:
+    """The serving loop's EMF event for one interval, dimensionless; zeros included (an alarm reads the healthy
+    value, and an interval that admitted nothing waited 0). The collector's pauses ride on the same line so a lag
+    peak and the pause behind it correlate on one datapoint."""
+    return line(namespace, timestamp_ms, {}, {
+        EVENT_LOOP_LAG_MEAN: (round(lag_mean_ms, 3), "Milliseconds"),
+        EVENT_LOOP_LAG_MAX: (round(lag_max_ms, 3), "Milliseconds"),
+        REQUEST_ADMISSION_WAIT_MEAN: (round(admission_mean_ms, 3), "Milliseconds"),
+        REQUEST_ADMISSION_WAIT_MAX: (round(admission_max_ms, 3), "Milliseconds"),
+        REQUEST_ADMISSIONS: (float(admissions), "Count"),
+        GC_COLLECTIONS: (float(gc_collections), "Count"),
+        GC_PAUSE_MAX: (round(gc_pause_max_ms, 3), "Milliseconds"),
+        GC_PAUSE_TOTAL: (round(gc_pause_total_ms, 3), "Milliseconds"),
+    })
 
 
 def run(session: Session) -> Optional[Report]:
@@ -239,6 +279,6 @@ def run(session: Session) -> Optional[Report]:
     now = session.execute(text("SELECT now()")).scalar_one()
     report = Report(crons=cron_ages(session, now, cron_timezone()), nodes=node_disks(session))
     session.rollback()
-    for event in lines(namespace, int(now.timestamp() * 1000), report):
+    for event in lines(namespace, to_epoch_ms(now), report):
         emf_log.info(event)
     return report

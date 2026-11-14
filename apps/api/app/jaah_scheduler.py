@@ -6,11 +6,9 @@ cold-start fallback. Pure; the live caller is `app/routes/fleet.py::_best_accoun
 first tier member (ties go to discovery order). The node holds no copy.
 
 API-key accounts have no quota to read (`app/account_auth.py`), so their readings are never defaulted
-(a missing percentage read as 0 would win every tier). Which lane an API-key account rides is declared per
-provider (`agent_providers.AgentProvider.api_key_lane`, carried on the candidate): a SPILLOVER account
-(a key beside a provider's subscription) is consulted only when every other account yields nobody
-(per-token billing = overflow lane); a PEER account (a provider whose only kind is a key) is an ordinary pick beside the OAuth
-ones, ranked by the same fewest-runners tier (`is_spillover`).
+(a missing percentage read as 0 would win every tier). Subscriptions are allocated first: every API-key
+account rides the SPILLOVER lane, consulted only when the subscription set yields nobody (per-token billing
+= overflow lane), whatever its provider (`is_spillover`).
 
 The DEFAULT_* constants are the single home for the numbers."""
 from __future__ import annotations
@@ -25,32 +23,48 @@ DEFAULT_HIGH_PCT = 80
 # the runner into the legacy-runtime CLI's usage-limit prompt immediately.
 DEFAULT_WEEKLY_HIGH_PCT = 100
 
-#: How many fleet runners one account may carry at once. An account at the cap is excluded
-#: outright like a disabled one; the operator override is the `max_runners_per_account` knob, resolved
-#: by callers (this module does no I/O). A hard cap by owner decision: with every account at it,
+#: How many fleet runners one SUBSCRIPTION account may carry at once. An account at the cap is excluded
+#: outright like a disabled one; the override is the org-tier `max_runners_per_account` knob (the
+#: operator's value, or the account's own org's), resolved by callers per account into the candidate's
+#: `org_max_runners` (this module does no I/O). A hard cap by owner decision: with every account at it,
 #: selection answers no account and the task waits (fleet ceiling = cap × accounts). A soft fallback
-#: was rejected because the limit would never bind. It binds both account kinds (it counts runners,
-#: not quota), so it is not in `QUOTA_DERIVED_EXCLUSION_KEYS`. An account's own `max_runners` (a provider
-#: declaring `per_account_runner_cap`) replaces this number for that account, above or below it.
+#: was rejected because the limit would never bind. It counts runners, not quota, so it is not in
+#: `QUOTA_DERIVED_EXCLUSION_KEYS`. An account's own `max_runners` replaces this number for that account,
+#: above or below it. An API-key account has no default cap: only its own `max_runners` binds it.
 DEFAULT_MAX_RUNNERS_PER_ACCOUNT = 2
 
 
 def is_spillover(candidate: dict) -> bool:
-    """Whether this candidate rides the API-key SPILLOVER lane: an API-key account whose provider does not
-    declare itself a peer (`agent_providers.AgentProvider.api_key_lane`). Anything but an explicit "peer"
-    is spillover, so a candidate missing the key, or carrying an unknown value, keeps the old position
-    (fail-safe: a lane is never widened by accident). OAuth candidates are never spillover."""
-    return account_auth.is_api_key(candidate.get("auth_kind")) and candidate.get("api_key_lane") != "peer"
+    """Whether this candidate rides the API-key SPILLOVER lane: every API-key account does, so subscription
+    accounts are always allocated first. OAuth candidates (and one missing `auth_kind`) are never spillover."""
+    return account_auth.is_api_key(candidate.get("auth_kind"))
+
+
+def is_tiered_pick(candidate: dict, provider_auth_kinds: tuple[str, ...]) -> bool:
+    """Whether a pick narrowed to one provider is that provider's degraded lane: an API key spilling over
+    behind the provider's OWN subscriptions. A provider with no subscription kind has nothing to
+    spill from, so its key is its ordinary pick. The availability readers' one rule (`agent_marketplace`,
+    `agent_router.features`)."""
+    return is_spillover(candidate) and account_auth.AUTH_KIND_OAUTH in provider_auth_kinds
 
 
 def runner_cap(candidate: dict, max_runners_per_account: Optional[int]) -> Optional[int]:
-    """The concurrent-runner cap that binds this candidate: its own `max_runners` when set, else the fleet's
-    `max_runners_per_account`. `max_runners_per_account=None` means "count no cap" (consoles, and the
-    cold-start question) and disables BOTH, because a human session is not a fleet runner either way."""
+    """The concurrent-runner cap that binds this candidate: its own `max_runners` when set; else, for a
+    subscription account, its org's default (`org_max_runners`, falling back to `max_runners_per_account`
+    for a candidate built without one); an API-key account has no default cap. `max_runners_per_account=None`
+    means "count no cap" (consoles, and the cold-start question) and disables every cap, because a human
+    session is not a fleet runner either way."""
     if max_runners_per_account is None:
         return None
     own = _own_cap(candidate)
-    return own if own is not None else max_runners_per_account
+    if own is not None:
+        return own
+    if account_auth.is_api_key(candidate.get("auth_kind")):
+        return None
+    org_cap = candidate.get("org_max_runners")
+    if isinstance(org_cap, int) and not isinstance(org_cap, bool) and org_cap > 0:
+        return org_cap
+    return max_runners_per_account
 
 
 def _own_cap(candidate: dict) -> Optional[int]:
@@ -89,9 +103,13 @@ EXCLUSION_REASONS: tuple[tuple[str, bool, str], ...] = (
     # A node fact, binding every kind: the asking node is a Multi-Node Host (`app/vnodes.py`). Last, because
     # every reason above is about an account an operator can fix. A co-located node over its disk cap is NOT
     # refused here: its cap is a warning (the console's "Over cap" chip), never a reason. Whether a full disk
-    # stops a launch is decided in one place, `app/launch_disk.py` (the disk gate and the GB floor), not here.
+    # stops a launch is decided in one place, `app/launch_gates.py` (the disk gate and the GB floor), not here.
     ("vnode_host", True, "the asking node is a host, which runs no work itself"),
 )
+
+#: `auth_rejected`'s reason for an API-key account: its verdict stands a day (`account_fold.verdict_ttl_seconds`)
+#: and waiting does not fix a refused key, so the reason names the fix.
+API_KEY_REJECTED_REASON = "its API key was refused, rotate or re-save it"
 
 #: The quota-derived subset: absences in the observation chain feeding the 5h/7d gate, meaningless
 #: (not merely unset) for an API-key account, which has no quota window or per-node credential dir.
@@ -115,34 +133,20 @@ def exclusion_reason(
     `auth_kind` is absent, so the OAuth path is unchanged.
 
     The concurrency cap is checked here, last (reporting order only), because the reason must name both
-    numbers; it binds both kinds. The number is `runner_cap`'s: the account's own cap where it has one,
-    else the fleet's. `max_runners_per_account=None` applies no cap and is only for `gate_and_tier`'s
+    numbers. The number is `runner_cap`'s: the account's own cap where it has one, else its org's for a
+    subscription account, else none. `max_runners_per_account=None` applies no cap and is only for `gate_and_tier`'s
     "is this fleet measured?" question and for consoles."""
     api_key = account_auth.is_api_key(candidate.get("auth_kind"))
     for key, excludes_when_true, reason in EXCLUSION_REASONS:
         if api_key and key in QUOTA_DERIVED_EXCLUSION_KEYS:
             continue
         if bool(candidate.get(key)) is excludes_when_true:
-            return reason
+            return API_KEY_REJECTED_REASON if api_key and key == "auth_rejected" else reason
     runners = runner_count(candidate)
     cap = runner_cap(candidate, max_runners_per_account)
     if cap is not None and runners >= cap:
-        whose = "this account's own" if _own_cap(candidate) is not None else "fleet's"
+        whose = "this account's own" if _own_cap(candidate) is not None else "organization's"
         return f"it is already carrying {runners} fleet runner(s), at or over the {whose} {cap}-runner limit"
-    return None
-
-
-def account_exclusion_reason(candidate: dict) -> Optional[str]:
-    """Why this account may not carry its own run on, or None: `exclusion_reason` narrowed to the account's
-    roster and verdict facts, for re-issuing a lease to the account already running there (a hand-off).
-
-    Skips `QUOTA_DERIVED_EXCLUSION_KEYS` (the account is live on this node; freshness is the dispatcher's
-    question) and `vnode_host` (a node fact), and counts no runner cap: the run replaces its own runner."""
-    for key, excludes_when_true, reason in EXCLUSION_REASONS:
-        if key in QUOTA_DERIVED_EXCLUSION_KEYS or key == "vnode_host":
-            continue
-        if bool(candidate.get(key)) is excludes_when_true:
-            return reason
     return None
 
 
@@ -180,13 +184,10 @@ def gate_and_tier(
     and `commands` sessions the cap does not count. `spend_gate`: the fleet path does not gate on spend.
     Absences exclude at the filter; blanking a percentage would fail open into `cold_start`.
 
-    Spillover: the spillover arm (`is_spillover`) runs only when the primary arm yields
-    `"empty"`/`"no_qualifying_account"`, skipping the quota gates. A PEER API-key account is in the
-    primary arm: it skips the quota-derived exclusions (`exclusion_reason`) and qualifies through
-    `has_quota_model=False` like a no-quota OAuth account, so its absent reading is never 0% used nor
-    "exhausted", and it never makes a fleet "measured". With both arms empty the primary verdict is
-    returned."""
-    # The partition. A missing `auth_kind` reads as OAuth; a missing lane as spillover.
+    Spillover: the API-key arm (`is_spillover`) runs only when the subscription arm yields
+    `"empty"`/`"no_qualifying_account"`, skipping the quota gates. With both arms empty the subscription
+    verdict is returned."""
+    # The partition. A missing `auth_kind` reads as OAuth.
     api_key_candidates = [c for c in candidates if is_spillover(c)]
     oauth_candidates = (
         # The same list object when there is nothing to partition off.
@@ -194,7 +195,7 @@ def gate_and_tier(
         else [c for c in candidates if not is_spillover(c)]
     )
 
-    # ── The primary arm: OAuth candidates plus peer API-key ones ─────────
+    # ── The primary arm: the subscription (OAuth) candidates ─────────
     enabled = [
         c for c in oauth_candidates
         if exclusion_reason(c, max_runners_per_account=max_runners_per_account) is None

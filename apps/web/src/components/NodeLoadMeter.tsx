@@ -6,7 +6,9 @@ import { TONE_COLOR, toneFor } from '../ui/statusTone'
 import { humanAge, humanDuration } from '../lib/relativeTime'
 import { scaleBitRate } from '../lib/bitRate'
 import { PHONE } from '../ui/listStyles'
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, RADIUS } from '../theme'
 import { NONE, NONE_SX } from '../ui/NoneMark'
+import Tip from '../ui/Tip'
 
 /* The compact CPU/RAM/disk meter, used on the `/nodes` list and the node's Metrics tab header.
  * It makes no judgement: levels come from the server (`app/node_host_metrics.py::classify`) and map to
@@ -104,7 +106,7 @@ function tmpInodesWarn(metrics: NodeHostMetrics): boolean {
 }
 
 /** The host whose disk a co-located node's D bar shows. A tenant on another org's host is told its own disk share
- *  instead, with CPU and RAM withheld (`routes/nodes/node_wire.py::_own_disk_only`) — that bar is the node's, so unnamed. */
+ *  instead, and no `hosted_on` (`routes/nodes/node_wire.py::_own_disk_only`) — that bar is the node's, so unnamed. */
 export function sharedDiskHost(n: NodeRecord): string | null {
   if (n.hosting !== 'co_located' || !n.hosted_on) return null
   const m = n.host_metrics
@@ -113,15 +115,16 @@ export function sharedDiskHost(n: NodeRecord): string | null {
 
 // ── Geometry ──────────────────────────────────────────────────────────────────────────────────────
 
-/* `compact` fits the list's 76px `col-node-load` cell (no padding): 15px letter + 3px gap + 4px padding
- * leaves a 54px bar. Three rows (C/M/D) must fit the phone band's 24px row (`ui/feed/geometry.ts`'s
+/* `compact` fits the list's 76px `col-node-load` cell (no padding): 15px letter + 3px gap leaves a 58px bar. Three rows (C/M/D) must fit the phone band's 24px row (`ui/feed/geometry.ts`'s
  * `ROW_H_PHONE`) without growing it (an owner decision): 6px bars + two 2px gaps = 22px. Each row is
- * the bar's height (`rowPx`), and the 9px letter (below the 11px type floor, theme.ts:268, by that decision)
+ * the bar's height (`rowPx`), and the `FONT_SIZE.xxs` letter (the smallest type token, by that decision)
  * is centred in it rather than stretching it. `full` prints the numbers. */
 const SCALE = {
-  compact: { letterPx: 15, fontSize: '0.5625rem', barPx: 6, rowPx: 6, phoneRowPx: 5, rowGapPx: 2, readoutPx: 0 },
-  full: { letterPx: 20, fontSize: '0.8125rem', barPx: 12, rowPx: null, phoneRowPx: null, rowGapPx: 5, readoutPx: 44 },
+  compact: { letterPx: 15, fontSize: FONT_SIZE.xxs, barPx: 6, rowPx: 6, phoneRowPx: 5, rowGapPx: 2, readoutPx: 0 },
+  full: { letterPx: 20, fontSize: FONT_SIZE.md, barPx: 12, rowPx: null, phoneRowPx: null, rowGapPx: 5, readoutPx: 44 },
 } as const
+/* How far a compact letter drops so its cap, not its line box, centres on the bar (measured at 10px mono). */
+const COMPACT_LETTER_NUDGE_PX = 1
 /* A phone's compact bars are 5px (19px a trio), so each row's three sit apart from the next row's in the 24px band
    rather than running on as one even stack of bars down the list. */
 const phoneRow = (scale: (typeof SCALE)[keyof typeof SCALE]) =>
@@ -148,7 +151,7 @@ function Bar({
   const tone = levelTone(level)
   const width = Math.min(100, Math.max(0, pct))
   return (
-    <Box sx={{ display: 'flex', alignItems: 'center', gap: '3px', minWidth: 0, height: scale.rowPx ?? undefined, ...phoneRow(scale) }}>
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 0, height: scale.rowPx ?? undefined, ...phoneRow(scale) }}>
       {/* `aria-hidden`: the wrapper's name already says "CPU"/"RAM". Fixed width so `?` cannot shift the bar. */}
       <Box
         component="span"
@@ -158,12 +161,15 @@ function Bar({
           flex: '0 0 auto',
           fontFamily: theme.typography.mono.fontFamily,
           fontSize: scale.fontSize,
-          lineHeight: 1,
-          // The 9px capital is taller than the 6px row: centred on its bar, it paints into the gaps.
-          ...(scale.rowPx ? { height: scale.rowPx, display: 'flex', alignItems: 'center' } : {}),
+          lineHeight: LINE_HEIGHT.tight,
+          /* The capital is taller than the 6px row: centred on its bar, it paints into the gaps. Its line box centres,
+             not its cap, which rides ~1px high: `top` puts the cap on the bar's centre, and keeps C inside the list
+             cell, which clips (`ELLIPSIS_SX`'s `overflow: hidden`; it cut C's top). */
+          ...(scale.rowPx ? { height: scale.rowPx, display: 'flex', alignItems: 'center', position: 'relative', top: COMPACT_LETTER_NUDGE_PX } : {}),
           color: 'text.secondary',
-          // A phone's compact meter names its bars by slot (the header above it): a stale one keeps only its `?`.
-          ...(scale.rowPx ? { [PHONE]: stale ? { width: 'auto' } : { display: 'none' } } : {}),
+          /* A phone's compact meter names its bars by slot (the header above it): a stale one keeps only its `?`,
+             no cap to centre, so no nudge. */
+          ...(scale.rowPx ? { [PHONE]: stale ? { width: 'auto', top: 0 } : { display: 'none' } } : {}),
         })}
       >
         <Box component="span" sx={scale.rowPx ? { [PHONE]: { display: 'none' } } : undefined}>{letter}</Box>
@@ -181,7 +187,7 @@ function Bar({
           border: 1,
           borderColor: 'divider',
           backgroundColor: 'action.hover',
-          borderRadius: '999px',
+          borderRadius: RADIUS.round,
           overflow: 'hidden',
           ...phoneRow(scale),
         }}
@@ -206,8 +212,8 @@ function Bar({
             textAlign: 'right',
             fontFamily: theme.typography.mono.fontFamily,
             fontSize: scale.fontSize,
-            fontWeight: 600,
-            lineHeight: 1,
+            fontWeight: FONT_WEIGHT.semibold,
+            lineHeight: LINE_HEIGHT.tight,
             color: 'text.primary',
           })}
         >
@@ -245,17 +251,16 @@ export function NodeLoadMeter({
   empty box would look like a rendering fault. */
   if (metrics == null || !hasLoadBar(metrics)) {
     return (
-      <Box
+      <Tip title={summary}><Box
         data-testid="node-load-meter"
         data-state="absent"
         role="img"
         aria-label={summary}
-        title={summary}
         // Centred in the list's cell; `full` sits under its field's label like any other value.
-        sx={[NONE_SX, { fontSize: scale.fontSize, lineHeight: 1, textAlign: variant === 'full' ? 'left' : 'center' }]}
+        sx={[NONE_SX, { fontSize: scale.fontSize, lineHeight: LINE_HEIGHT.tight, textAlign: variant === 'full' ? 'left' : 'center' }]}
       >
         {NONE}
-      </Box>
+      </Box></Tip>
     )
   }
 
@@ -272,22 +277,21 @@ export function NodeLoadMeter({
 
   const tmpPct = tmpInodesWarn(metrics) ? formatPct(metrics.tmp_inode_pct as number) : null
   const tmpBadge = tmpPct == null ? null : (
-    <Box
+    <Tip title={`/tmp inodes ${tmpPct} used`}><Box
       component="span"
       data-testid="node-load-tmp-inodes"
       data-tone={levelTone('warn')}
-      title={`/tmp inodes ${tmpPct} used`}
       sx={theme => ({
-        px: '3px',
+        px: 0.5,
         border: 1,
         borderColor: TONE_COLOR[levelTone('warn')],
-        borderRadius: '4px',
+        borderRadius: RADIUS.sm,
         bgcolor: 'background.paper',
         color: TONE_COLOR[levelTone('warn')],
         fontFamily: theme.typography.mono.fontFamily,
         fontSize: scale.fontSize,
-        fontWeight: 600,
-        lineHeight: 1.2,
+        fontWeight: FONT_WEIGHT.semibold,
+        lineHeight: LINE_HEIGHT.snug,
         whiteSpace: 'nowrap',
         alignSelf: scale.rowPx ? 'center' : 'flex-start',
         flexShrink: 0,
@@ -295,21 +299,20 @@ export function NodeLoadMeter({
       })}
     >
       {scale.rowPx ? '/tmp' : `/tmp inodes ${tmpPct}`}
-    </Box>
+    </Box></Tip>
   )
 
   const meter = (
-    <Box
+    <Tip title={summary}><Box
       data-testid="node-load-meter"
       data-state={metrics.stale ? 'stale' : 'fresh'}
       data-level={metrics.stale ? 'unknown' : metrics.level}
       role="img"
       aria-label={summary}
-      title={summary}
       sx={{
         width: '100%',
         minWidth: 0,
-        px: '2px',
+        px: 0,
         // Room for the last capital's overhang, so the cell never reports a wrapped value: 22px + 2 = the 24px row.
         py: scale.rowPx ? '1px' : 0,
         display: 'flex',
@@ -330,10 +333,10 @@ export function NodeLoadMeter({
         <Bar metric="disk" letter="D" pct={metrics.disk_pct} level={diskLevel} stale={metrics.stale} scale={scale} />
       ) : slot}
       {scale.rowPx ? null : tmpBadge}
-    </Box>
+    </Box></Tip>
   )
   return scale.rowPx && tmpBadge
-    ? <Box sx={{ display: 'flex', alignItems: 'center', gap: '3px', width: '100%', minWidth: 0 }}>{meter}{tmpBadge}</Box>
+    ? <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, width: '100%', minWidth: 0 }}>{meter}{tmpBadge}</Box>
     : meter
 }
 

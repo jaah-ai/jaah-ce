@@ -3,24 +3,19 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app import node_credentials
 # routes need one for a user who is NOT the caller (they carry no session cookie, only the node token).
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
-from app.db import get_session
+from app.db_async import DbDep, on_thread, release
 from app.models.tasks import Task
 # Task transitions go through the watermark-gated helpers; the state machine single-homes in routes/tasks/.
 from app.routes.tasks.policy import MAX_TASK_TEXT_LEN, MAX_TASK_TITLE_LEN
-from app.persona_registry import (
-    SHAPE_DELETE_FILED,
-    SHAPE_EDIT_FILED,
-    SHAPE_TOP_LEVEL,
-    SHAPE_DRAFT_TOP_LEVEL,
-)
 from app.routes.tasks.agent_filing import (
     delete_agent_filed_draft,
     edit_agent_filed_draft,
@@ -30,7 +25,7 @@ from app.entity_shape import StrictModel
 from app.routes.agent.auth import (
     MAX_WIRE_TASK_ID,
     _CALLER_TASK_HEADER,
-    _check_token,
+    AgentDoor,
     _guard_task_creating_caller,
     _refuse_a_node_not_holding,
 )
@@ -39,8 +34,8 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 
 
 # ── SHAPE_TOP_LEVEL — one standalone task in the caller's own project ─────────────────────────────────
-# A licence-holder with no epic (the `advisor`, and the `coder` as drafts only) files one top-level row — a sketch, a task or an epic —
-# in its own row's project. Rows, dedup and the start single-home in `file_agent_top_level_task` (app/routes/tasks/agent_filing.py).
+# Any persona's runner files one top-level row — a sketch, a task or an epic — in its own row's project: a draft, or
+# started only when it asks to and its chain was started by a person (`require_human_started`). Rows, dedup and the start single-home in `file_agent_top_level_task` (app/routes/tasks/agent_filing.py).
 # The most attachments one filing or amend may name: a draft's inputs, not an archive.
 MAX_FILED_ATTACHMENTS = 20
 
@@ -82,6 +77,9 @@ class AgentTopLevelTaskIn(StrictModel):
     depth: Literal["sketch", "task", "epic"] = "task"
     persona: Optional[str] = Field(default=None, min_length=1, max_length=64)
     guided: bool = False
+    # A person asked for this filing (`task_source.requested_source`): the board shows it as theirs. Must land
+    # together with `_TOOL_CREATE_TASK`'s `requested` (`extra='forbid'`).
+    requested: bool = False
     # The caller's own artifacts, attached to the new row as its inputs (shared bytes, no copy). Must land
     # together with `_TOOL_CREATE_TASK`'s `attachments` (`extra='forbid'`).
     attachments: list[AgentFiledAttachmentIn] = Field(default_factory=list, max_length=MAX_FILED_ATTACHMENTS)
@@ -94,7 +92,7 @@ class AgentTopLevelTaskOut(BaseModel):
     # Answered, not accepted: how the caller learns which project its filing landed in.
     project_id: int
     # `"draft"`, or on an honoured `start` `"ready"` (`"active"` for an epic). On a dedup collapse (`created=false`) it is
-    # the existing row's current state — which may be started even for a drafts-only filer.
+    # the existing row's current state.
     state: str
     # The persona the filing resolved to, so the caller can say what it filed.
     persona: str
@@ -104,41 +102,51 @@ class AgentTopLevelTaskOut(BaseModel):
 
 @router.post("/tasks", response_model=AgentTopLevelTaskOut)
 @infra(Tenancy.ORG_SCOPED)
-def create_agent_top_level_task(
+async def create_agent_top_level_task(
     body: AgentTopLevelTaskIn,
-    x_agent_task_id: str = Header(default=""),
-    agent: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
+    db: DbDep,
+    door: AgentDoor,
 ) -> AgentTopLevelTaskOut:
     """File one standalone top-level Task — sketch, task or epic — in the caller's own project, at `draft`
-    unless `start=true` (`SHAPE_TOP_LEVEL`; under `SHAPE_DRAFT_TOP_LEVEL` alone `start` is ignored and the row is
-    always a draft). `X-Agent-Task-Id` both authorises and resolves the project, off one row.
+    unless `start=true` (`SHAPE_TOP_LEVEL`). `X-Agent-Task-Id` both authorises and resolves the project, off one row.
     Idempotent on the required `dedup_key`.
 
     Default `draft` (see `AgentTopLevelTaskIn.start`; transition in `file_agent_top_level_task`). No path
-    scope: with no epic, the bound is the licence (own project, one row per key, licence-free personas
+    scope: with no epic, the bound is the writer's (own project, one row per key, `TOP_LEVEL_TASK_PERSONAS`
     only), all server-side.
 
-    404 when the caller is no longer a live filer, 409 when the key is held by a row this shape will not
+    403 for `start=true` from a chain a machine started (`require_human_started`); 404 when the caller is no
+    longer a live filer, 409 when the key is held by a row this shape will not
     dedup against (the writer's branches). `host` is a 422: no row to
     read a project off; its channel is `POST /tasks/system`.
     """
-    caller = _require_filing_caller(
-        x_agent_task_id, session, shape=(SHAPE_TOP_LEVEL, SHAPE_DRAFT_TOP_LEVEL), agent=agent
-    )
-    result = file_agent_top_level_task(caller, body.model_dump(), session)
-    if result["created"]:
+    agent, x_agent_task_id = door
+    out = await db.run_sync(_create_agent_top_level_task, body=body, x_agent_task_id=x_agent_task_id, agent=agent)
+    if out.created:
         # After the writer's commit, as `create_task` enqueues: the board's title is the filer's 5-6 word gist
-        # (`app/task_title.py`), not their whole line. Deferred import: the queue module registers a workflow.
+        # (`app/task_title.py`), not their whole line. Deferred import: the queue module registers a workflow. The
+        # engine's enqueue is a blocking write on its own engine: the threadpool, the route's read released first.
         from app.durable.task_title_queue import enqueue_title
 
-        enqueue_title(result["id"], result["title"])
+        await release(db)
+        await run_in_threadpool(enqueue_title, out.id, out.title)
+    return out
+
+
+def _create_agent_top_level_task(
+    session: Session,
+    body: AgentTopLevelTaskIn,
+    x_agent_task_id: str,
+    agent: node_credentials.AgentCaller,
+) -> AgentTopLevelTaskOut:
+    caller = _require_filing_caller(x_agent_task_id, session, agent=agent)
+    result = file_agent_top_level_task(caller, body.model_dump(), session)
     return AgentTopLevelTaskOut(**result)
 
 
 # ── SHAPE_EDIT_FILED / SHAPE_DELETE_FILED — the filing's own lifecycle, over ONE draft the caller filed ──
 # Both reach only a `draft` whose `created_by_task_id` is the caller's own task
-# (`_own_filed_draft_or_refuse`, app/routes/tasks/agent_filing.py); authority is the licence per shape. The target id
+# (`_own_filed_draft_or_refuse`, app/routes/tasks/agent_filing.py). The target id
 # travels in the body (amend) or query (delete) as `filed_task_id`, never the path or `task_id` (the
 # daemon fills `{task_id}` from the peer identity); the path is the literal `/tasks/filed`.
 class AgentFiledDraftEditIn(StrictModel):
@@ -172,14 +180,12 @@ class AgentFiledDraftDeleteOut(BaseModel):
     deleted: bool
 
 
-def _require_filing_caller(
-    x_agent_task_id: str, session: Session, *, shape: str | tuple[str, ...], agent: node_credentials.AgentCaller
-) -> Task:
+def _require_filing_caller(x_agent_task_id: str, session: Session, *, agent: node_credentials.AgentCaller) -> Task:
     """`_guard_task_creating_caller` for the doors acting on the caller's own filings, where `host` is a 422:
     no Task behind the call means no project or filing. The declared task must not be held on another node
-    (`_refuse_a_node_not_holding`), so another node of the org cannot borrow its licence and project.
+    (`_refuse_a_node_not_holding`), so another node of the org cannot borrow its project.
     """
-    caller = _guard_task_creating_caller(x_agent_task_id, session, shape=shape)
+    caller = _guard_task_creating_caller(x_agent_task_id, session)
     if caller is None:
         raise HTTPException(
             status_code=422,
@@ -195,35 +201,38 @@ def _require_filing_caller(
 
 @router.patch("/tasks/filed", response_model=AgentFiledDraftEditOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_thread
 def edit_agent_filed_task(
+    session: Session,
     body: AgentFiledDraftEditIn,
-    x_agent_task_id: str = Header(default=""),
-    agent: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
+    door: AgentDoor,
 ) -> AgentFiledDraftEditOut:
-    """Rewrite the title and body of one `draft` the caller's own task filed (`SHAPE_EDIT_FILED`). 403 without
-    the shape, 404 for a row that is not the caller's draft (existence undisclosed), 409 once it left
-    `draft`; the writer (`edit_agent_filed_draft`) owns every branch.
+    """Rewrite the title and body of one `draft` the caller's own task filed (`SHAPE_EDIT_FILED`). 404 for a
+    row that is not the caller's draft (existence undisclosed), 409 once it left `draft`; the writer (`edit_agent_filed_draft`) owns every branch.
     """
-    caller = _require_filing_caller(x_agent_task_id, session, shape=SHAPE_EDIT_FILED, agent=agent)
+    # Interleaves DB work with blocking I/O (a changed title enqueues its DBOS rewording): a worker thread on its own session (`app/db_async.py::run_blocking_in_session`).
+    agent, x_agent_task_id = door
+    caller = _require_filing_caller(x_agent_task_id, session, agent=agent)
     result = edit_agent_filed_draft(caller, body.filed_task_id, body.model_dump(), session)
     return AgentFiledDraftEditOut(**result)
 
 
 @router.delete("/tasks/filed", response_model=AgentFiledDraftDeleteOut)
 @infra(Tenancy.ORG_SCOPED)
+@on_thread
 def delete_agent_filed_task(
+    session: Session,
+    door: AgentDoor,
     filed_task_id: int = Query(
         ..., ge=1, le=MAX_WIRE_TASK_ID, description="the id a task_create call answered",
     ),
-    x_agent_task_id: str = Header(default=""),
-    agent: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> AgentFiledDraftDeleteOut:
     """Delete one `draft` the caller's own task filed (`SHAPE_DELETE_FILED`). The amend's refusals, then
     `delete_task_core` via `delete_agent_filed_draft`. A 200 with a body: the caller is a model reading a
     tool result.
     """
-    caller = _require_filing_caller(x_agent_task_id, session, shape=SHAPE_DELETE_FILED, agent=agent)
+    # Interleaves DB work with blocking I/O (`delete_task_core` reaps the draft's stored objects from S3 after its commit): a worker thread on its own session (`app/db_async.py::run_blocking_in_session`).
+    agent, x_agent_task_id = door
+    caller = _require_filing_caller(x_agent_task_id, session, agent=agent)
     result = delete_agent_filed_draft(caller, filed_task_id, session)
     return AgentFiledDraftDeleteOut(**result)

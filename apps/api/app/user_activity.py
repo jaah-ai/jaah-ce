@@ -9,6 +9,7 @@ worker thread via a fire-and-forget task, so it never blocks the event loop or t
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import re
@@ -29,6 +30,7 @@ from starlette.requests import Request
 from app import act_as, edition_features, request_caller
 from app.activity_kinds import SENTENCE_TEMPLATES, SUBJECT_PARAMS, _text
 from app.actors import transition_actor
+from app.clock import jsonable, utcnow
 from app.credentials.registry import CREDENTIAL_TYPES
 from app.entity_shape import optional_uuid
 from app.models.audit import ActivityEvent
@@ -47,11 +49,11 @@ READ_EXCLUDED_EXACT = {"/api/auth/me", "/api/health"}
 # (about one per reader per minute; `_recently_recorded` ignores the query), and AC5.4 requires none.
 # Cost: "who read the audit log" is not answerable here (an operator follow-up). A prefix, so any later
 # route under it is silently exempt too; choose deliberately. `/api/activity` is its predecessor.
-# `/api/git-connect`, `/api/slack-connect`, `/api/email-connect`: the OAuth callback's query carries a live `code` and
-# `state`.
+# `/api/git-connect`, `/api/slack-connect`, `/api/email-connect`, `/api/credentials/connect`: the OAuth callback's query
+# carries a live `code` and `state`.
 READ_EXCLUDED_PREFIXES = (
     "/api/auth/", "/api/public/", "/api/activity", "/api/audit", "/api/git-connect", "/api/slack-connect",
-    "/api/email-connect",
+    "/api/email-connect", "/api/credentials/connect",
 )
 # The Audit export tab polls its destination every minute while open: each poll would write a read row the export
 # then reports as waiting to send, the same self-reference as `/api/audit`.
@@ -98,13 +100,13 @@ def _remember_read(user_id: UUID, path: str, assisted: bool, at: datetime) -> No
 
 def _known_recent_read(user_id: UUID, path: str, assisted: bool) -> bool:
     at = _recent_reads.get((user_id, path, assisted))
-    return at is not None and at >= datetime.now(timezone.utc) - (READ_DEDUPE_WINDOW - _MEMO_MARGIN)
+    return at is not None and at >= utcnow() - (READ_DEDUPE_WINDOW - _MEMO_MARGIN)
 
 
 def _recently_recorded(session: Session, user_id: UUID, path: str, *, assisted: bool = False) -> bool:
     """A read of `path` by `user_id` already recorded inside the window — a Jarvis-assisted read and the
     user's own are deduplicated apart, so neither hides the other."""
-    cutoff = datetime.now(timezone.utc) - READ_DEDUPE_WINDOW
+    cutoff = utcnow() - READ_DEDUPE_WINDOW
     by_jarvis = ActivityEvent.data["assisted_by"].astext == ASSISTED_BY
     last = session.scalar(
         select(ActivityEvent.created_at)
@@ -193,15 +195,18 @@ class UserActivityMiddleware(BaseHTTPMiddleware):
 
     def _schedule_record_read(self, admin_id: UUID, request: Request, by: Optional[assist.Assist] = None) -> None:
         # Blocking DB work moved to a worker thread, fire-and-forget, so neither the loop nor this response
-        # waits on it.
+        # waits on it. A read the memo already holds costs no thread at all: most GETs are repeats
+        # inside the window, and each hop competed with requests for a thread and a pool connection.
+        if _known_recent_read(admin_id, request.url.path, by is not None):
+            return
         task = asyncio.create_task(asyncio.to_thread(self._record_read, admin_id, request, by))
         _background_tasks.add(task)
-        task.add_done_callback(_on_record_read_done)
+        task.add_done_callback(functools.partial(_on_capture_done, message="read-activity capture failed"))
 
     def _record_read(self, admin_id: UUID, request: Request, by: Optional[assist.Assist] = None) -> None:
         """One read row, deduplicated per path per minute. `by` marks it as a read the support agent made for
         the user: the sentence ends "(via Jarvis)" and `data` names the chat."""
-        from app.db import SessionLocal
+        from app.db import BridgedSession
 
         params = dict(request.query_params)
         filter_params = {k: v for k, v in params.items() if k not in PAGINATION_QUERY_KEYS}
@@ -210,7 +215,7 @@ class UserActivityMiddleware(BaseHTTPMiddleware):
         if _known_recent_read(admin_id, path, by is not None):
             return
         # Attributed: this runs on a worker after the response, where the request's label is invisible.
-        with exclusion_log.caller("middleware:user_activity.read"), SessionLocal() as session:
+        with exclusion_log.caller("middleware:user_activity.read"), BridgedSession() as session:
             # Bound from the reader's own row here: `BaseHTTPMiddleware` runs the app in a child task, so the
             # guard's `seam.bind()` never reaches this thread. Not `operator_scope()`: a user's read trail would
             # become tenancy-free (dedup matching any org's row). A missing admin row writes nothing, as
@@ -241,24 +246,15 @@ class UserActivityMiddleware(BaseHTTPMiddleware):
                 return
 
 
-def _on_capture_done(task: asyncio.Task) -> None:
-    """The write branch's twin of `_on_record_read_done`, existing only for its message: a lost write
-    audit row must be distinguishable in the logs from read-path noise."""
+def _on_capture_done(task: asyncio.Task, *, message: str) -> None:
+    """A capture task's done callback: forget it, and log `message` for a failure. The write branch's message
+    says an audit row was LOST, so it is distinguishable in the logs from read-path noise."""
     _background_tasks.discard(task)
     if task.cancelled():
         return
     exc = task.exception()
     if exc is not None:
-        log.error("write-activity capture failed — an audit row was LOST", exc_info=exc)
-
-
-def _on_record_read_done(task: asyncio.Task) -> None:
-    _background_tasks.discard(task)
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        log.error("read-activity capture failed", exc_info=exc)
+        log.error(message, exc_info=exc)
 
 
 def record(
@@ -401,7 +397,7 @@ def _uuids_to_str(data: dict[str, Any]) -> dict[str, Any]:
 
     def _one_level(value: Any) -> Any:
         # Both containers by the same rule: `{"k": [{"id": UUID}]}` and `{"k": {"id": UUID}}` are both live
-        # (`routes/groups.py`, `routes/projects.py`'s `jira_credential_change`). Still exactly one level deep.
+        # (`routes/groups.py`, `routes/projects.py`'s `agent_instructions_change`). Still exactly one level deep.
         if isinstance(value, dict):
             return {k: _scalar(v) for k, v in value.items()}
         if isinstance(value, list):
@@ -485,6 +481,9 @@ FULL_TERMS: frozenset[str] = frozenset({
     # The second factor (`app/mfa.py`): a recovery code is a password substitute, shown once, and the
     # enrolment URI carries the TOTP secret.
     "recovery_code", "recovery_codes", "recoverycode", "recoverycodes", "otpauth_uri", "otpauthuri",
+    # A tailnet pre-auth key (`routes/nodes/register.py::_join_auth_key`, `tailnet_auth_key`): a grant to join the
+    # tailnet, served once in a 201 like the token beside it.
+    "auth_key", "authkey",
 })
 
 # The longest `FULL_TERMS` entry in segments; bounds the run scan below (unbounded, a 32 KB body cost
@@ -703,7 +702,7 @@ WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # The prefixes the write branch never records:
 #   * `/api/agent/` (D3, belt to "no principal, no row"); `/api/public/` (no principal);
 #   * `/api/console/` (the console plane); `/api/audit` (defence in depth only: GET-only today);
-#   * `/api/git-connect`: its `POST .../start` response carries the App's `client_id`, a `secret` field.
+#   * `/api/git-connect`: its callback's query carries a live authorization `code`.
 #   * `/api/slack-connect`: likewise (the install URL); the callback records its own `slack_connected` row.
 #   * `/api/operator/transfers`: a move writes its own `org_transfer` row in EACH org it touched (AC13), and a
 #     plan is a read sent as a POST; a capture row in the operator's org would show the move twice.
@@ -714,8 +713,11 @@ WRITE_EXCLUDED_PREFIXES = (
 )
 
 # Exact paths the write branch never records. `/api/auth/switch` (an org switch): no audit event for a switch is
-# the operator's decision (PRD §5 of the multi-org epic, Q8) — do not add one.
-WRITE_EXCLUDED_EXACT = frozenset({"/api/auth/switch"})
+# the operator's decision (PRD §5 of the multi-org epic, Q8) — do not add one. `/api/client-events`: a flagged
+# console's error reports, kept in `client_events` already; a row per batch would bury the trail.
+# `/api/routing/preview`: a read sent as a POST (`routes/routing.py::preview_routing` writes nothing), asked per
+# keystroke pause on the task form; a row each would bury the trail.
+WRITE_EXCLUDED_EXACT = frozenset({"/api/auth/switch", "/api/client-events", "/api/routing/preview"})
 
 # The public auth routes (`app/auth.py::PUBLIC_PATHS`), captured including failed sign-ins (D18): the
 # one place a row has no `request.state.admin_id`. The two second-factor routes are where a sign-in now
@@ -750,11 +752,16 @@ ACCOUNT_TRANSFER_PATH = re.compile(r"^/api/accounts/(?:import|[^/]+/export)$")
 # Jaah API keys (`routes/api_keys.py`): create and rotate answer the secret once. Each write records its own row
 # (`api_key_created`, `…_edited` with the changed fields, `…_rotated`, `…_revoked`), never the secret.
 API_KEYS_BODY_PREFIX = "/api/api-keys"
+# Outgoing webhooks (`routes/webhooks.py`): create and rotate answer the endpoint's signing secret once. Each write
+# records its own row (`webhook_created`, `…_updated` with the changed fields, `…_deleted`, `…_secret_rotated`,
+# `…_tested`, `…_redelivered`), never the secret.
+WEBHOOKS_BODY_PREFIX = "/api/webhooks"
 
 
 def _suppress_bodies(path: str) -> bool:
     return path.startswith(
-        (CREDENTIAL_BODY_PREFIX, NODEVAULT_BODY_PREFIX, PROSPECT_DATA_BODY_PREFIX, API_KEYS_BODY_PREFIX)
+        (CREDENTIAL_BODY_PREFIX, NODEVAULT_BODY_PREFIX, PROSPECT_DATA_BODY_PREFIX, API_KEYS_BODY_PREFIX,
+         WEBHOOKS_BODY_PREFIX)
     ) or (
         path.startswith("/api/users/") and GIT_CONNECTIONS_SEGMENT in path
     ) or (
@@ -762,10 +769,11 @@ def _suppress_bodies(path: str) -> bool:
     ) or ACCOUNT_TRANSFER_PATH.match(path) is not None
 
 # Per-path response keys the denylist cannot name without blanking them everywhere: a Telegram link code is a
-# bearer secret until it is redeemed (its deep link carries it too), but `code` and `url` are ordinary keys on
+# bearer secret until it is redeemed (its deep links carry it too), but `code` and `url` are ordinary keys on
 # every other route. The link row keeps only a hash (`telegram_link`); the audit row keeps `expires_at`.
 RESPONSE_SECRET_KEYS: dict[str, frozenset[str]] = {
-    "/api/auth/me/telegram-link-code": frozenset({"code", "url"}),
+    "/api/auth/me/telegram-link-code": frozenset({"code", "url", "group_url"}),
+    "/api/me/notification-channels/telegram/code": frozenset({"code", "private_link", "group_link"}),
 }
 
 
@@ -884,14 +892,11 @@ MEDIA_TYPE_MAX_CHARS = 128
 # `String(48)`; a defensive guard, not an expected truncation.
 KIND_MAX_CHARS = 48
 
-# `String(255)`, and load-bearing: a failed sign-in records the submitted (unvalidated) email, and an
-# over-long one would make the insert raise and silently delete the row recording the attempt.
-ACTOR_LABEL_MAX_CHARS = 255
 
 # `String(512)`: a 403'd route with a long `str` path param reaches the insert.
 PATH_MAX_CHARS = 512
 
-# Each holds a worker thread and a DB connection from the request pool (`app/db.py`: 20 + 20), so
+# Each holds a worker thread and a connection of the one async pool (`app/db_async.py`: 20 + 20 locally), so
 # kept well under it.
 CAPTURE_MAX_INFLIGHT = 16
 
@@ -903,13 +908,6 @@ def _write_excluded(path: str) -> bool:
 def _media_type(raw: str) -> str:
     """The bare media type of a `Content-Type` header, lower-cased and without its parameters."""
     return raw.split(";")[0].strip().lower()
-
-
-def _json_safe(value: Any) -> Any:
-    """A path/query param as something `JSONB` can hold (a guard for a future non-`str` converter)."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    return str(value)
 
 
 def _field_names(body: Any) -> list[str]:
@@ -1062,7 +1060,9 @@ class _WriteCapture:
                 return
             task = asyncio.create_task(asyncio.to_thread(_write_activity_row, payload))
             _background_tasks.add(task)
-            task.add_done_callback(_on_capture_done)
+            task.add_done_callback(
+                functools.partial(_on_capture_done, message="write-activity capture failed — an audit row was LOST")
+            )
         except Exception:
             log.exception("write-activity capture failed")
 
@@ -1094,7 +1094,7 @@ class _WriteCapture:
             "kind": getattr(endpoint, "__name__", "unknown")[:KIND_MAX_CHARS],
             "route": getattr(route, "path", None),
             "declaration": declaration_of(endpoint),
-            "params": {k: _json_safe(v) for k, v in (scope.get("path_params") or {}).items()},
+            "params": {k: jsonable(v) for k, v in (scope.get("path_params") or {}).items()},
             "query": self.query,
             "request_raw": self.request_raw,
             "request_over_ceiling": self.request_over_ceiling,
@@ -1175,7 +1175,7 @@ def _write_activity_row(payload: dict[str, Any]) -> None:
 
     Everything expensive runs here, off the loop (AC1.5), as in `_record_read`; the caller hands over
     raw bytes and cheap scope facts (`_WriteCapture._payload`)."""
-    from app.db import SessionLocal
+    from app.db import BridgedSession
 
     path = payload["path"]
     status = payload["status"]
@@ -1274,7 +1274,7 @@ def _write_activity_row(payload: dict[str, Any]) -> None:
     data = {**(payload.get("caller") or {}), **data}
 
     # Attributed for `_record_read`'s reason, outside the scopes so every read here is this writer's.
-    with exclusion_log.caller("middleware:user_activity.write"), SessionLocal() as session:
+    with exclusion_log.caller("middleware:user_activity.write"), BridgedSession() as session:
         # Resolve the actor first, then write under that actor's org. `BaseHTTPMiddleware` runs the app in a
         # child task, so the request's `seam.bind()` never reaches this thread; on the public auth routes the
         # actor is only known once resolved.

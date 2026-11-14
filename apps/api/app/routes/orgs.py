@@ -35,14 +35,14 @@ one is not.
 Org zero, the operator plane, may be renamed but never disabled, deleted or re-slugged; every other org is
 an ordinary tenant. A tenant org's slug is an operator's to rename
 (`_rename_slug`): it is the org's tailnet tag outside the database, so a rename moves its devices to the new tag
-durably (`app/durable/org_retag.py`). Org zero's slug never changes. An operator may also
+durably (`app/durable/org_retag.py`), and it is the name prefix of the org's Jaah-made repos, so a rename renames them
+on GitHub durably too (`app/durable/jaah_repo_prefix.py`). Org zero's slug never changes. An operator may also
 converge a tenant org's existing devices onto its tags (`retag_org_tailnet`).
 """
 from __future__ import annotations
 
-import dataclasses
 import re
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Any, Literal, Optional
 from uuid import UUID
 
@@ -54,8 +54,9 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from app import (
-    access, cron_min_period, edition_features, hipaa, ce_caps, mfa, node_bus, org_limits,
-    org_quotas, org_slug, org_welcome, plan_terms, provider_auth_policy, staging_org,
+    access, cron_min_period, db_async, edition_features, git_access, hipaa, ce_caps, identities, mfa, node_bus,
+    notification_channels, org_limits, org_quotas, org_slug, org_sync_session, org_welcome, plan_terms,
+    provider_auth_policy, staging_org,
 )
 from app.operator_settings import (
     cache as settings_cache,
@@ -65,27 +66,32 @@ from app.operator_settings import (
 )
 from app.access_admin import revoke_direct_grants_retired_epoch
 from app.access_catalog import ROLES_BY_SLUG
-from app.actors import actor_names, actor_names_for, stamp_actor
+from app.actors import actor_names, actor_names_for, set_request_actor, stamp_actor
 from app.auth import require_operator, require_superadmin, require_user
 from app.authz.catalog import Tenancy
 from app.authz.declarations import always, org_admin, session_only, superadmin_only
-from app.authz.principal import Principal, current_principal
-from app.clock import as_utc, now_iso
-from app.db import SessionLocal, get_session
+from app.authz.principal import AsyncCaller, Principal, current_caller, current_principal
+from app.clock import as_utc, now_iso, utcnow
+from app.db_async import DbDep, on_session
 from app.entity_shape import (
     EntityOut,
     StrictModel,
+    or_404,
     administered_org_or_404,
     conflict_as_409,
     count_by,
     entity_fields,
     flush_or_409,
+    from_row,
     get_or_404,
     iso_or_none,
     row_by_uuid_or_404,
     tenant_org_or_404,
     validated_description,
     validated_name,
+    validated_org_name,
+    commit_row,
+    refused_as,
 )
 from app.durable import notify_outbox
 from app.events import emit_console_event
@@ -98,20 +104,23 @@ from app.models.orgs import (
     ORG_ACTIVE,
     ORG_PENDING,
     ORG_REJECTED,
+    ROUTING_MAX_MODES,
     SSO_PROVIDERS,
     Org,
     OrgDomain,
     OrgSignup,
 )
 from app.models.support import SiteEnquiry
+from app.agent_router import modes, policy_settings
 from app.org_gate import REASON_MAX
 from app.org_slug import SLUG_UNIQUE
 from app.user_activity import record_write
-from app.routes.commands import _SLUG_RE, SLUG_RULE
+from app.routes import org_setup
 from app.routes.settings import SettingKnobOut
 from app.tenancy import offboard, seam
 from app.tenancy.ids import OPERATOR_PLANE_ORG_IDS, ORG_ZERO_ID, is_tenant_org
 from app.tenancy.labels import OrgRef
+from app.project_onboarding import owner_to_push_as
 from app.tenancy.org_lifecycle import (
     ORG_DELETE_REFUSED_SQLSTATES,
     detach_outside_references,
@@ -221,6 +230,17 @@ class HipaaAckIn(StrictModel):
     surface: str = Field(max_length=64)
 
 
+class OrgRoutingOut(BaseModel):
+    """Intelligent routing for one org (`app/agent_router/`): whether its plan carries the feature (`offered`), the
+    highest mode its projects may run, and its routing policy (`policy_settings.py`'s shapes)."""
+
+    offered: bool
+    max_mode: str
+    allowed: Optional[dict[str, Any]] = None
+    tier_floor: Optional[str] = None
+    tier_ceiling: Optional[str] = None
+
+
 class OrgOut(EntityOut):
     """One org as the console renders it: the seven entity columns, the slug, `enabled`, and the two
     things an operator cannot type: whether the row is the operator plane, and how many users are bound to it.
@@ -250,9 +270,10 @@ class OrgOut(EntityOut):
     # operator's roster: `plan_name` None = no plan (an operator org), `plan_ends_at` None = never ends.
     plan_name: Optional[str] = None
     plan_ends_at: Optional[str] = None
-    # A coding agent can run for it (`org_limits.orgs_with_a_coder`): an enabled account, or on the Jaah account.
-    # The operator's "act as an org that can" offer reads it; operator view only, else None (not read).
-    has_coder: Optional[bool] = None
+    # Someone a task can push as (`project_onboarding.owner_to_push_as`: an enabled Owner, else a superadmin): an
+    # operator's create there starts its Repo Wizard as them (`project_onboarding.py`). Operator view of one org
+    # (`get_org`) only, else None (not read).
+    has_owner: Optional[bool] = None
     # Soft delete (`Org.deleted_at`): when the operator deleted it; None = live. A deleted org is listed nowhere but
     # the Customers roster's Deleted filter, and is restored or Compliance-Deleted from its page.
     deleted_at: Optional[str] = None
@@ -264,6 +285,10 @@ class OrgOut(EntityOut):
     sso_mfa_attested_by: Optional[str] = None
     # The operator's isolation exception (`app/tenant_defaults.py`); False is a tenant's default.
     colocation_allowed: bool = False
+    # "Run jobs as" (`Org.run_jobs_as_id`): the org default person its projects' background jobs run as; None = the org's
+    # fallback (`git_access.project_forge_person`).
+    run_jobs_as_id: Optional[UUID] = None
+    run_jobs_as_name: Optional[str] = None
     # The operator's two-factor exemption (`Org.mfa_skip`): its members sign in with no second factor.
     mfa_skip: bool = False
     # HIPAA mode (`app/hipaa.py`): `{enabled, baa_effective_date, warnings}`; `warnings` is empty while off.
@@ -291,6 +316,8 @@ class OrgOut(EntityOut):
     # live staging org. None on the other side, on an ordinary org, and on an Org Admin's own answer.
     parent_org: Optional[OrgRef] = None
     staging_org: Optional[OrgRef] = None
+    # Intelligent routing (`OrgRoutingOut`), on both views: the Org Admin edits it on their own org's settings.
+    routing: Optional[OrgRoutingOut] = None
 
 
 class OrgApproveIn(BaseModel):
@@ -312,17 +339,17 @@ class PendingCountOut(BaseModel):
 
 
 def _validated_slug(value: str) -> str:
-    """The slug grammar `POST /api/commands` enforces, applied at the org's only write path.
-
-    The grammar is imported, never restated (`routes/accounts.py::_validated_slug`); lowercase-only keeps
-    `Operator` from sitting beside `operator` under a case-sensitive unique index.
+    """The org slug grammar (`app/org_slug.py::ORG_SLUG_RE`: lowercase letters and digits), applied at the org's
+    write paths. Imported, never restated; no separator, so the org's repo prefix (`app/jaah_repos.py::repo_prefix`)
+    is never another org's, and lowercase-only keeps `Operator` from sitting beside `operator` under a case-sensitive
+    unique index.
 
     An `HTTPException`, not a pydantic `ValueError`: a validator's 422 carries a list `detail`, which
     `api.ts::apiDetail` cannot attribute to a field, so the operator would lose the message.
     """
     slug = (value or "").strip()
-    if not _SLUG_RE.match(slug):
-        raise HTTPException(status_code=422, detail=SLUG_RULE)
+    if not org_slug.is_org_slug(slug):
+        raise HTTPException(status_code=422, detail=org_slug.ORG_SLUG_RULE)
     return slug
 
 
@@ -372,10 +399,22 @@ class OrgUpdateIn(BaseModel):
     microvm_vcpus: Optional[int] = None
     microvm_ram_mib: Optional[int] = None
     microvm_disk_gib: Optional[int] = None
+    # Intelligent routing (`_apply_routing`), only with the plan feature: the org's maximum mode (lowering it demotes
+    # every project above it), the runners the router may pick (null = all) and the model tier range (null = no
+    # bound). An Org Admin may send these.
+    routing_max_mode: Optional[str] = None
+    routing_allowed: Optional[dict[str, Any]] = None
+    routing_tier_floor: Optional[str] = None
+    routing_tier_ceiling: Optional[str] = None
+    # "Run jobs as" (`Org.run_jobs_as_id`): a real, enabled member of this org (422 otherwise); `null` clears it.
+    # An Org Admin may send it.
+    run_jobs_as_id: Optional[UUID] = None
 
 
 #: The org's MicroVM size override (the `microvm_sizing.column`s), applied in `update_org`.
 _MICROVM_SIZE_FIELDS = frozenset(("microvm_vcpus", "microvm_ram_mib", "microvm_disk_gib"))
+#: Intelligent routing's org settings, applied in `update_org` (`_apply_routing`).
+_ROUTING_FIELDS = frozenset(("routing_max_mode", "routing_allowed", "routing_tier_floor", "routing_tier_ceiling"))
 #: The operator's isolation exceptions, applied in `update_org`.
 _EXCEPTION_FIELDS = ("colocation_allowed",)
 #: The PATCH fields only an operator may change: renaming or disabling a tenant is fleet administration,
@@ -443,27 +482,14 @@ def _enquiries(session: Session, emails: set[str]) -> dict[str, SiteEnquiry]:
 def _signup_out(
     row: Org, signup: OrgSignup, names: dict[UUID, str], welcomes: list[org_welcome.Sent], plans: dict[str, str]
 ) -> OrgSignupOut:
-    return OrgSignupOut(
-        plan_key=signup.plan_key,
+    return from_row(
+        OrgSignupOut, signup,
         plan_name=plans.get(signup.plan_key, signup.plan_key) if signup.plan_key else None,
-        provider=signup.provider,
-        email=signup.email,
         account_type=row.account_type or ACCOUNT_ORGANIZATION,
         owner_name=names.get(signup.owner_id),
-        occupation=signup.occupation,
-        job_title=signup.job_title,
-        intended_use=signup.intended_use,
-        signed_up_at=iso_or_none(signup.signed_up_at),
-        decided_at=iso_or_none(signup.decided_at),
         decided_by=names.get(signup.decided_by_id),
-        rejection_reason=signup.rejection_reason,
-        slack_posted_at=iso_or_none(signup.slack_posted_at),
-        slack_error=signup.slack_error,
         hubspot_synced=signup.hubspot_contact_id is not None,
-        hubspot_error=signup.hubspot_error,
-        welcome_sent_at=iso_or_none(signup.welcome_sent_at),
         welcome_sent_by=names.get(signup.welcome_sent_by_id),
-        welcome_error=signup.welcome_error,
         # A rejected org's card is detached; an error is moot once the plan has started.
         card_on_file=signup.payment_method_id is not None and row.lifecycle != ORG_REJECTED,
         billing_error=signup.billing_error if row.pending_plan_key else None,
@@ -479,7 +505,7 @@ def _signup_out(
 def _enquiry_out(row: Optional[SiteEnquiry]) -> Optional[OrgEnquiryOut]:
     if row is None:
         return None
-    return OrgEnquiryOut(company=row.company, role=row.role, note=row.note, created_at=iso_or_none(row.received_at))
+    return from_row(OrgEnquiryOut, row, created_at=iso_or_none(row.received_at))
 
 
 def _microvm_sizing_out(row: Org) -> Optional[dict[str, Any]]:
@@ -511,13 +537,13 @@ def _rows_out(session: Session, rows: list[Org], *, operator_view: bool = True) 
     enquiries = _enquiries(session, {s.email.lower() for s in signups.values()})
     plans = dict(session.execute(select(BillingPlan.key, BillingPlan.name)).tuples().all()) if signups else {}
     attesters = actor_names(session, [row.sso_mfa_attested_by_id for row in rows if row.sso_mfa_attested_by_id])
+    job_people = actor_names(session, [row.run_jobs_as_id for row in rows if row.run_jobs_as_id])
     plan_rows = _plans_by_key(session)
     ends = _plan_ends(session, rows, plan_rows) if operator_view else {}
     switches = _switch_terms(session, rows, plan_rows)
     hipaa_out = _hipaa_out(session, rows)
     parents, stagings = _staging_links(session, rows) if operator_view else ({}, {})
     dflt = plan_terms.defaults(session) if operator_view else None
-    coders = org_limits.orgs_with_a_coder(session, {row.id for row in rows}) if operator_view else None
     auto_approved: dict[UUID, bool] = {}
     # The community edition has no sign-up approval.
     if edition_features.enabled("signup"):
@@ -540,13 +566,14 @@ def _rows_out(session: Session, rows: list[Org], *, operator_view: bool = True) 
             enquiry=_enquiry_out(enquiries.get(signups[row.id].email.lower())) if row.id in signups else None,
             plan_name=ends[row.id][0] if row.id in ends else None,
             plan_ends_at=ends[row.id][1] if row.id in ends else None,
-            has_coder=row.id in coders if coders is not None else None,
             deleted_at=iso_or_none(row.deleted_at),
             sso_provider=row.sso_provider,
             sso_tenant=row.sso_tenant,
             sso_mfa_attested_at=iso_or_none(row.sso_mfa_attested_at),
             sso_mfa_attested_by=attesters.get(row.sso_mfa_attested_by_id),
             colocation_allowed=bool(row.colocation_allowed),
+            run_jobs_as_id=row.run_jobs_as_id,
+            run_jobs_as_name=job_people.get(row.run_jobs_as_id) if row.run_jobs_as_id else None,
             mfa_skip=bool(row.mfa_skip),
             hipaa=hipaa_out[row.id],
             microvm_allowed={
@@ -565,6 +592,13 @@ def _rows_out(session: Session, rows: list[Org], *, operator_view: bool = True) 
             ),
             parent_org=parents.get(row.parent_org_id) if row.parent_org_id is not None else None,
             staging_org=stagings.get(row.id),
+            routing=OrgRoutingOut(
+                offered=switches[row.id][plan_terms.INTELLIGENT_ROUTING].value,
+                max_mode=row.routing_max_mode,
+                allowed=row.routing_allowed,
+                tier_floor=row.routing_tier_floor,
+                tier_ceiling=row.routing_tier_ceiling,
+            ),
         )
         for row in rows
     ]
@@ -580,7 +614,7 @@ def _staging_links(session: Session, rows: list[Org]) -> tuple[dict[UUID, OrgRef
     parents: dict[UUID, OrgRef] = {}
     stagings: dict[UUID, OrgRef] = {}
     for org in related:
-        ref = OrgRef(id=org.id, slug=org.slug, name=org.name)
+        ref = from_row(OrgRef, org)
         if org.id in parent_ids:
             parents[org.id] = ref
         if org.parent_org_id in ids and org.deleted_at is None:
@@ -727,12 +761,13 @@ def _not_a_draft():
 
 @router.get("/api/orgs", response_model=Page[OrgOut])
 @superadmin_only(Tenancy.OPERATOR)
+@on_session
 def list_orgs(
+    session: Session,
     q: str = Query("", max_length=Q_MAX),
     ids: Optional[str] = Query(None, max_length=_IDS_MAX * 40),
     query: PageQuery = Depends(page_query(tuple(_ORG_SORTS))),
     _: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
 ) -> Page[OrgOut]:
     """Every live org, a page at a time: those awaiting approval first, then the operator plane, then
     alphabetically by name. A soft-deleted org is listed only by the Customers roster's Deleted filter
@@ -759,11 +794,8 @@ def list_orgs(
 
 @router.post("/api/orgs", response_model=OrgOut, status_code=201)
 @superadmin_only(Tenancy.OPERATOR)
-def create_org(
-    body: OrgCreateIn,
-    user: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
-) -> OrgOut:
+@on_session
+def create_org(session: Session, body: OrgCreateIn, user: AdminUser = Depends(require_superadmin)) -> OrgOut:
     """File a new tenant.
 
     The slug is checked before the insert so the ordinary duplicate gets an actionable 409 instead of a
@@ -774,15 +806,16 @@ def create_org(
     `plan_key` must be an active plan (422 otherwise); the self-serve rules (`app/self_serve_rules.py`) do not bind
     an operator. An edition without multi-org tenancy has its one org only (404).
     """
+    set_request_actor(session, user.id)
     if not edition_features.enabled("multi_org_tenancy"):
-        raise HTTPException(status_code=404, detail=ce_caps.NOT_IN_CE)
+        raise ce_caps.not_in_edition()
     from app import signup_plans
     from app.org_create import create_org_row
 
     if body.plan_key == plan_terms.DEFAULTS_KEY or signup_plans.active_row(session, body.plan_key) is None:
         raise HTTPException(status_code=422, detail="Choose one of the plans in Products › Plans.")
     slug = _validated_slug(body.slug)
-    name = validated_name(body.name)
+    name = validated_org_name(body.name)
     description = validated_description(body.description)
     taken = session.scalar(select(Org.id).where(Org.slug == slug))
     if taken is not None:
@@ -801,8 +834,7 @@ def create_org(
     # The customer's History opens with its creation (`app/customer_history.py`), as the operator who filed it.
     record_write(session, user, "org_created", f"Created the organization {name}",
                  data={"org_id": row.id, "slug": slug})
-    session.commit()
-    session.refresh(row)
+    commit_row(session, row)
     return _rows_out(session, [row])[0]
 
 
@@ -832,11 +864,12 @@ class SelfCreateOut(BaseModel):
 @router.post("/api/orgs/self-create", response_model=SelfCreateOut, status_code=201)
 @always(Tenancy.BOOTSTRAP)
 @session_only
-def self_create_org(
+async def self_create_org(
     body: SelfCreateIn,
     request: Request,
     admin: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
+    *,
+    db: DbDep,
 ) -> SelfCreateOut:
     """A signed-in person applies for ANOTHER org (account menu > Create organization; R6). The same
     admission as the self-service sign-up (`signup.create_signup`'s identity path): the org lands
@@ -855,45 +888,64 @@ def self_create_org(
 
     Refusals: 403 `signup_closed`; 422 `invalid_fields` (`plan_key` among them); 409 `legal_version_changed`; 409
     `self_serve_rules.SECOND_FREE` for a second Free org of the person's email; 409 `signup_pending` while an org of
-    this person still awaits review; 409 `signup_conflict` when the create lost a race."""
+    this person still awaits review; 409 `signup_conflict` when the create lost a race.
+
+    Phased so no connection is held off the database: the answers are read and checked, the slug's LLM call runs
+    in the threadpool, then the create commits; the system approval (its own session) and the operator notices
+    (enqueued) run in the threadpool after it."""
     # The community edition has no sign-up.
     if not edition_features.enabled("signup"):
-        raise HTTPException(status_code=404, detail=ce_caps.NOT_IN_CE)
-    from app import identities, org_approval, self_serve_rules, signup, signup_plans
+        raise ce_caps.not_in_edition()
+    from app import org_approval, self_serve_rules, signup, signup_plans
     from app.routes import signup as signup_routes
 
     signup.require_open()
+    identity_id = admin.identity_id
     with seam.identity_scope():
-        identity = session.get(UserIdentity, admin.identity_id) if admin.identity_id is not None else None
+        identity = await db.run_sync(
+            lambda session: session.get(UserIdentity, identity_id) if identity_id is not None else None
+        )
     if identity is None:
         raise HTTPException(status_code=401, detail="unauthorized")
-    answers = {
-        **body.model_dump(),
-        "first_name": identity.first_name or body.first_name,
-        "last_name": identity.last_name or body.last_name,
-    }
-    try:
-        application = signup.application_from(answers)
-    except signup.ApplicationInvalid as invalid:
-        raise signup_routes.invalid_fields(invalid.problems) from None
-    plan = signup_plans.offered_plan(session, body.plan_key if isinstance(body.plan_key, str) else None)
-    if plan is None:
-        raise signup_routes.invalid_fields([signup.FieldProblem("plan_key", "Choose one of the plans shown.")])
-    acceptance = signup_routes.acceptance_of(request, body.legal_version)
+
+    def read(session: Session) -> tuple[signup.Application, str, signup.Acceptance]:
+        answers = {
+            **body.model_dump(),
+            "first_name": identity.first_name or body.first_name,
+            "last_name": identity.last_name or body.last_name,
+        }
+        try:
+            application = signup.application_from(answers)
+        except signup.ApplicationInvalid as invalid:
+            raise signup_routes.invalid_fields(invalid.problems) from None
+        plan = signup_plans.offered_plan(session, body.plan_key if isinstance(body.plan_key, str) else None)
+        if plan is None:
+            raise signup_routes.invalid_fields([signup.FieldProblem("plan_key", "Choose one of the plans shown.")])
+        return application, plan.key, signup_routes.acceptance_of(request, body.legal_version)
+
+    application, plan_key, acceptance = await db.run_sync(read)
+    await db_async.release(db)
     # The slug first: its LLM call (`signup.abbreviation`, bounded but slow) must not run under the email lock, which
     # would hold every other self-create of this email for its length.
-    slug_base = signup.abbreviation(application.org_name)
-    # Held from the Free check to `create_signup`'s commit of the org (`self_serve_rules.lock_email`).
-    self_serve_rules.lock_email(session, identity.email)
-    self_serve_rules.refuse_second_free(session, identity.email, plan.key)
-    owner = signup.create_signup(
-        session, None, application, acceptance, identity=identity, plan_key=plan.key, slug_base=slug_base,
-    )
-    approved = org_approval.approve_at_signup(owner.org_id, identity.email, by_domain=False)
-    signup_routes.notify_operators(owner, application, identities.identity_provider(identity), approved=approved)
+    slug_base = await run_in_threadpool(signup.abbreviation, application.org_name)
+
+    def create(session: Session) -> tuple[AdminUser, str, str]:
+        set_request_actor(session, admin.id)
+        # Held from the Free check to `create_signup`'s commit of the org (`self_serve_rules.lock_email`).
+        self_serve_rules.lock_email(session, identity.email)
+        self_serve_rules.refuse_second_free(session, identity.email, plan_key)
+        owner = signup.create_signup(
+            session, None, application, acceptance, identity=identity, plan_key=plan_key, slug_base=slug_base,
+        )
+        return owner, identity.email, identities.identity_provider(identity)
+
+    owner, email, provider = await db.run_sync(create)
+    await db_async.release(db)  # `create_signup`'s refresh after its commit began a read: hand it back before the hops
+    approved = await run_in_threadpool(org_approval.approve_at_signup, owner.org_id, email, by_domain=False)
+    await run_in_threadpool(signup_routes.notify_operators, owner, application, provider, approved=approved)
     if not approved:
         return SelfCreateOut(org_id=owner.org_id, state="pending_approval")
-    notify_outbox.after_answer("signup_approved", str(owner.org_id))
+    await run_in_threadpool(notify_outbox.after_answer, "signup_approved", str(owner.org_id))
     return SelfCreateOut(org_id=owner.org_id, state="active")
 
 
@@ -903,22 +955,28 @@ class SlugSuggestionOut(BaseModel):
 
 @router.get("/api/orgs/slug-suggestion", response_model=SlugSuggestionOut)
 @superadmin_only(Tenancy.OPERATOR)
-def suggest_org_slug(
+async def suggest_org_slug(
     name: str,
     _: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
+    *,
+    db: DbDep,
 ) -> SlugSuggestionOut:
     """A free generated slug for an org called `name` (`app/org_slug.py`, the sign-up's own), for the Create
-    dialog to pre-fill. Declared before `/api/orgs/{org_id}`, which would otherwise claim the path."""
-    return SlugSuggestionOut(slug=org_slug.generate_slug(session, validated_name(name)))
+    dialog to pre-fill. Declared before `/api/orgs/{org_id}`, which would otherwise claim the path.
+    The sign-up's two halves (`signup.py`) apart: the abbreviation is an LLM call, made off the loop with no
+    connection held, then the free suffix is read."""
+    base = await run_in_threadpool(org_slug.abbreviation, validated_name(name))
+
+    def work(session: Session) -> SlugSuggestionOut:
+        return SlugSuggestionOut(slug=org_slug.unique_slug(session, base))
+
+    return await db.run_sync(work)
 
 
 @router.get("/api/orgs/pending-count", response_model=PendingCountOut)
 @superadmin_only(Tenancy.OPERATOR)
-def pending_org_count(
-    _: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
-) -> PendingCountOut:
+@on_session
+def pending_org_count(session: Session, _: AdminUser = Depends(require_superadmin)) -> PendingCountOut:
     """How many orgs await approval — the rail's badge, polled. Declared before `/api/orgs/{org_id}`,
     which would otherwise claim the path."""
     return PendingCountOut(
@@ -932,201 +990,316 @@ def pending_org_count(
 
 @router.get("/api/orgs/{org_id}", response_model=OrgOut)
 @org_admin(Tenancy.CALLER_PLANE)
+@on_session
 def get_org(
+    session: Session,
     org_id: str,
-    _: AdminUser = Depends(require_user),
-    principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> OrgOut:
     """One org, in the same shape the list serves it: an operator any org, an Org Owner/Admin their own
     (`administered_org_or_404` — another org is the same 404 as none), in the same view `update_org` answers them
     (no `signup`/`enquiry`: those are the operator's)."""
-    row = administered_org_or_404(session, org_id, principal)
-    return _rows_out(session, [row], operator_view=principal is not None and principal.is_operator)[0]
+    row = administered_org_or_404(session, org_id, caller.principal)
+    operator_view = caller.principal is not None and caller.principal.is_operator
+    out = _rows_out(session, [row], operator_view=operator_view)[0]
+    if operator_view:
+        out.has_owner = owner_to_push_as(session, row.id) is not None
+    return out
 
 
 @router.patch("/api/orgs/{org_id}", response_model=OrgOut)
 @org_admin(Tenancy.CALLER_PLANE)
-def update_org(
+async def update_org(
     org_id: str,
     body: OrgUpdateIn,
-    user: AdminUser = Depends(require_user),
-    principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
+    *,
+    db: DbDep,
 ) -> OrgOut:
     """Rename an org, retitle its description, disable/re-enable it, or set its default role.
 
     A PATCH because the form and the toggle are different controls; `model_fields_set` distinguishes
     "not sent" from "sent as null".
 
-    An Org Owner/Admin reaches their own org only, and only `default_role`, the SSO fields and the MicroVM size
-    (403 for any other field, before any mutation); an operator any org and every field. Seeded rows may be renamed but not
+    An Org Owner/Admin reaches their own org only, and only `default_role`, the SSO fields, the MicroVM size,
+    "Run jobs as" and intelligent routing (403 for any other field, before any mutation); an operator any org and every field. Seeded rows may be renamed but not
     disabled, refused before any mutation so a combined body changes nothing. Re-enabling is not guarded.
     """
-    row = _live(administered_org_or_404(session, org_id, principal))
-    fields = body.model_fields_set
-    operator = principal is not None and principal.is_operator
-    if ("enabled" in fields or fields & _HIPAA_FIELDS) and operator:
-        # Locked and re-read (HIPAA too: its date-while-on rule is checked against this row), as approve/reject lock it: an enable racing a reject would otherwise write
-        # `enabled=true` over a freshly rejected org without re-admitting it.
-        session.get(Org, row.id, with_for_update=True, populate_existing=True)
-    if fields & _HIPAA_FIELDS and not operator:
-        raise HTTPException(status_code=403, detail=HIPAA_OPERATOR_ONLY)
-    if fields & _OPERATOR_FIELDS and not operator:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "Only an operator can rename, retitle or disable an organization, or change its isolation "
-                "or two-factor setting."
-            ),
-        )
-    if fields & set(_EXCEPTION_FIELDS) and not is_tenant_org(row.id):
-        raise HTTPException(
-            status_code=422,
-            detail="The operator's own organizations are not isolated, so there is no exception to record.",
-        )
-    if "mfa_skip" in fields and not is_tenant_org(row.id):
-        raise HTTPException(status_code=422, detail="The operator's own organizations always require two-factor.")
-    hipaa_after = _hipaa_after(row, body, fields)
-    new_default_role = row.default_role_id
-    if "default_role" in fields:
-        if body.default_role is not None and body.default_role not in access.DEFAULT_ROLE_SLUGS:
+    #: The tailnet listings read off the loop for a slug rename, by `(old slug, new slug)` (`_rename_slug`).
+    tailnet: dict[tuple[str, str], Any] = {}
+
+    def work(session: Session) -> tuple[OrgOut, list[tuple[UUID, int]], Optional[tuple[UUID, str, str, list[str]]]]:
+        set_request_actor(session, caller.actor.id)
+        row = _live(administered_org_or_404(session, org_id, caller.principal))
+        fields = body.model_fields_set
+        operator = caller.principal is not None and caller.principal.is_operator
+        if ("enabled" in fields or fields & _HIPAA_FIELDS) and operator:
+            # Locked and re-read (HIPAA too: its date-while-on rule is checked against this row), as approve/reject lock it: an enable racing a reject would otherwise write
+            # `enabled=true` over a freshly rejected org without re-admitting it.
+            session.get(Org, row.id, with_for_update=True, populate_existing=True)
+        if fields & _HIPAA_FIELDS and not operator:
+            raise HTTPException(status_code=403, detail=HIPAA_OPERATOR_ONLY)
+        if fields & _OPERATOR_FIELDS and not operator:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Only an operator can rename, retitle or disable an organization, or change its isolation "
+                    "or two-factor setting."
+                ),
+            )
+        if fields & set(_EXCEPTION_FIELDS) and not is_tenant_org(row.id):
             raise HTTPException(
                 status_code=422,
-                detail="The default role is none, Project Viewer or Project Developer.",
+                detail="The operator's own organizations are not isolated, so there is no exception to record.",
             )
-        new_default_role = ROLES_BY_SLUG[body.default_role].id if body.default_role else None
+        if "mfa_skip" in fields and not is_tenant_org(row.id):
+            raise HTTPException(status_code=422, detail="The operator's own organizations always require two-factor.")
+        hipaa_after = _hipaa_after(row, body, fields)
+        new_default_role = row.default_role_id
+        if "default_role" in fields:
+            if body.default_role is not None and body.default_role not in access.DEFAULT_ROLE_SLUGS:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The default role is none, Project Viewer or Project Developer.",
+                )
+            new_default_role = ROLES_BY_SLUG[body.default_role].id if body.default_role else None
 
-    if "enabled" in fields and body.enabled is False and not is_tenant_org(row.id):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"'{row.name}' ({row.slug}) cannot be disabled — {_OPERATOR_UNDISABLABLE}. Rename it if the "
-                "label is wrong; there is no supported way to take it out of service."
-            ),
-        )
+        if "enabled" in fields and body.enabled is False and not is_tenant_org(row.id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"'{row.name}' ({row.slug}) cannot be disabled — {_OPERATOR_UNDISABLABLE}. Rename it if the "
+                    "label is wrong; there is no supported way to take it out of service."
+                ),
+            )
 
-    renamed: Optional[tuple[str, list[str]]] = None
-    if "slug" in fields:
-        renamed = _rename_slug(session, row, body.slug, user)
+        renamed: Optional[tuple[str, list[str]]] = None
+        if "slug" in fields:
+            renamed = _rename_slug(session, row, body.slug, caller.actor, tailnet)
 
-    changed = renamed is not None
-    if "name" in fields:
-        name = validated_name(body.name or "")
-        changed = changed or name != row.name
-        row.name = name
-    if "description" in fields:
-        description = validated_description(body.description)
-        changed = changed or description != row.description
-        row.description = description
-    if "enabled" in fields and body.enabled is not None:
-        if bool(body.enabled) != bool(row.enabled):
+        changed = renamed is not None
+        if "name" in fields:
+            name = validated_org_name(body.name or "")
+            changed = changed or name != row.name
+            row.name = name
+        if "description" in fields:
+            description = validated_description(body.description)
+            changed = changed or description != row.description
+            row.description = description
+        if "enabled" in fields and body.enabled is not None:
+            if bool(body.enabled) != bool(row.enabled):
+                changed = True
+                # A lifecycle row in the customer history (`app/customer_history.py::CATEGORY_OF`).
+                record_write(
+                    session, caller.actor, ORG_ENABLED if body.enabled else ORG_DISABLED,
+                    f"{'Enabled' if body.enabled else 'Disabled'} org {row.name}",
+                    data={"org_id": str(row.id)},
+                )
+            row.enabled = body.enabled
+            if body.enabled and row.lifecycle == ORG_REJECTED:
+                # Re-enabling a rejected org is the operator re-admitting it: rejected -> active, the one way
+                # out of `rejected`. Its members sign in again; nothing else of theirs was removed.
+                row.lifecycle = ORG_ACTIVE
+                changed = True
+                record_write(
+                    session, caller.actor, "org_readmitted", f"Re-admitted org {row.name} after its rejection",
+                    data={"org_id": str(row.id)},
+                )
+        if new_default_role != row.default_role_id:
             changed = True
-            # A lifecycle row in the customer history (`app/customer_history.py::CATEGORY_OF`).
+            before = _default_role_slug(row)
+            row.default_role_id = new_default_role
+            # Load-bearing audit: this decides what every future domain sign-in is granted.
             record_write(
-                session, user, ORG_ENABLED if body.enabled else ORG_DISABLED,
-                f"{'Enabled' if body.enabled else 'Disabled'} org {row.name}",
-                data={"org_id": str(row.id)},
+                session, caller.actor, "org_default_role",
+                f"Set the default role of org {row.name} to {body.default_role or 'none'}",
+                data={"org_id": str(row.id), "from": before, "to": body.default_role},
             )
-        row.enabled = body.enabled
-        if body.enabled and row.lifecycle == ORG_REJECTED:
-            # Re-enabling a rejected org is the operator re-admitting it: rejected -> active, the one way
-            # out of `rejected`. Its members sign in again; nothing else of theirs was removed.
-            row.lifecycle = ORG_ACTIVE
+
+        for field in _EXCEPTION_FIELDS:
+            value = getattr(body, field)
+            if field in fields and value is not None and bool(value) != bool(getattr(row, field)):
+                # Audited by request capture (the PATCH body names the field and its new value) and stamped
+                # below with `updated_by`; the risk register lists every tenant org that holds one.
+                setattr(row, field, bool(value))
+                changed = True
+
+        if fields & _MICROVM_SIZE_FIELDS:
+            # The community edition has no MicroVMs: a resent value is no change, a changed one is not in it.
+            if not edition_features.enabled("microvm") and any(
+                getattr(body, field) != getattr(row, field) for field in fields & _MICROVM_SIZE_FIELDS
+            ):
+                raise ce_caps.not_in_edition()
+            if edition_features.enabled("microvm"):
+                from app import microvm_sizing
+
+                with refused_as(422, ValueError):
+                    sizes = microvm_sizing.validated(
+                        {field: getattr(body, field) for field in fields & _MICROVM_SIZE_FIELDS})
+                for field, value in sizes.items():
+                    if getattr(row, field) != value:
+                        setattr(row, field, value)
+                        changed = True
+
+        if fields & _ROUTING_FIELDS:
+            changed = _apply_routing(session, row, body, fields, caller.actor) or changed
+
+        if "run_jobs_as_id" in fields and body.run_jobs_as_id != row.run_jobs_as_id:
+            if body.run_jobs_as_id is not None and not git_access.usable_job_person(
+                    session, body.run_jobs_as_id, row.id):
+                raise HTTPException(status_code=422, detail=RUN_JOBS_AS_UNUSABLE)
+            row.run_jobs_as_id = body.run_jobs_as_id
             changed = True
-            record_write(
-                session, user, "org_readmitted", f"Re-admitted org {row.name} after its rejection",
-                data={"org_id": str(row.id)},
-            )
-    if new_default_role != row.default_role_id:
-        changed = True
-        before = _default_role_slug(row)
-        row.default_role_id = new_default_role
-        # Load-bearing audit: this decides what every future domain sign-in is granted.
-        record_write(
-            session, user, "org_default_role",
-            f"Set the default role of org {row.name} to {body.default_role or 'none'}",
-            data={"org_id": str(row.id), "from": before, "to": body.default_role},
-        )
 
-    for field in _EXCEPTION_FIELDS:
-        value = getattr(body, field)
-        if field in fields and value is not None and bool(value) != bool(getattr(row, field)):
-            # Audited by request capture (the PATCH body names the field and its new value) and stamped
-            # below with `updated_by`; the risk register lists every tenant org that holds one.
-            setattr(row, field, bool(value))
+        retired: list[tuple[UUID, int]] = []
+        if fields & _SSO_FIELDS:
+            sso_changed, retired = _apply_sso(session, row, body, caller.actor)
+            changed = changed or sso_changed
+        if "mfa_skip" in fields and body.mfa_skip is not None and body.mfa_skip != bool(row.mfa_skip):
+            retired += _apply_mfa_skip(session, row, body.mfa_skip, caller.actor)
+            changed = True
+        hipaa_changed, hipaa_retired = _apply_hipaa(session, row, hipaa_after, caller.actor, frozenset(m for m, _ in retired))
+        if hipaa_changed:
+            retired += hipaa_retired
             changed = True
 
-    if fields & _MICROVM_SIZE_FIELDS:
-        # The community edition has no MicroVMs: a resent value is no change, a changed one is not in it.
-        if not edition_features.enabled("microvm") and any(
-            getattr(body, field) != getattr(row, field) for field in fields & _MICROVM_SIZE_FIELDS
-        ):
-            raise HTTPException(status_code=404, detail=ce_caps.NOT_IN_CE)
-        if edition_features.enabled("microvm"):
-            from app import microvm_sizing
+        if not changed:
+            # A no-op PATCH writes nothing, so `updated_by`/`updated_at` keep meaning "who last changed this"
+            # (`routes/groups.py`'s rule) and no open tab is notified.
+            return _rows_out(session, [row], operator_view=operator)[0], [], None
 
-            try:
-                sizes = microvm_sizing.validated(
-                    {field: getattr(body, field) for field in fields & _MICROVM_SIZE_FIELDS})
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from None
-            for field, value in sizes.items():
-                if getattr(row, field) != value:
-                    setattr(row, field, value)
-                    changed = True
-
-    retired: list[tuple[UUID, int]] = []
-    if fields & _SSO_FIELDS:
-        sso_changed, retired = _apply_sso(session, row, body, user)
-        changed = changed or sso_changed
-    if "mfa_skip" in fields and body.mfa_skip is not None and body.mfa_skip != bool(row.mfa_skip):
-        retired += _apply_mfa_skip(session, row, body.mfa_skip, user)
-        changed = True
-    hipaa_changed, hipaa_retired = _apply_hipaa(session, row, hipaa_after, user, frozenset(m for m, _ in retired))
-    if hipaa_changed:
-        retired += hipaa_retired
-        changed = True
-
-    if not changed:
-        # A no-op PATCH writes nothing, so `updated_by`/`updated_at` keep meaning "who last changed this"
-        # (`routes/groups.py`'s rule) and no open tab is notified.
-        return _rows_out(session, [row], operator_view=operator)[0]
-
-    stamp_actor(row, user)
-    # A slug taken between `_rename_slug`'s read and here is the ordinary duplicate's 409, not a 500.
-    flush_or_409(session, _SLUG_TAKEN, constraints=frozenset({SLUG_UNIQUE}))
-    # Same event and `PROBED_ENTITIES` requirement as the create path.
-    emit_console_event(session, entity="org", id=row.id, action="upserted")
-    session.commit()
-    # After the commit, as `reject_org` does: a node acting on a rolled-back change would sign out a live console.
-    for member_id, retired_epoch in retired:
-        revoke_direct_grants_retired_epoch(member_id, retired_epoch)
-    session.refresh(row)
-    # The community edition has no tailnet to retag.
-    if edition_features.enabled("tailnet"):
-        from app.durable import org_retag
-
+        stamp_actor(row, caller.actor)
+        # A slug taken between `_rename_slug`'s read and here is the ordinary duplicate's 409, not a 500.
+        flush_or_409(session, _SLUG_TAKEN, constraints=frozenset({SLUG_UNIQUE}))
+        # Same event and `PROBED_ENTITIES` requirement as the create path.
+        emit_console_event(session, entity="org", id=row.id, action="upserted", commit=True)
+        session.refresh(row)
+        retag = None
         if renamed is not None:
             old_slug, device_ids = renamed
-            org_retag.enqueue_retag(row.id, old_slug, row.slug, device_ids)
-    return _rows_out(session, [row], operator_view=operator)[0]
+            retag = (row.id, old_slug, row.slug, device_ids)
+        return _rows_out(session, [row], operator_view=operator)[0], retired, retag
+
+    # A rename reads the tailnet: off the loop, no connection held, then the PATCH runs again with the listing.
+    for _attempt in range(3):
+        try:
+            out, retired, retag = await db.run_sync(work)
+            break
+        except _TailnetNeeded as need:
+            await db.rollback()
+            tailnet[(need.old, need.new)] = await run_in_threadpool(_tailnet_devices, need.old, need.new)
+    else:
+        raise HTTPException(status_code=409, detail="The organization's slug changed meanwhile. Reload and try again.")
+    await db_async.release(db)  # the answer's read, before the hops below
+    # After the commit, as `reject_org` does: a node acting on a rolled-back change would sign out a live console.
+    for member_id, retired_epoch in retired:
+        await run_in_threadpool(revoke_direct_grants_retired_epoch, member_id, retired_epoch)
+    if retag is not None:
+        from app.durable import jaah_repo_prefix
+
+        # The org's Jaah-made repos follow its new prefix, in every edition.
+        await run_in_threadpool(jaah_repo_prefix.enqueue_rename, retag[0], [retag[1]])
+        # The community edition has no tailnet to retag.
+        if edition_features.enabled("tailnet"):
+            from app.durable import org_retag
+
+            await run_in_threadpool(org_retag.enqueue_retag, *retag)
+    return out
 
 
 _SLUG_TAKEN = "Another organization already has that slug."
+#: `update_org`'s refusal of a "Run jobs as" person it cannot use.
+RUN_JOBS_AS_UNUSABLE = "Run jobs as must be an enabled member of this organization."
+
+
+def _apply_routing(session: Session, row: Org, body: OrgUpdateIn, fields: set[str], user: AdminUser) -> bool:
+    """Write the org's intelligent routing settings from `body`; whether anything changed. 403 without the plan
+    feature — except a PATCH that only lowers the maximum, so an org that lost the feature can still wind its
+    projects down — and 422 on a bad value, both before any write. Lowering the maximum demotes every project above it in this
+    transaction (`modes.demote_projects`), one audit row per project; raising it restores nothing."""
+    if "routing_max_mode" in fields and body.routing_max_mode not in ROUTING_MAX_MODES:
+        raise HTTPException(status_code=422, detail="Set the maximum mode to off, recommend or auto.")
+    # Locked: a project raising its mode reads this row locked too (`routes/projects.py::_validated_routing`).
+    session.get(Org, row.id, with_for_update=True, populate_existing=True)
+    only_lowering = fields & _ROUTING_FIELDS == {"routing_max_mode"} and modes.rank(
+        body.routing_max_mode or modes.OFF) <= modes.rank(row.routing_max_mode)
+    if not only_lowering and not plan_terms.intelligent_routing(session, row):
+        raise HTTPException(status_code=403, detail=modes.NOT_ON_PLAN)
+    with refused_as(422, ValueError):
+        allowed = (
+            policy_settings.validated_allowed(session, row.id, body.routing_allowed, stored=row.routing_allowed)
+            if "routing_allowed" in fields else row.routing_allowed
+        )
+        floor, ceiling = policy_settings.validated_tiers(
+            body.routing_tier_floor if "routing_tier_floor" in fields else row.routing_tier_floor,
+            body.routing_tier_ceiling if "routing_tier_ceiling" in fields else row.routing_tier_ceiling,
+        )
+    changed = False
+    for column, value in (("routing_allowed", allowed), ("routing_tier_floor", floor), ("routing_tier_ceiling", ceiling)):
+        if getattr(row, column) != value:
+            setattr(row, column, value)
+            changed = True
+    # Checked above: a sent maximum is one of `ROUTING_MAX_MODES`, never None.
+    new_max = body.routing_max_mode if "routing_max_mode" in fields and body.routing_max_mode else row.routing_max_mode
+    if new_max != row.routing_max_mode:
+        before = row.routing_max_mode
+        row.routing_max_mode = new_max
+        changed = True
+        record_write(
+            session, user, "routing.max_mode_changed",
+            f"Set the routing maximum of org {row.name} to {new_max}",
+            data={"org_id": str(row.id), "from": before, "to": new_max}, in_org=row.id,
+        )
+        for project, project_before in modes.demote_projects(session, row.id, new_max):
+            record_write(
+                session, user, modes.DEMOTED,
+                f"Lowered routing of project {project.name} from {project_before} to {project.routing_mode}: "
+                f"the organization's maximum is now {new_max}",
+                data={"org_id": str(row.id), "project_id": project.id, "from": project_before,
+                      "to": project.routing_mode, "org_max": new_max},
+                in_org=row.id,
+            )
+    return changed
+
+
+class _TailnetNeeded(Exception):
+    """`_rename_slug` needs the tailnet's listing for `(old, new)`, which `update_org` reads off the loop."""
+
+    def __init__(self, old: str, new: str) -> None:
+        super().__init__(old, new)
+        self.old, self.new = old, new
+
+
+def _tailnet_devices(old: str, new: str) -> Any:
+    """`org_retag.tailnet_devices` for a rename (a headscale call, run in the threadpool); an unreadable tailnet is
+    a 503 that renamed nothing. Asked only where the edition has a tailnet (`_rename_slug`)."""
+    if edition_features.enabled("tailnet"):
+        from app.durable import org_retag
+
+        try:
+            return org_retag.tailnet_devices(old, new)
+        except Exception as exc:  # noqa: BLE001 — any headscale failure: nothing renamed, the operator retries
+            raise HTTPException(
+                status_code=503,
+                detail=f"Could not read the tailnet to move this organization's devices ({type(exc).__name__}); "
+                "nothing was renamed. Try again.",
+            ) from None
+    return []
 
 
 def _rename_slug(
-    session: Session, row: Org, value: Optional[str], user: AdminUser
+    session: Session, row: Org, value: Optional[str], user: AdminUser, tailnet: dict[tuple[str, str], Any],
 ) -> Optional[tuple[str, list[str]]]:
     """Rename `row`'s slug to `value`; `(old slug, the org's tailnet device ids)` when it changed, else None.
     The caller enqueues the retag of those devices after its commit (`app/durable/org_retag.py`).
 
     The row is locked first, so two renames of one org serialize instead of leaving the slug and the tags
-    disagreeing. The devices are read HERE, before the old slug is free, so the retag can only ever
+    disagreeing. The devices are read before the old slug is free, so the retag can only ever
     move devices this org held — never one another org enrols later under the reused old slug. For the
     same reason a slug whose tag devices still carry is refused: an org renamed onto it would inherit them.
-    An unreadable tailnet refuses the rename (503) rather than renaming blind.
+    An unreadable tailnet refuses the rename (503) rather than renaming blind. The listing is a headscale call, so
+    it is not made here: `tailnet` holds the ones `update_org` read off the loop, by `(old, new)`, and a pair it
+    lacks raises `_TailnetNeeded` for `update_org` to read it and run the PATCH again.
 
     Refused for org zero (its slug is the operator plane's own handle) and for a slug that is not also a
     tailnet tag name (`cloud_node_launch.tailnet_tags_for` would refuse the org's next node). Taken → 409,
@@ -1151,16 +1324,9 @@ def _rename_slug(
     old = row.slug
     on_old: list[str] = []
     if edition_features.enabled("tailnet"):
-        from app.durable import org_retag
-
-        try:
-            devices = org_retag.tailnet_devices(old, slug)
-        except Exception as exc:  # noqa: BLE001 — any headscale failure: nothing renamed, the operator retries
-            raise HTTPException(
-                status_code=503,
-                detail=f"Could not read the tailnet to move this organization's devices ({type(exc).__name__}); "
-                "nothing was renamed. Try again.",
-            ) from None
+        devices = tailnet.get((old, slug))
+        if devices is None:
+            raise _TailnetNeeded(old, slug)
         if devices.on_new:
             raise HTTPException(
                 status_code=409,
@@ -1177,27 +1343,34 @@ def _rename_slug(
 
 @router.post("/api/orgs/{org_id}/tailnet-retag", status_code=202)
 @superadmin_only(Tenancy.OPERATOR)
-def retag_org_tailnet(
+async def retag_org_tailnet(
     org_id: str,
     user: AdminUser = Depends(require_operator),
-    session: Session = Depends(get_session),
+    *,
+    db: DbDep,
 ) -> dict:
     """Converge a tenant org's tailnet devices onto its own tags (`app/durable/org_retag.py::enqueue_converge`):
     `devices` is how many the tailnet read here would retag, `workflow_id` the durable converge. Idempotent —
     already-correct devices are no-ops. 409 for an operator-plane org (its devices keep the fleet tags), 422 for
     a slug that is no tag name; an unreadable tailnet or a refused enqueue is a 503 that queued nothing. Audited
-    only once queued, with the workflow id."""
+    only once queued, with the workflow id. The tailnet read and the enqueue run in the threadpool, no
+    connection held."""
     # The community edition has no tailnet.
     if not edition_features.enabled("tailnet"):
-        raise HTTPException(status_code=404, detail=ce_caps.NOT_IN_CE)
+        raise ce_caps.not_in_edition()
     from app.cloud_node_launch import CloudNodeError
     from app.durable import org_retag
 
-    row = _live_one(session, org_id)
-    if not is_tenant_org(row.id):
-        raise HTTPException(status_code=409, detail="An operator-plane organization keeps the fleet's tailnet tags.")
+    def read(session: Session) -> Org:
+        row = _live_one(session, org_id)
+        if not is_tenant_org(row.id):
+            raise HTTPException(status_code=409, detail="An operator-plane organization keeps the fleet's tailnet tags.")
+        return row
+
+    row = await db.run_sync(read)
+    await db_async.release(db)
     try:
-        devices = org_retag.drifted_devices(row.id)
+        devices = await run_in_threadpool(org_retag.drifted_devices, row.id)
     except CloudNodeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     except Exception as exc:  # noqa: BLE001 — any headscale failure: nothing retagged, the operator retries
@@ -1205,14 +1378,19 @@ def retag_org_tailnet(
             status_code=503,
             detail=f"Could not read the tailnet ({type(exc).__name__}); nothing was retagged. Try again.",
         ) from None
-    workflow_id = org_retag.enqueue_converge(row.id)
+    workflow_id = await run_in_threadpool(org_retag.enqueue_converge, row.id)
     if workflow_id is None:
         raise HTTPException(status_code=503, detail="Could not queue the retag; nothing was retagged. Try again.")
-    record_write(
-        session, user, "org_tailnet_retagged", f"Queued a tailnet retag of org {row.name}",
-        data={"org_id": str(row.id), "slug": row.slug, "devices": devices, "workflow_id": workflow_id},
-    )
-    session.commit()
+
+    def write(session: Session) -> None:
+        set_request_actor(session, user.id)
+        record_write(
+            session, user, "org_tailnet_retagged", f"Queued a tailnet retag of org {row.name}",
+            data={"org_id": str(row.id), "slug": row.slug, "devices": devices, "workflow_id": workflow_id},
+        )
+        session.commit()
+
+    await db.run_sync(write)
     return {"devices": devices, "workflow_id": workflow_id}
 
 
@@ -1251,7 +1429,7 @@ def _apply_sso(
     sessions it ended. Records `sso_config_changed` on a change.
 
     A change that narrows how members may sign in — SSO-only turned on, a new provider or tenant, the MFA
-    attestation withdrawn — ends every member's session (the caller's included) by bumping `session_epoch`,
+    attestation withdrawn — ends every member's session (the caller's included; `identities.retire_org_sessions`),
     as `reject_org` does: a session a now-refused door minted, or an `sso` one minted under a withdrawn
     attestation, must not outlive the change. Turning SSO-only off, or attesting, narrows nothing.
 
@@ -1271,7 +1449,7 @@ def _apply_sso(
         attest = False
     row.sso_provider, row.sso_tenant = provider, tenant
     if attest is True and (not before["mfa_attested"] or (before["provider"], before["tenant"]) != (provider, tenant)):
-        row.sso_mfa_attested_at, row.sso_mfa_attested_by_id = datetime.now(timezone.utc), user.id
+        row.sso_mfa_attested_at, row.sso_mfa_attested_by_id = utcnow(), user.id
     elif attest is False:
         row.sso_mfa_attested_at, row.sso_mfa_attested_by_id = None, None
     after = {"provider": provider, "tenant": tenant, "mfa_attested": row.sso_mfa_attested_at is not None}
@@ -1283,11 +1461,7 @@ def _apply_sso(
         (provider, tenant) != (before["provider"], before["tenant"])
         or (before["mfa_attested"] and not after["mfa_attested"])
     )
-    retired: list[tuple[UUID, int]] = []
-    if narrows:
-        for member in session.scalars(select(AdminUser).where(AdminUser.org_id == row.id)):
-            retired.append((member.id, member.session_epoch or 0))
-            member.session_epoch = (member.session_epoch or 0) + 1
+    retired = identities.retire_org_sessions(session, row.id) if narrows else []
     # Load-bearing audit (SOC 2 G-01): this decides which doors every member of the org may sign in by.
     state = f"SSO-only via {provider} ({tenant})" if provider else "not SSO-only"
     record_write(
@@ -1302,11 +1476,7 @@ def _apply_mfa_skip(session: Session, row: Org, skip: bool, user: AdminUser) -> 
     member's session (the `(member, retired epoch)` pairs returned), as `_apply_sso` does when it narrows: a
     session minted with no second factor must not outlive the exemption. Turning it on narrows nothing."""
     row.mfa_skip = skip
-    retired: list[tuple[UUID, int]] = []
-    if not skip:
-        for member in session.scalars(select(AdminUser).where(AdminUser.org_id == row.id)):
-            retired.append((member.id, member.session_epoch or 0))
-            member.session_epoch = (member.session_epoch or 0) + 1
+    retired = [] if skip else identities.retire_org_sessions(session, row.id)
     # Load-bearing audit (SOC 2 G-01): this decides whether the org's members prove a second factor at all.
     record_write(
         session, user, "mfa_skip_changed",
@@ -1336,19 +1506,15 @@ def _apply_hipaa(
 
     Turning it ON ends the session of every member who may hold one minted on a skip — every member while the
     org skips the second factor, else each exempt one — since a HIPAA org honours no skip (`mfa.skip_reason`,
-    C6). Those `(member, retired epoch)` pairs are returned, as `_apply_mfa_skip` returns its own; a member in
-    `already_retired` (this PATCH already ended their session) is not retired twice."""
+    C6). A member in `already_retired` (this PATCH already ended their session) is not retired twice."""
     enabled, effective = after
     before = {"enabled": bool(row.hipaa_enabled), "date": iso_or_none(row.hipaa_baa_effective_date)}
     now = {"enabled": enabled, "date": iso_or_none(effective)}
-    retired: list[tuple[UUID, int]] = []
     if before == now:
-        return False, retired
-    if enabled and not before["enabled"]:
-        for member in session.scalars(select(AdminUser).where(AdminUser.org_id == row.id)):
-            if member.id not in already_retired and (row.mfa_skip or member.mfa_exempt):
-                retired.append((member.id, member.session_epoch or 0))
-                member.session_epoch = (member.session_epoch or 0) + 1
+        return False, []
+    retired = identities.retire_org_sessions(
+        session, row.id, only=lambda m: m.id not in already_retired and (row.mfa_skip or m.mfa_exempt)
+    ) if enabled and not before["enabled"] else []
     if before["enabled"] != enabled:
         # A new HIPAA term starts with no warning accepted: an acknowledgement stands only for the term it was given in.
         row.hipaa_acks = {}
@@ -1371,17 +1537,18 @@ def _apply_hipaa(
 
 @router.post("/api/orgs/{org_id}/hipaa/acknowledgements", status_code=204)
 @org_admin(Tenancy.CALLER_PLANE)
+@on_session
 def acknowledge_hipaa_warning(
+    session: Session,
     org_id: str,
     body: HipaaAckIn,
-    user: AdminUser = Depends(require_user),
-    principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> Response:
     """An org admin (or the operator) accepts a HIPAA warning: this org may keep using a surface whose vendor
     has no BAA on file (`hipaa.SURFACES`). Idempotent: a surface already acknowledged keeps its first record. 409
     while HIPAA is off; turning it on or off clears every acknowledgement (`_apply_hipaa`)."""
-    row = _live(administered_org_or_404(session, org_id, principal))
+    set_request_actor(session, caller.actor.id)
+    row = _live(administered_org_or_404(session, org_id, caller.principal))
     vendor = hipaa.SURFACES.get(body.surface)
     if vendor is None:
         raise HTTPException(status_code=422, detail=f"Unknown surface: {body.surface}.")
@@ -1391,17 +1558,16 @@ def acknowledge_hipaa_warning(
     acks = dict(row.hipaa_acks or {})
     if body.surface in acks:
         return Response(status_code=204)
-    acks[body.surface] = {"by": str(user.id), "at": now_iso()}
+    acks[body.surface] = {"by": str(caller.actor.id), "at": now_iso()}
     # A new dict, so the JSONB column is seen as changed.
     row.hipaa_acks = acks
     record_write(
-        session, user, "hipaa_warning_acknowledged",
+        session, caller.actor, "hipaa_warning_acknowledged",
         f"Acknowledged the HIPAA warning for {body.surface} in org {row.name}",
         data={"org_id": str(row.id), "surface": body.surface, "vendor": vendor},
         in_org=row.id,
     )
-    emit_console_event(session, entity="org", id=row.id, action="upserted")
-    session.commit()
+    emit_console_event(session, entity="org", id=row.id, action="upserted", commit=True)
     return Response(status_code=204)
 
 
@@ -1446,7 +1612,7 @@ def _submit_draft(session: Session, row: Org, signup: OrgSignup, user: AdminUser
     approval's commit; 409 `signup_incomplete` while its profile is unanswered (stage `profile`)."""
     # The community edition has no sign-up drafts (its caller, `approve_org`, already refuses there).
     if not edition_features.enabled("signup"):
-        raise HTTPException(status_code=404, detail=ce_caps.NOT_IN_CE)
+        raise ce_caps.not_in_edition()
     from app import signup_draft, signup_plans, signup_stage
 
     owner = session.scalar(select(AdminUser).where(AdminUser.id == signup.owner_id))
@@ -1463,11 +1629,12 @@ def _submit_draft(session: Session, row: Org, signup: OrgSignup, user: AdminUser
 
 @router.post("/api/orgs/{org_id}/approve", response_model=OrgOut)
 @superadmin_only(Tenancy.OPERATOR)
-def approve_org(
+async def approve_org(
     org_id: str,
     body: Optional[OrgApproveIn] = None,
     user: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
+    *,
+    db: DbDep,
 ) -> OrgOut:
     """Admit a pending self-service org: `active`, so its creation doors and dispatch unlock
     (`app/org_gate.py`). 409 unless pending. The approval is audited in the same transaction, and wakes the
@@ -1477,11 +1644,23 @@ def approve_org(
     automatic approval at sign-up."""
     # The community edition has no sign-up approval.
     if not edition_features.enabled("signup"):
-        raise HTTPException(status_code=404, detail=ce_caps.NOT_IN_CE)
-    from app import org_approval, signup_plans
-
+        raise ce_caps.not_in_edition()
     send_welcome = body.send_welcome if body is not None else True
     plan_key = body.plan_key if body is not None else None
+    # A worker thread: the welcome email is sent inline, and a draft's claim commits on a session of its own.
+    await db_async.release(db)
+    return await db_async.run_blocking_in_session(
+        _approve_org, org_id, user, send_welcome, plan_key, actor=user,
+    )
+
+
+def _approve_org(
+    session: Session, org_id: str, user: AdminUser, send_welcome: bool, plan_key: Optional[str],
+) -> OrgOut:
+    """`approve_org`'s body, on a worker thread; `approve_org` has refused the community edition already."""
+    if edition_features.enabled("signup"):
+        from app import org_approval, signup_plans
+
     row, signup, draft = _pending_for_decision(session, org_id, allow_draft=True)
     # Checked under the org's lock, so a plan retired meanwhile is refused rather than silently replaced.
     if plan_key is not None and signup_plans.active_row(session, plan_key) is None:
@@ -1497,11 +1676,13 @@ def approve_org(
     if draft and signup is not None:
         # A draft is submitted for the applicant and approved in one transaction; its email's open
         # sign-up row (org zero's) is consumed on a session of its own, committed as soon as the approval has.
-        with SessionLocal() as claim:
-            retired = _submit_draft(session, row, signup, user, claim)
-            outcome = org_approval.approve(
+        def submit_and_approve(claim: Session) -> tuple[tuple[UUID, int], Optional[org_welcome.Outcome]]:
+            submitted = _submit_draft(session, row, signup, user, claim)
+            return submitted, org_approval.approve(
                 session, row, signup, user, send_welcome=send_welcome, plan_key=plan_key, committed=claim.commit,
             )
+
+        retired, outcome = org_sync_session.on_own_session(submit_and_approve)
         revoke_direct_grants_retired_epoch(*retired)
     else:
         outcome = org_approval.approve(session, row, signup, user, send_welcome=send_welcome, plan_key=plan_key)
@@ -1512,14 +1693,16 @@ def approve_org(
 
 @router.post("/api/orgs/{org_id}/welcome-email", response_model=OrgOut)
 @superadmin_only(Tenancy.OPERATOR)
+@db_async.on_thread(actor="user")
 def send_welcome_email(
+    session: Session,
     org_id: str,
     user: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
 ) -> OrgOut:
     """Send (or resend) an approved self-service org's owner the welcome email (`app/org_welcome.py`). 409
     unless the org is active and self-service. A mail fault is not an error: `welcome_outcome` and the
     sign-up's `welcome_error` say it."""
+    # A worker thread: the email is sent inside the transaction that records its outcome.
     row = _live_one(session, org_id)
     if row.lifecycle != ORG_ACTIVE:
         raise HTTPException(
@@ -1527,9 +1710,7 @@ def send_welcome_email(
         )
     outcome = org_welcome.send(session, row, user)
     if outcome == "skipped":
-        raise HTTPException(
-            status_code=409, detail=f"'{row.name}' has no sign-up, so there is no owner to welcome."
-        )
+        raise HTTPException(status_code=409, detail=f"'{row.name}' has no sign-up, so there is no owner to welcome.")
     session.refresh(row)
     out = _rows_out(session, [row])[0]
     out.welcome_outcome = outcome
@@ -1561,11 +1742,8 @@ class BundleOut(BaseModel):
 
 @router.get("/api/orgs/{org_id}/bundles", response_model=list[BundleOut])
 @superadmin_only(Tenancy.OPERATOR)
-def list_org_bundles(
-    org_id: str,
-    user: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
-) -> list[BundleOut]:
+@on_session
+def list_org_bundles(session: Session, org_id: str, user: AdminUser = Depends(require_superadmin)) -> list[BundleOut]:
     """The nodes the org's plan includes, with the operator's detail of a failure."""
     row = _one(session, org_id)
     # The community edition has no plans bundles: the plan includes no node.
@@ -1585,71 +1763,80 @@ async def retry_org_bundle(
     bundle_id: UUID,
     user: AdminUser = Depends(require_superadmin),
     principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    *,
+    db: DbDep,
 ) -> list[BundleOut]:
     """Set up again a node product that failed, or whose node was deleted, from its one row — never a second
     node."""
     # The community edition has no plans bundles.
     if not edition_features.enabled("billing"):
-        raise HTTPException(status_code=404, detail=ce_caps.NOT_IN_CE)
+        raise ce_caps.not_in_edition()
     from app import plan_bundles
     from app.routes import billing_org_plan
 
-    row = _live_one(session, org_id)
-    org_uuid = row.id
-    await billing_org_plan.retry_bundle(session, org_uuid, bundle_id, user, principal)
-    return [BundleOut(**item) for item in plan_bundles.bundles_out(session, org_uuid, tenant=False)]
+    org_uuid = await db.run_sync(lambda session: _live_one(session, org_id).id)
+    # The retry hands its own sync session to worker threads and waits on AWS: the route's connection goes back.
+    await db_async.release(db)
+    await org_sync_session.awaited_on_own_session(billing_org_plan.retry_bundle, org_uuid, bundle_id, user, principal)
+    return await db.run_sync(
+        lambda session: [BundleOut(**item) for item in plan_bundles.bundles_out(session, org_uuid, tenant=False)]
+    )
 
 
 @router.post("/api/orgs/{org_id}/reject", response_model=OrgOut)
 @superadmin_only(Tenancy.OPERATOR)
-def reject_org(
+async def reject_org(
     org_id: str,
     body: OrgRejectIn,
     user: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
+    *,
+    db: DbDep,
 ) -> OrgOut:
     """Turn a pending self-service org away: `rejected` AND disabled, the optional reason stored for its
     members' sign-in refusal (`app/org_gate.py::refuse_unapproved_sign_in`), and every member's session
-    ended by bumping `session_epoch` in the same transaction. Deletes nothing. After the commit the applicant
+    ended in the same transaction (`identities.retire_org_sessions`). Deletes nothing. After the commit the applicant
     is emailed, without the reason, and any card saved at sign-up is detached. 409 unless pending;
     422 a reason over `REASON_MAX` characters (the refusal would cut it)."""
-    # The community edition has no sign-up approval.
-    if not edition_features.enabled("signup"):
-        raise HTTPException(status_code=404, detail=ce_caps.NOT_IN_CE)
-    from app import org_approval
+    def work(session: Session) -> tuple[UUID, list[tuple[UUID, int]], bool]:
+        set_request_actor(session, user.id)
+        # The community edition has no sign-up approval.
+        if not edition_features.enabled("signup"):
+            raise ce_caps.not_in_edition()
+        from app import org_approval
 
-    reason = (body.reason or "").strip()
-    if len(reason) > REASON_MAX:
-        raise HTTPException(status_code=422, detail=f"reason is at most {REASON_MAX} characters")
-    row, signup, _ = _pending_for_decision(session, org_id)
-    row.lifecycle = ORG_REJECTED
-    row.enabled = False
-    org_approval.decided(signup, user)
-    if signup is not None:
-        signup.rejection_reason = reason or None
-    # Every member's session ends now (`app/auth.py` refuses a cookie carrying a retired epoch); the
-    # retired epochs are kept for the post-commit direct-console revoke.
-    retired: list[tuple[UUID, int]] = []
-    for member in session.scalars(select(AdminUser).where(AdminUser.org_id == row.id)):
-        retired.append((member.id, member.session_epoch or 0))
-        member.session_epoch = (member.session_epoch or 0) + 1
-    stamp_actor(row, user)
-    record_write(
-        session, user, "org_rejected", f"Rejected org {row.name} ({row.slug})",
-        data={"org_id": str(row.id), "slug": row.slug, "reason": reason or None, "members_signed_out": len(retired)},
-    )
-    emit_console_event(session, entity="org", id=row.id, action="upserted")
-    session.commit()
+        reason = (body.reason or "").strip()
+        if len(reason) > REASON_MAX:
+            raise HTTPException(status_code=422, detail=f"reason is at most {REASON_MAX} characters")
+        row, signup, _ = _pending_for_decision(session, org_id)
+        row.lifecycle = ORG_REJECTED
+        row.enabled = False
+        org_approval.decided(signup, user)
+        if signup is not None:
+            signup.rejection_reason = reason or None
+        retired = identities.retire_org_sessions(session, row.id)
+        stamp_actor(row, user)
+        record_write(
+            session, user, "org_rejected", f"Rejected org {row.name} ({row.slug})",
+            data={"org_id": str(row.id), "slug": row.slug, "reason": reason or None, "members_signed_out": len(retired)},
+        )
+        emit_console_event(session, entity="org", id=row.id, action="upserted", commit=True)
+        return row.id, retired, signup is not None
+
+    key, retired, self_service = await db.run_sync(work)
     # After the commit (a node acting on a rolled-back reject would sign out a live console).
     for member_id, retired_epoch in retired:
-        revoke_direct_grants_retired_epoch(member_id, retired_epoch)
+        await run_in_threadpool(revoke_direct_grants_retired_epoch, member_id, retired_epoch)
     # The applicant's rejection email and the detach of any card saved at sign-up, durable and after the commit
     # (`org_approval.after_rejection`); the reason stays the operator's (D7).
-    if signup is not None:
-        notify_outbox.after_answer("org_rejected", str(row.id))
-    session.refresh(row)
-    return _rows_out(session, [row])[0]
+    if self_service:
+        await run_in_threadpool(notify_outbox.after_answer, "org_rejected", str(key))
+
+    def answer(session: Session) -> OrgOut:
+        row = _one(session, str(key))
+        session.refresh(row)
+        return _rows_out(session, [row])[0]
+
+    return await db.run_sync(answer)
 
 
 # ── Limits ────────────────────────────────────────────────────────────────────────────────────────
@@ -1701,12 +1888,8 @@ def _column(kind: str) -> str:
 
 def _limits_out(session: Session, row: Org) -> list[LimitOut]:
     return [
-        LimitOut(
-            kind=limit.kind,
-            label=limit.label,
-            limit=limit.limit,
-            source=limit.source,
-            usage=limit.usage,
+        from_row(
+            LimitOut, limit,
             override=getattr(row, _column(limit.kind)),
             default=default,
             fallback_source=fallback_source,
@@ -1731,11 +1914,8 @@ def _fallback(session: Session, row: Org, limit: org_limits.Limit | org_quotas.Q
 
 @router.get("/api/orgs/{org_id}/limits", response_model=list[LimitOut])
 @superadmin_only(Tenancy.OPERATOR)
-def get_org_limits(
-    org_id: str,
-    _: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
-) -> list[LimitOut]:
+@on_session
+def get_org_limits(session: Session, org_id: str, _: AdminUser = Depends(require_superadmin)) -> list[LimitOut]:
     """The org's caps, each with its effective value, whether an override or the default decided it,
     and its usage. An operator's: limits are operator-owned (never a tenant-writable knob)."""
     return _limits_out(session, _one(session, org_id))
@@ -1743,23 +1923,22 @@ def get_org_limits(
 
 @router.put("/api/orgs/{org_id}/limits", response_model=list[LimitOut])
 @superadmin_only(Tenancy.OPERATOR)
+@on_session
 def put_org_limits(
+    session: Session,
     org_id: str,
     body: LimitsIn,
     user: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
 ) -> list[LimitOut]:
     """Override or clear any of the org's caps. Refused whole (422) on an unknown kind or a value
     outside 0..100000, before any write. Lowering a cap below usage deletes and stops nothing: it only
     holds back new creation and dispatch (`app/org_limits.py`)."""
+    set_request_actor(session, user.id)
     row = _live_one(session, org_id)
     wanted = body.root
     unknown = sorted(set(wanted) - set(_KINDS))
     if unknown:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unknown limit: {', '.join(unknown)}. Use {', '.join(_KINDS)}.",
-        )
+        raise HTTPException(status_code=422, detail=f"Unknown limit: {', '.join(unknown)}. Use {', '.join(_KINDS)}.")
     for kind, value in wanted.items():
         top = org_quotas.maximum(kind) or _MAX_LIMIT
         if value is not None and not 0 <= value <= top:
@@ -1782,8 +1961,7 @@ def put_org_limits(
     if changed:
         stamp_actor(row, user)
         session.flush()
-        emit_console_event(session, entity="org", id=row.id, action="upserted")
-        session.commit()
+        emit_console_event(session, entity="org", id=row.id, action="upserted", commit=True)
         session.refresh(row)
         org_quotas.invalidate_budget(row.id)
     return _limits_out(session, row)
@@ -1811,63 +1989,41 @@ def _org_settings_out(session: Session, row: Org) -> list[SettingKnobOut]:
 
 @router.get("/api/orgs/{org_id}/settings", response_model=list[SettingKnobOut])
 @superadmin_only(Tenancy.OPERATOR)
-def get_org_settings(
-    org_id: str,
-    _: AdminUser = Depends(require_operator),
-    session: Session = Depends(get_session),
-) -> list[SettingKnobOut]:
+@on_session
+def get_org_settings(session: Session, org_id: str, _: AdminUser = Depends(require_operator)) -> list[SettingKnobOut]:
     """The org's settings overrides. An operator's: a tenant sees the effective values read-only in Settings."""
     return _org_settings_out(session, _one(session, org_id))
 
 
 @router.put("/api/orgs/{org_id}/settings", response_model=list[SettingKnobOut])
 @superadmin_only(Tenancy.OPERATOR)
+@on_session
 def put_org_settings(
+    session: Session,
     org_id: str,
     body: OrgSettingsIn,
     user: AdminUser = Depends(require_operator),
-    session: Session = Depends(get_session),
 ) -> list[SettingKnobOut]:
     """Override or clear org-tier settings for one org (`operator_settings.apply_org_overrides`: refused whole,
     422, on an unknown or operator-global key or an out-of-range value, before any write). This route is the
     org authorization that writer asks of its caller."""
+    set_request_actor(session, user.id)
     row = _live_one(session, org_id)
     # Before the writer, which commits: the audit row lands in the same transaction or not at all.
     record_write(
         session, user, "org_settings_changed", f"Changed settings overrides of org {row.name}",
         data={"org_id": str(row.id), "values": body.values},
     )
-    try:
+    with refused_as(422, settings_errors.OperatorSettingsError, session=session):
         # Two saves raced to create the same key (`uq_org_settings_org_id_key`): a 409, and nothing of this one landed.
         with conflict_as_409(session, "Changed by someone else just now. Reload and save again."):
             settings_writes.apply_org_overrides(session, row.id, body.values)
-    except settings_errors.OperatorSettingsError as exc:
-        session.rollback()
-        raise HTTPException(status_code=422, detail=str(exc)) from None
     settings_cache.invalidate_cache()
-    emit_console_event(session, entity="org", id=row.id, action="upserted")
-    session.commit()
+    emit_console_event(session, entity="org", id=row.id, action="upserted", commit=True)
     return _org_settings_out(session, row)
 
 
 # ── Cron minimum period ───────────────────────────────────────────────────────────────────────────────
-
-
-class CronMinPeriodOut(BaseModel):
-    """An org's minimum cron period, every tier (`app/cron_min_period.py::CronMinPeriod`), in seconds.
-    `override` and `own` are the org's two columns as stored (null = unset), so a form can show and clear
-    exactly what was set; `fallback` is what the org follows with no override; `upstream` is the lowest
-    `own` may be."""
-
-    operator_floor: int
-    tenant_default: int
-    fallback: int
-    fallback_source: str
-    override: Optional[int]
-    upstream: int
-    upstream_source: str
-    own: Optional[int]
-    effective: int
 
 
 class CronMinPeriodIn(StrictModel):
@@ -1879,42 +2035,40 @@ class CronMinPeriodIn(StrictModel):
     own: Optional[StrictInt] = None
 
 
-def _cron_min_period_out(session: Session, row: Org) -> CronMinPeriodOut:
-    return CronMinPeriodOut(**dataclasses.asdict(cron_min_period.resolve(session, row.id)))
-
-
-@router.get("/api/orgs/{org_id}/cron-min-period", response_model=CronMinPeriodOut)
+@router.get("/api/orgs/{org_id}/cron-min-period", response_model=cron_min_period.CronMinPeriod)
 @org_admin(Tenancy.CALLER_PLANE)
+@on_session
 def get_org_cron_min_period(
+    session: Session,
     org_id: str,
     principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
-) -> CronMinPeriodOut:
+) -> cron_min_period.CronMinPeriod:
     """The org's minimum cron period: an operator's for any org, an Org Owner/Admin's for their own."""
-    return _cron_min_period_out(session, administered_org_or_404(session, org_id, principal))
+    return cron_min_period.resolve(session, administered_org_or_404(session, org_id, principal).id)
 
 
-@router.patch("/api/orgs/{org_id}/cron-min-period", response_model=CronMinPeriodOut)
+@router.patch("/api/orgs/{org_id}/cron-min-period", response_model=cron_min_period.CronMinPeriod)
 @org_admin(Tenancy.CALLER_PLANE)
+@on_session
 def patch_org_cron_min_period(
+    session: Session,
     org_id: str,
     body: CronMinPeriodIn,
-    user: AdminUser = Depends(require_user),
-    principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
-) -> CronMinPeriodOut:
+    caller: AsyncCaller = Depends(current_caller),
+) -> cron_min_period.CronMinPeriod:
     """Set or clear the operator's per-org override (operator only; never under the operator minimum) and
     the org administrator's own value (never under the upstream the override leaves). Refused whole, before
     any write. Raising either changes no cron row: a faster row is throttled when it fires
     (`app/cron_runtime.py`) and refused on its next schedule save."""
-    row = _live(administered_org_or_404(session, org_id, principal))
+    set_request_actor(session, caller.actor.id)
+    row = _live(administered_org_or_404(session, org_id, caller.principal))
     sent = body.model_fields_set
-    if "override" in sent and not (principal is not None and principal.is_operator):
+    if "override" in sent and not (caller.principal is not None and caller.principal.is_operator):
         raise HTTPException(
             status_code=403,
             detail="An operator sets your organization's minimum — you may only raise it with your own.",
         )
-    try:
+    with refused_as(422, cron_min_period.MinPeriodError, session=session):
         if "override" in sent:
             override = cron_min_period.check_override(body.override)
             row.cron_min_period_seconds = override
@@ -1924,16 +2078,12 @@ def patch_org_cron_min_period(
             row.cron_min_period_own_seconds = cron_min_period.check_own(
                 body.own, cron_min_period.resolve(session, row.id)
             )
-    except cron_min_period.MinPeriodError as exc:
-        session.rollback()
-        raise HTTPException(status_code=422, detail=str(exc)) from None
     if session.is_modified(row):
-        stamp_actor(row, user)
+        stamp_actor(row, caller.actor)
         session.flush()
-        emit_console_event(session, entity="org", id=row.id, action="upserted")
-        session.commit()
+        emit_console_event(session, entity="org", id=row.id, action="upserted", commit=True)
         session.refresh(row)
-    return _cron_min_period_out(session, row)
+    return cron_min_period.resolve(session, row.id)
 
 
 def _erase_billing(org_id: UUID) -> None:
@@ -1946,22 +2096,13 @@ def _erase_billing(org_id: UUID) -> None:
     billing_org_plan.erase_billing(org_id)
 
 
-def _sign_out_members(session: Session, org_id: UUID) -> list[tuple[UUID, int]]:
-    """Retire every member's session epoch (`app/auth.py` refuses a cookie carrying one); the retired epochs, for
-    the post-commit direct-console revoke."""
-    retired: list[tuple[UUID, int]] = []
-    for member in session.scalars(select(AdminUser).where(AdminUser.org_id == org_id)):
-        retired.append((member.id, member.session_epoch or 0))
-        member.session_epoch = (member.session_epoch or 0) + 1
-    return retired
-
-
 @router.delete("/api/orgs/{org_id}", status_code=204)
 @superadmin_only(Tenancy.OPERATOR)
 async def delete_org(
     org_id: str,
     user: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
+    *,
+    db: DbDep,
 ) -> Response:
     """Delete an org — SOFTLY: nothing is purged. Any tenant org, enabled or not, the caller's own
     included; never the operator plane, whose members' sign-in it would refuse with no way back.
@@ -1974,6 +2115,15 @@ async def delete_org(
     records it. 409 while the org has a live staging org (`staging_org.refuse_parent_delete`). The org is hidden from every org list and refused at sign-in and dispatch, and its members,
     projects and nodes from theirs (`app/models/orgs.py::in_live_org`); Restore
     (`restore_org`) lists it again, Compliance Delete (`compliance_delete_org`) is the only purge. 204."""
+    key = await db.run_sync(_deletable_org, org_id)
+    # The wind-down hands its own sync session to worker threads: the route's connection goes back first.
+    await db_async.release(db)
+    await org_sync_session.awaited_on_own_session(_soft_delete_by_id, user, key)
+    return Response(status_code=204)
+
+
+def _deletable_org(session: Session, org_id: str) -> UUID:
+    """`delete_org`'s refusals: the org's id."""
     row = _one(session, org_id)
     if not is_tenant_org(row.id):
         raise HTTPException(
@@ -1983,8 +2133,15 @@ async def delete_org(
     if row.deleted_at is not None:
         raise HTTPException(status_code=409, detail=f"'{row.name}' ({row.slug}) is already deleted.")
     staging_org.refuse_parent_delete(session, row)
-    await _soft_delete(session, user, row)
-    return Response(status_code=204)
+    return row.id
+
+
+async def _soft_delete_by_id(session: Session, user: AdminUser, key: UUID) -> None:
+    """`_soft_delete` of the org `key`, re-read on `session` (a deleted one is 409)."""
+    org = await run_in_threadpool(session.get, Org, key)
+    if org is None or org.deleted_at is not None:
+        raise HTTPException(status_code=409, detail="That org is already deleted.")
+    await _soft_delete(session, user, org)
 
 
 async def _soft_delete(session: Session, user: AdminUser, row: Org) -> None:
@@ -2032,14 +2189,14 @@ def _own_org_for_owner(principal: Principal | None, session: Session) -> Org:
 @router.get("/api/org/delete", response_model=OwnOrgDeleteOut)
 @org_admin(Tenancy.CALLER_PLANE)
 @session_only
+@on_session
 def own_org_delete_check(
-    principal: Principal | None = Depends(current_principal),
-    user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
+    session: Session,
+    caller: AsyncCaller = Depends(current_caller),
 ) -> OwnOrgDeleteOut:
     """What deleting the caller's own org asks of its Owner (`delete_own_org`)."""
-    row = _own_org_for_owner(principal, session)
-    return OwnOrgDeleteOut(name=row.name, needs_code=mfa.is_enrolled(session, user))
+    row = _own_org_for_owner(caller.principal, session)
+    return OwnOrgDeleteOut(name=row.name, needs_code=mfa.is_enrolled(session, caller.actor))
 
 
 @router.post("/api/org/delete", status_code=204)
@@ -2047,9 +2204,9 @@ def own_org_delete_check(
 @session_only
 async def delete_own_org(
     body: OwnOrgDeleteIn,
-    principal: Principal | None = Depends(current_principal),
-    user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
+    *,
+    db: DbDep,
 ) -> Response:
     """Delete account — the Owner's own soft delete of their org (Billing's Delete account), the same as the
     operator's `delete_org`: a live subscription ends now with no refund, everything the org runs stops, every member
@@ -2059,32 +2216,35 @@ async def delete_own_org(
     (422 otherwise). An Owner with a second factor also gives a current code (`mfa.verify_current_code`, recovery
     codes accepted): a wrong one 403, counted and filed as `org_delete_refused`. Without one, the name alone
     confirms. 409 while the org has a live staging org (`staging_org.refuse_parent_delete`), before the code. 204."""
-    row = _own_org_for_owner(principal, session)
-    if body.name.strip() != row.name.strip():
-        raise HTTPException(status_code=422, detail="Type the organization's name exactly to confirm.")
-    staging_org.refuse_parent_delete(session, row)  # before the code, so a refused delete spends none
-    if mfa.is_enrolled(session, user):
-        check = mfa.verify_current_code(session, user, body.code, allow_recovery=True)
-        if not check.ok:
-            outcome = "throttled" if check.throttled else "wrong"
-            record_write(
-                session, user, ORG_DELETE_REFUSED, f"Delete of org {row.name} ({row.slug}) refused: {outcome} 2FA code",
-                data={"org_id": str(row.id), "slug": row.slug, "totp": outcome},
-            )
+    def work(session: Session) -> UUID:
+        row = _own_org_for_owner(caller.principal, session)
+        if body.name.strip() != row.name.strip():
+            raise HTTPException(status_code=422, detail="Type the organization's name exactly to confirm.")
+        staging_org.refuse_parent_delete(session, row)  # before the code, so a refused delete spends none
+        if mfa.is_enrolled(session, caller.actor):
+            check = mfa.verify_current_code(session, caller.actor, body.code, allow_recovery=True)
+            if not check.ok:
+                outcome = "throttled" if check.throttled else "wrong"
+                record_write(
+                    session, caller.actor, ORG_DELETE_REFUSED,
+                    f"Delete of org {row.name} ({row.slug}) refused: {outcome} 2FA code",
+                    data={"org_id": str(row.id), "slug": row.slug, "totp": outcome},
+                )
+                session.commit()
+                raise HTTPException(
+                    status_code=403,
+                    detail="Too many wrong codes. Wait, then retry." if check.throttled else "Wrong code.",
+                )
+            # The used step is spent now, so the code cannot authorize a second delete.
             session.commit()
-            raise HTTPException(
-                status_code=403, detail="Too many wrong codes. Wait, then retry." if check.throttled else "Wrong code.",
-            )
-        # The used step is spent now, so the code cannot authorize a second delete.
-        session.commit()
-    key = row.id
-    session.rollback()  # nothing more on the request's session: it holds no transaction through the wind-down
+        return row.id
+
+    key = await db.run_sync(work)
+    # Nothing more on the request's session: it holds no transaction through the wind-down.
+    await db_async.release(db)
     # The wind-down reaches past the caller's org (a host's carried nodes, the audit row in the operator plane).
-    with seam.detached(), seam.operator_scope(), SessionLocal() as fleet:
-        org = fleet.get(Org, key)
-        if org is None or org.deleted_at is not None:
-            raise HTTPException(status_code=409, detail="That org is already deleted.")
-        await _soft_delete(fleet, user, org)
+    with seam.detached(), seam.operator_scope():
+        await org_sync_session.awaited_on_own_session(_soft_delete_by_id, caller.actor, key)
     return Response(status_code=204)
 
 
@@ -2094,29 +2254,26 @@ def _mark_deleted(session: Session, user: AdminUser, key: UUID, audit_org: UUID)
     row = session.get(Org, key, with_for_update=True, populate_existing=True)
     if row is None or row.deleted_at is not None:
         raise HTTPException(status_code=409, detail="That org is already deleted.")
-    row.deleted_at = datetime.now(timezone.utc)
+    row.deleted_at = utcnow()
     row.deleted_by_id = user.id
     stamp_actor(row, user)
-    retired = _sign_out_members(session, row.id)
+    retired = identities.retire_org_sessions(session, row.id)
     record_write(
         session, user, "org_deleted", f"Deleted org {row.name} ({row.slug})",
         data={"org_id": str(row.id), "slug": row.slug, "members_signed_out": len(retired)}, in_org=audit_org,
     )
-    emit_console_event(session, entity="org", id=row.id, action="deleted")
-    session.commit()
+    emit_console_event(session, entity="org", id=row.id, action="deleted", commit=True)
     return retired
 
 
 @router.post("/api/orgs/{org_id}/restore", response_model=OrgOut)
 @superadmin_only(Tenancy.OPERATOR)
-def restore_org(
-    org_id: str,
-    user: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
-) -> OrgOut:
+@on_session
+def restore_org(session: Session, org_id: str, user: AdminUser = Depends(require_superadmin)) -> OrgOut:
     """Undo a soft delete: `deleted_at` cleared, the org listed again — and still DISABLED (re-enabling is the
     existing Enable, a separate decision). What the delete's wind-down ended (tasks, hostings, nodes) stays ended.
     409 unless deleted. Audit `org_restored`."""
+    set_request_actor(session, user.id)
     row = _one(session, org_id)
     session.get(Org, row.id, with_for_update=True, populate_existing=True)
     if row.deleted_at is None:
@@ -2132,15 +2289,67 @@ def restore_org(
         data={"org_id": str(row.id), "slug": row.slug},
     )
     emit_console_event(session, entity="org", id=row.id, action="upserted")
-    session.commit()
-    session.refresh(row)
+    commit_row(session, row)
     return _rows_out(session, [row])[0]
+
+
+@router.post("/api/orgs/{org_id}/setup/reset", status_code=204)
+@superadmin_only(Tenancy.OPERATOR)
+@on_session
+def reset_org_setup(session: Session, org_id: str, user: AdminUser = Depends(require_superadmin)) -> Response:
+    """Show a customer's setup guide again (`org_setup.reopen_onboarding`): every member's hide is cleared, the
+    latch reopened, and Choose plan unticked (`orgs.plan_chosen_at` cleared; the plan itself is kept) unless the
+    plan is a bought one (`_plan_bought`). Other steps
+    still done stay done — they are derived from org state, so deleting the org's nodes is what reopens compute.
+    409 for the operator plane or a deleted org. Audit `org_setup_reset`."""
+    set_request_actor(session, user.id)
+    row = _live_one(session, org_id)
+    if not is_tenant_org(row.id):
+        raise HTTPException(status_code=409, detail="The operator plane has no setup to reset.")
+    org_setup.reopen_onboarding(session, row.id)
+    if not _plan_bought(session, row):
+        row.plan_chosen_at = None
+    record_write(
+        session, user, ORG_SETUP_RESET, f"Reset setup of org {row.name} ({row.slug})",
+        data={"org_id": str(row.id), "slug": row.slug},
+    )
+    emit_console_event(session, entity="org", id=row.id, action="upserted", commit=True)
+    return Response(status_code=204)
+
+
+def _plan_bought(session: Session, org: Org) -> bool:
+    """The org is on a priced plan, which counts as chosen without the stamp (`routes/org_plan.py::_plan_out`'s
+    `plan_chosen`): a reset leaves it chosen, since choosing it again would mean buying it again."""
+    if not edition_features.enabled("billing"):
+        return False
+    from app import org_plans
+
+    own = next((p for p in org_plans.catalogue(session, org.plan_key, org.id) if p.key == org.plan_key), None)
+    return own is not None and not own.selectable
+
+
+#: The audit kind of the operator's Reset setup.
+ORG_SETUP_RESET = "org_setup_reset"
 
 
 #: The audit kinds of the soft-delete lifecycle (`org_deleted` is the soft delete itself, and the purge's).
 ORG_RESTORED = "org_restored"
 ORG_COMPLIANCE_DELETED = "org_compliance_deleted"
 ORG_COMPLIANCE_DELETE_REFUSED = "org_compliance_delete_refused"
+
+
+def _purgeable(session: Session, org_id: str) -> tuple[Org, UUID, str, str, dict]:
+    """`purge_org`'s up-front reads, ended with a rollback: the org (409 if restored), its id, name and slug (read
+    before the rollback expires it), and the outside rows that point into it (`undetachable_references`)."""
+    row = _one(session, org_id)
+    # Re-read: a Restore that landed during the offboarding must not have its org wound down again.
+    session.refresh(row)
+    if row.deleted_at is None:
+        raise HTTPException(status_code=409, detail=f"'{row.name}' ({row.slug}) was restored — nothing was purged.")
+    key, name, slug = row.id, row.name, row.slug
+    blocking = undetachable_references(session, key)
+    session.rollback()
+    return row, key, name, slug, blocking
 
 
 async def purge_org(org_id: str, user: AdminUser, session: Session) -> None:
@@ -2158,16 +2367,9 @@ async def purge_org(org_id: str, user: AdminUser, session: Session) -> None:
     the operator plane when the actor's own org is the one deleted, and staged AFTER the `orgs` row's delete
     flushes (the trigger fires there). `tests/test_org_delete.py` asserts it survives. The database work runs off
     the event loop (`run_in_threadpool`)."""
-    row = _one(session, org_id)
-    # Re-read: a Restore that landed during the offboarding must not have its org wound down again.
-    session.refresh(row)
-    if row.deleted_at is None:
-        raise HTTPException(status_code=409, detail=f"'{row.name}' ({row.slug}) was restored — nothing was purged.")
-    key, name, slug = row.id, row.name, row.slug
+    row, key, name, slug, blocking = await run_in_threadpool(_purgeable, session, org_id)
     actor_org = user.org_id
     audit_org = actor_org if actor_org != key else ORG_ZERO_ID
-    blocking = await run_in_threadpool(undetachable_references, session, key)
-    session.rollback()
     if blocking:
         if "orgs.parent_org_id" in blocking:
             raise HTTPException(status_code=409, detail=(
@@ -2238,11 +2440,16 @@ def _purge(
 
             compliance_seal.erase_for_org(session, key, user, in_org=audit_org)
         detached = detach_outside_references(session, key)
+        with seam.identity_scope():
+            people = set(session.scalars(select(AdminUser.identity_id).where(AdminUser.org_id == key)))
         deleted = purge_org_rows(session, key)
         # The ORM delete, so the instance leaves the identity map. Safe past the write seam: `Org` is an
         # `Axis` class, absent from the derivation map. Flushed here so the trigger has run before the audit row.
         session.delete(row)
         session.flush()
+        # The members' channels went with them: a Telegram chat only they pointed at is the person's no longer.
+        for person in people:
+            notification_channels.release_member_links(session, person)
         record_write(
             session,
             user,
@@ -2255,8 +2462,7 @@ def _purge(
             in_org=audit_org,
         )
         # Same `PROBED_ENTITIES` requirement as create/update; `deleted` like every other delete path.
-        emit_console_event(session, entity="org", id=key, action="deleted")
-        session.commit()
+        emit_console_event(session, entity="org", id=key, action="deleted", commit=True)
     except DBAPIError as exc:
         orig = getattr(exc, "orig", None)
         # `diag` is psycopg's, so reads are defensive; a driver without it leaves the exception alone.
@@ -2304,7 +2510,8 @@ async def offboard_org(
     org_id: str,
     body: OffboardIn,
     user: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
+    *,
+    db: DbDep,
 ) -> dict:
     """The offboarding dry run: every store holding the org's data, counted, and every reason an execution would
     be refused now (`app/tenancy/offboard.py::census`). Executing is Compliance Delete's alone — one door to the
@@ -2314,12 +2521,17 @@ async def offboard_org(
             status_code=409,
             detail="Offboarding runs as Compliance Delete: delete the org, then POST /compliance-delete with a 2FA code.",
         )
-    row = _one(session, org_id)
-    found = await run_in_threadpool(offboard.census, session, row, user)
+    row, found = await db.run_sync(_census, org_id, user)
+    await db_async.release(db)
     connected = set(await run_in_threadpool(node_bus.registry.connected_nodes))
     blockers = found.blockers + offboard.node_blockers(found, connected)
-    session.rollback()
     return _census_out(row, found, blockers)
+
+
+def _census(session: Session, org_id: str, user: AdminUser) -> tuple[Org, offboard.Census]:
+    """The org and its offboarding census (`offboard.census`, reads only)."""
+    row = _one(session, org_id)
+    return row, offboard.census(session, row, user)
 
 
 class ComplianceDeleteIn(BaseModel):
@@ -2336,7 +2548,8 @@ async def compliance_delete_org(
     org_id: str,
     body: ComplianceDeleteIn,
     user: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
+    *,
+    db: DbDep,
 ) -> dict:
     """Compliance Delete — the ONLY purge: offboard a soft-deleted tenant, every store holding its data
     emptied and re-read for residue (`app/tenancy/offboard.py`), then its rows purged (`purge_org`).
@@ -2349,75 +2562,93 @@ async def compliance_delete_org(
     when that is the org purged), so it escapes the purge as `org_deleted` does: who authorized it, when, the TOTP
     outcome, and the offboarding record. Filed whether the
     offboarding finished or stopped, in its own transaction; a stop is a 409 carrying the partial record."""
+    started_at = now_iso(timespec="seconds")
+    row, found = await db.run_sync(_census_of_deleted, org_id, user)
+    await db_async.release(db)
+    connected = set(await run_in_threadpool(node_bus.registry.connected_nodes))
+    blockers = found.blockers + offboard.node_blockers(found, connected)
+    if not body.execute:
+        return _census_out(row, found, blockers)
+
+    if blockers:
+        raise HTTPException(status_code=409, detail=" ".join(blockers))
+    org = {"id": str(row.id), "slug": row.slug, "name": row.name}
+
+    def authorize(session: Session) -> str:
+        """The operator's own TOTP step-up (a refusal filed and committed). When it was authorized."""
+        if not mfa.is_enrolled(session, user):
+            raise HTTPException(status_code=403, detail="Set up 2FA first.")
+        check = mfa.verify_current_code(session, user, body.code, allow_recovery=False)
+        if not check.ok:
+            outcome = "throttled" if check.throttled else "wrong"
+            # A refused step-up on the purge is a security event; committed with the failure count.
+            record_write(
+                session, user, ORG_COMPLIANCE_DELETE_REFUSED,
+                f"Compliance Delete of org {org['name']} ({org['slug']}) refused: {outcome} 2FA code",
+                data={"org_id": org["id"], "slug": org["slug"], "totp": outcome},
+            )
+            session.commit()
+            raise HTTPException(
+                status_code=403, detail="Too many wrong codes. Wait, then retry." if check.throttled else "Wrong code.",
+            )
+        authorized = now_iso(timespec="seconds")
+        # The used step is spent now, so the code cannot authorize a second purge; committed before the slow hops.
+        session.commit()
+        return authorized
+
+    authorized_at = await db.run_sync(authorize)
+
+    def file_record(session: Session, record: dict) -> None:
+        """Filed whether the offboarding finished or stopped, in its own transaction: the tenant's own history is
+        gone."""
+        record_write(
+            session, user, ORG_COMPLIANCE_DELETED,
+            # From `org`, not `row`: after the purge the expired instance would re-SELECT a deleted row.
+            f"Compliance-deleted org {org['name']} ({org['slug']})" if record["complete"]
+            else f"Compliance Delete of org {org['name']} ({org['slug']}) incomplete",
+            data={
+                "org_id": org["id"], "slug": org["slug"],
+                "authorized_by": {"user_id": str(user.id), "email": user.email},
+                "authorized_at": authorized_at, "totp": "verified", "offboard": record,
+            },
+            in_org=user.org_id if str(user.org_id) != org["id"] else ORG_ZERO_ID,
+        )
+        session.commit()
+
+    async def purge(session: Session) -> dict:
+        """The offboarding on its own sync session (it hands it to worker threads), then its record filed."""
+        stores: dict = {}
+        failure: Optional[BaseException] = None
+        try:
+            await offboard.execute(session, row, found, user, connected, stores)
+            record = offboard.record(org, user, started_at, stores)
+        except offboard.OffboardStopped as stop:
+            record = offboard.record(org, user, started_at, stores, stopped=stop.sentence)
+            # The partial record rides the 409, so the tool files it as evidence too.
+            failure = HTTPException(status_code=409, detail={"message": stop.sentence, "record": record})
+        except BaseException as exc:  # noqa: BLE001 — every stop past the first step is filed, then re-raised
+            # `purge_org` refusing the purge (a missed table, an outside reference) is the expected one.
+            await run_in_threadpool(session.rollback)
+            reason = str(exc.detail) if isinstance(exc, HTTPException) else f"{type(exc).__name__}: {exc}"
+            record = offboard.record(org, user, started_at, stores, stopped=reason)
+            failure = exc
+        await run_in_threadpool(file_record, session, record)
+        if failure is not None:
+            raise failure
+        return {"execute": True, "record": record}
+
+    # The route's connection is back (committed by the step-up) before the purge's own session opens.
+    return await org_sync_session.awaited_on_own_session(purge)
+
+
+def _census_of_deleted(session: Session, org_id: str, user: AdminUser) -> tuple[Org, offboard.Census]:
+    """`compliance_delete_org`'s census: 409 unless the org is soft-deleted."""
     row = _one(session, org_id)
     if row.deleted_at is None:
         raise HTTPException(
             status_code=409, detail=f"'{row.name}' ({row.slug}) is not deleted — delete it before Compliance Delete.",
         )
-    started_at = now_iso(timespec="seconds")
-    found = await run_in_threadpool(offboard.census, session, row, user)
-    connected = set(await run_in_threadpool(node_bus.registry.connected_nodes))
-    blockers = found.blockers + offboard.node_blockers(found, connected)
-    if not body.execute:
-        session.rollback()
-        return _census_out(row, found, blockers)
-
-    if blockers:
-        session.rollback()
-        raise HTTPException(status_code=409, detail=" ".join(blockers))
-    org = {"id": str(row.id), "slug": row.slug, "name": row.name}
-    if not mfa.is_enrolled(session, user):
-        session.rollback()
-        raise HTTPException(status_code=403, detail="Set up 2FA first.")
-    check = mfa.verify_current_code(session, user, body.code, allow_recovery=False)
-    if not check.ok:
-        outcome = "throttled" if check.throttled else "wrong"
-        # A refused step-up on the purge is a security event; committed with the failure count.
-        record_write(
-            session, user, ORG_COMPLIANCE_DELETE_REFUSED,
-            f"Compliance Delete of org {org['name']} ({org['slug']}) refused: {outcome} 2FA code",
-            data={"org_id": org["id"], "slug": org["slug"], "totp": outcome},
-        )
-        session.commit()
-        raise HTTPException(
-            status_code=403, detail="Too many wrong codes. Wait, then retry." if check.throttled else "Wrong code.",
-        )
-    authorized_at = now_iso(timespec="seconds")
-    # The used step is spent now, so the code cannot authorize a second purge; committed before the slow hops.
-    session.commit()
-
-    stores: dict = {}
-    failure: Optional[BaseException] = None
-    try:
-        await offboard.execute(session, row, found, user, connected, stores)
-        record = offboard.record(org, user, started_at, stores)
-    except offboard.OffboardStopped as stop:
-        record = offboard.record(org, user, started_at, stores, stopped=stop.sentence)
-        # The partial record rides the 409, so the tool files it as evidence too.
-        failure = HTTPException(status_code=409, detail={"message": stop.sentence, "record": record})
-    except BaseException as exc:  # noqa: BLE001 — every stop past the first step is filed, then re-raised
-        # `purge_org` refusing the purge (a missed table, an outside reference) is the expected one.
-        session.rollback()
-        reason = str(exc.detail) if isinstance(exc, HTTPException) else f"{type(exc).__name__}: {exc}"
-        record = offboard.record(org, user, started_at, stores, stopped=reason)
-        failure = exc
-    # Filed whether it finished or stopped, in its own transaction: the tenant's own history is gone.
-    record_write(
-        session, user, ORG_COMPLIANCE_DELETED,
-        # From `org`, not `row`: after the purge the expired instance would re-SELECT a deleted row.
-        f"Compliance-deleted org {org['name']} ({org['slug']})" if record["complete"]
-        else f"Compliance Delete of org {org['name']} ({org['slug']}) incomplete",
-        data={
-            "org_id": org["id"], "slug": org["slug"],
-            "authorized_by": {"user_id": str(user.id), "email": user.email},
-            "authorized_at": authorized_at, "totp": "verified", "offboard": record,
-        },
-        in_org=user.org_id if str(user.org_id) != org["id"] else ORG_ZERO_ID,
-    )
-    session.commit()
-    if failure is not None:
-        raise failure
-    return {"execute": True, "record": record}
+    return row, offboard.census(session, row, user)
 
 
 # ── Email domains (access-model C6, D4) ────────────────────────────────────────────────────────────
@@ -2440,10 +2671,11 @@ def _domains_out(session: Session, rows: list[OrgDomain]) -> list[OrgDomainOut]:
 
 @router.get("/api/orgs/{org_id}/domains", response_model=list[OrgDomainOut])
 @org_admin(Tenancy.CALLER_PLANE)
+@on_session
 def list_org_domains(
+    session: Session,
     org_id: str,
     principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
 ) -> list[OrgDomainOut]:
     """The org's email domains, alphabetically — for the Org page, so an Org Admin sees who may join."""
     row = administered_org_or_404(session, org_id, principal)
@@ -2455,14 +2687,16 @@ def list_org_domains(
 
 @router.post("/api/orgs/{org_id}/domains", response_model=OrgDomainOut, status_code=201)
 @superadmin_only(Tenancy.OPERATOR)
+@on_session
 def add_org_domain(
+    session: Session,
     org_id: str,
     body: OrgDomainIn,
     user: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
 ) -> OrgDomainOut:
     """Register an email domain on an org. 422 a malformed domain or org zero (the control plane's own org
     takes no sign-ups), 409 a domain already on any org."""
+    set_request_actor(session, user.id)
     row = _live_one(session, org_id)
     domain = access.normalized_domain(body.domain)
     if row.id == ORG_ZERO_ID:
@@ -2484,21 +2718,24 @@ def add_org_domain(
 
 @router.delete("/api/orgs/{org_id}/domains/{domain}", status_code=204)
 @superadmin_only(Tenancy.OPERATOR)
+@on_session
 def remove_org_domain(
+    session: Session,
     org_id: str,
     domain: str,
     user: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
 ) -> Response:
     """Remove an email domain from an org — 404 when it is not on this org. Users who joined through it
     stay; only future sign-ins stop joining."""
+    set_request_actor(session, user.id)
     row = _live_one(session, org_id)
     normalized = access.canonical_domain(domain)
-    found = session.scalar(
-        select(OrgDomain).where(OrgDomain.org_id == row.id, OrgDomain.domain == normalized)
+    found = or_404(
+        session.scalar(
+            select(OrgDomain).where(OrgDomain.org_id == row.id, OrgDomain.domain == normalized)
+        ),
+        detail="no such domain on this org",
     )
-    if found is None:
-        raise HTTPException(status_code=404, detail="no such domain on this org")
     session.delete(found)
     record_write(
         session, user, "org_domain_remove", f"Removed email domain {normalized} from org {row.name}",

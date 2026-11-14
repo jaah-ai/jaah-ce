@@ -1,0 +1,46 @@
+# Sentry, over the hand-written `sentry` type (adopted, AS3: its fields are unchanged; its Test, the organization
+# list, is the type's own key_test). Facts confirmed at the vendor's own docs: auth tokens (user, organization and
+# internal integration tokens; Bearer) https://docs.sentry.io/api/auth/ ; regional hosts
+# https://docs.sentry.io/api/guides/ . Probed 2026-11-03: GET /api/0/organizations/ with a bad token answers 401
+# {"detail":"Invalid token"}.
+# Its hosted MCP server (OAuth sign-in only) is reached today as a Custom MCP server (a limitation below).
+slug = "sentry"
+label = "Sentry"
+category = "dev_tools"
+credential_type = "sentry"
+vendor_docs_url = "https://docs.sentry.io/api/auth/"
+summary = "Read Sentry issues, events and releases so agents can debug production errors."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "base_url", label = "Base URL", kind = "url", required = true, placeholder = "https://sentry.io", help = "https://sentry.io for Sentry SaaS (or https://us.sentry.io / https://de.sentry.io for your data region), or your self-hosted Sentry's address" },
+  { key = "org_slug", label = "Organization slug", kind = "text", required = true, placeholder = "acme", help = "Sentry > Settings > Organization Settings > General > Organization Slug, the acme in https://acme.sentry.io or sentry.io/organizations/acme/" },
+  { key = "auth_token", label = "Auth token", kind = "secret", required = true, placeholder = "sntrys_...", help = "Sentry > Settings > Developer Settings > Custom Integrations > Create New Integration > Internal Integration: name it Jaah, set Issue & Event Read and Organization Read (add Project Read and Release Read if agents need them), Save, then under Tokens select New Token and copy it. A personal token from User Settings > Personal Tokens with org:read and event:read also works" },
+]
+
+[docs]
+agent_uses = [
+  "Read the Sentry issue a task names: its stack trace, breadcrumbs, tags and the latest event",
+  "Find the release and commit that introduced an error, to fix it at the source",
+  "Check whether an issue still occurs after a deploy",
+  "Feed post-deploy regression checks with error metrics for a release",
+]
+prerequisites = [
+  "A Sentry organization and the Manager, Admin or Owner role to create an internal integration (any member can create a personal token)",
+]
+limitations = [
+  "Sentry's hosted MCP server needs its own sign-in or token, which this secret does not hold: to give agents its tools, add a Custom MCP server secret with the URL https://mcp.sentry.dev/mcp, connect it, and link it to the project",
+  "An internal integration token is tied to one organization; connect each organization separately",
+  "A personal token acts as you and sees what you see; an internal integration acts as the organization",
+  "Sentry's API is rate-limited per token and per organization; very large exports are throttled",
+]
+troubleshooting = [
+  { symptom = "Test says Sentry rejected the auth token", fix = "The token was revoked, mistyped, or belongs to another Sentry host. Create a new token on the internal integration and select Replace; check Base URL matches the Sentry you sign in to" },
+  { symptom = "Test passes but agents get 403 on issues or events", fix = "The token lacks Issue & Event Read. Edit the internal integration's permissions; Sentry applies them to existing tokens" },
+  { symptom = "Agents get 404 for the organization", fix = "Organization slug is wrong. Copy it from Organization Settings > General" },
+]
+faq = [
+  { q = "Internal integration or personal token", a = "Use an internal integration for a team connection: it belongs to the organization and survives a person leaving. A personal token is fine for your own use" },
+  { q = "Does it work with self-hosted Sentry", a = "Yes. Set Base URL to your Sentry's https address and create the token there" },
+]

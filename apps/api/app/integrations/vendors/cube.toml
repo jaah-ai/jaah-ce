@@ -1,0 +1,42 @@
+slug = "cube"
+label = "Cube"
+category = "data"
+vendor_docs_url = "https://docs.cube.dev/reference/core-data-apis/rest-api"
+summary = "Lets agents read Cube's semantic layer: list cubes, measures and dimensions, and load data through the REST API."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "base_url", label = "Instance URL", kind = "url", required = true, placeholder = "https://example.gcp-us-central1.cubecloudapp.dev", help = "Cube Cloud > your deployment > Overview > API credentials > REST (JSON) API: the address before /cubejs-api/v1 (for self-hosted Cube, your server's https address)" },
+  { key = "api_token", label = "API token", kind = "secret", required = true, help = "A JWT signed with the deployment's API secret (CUBEJS_API_SECRET): in Cube Cloud, Overview > API credentials > REST (JSON) API shows a ready-made token; for self-hosted Cube, sign one with your server's secret" },
+]
+
+[test]
+method = "GET"
+path = "{base_url}/cubejs-api/v1/meta"
+auth = { field = "api_token", header = "Authorization" }
+list_field = "cubes"
+
+[docs]
+agent_uses = [
+  "List the cubes and views in the data model with their measures, dimensions and segments",
+  "Load data with a REST query (measures, dimensions, filters, time ranges) and read the result",
+  "Translate a query to the SQL Cube would run, to check or explain a number",
+]
+prerequisites = [
+  "A Cube Cloud deployment (or self-hosted Cube) whose REST API is reachable over https",
+  "An API token for the deployment. The one Cube Cloud shows carries no security context; sign your own JWT with the API secret if your model uses one",
+]
+limitations = [
+  "Tokens are JWTs: one with an exp claim stops working when it expires, and one signed with a rotated API secret stops working at once",
+  "The REST API reads data only; changing the data model is done in the deployment's Git repository",
+  "A Cube server reachable only on a private network cannot be tested or used from Jaah",
+]
+troubleshooting = [
+  { symptom = "Test says Cube rejected the API token (403)", fix = "Cube answers a token it cannot verify with 403. Copy the token again from Overview > API credentials, or sign a new JWT with the deployment's current API secret, then select Replace on the secret" },
+  { symptom = "Test says Cube returned HTTP 404", fix = "The Instance URL includes a path. Enter only the part before /cubejs-api/v1, such as https://example.gcp-us-central1.cubecloudapp.dev" },
+  { symptom = "Test says Cube returned HTTP 500 or the meta call times out", fix = "The deployment is asleep, still building or its data model has an error. Open the deployment in Cube Cloud, fix the build, and test again" },
+]
+faq = [
+  { q = "Can agents change the data model?", a = "Not through this connection. The model lives in the deployment's Git repository: connect that repository's forge to let agents propose model changes as pull requests" },
+]

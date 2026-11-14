@@ -1,0 +1,49 @@
+# Canva: hosted MCP server. Facts confirmed at https://www.canva.com/help/mcp-agent-setup (the Canva AI Connector) and the server's own OAuth metadata (mcp.canva.com/.well-known/oauth-protected-resource/mcp).
+# Canva accepts only pre-registered clients (`oauth_registered`): Jaah's client is the human setup task (setup-canva.md); a person may bring their own client ID meanwhile.
+slug = "canva"
+label = "Canva"
+category = "mcp"
+vendor_docs_url = "https://www.canva.com/help/mcp-agent-setup"
+summary = "Search, create and export Canva designs through Canva's MCP server."
+
+[[auth]]
+kind = "mcp"
+
+[mcp]
+url = "https://mcp.canva.com/mcp"
+url_editable = false
+transport = "streamable_http"
+auth = "oauth_registered"
+
+[mcp.registration]
+console_url = "https://www.canva.com/developers/"
+issuer = "https://mcp.canva.com"
+steps = [
+  "Ask Canva to approve Jaah as a client of the Canva AI Connector (mcp.canva.com): in the Canva Developer Portal open your integrations, or contact Canva's developer support, and request MCP client access for an app named Jaah",
+  "When Canva approves it, set the app's name to Jaah and its description to: Jaah agents read and create Canva designs for your team",
+]
+
+[docs]
+agent_uses = [
+  "Search your Canva designs and read a design's pages and text",
+  "Create a new design from a brand template, or autofill a template with a task's content",
+  "Export a design as PDF or PNG and hand the link back in the task",
+]
+prerequisites = [
+  "A Canva Pro, Teams, Business or Nonprofit account (the connector is not on Canva Free); autofilling brand templates may need Canva Enterprise",
+  "Jaah's Canva client registered by an operator, or your own Canva integration's client ID (Canva does not let apps register themselves)",
+]
+limitations = [
+  "Canva admits only MCP clients it has approved: until an operator registers Jaah's client, Connect needs your own client ID",
+  "Agents act as the signed-in Canva user and see only that user's designs and team folders",
+]
+troubleshooting = [
+  { symptom = "Connect says the authorization server refused to register Jaah", fix = "Canva requires a pre-registered client. Ask an operator to complete Jaah's Canva registration, or create an integration in the Canva developer portal and paste its client ID into the secret's Client ID field" },
+  { symptom = "Test says Canva rejected the token (401)", fix = "The grant expired or was revoked in Canva. Select Reconnect and sign in again" },
+  { symptom = "The secret shows Needs reconnect", fix = "Canva ended the grant (a password change, a revoked connection or a long idle period). Select Reconnect on the secret and sign in to Canva again" },
+  { symptom = "New tasks on the project have no Canva tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with, and an agent marked Not supported on that tab cannot load MCP servers" },
+]
+faq = [
+  { q = "Why does Canva need a registered app when other MCP servers do not", a = "Canva lists the AI clients its connector supports; any other client, Jaah's included, is set up with Canva first (the operator task), or brings its own client ID" },
+  { q = "What does Test do", a = "It opens an MCP session with Canva's server and lists its tools, then closes the session. It reads and changes nothing in your Canva account" },
+]

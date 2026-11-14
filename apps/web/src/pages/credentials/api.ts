@@ -4,7 +4,7 @@
 // `GET /api/credentials/types` (`useCredentialTypes`) because the server registry
 // (`apps/api/app/credentials/registry.py`) also decides which keys are secret and stripped.
 
-import { del, get, patch, post, put } from '../../api'
+import { del, get, patch, post, put, withQuery } from '../../api'
 import { fetchSealKey, type CredentialSealKey, type SealedSecretEnvelope } from '../../lib/credentialSeal'
 import { nodeVaultSealKey } from '../../lib/nodeVaultKeys'
 import type { CredentialHealth, CredentialSort } from '../../lib/credentialFilterStorage'
@@ -94,6 +94,11 @@ export type FieldSpec = {
   default?: string | null
   /** Helper text under the input — an instruction (the registry's `FieldSpec.help`); a placeholder is only an example. */
   help?: string | null
+  /** An optional field drawn beside the required ones, never folded into Advanced (the registry's
+   *  `FieldSpec.outright`: the system needs it and it has no standard value). */
+  outright?: boolean
+  /** A field the type's Connect fills (`credential_wire.CONNECT_FILLED_KEYS`); the form does not draw it. */
+  connect_filled?: boolean
 }
 
 /** The control-plane OAuth2 flow that can FILL a credential type: it runs the auth-code flow against the
@@ -108,6 +113,19 @@ export type OAuthConnectSpec = {
    *  fails only at `exchange_failed` after consent. Same for every type; built by
    *  `routes/credentials/credential_wire.py::_connect_redirect_uri`. Public, not a secret. */
   redirect_uri: string
+  /** The provider's scope catalogue, in its order; empty or absent when it has none (nothing to choose). */
+  scopes?: OAuthConnectScope[]
+  /** The client is Jaah's own app, so the row holds no client id/secret. */
+  platform_app?: boolean
+  /** False when that platform app is not set up on this deployment: Connect cannot start. */
+  configured?: boolean
+}
+
+/** One scope a connect can ask for. A required one is always asked; an optional one is the person's pick. */
+export type OAuthConnectScope = {
+  name: string
+  label: string
+  optional: boolean
 }
 
 export type CredentialTypeSpec = {
@@ -121,6 +139,9 @@ export type CredentialTypeSpec = {
    *  and the type's default host (null for a type with none). */
   host_field: string | null
   default_base_url: string | null
+  /** The url fields take any text: the form warns on an odd shape (`lib/urlShape.ts`) instead of refusing it, and
+   *  Test needs an http(s) one. Absent on an older API. */
+  free_form_url?: boolean
   /** Why this type has no connection test — server-owned text, rendered verbatim. Absent-but-untestable
    *  only for a RETIRED type synthesised from a row (`retiredTypeOption`). */
   untestable_reason?: string | null
@@ -130,6 +151,11 @@ export type CredentialTypeSpec = {
   /** Groups of OPTIONAL field keys; a row saves once one group is wholly filled. The form renders these
    *  fields outright, beside the required ones. Empty or absent for most types. */
   require_one_of?: string[][]
+  /** The catalog vendor this type is (`/credentials/new?integration=<slug>`), its logo, and whether a row is an MCP
+   *  connection a project may link. Absent on an older API. */
+  integration?: string | null
+  logo_url?: string | null
+  mcp?: boolean
 }
 
 /* Deliberately shadows `lib.dom.d.ts`'s global `Credential`; nothing uses `navigator.credentials`. If
@@ -155,6 +181,8 @@ export type Credential = {
   /** Whose row it is, by name: a personal row's owner (who may not be its creator), else its creator
    *  (`CredentialOut.owner`). `null` when unresolved; absent on an older API. */
   owner?: string | null
+  /** A personal row's owner's user id (`CredentialOut.owner_id`); null for an org or system row. */
+  owner_id?: string | null
   /* The org pair has three states (single home: `apps/api/app/routes/credentials/credential_wire.py::CredentialOut`):
    * `(null, null)` no org, `(set, set)` resolved, `(set, null)` an id naming no `orgs` row (no FK) — render
    * the id (`ui/OrgIndicator.tsx`'s `unresolvedId`). Optional so older API payloads parse. */
@@ -183,12 +211,15 @@ export type Credential = {
   last_tested_at?: string | null
   /** The last connection test's verdict; null when never tested. */
   last_test_ok?: boolean | null
+  /** The last test's sentence, and when the vendor refused the grant for good (the row needs Reconnect). */
+  last_test_message?: string | null
+  needs_reconnect_at?: string | null
   expires_at?: string | null
 }
 
 export type CredentialList = {
   items: Credential[]
-  /** Needed so "Next" can know the last page. Keyset paging caps it (`total_capped`). */
+  /** How many rows match. Keyset paging caps it (`total_capped`). */
   total: number
   /** Keyset paging: more rows match than `total` counts ("10,000+"). Absent on the OFFSET path. */
   total_capped?: boolean
@@ -255,13 +286,15 @@ export async function loadCredentialOptions(
   query: string,
   signal: AbortSignal,
   toOption: (row: Credential) => CredentialOption,
-  { types = [undefined], keep = rows => rows, sort = false }: {
+  { types = [undefined], keep = rows => rows, sort = false, headers }: {
     types?: (string | undefined)[]
     keep?: (rows: Credential[]) => Credential[]
     sort?: boolean
+    /** Passed to every page's read (`listCredentials`). */
+    headers?: HeadersInit
   } = {},
 ): Promise<CredentialOption[]> {
-  const pages = await Promise.all(types.map(type => listCredentials(1, PICKER_PAGE, { type, q: query, signal })))
+  const pages = await Promise.all(types.map(type => listCredentials(1, PICKER_PAGE, { type, q: query, signal, headers })))
   const kept = keep(pages.flatMap(page => page.items))
   const rows = [...new Map<string, CredentialOption>(kept.map(row => [row.id, toOption(row)])).values()]
   if (sort) rows.sort((a, b) => a.name.localeCompare(b.name))
@@ -301,28 +334,23 @@ export const listCredentials = (
     keyset?: boolean
     cursor?: string | null
     signal?: AbortSignal
+    /** The read's own headers: a picker narrowed to the org its write is checked against (`lib/orgScope.ts::oneOrgRead`). */
+    headers?: HeadersInit
   } = {},
 ) => {
-  const params = opts.keyset
-    ? new URLSearchParams({ per: String(per), paging: 'keyset' })
-    : new URLSearchParams({ page: String(page), per: String(per) })
-  if (opts.keyset && opts.cursor) params.set('cursor', opts.cursor)
-  // Omitted when empty: `?type=` is not a known type.
-  if (opts.type) params.set('type', opts.type)
-  if (opts.q) params.set('q', opts.q)
-  // Load-bearing: an empty `?owner_id=` or `?secrets=` 422s the page. Unset must be ABSENT.
-  for (const ownerId of opts.ownerIds ?? []) params.append('owner_id', ownerId)
-  if (opts.secrets) params.set('secrets', opts.secrets)
-  if (opts.health) params.set('health', opts.health)
-  // Only ever `true`, so existing callers' URLs stay byte-identical (two suites assert them verbatim).
-  if (opts.mine) params.set('mine', 'true')
-  // The default is not sent, for the same byte-identical reason.
-  if (opts.sort && opts.sort !== 'newest') params.set('sort', opts.sort)
-  const url = `/api/credentials?${params}`
-  // Omit the second argument when there is no signal: suites assert the call without a trailing `undefined`.
-  return opts.signal === undefined
-    ? get<CredentialList>(url)
-    : get<CredentialList>(url, { signal: opts.signal })
+  const url = withQuery('/api/credentials', {
+    ...(opts.keyset ? { per, paging: 'keyset', cursor: opts.cursor } : { page, per }),
+    // Load-bearing: an empty `?type=`, `?owner_id=` or `?secrets=` 422s the page. Unset must be ABSENT.
+    type: opts.type, q: opts.q, owner_id: opts.ownerIds, secrets: opts.secrets, health: opts.health,
+    // `mine` only ever `true` and the default sort unsent: callers' URLs stay byte-identical (two suites assert them).
+    mine: opts.mine, sort: opts.sort !== 'newest' ? opts.sort : undefined,
+  })
+  // Omit the second argument when there is nothing to send: suites assert the call without a trailing `undefined`.
+  if (opts.signal === undefined && opts.headers === undefined) return get<CredentialList>(url)
+  return get<CredentialList>(url, {
+    ...(opts.signal !== undefined && { signal: opts.signal }),
+    ...(opts.headers !== undefined && { headers: opts.headers }),
+  })
 }
 
 /** The roster narrowings `listCredentialTree` sends, as `listCredentials` does. */
@@ -408,12 +436,7 @@ export type CredentialOwner = {
 export const listCredentialOwners = (
   opts: { q?: string; limit?: number; ids?: readonly string[]; signal?: AbortSignal } = {},
 ) => {
-  const params = new URLSearchParams()
-  if (opts.q) params.set('q', opts.q)
-  if (opts.limit !== undefined) params.set('limit', String(opts.limit))
-  for (const id of opts.ids ?? []) params.append('ids', id)
-  const query = params.toString()
-  const url = query ? `/api/credentials/owners?${query}` : '/api/credentials/owners'
+  const url = withQuery('/api/credentials/owners', { q: opts.q, limit: opts.limit, ids: opts.ids })
   return opts.signal === undefined ? get<CredentialOwner[]>(url) : get<CredentialOwner[]>(url, { signal: opts.signal })
 }
 
@@ -425,11 +448,11 @@ export const createCredential = (body: CredentialBody) =>
 export const updateCredential = (id: string, body: CredentialBody, headers?: HeadersInit) =>
   headers ? patch<Credential>(`/api/credentials/${id}`, body, headers) : patch<Credential>(`/api/credentials/${id}`, body)
 
-/* Name and keys only (the connection dialog's "Edit credential"): the PATCH is partial, so the type,
- * description and NodeVault flag the form never shows stay as stored — a sent type that differed would
- * reset the config and drop the kept secrets. */
-export const updateCredentialKeys = (id: string, body: Pick<CredentialBody, 'name' | 'config'>) =>
-  patch<Credential>(`/api/credentials/${id}`, body)
+/** An Org Owner/Admin moves a credential to another type or, for `personal`, another member
+ *  (`PUT /api/credentials/{id}/owner`). Absent `owner_user_id` keeps a personal row's owner. */
+export const changeCredentialOwner = (
+  id: string, body: { ownership: CredentialOwnership; owner_user_id?: string }, headers?: HeadersInit,
+) => headers ? put<Credential>(`/api/credentials/${id}/owner`, body, headers) : put<Credential>(`/api/credentials/${id}/owner`, body)
 
 /* Rename only. A full `CredentialBody` from a list row would lack the secret keys the browser
  * never sees; the PATCH is a genuine partial update (`update_credential` leaves absent fields and config
@@ -503,8 +526,9 @@ export type CredentialConnectStart = {
  * The id is the LAST path segment on purpose — do not move it to `/api/credentials/{id}/connect/start`:
  * the PKCE cookie's `Path` must be the narrowest shared prefix (`/api/credentials/connect`,
  * `routes/credentials/connect.py::_CONNECT_COOKIE_PATH`). */
-export const startCredentialConnect = (credentialId: string) =>
-  post<CredentialConnectStart>(`/api/credentials/connect/start/${credentialId}`, {})
+/* `scopes` = the OPTIONAL scopes kept, sent only for a type with a catalogue; omitted = all of them. */
+export const startCredentialConnect = (credentialId: string, scopes?: string[]) =>
+  post<CredentialConnectStart>(`/api/credentials/connect/start/${credentialId}`, scopes ? { scopes } : {})
 
 
 /** One account's Git Access roster (`GET /api/users/{id}/git-credentials`, superadmin-only;
@@ -522,7 +546,7 @@ export type GitCredential = {
 export const listUserGitCredentials = (userId: string) =>
   get<{ credentials: GitCredential[] }>(`/api/users/${userId}/git-credentials`)
 
-/** `POST /api/git-connect/start`'s answer (`routes/git_connect.py::GitConnectStartOut`). "No GitHub OAuth
+/** A forge Connect start's answer (`routes/integrations.py::IntegrationConnectStartOut`). "No GitHub OAuth
  *  App configured" is a 503 rejection read via `apiDetail`, not a field. */
 export type GitConnectStart = {
   authorize_url: string
@@ -543,6 +567,8 @@ export type GitConnection = {
   forge_label: string
   self_managed: boolean
   state: 'connected' | 'needs_reconnect' | 'not_connected'
+  /** The root's default account: used for a repository no other account on the root reaches. */
+  is_default: boolean
   /** Resolution's own sentence on why the root is not usable. */
   detail: string | null
   credential: GitCredential | null
@@ -559,10 +585,20 @@ const rootPath = (userId: string, root: string) => `${gitConnectionsPath(userId)
 export const listGitConnections = (userId: string) =>
   get<{ connections: GitConnection[] }>(gitConnectionsPath(userId))
 
-export const putGitConnection = (userId: string, root: string, credentialId: string) =>
-  put<GitConnection>(rootPath(userId, root), { credential_id: credentialId })
+/** The ONE query over a viewer's connections, so every reader shares its cache (`components/GitConnectionsCard.tsx`,
+ *  `hooks/useProjectCreateLabel.ts`): a connect on /profile reaches them all. */
+export const gitConnectionsQuery = (userId: string) => ({
+  queryKey: ['git-connections', userId] as const,
+  queryFn: async () => (await listGitConnections(userId)).connections,
+})
 
-export const deleteGitConnection = (userId: string, root: string) => del(rootPath(userId, root))
+/* Connects one more account on `root` (or, with `makeDefault`, makes it the root's default). */
+export const putGitConnection = (userId: string, root: string, credentialId: string, makeDefault = false) =>
+  put<GitConnection>(rootPath(userId, root), { credential_id: credentialId, ...(makeDefault ? { make_default: true } : {}) })
+
+/* Disconnects the one account `credentialId` on `root`; without one, every account on it. */
+export const deleteGitConnection = (userId: string, root: string, credentialId?: string) =>
+  del(credentialId ? `${rootPath(userId, root)}?credential_id=${encodeURIComponent(credentialId)}` : rootPath(userId, root))
 
 /* Tested at the forge first: a refused token is a 422 carrying the tester's reason. */
 export const postGitConnectionPat = (userId: string, root: string, body: GitPatBody) =>
@@ -576,11 +612,11 @@ export const listGitCredentialsForRoot = (userId: string, root: string) =>
 /** The console pages a GitHub Connect may come back to (`routes/git_connect.py::RETURN_PATHS`). */
 export type GitConnectReturnTo = '/profile' | '/git-connect/done'
 
-/* Begin a forge's OAuth Connect (`routes/forge_connect.py`; `github` aliases `POST /api/git-connect/start`).
+/* Begin a forge's OAuth Connect through the shared integration start (`routes/integrations.py::start_integration_connect`).
  * A forge whose app is not configured answers 409 with the offer's sentence. `returnTo` is GitHub's only;
  * the default is Profile. */
 export const startForgeConnect = (forge: string, returnTo?: GitConnectReturnTo, app?: 'oauth_app') =>
-  post<GitConnectStart>(`/api/git-connect/${encodeURIComponent(forge)}/start`, {
+  post<GitConnectStart>(`/api/integrations/${encodeURIComponent(forge)}/connect/start`, {
     ...(returnTo ? { return_to: returnTo } : {}), ...(app ? { app } : {}),
   })
 

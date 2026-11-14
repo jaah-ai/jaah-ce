@@ -28,8 +28,7 @@ is no longer one, and the membership the system made for anyone no longer an ena
 The parent's admins may also run it by hand (`POST /api/org/staging/sync`), which settles a staging org created before
 this rule or a sync that failed (logged, never failing the parent's write).
 
-ACCEPTED LIMITS. Only DIRECT org-scope Owners/Admins are copied: one through a group is not (an access request never
-grants an org role). A binding a staging admin granted by hand, user or group, is theirs and stays — so a copied Owner can
+ACCEPTED LIMITS. Only DIRECT org-scope Owners/Admins are copied: one through a group is not. A binding a staging admin granted by hand, user or group, is theirs and stays — so a copied Owner can
 grant themselves a second, hand-made role that outlives their parent role. A staging admin who removes a parent admin's
 copy sees it return at the parent's next admin change. Only the Agents cap is shared — agents are what a plan bills;
 the staging org counts its own nodes, projects, users and GitHub runners against the parent's per-org values. A parent
@@ -48,8 +47,8 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import access, edition_features, identities, plan_terms
-from app.db import SessionLocal
+from app import access, edition_features, identities, org_slug, plan_terms
+from app.db import BridgedSession
 from app.clock import utcnow
 from app.entity_shape import SYSTEM_ACTOR_ID, constraint_name, new_uuid7
 from app.models.access import Role, RoleBinding
@@ -118,13 +117,13 @@ def dispatch_hold(session: Session, org: Org) -> Optional[str]:
         return None
     parent = session.get(Org, org.parent_org_id)
     if parent is None or parent.deleted_at is not None or not parent.enabled or parent.lifecycle != ORG_ACTIVE:
-        return "Waiting: the parent organization is not active."
+        return "Waiting: the parent organization is not active. Contact support to reactivate it."
     if not plan_terms.switch_on(session, parent.id, SWITCH):
         return f"Waiting: {plan_terms.SWITCH_BY_NAME[SWITCH].label} is not on {parent.name}'s plan. Upgrade in {parent.name}'s Billing."
     plan = plan_terms.plan_row(session, parent.plan_key)
     end = plan_terms.ends_of(parent, plan).value
     if end is not None and end <= utcnow():
-        return f"Waiting: {parent.name}'s plan has ended."
+        return f"Waiting: {parent.name}'s plan has ended. Renew it in {parent.name}'s Billing."
     return None
 
 
@@ -162,7 +161,7 @@ def _in_org(org_id: UUID) -> Iterator[Session]:
     org's rows are written after leaving it. ENTITLEMENT: `org_id` is the staging org `create` mints, or the parent /
     its live staging org `sync_admins` resolves from a parent id — never a request field; every caller either passed
     the parent's Owner/Admin guard or just committed a write the parent's own guards admitted."""
-    with seam.detached(), seam.bound_to(org_id), SessionLocal() as session:
+    with seam.detached(), seam.bound_to(org_id), BridgedSession() as session:
         yield session
 
 
@@ -171,7 +170,7 @@ def fleet_session() -> Iterator[Session]:
     """A fresh fleet-plane session to count one staging family's shared caps: a session bound to one org sees only
     that org's rows. ENTITLEMENT: every caller reads only `family_ids` of an org it already holds (the caller's own,
     or the org a cap check runs for), and takes counts out, never rows."""
-    with seam.detached(), seam.operator_scope(), SessionLocal() as session:
+    with seam.detached(), seam.operator_scope(), BridgedSession() as session:
         yield session
 
 
@@ -180,9 +179,9 @@ def create(session: Session, parent: Org, caller: AdminUser) -> UUID:
     bound to the parent. 403 off the plan, 409 from a staging org, for a parent not active, or when the parent
     already has one. A staging org is a second org: an edition without multi-org tenancy has none (404)."""
     if not edition_features.enabled("multi_org_tenancy"):
-        from app.ce_caps import NOT_IN_CE  # inline: `ce_caps` imports `org_limits`, which imports this module
+        from app import ce_caps  # inline: `ce_caps` imports `org_limits`, which imports this module
 
-        raise HTTPException(status_code=404, detail=NOT_IN_CE)
+        raise ce_caps.not_in_edition()
     plan_terms.require_switch(session, parent.id, SWITCH)
     if parent.parent_org_id is not None:
         grand = session.get(Org, parent.parent_org_id)
@@ -196,7 +195,9 @@ def create(session: Session, parent: Org, caller: AdminUser) -> UUID:
     if caller.identity_id is not None:
         admins.setdefault(caller.identity_id, "org_admin")
     parent_id, parent_name, plan_key, account_type = parent.id, parent.name, parent.plan_key, parent.account_type
-    slug_base = parent.slug[:40] + "-staging"
+    # Letters and digits only (`org_slug.ORG_SLUG_RE`): a `-staging` tail would put the staging org's repos under
+    # its parent's repo prefix (`jaah_repos.repo_prefix`). Room is left for `unique_slug`'s up to three digits.
+    slug_base = org_slug.conforming(parent.slug)[: org_slug.ORG_SLUG_MAX - 6] + "stg"
     org_id = new_uuid7()
     from app.org_create import create_org_row
 
@@ -326,9 +327,8 @@ def sync_admins(parent_id: UUID) -> Optional[SyncResult]:
                 or user.id in kept
             ):
                 continue
-            retired.append((user.id, user.session_epoch or 0))
+            retired.append(identities.retire_session(user))
             user.disabled_at, user.disabled_by_id = now, SYSTEM_ACTOR_ID
-            user.session_epoch = (user.session_epoch or 0) + 1
             removed.append((str(user.id), "membership"))
         if added or removed:
             record_write(

@@ -6,7 +6,7 @@ from app.persona_registry import MODE_ANALYSIS, charter_mode
 
 # ── Per-role prose table ──
 # Per-role inputs/focus/gate/output are this edition's doctrine bundle's (`doctrine.BUNDLE.roles`), rendered by
-# `role_render._render_role_section`, keyed by `charter_key`. Mode, delivery, terminals and manifest are persona
+# `role_render.render_role_section_with`, keyed by `charter_key`. Mode, delivery, terminals and manifest are persona
 # properties on `app/persona_registry.py`. `charter_keys()` returns the bundle's key order.
 _ROLES: dict[str, dict[str, str]] = BUNDLE.roles  # type: ignore[assignment]  # a bundle row is a role row
 

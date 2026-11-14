@@ -1,6 +1,7 @@
 import Box from '@mui/material/Box'
 import { useApiRead } from '../../hooks/useApiRead'
-import { DBOS_STATUS_GLYPH, DBOS_STATUS_HELP, DBOS_STATUS_TONE, isInFlight } from '../../lib/dbosStatus'
+import { grid } from '../../theme'
+import { DBOS_STATUS_HELP, dbosStatus } from '../../lib/dbosStatus'
 import { absoluteTime, relativeAge } from '../../lib/relativeTime'
 import Banner from '../../ui/Banner'
 import LoadFailedState from '../../ui/LoadFailedState'
@@ -28,14 +29,11 @@ import {
 /** Exactly the settled row count: the registry is closed. */
 const SKELETON_ROWS = 5
 
-/* The row's mark. Tones and sentences are single-homed in `lib/dbosStatus.ts` (DBOS statuses have no
- * `badge-*` tokens, so `ui/statusTone` does not apply). Glyphs: ✓ SUCCESS, ✕ ERROR /
- * MAX_RECOVERY_ATTEMPTS_EXCEEDED, » in flight, ■ CANCELLED (intent, not health), ○ registered and quiet,
- * ? engine did not answer (the pair `engine_available` separates). Unknown status → `?`, labelled by
- * its token. */
+/* The row's mark. Glyphs, tones and sentences are single-homed in `lib/dbosStatus.ts` (DBOS statuses have
+ * no `badge-*` tokens, so `ui/statusTone`'s badge map does not apply); this tab adds ○ registered and quiet,
+ * ? engine did not answer (the pair `engine_available` separates). */
 const UNKNOWN_GLYPH = '?'
 const QUIET_GLYPH = '○'
-const IN_FLIGHT_GLYPH = '»'
 
 const ENGINE_UNAVAILABLE_LABEL = 'unavailable'
 
@@ -60,9 +58,7 @@ function statusMark(type: WorkflowType, engineAvailable: boolean): FeedIndicator
     }
   }
   return {
-    tone: DBOS_STATUS_TONE[type.last_status] ?? 'neutral',
-    glyph: DBOS_STATUS_GLYPH[type.last_status] ?? (isInFlight(type.last_status) ? IN_FLIGHT_GLYPH : UNKNOWN_GLYPH),
-    label: type.last_status,
+    ...dbosStatus(type.last_status),
     title: DBOS_STATUS_HELP[type.last_status],
     // The row's state oracle.
     data: { status: type.last_status },
@@ -107,7 +103,7 @@ export default function WorkflowTypesTab({ enabled = true }: {
       {
         /* The raw `name` is what the runs filter, API and logs use. */
         key: 'name',
-        width: 132,
+        width: grid(22),
         gate: 'meta',
         align: 'left',
         mono: true,
@@ -120,7 +116,7 @@ export default function WorkflowTypesTab({ enabled = true }: {
         /* Trigger + queue in one slot: queue name (or `direct` — a direct workflow can never sit ENQUEUED) as
          * the value, trigger sentence on hover. */
         key: 'trigger',
-        width: 96,
+        width: grid(16),
         gate: 'meta',
         align: 'center',
         testId: 'workflow-type-trigger',
@@ -130,7 +126,7 @@ export default function WorkflowTypesTab({ enabled = true }: {
       {
         /* The widest slot, ellipsised; full text on hover and on the workflow's page. */
         key: 'description',
-        width: 240,
+        width: grid(40),
         gate: 'id',
         align: 'left',
         testId: 'workflow-type-description',
@@ -141,7 +137,7 @@ export default function WorkflowTypesTab({ enabled = true }: {
         /* `runs` counts the last N runs across ALL workflows, so the window qualifier rides the slot `title`.
          * `vocabulary.ts` single-homes `RUNS_COLUMN_HEADER` and `windowCaptionShort`. */
         key: 'runs',
-        width: 56,
+        width: grid(9),
         gate: 'id',
         align: 'right',
         /* Mono already gives digits one width. */
@@ -156,7 +152,7 @@ export default function WorkflowTypesTab({ enabled = true }: {
         /* The age alone (`lib/relativeTime` pairing, absolute on hover); non-age readings are WORDS so they
          * stay distinct. */
         key: 'last',
-        width: 108,
+        width: grid(18),
         align: 'right',
         dim: true,
         testId: 'workflow-type-last-run',

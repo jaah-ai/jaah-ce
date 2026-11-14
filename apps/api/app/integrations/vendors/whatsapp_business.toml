@@ -1,0 +1,46 @@
+slug = "whatsapp_business"
+label = "WhatsApp Business"
+category = "messaging"
+vendor_docs_url = "https://developers.facebook.com/docs/whatsapp/cloud-api/get-started"
+summary = "Send and manage WhatsApp messages from your business number through Meta's Cloud API."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "access_token", label = "Access token", kind = "secret", required = true, help = "Meta Business Suite > Business settings (business.facebook.com/settings) > Users > System users > select the system user > Generate new token. Pick your app, set the expiry to Never, and tick whatsapp_business_messaging and whatsapp_business_management" },
+  { key = "phone_number_id", label = "Phone number ID", kind = "text", required = true, help = "Meta App Dashboard (developers.facebook.com/apps) > your app > WhatsApp > API Setup > Phone number ID, under the From number" },
+  { key = "business_account_id", label = "WhatsApp Business Account ID", kind = "text", required = true, help = "Meta App Dashboard > your app > WhatsApp > API Setup > WhatsApp Business Account ID, shown beside the Phone number ID" },
+]
+
+[test]
+method = "GET"
+path = "https://graph.facebook.com/v23.0/me?fields=id,name"
+auth = { field = "access_token", header = "Authorization", prefix = "Bearer" }
+identity = [["name"], ["id"]]
+
+[docs]
+agent_uses = [
+  "Send an approved template message, for example an order update or an appointment reminder",
+  "Reply with a free-form message inside a conversation's 24-hour customer service window",
+  "List and check the status of the business account's message templates",
+  "Read the phone number's quality rating and messaging limit",
+]
+prerequisites = [
+  "A Meta business portfolio and a Meta app with the WhatsApp product added (developers.facebook.com/apps > Create app > Business, then Add product > WhatsApp)",
+  "A business phone number registered under WhatsApp > API Setup, or Meta's free test number",
+  "A system user in Business settings > Users > System users, with your app and the WhatsApp Business Account assigned to it under Assign assets",
+]
+limitations = [
+  "WhatsApp allows a business to start a conversation only with an approved message template; free-form text is allowed only within 24 hours of the customer's last message",
+  "A user access token from the API Setup page expires within a day. Use a system user token with expiry Never for a lasting connection",
+  "Meta charges per conversation and sets a daily messaging limit per phone number",
+]
+troubleshooting = [
+  { symptom = "Test fails with HTTP 400 or says the access token was rejected", fix = "Meta answers an expired or revoked token with error 190. Generate a new system user token in Business settings > Users > System users and select Replace on the secret" },
+  { symptom = "Sending fails with error 131030 (recipient not in allowed list)", fix = "With Meta's test number you can message only the numbers added under WhatsApp > API Setup > To. Add the recipient there, or register your own business number" },
+  { symptom = "Sending a template fails with error 132001", fix = "The template name or language does not exist on this WhatsApp Business Account. Check WhatsApp Manager > Message templates for the exact name and language code" },
+]
+faq = [
+  { q = "Is this the WhatsApp Business app on my phone?", a = "No. This is Meta's WhatsApp Cloud API. A number in use on the WhatsApp Business app must be migrated before the API can send from it" },
+  { q = "Can I send WhatsApp messages through Twilio instead?", a = "Yes. Connect Twilio instead and use a Twilio-approved WhatsApp sender; you do not need this connection then" },
+]

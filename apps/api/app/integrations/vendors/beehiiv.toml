@@ -1,0 +1,42 @@
+# beehiiv API v2 with an API key as a Bearer token. The Test lists publications (`GET /v2/publications`, `data`
+# list); a bad key answers 401 INVALID_API_KEY. Confirmed 2026-11-03 at the vendor_docs_url page and by calling it
+# with a made-up key. beehiiv also offers OAuth, but no Jaah-owned app is in this wave.
+slug = "beehiiv"
+label = "beehiiv"
+category = "marketing"
+vendor_docs_url = "https://developers.beehiiv.com/api-reference/publications/index"
+summary = "Manage beehiiv newsletter subscribers, posts and publication stats."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "beehiiv dashboard > Settings > Workspace settings > API > Create new API key. Name it Jaah; beehiiv shows the key once" },
+]
+
+[test]
+method = "GET"
+path = "https://api.beehiiv.com/v2/publications?limit=1"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+list_field = "data"
+
+[docs]
+agent_uses = [
+  "List the workspace's publications and read their subscriber and open-rate stats",
+  "Add a new subscriber, update one's custom fields, or unsubscribe one",
+  "List recent posts and read each post's opens, clicks and web views",
+  "Find a subscriber by email to answer a support question",
+]
+prerequisites = ["A beehiiv workspace and a role in it that may create API keys (owner or admin)"]
+limitations = [
+  "An API key reaches every publication in the workspace; beehiiv has no per-publication key",
+  "Some endpoints, such as creating posts, need a paid beehiiv plan",
+  "beehiiv rate-limits the API per key; a large subscriber import should run in batches",
+]
+troubleshooting = [
+  { symptom = "Test says beehiiv rejected the API key (401)", fix = "The key was deleted or mistyped. Create a new key under Settings > Workspace settings > API and select Replace on the secret" },
+  { symptom = "An agent gets 404 for a publication", fix = "Publication IDs start with pub_. Ask the agent to list publications first and use the ID it shows" },
+  { symptom = "An agent gets 403 on creating a post", fix = "Your beehiiv plan does not include that endpoint. Upgrade the plan or have the agent draft the post for you to paste" },
+]
+faq = [
+  { q = "Can agents send a newsletter", a = "They can create a post through the API where your plan allows it; sending stays a step you take in beehiiv unless the task says otherwise" },
+]

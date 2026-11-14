@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Literal, Optional, Union
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -29,6 +30,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import forge_oauth, identities
+from app.clock import utcnow
 from app.operator_settings import reads as settings_reads
 from app.config import get_settings
 from app.git_access import APP_KNOBS
@@ -340,9 +342,9 @@ def resolve_login(
 
     try:
         if stale_link is not None:
-            identities.set_fields(session, stale_link, **_cleared_fields(ident.provider))
+            identities.set_fields(stale_link, **_cleared_fields(ident.provider))
             session.flush()  # the id is unique: the release must reach the DB before the relink
-        identities.set_fields(session, chosen, **_link_fields(ident))
+        identities.set_fields(chosen, **_link_fields(ident))
         session.flush()
     except IntegrityError:
         session.rollback()
@@ -362,24 +364,17 @@ def _membership(
     return user if user is not None else LoginRefusal(ACCOUNT_DISABLED)
 
 
-def stamp_email_verified(session: Session, user: AdminUser, proven_email: str) -> None:
-    """Record that a sign-in just proved `proven_email` is this person's (`UserIdentity.email_verified_at`).
+def stamp_identity_email_verified(session: Session, identity_id: UUID, proven_email: str) -> Optional[datetime]:
+    """`stamp_email_verified` for a caller holding only the person (a proof redeemed through an emailed link): the
+    same conditional UPDATE, stamping only while the identity STILL holds `proven_email` and is unstamped. Returns the
+    stamp it wrote, or None. Caller commits."""
+    from sqlalchemy import update
 
-    One conditional UPDATE, not an attribute write: it stamps only while the identity STILL holds the
-    address the provider verified, so an admin changing the email between this sign-in's read and its
-    commit cannot leave the new, unproven address stamped. Caller commits."""
-    from datetime import datetime, timezone
-
-    from sqlalchemy import func, update
-    from sqlalchemy.orm.attributes import set_committed_value
-
-    if user.identity_id is None:
-        return
-    stamped_at = datetime.now(timezone.utc)
+    stamped_at = utcnow()
     stamped = session.execute(
         update(UserIdentity)
         .where(
-            UserIdentity.id == user.identity_id,
+            UserIdentity.id == identity_id,
             func.lower(UserIdentity.email) == proven_email.strip().lower(),
             UserIdentity.email_verified_at.is_(None),
         )
@@ -387,22 +382,26 @@ def stamp_email_verified(session: Session, user: AdminUser, proven_email: str) -
         .execution_options(synchronize_session=False)
         .returning(UserIdentity.id)
     ).first()
-    if stamped is not None:
-        # Mirrored onto the loaded objects so this same response reports it, without marking them dirty;
-        # the membership's legacy copy is written too (`models.set_identity_fields`'s dual write).
+    return stamped_at if stamped is not None else None
+
+
+def stamp_email_verified(session: Session, user: AdminUser, proven_email: str) -> None:
+    """Record that a sign-in just proved `proven_email` is this person's (`UserIdentity.email_verified_at`).
+
+    One conditional UPDATE, not an attribute write: it stamps only while the identity STILL holds the
+    address the provider verified, so an admin changing the email between this sign-in's read and its
+    commit cannot leave the new, unproven address stamped. Caller commits."""
+
+    from sqlalchemy.orm.attributes import set_committed_value
+
+    if user.identity_id is None:
+        return
+    stamped_at = stamp_identity_email_verified(session, user.identity_id, proven_email)
+    if stamped_at is not None:
+        # Mirrored onto the loaded identity so this same response reports it, without marking it dirty.
         identity = user._loaded_identity()
         if identity is not None:
             set_committed_value(identity, "email_verified_at", stamped_at)
-        session.execute(
-            update(AdminUser.__table__)
-            .where(
-                AdminUser.__table__.c.id == user.id,
-                func.lower(AdminUser.__table__.c.email) == proven_email.strip().lower(),
-                AdminUser.__table__.c.email_verified_at.is_(None),
-            )
-            .values(email_verified_at=stamped_at)
-        )
-        set_committed_value(user, "_legacy_email_verified_at", stamped_at)
 
 
 #: `record_sign_in`'s outcome for a provider sign-in the console's second factor must still complete.

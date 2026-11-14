@@ -3,7 +3,8 @@
  * pins it), so every value starts on the same x; a long value wraps inside its column, never past it. At
  * phone width each label stacks over its value, so neither a long label nor a long value is squeezed —
  * unless `stack={false}`: a list of one-word labels (a dialog's facts) keeps label-beside-value there, since
- * stacking only doubles its height.
+ * stacking only doubles its height. `inline` lays the pairs along one wrapping line instead, for a few short
+ * facts under a form where a row each costs more height than they are worth.
  *
  * Not `DetailPage`'s `DetailField` (a caption-scale strip, label over value, for a page's own field grid). Each row is a `div` around its `dt`/`dd` (valid in a `dl`) with
  * `display: contents`, so the pair sits on the list's grid. */
@@ -11,12 +12,14 @@ import type { JSX, ReactNode } from 'react'
 import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
 import { PHONE, monoSx } from './listStyles'
+import Tip from './Tip'
 
 export function KeyValueList({
   labelWidth,
   align = 'baseline',
   divided,
   stack = true,
+  inline,
   testId,
   children,
 }: {
@@ -28,10 +31,33 @@ export function KeyValueList({
   divided?: boolean
   /** Label over value at phone width (the default); false keeps the two columns for short labels. */
   stack?: boolean
+  /** The pairs side by side on one line, wrapping when it runs out; ignores `labelWidth`, `divided` and `stack`. */
+  inline?: boolean
   testId?: string
   children: ReactNode
 }): JSX.Element {
-  const cell = divided ? { py: 0.75, borderBottom: 1, borderColor: 'divider' } : null
+  const cell = divided ? { py: 0.5, borderBottom: 1, borderColor: 'divider' } : null
+  if (inline) {
+    return (
+      <Box
+        component="dl"
+        data-testid={testId}
+        sx={{
+          m: 0,
+          display: 'flex',
+          flexWrap: 'wrap',
+          columnGap: 3,
+          rowGap: 1,
+          alignItems: align,
+          // Each pair's `display: contents` row becomes one flex item, so a pair never splits across lines.
+          '& > div': { display: 'flex', columnGap: 1, alignItems: align, minWidth: 0 },
+          '& > div > dt': { flexShrink: 0 },
+        }}
+      >
+        {children}
+      </Box>
+    )
+  }
   return (
     <Box
       component="dl"
@@ -52,7 +78,7 @@ export function KeyValueList({
                 rowGap: 0,
                 '& > div > dt': divided ? { pb: 0, borderBottom: 0 } : { pt: 1 },
                 '& > div:first-of-type > dt': divided ? null : { pt: 0 },
-                '& > div > dd': { pt: 0.25 },
+                '& > div > dd': { pt: 0 },
               },
             }
           : null),
@@ -91,15 +117,14 @@ export function KeyValue({
   return (
     <Box data-testid={testId} sx={{ display: 'contents' }}>
       <Typography component="dt" variant="body2" sx={{ color: 'text.secondary', minWidth: 0 }}>{label}</Typography>
-      <Typography
+      <Tip title={title}><Typography
         component="dd"
         variant="body2"
-        title={title}
         data-testid={valueTestId}
         sx={[{ m: 0, minWidth: 0, overflowWrap: 'anywhere', fontWeight: strong ? 600 : undefined, color }, mono ? monoSx : {}]}
       >
         {children}
-      </Typography>
+      </Typography></Tip>
     </Box>
   )
 }

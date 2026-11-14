@@ -1,0 +1,54 @@
+slug = "power_bi"
+label = "Power BI"
+category = "data"
+default_base_url = "https://login.microsoftonline.com"   # where the secret goes: the token endpoint
+vendor_docs_url = "https://learn.microsoft.com/en-us/power-bi/developer/embedded/embed-service-principal"
+summary = "Lets agents list workspaces, reports, datasets and dashboards, refresh semantic models and run DAX queries in Power BI."
+
+[[auth]]
+kind = "service_account"
+fields = [
+  { key = "tenant_id", label = "Tenant ID", kind = "text", required = true, placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", help = "Azure portal > Microsoft Entra ID > Overview > Tenant ID (a GUID, or a domain such as yourcompany.onmicrosoft.com)" },
+  { key = "client_id", label = "Client ID", kind = "text", required = true, placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", help = "Azure portal > Microsoft Entra ID > App registrations > your app > Overview > Application (client) ID" },
+  { key = "client_secret", label = "Client secret", kind = "secret", required = true, help = "Your app > Certificates & secrets > Client secrets > New client secret; copy the Value column (not the Secret ID) right after creating it" },
+]
+
+[test]
+method = "GET"
+path = "https://api.powerbi.com/v1.0/myorg/groups"
+list_field = "value"
+[test.token]
+url = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+client_id_field = "client_id"
+client_secret_field = "client_secret"
+scope = "https://analysis.windows.net/powerbi/api/.default"
+
+[docs]
+agent_uses = [
+  "List the workspaces, reports, dashboards and semantic models (datasets) the service principal can reach",
+  "Trigger a semantic model refresh and read the refresh history to see whether it succeeded",
+  "Run DAX queries against a semantic model with the Execute Queries API to check numbers",
+  "Export a report, clone it between workspaces, or rebind it to another semantic model",
+]
+prerequisites = [
+  "A Power BI Pro, Premium Per User or Fabric/Premium capacity licence for the workspaces agents should reach",
+  "An app registration in Microsoft Entra ID with a client secret: Azure portal > Microsoft Entra ID > App registrations > New registration. It needs no Power BI API permissions; access comes from workspace roles",
+  "A security group in Microsoft Entra ID that contains the app",
+  "A Power BI or Fabric administrator who turns on Admin portal > Tenant settings > Developer settings > Service principals can call Fabric public APIs for that security group (Power BI's REST API is governed by the same setting)",
+  "The app added to each workspace: open the workspace > Manage access > Add people or groups, search for the app's name, and give it Member or Contributor (Viewer for read-only work)",
+]
+limitations = [
+  "A service principal reaches only workspaces it was added to; My workspace and classic (v1) workspaces are never reachable",
+  "Admin APIs (the /admin endpoints) need a separate tenant setting, Service principals can access read-only admin APIs, and work only for a group that holds no other Power BI API permission",
+  "The Execute Queries API is limited to 120 query requests per minute per user and returns at most 100,000 rows",
+  "Client secrets expire (at most two years); create a new one and replace it in Jaah before the old one lapses",
+]
+troubleshooting = [
+  { symptom = "Test says Power BI rejected the client ID and client secret (400) or (401) - check both", fix = "The tenant, client ID or secret is wrong, or the secret expired. Check the Tenant ID on Microsoft Entra ID > Overview, the Application (client) ID on the app's Overview, and paste the secret's Value (not its Secret ID)" },
+  { symptom = "Test says Power BI rejected the access token it issued (401) or (403)", fix = "Entra issued a token but Power BI refused the app. In Admin portal > Tenant settings > Developer settings, turn on the service principal setting for a security group, put the app in that group, and wait up to 15 minutes. An app that was granted Power BI API permissions in Entra with admin consent can also be refused: remove those permissions" },
+  { symptom = "The Test passes but agents see no workspaces or reports", fix = "The app is not a member of any workspace. Open each workspace > Manage access > Add people or groups and add the app with Member, Contributor or Viewer" },
+]
+faq = [
+  { q = "Why a service principal and not a sign-in button?", a = "A service principal is Microsoft's supported identity for unattended automation: it keeps working when a person leaves, needs no Power BI licence of its own, and sees only the workspaces you add it to" },
+  { q = "Can agents edit report visuals?", a = "Not through the REST API. Agents can refresh, export, clone and rebind reports and query their data; changing visuals needs Power BI Desktop or the report's PBIR files in a Git-connected workspace" },
+]

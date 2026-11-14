@@ -2,20 +2,23 @@ import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import Badge from '@mui/material/Badge'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import Link from '@mui/material/Link'
+import LinkButton from './LinkButton'
 import Popover from '@mui/material/Popover'
 import TextField from '@mui/material/TextField'
 import type { Theme } from '@mui/material/styles'
 import { useDebouncedCallback } from '../hooks/useDebouncedCallback'
+import { countOf } from '../lib/humanize'
 import { withUnmatched } from './FilterRow'
-import { Icon } from './icons'
-import { PHONE } from './listStyles'
+import { SlidersIcon } from './icons'
+import { PHONE, UNSTYLED_BUTTON_SX, ELLIPSIS_SX } from './listStyles'
 import { NO_AUTOFILL_INPUT } from './noAutofill'
+import { FONT_WEIGHT, LINE_HEIGHT, RADIUS, SIZE, grid, tint } from '../theme'
+import Tip from './Tip'
 
 /* The console's ONE settings menu for a list page's header — a wordless sliders button opening ONE
  * DRILL-DOWN panel that holds every setting the page has (operator-chosen design).
  * Level one lists each setting's NAME and CURRENT VALUE; tapping one replaces the contents with its page
- * (back arrow, name, checked options); picking returns. The panel is a CONSTANT 268px wide and near-constant
+ * (back arrow, name, checked options); picking returns. The panel is a CONSTANT 267px wide and near-constant
  * tall regardless of data, and every current value is visible where it opens.
  * HELP TEXT lives in each control's `title` (and `aria-label` where the name would lose it); a page that
  * cannot say it in a tooltip prints a caption (`PAGE_CAPTION_SX`).
@@ -28,7 +31,7 @@ import { NO_AUTOFILL_INPUT } from './noAutofill'
 /* EVERY toolbar button, one declaration: on a phone it drops its WORD and keeps its 44px box (`flex: 0 0
    auto`). Here, not `listStyles.ts` (rows' vocabulary); also used by `TaskToolbar` / `BulkActionBar`. */
 export const TOOLBAR_BUTTON_SX = {
-  [PHONE]: { flex: '0 0 auto', minWidth: 44, minHeight: 44, px: 0 },
+  [PHONE]: { flex: '0 0 auto', minWidth: SIZE.tapTarget, minHeight: SIZE.tapTarget, px: 0 },
 } as const
 
 /* …and the word they drop; each keeps its `aria-label`, so AT names them at every width. `textTransform`: the
@@ -37,71 +40,53 @@ export const TOOLBAR_BUTTON_SX = {
 export const TOOLBAR_LABEL_SX = { textTransform: 'none', [PHONE]: { display: 'none' } } as const
 
 /* A button WORDLESS AT EVERY WIDTH (this trigger, `/tasks`'s focus toggle, `BulkActionBar`'s ✕).
-   `minWidth: 40` + `px: 0` set desktop width, `GLYPH_BOX_SX` the height; the spread carries the 44×44 phone
+   `minWidth: grid(6.5)` + `px: 0` set desktop width, `GLYPH_BOX_SX` the height; the spread carries the 44×44 phone
    rule. Shared because two glyphs in different boxes is a reported defect. */
 export const GLYPH_BUTTON_SX = {
   ...TOOLBAR_BUTTON_SX,
-  minWidth: 40,
+  minWidth: grid(6.5),
   px: 0,
 } as const
 
 /* A wordless TOGGLE's lit state (`/tasks`'s Focus, the Flat/Tree toggle): accent border + glyph + an ACCENT-tinted
    well, not `variant="contained"` (that is ＋'s). A neutral `action.selected` well dropped the lit glyph to
    3.0:1 in dark (WCAG 1.4.11); the accent wash measures 3.97:1 dark / 4.79:1 light. The hover arm repeats
-   them so MUI's outlined hover cannot wash the accent out. `rgba(var(--mui-palette-…-mainChannel) / …)`
-   repaints across a theme flip; an `alpha()`d palette value does not. */
+   them so MUI's outlined hover cannot wash the accent out. `tint()` (the palette's channel variable) repaints
+   across a theme flip; an `alpha()`d palette value does not. */
 export const GLYPH_BUTTON_ON_SX = {
   ...GLYPH_BUTTON_SX,
   color: 'primary.main',
   borderColor: 'primary.main',
-  bgcolor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.16)',
-  '&:hover': { borderColor: 'primary.main', bgcolor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.24)' },
+  bgcolor: tint('primary', 0.16),
+  '&:hover': { borderColor: 'primary.main', bgcolor: tint('primary', 0.24) },
 } as const
 
 /* A WORDLESS BUTTON'S LINE BOX: a labelled button's height comes from its `variant="button"` line box
    (0.875rem × 1.75 = 24.5px), so a glyph-only one renders 8.5px short. The glyph sits in a box of the same
    line height. READ FROM THE THEME (never `minHeight: 32.5`); on a WRAPPER, not the `<svg>` (which would
-   scale the 16px mark). `1.75em`, NOT `calc(fontSize * lineHeight)`: `fontSize` may be a NUMBER, making
-   `calc(14 * 1.75)` invalid CSS that TypeScript accepts. */
+   scale the 16px mark). `1lh` of the button's own line height, NOT `calc(fontSize * lineHeight)`: `fontSize` may
+   be a NUMBER, making `calc(14 * 1.75)` invalid CSS that TypeScript accepts. */
 export const GLYPH_BOX_SX = (theme: Theme) => ({
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
   fontSize: theme.typography.button.fontSize,
-  height: `${theme.typography.button.lineHeight}em`,
+  lineHeight: theme.typography.button.lineHeight,
+  height: '1lh',
 })
-
-/* THE MENU'S MARK — three sliders as a 16px inline `<svg>` (`currentColor`, `aria-hidden`): no Unicode glyph
-   renders consistently and there is no icon package. SLIDERS, NOT A FUNNEL: the menu also changes how the
-   board is DRAWN. One mark for every consumer, not a prop. */
-function SlidersIcon() {
-  return (
-    <Icon size={16} testId="toolbar-menu-glyph" sx={{ display: 'block' }}>
-      {/* Knobs at different positions read as settings, not a list; 2px bars match the focus arcs beside it. */}
-      <Box
-        component="path"
-        d="M2 4h12M2 8h12M2 12h12"
-        sx={{ fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round' }}
-      />
-      <Box component="circle" cx="5.5" cy="4" r="2" sx={{ fill: 'currentColor' }} />
-      <Box component="circle" cx="10.5" cy="8" r="2" sx={{ fill: 'currentColor' }} />
-      <Box component="circle" cx="6.5" cy="12" r="2" sx={{ fill: 'currentColor' }} />
-    </Icon>
-  )
-}
 
 /* ── THE PANEL ───────────────────────────────────────────────────────────────────────────────────── */
 
-/* ONE SIZE at every level, and a constant, not a prop: 268px fits `/tasks`'s widest value rows and lands the period pills three-then-two. Per-page sizing would resize under the cursor.
-   AT PHONE WIDTH A DEFINITE WIDTH (`100vw - 32px`), not a cap: an auto-width popover clamps into the viewport
+/* ONE SIZE at every level, and a constant, not a prop: 267px fits `/tasks`'s widest value rows and lands the period pills three-then-two. Per-page sizing would resize under the cursor.
+   AT PHONE WIDTH A DEFINITE WIDTH (`100vw - 33px`), not a cap: an auto-width popover clamps into the viewport
    from its own measurement and ends flush against the edge. `marginThreshold` is the other half.
    `gap: 0`, no padding: rows own spacing so their rules run full width. */
 const PANEL_SX = {
   display: 'flex',
   flexDirection: 'column',
-  width: 268,
-  maxWidth: 'calc(100vw - 32px)',
-  [PHONE]: { width: 'calc(100vw - 32px)' },
+  width: grid(44.5),
+  maxWidth: `calc(100vw - ${grid(5.5)})`,
+  [PHONE]: { width: `calc(100vw - ${grid(5.5)})` },
 } as const
 
 /* MUI's default 16px, spelled because it pairs with the panel's phone width above. */
@@ -114,14 +99,14 @@ const PANEL_HEADER_SX = {
   gap: 1,
   px: 1.5,
   py: 1,
-  minHeight: 44,
+  minHeight: SIZE.tapTarget,
   borderBottom: '1px solid',
   borderColor: 'divider',
 } as const
 
 const PANEL_TITLE_SX = {
   typography: 'subtitle2',
-  fontWeight: 700,
+  fontWeight: FONT_WEIGHT.bold,
   color: 'text.primary',
   flex: 1,
   minWidth: 0,
@@ -137,7 +122,7 @@ const PANEL_CLEAR_SX = {
   color: 'text.secondary',
   flex: '0 0 auto',
   '&:hover': { color: 'text.primary' },
-  [PHONE]: { minHeight: 44, display: 'inline-flex', alignItems: 'center' },
+  [PHONE]: { minHeight: SIZE.tapTarget, display: 'inline-flex', alignItems: 'center' },
 } as const
 
 /* THE BACK ARROW: a real `<button>`, 44px floor, a chevron (the title beside it names the page); its
@@ -145,67 +130,65 @@ const PANEL_CLEAR_SX = {
 const PANEL_BACK_SX = {
   appearance: 'none',
   m: 0,
-  p: 0,
-  border: 0,
-  background: 'none',
-  cursor: 'pointer',
+  ...UNSTYLED_BUTTON_SX,
   color: 'text.secondary',
-  font: 'inherit',
-  fontSize: 18,
-  lineHeight: 1,
+  fontSize: grid(3),
+  lineHeight: LINE_HEIGHT.tight,
   display: 'inline-flex',
   alignItems: 'center',
   justifyContent: 'center',
-  width: 28,
-  height: 28,
-  borderRadius: 1,
+  width: SIZE.avatar,
+  height: SIZE.avatar,
+  borderRadius: RADIUS.sm,
   flex: '0 0 auto',
   '&:hover': { color: 'text.primary', bgcolor: 'action.hover' },
   '&:focus-visible': { outline: '2px solid', outlineColor: 'text.primary', outlineOffset: 1 },
-  [PHONE]: { width: 44, height: 44 },
+  [PHONE]: { width: SIZE.tapTarget, height: SIZE.tapTarget },
 } as const
 
 /* ── LEVEL ONE: THE VALUE ROWS ───────────────────────────────────────────────────────────────────── */
 
-/* NAME left, CURRENT VALUE right, a chevron for the page behind. A real `<button>` (one tab stop, announces
-   its value, opens on Enter), so the UA button styling is reset. 40px desktop, 44px phone. */
-const ROW_SX = {
+/* A full-width `<button>` row of the panel (a value row, an option): the UA button styling reset, 44px on a phone. */
+const ROW_BUTTON_SX = {
   appearance: 'none',
   m: 0,
   border: 0,
-  borderBottom: '1px solid',
-  borderColor: 'divider',
   background: 'none',
   cursor: 'pointer',
   font: 'inherit',
   typography: 'body2',
-  color: 'text.secondary',
   display: 'flex',
   alignItems: 'center',
   gap: 1,
   textAlign: 'left',
   width: '100%',
   px: 1.5,
-  minHeight: 40,
-  '&:last-of-type': { borderBottom: 0 },
   '&:hover': { bgcolor: 'action.hover' },
   '&:focus-visible': { outline: '2px solid', outlineColor: 'text.primary', outlineOffset: -2 },
-  [PHONE]: { minHeight: 44 },
+  [PHONE]: { minHeight: SIZE.tapTarget },
+} as const
+
+/* NAME left, CURRENT VALUE right, a chevron for the page behind. A real `<button>` (one tab stop, announces
+   its value, opens on Enter), so the UA button styling is reset. 39px desktop, 44px phone. */
+const ROW_SX = {
+  minHeight: grid(6.5), // before the base, whose phone floor must follow it
+  ...ROW_BUTTON_SX,
+  borderBottom: '1px solid',
+  borderColor: 'divider',
+  color: 'text.secondary',
+  '&:last-of-type': { borderBottom: 0 },
 } as const
 
 /* The loudest thing on the row: the answers are why the panel opens on a list. Truncates (a two-line row
    breaks the constant height); the row's `title` has it in full. */
 const ROW_VALUE_SX = {
   ml: 'auto',
-  minWidth: 0,
-  fontWeight: 600,
+  ...ELLIPSIS_SX,
+  fontWeight: FONT_WEIGHT.semibold,
   color: 'text.primary',
-  overflow: 'hidden',
-  textOverflow: 'ellipsis',
-  whiteSpace: 'nowrap',
 } as const
 
-const ROW_CHEVRON_SX = { flex: '0 0 auto', color: 'text.disabled', fontSize: 16, lineHeight: 1 } as const
+const ROW_CHEVRON_SX = { flex: '0 0 auto', color: 'text.disabled', fontSize: SIZE.iconSm, lineHeight: LINE_HEIGHT.tight } as const
 
 /* THE ROW THAT IS NOT A DOOR — a two-state setting's control on the row itself (`/tasks`'s Hidden switch).
    A `<label>`, so the whole 44px ROW toggles the implicitly associated input. Not a `<button>` (a nested input
@@ -220,13 +203,13 @@ const TOGGLE_ROW_SX = {
   color: 'text.primary',
   cursor: 'pointer',
   px: 1.5,
-  minHeight: 40,
+  minHeight: grid(6.5),
   borderTop: '1px solid',
   borderColor: 'divider',
   '&:hover': { bgcolor: 'action.hover' },
   /* The inner control carries the ring; the label must not add a second. */
   '&:focus-visible': { outline: 'none' },
-  [PHONE]: { minHeight: 44 },
+  [PHONE]: { minHeight: SIZE.tapTarget },
 } as const
 
 /* ── LEVEL TWO: ONE SETTING'S PAGE, AND THE KIT ITS BODIES ARE DRAWN WITH ────────────────────────── */
@@ -241,59 +224,41 @@ export const PAGE_BODY_SX = { display: 'flex', flexDirection: 'column', py: 0.5 
 
 /* A LIST-SHAPED PAGE SCROLLS rather than growing the panel (the header is not sticky, so a tall panel carries
    the back arrow off screen). UNCONDITIONAL in `RadioPage`/`CheckboxPage`: a page cannot be trusted to know
-   it will grow data-driven. ONE CONSTANT for all pages. */
+   it will grow data-driven. ONE CONSTANT for all pages, tall enough for eight options (the task board's State
+   page: Any + seven states) to show whole with no scroll — at the phone's 44px rows too, so 360px. */
 const PAGE_LIST_SX = {
   display: 'flex',
   flexDirection: 'column',
-  maxHeight: 264,
+  maxHeight: grid(60),
   overflowY: 'auto',
 } as const
 
 /* The TICK column is reserved (left) so labels line up. Same 44px floor. */
-const OPTION_SX = {
-  appearance: 'none',
-  m: 0,
-  border: 0,
-  background: 'none',
-  cursor: 'pointer',
-  font: 'inherit',
-  typography: 'body2',
-  color: 'text.primary',
-  display: 'flex',
-  alignItems: 'center',
-  gap: 1,
-  textAlign: 'left',
-  width: '100%',
-  px: 1.5,
-  minHeight: 36,
-  '&:hover': { bgcolor: 'action.hover' },
-  '&:focus-visible': { outline: '2px solid', outlineColor: 'text.primary', outlineOffset: -2 },
-  [PHONE]: { minHeight: 44 },
-} as const
+const OPTION_SX = { minHeight: grid(6), ...ROW_BUTTON_SX, color: 'text.primary' } as const
 
 /* The tick. THE BOX RESERVES THE COLUMN, NOT THE MARK: `✓` or nothing is a conditional at the render sites,
    keeping the glyph out of option text that specs assert on. `aria-hidden` there: `aria-checked` is what AT
    reads. */
 const OPTION_TICK_SX = {
   flex: '0 0 auto',
-  width: 14,
+  width: SIZE.iconXs,
   color: 'primary.main',
-  fontSize: 13,
-  lineHeight: 1,
+  fontSize: grid(2),
+  lineHeight: LINE_HEIGHT.tight,
 } as const
 
-const OPTION_LABEL_SX = { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } as const
+const OPTION_LABEL_SX = ELLIPSIS_SX
 
-/* The label's own box, so a leading mark (`/tasks`'s creator disc) binds to the name with a 6px gap. ALWAYS
+/* The label's own box, so a leading mark (`/tasks`'s assignee disc) binds to the name with a 3px gap. ALWAYS
    RENDERED, keeping `CheckboxPage` one shape; with no mark the truncation boundary is unchanged. Not exported. */
 const OPTION_LABEL_ROW_SX = {
   display: 'flex',
   alignItems: 'center',
-  gap: 0.75,
+  gap: 0.5,
   minWidth: 0,
 } as const
 
-/* Small print at the row's end (a period's day count, a creator's task count). */
+/* Small print at the row's end (a period's day count, an assignee's task count). */
 const OPTION_META_SX = { ml: 'auto', flex: '0 0 auto', color: 'text.secondary', typography: 'caption' } as const
 
 /* The one help text the panel PRINTS — only where a tooltip cannot work (`/tasks`'s period summary). */
@@ -303,15 +268,16 @@ export const PAGE_CAPTION_SX = { typography: 'caption', color: 'text.secondary',
    `/worktrees`'s Search and `/tasks`'s two date inputs).
    THE HEIGHT LIVES ON THE INPUT ROOT (the `InputBase`), not the `FormControl` wrapper, AND THE INPUT'S OWN
    PADDING IS RESTATED: a `minHeight` alone either centres a 40px input in a 44px box or, on a native date
-   input, shrinks it to three dots with oracles green. 8.5 + 1.4375em (23px) + 8.5 = 40, so (44 − 23) / 2 = 10.5.
+   input, shrinks it to three dots with oracles green. 8.5 + 1.4375em (23px) + 8.5 = 40; restated as
+   9px (`1.5`) over 12px (`2`) around the 23px line, the input itself is 44px, the tap floor.
    `PHONE`, NOT `TAP_FLOOR_DOWN`: every control in this panel floors at 480px (the theme's `sm` floor is
    `MuiIconButton`'s alone), and `/tasks`'s date inputs already used this boundary.
    `theme.custom?` with the number restated (as `listStyles.ts`'s `tapTargetSx`): `custom` is absent under
    MUI's stock theme in tests. */
 export const PAGE_FIELD_SX = (theme: Theme) => ({
   m: 0,
-  '& .MuiInputBase-root': { [PHONE]: { minHeight: theme.custom?.tapTargetPx ?? 44 } },
-  '& .MuiInputBase-input': { [PHONE]: { pt: '10.5px', pb: '10.5px' } },
+  '& .MuiInputBase-root': { [PHONE]: { minHeight: theme.custom?.tapTargetPx ?? SIZE.tapTarget } },
+  '& .MuiInputBase-input': { [PHONE]: { pt: 1.5, pb: 2 } },
 })
 
 /* ONE TAB STOP PER GROUP, entered at the checked option — the roving tabindex `radiogroup` promises. A
@@ -387,7 +353,7 @@ type ToolbarMenuRow = {
   id: string
   label: string
   hint?: string
-  /* Usually a `Switch`, and it OWES ITS OWN ACCESSIBLE NAME: the row's word alone rarely tells the whole story. */
+  /* Usually a `ui/SettingCheckbox` (`labelHidden`), and it OWES ITS OWN ACCESSIBLE NAME: the row's word alone rarely tells the whole story. */
   control: ReactNode
 }
 
@@ -417,7 +383,7 @@ type ToolbarMenuRadioOption<V> = {
 type ToolbarMenuCheckboxOption<V> = {
   value: V
   label: string
-  /* A mark before the word, inside `OPTION_LABEL_ROW_SX` (`/tasks`'s creator disc, `aria-hidden` at source). */
+  /* A mark before the word, inside `OPTION_LABEL_ROW_SX` (`/tasks`'s assignee disc, `aria-hidden` at source). */
   icon?: ReactNode
   /** Row-end small print. See `OPTION_META_SX`. */
   meta?: string
@@ -460,9 +426,8 @@ export function RadioPage<V extends string | null>({
         const checked = value === option.value
         const optionTestId = option.testId ?? `${testId}-${option.value ?? 'any'}`
         return (
-          <Box
+          <Tip key={optionTestId} title={option.hint || undefined}><Box
             /* The resolved testid is also the key: unique by construction and stable across re-orders. */
-            key={optionTestId}
             component="button"
             type="button"
             role="radio"
@@ -472,13 +437,12 @@ export function RadioPage<V extends string | null>({
               onPick(option.value)
               nav.pick()
             }}
-            title={option.hint || undefined}
             data-testid={optionTestId}
             sx={OPTION_SX}
           >
             <Box component="span" aria-hidden="true" sx={OPTION_TICK_SX}>{checked ? '✓' : ''}</Box>
             <Box component="span" sx={OPTION_LABEL_SX}>{option.label}</Box>
-          </Box>
+          </Box></Tip>
         )
       })}
     </Box>
@@ -492,23 +456,50 @@ export function filterRadioPage(
   testId: string, id: string, label: string, allLabel: string, vocabulary: { value: string; label: string }[],
   value: string, onPick: (value: string) => void,
 ): ToolbarMenuItem {
-  const options = withUnmatched(vocabulary, value)
+  const options = withUnmatched(vocabulary, value).map(o => ({ ...o, hint: '' }))
+  return radioItem({
+    id, label, testId, value, onPick,
+    options: [{ value: '', label: allLabel, hint: '', testId: `${testId}-any` }, ...options],
+  })
+}
+
+/* ONE BUILDER PER PAGE SHAPE, so a setting is a line of data, not a restated `render`. */
+
+/** A single-select setting: the row shows `shown`, else the picked option's word (the first option is the off
+ *  state). `groupLabel` names the radiogroup where the row's word is too short for it. */
+export function radioItem<V extends string | null>({ id, label, shown, closeOnPick, groupLabel, ...body }: {
+  id: string
+  label: string
+  testId: string
+  options: ToolbarMenuRadioOption<V>[]
+  value: V
+  onPick: (next: V) => void
+  shown?: string
+  closeOnPick?: boolean
+  groupLabel?: string
+}): ToolbarMenuItem {
   return {
     kind: 'page',
     id,
     label,
-    value: options.find(o => o.value === value)?.label ?? allLabel,
-    render: nav => (
-      <RadioPage
-        testId={testId}
-        label={label}
-        options={[{ value: '', label: allLabel, hint: '', testId: `${testId}-any` }, ...options.map(o => ({ ...o, hint: '' }))]}
-        value={value}
-        onPick={onPick}
-        nav={nav}
-      />
-    ),
+    closeOnPick,
+    value: shown ?? body.options.find(o => o.value === body.value)?.label ?? body.options[0].label,
+    render: nav => <RadioPage label={groupLabel ?? label} {...body} nav={nav} />,
   }
+}
+
+/** A multi-select setting: `value` is the row's word, the caller's (a name, a count). */
+export function checkItem<V extends string>({ id, label, value, ...body }: {
+  id: string
+  label: string
+  value: string
+  testId: string
+  options: ToolbarMenuCheckboxOption<V>[]
+  values: readonly V[]
+  onToggle: (value: V) => void
+  emptyNote?: string
+}): ToolbarMenuItem {
+  return { kind: 'page', id, label, value, render: () => <CheckboxPage label={label} {...body} /> }
 }
 
 /* THE MULTI-SELECT TWIN: `role="group"` with checkbox rows, no `nav` (staying put is the difference).
@@ -527,7 +518,7 @@ export function CheckboxPage<V extends string>({
   values: readonly V[]
   onToggle: (value: V) => void
   /* The empty page's sentence, in the CALLER'S words (a generic one would print one vocabulary everywhere).
-     Omitted: renders nothing (`/tasks`'s Creator page before the roster answers). */
+     Omitted: renders nothing (`/tasks`'s Assignee page before the roster answers). */
   emptyNote?: string
 }) {
   return (
@@ -677,7 +668,7 @@ export default function ToolbarMenu({
   const pages = items.filter((item): item is ToolbarMenuPage => item.kind === 'page')
   const page = pageId === null ? undefined : pages.find(candidate => candidate.id === pageId)
   /* …AND THE STATE FOLLOWS THE RENDER: `pageId` must be cleared when its item disappears, or the page JUMPS
-     BACK open when the item returns (e.g. `/tasks`'s Creator row reappearing over SSE) with focus stranded.
+     BACK open when the item returns (e.g. `/tasks`'s Assignee row reappearing over SSE) with focus stranded.
      ONLY WHILE OPEN: on close `pageId` stays until the exit transition ends (`onExited`), so the fading panel
      does not swap to level one. */
   useEffect(() => {
@@ -705,7 +696,7 @@ export default function ToolbarMenu({
       if (!panelRef.current?.contains(document.activeElement)) backRef.current?.focus()
     } else if (previousPage.current !== null) {
       /* THE REMEMBERED ROW CAN BE GONE: the press that finished a page can stop the caller offering it (e.g.
-         `/tasks` with a creator picked on an emptied roster, where the row exists on the PICK alone). Then
+         `/tasks` with an assignee picked on an emptied roster, where the row exists on the PICK alone). Then
          the FIRST ROW STILL STANDING takes focus (as `clear()` does) — somewhere INSIDE the panel, which Escape-to-close needs.
          Resolved via `pages`, not `rowRefs`' keys (which hold stale nulls in mount order). */
       const remembered = rowRefs.current[previousPage.current]
@@ -743,7 +734,7 @@ export default function ToolbarMenu({
            with the field's own height source; in a button cluster the line is the buttons', so nothing changes. */
         sx={{ alignSelf: 'stretch', [PHONE]: { flex: '0 0 auto' } }}
       >
-        <Button
+        <Tip title={hint}><Button
           variant="outlined"
           color="inherit"
           onClick={e => {
@@ -755,18 +746,18 @@ export default function ToolbarMenu({
           aria-label={
             badgeCount === 0
               ? `${name} options`
-              : `${name} options (${badgeCount} filter${badgeCount === 1 ? '' : 's'} on)`
+              : `${name} options (${countOf(badgeCount, 'filter')} on)`
           }
           aria-haspopup="dialog"
           aria-expanded={anchor !== null}
-          title={hint}
           data-testid="toolbar-menu"
           sx={GLYPH_BUTTON_SX}
         >
           <Box component="span" sx={GLYPH_BOX_SX}>
-            <SlidersIcon />
+            {/* THE MENU'S MARK (`ui/icons`): one mark for every consumer, not a prop. */}
+            <SlidersIcon size={SIZE.iconSm} testId="toolbar-menu-glyph" sx={{ display: 'block' }} />
           </Box>
-        </Button>
+        </Button></Tip>
       </Badge>
 
       <Popover
@@ -820,18 +811,14 @@ export default function ToolbarMenu({
                   {heading}
                 </Box>
                 {onClear && badgeCount > 0 && (
-                  <Link
-                    component="button"
-                    type="button"
+                  <LinkButton
                     underline="hover"
                     onClick={clear}
-                    /* One sentence for every menu, not a prop: Clear discharges exactly what the badge counts. */
-                    title="Turn every active filter off"
                     data-testid="toolbar-menu-clear"
                     sx={PANEL_CLEAR_SX}
                   >
                     Clear
-                  </Link>
+                  </LinkButton>
                 )}
               </Box>
 
@@ -839,12 +826,10 @@ export default function ToolbarMenu({
                   its switch last). Each row's `title` is its help line. */}
               {items.map(item =>
                 item.kind === 'page' ? (
-                  <Box
-                    key={item.id}
+                  <Tip key={item.id} title={item.hint}><Box
                     component="button"
                     type="button"
                     onClick={() => setPageId(item.id)}
-                    title={item.hint}
                     /* The name carries the current value and that pressing opens a page. */
                     aria-label={`${item.label}: ${valueName(item)}. Press to change.`}
                     data-testid={`toolbar-menu-row-${item.id}`}
@@ -854,19 +839,17 @@ export default function ToolbarMenu({
                     <Box component="span">{item.label}</Box>
                     <Box component="span" sx={ROW_VALUE_SX}>{item.value}</Box>
                     <Box component="span" aria-hidden="true" sx={ROW_CHEVRON_SX}>›</Box>
-                  </Box>
+                  </Box></Tip>
                 ) : (
-                  <Box
-                    key={item.id}
+                  <Tip key={item.id} title={item.hint}><Box
                     component="label"
                     sx={TOGGLE_ROW_SX}
-                    title={item.hint}
                     data-testid={`toolbar-menu-row-${item.id}`}
                   >
                     {/* The word takes the spare width, ranging the control at the far end without caller `ml: 'auto'`. */}
                     <Box component="span" sx={{ flex: 1, minWidth: 0 }}>{item.label}</Box>
                     {item.control}
-                  </Box>
+                  </Box></Tip>
                 ),
               )}
             </>

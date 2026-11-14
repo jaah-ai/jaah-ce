@@ -3,6 +3,7 @@ import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import { obfuscatePlugin } from './obfuscate'
 import { consoleCspPlugin, isLiveHost } from './devCsp'
+import { chunkImportPlugin } from './chunkImportPlugin'
 
 // Dev-server fallbacks track this repo's port grid (block 2 → API 8020 / FRONTEND 3020).
 // In a worktree, override via VITE_API_PROXY_TARGET / VITE_HMR_CLIENT_PORT (the pool-banded ports).
@@ -148,6 +149,8 @@ export default defineConfig({
     consoleCspPlugin(),
     // Opt-in, build-only; the deploy workflow sets it for the `main` image alone (obfuscate.ts).
     obfuscatePlugin(process.env.WEB_OBFUSCATE === '1'),
+    // A chunk import stuck on a dead connection is fetched again under a one-off address (chunkImportPlugin.ts).
+    chunkImportPlugin(LIVE_RECOVERY_ENTRY),
   ],
   // Two pages: the console (`index.html`) and, where the tree carries it, the Live Cast viewer (`live.html`,
   // `src/live/main.tsx`), which nginx serves on the live host alone. Shared modules split into common chunks, so the
@@ -193,7 +196,23 @@ export default defineConfig({
       '/api/console-relay': { target: relayTarget, changeOrigin: true, ws: true },
       '/api/console-stream': { target: relayTarget, changeOrigin: true, ws: true },
       // ws: true kept for the API's remaining WebSocket (/api/node-bus).
-      '/api': { target: apiTarget, changeOrigin: true, ws: true },
+      /* An API that cannot be reached answers 502, as the ALB, CloudFront and nginx do, not Vite's default 500, so
+         the console's outage notice (`src/net/reachability.ts`) reads a stopped local API the way it reads a deployed
+         one. Runs before Vite's own error listener (registered after `configure`), which then sees the headers sent. */
+      '/api': {
+        target: apiTarget,
+        changeOrigin: true,
+        ws: true,
+        configure: proxy => {
+          proxy.on('error', (_err, _req, res) => {
+            if (res && 'writeHead' in res && !res.headersSent && !res.writableEnded) {
+              res.writeHead(502, { 'Content-Type': 'text/plain' }).end('Bad Gateway')
+            }
+          })
+        },
+      },
+      // RFC 9116's security.txt: the API renders it (`app/legal_pages.py`), as nginx and the edge route it.
+      '/.well-known/security.txt': { target: apiTarget, changeOrigin: true },
       /* THE PRESIGNED-UPLOAD PATH IN LOCAL DEV, and every clause here is
          load-bearing — do not "simplify" this entry away.
          MinIO publishes no host port in the local stack, so there is no absolute URL the browser could

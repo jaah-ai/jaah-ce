@@ -1,0 +1,506 @@
+# The real-time event catalog — the single home of what the event stream (`GET /api/stream`) can send.
+#
+# `tools/event_catalog.py --write` renders `apps/docs/content/real-time/event-stream/event-catalog.md`
+# from this file; `apps/api/test_event_catalog.py` (quick gate) fails when an `emit_console_event` call
+# site in `apps/api/app` names an entity or action missing here, when an entity or action here is emitted
+# nowhere, or when the committed page differs from a fresh render.
+#
+# `verified`: the day this catalog was last checked against the code; the page's `last_verified`.
+#
+# [[entity]]
+#   name     — the wire `entity` string.
+#   title    — the section heading on the page.
+#   audience — who receives it (mirrors `_may_see` in apps/api/app/routes/stream.py):
+#              `members`    — any member who may see that row (the same rule as reading it);
+#              `own-org`    — every member of the org it happened in;
+#              `org-admins` — the organization's owners and admins;
+#              `operator`   — the Jaah operator only. Kept here for the drift check, never rendered.
+#   id       — what the wire `id` carries for this entity, in reader terms.
+#   summary  — one sentence: what changed.
+#   example_id — the `id` in the page's example event: an integer for an integer id (task, command), a
+#              uuid string for a uuid id, `0` where the id is always `0`. Required unless `operator`.
+#   [[entity.action]] name, when — the wire `action` string and when it fires, in user terms. Optional
+#     `audience = "operator"` when the relay never delivers this action to a tenant (it is then not
+#     rendered), with an optional `note` the page shows instead, telling the reader what to do.
+#
+# [[dynamic]] — a call site whose `action` is not a string literal. One entry per (file, entity) covers
+#   every such site in that file. `source` is a dotted importable name whose value is the set (or the
+#   single string) of actions it can carry; `values` lists them instead when no constant holds them, or
+#   the extra actions beside `source` (with `reason`). Every value must also appear as an action of that
+#   entity above.
+
+verified = 2026-11-13
+
+[[entity]]
+name = "task"
+title = "Tasks"
+audience = "members"
+id = "The task's id — the number in its console address (`/tasks/{id}`)."
+summary = "A task, epic or chat changed."
+example_id = 4916
+
+  [[entity.action]]
+  name = "created"
+  when = "A task, epic or chat was created — by a person, a schedule or an agent."
+
+  [[entity.action]]
+  name = "updated"
+  when = "A task's fields were edited (title, body, settings)."
+
+  [[entity.action]]
+  name = "deleted"
+  when = "A task was deleted."
+  audience = "operator"
+  note = "The task is gone before access is checked. Refetch the list to notice a removal."
+
+  [[entity.action]]
+  name = "titled"
+  when = "Jaah generated a title for the task."
+
+  [[entity.action]]
+  name = "tagged"
+  when = "The task's tags changed."
+
+  [[entity.action]]
+  name = "rated"
+  when = "Someone rated the task's result."
+
+  [[entity.action]]
+  name = "outcome_judged"
+  when = "An Owner or Admin confirmed, dismissed or added a defect link, so the task's outcome may have changed."
+
+  [[entity.action]]
+  name = "metered"
+  when = "A running task's usage and cost figures were updated."
+
+  [[entity.action]]
+  name = "prioritized"
+  when = "The task's priority changed."
+
+  [[entity.action]]
+  name = "dependency_added"
+  when = "The task was made to wait on another task."
+
+  [[entity.action]]
+  name = "dependency_removed"
+  when = "A dependency was removed from the task."
+
+  [[entity.action]]
+  name = "control_message"
+  when = "The control plane queued a message for the task's live runner, or the runner's node typed it in."
+
+  [[entity.action]]
+  name = "stale"
+  when = "A task this one depends on changed, so its result may be out of date."
+
+  [[entity.action]]
+  name = "agent_filing_deduped"
+  when = "The agent working on this task asked to file a task that already exists, so the existing one was kept."
+
+  [[entity.action]]
+  name = "set_state"
+  when = "Someone set the task's state by hand, or a child's new state reactivated its epic."
+
+  [[entity.action]]
+  name = "run"
+  when = "Someone started or restarted the task, or Jaah reopened it to finish its pull request."
+
+  [[entity.action]]
+  name = "stop"
+  when = "Someone stopped the task."
+
+  [[entity.action]]
+  name = "reset"
+  when = "Someone reset the task to run again from the start."
+
+  [[entity.action]]
+  name = "complete"
+  when = "Someone marked the task complete."
+
+  [[entity.action]]
+  name = "draft"
+  when = "The task moved to Draft."
+
+  [[entity.action]]
+  name = "ready"
+  when = "The task moved to Ready — queued to start."
+
+  [[entity.action]]
+  name = "active"
+  when = "The task moved to Active — an agent is working on it."
+
+  [[entity.action]]
+  name = "awaiting_response"
+  when = "The task moved to Awaiting response — it asked a question someone must answer."
+
+  [[entity.action]]
+  name = "paused"
+  when = "The task moved to Paused — its work stopped and is held for a resume."
+
+  [[entity.action]]
+  name = "system_failed"
+  when = "The task moved to Failed — Jaah used up its attempts."
+
+  [[entity.action]]
+  name = "done"
+  when = "The task moved to Done."
+
+[[entity]]
+name = "feature"
+title = "Features"
+audience = "members"
+id = "The feature's id."
+summary = "A feature changed."
+example_id = "0199b3f2-4c1e-7a85-9d2b-6e0f1a7c3b48"
+
+  [[entity.action]]
+  name = "created"
+  when = "A feature was created."
+
+  [[entity.action]]
+  name = "updated"
+  when = "A feature was edited."
+
+  [[entity.action]]
+  name = "deleted"
+  when = "A feature was deleted: hidden, its row kept."
+  audience = "operator"
+  note = "The feature is gone before access is checked. Refetch the list to notice a removal."
+
+[[entity]]
+name = "node"
+title = "Nodes"
+audience = "members"
+id = "The node's id, or `0` when the list of nodes as a whole changed."
+summary = "A node changed: its settings, its health, or the work it reports."
+example_id = "0199a7d0-2e6b-7c14-8f3a-b51d9e04c672"
+
+  [[entity.action]]
+  name = "upserted"
+  when = "A node was added, edited, or reported new state (health, capacity, agent accounts)."
+
+  [[entity.action]]
+  name = "deleted"
+  when = "A node was removed."
+  audience = "operator"
+  note = "The node is gone before access is checked. Refetch the list to notice a removal."
+
+[[entity]]
+name = "node_order"
+title = "Node orders"
+audience = "org-admins"
+id = "The Add-node order's id."
+summary = "An Add-node order moved to its next step, finished, or failed."
+example_id = "0199b410-8a3c-7e29-a6d4-1f72c0b95e3d"
+
+  [[entity.action]]
+  name = "upserted"
+  when = "An order was placed, moved a step, finished, or failed. Fetch the order to read its step."
+
+[[entity]]
+name = "live_cast"
+title = "Live Cast"
+audience = "org-admins"
+id = "The project's id."
+summary = "A project's Live Cast settings, publication or a manual override on one of its tasks changed."
+example_id = 42
+
+  [[entity.action]]
+  name = "updated"
+  when = "The project's Live Cast checkbox, default or rules were saved."
+
+  [[entity.action]]
+  name = "published"
+  when = "The project's Live Cast was published."
+
+  [[entity.action]]
+  name = "unpublished"
+  when = "The project's Live Cast was unpublished."
+
+  [[entity.action]]
+  name = "override"
+  when = "A manual override on one of the project's tasks or attachments was set or cleared."
+
+[[entity]]
+name = "account"
+title = "Agent accounts"
+audience = "members"
+id = "The agent account's id, or `0` when the list of agent accounts as a whole changed."
+summary = "An agent account changed."
+example_id = "0199a812-5f07-7b6e-9c41-d3a08e6f2b17"
+
+  [[entity.action]]
+  name = "upserted"
+  when = "An agent account was added or edited, or its setup on a node finished."
+
+  [[entity.action]]
+  name = "deleted"
+  when = "An agent account was removed."
+  audience = "operator"
+  note = "The account is gone before access is checked. Refetch the list to notice a removal."
+
+[[entity]]
+name = "command"
+title = "Commands"
+audience = "members"
+id = "The command log entry's id. You receive it when you can see the node the command ran on, or when it ran on no node."
+summary = "A command was sent to a node, and the command log has a new entry."
+example_id = 5203
+
+  [[entity.action]]
+  name = "dispatched"
+  when = "The command was sent, but its node did not report back."
+
+  [[entity.action]]
+  name = "done"
+  when = "The node ran the command."
+
+  [[entity.action]]
+  name = "failed"
+  when = "The command failed on its node."
+
+  [[entity.action]]
+  name = "rejected"
+  when = "The node refused to run the command."
+
+[[entity]]
+name = "worktree"
+title = "Worktrees"
+audience = "own-org"
+id = "Always `0`: refetch your worktrees."
+summary = "Some worktree in your organization changed."
+example_id = 0
+
+  [[entity.action]]
+  name = "upserted"
+  when = "A worktree was claimed, released or changed state."
+
+  [[entity.action]]
+  name = "deleted"
+  when = "A worktree was removed."
+
+[[entity]]
+name = "runner"
+title = "Runners"
+audience = "own-org"
+id = "Always `0`: refetch your worktrees and their runners."
+summary = "An agent run started or ended on a worktree in your organization."
+example_id = 0
+
+  [[entity.action]]
+  name = "upserted"
+  when = "A node reported that an agent run started, ended or changed."
+
+[[entity]]
+name = "session"
+title = "Agent sessions"
+audience = "own-org"
+id = "Always `0`: refetch the session list."
+summary = "The list of agent sessions in your organization changed."
+example_id = 0
+
+  [[entity.action]]
+  name = "changed"
+  when = "An agent session started, ended or was deleted."
+
+[[entity]]
+name = "token_wallet"
+title = "Jaah AI balance"
+audience = "own-org"
+id = "Your organization's id."
+summary = "Your organization's Jaah AI balance changed."
+example_id = "01989c55-1b2d-7f40-8e6a-4c93d7a1f025"
+
+  [[entity.action]]
+  name = "changed"
+  when = "Credit was added to or spent from the balance, or its settings changed."
+
+[[entity]]
+name = "cron"
+title = "Schedules"
+audience = "org-admins"
+id = "The schedule's id."
+summary = "An automation schedule changed."
+example_id = "0199b0c4-73e8-7d1a-b2f5-08e64a9c1d3b"
+
+  [[entity.action]]
+  name = "upserted"
+  when = "A schedule was created, edited or moved to another folder."
+
+  [[entity.action]]
+  name = "deleted"
+  when = "A schedule was deleted."
+
+[[entity]]
+name = "node_group"
+title = "Node groups"
+audience = "org-admins"
+id = "The node group's id."
+summary = "A node group changed."
+example_id = "0199ae31-9d4f-7a62-8b07-e5c21f3d6a90"
+
+  [[entity.action]]
+  name = "upserted"
+  when = "A node group was created or edited, or it added or removed nodes."
+
+  [[entity.action]]
+  name = "deleted"
+  when = "A node group was deleted."
+
+[[entity]]
+name = "org"
+title = "Orgs"
+audience = "operator"
+id = "The organization's id."
+summary = "An org was created, edited or deleted."
+
+  [[entity.action]]
+  name = "upserted"
+  when = "An org was created or edited."
+
+  [[entity.action]]
+  name = "deleted"
+  when = "An org was deleted."
+
+# --- non-literal call sites -------------------------------------------------------------------------------
+
+[[entity]]
+name = "pipeline"
+title = "Pipeline"
+audience = "members"
+id = "The project's id."
+summary = "Something moved on a project's pipeline: a task, a merge, a release, a pass, an approval, an archive or a setup save."
+example_id = 42
+
+  [[entity.action]]
+  name = "changed"
+  when = "Anything a pipeline count, list or step shows changed. Fetch the project's pipeline view again."
+
+[[dynamic]]
+file = "routes/tasks/answers.py"
+entity = "task"
+source = "app.task_lifecycle.STATES"
+
+[[dynamic]]
+file = "routes/tasks/checkout_gate.py"
+entity = "task"
+source = "app.task_lifecycle.STATES"
+
+[[dynamic]]
+file = "routes/tasks/awaiting.py"
+entity = "task"
+source = "app.task_lifecycle.STATES"
+
+[[dynamic]]
+file = "routes/tasks/dispatch.py"
+entity = "task"
+source = "app.task_lifecycle.STATES"
+values = ["run"]
+reason = "`_start` also emits the `events` its callers pass: `run` for a Start, a restart or a merge-lane reopen."
+
+[[dynamic]]
+file = "routes/tasks/epic_finish.py"
+entity = "task"
+source = "app.task_lifecycle.STATES"
+
+[[dynamic]]
+file = "routes/tasks/epics.py"
+entity = "task"
+source = "app.task_lifecycle.STATES"
+
+[[dynamic]]
+file = "routes/tasks/runner_settle.py"
+entity = "task"
+source = "app.task_lifecycle.STATES"
+
+[[dynamic]]
+file = "routes/tasks/transitions.py"
+entity = "task"
+source = "app.task_lifecycle.STATES"
+
+[[dynamic]]
+file = "routes/agent/task_reads.py"
+entity = "task"
+source = "app.task_lifecycle.STATES"
+
+[[dynamic]]
+file = "routes/agent/task_terminal.py"
+entity = "task"
+source = "app.task_lifecycle.STATES"
+
+[[dynamic]]
+file = "jaah_routing/pause.py"
+entity = "task"
+source = "app.task_lifecycle.STATES"
+
+[[dynamic]]
+file = "slot_allocation.py"
+entity = "task"
+source = "app.task_lifecycle.STATES"
+
+[[dynamic]]
+file = "routes/commands.py"
+entity = "command"
+values = ["dispatched", "done", "failed", "rejected"]
+reason = "The action is the command's status, written by the API or reported by the node (apps/jaahd/commands.py reply contract)."
+
+# [[webhooks.event]] — the outgoing webhook event catalog (`apps/api/app/webhooks/catalog.py` reads it at import and
+#   validates an endpoint's `event_types` against it; `tools/event_catalog.py` renders it on the Event catalog page).
+#   type        — the wire `type` (the `X-Jaah-Event` header and the body's `type`).
+#   label       — its name in the console.
+#   description — one sentence: when it is sent.
+#   kinds       — the `activity_events.kind` values it is made from; empty for `ping`, which only a test sends.
+
+[[webhooks.event]]
+type = "ping"
+label = "Ping"
+description = "Sent only when you press Send test on an endpoint, to check it receives and verifies deliveries."
+kinds = []
+
+[[webhooks.event]]
+type = "task.created"
+label = "Task created"
+description = "A task was created in a project."
+kinds = ["task:created"]
+
+[[webhooks.event]]
+type = "task.started"
+label = "Task started"
+description = "A task started running on a node."
+kinds = ["task:active"]
+
+[[webhooks.event]]
+type = "task.awaiting_response"
+label = "Task awaiting response"
+description = "A task asked a question and is waiting for an answer."
+kinds = ["task:awaiting_response"]
+
+[[webhooks.event]]
+type = "task.done"
+label = "Task done"
+description = "A task finished."
+kinds = ["task:done"]
+
+[[webhooks.event]]
+type = "task.failed"
+label = "Task failed"
+description = "A task failed and stopped running."
+kinds = ["task:system_failed"]
+
+[[webhooks.event]]
+type = "task.stopped"
+label = "Task stopped"
+description = "Someone stopped a task."
+kinds = ["task:stop"]
+
+[[webhooks.event]]
+type = "pr.opened"
+label = "Pull request opened"
+description = "A task opened a pull request."
+kinds = ["pr:opened"]
+
+[[webhooks.event]]
+type = "pr.merged"
+label = "Pull request merged"
+description = "A pull request a task opened was merged. Pull requests opened outside a task don't fire it."
+kinds = ["pr:merged"]

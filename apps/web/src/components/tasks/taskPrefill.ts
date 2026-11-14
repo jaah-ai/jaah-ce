@@ -5,7 +5,7 @@
 // chat preset), and every value is checked against what the server itself would accept — the persona
 // against the operator-pickable roster (`GET /api/tasks/personas`), the project against `GET /api/projects`.
 // Anything else is dropped SILENTLY: a hand-edited URL degrades to the ordinary blank form, never an error.
-// `?template=<id>` is a gallery card's Customize: the host fetches the template (`GET /api/templates/{id}`) and the
+// `?template=<id>` is a gallery row's Customize: the host fetches the template (`GET /api/templates/{id}`) and the
 // whole seed comes from it — description, persona, involvement and model — and no project (a template belongs to
 // none): the form takes the scope's project, else leaves it for the author to pick (`TaskEditForm`'s `ownProjectId`). Its persona is the server's (validated as creatable when the
 // template was saved), not the picker roster's: an epic template seeds the epic depth.
@@ -47,6 +47,11 @@ export type TaskPrefill = {
    *  so this line IS the seeded title. */
   body?: string
   template?: TemplateSeed
+  /** The Involvement the form opens on (`true` = unattended); the late create defaults do not replace it. */
+  autonomous?: boolean
+  /** Files copied from the seed's source (a support ticket), staged as a duplicate's are: inline images keyed by
+   *  the body's `attachment:<token>`, the rest as attached files. Uploaded on Save. */
+  staged?: { inlineImages: ReadonlyMap<string, File>; files: readonly File[] }
 }
 
 /** `null` when the URL names neither, so an ordinary `/tasks/new` never waits on a seed. */

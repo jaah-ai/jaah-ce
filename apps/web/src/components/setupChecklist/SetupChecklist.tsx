@@ -1,12 +1,16 @@
-import { useId, useRef, useState, type JSX, type ReactNode } from 'react'
+import { useEffect, useId, useRef, useState, type JSX, type ReactNode } from 'react'
 import { Link as RouterLink } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import ButtonBase from '@mui/material/ButtonBase'
 import Collapse from '@mui/material/Collapse'
 import Link from '@mui/material/Link'
+import type { Theme } from '@mui/material/styles'
+import type { SystemStyleObject } from '@mui/system'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
 import { tapTargetSx } from '../../ui/listStyles'
+import StackedBar from '../../ui/StackedBar'
+import { FONT_WEIGHT, LINE_HEIGHT, RADIUS, SIZE, grid } from '../../theme'
 
 /* THE CHECKLIST BODY both onboarding guides draw: the user's "Get started" (`onboarding/getStartedGuide.ts`)
  * and the org's "Set up your company" (`onboarding/companySetupGuide.tsx`). Presentation only — each guide
@@ -59,12 +63,12 @@ const NOTE_SX = {
   color: 'text.secondary',
   flex: '0 1 auto',
   px: 1,
-  py: 0.25,
+  py: 0,
   border: 1,
   borderColor: 'divider',
-  borderRadius: '10px',
+  borderRadius: RADIUS.md,
   bgcolor: 'action.hover',
-  lineHeight: 1.4,
+  lineHeight: LINE_HEIGHT.snug,
   textAlign: 'right',
   overflowWrap: 'anywhere',
 } as const
@@ -87,7 +91,7 @@ export function nextStepId(steps: readonly SetupChecklistStep[]): string | null 
 
 /**
  * The state glyph. SVG, not ✓/○ (rule single-homed in `ChatGlyph.tsx`): it must track the palette in both
- * themes. Sized in `em`.
+ * themes. A list-row icon.
  * CARRIES THE STATE IN WORDS via `role="img"` + name — colour and weight are invisible to assistive tech
  * (WCAG 1.4.1, 1.3.1). In place rather than an sr-only sibling (`SR_ONLY_SX` needs a positioned
  * ancestor). The meter stays `aria-hidden`; "N of M" already speaks it.
@@ -104,7 +108,7 @@ function StepGlyph({ status, testIdPrefix }: { status: SetupChecklistStatus; tes
       data-testid={
         done ? `${testIdPrefix}-step-done` : status === 'todo' ? `${testIdPrefix}-step-todo` : `${testIdPrefix}-step-${status}`
       }
-      sx={{ width: '1.15em', height: '1.15em', display: 'block', flex: '0 0 auto' }}
+      sx={{ width: SIZE.iconSm, height: SIZE.iconSm, display: 'block', flex: '0 0 auto' }}
     >
       {done && (
         <>
@@ -171,24 +175,16 @@ function ProgressMeter({
   testIdPrefix: string
 }): JSX.Element {
   return (
-    <Box
-      aria-hidden="true"
-      data-testid={`${testIdPrefix}-progress`}
-      sx={{ display: 'flex', gap: 0.5, mb: 1.25 }}
-    >
-      {Array.from({ length: total }, (_, i) => (
-        <Box
-          key={i}
-          sx={{
-            flex: 1,
-            height: 4,
-            borderRadius: 2,
-            bgcolor: i < done ? 'success.main' : 'divider',
-            transition: theme => theme.transitions.create('background-color'),
-          }}
-        />
-      ))}
-    </Box>
+    <StackedBar
+      testId={`${testIdPrefix}-progress`}
+      gap={0.5}
+      segments={Array.from({ length: total }, (_, i) => ({
+        key: String(i),
+        value: 1,
+        fill: theme => (i < done ? theme.vars.palette.success.main : theme.vars.palette.divider),
+      }))}
+      sx={{ height: grid(0.5), mb: 1 }}
+    />
   )
 }
 
@@ -241,6 +237,28 @@ export function useChecklistDismiss(onDismiss: () => Promise<boolean>): {
   }
 }
 
+/** A row's link to its step's page — the label (`labelLinks`) or the trailing destination; `sx` is the caller's
+ *  extra over the shared tap target. */
+function StepLink({ step, testIdPrefix, sx, children }: {
+  step: SetupChecklistStep
+  testIdPrefix: string
+  sx: SystemStyleObject<Theme>
+  children: ReactNode
+}): JSX.Element {
+  return (
+    <Link
+      component={RouterLink}
+      to={step.to}
+      data-testid={`${testIdPrefix}-link-${step.id}`}
+      variant="body2"
+      underline="hover"
+      sx={theme => ({ ...tapTargetSx(theme), display: 'inline-flex', alignItems: 'center', ...sx })}
+    >
+      {children}
+    </Link>
+  )
+}
+
 export function SetupChecklist({
   testIdPrefix,
   steps,
@@ -264,6 +282,13 @@ export function SetupChecklist({
   /* One open panel at a time (a step's `expand`). */
   const [openId, setOpenId] = useState<string | null>(null)
   const panelIdBase = useId()
+  /* A panel whose step just finished closes: its job is done (a finished row may keep its panel, to change it). */
+  const openStepDone = steps.find(step => step.id === openId)?.done ?? false
+  const wasDone = useRef({ id: openId, done: openStepDone })
+  useEffect(() => {
+    if (openStepDone && wasDone.current.id === openId && !wasDone.current.done) setOpenId(null)
+    wasDone.current = { id: openId, done: openStepDone }
+  }, [openId, openStepDone])
 
   const { done: doneCount } = checklistProgress(steps)
   const nextId = highlightNext ? nextStepId(steps) : null
@@ -280,13 +305,13 @@ export function SetupChecklist({
           role="status"
           color="error"
           data-testid={`${testIdPrefix}-dismiss-failed`}
-          sx={{ display: 'block', mb: 0.75 }}
+          sx={{ display: 'block', mb: 0.5 }}
         >
           Could not save that — try again.
         </Typography>
       )}
       <ProgressMeter total={steps.length} done={doneCount} testIdPrefix={testIdPrefix} />
-      <Stack component="ul" spacing={0.75} sx={{ listStyle: 'none', m: 0, p: 0 }}>
+      <Stack component="ul" spacing={0.5} sx={{ listStyle: 'none', m: 0, p: 0 }}>
         {steps.map(step => {
           const { done } = step
           const status = statusOf(step)
@@ -315,10 +340,10 @@ export function SetupChecklist({
                         gap: 1,
                         minWidth: 0,
                         /* Every row carries the same inset, so the highlight moves no text. */
-                        mx: -0.75,
-                        px: 0.75,
+                        mx: -0.5,
+                        px: 0.5,
                         py: 0.5,
-                        borderRadius: 1,
+                        borderRadius: RADIUS.sm,
                         borderLeft: 3,
                         borderColor: isNext ? 'primary.main' : 'transparent',
                         bgcolor: isNext ? 'action.hover' : 'transparent',
@@ -338,24 +363,18 @@ export function SetupChecklist({
                     letter per line. */}
                 <Box sx={{ flex: 1, mr: 1 }}>
                   {labelLink ? (
-                    <Link
-                      component={RouterLink}
-                      to={step.to}
-                      data-testid={`${testIdPrefix}-link-${step.id}`}
-                      variant="body2"
-                      underline="hover"
-                      sx={theme => ({
-                        ...tapTargetSx(theme),
-                        display: 'inline-flex',
-                        alignItems: 'center',
+                    <StepLink
+                      step={step}
+                      testIdPrefix={testIdPrefix}
+                      sx={{
                         // A finished row stays a link, quieter: it reads as done, not as a call to act.
                         color: done ? 'text.secondary' : 'primary.main',
                         fontWeight: done ? 400 : 500,
                         overflowWrap: 'break-word',
-                      })}
+                      }}
                     >
                       {step.label}
-                    </Link>
+                    </StepLink>
                   ) : (
                     <Typography
                       variant="body2"
@@ -379,7 +398,7 @@ export function SetupChecklist({
                     </Typography>
                   )}
                 </Box>
-                {/* A finished row keeps NO link — it could only offer an undo. A note stands where a link the
+                {/* A finished row links only when the caller left it a destination. A note stands where a link the
                     viewer cannot use would be: a muted pill, smaller than a link, so it reads as where the step
                     stands, never as a dead link. It may wrap, never truncate. */}
                 {note !== undefined && note !== '' && (
@@ -391,7 +410,7 @@ export function SetupChecklist({
                     {note}
                   </Typography>
                 )}
-                {actionable && step.expand !== undefined && (
+                {(actionable || (done && step.to !== '')) && step.expand !== undefined && (
                   <ButtonBase
                     data-testid={`${testIdPrefix}-link-${step.id}`}
                     aria-expanded={expanded}
@@ -401,51 +420,37 @@ export function SetupChecklist({
                       ...tapTargetSx(theme),
                       ...theme.typography.body2,
                       flex: '0 0 auto',
-                      fontWeight: 500,
+                      fontWeight: FONT_WEIGHT.medium,
                       color: 'primary.main',
-                      gap: 0.25,
+                      gap: 0,
                       '&:hover': { textDecoration: 'underline' },
                     })}
                   >
                     {step.cta}
-                    <Box component="span" aria-hidden="true" sx={{ fontSize: '1em', lineHeight: 1 }}>
+                    <Box component="span" aria-hidden="true" sx={{ fontSize: 'inherit', lineHeight: LINE_HEIGHT.tight }}>
                       {expanded ? '▴' : '▾'}
                     </Box>
                   </ButtonBase>
                 )}
                 {actionable && step.expand === undefined && !labelLink && (
-                  <Link
-                    component={RouterLink}
-                    to={step.to}
-                    data-testid={`${testIdPrefix}-link-${step.id}`}
-                    variant="body2"
-                    underline="hover"
-                    sx={theme => ({
-                      ...tapTargetSx(theme),
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: 0.25,
-                      flex: '0 0 auto',
-                      fontWeight: 500,
-                    })}
-                  >
+                  <StepLink step={step} testIdPrefix={testIdPrefix} sx={{ gap: 0, flex: '0 0 auto', fontWeight: FONT_WEIGHT.medium }}>
                     {step.cta}
-                    {/* Full size, baseline-nudged: at 0.85em it read as a stray artifact. */}
+                    {/* Full size: at 0.85em it read as a stray artifact. */}
                     <Box
                       component="span"
                       aria-hidden="true"
-                      sx={{ fontSize: '1em', lineHeight: 1, position: 'relative', top: '0.05em' }}
+                      sx={{ fontSize: 'inherit', lineHeight: LINE_HEIGHT.tight }}
                     >
                       →
                     </Box>
-                  </Link>
+                  </StepLink>
                 )}
               </Box>
               {/* The region stays mounted, so the toggle's `aria-controls` always names an element; its content
                   mounts only once opened (a panel may fetch). */}
               {step.expand !== undefined && (
                 <Collapse in={expanded}>
-                  <Box id={panelId} sx={{ pt: 0.75, pb: 0.5, pl: highlightNext ? 0 : 3 }}>
+                  <Box id={panelId} sx={{ pt: 0.5, pb: 0.5, pl: highlightNext ? 0 : 3 }}>
                     {expanded && step.expand}
                   </Box>
                 </Collapse>

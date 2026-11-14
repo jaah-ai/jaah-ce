@@ -1,0 +1,42 @@
+slug = "apollo"
+label = "Apollo.io"
+category = "crm"
+vendor_docs_url = "https://docs.apollo.io/reference/authentication"
+summary = "Search Apollo.io's people and company database, enrich leads and manage contacts and sequences."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "In Apollo, open Settings > Integrations > API Keys, select Create new key, name it Jaah, tick the endpoints agents need or turn on Set as master key, select Create API key and copy the key" },
+]
+
+[test]
+path = "https://api.apollo.io/api/v1/auth/health"
+auth = { field = "api_key", header = "x-api-key" }
+require_true = ["is_logged_in"]
+
+[docs]
+agent_uses = [
+  "Search Apollo's database for people by title, seniority, company or location, and for companies by industry or size",
+  "Enrich a person or company from an email address or domain",
+  "Create and update contacts and accounts in your Apollo workspace",
+  "Add contacts to sequences and read sequence and email activity",
+]
+prerequisites = [
+  "An Apollo.io account on a plan that includes API access, and permission to create API keys (admins by default)",
+  "Enough Apollo credits for enrichment: each enrichment that returns an email or phone number spends credits",
+]
+limitations = [
+  "A key works only on the endpoints ticked when it was created; a master key reaches every endpoint, including user lists and sequence management",
+  "People search, enrichment and phone reveals spend your Apollo credits like they do in the app",
+  "Apollo rate-limits each key per minute, hour and day according to your plan",
+]
+troubleshooting = [
+  { symptom = "Test says Apollo.io rejected the API key (401) or did not accept it", fix = "The key was deleted or mistyped. Create a new key under Settings > Integrations > API Keys and select Replace on the secret" },
+  { symptom = "Test passes but an agent gets 403 on a call", fix = "The key was not created with that endpoint ticked. Create a new key with the endpoint ticked (or as a master key) and replace the secret" },
+  { symptom = "An agent gets 422 'insufficient credits'", fix = "Your workspace has used its credits for the billing period. Add credits in Apollo under Settings > Plans & Billing" },
+]
+faq = [
+  { q = "Does Test spend credits", a = "No. Test calls Apollo's auth health check, which reads nothing and spends no credits" },
+  { q = "Should I use a master key", a = "Only if agents need user lists or sequence management. A key limited to the endpoints you use is safer" },
+]

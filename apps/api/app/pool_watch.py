@@ -1,73 +1,65 @@
-"""The app pool's saturation watch: the one "this task is wedged" signal, and the thread dump that names
-the holders.
+"""The pool's saturation watch: the one "this task is wedged" signal, and the thread dump that names the holders.
 
-WHY. On 2026-10-14 the main control plane stalled twice: on one of its two tasks every pooled
-connection was checked out and idle in transaction for minutes while the database and the CPU sat idle, every
-request timed out at the ALB, and `/api/health` (async, no DB — `app/main.py`) stayed green, so ECS kept the
-wedged task until an operator stopped it. Nothing recorded which threads held the connections: `py-spy record`
-(`app/cpu_profile.py`) drops idle threads, so the CPU profile cannot show a blocked holder.
+THE POOL. The control plane has one connection pool per process: the async engine's (`app/db_async.py`, built on
+the serving loop by `db_async.start()` in `app/main.py::_lifespan` before this watch starts; lane `async`). Every
+request, cron body, bridged sync session and DBOS step draws on it. Its `WatchedAsyncQueuePool` counts each
+timed-out checkout here (`app/db.py::WatchedPoolMixin`). Before the pool is built — or in a process where it is
+sized 0 — the watch reads zeros, which are never saturated.
 
-WHAT IT MEASURES. A lifespan actor samples `app.db.engine.pool` every `SAMPLE_SECONDS`: the pool is SATURATED
-while `checkedout >= pool_size + max_overflow` (every connection the environment allows is out —
+WHY. When every pooled connection is checked out and none comes back, every request times out at the ALB while
+`/api/health` (async, no DB — `app/main.py`) would stay green, so ECS would keep a wedged task until an operator
+stopped it. And the CPU profile (`app/cpu_profile.py`) charges only threads that used CPU, so it cannot show a
+blocked holder; a thread dump can.
+
+WHAT IT MEASURES. A lifespan actor samples the pool every `SAMPLE_SECONDS`: the pool is SATURATED while
+`checkedout >= pool_size + max_overflow` (every connection the environment allows is out —
 `app/config.py::db_pool_sizes`), and WEDGED while it is saturated AND no connection came back since the last
 sample (the engine's `checkin` events, counted here). A flood turns connections over and is saturated but never
-wedged; the stall held every connection and returned none. `saturated_for()` / `wedged_for()` are how long
-each has been continuously true, 0.0 otherwise. A momentary full pool (a deploy's overlap, a console poll
-wave) is normal and clears within seconds; the stalls lasted a minute and five.
+wedged; a stall holds every connection and returns none. `saturated_for()` / `wedged_for()` are how long each has
+been continuously true, 0.0 otherwise. A momentary full pool (a deploy's overlap, a console poll wave) is normal
+and clears within seconds.
 
 WHAT IT DOES WITH IT.
  - `wedged()`: wedged for `HEALTH_FAIL_AFTER_SECONDS` or longer. `GET /api/health` answers 503 then, so the
-   ALB's probes (5s x 3 misses) take the task out and ECS replaces
-   it, as it would a crash. The verdict is a memory read; the probe never touches the pool. Saturation alone
-   never fails the probe: a request flood must stay slow, not become a fleet-wide restart.
+   ALB's probes (5s x 3 misses) take the task out and ECS replaces it, as it would a crash. The verdict is a
+   memory read; the probe never touches the pool. Saturation alone never fails the probe: a request flood must
+   stay slow, not become a fleet-wide restart.
  - `starved()`: saturated for `STARVED_AFTER_SECONDS` or longer while, over the last `STARVED_WINDOW_SECONDS`,
-   at least `STARVED_MIN_TIMEOUTS` checkouts TIMED OUT and more timed out than connections came back
-   (`app/db.py::WatchedQueuePool` counts each timeout). The second stall shape (main, 2026-10-17):
-   requests held one connection and waited for a second, each gave up after `pool_timeout` and handed its
-   connection back, so a connection came back every few seconds and `wedged()` never held while the pool
-   stayed full and failed hundreds of checkouts a minute for seven minutes. A busy pool that turns over and
-   times out the odd checkout (an `asyncio.to_thread` or DBOS burst outside the request threadpool's bound)
-   serves far more than it fails, so it is never starved: one task's 503 must not push its peer over too.
+   at least `STARVED_MIN_TIMEOUTS` checkouts TIMED OUT and more timed out than connections came back. The other
+   stall shape: holders each wait for a second connection, give up after `pool_timeout` and hand theirs back, so
+   a connection comes back every few seconds and `wedged()` never holds while the pool stays full and fails
+   hundreds of checkouts a minute. A busy pool that turns over and times out the odd checkout serves far more
+   than it fails, so it is never starved: one task's 503 must not push its peer over too.
    `unhealthy()` (wedged or starved) is what `/api/health` answers.
+ - Every sample that saw new timeouts logs one `pool watch: the async pool is starving` line.
  - The backstop, on ECS only (`ECS_CONTAINER_METADATA_URI_V4`, set by the ECS agent — never a test run or a
    local stack): unhealthy for `EXIT_AFTER_SECONDS` without the ALB having replaced the task (a probe that
    cannot reach it, a target group that never acts), the process dumps every thread in-process and exits, so
    ECS starts a fresh task as it would after a crash.
  - After `DUMP_AFTER_SECONDS` of saturation, and then at most once per `DUMP_INTERVAL_SECONDS` whatever the
-   episodes, `py-spy dump --pid <self>` is logged line by line under logger `app.pool_dump` (every thread,
-   idle ones included: that is the holders' stacks; never `--locals`, so a frame is a function and a line,
-   no values), after one JSON header line with the pool's numbers:
+   episodes, every Python thread's stack is logged line by line under logger `app.pool_dump`
+   (`dump_threads_in_process`: idle threads included, since that is the holders' stacks; a frame is a file, a
+   line and a function, never a value), after one JSON header line with the pool's numbers:
 
-     {"pool_dump": "start", "pid": 7, "checkedout": 30, "capacity": 30, "saturated_for": 6.2, "wedged_for": 6.2}
+     {"pool_dump": "start", "pid": 7, "lane": "async", "checkedout": 30, "capacity": 30, "saturated_for": 6.2, "wedged_for": 6.2}
 
    Query it (CloudWatch Logs Insights, the control plane's `/ecs/<name>-cp` group):
      filter @message like /pool_dump|^Thread |^    / | sort @timestamp asc
 
 OFF-SWITCH: none; a failure here is a log line, never a crash — the one deliberate exit is the backstop above.
-The dump prefers the py-spy binary (`apps/api/requirements.txt`; native frames too); where it cannot attach — on
-main a child process may not ptrace its parent, so every py-spy dump there failed `Permission Denied` — the
-same stacks are taken in-process (`sys._current_frames`, Python frames only, still never locals).
+The dump is taken in-process (`sys._current_frames`, Python frames only): py-spy cannot read the free-threaded
+CPython the api runs (`app/cpu_profile.py` says why).
 
-THE OTHER LANES. The control plane draws on three pools (`app/db.py`): the request pool above, the identity
-pool (auth and node-token reads) and the background pool (lease-drain, crons, `asyncio.to_thread`). Each is a
-`WatchedQueuePool` naming its lane, so every timed-out checkout is counted under its lane, and the sampler
-watches each lane with its own tracker: a sample that saw new timeouts logs one `pool watch: the <lane> pool
-is starving` line, and a lane saturated past `DUMP_AFTER_SECONDS` gets the same thread dump, its header naming
-the lane. Only the request lane's verdict answers `/api/health` and arms the backstop; a starved identity pool
-fails every cookie request with a 500 and a starved background pool stalls dispatch, which the health probe
-must not turn into a fleet-wide restart.
+THE METRICS. Once every `METRICS_INTERVAL_SECONDS` the sampler writes one Embedded Metric Format line
+(`app/metrics_emf.py::pool_line`, dimension `Lane=async`: the interval's peak checked-out and overflow figures,
+its timeouts, the median cost of `release_route_connection`'s round trips, and the sessions that had to open on
+`app/db.py::offline_engine` while the loop served) when `METRICS_NAMESPACE` is set, so CloudWatch can alarm on
+the pool. Per process: each control-plane task writes its own, and an alarm reads their `Maximum`/`Sum`.
 
-THE LANE METRICS. Once every `METRICS_INTERVAL_SECONDS` the sampler writes one Embedded Metric Format line per
-lane (`app/metrics_emf.py::pool_lines`: the peak checked-out and overflow figures and the timeouts of the
-interval, dimension `Lane`; the request lane's also carries the median cost of `release_after_endpoint`'s
-round trips) when `METRICS_NAMESPACE` is set, so CloudWatch can alarm on a lane. Per process:
-each control-plane task writes its own, and an alarm reads their `Maximum`.
-
-THE THREAD LIMIT lives here too (`apply_thread_limit`): AnyIO's request threadpool is sized to the pool's
-capacity (`app/config.py::request_thread_limit`), so no more sync handlers run at once than there are
-connections for them. With more threads than connections, a saturated pool parked the surplus threads for
-`pool_timeout` on every request; with the bound, a request past capacity waits for a thread instead, holding
-nothing.
+THE THREADS live here too. `apply_thread_limit` sizes AnyIO's default threadpool to `API_THREAD_LIMIT`
+(`app/config.py::request_thread_limit`, default 200): it runs sync dependencies (`current_principal`) and
+`run_in_threadpool` callers, whose sessions reach the pool through the bridge, so a thread does not stand for a
+connection. `apply_to_thread_lane` sizes and names the loop's default executor for `asyncio.to_thread`.
 """
 from __future__ import annotations
 
@@ -77,11 +69,9 @@ import contextlib
 import json
 import logging
 import os
-import shutil
 import statistics
 import sys
 import threading
-import functools
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -90,6 +80,7 @@ from typing import Optional
 import anyio
 
 from app.config import request_thread_limit
+from app.metrics_emf import POOL_LANE
 
 SAMPLE_SECONDS = 1.0
 #: A dump this soon after saturation begins still catches the holders of a short stall.
@@ -98,13 +89,11 @@ DUMP_AFTER_SECONDS = 5.0
 DUMP_INTERVAL_SECONDS = 60.0
 #: Twice the ALB's time to declare a target unhealthy (3 x 5s), so only a stall, never a burst, fails the probe.
 HEALTH_FAIL_AFTER_SECONDS = 30.0
-#: `py-spy dump` of a 40-thread process takes well under a second; this bounds a hung ptrace.
-DUMP_TIMEOUT_SECONDS = 20.0
 #: Twice `HEALTH_FAIL_AFTER_SECONDS`: a pool full AND failing more checkouts than it serves this long is wedged.
 STARVED_AFTER_SECONDS = 60.0
 #: The window timeouts and checkins are counted over.
 STARVED_WINDOW_SECONDS = 60.0
-#: Fewer timeouts than this in the window is noise, whatever the turnover (the incident ran 300+ a minute).
+#: Fewer timeouts than this in the window is noise, whatever the turnover (a real stall runs 300+ a minute).
 STARVED_MIN_TIMEOUTS = 10
 #: Set by the ECS agent in every task; the backstop's exit is armed only where it is.
 ECS_MARKER_ENV = "ECS_CONTAINER_METADATA_URI_V4"
@@ -112,13 +101,13 @@ ECS_MARKER_ENV = "ECS_CONTAINER_METADATA_URI_V4"
 EXIT_AFTER_SECONDS = 90.0
 #: The process's exit status when the backstop fires (EX_SOFTWARE), told apart from a crash in ECS's stop reason.
 EXIT_STATUS = 70
-#: How often each lane's figures are written as EMF (`app/metrics_emf.py::pool_lines`): CloudWatch's finest
+#: How often the pool's figures are written as EMF (`app/metrics_emf.py::pool_line`): CloudWatch's finest
 #: standard resolution.
 METRICS_INTERVAL_SECONDS = 60.0
 
-#: The connection lanes (`app/db.py`); `WatchedQueuePool.lane` names one of them.
-REQUEST, IDENTITY, BACKGROUND = "request", "identity", "background"
-LANES = (REQUEST, IDENTITY, BACKGROUND)
+#: The pool's lane (`app/db.py::WatchedPoolMixin.lane`): the EMF `Lane` dimension value and the dump header's
+#: `lane`, a contract with the monitoring terraform and its dashboards (`app/metrics_emf.py::POOL_LANE`).
+ASYNC = POOL_LANE
 
 dump_log = logging.getLogger("app.pool_dump")
 dump_log.setLevel(logging.INFO)
@@ -203,13 +192,8 @@ class SaturationTracker:
         return self.wedged_for(now) >= HEALTH_FAIL_AFTER_SECONDS or self.starved(now)
 
 
+#: The pool's tracker: what the lifespan watcher writes and the health verdicts read.
 _tracker = SaturationTracker()
-#: The other lanes' trackers; the request lane's is `_tracker`, which the health verdicts read.
-_lane_trackers = {IDENTITY: SaturationTracker(), BACKGROUND: SaturationTracker()}
-
-
-def tracker_for(lane: str) -> SaturationTracker:
-    return _tracker if lane == REQUEST else _lane_trackers[lane]
 
 
 def _now() -> float:
@@ -217,42 +201,63 @@ def _now() -> float:
     return time.monotonic()
 
 
-_checkins = dict.fromkeys(LANES, 0)
+class _Counter:
+    """A running count. Connections come back from the loop and from bridged threads at once, and on free-threaded
+    CPython a bare `+=` from two of them loses increments (there is no GIL to keep the read-modify-write whole)."""
+
+    def __init__(self) -> None:
+        self.value = 0
+        self._lock = threading.Lock()
+
+    def add(self) -> None:
+        with self._lock:
+            self.value += 1
 
 
-def _checkin_counter(lane: str):
-    def count(*_args) -> None:
-        """Engine `checkin` listener: one more connection returned to the lane's pool. A bare increment is enough
-        for a counter one sampler reads once a second (the GIL keeps it whole)."""
-        _checkins[lane] += 1
-
-    return count
+_checkins = _Counter()
 
 
-#: One listener per lane, built once so `event.contains` recognises it.
-_CHECKIN_LISTENERS = {lane: _checkin_counter(lane) for lane in LANES}
+def _count_checkin(*_args) -> None:
+    """Engine `checkin` listener: one more connection returned to the pool."""
+    _checkins.add()
 
 
-def lane_engine(lane: str):
-    """The engine behind a lane (`app/db.py`)."""
-    from app import db
+def _pool_engine():  # type: ignore[no-untyped-def]
+    """The pool's sync engine (`db_async.pooled_engine().sync_engine`) with the checkin counter on it, or None
+    while the pool is not built (before the lifespan's `db_async.start()`, or sized 0). Listens on whichever engine
+    is current, so a pool built after the watch started, or rebuilt, is still counted. The app's own pool arrives
+    already counted (`db_async._build_pooled` wires it before publishing), so this listen only fires for an engine
+    built elsewhere (a test's own pool)."""
+    from sqlalchemy import event
 
-    return {REQUEST: db.engine, IDENTITY: db.identity_engine, BACKGROUND: db.background_engine}[lane]
+    from app import db_async
+
+    pooled = db_async.pooled_engine()
+    if pooled is None:
+        return None
+    engine = pooled.sync_engine
+    if not event.contains(engine, "checkin", _count_checkin):
+        event.listen(engine, "checkin", _count_checkin)
+    return engine
 
 
-def pool_numbers(lane: str = REQUEST) -> tuple[int, int, int]:
-    """`(checkedout, capacity, checkins)` of a lane's pool. Capacity is the environment's ceiling
-    (`pool_size + max_overflow`); a pool class without overflow counts as its size. `checkins` is the running
-    count of connections returned since the listener was installed (`start_pool_watch`)."""
-    pool = lane_engine(lane).pool
+def pool_numbers() -> tuple[int, int, int]:
+    """`(checkedout, capacity, checkins)` of the pool. Capacity is the environment's ceiling
+    (`pool_size + max_overflow`). `checkins` is the running count of connections returned since the listener was
+    installed. `(0, 0, checkins)` while the pool is not built: capacity 0 is never saturated."""
+    engine = _pool_engine()
+    if engine is None:
+        return 0, 0, _checkins.value
+    pool = engine.pool
     capacity = pool.size() + max(0, int(getattr(pool, "_max_overflow", 0)))
-    return pool.checkedout(), capacity, _checkins[lane]
+    return pool.checkedout(), capacity, _checkins.value
 
 
-def overflow_in_use(lane: str = REQUEST) -> int:
-    """Connections a lane's pool has open beyond its `pool_size` right now (QueuePool's `overflow()` counts up
-    from `-pool_size`)."""
-    return max(0, int(lane_engine(lane).pool.overflow()))
+def overflow_in_use() -> int:
+    """Connections the pool has open beyond its `pool_size` right now (QueuePool's `overflow()` counts up from
+    `-pool_size`); 0 while the pool is not built."""
+    engine = _pool_engine()
+    return 0 if engine is None else max(0, int(engine.pool.overflow()))
 
 
 def saturated_for() -> float:
@@ -280,56 +285,21 @@ def unhealthy() -> bool:
     return wedged() or starved()
 
 
-def count_checkout_timeout(lane: str = REQUEST) -> None:
-    """One checkout of a lane's pool timed out (`app/db.py::WatchedQueuePool`, once per checkout). A lane this
-    module does not know is ignored: it runs inside the pool's own `TimeoutError`, which must reach the caller."""
-    tracker = _tracker if lane == REQUEST else _lane_trackers.get(lane)
-    if tracker is not None:
-        tracker.timed_out(_now())
+def count_checkout_timeout(lane: str = ASYNC) -> None:
+    """One checkout of the pool timed out (`app/db.py::WatchedPoolMixin`, once per checkout). A lane other than
+    `ASYNC` is ignored: this runs inside the pool's own `TimeoutError`, which must reach the caller."""
+    if lane == ASYNC:
+        _tracker.timed_out(_now())
 
 
-#: Never `--locals` (`-l`): with it every frame's variables — request bodies, tokens, SQL parameters — would
-#: land in the log. `test_pool_watch.py` pins this argv.
-DUMP_ARGV = ("dump", "--nonblocking")
-
-
-async def dump_threads(binary: str, *, checkedout: int, capacity: int, saturated: float, wedged: float,
-                       lane: str = REQUEST) -> None:
-    """One `py-spy dump` of this process, logged. Raises on a failed dump."""
-    pid = os.getpid()
-    proc = await asyncio.create_subprocess_exec(
-        binary, *DUMP_ARGV, "--pid", str(pid),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=DUMP_TIMEOUT_SECONDS)
-    except (asyncio.CancelledError, asyncio.TimeoutError):
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        raise
-    if proc.returncode != 0:
-        raise RuntimeError(f"py-spy exited {proc.returncode}: {stderr.decode(errors='replace').strip()[-500:]}")
-    dump_log.info(json.dumps({
-        "pool_dump": "start", "pid": pid, "lane": lane, "checkedout": checkedout, "capacity": capacity,
-        "saturated_for": round(saturated, 1), "wedged_for": round(wedged, 1),
-    }))
-    for line in stdout.decode(errors="replace").splitlines():
-        if line.strip():
-            dump_log.info(line)
-    dump_log.info(json.dumps({"pool_dump": "end", "pid": pid}))
-
-
-def dump_threads_in_process(*, checkedout: int, capacity: int, saturated: float, wedged: float,
-                            lane: str = REQUEST) -> None:
-    """The same dump as `dump_threads`, taken from inside the process: every Python thread's stack by name and
-    id, framed by the same header and footer. Frames only — a file, a line, a function and its source line —
+def dump_threads_in_process(*, checkedout: int, capacity: int, saturated: float, wedged: float) -> None:
+    """The pool dump, taken from inside the process: every Python thread's stack by name and id, framed by a
+    JSON header and footer. Frames only — a file, a line, a function and its source line —
     never a value."""
     pid = os.getpid()
     names = {t.ident: t.name for t in threading.enumerate()}
     dump_log.info(json.dumps({
-        "pool_dump": "start", "pid": pid, "lane": lane, "checkedout": checkedout, "capacity": capacity,
+        "pool_dump": "start", "pid": pid, "lane": ASYNC, "checkedout": checkedout, "capacity": capacity,
         "saturated_for": round(saturated, 1), "wedged_for": round(wedged, 1), "via": "in-process",
     }))
     for ident, frame in sys._current_frames().items():
@@ -344,6 +314,12 @@ def dump_threads_in_process(*, checkedout: int, capacity: int, saturated: float,
 _ON_ECS = object()
 
 
+def _offline_while_serving() -> int:
+    from app import db
+
+    return db.offline_while_serving
+
+
 class PoolWatch:
     """The sampler: one per process in production (`start_pool_watch`), one per test when a test drives it.
     Every dependency is an attribute so a test substitutes its own clock, sleep, pool numbers and dump
@@ -351,35 +327,32 @@ class PoolWatch:
     TestClient runs the lifespan, so one is)."""
 
     def __init__(self, tracker: SaturationTracker, *, sample_seconds: float = SAMPLE_SECONDS, numbers=None,
-                 clock=None, sleep=None, dump=None, which=None, dump_in_process=None, exit=_ON_ECS,
-                 lanes=None, overflow=None, emit=None) -> None:
+                 clock=None, sleep=None, dump_in_process=None, exit=_ON_ECS,
+                 overflow=None, offline=None, emit=None) -> None:
         self.tracker = tracker
         self.sample_seconds = sample_seconds
         self.numbers = numbers or pool_numbers
-        #: The other lanes, `{lane: (tracker, numbers)}`: watched for starvation and dumped, never a health verdict.
-        self.lanes: dict = {lane: (tracker_for(lane), functools.partial(pool_numbers, lane))
-                            for lane in (IDENTITY, BACKGROUND)} if lanes is None else dict(lanes)
-        #: `overflow(lane)`: connections open past the lane's `pool_size` now.
+        #: `overflow()`: connections open past the pool's `pool_size` now.
         self.overflow = overflow or overflow_in_use
-        #: `emit(lines)`: where the lane metrics go; the default writes them to `app.metrics` when a namespace is set.
+        #: `offline()`: the running count of sessions opened on the offline engine while the loop served.
+        self.offline = offline or _offline_while_serving
+        #: `emit(figures)`: where the pool metrics go; the default writes them to `app.metrics` under a namespace.
         self.emit = emit or _emit_pool_metrics
         self.clock = clock or _now
         self.sleep = sleep or asyncio.sleep
-        self.dump = dump or dump_threads
-        self.which = which or shutil.which
         self.dump_in_process = dump_in_process or dump_threads_in_process
         #: None: the backstop only logs. The default exits only on ECS (`ECS_MARKER_ENV`), never a test run or a
         #: local stack; a test passes its own callable, or None.
         self.exit = (os._exit if os.environ.get(ECS_MARKER_ENV) else None) if exit is _ON_ECS else exit
         self.dump_task: Optional[asyncio.Task] = None
         self.unhealthy_since: Optional[float] = None
-        #: Per lane: the timeouts already logged, and the interval's peaks and timeouts for the next metrics line.
-        #: Seeded from the trackers' totals: the module's trackers outlive a watch (a test's lifespan, a restart).
-        totals = {REQUEST: tracker.timeouts_total,
-                  **{lane: lane_tracker.timeouts_total for lane, (lane_tracker, _) in self.lanes.items()}}
-        self.logged_timeouts = {lane: totals.get(lane, 0) for lane in LANES}
-        self.metrics_from = dict(self.logged_timeouts)
-        self.peaks: dict[str, tuple[int, int]] = {}
+        #: The timeouts already logged, and where the next metrics interval's timeouts and offline sessions count
+        #: from. Seeded from the running totals: the module's tracker outlives a watch (a test's lifespan, a restart).
+        self.logged_timeouts = tracker.timeouts_total
+        self.metrics_from = tracker.timeouts_total
+        self.offline_from = self.offline()
+        #: The interval's `(peak checked out, peak overflow)`.
+        self.peak = (0, 0)
         self.metrics_due_at: Optional[float] = None
 
     def _backstop(self, checkedout: int, capacity: int, now: float) -> None:
@@ -413,9 +386,8 @@ class PoolWatch:
 
     async def run(self) -> None:
         """Sample forever. The dump runs as its own task so sampling never pauses behind a slow ptrace (a
-        stale `saturated_since` would otherwise hold a 503 past the pool's recovery). A request pool that cannot
-        be read (a pool class without the counters) ends the watch with one warning, not a traceback a second;
-        another lane that cannot be read leaves the watch, with one warning."""
+        stale `saturated_since` would otherwise hold a 503 past the pool's recovery). A pool that cannot be read
+        (a pool class without the counters) ends the watch with one warning, not a traceback a second."""
         while True:
             await self.sleep(self.sample_seconds)
             try:
@@ -426,88 +398,71 @@ class PoolWatch:
             now = self.clock()
             due = self.tracker.observe(checkedout, capacity, checkins, now)
             self._backstop(checkedout, capacity, now)
-            self._sampled(REQUEST, self.tracker, checkedout, capacity, now)
+            self._sampled(checkedout, capacity, now)
             if due:
-                self._dump_if_free(REQUEST, self.tracker, checkedout, capacity, now)
-            for lane, (tracker, numbers) in list(self.lanes.items()):
-                try:
-                    lane_out, lane_capacity, lane_checkins = numbers()
-                except Exception as exc:  # noqa: BLE001 — see the docstring
-                    log.warning("pool watch: cannot read the %s pool (%s) — not watching it", lane, exc)
-                    del self.lanes[lane]
-                    continue
-                lane_due = tracker.observe(lane_out, lane_capacity, lane_checkins, now)
-                self._sampled(lane, tracker, lane_out, lane_capacity, now)
-                if lane_due:
-                    self._dump_if_free(lane, tracker, lane_out, lane_capacity, now)
+                self._dump_if_free(checkedout, capacity, now)
             self._publish_if_due(now)
 
-    def _sampled(self, lane: str, tracker: SaturationTracker, checkedout: int, capacity: int, now: float) -> None:
-        """Log the lane's checkouts that timed out since the last sample (one line a second at most), and keep the
+    def _sampled(self, checkedout: int, capacity: int, now: float) -> None:
+        """Log the checkouts that timed out since the last sample (one line a second at most), and keep the
         interval's peaks for the metrics line."""
-        new = tracker.timeouts_total - self.logged_timeouts[lane]
-        self.logged_timeouts[lane] = tracker.timeouts_total
+        tracker = self.tracker
+        new = tracker.timeouts_total - self.logged_timeouts
+        self.logged_timeouts = tracker.timeouts_total
         if new > 0:
             log.warning(
                 "pool watch: the %s pool is starving — %d checkout(s) timed out since the last sample, %d in the "
                 "last %.0fs (%d/%d checked out, saturated for %.0fs)",
-                lane, new, len(tracker.timeouts), STARVED_WINDOW_SECONDS, checkedout, capacity,
+                ASYNC, new, len(tracker.timeouts), STARVED_WINDOW_SECONDS, checkedout, capacity,
                 tracker.saturated_for(now),
             )
         try:
-            overflow = self.overflow(lane)
+            overflow = self.overflow()
         except Exception:  # noqa: BLE001 — a figure missing from one metrics line is not worth a traceback a second
             overflow = 0
-        peak_out, peak_overflow = self.peaks.get(lane, (0, 0))
-        self.peaks[lane] = (max(peak_out, checkedout), max(peak_overflow, overflow))
+        self.peak = (max(self.peak[0], checkedout), max(self.peak[1], overflow))
 
-    def _dump_if_free(self, lane: str, tracker: SaturationTracker, checkedout: int, capacity: int, now: float) -> None:
+    def _dump_if_free(self, checkedout: int, capacity: int, now: float) -> None:
         if self.dump_task is not None and not self.dump_task.done():
             return   # the previous dump is still running; `last_dump_at` keeps the cadence
+        tracker = self.tracker
         tracker.dumped(now)   # before the dump: a slow or failing dump must not fire every sample
         log.warning(
             "pool watch: the %s pool has been saturated for %.0fs (%d/%d checked out, wedged for %.0fs) — "
             "dumping every thread's stack under logger app.pool_dump",
-            lane, tracker.saturated_for(now), checkedout, capacity, tracker.wedged_for(now),
+            ASYNC, tracker.saturated_for(now), checkedout, capacity, tracker.wedged_for(now),
         )
         self.dump_task = asyncio.create_task(self._dump_once(
-            lane=lane, checkedout=checkedout, capacity=capacity,
+            checkedout=checkedout, capacity=capacity,
             saturated=tracker.saturated_for(now), wedged=tracker.wedged_for(now),
         ), name="pool-dump")
 
     def _publish_if_due(self, now: float) -> None:
-        """Every `METRICS_INTERVAL_SECONDS`, hand each lane's peaks and timeouts of the interval to `emit`."""
+        """Every `METRICS_INTERVAL_SECONDS`, hand the interval's `(peak checked out, peak overflow, timeouts,
+        offline sessions)` to `emit`."""
         if self.metrics_due_at is None:
             self.metrics_due_at = now + METRICS_INTERVAL_SECONDS
         if now < self.metrics_due_at:
             return
         self.metrics_due_at = now + METRICS_INTERVAL_SECONDS
-        trackers = {REQUEST: self.tracker, **{lane: tracker for lane, (tracker, _) in self.lanes.items()}}
-        figures = {}
-        for lane, tracker in trackers.items():
-            peak_out, peak_overflow = self.peaks.get(lane, (0, 0))
-            figures[lane] = (peak_out, peak_overflow, tracker.timeouts_total - self.metrics_from[lane])
-            self.metrics_from[lane] = tracker.timeouts_total
-        self.peaks.clear()
+        try:
+            offline = self.offline()
+        except Exception:  # noqa: BLE001 — as `_sampled`'s overflow
+            offline = self.offline_from
+        figures = (*self.peak, self.tracker.timeouts_total - self.metrics_from, offline - self.offline_from)
+        self.metrics_from = self.tracker.timeouts_total
+        self.offline_from = offline
+        self.peak = (0, 0)
         try:
             self.emit(figures)
         except Exception:  # noqa: BLE001 — see the module docstring: the watch never takes the api down
-            log.exception("pool watch: writing the lane metrics failed")
+            log.exception("pool watch: writing the pool metrics failed")
 
     async def _dump_once(self, **numbers) -> None:
         try:
-            binary = self.which("py-spy")
-            if binary is None:
-                raise RuntimeError("no py-spy binary on PATH (apps/api/requirements.txt pins it)")
-            await self.dump(binary, **numbers)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 — see the module docstring: the watch never takes the api down
-            log.warning("pool watch: py-spy dump failed (%s) — dumping in-process instead", str(exc)[:300])
-            try:
-                self.dump_in_process(**numbers)
-            except Exception:  # noqa: BLE001 — as above
-                log.exception("pool watch: thread dump failed; next attempt in %.0fs", self.tracker.dump_interval)
+            self.dump_in_process(**numbers)
+        except Exception:  # noqa: BLE001 — see the module docstring: the watch never takes the api down
+            log.exception("pool watch: thread dump failed; next attempt in %.0fs", self.tracker.dump_interval)
 
     async def cancel(self) -> None:
         task = self.dump_task
@@ -518,21 +473,25 @@ class PoolWatch:
 
 
 def apply_thread_limit() -> int:
-    """Size AnyIO's default thread limiter (what `starlette.concurrency.run_in_threadpool` draws on) to
-    `request_thread_limit()`. Must run on the serving loop: the limiter is the running backend's."""
+    """Size AnyIO's default thread limiter (what `starlette.concurrency.run_in_threadpool` and FastAPI's sync
+    dependencies draw on) to `request_thread_limit()`. A thread does not stand for a connection: its sessions
+    reach the async pool through the bridge (`app/db_async.py::sync_bind`). Must run on the serving loop: the
+    limiter is the running backend's."""
     limit = request_thread_limit()
     anyio.to_thread.current_default_thread_limiter().total_tokens = limit
     return limit
 
 
 def apply_to_thread_lane() -> int:
-    """Give the serving loop a default executor whose workers are in the background lane (`app/db.py`), so
-    an `asyncio.to_thread` DB caller — outside the request threadpool's bound — never draws on the request
-    pool. Python's own default size. Must run on the serving loop."""
-    from app.db import background_executor
+    """Give the serving loop a default executor of Python's own default size, sized here once and named, for its
+    `asyncio.to_thread` callers. Their sessions draw on the async pool through the bridge
+    (`app/db_async.py::sync_bind`). Must run on the serving loop."""
+    from concurrent.futures import ThreadPoolExecutor
 
     workers = min(32, (os.cpu_count() or 1) + 4)
-    asyncio.get_running_loop().set_default_executor(background_executor(workers, "to-thread"))
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=workers, thread_name_prefix="to-thread")
+    )
     return workers
 
 
@@ -547,8 +506,9 @@ def take_release_p50_ms() -> Optional[float]:
     return statistics.median(costs) * 1000.0 if costs else None
 
 
-def _emit_pool_metrics(figures: dict[str, tuple[int, int, int]]) -> None:
-    """Write the lanes' figures as EMF lines (`app/metrics_emf.py::pool_lines`); nothing without a namespace."""
+def _emit_pool_metrics(figures: tuple[int, int, int, int]) -> None:
+    """Write the pool's interval figures as one EMF line (`app/metrics_emf.py::pool_line`); nothing without a
+    namespace."""
     from app import metrics_emf
     from app.config import get_settings
 
@@ -556,25 +516,20 @@ def _emit_pool_metrics(figures: dict[str, tuple[int, int, int]]) -> None:
     namespace = get_settings().metrics_namespace
     if not namespace:
         return
-    for event in metrics_emf.pool_lines(namespace, int(time.time() * 1000), figures, release_p50_ms):
-        metrics_emf.emf_log.info(event)
-
-
-def _listen_for_checkins() -> None:
-    from sqlalchemy import event
-
-    for lane in LANES:
-        engine = lane_engine(lane)
-        if not event.contains(engine, "checkin", _CHECKIN_LISTENERS[lane]):
-            event.listen(engine, "checkin", _CHECKIN_LISTENERS[lane])
+    checked_out, overflow, timeouts, offline = figures
+    metrics_emf.emf_log.info(metrics_emf.pool_line(
+        namespace, int(time.time() * 1000), checked_out, overflow, timeouts,
+        release_p50_ms=release_p50_ms, offline_while_serving=offline,
+    ))
 
 
 async def start_pool_watch(app) -> None:
-    """Lifespan startup hook. Mirrors the other actors in `app/main.py::_lifespan`. The watcher's tracker is
-    the module's, so `wedged()` (the health route) reads what this watcher writes."""
-    _listen_for_checkins()
+    """Lifespan startup hook, after `db_async.start()` built the pool (`app/main.py::_lifespan`). Mirrors the other
+    actors there. The watcher's tracker is the module's, so `unhealthy()` (the health route) reads what this
+    watcher writes."""
+    _pool_engine()   # the checkin counter, from the first connection back
     log.info("pool watch: request threadpool bounded to %d threads", apply_thread_limit())
-    log.info("pool watch: asyncio.to_thread runs %d background-lane threads", apply_to_thread_lane())
+    log.info("pool watch: asyncio.to_thread runs %d threads", apply_to_thread_lane())
     watch = PoolWatch(_tracker)
     app.state.pool_watch = watch
     app.state.pool_watch_task = asyncio.create_task(watch.run(), name="pool-watch")

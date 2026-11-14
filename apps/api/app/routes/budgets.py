@@ -23,11 +23,11 @@ from app.actors import actor_names, stamp_actor
 from app.auth import require_user
 from app.authz.catalog import Tenancy
 from app.authz.declarations import org_admin
-from app.db import get_session
+from app.db_async import on_session
 from app.models.access import Budget, Group
 from app.models.identity import AdminUser
 from app.models.projects import Project
-from app.entity_shape import get_or_404, optional_uuid
+from app.entity_shape import commit_row, from_row, get_or_404, optional_uuid, or_404
 
 router = APIRouter(prefix="/api/budgets", tags=["budgets"])
 
@@ -71,10 +71,9 @@ class BudgetIn(BaseModel):
 
 def _out(status: budgets.Status, names: dict[UUID, str]) -> BudgetOut:
     budget = status.budget
-    return BudgetOut(
-        id=budget.id, scope=status.scope, project_id=budget.project_id, group_id=budget.group_id, name=status.name,
-        monthly_usd_micros=budget.monthly_usd_micros, spent_micros=status.spent_micros, percent=status.percent,
-        state=status.state, month=budgets.month_of(), updated_at=budget.updated_at,
+    return from_row(
+        BudgetOut, budget, scope=status.scope, name=status.name, spent_micros=status.spent_micros,
+        percent=status.percent, state=status.state, month=budgets.month_of(),
         updated_by=names.get(budget.updated_by_id),
     )
 
@@ -90,9 +89,7 @@ def _subject(session: Session, scope: str, scope_id: str) -> tuple[UUID, str, in
         project = get_or_404(session, Project, int(scope_id), detail=_NO_PROJECT)
         return project.org_id, project.name, project.id  # type: ignore[return-value]
     group_id = optional_uuid(scope_id)
-    group = session.get(Group, group_id) if group_id is not None else None
-    if group is None:
-        raise HTTPException(status_code=404, detail="unknown group")
+    group = or_404(session.get(Group, group_id) if group_id is not None else None, detail="unknown group")
     return group.org_id, group.name, group.id  # type: ignore[return-value]
 
 
@@ -113,7 +110,8 @@ def _status(session: Session, budget: Budget, name: str) -> BudgetOut:
 
 @router.get("", response_model=BudgetsOut)
 @org_admin(Tenancy.CALLER_PLANE)
-def list_budgets(actor: AdminUser = Depends(require_user), session: Session = Depends(get_session)) -> BudgetsOut:
+@on_session
+def list_budgets(session: Session, actor: AdminUser = Depends(require_user)) -> BudgetsOut:
     """Every budget of the caller's org with this month's spend: projects first, then groups, each by name."""
     plan_terms.require_switch(session, actor.org_id, budgets.SWITCH)  # type: ignore[arg-type]
     statuses = budgets.statuses(session, actor.org_id)  # type: ignore[arg-type]
@@ -123,9 +121,8 @@ def list_budgets(actor: AdminUser = Depends(require_user), session: Session = De
 
 @router.get("/{scope}/{scope_id}", response_model=ScopeBudgetOut)
 @org_admin(Tenancy.CALLER_PLANE)
-def get_budget(
-    scope: Literal["project", "group"], scope_id: str, session: Session = Depends(get_session),
-) -> ScopeBudgetOut:
+@on_session
+def get_budget(session: Session, scope: Literal["project", "group"], scope_id: str) -> ScopeBudgetOut:
     """One project's or group's budget (None = unlimited) and what it spent this month."""
     org_id, name, typed_id = _subject(session, scope, scope_id)
     plan_terms.require_switch(session, org_id, budgets.SWITCH)
@@ -139,9 +136,13 @@ def get_budget(
 
 @router.put("/{scope}/{scope_id}", response_model=BudgetOut)
 @org_admin(Tenancy.CALLER_PLANE)
+@on_session
 def put_budget(
-    scope: Literal["project", "group"], scope_id: str, body: BudgetIn,
-    actor: AdminUser = Depends(require_user), session: Session = Depends(get_session),
+    session: Session,
+    scope: Literal["project", "group"],
+    scope_id: str,
+    body: BudgetIn,
+    actor: AdminUser = Depends(require_user),
 ) -> BudgetOut:
     """Set the monthly budget. A raise past the spend lifts the hold on the next dispatch pass, and re-arms the
     notice of each threshold it is now below (`budgets.stamp_after_raise`)."""
@@ -157,16 +158,14 @@ def put_budget(
         budget.monthly_usd_micros = body.monthly_usd_micros
         budgets.stamp_after_raise(budget, budgets.spent(session, org_id, scope, typed_id))
         stamp_actor(budget, actor)
-    session.commit()
-    session.refresh(budget)
+    commit_row(session, budget)
     return _status(session, budget, name)
 
 
 @router.delete("/{scope}/{scope_id}", status_code=204)
 @org_admin(Tenancy.CALLER_PLANE)
-def delete_budget(
-    scope: Literal["project", "group"], scope_id: str, session: Session = Depends(get_session),
-) -> Response:
+@on_session
+def delete_budget(session: Session, scope: Literal["project", "group"], scope_id: str) -> Response:
     """Remove the budget: the project or group is unlimited again. Removing none is a no-op."""
     org_id, _name, typed_id = _subject(session, scope, scope_id)
     plan_terms.require_switch(session, org_id, budgets.SWITCH)

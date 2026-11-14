@@ -1,30 +1,28 @@
 import type { TaskTree, TaskTreeCounts, TaskTreeFeature, TaskTreeProject } from '../../../types'
-import { locateScope, parseScope, scopeKey, type TaskScope } from '../../../lib/taskScope'
+import { locateScope, scopeKey, type TaskScope } from '../../../lib/taskScope'
 
 /* THE RAIL'S SHAPE, as data — what `TaskTree.tsx` renders, kept pure so the rules are testable without a DOM.
  *
  *   Pinned            (only when something is pinned)
  *   All projects
  *     Project
- *       Feature       (active only, in the project's shared order: `PUT /api/features/order`)
- *       Shipped (n)   (a collapsed group of shipped features)
+ *       Feature       (in the project's shared order: `PUT /api/features/order`)
  *
- * A project's no-feature tasks draw no node of their own: they are the project's, and its row carries them.
+ * A project-level task (one outside every feature) is the project's alone, and the project's row carries it.
  *
  * The rail shows containers, never individual tasks (D-rail). Every node carries its counts; a parent's are the
  * server's roll-up of its children's. THE STOPPED PILL shows each stopped task exactly once on screen
  * (`pillCounts`): a closed branch carries its whole tree's, an open one only what no child row shows, and All
  * projects none. */
 
-export type RailNodeKind = 'all' | 'project' | 'feature' | 'shipped'
+export type RailNodeKind = 'all' | 'project' | 'feature'
 
 export type RailNode = {
-  /** The row's identity: a `scopeKey`, or `shipped:<project id>` for the Shipped group. Also its
-   *  `task_rail_expanded` entry. */
+  /** The row's identity: its scope's `scopeKey`. Also its `task_rail_expanded` entry. */
   key: string
   kind: RailNodeKind
-  /** What selecting the row shows; absent for the Shipped group, which only folds. */
-  scope?: TaskScope
+  /** What selecting the row shows. */
+  scope: TaskScope
   label: string
   /** 1-based, as `aria-level`. */
   level: number
@@ -37,17 +35,12 @@ export type RailNode = {
   feature?: TaskTreeFeature
 }
 
-/** Is this row muted (`lib/taskMute.ts`): its own node, or any row under a muted project? It draws greyed, with
- *  no pill and no ring. */
+/** Is this row hidden (`lib/taskMute.ts`): its own node, or any row under a hidden project? Drawn only while the
+ *  rail shows hidden rows (`visibleRows`' `showHidden`), greyed, with no pill and no ring. */
 export function isMutedNode(node: RailNode): boolean {
   if (node.kind === 'all') return false
   if (node.project?.muted === true) return true
   return node.kind === 'feature' && node.feature?.muted === true
-}
-
-/** The key of a project's Shipped group. */
-export function shippedKey(projectId: number): string {
-  return `shipped:${projectId}`
 }
 
 export const ALL_KEY = 'all'
@@ -56,82 +49,60 @@ export const ALL_KEY = 'all'
 export function keyInTree(key: string, tree: TaskTree): boolean {
   if (key === ALL_KEY) return true
   for (const project of tree.projects) {
-    if (key === `project:${project.id}` || key === shippedKey(project.id)) return true
+    if (key === `project:${project.id}`) return true
     if (project.features.some(f => key === `feature:${f.id}`)) return true
   }
   return false
 }
 
-/** The keys that must be open for `scope`'s own row to show: its project and, for a shipped feature, its
- *  Shipped group. */
+/** The keys that must be open for `scope`'s own row to show: All projects and, for a feature, its project. */
 export function ancestorKeys(scope: TaskScope, tree: TaskTree | undefined): string[] {
-  const { project, feature } = locateScope(scope, tree)
+  const { project } = locateScope(scope, tree)
   if (!project) return []
-  const keys = [ALL_KEY]
-  // A no-feature set is the project's own, and the project's row is the one lit (`railKey`).
-  if (scope.kind === 'project' || scope.kind === 'unfiled') return keys
-  keys.push(`project:${project.id}`)
-  if (feature && feature.status === 'shipped') keys.push(shippedKey(project.id))
-  return keys
-}
-
-/** The row that lights for the board's scope key: its own, except a project's no-feature scope, which has no row —
- *  the project's lights. */
-export function railKey(key: string): string {
-  const scope = parseScope(key)
-  return scope.kind === 'unfiled' ? scopeKey({ kind: 'project', projectId: scope.projectId }) : key
+  if (scope.kind === 'project') return [ALL_KEY]
+  return [ALL_KEY, `project:${project.id}`]
 }
 
 function sumCounts(parts: TaskTreeCounts[]): TaskTreeCounts {
-  const total: TaskTreeCounts = { stopped: 0, questions: 0, failed: 0, paused: 0, waiting: 0, in_progress: 0, queued: 0, draft: 0, done: 0, total: 0 }
+  const total: TaskTreeCounts = { stopped: 0, questions: 0, failed: 0, paused: 0, in_progress: 0, queued: 0, draft: 0, suggested: 0, done: 0, total: 0 }
   for (const c of parts) {
     for (const k of Object.keys(total) as (keyof TaskTreeCounts)[]) total[k] = (total[k] ?? 0) + (c[k] ?? 0)
   }
   return total
 }
 
-/** A project's children, at level 3: active features, then Shipped. */
-function projectChildren(
-  project: TaskTreeProject,
-  parentKey: string,
-  isOpen: (key: string) => boolean,
-  out: RailNode[],
-) {
-  const level = 3
-  for (const feature of project.features) {
-    if (feature.status !== 'active') continue
+/** A project's children, at level 3: its features. */
+function projectChildren(project: TaskTreeProject, parentKey: string, out: RailNode[], showHidden: HiddenRule) {
+  for (const feature of shownFeatures(project, showHidden)) {
     const scope: TaskScope = { kind: 'feature', featureId: feature.id }
     out.push({
-      key: scopeKey(scope), kind: 'feature', scope, label: feature.name, level, counts: feature.counts,
+      key: scopeKey(scope), kind: 'feature', scope, label: feature.name, level: 3, counts: feature.counts,
       expandable: false, expanded: false, parentKey, project, feature,
     })
   }
-  const shipped = project.features.filter(f => f.status === 'shipped')
-  if (shipped.length === 0) return
-  const key = shippedKey(project.id)
-  const open = isOpen(key)
-  out.push({
-    // Without the muted ones' counts, as a project's (`lib/taskMute.ts::applyMutes`).
-    key, kind: 'shipped', label: `Shipped (${shipped.length})`, level, counts: sumCounts(shipped.filter(f => !f.muted).map(f => f.counts)),
-    expandable: true, expanded: open, parentKey, project,
-  })
-  if (!open) return
-  for (const feature of shipped) {
-    const scope: TaskScope = { kind: 'feature', featureId: feature.id }
-    out.push({
-      key: scopeKey(scope), kind: 'feature', scope, label: feature.name, level: level + 1, counts: feature.counts,
-      expandable: false, expanded: false, parentKey: key, project, feature,
-    })
-  }
+}
+
+/** Which hidden rows the rail draws: all of them (the find box's eye), or only `keep`'s — the board's open node
+ *  and its ancestors, so hiding what is open never leaves the board with no lit row. */
+export type HiddenRule = boolean | ReadonlySet<string>
+
+function drawsHidden(rule: HiddenRule, key: string): boolean {
+  return rule === true || (rule !== false && rule.has(key))
+}
+
+/** The project's features the rail draws: the ones not hidden, and hidden ones `rule` keeps. */
+function shownFeatures(project: TaskTreeProject, rule: HiddenRule): TaskTreeFeature[] {
+  return project.features.filter(f => !f.muted || drawsHidden(rule, `feature:${f.id}`))
 }
 
 /** Does the project row fold? Only when it has a feature row to show — never a lone empty wrapper. */
-function hasChildren(project: TaskTreeProject): boolean {
-  return project.features.length > 0
+function hasChildren(project: TaskTreeProject, showHidden: HiddenRule): boolean {
+  return shownFeatures(project, showHidden).length > 0
 }
 
-/** The tree's VISIBLE rows, in order, below All projects (which is always open). */
-export function visibleRows(tree: TaskTree, isOpen: (key: string) => boolean): RailNode[] {
+/** The tree's VISIBLE rows, in order, below All projects (which is always open). A hidden project or feature
+ *  (`lib/taskMute.ts`) has no row unless `showHidden` draws it (`HiddenRule`). */
+export function visibleRows(tree: TaskTree, isOpen: (key: string) => boolean, showHidden: HiddenRule = false): RailNode[] {
   const out: RailNode[] = [{
     key: ALL_KEY, kind: 'all', scope: { kind: 'all' }, label: 'All projects', level: 1, counts: tree.counts,
     expandable: false, expanded: true, parentKey: null,
@@ -139,54 +110,57 @@ export function visibleRows(tree: TaskTree, isOpen: (key: string) => boolean): R
   for (const project of tree.projects) {
     const scope: TaskScope = { kind: 'project', projectId: project.id }
     const key = scopeKey(scope)
-    const expandable = hasChildren(project)
+    if (project.muted && !drawsHidden(showHidden, key)) continue
+    const expandable = hasChildren(project, showHidden)
     const open = expandable && isOpen(key)
     out.push({
       key, kind: 'project', scope, label: project.name, level: 2, counts: project.counts,
       expandable, expanded: open, parentKey: ALL_KEY, project,
     })
-    if (open) projectChildren(project, key, isOpen, out)
+    if (open) projectChildren(project, key, out, showHidden)
   }
   return out
 }
 
-/** One node the tree holds, resolved by key (for the Pinned group). */
-export function nodeForKey(key: string, tree: TaskTree): RailNode | undefined {
+/** One node the tree holds, resolved by key (for the Pinned group); a hidden one only when `showHidden`. */
+export function nodeForKey(key: string, tree: TaskTree, showHidden = false): RailNode | undefined {
   // Every node is reachable with everything open.
-  return visibleRows(tree, () => true).find(n => n.key === key && n.kind !== 'shipped' && n.kind !== 'all')
+  return visibleRows(tree, () => true, showHidden).find(n => n.key === key && n.kind !== 'all')
 }
 
-/** The counts `node`'s Stopped pill shows, or `undefined` for none. All projects: never. A project or the Shipped
- *  group: its whole tree while closed (`asLeaf`: a pinned or matched row, which never opens, counts as closed);
- *  open, only what no child row shows — for a project, its no-feature tasks. A feature: its own. */
+/** The counts `node`'s Stopped pill shows, or `undefined` for none. All projects: never. A project: its whole
+ *  tree while closed (`asLeaf`: a pinned or matched row, which never opens, counts as closed); open, only what no
+ *  feature row shows — its counts without its shown features' (a hidden feature's are already out of them,
+ *  `lib/taskMute.ts::applyMutes`). A feature: its own. */
 export function pillCounts(node: RailNode, asLeaf = false): TaskTreeCounts | undefined {
   switch (node.kind) {
     case 'all':
       return undefined
-    case 'project':
+    case 'project': {
       if (asLeaf || !node.expanded) return node.counts
-      return node.project!.unfiled ?? undefined
-    case 'shipped':
-      return asLeaf || !node.expanded ? node.counts : undefined
+      const shown = sumCounts(node.project!.features.filter(f => !f.muted).map(f => f.counts))
+      const own = { ...node.counts }
+      for (const k of Object.keys(own) as (keyof TaskTreeCounts)[]) own[k] = Math.max(0, (own[k] ?? 0) - (shown[k] ?? 0))
+      return own
+    }
     default:
       return node.counts
   }
 }
 
 /* THE STOPPED MARK: one pill per kind, stacked. The FRONT pill is the most urgent kind present (a question
-   awaiting the operator first, then failed, waiting, paused) and carries that kind's own count; any other kind
+   awaiting the operator first, then failed, paused) and carries that kind's own count; any other kind
    present peeks out behind it as a bare pill in its colour. The noun for every kind is on the stack's title and
    the row's accessible name. The glyph is the task pane's (`pane/stopReason.ts`), never the pill's. */
 export const STOP_KINDS = [
   { field: 'failed', glyph: '!', noun: ['failed', 'failed'], bg: 'error.main', fg: 'error.contrastText' },
   { field: 'questions', glyph: '?', noun: ['question', 'questions'], bg: 'warning.main', fg: 'warning.contrastText' },
-  { field: 'waiting', glyph: '⧗', noun: ['waiting on customer', 'waiting on customer'], bg: 'info.main', fg: 'info.contrastText' },
   { field: 'paused', glyph: '⏸', noun: ['paused', 'paused'], bg: 'grey.600', fg: 'common.white' },
 ] as const
 
 export type StopKind = (typeof STOP_KINDS)[number]
 
-const STACK_ORDER: readonly StopKind['field'][] = ['questions', 'failed', 'waiting', 'paused']
+const STACK_ORDER: readonly StopKind['field'][] = ['questions', 'failed', 'paused']
 
 /** The kinds a node has stopped rows of, front of the stack first; `[]` when none. */
 export function stackedStopKinds(counts: TaskTreeCounts): StopKind[] {
@@ -206,52 +180,51 @@ export function stoppedPhrase(counts: TaskTreeCounts): string {
 }
 
 /* THE FILTER BOX: a client-side, case-insensitive substring match over every container the rail can show —
-   projects and features active or shipped — as a flat list with the
+   projects and features, hidden ones only when `showHidden` — as a flat list with the
    path it sits under. */
 export type RailMatch = { node: RailNode; path: string; start: number }
 
-export function filterTree(tree: TaskTree, term: string): RailMatch[] {
+export function filterTree(tree: TaskTree, term: string, showHidden = false): RailMatch[] {
   const needle = term.trim().toLowerCase()
   if (needle === '') return []
   const out: RailMatch[] = []
-  for (const node of visibleRows(tree, () => true)) {
-    if (node.kind === 'all' || node.kind === 'shipped') continue
+  for (const node of visibleRows(tree, () => true, showHidden)) {
+    if (node.kind === 'all') continue
     const start = node.label.toLowerCase().indexOf(needle)
     if (start < 0) continue
     const path: string[] = []
     if (node.kind !== 'project' && node.project) path.push(node.project.name)
-    if (node.kind === 'feature' && node.feature?.status === 'shipped') path.push('Shipped')
     out.push({ node, path: path.join(' › '), start })
   }
   return out
 }
 
-/* THE FEATURE ORDER: a drag (or Move up / Move down) moves one active feature before or after another of the
-   same project. `PUT /api/features/order` takes the whole active list, so these compute it. */
+/* THE FEATURE ORDER: a drag (or Move up / Move down) moves one feature before or after another of the same
+   project. `PUT /api/features/order` takes the project's whole list, so these compute it. */
 
-/** The project's active feature ids with `featureId` moved to `edge` of `targetId`; `undefined` when nothing
- *  would change (or either is not an active feature of the project). */
+/** The project's feature ids with `featureId` moved to `edge` of `targetId`; `undefined` when nothing would
+ *  change (or either is not a feature of the project). */
 export function reorderedIds(
   tree: TaskTree, projectId: number, featureId: string, targetId: string, edge: 'before' | 'after',
 ): string[] | undefined {
   const project = tree.projects.find(p => p.id === projectId)
   if (!project || featureId === targetId) return undefined
-  const current = project.features.filter(f => f.status === 'active').map(f => f.id)
+  const current = project.features.map(f => f.id)
   if (!current.includes(featureId) || !current.includes(targetId)) return undefined
   const next = current.filter(id => id !== featureId)
   next.splice(next.indexOf(targetId) + (edge === 'after' ? 1 : 0), 0, featureId)
   return next.every((id, i) => id === current[i]) ? undefined : next
 }
 
-/** `tree` with the project's active features in `ids`' order, shipped ones after them as they were. */
+/** `tree` with the project's features in `ids`' order, any `ids` misses after them as they were. */
 export function withFeatureOrder(tree: TaskTree, projectId: number, ids: string[]): TaskTree {
   return {
     ...tree,
     projects: tree.projects.map(p => {
       if (p.id !== projectId) return p
       const byId = new Map(p.features.map(f => [f.id, f]))
-      const active = ids.flatMap(id => byId.get(id) ?? [])
-      return { ...p, features: [...active, ...p.features.filter(f => !ids.includes(f.id))] }
+      const ordered = ids.flatMap(id => byId.get(id) ?? [])
+      return { ...p, features: [...ordered, ...p.features.filter(f => !ids.includes(f.id))] }
     }),
   }
 }

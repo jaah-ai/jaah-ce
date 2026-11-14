@@ -5,7 +5,7 @@ The daemon DIALS the CP and holds one WebSocket carrying: `cmd` (CP->node, reply
 deregister), `heartbeat` (driven by the idle loop — see `send_heartbeat`), `hb_ack` (the CP's verdict
 on whether this socket is routed; `false` re-dials — the only self-heal for open-but-unregistered),
 `console_open` (control step only; PTY bytes ride a dedicated socket, `console.py`), the
-`console_direct_*` family, `vnode.converge`, and `send_intent`.
+`console_direct_*` family, `vnode.converge`, `refresh`, and `send_intent`.
 
 `send_intent` (no reply) carries one entry in `GET /api/agent/pool-tick`'s `intents` shape, parsed by
 the same `reconcile.tick_wire._slot_intent_from_entry`. A latency device only: the `slot_intents` row stays the
@@ -50,6 +50,14 @@ FRAME_VNODE_CONVERGE = "vnode.converge"
 # `app/node_send_intent.py::FRAME_UNINSTALL` — change both or neither. Only drops a marker
 # (`uninstall_request.py`); the root unit acts only once the CP refuses this node's token.
 FRAME_UNINSTALL = "uninstall"
+# CP -> node, NO reply: "something you cache changed — re-read it now". Twin of the CP's
+# `app/node_refresh.py::FRAME_REFRESH` — change both or neither. `topic` names what changed (`accounts`,
+# `memory`); every topic keeps its own slow poll as the durable path, so a dropped frame costs latency only.
+FRAME_REFRESH = "refresh"
+# CP -> node `ping`, answered with `pong` (no reply to that): the CP's own keepalive, since its server sends no
+# WebSocket pings (`apps/api/app/ws_keepalive.py`). Names pinned by the CP's `app/node_bus.py`.
+FRAME_PING = "ping"
+FRAME_PONG = "pong"
 
 WS_PATH = "/api/node-bus"
 
@@ -64,7 +72,7 @@ _RECONNECT_BACKOFF_INITIAL = 1.0
 _RECONNECT_BACKOFF_MAX = 30.0
 
 # Handoff closes — "this replica is standing down, another is coming up": 4504 (the CP's own close,
-# single-homed at `apps/api/app/routes/node_bus.py::_WS_HANDOFF`), 1012 SERVICE_RESTART (uvicorn), 1001
+# single-homed at `apps/api/app/routes/node_bus.py::_WS_HANDOFF`), 1012 SERVICE_RESTART (a server restart), 1001
 # GOING_AWAY. Only a deliberate handoff earns a near-zero retry; 1011, 1006 and transport failures stay
 # on the exponential ladder, as does a 403 (the public listener refuses `/api/node-bus` permanently).
 _HANDOFF_CLOSE_CODE = 4504
@@ -72,6 +80,10 @@ _HANDOFF_CLOSE_CODES = frozenset({_HANDOFF_CLOSE_CODE, 1012, 1001})
 _HANDOFF_RETRY_SECONDS = 0.5
 # Jitter so the fleet does not redial the incoming replica in one burst; redial lands in [0.5s, 1.0s).
 _HANDOFF_RETRY_JITTER_SECONDS = 0.5
+# The refresh a (re)connect owes (`_schedule_reconnect_refresh`): spread over this window, and skipped when the
+# last one was this recent (a re-dial loop, a deploy's double handoff).
+_RECONNECT_REFRESH_JITTER_SECONDS = 10.0
+_RECONNECT_REFRESH_FLOOR_SECONDS = 60.0
 
 
 def _is_handoff_close(exc: BaseException) -> bool:
@@ -116,11 +128,6 @@ def resolve_cp_ws_url() -> str:
     return urlunsplit((scheme, parts.netloc, WS_PATH, "", ""))
 
 
-def _expected_token() -> str:
-    """Read at call time, never pinned at import (see `commands.py::_expected_token`)."""
-    return env_helpers.environ_node_token()
-
-
 class _WsMsg:
     """The message shape `commands._serve_one` uses (`.data`, `await .respond(bytes)`), keeping the
     executor transport-blind."""
@@ -162,6 +169,7 @@ class NodeBusClient:
         on_send_intent: Optional[Callable[[dict], None]] = None,
         on_vnode_converge: Optional[Callable[[], None]] = None,
         on_uninstall: Optional[Callable[[], None]] = None,
+        on_refresh: Optional[Callable[[Optional[str], Optional[int]], None]] = None,
     ) -> None:
         self._node_id = node_id
         # Fired once per (re)connect, right after `hello` (see `_session`).
@@ -179,6 +187,14 @@ class NodeBusClient:
         self._on_vnode_converge = on_vnode_converge
         # `uninstall_request.request_uninstall`: writes one empty marker and returns. None ignores the frame.
         self._on_uninstall = on_uninstall
+        # `main._refresh_topic`: drops a cache and spawns its re-read, never awaits it. Called with the frame's
+        # topic and project, and with (None, None) after a (re)connect — frames sent while the socket was down
+        # never arrived. That one is jittered and at most once per `_RECONNECT_REFRESH_FLOOR_SECONDS`, so a CP
+        # deploy that reconnects the whole fleet does not also make it re-read everything in one burst.
+        self._on_refresh = on_refresh
+        self._reconnect_refresh_at: Optional[float] = None
+        # In-flight `pong` answers, held strongly until each completes (`_read_forever`).
+        self._pong_tasks: set[asyncio.Future] = set()
         # `commands.CommandBridge.deliver` — spawns a task per command, so the read loop never blocks.
         self._deliver_command = deliver_command
         self._cp_ws_url = cp_ws_url
@@ -249,7 +265,7 @@ class NodeBusClient:
         log.info("node-bus: dialling %s as %s", url, self._node_id)
         # Explicit ping settings: a library default change must not lengthen how long a half-open session
         # looks alive. `compression=None`: no permessage-deflate — its stateful context serializes every
-        # frame, and the CP refuses it anyway (`--ws-per-message-deflate false`).
+        # frame, and the CP refuses it anyway (Granian negotiates no permessage-deflate).
         async with connect(
             url,
             open_timeout=CONNECT_TIMEOUT_SECONDS,
@@ -261,12 +277,13 @@ class NodeBusClient:
             await self._send({
                 "t": FRAME_HELLO,
                 "v": BUS_SCHEMA_VERSION,
-                "token": _expected_token(),
+                "token": env_helpers.environ_node_token(),
                 "node_id": self._node_id,
             })
             self._connected.set()
             log.info("node-bus: connected to %s", url)
             self._fire_on_connected()
+            self._schedule_reconnect_refresh()
 
             # NO HEARTBEAT TIMER HERE, deliberately — see `send_heartbeat`.
             await self._read_forever(ws, stop)
@@ -329,12 +346,28 @@ class NodeBusClient:
                 self._serve_send_intent(frame)
             elif kind == FRAME_VNODE_CONVERGE:
                 # Inline and reply-less like `send_intent`: the callback spawns the pass and returns.
-                self._serve_vnode_converge()
+                self._serve_nudge(self._on_vnode_converge, kind, "converge loop")
+            elif kind == FRAME_PING:
+                # Off the read loop like a reply: the send takes the socket's send lock. Held strongly until done
+                # (the loop keeps only a weak reference to a task).
+                pong = asyncio.ensure_future(self._answer_ping())
+                self._pong_tasks.add(pong)
+                pong.add_done_callback(self._pong_tasks.discard)
+            elif kind == FRAME_REFRESH:
+                # Inline and reply-less: the callback drops a cache and spawns the re-read.
+                self._serve_refresh(frame.get("topic"), frame.get("project_id"))
             elif kind == FRAME_UNINSTALL:
                 # Inline and reply-less: the CP deleted the node row before sending, so nothing awaits an answer.
-                self._serve_uninstall()
+                self._serve_nudge(self._on_uninstall, kind, "uninstall request")
             else:
                 log.debug("node-bus: ignoring frame type %r", kind)
+
+    async def _answer_ping(self) -> None:
+        """Answer the CP's keepalive `ping` with `pong`. Never raises: a socket too dead to answer is the CP's to close."""
+        try:
+            await self._send({"t": FRAME_PONG, "v": BUS_SCHEMA_VERSION})
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            log.debug("node-bus: could not answer the CP's ping: %s", exc)
 
     def _note_hb_ack(self, frame: dict) -> None:
         """Act on the CP's registration verdict for this socket.
@@ -395,27 +428,43 @@ class NodeBusClient:
         except Exception:
             log.exception("node-bus: console_direct_revoke handler failed")
 
-    def _serve_vnode_converge(self) -> None:
-        """Hand a `vnode.converge` nudge to the converge loop. Never raises: we are on the read loop."""
-        callback = self._on_vnode_converge
+    def _serve_nudge(self, callback: Optional[Callable[[], None]], kind: str, receiver: str) -> None:
+        """Hand a reply-less `kind` frame (`vnode.converge` to the converge loop, `uninstall` to the uninstall
+        request) to `callback`. Never raises: we are on the read loop."""
         if callback is None:
-            log.debug("node-bus: vnode.converge ignored — no converge loop is wired on this client")
+            log.debug("node-bus: %s ignored — no %s is wired on this client", kind, receiver)
             return
         try:
             callback()
         except Exception:
-            log.exception("node-bus: vnode.converge handler failed")
+            log.exception("node-bus: %s handler failed", kind)
 
-    def _serve_uninstall(self) -> None:
-        """Hand an `uninstall` frame to the uninstall request. Never raises: we are on the read loop."""
-        callback = self._on_uninstall
-        if callback is None:
-            log.debug("node-bus: uninstall ignored — no uninstall request is wired on this client")
+    def _schedule_reconnect_refresh(self) -> None:
+        """After a (re)connect: one `(None, None)` refresh, jittered, unless one ran within the floor."""
+        if self._on_refresh is None:
             return
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if self._reconnect_refresh_at is not None and now - self._reconnect_refresh_at < _RECONNECT_REFRESH_FLOOR_SECONDS:
+            return
+        self._reconnect_refresh_at = now
+        loop.call_later(random.random() * _RECONNECT_REFRESH_JITTER_SECONDS, self._serve_refresh, None, None)
+
+    def _serve_refresh(self, topic: object, project_id: object = None) -> None:
+        """Hand one `refresh` topic (None = every topic) and its project (None = every one) to `on_refresh`. Never
+        raises: we are on the read loop."""
+        callback = self._on_refresh
+        if callback is None:
+            return
+        if topic is not None and not isinstance(topic, str):
+            log.debug("node-bus: refresh frame with a non-string topic %r ignored", topic)
+            return
+        if isinstance(project_id, bool) or not isinstance(project_id, (int, type(None))):
+            project_id = None
         try:
-            callback()
+            callback(topic, project_id)
         except Exception:
-            log.exception("node-bus: uninstall handler failed")
+            log.exception("node-bus: refresh handler failed for topic %r", topic)
 
     def _serve_send_intent(self, frame: dict) -> None:
         """Act on one `send_intent`: hand the carried intent to the node's intent sink, and return.

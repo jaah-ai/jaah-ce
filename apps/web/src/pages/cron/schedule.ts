@@ -33,20 +33,3 @@ export function scheduleFields(draft: ScheduleDraft): Record<string, unknown> {
   return { schedule_kind: draft.kind, cron_expression: draft.expression.trim() }
 }
 
-/** Seconds, split into the count and unit an operator reads it as. */
-export type IntervalUnits = {
-  /** Null when there is no interval yet (renders empty, not `0`). */
-  count: number | null
-  /** The unit's size in seconds: 1, 60, 3600 or 86400. */
-  unit: number
-}
-
-/* Largest first: the BIGGEST unit dividing exactly (3600 -> "1 hour"). Anything else shows as seconds,
- * never rounded. */
-const UNIT_SIZES = [86400, 3600, 60, 1] as const
-
-export function intervalUnits(seconds: number | null): IntervalUnits {
-  if (seconds === null) return { count: null, unit: 1 }
-  const unit = UNIT_SIZES.find(size => seconds % size === 0 && seconds >= size) ?? 1
-  return { count: seconds / unit, unit }
-}

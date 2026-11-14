@@ -13,9 +13,11 @@ deploy, NAT egress per GB.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, NoReturn, Optional
 from uuid import UUID
 
@@ -24,11 +26,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import Numeric, Text, and_, case, cast as sa_cast, delete, exists, func, not_, null, or_, select
 from sqlalchemy.orm import Session, aliased
-from starlette.background import BackgroundTask
 
 from app import session_transcript_archive as archive
 from app import session_transcripts as transcripts
 from app import data_access_events, data_residency, hipaa, node_log_history, pane_logs, sessions_cleanup
+from app.clock import utcnow
 from app.operator_settings import reads as settings_reads
 from app.actors import actor_names as resolve_actor_names
 from app.agent_session_lifecycle import engine_label
@@ -51,22 +53,22 @@ from app.agent_sessions import (
     shown_ending,
 )
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller
 from app.authz.visibility import (
     readable_account_clause, scoped_task_select, visible_node_clause, visible_session_clause,
 )
-from app.auth import require_user
+from app.auth import adopt_user
 from app.config import session_transcript_config
-from app.db import get_session
+from app.db_async import DbDep, on_session
 from app.events import emit_console_event
-from app.entity_shape import get_or_404, optional_uuid
+from app.entity_shape import from_row, get_or_404, optional_uuid, or_404
 from app.models.agent_sessions import AgentSession
 from app.models.audit import ActivityEvent
 from app.models.credentials import Account
 from app.models.identity import AdminUser
 from app.models.nodes import Microvm, Node
 from app.models.tasks import Task
-from app.list_page import like_pattern
+from app.list_page import PER_MAX, like_pattern
 from app.node_identity import node_ref
 from app.routes.agent_sessions import reconstructed_by_node
 from app.routes.audit import _require_aware
@@ -79,12 +81,11 @@ router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 @router.get("/{session_id}/transcript.tar.gz", response_class=StreamingResponse, response_model=None)
 @feature("sessions", "edit")
-def download_session_transcript(
+async def download_session_transcript(
+    db: DbDep,
     session_id: UUID,
     request: Request,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> StreamingResponse:
     """Stream this session's transcript as a `.tar.gz` assembled on demand from presigned S3 GETs.
 
@@ -92,142 +93,171 @@ def download_session_transcript(
     `sha256` is checked in passing; a mismatch or failed fetch aborts the connection with no trailer.
     That is a transport check (the digest is the node's, over bytes the CP never sees).
 
-    429 (with `Retry-After`) when both assembly slots are busy; 409 when the session has no uploaded
-    transcript; 503 when the bucket or AWS credentials are unresolvable (normal on a local `./dc` stack).
+    409 when the session has no uploaded transcript; 503 when the bucket or AWS credentials are unresolvable
+    (normal on a local `./dc` stack).
     """
-    plan_terms.require_tenant_switch(session, principal, plan_terms.SESSION_TRANSCRIPTS)
-    permit = archive.acquire_permit()
-    if permit is None:
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"{archive.MAX_CONCURRENT_ASSEMBLIES} transcript downloads are already being "
-                "assembled; try again shortly"
-            ),
-            headers={"Retry-After": str(archive.RETRY_AFTER_SECONDS)},
-        )
-    # Acquire -> return is fenced: an exception here is the one path that could strand a permit.
-    try:
-        # Scoped as the list is (D13), via `visible_node_ref_clause` in the same WHERE, so an ungranted
-        # node's transcript is indistinguishable from a missing session. `principal is None` (agent
-        # caller) is never admitted by `require_user`; refusing it keeps the allow-all arm unreachable.
-        if principal is None:
-            raise HTTPException(status_code=404, detail="no such session")
-        row = get_or_404(
-            session, AgentSession, session_id, detail="no such session", where=(visible_session_clause(principal),)
-        )
-        if row.transcript_status != TRANSCRIPT_UPLOADED:
-            # The row's own recorded reason, when it has one.
-            because = f": {row.transcript_error}" if row.transcript_error else ""
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"this session has no transcript to download "
-                    f"(transcript_status={row.transcript_status}){because}"
-                ),
-            )
-        config = session_transcript_config()
-        if archive.on_volume(row.transcript_bucket):
-            # The community edition's volume: read as files, nothing to sign.
-            region, bucket, credentials = "", row.transcript_bucket, None
-        elif config is None:
+    found = await db.run_sync(_download_session_transcript, session_id, caller.actor, caller.principal)
+    credentials = None
+    if found.sign:
+        if not edition_features.enabled("aws"):
+            # Unreachable: the config is always None without `aws`.
+            raise HTTPException(status_code=503, detail="transcript storage is not configured here")
+        from app.aws.container_credentials import resolve_credentials
+
+        # Off the loop: a cold cache fetches from the container credentials endpoint.
+        credentials = await asyncio.to_thread(resolve_credentials)
+        if credentials is None:
             raise HTTPException(
                 status_code=503,
-                detail="transcript storage is not configured here",
+                detail="no AWS credentials are available to sign the transcript read",
             )
-        else:
-            region, configured_bucket = config
-            # The row's bucket wins (where the bytes went), read in that bucket's own data region: the
-            # region has no column, the operator's `data_regions` names it (`data_residency.region_of_bucket`).
-            bucket = row.transcript_bucket or configured_bucket
-            if bucket != configured_bucket:
-                region = data_residency.region_of_bucket(bucket)
-            if not edition_features.enabled("aws"):
-                # Unreachable: the config above is always None without `aws`.
-                raise HTTPException(status_code=503, detail="transcript storage is not configured here")
-            from app.aws.container_credentials import resolve_credentials
+    try:
+        # Off the loop, with no connection held: the manifest is an S3 GET (or a volume read).
+        plan = await asyncio.to_thread(_archive_plan, found, credentials)
+    except (archive.ManifestUnreadable, transcripts.KeyRefused) as exc:
+        log.warning("sessions: transcript manifest for %s — %s", found.agent_session_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    await db.run_sync(_record_transcript_download, request, found)
 
-            credentials = resolve_credentials()
-            if credentials is None:
-                raise HTTPException(
-                    status_code=503,
-                    detail="no AWS credentials are available to sign the transcript read",
-                )
-        # The last DB reads: everything below is derived from plain values (the download record excepted).
-        agent_session_id = row.agent_session_id
-        started_at = row.started_at
-        download_data = {
-            "session_id": str(row.id),
-            "name": row.name,
-            "agent_session_id": agent_session_id,
-            "task_id": row.task_id,
-            "node_id": str(row.node_id) if row.node_id is not None else None,
-        }
-        session_org_id = row.org_id
-        # Read now, like the actor below: no SQL may run after the record's commit, which hands the connection
-        # back before the stream starts.
-        phi_on = hipaa.org_is_on(session, session_org_id)
-        # Read now: the rollback below expires `_user`, and the record must not reload it.
-        downloader_id = _user.id if _user is not None else None
-        downloader_email = _user.email if _user is not None else None
-        # Release the connection now: `get_session` holds it until return, i.e. across the manifest fetch.
-        session.rollback()
+    return StreamingResponse(
+        archive.stream_archive(plan),
+        media_type="application/gzip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{plan.filename}"',
+            "Cache-Control": "no-store",
+            # nginx would otherwise buffer the whole archive before forwarding a byte.
+            "X-Accel-Buffering": "no",
+        },
+    )
 
-        try:
-            # Derived, not read off the row, like every member key.
-            manifest_key = transcripts.manifest_key(
-                session_id=agent_session_id, started_at=started_at
-            )
-            manifest_bytes, manifest = archive.fetch_manifest(
-                bucket=bucket, region=region, key=manifest_key, credentials=credentials
-            )
-            plan = archive.plan_archive(
-                agent_session_id=agent_session_id,
-                started_at=started_at,
-                manifest_bytes=manifest_bytes,
-                manifest=manifest,
-                bucket=bucket,
-                region=region,
-                credentials=credentials,
-            )
-        except (archive.ManifestUnreadable, transcripts.KeyRefused) as exc:
-            log.warning("sessions: transcript manifest for %s — %s", agent_session_id, exc)
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        # Recorded once the archive is known to be servable, and committed (which hands the connection
-        # straight back) before the first byte streams: a failed record is a 500, not an unrecorded download.
-        # A HIPAA org's PHI read rides the same commit.
-        hipaa.stage_phi_read(
-            session, request, record_type="transcript", record_id=agent_session_id,
-            task_id=download_data["task_id"], org_id=session_org_id, on=phi_on,
-            user_id=downloader_id, actor_label=downloader_email,
-        )
-        data_access_events.record_committed(
-            session,
-            data_access_events.TRANSCRIPT_DOWNLOADED,
-            f"Downloaded the transcript of session {agent_session_id}",
-            data=download_data,
-            org_id=session_org_id,
-            user_id=downloader_id,
-            actor_label=downloader_email,
-        )
 
-        response = StreamingResponse(
-            archive.stream_archive(plan, permit),
-            media_type="application/gzip",
-            headers={
-                "Content-Disposition": f'attachment; filename="{plan.filename}"',
-                "Cache-Control": "no-store",
-                # nginx would otherwise buffer the whole archive before forwarding a byte.
-                "X-Accel-Buffering": "no",
-            },
-            # The other release path: a client disconnecting before the generator starts. `Permit` is
-            # single-shot, so both firing is a no-op.
-            background=BackgroundTask(permit.release),
+@dataclass(frozen=True)
+class _TranscriptDownload:
+    """What `download_session_transcript` read, as plain values: the row's archive coordinates and the record's
+    fields. `sign` is whether the read needs AWS credentials (resolved off the loop)."""
+
+    bucket: str
+    region: str
+    sign: bool
+    agent_session_id: str
+    started_at: datetime
+    download_data: dict[str, Any]
+    session_org_id: Optional[UUID]
+    phi_on: bool
+    downloader_id: Optional[UUID]
+    downloader_email: Optional[str]
+
+
+def _download_session_transcript(
+    session: Session,
+    session_id: UUID,
+    _user: AdminUser,
+    principal: Principal | None,
+) -> _TranscriptDownload:
+    """`download_session_transcript`'s reads, over the route's async session (`run_sync`); ends by handing the
+    connection back."""
+    _user = adopt_user(session, _user)
+    plan_terms.require_tenant_switch(session, principal, plan_terms.SESSION_TRANSCRIPTS)
+    # Scoped as the list is (D13), via `visible_node_ref_clause` in the same WHERE, so an ungranted
+    # node's transcript is indistinguishable from a missing session. `principal is None` (agent
+    # caller) is never admitted by `require_user`; refusing it keeps the allow-all arm unreachable.
+    principal = or_404(principal, detail="no such session")
+    row = get_or_404(
+        session, AgentSession, session_id, detail="no such session", where=(visible_session_clause(principal),)
+    )
+    if row.transcript_status != TRANSCRIPT_UPLOADED:
+        # The row's own recorded reason, when it has one.
+        because = f": {row.transcript_error}" if row.transcript_error else ""
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"this session has no transcript to download "
+                f"(transcript_status={row.transcript_status}){because}"
+            ),
         )
-    except BaseException:
-        permit.release()
-        raise
-    return response
+    config = session_transcript_config()
+    if archive.on_volume(row.transcript_bucket):
+        # The community edition's volume: read as files, nothing to sign.
+        region, bucket, sign = "", row.transcript_bucket, False
+    elif config is None:
+        raise HTTPException(status_code=503, detail="transcript storage is not configured here")
+    else:
+        region, configured_bucket = config
+        # The row's bucket wins (where the bytes went), read in that bucket's own data region: the
+        # region has no column, the operator's `data_regions` names it (`data_residency.region_of_bucket`).
+        bucket = row.transcript_bucket or configured_bucket
+        if bucket != configured_bucket:
+            region = data_residency.region_of_bucket(bucket)
+        if not edition_features.enabled("aws"):
+            # Unreachable: the config above is always None without `aws`.
+            raise HTTPException(status_code=503, detail="transcript storage is not configured here")
+        sign = True
+    # The last DB reads: everything below is derived from plain values (the download record excepted).
+    agent_session_id = row.agent_session_id
+    started_at = row.started_at
+    download_data = {
+        "session_id": str(row.id),
+        "name": row.name,
+        "agent_session_id": agent_session_id,
+        "task_id": row.task_id,
+        "node_id": str(row.node_id) if row.node_id is not None else None,
+    }
+    session_org_id = row.org_id
+    # Read now, like the actor below: no SQL may run after the record's commit, which hands the connection
+    # back before the stream starts.
+    phi_on = hipaa.org_is_on(session, session_org_id)
+    # Read now: the rollback below expires `_user`, and the record must not reload it.
+    downloader_id = _user.id if _user is not None else None
+    downloader_email = _user.email if _user is not None else None
+    # Release the connection now: the route's session would otherwise hold it across the manifest fetch.
+    session.rollback()
+    return _TranscriptDownload(
+        bucket=bucket, region=region, sign=sign, agent_session_id=agent_session_id, started_at=started_at,
+        download_data=download_data, session_org_id=session_org_id, phi_on=phi_on,
+        downloader_id=downloader_id, downloader_email=downloader_email,
+    )
+
+
+def _archive_plan(found: _TranscriptDownload, credentials: Any) -> archive.ArchivePlan:
+    """The manifest fetched and every member planned — network (an S3 GET), so on a worker thread."""
+    # Derived, not read off the row, like every member key.
+    manifest_key = transcripts.manifest_key(
+        session_id=found.agent_session_id, started_at=found.started_at
+    )
+    manifest_bytes, manifest = archive.fetch_manifest(
+        bucket=found.bucket, region=found.region, key=manifest_key, credentials=credentials
+    )
+    return archive.plan_archive(
+        agent_session_id=found.agent_session_id,
+        started_at=found.started_at,
+        manifest_bytes=manifest_bytes,
+        manifest=manifest,
+        bucket=found.bucket,
+        region=found.region,
+        credentials=credentials,
+    )
+
+
+def _record_transcript_download(session: Session, request: Request, found: _TranscriptDownload) -> None:
+    """The download's record, over the route's async session (`run_sync`).
+
+    Recorded once the archive is known to be servable, and committed (which hands the connection
+    straight back) before the first byte streams: a failed record is a 500, not an unrecorded download.
+    A HIPAA org's PHI read rides the same commit."""
+    hipaa.stage_phi_read(
+        session, request, record_type="transcript", record_id=found.agent_session_id,
+        task_id=found.download_data["task_id"], org_id=found.session_org_id, on=found.phi_on,
+        user_id=found.downloader_id, actor_label=found.downloader_email,
+    )
+    data_access_events.record_committed(
+        session,
+        data_access_events.TRANSCRIPT_DOWNLOADED,
+        f"Downloaded the transcript of session {found.agent_session_id}",
+        data=found.download_data,
+        org_id=found.session_org_id,
+        user_id=found.downloader_id,
+        actor_label=found.downloader_email,
+    )
 
 
 class PaneLogOut(BaseModel):
@@ -256,39 +286,39 @@ class PaneLogOut(BaseModel):
 
 @router.get("/{session_id}/pane-log", response_model=PaneLogOut)
 @feature("sessions", "edit")
+@on_session
 def get_session_pane_log(
+    session: Session,
     session_id: UUID,
     request: Request,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> PaneLogOut:
     """This session's pane-log tail. `sessions:edit`, the transcript download's key and for its reason: the pane
     is what the agent showed, the same content a transcript holds. Scoped as the list is; 404 for a session not
     visible or with no tail. A HIPAA org's read is recorded like a transcript's."""
-    plan_terms.require_tenant_switch(session, principal, plan_terms.SESSION_TRANSCRIPTS)
-    if principal is None:
-        raise HTTPException(status_code=404, detail="no such session")
-    found = session.execute(
-        select(AgentSession, Node.name)
-        .join(Node, Node.id == AgentSession.node_id, isouter=True)
-        .where(AgentSession.id == session_id, visible_session_clause(principal))
-    ).first()
-    if found is None:
-        raise HTTPException(status_code=404, detail="no such session")
+    _user = adopt_user(session, caller.actor)
+    plan_terms.require_tenant_switch(session, caller.principal, plan_terms.SESSION_TRANSCRIPTS)
+    principal = or_404(caller.principal, detail="no such session")
+    found = or_404(
+        session.execute(
+            select(AgentSession, Node.name)
+            .join(Node, Node.id == AgentSession.node_id, isouter=True)
+            .where(AgentSession.id == session_id, visible_session_clause(principal))
+        ).first(),
+        detail="no such session",
+    )
     row, node_name = found
-    if row.pane_log_tail is None:
-        raise HTTPException(status_code=404, detail="this session has no pane log")
+    or_404(row.pane_log_tail, detail="this session has no pane log")
     # Through `scoped_task_select`, as the list's titles: a task the reader cannot reach gets its id only.
     task = None if row.task_id is None else session.scalars(
         scoped_task_select(principal).where(Task.id == row.task_id)
     ).first()
     end_reason, _ = shown_ending(row.end_reason, row.end_detail)
-    out = PaneLogOut(
-        id=row.id, name=row.name, node=node_name, node_id=str(row.node_id) if row.node_id else None,
-        task_id=row.task_id, task_title=task.title if task else None, end_reason=end_reason,
-        end_reason_label=end_reason_label(end_reason), started_at=row.started_at,
-        ended_at=row.ended_at, captured_at=row.pane_log_captured_at, written_at=row.pane_log_written_at,
+    out = from_row(
+        PaneLogOut, row, node=node_name, node_id=str(row.node_id) if row.node_id else None,
+        task_title=task.title if task else None, end_reason=end_reason,
+        end_reason_label=end_reason_label(end_reason),
+        captured_at=row.pane_log_captured_at, written_at=row.pane_log_written_at,
         written_after_end=pane_logs.written_after_end(row.pane_log_written_at, row.ended_at),
         redactions=row.pane_log_redactions or 0, redaction_confidence=transcripts.REDACTION_CONFIDENCE,
         # Tidied again as served, so a tail stored before `pane_logs.tidy` reads the same as a new one.
@@ -308,7 +338,6 @@ def get_session_pane_log(
 # (it must compose with pagination), and every order ends in `AgentSession.id` so it is total.
 
 PER_PAGE = 25
-_PER_MAX = 200
 _PAGE_MAX = 1_000_000
 _Q_MAX_LEN = 200
 
@@ -590,7 +619,7 @@ def _storage_state() -> tuple[bool, Optional[str]]:
     Unconfigured bucket (normal locally) and absent credentials get different sentences; neither is an
     error. Memoized for `_STORAGE_PROBE_TTL`."""
     global _storage_probe
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     with _storage_probe_lock:
         cached = _storage_probe
     if cached is not None and now - cached[0] < _STORAGE_PROBE_TTL:
@@ -683,9 +712,7 @@ def _list_filters(
 
     if transcript_status is not None:
         if transcript_status not in TRANSCRIPT_STATUSES:
-            raise HTTPException(
-                status_code=422, detail=f"unknown transcript status '{transcript_status}'"
-            )
+            raise HTTPException(status_code=422, detail=f"unknown transcript status '{transcript_status}'")
         filters.append(AgentSession.transcript_status == transcript_status)
 
     if end_reason is not None:
@@ -803,9 +830,10 @@ def _ordering(sort: Optional[str], direction: str) -> list[Any]:
 
 @router.get("", response_model=SessionListOut)
 @feature("sessions", "view")
-def list_sessions(
+async def list_sessions(
+    db: DbDep,
     page: int = Query(default=1, ge=1, le=_PAGE_MAX),
-    per: int = Query(default=PER_PAGE, ge=1, le=_PER_MAX),
+    per: int = Query(default=PER_PAGE, ge=1, le=PER_MAX),
     window: str = Query(default=DEFAULT_WINDOW),
     since: Optional[datetime] = Query(
         default=None, description="Started at or after; ISO-8601 with an explicit UTC offset."
@@ -828,9 +856,7 @@ def list_sessions(
     pane_log: bool = Query(default=False),
     # The Node page's Dead runs: a pane-log tail to read, or a runner the CP lost (`dead_run_clause`).
     dead: bool = Query(default=False),
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> SessionListOut:
     """One page of the fleet's agentic sessions, plus everything the page needs to be honest about it.
 
@@ -842,6 +868,39 @@ def list_sessions(
     Task titles come through `scoped_task_select`, not a join: a caller reaching no task gets the id
     only, and no join can multiply `total`.
     """
+    # Probed off the loop and before the session's first statement: a cold probe asks the container credentials
+    # endpoint (`_storage_state`).
+    storage = await asyncio.to_thread(_storage_state)
+    return await db.run_sync(
+        _list_sessions, page, per, window, since, until, sort, dir_, status, transcript_status, stale, end_reason,
+        node, task, q, pane_log, dead, caller.actor, caller.principal, storage,
+    )
+
+
+def _list_sessions(
+    session: Session,
+    page: int,
+    per: int,
+    window: str,
+    since: Optional[datetime],
+    until: Optional[datetime],
+    sort: Optional[str],
+    dir_: str,
+    status: Optional[str],
+    transcript_status: Optional[str],
+    stale: bool,
+    end_reason: Optional[str],
+    node: Optional[str],
+    task: Optional[int],
+    q: Optional[str],
+    pane_log: bool,
+    dead: bool,
+    _user: AdminUser,
+    principal: Principal | None,
+    storage: tuple[bool, Optional[str]],
+) -> SessionListOut:
+    """`list_sessions`'s body, over the route's async session (`run_sync`). `storage` is `_storage_state()`."""
+    _user = adopt_user(session, _user)
     # The Node page's dead runs list (metadata) reads on every plan; its pane-log tail asks the switch.
     if not (pane_log or dead):
         plan_terms.require_tenant_switch(session, principal, plan_terms.SESSION_TRANSCRIPTS)
@@ -854,7 +913,7 @@ def list_sessions(
     if sort is not None and sort not in SORTS:
         raise HTTPException(status_code=422, detail=f"unknown sort '{sort}'")
 
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     filters = _list_filters(
         window=window,
         since=since,
@@ -1006,7 +1065,7 @@ def list_sessions(
     attempts_over = _attempts_over(session, principal, [row for row, *_ in rows], task_states, now)
     node_statuses = _owing_node_statuses(session, [row for row, *_ in rows])
 
-    storage_available, storage_reason = _storage_state()
+    storage_available, storage_reason = storage
 
     # Skipped when `total_unfiltered` is zero (stale is a subset). Not memoized: the bulk delete's event
     # must refetch a fresh count. Uses the request's own `now`, so it agrees with the `stale` filter.
@@ -1014,44 +1073,21 @@ def list_sessions(
 
     return SessionListOut(
         items=[
-            SessionOut(
-                id=row.id,
-                name=row.name,
-                agent_session_id=row.agent_session_id,
-                agent_kind=row.agent_kind,
+            from_row(
+                SessionOut, row,
                 agent_ref=AgentRefOut(**row.agent_ref) if row.agent_ref else None,
                 engine=engine_label(row.agent_kind),
-                runtime=row.runtime,
-                dispatched_runtime=row.dispatched_runtime,
                 node=node_name,
                 node_id=str(row.node_id) if row.node_id is not None else None,
                 account=account_names.get(row.account_id) if row.account_id else None,
-                task_id=row.task_id,
                 task_title=task_titles.get(row.task_id) if row.task_id else None,
-                worktree_ref=row.worktree_ref,
-                branch=row.branch,
-                holder=row.holder,
-                status=row.status,
                 end_reason=endings[row.id][0],
                 end_reason_label=end_reason_label(endings[row.id][0]),
-                started_at=row.started_at,
-                ended_at=row.ended_at,
-                model=row.model,
-                tokens_in=row.tokens_in,
-                tokens_out=row.tokens_out,
                 cost_usd=costs.get(row.agent_session_id),
-                subagent_count=row.subagent_count,
-                transcript_status=row.transcript_status,
-                transcript_error=row.transcript_error,
-                transcript_bytes=row.transcript_bytes,
-                transcript_attempts=row.transcript_attempts,
-                transcript_leased_at=row.transcript_leased_at,
                 held_live=bool(held_live),
                 node_errors=node_errors.get(row.id, []),
                 pane_log_state=pane_logs.state(row.pane_log_captured_at, row.pane_log_tail),
                 end_detail=endings[row.id][1],
-                events_last_seq=row.events_last_seq,
-                events_refused=row.events_refused,
                 no_events=_no_events(row),
                 vm_failure=vm_failures.get(row.id),
                 attempt_over=attempts_over.get(row.id),
@@ -1359,10 +1395,10 @@ class StaleDeleteOut(BaseModel):
 
 @router.post("/stale/delete", response_model=StaleDeleteOut)
 @feature("sessions", "edit")
+@on_session
 def delete_stale_sessions(
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    session: Session,
+    caller: AsyncCaller = Depends(current_caller),
 ) -> StaleDeleteOut:
     """Delete every stale session row this principal can see — the button under the list's banner.
 
@@ -1371,9 +1407,10 @@ def delete_stale_sessions(
     rows they cannot see. The count and the delete get the identical principal — the whole contract.
     Bounded by `sessions_cleanup.MAX_DELETE_PER_CALL`, reported via `truncated` + `remaining`.
     """
+    user = adopt_user(session, caller.actor)
     # One clock for sweep and re-count, so `deleted + remaining` describes one instant.
-    now = datetime.now(timezone.utc)
-    deleted = sessions_cleanup.delete_stale(session, principal, now)
+    now = utcnow()
+    deleted = sessions_cleanup.delete_stale(session, caller.principal, now)
     if deleted:
         # Only when rows went, and before the commit (`pg_notify` is transactional). `id=0` is the
         # collection sentinel (a real id would reach subscribers who cannot read the list), tagged with
@@ -1386,7 +1423,7 @@ def delete_stale_sessions(
         # The actor is logged because the rows take their `updated_by_id` with them.
         log.info("sessions: %s deleted %d stale session row(s)", user.email, deleted)
     # Re-counted before `truncated` is decided, with the same principal and clock.
-    remaining = sessions_cleanup.count_stale(session, principal, now)
+    remaining = sessions_cleanup.count_stale(session, caller.principal, now)
     return StaleDeleteOut(
         deleted=deleted,
         # `and remaining > 0`: the flag is about what is left, so an exact-ceiling pass that cleared the
@@ -1399,11 +1436,11 @@ def delete_stale_sessions(
 
 @router.delete("/{session_id}", status_code=204)
 @feature("sessions", "edit")
+@on_session
 def delete_session(
+    session: Session,
     session_id: UUID,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> Response:
     """Delete one stale session row the operator is looking at.
 
@@ -1416,8 +1453,9 @@ def delete_session(
     404 for everything this principal may not destroy, and order matters: scope is applied first, so an
     out-of-scope protected row answers 404, not a 409 that would confirm it exists. A test pins this.
     """
+    user = adopt_user(session, caller.actor)
     # One clock for the delete and any refusal it explains.
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     cutoff = sessions_cleanup.stale_cutoff(now)
 
     # The predicate is in the delete, not checked in Python first (a concurrent upload could move the
@@ -1429,7 +1467,7 @@ def delete_session(
         select(AgentSession.id)
         .where(AgentSession.id == session_id)
         .where(sessions_cleanup.stale_clause(cutoff))
-        .where(sessions_cleanup.deletable_node_ref_clause(principal, AgentSession.node_id))
+        .where(sessions_cleanup.deletable_node_ref_clause(caller.principal, AgentSession.node_id))
     )
     # RETURNING: the identifiers are the only record the row existed; reading them first would reopen
     # the race.
@@ -1446,7 +1484,7 @@ def delete_session(
         execution_options={"synchronize_session": False},
     ).first()
     if removed is None:
-        _refuse_single_delete(session, session_id, principal, cutoff)
+        _refuse_single_delete(session, session_id, caller.principal, cutoff)
 
     # The actor is logged because the row takes its `updated_by_id` with it.
     log.info(
@@ -1456,8 +1494,8 @@ def delete_session(
     # Same sentinel, pre-commit placement and org tag as the bulk route.
     emit_console_event(
         session, entity="session", id=0, action="changed", org_id=user.org_id,
+        commit=True,
     )
-    session.commit()
     return Response(status_code=204)
 
 

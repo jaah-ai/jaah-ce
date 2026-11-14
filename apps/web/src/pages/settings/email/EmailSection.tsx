@@ -1,5 +1,5 @@
 import { type JSX, useState } from 'react'
-import { Link as RouterLink, useNavigate } from 'react-router-dom'
+import { Link as RouterLink, useLocation } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
@@ -7,12 +7,11 @@ import Link from '@mui/material/Link'
 import Typography from '@mui/material/Typography'
 import { apiDetail } from '../../../api'
 import { type TabDef, TabPanel, Tabs } from '../../../components/Tabs'
-import { useConfirm } from '../../../components/ConfirmDialog'
+import { danger, useConfirm } from '../../../components/ConfirmDialog'
 import { useSubmit } from '../../../hooks/useSubmit'
 import { useUrlTab } from '../../../hooks/useUrlTab'
-import { navigateExternal } from '../../../lib/externalNavigate'
+import { leaveForAuthorize } from '../../../lib/leaveForAuthorize'
 import { absoluteTime, relativeAge } from '../../../lib/relativeTime'
-import { safeHref } from '../../../lib/safeHref'
 import Banner from '../../../ui/Banner'
 import { CopyButton } from '../../../ui/CopyButton'
 import EmptyState from '../../../ui/EmptyState'
@@ -23,26 +22,31 @@ import LoadingState from '../../../ui/LoadingState'
 import { TONE_COLOR } from '../../../ui/statusTone'
 import UnmatchedEmails from '../../triggers/UnmatchedEmails'
 import {
+  CREATED_ADDRESS_STATE,
   type GmailConnection,
   gmailConnectionUrl,
   getOrgEmail,
   KIND_LABEL,
+  NEW_ADDRESS_URL,
   ORG_EMAIL_KEY,
   revokeTenantAddress,
+  SERVICE_ACCOUNT_NEW_URL,
   startGmailConnect,
   type TenantAddress,
 } from './api'
+import { FONT_SIZE, FONT_WEIGHT } from '../../../theme'
 import { useGmailConnectReturn } from './connectReturn'
-import NewAddressDialog from './NewAddressDialog'
-import ServiceAccountDialog from './ServiceAccountDialog'
+import NewButton from '../../../ui/NewButton'
 
 /* Settings › Organizations › Email: one card of several lists of the org's mail, so a strip
  * (`?mail=`, the style guide's sub-tabs) rather than stacked cards inside Settings' own card:
  * - Connections: the Gmail mailboxes the org sends from (a service account also receives; the kind's hover says
  *   when it last read). A row opens the connection (`GmailConnectionPage.tsx`). Connect with Google is offered only
- *   while the operator set up the Google client; a service account always (on the plan).
+ *   while the operator set up the Google client; a service account always (on the plan), on its own page
+ *   (`ServiceAccountNewPage.tsx`).
  * - Addresses: the hosted addresses the org receives at; each feeds the one automation whose email trigger holds it,
- *   else its mail lands in Inbound. New is a one-shot act (a dialog: an optional label); Revoke confirms.
+ *   else its mail lands in Inbound. New opens its page (`NewAddressPage.tsx`), which lands back here with a Created banner;
+ *   an address has no page of its own (no read or update route), so a row does not link. Revoke confirms.
  * - Inbound: the org's unmatched and rejected mail (`triggers/UnmatchedEmails.tsx`), mounted only while open so a
  *   hidden tab does not poll.
  * Off the plan every list still shows, so an org keeps its history and can remove a secret or an address — nothing
@@ -72,11 +76,8 @@ function lastUsedNode(row: GmailConnection): JSX.Element | string {
 }
 
 export function EmailSection({ orgId }: { orgId: string }): JSX.Element {
-  const navigate = useNavigate()
-  const queryClient = useQueryClient()
   const query = useQuery({ queryKey: [...ORG_EMAIL_KEY, orgId], queryFn: () => getOrgEmail(orgId), refetchOnMount: 'always' })
   const [tab, selectTab] = useUrlTab(TABS, 'connections', 'mail')
-  const [adding, setAdding] = useState(false)
   const { busy, formError, run } = useSubmit()
   const [, returnedError, clearReturn] = useGmailConnectReturn()
 
@@ -87,16 +88,8 @@ export function EmailSection({ orgId }: { orgId: string }): JSX.Element {
     run('Could not start Connect with Google.', async () => {
       clearReturn()
       const { authorize_url } = await startGmailConnect()
-      const href = safeHref(authorize_url)
-      if (!href) throw new Error('The Google link the server returned is not a usable URL.')
-      navigateExternal(href)
+      leaveForAuthorize(authorize_url, 'The Google link the server returned is not a usable URL.')
     })
-
-  const connected = (row: GmailConnection) => {
-    setAdding(false)
-    void queryClient.invalidateQueries({ queryKey: ORG_EMAIL_KEY })
-    navigate(gmailConnectionUrl(row.id))
-  }
 
   const actions = email?.on_plan ? (
     <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
@@ -107,7 +100,7 @@ export function EmailSection({ orgId }: { orgId: string }): JSX.Element {
         </Button>
       )}
       <Button variant={email.oauth_available ? 'outlined' : 'contained'} size="small" disabled={busy}
-        onClick={() => setAdding(true)} data-testid="gmail-add-sa" sx={tapTargetSx}>
+        component={RouterLink} to={SERVICE_ACCOUNT_NEW_URL} data-testid="gmail-add-sa" sx={tapTargetSx}>
         Add service account
       </Button>
     </Box>
@@ -120,7 +113,7 @@ export function EmailSection({ orgId }: { orgId: string }): JSX.Element {
       : row.sync_error
         ? { tone: 'warning', glyph: '!', label: 'Receiving failed' }
         : { tone: 'success', glyph: '●', label: 'Connected' },
-    title: <Box component="span" sx={{ fontWeight: 600 }}>{row.address}</Box>,
+    title: <Box component="span" sx={{ fontWeight: FONT_WEIGHT.semibold }}>{row.address}</Box>,
     titleText: row.address,
     href: gmailConnectionUrl(row.id),
     notes: [
@@ -175,12 +168,11 @@ export function EmailSection({ orgId }: { orgId: string }): JSX.Element {
           <UnmatchedEmails framed={false} />
         </TabPanel>
       )}
-      {adding && <ServiceAccountDialog orgId={orgId} onClose={() => setAdding(false)} onConnected={connected} />}
     </Box>
   )
 }
 
-/** The Addresses tab: the hosted addresses, New (a label dialog) and Revoke (a confirm). `why` says why nothing new
+/** The Addresses tab: the hosted addresses, New (its page) and Revoke (a confirm). `why` says why nothing new
  *  can be made, when so. */
 function Addresses({ orgId, addresses, canCreate, why }: {
   orgId: string
@@ -190,29 +182,26 @@ function Addresses({ orgId, addresses, canCreate, why }: {
 }): JSX.Element {
   const queryClient = useQueryClient()
   const [confirm, confirmDialog] = useConfirm()
-  const [creating, setCreating] = useState(false)
-  const [created, setCreated] = useState<TenantAddress | null>(null)
+  // `NewAddressPage` lands here carrying the address it made.
+  const landed = (useLocation().state as Record<string, unknown> | null)?.[CREATED_ADDRESS_STATE]
+  const [created, setCreated] = useState<string | null>(typeof landed === 'string' ? landed : null)
   const refresh = () => void queryClient.invalidateQueries({ queryKey: ORG_EMAIL_KEY })
 
   const revoke = async (row: TenantAddress) => {
-    const done = await confirm({
+    const done = await confirm(danger('Revoke', {
       title: 'Revoke address?',
       identity: row.address,
       message: `Mail sent to it will no longer arrive.${row.automation_id
         ? ` Automation “${row.automation_name ?? 'Unnamed'}” stops receiving.` : ''} Mail already received is kept.`,
-      confirmLabel: 'Revoke',
-      destructive: true,
       run: { action: () => revokeTenantAddress(orgId, row.id), failed: 'Could not revoke the address.', busyLabel: 'Revoking…' },
-    })
+    }))
     if (!done) return
-    if (created?.id === row.id) setCreated(null)
+    if (created === row.address) setCreated(null)
     refresh()
   }
 
   const newButton = canCreate ? (
-    <Button variant="contained" size="small" onClick={() => setCreating(true)} data-testid="email-address-new" sx={tapTargetSx}>
-      New address
-    </Button>
+    <NewButton label="New address" to={NEW_ADDRESS_URL} testId="email-address-new" sx={tapTargetSx} />
   ) : undefined
 
   const rows: FeedRowSpec[] = addresses.map((row): FeedRowSpec => {
@@ -228,13 +217,14 @@ function Addresses({ orgId, addresses, canCreate, why }: {
           <Box component="span" sx={{ ...monoSx, userSelect: 'text', overflowWrap: 'anywhere' }}>{row.address}</Box>
           {labelled && (
             <Box component="span" data-testid="email-address-label"
-              sx={{ display: 'block', color: 'text.secondary', fontSize: '0.8125rem', overflowWrap: 'anywhere' }}>
+              sx={{ display: 'block', color: 'text.secondary', fontSize: FONT_SIZE.md, overflowWrap: 'anywhere' }}>
               {row.name}
             </Box>
           )}
         </>
       ),
       titleText: labelled ? `${row.address} · ${row.name}` : row.address,
+      href: null,
       titleLines: 'all',
       titleAside: <CopyButton variant="icon" text={() => row.address} label="Copy address" testId="email-address-copy" />,
       notes: used ? [] : [{ key: 'unused', tone: 'muted', text: 'Not used — mail goes to Unmatched' }],
@@ -258,8 +248,8 @@ function Addresses({ orgId, addresses, canCreate, why }: {
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
       {created && (
         <Banner severity="success" onDismiss={() => setCreated(null)} testId="email-address-created"
-          action={<CopyButton variant="text" text={() => created.address} label="Copy" />}>
-          Created <Box component="span" sx={{ ...monoSx, userSelect: 'text' }}>{created.address}</Box>
+          action={<CopyButton variant="text" text={() => created} label="Copy" />}>
+          Created <Box component="span" sx={{ ...monoSx, userSelect: 'text' }}>{created}</Box>
         </Banner>
       )}
       {(why || (newButton && rows.length > 0)) && (
@@ -271,10 +261,6 @@ function Addresses({ orgId, addresses, canCreate, why }: {
       {rows.length === 0
         ? <EmptyState title="No addresses." action={newButton} />
         : <FeedList ariaLabel="Addresses" testId="email-addresses" sections={[{ key: 'addresses', rows }]} />}
-      {creating && (
-        <NewAddressDialog orgId={orgId} onClose={() => setCreating(false)}
-          onCreated={row => { setCreating(false); setCreated(row); refresh() }} />
-      )}
       {confirmDialog}
     </Box>
   )

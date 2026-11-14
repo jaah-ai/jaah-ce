@@ -5,6 +5,7 @@
  * `TaskRating` block), and a client mean over a partial vote set would disagree with the board. This
  * file FORMATS an average, never produces one. */
 import type { PipelineTask, TaskRatingVote } from '../types'
+import { countOf, oneDecimal } from './humanize'
 
 /**
  * May this task be rated? One predicate for every surface that OFFERS a rating
@@ -38,7 +39,7 @@ export function formatAverage(avg: number | null): string {
   // wire, and `NaN` would render literally.
   if (avg === null || !Number.isFinite(avg)) return ''
   const rounded = Math.round(avg * 10) / 10
-  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)
+  return oneDecimal(rounded)
 }
 
 /**
@@ -50,7 +51,7 @@ export function ratingSummaryTitle(count: number, average: number | null): strin
   const shown = formatAverage(average)
   // Also the `count === 0` case: every done task until somebody votes.
   if (shown === '' || !Number.isFinite(count) || count <= 0) return 'Not rated yet'
-  return `${shown} out of 5 — ${count} ${count === 1 ? 'rating' : 'ratings'}`
+  return `${shown} out of 5 — ${countOf(count, 'rating')}`
 }
 
 /**
@@ -67,7 +68,7 @@ export function voteListTitle(votes: TaskRatingVote[]): string {
        * the separator. */
       const who = typeof vote.user === 'string' && vote.user.trim() !== '' ? vote.user.trim() : 'Unknown'
       const stars = Number.isFinite(vote.stars) ? vote.stars : 0
-      return `${who} — ${stars} ${stars === 1 ? 'star' : 'stars'}`
+      return `${who} — ${countOf(stars, 'star')}`
     })
     .join('\n')
 }

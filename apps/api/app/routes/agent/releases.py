@@ -1,15 +1,17 @@
 """What the CP wants a node to run: release, autoupdate, runner flags, port grid and NodeLink mounts."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Optional, Union
+from datetime import datetime
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
-from app import edition_features, node_autoupdate, node_credentials, nodelink, platform_release, port_grid
+from app import edition_features, node_autoupdate, node_credentials, platform_release, port_grid
+from app.clock import utcnow
 from app.operator_settings import (
     catalog as settings_catalog,
     errors as settings_errors,
@@ -18,7 +20,7 @@ from app.operator_settings import (
 # routes need one for a user who is NOT the caller (they carry no session cookie, only the node token).
 from app.authz.catalog import Tenancy
 from app.authz.declarations import infra
-from app.db import get_session
+from app.db_async import DbDep, on_session, on_thread, release
 from app.version import PROCESS_STARTED_AT, stamped_release
 from app.models.nodes import Node
 from app.routes.agent.auth import _check_token
@@ -54,38 +56,33 @@ class ReleaseDesiredOut(BaseModel):
 
 @router.get("/port-grid", response_model=PoolTickGrid)
 @infra(Tenancy.ORG_SCOPED)
-def get_port_grid(
-    caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
-) -> PoolTickGrid:
-    """The deterministic port grid, for a caller that is not running a pool tick.
+@on_session
+def get_port_grid(session: Session, caller: node_credentials.AgentCaller = Depends(_check_token)) -> PoolTickGrid:
+    """The org's slot-port range, for a caller that is not running a pool tick.
 
-    Consumers: the pool-ports audit tool (audit/reband) and `apps/jaahd/console_direct.py` (refuse a
-    console port inside a pool window). Same model as `PoolTickOut.grid`.
+    Consumers: the pool-ports audit tool and `apps/jaahd/console_direct.py` (refuse a console port inside the
+    range slots are assigned from). Same model as `PoolTickOut.grid`.
 
-    No node scope but an org scope: bands collide only on one host, and a host belongs to one org for life
-    (`nodes.org_id`), so per-org disjointness is enough (spec §4.4). Hence `ORG_SCOPED`; for `INFRA` the
-    scope is decided by `_read_scope_for` off the arm, and the org comes only from the credential.
-
-    An org-less caller (CP loopback, dev bypass) gets the operator's grid with every var tier 2 until some
-    org overrides a port scalar (Orgs > <org> > Settings), after which `operator_settings` refuses the read
-    and this answers 409: the grid is per org and the credential proves none. No node can reach that case.
-    An empty `range_start_by_var` is legitimate (every var tier 2), not a failed fetch.
+    Org-scoped: the range is an org knob and a host belongs to one org for life (`nodes.org_id`). Hence
+    `ORG_SCOPED`; for `INFRA` the scope is decided by `_read_scope_for` off the arm, and the org comes only from
+    the credential. An org-less caller (CP loopback, dev bypass) gets the operator's range until some org
+    overrides a port knob, after which `operator_settings` refuses the read and this answers 409: the credential
+    proves no org. No node can reach that case.
     """
     try:
         return PoolTickGrid(**port_grid.grid(session, caller.org_id).wire())
     except settings_errors.OperatorSettingsScopeError:
         raise HTTPException(
             status_code=409,
-            detail="An organization overrides the port grid, so it is per organization; this credential names none.",
+            detail="An organization overrides the port range, so it is per organization; this credential names none.",
         ) from None
 
 
 @router.get("/release-desired", response_model=Optional[ReleaseDesiredOut])
 @infra(Tenancy.OPERATOR)
-def get_release_desired(
+async def get_release_desired(
+    db: DbDep,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
 ) -> Optional[ReleaseDesiredOut]:
     """The release the calling node is meant to be running: this control plane's own version, or for a
     macOS/Windows node the newest one whose bundle is published (`app/platform_release.py`).
@@ -94,7 +91,16 @@ def get_release_desired(
     The node comes only from the credential, and only its own `os` is read (which bundle it installs), so
     the subject stays the fleet's release; a credential that names no node is answered as Linux is.
     """
-    os = session.scalar(select(Node.os).where(Node.id == caller.node_id)) if caller.node_id else None
+    os = (
+        await db.run_sync(lambda session: session.scalar(select(Node.os).where(Node.id == caller.node_id)))
+        if caller.node_id else None
+    )
+    await release(db)
+    # Off the loop: on a cold cache `platform_release.for_os` reads S3 under a process-wide lock.
+    return await run_in_threadpool(_release_desired_for, os)
+
+
+def _release_desired_for(os: Optional[str]) -> Optional[ReleaseDesiredOut]:
     desired = cp_release_desired()
     if desired is None:
         return None
@@ -119,7 +125,7 @@ def cp_release_desired() -> Optional[ReleaseDesiredOut]:
     return ReleaseDesiredOut(
         version=version,
         updated_at=started,
-        updated_age=(datetime.now(timezone.utc) - started).total_seconds(),
+        updated_age=(utcnow() - started).total_seconds(),
     )
 
 
@@ -132,10 +138,8 @@ class AutoupdateOut(BaseModel):
 
 @router.get("/autoupdate", response_model=AutoupdateOut)
 @infra(Tenancy.ORG_SCOPED)
-def get_autoupdate(
-    caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
-) -> AutoupdateOut:
+@on_session
+def get_autoupdate(session: Session, caller: node_credentials.AgentCaller = Depends(_check_token)) -> AutoupdateOut:
     """The calling node's auto-update switch: Settings, overridden by its host or itself.
 
     Asked by the daemon before it requests a converge and by each root updater (the .deb's `jaahd-update`,
@@ -166,7 +170,9 @@ class RunnerFlagsOut(BaseModel):
 
 @router.get("/settings/runner-flags", response_model=RunnerFlagsOut)
 @infra(Tenancy.OPERATOR)
+@on_session
 def get_runner_flags(
+    session: Session,
     _: None = Depends(_check_token),
 ) -> RunnerFlagsOut:
     """The runner-behaviour kill switches, resolved, for the runner-flags tool on a node.
@@ -176,69 +182,23 @@ def get_runner_flags(
     (`test_authz_policy._INFRA_OPERATOR_PLANE_ALLOWLIST`; `operator_settings.reads._refuse_unscoped_read`). No
     cache header: `operator_settings` has a 3s cache and the node caches on disk.
     """
+    # The operator tier read through this session first, so a cache miss below opens no session of its own.
+    settings_reads.overrides(session)
     return RunnerFlagsOut(
         **{key: settings_reads.get_bool(key) for key in settings_catalog.RUNNER_FLAG_KEYS}
     )
 
 
-# ── NodeLink: the store this node should mount ───────────────────────────────────────────────────────
+# ── NodeLink: the stores this node should mount ──────────────────────────────────────────────────────
 # Read by the node's root mount unit (`jaah-shared-mount converge`) when the CP sends
 # `nodelink_converge` (`app/nodelink.py`). The node is derived from the credential, as for the runner pool.
-
-
-class NodeLinkDesiredOut(BaseModel):
-    """What this node should mount on the old single-share wire. `enabled` is tri-state: false = unmount, true
-    = mount the ids (its NodeLink at `{jaah-home}/auth/.shared`), null = no opinion (no store of its org is
-    ready; the node keeps its own config). The ids are null unless
-    `enabled` is true (`nodelink.desired_for_node`); `mount_ip` is also null when the node resolves the EFS
-    DNS name."""
-
-    enabled: Optional[bool]
-    efs_id: Optional[str] = None
-    access_point_id: Optional[str] = None
-    region: Optional[str] = None
-    mount_ip: Optional[str] = None
-
-
-@router.get("/nodelink", response_model=NodeLinkDesiredOut)
-@infra(Tenancy.ORG_SCOPED)
-def nodelink_desired(
-    caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
-) -> NodeLinkDesiredOut:
-    """Whether this node mounts its NodeLink store, and which. A credential that names no node is a 403
-    (no claim is accepted, as `_gha_caller_node_id`); a node with no row answers disabled."""
-    if caller.node_id is None:
-        raise HTTPException(status_code=403, detail="NodeLink requires a per-node credential")
-    node = session.scalar(select(Node).where(Node.id == caller.node_id))
-    if node is None:
-        return NodeLinkDesiredOut(enabled=False)
-    return NodeLinkDesiredOut(**nodelink.desired_for_node(session, node))
+# Only the version-2 document is served; the `?version=2` a daemon sends is not read.
 
 
 class NodeLinkStoreOut(BaseModel):
     efs_id: Optional[str] = None
     region: Optional[str] = None
     mount_ip: Optional[str] = None
-
-
-class NodeLinkEntryOut(BaseModel):
-    id: str
-    slug: str
-    name: str
-    kind: str
-    access_point_id: str
-    # Absolute, resolved for THIS node.
-    path: str
-
-
-class NodeLinksDesiredOut(BaseModel):
-    """Version 1 (`nodelinks.agent_answer`): the NodeLinks of ONE store this node should mount. `store` null
-    = no opinion (no store is ready); `store` set with an empty list = unmount every NodeLink."""
-
-    version: int
-    store: Optional[NodeLinkStoreOut] = None
-    nodelinks: list[NodeLinkEntryOut]
 
 
 class NodeLinkEntryV2Out(BaseModel):
@@ -253,42 +213,39 @@ class NodeLinkEntryV2Out(BaseModel):
     # How to mount it: `{"type": "efs" | "nfs" | "aznfs", …}`, the store's adapter's `mount_spec`.
     # A daemon fails closed on a type it does not know.
     mount: dict[str, Optional[str]]
+    # "virtiofs" for a node housed in a Whole-node VM (`nodelinks.TRANSPORT_VIRTIOFS`): its guest mounts the
+    # host's virtio-fs export of this NodeLink, never the store. Null otherwise.
+    transport: Optional[Literal["virtiofs"]] = None
 
 
 class NodeLinksDesiredV2Out(BaseModel):
-    """Version 2 (`?version=2`, `nodelinks.agent_answer`): every NodeLink this node should mount, each with its
-    own store. `authoritative` false = no opinion (no store is ready); true with an empty list = unmount all."""
+    """Version 2 (`nodelinks.agent_answer`): every NodeLink this node should mount, each with its own store.
+    `authoritative` false = no opinion (no store is ready); true with an empty list = unmount all."""
 
     version: int
     authoritative: bool
     nodelinks: list[NodeLinkEntryV2Out]
 
 
-#: `nodelinks.WIRE_VERSION` and `WIRE_VERSION_STORES`; the community edition, which has no NodeLink, ships neither.
-_WIRE_VERSION, _WIRE_VERSION_STORES = (
-    (nodelinks.WIRE_VERSION, nodelinks.WIRE_VERSION_STORES) if edition_features.enabled("nodelink") else (1, 2)
-)
+#: `nodelinks.WIRE_VERSION_STORES`; the community edition, which has no NodeLink, does not ship it.
+_WIRE_VERSION_STORES = nodelinks.WIRE_VERSION_STORES if edition_features.enabled("nodelink") else 2
 
 
-@router.get("/nodelinks", response_model=Union[NodeLinksDesiredV2Out, NodeLinksDesiredOut])
+@router.get("/nodelinks", response_model=NodeLinksDesiredV2Out)
 @infra(Tenancy.ORG_SCOPED)
+@on_thread
 def nodelinks_desired(
+    session: Session,
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
-    version: int = Query(default=_WIRE_VERSION, ge=1),
-) -> Union[NodeLinksDesiredV2Out, NodeLinksDesiredOut]:
-    """This node's NodeLinks — every one attached to it, of its own org only. Without `?version=2` the
-    single-store answer older packages read. A credential that names no node is a 403, as `/nodelink`; a
-    node with no row is served nothing."""
+) -> NodeLinksDesiredV2Out:
+    """This node's NodeLinks — every one attached to it, of its own org only. A credential that names no node
+    is a 403 (no claim is accepted, as `_gha_caller_node_id`); a node with no row is served nothing."""
+    # In a worker thread on a session of its own: the answer reads the operator plane on sessions of its own
+    # (`nodelinks._effective_org`, `co_located_homes`). The route's session has run nothing yet.
     if caller.node_id is None:
         raise HTTPException(status_code=403, detail="NodeLink requires a per-node credential")
     if not edition_features.enabled("nodelink"):
         # No NodeLink: no opinion, as for an org with no store ready, so nothing the node mounts is touched.
-        if version >= _WIRE_VERSION_STORES:
-            return NodeLinksDesiredV2Out(version=_WIRE_VERSION_STORES, authoritative=False, nodelinks=[])
-        return NodeLinksDesiredOut(version=_WIRE_VERSION, store=None, nodelinks=[])
+        return NodeLinksDesiredV2Out(version=_WIRE_VERSION_STORES, authoritative=False, nodelinks=[])
     node = session.scalar(select(Node).where(Node.id == caller.node_id))
-    answer = nodelinks.agent_answer(session, node, version=version)
-    if answer["version"] >= nodelinks.WIRE_VERSION_STORES:
-        return NodeLinksDesiredV2Out(**answer)
-    return NodeLinksDesiredOut(**answer)
+    return NodeLinksDesiredV2Out(**nodelinks.agent_answer(session, node))

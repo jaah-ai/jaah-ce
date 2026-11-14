@@ -1,0 +1,50 @@
+# AWS Athena: an IAM access key, SigV4-signed; the Test lists workgroups (ListWorkGroups).
+slug = "aws_athena"
+label = "AWS Athena"
+category = "data"
+vendor_docs_url = "https://docs.aws.amazon.com/athena/latest/APIReference/API_ListWorkGroups.html"
+summary = "Let agents run SQL with Amazon Athena over data in your S3 data lake."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "access_key_id", label = "Access key ID", kind = "text", required = true, placeholder = "AKIA...", help = "AWS console > IAM > Users > the agents' user > Security credentials > Access keys > Create access key; choose Application running outside AWS and copy the Access key ID" },
+  { key = "secret_access_key", label = "Secret access key", kind = "secret", required = true, help = "Shown once, beside the access key ID, when the key is created; download the .csv if you need to keep it" },
+  { key = "region", label = "Region", kind = "text", required = false, default = "us-east-1", placeholder = "us-east-1", help = "The region your Athena tables and workgroup live in (the region picker at the top right of the Athena console)" },
+  { key = "workgroup", label = "Workgroup", kind = "text", required = false, default = "primary", placeholder = "primary", help = "Athena console > Workgroups; the workgroup agents run queries in, which sets where results are written" },
+]
+
+[test]
+method = "POST"
+path = "https://athena.us-east-1.amazonaws.com/"
+body = '{"MaxResults": 1}'
+content_type = "application/x-amz-json-1.1"
+auth = { sigv4 = { service = "athena", region = "us-east-1", access_key_field = "access_key_id", secret_key_field = "secret_access_key" } }
+headers = { "X-Amz-Target" = "AmazonAthena.ListWorkGroups" }
+list_field = "WorkGroups"
+
+[docs]
+agent_uses = [
+  "Run SQL over the tables in your Glue Data Catalog to answer questions about data in S3",
+  "List databases and tables and read their columns before writing a query",
+  "Read the result and status of a query run, and the reason it failed",
+  "Check that a partition for today's data exists",
+]
+prerequisites = [
+  "An AWS account with Athena set up in a workgroup that has a query result location in S3.",
+  "An IAM user for agents with athena:ListWorkGroups (the Test needs it), the Athena query actions, glue:Get* on the catalog, and S3 read access to the data plus write access to the result location. The AWS managed policy AmazonAthenaFullAccess covers Athena and Glue; add the S3 grants yourself.",
+]
+limitations = [
+  "Jaah tests by listing workgroups in us-east-1. It proves the key, not access to a given table or region.",
+  "Only long-lived IAM access keys are supported, not temporary (STS) credentials.",
+  "Athena bills by data scanned. Set a per-query data limit on the agents' workgroup to cap cost.",
+]
+troubleshooting = [
+  { symptom = "Test says AWS Athena returned HTTP 400", fix = "Athena answers 400 for a missing permission (AccessDeniedException) and for an unknown key (UnrecognizedClientException). Check the key pair in IAM, then allow athena:ListWorkGroups on the user" },
+  { symptom = "Test says AWS Athena rejected the secret access key (403)", fix = "The secret does not match the access key ID, or the key is deactivated. Create a new key pair and select Replace on the secret" },
+  { symptom = "Queries fail with 'No output location provided'", fix = "Set a query result location on the workgroup (Workgroups > Edit > Query result configuration), or name a workgroup that has one" },
+]
+faq = [
+  { q = "Which region does it use?", a = "The Test always uses us-east-1. Agents use the Region you set, so set it to where your tables live" },
+  { q = "Can agents create tables?", a = "Only if the IAM policy allows glue:CreateTable and the S3 writes. Leave those out to keep agents read-only" },
+]

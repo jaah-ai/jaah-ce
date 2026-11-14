@@ -1,0 +1,39 @@
+# Wispr Flow: hosted MCP server. Facts confirmed at https://docs.wisprflow.ai/articles/9551372685-connect-an-mcp-client-to-wispr-flow-remote-mcp-server and the server's own OAuth metadata (api.wisprflow.ai/.well-known/oauth-protected-resource; Dynamic Client Registration at mcp-auth.wisprflow.com/oauth2/register).
+slug = "wispr_flow"
+label = "Wispr Flow"
+category = "mcp"
+vendor_docs_url = "https://docs.wisprflow.ai/articles/9551372685-connect-an-mcp-client-to-wispr-flow-remote-mcp-server"
+summary = "Read your Wispr Flow Notetaker meetings, transcripts and notes through Flow's MCP server."
+
+[[auth]]
+kind = "mcp"
+
+[mcp]
+url = "https://api.wisprflow.ai/connect/mcp"
+url_editable = false
+transport = "streamable_http"
+auth = "oauth_dcr"
+
+[docs]
+agent_uses = [
+  "Find a meeting a task names and read its transcript and summary",
+  "Pull decisions and action items from recent meetings into a task list",
+  "Read scratchpad notes and calendar events around a meeting",
+]
+prerequisites = [
+  "A Wispr Flow account using Notetaker (Mac or Windows), with MCP access allowed: a HIPAA agreement or an organization policy can turn it off (the server address is under Settings > MCP in the Flow app)",
+]
+limitations = [
+  "The server is read-only and covers Notetaker data only: your dictations are not exposed",
+  "Authorization is per account: agents see every meeting the signed-in account can see",
+]
+troubleshooting = [
+  { symptom = "Test says Wispr Flow rejected the token (401)", fix = "The sign-in expired or was revoked. Select Reconnect and sign in to Wispr Flow again" },
+  { symptom = "Agents find no meetings", fix = "Notetaker has not recorded meetings for this account yet, or you signed in with another account. Reconnect with the account that uses Notetaker" },
+  { symptom = "The secret shows Needs reconnect", fix = "Wispr Flow ended the grant (a password change, a revoked connection or a long idle period). Select Reconnect on the secret and sign in to Wispr Flow again" },
+  { symptom = "New tasks on the project have no Wispr Flow tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with, and an agent marked Not supported on that tab cannot load MCP servers" },
+]
+faq = [
+  { q = "Does Jaah need an app registered at Wispr Flow", a = "No. Jaah registers itself with Wispr Flow's sign-in server the first time anyone connects, and every later connection reuses that registration" },
+  { q = "What does Test do", a = "It opens an MCP session with Wispr Flow's server and lists its tools, then closes the session. It reads and changes nothing in your Wispr Flow account" },
+]

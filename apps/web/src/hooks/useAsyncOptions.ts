@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { apiDetail } from '../api'
+import { countOf } from '../lib/humanize'
 import { useDebouncedCallback } from './useDebouncedCallback'
 
 /* THE SERVER-BACKED OPTION LIST behind `ui/AsyncLookup` (one value) and `ui/AsyncMultiLookup` (several): the
@@ -42,7 +43,7 @@ export interface AsyncOptions<T> {
   requestFirstPage: () => void
   /** The rows for the query RIGHT NOW, awaited: flushes the debounce and resolves once that request lands
    *  (at once when it already has), so an Enter can act on what the box would list without a second request
-   *  (`components/access/PrincipalMultiSelect`'s DM1 rule). Rejects when the request fails or a newer query
+   *  (`ui/AsyncMultiLookup`'s `onEnterComplete`). Rejects when the request fails or a newer query
    *  supersedes it; an unfetchable query resolves empty. */
   settle: () => Promise<readonly T[]>
 }
@@ -138,7 +139,7 @@ export function useAsyncOptions<T>({
     ? `${fetchError} — retype to retry.`
     : fetchable
       ? noOptionsText
-      : `Type at least ${minChars} character${minChars === 1 ? '' : 's'} to search.`
+      : `Type at least ${countOf(minChars, 'character')} to search.`
 
   return {
     shown: settled ? options : none,

@@ -2,10 +2,11 @@
  * reads the same `ViewRow`, so switching styles changes layout, never data. State word/tone/glyph come
  * from `shared.tsx`, never forked here.
  */
+import { taskOrigin, type TaskOrigin } from '../../../lib/taskOrigin'
 import { startOfZonedDay, startOfZonedWeek } from '../../../lib/zonedDay'
 // The ratability predicate from its single home.
 import { isRatableTask } from '../../../lib/taskRating'
-import { compactAge } from '../../../lib/relativeTime'
+import { compactAge, HOUR_MS, shortDate } from '../../../lib/relativeTime'
 import type { OrgRef, PipelineTask } from '../../../types'
 import type { Tone } from '../../../ui/StatusChip'
 import {
@@ -20,6 +21,7 @@ import {
   taskStatus,
 } from '../shared'
 import { taskRoleLabel } from '../personaRegistry'
+import { DEFAULT_PERSONA } from '../taskPersona'
 
 export type ViewRow = {
   task: PipelineTask
@@ -34,7 +36,7 @@ export type ViewRow = {
   href: string
   /** The `?` indicator's target, or null for exactly the rows `stateLabel` does not read as "Asking".
    *  Separate from `href` (the title opens the row's own task); on a container it points at the subtask
-   *  holding the gate. `shared.tsx`'s `answerHref` owns that choice and the `?tab=answer` link. */
+   *  holding the gate. `shared.tsx`'s `answerHref` owns that choice and the `?tab=qa` link. */
   answerHref: string | null
   state: string
   /** State word, tone and glyph from the shared vocabulary, off `state` plus the two refinements below. */
@@ -63,7 +65,8 @@ export type ViewRow = {
   /** The age slot's figure (`compactAge`): time since the RUN started on an `active` row that says when
    *  (`run_started_at` — the deleted Queue style's running age), else since `updated_at`. */
   age: string
-  /** The age slot's hover: `Running 12m` on a run-aged row, else `null` (the slot carries no hover). */
+  /** The age slot's hover: the moment the figure counts from, briefly (`Nov 2, 2:05 PM`; the year only outside this
+   *  one), on every state; `null` when there is no such moment. */
   ageTitle: string | null
   /** Sort/bucket key: parsed `updated_at`, or 0 when unparseable. */
   updatedMs: number
@@ -75,6 +78,14 @@ export type ViewRow = {
   /** The creator's resolved display name (never an id; `types.ts`'s `Provenance`), or `null`. Rendered as
    *  initials plus a hue (`lib/authorBadge.ts`), with the full name on hover and as the accessible name. */
   createdBy: string | null
+  /** The assignee's resolved name, and its id where the payload carries one (a board row does not), or `null`. */
+  assignee: string | null
+  assigneeId: string | null
+  /** Who filed it: human, automated or system (`lib/taskOrigin.ts`) — the row's title tone and creator glyph. */
+  origin: TaskOrigin
+  /** Finished and not yet opened by this viewer (`PipelineTask.done_unseen`): the disc's attention halo and
+   *  `UNSEEN` in the row's words. Never a subtask's, whatever the payload says (an epic reports for its stages). */
+  unseen: boolean
   /** The operator's five-star verdict: mean and vote count (`types.ts`'s `rating_average`/`rating_count`).
    *  Ratability is folded in — no `ratable` flag: a row not `done`, or a pipeline child (not top-level,
    *  epic or plannable — `lib/taskRating.ts`), reads as unrated (`null`, `0`). A separate flag could be
@@ -114,6 +125,7 @@ export function toViewRow(task: PipelineTask, parent?: PipelineTask): ViewRow {
   const done = task.state === 'done'
   /* The run's start, read only while it runs: a finished row's age stays its last move. */
   const runStart = task.state === 'active' ? task.run_started_at ?? null : null
+  const ageFrom = runStart ?? task.updated_at
   /* Asked of `lib/taskRating.ts`'s `isRatableTask`, the single home of the rule; never re-spelled here. */
   const ratable = isRatableTask(task)
   /* Only these refinements from `taskStatus` are taken, deliberately:
@@ -166,15 +178,21 @@ export function toViewRow(task: PipelineTask, parent?: PipelineTask): ViewRow {
     childCount,
     doneChildCount,
     pct: childCount > 0 ? Math.round((doneChildCount / childCount) * 100) : null,
-    persona: taskRoleLabel(task),
-    age: compactAge(runStart ?? task.updated_at),
-    ageTitle: runStart ? `Running ${compactAge(runStart)}` : null,
+    /* The default persona says nothing on a top-level row (AC-18); an epic's subtasks keep theirs (their stage). */
+    persona: task.parent_task_id === null && task.persona === DEFAULT_PERSONA && !task.playbook_stage?.label
+      ? '' : taskRoleLabel(task),
+    age: compactAge(ageFrom),
+    ageTitle: ageFrom ? shortDate(ageFrom, new Date(), true) : null,
     updatedMs: Number.isNaN(updatedMs) ? 0 : updatedMs,
     tags: (task.tags ?? []).map(tag => tag.name),
     system: isHiddenSystemRow(task),
     // `archived_at` itself, never the cleanup-verb predicate.
     archived: task.archived_at != null,
     createdBy: task.created_by ?? null,
+    assignee: task.assigned_to ?? null,
+    assigneeId: task.assigned_to_id ?? null,
+    origin: taskOrigin(task),
+    unseen: done && task.done_unseen === true && task.parent_task_id == null,
     // Both through `ratable` (see the fields' note).
     ratingAverage: ratable ? task.rating_average ?? null : null,
     ratingCount: ratable ? task.rating_count ?? 0 : 0,
@@ -192,9 +210,6 @@ export function toViewRows(tasks: PipelineTask[]): ViewRow[] {
 
 /** One activity-feed heading and its rows. Empty buckets are dropped. */
 export type TimeBucket = { label: string; rows: ViewRow[] }
-
-const MINUTE = 60_000
-const HOUR = 60 * MINUTE
 
 /* The activity feed's buckets. "Today" and "This week" are calendar boundaries (midnight, and the Monday
  * opening the week), not rolling 24h/7d windows, which named the wrong day.
@@ -233,7 +248,7 @@ export function bucketByRecency(
     // A running row goes to the top regardless of timestamp; holds because `live` means `active`.
     else if (row.live) buckets[0].rows.push(row)
     /* "Last hour" stays a rolling window: it names a duration, not a calendar period. Do not "fix" it. */
-    else if (age < HOUR) buckets[1].rows.push(row)
+    else if (age < HOUR_MS) buckets[1].rows.push(row)
     /* Since midnight / the week's Monday in `zone`, never `now - 24h` / `now - 7d` (see above). */
     else if (row.updatedMs >= dayStart) buckets[2].rows.push(row)
     else if (row.updatedMs >= weekStart) buckets[3].rows.push(row)

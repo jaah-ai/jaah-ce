@@ -1,4 +1,4 @@
-"""The audit trail: activity events, their search index, and the command audit."""
+"""The audit trail: activity events, their search index, the command audit, and the console's client events."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -8,7 +8,7 @@ from sqlalchemy import ForeignKey, Index, SmallInteger, String, Text, desc, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
-from app.models.base import Base, org_unique, OrgScoped, timestamp_column
+from app.models.base import Base, _in_check, org_unique, OrgScoped, timestamp_column
 
 
 class ActivityEvent(OrgScoped, Base):
@@ -159,3 +159,41 @@ class CommandAudit(OrgScoped, Base):
     created_at: Mapped[datetime] = timestamp_column(index=True)
     completed_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)
     result: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+
+
+#: `client_events.kind`: what the console reported (`app/client_events.py`).
+CLIENT_EVENT_KINDS = ("render_error", "chunk_error", "stall", "uncaught_error", "page_load", "navigation", "slow_read",
+                      "slow_write")
+
+
+class ClientEvent(OrgScoped, Base):
+    """One error or stall a flagged console session reported (`POST /api/client-events`, `app/client_events.py`).
+
+    Append-only, read by an operator on Audit > Client errors, pruned after 30 days by the `client-events-prune`
+    cron. `user_id` SET NULL: a deleted member's reports outlive them, unattributed, until the prune."""
+
+    __tablename__ = "client_events"
+    __table_args__ = (
+        org_unique(__tablename__),
+        _in_check("kind", CLIENT_EVENT_KINDS, "ck_client_events_kind"),
+        # The prune's cutoff; the operator's list is a keyset on `id DESC`, narrowed to one org or one member.
+        Index("ix_client_events_created_at", "created_at"),
+        Index("ix_client_events_org_id_id", "org_id", "id"),
+        Index("ix_client_events_user_id_id", "user_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="SET NULL"), nullable=True
+    )
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    # The pathname only; the client strips the query.
+    route: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    message: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    detail: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    build_version: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    client_ip: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # The browser's clock, as sent; `created_at` is the server's.
+    occurred_at: Mapped[datetime] = timestamp_column(server_now=False)
+    created_at: Mapped[datetime] = timestamp_column()

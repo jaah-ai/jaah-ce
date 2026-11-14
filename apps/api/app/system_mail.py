@@ -124,12 +124,23 @@ def from_address() -> str:
     return f"{from_local()}@{domain}"
 
 
-def send(msg: mail_message.OutboundEmail, *, delivery_id: UUID) -> str:
-    """Send `msg` through SES; its MessageId. Raises `NotConfigured` or `SendError` (see the module docstring)."""
+def send(
+    msg: mail_message.OutboundEmail, *, delivery_id: UUID, local_part: Optional[str] = None,
+    display_name: Optional[str] = None,
+) -> str:
+    """Send `msg` through SES; its MessageId. Raises `NotConfigured` or `SendError` (see the module docstring).
+    `local_part`/`display_name` replace the operator's From for a sender of its own on the same domain, identity and
+    configuration set (a hosted app's relayed mail, `app/hosted_apps/mail.py`); `local_part` must match
+    `LOCAL_PART_PATTERN`."""
     sender = from_address()
+    if local_part is not None:
+        if not LOCAL_PART_PATTERN.fullmatch(local_part):
+            raise SendError("the From local part is not one this domain sends from", status=400, code="InvalidMessage")
+        sender = f"{local_part}@{sender.rsplit('@', 1)[1]}"
     try:
         message = mail_message.build(
-            sender, [msg.to], [], subject=msg.subject, text=msg.text, html=msg.html, sender_name=sender_name(),
+            sender, [msg.to], [], subject=msg.subject, text=msg.text, html=msg.html,
+            sender_name=sender_name() if display_name is None else display_name,
             reply_to=msg.reply_to, extra_headers=msg.headers,
         )
     except mail_message.InvalidMessage as exc:
@@ -155,10 +166,10 @@ def send(msg: mail_message.OutboundEmail, *, delivery_id: UUID) -> str:
 @contextlib.contextmanager
 def _operator_session() -> Iterator[Any]:
     """A fresh operator-plane session, out of any caller scope: the fallback mailbox is org zero's whoever sends."""
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.tenancy import seam
 
-    with seam.detached(), seam.operator_scope(), SessionLocal() as session:
+    with seam.detached(), seam.operator_scope(), BridgedSession() as session:
         yield session
 
 

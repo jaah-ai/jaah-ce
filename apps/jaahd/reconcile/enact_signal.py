@@ -5,13 +5,18 @@ import asyncio
 import functools
 import logging
 from pathlib import Path
+from typing import Callable
 
 import cloud_modules
 import host_platform
 from env_helpers import mark_agents_dirty
 from reconcile import tick_wire, context, enact_reset
-from reconcile.vocab import OUTCOME_DONE, OUTCOME_FAILED, OUTCOME_REFUSED_PRECONDITION, OUTCOME_REFUSED_STALE
-from reconcile.tick_wire import RosterSlot, SLOT_TASK, SLOT_USER, SlotIntent
+from worktree_mechanics import core as wm_core
+from reconcile.vocab import (
+    NOT_SWITCHED_PREFIX, OUTCOME_DONE, OUTCOME_FAILED, OUTCOME_REFUSED_PRECONDITION, OUTCOME_REFUSED_STALE,
+    RUNNER_BUSY_PREFIX,
+)
+from reconcile.tick_wire import RosterSlot, SLOT_TASK, SlotIntent
 from reconcile.context import ReconcileContext
 
 log = logging.getLogger(__name__)
@@ -126,14 +131,8 @@ async def _enact_kill_runner(ctx: "ReconcileContext", slot: RosterSlot | None, i
         )
         _retire_intent_state(intent_id)
         return OUTCOME_DONE, "nothing swept: the slot is no longer bound to this task", {}
-    # Only a `task`-held slot: the record is sensed, so a `free` or `user` slot can still show a live pane (an
-    # operator's or human's console).
-    if record_state == SLOT_USER:
-        return _refuse_kill_runner(
-            intent_id, what,
-            "the slot is user-owned, not task-owned — a kill_runner intent may never sweep a human's "
-            "own console session",
-        )
+    # Only a `task`-held slot: the record is sensed, so a `free` slot can still show a live pane (an
+    # operator's console).
     if record_state != SLOT_TASK:
         return _refuse_kill_runner(
             intent_id, what,
@@ -197,7 +196,7 @@ async def _close_acp_before_kill(worktree: str, task: str | None, what: str) -> 
     cancel the turn, emit that result and flush; a host still up at the deadline is swept as before, and its
     signal handler ships what it already took (`acp/host.py::Host.serve`). Never raises and never refuses: a
     legacy runner, another task's session or an unreachable hub fall straight through to the sweep."""
-    import runner_registry  # noqa: PLC0415 — deferred, as `enact_launch._old_front_pane`
+    import runner_registry  # noqa: PLC0415 — deferred: a stdlib leaf read only on this path
 
     try:
         ident = await asyncio.to_thread(runner_registry.live_in_worktree, worktree)
@@ -216,7 +215,7 @@ async def _close_acp_before_kill(worktree: str, task: str | None, what: str) -> 
         return
     if not queued:
         return
-    # Counted polls, not a clock (as `enact_launch._close_for_handoff`).
+    # Counted polls, not a clock: the wait is bounded however the sleep is driven.
     for _ in range(int(KILL_CLOSE_WAIT_S / KILL_CLOSE_POLL_S)):
         await asyncio.sleep(KILL_CLOSE_POLL_S)
         current = await asyncio.to_thread(runner_registry.live_in_worktree, worktree)
@@ -378,13 +377,29 @@ def _acp_task_mismatch(hub, session_id: str, task_id: object) -> bool:
     return str(record.get("task_id", "")) != str(task_id)
 
 
+async def _acp_session_hub(session_id: str, what: str):
+    """The ACP runtime hub when `session_id` is an ACP session on this node, else None (a pane or VM session).
+    Never fatal: a hub that cannot start leaves the pane delivery intact, logged."""
+    if not session_id:
+        return None
+    try:
+        hub = context._acp_hub()
+        return hub if await asyncio.to_thread(hub.is_acp, session_id) else None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("reconcile: %s — the ACP runtime hub is unavailable (%s: %s); delivering as a pane "
+                    "session", what, type(exc).__name__, exc)
+        return None
+
+
 def _deliver_acp_answer(hub, intent: SlotIntent, session_id: str, question: str, answer: str,
-                        what: str, *, bare: bool = False) -> tuple[str, str, dict]:
+                        what: str, *, bare: bool = False, dismiss: bool = False) -> tuple[str, str, dict]:
     """`deliver_answer` for an ACP session: resolve its open user-input request (the named one, else the
     oldest), or queue the composed answer as the host's next prompt. Synchronous; run in a thread.
 
     `bare` (every question ignored): the open request is DECLINED with no answer — nothing about it is
-    sent — and only with none open is `answer` (the wake word) queued, unframed."""
+    sent — and only with none open is `answer` (the wake word) queued, unframed. `dismiss` (a task edit closed
+    the question): the open request is DECLINED and the text ALWAYS queued as the next prompt — it answers
+    nothing the request asked, so it never fills it."""
     import answer_delivery  # noqa: PLC0415
 
     intent_id = intent.id
@@ -392,7 +407,20 @@ def _deliver_acp_answer(hub, intent: SlotIntent, session_id: str, question: str,
         return _refuse_deliver_answer(intent_id, what, "the ACP session belongs to another task")
     request_id = intent.payload.get("request_id")
     request_id = request_id if isinstance(request_id, str) and request_id else None
-    if bare:
+    if dismiss:
+        # The edit closes EVERY open request, not only the oldest. The first decline carries `intent_id`, so a
+        # re-served intent (already recorded: True, nothing declined) declines nothing more.
+        from acp import runtime as acp_runtime  # noqa: PLC0415
+
+        before = len(hub.open_requests(session_id))
+        if (hub.resolve_request(session_id, request_id=request_id, decision="decline", answers=None,
+                                intent_id=intent_id)
+                and len(hub.open_requests(session_id)) < before):
+            for _ in range(acp_runtime.MAX_OPEN_REQUESTS - 1):
+                if not hub.resolve_request(session_id, request_id=None, decision="decline", answers=None):
+                    break
+        resolved = False
+    elif bare:
         resolved = hub.resolve_request(session_id, request_id=None, decision="decline", answers=None,
                                        intent_id=intent_id)
     else:
@@ -469,17 +497,9 @@ async def _enact_deliver_answer(ctx: "ReconcileContext", slot: RosterSlot | None
     session_id = str(intent.payload.get("session_id") or "")
     # `bare`: the CP's whole message (the ignored-round wake word), sent without the `Answer: ` frame.
     bare = intent.payload.get("bare") is True
-    hub = None
-    if session_id:
-        # Built only here, and never fatal: a hub that cannot start leaves the legacy delivery below intact.
-        try:
-            hub = context._acp_hub()
-            if not await asyncio.to_thread(hub.is_acp, session_id):
-                hub = None
-        except Exception as exc:  # noqa: BLE001
-            log.warning("reconcile: %s — the ACP runtime hub is unavailable (%s: %s); delivering as a pane "
-                        "session", what, type(exc).__name__, exc)
-            hub = None
+    # `dismiss`: a task edit closed the open question — `Esc`, then the text as a message, never typed into it.
+    dismiss = intent.payload.get("dismiss") is True
+    hub = await _acp_session_hub(session_id, what)
     if hub is not None:
         # An ACP session has no composer to paste into: the answer decides its open request, else it is
         # queued as the host's next prompt. The session/task fence runs before any file is staged.
@@ -487,10 +507,12 @@ async def _enact_deliver_answer(ctx: "ReconcileContext", slot: RosterSlot | None
             return _refuse_deliver_answer(intent_id, what, "the ACP session belongs to another task")
         await _stage_answer_attachments(intent, task_id)
         return await asyncio.to_thread(
-            functools.partial(_deliver_acp_answer, hub, intent, session_id, question, answer, what, bare=bare))
+            functools.partial(_deliver_acp_answer, hub, intent, session_id, question, answer, what, bare=bare,
+                              dismiss=dismiss))
     forwarded = await asyncio.to_thread(_windows_vm_intent, {
         "kind": "deliver_answer", "task_id": task_id, "session_id": intent.payload.get("session_id"),
-        "question": question, "answer": answer, **({"bare": True} if bare else {})})
+        "question": question, "answer": answer, **({"bare": True} if bare else {}),
+        **({"dismiss": True} if dismiss else {})})
     if forwarded is not None and not forwarded.get("no_vm"):
         return _vm_delivery_outcome(intent_id, what, forwarded["ok"] or None, "answer")
     vm_id = await asyncio.to_thread(_bound_vm, intent)
@@ -499,7 +521,7 @@ async def _enact_deliver_answer(ctx: "ReconcileContext", slot: RosterSlot | None
         # A MicroVM session has no pane and no slot record: its console is the target (D19).
         delivered = await asyncio.to_thread(
             answer_delivery.deliver_vm_answer, vm_id, message,
-            task_id=task_id, session_id=intent.payload.get("session_id"),
+            task_id=task_id, session_id=intent.payload.get("session_id"), dismiss=dismiss,
         )
         return _vm_delivery_outcome(intent_id, what, delivered, "answer")
     pane, refusal = await _fenced_pane(ctx, intent, what, "deliver-answer")
@@ -512,7 +534,7 @@ async def _enact_deliver_answer(ctx: "ReconcileContext", slot: RosterSlot | None
     delivered = await asyncio.to_thread(
         functools.partial(
             answer_delivery.deliver_answer, tmux_target, message, expect_cwd=record_path,
-            tui=_runner_tui(record_path),
+            tui=_runner_tui(record_path), dismiss=dismiss,
         )
     )
     if delivered is not True:
@@ -545,6 +567,18 @@ async def _enact_deliver_message(ctx: "ReconcileContext", slot: RosterSlot | Non
     if not text.strip():
         return _refuse_deliver_answer(intent.id, what, "the payload carries no message text",
                                       "deliver-message")
+    session_id = str(intent.payload.get("session_id") or "")
+    hub = await _acp_session_hub(session_id, what)
+    if hub is not None:
+        # No pane to type into: the message is the host's next operator prompt (a `steer`), after its turn.
+        if await asyncio.to_thread(_acp_task_mismatch, hub, session_id, task_id):
+            return _refuse_deliver_answer(intent.id, what, "the ACP session belongs to another task",
+                                          "deliver-message")
+        if not await asyncio.to_thread(hub.enqueue_control, session_id, {
+                "id": f"message-{intent.id}", "type": "steer", "payload": {"text": text}}):
+            return OUTCOME_FAILED, "the message could not be queued for the ACP session's host", {}
+        _retire_intent_state(intent.id)
+        return OUTCOME_DONE, "", {}
     forwarded = await asyncio.to_thread(_windows_vm_intent, {
         "kind": "deliver_message", "task_id": task_id, "session_id": intent.payload.get("session_id"),
         "text": text})
@@ -572,6 +606,85 @@ async def _enact_deliver_message(ctx: "ReconcileContext", slot: RosterSlot | Non
         return OUTCOME_FAILED, f"the message was not submitted into the pane (result={delivered})", {}
     _retire_intent_state(intent.id)
     return OUTCOME_DONE, "", {}
+
+
+async def _enact_switch_model(ctx: "ReconcileContext", slot: RosterSlot | None, intent: SlotIntent,
+                              obs: dict | None) -> tuple[str, str, dict]:
+    """Enact one `switch_model` intent: switch the named session's model in place (an operator's edit of a
+    running task). An ACP session gets a `set_model` control on its host's lane; a pane session its CLI's own
+    switch (`model_switch`, the driver its adapter returns), behind `_fenced_pane`'s session fence and cwd proof.
+
+    `done` on a verified switch; `failed` (re-served) on a transient one — a busy runner (`RUNNER_BUSY_PREFIX`:
+    a wait the CP never charges, so a long turn is no reason to park), no confirmation seen. A
+    switch that can never happen — a CLI with no in-place switch, a model the CLI does not offer, a MicroVM
+    session — retires as `done` with a `not switched:` reason (`kill_runner`'s stale retirement): a refusal would
+    be re-served until parked. An unsafe model token is refused outright: it is typed into a terminal."""
+    import model_switch  # noqa: PLC0415 — deferred: subprocess-heavy sibling, needed only on this verb
+
+    model = str(intent.payload.get("model") or "")
+    task_id = intent.payload.get("task_id")
+    what = f"switch_model on {intent.project} #{intent.number}" + (f" (task {task_id})" if task_id is not None else "")
+    if not model_switch.MODEL_RE.match(model):
+        return _refuse_deliver_answer(intent.id, what, "the payload's model is not a safe model id", "switch-model")
+    session_id = str(intent.payload.get("session_id") or "")
+    hub = await _acp_session_hub(session_id, what)
+    if hub is not None:
+        if await asyncio.to_thread(_acp_task_mismatch, hub, session_id, task_id):
+            return _refuse_deliver_answer(intent.id, what, "the ACP session belongs to another task", "switch-model")
+        if not await asyncio.to_thread(hub.enqueue_control, session_id, {
+                "id": f"model-{intent.id}", "type": "set_model", "payload": {"model": model}}):
+            return OUTCOME_FAILED, "the model switch could not be queued for the ACP session's host", {}
+        _retire_intent_state(intent.id)
+        return OUTCOME_DONE, "", {}
+    if await asyncio.to_thread(_bound_vm, intent):
+        _retire_intent_state(intent.id)
+        return OUTCOME_DONE, f"{NOT_SWITCHED_PREFIX}a MicroVM session's model cannot be switched in place", {}
+    pane, refusal = await _fenced_pane(ctx, intent, what, "switch-model")
+    if refusal is not None or pane is None:
+        return refusal or (OUTCOME_FAILED, "the session fence named no pane", {})
+    tmux_target, record_path = pane
+    driver, config_dir = await asyncio.to_thread(_runner_model_switch, record_path)
+    if driver is None:
+        _retire_intent_state(intent.id)
+        return OUTCOME_DONE, f"{NOT_SWITCHED_PREFIX}this CLI has no in-place model switch", {}
+    saved = model_switch.SavedDefault(intent.id, config_dir=config_dir)
+    status, why = await asyncio.to_thread(functools.partial(
+        model_switch.switch_model, tmux_target, model, expect_cwd=record_path, driver=driver,
+        config_dir=config_dir, saved=saved))
+    if status == model_switch.SWITCHED:
+        _retire_switch(intent.id, saved)
+        return OUTCOME_DONE, "", {}
+    if status == model_switch.UNSUPPORTED:
+        log.warning("switch-model: %s not switched to %s — %s", what, model, why)
+        _retire_switch(intent.id, saved)
+        return OUTCOME_DONE, f"{NOT_SWITCHED_PREFIX}{why}", {}
+    if status == model_switch.BUSY:
+        log.info("switch-model: %s waits for its runner (%s) — retrying next pass", what, why)
+        return OUTCOME_FAILED, f"{RUNNER_BUSY_PREFIX}{why}", {}
+    log.warning("switch-model: %s did not switch to %s (%s) — retrying next pass", what, model, why)
+    return OUTCOME_FAILED, why, {}
+
+
+def _retire_switch(intent_id: object, saved) -> None:
+    """`_retire_intent_state`, plus the intent's hold on its account's saved default (`model_switch.SavedDefault`)."""
+    _retire_intent_state(intent_id)
+    saved.forget()
+
+
+def _runner_model_switch(worktree: str) -> tuple[Callable[..., tuple[str, str]] | None, str]:
+    """`(driver, config_dir)` for the CLI running in `worktree`: its adapter's `model_switch()` (None = no in-place
+    switch) and the run's account config dir. A runner recorded with no provider runs the default one (as
+    `_runner_tui`); a provider this node has no adapter for has no switch."""
+    import agent_providers  # noqa: PLC0415 — deferred, as `_runner_tui`
+    import agents  # noqa: PLC0415
+    import runner_registry  # noqa: PLC0415
+
+    ident = runner_registry.live_in_worktree(worktree)
+    provider = (ident.provider if ident is not None else "") or agent_providers.DEFAULT_PROVIDER
+    if provider not in agents.registered_providers():
+        return None, ""
+    switcher = getattr(agents.get_adapter(provider), "model_switch", None)
+    return (switcher() if switcher is not None else None), (ident.account_dir if ident is not None else "")
 
 
 async def _enact_erase_tree(ctx: "ReconcileContext", slot: RosterSlot | None, intent: SlotIntent,
@@ -610,9 +723,6 @@ async def _enact_destroy_slot(ctx: "ReconcileContext", slot: RosterSlot, intent:
         report["detail"] = detail
         return outcome, detail, {"report": report}
 
-    if slot.is_main:
-        report["refused"] = True
-        return _done(OUTCOME_DONE, "slot 0 is the project's clone, never a destroyable slot")
     kind_refusal = tick_wire.slot_kind_mismatch(slot, intent)
     if kind_refusal:
         report["refused"] = True
@@ -631,7 +741,7 @@ async def _enact_destroy_slot(ctx: "ReconcileContext", slot: RosterSlot, intent:
         swept, targets = await enact_reset._clear_tree_detail(ctx, slot.path, what)
         report["killed"] = [f"pid {r.get('pid')}: {r.get('cmd') or '?'}"[:200] for r in swept] + [
             f"tmux {t}" for t in targets]
-    task_branch = f"{slot.branch_prefix}fleet/task-{task_id}" if task_id else ""
+    task_branch = wm_core.task_branch(slot.branch_prefix, task_id) if task_id else ""
     report["unpushed"] = await asyncio.to_thread(
         slot_destroy.scan_unpushed, slot.path if obs is not None else slot.clone,
         head=obs is not None, task_branch=task_branch,

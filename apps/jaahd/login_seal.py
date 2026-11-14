@@ -50,9 +50,9 @@ RSA_BITS = 2048
 # RSA-2048 OAEP-SHA256: k − 2·hLen − 2 = 256 − 64 − 2 bytes of plaintext per chunk.
 CHUNK_PLAINTEXT_BYTES = 190
 CHUNK_CIPHERTEXT_BYTES = RSA_BITS // 8
-# The longest sealed value either side accepts on the wire, in base64 characters. 11 chunks hold the
-# control plane's 2048-character URL bound (`routes/commands.py::_OAUTH_URL_MAX_LEN`) with room to spare;
-# a 512-character code (`_OAUTH_CODE_RE`) is 3.
+# The longest sealed value either side accepts on the wire, in base64 characters. 11 chunks hold a
+# 2048-character authorize URL (a Google consent URL measures ~550) with room to spare; a 512-character
+# code (`_OAUTH_CODE_RE`) is 3.
 MAX_SEALED_CHARS = 4096
 # A 2048-bit SPKI is 294 DER bytes; the bound leaves room for a longer modulus without admitting a blob.
 MAX_KEY_CHARS = 1024

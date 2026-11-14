@@ -8,10 +8,14 @@
 // sync" (apps/api/app/routes/portfolio.py never fabricates `down`, and the pool policy holds `stack_present`
 // to the same rule).
 import { countOf } from './humanize'
+import { HOUR_MS } from './relativeTime'
 import type { Worktree } from '../types'
+import type { Tone } from '../ui/StatusChip'
+import { toneOf } from '../ui/statusTone'
 
-/** The chip tone vocabulary, mirroring `ui/StatusChip`'s `Tone` without importing a component here. */
-export type SlotTone = 'neutral' | 'info' | 'success' | 'warning' | 'error' | 'unknown'
+/** The chip tone vocabulary: `ui/StatusChip`'s `Tone` (a type-only import, so no component is pulled in),
+ *  plus the table-only `unknown`. */
+export type SlotTone = Tone | 'unknown'
 
 /** One rendered status atom: the word, its tone, a shape glyph, and the sentence that explains it. */
 export type SlotSignal = {
@@ -23,34 +27,22 @@ export type SlotSignal = {
   hint: string
 }
 
-// Slot 0 is the main clone, rendered `main` (mirrors `MAIN_CLONE_NUMBER` in
-// `apps/api/app/routes/pool_slots.py`). Declared by an assignment's converge, never leased to a task.
-export const MAIN_CLONE_NUMBER = 0
-
-/** The slot's number as the pool speaks it — `main` for slot 0, the bare id otherwise. */
+/** The slot's number as the pool speaks it. */
 export function slotNumberLabel(slot: Worktree): string {
-  return slot.number === MAIN_CLONE_NUMBER ? 'main' : `#${slot.number}`
+  return `#${slot.number}`
 }
 
-/** The slot's fully-qualified IDENTITY — `project#number`, with slot 0 spelled `main`. */
+/** The slot's fully-qualified IDENTITY — `project#number`. */
 export function slotIdentity(slot: Worktree): string {
-  return `${slot.project}#${slot.number === MAIN_CLONE_NUMBER ? 'main' : slot.number}`
+  return `${slot.project}#${slot.number}`
 }
 
-/* `main` is a LABEL, not an occupancy state. `lease()` refuses `number = 0` (A9,
-   `apps/api/app/slot_state.py`), so the main clone's `state` is genuinely `free` and `isHeld` needs no
-   carve-out. */
 export const STATE_FREE = 'free'
 
 /** Does something HOLD this slot? Single-homed (headline rollup, group bars, Held filter, row weight).
- *  `state` is closed `free` | `task` | `user`, so held = not free. */
+ *  `state` is closed `free` | `task`, so held = not free. */
 export function isHeld(slot: Worktree): boolean {
   return slot.state !== STATE_FREE
-}
-
-/** Held by a PERSON rather than a fleet task? Gates the Owner detail row. */
-export function isUserOwned(slot: Worktree): boolean {
-  return slot.state === 'user'
 }
 
 /** Is this slot held by a task waiting on a HUMAN ANSWER — the hold's REASON?
@@ -71,21 +63,14 @@ export function isAwaitingAnswer(slot: Worktree): boolean {
 export const AWAITING_ANSWER_WORDS =
   'waiting on a human answer — open the task and answer it, or the slot stays held'
 
-/** A `state === 'user'` slot owner's readable identity — never the bare uuid — with a generic fallback.
- *  `null` otherwise, so each caller picks its own "not a person" rendering. */
-export function userOwnerLabel(slot: Worktree): string | null {
-  if (!isUserOwned(slot)) return null
-  return slot.owner_user_email ?? 'a person'
+/** Who holds `slot`, as every surface names it: the task's number; a held slot whose task row is gone is
+ *  "a task". */
+export function holderLabel(slot: Worktree): string {
+  return slot.task_id !== null ? `#${slot.task_id}` : 'a task'
 }
 
-// The `Declared…` explanation for a NUMBERED slot, single-homed across `stateSignal`'s three surfaces.
+// The `Declared…` explanation, single-homed across `stateSignal`'s three surfaces.
 const DECLARED_HINT = 'Declared — built on the node’s next reconcile pass'
-
-/* The main clone's declared hint: the sentence above is FALSE for it. `_unmaterialised_candidates`
-   (apps/jaahd/reconcile/) excludes `is_main`; slot 0 materialises as the CLONE RUNG of the first real
-   slot, never on a reconcile pass. */
-const DECLARED_MAIN_HINT =
-  'Declared. Returns when a numbered slot under it is next created or leased.'
 
 /** The two-way LIFECYCLE state (has the node built the tree?), orthogonal to occupancy (`state`). No
  *  `parked`: that is `state === 'task'` with no live session (`hasLiveSession`, `lib/worktree.ts`). */
@@ -101,7 +86,7 @@ export function stateSignal(slot: Worktree): SlotSignal {
   if (state === 'declared') {
     return {
       label: 'Declared', tone: 'neutral', glyph: '○',
-      hint: slot.number === MAIN_CLONE_NUMBER ? DECLARED_MAIN_HINT : DECLARED_HINT,
+      hint: DECLARED_HINT,
     }
   }
   return { label: 'Ready', tone: 'success', glyph: '●', hint: 'Ready.' }
@@ -257,19 +242,11 @@ export function gitWords(slot: Worktree): string {
   ].filter(Boolean).join(', ')
 }
 
-/* The occupancy tone: `free` success, `task` info (occupancy, not liveness), `user` neutral
-   (a person's slot is ordinary; the word distinguishes it). No alarms. */
-export function stateTone(state: string): SlotTone {
-  switch (state) {
-    case 'free':
-      return 'success'
-    case 'task':
-      return 'info'
-    case 'user':
-      return 'neutral'
-    default:
-      return 'neutral'
-  }
+/* The occupancy tone: `free` success, `task` info (occupancy, not liveness). No alarms. */
+const OCCUPANCY_TONE: Record<string, Tone> = { free: 'success', task: 'info' }
+
+export function stateTone(state: string): Tone {
+  return toneOf(OCCUPANCY_TONE, state)
 }
 
 /* `protected` (types.ts) is a server-computed read, never re-derived. Its old holder-based rule is gone;
@@ -304,7 +281,7 @@ export const DESTROY_STUCK_HOURS = 0.5
 export function retiringHours(slot: Worktree, now: number = Date.now()): number | null {
   if (!slot.retiring || !slot.retiring_since) return null
   const since = Date.parse(slot.retiring_since)
-  return Number.isNaN(since) ? null : Math.max(0, (now - since) / 3_600_000)
+  return Number.isNaN(since) ? null : Math.max(0, (now - since) / HOUR_MS)
 }
 
 /** A destroy's run time: minutes under an hour (a fresh removal read `0h`), else the panel's `7h` / `3d`. */
@@ -333,7 +310,7 @@ export function sessionAge(slot: Worktree, now: number = Date.now()): SlotDurati
   }
   // A future start is node-to-browser clock skew; `-0.3h` would read as a bug.
   return {
-    label: durationLabel(Math.max(0, (now - started) / 3_600_000)),
+    label: durationLabel(Math.max(0, (now - started) / HOUR_MS)),
     hint: `Since ${slot.session_started_at}`,
   }
 }

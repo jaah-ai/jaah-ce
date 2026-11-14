@@ -2,6 +2,8 @@ import Box from '@mui/material/Box'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
 import type { EpicMetrics } from '../../types'
+import { FONT_SIZE } from '../../theme'
+import { countOf } from '../../lib/humanize'
 import { humanDuration } from '../../lib/relativeTime'
 import { personaLabel } from './personaRegistry'
 import { TaskPrList } from './TaskPrList'
@@ -50,8 +52,8 @@ export default function FinishSection({ metrics }: { metrics: EpicMetrics | null
   return (
     /* No padding of its own: the `ui/detail` `DetailSection` supplies the panel inset; doubling it pushed this
        block past its heading and siblings. Line spacing is the `gap`. */
-    <Box sx={{ display: 'flex', flexDirection: 'column', gap: '0.375rem' }}>
-      <Stack direction="row" useFlexGap sx={{ flexWrap: 'wrap', gap: '4px 12px', fontSize: '0.8125rem' }}>
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+      <Stack direction="row" useFlexGap sx={{ flexWrap: 'wrap', rowGap: 0.5, columnGap: 2, fontSize: FONT_SIZE.md }}>
         {/* The verify verdict heads this row, a wrapping `Stack` so another verdict-shaped finding can join it. */}
         <Typography component="span" variant="inherit" sx={{ color: 'text.secondary' }}>
           Verify:{' '}
@@ -83,8 +85,7 @@ export default function FinishSection({ metrics }: { metrics: EpicMetrics | null
       )}
 
       <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-        Re-exploration: {benchmarks.re_exploration.duplicate_target_count} duplicate target
-        {benchmarks.re_exploration.duplicate_target_count === 1 ? '' : 's'}
+        Re-exploration: {countOf(benchmarks.re_exploration.duplicate_target_count, 'duplicate target')}
         {benchmarks.re_exploration.duplicated_targets.length > 0
           ? ` (${benchmarks.re_exploration.duplicated_targets.join(', ')})`
           : ''}
@@ -92,13 +93,11 @@ export default function FinishSection({ metrics }: { metrics: EpicMetrics | null
         Data loss between phases:{' '}
         {benchmarks.data_loss_between_phases.length === 0
           ? 'none'
-          : `${benchmarks.data_loss_between_phases.length} gap${
-              benchmarks.data_loss_between_phases.length === 1 ? '' : 's'
-            }`}
+          : countOf(benchmarks.data_loss_between_phases.length, 'gap')}
       </Typography>
 
       {unresolvedCount > 0 && (
-        <Typography component="ul" variant="caption" sx={{ m: 0, pl: '1.25rem', color: 'text.secondary' }}>
+        <Typography component="ul" variant="caption" sx={{ m: 0, pl: 3, color: 'text.secondary' }}>
           {verify.missing_analysis_artifacts.map(m => (
             <li key={`artifact-${m.child_id}`}>
               Missing analysis artifact — child #{m.child_id} ({personaLabel(m.persona)})
@@ -119,7 +118,7 @@ export default function FinishSection({ metrics }: { metrics: EpicMetrics | null
       )}
 
       {prs.length > 0 && (
-        <Box data-testid="finish-prs" sx={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+        <Box data-testid="finish-prs" sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
           <Typography variant="caption" sx={{ color: 'text.secondary' }}>Pull requests</Typography>
           <TaskPrList
             prs={prs}

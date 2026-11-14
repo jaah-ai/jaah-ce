@@ -4,7 +4,8 @@
 
 import { del, get, patch, post, put } from '../api'
 import type { Tone } from '../ui/StatusChip'
-import { humanize } from './humanize'
+import { countOf, currencyFormat, humanize } from './humanize'
+import { DAY_MS } from './relativeTime'
 
 export type BillingAddress = {
   line1: string | null
@@ -195,22 +196,7 @@ export const planDelete = (id: string) => del<DeletePlan>(`${pmPath(id)}?dry_run
 export const deletePaymentMethod = (id: string) => del<DeletePlan>(pmPath(id))
 export const syncBilling = () => post<PaymentMethod[]>(`${ROOT}/sync`)
 
-/* Purchases. A body carries a plan key (and the preview it confirms, the agents, the interval) only — never an
- * amount: the server prices. `agents`/`interval` are sent only when set. */
-export type PurchaseOptions = { agents?: number; interval?: BillingInterval }
-const extras = ({ agents, interval }: PurchaseOptions = {}) => ({
-  ...(agents !== undefined ? { agents } : {}),
-  ...(interval !== undefined ? { interval } : {}),
-})
-export const previewPlan = (plan_key: string, opts?: PurchaseOptions) => post<Preview>(`${ROOT}/preview`, { plan_key, ...extras(opts) })
-export const subscribe = (plan_key: string, opts?: PurchaseOptions) =>
-  post<BillingChange>(`${ROOT}/subscribe`, { plan_key, ...extras(opts) })
-export const changePlan = (plan_key: string, preview_id?: string, opts?: { agents?: number }) =>
-  post<BillingChange>(`${ROOT}/change`, { plan_key, ...(preview_id ? { preview_id } : {}), ...extras(opts) })
-/** A per-agent plan's agent count. More agents are charged now, prorated (`client_secret` set when 3-D Secure is owed);
- *  fewer are a credit on the next invoice. */
-export const previewAgents = (agents: number) => post<Preview>(`${ROOT}/agents/preview`, { agents })
-export const changeAgents = (agents: number, preview_id: string) => post<BillingChange>(`${ROOT}/agents`, { agents, preview_id })
+/* Plan changes. Plans are bought in Billing › Products (`lib/products.ts`); a body carries no amount: the server prices. */
 /** Monthly ↔ yearly: charged now; `client_secret` set when 3-D Secure is owed. */
 export const previewInterval = (interval: BillingInterval) => post<Preview>(`${ROOT}/interval/preview`, { interval })
 export const changeInterval = (interval: BillingInterval, preview_id: string) =>
@@ -253,14 +239,13 @@ export function noticeAction(
 
 /** "$12.34", "$49.00": an amount always shows its cents (a price tag drops them — `priceTagText`). */
 export function moneyText(amount: number, currency: string): string {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: currency.toUpperCase() }).format(amount / 100)
+  return currencyFormat(currency.toUpperCase()).format(amount / 100)
 }
 
 /** "$49", "$49.50", "$12,345": a price tag drops whole-dollar cents. */
 export function priceTagText(cents: number, currency: string): string {
   const digits = cents % 100 === 0 ? 0 : 2
-  const opts = { style: 'currency', currency: currency.toUpperCase(), minimumFractionDigits: digits, maximumFractionDigits: digits } as const
-  return new Intl.NumberFormat('en-US', opts).format(cents / 100)
+  return currencyFormat(currency.toUpperCase(), { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(cents / 100)
 }
 
 /** "49" or "49.50" — the field's text for a stored amount. */
@@ -288,19 +273,8 @@ export function priceError(cents: number, { allowFree = false } = {}): string {
 
 /** A free trial's time left, from its end: "12 days left", "1 day left", or "Ended" once past (days round up). */
 export function trialLeftText(endIso: string, now: Date = new Date()): string {
-  const days = Math.ceil((Date.parse(endIso) - now.getTime()) / 86_400_000)
-  return days <= 0 ? 'Ended' : `${days} ${days === 1 ? 'day' : 'days'} left`
-}
-
-/** "Nov 3", or "Nov 3, 2027" outside the current year; `withTime` adds the clock ("Nov 3, 2:05 PM"). Local
- *  time, en-US. An unparseable date reads as itself. The console's ONE short date (the Compliance pages re-export it). */
-export function shortDate(iso: string, now: Date = new Date(), withTime = false): string {
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) return iso
-  const sameYear = date.getFullYear() === now.getFullYear()
-  return date.toLocaleString('en-US', {
-    month: 'short', day: 'numeric', ...(sameYear ? {} : { year: 'numeric' }), ...(withTime ? { hour: 'numeric', minute: '2-digit' } : {}),
-  })
+  const days = Math.ceil((Date.parse(endIso) - now.getTime()) / DAY_MS)
+  return days <= 0 ? 'Ended' : `${countOf(days, 'day')} left`
 }
 
 /** Invoice status → its chip. */

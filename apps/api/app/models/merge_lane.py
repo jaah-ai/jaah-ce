@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
-from sqlalchemy import BigInteger, ForeignKey, Index, Integer, String, Text, text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, ForeignKey, Index, Integer, String, Text, text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -30,6 +30,10 @@ class MergeLaneRow(UuidPkMixin, OrgScoped, Base):
         ),
         Index("ix_merge_lane_rows_project_state", "project_id", "state"),
         Index("ix_merge_lane_rows_lane_task_id", "lane_task_id"),
+        # The tick's fleet-wide `failed` reads (`reopen_settled_failures`, `close_ended_failures`), no project filter.
+        Index("ix_merge_lane_rows_failed_task_id", "task_id", postgresql_where=text("state = 'failed'")),
+        # A task's newest row (`merge_lane._latest_row_id`).
+        Index("ix_merge_lane_rows_task_created", "task_id", "created_at"),
     )
 
     project_id: Mapped[int] = mapped_column(
@@ -47,6 +51,8 @@ class MergeLaneRow(UuidPkMixin, OrgScoped, Base):
     # batched; the row is born `failed` with `failure.kind = "no_git_person"`.
     git_person_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     state: Mapped[str] = mapped_column(Text, nullable=False, server_default="queued")
+    # Held by the Merge step's gate (by hand, or approvals still owed): the lane does not batch it.
+    held: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     lane_task_id: Mapped[Optional[int]] = mapped_column(
         BigInteger, ForeignKey("tasks.id", ondelete="SET NULL", name="fk_merge_lane_rows_lane_task_id"), nullable=True
     )

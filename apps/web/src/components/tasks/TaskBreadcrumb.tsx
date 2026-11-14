@@ -1,27 +1,25 @@
-import { useLayoutEffect, useRef, useState, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
+import { useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react'
 import Box from '@mui/material/Box'
-import InputBase from '@mui/material/InputBase'
 import Menu from '@mui/material/Menu'
 import Skeleton from '@mui/material/Skeleton'
 import MenuItem from '@mui/material/MenuItem'
 import Breadcrumb, { type BreadcrumbItem } from '../Breadcrumb'
-import ProjectMenu, { type ProjectMenuRow } from './ProjectMenu'
+import ProjectMenu, { MENU_ITEM_SX, type ProjectMenuRow } from './ProjectMenu'
 import type { FeatureSummary } from '../../types'
 import { parseFeatureIcon } from '../../lib/featureIcon'
 import FeatureIcon from './FeatureIcon'
 import { deescapeMarkdownText, storedTitleAsShown } from './shared'
+import { projectRootLabel } from './featureFiling'
 
-// `PHONE` is imported from `ui/listStyles.ts`, its single home. The `16px` font floor below is the iOS
-// auto-zoom floor (Safari zooms the editor on focus under it).
-import { ABOVE_PHONE, PHONE, TASK_TRAIL_CONTAINER } from '../../ui/listStyles'
+import { ABOVE_PHONE, TRAIL_NO_ASIDE, ELLIPSIS_SX } from '../../ui/listStyles'
+import { FONT_SIZE, LINE_HEIGHT, grid } from '../../theme'
 import { SystemChip } from '../../ui/MarkChip'
+import Tip from '../../ui/Tip'
+import InlineTitleEdit from '../../ui/InlineTitleEdit'
 
 // `TaskCreate` carries NO `title` (`create_task` derives it from the body), so on `/tasks/new` this crumb
 // names the surface rather than offering an edit the API would discard.
 export const NEW_TASK_CRUMB = 'New task'
-
-// An unfiled task's feature crumb and menu row: a plain label, not the board's project-named group.
-const NO_FEATURE_LABEL = 'No feature'
 
 /* The task editor's breadcrumb `{Project} › [{Feature}] › {id}: {Title}` — the
  * task's full path (AC-8.2, AC-1.1). It REPLACES the page `<h1>`, so it is the only thing saying which task
@@ -30,10 +28,11 @@ const NO_FEATURE_LABEL = 'No feature'
  *   the task is CREATED; on an existing task it stages a MOVE saved with the form (`project_id` on
  *   `TaskUpdate`). A project the host refuses (`pickRefusal`) is listed but unselectable (hiding it would
  *   hide why).
- * · Feature — "No feature" or one of the staged project's active features, a STAGED pick like the
- *   project (`feature_id` on the same PUT); plain text where not editable. Absent on `/tasks/new` while
- *   no feature is staged: a create from project scope is a project-level task (`acme › New task`). The host
- *   keeps project and feature in agreement.
+ * · Feature — the project's root ("acme/", the task in its project alone) or one of the staged project's
+ *   features, a STAGED pick like the project (`feature_id` on the same PUT); plain text where not editable. Its
+ *   menu also ends in "New feature…" (`onNewFeature`). A task in its project alone draws it only where it is a
+ *   picker, the one place filing lives; absent for a reader and on `/tasks/new` while nothing is staged: a
+ *   create from project scope is a project-level task (`acme › New task`). The host keeps project and feature in agreement.
  * · `{id}: {title}` — bare id; the title is click-to-edit, committing to the FORM's draft on blur (only
  *   Save persists; Escape reverts).
  * Editability is gated by `*Editable` props, not a permission hook, so tests need no permission mock. */
@@ -55,6 +54,7 @@ export default function TaskBreadcrumb({
   featureLabel,
   features = [],
   onFeatureChange,
+  onNewFeature,
   featureEditable = false,
   featureIcon = null,
 }: {
@@ -83,13 +83,16 @@ export default function TaskBreadcrumb({
   title: string
   onTitleChange: (next: string) => void
   titleEditable: boolean
-  /** The staged feature, `null` for none ("Other"). */
+  /** The staged feature, `null` for the project itself. */
   featureId?: string | null
-  /** Its name, where the host could resolve one (a shipped or unlisted feature still names itself). */
+  /** Its name, where the host could resolve one (a deleted or unlisted feature still names itself). */
   featureLabel?: string
-  /** What the feature picker offers: the staged project's active features the caller may file into. */
+  /** What the feature picker offers: the staged project's features the caller may file into. */
   features?: FeatureSummary[]
   onFeatureChange?: (feature: FeatureSummary | null) => void
+  /** The feature menu's last item, "New feature…": create one in the task's project, then file there. Absent: not
+   *  offered (the caller may not create there). */
+  onNewFeature?: () => void
   /** False for a reader, a stage task (it moves with its epic) and while a save is in flight. */
   featureEditable?: boolean
   /** The staged feature's icon, drawn before the feature crumb and the title; null draws nothing. */
@@ -97,45 +100,13 @@ export default function TaskBreadcrumb({
 }) {
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null)
   const [featureAnchor, setFeatureAnchor] = useState<HTMLElement | null>(null)
-  // `null` = not editing, distinct from editing an empty title.
-  const [draft, setDraft] = useState<string | null>(null)
-  // Set by Escape so the blur it causes does not commit the rejected value.
-  const escapedRef = useRef(false)
-  const inputRef = useRef<HTMLInputElement>(null)
   const trailRef = useRef<HTMLElement | null>(null)
 
   /* `'Project'` is the unresolved fallback once the roster has landed without this project; before then, a skeleton —
      unless the host already knows its name (`projectLabel`). */
   const project = projects.find(p => p.id === projectId)
   const projectName = project?.name ?? projectLabel ?? 'Project'
-  const shownFeature = featureId ? (featureLabel ?? 'Feature') : NO_FEATURE_LABEL
-
-  function commit() {
-    if (escapedRef.current) {
-      escapedRef.current = false
-      setDraft(null)
-      return
-    }
-    /* A blanked title on an existing task reverts: `submit()` omits an empty `title` so the server keeps the
-     * stored one (AC2.2), and the crumb must show what the save will do. On create a blank is carried. */
-    /* An unedited field is no change: it opened on the de-escaped title, and committing that would rewrite the
-     * stored one. */
-    const unchanged = draft === deescapeMarkdownText(title)
-    if (draft !== null && !unchanged && !(taskId !== undefined && draft.trim() === '')) onTitleChange(draft)
-    setDraft(null)
-  }
-
-  function onTitleKeyDown(e: KeyboardEvent<HTMLInputElement>) {
-    if (e.key === 'Enter') {
-      e.preventDefault()
-      // One commit path: blur. Committing on Enter as well would run twice, the second with a stale `draft`.
-      inputRef.current?.blur()
-    } else if (e.key === 'Escape') {
-      e.preventDefault()
-      escapedRef.current = true
-      inputRef.current?.blur()
-    }
-  }
+  const shownFeature = featureId ? (featureLabel ?? 'Feature') : projectRootLabel(projectName)
 
   const idPrefix = taskId === undefined ? '' : `${taskId}: `
   // The icon belongs to a filed task only, so it follows the feature crumb's own condition.
@@ -148,77 +119,22 @@ export default function TaskBreadcrumb({
     ? storedTitleAsShown(title)
     : taskId === undefined ? NEW_TASK_CRUMB : '(untitled)'
 
-  const currentCrumb = draft !== null ? (
-    <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0, minWidth: 0 }}>
-      {parseFeatureIcon(titleIcon) && (
-        <Box component="span" sx={{ flex: '0 0 auto' }}><FeatureIcon icon={titleIcon} inline /></Box>
-      )}
-      {idPrefix && <Box component="span" sx={{ flex: '0 0 auto' }}>{idPrefix}</Box>}
-      <InputBase
-        inputRef={inputRef}
-        value={draft}
-        autoFocus
-        // Multiline + `fullWidth`: titles run 100+ chars, and without `fullWidth` (and `Breadcrumb`'s
-        // `:last-of-type` grow rule) MUI sizes the input to ~180px. No select-all on open: the first keystroke
-        // would destroy the title.
-        multiline
-        fullWidth
-        onChange={e => setDraft(e.target.value)}
-        onBlur={commit}
-        onKeyDown={onTitleKeyDown}
-        inputProps={{ 'aria-label': 'Task title' }}
-        data-testid="task-crumb-title-input"
-        sx={theme => ({
-          flex: '1 1 auto',
-          minWidth: 0,
-          font: 'inherit',
-          px: '4px',
-          border: 1,
-          borderColor: 'primary.main',
-          borderRadius: 1,
-          // `InputBase` has no focus ring; thicken the border, with an inset so the baseline does not shift.
-          '&.Mui-focused': { borderWidth: 2, px: '3px' },
-          // `theme.custom.tapTargetPx` is the touch floor's single home; 16px is the iOS auto-zoom floor.
-          [PHONE]: { fontSize: '16px', minHeight: theme.custom.tapTargetPx },
-        })}
-      />
-    </Box>
-  ) : (
-    <Box
-      component={titleEditable ? 'button' : 'span'}
-      type={titleEditable ? 'button' : undefined}
-      onClick={titleEditable ? () => setDraft(deescapeMarkdownText(title)) : undefined}
-      data-testid="task-crumb-title"
-      aria-label={titleEditable ? `Edit title: ${shownTitle}` : undefined}
-      // The whole title on hover: above the phone the one-line trail ellipsises it (`Breadcrumb`'s `oneLine`).
-      title={`${idPrefix}${shownTitle}`}
-      sx={theme => ({
-        font: 'inherit',
-        color: 'inherit',
-        textAlign: 'left',
-        p: 0,
-        m: 0,
-        border: 0,
-        background: 'none',
-        /* A `<button>` is an atomic inline box: the `<h1>`'s ellipsis would clip it mid-glyph, so the box itself
-           ellipsises on the one-line trail. */
-        [ABOVE_PHONE]: { display: 'block', maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-        ...(titleEditable
-          ? {
-              cursor: 'text',
-              // Dotted underline on hover only: the crumb is the page's identifier first.
-              '&:hover': { textDecoration: 'underline dotted' },
-              /* The 44px tap floor as padding cancelled by an equal negative margin (`Breadcrumb`'s crumb hit
-                 box): a `minHeight` would centre a one-line title 12px below the `›` that leads it. */
-              [PHONE]: { py: `${(theme.custom.tapTargetPx - 18) / 2}px`, my: `${(18 - theme.custom.tapTargetPx) / 2}px` },
-            }
-          : {}),
-      })}
-    >
-      <FeatureIcon icon={titleIcon} inline />
-      {idPrefix}
-      {shownTitle}
-    </Box>
+  /* The title, click-to-edit (`ui/InlineTitleEdit`): it commits to the FORM's draft (only Save persists). A blanked
+   * title on an existing task reverts: `submit()` omits an empty `title` so the server keeps the stored one (AC2.2),
+   * and the crumb must show what the save will do. On create a blank is carried. */
+  const currentCrumb = (
+    <InlineTitleEdit
+      value={deescapeMarkdownText(title)}
+      shown={shownTitle}
+      onCommit={onTitleChange}
+      editable={titleEditable}
+      blank={taskId === undefined ? 'commit' : 'revert'}
+      lead={(parseFeatureIcon(titleIcon) || idPrefix) ? <><FeatureIcon icon={titleIcon} inline />{idPrefix}</> : undefined}
+      tip={`${idPrefix}${shownTitle}`}
+      inputLabel="Task title"
+      editLabel={`Edit title: ${shownTitle}`}
+      testId="task-crumb-title"
+    />
   )
 
   // Keyed on what changes a crumb's width or makes it a picker at all; a resize of the trail re-runs it too.
@@ -228,9 +144,9 @@ export default function TaskBreadcrumb({
     !project && projectLabel === undefined && projectPending
       ? { label: <Skeleton data-testid="task-crumb-project-pending" role="status" aria-label="Loading project" variant="text" sx={PENDING_CRUMB_SX} /> }
       : pickerCrumb(projectName, projectEditable, 'Project', 'project', setMenuAnchor, null, project?.system_kind ? <SystemChip /> : null, projectTo, pickerPending),
-    /* A filed task names its feature; an unfiled one names none: "No feature" was a crumb that said
-       nothing. Filing an unfiled task stays on the page's "Move to feature…" action. */
-    ...(featureId
+    /* A task in a feature names it. One in its project alone names none to a reader, but an editor's is the
+       project-root picker that files it: Move to feature lives here now. */
+    ...(featureId || (featureEditable && taskId !== undefined)
       ? [pickerCrumb(shownFeature, featureEditable, 'Feature', 'feature', setFeatureAnchor, featureIcon, null, undefined, pickerPending)]
       : []),
     { label: currentCrumb },
@@ -263,34 +179,36 @@ export default function TaskBreadcrumb({
         <MenuItem
           selected={!featureId}
           onClick={() => { setFeatureAnchor(null); if (featureId) onFeatureChange?.(null) }}
-          sx={FEATURE_ITEM_SX}
+          sx={MENU_ITEM_SX}
         >
-          {NO_FEATURE_LABEL}
+          {projectRootLabel(projectName)}
         </MenuItem>
         {features.map(f => (
           <MenuItem
             key={f.id}
             selected={f.id === featureId}
             onClick={() => { setFeatureAnchor(null); if (f.id !== featureId) onFeatureChange?.(f) }}
-            sx={FEATURE_ITEM_SX}
+            sx={MENU_ITEM_SX}
           >
             {f.name}
           </MenuItem>
         ))}
+        {onNewFeature && (
+          <MenuItem
+            onClick={() => { setFeatureAnchor(null); onNewFeature() }}
+            data-testid="task-crumb-new-feature"
+            sx={MENU_ITEM_SX}
+          >
+            New feature…
+          </MenuItem>
+        )}
       </Menu>
     </>
   )
 }
 
-const FEATURE_ITEM_SX = {
-  whiteSpace: 'normal',
-  flexWrap: 'wrap',
-  gap: 0.75,
-  [PHONE]: { minHeight: 44 },
-} as const
-
 // A typical project name's width, so the trail does not jump when the name lands.
-const PENDING_CRUMB_SX = { display: 'inline-block', width: '4rem', flex: '0 0 auto' } as const
+const PENDING_CRUMB_SX = { display: 'inline-block', width: grid(10.5), flex: '0 0 auto' } as const
 
 /* THE PICKER CRUMB ON THE ONE-LINE TRAIL: the crumb is an atomic inline-flex box, so the trail's own
    ellipsis clipped it mid-glyph and took the ▾ with it. Above the phone the box caps at its crumb's width and the
@@ -302,20 +220,16 @@ const PICKER_CRUMB_SX = {
   [ABOVE_PHONE]: { maxWidth: '100%', verticalAlign: 'top' },
 } as const
 const PICKER_NAME_SX = {
-  [ABOVE_PHONE]: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  [ABOVE_PHONE]: ELLIPSIS_SX,
 } as const
-/* The mark after the name (the System chip) gives way FIRST: its shrink weight dwarfs the name's, so it
-   narrows before the name loses a glyph — a cramped "c…" beside a whole chip told the reader less. The chip's own
-   label ellipsises ("Sy…"), and below `ASIDE_FLOOR` (a letter and the ellipsis inside the chip's padding) the chip
-   goes OUTRIGHT rather than leaving a border sliver, two ways:
-   · on a trail narrower than `ASIDE_TRAIL_MIN` it is not drawn — measured with a short name ("acme", "No feature")
-     the chip reaches its floor there, so the 1024px split's ~260px trail shows "acme ▾" with no blank where it was.
-     A query on the trail's width (its header lead) (`ui/listStyles.ts`'s `TASK_TRAIL_CONTAINER`) cannot feed back on what it hides;
-   · with a longer name it reaches the floor on a wider trail: the box is a one-line wrapping row led by a
-     zero-width `::before`, so a chip whose floor no longer fits beside it wraps to a second line, which the box's
-     fixed height and `overflow` cut away (the box keeps its leftover, at most the floor). 24px is MUI's small Chip. */
-const ASIDE_TRAIL_MIN = 290
-const ASIDE_FLOOR = '2rem'
+/* The mark after the name (the System chip, a `ui/StatusChip` pill that never shrinks its word) gives way FIRST:
+   its box's shrink weight dwarfs the name's, so it narrows before the name loses a glyph — a cramped "c…" beside a
+   whole chip told the reader less. The chip goes OUTRIGHT rather than leaving a border sliver, two ways:
+   · on a trail narrower than 290px (`TRAIL_NO_ASIDE`) it is not drawn — the 1024px split's ~260px trail shows "acme ▾"
+     with no blank where it was. A query on the trail's width (its header lead) (`ui/listStyles.ts`'s
+     `TASK_TRAIL_CONTAINER`) cannot feed back on what it hides;
+   · with a longer name the box is a one-line wrapping row led by a zero-width `::before`, so a chip that no longer
+     fits beside it wraps to a second line, which the box's fixed height and `overflow` cut away. */
 const PICKER_ASIDE_SX = {
   display: 'inline-flex',
   [ABOVE_PHONE]: {
@@ -323,10 +237,9 @@ const PICKER_ASIDE_SX = {
     minWidth: 0,
     overflow: 'hidden',
     flexWrap: 'wrap',
-    height: 24,
+    height: grid(4),
     '&::before': { content: '""', height: '100%' },
-    '& > .MuiChip-root': { flex: `1 1 ${ASIDE_FLOOR}`, minWidth: 0, maxWidth: 'max-content' },
-    [`@container ${TASK_TRAIL_CONTAINER} (max-width:${ASIDE_TRAIL_MIN - 0.05}px)`]: { display: 'none' },
+    [TRAIL_NO_ASIDE]: { display: 'none' },
   },
 } as const
 
@@ -362,9 +275,13 @@ function snapEllipsis(name: HTMLElement) {
     const ctx = measureCanvas.getContext('2d')
     if (!ctx) return null
     const style = getComputedStyle(name)
+    // save/restore: the shared canvas starts every measure at its default (zero) letter spacing.
+    ctx.save()
     ctx.font = style.font
-    ctx.letterSpacing = style.letterSpacing === 'normal' ? '0px' : style.letterSpacing
-    return ctx.measureText('…').width
+    if (style.letterSpacing !== 'normal') ctx.letterSpacing = style.letterSpacing
+    const width = ctx.measureText('…').width
+    ctx.restore()
+    return width
   })()
   if (ellipsis === null) return
   // The widest prefix that fits beside the ellipsis: the one the browser draws.
@@ -387,7 +304,7 @@ function snapEllipsis(name: HTMLElement) {
 
 /* The caret distinguishes a picker crumb from a navigating one before the press. The small glyph has almost no side
    bearing, so its margins stand in for a letter's: the gap to the name and to the `›` then match a plain crumb's. */
-const CARET_SX = { flex: '0 0 auto', fontSize: '0.7em', lineHeight: 1, ml: '4px', mr: '2px' } as const
+const CARET_SX = { flex: '0 0 auto', fontSize: FONT_SIZE.xxs, lineHeight: LINE_HEIGHT.tight, ml: 0.5, mr: 0 } as const
 
 /** A crumb that is a picker when `editable` (a caret and a menu), otherwise a link to `to`, or plain text.
  *  `pickerPending`: not editable YET — drawn in the picker's own box with its caret's width held unseen. */
@@ -405,13 +322,13 @@ function pickerCrumb(
   const lead = <FeatureIcon icon={icon} inline />
   // The picker's box and name, shared by the live picker and the one still pending, so their widths agree.
   const pickerBox = (caret: ReactNode) => (
-    <Box component="span" data-testid={`task-crumb-${slug}`} title={name} sx={PICKER_CRUMB_SX}>
+    <Tip title={name}><Box component="span" data-testid={`task-crumb-${slug}`} sx={PICKER_CRUMB_SX}>
       {/* No flex gap: the inline icon carries its own, so both crumb forms space it alike. */}
       {lead}
       <Box component="span" data-testid={`task-crumb-${slug}-name`} data-snap-ellipsis sx={PICKER_NAME_SX}>{name}</Box>
       {aside && <Box component="span" data-testid={`task-crumb-${slug}-aside`} sx={PICKER_ASIDE_SX}>{aside}</Box>}
       {caret}
-    </Box>
+    </Box></Tip>
   )
   if (!editable && pickerPending && !to) {
     return {
@@ -421,7 +338,7 @@ function pickerCrumb(
       text: name,
     }
   }
-  if (!editable) return { label: <span data-testid={`task-crumb-${slug}`} title={name}>{lead}{name}{aside}</span>, to, text: name }
+  if (!editable) return { label: <Tip title={name}><span data-testid={`task-crumb-${slug}`}>{lead}{name}{aside}</span></Tip>, to, text: name }
   return {
     label: pickerBox(<Box component="span" aria-hidden data-testid={`task-crumb-${slug}-caret`} sx={CARET_SX}>▾</Box>),
     ariaLabel: `${noun}: ${name} — change ${noun.toLowerCase()}`,

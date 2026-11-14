@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
@@ -23,17 +23,17 @@ from app.auth import require_user
 from app.authz.catalog import Tenancy
 from app.authz.declarations import feature, superadmin_only
 from app.authz.object_access import can_access
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller
 from app.authz.visibility import ObjectAccess, sees_all_nodes
-from app.db import get_session
-from app.entity_shape import StrictModel
+from app.db_async import on_session, on_thread
+from app.entity_shape import StrictModel, commit_row, or_404, refused_as
 from app.events import emit_console_event
 from app.models.credentials import Credential
 from app.models.identity import AdminUser
 from app.models.nodes import Node
 from app.node_identity import is_uuid_shaped
 from app.tenancy.copy import administrator_changes
-from app.tenancy.ids import is_operator_plane, is_tenant_org
+from app.tenancy.ids import is_operator_user, is_tenant_org
 from app.routes.nodes import reads
 from app.routes.nodes.node_wire import (
     NodeCounts,
@@ -74,6 +74,14 @@ class NodeTransferFenceOut(BaseModel):
     lifted: bool
 
 
+class NodeVmSizeIn(StrictModel):
+    """A Whole-node VM's size fields; one left out is unchanged, null resets it to the default."""
+
+    vcpus: Optional[int] = None
+    ram_mib: Optional[int] = None
+    disk_gib: Optional[int] = None
+
+
 class NodeUpdateIn(StrictModel):
     """PUT body — editable fields ONLY. `extra='forbid'` rejects any unknown or read-only field
     (status/last_seen/config_snapshot/counts/…) with a 422. No state-conditional restrictions."""
@@ -93,7 +101,7 @@ class NodeUpdateIn(StrictModel):
     # a node is never registered mid-wind-down.
     draining: Optional[bool] = None
     # No `nodelink_enabled`: the switch is retired (mounts follow a node's NodeLink attachments,
-    # `routes/nodelinks.py`); the node read still serves the column. No `nodelink_root`: where the node mounts
+    # `routes/nodelinks.py`), and the node read no longer serves it. No `nodelink_root`: where the node mounts
     # its account-token share is the node's own report (`nodes.shared_accounts_root`). A body naming either is
     # a 422 (`StrictModel`), on the PUT and the create.
     role: Optional[str] = None
@@ -110,14 +118,22 @@ class NodeUpdateIn(StrictModel):
     # MicroVM mode and the node's VM size override (null clears one), gated by `_require_authority_for_microvm`;
     # a flip is refused with `microvm_mode.blocker`'s sentence. Not on `NodeCreateIn`: a node is marked later.
     microvm: Optional[bool] = None
+    # The node's shape (`app/node_shape.py`): `microvm` above is its Legacy/MicroVM half, both through one writer.
+    shape: Optional[Literal["legacy", "microvm", "node_vm"]] = None
     microvm_vcpus: Optional[int] = None
     microvm_ram_mib: Optional[int] = None
     microvm_disk_gib: Optional[int] = None
+    # A Whole-node VM's own size (`app/node_vm_sizing.py`; each field null = back to the default), gated as the
+    # MicroVM fields are and written through `node_vm_sizing.change`.
+    node_vm_size: Optional[NodeVmSizeIn] = None
     # KVM for sessions on a co-located node, gated by `_check_session_kvm`: the host's owner only, and on only
     # where the host has `/dev/kvm`. Not on `NodeCreateIn`: a node is co-located by its host's door.
     session_kvm: Optional[bool] = None
     # The operator's allocation of this node to its tenant (`app/node_allocation.py`); a non-operator change is a 403.
     operator_allocated: Optional[bool] = None
+    # How many tasks may run here at once (`nodes.max_running_tasks`, the `launch_gates.TASKS` gate); 0 (or null)
+    # clears it, stored NULL. Editable as `description` is: the tenant's own throttle on its own node.
+    max_running_tasks: Optional[int] = Field(default=None, ge=0, le=64)
 
     @model_validator(mode="before")
     @classmethod
@@ -144,10 +160,11 @@ def _credential_in_reach(session: Session, credential_id: UUID, expected_type: s
 
 @router.post("/api/nodes/{node_id}/lift-transfer-fence", response_model=NodeTransferFenceOut)
 @superadmin_only(Tenancy.OPERATOR)
+@on_session
 def lift_node_transfer_fence(
+    session: Session,
     node_id: str,
     user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> NodeTransferFenceOut:
     """Let a node an org transfer fenced take work again before it has confirmed the old org's cleanup (PRD R3.4):
     the operator's call for a node that will never answer (`durable/node_transfer.py` keeps asking meanwhile).
@@ -155,9 +172,7 @@ def lift_node_transfer_fence(
     a node not fenced is a no-op that writes nothing."""
     from app.user_activity import record_write
 
-    row = _node_row(session, node_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"unknown node '{node_id}'")
+    row = or_404(_node_row(session, node_id), detail=f"unknown node '{node_id}'")
     lifted = session.execute(
         update(Node).where(Node.id == row.id, Node.org_transfer_cleanup_pending.is_(True))
         .values(org_transfer_cleanup_pending=False).execution_options(synchronize_session=False)
@@ -230,7 +245,8 @@ _LAUNCH_SPEC_KEYS = ("connection_id", "instance_type", "market", "root_volume_gb
 # written by the launch and the node-ssm backfill only, and `image_id` (the image it booted) by the launch only: a
 # tenant without host administration may not author them, and no tenant drops them on save. Both the authorship
 # refusal and the carry-through cover these via this tuple. So does the boot-log sentence the sweep writes
-# (`cloud_boot_watch.BOOT_REPORT_KEY`): the host page shows it as the system's own diagnosis.
+# (`cloud_boot_watch.BOOT_REPORT_KEY`): the host page shows it as the system's own diagnosis; and the launch's
+# break-glass warning (`cloud_node_launch.BREAK_GLASS_WARNING_KEY`), the node page's.
 # The community edition launches no machine, so it has no share credential, machine state or boot log to guard.
 _SUPERADMIN_ONLY_INFRA_KEYS: tuple[str, ...] = (
     _LAUNCH_PROOF_KEYS + ("account_id", "image_id") + _LAUNCH_SPEC_KEYS + _INSTANCE_REF_KEYS
@@ -238,7 +254,8 @@ _SUPERADMIN_ONLY_INFRA_KEYS: tuple[str, ...] = (
 if edition_features.enabled("cloud_nodes"):
     _SUPERADMIN_ONLY_INFRA_KEYS = (
         _LAUNCH_PROOF_KEYS + (SHARED_STORE_CREDENTIAL_KEY, "account_id", "image_id") + _LAUNCH_SPEC_KEYS
-        + _INSTANCE_REF_KEYS + cloud_lifecycle.INFRA_KEYS + (cloud_boot_watch.BOOT_REPORT_KEY,)
+        + _INSTANCE_REF_KEYS + cloud_lifecycle.INFRA_KEYS
+        + (cloud_boot_watch.BOOT_REPORT_KEY, cloud_node_launch.BREAK_GLASS_WARNING_KEY)
     )
 
 # Host-level fields: what the machine is and how it is run, as distinct from identity (`name`/`description`/
@@ -313,7 +330,7 @@ def _require_superadmin_to_author_a_launch_proof(
                 f"credential store from. Omit them (whatever is stored is kept), or ask a superadmin."
             ),
         )
-    if is_operator_plane(actor.org_id, actor.is_superadmin):
+    if is_operator_user(actor):
         # The operator's own verdict is unchanged: its seam reaches every org's credential anyway.
         return
     if not edition_features.enabled("cloud_nodes"):
@@ -366,16 +383,15 @@ def _merge_a_non_superadmins_infra(
 ) -> None:
     """Carry the stored launch proofs through a non-operator's `infra` payload, in place.
 
-    `infra` is written wholesale, so an omitted key is deleted, and `NodeDetailPage` sends a fixed six-key
-    object with no region or instance id: a plain Save would erase a cloud node's launch record (wedging
-    `node_group_reconcile` and making `delete_node` skip a billing machine). The page round-trips what it
-    does not edit; this is the server-side floor.
+    `infra` is written wholesale, so an omitted key is deleted: an API caller sending a partial object would erase a
+    cloud node's launch record (wedging `node_group_reconcile` and making `delete_node` skip a billing machine). The
+    console's node page sends no `infra` at all; this is the server-side floor for every other caller.
 
     Non-operator only: an operator's dict stays authoritative (launch paths re-record proofs; an operator may
     clear a stale one). Below that tier the stored value is the only correct one — a tenant superadmin is
     not served the credential references (`_TENANT_WITHHELD_INFRA_KEYS`), so their Save omits them. Omission
     only: a named key is the guard's. A `None`/non-dict `infra` is left for `NodeUpdateIn`."""
-    if is_operator_plane(actor.org_id, actor.is_superadmin) or "infra" not in fields:
+    if is_operator_user(actor) or "infra" not in fields:
         return
     sent = fields.get("infra")
     if not isinstance(sent, dict) or not isinstance(stored, dict):
@@ -397,10 +413,14 @@ def _require_authority_for_microvm(
     tenant admin on a shared node (A6), or anyone who does not administer the node's org. Change, not presence:
     the edit form resends every field, and the reader can already read these values."""
     changed = [name for name in _MICROVM_FIELDS if name in fields and fields[name] != getattr(row, name)]
+    if fields.get("shape") is not None and fields["shape"] != _shape_now(session, row):
+        changed.append("shape")
+    if fields.get("node_vm_size"):
+        changed.append("node_vm_size")
     if not changed:
         return
     if not edition_features.enabled("microvm"):
-        raise HTTPException(status_code=404, detail=ce_caps.NOT_IN_CE)  # The community edition has no MicroVMs.
+        raise ce_caps.not_in_edition()  # The community edition has no MicroVMs.
     from app import microvm_mode
 
     if _microvm_editable(session, row, actor, principal):
@@ -410,40 +430,63 @@ def _require_authority_for_microvm(
     raise HTTPException(status_code=403, detail=administrator_changes("A node's MicroVM settings"))
 
 
-def _apply_microvm_flip(session: Session, updates: dict[str, Any], row: Node) -> Optional[bool]:
-    """Take `microvm` out of `updates` (the setattr loop must not write it) and size-check the override; return
-    the flip to make (None = none). A refused flip is a 409 with `microvm_mode.blocker`'s one sentence."""
+def _shape_now(session: Session, row: Node) -> str:
+    """The node's shape (`node_shape.shape_of`); `legacy` where MicroVM is not shipped."""
+    if not edition_features.enabled("microvm"):
+        return "legacy"
+    from app import node_shape
+
+    return node_shape.shape_of(session, row)
+
+
+def _apply_shape_change(session: Session, updates: dict[str, Any], row: Node) -> Optional[UUID]:
+    """Take `shape` and `microvm` out of `updates` (the setattr loop must not write them), size-check the VM
+    override, and move the node to the shape asked through its one writer (`node_shape.change`): `microvm: true`
+    asks for MicroVM, `false` for Legacy from MicroVM. A refusal is a 409 with that writer's one sentence —
+    `microvm_mode.turn_on`'s re-check under lock (a worktree leased since) included. Returns the host to nudge
+    after the commit when the change rebuilds the node there (to or from Whole-node VM), else None."""
+    shape = updates.pop("shape", None)
+    microvm = updates.pop("microvm", None)
     if not edition_features.enabled("microvm"):
         return None  # The community edition has no MicroVMs: `_require_authority_for_microvm` refused any change.
-    from app import microvm_mode, microvm_sizing
+    from app import microvm_sizing, node_shape
 
-    try:
+    with refused_as(422, ValueError):
         updates.update(microvm_sizing.validated(updates))
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
-    if "microvm" not in updates:
+    if shape is None and microvm is not None:
+        current = node_shape.shape_of(session, row)
+        shape = node_shape.MICROVM if microvm else (node_shape.LEGACY if current == node_shape.MICROVM else current)
+    if shape is None:
         return None
-    wanted = bool(updates.pop("microvm"))
-    if wanted == bool(row.microvm):
-        return None
-    refusal = microvm_mode.blocker(session, row, turning_on=wanted)
-    if refusal is not None:
-        raise HTTPException(status_code=409, detail=refusal)
-    return wanted
+    with refused_as(409, ValueError, session=session):
+        return node_shape.change(session, row, shape)
 
 
-def _turn_microvm_on(session: Session, row: Node) -> None:
-    """Destroy the node's free static worktrees in this transaction (`microvm_mode.turn_on`), re-checking under
-    lock that none became held since `_apply_microvm_flip`'s refusal; a 409 when one did."""
+NOT_A_NODE_VM = "This node isn't a Whole-node VM."
+
+
+def _apply_node_vm_size(session: Session, size: Optional[dict[str, Any]], row: Node) -> Optional[UUID]:
+    """Write a Whole-node VM's size (`node_vm_sizing.change`): 409 with its one sentence (a held task, a disk
+    shrink, the disk before its host reported it), 422 for a value out of bounds. Returns the host to nudge, which
+    restarts the VM at the new size."""
+    if not size:
+        return None
     if not edition_features.enabled("microvm"):
-        return  # Unreached: `_apply_microvm_flip` flips nothing where MicroVM is not shipped.
-    from app import microvm_mode
+        return None  # Unreached: `_require_authority_for_microvm` refused the change.
+    from app import node_shape, node_vm_sizing
+    from app.models.worktrees import VirtualNode
 
-    try:
-        microvm_mode.turn_on(session, row)
-    except ValueError as exc:
-        session.rollback()
-        raise HTTPException(status_code=409, detail=str(exc)) from None
+    if node_shape.shape_of(session, row) != node_shape.NODE_VM:
+        raise HTTPException(status_code=409, detail=NOT_A_NODE_VM)
+    # Locked: two saves at once must not both pass the shrink and task checks.
+    vnode = session.scalar(select(VirtualNode).where(VirtualNode.node_id == row.id).with_for_update())
+    if vnode is None:  # pragma: no cover - `shape_of` needs one
+        raise HTTPException(status_code=409, detail=NOT_A_NODE_VM)
+    with refused_as(422, ValueError):
+        own = node_vm_sizing.validated(size)
+    with refused_as(409, ValueError, session=session):
+        node_vm_sizing.change(session, row, vnode, own)
+    return vnode.host_node_id
 
 
 SESSION_KVM_NOT_CO_LOCATED = "KVM for sessions applies to a node on a Multi-Node Host only."
@@ -488,22 +531,24 @@ def _check_session_kvm(
 
 @router.put("/api/nodes/{node_id}", response_model=NodeDetailOut)
 @feature("nodes", "edit", tenancy=Tenancy.CALLER_PLANE)
+@on_thread
 def update_node(
+    session: Session,
     node_id: str,
     body: NodeUpdateIn,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> NodeDetailOut:
     """Edit a node's record. `nodes:edit` is unchanged in meaning; a node grant is not an edit right.
 
     Adds D13 only: a node this caller cannot see is not editable by URL either. The probe is the read clause
     (`NODE_SPEC` has no separate `write_clause`); grant without key is refused, key without grant gets the
     read's 404."""
+    # In a thread: `vnodes.host_of`/`fleet_session` and `node_allocation.jaah_cloud` read the operator plane on
+    # sync sessions of their own.
     presence = jaah_discovery.presence_map(session)
     row = _node_row(session, node_id)
     if row is not None and not can_access(
-        session, principal, "node", row.id, mode=ObjectAccess.WRITE
+        session, caller.principal, "node", row.id, mode=ObjectAccess.WRITE
     ):
         # The file's own message: the kernel's generic `"not found"` would restore the existence oracle.
         raise HTTPException(status_code=404, detail=f"unknown node '{node_id}'")
@@ -515,21 +560,21 @@ def update_node(
             detail=(
                 f"unknown node '{node_id}'"
                 + (" — it is connected but not registered; POST /api/nodes to register it"
-                   if node_id in presence and sees_all_nodes(principal) else "")
+                   if node_id in presence and sees_all_nodes(caller.principal) else "")
             ),
         )
 
     updates = body.model_dump(exclude_unset=True)
     # An allocated node's locked half first: a tenant changing it reads the allocation, not a tier refusal.
-    node_allocation.refuse_locked_fields(updates, row, user)
+    node_allocation.refuse_locked_fields(updates, row, caller.actor)
     # Authority before shape, both on the pre-validation dict (as `app/routes/projects.py::update_project`):
     # a caller naming a field it may not author gets the 403, learning nothing about the value.
-    _require_authority_for_microvm(session, updates, row, user, principal)
-    kvm_host = _check_session_kvm(session, updates, row, user, principal)
-    _require_a_tenant_superadmin_for_host_fields(updates, user, principal)
-    _require_superadmin_to_author_a_launch_proof(session, updates, row.infra, user, principal)
+    _require_authority_for_microvm(session, updates, row, caller.actor, caller.principal)
+    kvm_host = _check_session_kvm(session, updates, row, caller.actor, caller.principal)
+    _require_a_tenant_superadmin_for_host_fields(updates, caller.actor, caller.principal)
+    _require_superadmin_to_author_a_launch_proof(session, updates, row.infra, caller.actor, caller.principal)
     # After the refusal: this only fills in keys the payload omitted (see its docstring).
-    _merge_a_non_superadmins_infra(updates, row.infra, user)
+    _merge_a_non_superadmins_infra(updates, row.infra, caller.actor)
     _reject_an_explicit_null_on_a_not_null_column(updates)
     # `name` must stay a readable label (never an id's shape); `description` defaults to `''`.
     if "name" in updates:
@@ -548,6 +593,8 @@ def update_node(
         updates["name"] = renamed
     if "description" in updates and updates["description"] is None:
         updates["description"] = ""
+    if "max_running_tasks" in updates and (updates["max_running_tasks"] is None or updates["max_running_tasks"] == 0):
+        updates["max_running_tasks"] = None  # 0 is "no limit", which the column holds as NULL.
     # The drain/enabled pair is settled against the resulting row, not just the body: a PUT names only what
     # it changes, and the illegal pair can arrive through either field.
     # The clear runs before the refusal: reversed, `{"enabled": false}` on a draining node would be refused.
@@ -568,23 +615,23 @@ def update_node(
                 "Drain a node that is enabled, or Disable it outright."
             ),
         )
-    microvm_flip = _apply_microvm_flip(session, updates, row)
+    rebuild_host = _apply_shape_change(session, updates, row)
+    vm_size = updates.pop("node_vm_size", None)
     for field_name, value in updates.items():
         setattr(row, field_name, value)
-    if microvm_flip is True:
-        _turn_microvm_on(session, row)
-    elif microvm_flip is False:
-        row.microvm = False
-    stamp_actor(row, user)
+    # After the loop: a disk grow writes `infra`, which a resent `infra` would otherwise overwrite.
+    resize_host = _apply_node_vm_size(session, vm_size, row)
+    stamp_actor(row, caller.actor)
 
     emit_console_event(session, entity="node", id=row.id, action="upserted")
-    session.commit()
-    session.refresh(row)
-    if kvm_host is not None:
-        if edition_features.enabled("multi_node_hosts"):  # `_check_session_kvm` returns no host without them.
+    commit_row(session, row)
+    for host in (kvm_host, rebuild_host, resize_host):
+        if host is None:
+            continue
+        if edition_features.enabled("multi_node_hosts"):  # neither is returned without them.
             from app import vnodes
 
-            vnodes.nudge_host(kvm_host)
+            vnodes.nudge_host(host)
 
     counts = _counts_map(session, [row.id]).get(
         row.id, NodeCounts(worktrees=0, runners=0, accounts=0)
@@ -599,6 +646,8 @@ def update_node(
         published=reads._published_release(session, [row]),
     )
     if isinstance(out, NodeDetailOut):
-        out.microvm_editable = _microvm_editable(session, row, user, principal)
-        out.session_kvm_editable = _session_kvm_editable(session, row, user, principal)
-    return _narrow_for_tenant(out, user, principal)
+        out.microvm_editable = _microvm_editable(session, row, caller.actor, caller.principal)
+        if not out.microvm_editable:
+            out.shape_options = [out.shape]  # nothing this reader may change it to
+        out.session_kvm_editable = _session_kvm_editable(session, row, caller.actor, caller.principal)
+    return _narrow_for_tenant(out, caller.actor, caller.principal)

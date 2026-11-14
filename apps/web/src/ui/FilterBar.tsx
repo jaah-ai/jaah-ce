@@ -1,29 +1,12 @@
-import { useState, type JSX, type ReactNode } from 'react'
-import IconButton from '@mui/material/IconButton'
-import Menu from '@mui/material/Menu'
+import type { JSX, ReactNode } from 'react'
 import Stack from '@mui/material/Stack'
 import Toolbar from '@mui/material/Toolbar'
-import { MoreHorizIcon } from './icons'
 
-/* The ONE filter/action strip above a table. The overflow menu is part of the primitive: every action
- * reachable at 1440px must stay reachable at 390px (AC4(f)) without wrapping, which would grow the height
- * above the first data row (AC5). Controls that fit stay; secondary ones collapse into a Menu.
+/* The ONE filter/action strip above a table. Every action reachable at 1440px must stay reachable at 390px
+ * (AC4(f)) without wrapping, which would grow the height above the first data row (AC5): controls that fit
+ * stay; secondary ones collapse into a `ui/OverflowMenu` the caller places in its row (`ui/BulkActionBar`).
  */
-export function FilterBar({
-  children,
-  overflow,
-  overflowLabel = 'More filters',
-}: {
-  children: ReactNode
-  /** Secondary controls behind the ⋯ button at every width. The function form receives the closer:
-   *  MUI `Menu` does not dismiss on item press, and an action must not leave the menu over the list it
-   *  changed. Keep this a doc comment — it is the one union-typed prop. */
-  overflow?: ReactNode | ((close: () => void) => ReactNode)
-  /* The wordless ⋯ button's whole accessible name; override where the overflow holds actions, not filters. */
-  overflowLabel?: string
-}): JSX.Element {
-  const [anchor, setAnchor] = useState<HTMLElement | null>(null)
-
+export function FilterBar({ children }: { children: ReactNode }): JSX.Element {
   return (
     <Toolbar
       variant="dense"
@@ -39,21 +22,6 @@ export function FilterBar({
       >
         {children}
       </Stack>
-      {overflow && (
-        <>
-          <IconButton
-            aria-label={overflowLabel}
-            aria-haspopup="true"
-            aria-expanded={anchor ? true : undefined}
-            onClick={e => setAnchor(e.currentTarget)}
-          >
-            <MoreHorizIcon />
-          </IconButton>
-          <Menu anchorEl={anchor} open={Boolean(anchor)} onClose={() => setAnchor(null)}>
-            {typeof overflow === 'function' ? overflow(() => setAnchor(null)) : overflow}
-          </Menu>
-        </>
-      )}
     </Toolbar>
   )
 }

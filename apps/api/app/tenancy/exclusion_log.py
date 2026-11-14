@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Iterator, NamedTuple, Optional
 from uuid import UUID
 
-from app.clock import as_utc
+from app.clock import as_utc, utcnow
 
 log = logging.getLogger("tenancy-exclusion-log")
 
@@ -292,7 +292,7 @@ def _minute(at: Optional[datetime]) -> datetime:
 
     Always UTC and aware, so processes in different zones share a bucket.
     """
-    moment = at or datetime.now(timezone.utc)
+    moment = at or utcnow()
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     return moment.astimezone(timezone.utc).replace(second=0, microsecond=0)
@@ -325,10 +325,10 @@ def log_started_at(*, session_factory=None) -> Optional[datetime]:
     None is a real answer (pre-marker DB, hand-deleted row): the caller falls back to the retention
     window alone.
     """
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.models.control_plane import SystemState
 
-    factory = session_factory or SessionLocal
+    factory = session_factory or BridgedSession
     with factory() as session:
         row = session.get(SystemState, LOG_STARTED_AT_KEY)
     # Every shape a hand-edited JSONB row can take is a `None`, never a 500 in the page's request.
@@ -404,7 +404,7 @@ def _record_flush_outcome(error: Optional[Exception]) -> None:
     global _LAST_FLUSH_OK_AT, _CONSECUTIVE_FAILURES, _LAST_FLUSH_ERROR
     with _HEALTH_LOCK:
         if error is None:
-            _LAST_FLUSH_OK_AT = datetime.now(timezone.utc)
+            _LAST_FLUSH_OK_AT = utcnow()
             _CONSECUTIVE_FAILURES = 0
             _LAST_FLUSH_ERROR = None
             return
@@ -468,7 +468,7 @@ def flush(*, session_factory=None) -> int:
     `Shared`, and `read_seam` skips non-selects, so the flush cannot log itself; and `seam.bind` is
     async-only while this runs on a worker thread.
     """
-    from app.db import SessionLocal
+    from app.db import BridgedSession
 
     with _LOCK:
         if not _BUFFER:
@@ -476,7 +476,7 @@ def flush(*, session_factory=None) -> int:
         batch = list(_BUFFER.items())
         _BUFFER.clear()
 
-    factory = session_factory or SessionLocal
+    factory = session_factory or BridgedSession
     rows = [
         {
             "occurred_at": occurred_at,

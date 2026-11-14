@@ -51,7 +51,7 @@ CONVERSATION_RULES = "conversation_rules"
 MOCKUP_RULES = "mockup_rules"
 PLAN_RULES = "plan_rules"
 REVIEW_RULES = "review_rules"
-#: The onboarding engineer's own build-pair terminal section — no deliverable supplies one.
+#: The Repo Wizard's own build-pair terminal section — no deliverable supplies one.
 OWN_TERMINAL = "own_terminal"
 
 #: The role-dict keys an EXPERT brings (its prose and its own quality gate), in `_ROLES` spelling.

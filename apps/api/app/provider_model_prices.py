@@ -112,7 +112,7 @@ def bedrock_family_prices() -> dict[str, dict[str, Decimal]]:
     columns = list(PRICE_COLUMNS)
     out: dict[str, dict[str, Decimal]] = {}
     for name, _description, *rates in SEED_PRICES:
-        by_class = dict(zip(columns, rates))
+        by_class = dict(zip(columns, rates, strict=False))
         out[f"bedrock:{name}"] = {cls: Decimal(by_class[cls]) for cls in TOKEN_CLASSES}
     return out
 

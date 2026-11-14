@@ -1,0 +1,73 @@
+# Airtable. Facts confirmed at the vendor's own docs: OAuth (PKCE S256, confidential client as HTTP Basic on the
+# token call) https://airtable.com/developers/web/api/oauth-reference ; scopes
+# https://airtable.com/developers/web/api/scopes ; whoami https://airtable.com/developers/web/api/get-user-id-scopes
+slug = "airtable"
+label = "Airtable"
+category = "productivity"
+vendor_docs_url = "https://airtable.com/developers/web/api/oauth-reference"
+summary = "Read and update records in the Airtable bases you share with Jaah."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://airtable.com/oauth2/v1/authorize"
+token_url = "https://airtable.com/oauth2/v1/token"
+pkce = true
+basic_auth = true
+scopes = [
+  { name = "user.email:read", label = "See your email address, so the connection shows whose it is" },
+  { name = "schema.bases:read", label = "Read base, table and field names, so agents know where data lives" },
+  { name = "data.records:read", label = "Read records, so agents can look things up" },
+  { name = "data.records:write", label = "Create and update records when a task asks for it", optional = true },
+  { name = "data.recordComments:read", label = "Read record comments for context", optional = true },
+]
+jaah_app = true
+[auth.oauth.registration]
+console_url = "https://airtable.com/create/oauth"
+steps = [
+  "Select Register new OAuth integration, enter the name Jaah and the first redirect URI below, then select Register integration",
+  "On the integration's page, under Scopes, tick user.email:read, schema.bases:read, data.records:read, data.records:write and data.recordComments:read, and nothing else",
+  "Under Client secret select Generate client secret: Jaah is a server-side app and sends the secret with HTTP Basic auth",
+  "Fill in the listing details: Tagline \"AI agents that work your tasks\", Homepage URL, Privacy policy URL and Terms of service URL set to the Jaah website, its privacy policy and its terms of service, Support email set to the Jaah support address, and upload the Jaah logo",
+  "Select Save changes",
+]
+review = "Not required: an Airtable OAuth integration works for every Airtable user once it has a privacy policy, terms and support email. Airtable allows several redirect URLs on one integration, so add both"
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "Personal access token", kind = "secret", required = true, placeholder = "pat...", help = "airtable.com/create/tokens > Create new token: add the scopes user.email:read, schema.bases:read, data.records:read (and data.records:write if agents should edit), add the bases agents may use under Access, then Create token and copy it - Airtable shows it once" },
+]
+
+[test]
+method = "GET"
+path = "https://api.airtable.com/v0/meta/whoami"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+identity = [["email"], ["id"]]
+
+[docs]
+agent_uses = [
+  "Look up a record in a base, for example a customer, an order or a content item a task names",
+  "List a table's fields and views so a task can work with the right data",
+  "Create or update records when a task reports results back, if you granted write access",
+  "Read the comments on a record for context before acting on it",
+]
+prerequisites = [
+  "An Airtable account with access to the bases agents should use",
+  "For an organization connection, an account that is a collaborator on every base agents need: the connection sees only the bases its account can see",
+]
+limitations = [
+  "Agents reach only the bases you pick on Airtable's consent screen (or the token's Access list). Add a base later by reconnecting, or by editing the token at airtable.com/create/tokens",
+  "Agents cannot create bases, change field types, manage collaborators or change billing",
+  "Airtable limits each base to five API requests per second; a busy agent may be slowed down",
+]
+troubleshooting = [
+  { symptom = "Test says Airtable rejected the personal access token (401)", fix = "The token was deleted, regenerated or mistyped. Create a new token at airtable.com/create/tokens and select Replace on the secret" },
+  { symptom = "Test passes but agents get 403 or NOT_FOUND for a base", fix = "The base is not in the token's Access list or was not picked at consent. Edit the token and add the base, or select Reconnect and tick it" },
+  { symptom = "The test names an ID such as usr... instead of an email", fix = "The token lacks the user.email:read scope. It still works; add the scope if you want the email shown" },
+  { symptom = "The secret shows Needs reconnect", fix = "Airtable ended the grant (the integration was revoked or the refresh token expired after 60 days unused). Select Reconnect and sign in again" },
+]
+faq = [
+  { q = "Can agents see every base in my account", a = "No. Only the bases you choose on the consent screen, or list in the token's Access section" },
+  { q = "Do changes appear under my name", a = "Yes. Records an agent creates or edits show the connected account as the editor in the record history" },
+]

@@ -14,10 +14,13 @@
 //           the same element before and after an editor opens: never remounted, scroll and rows kept.
 //   detail  the real location, rendered a second time into the pane by `DetailRoutes`.
 // Below `DOCK_MIN_VIEWPORT` (where the console stops docking too) there is no split: `main` IS the real
-// location and the editor is the full page it always was. Crossing that width with an editor open moves the
-// editor between the pane and `<main>`, which remounts it; an editor carries its unsaved input across with
-// `hooks/useRemountDraft.ts`, and the task page its landed read (`lib/taskPageSeed.ts::takeLandedTaskRead`) —
-// keeping one mount would need the editor outside both trees.
+// location and the editor is the full page it always was.
+//
+// ONE MOUNT ACROSS THAT WIDTH: an editor that would sit beside a background (`editorLocation`) is rendered ONCE,
+// at a fixed place outside both trees, into a detached node `DetailWorkspace` moves into the pane or into `<main>`
+// (`EditorSlot`). Resizing across the width moves the node, never the React tree, so the editor's unsaved input,
+// its reads and its leave guard stay as they were — a background whose guard refuses only moves the node to `<main>`.
+// The move is a DOM move: focus inside the editor is put back, but an `<iframe>` in it would reload.
 //
 // A PAGE THE VIEWER MAY NOT OPEN IS NEVER FORCED ON THEM: a route guard that would redirect in the
 // background reports it instead (`useListBackground`), and the editor falls back to a full page.
@@ -36,6 +39,7 @@ import {
   useState,
   type ReactNode,
 } from 'react'
+import { createPortal } from 'react-dom'
 import {
   Routes,
   UNSAFE_NavigationContext,
@@ -58,6 +62,7 @@ import {
   canSplit,
   detailRatioFromDividerX,
   detailWidthFor,
+  listCarriesParams,
   listForDetail,
   loadDetailPaneState,
   safeReturnPath,
@@ -65,6 +70,7 @@ import {
   type DetailPaneState,
 } from '../lib/listDetail'
 import { DIVIDER_PX, SPLIT_INSET_PX } from '../lib/splitPane'
+import { grid } from '../theme'
 import {
   BAR_SEAT_ATTR,
   LAUNCHER_CLEARANCE_SX,
@@ -77,6 +83,7 @@ import { usePersistedState } from '../hooks/usePersistedState'
 import { useViewportIs } from '../hooks/useViewportWidth'
 import { ACT_AS_OVERLAP_VAR, MAIN_END_INSET_VAR } from './ActAsBar'
 import { CloseButton, MaximizeButton } from './PaneWindowButtons'
+import { PaneWindowSlotProvider, usePaneWindowSlots } from './PaneWindowSlot'
 import SplitDivider from './SplitDivider'
 
 export type ListDetailRouting = {
@@ -84,6 +91,9 @@ export type ListDetailRouting = {
   mainLocation: Location
   /** The editor in the pane, or `null` when nothing is split. */
   detailLocation: Location | null
+  /** The editor at ANY width — in the pane, the full page below the split, or beside a refused background;
+   *  `null` for a page that is no editor. Rendered once, so no layout change remounts it (`DetailWorkspace`). */
+  editorLocation: Location | null
   /** The background page, where Close goes back to — as the operator left it. `null` when nothing is split. */
   listLocation: Location | null
   /** The background's guard refused the viewer: stop splitting over that page for this session. */
@@ -139,6 +149,22 @@ export function useWideDetailPane(): void {
   }, [request])
 }
 
+/* ── The full-page request ─────────────────────────────────────────────────────────────────────────
+   An editor with nothing to show beside its list (its record not found) asks, while the request is mounted, to be
+   the page itself: no list squeezed behind a pane holding one line. Never persisted; leaving the editor ends it. */
+const FullPageContext = createContext<((full: boolean) => void) | null>(null)
+
+/** Inside an editor: show it as the full page while this is mounted. Renders nothing; a no-op outside the shell. */
+export function FullPageDetail(): null {
+  const request = useContext(FullPageContext)
+  useEffect(() => {
+    if (!request) return
+    request(true)
+    return () => request(false)
+  }, [request])
+  return null
+}
+
 /* ── The background marker ──────────────────────────────────────────────────────────────────────────
    Provided around the main outlet only while it renders a page BEHIND an open editor. A guard (or a page
    that redirects on arrival) asks for it: present, it must not navigate — a redirect from the background
@@ -180,25 +206,44 @@ export function useListDetailRouting(): ListDetailRouting {
      beside, kept while the operator moves between editors and dropped on leaving them. */
   const lastPage = useRef<Location | null>(null)
   const background = useRef<Location | null>(null)
+  /* The editor shown last: a sub-record's editor whose list IS that editor (`/projects/:id/env/:varId` beside
+     `/projects/:id?tab=environment`) sits beside it, not beside whatever the parent sat beside. */
+  const lastEditor = useRef<string | null>(null)
   const pathname = normalizePathname(location.pathname)
-  const coldList = listForDetail(pathname)
+  const coldList = listForDetail(pathname, location.search)
   if (coldList === null) {
     if (lastPage.current?.key !== location.key) lastPage.current = asBackground(location)
     background.current = null
-  } else if (background.current === null) {
-    // A list may carry its tab (`/products?tab=plans`): the search half rides along.
+  } else {
+    // A list may carry its tab (`/products?tab=kind-plan`): the search half rides along.
     const [listPath, listSearch = ''] = coldList.split('?')
-    background.current = lastPage.current ?? {
+    const cold: Location = {
       pathname: listPath,
       search: listSearch ? `?${listSearch}` : '',
       hash: '',
       state: null,
       key: `cold:${coldList}`,
     }
+    if (background.current === null) background.current = lastPage.current ?? cold
+    // Editor → its sub-record: the parent editor becomes the list.
+    else if (lastEditor.current !== null && lastEditor.current !== pathname && lastEditor.current === listPath) {
+      background.current = cold
+    }
+    // Back from a sub-record to its parent editor: the parent cannot sit beside itself.
+    if (background.current.pathname === pathname) background.current = lastPage.current ?? cold
+    /* A COLD LIST FOLLOWS THE PARAMS IT CARRIES (`lib/listDetail.ts`, `carry`): a task page that writes its
+       `?scope=` after a bare link moves the board beside it there. A list the operator came from, or moved, stays,
+       and so does a cold one when the next editor carries nothing (it is about to write the same params back). */
+    const followsCarried = listCarriesParams(pathname) && cold.search !== ''
+      && background.current.key.startsWith('cold:') && background.current.key !== cold.key
+      && background.current.pathname === cold.pathname
+    if (followsCarried) background.current = cold
   }
+  lastEditor.current = coldList === null ? null : pathname
 
   const behind = background.current
-  const split = wide && behind !== null && !denied.has(behind.pathname)
+  const editor = behind !== null
+  const split = wide && editor && !denied.has(behind.pathname)
   const listLocation = split ? behind : null
 
   const denyList = useCallback((path: string) => {
@@ -221,13 +266,14 @@ export function useListDetailRouting(): ListDetailRouting {
     () => ({
       mainLocation: listLocation ?? location,
       detailLocation: listLocation ? location : null,
+      editorLocation: editor ? location : null,
       listLocation,
       denyList,
       moveList,
       pane,
       setPane,
     }),
-    [listLocation, location, denyList, moveList, pane, setPane],
+    [listLocation, location, editor, denyList, moveList, pane, setPane],
   )
 }
 
@@ -263,19 +309,49 @@ function useMeasuredWidth() {
   return { ref, width }
 }
 
+/* The control that had focus inside the editor when its node left a slot: detaching a node drops focus to `<body>`. */
+const focusOnMove = new WeakMap<HTMLElement, HTMLElement>()
+
+/** Where the editor's node sits right now: it moves the node in on mount, and out again when the layout drops it;
+ *  focus inside the editor comes along. */
+function EditorSlot({ node }: { node: HTMLElement }) {
+  const ref = useRef<HTMLDivElement | null>(null)
+  // A layout effect, before the editor's own (rendered after this slot): its first measure and focus land in the page.
+  useLayoutEffect(() => {
+    const slot = ref.current
+    if (!slot) return
+    slot.appendChild(node)
+    const focused = focusOnMove.get(node)
+    focusOnMove.delete(node)
+    if (focused && node.contains(focused)) focused.focus({ preventScroll: true })
+    return () => {
+      const active = document.activeElement
+      if (active instanceof HTMLElement && node.contains(active)) focusOnMove.set(node, active)
+      if (node.parentNode === slot) slot.removeChild(node)
+    }
+  }, [node])
+  return <Box ref={ref} data-testid="editor-slot" sx={{ display: 'contents' }} />
+}
+
 /**
  * THE ROOM LEFT OF THE CONSOLE: the app's `<main>` (the background page) and, while an editor is open, the
  * divider and the editor's pane. `<main>` is ALWAYS the first child, so opening or closing an editor never
  * remounts the page behind it. `renderMain` learns whether that page is out of sight (Maximize, or too
- * little room).
+ * little room), and — below the split, with an editor open — the slot it shows IN PLACE of its page.
+ *
+ * The editor itself is rendered last, at a place no layout change moves, into a node the slot holds (pane or
+ * `<main>`): crossing the split width never remounts it.
  */
 export function DetailWorkspace({
   renderMain,
   detail,
+  split = true,
 }: {
-  renderMain: (listHidden: boolean) => ReactNode
-  /** The editor's page, already wrapped for loading and errors; `null` = nothing split. */
+  renderMain: (listHidden: boolean, editorSlot: ReactNode | null) => ReactNode
+  /** The editor's page, already wrapped for loading and errors; `null` = no editor. */
   detail: ReactNode | null
+  /** The editor sits in the pane beside the background; false = it is the full page, in `<main>`. */
+  split?: boolean
 }) {
   const routing = useListDetail()
   const navigate = useNavigate()
@@ -283,7 +359,16 @@ export function DetailWorkspace({
   const { ratio, maximized } = routing?.pane ?? { ratio: DEFAULT_DETAIL_RATIO, maximized: false }
   const setPane = routing?.setPane
 
-  const open = detail !== null
+  /* An editor that asked to be the page (`FullPageDetail`) is not split, whatever the route. */
+  const [fullPage, setFullPage] = useState(false)
+  const open = detail !== null && split && !fullPage
+  /* The editor's own node: `display: contents`, so the editor sizes against the pane's body or `<main>` as if it
+     were their child (`height: 100%` resolves there). */
+  const [editorNode] = useState(() => {
+    const node = document.createElement('div')
+    node.style.display = 'contents'
+    return node
+  })
   const roomy = canSplit(roomWidth)
   const listHidden = open && (maximized || !roomy)
   const [wide, setWide] = useState(false)
@@ -317,15 +402,33 @@ export function DetailWorkspace({
   const paneRef = useRef<HTMLElement | null>(null)
   const openPath = routing?.detailLocation?.pathname ?? null
   useEffect(() => {
-    if (openPath !== null) paneRef.current?.focus({ preventScroll: true })
+    const pane = paneRef.current
+    // Not when focus came along with the editor (a resize into the split): it is already where the operator was.
+    if (openPath !== null && pane && !pane.contains(document.activeElement)) pane.focus({ preventScroll: true })
   }, [openPath])
 
   const paneBodyRef = useRef<HTMLDivElement | null>(null)
   useBarSeat(paneBodyRef, open)
 
+  /* The window buttons ride the page header's row when it has one (`PaneWindowSlot`), else a row of their own. */
+  const windowSlots = usePaneWindowSlots()
+  const windowButtons = (
+    <>
+      {/* Restore needs room for both panes; without it there is nothing to restore to. */}
+      {roomy && setPane && (
+        <MaximizeButton
+          noun="pane"
+          maximized={maximized}
+          onToggle={() => setPane(prev => ({ ...prev, maximized: !prev.maximized }))}
+        />
+      )}
+      <CloseButton noun="pane" onClose={close} />
+    </>
+  )
+
   return (
     <Box ref={ref} data-testid="detail-workspace" sx={{ display: 'flex', flex: 1, minWidth: 0, height: '100%' }}>
-      {renderMain(listHidden)}
+      {renderMain(listHidden, detail !== null && !open ? <EditorSlot node={editorNode} /> : null)}
       {open && !listHidden && setPane && (
         <SplitDivider
           testId="detail-pane-divider"
@@ -357,20 +460,15 @@ export function DetailWorkspace({
             '&:focus': { outline: 'none' },
           }}
         >
-          <Box
-            data-testid="detail-pane-header"
-            sx={{ display: 'flex', justifyContent: 'flex-end', gap: 0.5, px: 1, pt: 0.5, flexShrink: 0 }}
-          >
-            {/* Restore needs room for both panes; without it there is nothing to restore to. */}
-            {roomy && setPane && (
-              <MaximizeButton
-                noun="pane"
-                maximized={maximized}
-                onToggle={() => setPane(prev => ({ ...prev, maximized: !prev.maximized }))}
-              />
-            )}
-            <CloseButton noun="pane" onClose={close} />
-          </Box>
+          {/* The portal in a fragment: MUI's `children` check takes no bare portal. */}
+          {windowSlots.slot ? <>{createPortal(windowButtons, windowSlots.slot)}</> : (
+            <Box
+              data-testid="detail-pane-header"
+              sx={{ display: 'flex', justifyContent: 'flex-end', gap: 0.5, px: 1, pt: 0.5, flexShrink: 0 }}
+            >
+              {windowButtons}
+            </Box>
+          )}
           {/* THE PANE'S SCROLLPORT, with `.app-main`'s insets — but only `SPLIT_INSET_PX` at the sides beside the list
               (the divider and the window edge already bound it; not flush, so nothing is clipped;
               maximized, it is a full page again): a page sizes itself against this box exactly as against
@@ -379,21 +477,37 @@ export function DetailWorkspace({
             ref={paneBodyRef}
             data-testid="detail-pane-body"
             sx={{
-              flex: 1, minHeight: 0, overflow: 'auto', px: listHidden ? '0.5rem' : `${SPLIT_INSET_PX}px`, pb: '1.75rem', pt: 0.5,
+              flex: 1, minHeight: 0, overflow: 'auto', px: listHidden ? 1 : `${SPLIT_INSET_PX}px`, pb: 4.5, pt: 0.5,
               ...LAUNCHER_CLEARANCE_SX,
               // The bar keeps the launcher's seat only in the launcher's row; mid-pane Save keeps the content's right edge.
-              [`&:not([${BAR_SEAT_ATTR}])`]: { [LAUNCHER_SEAT_VAR]: '0px' },
+              [`&:not([${BAR_SEAT_ATTR}])`]: { [LAUNCHER_SEAT_VAR]: grid(0) },
+              /* The header holding the window buttons stays in view while a long page scrolls, so Close never scrolls
+                 away (inert on a page that fills the pane and scrolls inside itself). */
+              '& [data-slot="page-header"]:has(> [data-slot="pane-window"]:not(:empty))': {
+                position: 'sticky', top: 0, zIndex: (theme: Theme) => theme.zIndex.mobileStepper, bgcolor: 'background.default',
+              },
               ...(!listHidden && {
                 [`&[${BAR_SEAT_ATTR}]`]: { [LAUNCHER_SEAT_VAR]: `${LAUNCHER_SEAT_FLUSH_PX - SPLIT_INSET_PX}px` },
               }),
               // The act-as bar sticks in `.app-main`, never here: a sticky strip in the pane takes no offset.
-              [ACT_AS_OVERLAP_VAR]: '0px',
+              [ACT_AS_OVERLAP_VAR]: grid(0),
             }}
           >
-            <WidePaneContext.Provider value={setWide}>{detail}</WidePaneContext.Provider>
+            <EditorSlot node={editorNode} />
           </Box>
         </Box>
       )}
+      {/* In a fragment: MUI's `children` check takes no bare portal. */}
+      <>
+        {detail !== null && createPortal(
+          <FullPageContext.Provider value={split ? setFullPage : null}>
+            <WidePaneContext.Provider value={open ? setWide : null}>
+              <PaneWindowSlotProvider value={open ? windowSlots.register : null}>{detail}</PaneWindowSlotProvider>
+            </WidePaneContext.Provider>
+          </FullPageContext.Provider>,
+          editorNode,
+        )}
+      </>
     </Box>
   )
 }
@@ -496,31 +610,44 @@ export function ListDetailShell({
   /* The page's own pathname: the background's while an editor is split (the URL is then the editor's). */
   const pathname = routing?.mainLocation.pathname ?? location.pathname
   const detailLocation = routing?.detailLocation ?? null
+  /* The editor, split or full page: ONE element at one place, so crossing the split width keeps it mounted. */
+  const editorLocation = detailLocation ?? routing?.editorLocation ?? null
+  const split = detailLocation !== null
+  const editorFallback = split ? detailFallback : fallback
+  /* `<main>` gives the launcher's clearance back when a drawn form action bar does not end its content (a Pipeline
+     tab's History under its Save), as the pane's body does (`LAUNCHER_CLEAR_ATTR`). */
+  const mainRef = useRef<HTMLElement | null>(null)
+  useBarSeat(mainRef, true)
   return (
     <DetailWorkspace
-      detail={detailLocation && (
-        <Suspense key={`${pageKey(detailLocation.pathname)}|${scopeKey}`} fallback={detailFallback}>
-          <ErrorBoundary resetOn={detailLocation.pathname} label="this pane">
-            {ready ? <DetailRoutes location={detailLocation}>{routes}</DetailRoutes> : detailFallback}
+      split={split}
+      detail={editorLocation && (
+        <Suspense key={`${pageKey(editorLocation.pathname)}|${scopeKey}`} fallback={editorFallback}>
+          <ErrorBoundary resetOn={editorLocation.pathname} label={split ? 'this pane' : 'this page'}>
+            {ready ? <DetailRoutes location={editorLocation}>{routes}</DetailRoutes> : editorFallback}
           </ErrorBoundary>
         </Suspense>
       )}
-      renderMain={listHidden => (
+      renderMain={(listHidden, editorSlot) => (
         /* Hidden, never unmounted, while the editor is maximized: the list keeps its state. Beside an open
            editor the list runs near the divider: `SPLIT_INSET_PX` on the right, published for full-bleed bars. */
         <Box
           component="main"
+          ref={mainRef}
           data-testid="app-main"
-          sx={[mainSx, detailLocation !== null && SPLIT_MAIN_SX, listHidden && { display: 'none' }]}
+          sx={[mainSx, detailLocation !== null && editorSlot === null && SPLIT_MAIN_SX, listHidden && { display: 'none' }]}
         >
           {mainTop}
-          <Suspense key={`${pageKey(pathname)}|${scopeKey}`} fallback={fallback}>
-            <ErrorBoundary resetOn={pathname} label="this page">
-              <ListBackground active={detailLocation !== null}>
-                {ready ? page : fallback}
-              </ListBackground>
-            </ErrorBoundary>
-          </Suspense>
+          {/* Below the split (or at its own request) the editor IS the page: its slot stands in for the page outlet. */}
+          {editorSlot ?? (
+            <Suspense key={`${pageKey(pathname)}|${scopeKey}`} fallback={fallback}>
+              <ErrorBoundary resetOn={pathname} label="this page">
+                <ListBackground active={detailLocation !== null}>
+                  {ready ? page : fallback}
+                </ListBackground>
+              </ErrorBoundary>
+            </Suspense>
+          )}
         </Box>
       )}
     />

@@ -37,16 +37,17 @@ export function rowKeys(rows: readonly GridRow[], action?: GridAction): string[]
   return rows.flatMap(row => GRID_ACTIONS.filter(a => action === undefined || a === action).flatMap(a => row.keys[a] ?? []))
 }
 
-export function preset(rows: readonly GridRow[], which: Preset): GridValue {
-  if (which === 'all') return { ticked: new Set(rowKeys(rows)), orgAdmin: true }
+/** `orgAdmin`: whether All ticks Administration too — only for an Org Owner or Admin (`routes/api_keys.py`). */
+export function preset(rows: readonly GridRow[], which: Preset, orgAdmin = true): GridValue {
+  if (which === 'all') return { ticked: new Set(rowKeys(rows)), orgAdmin }
   if (which === 'read') return { ticked: new Set(rowKeys(rows, 'view')), orgAdmin: false }
   return { ticked: new Set(), orgAdmin: false }
 }
 
 /** The preset a value equals, if any (the preset buttons show which one is in force). */
-export function presetOf(rows: readonly GridRow[], value: GridValue): Preset | null {
+export function presetOf(rows: readonly GridRow[], value: GridValue, orgAdmin = true): Preset | null {
   for (const which of ['all', 'read', 'none'] as const) {
-    const p = preset(rows, which)
+    const p = preset(rows, which, orgAdmin)
     if (p.orgAdmin === value.orgAdmin && p.ticked.size === value.ticked.size && [...p.ticked].every(k => value.ticked.has(k))) {
       return which
     }

@@ -4,9 +4,22 @@ fastapi==0.142.4
 # PYSEC-2026-161 the Host-header bypass among them). 1.7.0 is what fastapi 0.142.2 resolves to and the
 # first line `pip-audit` reports clean; bump it with fastapi, never apart from it.
 starlette==1.10.0
-uvicorn[standard]==0.54.0
-sqlalchemy==2.0.55
-psycopg[binary]==3.3.6
+# The ASGI server (`apps/api/entrypoint.sh`): Rust I/O, one process, a cp314t wheel. Its flags and why are
+# entrypoint.sh's.
+granian==2.8.7
+# The local stack's restart-on-edit (its compose file): Granian's own `--reload` refuses a
+# free-threaded build, so the `watchfiles` CLI restarts the launcher instead. Rust, a cp314t wheel.
+watchfiles==1.3.0
+# `click` is declared because dbos is installed with --no-deps (the api image's Dockerfile says why): granian brings
+# it today, and dbos's own floor (>=8.1) must not ride on another package's dependency.
+click==8.5.1
+# The `asyncio` extra (greenlet) for the same reason: dbos requires `sqlalchemy[asyncio]`.
+sqlalchemy[asyncio]==2.0.57
+# NO implementation extra, on purpose. The images are free-threaded, where psycopg-binary has no wheel: they compile
+# the C implementation (`psycopg-c` at THIS version) in their `wheels` stage against the image's libpq (each
+# api image's Dockerfile). A GIL host (the gate's venv) gets
+# psycopg-binary through dbos's own `psycopg[binary]`, so nothing here needs a compiler there.
+psycopg==3.3.8
 alembic==1.20.1
 bcrypt==5.0.0
 itsdangerous==2.2.0
@@ -18,7 +31,7 @@ itsdangerous==2.2.0
 # RuntimeError), so the version this code is written against is a real contract, not an accident.
 # Pinned to the version the transitive resolve already lands on and the bridge was verified against, so
 # declaring it changes no installed byte — the point is to stop a future resolve moving it silently.
-anyio==4.15.1
+anyio==4.16.0
 # multipart/form-data parsing for FastAPI's UploadFile (task attachment uploads, app/routes/attachments.py).
 # Pinned >=0.0.18 — CVE-2024-53981 (GHSA-59g5-xgcq-4qw3, a malformed-boundary DoS) affects earlier releases.
 #
@@ -46,9 +59,9 @@ anyio==4.15.1
 # carrying BOTH still resolves, so the blast radius is a client that sends `filename*` alone. Named
 # rather than discovered. (Security-neutral-to-positive: where both are present the ASCII one now wins,
 # so the BIDI-override stripping downstream sees the tamer value.)
-python-multipart==0.0.32
+python-multipart==0.0.33
 # verifies Google Sign-In ID tokens against Google's public keys
-google-auth==2.62.0
+google-auth==2.62.1
 # HTTP transport google-auth uses to fetch Google's public JWKS (google.auth.transport.requests)
 requests==2.34.2
 # `cryptography` (AES-256-GCM for `credentials.config` at rest — app/credential_crypto.py; PyJWT's RS256 rides it):
@@ -61,7 +74,7 @@ requests==2.34.2
 PyJWT==2.15.1
 # Live session-summary LLM (DeepSeek via its Anthropic-compatible API). Moved here from the agent so the
 # agent stays pure-stdlib; imported lazily in app/session_summary.py (absent key/SDK → deterministic label).
-anthropic>=2.3.0,<3
+anthropic>=2.6.0,<3
 # Renders the HUMAN-READABLE schedule sentence the console's cron list and detail pages show beside the
 # raw expression ("Every 5 minutes", "At 06:30 AM, only on Monday") — `app/cron_schedule.describe_schedule`
 # is its only call site. Pure Python, MIT, and `pip show` reports ZERO runtime dependencies, so it adds
@@ -81,24 +94,15 @@ cron-descriptor==2.2.1
 # of `POST /api/agent/sessions/{sid}/transcript` — the CP's own presigned `manifest.json` PUT. Split
 # test deps out of the production image with this still below the line and that route 500s.
 httpx==0.27.2
-# Stripe billing (`app/billing/`). `app/billing/gateway.py` is the ONE importer: every other module reaches
-# Stripe through its `Gateway`, so this pin and that module's `STRIPE_API_VERSION` move together.
-# Pinned exactly because the SDK release IS the API version: 16.0.0's `stripe/_api_version.py` pins
-# `2026-09-30.endive`, and `tests/billing/test_gateway_contract.py` fails the day the two disagree.
-stripe==16.0.0
-# The CPU profiler `app/cpu_profile.py` runs as a subprocess (`py-spy record` against the api's own pid) while
-# the `cpu_profiling` operator setting is on. A self-contained Rust binary in a manylinux wheel: no Python
-# imports it and it pulls in no dependency. Pinned exactly; 0.4.2 verified to sample CPython 3.14.
-py-spy==0.4.2
 # SAML 2.0 and OIDC sign-in (`app/org_sso.py`). pysaml2 is the SAML SP: it parses IdP metadata and
 # checks an assertion's XML signature by shelling out to the `xmlsec1` binary, which the api image installs.
 # Authlib is the OIDC relying party: discovery, the code exchange and the ID token's JWKS signature check.
 # dnspython reads the `_jaah.<domain>` TXT record that verifies an SSO domain.
 pysaml2==7.5.5
-Authlib==1.9.1
+Authlib==1.9.5
 # joserfc: the JOSE library Authlib builds on, imported directly by `app/sso_signin.py` for the ID token check.
-joserfc==1.7.7
-dnspython==2.9.0
+joserfc==1.8.0
+dnspython==2.9.2
 # pysaml2's own dependencies, declared so a resolve never moves the SAML parser stack silently: defusedxml
 # (the hardened XML parser pysaml2 reads every Response with), xmlschema + elementpath (schema validation;
 # xmlschema 2.x caps elementpath below 5), pyOpenSSL (certificate loading), python-dateutil + six (timestamps).
@@ -107,10 +111,12 @@ defusedxml==0.7.1
 xmlschema==2.5.1
 elementpath==4.8.0
 pyOpenSSL==26.4.0
-python-dateutil==3.0.0
+python-dateutil==4.0.0
 six==1.17.0
+# Error tracking (`app/error_tracking.py`), OFF until the operator sets `error_tracking_dsn`. Pure Python.
+sentry-sdk==2.74.0
 # test deps (unit suite runs inside the container via ./dc test)
-pytest==9.1.1
+pytest==9.2.0
 pytest-xdist==3.8.0
 pytest-timeout==2.4.0
 # What starlette 1.x's `TestClient` drives (it falls back to `httpx` only with a deprecation warning). Already

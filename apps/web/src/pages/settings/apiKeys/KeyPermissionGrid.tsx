@@ -12,10 +12,11 @@ import {
   PERMISSION_ROW_RULE_SX,
 } from '../../../ui/permissionGridStyles'
 import SettingCheckbox from '../../../ui/SettingCheckbox'
-import { ACTION_LABELS, GRID_ACTIONS, preset, presetOf, type GridRow, type GridValue, type Preset } from './keyPermissions'
+import { ACTION_LABELS, GRID_ACTIONS, preset, presetOf, type GridAction, type GridRow, type GridValue, type Preset } from './keyPermissions'
+import { FONT_WEIGHT, grid } from '../../../theme'
 
 /* What an API key may do: one row per feature (the catalog's own labels), a box per View/Create/Edit/Delete, and
- * the Administration row. Presets above set the whole grid in one click. The look is the console's permission
+ * the Administration row (an Org Owner or Admin's alone: `orgAdminShown`). Presets above set the whole grid in one click. The look is the console's permission
  * grid (`ui/permissionGridStyles.ts`). On a phone every feature is a card of its own with four labelled boxes —
  * never a squeezed or sideways-scrolled table; labels wrap, never truncate. */
 
@@ -25,15 +26,27 @@ const PRESETS: readonly { id: Preset; label: string }[] = [
   { id: 'none', label: 'None' },
 ]
 
-const COLUMNS = 'minmax(10rem, 1fr) repeat(4, 4.5rem)'
+/** What a column's box lets the key do on its row's feature; an unticked box's calls are refused. */
+const ACTION_HELP: Record<GridAction, string> = {
+  view: 'Lets the key read this; unticked, reads are refused.',
+  create: 'Lets the key add new items here.',
+  edit: 'Lets the key change existing items here.',
+  delete: 'Lets the key remove items here.',
+}
 
-const ORG_ADMIN_HELP = 'Acts with the owner’s admin rank: people, groups, access and settings.'
+/* Features with no View box because no permission gates their reads — every member reads them, so every key does
+ * (`authz/catalog.py`'s `UNHONOURED_PERMISSION_KEYS`: task templates). Their View cell says so rather than standing
+ * blank beside the rows that have one. */
+const OPEN_READ_FEATURES: ReadonlySet<string> = new Set(['templates'])
+const OPEN_READ_HELP = 'Every member can view these, so every key can too.'
+
+const ORG_ADMIN_HELP = 'Acts with the owner’s admin rank: people, groups, access, settings.'
 
 const ROW_SX = {
   display: 'grid',
-  gridTemplateColumns: COLUMNS,
+  gridTemplateColumns: `minmax(${grid(26.5)}, 1fr) repeat(4, ${grid(12)})`,
   alignItems: 'center',
-  columnGap: '1rem',
+  columnGap: 2.5,
   minHeight: PERMISSION_ROW_MIN_HEIGHT,
   [PHONE]: {
     // A card per feature: the name across the top, its boxes two by two under it, each with its word.
@@ -52,7 +65,7 @@ const CELL_SX = {
 } as const
 
 const LABEL_SX = {
-  fontWeight: 500,
+  fontWeight: FONT_WEIGHT.medium,
   minWidth: 0,
   overflowWrap: 'anywhere',
   [PHONE]: { gridColumn: '1 / -1' },
@@ -63,13 +76,15 @@ export default function KeyPermissionGrid({
   value,
   onChange,
   disabled = false,
+  orgAdminShown = true,
 }: {
   rows: readonly GridRow[]
   value: GridValue
   onChange: (next: GridValue) => void
   disabled?: boolean
+  orgAdminShown?: boolean
 }): JSX.Element {
-  const inForce = presetOf(rows, value)
+  const inForce = presetOf(rows, value, orgAdminShown)
 
   const toggle = (key: string, checked: boolean) => {
     const ticked = new Set(value.ticked)
@@ -87,7 +102,7 @@ export default function KeyPermissionGrid({
             variant={inForce === p.id ? 'contained' : 'outlined'}
             aria-pressed={inForce === p.id}
             disabled={disabled}
-            onClick={() => onChange(preset(rows, p.id))}
+            onClick={() => onChange(preset(rows, p.id, orgAdminShown))}
             data-testid={`key-preset-${p.id}`}
             sx={tapTargetSx}
           >
@@ -97,10 +112,12 @@ export default function KeyPermissionGrid({
       </ButtonGroup>
 
       <Box role="group" aria-label="Permissions">
-        <Box sx={{ ...ROW_SX, minHeight: 28, [PHONE]: { display: 'none' } }} aria-hidden>
+        <Box sx={{ ...ROW_SX, minHeight: grid(4.5), [PHONE]: { display: 'none' } }}>
           <span />
           {GRID_ACTIONS.map(action => (
-            <Typography key={action} variant="caption" sx={PERMISSION_HEADING_SX}>{ACTION_LABELS[action]}</Typography>
+            <Typography key={action} variant="caption" sx={PERMISSION_HEADING_SX}>
+              <HelpLabel label={ACTION_LABELS[action]} help={ACTION_HELP[action]} />
+            </Typography>
           ))}
         </Box>
         {rows.map(row => (
@@ -109,12 +126,23 @@ export default function KeyPermissionGrid({
             <Typography sx={LABEL_SX} data-testid="key-permission-label">{row.label}</Typography>
             {GRID_ACTIONS.map(action => {
               const key = row.keys[action]
+              if (!key && action === 'view' && OPEN_READ_FEATURES.has(row.feature)) {
+                return (
+                  <Box key={action} sx={{ ...CELL_SX, gap: 0.5 }} data-testid="key-permission-open-view">
+                    <Typography component="span" variant="body2" sx={CELL_WORD_SX}>View:</Typography>
+                    <Typography component="span" variant="body2" sx={{ color: 'text.secondary' }}>
+                      <HelpLabel label="Always" help={OPEN_READ_HELP} />
+                    </Typography>
+                  </Box>
+                )
+              }
               if (!key) return <span key={action} />
               return (
                 <Box key={action} component="label" sx={CELL_SX}>
                   <SettingCheckbox
                     name={key}
                     label={`${ACTION_LABELS[action]} ${row.label.toLowerCase()}`}
+                    help={ACTION_HELP[action]}
                     checked={value.ticked.has(key)}
                     disabled={disabled}
                     onChange={checked => toggle(key, checked)}
@@ -127,7 +155,7 @@ export default function KeyPermissionGrid({
             })}
           </Box>
         ))}
-        <Box role="group" aria-label="Administration" data-testid="key-permission-org-admin-row"
+        {orgAdminShown && <Box role="group" aria-label="Administration" data-testid="key-permission-org-admin-row"
           sx={{ ...ROW_SX, ...PERMISSION_ROW_RULE_SX }}>
           <Typography component="span" sx={LABEL_SX}>
             <HelpLabel label="Administration" help={ORG_ADMIN_HELP} />
@@ -145,7 +173,7 @@ export default function KeyPermissionGrid({
             />
             <Typography component="span" variant="body2" sx={CELL_WORD_SX}>Allowed</Typography>
           </Box>
-        </Box>
+        </Box>}
       </Box>
     </Box>
   )

@@ -9,7 +9,7 @@ const RETURN_PARAM = 'gmail_connect'
 
 /* The callback's closed slug vocabulary. `Object.create(null)`: the key comes off the URL (`?reason=__proto__`). */
 const RETURN_ERRORS: Record<string, string> = Object.assign(Object.create(null), {
-  not_configured: "Gmail sign-in isn't set up. Add a service account, or ask an operator.",
+  not_configured: "Gmail sign-in isn't set up. Add a service account, or ask Jaah support.",
   expired: 'The connect attempt timed out. Connect with Google again.',
   state_mismatch: "That response didn't match this browser's attempt. Connect with Google again.",
   wrong_user: 'That attempt belongs to another signed-in user. Connect with Google again.',
@@ -25,7 +25,7 @@ const RETURN_ERRORS: Record<string, string> = Object.assign(Object.create(null),
 const RETURN_FALLBACK = "Gmail didn't connect. Connect with Google again."
 
 /** Consume the return flags once: what came back (`null` when none), a failure's sentence, and a way to dismiss it. */
-export const useGmailConnectReturn = () => useConnectReturn(RETURN_PARAM, RETURN_ERRORS, RETURN_FALLBACK)
+export const useGmailConnectReturn = () => useConnectReturn({ param: RETURN_PARAM }, RETURN_ERRORS, RETURN_FALLBACK)
 
 /** The return's error where the Email card itself is not offered — an org whose plan leaves Tenant email out, which
  * is exactly when the callback answers `off_plan` (`pages/settings/ownOrg/OwnOrgPanels.tsx`). */

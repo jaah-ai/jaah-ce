@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterator, Optional
 from uuid import UUID
 
 if TYPE_CHECKING:
@@ -15,7 +15,7 @@ from app.operator_settings import defaults
 from app.operator_settings.catalog import _BY_KEY, STATE_KEY, in_edition
 from app.operator_settings.errors import OperatorSettingsError
 from app.operator_settings.knobs import Knob
-from app.url_validation import https_url_problem
+from app.url_validation import https_url_problem, sentry_dsn_problem
 
 # One address of an `email_list` knob: a deliberately loose shape check (one `@`, a dotted host, no spaces).
 _EMAIL_RE = re.compile(r"[^@\s,]+@[^@\s,]+\.[^@\s,]+")
@@ -62,6 +62,10 @@ def _validate_value(knob: Knob, value: Any) -> Any:
     if knob.https_url and not (knob.blank_ok and value == ""):
         # Before the length bounds, so a blank or `http://` value is refused in words, not by its length.
         problem = https_url_problem(value)
+        if problem is not None:
+            raise OperatorSettingsError(f"{knob.label} {problem}.")
+    if knob.sentry_dsn and value != "":
+        problem = sentry_dsn_problem(value)
         if problem is not None:
             raise OperatorSettingsError(f"{knob.label} {problem}.")
     if knob.email_list:
@@ -111,6 +115,10 @@ def _validate_value(knob: Knob, value: Any) -> Any:
             value = data_residency.canonical(value)
         except ValueError as exc:
             raise OperatorSettingsError(f"{knob.label}: {exc}") from None
+    if knob.pattern is not None and value.strip():
+        value = value.strip()
+        if not re.fullmatch(knob.pattern[0], value):
+            raise OperatorSettingsError(f"{knob.label}: “{value[:80]}” is not {knob.pattern[1]}.")
     if knob.minimum is not None and len(value) < knob.minimum:
         raise OperatorSettingsError(f"{knob.label} must be at least {int(knob.minimum)} characters long.")
     if knob.maximum is not None and len(value) > knob.maximum:
@@ -134,6 +142,18 @@ def _validate_value(knob: Knob, value: Any) -> Any:
     return value
 
 
+def _submitted(values: dict[str, Any]) -> Iterator[tuple[Knob, Optional[Any]]]:
+    """Both writers' door: `values` as `(knob, value_or_null)` pairs, lazily (so a writer's refusal of an earlier
+    key still comes before this one's refusal of a later key); a non-object body or unknown key is refused."""
+    if not isinstance(values, dict):
+        raise OperatorSettingsError("values must be a JSON object")
+    for key, value in values.items():
+        knob = _BY_KEY.get(key)
+        if knob is None or not in_edition(knob):
+            raise OperatorSettingsError(f"unknown setting '{key}'")
+        yield knob, value
+
+
 def apply_overrides(session: Session, values: dict[str, Any], *, org: Optional[UUID] = None) -> None:
     """Validate every `{key: value_or_null}` pair in `values`, then write. All-or-nothing: one bad key
     raises before anything is touched. `null` clears that key's override. The dict is replaced whole,
@@ -146,14 +166,8 @@ def apply_overrides(session: Session, values: dict[str, Any], *, org: Optional[U
 
     Does not invalidate the cache: the PUT route does after a successful commit, so a rolled-back write
     never appears to take effect."""
-    if not isinstance(values, dict):
-        raise OperatorSettingsError("values must be a JSON object")
-
     planned: list[tuple[Knob, Optional[Any]]] = []
-    for key, value in values.items():
-        knob = _BY_KEY.get(key)
-        if knob is None or not in_edition(knob):
-            raise OperatorSettingsError(f"unknown setting '{key}'")
+    for knob, value in _submitted(values):
         if value is None and not knob.data_regions:
             planned.append((knob, None))
             continue
@@ -168,7 +182,7 @@ def apply_overrides(session: Session, values: dict[str, Any], *, org: Optional[U
                     "supplies its own org — the pointer is checked against the credentials that org "
                     "owns before it is stored"
                 )
-            checked = _validated_credential(session, org, knob, checked)
+            checked = _validated_credential(session, org, knob, checked, home=_OPERATOR_CREDENTIAL_HOME)
         if knob.plan and checked and checked not in defaults._active_plans(session):
             raise OperatorSettingsError(f"{knob.label} must be one of the active plans in Products › Plans.")
         if knob.project and checked and checked not in defaults.project_choices():
@@ -237,7 +251,13 @@ def _validated_connection(session: Session, org: UUID, knob: Knob, raw: str) -> 
     return raw
 
 
-def _validated_credential(session: Session, org: UUID, knob: Knob, raw: str) -> str:
+# Where a refused credential pointer's fix lives, said after the refusal: the operator tier's writer is the
+# operator organization (`routes/settings.py` seats it there), the org tier's is the org being configured.
+_OPERATOR_CREDENTIAL_HOME = "Add one to the operator organization in Credentials, then pick it here."
+_ORG_CREDENTIAL_HOME = "Add one to this organization in Credentials, then pick it here."
+
+
+def _validated_credential(session: Session, org: UUID, knob: Knob, raw: str, *, home: str) -> str:
     """`raw` if it names a credential of `org` and of one of `knob`'s declared types, else refuse.
 
     The write door on every credential pointer, at both tiers (an unchecked operator-tier
@@ -245,7 +265,7 @@ def _validated_credential(session: Session, org: UUID, knob: Knob, raw: str) -> 
     whose configuration this is; this decides which row a pointer may name. At the org tier it stops org A
     pointing at org B's row (neither resolver adds its own `org_id` predicate).
     Not a liveness check: that stays the consumer's question. One message for both refusals, so it is not a
-    cross-org existence oracle.
+    cross-org existence oracle. `home` names where to add an acceptable one (the same for every refusal).
 
     The writer's own org at both tiers, deliberately: `GET /api/credentials` is org-scoped, so the picker
     only offers own-org rows, and `PUT /api/settings` is org-scoped too, so a wider `IN` would be a no-op
@@ -261,7 +281,7 @@ def _validated_credential(session: Session, org: UUID, knob: Knob, raw: str) -> 
         return ""
     unusable = OperatorSettingsError(
         f"{knob.label} must name one of this organization's credentials of type "
-        f"{', '.join(knob.credential_type or ())}."
+        f"{', '.join(knob.credential_type or ())}. {home}"
     )
     credential_id = optional_uuid(raw)
     if credential_id is None:
@@ -292,24 +312,18 @@ def apply_org_overrides(session: Session, org: UUID, values: dict[str, Any]) -> 
 
     from app.models.orgs import OrgSetting
 
-    if not isinstance(values, dict):
-        raise OperatorSettingsError("values must be a JSON object")
-
     planned: list[tuple[Knob, Optional[Any]]] = []
-    for key, value in values.items():
-        knob = _BY_KEY.get(key)
-        if knob is None or not in_edition(knob):
-            raise OperatorSettingsError(f"unknown setting '{key}'")
+    for knob, value in _submitted(values):
         if knob.tier != "org":
             raise OperatorSettingsError(
-                f"'{key}' is an operator-global setting and cannot be overridden per org"
+                f"'{knob.key}' is an operator-global setting and cannot be overridden per org"
             )
         if value is None:
             planned.append((knob, None))
             continue
         checked = _validate_value(knob, value)
         if knob.credential_type is not None:
-            checked = _validated_credential(session, org, knob, checked)
+            checked = _validated_credential(session, org, knob, checked, home=_ORG_CREDENTIAL_HOME)
         if knob.plan and checked and checked not in defaults._active_plans(session):
             raise OperatorSettingsError(f"{knob.label} must be one of the active plans in Products › Plans.")
         if knob.cloud_connection:

@@ -1,19 +1,19 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import TextField from '@mui/material/TextField'
 import { operatorPlaneRefusal } from '../../components/ChangeOrgDialog'
-import type { ConfirmOptions } from '../../components/ConfirmDialog'
+import { type ConfirmOptions, danger } from '../../components/ConfirmDialog'
 import type { CredentialView } from '../../lib/credentialFilterStorage'
+import { groupedCount, groupedCountOf } from '../../lib/humanize'
 import { currentOrgScope } from '../../lib/orgScope'
 import { useRowSelection } from '../../hooks/useRowSelection'
 import type { Org } from '../../types'
 import BulkActionBar, { type BulkAction } from '../../ui/BulkActionBar'
-import { ACTIONS_SLOT } from '../../ui/feed/geometry'
+import FormTextField from '../../ui/FormTextField'
+import FormField from '../../ui/FormField'
 import { OrgSelect } from '../../ui/OrgSelect'
-import type { FeedSlot } from '../../ui/feed/types'
-import { fieldTapTargetSx, PHONE } from '../../ui/listStyles'
-import { SELECT_SLOT, SelectAllBox, SelectRowBox, selectSlot } from '../../ui/RowSelect'
+import type { FeedColumn, FeedSlot } from '../../ui/feed/types'
+import { SelectAllBox, SelectRowBox, selectSlot } from '../../ui/RowSelect'
 import Toast from '../../ui/Toast'
 import {
   BULK_CAP,
@@ -24,6 +24,8 @@ import {
   type CredentialBulkSet,
   type CredentialMatch,
 } from './api'
+import { bulkDeletesLastGithub, withLastGithubWarning } from './lastGithubWarning'
+import { FONT_SIZE } from '../../theme'
 
 // BULK ACTIONS ON THE CREDENTIALS ROSTER: Flat mode's per-row tick, the page tick, "Select all N
 // matching", the action bar and its confirms. Each action is ONE server call over the whole set
@@ -31,11 +33,11 @@ import {
 // "All matching" sends the roster's filters (`match`) with the count the confirm named (`expect_count`), never ids,
 // so a set that changed meanwhile is refused, not acted on. The server is the gate: a tick offers, it grants nothing.
 
-const CAP_REASON = `At most ${BULK_CAP.toLocaleString()} secrets per action. Narrow the filter.`
+const CAP_REASON = `At most ${groupedCount(BULK_CAP)} secrets per action. Narrow the filter.`
 
 /** A count as the reader sees it: `10,000+` past the server's count cap. */
 function countText(count: number, capped: boolean): string {
-  return `${count.toLocaleString()}${capped ? '+' : ''}`
+  return `${groupedCount(count)}${capped ? '+' : ''}`
 }
 
 function plural(count: string, one: boolean): string {
@@ -62,17 +64,18 @@ function matchOf(view: CredentialView): CredentialMatch | null {
 function FolderField({ onChange }: { onChange: (value: string) => void }) {
   const [value, setValue] = useState('')
   return (
-    <TextField
-      autoFocus
-      fullWidth
-      size="small"
-      label="Folder"
-      placeholder="team/service — empty for the top level"
-      value={value}
-      onChange={event => { setValue(event.target.value); onChange(event.target.value) }}
-      sx={[fieldTapTargetSx, { mt: 2 }]}
-      slotProps={{ htmlInput: { 'data-testid': 'bulk-move-folder' } }}
-    />
+    <Box sx={{ mt: 2 }}>
+      <FormTextField
+        autoFocus
+        label="Folder"
+        id="bulk-move-folder"
+        help="Keeps each last name part: a/b/jira to team becomes team/jira."
+        placeholder="team/service — empty for the top level"
+        value={value}
+        onChange={next => { setValue(next); onChange(next) }}
+        testId="bulk-move-folder"
+      />
+    </Box>
   )
 }
 
@@ -82,14 +85,15 @@ function OrgField({ onChange }: { onChange: (org: Org) => void }) {
   const [value, setValue] = useState<Org | null>(null)
   return (
     <Box sx={{ mt: 2 }}>
-      <OrgSelect
-        id="bulk-change-org-target"
-        label="Move to"
-        value={value?.id ?? null}
-        onChange={(_id, org) => { setValue(org); onChange(org) }}
-        optionDisabled={operatorPlaneRefusal('credential')}
-        testId="bulk-change-org-target"
-      />
+      <FormField label="Move to" help="The selected credentials move into this org.">
+        <OrgSelect
+          id="bulk-change-org-target"
+          value={value?.id ?? null}
+          onChange={(_id, org) => { setValue(org); onChange(org) }}
+          optionDisabled={operatorPlaneRefusal('credential')}
+          testId="bulk-change-org-target"
+        />
+      </FormField>
     </Box>
   )
 }
@@ -97,7 +101,9 @@ function OrgField({ onChange }: { onChange: (org: Org) => void }) {
 export type CredentialBulk = {
   /** The tick for one flat row, as a trailing slot. */
   rowSlot: (row: Credential) => FeedSlot
-  /** The page tick and the select-all-matching banner, above the rows. */
+  /** The select column's header: the page tick (`FeedList`'s `columns`). */
+  selectColumn: FeedColumn
+  /** The select-all-matching banner, above the rows, once every shown row is ticked. */
   header: ReactNode
   /** The action bar, the confirms' toast. */
   bar: ReactNode
@@ -124,11 +130,10 @@ export function useCredentialBulk({
   /** Re-read the roster after an action landed. */
   onDone: () => void
 }): CredentialBulk {
-  /* Ticks on other pages survive a page change (`keepHidden`); the filter-change effect below drops them. */
   const onPage = useMemo(() => new Set(items.map(row => row.id)), [items])
   const {
     selected: picked, set: setPicked, toggle, clear: clearPicked, toggleAll, allShownSelected, someShownSelected,
-  } = useRowSelection(onPage, { keepHidden: true })
+  } = useRowSelection(onPage)
   const [allMatching, setAllMatching] = useState(false)
   const [toast, setToast] = useState<{ text: string; seq: number } | null>(null)
 
@@ -151,8 +156,7 @@ export function useCredentialBulk({
   const pageAll = onPage.size > 0 && (allMatching || allShownSelected)
   const pageSome = allMatching ? onPage.size > 0 : someShownSelected
 
-  /* The page tick adds or drops this page's rows only. Off "all matching", it drops the lot (none of it is off
-     screen any more). */
+  /* The header tick is the rows on screen; off "all matching", it drops the lot. */
   function togglePage() {
     if (allMatching) clear()
     else toggleAll()
@@ -160,7 +164,7 @@ export function useCredentialBulk({
 
   function toggleRow(id: string) {
     if (allMatching) {
-      // Unticking one row of "all matching" falls back to the page minus that row: the rest are off screen.
+      // Unticking one row of "all matching" falls back to the shown rows minus that row: the rest are off screen.
       setAllMatching(false)
       setPicked(new Set([...onPage].filter(other => other !== id)))
       return
@@ -176,24 +180,26 @@ export function useCredentialBulk({
 
   function landed(verb: string, done: number, where = '') {
     clear()
-    setToast(prev => ({ text: `${verb} ${plural(done.toLocaleString(), done === 1)}${where}`, seq: (prev?.seq ?? 0) + 1 }))
+    setToast(prev => ({ text: `${verb} ${groupedCountOf(done, 'secret')}${where}`, seq: (prev?.seq ?? 0) + 1 }))
     onDone()
   }
 
   async function runDelete() {
     let done = 0
-    const ok = await confirm({
+    const lastGithub = await bulkDeletesLastGithub(allMatching && match !== null ? { applied } : { ids: [...picked] }, items)
+    const ok = await confirm(danger(`Delete ${shown}`, {
       title: `Delete ${plural(shown, count === 1)}`,
-      message: `This removes ${count === 1 ? 'it' : `all ${shown}`} and the secrets stored with ${count === 1 ? 'it' : 'them'}. This cannot be undone.`,
-      confirmLabel: `Delete ${shown}`,
-      destructive: true,
+      message: withLastGithubWarning(
+        `This removes ${count === 1 ? 'it' : `all ${shown}`} and the secrets stored with ${count === 1 ? 'it' : 'them'}. This cannot be undone.`,
+        lastGithub,
+      ),
       typed: count > 1 ? { name: String(count), action: 'the delete' } : undefined,
       run: {
         action: async () => { done = (await bulkDeleteCredentials(set(), count)).count },
         failed: 'Failed to delete secrets',
         busyLabel: 'Deleting…',
       },
-    })
+    }))
     if (ok) landed('Deleted', done)
   }
 
@@ -256,32 +262,29 @@ export function useCredentialBulk({
     <SelectRowBox testId="credential-select" checked={allMatching || picked.has(row.id)} onChange={() => toggleRow(row.id)} name={row.name} />,
   )
 
-  /* After a full page is ticked, offer the rest: a link to every row the filters match (the "N" capped as the
-     count is). Not when the narrowing cannot be sent (`matchOf`), nor when the page is everything. */
+  /* Once every shown row is ticked, offer the rest: a link to every row the filters match (the "N" capped as the
+     count is). Not when the narrowing cannot be sent (`matchOf`), nor when the shown rows are everything. */
   const offerAll = pageAll && !allMatching && match !== null && (total > onPage.size || totalCapped)
+  /* THE SELECT COLUMN'S HEADER TICKS EVERY ROW SHOWN (as `/users` and `/nodes`), over the rows' ticks. */
+  const selectColumn: FeedColumn = {
+    key: 'select',
+    ariaLabel: 'Select shown',
+    label: (
+      <SelectAllBox
+        testId="credential-select-page"
+        allSelected={pageAll}
+        someSelected={pageSome}
+        onChange={togglePage}
+        shown={`${onPage.size} secrets shown`}
+      />
+    ),
+  }
   const header = onPage.size === 0 ? null : (
     <>
-      <Box
-        role="group"
-        aria-label="Select secrets"
-        sx={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 1, fontSize: '0.75rem', color: 'text.secondary' }}
-      >
-        <Box component="span">Select page</Box>
-        <Box sx={{ width: SELECT_SLOT, display: 'flex', justifyContent: 'center' }}>
-          <SelectAllBox
-            testId="credential-select-page"
-            allSelected={pageAll}
-            someSelected={pageSome}
-            onChange={togglePage}
-            shown={`${onPage.size} secrets shown`}
-          />
-        </Box>
-        <Box aria-hidden="true" sx={{ width: ACTIONS_SLOT, [PHONE]: { width: 24 } }} />
-      </Box>
       {(offerAll || allMatching) && (
         <Box
           data-testid="credential-select-banner"
-          sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, fontSize: '0.875rem', py: 0.5 }}
+          sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, fontSize: FONT_SIZE.base, py: 0.5 }}
         >
           {allMatching ? (
             <>
@@ -290,7 +293,7 @@ export function useCredentialBulk({
             </>
           ) : (
             <>
-              <span>All {onPage.size} on this page are selected.</span>
+              <span>All {onPage.size} shown are selected.</span>
               <Button size="small" onClick={() => setAllMatching(true)} data-testid="credential-select-all">
                 Select all {countText(total, totalCapped)} matching
               </Button>
@@ -308,5 +311,5 @@ export function useCredentialBulk({
     </>
   )
 
-  return { rowSlot, header, bar }
+  return { rowSlot, selectColumn, header, bar }
 }

@@ -21,6 +21,13 @@ The single home for three folds, all run from `node_log_findings.record` (the on
   `models.MAX_GHA_REPORTED_SLOTS` units are kept, those whose newest job started last: the unit name is the
   node's own text, and a host's runner pool never reports more slots than that (the pool's `observed` is not
   read here, as the fold sees the node row alone).
+  Beside the units, the reserved key `HEALTH_KEY` holds each unit's runner health since its last job
+  (`runner_faults` reads it): `{"_health": {"<unit>": {"starts", "start_at", "stopping", "refused",
+  "refused_at"}}}`. `starts` counts systemd's starts of the unit (`Started …`, `Failed to start …`) since its
+  newest job; a requested stop (`Stopping …`) makes the next start the first again, so only a unit that keeps
+  exiting on its own climbs. `refused` is the runner version GitHub's refusal named (`Runner version vX is
+  deprecated and cannot receive messages`), cleared when the runner later reports another version. A new job
+  start drops the unit's entry.
 
 * `nodes.recent_errors` — the node's newest `MAX_RECENT_ERRORS` journal lines at priority ≤ `ERROR_PRIORITY`
   (warning or worse), newest first: `[{"at", "unit", "message"}]`. The kernel's lines and the GHA runner units'
@@ -43,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional, Protocol
 
 from app import agent_sessions, runner_terminations
-from app.clock import as_utc, parse_utc
+from app.clock import as_utc, parse_utc, utcnow
 from app.fleet_verdicts import redact_node_detail
 from app.models.node_groups import MAX_GHA_REPORTED_SLOTS
 
@@ -111,6 +118,13 @@ _JOB_DONE_RE = re.compile(r"Job (.{1,256}) completed with result: (\w{1,32})")
 # systemd about the unit: a stop or kill is coming (signal only), or the runner is gone (closes an open job).
 _SIGNAL_MARKS = ("A process of this unit has been killed by the OOM killer",)
 _GONE_MARKS = ("Main process exited", "Deactivated", "Failed with result")
+# Runner health (`HEALTH_KEY`): GitHub's refusal of a runner version, the version the runner says it is, and
+# systemd's start lines about the unit (a requested stop says `Stopping …`; an exit-and-restart does not).
+HEALTH_KEY = "_health"
+RESTART_LOOP_STARTS = 3
+_REFUSED_RE = re.compile(r"Runner version (v?[0-9][0-9.]{0,31}) is deprecated and cannot receive messages")
+_RUNNER_VERSION_RE = re.compile(r"Current runner version: '(v?[0-9][0-9.]{0,31})'")
+_START_MARKS = ("Started ", "Failed to start ")
 
 
 class _Entry(Protocol):
@@ -121,12 +135,14 @@ class _Entry(Protocol):
 def fold(row: Any, entries: Iterable[_Entry], now: Optional[datetime] = None) -> bool:
     """Fold `entries` (oldest first, as shipped) into `row.update_history`, `row.gha_recent_jobs` and
     `row.recent_errors`; whether any changed. A line stamped ahead of `now` is read as now."""
-    ceiling = as_utc(now) if now is not None else datetime.now(timezone.utc)
+    ceiling = as_utc(now) if now is not None else utcnow()
     updates = list(getattr(row, "update_history", None) or [])
-    jobs = {unit: list(items) for unit, items in (getattr(row, "gha_recent_jobs", None) or {}).items()}
+    recorded = getattr(row, "gha_recent_jobs", None) or {}
+    jobs = {unit: list(items) for unit, items in recorded.items() if unit != HEALTH_KEY}
+    health = {unit: dict(state) for unit, state in (recorded.get(HEALTH_KEY) or {}).items()}
     errors = list(getattr(row, "recent_errors", None) or [])
     seen_errors = {(e.get("at"), e.get("message")) for e in errors if isinstance(e, dict)}
-    updates_changed = jobs_changed = errors_changed = False
+    updates_changed = jobs_changed = errors_changed = health_changed = False
     last_updater_line: Optional[tuple[datetime, str]] = None
     for entry in entries:
         unit = str(getattr(entry, "unit", "") or "")
@@ -141,8 +157,13 @@ def fold(row: Any, entries: Iterable[_Entry], now: Optional[datetime] = None) ->
                 updates_changed = True
         elif unit.startswith(GHA_UNIT_PREFIX):
             unit_jobs = jobs.setdefault(unit, [])
+            started = bool(_JOB_START_RE.search(text.rstrip()))
             if _fold_job_line(unit_jobs, text, at):
                 jobs_changed = True
+                if started and health.pop(unit, None) is not None:
+                    health_changed = True
+            elif _fold_health_line(health, unit, unit_jobs, text, at):
+                health_changed = True
         if isinstance(priority, int) and priority <= ERROR_PRIORITY and unit != KERNEL_UNIT \
                 and not unit.startswith(GHA_UNIT_PREFIX):
             key = (at.isoformat(), text.rstrip()[:MAX_DETAIL_CHARS])
@@ -153,14 +174,19 @@ def fold(row: Any, entries: Iterable[_Entry], now: Optional[datetime] = None) ->
                 errors_changed = True
     if updates_changed:
         row.update_history = updates[:MAX_UPDATES]
-    if jobs_changed:
+    if jobs_changed or health_changed:
         kept = sorted(((unit, items[:MAX_JOBS_PER_UNIT]) for unit, items in jobs.items() if items),
                       key=lambda pair: parse_utc(pair[1][0].get("started_at")) or _EPOCH, reverse=True)
-        row.gha_recent_jobs = dict(kept[:MAX_GHA_REPORTED_SLOTS])
+        folded: dict[str, Any] = dict(kept[:MAX_GHA_REPORTED_SLOTS])
+        # Bounded like the units: the freshest `MAX_GHA_REPORTED_SLOTS`.
+        fresh = sorted(health.items(), key=lambda pair: _health_at(pair[1]), reverse=True)
+        if fresh:
+            folded[HEALTH_KEY] = dict(fresh[:MAX_GHA_REPORTED_SLOTS])
+        row.gha_recent_jobs = folded
     if errors_changed:
         errors.sort(key=lambda e: parse_utc(e.get("at")) or _EPOCH, reverse=True)
         row.recent_errors = errors[:MAX_RECENT_ERRORS]
-    return updates_changed or jobs_changed or errors_changed
+    return updates_changed or jobs_changed or errors_changed or health_changed
 
 
 # ── Updates ──────────────────────────────────────────────────────────────────────
@@ -280,6 +306,65 @@ def _fold_job_line(unit_jobs: list, text: str, at: datetime) -> bool:
                 changed = True
         return changed
     return False
+
+
+def _health_at(state: dict) -> datetime:
+    return max(parse_utc(state.get("start_at")) or _EPOCH, parse_utc(state.get("refused_at")) or _EPOCH)
+
+
+def _fold_health_line(health: dict, unit: str, unit_jobs: list, text: str, at: datetime) -> bool:
+    """Apply one non-job line from a runner unit to its health entry (see `HEALTH_KEY`); whether it changed.
+    A line not after the unit's newest job start, or not after the start/refusal already counted, is a re-send."""
+    line = text.rstrip()
+    newest_job = parse_utc(unit_jobs[0].get("started_at")) if unit_jobs else None
+    if newest_job is not None and at <= newest_job:
+        return False
+    state = health.get(unit)
+    refused = _REFUSED_RE.search(line)
+    if refused:
+        if state is not None and at <= (parse_utc(state.get("refused_at")) or _EPOCH):
+            return False
+        health[unit] = dict(state or {}, refused=refused.group(1), refused_at=at.isoformat())
+        return True
+    version = _RUNNER_VERSION_RE.search(line)
+    if version:
+        if state is None or not state.get("refused") \
+                or version.group(1).lstrip("v") == str(state["refused"]).lstrip("v") \
+                or at <= (parse_utc(state.get("refused_at")) or _EPOCH):
+            return False
+        # A runner on another version came up: the loop the refusal drove is over, so its starts are too (this
+        # one counts) — else a fixed but idle slot would read as a restart loop until CI sends it a job.
+        health[unit] = {**{k: v for k, v in state.items() if k not in ("refused", "refused_at")}, "starts": 1}
+        return True
+    if line.startswith("Stopping "):
+        if state is None or state.get("stopping"):
+            return False
+        health[unit] = dict(state, stopping=True)
+        return True
+    if line.startswith(_START_MARKS):
+        if state is not None and at <= (parse_utc(state.get("start_at")) or _EPOCH):
+            return False
+        starts = 1 if state is None or state.get("stopping") else int(state.get("starts") or 0) + 1
+        health[unit] = dict(state or {}, starts=starts, start_at=at.isoformat(), stopping=False)
+        return True
+    return False
+
+
+def runner_faults(node: Any, unit_names: Iterable[str]) -> dict[str, str]:
+    """`{unit: why}` for each of `unit_names` whose runner is failing since its last job: GitHub refused its
+    version (`refused`, named), or it started `RESTART_LOOP_STARTS` times in a row on its own. The sentence's
+    subject is the caller's (the slot)."""
+    recorded = (getattr(node, "gha_recent_jobs", None) or {}).get(HEALTH_KEY) or {}
+    faults: dict[str, str] = {}
+    for unit in unit_names:
+        state = recorded.get(unit) or {}
+        if state.get("refused"):
+            version = "v" + str(state["refused"]).lstrip("v")
+            faults[unit] = (f"GitHub refuses runner {version} (deprecated) — set a current runner version in "
+                            "System Settings")
+        elif int(state.get("starts") or 0) >= RESTART_LOOP_STARTS:
+            faults[unit] = f"restarted {RESTART_LOOP_STARTS} times in a row without taking a job"
+    return faults
 
 
 def recent_jobs_for(node: Any, unit_names: Iterable[str]) -> dict[str, list[dict]]:

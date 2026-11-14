@@ -6,10 +6,103 @@ import DialogActions from '@mui/material/DialogActions'
 import DialogContent from '@mui/material/DialogContent'
 import DialogTitle from '@mui/material/DialogTitle'
 import type { SxProps, Theme } from '@mui/material/styles'
-import useMediaQuery from '@mui/material/useMediaQuery'
+import { FONT_SIZE, FONT_WEIGHT } from '../theme'
 import Banner from './Banner'
 import { DisabledReason } from './DisabledReason'
-import { PHONE_QUERY, tapTargetSx } from './listStyles'
+import { usePhone } from '../hooks/usePhone'
+import { tapTargetSx } from './listStyles'
+import Tip from './Tip'
+
+/* THE ONE DIALOG FRAME (style guide § Controls): every modal in the console is a `DialogFrame` — a form or a
+ * confirm through `FormDialog` below, a dialog that draws its own body (a wizard, the card form, a full-screen
+ * viewer or phone picker) directly. The frame is the wizard look: Add node's title, side padding and footer
+ * rhythm, the paper pinned near the top so a growing body grows downward. */
+
+/** The frame's side padding: 16px on a phone, 24px from `sm` up. */
+export const DIALOG_PAD_X = { xs: 2, sm: 3 } as const
+/** A body drawn by a frame's caller: the side padding, 20px above and below. */
+export const DIALOG_CONTENT_SX = { px: DIALOG_PAD_X, py: 2.5 } as const
+/** A footer drawn by a frame's caller: the side padding, buttons wrapping on a narrow phone. */
+export const DIALOG_ACTIONS_SX = { px: DIALOG_PAD_X, py: 1.5, flexWrap: 'wrap', rowGap: 0.5 } as const
+const TITLE_SX = {
+  px: DIALOG_PAD_X, pt: 2.5, pb: 1, fontSize: FONT_SIZE.lg, fontWeight: FONT_WEIGHT.semibold, overflowWrap: 'anywhere',
+} as const
+/* Pinned near the top, not centred: a step or a refusal that grows the body pushes the footer down, never the
+   title up. A full-screen frame has no margin to pin. */
+const PINNED_SX = { '& .MuiDialog-container': { alignItems: 'flex-start' } } as const
+const PINNED_PAPER_SX = { mt: '6dvh', maxHeight: '88dvh' } as const
+
+export function DialogFrame({
+  open = true,
+  onClose,
+  title,
+  labelledBy,
+  describedBy,
+  fullScreen = false,
+  maxWidth = 'sm',
+  testId,
+  rootTestId,
+  paperProps,
+  paperSx,
+  backdropSx,
+  sx,
+  onKeyDown,
+  onEntered,
+  children,
+}: {
+  open?: boolean
+  /** Omitted: a backdrop click or Escape does nothing (a true modal; its own buttons are the way out). */
+  onClose?: DialogProps['onClose']
+  /** The frame's title, which names the dialog. Omitted when the body draws its own header (`labelledBy`). */
+  title?: ReactNode
+  /** The `id` naming the dialog when the body, not the frame, draws its title. */
+  labelledBy?: string
+  describedBy?: string
+  fullScreen?: boolean
+  maxWidth?: DialogProps['maxWidth']
+  /** The paper's `data-testid`. */
+  testId?: string
+  /** The root's `data-testid` (a test that scopes to the whole modal, backdrop included). */
+  rootTestId?: string
+  /** More paper attributes (`data-*`). */
+  paperProps?: Record<string, string | undefined>
+  paperSx?: SxProps<Theme>
+  backdropSx?: SxProps<Theme>
+  /** Merged over the frame's placement (a bottom sheet re-pins it). */
+  sx?: Exclude<SxProps<Theme>, readonly unknown[]>
+  onKeyDown?: DialogProps['onKeyDown']
+  onEntered?: () => void
+  children: ReactNode
+}): JSX.Element {
+  const ownTitleId = useId()
+  return (
+    <Dialog
+      open={open}
+      onClose={onClose}
+      fullScreen={fullScreen}
+      fullWidth
+      maxWidth={maxWidth}
+      /* Spread, never `onKeyDown={undefined}`: an explicit undefined replaces the modal's own Escape handler. */
+      {...(onKeyDown && { onKeyDown })}
+      aria-labelledby={labelledBy ?? (title !== undefined ? ownTitleId : undefined)}
+      aria-describedby={describedBy}
+      data-testid={rootTestId}
+      sx={[fullScreen ? {} : PINNED_SX, sx ?? false]}
+      slotProps={{
+        paper: {
+          'data-testid': testId,
+          ...paperProps,
+          sx: [fullScreen ? {} : PINNED_PAPER_SX, ...(Array.isArray(paperSx) ? paperSx : [paperSx ?? false])],
+        } as object,
+        backdrop: { sx: backdropSx },
+        transition: onEntered ? { onEntered } : undefined,
+      }}
+    >
+      {title !== undefined && <DialogTitle id={ownTitleId} sx={TITLE_SX}>{title}</DialogTitle>}
+      {children}
+    </Dialog>
+  )
+}
 
 /* The shared form-dialog frame: title, form-level error, Cancel/Submit.
  *
@@ -98,11 +191,8 @@ export function FormDialog({
   /** Merged over the content's column layout (e.g. `p: 0` for an edge-to-edge viewer). */
   contentSx?: Exclude<SxProps<Theme>, readonly unknown[]>
 }): JSX.Element {
-  // MUI's `Dialog` does not take its name from `DialogTitle`; wired here, or a
-  // screen reader drops which group the tag is added to.
-  const titleId = useId()
   const submitRef = useRef<HTMLButtonElement | null>(null)
-  const phone = useMediaQuery(PHONE_QUERY)
+  const phone = usePhone()
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault()
@@ -114,30 +204,26 @@ export function FormDialog({
   }
 
   return (
-    <Dialog
+    <DialogFrame
       open={open}
       onClose={busy ? undefined : (_e, reason) => {
         if (modal && (reason === 'backdropClick' || (modal === true && reason === 'escapeKeyDown'))) return
         onClose()
       }}
+      title={title}
       fullScreen={fullScreenOnPhone && phone}
-      fullWidth
       maxWidth={maxWidth}
-      aria-labelledby={titleId}
-      aria-describedby={describedBy}
-      slotProps={{
-        paper: { 'data-testid': testId, sx: paperSx } as object,
-        backdrop: { sx: backdropSx },
-        /* `autoFocus` alone can fire mid-transition and be lost, leaving focus on the paper (Enter then confirms
-           nothing): once entered, the submit takes it unless the operator has already moved into the form. */
-        transition: submitAutoFocus ? {
-          onEntered: () => {
-            const button = submitRef.current
-            const active = document.activeElement
-            if (button && !(active && active !== button && button.form?.contains(active))) button.focus()
-          },
-        } : undefined,
-      }}
+      describedBy={describedBy}
+      testId={testId}
+      paperSx={paperSx}
+      backdropSx={backdropSx}
+      /* `autoFocus` alone can fire mid-transition and be lost, leaving focus on the paper (Enter then confirms
+         nothing): once entered, the submit takes it unless the operator has already moved into the form. */
+      onEntered={submitAutoFocus ? () => {
+        const button = submitRef.current
+        const active = document.activeElement
+        if (button && !(active && active !== button && button.form?.contains(active))) button.focus()
+      } : undefined}
     >
       {/* The form carries the paper's flex column: a plain `<form>` between paper and `DialogContent` broke
           the shrink chain, so a tall form overflowed a clipped paper (measured: Save 60px below the
@@ -154,14 +240,13 @@ export function FormDialog({
         noValidate
         sx={{ display: 'flex', flexDirection: 'column', minHeight: 0, flex: '1 1 auto', overflow: 'hidden' }}
       >
-        <DialogTitle id={titleId} sx={{ px: 2, py: 1.5, fontSize: '1rem', fontWeight: 600, overflowWrap: 'anywhere' }}>{title}</DialogTitle>
         {header}
         {/* `dividers`: the hairlines signal that the content scrolls. */}
-        <DialogContent dividers sx={[{ px: 2, pb: 1, display: 'flex', flexDirection: 'column', gap: 2, minHeight: 0, flex: '1 1 auto', overflowY: 'auto' }, contentSx ?? false]}>
+        <DialogContent dividers sx={[{ ...DIALOG_CONTENT_SX, display: 'flex', flexDirection: 'column', gap: 2, minHeight: 0, flex: '1 1 auto', overflowY: 'auto' }, contentSx ?? false]}>
           {error && <Banner severity="error" testId={errorTestId}>{error}</Banner>}
           {children}
         </DialogContent>
-        <DialogActions sx={{ px: 2, pb: 1.5, flexWrap: 'wrap', rowGap: 0.5 }}>
+        <DialogActions sx={DIALOG_ACTIONS_SX}>
           {!hideCancel && (
             <Button type="button" onClick={onClose} color="inherit" disabled={busy} sx={tapTargetSx} data-testid={cancelTestId}>
               {cancelLabel}
@@ -169,23 +254,22 @@ export function FormDialog({
           )}
           {secondaryAction}
           {!hideSubmit && <DisabledReason reason={submitDisabledReason}>
-            <Button
+            <Tip title={submitDisabledReason}><Button
               type="submit"
               variant="contained"
               color={destructive ? 'error' : 'primary'}
               disabled={busy || submitDisabled || submitDisabledReason !== undefined}
-              title={submitDisabledReason}
               data-testid={submitTestId}
               autoFocus={submitAutoFocus}
               ref={submitRef}
               sx={tapTargetSx}
             >
               {busy ? busyLabel : submitLabel}
-            </Button>
+            </Button></Tip>
           </DisabledReason>}
         </DialogActions>
       </Box>
-    </Dialog>
+    </DialogFrame>
   )
 }
 

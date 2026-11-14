@@ -11,16 +11,21 @@ routes its OWN calls through its own socket (deadlock, credential loop).
 """
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from typing import Any
 
 import environment
 import node_settings
+import node_token_http
 import plugin_repair
 import runner_env
 import token_revocation
@@ -30,7 +35,7 @@ from env_helpers import (
 
 log = logging.getLogger("jaahd.control_plane_api")
 
-# The pool-banded API_PORT from the launcher env; default is this repo's grid slot (8020).
+# The slot's API_PORT from the launcher env; default 8020.
 CONTROL_PLANE_API_PORT = int(os.environ.get("API_PORT", "8020"))
 NODE_TOKEN = os.environ.get("NODE_TOKEN", "")
 
@@ -53,23 +58,9 @@ def _json_default(obj: object) -> str:
     raise TypeError(f"not JSON serializable: {type(obj)}")
 
 
-def _caller_task_id() -> str:
-    """This process's `X-Agent-Task-Id` declaration. `host` is NOT an unconditional fallback: in a
-    dispatched runner a missing `CONTROL_TASK_ID` means the id was LOST, so declare nothing and let the
-    server refuse — a safe-off default may cover a switch, never an identity.
-
-    The runner test is `CONTROL_RUNNER_SESSION_ID` (dispatched runners only, credential-independent) —
-    not `COCKPIT_AGENT_BASE` or `JAAH_WORKTREE`, which host producers may carry."""
-    task_id = runner_env.task_id().strip()
-    if task_id:
-        return task_id
-    return "" if runner_env.runner_session_id().strip() else "host"
-
-
 def _agent_headers() -> dict[str, str]:
-    # Sent on every call (one builder beats a per-call opt-in). A deliberate copy of
-    # the monorepo control-plane client's `caller_task_id`, which holds the rationale (jaahd cannot import it).
-    h: dict[str, str] = {"Content-Type": "application/json", "X-Agent-Task-Id": _caller_task_id()}
+    # Sent on every call (one builder beats a per-call opt-in); `runner_env.caller_task_id` holds the rationale.
+    h: dict[str, str] = {"Content-Type": "application/json", "X-Agent-Task-Id": runner_env.caller_task_id()}
     # Both arms are the daemon's own. The module `NODE_TOKEN` leads because the 401 retry writes a
     # rotated value there. Never add a broker arm: user `jaah` must have no path to the token
     # (`cred_broker`'s module docstring).
@@ -113,37 +104,11 @@ def cp_error_body(exc: BaseException) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _origin(url: str) -> tuple[str, str]:
-    """`(scheme, host:port)`, folded, for comparing two URLs as the same trust boundary.
-
-    Shared by the redirect handler and `_agent_urlopen`'s body capture so they agree on "somewhere else"."""
-    parts = urllib.parse.urlsplit(url)
-    return parts.scheme.lower(), parts.netloc.lower()
-
-
-class _DropNodeTokenOffHost(urllib.request.HTTPRedirectHandler):
-    """Follow a redirect, but never carry this node's own CP credential across a host boundary.
-
-    An attachment's content route answers a 307 to a presigned S3 URL, and `urllib` copies every header
-    onto the redirect — posting the node's bearer `X-Agent-Token` to Amazon. Stripped whenever SCHEME or
-    HOST changes (a same-host https→http downgrade would put it on the wire in cleartext).
-
-    Matched case-insensitively, not via `Request.remove_header`: that capitalizes its argument through
-    3.13 and not on 3.14, so no single spelling works on both."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if redirected is None:
-            return None
-        if _origin(newurl) != _origin(req.full_url):
-            for store in (redirected.headers, redirected.unredirected_hdrs):
-                for name in [k for k in store if k.lower() == "x-agent-token"]:
-                    store.pop(name, None)
-        return redirected
-
-
-# Every default handler, only the redirect one replaced.
-_OFF_HOST_SAFE_OPEN = urllib.request.build_opener(_DropNodeTokenOffHost()).open
+# The off-host redirect guard (a 307 to presigned S3 must not carry the node's bearer token) lives in the
+# stdlib-only leaf `node_token_http`, shared with `tools/control_plane_client.py`; bound under the names
+# this module's callers and `microvm_bridge` reach.
+_origin = node_token_http.origin
+_OFF_HOST_SAFE_OPEN = node_token_http.OFF_HOST_SAFE_OPEN
 
 
 #: The most bytes one response may move into memory. A ceiling because an unstreamed body is resident in the
@@ -190,6 +155,63 @@ _RESPONSE_CHUNK_BYTES = 1024 * 1024
 _TRANSPORT_OPEN = None
 
 
+# Conditional GET (ETag / If-None-Match) for the node's hot rosters. The CP fingerprints these answers
+# (`apps/api/app/conditional_get.py::CONDITIONAL_PATHS`, the twin of this set — change both or neither) and
+# answers an unchanged one with a body-less 304, which this cache turns back into the body last seen. Keyed by
+# the full URL (the query carries the node and project); a handful of entries per node, so the bound is loose.
+CONDITIONAL_PATHS = frozenset({"/api/agent/pool-tick", "/api/agent/accounts", "/api/agent/worktrees"})
+_CONDITIONAL_MAX_ENTRIES = 64
+_conditional_cache: dict[str, tuple[str, bytes]] = {}
+_conditional_lock = threading.Lock()
+
+
+def _conditional_key(req: urllib.request.Request, sink) -> str | None:
+    """The cache key for a request this cache serves — a plain GET of a `CONDITIONAL_PATHS` path — else None."""
+    if sink is not None or req.get_method() != "GET":
+        return None
+    if urllib.parse.urlsplit(req.full_url).path not in CONDITIONAL_PATHS:
+        return None
+    return req.full_url
+
+
+def _conditional_prepare(key: str | None, req: urllib.request.Request) -> tuple[str, bytes] | None:
+    """Add `If-None-Match` for a body this cache holds; returns that entry (None = ask unconditionally)."""
+    if key is None:
+        return None
+    with _conditional_lock:
+        cached = _conditional_cache.get(key)
+    if cached is not None:
+        req.add_header("If-None-Match", cached[0])
+    return cached
+
+
+def _carries_intents(key: str, body: bytes) -> bool:
+    """Whether a pool-tick body holds an intent: a `lease_slot` carries the runner's env in the clear, which this
+    cache must not keep in memory past the request that brought it. Unparseable counts as carrying one."""
+    if urllib.parse.urlsplit(key).path != "/api/agent/pool-tick":
+        return False
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return True
+    return not isinstance(parsed, dict) or bool(parsed.get("intents") or parsed.get("microvm_intents"))
+
+
+def _conditional_remember(key: str | None, response, body: bytes) -> None:
+    """Keep a 200's body under its `ETag`, or forget the key when the answer carried none (or carried intents)."""
+    if key is None:
+        return
+    headers = getattr(response, "headers", None)
+    etag = headers.get("ETag", "") if headers else ""
+    with _conditional_lock:
+        _conditional_cache.pop(key, None)
+        if not etag or _carries_intents(key, body):
+            return
+        while len(_conditional_cache) >= _CONDITIONAL_MAX_ENTRIES:
+            _conditional_cache.pop(next(iter(_conditional_cache)))
+        _conditional_cache[key] = (etag, body)
+
+
 def set_transport(open_url) -> None:
     """Route every CP call through `open_url(req, timeout=)` (`urlopen`'s shape), or back through urllib on None."""
     global _TRANSPORT_OPEN
@@ -212,11 +234,20 @@ def _agent_urlopen(req: urllib.request.Request, *, expected: tuple[int, ...] = (
         raise urllib.error.URLError("NODE_TOKEN refused by the control plane; backing off (token_revocation)")
     # `opener=_OFF_HOST_SAFE_OPEN` for the one caller that may be redirected off-host.
     open_url = _TRANSPORT_OPEN or opener or urllib.request.urlopen
+    conditional = _conditional_key(req, sink)
+    cached = _conditional_prepare(conditional, req)
     try:
-        body_bytes = _drain(open_url(req, timeout=timeout), sink, cap)
+        response = open_url(req, timeout=timeout)
+        body_bytes = _drain(response, sink, cap)
+        _conditional_remember(conditional, response, body_bytes)
         token_revocation.WATCH.observe_answer()
         return body_bytes
     except urllib.error.HTTPError as exc:
+        if exc.code == 304 and cached is not None:
+            # Unchanged since the body this cache holds: the CP answered, so the token is good.
+            exc.close()
+            token_revocation.WATCH.observe_answer()
+            return cached[1]
         detail = ""
         body = ""
         # ONLY A BODY THE CONTROL PLANE AUTHORED IS EVER READ: an S3 error body (after a redirect) echoes
@@ -254,10 +285,16 @@ def _agent_urlopen(req: urllib.request.Request, *, expected: tuple[int, ...] = (
                     req.remove_header("X-agent-token")
                 try:
                     # Cannot double-write the sink: `HTTPError` is raised off the status line, before any body.
-                    body_bytes = _drain(open_url(req, timeout=timeout), sink, cap)
+                    response = open_url(req, timeout=timeout)
+                    body_bytes = _drain(response, sink, cap)
+                    _conditional_remember(conditional, response, body_bytes)
                     token_revocation.WATCH.observe_answer()
                     return body_bytes
                 except urllib.error.HTTPError as retry_exc:
+                    if retry_exc.code == 304 and cached is not None:
+                        retry_exc.close()
+                        token_revocation.WATCH.observe_answer()
+                        return cached[1]
                     if _origin(getattr(retry_exc, "url", "") or req.full_url) == _origin(req.full_url):
                         if retry_exc.code == 401:
                             token_revocation.WATCH.observe_401(fresh)
@@ -297,42 +334,35 @@ def _agent_urlopen(req: urllib.request.Request, *, expected: tuple[int, ...] = (
         raise
 
 
+def _agent_json(method: str, path: str, payload: dict | None = None, *, want: type = dict,
+                expected: tuple[int, ...] = (), timeout: float | None = None):
+    """One JSON exchange with the local control-plane API: the answer when it is a `want` (dict or list),
+    else `want()` — so a 204/empty body, a JSON `null` (e.g. an empty claim) or an answer of another shape
+    needs no special-casing by a consumer. Raises whatever `_agent_urlopen` raises; `expected` statuses
+    still raise but log at DEBUG there, for a caller that classifies them itself."""
+    data = json.dumps(payload, default=_json_default).encode() if payload is not None else None
+    req = urllib.request.Request(f"{resolve_control_plane_api_base()}{path}", data=data, headers=_agent_headers(),
+                                 method=method)
+    # Options only when given: the suite's transport fakes stand in for `_agent_urlopen(req)`.
+    opts: dict[str, Any] = {**({"expected": expected} if expected else {}), **({"timeout": timeout} if timeout is not None else {})}
+    body = _agent_urlopen(req, **opts)
+    parsed = json.loads(body) if body else None
+    return parsed if isinstance(parsed, want) else want()
+
+
 def _agent_api_post(path: str, payload: dict, *, expected: tuple[int, ...] = ()) -> dict:
-    """POST JSON to the local control-plane API. Returns {} on a 204/empty body OR a JSON `null` (e.g. an
-    empty claim), so dict-consumers needn't special-case either. Ported from the former host-agent.
-    `expected` statuses still raise, but log at DEBUG (`_agent_urlopen`) — for a caller that retries them."""
-    url = f"{resolve_control_plane_api_base()}{path}"
-    data = json.dumps(payload, default=_json_default).encode()
-    req = urllib.request.Request(url, data=data, headers=_agent_headers(), method="POST")
-    # `expected` only when given: the suite's transport fakes stand in for `_agent_urlopen(req)`.
-    body = _agent_urlopen(req, expected=expected) if expected else _agent_urlopen(req)
-    if not body:
-        return {}
-    parsed = json.loads(body)
-    return parsed if isinstance(parsed, dict) else {}
+    """POST JSON to the local control-plane API; `_agent_json`'s dict coercion. Ported from the former host-agent."""
+    return _agent_json("POST", path, payload, expected=expected)
 
 
 def _agent_api_get(path: str) -> dict:
-    """GET JSON from the local control-plane API. {} on a 204/empty/null body."""
-    url = f"{resolve_control_plane_api_base()}{path}"
-    req = urllib.request.Request(url, headers=_agent_headers(), method="GET")
-    body = _agent_urlopen(req)
-    if not body:
-        return {}
-    parsed = json.loads(body)
-    return parsed if isinstance(parsed, dict) else {}
+    """GET JSON from the local control-plane API; `_agent_json`'s dict coercion."""
+    return _agent_json("GET", path)
 
 
 def _agent_api_get_list(path: str) -> list:
-    """GET a JSON array from the local control-plane API. [] on a 204/empty/null body or a non-list
-    response — mirrors _agent_api_get's dict-coercion for list-returning endpoints."""
-    url = f"{resolve_control_plane_api_base()}{path}"
-    req = urllib.request.Request(url, headers=_agent_headers(), method="GET")
-    body = _agent_urlopen(req)
-    if not body:
-        return []
-    parsed = json.loads(body)
-    return parsed if isinstance(parsed, list) else []
+    """GET a JSON array from the local control-plane API; `_agent_json`'s coercion, for a list."""
+    return _agent_json("GET", path, want=list)
 
 
 def _best_effort(
@@ -351,13 +381,11 @@ def _best_effort(
 
 def agent_api_accounts(include_disabled: bool = False) -> list[dict]:
     """The credential-account set the dispatcher selects from, read from the DB SSOT via
-    `GET /api/agent/accounts`. Each element is `{slug, config_dir, securestorage_dir, enabled, node_id,
-    runners}`; ENABLED only unless `include_disabled`. This node's id is always sent: `config_dir` is a
-    per-node answer the CP computes.
+    `GET /api/agent/accounts`. Each element is `{slug, config_dir, enabled, node_id, runners}`; ENABLED
+    only unless `include_disabled`. This node's id is always sent: `config_dir` is a per-node answer the CP
+    computes. The account's token store is the node's own resolution (`shared_storage.securestorage_dir`).
 
-    `securestorage_dir` is non-empty only for a SHARED account on a node with sharing enabled — the node's
-    only answer to "is this account shared here"; never re-derive it from disk. No `quota` field: a node
-    publishes only quota it observed itself (carry-forward is `fleet_observe.account_upsert_statement`).
+    No `quota` field: a node publishes only quota it observed itself (carry-forward is `fleet_observe.account_upsert_statement`).
 
     An unreachable API RAISES; only an empty/204/non-list body yields `[]` ("no accounts").
     `reconcile.accounts_probe.account_roster` depends on that distinction."""
@@ -377,22 +405,6 @@ def account_enabled(config_dir: str) -> bool | None:
         if isinstance(rec, dict) and (rec.get("config_dir") or "").rstrip("/") == norm:
             return rec.get("enabled", True) is not False
     return None
-
-def agent_api_worktrees(project: str, project_id: int | None = None) -> list[dict]:
-    """The pool-worktree roster for PROJECT from `GET /api/agent/worktrees`. Each element is `{node_id,
-    project_id, project, number, path, branch, holder, last_active}`.
-
-    `project_id`, when the caller knows it, is the identity the CP filters on; the name rides along for an
-    older CP, which reads only `project`.
-
-    RAISES on an unreachable API, never `[]`: `worktree_mechanics.lifecycle.roster_from_db` turns that into
-    `ResetRefused` — keep its `try/except`. `[]` means only "this project has no declared slots"."""
-    params: dict = {"project": str(project)}
-    if project_id is not None:
-        params["project_id"] = int(project_id)
-    query = urllib.parse.urlencode(params)
-    return _agent_api_get_list(f"/api/agent/worktrees?{query}")
-
 
 def this_node_id() -> str:
     """This daemon's own node id, for per-node pool readers that have no node identity threaded to them.
@@ -475,25 +487,18 @@ def post_microvm_facts(vm_id: str, body: dict) -> dict:
 
 
 def agent_api_port_grid() -> dict:
-    """The pool port grid's INPUTS, read from the DB SSOT via `GET /api/agent/port-grid`:
-    `{"range_start_by_var": {VAR: start}, "block_size", "stride", "window", "auto_port_floor",
-    "auto_port_ceiling"}` — fleet-global operator knobs (Settings), for readers with no slot in
-    hand (`console_direct.pool_grid_windows`); the per-project half rides each pool-tick roster entry.
+    """The pool's node-assigned port range, read from the DB SSOT via `GET /api/agent/port-grid`:
+    `{"auto_port_floor", "auto_port_ceiling"}` — fleet-global operator knobs (Settings), for readers with no
+    slot in hand (`console_direct.pool_auto_port_range`).
 
-    RAISES on an unreachable API: an EMPTY grid is a legitimate answer ("every port var is tier 2"). A
-    body missing the scalars is raised too — a real empty grid still carries them, and `{}` from a
-    204/empty body must not read as "no windows"."""
+    RAISES on an unreachable API, and on a body missing either knob — `{}` from a 204/empty body must not
+    read as "the defaults"."""
     body = _agent_api_get("/api/agent/port-grid")
-    missing = [
-        field
-        for field in ("range_start_by_var", "block_size", "stride", "window",
-                      "auto_port_floor", "auto_port_ceiling")
-        if field not in body
-    ]
+    missing = [field for field in ("auto_port_floor", "auto_port_ceiling") if field not in body]
     if missing:
         raise RuntimeError(
-            f"GET /api/agent/port-grid answered without {missing} — a truncated or empty response, not an "
-            f"empty grid (an empty grid still carries every scalar). Refusing to read it as 'no windows'"
+            f"GET /api/agent/port-grid answered without {missing} — a truncated or empty response. "
+            f"Refusing to read it as the default range"
         )
     return body
 
@@ -503,12 +508,14 @@ def agent_api_port_grid() -> dict:
 # and answers anything else `unsupported_verb`; `tests/test_slot_intent_vocabulary.py` pins the coupling.
 
 # Ack outcomes this node EMITS: a SUBSET of `fleet_verdicts.SLOT_INTENT_OUTCOMES` (the CP 422s an unknown
-# one, and the intent is re-served forever), pinned by the same drift test. `done`, `accepted` and
-# `unsupported_verb` retire an intent; `refused_stale`, `refused_precondition` and `failed` leave it pending.
+# one, and the intent is re-served forever), pinned by the same drift test. `done`, `accepted`,
+# `unsupported_verb` and `clone_refused` retire an intent; `refused_stale`, `refused_precondition` and `failed`
+# leave it pending.
 SLOT_INTENT_DONE = "done"
 SLOT_INTENT_UNSUPPORTED_VERB = "unsupported_verb"
+SLOT_INTENT_CLONE_REFUSED = "clone_refused"
 SLOT_INTENT_OUTCOMES = frozenset({
-    SLOT_INTENT_DONE, SLOT_INTENT_UNSUPPORTED_VERB,
+    SLOT_INTENT_DONE, SLOT_INTENT_UNSUPPORTED_VERB, SLOT_INTENT_CLONE_REFUSED,
     "accepted", "refused_stale", "refused_precondition", "failed",
 })
 
@@ -554,23 +561,127 @@ def ack_slot_intent(
     try:
         _agent_api_post(f"/api/agent/slot-intents/{intent_id}/ack", body)
         return True
-    except urllib.error.URLError as exc:
-        log.warning("ack_slot_intent: API unreachable for intent %s: %s", intent_id, exc)
+    except urllib.error.URLError as exc:  # HTTPError too: a refusal is logged, the intent is redelivered
+        log.warning("ack_slot_intent: no ack recorded for intent %s: %s", intent_id, exc)
         return False
 
 
-def claim_task_active(task_id: object) -> bool:
+def claim_task_active(task_id: object, *, session_id: str = "") -> bool:
     """`ready → active` for a task this node just launched — `POST /api/agent/tasks/claim-active`. True iff
     this call won the claim (False when it was already claimed, or on any failure).
 
     Called right after every launch (`fleet_dispatch.launch_runner`, `_launch_no_model`); a model runner's
-    SessionStart hook (`hooks/runner-status.py::rs_start`) repeats it, idempotently. Best-effort, logged."""
+    SessionStart hook (`hooks/runner-status.py::rs_start`) repeats it, idempotently. Best-effort, logged. A
+    transient failure (`_transient`) is re-sent by `retry_launch_reports` while the runner `session_id` names
+    is still live here: without it a CP blip at launch left a working runner's task `ready` — shown Queued —
+    until its first turn ended."""
+    path, payload = "/api/agent/tasks/claim-active", {"task_id": int(task_id)}
     try:
-        body = _agent_api_post("/api/agent/tasks/claim-active", {"task_id": int(task_id)})
-    except Exception as exc:  # noqa: BLE001 — bookkeeping; the runner's SessionStart claim retries it
+        body = _agent_api_post(path, payload)
+    except Exception as exc:  # noqa: BLE001 — bookkeeping; a transient failure is re-sent (`retry_launch_reports`)
         log.warning("claim_task_active: could not claim task %s active: %s: %s", task_id, type(exc).__name__, exc)
+        _remember_launch_report("claim", task_id, session_id, path, payload, exc)
         return False
+    _forget_launch_report("claim", task_id, session_id)
     return body.get("claimed") is True
+
+
+# ── Launch reports a transient CP failure dropped ─────────────────────────────────────────────────────
+# The two writes a launch owes the CP — the runner binding (`set_runner_binding`) and the `ready → active`
+# claim (`claim_task_active`) — are one-shot. A deploy's few failing minutes (seen: a 500 on every task
+# read for 3.5 min) lost both, and the task read Queued for 16 minutes while its runner worked. Each such
+# report waits here and `retry_launch_reports` re-sends it every `LAUNCH_REPORT_RETRY_INTERVAL_S` until it
+# lands, the CP refuses it, its runner is no longer live on this node, or `LAUNCH_REPORT_RETRY_WINDOW_S`
+# passes. A runner not yet registered (the binding is sent before the spawn) is waited for up to
+# `LAUNCH_REPORT_SPAWN_GRACE_S`. In memory: a daemon restart drops them, and the runner's own turn-end
+# heartbeat still claims.
+
+LAUNCH_REPORT_RETRY_INTERVAL_S = 15.0
+LAUNCH_REPORT_RETRY_WINDOW_S = 15 * 60.0
+LAUNCH_REPORT_SPAWN_GRACE_S = 120.0
+_launch_reports: dict[tuple[str, str], dict[str, Any]] = {}
+_launch_reports_lock = threading.Lock()
+
+
+def _transient(exc: BaseException) -> bool:
+    """A failure worth re-sending: no answer, a timeout, a dropped connection, a 5xx or a 429 — and the
+    token backoff's `URLError`, which a rotated token heals within the window. Any other HTTP status is the
+    CP's answer (a refusal), which a retry would only earn again."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= 500 or exc.code == 429
+    return isinstance(exc, (urllib.error.URLError, OSError, http.client.HTTPException))
+
+
+def _remember_launch_report(kind: str, task_id: object, session_id: str, path: str, payload: dict,
+                            exc: BaseException) -> None:
+    """Queue one dropped launch report for `retry_launch_reports`; a newer report of the same kind for the same
+    task replaces it. Not queued: a refusal, or a report naming no runner (nothing to check liveness by)."""
+    if not session_id or not _transient(exc):
+        return
+    now = time.monotonic()
+    with _launch_reports_lock:
+        _launch_reports[(kind, str(task_id))] = {
+            "session_id": session_id, "path": path, "payload": payload,
+            "give_up_at": now + LAUNCH_REPORT_RETRY_WINDOW_S, "spawn_by": now + LAUNCH_REPORT_SPAWN_GRACE_S,
+        }
+
+
+def _forget_launch_report(kind: str, task_id: object, session_id: str) -> None:
+    """Drop the queued report of `kind` for `task_id` — only `session_id`'s, so an older attempt's answer
+    never drops a newer attempt's report."""
+    key = (kind, str(task_id))
+    with _launch_reports_lock:
+        if _launch_reports.get(key, {}).get("session_id") == session_id:
+            del _launch_reports[key]
+
+
+def _live_runner_sessions() -> set[tuple[str, str]]:
+    """`{(task id, session id)}` of every runner live on this node (`runner_registry.live_runners`)."""
+    import runner_registry  # noqa: PLC0415 — the registry pulls the platform layer; only the retry needs it
+
+    return {(str(r.task_id), r.session_id) for r in runner_registry.live_runners()}
+
+
+def retry_launch_reports(*, live: set[tuple[str, str]] | None = None) -> int:
+    """Re-send every queued launch report whose runner is live here; returns how many landed. Binding first,
+    so the claim it precedes at launch never lands ahead of it. Never raises."""
+    with _launch_reports_lock:
+        pending = sorted(_launch_reports.items(), key=lambda item: item[0][0] != "binding")
+    if not pending:
+        return 0
+    if live is None:
+        try:
+            live = _live_runner_sessions()
+        except Exception as exc:  # noqa: BLE001 — an unreadable registry decides nothing; the next step re-reads
+            log.warning("launch reports: runner registry unreadable, retrying next step: %s", exc)
+            return 0
+    now, landed = time.monotonic(), 0
+    for (kind, task_id), report in pending:
+        session_id = report["session_id"]
+        if (task_id, session_id) in live:
+            report["seen_live"] = True
+        elif report.get("seen_live") or now >= report["spawn_by"]:
+            log.info("launch report %s for task %s dropped: its runner is gone", kind, task_id)
+            _forget_launch_report(kind, task_id, session_id)
+            continue
+        else:
+            continue  # launched moments ago: its runner is not registered yet
+        if now >= report["give_up_at"]:
+            log.info("launch report %s for task %s dropped: retry window over", kind, task_id)
+            _forget_launch_report(kind, task_id, session_id)
+            continue
+        try:
+            _agent_api_post(report["path"], report["payload"])
+        except Exception as exc:  # noqa: BLE001 — a failing CP must never wedge the daemon's step
+            if _transient(exc):
+                log.warning("launch report %s for task %s still not delivered: %s", kind, task_id, exc)
+                continue
+            log.warning("launch report %s for task %s refused, not retried: %s", kind, task_id, exc)
+        else:
+            landed += 1
+            log.info("launch report %s for task %s delivered on retry", kind, task_id)
+        _forget_launch_report(kind, task_id, session_id)
+    return landed
 
 
 def claim_slot_launch(intent_id: object, *, generation: int, dispatch_id: str) -> tuple[bool, str]:
@@ -612,18 +723,17 @@ def set_slot_holder(
     number: object,
     *,
     last_used: str = "",
-    title: str | None = None,
     project_id: int | None = None,
 ) -> dict:
-    """Stamp a pool slot's LABEL — its Title and `last_used` — via `POST /api/agent/slot-holder`.
+    """Stamp a pool slot's `last_used` via `POST /api/agent/slot-holder`.
 
     The name and URL are kept for .deb/CP version skew; it no longer declares who holds a slot
-    (`slot_state.lease()` does, CP-side). It writes the two `slot_columns.MUTATED` fields only.
+    (`slot_state.lease()` does, CP-side).
 
     `last_used`: "" sends `None` ("not supplied", prior value kept). This is `worktrees.last_used`'s ONLY
-    writer. `title`: `None` = leave alone, `""` = an operator CLEAR — so the key is always sent.
+    writer. `title` rides as a constant `None` ("leave alone") while the CP still accepts the field.
 
-    Returns `SlotHolderOut` — `{project_id, project, number, mutated, title_rejected}`; `mutated == 0`
+    Returns `SlotHolderOut` — `{project_id, project, number, mutated, …}`; `mutated == 0`
     means the write was DROPPED (no sensed row). Raises `URLError`/`HTTPError` (404 = unknown project).
 
     `project_id` is the slot's identity whenever the caller knows it; the name stays for an older CP."""
@@ -632,7 +742,7 @@ def set_slot_holder(
         "project": project,
         "number": int(number),
         "last_used": last_used or None,
-        "title": title,
+        "title": None,
     }
     if project_id is not None:
         payload["project_id"] = int(project_id)
@@ -670,9 +780,8 @@ def agent_api_fleet_observe(payload: dict) -> dict | None:
 
 
 def agent_api_node_egress(ipv4: str | None) -> bool:
-    """POST this node's egress IPv4 (or null) for the headscale edge's allowlist (`egress_report.py`).
-
-    True when the CP accepted it; False on any failure, so the caller retries next pass."""
+    """POST this node's egress IPv4 (or null) for the headscale edge's allowlist (`egress_report.py`); False
+    on any failure, so the caller retries next pass."""
     return _best_effort("agent_api_node_egress", "POST", "/api/agent/nodes/egress", {"ipv4": ipv4}) is not None
 
 
@@ -699,9 +808,8 @@ def agent_api_disk_reclaim(report: dict) -> bool:
 
 
 def agent_api_node_model_catalogs(catalogs: dict) -> bool:
-    """POST this node's sensed vendor-CLI model catalogues (`provider_models.py`).
-
-    True when the CP accepted them; False on any failure, so the caller retries next pass."""
+    """POST this node's sensed vendor-CLI model catalogues (`provider_models.py`); False on any failure, so
+    the caller retries next pass."""
     return _best_effort(
         "agent_api_node_model_catalogs", "POST", "/api/agent/nodes/model-catalogs", {"catalogs": catalogs},
     ) is not None
@@ -710,6 +818,14 @@ def agent_api_node_model_catalogs(catalogs: dict) -> bool:
 # ── Session transcript capture ─────────────────────────────────────────────────────────────────────────
 # The node half of `apps/api/app/routes/agent_sessions.py`: daemon-direct, not socket verbs; sole caller
 # `session_sweep.py`. No storage KEYS cross this boundary: the node names a member, gets a presigned URL.
+
+def _session_post(label: str, session_id: str, route: str, body: dict) -> dict | None:
+    """One best-effort POST under `/api/agent/sessions/{id}`: the CP's dict, or None on any failure (a miss
+    is offered again next tick). `route` is the literal path with `{}` where the URL-quoted id goes — a
+    literal at each call site, as `test_fleet_wire_contract` reads them."""
+    return _best_effort(label, "POST", route.format(urllib.parse.quote(str(session_id))), body,
+                        failed=f"POST failed for {session_id}")
+
 
 def agent_api_sessions_work(node_id: str) -> dict | None:
     """`GET /api/agent/sessions/work` — what this node still owes, and whether the CP can pay for it.
@@ -732,40 +848,26 @@ def agent_api_sessions_observed(node_id: str, items: list) -> bool:
 
 
 def agent_api_session_end(session_id: str, end_reason: str, ended_at: str | None = None) -> bool:
-    """`POST /api/agent/sessions/{id}/end` — this session is over. IDEMPOTENT on the CP side.
-
-    For a session the node's own probe found dead (`session_sweep.is_abandoned`); `end_reason` is
-    validated CP-side."""
-    payload: dict = {"end_reason": end_reason}
-    if ended_at:
-        payload["ended_at"] = ended_at
-    return _best_effort("agent_api_session_end", "POST",
-                        f"/api/agent/sessions/{urllib.parse.quote(str(session_id))}/end", payload,
-                        failed=f"POST failed for {session_id}") is not None
+    """This session is over — one the node's own probe found dead (`session_sweep.is_abandoned`);
+    `end_reason` is validated CP-side. IDEMPOTENT on the CP side."""
+    payload = {"end_reason": end_reason, **({"ended_at": ended_at} if ended_at else {})}
+    return _session_post("agent_api_session_end", session_id, "/api/agent/sessions/{}/end", payload) is not None
 
 
 def agent_api_session_pane_log(session_id: str, tail: str | None, written_at: str | None) -> bool:
-    """`POST /api/agent/sessions/{id}/pane-log` — an unexplained end's raw pane-log tail (`session_sweep`'s
-    pane-log leg). IDEMPOTENT on the CP side: first capture wins.
-
-    `tail` None = no pane log on this node, so the CP records "missing" and stops asking. Raw bytes: the
-    CP does all cleaning and redaction. Best-effort; a miss is offered again next tick."""
-    return _best_effort("agent_api_session_pane_log", "POST",
-                        f"/api/agent/sessions/{urllib.parse.quote(str(session_id))}/pane-log",
-                        {"tail": tail, "written_at": written_at},
-                        failed=f"POST failed for {session_id}") is not None
+    """An unexplained end's raw pane-log tail (`session_sweep`'s pane-log leg); IDEMPOTENT on the CP side,
+    first capture wins. `tail` None = no pane log on this node, so the CP records "missing" and stops
+    asking. Raw bytes: the CP does all cleaning and redaction."""
+    return _session_post("agent_api_session_pane_log", session_id, "/api/agent/sessions/{}/pane-log",
+                         {"tail": tail, "written_at": written_at}) is not None
 
 
 def agent_api_session_usage(session_id: str, payload: dict) -> bool:
-    """`POST /api/agent/sessions/{id}/usage` — a STILL-RUNNING session's usage so far (`session_sweep`'s
-    live leg), so the Tasks board prices a runner before it ends.
-
-    `payload` is `{tokens_in, tokens_out, usage_by_model, usage_incomplete, explored_targets}`, the same
-    derived values the transcript report carries. 204 also when the CP decides it is a no-op. A miss is
-    simply posted again on a later tick."""
-    return _best_effort("agent_api_session_usage", "POST",
-                        f"/api/agent/sessions/{urllib.parse.quote(str(session_id))}/usage", payload,
-                        failed=f"POST failed for {session_id}") is not None
+    """A STILL-RUNNING session's usage so far (`session_sweep`'s live leg), so the Tasks board prices a
+    runner before it ends. `payload` is `{tokens_in, tokens_out, usage_by_model, usage_incomplete,
+    explored_targets}`, the same derived values the transcript report carries. 204 also when the CP decides
+    it is a no-op."""
+    return _session_post("agent_api_session_usage", session_id, "/api/agent/sessions/{}/usage", payload) is not None
 
 
 def post_session_events(session_id: str, task_id: str, events: list[dict]) -> None:
@@ -777,25 +879,20 @@ def post_session_events(session_id: str, task_id: str, events: list[dict]) -> No
 
 
 def agent_api_session_upload_ticket(session_id: str, members: list) -> dict | None:
-    """`POST /api/agent/sessions/{id}/upload-ticket` — **TAKES THE LEASE** and returns one presigned
-    PUT per member: `{"bucket", "expires_at", "urls": [{"name", "url"}]}`.
-
-    Call once per session, immediately before uploading it: lease and URLs expire at 15 minutes.
-    `members` is `[{"name", "bytes"}]` only. Every returned URL is a BEARER TOKEN — never log or persist.
-    None on any failure (a 503 costs the row nothing)."""
-    return _best_effort("agent_api_session_upload_ticket", "POST",
-                        f"/api/agent/sessions/{urllib.parse.quote(str(session_id))}/upload-ticket",
-                        {"members": members}, failed=f"POST failed for {session_id}")
+    """**TAKES THE LEASE** and returns one presigned PUT per member: `{"bucket", "expires_at", "urls":
+    [{"name", "url"}]}`. Call once per session, immediately before uploading it: lease and URLs expire at
+    15 minutes. `members` is `[{"name", "bytes"}]` only. Every returned URL is a BEARER TOKEN — never log or
+    persist. None on any failure (a 503 costs the row nothing)."""
+    return _session_post("agent_api_session_upload_ticket", session_id, "/api/agent/sessions/{}/upload-ticket",
+                         {"members": members})
 
 
 def agent_api_session_report(session_id: str, payload: dict) -> bool:
-    """`POST /api/agent/sessions/{id}/transcript` — what became of the upload.
-
-    Never infer completion from a 204: the CP flips to `uploaded` only after its manifest lands. Sent even
-    with no ticket (terminal outcomes). One POST per pass, never retried in-pass."""
-    return _best_effort("agent_api_session_report", "POST",
-                        f"/api/agent/sessions/{urllib.parse.quote(str(session_id))}/transcript", payload,
-                        failed=f"POST failed for {session_id}") is not None
+    """What became of the upload. Never infer completion from a 204: the CP flips to `uploaded` only after
+    its manifest lands. Sent even with no ticket (terminal outcomes). One POST per pass, never retried
+    in-pass."""
+    return _session_post("agent_api_session_report", session_id, "/api/agent/sessions/{}/transcript",
+                         payload) is not None
 
 
 def agent_api_node_logs(batch: dict) -> dict:
@@ -847,17 +944,32 @@ def agent_api_autoupdate_enabled() -> bool | None:
     return enabled if isinstance(enabled, bool) else None
 
 
+#: The detail a per-project agent route answers 404 with when the project is gone (`routes/agent_guard.py::_NOT_FOUND`).
+PROJECT_GONE = "no such project"
+
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> object:
+    """The JSON `detail` of an HTTP error's body; None when it has none or cannot be read."""
+    try:
+        return json.loads(exc.read(4096) or b"null").get("detail")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def _agent_api_bundle(path: str, query: str, *, timeout: float, what: str) -> tuple[int, dict]:
     """A per-project bundle GET: `(200, {...})`, `(204, {})` unchanged since the query's `since`, `(410, {})`
-    the feature is off for the project. Any other HTTP status or a transport failure RAISES: the caller
-    decides what a miss means. `path` is a literal at each call site (`test_fleet_wire_contract` reads them)."""
+    the feature is off for the project, `(404, {})` the route's own "no such project" (`PROJECT_GONE`: deleted, or
+    moved to another org) — any other 404 (a proxy, a CP without the route) is a miss. Any other HTTP status or a
+    transport failure RAISES: the caller decides what a miss means. `path` is a literal at each call site (`test_fleet_wire_contract` reads them)."""
     req = urllib.request.Request(f"{resolve_control_plane_api_base()}{path}?{query}", headers=_agent_headers(),
                                  method="GET")
     try:
-        body = _agent_urlopen(req, expected=(410,), timeout=timeout)
+        body = _agent_urlopen(req, expected=(404, 410), timeout=timeout)
     except urllib.error.HTTPError as exc:
         if exc.code == 410:
             return 410, {}
+        if exc.code == 404 and _http_error_detail(exc) == PROJECT_GONE:
+            return 404, {}
         raise
     if not body:
         return 204, {}
@@ -884,24 +996,15 @@ def agent_api_guard_record(project_id: object, decisions: list, *, timeout: floa
     (`guard_bundle.ship_spool`): the daemon's own call, declared `host`, so the CP files them under the project
     (bounded to one this node hosts) and under the task its own record ties each line's `session_ref` to on this
     node, or none. Raises on any failure; the caller decides what it means."""
-    url = f"{resolve_control_plane_api_base()}/api/agent/guard/decisions"
-    data = json.dumps({"project_id": int(project_id), "decisions": decisions}).encode()
-    req = urllib.request.Request(url, data=data, headers=_agent_headers(), method="POST")
-    body = _agent_urlopen(req, timeout=timeout)
-    parsed = json.loads(body) if body else {}
-    return parsed if isinstance(parsed, dict) else {}
+    return _agent_json("POST", "/api/agent/guard/decisions", {"project_id": int(project_id), "decisions": decisions},
+                       timeout=timeout)
 
 
 def agent_api_memory_report(task_id: object, events: list, *, timeout: float) -> dict:
     """`POST /api/agent/tasks/{task_id}/memory/report` (verb `memory.report`) for a RELEASED runner's orphaned
     spool (`project_memory_bundle.ship_orphan_spool`): the daemon's own call, declared `host`, because the runner
     whose identity the verb would carry is gone. Raises on any failure; the caller logs and moves on."""
-    url = f"{resolve_control_plane_api_base()}/api/agent/tasks/{int(task_id)}/memory/report"
-    data = json.dumps({"events": events}).encode()
-    req = urllib.request.Request(url, data=data, headers=_agent_headers(), method="POST")
-    body = _agent_urlopen(req, timeout=timeout)
-    parsed = json.loads(body) if body else {}
-    return parsed if isinstance(parsed, dict) else {}
+    return _agent_json("POST", f"/api/agent/tasks/{int(task_id)}/memory/report", {"events": events}, timeout=timeout)
 
 
 # ── GHA runner pools ──────────────────────────────────────────────────────────────────────────────────
@@ -939,12 +1042,8 @@ def post_jaah_session_usage(jaah_session_id: str, calls: list) -> dict:
     `{"accepted": n, "duplicates": m}`. RAISES on any refusal or fault — the caller keeps its offset and
     retries; a 404 (a CP without the route, or a session it no longer takes) is declared expected so the
     retry loop logs it once per attempt at the caller, not twice."""
-    url = f"{resolve_control_plane_api_base()}/api/agent/jaah-sessions/{urllib.parse.quote(jaah_session_id)}/usage"
-    req = urllib.request.Request(url, data=json.dumps({"calls": calls}).encode(), headers=_agent_headers(),
-                                 method="POST")
-    body = _agent_urlopen(req, expected=(404,))
-    parsed = json.loads(body) if body else {}
-    return parsed if isinstance(parsed, dict) else {}
+    return _agent_json("POST", f"/api/agent/jaah-sessions/{urllib.parse.quote(jaah_session_id)}/usage",
+                       {"calls": calls}, expected=(404,))
 
 
 class _CountingSink:
@@ -989,11 +1088,16 @@ def set_runner_binding(
     payload: dict = {"runner_session_id": session_id, "worktree_ref": worktree_ref}
     if account_dir:
         payload["account_dir"] = account_dir
+    path = f"/api/agent/tasks/{task_id}/runner-session"
     try:
-        return _agent_api_post(f"/api/agent/tasks/{task_id}/runner-session", payload)
-    except urllib.error.URLError as exc:
-        log.warning("set_runner_binding: API unreachable for task %s: %s", task_id, exc)
+        body = _agent_api_post(path, payload)
+    except Exception as exc:  # noqa: BLE001 — bookkeeping; a read timeout or reset arrives unwrapped, not as URLError
+        log.warning("set_runner_binding: could not bind task %s: %s: %s", task_id, type(exc).__name__, exc)
+        # A transient failure is re-sent while the runner lives (`retry_launch_reports`).
+        _remember_launch_report("binding", task_id, session_id or "", path, payload, exc)
         return {}
+    _forget_launch_report("binding", task_id, session_id or "")
+    return body
 
 
 # ── a virtual-node HOST's converge loop (`vnode_converge.py`) ────────────────────────────────────────
@@ -1001,45 +1105,35 @@ def set_runner_binding(
 # Five routes, 403 for a non-host (the CP's vnode-host routes); the loop's own
 # classifications (403/404/410) are declared `expected`.
 
-def _vnode_host_request(method: str, path: str, *, payload: dict | None = None,
-                        expected: tuple[int, ...] = ()) -> dict:
-    url = f"{resolve_control_plane_api_base()}{path}"
-    data = json.dumps(payload, default=_json_default).encode() if payload is not None else None
-    req = urllib.request.Request(url, data=data, headers=_agent_headers(), method=method)
-    body = _agent_urlopen(req, expected=expected)
-    if not body:
-        return {}
-    parsed = json.loads(body)
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def agent_api_vnode_host_desired() -> dict:
+def agent_api_vnode_host_desired(*, capabilities: tuple[str, ...] = ()) -> dict:
     """`GET /api/agent/vnode-host/desired` — `{"vnodes": [{id, slot, state, shared}]}`. HTTPError 403 on
     a node that is not a host (404 from a control plane that predates the route), which the loop caches
     for its lifetime (R7). `vnode_tags=1` advertises that this host builds a vnode under the `tag` the CP
-    hands it — the CP issues tags only to a host that says so (an older CP ignores the parameter).
-    `vnode_nodelinks=1` likewise: this host's helper mounts each NodeLink of a vnode, so the CP may add the
-    `nodelinks` list to its `shared` block (an older helper refuses the field)."""
-    return _vnode_host_request("GET", "/api/agent/vnode-host/desired?vnode_tags=1&vnode_nodelinks=1",
-                               expected=(403, 404))
+    hands it — the CP issues tags only to a host that says so.
+    `capabilities` (`nodevm`: this host can run a Whole-node VM, `nodevm.supported`) rides as one more
+    parameter, only when there is one — so a host with none asks exactly what it always did."""
+    query = "vnode_tags=1"
+    if capabilities:
+        query += "&" + urllib.parse.urlencode({"capabilities": ",".join(capabilities)})
+    return _agent_json("GET", f"/api/agent/vnode-host/desired?{query}", expected=(403, 404))
 
 
 def agent_api_vnode_enrolment(virtual_node_id: str) -> dict:
     """`GET /api/agent/vnode-host/enrolment/{id}` — READ ONCE, and it carries two live secrets: the caller
     hands it straight to the vnode helper and never logs or keeps it. HTTPError 410 once read."""
-    return _vnode_host_request("GET", f"/api/agent/vnode-host/enrolment/{urllib.parse.quote(virtual_node_id)}",
-                               expected=(410,))
+    return _agent_json("GET", f"/api/agent/vnode-host/enrolment/{urllib.parse.quote(virtual_node_id)}",
+                       expected=(410,))
 
 
 def agent_api_vnode_enrolment_reissue(virtual_node_id: str) -> None:
     """`POST .../enrolment/{id}/reissue` — a fresh envelope after a 410 (204)."""
-    _vnode_host_request("POST", f"/api/agent/vnode-host/enrolment/{urllib.parse.quote(virtual_node_id)}/reissue",
-                        payload={})
+    _agent_json("POST", f"/api/agent/vnode-host/enrolment/{urllib.parse.quote(virtual_node_id)}/reissue",
+                payload={})
 
 
 def agent_api_vnode_host_report(entries: list[dict]) -> dict:
     """`POST /api/agent/vnode-host/report` — `{"vnodes": [{id, state, failure_reason?, tailnet_device_id?}]}`."""
-    return _vnode_host_request("POST", "/api/agent/vnode-host/report", payload={"vnodes": entries})
+    return _agent_json("POST", "/api/agent/vnode-host/report", payload={"vnodes": entries})
 
 
 def agent_api_vnode_host_usage(entries: list[dict], root: dict | None = None) -> dict:
@@ -1048,4 +1142,4 @@ def agent_api_vnode_host_usage(entries: list[dict], root: dict | None = None) ->
     payload: dict = {"vnodes": entries}
     if root is not None:
         payload["root"] = root
-    return _vnode_host_request("POST", "/api/agent/vnode-host/usage", payload=payload)
+    return _agent_json("POST", "/api/agent/vnode-host/usage", payload=payload)

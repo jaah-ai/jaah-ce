@@ -1,9 +1,12 @@
 import type { JSX } from 'react'
 import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
+import EmptyState from '../../ui/EmptyState'
 import { PERSONA_GROUPS } from '../../components/tasks/shared'
 import { PHONE } from '../../ui/listStyles'
 import { type StageIn, type Vocabulary, labelOf } from './api'
+import { FONT_WEIGHT, LETTER_SPACING, RADIUS } from '../../theme'
+import Tip from '../../ui/Tip'
 
 /* THE CHAIN STRIP — a playbook's stages drawn the way the epic view groups today's epics: Prepare → Build →
  * Finish, with the epic view's own group labels (`PERSONA_GROUPS`, read-only). Prepare is every stage before
@@ -51,18 +54,18 @@ function StageChip({ stage, vocab, repeated }: { stage: StageIn; vocab?: Vocabul
         py: 0.5,
         border: '1px solid',
         borderColor: repeated ? 'primary.main' : 'divider',
-        borderRadius: 1,
+        borderRadius: RADIUS.sm,
         bgcolor: 'background.paper',
         // The "stacked" look of a repeated group: two offset sheets behind the chip.
         ...(repeated && {
           boxShadow: (t: { palette: { divider: string } }) =>
             `3px 3px 0 -1px ${t.palette.divider}, 6px 6px 0 -2px ${t.palette.divider}`,
-          mr: '6px',
-          mb: '6px',
+          mr: 1,
+          mb: 1,
         }),
       }}
     >
-      <Typography variant="body2" sx={{ fontWeight: 600, overflowWrap: 'anywhere' }}>
+      <Typography variant="body2" sx={{ fontWeight: FONT_WEIGHT.semibold, overflowWrap: 'anywhere' }}>
         {label}
       </Typography>
       <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', overflowWrap: 'anywhere' }}>
@@ -82,10 +85,10 @@ function Row({ stages, vocab, repeated }: { stages: StageIn[]; vocab?: Vocabular
   return (
     <Box
       component="ol"
-      sx={{ listStyle: 'none', m: 0, p: 0, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 0.75, minWidth: 0 }}
+      sx={{ listStyle: 'none', m: 0, p: 0, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 0.5, minWidth: 0 }}
     >
       {stages.map((s, i) => (
-        <Box component="li" key={`${s.key}-${i}`} sx={{ display: 'flex', alignItems: 'center', gap: 0.75, minWidth: 0 }}>
+        <Box component="li" key={`${s.key}-${i}`} sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 0 }}>
           {i > 0 && <Arrow />}
           <StageChip stage={s} vocab={vocab} repeated={repeated} />
         </Box>
@@ -101,10 +104,10 @@ export default function ChainStrip({ stages, vocab }: { stages: readonly StageIn
       data-testid="chain-strip"
       aria-label="Stage chain"
       role="group"
-      sx={{ p: 1.25, border: '1px dashed', borderColor: 'divider', borderRadius: 1, minWidth: 0 }}
+      sx={{ p: 1, border: '1px dashed', borderColor: 'divider', borderRadius: RADIUS.sm, minWidth: 0 }}
     >
       {stages.length === 0 ? (
-        <Typography variant="body2" sx={{ color: 'text.secondary' }}>No stages yet.</Typography>
+        <EmptyState inline title="No stages yet." />
       ) : groups === null ? (
         <Row stages={[...stages]} vocab={vocab} />
       ) : (
@@ -132,18 +135,17 @@ export default function ChainStrip({ stages, vocab }: { stages: readonly StageIn
                 <Typography
                   variant="caption"
                   component="h3"
-                  sx={{ m: 0, color: 'text.secondary', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.04em' }}
+                  sx={{ m: 0, color: 'text.secondary', fontWeight: FONT_WEIGHT.semibold, textTransform: 'uppercase', letterSpacing: LETTER_SPACING.caps }}
                 >
                   {groupLabel(g.key)}
                   {g.key === 'coder' && (
-                    <Box
+                    <Tip title="Once for each planned item"><Box
                       component="span"
                       data-testid="chain-repeat"
-                      title="Once for each planned item"
-                      sx={{ ml: 0.75, textTransform: 'none' }}
+                      sx={{ ml: 0.5, textTransform: 'none' }}
                     >
                       × N
-                    </Box>
+                    </Box></Tip>
                   )}
                 </Typography>
                 <Row stages={g.stages} vocab={vocab} repeated={g.key === 'coder'} />

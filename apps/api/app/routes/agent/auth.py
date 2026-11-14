@@ -3,18 +3,19 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
+from typing import TYPE_CHECKING, Annotated, Optional
 from uuid import UUID
 
 from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
-from app import carryover, edition_features, node_credentials, org_quotas, project_identity
-from app.db import get_session, release_route_connection
+from app import carryover, edition_features, node_credentials, org_quotas
+from app.db_async import get_db, release
 from app.tenancy import seam
-from app.tenancy.ids import ORG_ZERO_ID
 from app.task_lookup import get_task_or_404
 from app.node_identity import node_id_or_none, wire_node_id_or_404
 from app.models.nodes import Microvm
@@ -22,8 +23,11 @@ from app.models.projects import Project
 from app.models.tasks import Task
 from app.models.worktrees import Worktree
 # Task transitions go through the watermark-gated helpers; the state machine single-homes in routes/tasks/.
-from app.persona_registry import TASK_CREATION_LICENCE_BY_PERSONA
 from app.entity_shape import get_or_404
+
+if TYPE_CHECKING:
+    from app.authz.principal import Principal
+    from app.models.identity import AdminUser
 
 log = logging.getLogger("agent-routes")
 
@@ -98,38 +102,56 @@ def _read_scope_for(caller: node_credentials.AgentCaller) -> "UUID | object | No
     return caller.org_id
 
 
-def _authenticate_and_admit(
-    x_agent_token: str, session: Session, x_agent_task_id: str = "", route: Optional[Request] = None,
+async def _authenticate_and_admit(
+    x_agent_token: str, db: AsyncSession, x_agent_task_id: str = "", route: Optional[Request] = None,
 ) -> tuple[node_credentials.AgentCaller, Optional[UUID], Optional[int]]:
     """`_authenticate_agent`, then count the call against its org's request budget (429 when full,
     `app/org_quotas.py`), then look up a carry-over for the declared task on a route that carries one
-    (`_carries`, `app/carryover.py`). One threadpool hop for all three: this is the hottest path in the
-    process. A node-less arm carries no org, is never counted and is never carried over. Returns the caller, the
-    carry-over's org and its task, or Nones.
+    (`_carries`, `app/carryover.py`). The hottest path in the process: the reads run over the request's async
+    session (`app/db_async.py`), and the budget's count — a blocking call on the limiter's own connection — runs in
+    a thread, with the request's connection handed back first. A node-less arm carries no org, is never counted and
+    is never carried over. Returns the caller, the carry-over's org and its task, or Nones.
 
-    Hands the route session's read-only connection back before returning (`app/db.py::release_route_connection`): the
-    endpoint runs in a later threadpool hop, and a connection held across that wait is the hold-and-wait that
-    starved the pool."""
+    Hands the request's read-only connection back before returning (`db_async.release`), so the route starts
+    holding nothing."""
     try:
-        return _authenticate_and_admit_on(x_agent_token, session, x_agent_task_id, route)
+        caller, budget = await db.run_sync(_authenticate_with_budget, x_agent_token)
+        if caller.node_id is None:
+            return caller, None, None
+        if budget > 0:
+            await release(db)
+            await run_in_threadpool(org_quotas.admit_agent_call, caller.org_id, budget)
+        if route is None:
+            return caller, None, None
+        return await db.run_sync(_carry_over_of, caller, x_agent_task_id, route)
     finally:
-        if isinstance(session, Session):  # a direct call may pass none
-            release_route_connection(session)
+        await _release_quietly(db)
 
 
-def _authenticate_and_admit_on(
-    x_agent_token: str, session: Session, x_agent_task_id: str, route: Optional[Request],
-) -> tuple[node_credentials.AgentCaller, Optional[UUID], Optional[int]]:
+async def _release_quietly(db: AsyncSession) -> None:
+    """`db_async.release` that never replaces the door's own answer (a 401, a 429) with a 500: a failed release
+    keeps the connection until the session closes, as `app/db.py::release_route_connection` does."""
+    try:
+        await release(db)
+    except SQLAlchemyError as exc:
+        log.debug("agent auth: kept the request connection (%s)", type(exc).__name__)
+
+
+def _authenticate_with_budget(session: Session, x_agent_token: str) -> tuple[node_credentials.AgentCaller, int]:
+    """The caller, and the budget its org's call counts against (0: not counted; `org_quotas.agent_budget`)."""
     caller = _authenticate_agent(x_agent_token, session)
     if caller.node_id is None:
-        return caller, None, None
-    org_quotas.admit_agent_request(session, caller.org_id)
-    if route is None:
-        return caller, None, None
+        return caller, 0
+    return caller, org_quotas.agent_budget(session, caller.org_id)
+
+
+def _carry_over_of(
+    session: Session, caller: node_credentials.AgentCaller, x_agent_task_id: str, route: Request,
+) -> tuple[node_credentials.AgentCaller, Optional[UUID], Optional[int]]:
     # Raw and before any bind, so it stamps nothing; the probe is the partial index on open rows.
     declared = x_agent_task_id.strip()
-    if not _CALLER_TASK_ID_RE.fullmatch(declared):
-        return caller, None, None
+    if caller.node_id is None or not _CALLER_TASK_ID_RE.fullmatch(declared):
+        return caller, None, None   # a node-less arm is never carried (`_authenticate_and_admit` returns first)
     carried_to = carryover.scope_for(session, node_id=caller.node_id, task_id=int(declared))
     if carried_to is None or not _carries(session, caller, int(declared), route):
         return caller, None, None
@@ -160,14 +182,15 @@ def _carries(session: Session, caller: node_credentials.AgentCaller, task_id: in
 
 async def _check_token(
     x_agent_token: str = Header(default=""),
-    session: Session = Depends(get_session),
+    db: AsyncSession = Depends(get_db),
     x_agent_task_id: str = Header(default=""),
     request: Request = None,
 ) -> node_credentials.AgentCaller:
     """The agent-surface dependency: authenticate, then bind this request's org.
 
     `async def` on purpose: FastAPI runs a `def` in a worker thread on a copied context, where
-    `seam.bind()` would die with the thread. The blocking half runs via `run_in_threadpool`. A second bind
+    `seam.bind()` would die with the thread. Its reads run on the request's async session, the one the route's
+    `DbDep` receives (FastAPI resolves `get_db` once per request), and leave it holding nothing. A second bind
     site because `authz.authz_guard` binds no principal for `INFRA` routes. The seam stamps the session on
     its first transaction (`seam.stamp_scope`).
 
@@ -179,9 +202,7 @@ async def _check_token(
     """
     if not isinstance(x_agent_task_id, str):
         x_agent_task_id = ""   # a direct call, where the `Header` default is the marker object itself
-    caller, carried_to, carried_task = await run_in_threadpool(
-        _authenticate_and_admit, x_agent_token, session, x_agent_task_id, request
-    )
+    caller, carried_to, carried_task = await _authenticate_and_admit(x_agent_token, db, x_agent_task_id, request)
     carryover.bind_request(carried_task)
     scope = carried_to if carried_to is not None else _read_scope_for(caller)
     if carried_to is not None:
@@ -240,27 +261,35 @@ def caller_node_ref(
     return str(caller.node_id)
 
 
-def _wire_project(
-    session: Session, caller: object, project_id: Optional[int], project: str
-) -> Optional[Project]:
-    """The project an agent-plane request names: `project_id` when sent, else `project` as a NAME
-    inside the calling node's org — the fallback for a daemon older than `project_id` on the wire, and the
-    only place an agent route resolves a name. None when neither names a row the caller can read; each route
-    words its own 404.
+def project_of_task(session: Session, task: Task) -> Project:
+    """The caller's own project, or a 409 naming the reason there is none.
 
-    `caller` is `_check_token`'s `AgentCaller`, or the `None` an in-process producer passes. Names are unique
-    per org (`uq_projects_org_name`): a node's name is read in the node's org, and an in-process producer's (the
-    control plane's own alarms, which file under the operator's projects) in the operator plane. A wire caller
-    with no org resolves nothing: fail closed. The id is read through the session, so the read seam narrows it
-    to the caller's tenant."""
+    Both arms guard states the schema currently forbids (`project_id` is NOT NULL with an FK). 409, not
+    404 (the caller named a task, not a project) and not an assert (a data conflict, not a broken CP)."""
+    if task.project_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"task {task.id} names no project",
+        )
+    project = session.get(Project, task.project_id)
+    if project is None:
+        # Unconstructible today (FK); a 409 for the reason above.
+        raise HTTPException(
+            status_code=409,
+            detail=f"task {task.id} names project {task.project_id}, which no longer exists",
+        )
+    return project
+
+
+def _wire_project(session: Session, project_id: Optional[int]) -> Optional[Project]:
+    """The project an agent-plane request names by `project_id`, or None: no id sent, or the id names no row
+    the caller can read (the id is read through the session, so the read seam narrows it to the caller's
+    tenant). Each route words its own 404.
+
+    The id is the identity (`app/project_identity.py`); the `project` display name beside it on the wire is
+    never resolved — names are unique per org, not fleet-wide."""
     if project_id is None:
-        if caller is None:
-            org = ORG_ZERO_ID
-        else:
-            org = caller.org_id if isinstance(caller, node_credentials.AgentCaller) else None
-        project_id = project_identity.legacy_project_id(session, project, org)
-        if project_id is None:
-            return None
+        return None
     return session.scalar(select(Project).where(Project.id == project_id))
 
 
@@ -340,35 +369,52 @@ async def _check_token_for_task(
     task_id: int,
     x_agent_task_id: str = Header(default=""),
     caller: node_credentials.AgentCaller = Depends(_check_token),
-    session: Session = Depends(get_session),
+    db: AsyncSession = Depends(get_db),
 ) -> node_credentials.AgentCaller:
     """`_check_token`, then `require_caller_task` against the route's `task_id` (path or query)."""
-    await run_in_threadpool(require_caller_task, session, caller, x_agent_task_id, task_id)
+    try:
+        await db.run_sync(require_caller_task, caller, x_agent_task_id, task_id)
+    finally:
+        await release(db)
     return caller
 
 
 async def _check_token_for_live_task(
     task_id: int,
     caller: node_credentials.AgentCaller = Depends(_check_token_for_declared_task),
-    session: Session = Depends(get_session),
+    db: AsyncSession = Depends(get_db),
 ) -> node_credentials.AgentCaller:
     """The declared-task wall, then `_require_live_hold`: for the routes that serve a RUNNING agent (the SDK's
     `agent.*` surface and its bundle), which a node may reach only while it holds the task."""
-    await run_in_threadpool(_require_live_hold, session, caller, task_id)
+    try:
+        await db.run_sync(_require_live_hold, caller, task_id)
+    finally:
+        await release(db)
     return caller
 
 
-def _guard_task_creating_caller(
-    x_agent_task_id: str, session: Session, *, shape: str | tuple[str, ...]
-) -> Optional[Task]:
-    """Enforce the task-creation authority: a runner may create Tasks only when its persona holds a licence
-    (`TASK_CREATION_LICENCES`, app/persona_registry.py; charter R30) covering this `shape`.
+async def _agent_door(
+    x_agent_task_id: str = Header(default=""),
+    agent: node_credentials.AgentCaller = Depends(_check_token),
+) -> tuple[node_credentials.AgentCaller, str]:
+    """`(agent, x_agent_task_id)`: the authenticated caller and the raw `X-Agent-Task-Id` it declared, the pair
+    every door without a task in its path starts from. The header is read here only; what it must name is
+    each door's own wall (`live_agent_caller`, `caller_and_launcher`, `require_caller_task`, ...), run in the
+    handler, so the 401 (`_check_token`) still comes before any 422 on the header."""
+    return agent, x_agent_task_id
 
-    `shape` is required per endpoint so the widest door is never the default; a tuple is a door several
-    shapes share, passed when the licence holds any of them (the writer reads which). Fails closed on
-    `X-Agent-Task-Id`: absent/malformed → 422, unknown → 404, no licence or wrong shape → 403; only `host`
-    and a licensed id pass. The identity is self-declared, so a forged `host` is covered by the charter.
-    Returns the caller's own row (None for `host`), which `SHAPE_TOP_LEVEL` resolves the project from.
+
+#: `door: AgentDoor` in a handler; spread into the pair-taking walls: `caller_and_launcher(session, *door)`.
+AgentDoor = Annotated[tuple[node_credentials.AgentCaller, str], Depends(_agent_door)]
+
+
+def _guard_task_creating_caller(x_agent_task_id: str, session: Session) -> Optional[Task]:
+    """Resolve who is creating: the caller's own row, or None for the `host` producer.
+
+    Every persona may use every creation shape (`persona_registry.TASK_CREATION_LICENCE`); what a call may
+    reach is each door's own bound, and a door that makes work run unattended adds the loop guard
+    (`require_human_started`). Fails closed on `X-Agent-Task-Id`: absent/malformed → 422, unknown → 404; only
+    `host` and a real task id pass. The identity is self-declared, so a forged `host` is covered by the charter.
     """
     declared = x_agent_task_id.strip()
     if declared == HOST_PRODUCER_CALLER:
@@ -385,41 +431,9 @@ def _guard_task_creating_caller(
             ),
         )
     caller_id = int(declared)
-    caller = get_or_404(
+    return get_or_404(
         session, Task, caller_id, detail=f"{_CALLER_TASK_HEADER} names task {caller_id}, which does not exist"
     )
-    licence = TASK_CREATION_LICENCE_BY_PERSONA.get(caller.persona)
-    if licence is None:
-        # Names WHAT is refused, never WHICH personas are accepted: the guard checks the declared
-        # task's PERSONA, so naming the allowed set invites a re-declaration as the epic's plan child.
-        log.warning(
-            "task-creation refused: task %s (persona=%s) holds no task-creation licence",
-            caller_id, caller.persona,
-        )
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"task {caller_id} (persona={caller.persona!r}) may not create tasks. Do this work in your own "
-                "session (subagents allowed) and record any adjacent finding as a deferred follow-up in "
-                "your settle summary instead of spawning a Task (runner charter R30)."
-            ),
-        )
-    if licence.shapes.isdisjoint((shape,) if isinstance(shape, str) else shape):
-        # Licence-holder at the wrong door: same 403, still no accepted set; it quotes the caller's OWN
-        # bound because this caller may create and the actionable answer is in which shape.
-        log.warning(
-            "task-creation refused: task %s (persona=%s) holds no licence for shape %s",
-            caller_id, caller.persona, shape,
-        )
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"task {caller_id} (persona={caller.persona!r}) holds no licence for this shape. Its "
-                f"licence covers {licence.constraint} — use the endpoint that does THAT, and record "
-                "anything else as a deferred follow-up in your outcome / stage output (runner charter R30)."
-            ),
-        )
-    return caller
 
 
 def _require_live_hold(session: Session, caller: node_credentials.AgentCaller, task_id: int) -> None:
@@ -515,3 +529,110 @@ def _refuse_a_node_not_holding(
             task_id, caller.node_id, sorted(str(n) for n in holder_node_ids),
         )
         raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+
+
+def declared_task_id(
+    session: Session, caller: node_credentials.AgentCaller, x_agent_task_id: str, *, not_found: str
+) -> int:
+    """The task id `X-Agent-Task-Id` declares, refused (404 `not_found`) unless it is well-formed, and (the task's own
+    404) when the task is held on another node (`_refuse_a_node_not_holding`). The door of the toolbox routes."""
+    declared = x_agent_task_id.strip()
+    if not _CALLER_TASK_ID_RE.fullmatch(declared):
+        raise HTTPException(status_code=404, detail=not_found)
+    task_id = int(declared)
+    _refuse_a_node_not_holding(session, caller, task_id)
+    return task_id
+
+
+def open_declared_task(
+    session: Session, caller: node_credentials.AgentCaller, x_agent_task_id: str, *, persona: str, not_found: str
+) -> Task:
+    """The declared task (`declared_task_id`), refused (404 `not_found`) unless it is an open task of `persona`."""
+    task = session.get(Task, declared_task_id(session, caller, x_agent_task_id, not_found=not_found))
+    if task is None or task.persona != persona or task.state not in ("active", "awaiting_response"):
+        raise HTTPException(status_code=404, detail=not_found)
+    return task
+
+
+def require_human_started(session: Session, caller: Task, *, what: str) -> None:
+    """403 when `caller`'s chain was started by a machine (`task_ancestry.machine_origin`): the loop guard
+    on every door that makes work run unattended — a running task, a schedule, a trigger, an automation.
+    `what` names the refused act in the detail."""
+    from app.task_ancestry import machine_origin
+
+    reason = machine_origin(session, caller.id)
+    if reason is None:
+        return
+    log.warning("agent: refused %s to task=%s (%s)", what, caller.id, reason)
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"{what} is open only to a task a person started in the console, and {reason}; this stops a "
+            "chain of machine-started work from feeding itself. File a draft or name it in your report."
+        ),
+    )
+
+
+def launcher_principal(session: Session, caller: Task):
+    """`(user, principal)` of the human this task acts for (`task_ancestry.launcher_user_id`), or a 403 when
+    the chain names nobody. Every org-wide door (`routes/agent_org.py` and its siblings) asks the console's
+    own permission keys of this principal, so a runner never out-reaches its human."""
+    from app.authz.principal import principal_for_user
+    from app.models.identity import AdminUser
+    from app.task_ancestry import launcher_user_id
+
+    user_id = launcher_user_id(session, caller.id)
+    user = session.get(AdminUser, user_id) if user_id is not None else None
+    if user is None or user.is_system:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"task {caller.id} resolves no human who started or created it, so it has no console authority "
+                "to act with. Name it in your report."
+            ),
+        )
+    principal = principal_for_user(session, user)
+    if user.org_id != caller.org_id and not principal.is_operator:
+        # The org-wide doors act inside the caller task's org; a launcher seated elsewhere (a creator from
+        # another org, which `launcher_user_id` falls back to) holds no console authority there.
+        log.warning("agent: refused task=%s its launcher %s (seated in another org)", caller.id, user.id)
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"the person task {caller.id} acts for is not a member of its org, so it has no console "
+                "authority there. Name it in your report."
+            ),
+        )
+    return user, principal
+
+
+def live_agent_caller(session: Session, agent: node_credentials.AgentCaller, x_agent_task_id: str) -> Task:
+    """The calling task for an org-wide door: declared in `X-Agent-Task-Id`, held by THIS node, and still
+    live (`routes/tasks/agent_filing.py::_require_live_filer`). No persona licence: what the call may
+    reach is the launcher's own console authority (`launcher_principal`)."""
+    from app.routes.tasks.agent_filing import _require_live_filer
+
+    declared = x_agent_task_id.strip()
+    if not _CALLER_TASK_ID_RE.fullmatch(declared):
+        # The header value is not echoed: it is caller-supplied, and a model reads this detail.
+        raise HTTPException(
+            status_code=422, detail=f"{_CALLER_TASK_HEADER} is required and must be your own task id (digits)"
+        )
+    caller = _task_or_404_for_node(session, agent, int(declared))
+    # `_task_or_404_for_node` passes an UNHELD task (its no-holder gap); a node-token holder must not declare
+    # a queued task of its org and borrow that task's launcher's authority. A node-less arm (CP-self, dev
+    # bypass) keeps that function's fleet-wide posture: it holds no node to check against.
+    if agent.node_id is not None:
+        _require_live_hold(session, agent, caller.id)
+    _require_live_filer(caller)
+    return caller
+
+
+def caller_and_launcher(
+    session: Session, agent: node_credentials.AgentCaller, x_agent_task_id: str
+) -> tuple[Task, AdminUser, Principal]:
+    """`(caller, launcher, principal)` for one agent door: the live task (`live_agent_caller`) and whom it acts as
+    (`launcher_principal`)."""
+    caller = live_agent_caller(session, agent, x_agent_task_id)
+    user, principal = launcher_principal(session, caller)
+    return caller, user, principal

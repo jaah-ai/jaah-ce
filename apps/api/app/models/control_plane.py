@@ -1,10 +1,11 @@
-"""The control plane's own runtime: peer processes, ECS tasks, console tickets, rate limits and flags."""
+"""The control plane's own runtime: peer processes, ECS tasks, console tickets, rate limits, idempotency keys
+and flags."""
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
-from sqlalchemy import BigInteger, Boolean, ForeignKey, Identity, Index, Integer, String, Text, text
+from sqlalchemy import BigInteger, Boolean, Identity, Index, Integer, LargeBinary, SmallInteger, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -81,22 +82,20 @@ class ConsoleTicket(Base):
 
     # The NODE leg's ticket hash (the row's original meaning, kept as the key).
     ticket_hash: Mapped[str] = mapped_column(Text, primary_key=True)
-    # Unused since the relay split (a relay is not a peer); the outgoing release still writes it.
-    peer_id: Mapped[Optional[UUID]] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("cp_peers.id", ondelete="CASCADE"), nullable=True
-    )
     browser_ticket_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # The node the dial-back must come from, in both spellings: the bus key and the `nodes.name`.
     node_id: Mapped[str] = mapped_column(Text, nullable=False)
     node_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # The relay discards every browser frame when set — the viewer tier, decided by the API at open.
     read_only: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
-    # The viewer's session (`auth.session_row_is_live` inputs), re-checked by the API's sweep.
+    # The viewer's session (`auth.session_row_is_live` inputs), re-checked by the API's sweep; the browser leg must
+    # carry it (`console_relay/tickets.py::claim`).
     user_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     session_epoch: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     session_iepoch: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    # The viewer's address at the mint: the browser leg must be claimed from it, and the sweep ends the console
-    # once it leaves the org's IP allowlist (`app/ip_allowlist.py`). NULL on a row of the outgoing release.
+    # The viewer's address: the mint's, then the browser leg's own once claimed. The sweep ends the console once it
+    # leaves the org's IP allowlist (`app/ip_allowlist.py`); a row minted without a session must be claimed from it.
+    # NULL on a row of the outgoing release.
     client_ip: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # The relay task holding the rendezvous (`http://ip:port`), set by the first leg to arrive.
     owner_address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -119,7 +118,8 @@ class ConsoleTicket(Base):
 
 class RateLimitHit(Base):
     """One counted request for a rate-limit `bucket` and `key`, shared across peers so a limit holds
-    fleet-wide rather than per process. Hour-old rows are pruned by the peer heartbeat."""
+    fleet-wide rather than per process. The peer heartbeat prunes rows past their
+    bucket's window, and every row after a day."""
 
     __tablename__ = "rate_limit_hits"
     __table_args__ = (Index("ix_rate_limit_hits_bucket_key_hit_at", "bucket", "key", "hit_at"),)
@@ -128,3 +128,28 @@ class RateLimitHit(Base):
     bucket: Mapped[str] = mapped_column(Text, nullable=False)
     key: Mapped[str] = mapped_column(Text, nullable=False)
     hit_at: Mapped[datetime] = timestamp_column(server_now=False)
+
+
+class RequestIdempotency(Base):
+    """One console write's idempotency key and the answer it got (`app/idempotency.py`, its single home).
+
+    Keyed by principal (`admin_id` from the session) and the client's key; never a tenant object. `state` is
+    `running` from the claim (committed before the route runs) to `done` (answer stored). `body` NULL with a
+    `status` is an answer too large to keep. Rows past `idempotency.RETENTION` are ignored and pruned by the
+    `request-idempotency-prune` cron."""
+
+    __tablename__ = "request_idempotency"
+    __table_args__ = (Index("ix_request_idempotency_created_at", "created_at"),)
+
+    admin_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    method: Mapped[str] = mapped_column(Text, nullable=False)
+    path: Mapped[str] = mapped_column(Text, nullable=False)
+    body_sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[Optional[int]] = mapped_column(SmallInteger, nullable=True)
+    headers: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    body: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
+    created_at: Mapped[datetime] = timestamp_column()
+    heartbeat_at: Mapped[datetime] = timestamp_column()
+    completed_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)

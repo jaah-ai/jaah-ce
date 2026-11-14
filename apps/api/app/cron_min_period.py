@@ -23,13 +23,14 @@ schedule complies is never skipped, so an early wake or a Run now of it is untou
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import timezone
 from typing import Literal, Optional
 from uuid import UUID
 
 from sqlalchemy.orm import Session
 
 from app import plan_terms
+from app.clock import utcnow
 from app.operator_settings import reads as settings_reads
 from app.cron_schedule import CronScheduleError, min_gap_over_next_occurrences
 from app.models.orgs import Org
@@ -158,7 +159,7 @@ def schedule_gap(
 
     Raises `CronScheduleError` when the expression cannot be measured."""
     return min_gap_over_next_occurrences(
-        schedule_kind, cron_expression, interval_seconds, datetime.now(timezone.utc), timezone.utc
+        schedule_kind, cron_expression, interval_seconds, utcnow(), timezone.utc
     )
 
 

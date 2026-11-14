@@ -11,7 +11,7 @@
 # without a URI part forwards the RAW request line — so the two can disagree about what a request is.
 #
 # MEASURED: `GET /api/agent%2f%2e%2e/x` on 3051 normalizes to $uri=/api/x, which matches NO machine
-# location and so met no guard, while the upstream received `/api/agent%2f%2e%2e/x` verbatim. uvicorn
+# location and so met no guard, while the upstream received `/api/agent%2f%2e%2e/x` verbatim. The api server
 # percent-decodes that to `/api/agent/../x`, which satisfies `app/auth.py::PUBLIC_PREFIXES`'
 # `startswith("/api/agent/")` — i.e. it skips SessionAuthMiddleware entirely. It is a 404 today only
 # because no route matches a literal `..` segment, which is luck, not a boundary.
@@ -125,7 +125,7 @@ log_format git_connect_no_args '$remote_addr - $remote_user [$time_local] '
 #
 # `gzip_comp_level 5` rather than the 1 default or the 9 maximum: 9 spends materially more CPU for a
 # few percent, and CPU is the constrained resource on this task (one Fargate task shared by nginx and
-# uvicorn). 5 is the usual knee of that curve.
+# the api server). 5 is the usual knee of that curve.
 #
 # `gzip_min_length 1024` because below roughly a kilobyte the gzip header plus the CPU is a loss, and
 # a great many of this API's responses are small status objects.
@@ -210,6 +210,24 @@ server {
     # browser. It happens to be inert today only because `text/event-stream` is not in `gzip_types`;
     # that is one edit away from being false, and this location is where the requirement belongs.
     gzip off;
+  }
+
+  # The console's read relay (apps/api/app/routes/read_relay.py): a WebSocket a browser opens when its HTTP/2
+  # connection went silent, so it needs the Upgrade/Connection headers and HTTP/1.1 here, and nowhere else.
+  # Served on the public listener too — it is a browser route; the relay itself refuses the machine surface.
+  location = /api/read-relay {
+    default_type application/json;
+    if ($refuse_public_raw_normalized_split) {
+      return 400 '{"detail":"malformed path"}';
+    }
+
+    proxy_pass http://${API_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 300s;
   }
 
   # Console setup (T13b, spec R5/Component 6) — `POST /api/console/{project}/{number}/open` and the direct
@@ -403,7 +421,7 @@ server {
     proxy_set_header X-Real-IP $remote_addr;
   }
 
-  # ADD TO SLACK, `/api/slack-connect/{start,callback}`: the callback's `?code=&state=` is a live
+  # ADD TO SLACK, `/api/slack-connect/callback`: the callback's `?code=&state=` is a live
   # credential for exactly the reason `location /api/git-connect/` states, so the same treatment — both raw-URI
   # guards, the no-args access log, and `error_log crit`.
   location /api/slack-connect/ {
@@ -428,6 +446,26 @@ server {
   # credential for exactly the reason `location /api/git-connect/` states, so the same treatment — both raw-URI
   # guards, the no-args access log, and `error_log crit`.
   location /api/email-connect/ {
+    default_type application/json;
+    if ($refuse_public_raw_normalized_split) {
+      return 400 '{"detail":"malformed path"}';
+    }
+    if ($refuse_machine_surface_raw) {
+      return 403 '{"detail":"This is the public browser entrypoint. The agent/node API is not served here - dial the control plane\'s internal hostname over the tailnet."}';
+    }
+
+    access_log /dev/stdout git_connect_no_args;
+    # Why `crit`: see `location /api/git-connect/` — the error log carries the request line unredacted.
+    error_log /dev/stderr crit;
+
+    proxy_pass http://${API_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  # THE SHARED CREDENTIAL CONNECT, `/api/credentials/connect/{start/<id>,callback}`: every catalog vendor's callback
+  # and the one Connect Gmail forwards to carry a live `?code=&state=`, so the same treatment as the location above.
+  location /api/credentials/connect/ {
     default_type application/json;
     if ($refuse_public_raw_normalized_split) {
       return 400 '{"detail":"malformed path"}';
@@ -509,6 +547,16 @@ server {
     add_header Cache-Control "no-cache";
     include /etc/nginx/snippets/security-headers.conf;
     return 200 "User-agent: *\nAllow: /docs/\nDisallow: /\n";
+  }
+
+  # RFC 9116's security.txt, rendered by the api from the Security contact setting (`app/legal_pages.py`) —
+  # without it the SPA fallback below answers it with index.html. The deployed edge routes it the same way.
+  # The proxy target names the path: a bare upstream would forward the raw request line, which a normalized
+  # match here does not vouch for (the raw-URI map at the top of this file).
+  location = /.well-known/security.txt {
+    proxy_pass http://${API_UPSTREAM}/.well-known/security.txt;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
   }
 
   # Vite's build gives every JS/CSS/asset file a content hash in its filename — a
@@ -611,7 +659,7 @@ server {
   # The widget's public API, proxied to the app exactly as the console block's `/api/` is: the same raw-URI
   # guards (a new `/api/...` location owes them — see the maps at the top of this file) and the same
   # forwarding headers. Those set no X-Forwarded-For on purpose: the ALB's own XFF passes through, so
-  # uvicorn's trusted-loopback hop resolves `request.client.host` to the real client (apps/api/entrypoint.sh)
+  # the api server's trusted-loopback hop resolves `request.client.host` to the real client (apps/api/entrypoint.sh)
   # and the per-IP limit stays per visitor. `$proxy_add_x_forwarded_for` would append the ALB's address and
   # put every visitor in one bucket. A turn is an SSE stream, so unbuffered and uncompressed like
   # `/api/stream` above.
@@ -672,6 +720,16 @@ server {
 
   # hooks-paths:
   location /api/public/triggers/ {
+    # Above the api's 25 MiB cap for a record-only GitHub trigger's signed delivery (a large promotion push;
+    # `MAX_RECORD_ONLY_GITHUB_BODY_BYTES`); every other trigger is still held to 1 MiB by the api itself. The body
+    # STREAMS to the api (no request buffering; HTTP/1.1 so a chunked body streams too): the api picks each
+    # delivery's cap from its token and signature before reading, so an unsigned or unknown-token body is cut at
+    # 1 MiB there, never spooled whole to this task's disk first.
+    client_max_body_size 26m;
+    proxy_request_buffering off;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    client_body_timeout 15s;
     proxy_pass http://${API_UPSTREAM}/api/public/triggers/;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
@@ -688,6 +746,30 @@ server {
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
   }
+
+  location = /api/public/ci/hosted-app-deploy {
+    proxy_pass http://${API_UPSTREAM}/api/public/ci/hosted-app-deploy;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  location = /api/public/ci/hosted-app-deploy/started {
+    proxy_pass http://${API_UPSTREAM}/api/public/ci/hosted-app-deploy/started;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  location = /api/public/ci/hosted-app-deploy/finished {
+    proxy_pass http://${API_UPSTREAM}/api/public/ci/hosted-app-deploy/finished;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  location /api/public/trackers/ {
+    proxy_pass http://${API_UPSTREAM}/api/public/trackers/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
   # end hooks-paths
 
   # The bare prefixes, which nginx would otherwise 301 to the slashed form: 404 like everything off the fence.
@@ -696,6 +778,10 @@ server {
   }
 
   location = /api/public/email/unsubscribe {
+    return 404;
+  }
+
+  location = /api/public/trackers {
     return 404;
   }
 
@@ -708,7 +794,7 @@ server {
 #
 # The internet-facing Live Cast ALB targets this port and nothing else. Its forward rule is deliberately
 # broad (`/`, `/*`): THIS block is the fence. It serves the viewer page (`live.html`, for every client
-# route, with the api's snapshot of that route spliced in), the content-hashed build under `/assets/`, the
+# route; its JS renders the route), the content-hashed build under `/assets/`, the
 # share card `/live-og.png`, its own robots.txt, sitemap and health probe, and proxies `/api/public/live/`
 # and nothing else under `/api` — no console document, no other /api location, no machine surface. A deploy
 # test pins all of it.
@@ -726,41 +812,24 @@ server {
 # `/assets/` stay `noindex, nofollow` — each location there states it, since nginx does not inherit
 # `add_header` into a location that declares its own.
 #
-# THE SNAPSHOT (SSI): `location /` records the route (`$live_path`, set before try_files rewrites `$uri` to
-# `/live.html`) and lets `live.html`'s two `include virtual` directives fetch `/_live_snapshot/{head,body}<route>`
-# (with the board page, `$live_page`) — an internal GET subrequest to the api's `/api/public/live/_snapshot/`, carrying the visitor's own address, so
-# the api's per-IP budget sees the visitor. A slow or failed api renders each include's stub block instead
-# (`ssi_silent_errors`, short timeouts, every error status turned into an empty 204): the page always loads, as the
-# client-only viewer it was.
-#
-# THE EDGE CACHE (`live_snapshot` zone): a fragment is the same for every visitor, so one render per route (and board page) serves
-# all of them for `proxy_cache_valid` — the snapshot's fan-out of viewer reads (and the sitemap's walk) is paid
-# once per route per window, not once per page view. The price: an unpublish or a hidden task leaves the snapshot
-# up to 10 s late (the sitemap up to 5 min); the viewer's own reads stay `no-store`. Only a 200 is kept: the api's
-# empty 204 (a visitor's refused budget, a fault) is never served to anyone else.
-proxy_cache_path /tmp/nginx-live-cache levels=1:2 keys_zone=live_snapshot:10m max_size=64m inactive=10m use_temp_path=off;
+# THE EDGE CACHE (`live_cache` zone): the sitemap is the same for every visitor, so one render serves all of them for
+# `proxy_cache_valid` — its walk of every published project is paid once per window, not once per fetch. The price:
+# an unpublish or a hidden task leaves the sitemap up to 5 min late. Only a 200 is kept.
+proxy_cache_path /tmp/nginx-live-cache levels=1:2 keys_zone=live_cache:10m max_size=64m inactive=10m use_temp_path=off;
 
 #
 # The proxy NAMES THE PATH IT MATCHED, so nginx forwards the normalized uri it fenced on, never the raw
 # request line; the raw-URI guard below refuses a raw path that disagrees with its normalized form anyway
 # (the reasoning is the console's — see the maps at the top of this file). Here it also refuses `//` and `/./`,
 # which nginx collapses but the WAF's per-route budget would otherwise read as a different path. It guards the
-# viewer page too, so the route the snapshot is rendered for is the route the visitor typed. A viewer route has
-# none of these in its path; a query is outside the match.
+# viewer page too. A viewer route has none of these in its path; a query is outside the match.
 #
 # The query string is not logged (`git_connect_no_args`, and `error_log crit` where nginx would print the raw
-# request line on an upstream failure): no viewer route reads one but the snapshot's board page, and a visitor's
+# request line on an upstream failure): no viewer route reads one, and a visitor's
 # query (an ad click's `fbclid`, `utm_*`) is tracking data the log has no use for.
 map $request_uri $refuse_live_raw_normalized_split {
   default                   0;
   "~*^[^?]*(\.\.|%2e|%2f|%5c|//|/\./)" 1;
-}
-
-# The board page a project's snapshot renders (`?page=N`, app/routes/live_snapshot.py), which `live.html`'s includes
-# forward: digits alone, so no other query reaches the api or splits the edge cache.
-map $arg_page $live_page {
-  default             "";
-  "~^[1-9][0-9]{0,2}$" $arg_page;
 }
 
 server {
@@ -809,36 +878,29 @@ server {
     proxy_set_header X-Real-IP $remote_addr;
   }
 
-  # The viewer page's snapshot fragments: reachable only as `live.html`'s SSI subrequest (`internal`), which nginx
-  # always issues as GET. Uncompressed (`Accept-Encoding` cleared — the subrequest inherits the visitor's, and a
-  # gzipped fragment would be spliced in as bytes) and short timeouts, so a slow api costs the page its stub,
-  # never its load.
-  location /_live_snapshot/ {
-    internal;
+  # The viewer's read relay: the console's `location = /api/read-relay` (its WebSocket shape and reasons), opened by
+  # the viewer when a live read's connection went silent (apps/web/src/net/relay.ts). The live host holds no session
+  # cookie, so the api takes it as its ANONYMOUS socket, which replays only `GET /api/public/live/*`, per-IP bounded
+  # (apps/api/app/routes/read_relay.py): this location opens no other api path.
+  location = /api/read-relay {
+    default_type application/json;
     if ($refuse_live_raw_normalized_split) {
-      return 400;
+      return 400 '{"detail":"malformed path"}';
+    }
+    limit_except GET {
+      deny all;
     }
     error_log /dev/stderr crit;
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    include /etc/nginx/snippets/security-headers.conf;
 
-    proxy_pass http://${API_UPSTREAM}/api/public/live/_snapshot/;
-    proxy_method GET;
-    proxy_pass_request_body off;
-    proxy_set_header Content-Length "";
-    proxy_set_header Accept-Encoding "";
+    proxy_pass http://${API_UPSTREAM}/api/read-relay;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
-    proxy_connect_timeout 2s;
-    proxy_send_timeout 5s;
-    proxy_read_timeout 5s;
-
-    proxy_cache live_snapshot;
-    proxy_cache_key "$uri?$args";
-    proxy_ignore_headers Cache-Control Expires Set-Cookie;
-    proxy_cache_valid 200 10s;
-    proxy_cache_lock on;
-    proxy_cache_use_stale updating error timeout;
-    proxy_intercept_errors on;
-    error_page 400 404 429 500 502 503 504 = @live_snapshot_empty;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 300s;
   }
 
   # Every published project's routes, rendered by the api. Its caching is this edge's, not the api's.
@@ -854,7 +916,7 @@ server {
     add_header Cache-Control "public, max-age=300";
     include /etc/nginx/snippets/security-headers.conf;
 
-    proxy_cache live_snapshot;
+    proxy_cache live_cache;
     proxy_cache_key "sitemap.xml";
     proxy_ignore_headers Cache-Control Expires Set-Cookie;
     proxy_cache_valid 200 300s;
@@ -866,10 +928,6 @@ server {
     proxy_set_header X-Real-IP $remote_addr;
   }
   # end live-paths
-  # An error's body would be spliced into the page: an empty 204 makes the include render its stub.
-  location @live_snapshot_empty {
-    return 204;
-  }
 
 
   # The bare prefix, which nginx would otherwise 301 to the slashed form — with `:3053` in the Location.
@@ -922,6 +980,15 @@ server {
     try_files $uri =404;
   }
 
+  # The build's manifest: the read relay's liveness probe (apps/web/src/net/relay.ts `PROBE_PATH`), static so a busy
+  # api never slows it. Without it the probe fell to `location /` and rendered the viewer page.
+  location = /version.json {
+    add_header Cache-Control "no-cache";
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    include /etc/nginx/snippets/security-headers.conf;
+    try_files /version.json =404;
+  }
+
   # The same content-hashed build the console serves (Vite), so immutable.
   location /assets/ {
     add_header Cache-Control "public, max-age=31536000, immutable";
@@ -931,16 +998,12 @@ server {
   }
 
   # THE VIEWER PAGE FOR EVERY CLIENT ROUTE (`/`, `/<org>/<slug>`, …) — `live.html` and never another file from
-  # the build root, so the console's own `index.html` is not reachable here, with the route's snapshot spliced in
-  # (THE SNAPSHOT, above). No-cache for the reason the console's `/` states. Its Content-Security-Policy is the
-  # viewer's own (nginx-live-csp.conf).
+  # the build root, so the console's own `index.html` is not reachable here; the viewer's JS renders the route.
+  # No-cache for the reason the console's `/` states. Its Content-Security-Policy is the viewer's own (nginx-live-csp.conf).
   location / {
-    set $live_path $uri;
     if ($refuse_live_raw_normalized_split) {
       return 400;
     }
-    ssi on;
-    ssi_silent_errors on;
     add_header Cache-Control "no-cache";
     include /etc/nginx/snippets/security-headers.conf;
     include /etc/nginx/snippets/live-csp.conf;

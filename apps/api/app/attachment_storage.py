@@ -34,7 +34,8 @@ from uuid import UUID
 
 import httpx
 
-from app import ce_bootstrap, edition_features, session_transcript_archive, session_transcripts
+from app import ce_bootstrap, edition_features, http_bounded, session_transcript_archive, session_transcripts
+from app.clock import utcnow
 from app.config import get_settings
 
 if TYPE_CHECKING:
@@ -54,6 +55,11 @@ UPLOAD_TTL_SECONDS = 15 * 60
 
 #: How long a download redirect lives. The browser follows it immediately.
 DOWNLOAD_TTL_SECONDS = 5 * 60
+
+#: How long a played media URL lives (`app/routes/attachments.py::media_redirect`): unlike a download, a media
+#: element keeps issuing Range requests to the URL it was redirected to for as long as the operator watches or
+#: seeks, so five minutes would cut a long video off mid-playback.
+MEDIA_TTL_SECONDS = 2 * 60 * 60
 
 #: Ceiling on bytes buffered in memory for an inline preview — not the storage cap (`MAX_ATTACHMENT_SIZE`).
 #: The frontend previews text only up to 2 MB (`artifactKinds.ts` `TEXT_PREVIEW_MAX_BYTES`); anything
@@ -242,7 +248,7 @@ def _sign(
         region=where.region,
         service="s3",
         credentials=where.credentials,
-        amz_date=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+        amz_date=utcnow().strftime("%Y%m%dT%H%M%SZ"),
         expires_seconds=expires_seconds,
         content_length=content_length,
         content_md5=content_md5,
@@ -294,11 +300,12 @@ def presign_upload(where: Target, key: str, *, content_length: int) -> tuple[str
         expires_seconds=UPLOAD_TTL_SECONDS,
         content_length=content_length,
     )
-    return url, datetime.now(timezone.utc) + timedelta(seconds=UPLOAD_TTL_SECONDS)
+    return url, utcnow() + timedelta(seconds=UPLOAD_TTL_SECONDS)
 
 
 def presign_download(
-    where: Target, key: str, *, filename: str = "", content_type: str = "", inline: bool = False
+    where: Target, key: str, *, filename: str = "", content_type: str = "", inline: bool = False,
+    ttl_seconds: int = DOWNLOAD_TTL_SECONDS,
 ) -> str:
     """A URL authorizing one GET of `key`, with S3 told what to call the file and what to type it as.
 
@@ -326,10 +333,10 @@ def presign_download(
     if content_type:
         parameters.append("response-content-type=" + quote(content_type, safe=""))
     if where.root:
-        return _local_url("GET", key, DOWNLOAD_TTL_SECONDS, disposition=disposition, content_type=content_type)
+        return _local_url("GET", key, ttl_seconds, disposition=disposition, content_type=content_type)
     # No emptiness guard: the disposition is always seeded above.
     url = object_url(where, key) + "?" + "&".join(parameters)
-    return _sign(where, method="GET", url=url, expires_seconds=DOWNLOAD_TTL_SECONDS)
+    return _sign(where, method="GET", url=url, expires_seconds=ttl_seconds)
 
 
 def _request(
@@ -352,7 +359,7 @@ def _request(
     )
     headers = {"Content-MD5": content_md5} if content_md5 is not None else None
     try:
-        with httpx.Client(timeout=_FETCH_TIMEOUT, follow_redirects=False) as client:
+        with http_bounded.client(_FETCH_TIMEOUT) as client:
             request = client.build_request(method, url, content=body, headers=headers)
             # httpx sets `content-type` on a request with a body; a presigned request must send none.
             request.headers.pop("content-type", None)
@@ -397,7 +404,7 @@ def fetch_versioned(where: Target, key: str, *, timeout: Optional[float] = None)
         write=min(_FETCH_TIMEOUT.write, timeout), pool=min(_FETCH_TIMEOUT.pool, timeout),
     )
     try:
-        with httpx.Client(timeout=limits, follow_redirects=False) as client:
+        with http_bounded.client(limits) as client:
             request = client.build_request("GET", url)
             request.headers.pop("content-type", None)
             presign.reject_forbidden_headers(request.headers.keys())
@@ -536,18 +543,27 @@ def reap_unreferenced_object(session: Session, key: str, bucket: Optional[str] =
         return False
 
 
+def reap_unreferenced_objects(keys: list[tuple[Optional[str], str]]) -> None:
+    """`reap_unreferenced_object` over each `(bucket, key)` a route collected before its commit (a delete, or a
+    replaced card): after the commit, on a worker thread (`asyncio.to_thread`), each object goes once no row of
+    either store names it. The reaper reads on a fleet session of its own and deletes from S3; its `session`
+    argument is unused."""
+    for bucket, key in keys:
+        reap_unreferenced_object(None, key, bucket)  # type: ignore[arg-type]
+
+
 def _key_still_referenced(key: str) -> bool:
     """Whether any surviving row, in any org or in either store, names `key` — on a fleet session of its own, as the
     caller's org-bound session would miss another org's task sharing a global template's image. Existence only."""
     # Deferred, so importing the storage layer does not pull in the ORM.
     from sqlalchemy import select
 
-    from app.db import SessionLocal
+    from app.db import BridgedSession
     from app.models.task_extras import TaskAttachment
     from app.models.task_templates import TaskTemplateAsset
     from app.tenancy import seam
 
-    with seam.detached(), seam.operator_scope(), SessionLocal() as fleet:
+    with seam.detached(), seam.operator_scope(), BridgedSession() as fleet:
         for column in (TaskAttachment.s3_key, TaskTemplateAsset.s3_key):
             if fleet.scalars(select(column).where(column == key).limit(1)).first() is not None:
                 return True

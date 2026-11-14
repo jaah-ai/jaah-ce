@@ -26,7 +26,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Optional
 from uuid import UUID
 
@@ -35,7 +35,8 @@ from sqlalchemy.orm import Session
 
 from app import identities, mfa
 from app.auth import SUPERADMIN_PASSWORD, hash_password, password_problem, password_refusal, password_reset_eligible
-from app.config import get_settings
+from app.clock import utcnow
+from app.config import console_url
 from app.entity_shape import optional_uuid
 from app.models.identity import AdminUser, PasswordReset, set_identity_fields
 from app.models.orgs import Org
@@ -111,7 +112,7 @@ def request_reset(session: Session, email: str, source_ip: Optional[str]) -> Opt
     )
     if user is None:
         return None
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     with seam.bound_to(user.org_id):
         if not password_reset_eligible(session, user):
             return None
@@ -167,7 +168,7 @@ def spend_open_links(session: Session, identity_id: UUID, *, invitations_only: b
     stmt = update(PasswordReset).where(PasswordReset.identity_id == identity_id, PasswordReset.used_at.is_(None))
     if invitations_only:
         stmt = stmt.where(_INVITATION_ROW)
-    session.execute(stmt.values(used_at=datetime.now(timezone.utc)))
+    session.execute(stmt.values(used_at=utcnow()))
 
 
 def invite_link(session: Session, user: AdminUser) -> Optional[str]:
@@ -180,7 +181,7 @@ def invite_link(session: Session, user: AdminUser) -> Optional[str]:
         return None
     spend_open_links(session, user.identity_id, invitations_only=True)
     secret = secrets.token_urlsafe(32)
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     row = PasswordReset(
         user_id=user.id, identity_id=user.identity_id, token_hash=_secret_hash(secret),
         created_at=now, expires_at=now + INVITE_TTL,
@@ -191,7 +192,7 @@ def invite_link(session: Session, user: AdminUser) -> Optional[str]:
 
 
 def reset_url(token: str) -> str:
-    return f"{get_settings().frontend_url.rstrip('/')}/reset-password?token={token}"
+    return console_url(f"/reset-password?token={token}")
 
 
 def _parse(token: str) -> tuple[UUID, str]:
@@ -212,7 +213,7 @@ def _live_row(session: Session, row_id: UUID, secret: str, *, lock: bool) -> Pas
         # Two submits of one link serialize here; the second reads `used_at` set and is refused.
         stmt = stmt.with_for_update()
     row = session.scalar(stmt)
-    if row is None or row.used_at is not None or row.expires_at <= datetime.now(timezone.utc):
+    if row is None or row.used_at is not None or row.expires_at <= utcnow():
         raise ResetLinkInvalid()
     return row
 
@@ -274,9 +275,10 @@ def check_link(session: Session, token: str) -> CheckedLink:
         raise ResetLinkInvalid() from None
 
 
-def complete_reset(session: Session, token: str, password: str) -> ResetDone:
+def complete_reset(session: Session, token: str, password: str, *, password_hash: str | None = None) -> ResetDone:
     """Set `password` through the link `token`, committed. Raises `ResetLinkInvalid`, `SuperadminRefused` or
-    `PasswordRejected`, each before anything is written.
+    `PasswordRejected`, each before anything is written. `password_hash`: `password` already hashed — by a caller
+    on the event loop, which hashes it off the loop (`app/offload.py::run_cpu`) before its transaction.
 
     The caller revokes the direct-console grants of `retired_epoch` after this returns, as `update_me` does."""
     row_id, secret = _parse(token)
@@ -290,7 +292,15 @@ def complete_reset(session: Session, token: str, password: str) -> ResetDone:
             problem = password_problem(password, user.email)
             if problem is not None:
                 raise PasswordRejected(problem)
-            set_identity_fields(user, password_hash=hash_password(password))
+            set_identity_fields(user, password_hash=password_hash or hash_password(password))
+            if _is_invitation(row):
+                # Accepting an emailed invitation proves its address, so a new invitee's account-email alert channel
+                # is live at once. The link went to the login email: changing it spends every open link
+                # (`routes/users.py`), and the UPDATE stamps only while the email still matches. A console Accept
+                # (`org_invitations.accept`) stamps nothing: it is a signed-in act, not proof of the mailbox.
+                from app.login_oauth import stamp_identity_email_verified
+
+                stamp_identity_email_verified(session, row.identity_id, user.email or "")
             # The person's sign-out everywhere (`identities.end_every_session`).
             retired = identities.end_every_session(session, user)
             retired_epoch = dict(retired)[user.id]

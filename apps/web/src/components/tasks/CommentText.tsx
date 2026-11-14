@@ -1,12 +1,12 @@
-/* THE COMMENT RENDERER — one task comment's body drawn from `lib/commentText.ts`'s tokens; NOTHING here
- * parses. Change what a comment MEANS in the lib (Slack's `commentPlainText` reads the same tokens);
- * change what it LOOKS LIKE here.
+/* THE COMMENT RENDERER — one task comment's body (or one website-chat message, `WebsiteChatsTab`) drawn
+ * from `lib/commentText.ts`'s blocks and tokens; NOTHING here parses. Change what a comment MEANS in the
+ * lib; change what it LOOKS LIKE here.
  *
  * NOTHING BECOMES MARKUP: every token's `text` is a React child, and there is no
  * `dangerouslySetInnerHTML` — adding one would be the injection hole the tokenizer exists to close (a
  * comment is text a stranger typed).
  *
- * DENSITY IS INHERITED: no `fontSize`, so it matches its host row. `lineHeight: 1.35` is set (MUI's 1.5
+ * DENSITY IS INHERITED: no `fontSize`, so it matches its host row. `LINE_HEIGHT.snug` is set (MUI's 1.5
  * makes a two-line comment look like two). `pre-wrap` draws the newlines the tokenizer keeps; `break-word`
  * stops a pasted long URL widening the column.
  *
@@ -14,38 +14,82 @@
  * (`--mui-palette-*Channel`), never `alpha(theme.palette.…)`, which cannot parse a CSS variable and
  * freezes at light.
  */
+import { Fragment, type ReactNode } from 'react'
 import Box from '@mui/material/Box'
-import Link from '@mui/material/Link'
+import ExternalLink from '../../ui/ExternalLink'
 import type { SxProps, Theme } from '@mui/material/styles'
-import { tokenizeComment } from '../../lib/commentText'
+import { commentBlocks, tokenizeComment } from '../../lib/commentText'
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, RADIUS, tint } from '../../theme'
 import type { TaskCommentMention } from '../../types'
+import Tip from '../../ui/Tip'
 
 const ROOT_SX: SxProps<Theme> = {
   whiteSpace: 'pre-wrap',
   wordBreak: 'break-word',
-  lineHeight: 1.35,
+  lineHeight: LINE_HEIGHT.snug,
 }
 
 /* `action.selected`, not a named hue: a code span is not a STATUS. It is scheme-aware on its own.
-   `0.9em` is relative; the host owns the size. */
+   `FONT_SIZE.xs`: a step under the dense host rows it sits in. */
 const CODE_SX = (theme: Theme) => ({
   fontFamily: theme.typography.mono.fontFamily,
-  fontSize: '0.9em',
+  fontSize: FONT_SIZE.xs,
   bgcolor: 'action.selected',
-  borderRadius: '3px',
-  px: '0.25rem',
+  borderRadius: RADIUS.sm,
+  px: 0.5,
 })
 
 /* No border: at this size a 1px outline reads as a text-input, and the tint already bounds the chip. */
 const MENTION_SX: SxProps<Theme> = {
   color: 'primary.main',
-  backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.12)',
-  borderRadius: '3px',
-  px: '0.1875rem',
-  fontWeight: 500,
+  backgroundColor: tint('primary', 0.12),
+  borderRadius: RADIUS.sm,
+  px: 0.5,
+  fontWeight: FONT_WEIGHT.medium,
 }
 
-const BOLD_SX: SxProps<Theme> = { fontWeight: 600 }
+const BOLD_SX: SxProps<Theme> = { fontWeight: FONT_WEIGHT.semibold }
+
+/* No margin: the host spaces blocks (a transcript's `& > * + *`), and a list inside pre-wrap text must sit
+   on the line the bullets occupy. */
+const LIST_SX: SxProps<Theme> = { m: 0, pl: 2.5 }
+
+/** One run of text as React children, a token each. */
+function marks(text: string, mentions: readonly TaskCommentMention[]): ReactNode[] {
+  return tokenizeComment(text, mentions).map((token, index) => {
+    /* THE INDEX IS THE KEY, correctly: tokens are re-derived whole each render and hold no state. */
+    switch (token.kind) {
+      case 'bold':
+        return (
+          <Box key={index} component="strong" sx={BOLD_SX}>
+            {token.text}
+          </Box>
+        )
+      case 'code':
+        return (
+          <Box key={index} component="code" sx={CODE_SX}>
+            {token.text}
+          </Box>
+        )
+      case 'link':
+        /* A label that is not the URL shows the real host, so a comment cannot dress one address as another. */
+        return (
+          <Tip key={index} title={token.href}><ExternalLink href={token.href}>
+            {token.text}
+            {token.text !== token.href && <Box component="span" sx={{ color: 'text.secondary' }}> ({new URL(token.href).host})</Box>}
+          </ExternalLink></Tip>
+        )
+      case 'mention':
+        return (
+          <Box key={index} component="span" sx={MENTION_SX}>
+            {token.text}
+          </Box>
+        )
+      default:
+        return token.text
+    }
+  })
+}
 
 export default function CommentText({
   body,
@@ -68,40 +112,17 @@ export default function CommentText({
   return (
     /* An empty body still renders this box, so "no body" and "not loaded" look different. */
     <Box data-testid={testId} sx={[ROOT_SX, ...(Array.isArray(sx) ? sx : [sx])]}>
-      {tokenizeComment(body, mentions).map((token, index) => {
-        /* THE INDEX IS THE KEY, correctly: tokens are re-derived whole each render and hold no state. */
-        switch (token.kind) {
-          case 'bold':
-            return (
-              <Box key={index} component="strong" sx={BOLD_SX}>
-                {token.text}
-              </Box>
-            )
-          case 'code':
-            return (
-              <Box key={index} component="code" sx={CODE_SX}>
-                {token.text}
-              </Box>
-            )
-          case 'link':
-            /* `rel` is required beside `target="_blank"`: without `noopener` a stranger-supplied link gets
-               `window.opener`. */
-            return (
-              <Link key={index} href={token.href} target="_blank" rel="noopener noreferrer">
-                {token.text}
-              </Link>
-            )
-          case 'mention':
-            /* `title` is the name without the `@` (the chip shows the sigil). */
-            return (
-              <Box key={index} component="span" title={token.text.slice(1)} sx={MENTION_SX}>
-                {token.text}
-              </Box>
-            )
-          default:
-            return token.text
-        }
-      })}
+      {commentBlocks(body).map((block, index) =>
+        block.kind === 'list' ? (
+          <Box key={index} component="ul" sx={LIST_SX}>
+            {block.items.map((item, i) => (
+              <li key={i}>{marks(item, mentions)}</li>
+            ))}
+          </Box>
+        ) : (
+          <Fragment key={index}>{marks(block.text, mentions)}</Fragment>
+        ),
+      )}
     </Box>
   )
 }

@@ -1,0 +1,59 @@
+# Lightspeed Retail (R-Series): OAuth 2.0 against fixed endpoints at cloud.lightspeedapp.com, the client sent in the
+# token request's body; the API answers at api.lightspeedapp.com with the access token as a Bearer token.
+slug = "lightspeed"
+label = "Lightspeed Retail"
+category = "payments"
+vendor_docs_url = "https://developers.lightspeedhq.com/retail/authentication/authentication-overview/"
+summary = "Read and update Lightspeed Retail (R-Series) items, inventory, sales, customers and shops."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://cloud.lightspeedapp.com/auth/oauth/authorize"
+token_url = "https://cloud.lightspeedapp.com/auth/oauth/token"
+pkce = false
+scopes = [
+  { name = "employee:all", label = "Act as the employee who connects, with that employee's rights, so agents can read and update items, inventory, sales and customers" },
+]
+jaah_app = true
+[auth.oauth.registration]
+console_url = "https://cloud.lightspeedapp.com/oauth/register.php"
+steps = [
+  "Under Integration Name enter Jaah, and under Website enter the public homepage of the company that runs this Jaah (its https address)",
+  "Under Redirect URI enter the prod redirect URI (listed under Redirect URIs). The form takes one redirect URI per API client, and Lightspeed allows one API client per integration: register the dev redirect URI as a second integration named Jaah Dev with its own client",
+  "Fill in Contact Person (name, email and phone of the account owner at Jaah), tick I agree to the Terms of Service and submit",
+  "Copy the API client ID and secret the confirmation page shows. To change the redirect URI later, use the form's link for updating an existing API client",
+]
+review = "Not required: Lightspeed issues the client at once and it works for every Lightspeed Retail (R-Series) account"
+
+# The connected account: one small object every token may read.
+[test]
+method = "GET"
+path = "https://api.lightspeedapp.com/API/V3/Account.json"
+identity = [["Account", "name"]]
+
+[docs]
+agent_uses = [
+  "Look up an item's price, stock on hand and reorder point across shops",
+  "Find items below their reorder point and draft a purchase list",
+  "Report sales by shop, register or employee for a day or a period",
+  "Look up a customer and their purchase history when a task names them",
+]
+prerequisites = [
+  "A Lightspeed Retail (R-Series) account. Lightspeed Retail X-Series (formerly Vend) and Lightspeed Restaurant are different products and cannot be connected here",
+  "A Lightspeed employee login with the rights agents should have: agents act as that employee",
+]
+limitations = [
+  "Lightspeed Retail X-Series, Restaurant and eCom are not supported: each signs in at a per-store address this connection cannot use yet",
+  "Agents act as the employee who connected, with that employee's rights in Lightspeed",
+  "Lightspeed meters each account's API use with a leaky bucket (about one request a second sustained); bulk work is slowed down, not refused",
+]
+troubleshooting = [
+  { symptom = "The secret shows Needs reconnect", fix = "The employee who connected was removed or changed their password, or Jaah was revoked in Lightspeed. Select Reconnect and sign in as an active employee" },
+  { symptom = "Test says Lightspeed Retail rejected the access token (401)", fix = "The grant was revoked. Select Reconnect and sign in to Lightspeed again" },
+  { symptom = "Signing in fails with a redirect URI error", fix = "Your own OAuth app's redirect URI does not match Jaah's exactly. Correct it with Lightspeed's update form, or leave the client fields blank to use Jaah's app" },
+]
+faq = [
+  { q = "I use Lightspeed X-Series (formerly Vend). Can I connect it", a = "Not yet. X-Series signs in at an address that differs for every store, which this connection does not support" },
+  { q = "Does Test change anything", a = "No. It reads your Lightspeed account's name and nothing else" },
+]

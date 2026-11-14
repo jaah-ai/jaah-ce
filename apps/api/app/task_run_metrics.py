@@ -21,6 +21,7 @@ from typing import Any, Iterable, Mapping, NamedTuple, Optional, Protocol, TypeV
 from sqlalchemy import ARRAY, BigInteger, ColumnElement, Text, any_, bindparam, func, select
 from sqlalchemy.orm import Session
 
+from app.clock import utcnow
 from app.persona_registry import PERSONA_CHARTER
 from app.entity_shape import iso_or_none
 from app.model_prices import (
@@ -139,7 +140,12 @@ def _scope_tasks(
     if within is not None:
         step = step.where(within)
     tree = tree.union(step)
-    return list(session.scalars(select(Task).join(tree, Task.id == tree.c.id).order_by(Task.id)))
+    # The rows by `id = ANY(ARRAY(<walk>))`, not a join on the CTE: Postgres estimates a recursive CTE at ~1K rows
+    # and answered the join with a hash over a seq scan of every task (~1.7K buffers per page open);
+    # the array is an InitPlan the primary key reads row by row.
+    return list(session.scalars(
+        select(Task).where(Task.id == any_(func.array(select(tree.c.id).scalar_subquery()))).order_by(Task.id)
+    ))
 
 
 def _state_trails(task_ids: list[int], session: Session) -> dict[int, list[tuple[datetime, str]]]:
@@ -217,7 +223,7 @@ def active_seconds(session: Session, tasks: list[Task]) -> dict[int, float]:
     if not tasks:
         return {}
     trails = _state_trails([t.id for t in tasks], session)
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     epoch = datetime.min.replace(tzinfo=timezone.utc)
     return {t.id: _agentic_seconds(trails[t.id], t.state, now, epoch) for t in tasks}
 
@@ -322,6 +328,12 @@ def fold_captures(
     return tokens_in, tokens_out, usage, unaccounted, unreadable
 
 
+def id_any(column: Any, ids: Iterable[int]) -> Any:
+    """`column = ANY(:ids)`: one array parameter, for `_state_trails`' reason (an expanded `IN` over a year of
+    ids costs more to render than to run)."""
+    return column == any_(bindparam(None, list(ids), type_=ARRAY(BigInteger)))
+
+
 def jaah_charges(session: Session, task_ids: Iterable[int]) -> dict[int, int]:
     """`{task_id: Σ charge_micros}` for each of `task_ids` that ran on the Jaah account (a runner `jaah_sessions`
     row). Such a task's dollars are what the tenant was CHARGED — its ledger debits, live while it runs — not its
@@ -330,7 +342,7 @@ def jaah_charges(session: Session, task_ids: Iterable[int]) -> dict[int, int]:
     if not ids:
         return {}
     jaah = set(session.scalars(
-        select(JaahSession.task_id).where(JaahSession.kind == "runner", JaahSession.task_id.in_(ids)).distinct()
+        select(JaahSession.task_id).where(JaahSession.kind == "runner", id_any(JaahSession.task_id, ids)).distinct()
     ))
     if not jaah:
         return {}
@@ -465,7 +477,7 @@ def compute_run_metrics(
         return None
     scope_ids = [t.id for t in scope]
     trails = _state_trails(scope_ids, session)
-    now = datetime.now(timezone.utc)
+    now = utcnow()
 
     # The go instant is the root's first transition out of `draft` after its last reset (`ready` for a
     # dispatched task, `active` for an epic), so queue wait is included and an abandoned run is not.
@@ -603,7 +615,7 @@ def run_aggregates(
     # read is visible to a holder of the root's grant.
     tree = (
         select(Task.id.label("root"), Task.id.label("node"))
-        .where(Task.id.in_(task_ids))
+        .where(id_any(Task.id, task_ids))
         .cte("cost_scope", recursive=True)
     )
     step = select(tree.c.root, Task.id).where(Task.parent_task_id == tree.c.node)
@@ -614,6 +626,9 @@ def run_aggregates(
         select(tree.c.root, Task.id, Task.persona, Task.metrics)
         .select_from(tree)
         .join(Task, Task.id == tree.c.node)
+        # Redundant with the join, and there for the planner: the array (an InitPlan) reads the scope's rows by
+        # primary key where the join alone hashed a seq scan of every task (`_scope_tasks`).
+        .where(Task.id == any_(func.array(select(tree.c.node).scalar_subquery())))
         .where(Task.persona.in_(list(PERSONA_CHARTER)))
     ).all()
     prices = live_rates(session, rows)

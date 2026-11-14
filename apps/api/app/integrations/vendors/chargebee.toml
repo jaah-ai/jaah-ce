@@ -1,0 +1,46 @@
+# Chargebee: Basic auth with the API key as the user name and an empty password, on the site's own subdomain.
+slug = "chargebee"
+label = "Chargebee"
+category = "payments"
+vendor_docs_url = "https://apidocs.chargebee.com/docs/api/auth"
+summary = "Read and manage Chargebee subscriptions, customers, invoices and plans."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "site", label = "Site name", kind = "text", required = true, placeholder = "acme-test", help = "The first part of your Chargebee address: for https://acme-test.chargebee.com it is acme-test. A test site and a live site are separate sites with separate keys" },
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "In Chargebee, open Settings > Configure Chargebee > API Keys and Events > API Keys and select + Add API Key. Choose Read-Only Key > All for agents that only report, or Full-Access Key when they must change subscriptions, name it Jaah and select Create Key" },
+]
+
+# One page of one subscription: the cheapest call every key type that can read billing data may make.
+[test]
+method = "GET"
+path = "https://{site}.chargebee.com/api/v2/subscriptions?limit=1"
+auth = { basic = ["api_key"] }
+list_field = "list"
+
+[docs]
+agent_uses = [
+  "Look up a customer's subscription, plan, status and next billing date when a support task names them",
+  "List invoices, credit notes and unpaid balances to answer a billing question or build a revenue report",
+  "Pause, cancel or change a subscription's plan when a task asks for it (needs a Full-Access key)",
+  "Check that a plan, add-on or coupon exists with the right price before a release that relies on it",
+]
+prerequisites = [
+  "A Chargebee site, test or live, and a user who can open Settings > Configure Chargebee > API Keys and Events (an Admin or Owner role)",
+  "Decide whether agents only read (Read-Only key) or also change billing (Full-Access key): the key's type is the limit, Jaah adds none",
+]
+limitations = [
+  "One secret reaches one Chargebee site. A test site and a live site need one secret each",
+  "Chargebee limits API calls per site per minute (lower on test sites); an agent that loops over thousands of records is slowed down, not refused for good",
+  "A Restricted Read-Only key can read only the data groups ticked when it was created, so some reads fail with 401 even though Test passes",
+]
+troubleshooting = [
+  { symptom = "Test says Chargebee rejected the API key (401)", fix = "The key belongs to another site (often the test key used on the live site, or the reverse), was deleted, or was mistyped. Check Site name matches the key's site, create a new key in Settings > Configure Chargebee > API Keys and Events and select Replace" },
+  { symptom = "Test says Chargebee cannot be reached at that address", fix = "Site name must be only the first part of the address, such as acme-test, with no https:// and no .chargebee.com" },
+  { symptom = "Test passes but an agent's change is refused with 401", fix = "The key is Read-Only. Create a Full-Access key and replace the stored one" },
+]
+faq = [
+  { q = "Which key type should I create", a = "Read-Only > All when agents only report on billing; Full-Access only when tasks must change subscriptions or customers. You can replace the key later without changing anything else" },
+  { q = "Does Test change anything in Chargebee", a = "No. It reads one page of at most one subscription and discards it" },
+]

@@ -1,0 +1,40 @@
+# Lovable API, over the hand-written `lovable` type (adopted, AS3: its fields and Test, GET /v1/workspaces with the
+# Lovable-API-Key header, are unchanged). Facts confirmed at the vendor's own docs: workspace API keys (Business and
+# Enterprise, owners and admins; lov_ prefix; per-key scopes and IP allowlist) https://docs.lovable.dev/features/api-keys ;
+# https://docs.lovable.dev/api-reference/introduction . Probed 2026-11-03: a bad key answers 401.
+slug = "lovable"
+label = "Lovable API"
+category = "dev_tools"
+credential_type = "lovable"
+vendor_docs_url = "https://docs.lovable.dev/features/api-keys"
+summary = "Manage and deploy your Lovable projects and read workspace data from agent work."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, placeholder = "lov_...", help = "Lovable > Workspace settings > API keys & OAuth > Workspace access tokens > New API key: name it Jaah, choose access for Projects and Workspace (Read for a read-only connection), then Create and copy it - Lovable shows it once" },
+]
+
+[docs]
+agent_uses = [
+  "List the workspace's projects and read their settings and status",
+  "Deploy or publish an existing Lovable project from a task",
+  "Read workspace members, groups, security insights and analytics for a report",
+]
+prerequisites = [
+  "A Lovable workspace on the Business or Enterprise plan, and the Owner or Admin role in it",
+]
+limitations = [
+  "A key reaches one workspace; connect each workspace separately",
+  "The API manages and deploys existing projects; it does not build or edit apps with Lovable's AI",
+  "A key with an IP allowlist refuses calls from other addresses with 403 ip_restricted: leave the allowlist empty, or add the addresses your Jaah calls from",
+]
+troubleshooting = [
+  { symptom = "Test says Lovable rejected the API key", fix = "The key was revoked or mistyped. Create a new key in Workspace settings > API keys & OAuth and select Replace" },
+  { symptom = "Test fails with 403 ip_restricted", fix = "The key's IP allowlist does not include Jaah. Clear the allowlist or add Jaah's outbound addresses" },
+  { symptom = "There is no API keys option in Workspace settings", fix = "The workspace is not on Business or Enterprise, or you are not an Owner or Admin" },
+]
+faq = [
+  { q = "Does the API use my AI credits", a = "No. Lovable's current API endpoints do not consume AI build credits" },
+  { q = "Which access should the key have", a = "Read on Projects and Workspace for a look-only connection; Read & write on Projects to let agents deploy" },
+]

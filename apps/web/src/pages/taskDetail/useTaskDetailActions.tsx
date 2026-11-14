@@ -1,21 +1,22 @@
 // The Task page's handlers: gate-round writes, the ⋯'s task verbs, the runner console doors and the form's saves.
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { apiDetail, del, post } from '../../api'
+import { apiDetail, post } from '../../api'
 import { useConfirm } from '../../components/ConfirmDialog'
 import { useConsoleDock } from '../../components/ConsoleDock'
 import { CONTROLS, startIntentFor } from '../../components/tasks/controls'
 import type { RoundSend } from '../../components/tasks/GateSteps'
 import { PANE_QUERY_KEY, forgetDeletedTasks } from '../../components/tasks/pane/queryKeys'
-import { postRoundAnswer } from '../../components/tasks/roundAnswer'
+import { postRoundAnswers, throwIfRoundsFailed } from '../../components/tasks/roundAnswer'
 import { taskOverflowItems, taskRowActionFlags, type TaskRowActionHandlers } from '../../components/tasks/rowActions'
 import { deescapeMarkdownText, displayTitle, LIVE_STATES } from '../../components/tasks/shared'
 import { useTaskActions } from '../../components/tasks/useTaskActions'
-import { lastBoardScope } from '../../lib/boardScope'
-import { taskDeepLinkPath } from '../../lib/taskDeepLink'
+import { savedTaskReturn } from '../../lib/taskReturn'
 import { duplicateTask } from '../../lib/taskDuplicate'
-import { hasLiveSession, resolveTitle } from '../../lib/worktree'
+import { slotConsoleRequest } from '../../hooks/useWorktreeAccess'
+import { useTaskPins } from '../../hooks/useTaskPins'
 import { queryClient } from '../../queryClient'
+import { pipelineItemsKey } from '../../lib/pipelineBoard'
 import type { PipelineTask } from '../../types'
 import type { OverflowItem } from '../../ui/OverflowMenu'
 import type { TaskTab } from './taskDetailConstants'
@@ -23,6 +24,7 @@ import type { TaskDetailAccess } from './useTaskDetailAccess'
 import type { TaskDetailDerived } from './useTaskDetailDerived'
 import type { TaskDetailRead } from './useTaskDetailLoad'
 import { isEnabled } from '../../lib/editionFeatures'
+import { countOf } from '../../lib/humanize'
 
 export type TaskDetailActions = ReturnType<typeof useTaskDetailActions>
 
@@ -42,7 +44,7 @@ export function keepLoaded(prev: PipelineTask | null, updated: PipelineTask): Pi
 }
 
 export function useTaskDetailActions({
-  id, isCreate, viewer, read, access, derived, ratingFolded, setRatingOpen, selectTab, titleEditable = false,
+  id, isCreate, viewer, read, access, derived, selectTab, titleEditable = false,
   onTitleRegenerated,
 }: {
   id: string | undefined
@@ -51,8 +53,6 @@ export function useTaskDetailActions({
   read: TaskDetailRead
   access: TaskDetailAccess
   derived: TaskDetailDerived
-  ratingFolded: boolean
-  setRatingOpen: (open: boolean) => void
   selectTab: (tab: TaskTab, pin?: boolean) => void
   /** May this viewer change the title (`useTaskDetailFiling`'s `titleEditable`)? Offers "Re-generate title". */
   titleEditable?: boolean
@@ -63,6 +63,7 @@ export function useTaskDetailActions({
   const { otherOrg, canEditTasks, canCreateTasks, canDeleteThisTask, canRunThisTask, awaitingApproval } = access
   const { runnerProjectName, runnerWorktree, consoleRunnerWorktree } = derived
   const navigate = useNavigate()
+  const { isPinned, onTogglePin } = useTaskPins()
   // Post-save action failures from the edit form. On the PAGE because the form remounts on its own
   // writes (see the banner).
   const [actionError, setActionError] = useState('')
@@ -77,12 +78,9 @@ export function useTaskDetailActions({
   // Local submit/error state for this page's own gate-answer form.
   const [submitting, setSubmitting] = useState(false)
   const [answerError, setAnswerError] = useState('')
-  /* Revise's own error line: `answerError` renders on the Answer tab, Revise is clicked on the Q&A
-     subtab. */
+  /* Revise's own error line: `answerError` renders in the gate's form, Revise is clicked on
+     a trail entry. */
   const [reviseError, setReviseError] = useState('')
-  // The row menu's two filing dialogs, opened from this page's ⋯ (`pageActionItems`).
-  const [filingOpen, setFilingOpen] = useState(false)
-  const [waitingOpen, setWaitingOpen] = useState(false)
 
   // A's gate error over B's form: the error line belongs to one task (`/tasks/A → /tasks/B` keeps this instance).
   useEffect(() => {
@@ -99,16 +97,19 @@ export function useTaskDetailActions({
   // The Web Console lives in the shell (components/ConsoleDock.tsx); this page only picks the slot.
   const { open: openConsole } = useConsoleDock()
 
-  // Create and Save land on the task LIST with the saved row REVEALED (`taskDeepLinkPath`) — the board
-  // is bounded and tree-shaped, so a bare `/tasks` may hide it — on the scope the board last showed in this
-  // tab (`lib/boardScope.ts::lastBoardScope`), never moved to the row's project; only a tab with
-  // no earlier board falls back to the row's own project. `replace: true` so Back skips the form.
+  // Create and Save land on the task LIST with the saved row REVEALED, on the scope the board last showed in this
+  // tab and on a stage, not the whole list (`lib/taskReturn.ts`). `replace: true` so Back skips the form.
   // The pane's cached rows predate this save and are persisted, fresh for their `staleTime`: invalidated, they
   // refetch on landing; left alone, the list (and a reload of it) kept the board without the row just created.
+  // The pipeline's strip and stage lists likewise: an answered row otherwise kept its question mark until a poll.
   const backToList = useCallback(
-    (taskId: number, projectId: number) => {
+    (saved: PipelineTask) => {
+      const projectId = saved.project_id
+      const { path, state } = savedTaskReturn(saved)
       void queryClient.invalidateQueries({ queryKey: PANE_QUERY_KEY })
-      navigate(taskDeepLinkPath(taskId, projectId, lastBoardScope()), { replace: true })
+      void queryClient.invalidateQueries({ queryKey: ['pipeline-view', projectId] })
+      void queryClient.invalidateQueries({ queryKey: pipelineItemsKey(projectId) })
+      navigate(path, { replace: true, state })
     },
     [navigate],
   )
@@ -119,7 +120,7 @@ export function useTaskDetailActions({
   const leaveIfAnswered = useCallback(
     (updated: PipelineTask) => {
       if ((updated.questions ?? []).some(q => q.status === 'open')) return
-      backToList(updated.id, updated.project_id)
+      backToList(updated)
     },
     [backToList],
   )
@@ -165,27 +166,17 @@ export function useTaskDetailActions({
     }), { error: setAnswerError, fallback: 'Failed to post answer', after: leaveIfAnswered }),
   [writeRound, leaveIfAnswered])
 
-  /* Sends every open round's outcome from the Answer tab's pages (`GateSteps`) in one write: each answer via
-     `postRoundAnswer`, each skip via POST /tasks/{id}/ignore-question, in page order. The server resumes the
-     Task once NOTHING is outstanding, so the last post delivers them all. A failure stops the run: the rounds
-     already posted have settled, the rest stay open with their drafts. Clears the Q&A trail's Revise banner
-     too: it lives on another tab and nothing else would clear it once the rounds are settled. */
+  /* Sends every open round's outcome from the Q&A tab's pages (`GateSteps`) in ONE call
+     (POST /tasks/{id}/input-requests/answers): the server saves each answer or skip on its own and wakes the
+     runner once nothing is outstanding. Entries it refused stay open with their drafts; their reasons become
+     the form's error, over the row the response carries, so a retry sends only the rest. Clears the Q&A
+     trail's Revise banner too: it lives on another tab and nothing else would clear it once the rounds settle. */
   const submitRounds = useCallback((sends: RoundSend[]) =>
     writeRound(async taskId => {
-      let updated: PipelineTask | undefined
-      try {
-        for (const s of sends) {
-          updated = s.ignore
-            ? await post<PipelineTask>(`/api/tasks/${taskId}/ignore-question`, { question_id: s.questionId })
-            : await postRoundAnswer(taskId, s.answer, s.questionId, s.comment, s.attachmentIds)
-        }
-      } catch (err) {
-        // The rounds posted before the failure have settled: show that, so a retry sends only the rest.
-        const partial = updated
-        if (partial) setTask(prev => keepLoaded(prev, partial))
-        throw err
-      }
-      if (updated === undefined) throw new Error('Nothing to send')
+      if (sends.length === 0) throw new Error('Nothing to send')
+      const { task: updated, results } = await postRoundAnswers(taskId, sends)
+      if (results.some(r => r.outcome === 'failed')) setTask(prev => keepLoaded(prev, updated))
+      throwIfRoundsFailed(results)
       return updated
     }, {
       error: setAnswerError, alsoClear: setReviseError, fallback: 'Failed to send answers', after: leaveIfAnswered,
@@ -193,28 +184,18 @@ export function useTaskDetailActions({
   [writeRound, leaveIfAnswered, setTask])
 
   /* REVISE one resolved round via POST /tasks/{id}/revise-question: it REOPENS the round, so every
-     existing answer path then works unchanged. The error is its own, since `answerError` renders on the
-     Answer tab. On success jump to the Answer tab, where the reopened round is answerable. */
+     existing answer path then works unchanged. The error is its own, since `answerError` renders in the
+     gate's form. On success jump to the Q&A tab, where the reopened round is answerable. */
   const submitReviseQuestion = useCallback((questionId: number) =>
     writeRound(taskId => post<PipelineTask>(`/api/tasks/${taskId}/revise-question`, { question_id: questionId }), {
-      error: setReviseError, fallback: 'Failed to revise answer', after: () => selectTabRef.current('answer'),
+      error: setReviseError, fallback: 'Failed to revise answer', after: () => selectTabRef.current('qa'),
     }),
   [writeRound])
 
-  /* A filing, a wait or a ⋯ write returns the row; the page holds it (children and tags rescued, as `onSaved`
+  /* A ⋯ write returns the row; the page holds it (children and tags rescued, as `onSaved`
      does) — unless it lands after the page moved to another id (the route reuses this page). */
   const holdUpdated = (updated: PipelineTask) =>
     setTask(prev => prev !== null && prev.id !== updated.id ? prev : keepLoaded(prev, updated))
-  /* The waiting banner's ×: drops the reason, keeps the state. */
-  const dismissWaiting = async () => {
-    if (task === null) return
-    setActionError('')
-    try {
-      holdUpdated(await del<PipelineTask>(`/api/tasks/${task.id}/wait-on-customer`))
-    } catch (err) {
-      setActionError(apiDetail(err, 'Could not clear Waiting on customer'))
-    }
-  }
   /* One write from the ⋯: busy, clear the error line, hold the returned row (the SSE refetch confirms), name
      a failure. The row is the loaded one, not an argument: the board's model (`useTaskActions`) is per row. */
   const runPageAction = async (_t: PipelineTask, failure: string, write: () => Promise<PipelineTask | void>) => {
@@ -235,21 +216,11 @@ export function useTaskDetailActions({
      fence (the live API also sends `microvm` null and the pool roster empty — this is belt and braces). */
   // No MicroVM without the feature (`microvm`): the community edition has none.
   const microvm = isEnabled('microvm') ? task?.microvm : null
-  const openRunnerConsole = viewer ? undefined : consoleRunnerWorktree ? () => openConsole({
-    project: consoleRunnerWorktree.project,
-    projectId: consoleRunnerWorktree.project_id,
-    number: consoleRunnerWorktree.number,
-    // `nodeId`: (project, number) names one slot PER NODE; without it the relay may attach another
-    // node's same-numbered slot, and the node-addressed Title editor cannot show.
-    nodeId: consoleRunnerWorktree.node_uuid,
-    // Fail-closed server verdict, as in `components/WorktreePool.tsx`; the console ANDs it with its own
-    // key predicate.
-    mayEdit: consoleRunnerWorktree.may_edit,
-    title: resolveTitle(consoleRunnerWorktree),
-    // The row's own session answer at click time (the memo's arms do not prove one); see
-    // `ConsolePane.tsx`'s SLOT_EMPTY_REASON.
-    hadLiveSession: hasLiveSession(consoleRunnerWorktree),
-  }) : microvm && runnerProjectName && task ? () => openConsole({
+  // The slot's request — the server's `may_edit` verdict, node, Title and session snapshot — is
+  // `hooks/useWorktreeAccess.ts::slotConsoleRequest`.
+  const openRunnerConsole = viewer ? undefined : consoleRunnerWorktree ? () => openConsole(
+    slotConsoleRequest(consoleRunnerWorktree),
+  ) : microvm && runnerProjectName && task ? () => openConsole({
     // A MicroVM task holds no slot: the relay attaches its VM by `view` (number 0); the CP resolves the
     // node from the VM row and never creates.
     project: runnerProjectName,
@@ -268,7 +239,8 @@ export function useTaskDetailActions({
 
   /* ── THE ⋯: EVERY TASK ACTION THE BOARD ROW OFFERS ─────────────────────────────────────
      Same flags, items and gates as the board's row menu (`rowActions.tsx` decides which a task offers and
-     why), minus Edit — this page IS the editor. It is the page's only home for Stop and Delete/Archive.
+     why). Edit opens this page's Task tab, the editor: the page may have landed on Q&A or
+     Artifacts. It is the page's only home for Stop and Delete/Archive.
      Offered with unsaved edits too (an operator decision): a write that returns the row re-keys the form. */
   /* The board's verbs (`useTaskActions`: same confirms, routes and preempt dialog) under this page's model.
      Delete: `DELETE /api/tasks/{id}` (any state; `tasks:delete`, or a `tasks:create` author's own
@@ -291,8 +263,7 @@ export function useTaskDetailActions({
       message: (
         <>
           {verb} “<strong>{displayTitle(t.title, { showPersona: true })}</strong>”? The task
-          {(t.children?.length ?? 0) > 0 && <> and its {t.children?.length} subtask
-            {t.children?.length === 1 ? '' : 's'}</>} and its attachments are deleted for good —
+          {(t.children?.length ?? 0) > 0 && <> and its {countOf(t.children?.length ?? 0, 'subtask')}</>} and its attachments are deleted for good —
           this cannot be undone.{LIVE_STATES.has(t.state) && <> It will be stopped.</>}
         </>
       ),
@@ -312,16 +283,19 @@ export function useTaskDetailActions({
     ? null
     : (() => {
         const handlers: TaskRowActionHandlers = {
+          // Only where the Task tab is editable: Edit must never open a read-only form.
+          onEdit: access.canEditThisTask ? () => selectTabRef.current('task', true) : undefined,
           onStart: canEditTasks ? (t, intent) => void actions.start(t, intent) : undefined,
           onStop: canEditTasks ? t => void actions.stop(t) : undefined,
           onReset: canEditTasks ? t => void actions.reset(t) : undefined,
           onComplete: canEditTasks ? t => void actions.complete(t) : undefined,
           onDelete: canDeleteThisTask ? t => void actions.confirmDelete(t) : undefined,
+          onDiscard: canDeleteThisTask ? t => void actions.discard(t) : undefined,
           /* Another org's row: the editor opens acting as it, so the copy files there, as New task does. */
           onDuplicate: canCreateTasks ? t => duplicateTask(t, otherOrg, navigate) : undefined,
           duplicateAsOf: () => otherOrg,
-          onMoveToFeature: canEditTasks ? () => setFilingOpen(true) : undefined,
-          onWaitOnCustomer: canEditTasks ? () => setWaitingOpen(true) : undefined,
+          // This user's pin (`lib/taskPin.ts`): the ⋯'s Pin / Unpin; none on the Live Cast viewer.
+          ...(viewer ? {} : { isPinned, onTogglePin }),
           canRunRow: () => canRunThisTask,
           startBlockedReason: awaitingApproval,
           worktreeFor: () => runnerWorktree,
@@ -331,20 +305,22 @@ export function useTaskDetailActions({
         const variant = task.parent_task_id === null ? 'root' : 'leaf'
         const flags = taskRowActionFlags(task, variant, handlers)
         return {
+          // The header's Accept/Discard on a Jaah suggestion (`SuggestionActions`) read the same gates.
+          handlers,
           // Named as the trail shows the title (de-escaped), like the ⋯ itself (`TaskDetailHeader`).
-          items: taskOverflowItems(task, deescapeMarkdownText(task.title), variant, handlers, flags),
+          items: taskOverflowItems(task, deescapeMarkdownText(task.title), handlers, flags),
           // The pill's Start is the overflow's Start, gated the same way.
           onPillStart: flags.showStart && !flags.startBlockedReason
-            ? () => void actions.start(task, startIntentFor(task, variant))
+            ? () => void actions.start(task, startIntentFor(task))
             : undefined,
           // Beside the pill's Start, on the same gate, while a MicroVM node holds the task's last VM.
           onStartElsewhere: flags.showStart && !flags.startBlockedReason && isEnabled('microvm') && task.vm_hold_node
-            ? () => void actions.startElsewhere(task, startIntentFor(task, variant))
+            ? () => void actions.startElsewhere(task, startIntentFor(task))
             : undefined,
         }
       })()
-  /* Re-generate title: the auto-title model over the current body, overwriting the title. Page-only, like
-     Rate result; on the title route, so an operator gets it on another org's row too. */
+  /* Re-generate title: the auto-title model over the current body, overwriting the title. Page-only; on the title
+     route, so an operator gets it on another org's row too. */
   const regenerateTitle = task !== null && titleEditable
     ? () => void runPageAction(task, 'Could not re-generate the title',
       async () => {
@@ -363,22 +339,14 @@ export function useTaskDetailActions({
           testId: 'task-regenerate-title', onClick: regenerateTitle,
         }]
       : []),
-    ...(ratingFolded
-      ? [{ key: 'rate', icon: '☆', label: 'Rate result', ariaLabel: 'Rate result', testId: 'task-rating-fold', onClick: () => setRatingOpen(true) }]
-      : []),
   ]
 
   // The edit form's Save and Go return to the LIST; `setTask` first so the page holds the saved row regardless.
   const onEditSaved = (saved: PipelineTask) => {
     setActionError('')
     setSavedNotice('')
-    // `tags` rescued beside `children` (see `submitAnswer`).
-    setTask(prev => ({
-      ...saved,
-      children: saved.children ?? prev?.children,
-      tags: saved.tags?.length ? saved.tags : prev?.tags,
-    }))
-    backToList(saved.id, saved.project_id)
+    setTask(prev => keepLoaded(prev, saved))
+    backToList(saved)
   }
   /* A Go whose late reset confirm was cancelled (the row went running during the save): the save landed and
      the runner is untouched, so the page STAYS on the saved row — the form re-keys on it, clean — and says what
@@ -393,9 +361,9 @@ export function useTaskDetailActions({
   }
 
   return {
-    confirm, confirmDialog, submitting, answerError, reviseError, actionError, setActionError, acting, filingOpen,
-    setFilingOpen, waitingOpen, setWaitingOpen, backToList, submitAnswer, submitRounds,
-    submitReviseQuestion, holdUpdated, dismissWaiting, openRunnerConsole, openRunnerChat, preemptDialog: actions.preemptDialog,
+    confirm, confirmDialog, submitting, answerError, reviseError, actionError, setActionError, acting,
+    backToList, submitAnswer, submitRounds,
+    submitReviseQuestion, holdUpdated, openRunnerConsole, openRunnerChat, preemptDialog: actions.preemptDialog,
     pageActions, pageActionItems, onEditSaved, onEditKept, savedNotice, setSavedNotice,
   }
 }

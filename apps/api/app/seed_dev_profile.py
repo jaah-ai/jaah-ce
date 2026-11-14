@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Optional
 
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from app.clock import utcnow
 from app.models.access import Group, RoleBinding, UserGroupMembership
 from app.models.agent_sessions import AgentSession
 from app.models.audit import CommandAudit
@@ -32,10 +33,11 @@ from app.models.orgs import Org
 from app.models.projects import Project, Runner
 from app.models.tasks import Task
 from app.models.worktrees import WORKTREE_KIND_DYNAMIC, Worktree
-from app import access, agent_providers, db_credentials, edition_features, identities, project_repos, slot_allocation
+from app import access, agent_providers, db_credentials, edition_features, identities, project_repos
 from app.access_catalog import ROLES_BY_SLUG, SCOPE_ACCOUNT, SCOPE_ORG, SCOPE_PROJECT
 from app.tenancy.ids import ORG_ZERO_ID
 from app.plan_terms import DEFAULTS_KEY
+from app.releases import basics
 
 #: The profile names the CLI accepts; a set so an unknown `--profile x` is refused by name in `app/seed.py`.
 PROFILE_DEV = "dev"
@@ -53,14 +55,13 @@ _CREDENTIAL_LINE_PREFIX = "DEV_NODE_CREDENTIAL"
 #: The synthetic node. A DNS label, because a real node's name becomes its systemd unit and hostname.
 DEV_NODE_NAME = "dev-node"
 # The address a seeded node is told to dial: this stack's own api over loopback. `API_BASE_URL` follows
-# `tests/conftest.py`'s convention; the default is uvicorn's in-container bind.
+# `tests/conftest.py`'s convention; the default is the server's in-container bind.
 CP_BASE_URL = os.environ.get("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 #: The credential account a dispatch resolves. `oauth`, not `api_key`: the api-key arm's DB check
 #: (`ck_accounts_api_key_has_credential`) requires real key material. Short because the slug renders in a
 #: fixed 52px lead cell (`pages/credentials/Accounts.tsx`).
 DEV_ACCOUNT_SLUG = "dev"
-#: How many static slots the fixture seeds for `acme` on the dev node (its `worktrees` rows, pinned as the pair's
-#: assignment override by `_dev_slots`): a pool, still readable.
+#: How many free slots the fixture seeds for `acme` on the dev node (`_dev_slots`).
 DEV_SLOT_COUNT = 6
 
 #: The database hosts this fixture accepts — the second half of its gate. `APP_ENV` describes the
@@ -71,12 +72,14 @@ _LOCAL_DB_HOSTS: frozenset[str] = db_credentials.LOCAL_DB_HOSTS
 
 #: The two fixture projects, and every delivery field a dispatch reads. Names and count are the
 #: Playwright suite's requirement (`tasks-form-no-gates.spec.ts` needs `acme-ops` and a switcher); `acme`
-#: sorts first as the create form's default. `repo_url` is set because slot paths derive from
-#: `owner/repo` (`pool_slots.slot_path`); without it slots name no directory.
+#: sorts first as the create form's default. `repo_url` is set because a dispatch clones from it.
 _DEV_PROJECTS: tuple[tuple[str, str], ...] = (
     ("acme", "https://github.com/example/acme"),
     ("acme-ops", "https://github.com/acme/acme-ops"),
 )
+#: The fixture project on a custom pipeline (`app/releases/basics.py`), so its Pipeline tab — the full stage editor the
+#: Playwright suite drives (`pipeline-page.spec.ts`, `project-edit-tabs.spec.ts`) — shows; `acme-ops` stays on its basic.
+_DEV_CUSTOM_PIPELINE_PROJECT = "acme"
 #: The delivery columns every fixture project carries, spelled once. They equal the DB defaults, but a
 #: row that merely inherited them looks unfinished, which `lease_drain` skips.
 _DEV_PROJECT_DELIVERY: dict[str, object] = {
@@ -157,7 +160,7 @@ _PERSONA_PASSWORD_VAR = "E2E_NONSUPERADMIN_PASSWORD"
 #: (`live_cast/entitlement.py`) — given the product by a comp, one project, and a board in the states a viewer is
 #: shown (`live_cast/visibility.py::WITHHELD_STATES` hides the rest). Titles are distinct from `_DEV_STANDALONE`'s:
 #: `_dev_tasks` dedupes by title alone.
-DEV_LIVE_ORG_SLUG = "dev-live"
+DEV_LIVE_ORG_SLUG = "devlive"
 DEV_LIVE_PROJECT = "live-demo"
 _DEV_LIVE_TASKS: tuple[tuple[str, str], ...] = (
     ("Live: ship the public board snapshot", "done"),
@@ -252,6 +255,7 @@ def seed_dev(session) -> dict:
         _access_personas(session, created)
         _board_preferences(session, created)
         _dev_live_cast(session, created)
+        _default_email_channels(session, created)
         _enable_pipeline_cron(session, created)
         _plan_switches_on(session, created)
         # Last, and read-only: an inserted count is not proof the rows are there (rejected, wrong tenant, unflushed).
@@ -278,7 +282,7 @@ def _refuse_a_non_local_database(session) -> None:
         f"({sorted(_LOCAL_DB_HOSTS)}). APP_ENV describes the PROCESS and DATABASE_URL chooses the "
         "TARGET, so the two can disagree — the `awsdb` compose profile exists to make them disagree. "
         "This profile mints a node credential and converges the delivery columns of any project named "
-        "`acme` or `acme-ops`, so a database it cannot identify as throwaway is refused rather than "
+        "`acme` or `acme-ops` (and puts `acme` on a custom pipeline), so a database it cannot identify as throwaway is refused rather than "
         "seeded."
     )
 
@@ -302,12 +306,16 @@ def _dev_projects(session, created: dict) -> dict[str, Project]:
             inserted += 1
         else:
             # Converge, don't recreate: operator edits to governance fields stay; only the delivery columns the
-            # fixture promises are re-asserted.
+            # fixture promises, and `acme`'s custom pipeline below, are re-asserted.
             for field, value in delivery.items():
                 setattr(row, field, value)
             if (row.repo_url or "").strip():
                 repo = {"integration_branch": repo["integration_branch"]}
         project_repos.upsert_primary(session, row, repo, None)
+        if name == _DEV_CUSTOM_PIPELINE_PROJECT and row.pipeline_mode != basics.CUSTOM:
+            # Its Pipeline tab is the custom editor's. Custom pipelines are on for the dev org already (revision
+            # 202611140800); `_plan_switches_on` turns them on for the other seeded orgs.
+            row.pipeline_mode = basics.CUSTOM
         rows[name] = row
     created["dev_projects"] = inserted
     return rows
@@ -375,20 +383,17 @@ def _dev_account(session, created: dict) -> Account:
 
 
 def _dev_slots(session, node: Node, project: Project, created: dict) -> None:
-    """Seed the static slots for `project` on `node`: `DEV_SLOT_COUNT` `worktrees` rows, then the pair's
-    assignment pinned to that count so `converge` keeps them.
+    """Seed `DEV_SLOT_COUNT` free `worktrees` rows for `project` on `node`.
 
-    The path is derived (`resolve_clone` + `slot_path`), never typed, so the port grid can reason about
+    The path is derived (`node_clone.slot_path`), never typed, so the port grid can reason about
     it. Every slot is `free`: pre-held slots would leave the drain nowhere to place a first epic."""
-    from app.node_clone import resolve_clone
-    from app.routes.pool_slots import slot_path
+    from app.node_clone import slot_path
     from app.slot_title import default_name
 
-    clone = resolve_clone(node.jaah_home, project.id)
-    if not clone:
+    if not slot_path(node.jaah_home, project.id, 1):
         raise RuntimeError(
-            f"cannot derive a clone path for project {project.name!r} on node {node.name!r} — "
-            "`node_clone.resolve_clone` needs the node's `jaah_home`, "
+            f"cannot derive a slot path for project {project.name!r} on node {node.name!r} — "
+            "`node_clone.slot_path` needs the node's `jaah_home`, "
             "and this fixture sets it (app/seed_dev_profile.py::_DEV_PROJECTS)"
         )
     existing = set(session.scalars(
@@ -407,13 +412,11 @@ def _dev_slots(session, node: Node, project: Project, created: dict) -> None:
             org_id=node.org_id,
             project_id=project.id,
             number=number,
-            path=slot_path(clone, number),
+            path=slot_path(node.jaah_home, project.id, number),
             # Through the helper: `slot_title.stored_opinion` recognises exactly this string as "not renamed".
             name=default_name(project.name, number),
         ))
         inserted += 1
-    # The pair's assignment override holds what was seeded, so the assignment sweep keeps these slots.
-    slot_allocation.pin_to_declared(session, node.id, project.id)
     created["dev_slots"] = inserted
 
 
@@ -530,7 +533,7 @@ def _dev_runners_and_sessions(
     Both tables are observations nothing acts on, so invented rows are safe. Transcript statuses are
     spread so the degraded states render; `uploaded` is absent
     because `ck_sessions_uploaded_names_a_manifest` needs a manifest key."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     default = agent_providers.DEFAULT_PROVIDER
     runner_shapes = (
         (default, "active", 1), (default, "active", 2), (default, "idle", 3),
@@ -642,7 +645,7 @@ def _probe_node(session, org_prefix: str, org_id: uuid.UUID, registered_node, cp
 def _probe_project(session, org_prefix: str, org_id: uuid.UUID) -> Project:
     """The `<org>-probe-projects` row.
 
-    No `description` (the table has no such column) and no `port_block` (unique per org; could collide)."""
+    No `description` (the table has no such column)."""
     name = _probe_name(org_prefix, "projects")
     row = session.scalar(select(Project).where(Project.name == name, Project.org_id == org_id))
     if row is None:
@@ -674,8 +677,8 @@ def _probe_task(session, org_prefix, org_id, project: Project, persona: str) -> 
 def _probe_worktree(session, org_prefix, org_id, node: Node, project: Project, task: Task) -> int:
     """The `<org>-probe-worktrees` row, HELD BY the probe task.
 
-    The hold matters: a `free` slot is invisible to a scoped viewer. `task` is the only hold available
-    (`user` needs an `owner_user_id`). Returns rows inserted, like every probe, so a converged re-run
+    The hold matters: a `free` slot is invisible to a scoped viewer, and `task` is the only hold.
+    Returns rows inserted, like every probe, so a converged re-run
     reports zero; the hold is still converged unconditionally."""
     name = _probe_name(org_prefix, "worktrees")
     row = session.scalar(select(Worktree).where(Worktree.name == name))
@@ -689,8 +692,7 @@ def _probe_worktree(session, org_prefix, org_id, node: Node, project: Project, t
             node_id=node.id,
             project_id=project.id,
             org_id=org_id,
-            # Dynamic: the probe project sizes no pool, and a held dynamic worktree on an assignment of zero
-            # statics is what the assignment model converges to and then leaves alone.
+            # Dynamic, as every slot is: a held row is one the converge leaves alone.
             kind=WORKTREE_KIND_DYNAMIC,
             has_repo=False,
         )
@@ -698,7 +700,7 @@ def _probe_worktree(session, org_prefix, org_id, node: Node, project: Project, t
         session.flush()
         inserted = 1
     # A folder slot, as the repo-less probe project implies: a git slot there is retired by the converge pass
-    # (`slot_allocation._converge_assigned`), and the probe node has no daemon to confirm the destroy, so the
+    # (`slot_allocation.converge`, the lost-repository arm), and the probe node has no daemon to confirm the destroy, so the
     # row sat at "Destroying" for good. A row seeded before this converges here; its old `destroy_slot` intent
     # stays, harmless, since the probe node never runs a daemon.
     if row.has_repo or row.retiring_at is not None or row.destroy_error is not None:
@@ -708,8 +710,6 @@ def _probe_worktree(session, org_prefix, org_id, node: Node, project: Project, t
     if row.state != "task" or row.task_id != task.id:
         row.state = "task"
         row.task_id = task.id
-        row.owner_user_id = None
-    slot_allocation.pin_to_declared(session, node.id, project.id)
     return inserted
 
 
@@ -774,7 +774,7 @@ def _probe_audit(session, org_prefix, org_id) -> int:
 
 
 def _probe_admin_user(session, org_prefix, org_id) -> int:
-    """The `<org>-probe-admin-users` row, WITH NO `password_hash`: listed on `/directory`, never signable-in."""
+    """The `<org>-probe-admin-users` row, WITH NO `password_hash`: listed on `/users`, never signable-in."""
     name = _probe_name(org_prefix, "admin-users")
     email = f"{name}@cockpit.local"
     if _membership_id(session, email) is not None:
@@ -783,7 +783,7 @@ def _probe_admin_user(session, org_prefix, org_id) -> int:
         email=email,
         description=_PROBE_DESCRIPTION,
         is_superadmin=False,
-        activated_at=datetime.now(timezone.utc),
+        activated_at=utcnow(),
         org_id=org_id,
     ))
     return 1
@@ -863,11 +863,11 @@ def _e2e_self_service_org(session, created: dict) -> None:
     )
     owner = AdminUser(
         email=E2E_SELF_SERVICE_OWNER_EMAIL, role="admin", org_id=org.id,
-        activated_at=datetime.now(timezone.utc),
+        activated_at=utcnow(),
     )
     session.add(owner)
     session.flush()
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     session.add(OrgSignup(
         org_id=org.id, owner_id=owner.id, provider="google", email=owner.email,
         signed_up_at=now, submitted_at=now,
@@ -961,10 +961,6 @@ def _bind(session, *, role: str, scope: dict, user_id=None, group_id=None) -> in
     ).all())
 
 
-def _user_id(session, email: str) -> Optional[uuid.UUID]:
-    return _membership_id(session, email)
-
-
 def _access_personas(session, created: dict) -> None:
     """One login per binding shape, the dev groups, and one attached plus one personal credential.
     Every login is a member of the org's Everyone group.
@@ -991,7 +987,7 @@ def _access_personas(session, created: dict) -> None:
 
     bindings = 0
     for email, role, scope_type, scope_name in _DEV_PERSONAS:
-        user_id = _user_id(session, email)
+        user_id = _membership_id(session, email)
         if user_id is None:
             print(f"seed[dev]: no {email} row — no {role} binding (the login itself was skipped)")
             continue
@@ -1008,7 +1004,7 @@ def _access_personas(session, created: dict) -> None:
             session.flush()
         group_rows += _bind(session, role=role, scope=_persona_scope(session, scope_type, scope_name),
                             group_id=group.id)
-        member_id = _user_id(session, member_email)
+        member_id = _membership_id(session, member_email)
         if member_id is not None and session.scalar(
             select(UserGroupMembership.id).where(
                 UserGroupMembership.user_id == member_id, UserGroupMembership.group_id == group.id)
@@ -1056,7 +1052,7 @@ def _persona_credentials(session) -> int:
         session.add(ProjectCredential(project_id=project_id, credential_id=attached.id, org_id=DEV_ORG_ID))
         inserted += 1
 
-    owner_id = _user_id(session, _DEV_PERSONAL_CREDENTIAL_OWNER)
+    owner_id = _membership_id(session, _DEV_PERSONAL_CREDENTIAL_OWNER)
     if owner_id is None:
         print(f"seed[dev]: no {_DEV_PERSONAL_CREDENTIAL_OWNER} row — no personal credential to own")
     else:
@@ -1071,7 +1067,7 @@ def _persona_census(session) -> list[str]:
     A persona whose login is absent is skipped (its password variable was unset, printed at write)."""
     missing: list[str] = []
     for email, role, scope_type, scope_name in _DEV_PERSONAS:
-        user_id = _user_id(session, email)
+        user_id = _membership_id(session, email)
         if user_id is None:
             continue
         clauses = [RoleBinding.user_id == user_id, RoleBinding.role_id == ROLES_BY_SLUG[role].id]
@@ -1087,7 +1083,7 @@ def _persona_census(session) -> list[str]:
             RoleBinding.group_id == group_id, RoleBinding.role_id == ROLES_BY_SLUG[role].id, *scope,
         )) is None:
             missing.append(f"group binding {role} -> {name}")
-        member_id = _user_id(session, member_email)
+        member_id = _membership_id(session, member_email)
         if member_id is not None and group_id is not None and session.scalar(select(UserGroupMembership.id).where(
             UserGroupMembership.user_id == member_id, UserGroupMembership.group_id == group_id
         )) is None:
@@ -1100,7 +1096,7 @@ def _persona_census(session) -> list[str]:
             ProjectCredential.project_id == _persona_scope(session, SCOPE_PROJECT, project_name)["project_id"])
     ) is None:
         missing.append(f"attached credential {name}")
-    owner_id = _user_id(session, _DEV_PERSONAL_CREDENTIAL_OWNER)
+    owner_id = _membership_id(session, _DEV_PERSONAL_CREDENTIAL_OWNER)
     personal = _seeded_credential(session, _DEV_PERSONAL_CREDENTIAL, DEV_ORG_ID)
     if owner_id is not None and (personal is None or personal.owner_id != owner_id):
         missing.append(f"personal credential {_DEV_PERSONAL_CREDENTIAL}")
@@ -1118,17 +1114,11 @@ def _fixture_admin_id(session) -> Optional[uuid.UUID]:
     return _membership_id(session, email)
 
 
-#: The nameless smoke identity's name prompt, recorded closed: the console's `NAME_PROMPT_DISMISSED_STEP`
-#: (`apps/web/src/lib/onboarding.ts`); the server stores step ids as opaque strings.
-_NAME_PROMPT_DISMISSED_STEP = "name_prompt_dismissed"
-
-
 def _board_preferences(session, created: dict) -> None:
-    """Put the e2e smoke identity on a board that shows everything, with the Get-started card and the name prompt
-    dismissed.
+    """Put the e2e smoke identity on a board that shows everything, with the Get-started card dismissed.
 
-    An undismissed Get-started card (or the in-flow name prompt) shifts the board's geometry, which fails specs
-    as something else. Written through `app/preferences.py`'s round-trip so the stored document keeps the API's shape, including the `notifications` block."""
+    An undismissed Get-started card shifts the board's geometry, which fails specs
+    as something else. Written through `app/preferences.py`'s round-trip so the stored document keeps the API's shape."""
     from app.preferences import UserPreferences, preferences_to_store
 
     # Selected, not `session.get`: the tenancy-bypass census test counts primary-key `get`s.
@@ -1140,14 +1130,32 @@ def _board_preferences(session, created: dict) -> None:
         created["board_preferences"] = "skipped"
         return
     preferences = UserPreferences.from_stored(user.preferences)
-    if preferences.onboarding_dismissed and _NAME_PROMPT_DISMISSED_STEP in preferences.onboarding_steps_done:
+    if preferences.onboarding_dismissed:
         created["board_preferences"] = "exists"
         return
     preferences.onboarding_dismissed = True
-    if _NAME_PROMPT_DISMISSED_STEP not in preferences.onboarding_steps_done:
-        preferences.onboarding_steps_done = [*preferences.onboarding_steps_done, _NAME_PROMPT_DISMISSED_STEP]
     user.preferences = preferences_to_store(preferences, user.preferences)
     created["board_preferences"] = "set"
+
+
+def _default_email_channels(session, created: dict) -> None:
+    """Give every seeded membership its account-email channel (`notification_channels.ensure_account_email`), so a
+    local stack's Alerts tab shows the default Email channel as a released one does. Last among the writers: every
+    membership the profile makes exists by now. Idempotent."""
+    from app import notification_channels
+    from app.models.notifications import NotificationChannel
+
+    missing = session.scalars(
+        select(AdminUser).where(
+            AdminUser.is_system.is_(False),
+            ~select(NotificationChannel.id).where(
+                NotificationChannel.admin_user_id == AdminUser.id, NotificationChannel.account_email.is_(True),
+            ).exists(),
+        )
+    ).all()
+    for user in missing:
+        notification_channels.ensure_account_email(session, user)
+    created["default_email_channels"] = len(missing)
 
 
 # ── The census: the read-back that makes a green run falsifiable ────────────────────────────────────
@@ -1265,7 +1273,7 @@ def _dev_live_cast(session, created: dict) -> None:
 
     from app.live_cast import state
     from app.live_cast.models import DEFAULT_ALL
-    from app.models.billing import OrgComp
+    from app.models.products import Product, ProductLine
     from app.org_create import create_org_row
     from app.routes.tasks.policy import PERSONA_CODER
     from app.signup_plans import PRESELECTED
@@ -1280,9 +1288,23 @@ def _dev_live_cast(session, created: dict) -> None:
         org = create_org_row(session, slug=DEV_LIVE_ORG_SLUG, name="Dev Live",
                              description="The local Live Cast (`./dc seed --dev`)", self_service=False,
                              plan_key=PRESELECTED)
-    if session.scalar(select(OrgComp.id).where(OrgComp.org_id == org.id, OrgComp.kind == "live_cast")) is None:
-        session.add(OrgComp(org_id=org.id, name="Dev Live Cast", kind="live_cast", quantity=1, backfill_tasks=50,
-                            end_mode="never"))
+    product = session.scalar(select(Product).where(Product.kind == "live_cast", Product.customer_org_id.is_(None))
+                             .order_by(Product.created_at).limit(1))
+    if product is None:
+        print("seed[dev]: no Live Cast product in the catalogue — the Dev Live org gets no comp")
+    elif session.scalar(select(ProductLine.id).where(
+        ProductLine.owner == "comp", ProductLine.customer_org_id == org.id, ProductLine.product_id == product.id,
+    )) is None:
+        # The product engine's comp line (its legacy row the line mirror writes, billing edition only).
+        line = ProductLine(owner="comp", customer_org_id=org.id, product_id=product.id, quantity=1, end_mode="never",
+                           config={"backfill_tasks": 50}, name="Dev Live Cast", origin="operator",
+                           created_by_id=actor_id, updated_by_id=actor_id)
+        session.add(line)
+        session.flush()
+        if edition_features.enabled("billing"):
+            from app.products import engine
+
+            engine.mirror_line(session, line)
     project = session.scalar(select(Project).where(Project.org_id == org.id, Project.name == DEV_LIVE_PROJECT))
     if project is None:
         project = Project(name=DEV_LIVE_PROJECT, org_id=org.id)
@@ -1312,7 +1334,7 @@ def _plan_switches_on(session, created: dict) -> None:
     off until an operator turns one on."""
     from app import provider_auth_policy
 
-    names = ("playbooks_enabled",)
+    names = ("playbooks_enabled", "pipeline_custom_enabled")
     seeded_grid = provider_auth_policy.encoded(
         [*provider_auth_policy.builtin_cells(), (provider_auth_policy.SDK_ROW, provider_auth_policy.OWN)]
     )

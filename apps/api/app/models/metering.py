@@ -114,10 +114,12 @@ class BedrockRevocation(UuidPkMixin, OrgScoped, Base):
 
 #: `token_ledger_entries.kind` (`ck_token_ledger_entries_kind`). Credits add, the rest subtract, and
 #: `spend_correction` is signed either way (`app/token_billing/ledger.py`).
-LEDGER_CREDIT_KINDS = ("signup_credit", "operator_credit", "topup", "auto_recharge")
+#: `sponsored_credit` is Easy Mode's one-time sponsored credit (`app/easy_mode_admin.py`), `sponsored_expiry` its
+#: removal at the sponsorship's end (`ledger.expire_sponsored`).
+LEDGER_CREDIT_KINDS = ("signup_credit", "operator_credit", "topup", "auto_recharge", "sponsored_credit")
 
 
-LEDGER_DEBIT_KINDS = ("operator_debit", "refund")
+LEDGER_DEBIT_KINDS = ("operator_debit", "refund", "sponsored_expiry")
 
 
 LEDGER_SPEND_KINDS = ("spend", "spend_correction")
@@ -220,7 +222,8 @@ class TokenUsageCall(UuidPkMixin, OrgScoped, Base):
 class TokenWallet(UuidPkMixin, OrgScoped, Base):
     """A tenant's balance — a CACHE of its ledger, one row per org, updated under `SELECT … FOR UPDATE` in the
     same transaction as every ledger insert (`app/token_billing/ledger.py`). Invariant:
-    `balance_micros = Σ token_ledger_entries.amount_micros = free_micros + paid_micros`."""
+    `balance_micros = Σ token_ledger_entries.amount_micros = free_micros + paid_micros`. `sponsored_micros` is the
+    part of `free_micros` that is Easy Mode's sponsored credit, drawn first (`app/token_billing/ledger.py`)."""
 
     __tablename__ = "token_wallets"
     __table_args__ = (
@@ -228,11 +231,14 @@ class TokenWallet(UuidPkMixin, OrgScoped, Base):
         UniqueConstraint("org_id", name="uq_token_wallets_org_id"),
         _in_check("floor_state", FLOOR_STATES, "ck_token_wallets_floor_state"),
         CheckConstraint("balance_micros = free_micros + paid_micros", name="ck_token_wallets_split"),
+        CheckConstraint("sponsored_micros >= 0", name="ck_token_wallets_sponsored"),
     )
 
     balance_micros: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     free_micros: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     paid_micros: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    #: ⊂ `free_micros` (read clamped to it: a release without this column may draw free credit meanwhile).
+    sponsored_micros: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     floor_state: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'ok'"))
     #: C8's de-duplication of the low-balance alert.
     low_alerted_at: Mapped[Optional[datetime]] = timestamp_column(nullable=True)

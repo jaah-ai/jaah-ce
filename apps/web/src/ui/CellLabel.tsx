@@ -8,12 +8,14 @@ import { ABOVE_PHONE } from './listStyles'
  * A real element, not a cell `::before`: a pseudo-element is a flex item of the cell and would centre
  * against a wrapping chip cluster; as a child it leads the same wrap flow.
  * No height cost; `display: none` above the phone, written hide-above (see `ABOVE_PHONE`: environments
- * without media queries see the base). Shared by `/users` and `/projects` on the `PHONE` breakpoint. */
+ * without media queries see the base). Shared by `/users` and `/projects` on the `PHONE` breakpoint; a table
+ * that restacks on its own width instead shows it through `data-cell-label` (Project settings › Pipeline). */
 export function CellLabel({ children }: { children: string }): JSX.Element {
   return (
     <Typography
       component="span"
       variant="caption"
+      data-cell-label=""
       sx={{
         display: 'inline',
         [ABOVE_PHONE]: { display: 'none' },

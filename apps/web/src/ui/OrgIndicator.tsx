@@ -4,12 +4,15 @@ import useMediaQuery from '@mui/material/useMediaQuery'
 import { useCallback, type JSX } from 'react'
 import { useAuth } from '../auth'
 import { isEnabled } from '../lib/editionFeatures'
+import { fnv1a } from '../lib/fnv1a'
 import { useOrgScope } from '../lib/orgScope'
 import Banner from './Banner'
 import type { OrgRef } from '../types'
 import { monoFamily } from './feed/geometry'
-import { ORG_QUERY, PHONE } from './listStyles'
+import { ORG_QUERY, PHONE, ELLIPSIS_SX } from './listStyles'
 import type { FeedSlot } from './feed/types'
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, RADIUS } from '../theme'
+import Tip from './Tip'
 
 /* The org indicator — the console's one answer to "which tenant does this belong to", used via
  * `ui/feed` slots, `ui/DataTable` cells and `ui/detail` headers; pages pick placement and width, the ink
@@ -30,15 +33,9 @@ export const ORG_HUES = [212, 258, 340, 12, 30, 92, 168, 190, 236, 288, 318, 50]
 
 /** Stable hue per org id. FNV-1a over the whole id: UUIDv7 ids share their timestamp prefix and differ
  *  in the last few hex chars, which a weak mixer collapses (the four real ids land on four hues, pinned
- *  in the test file — still not a promise). `>>> 0` reduces over the unsigned value. Total over any
- *  string. */
+ *  in the test file — still not a promise). Total over any string. */
 export function orgHue(orgId: string): number {
-  let hash = 0x811c9dc5
-  for (let i = 0; i < orgId.length; i += 1) {
-    hash ^= orgId.charCodeAt(i)
-    hash = Math.imul(hash, 0x01000193)
-  }
-  return ORG_HUES[(hash >>> 0) % ORG_HUES.length]
+  return ORG_HUES[fnv1a(orgId) % ORG_HUES.length]
 }
 
 /** Shape check, not truthiness: a caller indexing a JSON map with a raw URL value (`?repo=constructor`)
@@ -84,71 +81,65 @@ export function OrgIndicator({
        in a slot owes the id a ⋯ info item (`lib/credentialRow.tsx`), since `title` is unreachable by touch. */
     if (unresolvedId) {
       return (
-        <Box
+        <Tip title={inkOnly ? undefined : orgTitle(org, unresolvedId)}><Box
           component="span"
           data-testid={testId}
           data-org-id={inkOnly ? undefined : unresolvedId}
           data-org-unresolved={inkOnly ? undefined : 'true'}
-          title={inkOnly ? undefined : orgTitle(org, unresolvedId)}
           sx={theme => ({
             display: 'inline-block',
             maxWidth: '100%',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
+            ...ELLIPSIS_SX,
             fontFamily: monoFamily(theme),
             fontSize: 'inherit',
             color: 'text.disabled',
           })}
         >
           {unresolvedId}
-        </Box>
+        </Box></Tip>
       )
     }
     return (
-      <Box
+      <Tip title={inkOnly ? undefined : orgTitle(org)}><Box
         component="span"
         data-testid={testId}
         data-org-id={inkOnly ? undefined : ''}
-        title={inkOnly ? undefined : orgTitle(org)}
         sx={{ color: 'text.disabled' }}
       >
         —
-      </Box>
+      </Box></Tip>
     )
   }
   const hue = orgHue(org.id)
   return (
-    <Box
+    <Tip title={inkOnly ? undefined : orgTitle(org)}><Box
       component="span"
       data-testid={testId}
       data-org-id={inkOnly ? undefined : org.id}
       data-org-slug={inkOnly ? undefined : org.slug}
-      title={inkOnly ? undefined : orgTitle(org)}
       sx={{
         display: 'inline-block',
         maxWidth: '100%',
         /* Never shrinks or wraps its text (`StatusChip`'s rule); a too-narrow box ellipsises visibly, so
            callers price their own width against real names. */
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-        whiteSpace: 'nowrap',
+        ...ELLIPSIS_SX,
         fontSize: 'inherit',
         color: 'text.primary',
         /* An `overflow: hidden` inline-block sits on its bottom edge, not its text's baseline: `top` lines it up
            with the label beside it. */
         ...(plain ? { verticalAlign: 'top' } : {
           px: 0.5,
-          borderRadius: 0.75,
-          fontWeight: 600,
-          lineHeight: 1.5,
+          borderRadius: RADIUS.sm,
+          fontWeight: FONT_WEIGHT.semibold,
+          lineHeight: LINE_HEIGHT.normal,
           bgcolor: `hsl(${hue} 72% 50% / 0.16)`,
-          boxShadow: `inset 0 0 0 1px hsl(${hue} 72% 50% / 0.34)`,
+          outline: `1px solid hsl(${hue} 72% 50% / 0.34)`,
+          outlineOffset: -1,
         }),
       }}
     >
       {org.name}
-    </Box>
+    </Box></Tip>
   )
 }
 
@@ -271,8 +262,8 @@ export function OrgAside({
            at 1280 and 1440. Unified for all four callers (caption and token now share one size); header
            height is set by the `h6` title, re-rendered at 1440 and 448. A subordinate caption would be a
            prop here, not a fifth aside. */
-        fontSize: '0.8125rem',
-        lineHeight: 1.5,
+        fontSize: FONT_SIZE.md,
+        lineHeight: LINE_HEIGHT.normal,
         ...(wrap ? { flexWrap: 'wrap' } : {}),
         ...(hideOnPhone ? { [PHONE]: { display: 'none' } } : {}),
       }}
@@ -292,8 +283,6 @@ export function OrgAside({
     </Box>
   )
 }
-
-export default OrgIndicator
 
 /* ── Another org's row ──────────────────────────────────────────────────────────────────────────────────
  *

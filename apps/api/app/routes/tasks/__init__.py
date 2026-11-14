@@ -23,6 +23,7 @@ Modules:
 - `agent_filing` — Agent-filed top-level Tasks: filing, dedup, and editing or deleting an agent's own drafts.
 - `read` — Task read: `GET /api/tasks/{task_id}`.
 - `answers` — Answering a Task's questions: delivery to the live runner, Slack echo, rounds, ignore/revise, the answer lock.
-- `transitions` — Task state transitions: priority, reset, stop, wait-on-customer, set-state, force-start, complete.
+- `question_drafts` — A person's unsent answers to the open rounds, kept until Send.
+- `transitions` — Task state transitions: priority, reset, stop, set-state, force-start, complete.
 - `activity` — Task activity: the activity log, the questions list and run metrics.
 """

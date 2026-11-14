@@ -29,13 +29,12 @@ else — a literal `mailto:` included, since a contact is written as its `{{toke
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 import secrets
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -346,17 +345,10 @@ def render(slug: str, *, preview: bool) -> Optional[dict[str, Any]]:
 
 # ── when each page's text last changed (Settings > Legal's "Last updated" warning) ─────────────────────
 
-#: Beside the pages: `{slug: {"changed": "YYYY-MM-DD", "digest": <published_digest>}}`. Whoever edits a page's
-#: published text records the date here; `tests/test_legal_pages.py` fails until the digest matches again.
+#: Beside the pages: `{slug: {"changed": "YYYY-MM-DD", "digest": <sha256 of the published source, 16 hex>}}`.
+#: Whoever edits a page's published text records the date here; `tests/test_legal_pages.py` computes the digest
+#: and fails until it matches again.
 CONTENT_DATES_FILE = "page-dates.json"
-
-
-def published_digest(slug: str) -> str:
-    """A short hash of the page's PUBLISHED source: its `<!-- internal -->` blocks dropped, so a drafting note
-    is never a change the public sees."""
-    filename = dict(PAGES)[slug]
-    text = _INTERNAL.sub("", (source_dir() / filename).read_text(encoding="utf-8"))
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 def content_dates() -> dict[str, dict[str, str]]:
@@ -406,3 +398,30 @@ def signup_link(slug: str) -> str:
     if is_live():
         return f"{frontend_origin()}/legal/{slug}"
     return UNPUBLISHED_SIGNUP_LINKS[slug]
+
+
+# ── /.well-known/security.txt (RFC 9116), its Contact the Security contact setting ────────────────────────
+
+SECURITY_TXT_PATH = "/.well-known/security.txt"
+#: How far ahead `Expires` reads. Rolling, so it never lapses; RFC 9116 §2.5.5 wants it under a year.
+SECURITY_TXT_LIFETIME = timedelta(days=180)
+
+
+def security_txt(now: Optional[datetime] = None) -> Optional[str]:
+    """The RFC 9116 body, or None while the Security contact (`legal_security_contact`) is unset — never a
+    made-up contact. Each address (the knob is an email list) is a `mailto:` Contact; `Policy` names
+    the security page only once the pages are live, so it never points at a 404."""
+    from app.login_oauth import frontend_origin
+    from app.operator_settings import reads as settings_reads
+
+    contacts = [f"mailto:{c.strip()}" for c in settings_reads.get_str(TOKENS["security_contact"][0]).split(",") if c.strip()]
+    if not contacts:
+        return None
+    origin = frontend_origin()
+    expires = ((now or datetime.now(timezone.utc)) + SECURITY_TXT_LIFETIME).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = [f"Contact: {c}" for c in contacts]
+    lines.append(f"Expires: {expires}")
+    if is_live():
+        lines.append(f"Policy: {origin}/legal/security")
+    lines += ["Preferred-Languages: en", f"Canonical: {origin}{SECURITY_TXT_PATH}"]
+    return "\n".join(lines) + "\n"

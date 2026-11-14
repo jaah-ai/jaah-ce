@@ -6,7 +6,9 @@ import Typography from '@mui/material/Typography'
 import type { Theme } from '@mui/material/styles'
 import { FEATURE_ICON_COLOURS, FEATURE_ICON_SHAPES, FEATURE_ICONS, parseFeatureIcon } from '../../lib/featureIcon'
 import FeatureIcon from './FeatureIcon'
+import { RADIUS, SIZE, grid } from '../../theme'
 import { capitalize } from '../../lib/humanize'
+import Tip from '../../ui/Tip'
 
 /* The Feature Edit page's icon control (`pages/FeatureEditPage.tsx`): a button showing the current icon — or
  * a dashed empty slot named "Choose icon" when there is none — that opens a palette. The palette is ONE
@@ -45,8 +47,6 @@ function nextIndex(from: number, key: string): number | null {
       return null
   }
 }
-
-const CELL = 32
 
 export default function FeatureIconPicker({
   value,
@@ -93,37 +93,35 @@ export default function FeatureIconPicker({
     const icon = ITEMS[index]
     const checked = index === selectedIndex
     return (
-      <ButtonBase
-        key={icon ?? 'none'}
+      <Tip key={icon ?? 'none'} title={featureIconLabel(icon)}><ButtonBase
         ref={el => {
           cells.current[index] = el
         }}
         role="radio"
         aria-checked={checked}
         aria-label={featureIconLabel(icon)}
-        title={featureIconLabel(icon)}
         tabIndex={index === focusIndex ? 0 : -1}
         data-testid={`feature-icon-option-${icon ?? 'none'}`}
         onClick={() => pick(index)}
         onFocus={() => setFocusIndex(index)}
         sx={(theme: Theme) => ({
-          minWidth: CELL,
-          height: CELL,
+          minWidth: SIZE.thumb,
+          height: SIZE.thumb,
           px: icon ? 0 : 1,
-          borderRadius: 1,
+          borderRadius: RADIUS.sm,
           border: 2,
           borderColor: checked ? 'primary.main' : 'transparent',
-          gap: 0.75,
+          gap: 0.5,
           '&:hover': { bgcolor: 'action.hover' },
           '&.Mui-focusVisible': { outline: `2px solid ${theme.palette.primary.main}`, outlineOffset: 1 },
         })}
       >
         {icon ? (
-          <FeatureIcon icon={icon} size={12} testId="feature-icon-option-glyph" />
+          <FeatureIcon icon={icon} size={grid(2)} testId="feature-icon-option-glyph" />
         ) : (
           <Typography variant="body2" component="span">No icon</Typography>
         )}
-      </ButtonBase>
+      </ButtonBase></Tip>
     )
   }
 
@@ -139,9 +137,9 @@ export default function FeatureIconPicker({
         onClick={e => openPalette(e.currentTarget)}
         sx={(theme: Theme) => ({
           flex: '0 0 auto',
-          width: 40,
-          height: 40,
-          borderRadius: 1,
+          width: grid(6.5),
+          height: grid(6.5),
+          borderRadius: RADIUS.sm,
           border: 1,
           borderStyle: current ? 'solid' : 'dashed',
           borderColor: current ? 'divider' : 'text.disabled',
@@ -149,7 +147,7 @@ export default function FeatureIconPicker({
           '&.Mui-focusVisible': { outline: `2px solid ${theme.palette.primary.main}`, outlineOffset: 1 },
         })}
       >
-        {current && <FeatureIcon icon={current} size={16} testId="feature-icon-preview" />}
+        {current && <FeatureIcon icon={current} size={SIZE.iconSm} testId="feature-icon-preview" />}
       </ButtonBase>
       <Popover
         open={anchor !== null}
@@ -170,7 +168,7 @@ export default function FeatureIconPicker({
         >
           <Box>{cell(0)}</Box>
           {FEATURE_ICON_SHAPES.map((shape, row) => (
-            <Box key={shape} sx={{ display: 'grid', gridTemplateColumns: `repeat(${COLUMNS}, ${CELL}px)`, gap: 0.5 }}>
+            <Box key={shape} sx={{ display: 'grid', gridTemplateColumns: `repeat(${COLUMNS}, max-content)`, gap: 0.5 }}>
               {FEATURE_ICON_COLOURS.map((_, col) => cell(1 + row * COLUMNS + col))}
             </Box>
           ))}

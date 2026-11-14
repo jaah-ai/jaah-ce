@@ -4,7 +4,7 @@
 (`cron_runtime.wake_after_commit`), so it fires once, from the committing process, and only if the write
 commits. Each is a pass fired early via `cron_runtime.fire_now_activity`: `task-pipeline` on every
 transition (an epic is its children's rollup), `lease-drain` on all but `active` (the drain's own
-output) and `awaiting_response` (the row keeps its slot, so the drain has nothing to free or fill), `trigger-intake` on `done` and `system_failed` (a trigger's queue drains when its Task closes). Keyed on `activity_type`, never the editable `crons.name`. The done workflow is not here: the `done`
+output) and `awaiting_response` (the row keeps its slot, so the drain has nothing to free or fill), `trigger-intake` on `done` and `system_failed` (a trigger's queue drains when its Task closes), `release-tick` on `done` (a merged change waits to deploy: auto-deploy, `app/releases/tick.py`). Keyed on `activity_type`, never the editable `crons.name`. The done workflow is not here: the `done`
 write enqueues it on its own transaction (`app/durable/task_done.py::enqueue_in_transaction`). The node is
 not woken. Crons are loss-tolerant (each interval is the backstop). Nothing here raises.
 """
@@ -20,6 +20,10 @@ DISPATCH_ACTIVITY = "lease-drain"
 # queue drains now rather than at the next interval (AC-11.1).
 TRIGGER_INTAKE_ACTIVITY = "trigger-intake"
 TRIGGER_INTAKE_WAKE_ACTIONS = frozenset({DONE, SYSTEM_FAILED})
+# The release tick (`app/releases/tick.py`): a task's `done` is its change merged into the integration branch (a lane
+# merge settles its task too), so auto-deploy follows it now rather than at the next interval.
+RELEASE_TICK_ACTIVITY = "release-tick"
+RELEASE_TICK_WAKE_ACTIONS = frozenset({DONE})
 
 # Fire the pipeline but not the drain: `active` is the drain's own output, and `awaiting_response` keeps its
 # slot (`lease_drain._release_finished`), so neither changes what the drain frees or fills. An operator chat
@@ -38,4 +42,6 @@ def wake_activities_for(action: str) -> tuple[str, ...]:
         activities.append(DISPATCH_ACTIVITY)
     if action in TRIGGER_INTAKE_WAKE_ACTIONS:
         activities.append(TRIGGER_INTAKE_ACTIVITY)
+    if action in RELEASE_TICK_WAKE_ACTIONS:
+        activities.append(RELEASE_TICK_ACTIVITY)
     return tuple(activities)

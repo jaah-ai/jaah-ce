@@ -1,14 +1,22 @@
-import type { ReactNode } from 'react'
+import type { JSX, ReactNode } from 'react'
 import type { QueryClient } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
-import { ApiError, get } from '../api'
+import { ApiError, apiDetail, get } from '../api'
 import { clockTime } from '../lib/relativeTime'
 import { formatZonedSpan } from '../lib/zonedTime'
 import { formatCostUsd } from '../lib/taskCost'
+import AdvancedSection from '../ui/AdvancedSection'
+import { CodeBlock } from '../ui/CodeBlock'
+import StatusChip, { type Tone } from '../ui/StatusChip'
 import { Mono } from '../ui/DetailFields'
 import { PHONE, PRE_WRAP_SX, monoSx } from '../ui/listStyles'
+import EmptyState from '../ui/EmptyState'
 import { groupedCount, humanize } from '../lib/humanize'
+import { isRecord } from '../lib/records'
+import { FONT_SIZE, FONT_WEIGHT, grid } from '../theme'
+import LoadingState from '../ui/LoadingState'
+import Tip from '../ui/Tip'
 
 /* An ACP agent session's normalised event stream (§3.1): the poll reader and the per-event renderers, shared by
  * the task page's Activity section (`TaskActivity`) and the console's Chat view (`console/ChatView`).
@@ -56,8 +64,7 @@ const QUIET_READS_AFTER_END = 10
 export const str = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null)
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
-export const obj = (v: unknown): Record<string, unknown> =>
-  v !== null && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
+export const obj = (v: unknown): Record<string, unknown> => (isRecord(v) ? v : {})
 const json = (v: unknown): string => {
   try {
     return JSON.stringify(v, null, 2) ?? ''
@@ -143,6 +150,18 @@ export function stillPolling(log: EventLog | undefined): boolean {
   return !ended && log.quiet < QUIET_READS_AFTER_END
 }
 
+/** What a stream's panel shows before its rows — the read's failure, the wait, an empty log — or null once there are events. */
+export function eventsPlaceholder(query: { isError: boolean; isPending: boolean; error: unknown }, events: readonly AgentEvent[]): JSX.Element | null {
+  if (query.isError) return (
+    <Typography variant="body2" role="alert" sx={[PRE_WRAP_SX, { color: 'error.main' }]}>
+      {apiDetail(query.error, 'Events failed to load')}
+    </Typography>
+  )
+  if (query.isPending) return <LoadingState />
+  if (events.length === 0) return <EmptyState inline title="No events yet." />
+  return null
+}
+
 /** A 503 (storage not configured) is an answer; retrying it only delays the detail. */
 export const retryUnlessUnavailable = (count: number, err: unknown): boolean =>
   !(err instanceof ApiError && err.status === 503) && count < 2
@@ -225,7 +244,7 @@ function Label({ children, tone }: { children: ReactNode; tone?: string }) {
     <Typography
       component="span"
       variant="caption"
-      sx={{ fontWeight: 600, color: tone ?? 'text.secondary', mr: 0.75 }}
+      sx={{ fontWeight: FONT_WEIGHT.semibold, color: tone ?? 'text.secondary', mr: 0.5 }}
     >
       {children}
     </Typography>
@@ -243,31 +262,16 @@ function Paths({ paths }: { paths: string[] }) {
   )
 }
 
-/** A long block (command output, raw JSON): collapsed, and scrolls inside itself when opened. */
-function Block({ summary, text }: { summary: string; text: string }) {
-  return (
-    <Box component="details" sx={{ mt: 0.5 }}>
-      <Box component="summary" sx={{ cursor: 'pointer', typography: 'caption', color: 'text.secondary' }}>
-        {summary}
-      </Box>
-      <Box
-        component="pre"
-        sx={[monoSx, PRE_WRAP_SX, {
-          m: 0, mt: 0.5, p: 1, maxHeight: '20rem', overflow: 'auto', fontSize: '0.75rem',
-          bgcolor: 'action.hover', borderRadius: 1,
-        }]}
-      >
-        {text}
-      </Box>
-    </Box>
-  )
-}
-
-const STATUS_TONE: Record<string, string> = { failed: 'error.main', declined: 'warning.main' }
+/* Only the statuses worth a mark: a completed step says nothing, so the line stays a command and its exit. */
+const STATUS_TONE: Record<string, Tone> = { failed: 'error', declined: 'warning' }
 
 function StatusWord({ status }: { status?: string | null }) {
   if (!status || !STATUS_TONE[status]) return null
-  return <Label tone={STATUS_TONE[status]}>{status}</Label>
+  return (
+    <Box component="span" sx={{ mr: 0.5 }}>
+      <StatusChip label={humanize(status)} tone={STATUS_TONE[status]} data-status={status} />
+    </Box>
+  )
 }
 
 /** A usage row's cost, with what it covers: a `cumulative` figure is the whole session's so far, anything
@@ -301,13 +305,12 @@ function usageLine(d: Record<string, unknown>): ReactNode {
           {' · '}
           <Mono wrap="pre">{costLabel(cost, d.cost_kind)}</Mono>
           {agentReported && (
-            <Box
+            <Tip title="Cost reported by the agent, not priced from tokens"><Box
               component="span"
-              title="Cost reported by the agent, not priced from tokens"
               sx={{ ml: 0.5, color: 'text.secondary' }}
             >
               agent-reported
-            </Box>
+            </Box></Tip>
           )}
         </>
       )}
@@ -322,8 +325,8 @@ function optionText(o: unknown): string {
 /** A question's choices: a captioned list, each label with its description (muted) when it has one. */
 function Options({ options }: { options: unknown[] }) {
   return (
-    <Box component="section" aria-label="Options" sx={{ mt: 0.25 }}>
-      <Typography variant="caption" sx={{ color: 'text.secondary', fontWeight: 600 }}>Options</Typography>
+    <Box component="section" aria-label="Options" sx={{ mt: 0 }}>
+      <Typography variant="caption" sx={{ color: 'text.secondary', fontWeight: FONT_WEIGHT.semibold }}>Options</Typography>
       <Box component="ul" sx={{ m: 0, pl: 2 }}>
         {options.map((o, i) => (
           <li key={i}>
@@ -381,7 +384,12 @@ function EventBody({ event }: { event: AgentEvent }) {
           {/* The first sight of a call may not carry its command yet: the tool's title, never a bare "$ ". */}
           <Box><Mono wrap="pre">{str(d.command) ? `$ ${str(d.command)}` : str(d.name) ?? ''}</Mono></Box>
           {str(d.cwd) && <Box><Mono wrap="pre" muted>{str(d.cwd)}</Mono></Box>}
-          {str(d.output) && <Block summary="Output" text={str(d.output) as string} />}
+          {/* A long block (command output, raw JSON): collapsed, and scrolls inside itself when opened. */}
+          {str(d.output) && (
+            <AdvancedSection dense label="Output" testId="agent-event-output">
+              <CodeBlock maxHeight={grid(53)}>{str(d.output) as string}</CodeBlock>
+            </AdvancedSection>
+          )}
         </>
       )
     }
@@ -401,7 +409,11 @@ function EventBody({ event }: { event: AgentEvent }) {
           <StatusWord status={event.status} />
           <Mono wrap="pre">{str(d.name) ?? ''}</Mono>
           <Paths paths={strs(d.paths)} />
-          {d.input !== undefined && d.input !== null && <Block summary="Input" text={json(d.input)} />}
+          {d.input !== undefined && d.input !== null && (
+            <AdvancedSection dense label="Input" testId="agent-event-input">
+              <CodeBlock maxHeight={grid(53)}>{json(d.input)}</CodeBlock>
+            </AdvancedSection>
+          )}
         </>
       )
     case 'approval_request': {
@@ -431,7 +443,7 @@ function EventBody({ event }: { event: AgentEvent }) {
           <Label tone="warning.main">Question</Label>
           {questions.map((q, i) => (
             <Box key={i} sx={{ typography: 'body2', ...PRE_WRAP_SX }}>
-              {str(q.header) && <Box component="span" sx={{ fontWeight: 600 }}>{str(q.header)}: </Box>}
+              {str(q.header) && <Box component="span" sx={{ fontWeight: FONT_WEIGHT.semibold }}>{str(q.header)}: </Box>}
               {str(q.question) ?? ''}
               {Array.isArray(q.options) && q.options.length > 0 && (
                 <Options options={q.options} />
@@ -479,7 +491,7 @@ function EventBody({ event }: { event: AgentEvent }) {
         <Box sx={{ typography: 'body2', color: 'warning.main', ...PRE_WRAP_SX }}>
           <Label tone="warning.main">Rate limit</Label>
           {[str(d.window), str(d.account_slug)].filter(Boolean).join(' · ')}
-          {resets && <> · resets <span title={resets}>{resetTime(resets)}</span></>}
+          {resets && <> · resets <Tip title={resets}><span>{resetTime(resets)}</span></Tip></>}
         </Box>
       )
     }
@@ -492,9 +504,13 @@ function EventBody({ event }: { event: AgentEvent }) {
           <Label tone="error.main">Error</Label>
           {str(d.class) && <Mono wrap="pre">{str(d.class)}</Mono>}
           <Typography variant="body2" sx={[PRE_WRAP_SX, { color: 'error.main' }]}>{vendor?.summary ?? message}</Typography>
-          {vendor && <Block summary="Details" text={vendor.raw} />}
+          {vendor && (
+            <AdvancedSection dense label="Details" testId="agent-event-error-details">
+              <CodeBlock maxHeight={grid(53)}>{vendor.raw}</CodeBlock>
+            </AdvancedSection>
+          )}
           {resets && (
-            <Typography variant="caption">resets <span title={resets}>{resetTime(resets)}</span></Typography>
+            <Typography variant="caption">resets <Tip title={resets}><span>{resetTime(resets)}</span></Tip></Typography>
           )}
         </Box>
       )
@@ -513,17 +529,16 @@ function EventBody({ event }: { event: AgentEvent }) {
           <Label>{event.kind}</Label>
           <StatusWord status={event.status} />
           {Object.keys(d).length > 0 && (
-            <Box component="pre" sx={[monoSx, PRE_WRAP_SX, { m: 0, fontSize: '0.75rem' }]}>{json(d)}</Box>
+            <CodeBlock tone="plain">{json(d)}</CodeBlock>
           )}
         </>
       )
   }
 }
 
-/* HOW THE SESSION OPENED: the ACP host's `session_start.data.how` (`acp/client.py::open_session`) —
-   a fresh conversation, or one reopened by `session/resume` / `session/load`. Only the ACP host writes this stream
-   (`acp/host.py`), so every session here opened over ACP. An unknown value shows as sent. */
-const HOW_WORDS: Record<string, string> = { new: 'new', resume: 'resumed', load: 'reloaded' }
+/* HOW THE SESSION OPENED: an older stream's `session_start.data.how`, shown as sent. The ACP host (`acp/host.py`,
+   the only writer of this stream, so every session here opened over ACP) opens every session fresh and writes no
+   `how` since native resume went. */
 
 /** The engine CLI(s) the session ran, from `session_start.data.cli_versions` (`{argv0: "<exe> --version" first
  *  line}`, `acp/selfcheck.py::cli_versions`): the version line, named by the executable when the line does not
@@ -556,7 +571,7 @@ function dividerText(event: AgentEvent): string | null {
     case 'session_start': {
       const how = str(d.how)
       const engine = agentText(d.agent) ?? cliVersionsText(d.cli_versions)
-      return ['Session start', 'ACP', how ? HOW_WORDS[how] ?? how : null, engine]
+      return ['Session start', 'ACP', how || null, engine]
         .filter(Boolean)
         .join(' · ')
     }
@@ -575,12 +590,11 @@ function dividerText(event: AgentEvent): string | null {
 
 export function EventRow({ event }: { event: AgentEvent }) {
   const time = (
-    <Typography
+    <Tip title={event.ts}><Typography
       component="time"
       variant="caption"
       dateTime={event.ts}
-      title={event.ts}
-      sx={[monoSx, { color: 'text.secondary', flexShrink: 0, [PHONE]: { fontSize: '0.6875rem' } }]}
+      sx={[monoSx, { color: 'text.secondary', flexShrink: 0, [PHONE]: { fontSize: FONT_SIZE.xs } }]}
     >
       {/* Both forms rendered, CSS picks one: seconds above the phone breakpoint, minutes below it. */}
       <Box component="span" data-precision="seconds" sx={{ [PHONE]: { display: 'none' } }}>
@@ -589,7 +603,7 @@ export function EventRow({ event }: { event: AgentEvent }) {
       <Box component="span" data-precision="minutes" sx={{ display: 'none', [PHONE]: { display: 'inline' } }}>
         {clockTime(event.ts)}
       </Box>
-    </Typography>
+    </Typography></Tip>
   )
   const divider = dividerText(event)
   if (divider !== null) {
@@ -597,7 +611,7 @@ export function EventRow({ event }: { event: AgentEvent }) {
       <Box
         data-testid="task-activity-event"
         data-kind={event.kind}
-        sx={{ display: 'flex', alignItems: 'center', gap: 1, color: 'text.secondary', py: 0.25, [PHONE]: { gap: 0.5 } }}
+        sx={{ display: 'flex', alignItems: 'center', gap: 1, color: 'text.secondary', py: 0, [PHONE]: { gap: 0.5 } }}
       >
         {time}
         <Box sx={{ flex: '1 1 auto', borderTop: 1, borderColor: 'divider' }} />

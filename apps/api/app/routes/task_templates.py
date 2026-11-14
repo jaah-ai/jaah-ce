@@ -16,6 +16,7 @@ Access, every route `ORG_SCOPED`:
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from contextlib import contextmanager
 from datetime import datetime, time, timezone
@@ -27,7 +28,6 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete, func, literal, or_, select, union_all
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import act_as, attachment_storage, model_catalog, org_quotas, session_transcript_archive
@@ -37,8 +37,9 @@ from app.actors import stamp_actor
 from app.authz.catalog import TEMPLATES_EDIT_KEY, Tenancy, permission_key
 from app.authz.declarations import always, feature
 from app.authz.principal import Principal, current_principal
-from app.db import SessionLocal, get_session
-from app.entity_shape import constraint_name, iso_or_none, slugify
+from app.clock import utcnow
+from app.db_async import DbDep, on_session, release, run_in_session
+from app.entity_shape import conflict_as_409, iso_or_none, or_404, refused_as, slug_taken, unique_slug, partial_of
 from app.models.automations import Automation
 from app.models.identity import AdminUser
 from app.models.task_extras import ATTACHMENT_KIND_FILE, TaskAttachment
@@ -54,7 +55,7 @@ from app.models.task_templates import (
 from app.models.tasks import Task
 from app.persona_registry import CREATABLE_PERSONAS
 from app.routes.agent.task_reads import _content_disposition
-from app.attachment_storage import reap_unreferenced_object
+from app.attachment_storage import reap_unreferenced_objects
 from app.routes.attachments import (
     MAX_COMMENT_IMAGE_SIZE,
     _read_bounded,
@@ -73,11 +74,11 @@ MAX_ROWS = 200
 MAX_REFS = 100
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _MAX_SLUG = 64
+_SLUG_CONSTRAINTS = ("uq_task_templates_slug", "uq_org_task_templates_org_slug")
 _BUILTIN_IMAGE_RE = re.compile(r"^builtin:[a-z0-9]+(?:-[a-z0-9]+)*$")
 #: A search query's words: letters and digits only, so the tsquery built from them has no operator of the caller's.
 _QUERY_TOKEN_RE = re.compile(r"[^\W_]+")
 _MAX_QUERY_TOKENS = 8
-_SLUG_ATTEMPTS = 20
 _PURPOSE_ORDER = {key: position for position, key in enumerate(PURPOSES)}
 _TASKS_CREATE_KEY = permission_key("tasks", "create")
 _PROTOTYPER, _ADVISOR, _EPIC = "prototyper", "advisor", "epic"
@@ -107,23 +108,8 @@ class TemplateIn(BaseModel):
     published: bool = False
 
 
-class TemplatePatch(BaseModel):
+class TemplatePatch(partial_of(TemplateIn, exclude=("origin",))):  # type: ignore[misc,valid-type]  # generated base
     """A partial edit: only the fields sent change."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    slug: Optional[str] = Field(default=None, max_length=_MAX_SLUG)
-    name: Optional[str] = Field(default=None, max_length=MAX_NAME * 2)
-    summary: Optional[str] = Field(default=None, max_length=MAX_SUMMARY * 2)
-    purpose: Optional[str] = None
-    title: Optional[str] = Field(default=None, max_length=1000)
-    body: Optional[str] = Field(default=None, max_length=200_000)
-    persona: Optional[str] = None
-    autonomous: Optional[bool] = None
-    model: Optional[str] = None
-    image_key: Optional[str] = None
-    featured: Optional[bool] = None
-    published: Optional[bool] = None
 
 
 # ── Derived fields (the task form's own seeds, `TaskAxisControls.tsx`) ───────────────────────────────
@@ -193,11 +179,12 @@ class _Viewer:
 
 
 @contextmanager
-def _member_session(principal: Optional[Principal]) -> Iterator[tuple[Session, _Viewer]]:
-    """A session bound to the caller's own org — 401 without a signed-in person. The guard bound nothing (`ALWAYS`)."""
+def _member_session(session: Session, principal: Optional[Principal]) -> Iterator[tuple[Session, _Viewer]]:
+    """The route's session, bound to the caller's own org — 401 without a signed-in person. The guard bound nothing
+    (`ALWAYS`)."""
     if principal is None or principal.org_id is None:
         raise HTTPException(status_code=401, detail="unauthorized")
-    with seam.bound_to(principal.org_id), SessionLocal() as session:
+    with seam.bound_to(principal.org_id):
         yield session, _Viewer(session, principal)
 
 
@@ -215,6 +202,14 @@ def _refuse_edit(viewer: _Viewer, origin: str) -> None:
         raise HTTPException(status_code=403, detail="Templates (org) is off on your plan.")
     if origin == lib.ORIGIN_ORG and not viewer.edits_org:
         raise HTTPException(status_code=403, detail="forbidden")
+
+
+def _visible_or_404(session: Session, viewer: _Viewer, template_id: UUID) -> lib.AnyTemplate:
+    """The row the viewer sees; a draft hidden from them and another org's template are the same 404."""
+    row = lib.find(session, template_id)
+    if row is None or not viewer.sees(row):
+        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
+    return row
 
 
 def _editable_or_404(session: Session, viewer: _Viewer, template_id: UUID) -> lib.AnyTemplate:
@@ -262,6 +257,8 @@ def _card(row: lib.AnyTemplate, viewer: _Viewer, *, favorite: bool, starts: int)
         "starts_90d": starts,
         "editable": viewer.editable(row),
         "may_start": viewer.may_start,
+        # What Start asks for: the body's input placeholders (`task_templates.inputs_of`).
+        "inputs": [{"label": i.label, "required": i.required} for i in lib.inputs_of(row.body)],
     }
 
 
@@ -382,7 +379,9 @@ def _purpose_or_422(purpose: Optional[str]) -> None:
 
 @router.get("")
 @always(Tenancy.ORG_SCOPED)
+@on_session
 def list_templates(
+    session: Session,
     principal: Optional[Principal] = Depends(current_principal),
     q: Optional[str] = Query(None, max_length=200),
     purpose: Optional[str] = Query(None),
@@ -390,7 +389,7 @@ def list_templates(
 ) -> list[dict[str, Any]]:
     """The gallery: published, visible templates — global, plus the caller org's own while its switch is on."""
     _purpose_or_422(purpose)
-    with _member_session(principal) as (session, viewer):
+    with _member_session(session, principal) as (session, viewer):
         global_where: list[Any] = [TaskTemplate.published.is_(True)]
         org_where: Optional[list[Any]] = (
             [OrgTaskTemplate.published.is_(True), OrgTaskTemplate.org_id == viewer.org_id] if viewer.switch_on else None
@@ -409,14 +408,16 @@ def list_templates(
 
 @router.get("/manage")
 @always(Tenancy.ORG_SCOPED)
+@on_session
 def manage_templates(
+    session: Session,
     principal: Optional[Principal] = Depends(current_principal),
     q: Optional[str] = Query(None, max_length=200),
     origin: Optional[Literal["global", "org"]] = Query(None),
 ) -> list[dict[str, Any]]:
     """Every template the caller edits, drafts included: the operator's global ones, and the caller org's own for an
     org editor (switch on). 403 for anyone who edits neither."""
-    with _member_session(principal) as (session, viewer):
+    with _member_session(session, principal) as (session, viewer):
         if not (viewer.edits_global or viewer.edits_org):
             raise HTTPException(status_code=403, detail="forbidden")
         global_where: list[Any] = [] if viewer.edits_global and origin != lib.ORIGIN_ORG else [TaskTemplate.id.is_(None)]
@@ -428,7 +429,8 @@ def manage_templates(
 
 @router.get("/refs")
 @always(Tenancy.ORG_SCOPED)
-def template_refs(
+async def template_refs(
+    db: DbDep,
     principal: Optional[Principal] = Depends(current_principal),
     ids: str = Query("", max_length=MAX_REFS * 37, description="Comma-separated template ids."),
 ) -> list[dict[str, Any]]:
@@ -440,10 +442,10 @@ def template_refs(
         raise HTTPException(status_code=422, detail="ids must be comma-separated template ids") from None
     if len(wanted) > MAX_REFS:
         raise HTTPException(status_code=422, detail=f"at most {MAX_REFS} ids")
-    with _member_session(principal) as (session, viewer):
-        globals_ = {row.id: row for row in session.scalars(select(TaskTemplate).where(TaskTemplate.id.in_(wanted)))}
-        own = {row.id: row for row in session.scalars(select(OrgTaskTemplate).where(OrgTaskTemplate.id.in_(wanted)))}
-    others = _foreign_template_ids([i for i in wanted if i not in globals_ and i not in own])
+    globals_, own, viewer = await db.run_sync(_refs_rows, principal, wanted)
+    # The fleet read opens a session of its own: the route's hands its connection back first (one per task).
+    await release(db)
+    others = await _foreign_template_ids([i for i in wanted if i not in globals_ and i not in own])
     out = []
     for template_id in wanted:
         row = globals_.get(template_id) or own.get(template_id)
@@ -461,36 +463,68 @@ def template_refs(
     return out
 
 
-def _foreign_template_ids(ids: list[UUID]) -> set[UUID]:
+def _refs_rows(
+    session: Session, principal: Optional[Principal], wanted: list[UUID]
+) -> tuple[dict[UUID, TaskTemplate], dict[UUID, OrgTaskTemplate], _Viewer]:
+    """`template_refs`'s org-bound read, over the route's async session (`run_sync`)."""
+    with _member_session(session, principal) as (session, viewer):
+        globals_ = {row.id: row for row in session.scalars(select(TaskTemplate).where(TaskTemplate.id.in_(wanted)))}
+        own = {row.id: row for row in session.scalars(select(OrgTaskTemplate).where(OrgTaskTemplate.id.in_(wanted)))}
+    return globals_, own, viewer
+
+
+async def _foreign_template_ids(ids: list[UUID]) -> set[UUID]:
     """Which of `ids` name another org's template — existence only, never a column of the row: `refs` must tell
     "deleted" from "not yours" for an automation's stored id (AC-15) without leaking the other org's name."""
     if not ids:
         return set()
-    with seam.detached(), seam.operator_scope(), SessionLocal() as fleet:
-        return set(fleet.scalars(select(OrgTaskTemplate.id).where(OrgTaskTemplate.id.in_(ids))).all())
+    with seam.detached(), seam.operator_scope():
+        return await run_in_session(_template_ids_in, ids)
+
+
+def _template_ids_in(fleet: Session, ids: list[UUID]) -> set[UUID]:
+    return set(fleet.scalars(select(OrgTaskTemplate.id).where(OrgTaskTemplate.id.in_(ids))).all())
 
 
 @router.get("/{template_id}")
 @always(Tenancy.ORG_SCOPED)
-def get_template(template_id: UUID, principal: Optional[Principal] = Depends(current_principal)) -> dict[str, Any]:
+@on_session
+def get_template(
+    session: Session,
+    template_id: UUID,
+    principal: Optional[Principal] = Depends(current_principal),
+) -> dict[str, Any]:
     """One template with its task fields; a draft for its editors only, another org's for nobody (404)."""
-    with _member_session(principal) as (session, viewer):
-        row = lib.find(session, template_id)
-        if row is None or not viewer.sees(row):
-            raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
+    with _member_session(session, principal) as (session, viewer):
+        row = _visible_or_404(session, viewer, template_id)
         return _detail(session, viewer, row)
 
 
 @router.get("/{template_id}/usage")
 @always(Tenancy.ORG_SCOPED)
-def template_usage(template_id: UUID, principal: Optional[Principal] = Depends(current_principal)) -> dict[str, int]:
+async def template_usage(
+    db: DbDep, template_id: UUID, principal: Optional[Principal] = Depends(current_principal)
+) -> dict[str, int]:
     """What a delete would touch, for its confirm (AC-4): the automations naming the template and the tasks started
     from it in the popularity window. A global template's are counted across every org (the operator's read)."""
-    with _member_session(principal) as (session, viewer):
+    org_usage, global_id = await db.run_sync(_template_usage, template_id, principal)
+    if org_usage is not None:
+        return org_usage
+    # The fleet read opens a session of its own: the route's hands its connection back first (one per task).
+    await release(db)
+    return await _global_usage(global_id)
+
+
+def _template_usage(
+    session: Session, template_id: UUID, principal: Optional[Principal]
+) -> tuple[Optional[dict[str, int]], UUID]:
+    """`template_usage`'s org-bound part, over the route's async session (`run_sync`): an org template's counts, or
+    None and the global template's id (admitted for the operator) for `_global_usage`."""
+    with _member_session(session, principal) as (session, viewer):
         row = _editable_or_404(session, viewer, template_id)
         if isinstance(row, OrgTaskTemplate):
-            return _usage(session, row.id, Task.org_template_id)
-    return _global_usage(row.id)
+            return _usage(session, row.id, Task.org_template_id), row.id
+    return None, row.id
 
 
 def _usage(session: Session, template_id: UUID, task_column: Any) -> dict[str, int]:
@@ -506,40 +540,23 @@ def _usage(session: Session, template_id: UUID, task_column: Any) -> dict[str, i
     return {"automations": int(automations or 0), "tasks_90d": int(tasks or 0)}
 
 
-def _global_usage(template_id: UUID) -> dict[str, int]:
+async def _global_usage(template_id: UUID) -> dict[str, int]:
     """CALL ONLY AFTER `_editable_or_404` HAS ADMITTED AN OPERATOR: it opens a fleet session. `_usage` for a global template, on a fleet session: its automations and tasks live in every org. Reached only
     by the operator (`_editable_or_404` refused everyone else); only two counts leave."""
-    with seam.detached(), seam.operator_scope(), SessionLocal() as fleet:
-        return _usage(fleet, template_id, Task.template_id)
+    with seam.detached(), seam.operator_scope():
+        return await run_in_session(_usage, template_id, Task.template_id)
 
 
 # ── Mutations ────────────────────────────────────────────────────────────────────────────────────────
 
 
-def _slugify(name: str) -> str:
-    return slugify(name, limit=_MAX_SLUG) or "template"
-
-
-def _slug_taken(session: Session, origin: str, org_id: Optional[UUID], slug: str, *, except_id: Optional[UUID]) -> bool:
+def _slug_scope(origin: str, org_id: Optional[UUID]) -> tuple[type, tuple]:
+    """The table a template's slug is unique in, and the rows it is unique among: the whole global table, or one
+    org's rows of the org table (`entity_shape.slug_taken` / `unique_slug` take both); a suffixed slug must still
+    fit the column, so `unique_slug` is asked with `max_len=_MAX_SLUG`."""
     if origin == lib.ORIGIN_GLOBAL:
-        query = select(TaskTemplate.id).where(TaskTemplate.slug == slug)
-        if except_id is not None:
-            query = query.where(TaskTemplate.id != except_id)
-    else:
-        query = select(OrgTaskTemplate.id).where(OrgTaskTemplate.org_id == org_id, OrgTaskTemplate.slug == slug)
-        if except_id is not None:
-            query = query.where(OrgTaskTemplate.id != except_id)
-    return session.scalars(query.limit(1)).first() is not None
-
-
-def _free_slug(session: Session, origin: str, org_id: Optional[UUID], base: str) -> str:
-    """`base`, else `base-2`, `base-3`, … — the first free in its table (per org for an org template)."""
-    for number in range(1, _SLUG_ATTEMPTS + 1):
-        suffix = "" if number == 1 else f"-{number}"
-        candidate = base[: _MAX_SLUG - len(suffix)].rstrip("-") + suffix
-        if not _slug_taken(session, origin, org_id, candidate, except_id=None):
-            return candidate
-    raise HTTPException(status_code=409, detail="Could not find a free slug. Name the template differently.")
+        return TaskTemplate, ()
+    return OrgTaskTemplate, (OrgTaskTemplate.org_id == org_id,)
 
 
 def _clean(fields: dict[str, Any], origin: str) -> dict[str, Any]:
@@ -562,10 +579,8 @@ def _clean(fields: dict[str, Any], origin: str) -> dict[str, Any]:
     if "slug" in out and out["slug"] is not None and not _SLUG_RE.match(out["slug"]):
         raise HTTPException(status_code=422, detail="slug: lowercase letters, digits and single hyphens")
     if "model" in out:
-        try:
+        with refused_as(422, ValueError, chain=True, prefix="model: "):
             out["model"] = model_catalog.validate_model(out["model"]) or None
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=f"model: {exc}") from exc
     if out.get("image_key") is not None:
         if origin != lib.ORIGIN_GLOBAL or not _BUILTIN_IMAGE_RE.match(out["image_key"]):
             raise HTTPException(status_code=422, detail="image_key: only a built-in image (builtin:<slug>)")
@@ -603,21 +618,18 @@ def _actor(session: Session, principal: Principal) -> AdminUser:
 
 
 def _commit_or_slug_taken(session: Session) -> None:
-    try:
+    """Commit, a slug lost to a concurrent save being the same 409 as one seen before it."""
+    with conflict_as_409(session, "slug: already used", constraints=_SLUG_CONSTRAINTS):
         session.commit()
-    except IntegrityError as exc:
-        session.rollback()
-        if constraint_name(exc) not in ("uq_task_templates_slug", "uq_org_task_templates_org_slug"):
-            raise
-        raise HTTPException(status_code=409, detail="slug: already used") from None
 
 
 @router.post("", status_code=201)
 @feature("templates", "edit")
+@on_session
 def create_template(
+    session: Session,
     body: TemplateIn,
     principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     """A new template, a draft unless sent `published`: global (the operator) or the caller org's (an org editor)."""
     viewer = _editor_viewer(session, principal)
@@ -625,9 +637,12 @@ def create_template(
     fields = _clean(body.model_dump(exclude={"origin"}), body.origin)
     _model_bar_or_403(viewer, fields)
     org_id = viewer.org_id if body.origin == lib.ORIGIN_ORG else None
+    model, where = _slug_scope(body.origin, org_id)
     if fields["slug"] is None:
-        fields["slug"] = _free_slug(session, body.origin, org_id, _slugify(fields["name"]))
-    elif _slug_taken(session, body.origin, org_id, fields["slug"], except_id=None):
+        fields["slug"] = unique_slug(
+            session, model, fields["name"], default="template", where=where, limit=_MAX_SLUG, max_len=_MAX_SLUG,
+        )
+    elif slug_taken(session, model, fields["slug"], where=where):
         raise HTTPException(status_code=409, detail="slug: already used")
     row: lib.AnyTemplate = TaskTemplate(**fields) if org_id is None else OrgTaskTemplate(org_id=org_id, **fields)
     _publishable_or_422(row)
@@ -640,20 +655,22 @@ def create_template(
 
 @router.patch("/{template_id}")
 @feature("templates", "edit")
+@on_session
 def update_template(
+    session: Session,
     template_id: UUID,
     body: TemplatePatch,
     principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     viewer = _editor_viewer(session, principal)
     row = _editable_or_404(session, viewer, template_id)
     origin = lib.origin_of(row)
     fields = _clean(body.model_dump(exclude_unset=True), origin)
     _model_bar_or_403(viewer, fields)
+    model, where = _slug_scope(origin, getattr(row, "org_id", None))
     if fields.get("slug") is None:
         fields.pop("slug", None)
-    elif _slug_taken(session, origin, getattr(row, "org_id", None), fields["slug"], except_id=row.id):
+    elif slug_taken(session, model, fields["slug"], where=where, exclude=row.id):
         raise HTTPException(status_code=409, detail="slug: already used")
     for name, value in fields.items():
         setattr(row, name, value)
@@ -666,39 +683,50 @@ def update_template(
 
 @router.delete("/{template_id}", status_code=204)
 @feature("templates", "edit")
-def delete_template(
+async def delete_template(
+    db: DbDep,
     template_id: UUID,
     principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
 ) -> Response:
     """A hard delete. Stars, counters and images go with it; tasks started from it keep its name (D15) and its
     images, whose bytes the reaper spares while a task still names them."""
+    doomed = await db.run_sync(_delete_template, template_id, principal)
+    await asyncio.to_thread(reap_unreferenced_objects, doomed)
+    return Response(status_code=204)
+
+
+def _delete_template(
+    session: Session,
+    template_id: UUID,
+    principal: Optional[Principal],
+) -> list[tuple[Optional[str], str]]:
+    """`delete_template`'s body, over the route's async session (`run_sync`): commits the delete and returns the
+    stored keys `reap_unreferenced_objects` takes after it."""
     viewer = _editor_viewer(session, principal)
     row = _editable_or_404(session, viewer, template_id)
     doomed = _stored_keys(_template_assets(session, row))
     session.delete(row)
     session.commit()
-    _reap(session, doomed)
-    return Response(status_code=204)
+    return doomed
 
 
 @router.post("/{template_id}/duplicate", status_code=201)
 @feature("templates", "edit")
+@on_session
 def duplicate_template(
+    session: Session,
     template_id: UUID,
     principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     """A draft copy in the caller's org of a global template or one of the org's own (D11), images included."""
     viewer = _editor_viewer(session, principal)
-    source = lib.find(session, template_id)
-    if source is None or not viewer.sees(source):
-        raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
+    source = _visible_or_404(session, viewer, template_id)
     _refuse_edit(viewer, lib.ORIGIN_ORG)
     suffix = " copy"
     copy = OrgTaskTemplate(
         org_id=viewer.org_id,
-        slug=_free_slug(session, lib.ORIGIN_ORG, viewer.org_id, source.slug),
+        slug=unique_slug(session, OrgTaskTemplate, source.slug, default="template",
+                         where=(OrgTaskTemplate.org_id == viewer.org_id,), limit=_MAX_SLUG, max_len=_MAX_SLUG),
         name=source.name[: MAX_NAME - len(suffix)].rstrip() + suffix,
         summary=source.summary,
         purpose=source.purpose,
@@ -722,12 +750,15 @@ def duplicate_template(
 
 @router.put("/{template_id}/favorite", status_code=204)
 @always(Tenancy.ORG_SCOPED)
-def favorite_template(template_id: UUID, principal: Optional[Principal] = Depends(current_principal)) -> Response:
+@on_session
+def favorite_template(
+    session: Session,
+    template_id: UUID,
+    principal: Optional[Principal] = Depends(current_principal),
+) -> Response:
     """Star a template the caller sees; idempotent."""
-    with _member_session(principal) as (session, viewer):
-        row = lib.find(session, template_id)
-        if row is None or not viewer.sees(row):
-            raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
+    with _member_session(session, principal) as (session, viewer):
+        row = _visible_or_404(session, viewer, template_id)
         column = "template_id" if isinstance(row, TaskTemplate) else "org_template_id"
         session.execute(
             insert(TaskTemplateFavorite)
@@ -740,10 +771,15 @@ def favorite_template(template_id: UUID, principal: Optional[Principal] = Depend
 
 @router.delete("/{template_id}/favorite", status_code=204)
 @always(Tenancy.ORG_SCOPED)
-def unfavorite_template(template_id: UUID, principal: Optional[Principal] = Depends(current_principal)) -> Response:
+@on_session
+def unfavorite_template(
+    session: Session,
+    template_id: UUID,
+    principal: Optional[Principal] = Depends(current_principal),
+) -> Response:
     """Unstar; idempotent. No visibility check: a star on a template since unpublished or switched off still comes
     off, and the delete reaches the caller's own stars only."""
-    with _member_session(principal) as (session, viewer):
+    with _member_session(session, principal) as (session, viewer):
         session.execute(
             delete(TaskTemplateFavorite).where(
                 TaskTemplateFavorite.user_id == viewer.principal.user_id,
@@ -760,12 +796,6 @@ def unfavorite_template(template_id: UUID, principal: Optional[Principal] = Depe
 def _stored_keys(rows: list[assets_lib.AnyAsset]) -> list[tuple[Optional[str], str]]:
     """`(bucket, key)` of each row with bytes, read BEFORE the delete (the instances expire on commit)."""
     return [(row.s3_bucket, row.s3_key) for row in rows if row.s3_key]
-
-
-def _reap(session: Session, keys: list[tuple[Optional[str], str]]) -> None:
-    """After the commit: each object goes once no row of either store names it."""
-    for bucket, key in keys:
-        reap_unreferenced_object(session, key, bucket)
 
 
 def _find_asset(session: Session, row: lib.AnyTemplate, asset_id: str) -> Optional[assets_lib.AnyAsset]:
@@ -810,17 +840,44 @@ def _target_or_503(bucket: Optional[str]) -> attachment_storage.Target:
 
 @router.post("/{template_id}/assets", status_code=201)
 @feature("templates", "edit")
-def upload_template_asset(
+async def upload_template_asset(
+    db: DbDep,
     template_id: UUID,
     kind: str = Form(...),
     file: UploadFile = File(...),
     principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     """Store one image on a template the caller edits: its card image (at most `MAX_CARD_IMAGE_SIZE`; png, jpeg,
     webp or svg — it replaces the previous one, whose bytes are reaped) or one pasted into its body (at most
     `MAX_COMMENT_IMAGE_SIZE`; raster). The type is read from the bytes, never the claim. Buffered in-process: both
     caps sit far under `MAX_BUFFERED_ATTACHMENT_SIZE`."""
+    viewer, row, where, cap, existing_names = await db.run_sync(_upload_admission, template_id, kind, principal)
+    # Every check so far was a read: its connection goes back before the body is buffered.
+    await release(db)
+    data = await asyncio.to_thread(_read_bounded, file.file, cap)
+    pending, user = await db.run_sync(_upload_pending, viewer, row, kind, file.filename, data, where, existing_names)
+    try:
+        etag = await asyncio.to_thread(attachment_storage.put, where, pending.s3_key, data)
+    except attachment_storage.StorageUnavailable as exc:
+        # The pending row names no bytes; nothing else would ever remove it.
+        await db.run_sync(_drop_pending, pending)
+        raise HTTPException(
+            status_code=502, detail=f"Image storage did not accept the upload ({type(exc).__name__}). Try again.",
+        ) from None
+    out, replaced = await db.run_sync(_upload_confirm, row, kind, pending, etag, user)
+    await asyncio.to_thread(reap_unreferenced_objects, replaced)
+    return out
+
+
+def _upload_admission(
+    session: Session,
+    template_id: UUID,
+    kind: str,
+    principal: Optional[Principal],
+) -> tuple[_Viewer, lib.AnyTemplate, attachment_storage.Target, int, set[str]]:
+    """`upload_template_asset`'s checks before the body is read, over the route's async session (`run_sync`): the
+    viewer, the template, the target bucket, the byte cap, and the filenames already taken. The instances stay in
+    the session's identity map for the later steps (`expire_on_commit=False`)."""
     viewer = _editor_viewer(session, principal)
     row = _editable_or_404(session, viewer, template_id)
     if kind not in (assets_lib.CARD_IMAGE, assets_lib.BODY_IMAGE):
@@ -839,13 +896,31 @@ def upload_template_asset(
         )
     cap = assets_lib.MAX_CARD_IMAGE_SIZE if card else MAX_COMMENT_IMAGE_SIZE
     # An org's own file size cap binds its template images too (`org_quotas.file_cap_bytes`).
-    data = _read_bounded(file.file, cap if org_id is None else min(cap, org_quotas.file_cap_bytes(session, org_id)))
+    cap = cap if org_id is None else min(cap, org_quotas.file_cap_bytes(session, org_id))
+    return viewer, row, where, cap, {a.filename for a in existing}
+
+
+def _upload_pending(
+    session: Session,
+    viewer: _Viewer,
+    row: lib.AnyTemplate,
+    kind: str,
+    upload_filename: Optional[str],
+    data: bytes,
+    where: attachment_storage.Target,
+    existing_names: set[str],
+) -> tuple[assets_lib.AnyAsset, AdminUser]:
+    """`upload_template_asset`'s pending row, over the route's async session (`run_sync`): the type read from the
+    bytes, then the row committed with `uploaded_at` NULL (read by nothing) so no transaction is held across the
+    PUT."""
+    card = kind == assets_lib.CARD_IMAGE
     allowed = assets_lib.CARD_IMAGE_TYPES if card else assets_lib.BODY_IMAGE_TYPES
     content_type = assets_lib.sniffed_type(data)
     if content_type not in allowed:
         names = ", ".join(t.removeprefix("image/").removesuffix("+xml") for t in allowed)
         raise HTTPException(status_code=415, detail=f"A {kind.replace('_', ' ')} must be one of: {names}.")
-    filename = _free_filename({a.filename for a in existing}, _stored_filename(file.filename, "image"))
+    org_id = row.org_id if isinstance(row, OrgTaskTemplate) else None
+    filename = _free_filename(existing_names, _stored_filename(upload_filename, "image"))
     user = _actor(session, viewer.principal)
     asset: assets_lib.AnyAsset
     if org_id is None:
@@ -865,22 +940,32 @@ def upload_template_asset(
         session.flush()
         asset.s3_key = attachment_storage.object_key(org_template_id=row.id, attachment_id=asset.id)
     asset.s3_bucket = where.bucket
-    # Committed pending (`uploaded_at` NULL, read by nothing) so no transaction is held across the PUT.
     session.commit()
-    try:
-        etag = attachment_storage.put(where, asset.s3_key, data)
-    except attachment_storage.StorageUnavailable as exc:
-        # The pending row names no bytes; nothing else would ever remove it.
-        session.delete(asset)
-        session.commit()
-        raise HTTPException(
-            status_code=502, detail=f"Image storage did not accept the upload ({type(exc).__name__}). Try again.",
-        ) from None
-    asset.uploaded_at = datetime.now(timezone.utc)
+    return asset, user
+
+
+def _drop_pending(session: Session, asset: assets_lib.AnyAsset) -> None:
+    """Delete the pending row a failed PUT left, over the route's async session (`run_sync`)."""
+    session.delete(asset)
+    session.commit()
+
+
+def _upload_confirm(
+    session: Session,
+    row: lib.AnyTemplate,
+    kind: str,
+    asset: assets_lib.AnyAsset,
+    etag: Optional[str],
+    user: AdminUser,
+) -> tuple[dict[str, Any], list[tuple[Optional[str], str]]]:
+    """`upload_template_asset`'s confirm after the PUT, over the route's async session (`run_sync`): the row marked
+    uploaded (a card swapped in), committed; returns the response and the replaced card's keys for
+    `reap_unreferenced_objects`."""
+    asset.uploaded_at = utcnow()
     if isinstance(asset, TaskAttachment):
         asset.etag = etag or None
     replaced: list[tuple[Optional[str], str]] = []
-    if card:
+    if kind == assets_lib.CARD_IMAGE:
         # Locked, so two concurrent card uploads swap one after the other and the loser's old card is the winner's.
         session.refresh(row, with_for_update=True)
         old = _find_asset(session, row, assets_lib.asset_id_of(row.image_key) or "")
@@ -890,56 +975,60 @@ def upload_template_asset(
         row.image_key = f"{assets_lib.ASSET_PREFIX}{asset.id}"
         stamp_actor(row, user)
     session.commit()
-    _reap(session, replaced)
-    return {**_asset_out(row, asset), "url": _asset_url(row.id, asset.id)}
+    return {**_asset_out(row, asset), "url": _asset_url(row.id, asset.id)}, replaced
 
 
 @router.delete("/{template_id}/assets/{asset_id}", status_code=204)
 @feature("templates", "edit")
-def delete_template_asset(
+async def delete_template_asset(
+    db: DbDep,
     template_id: UUID,
     asset_id: str,
     principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
 ) -> Response:
     """Remove one image; removing the card image leaves the purpose placeholder. Tasks that copied it keep it."""
+    doomed = await db.run_sync(_delete_template_asset, template_id, asset_id, principal)
+    await asyncio.to_thread(reap_unreferenced_objects, doomed)
+    return Response(status_code=204)
+
+
+def _delete_template_asset(
+    session: Session,
+    template_id: UUID,
+    asset_id: str,
+    principal: Optional[Principal],
+) -> list[tuple[Optional[str], str]]:
+    """`delete_template_asset`'s body, over the route's async session (`run_sync`): commits the delete and returns the
+    stored keys `reap_unreferenced_objects` takes after it."""
     viewer = _editor_viewer(session, principal)
     row = _editable_or_404(session, viewer, template_id)
-    asset = _find_asset(session, row, asset_id)
-    if asset is None:
-        raise HTTPException(status_code=404, detail="image not found")
+    asset = or_404(_find_asset(session, row, asset_id), detail="image not found")
     if assets_lib.asset_id_of(row.image_key) == str(asset.id):
         row.image_key = None
         stamp_actor(row, _actor(session, viewer.principal))
     doomed = _stored_keys([asset])
     session.delete(asset)
     session.commit()
-    _reap(session, doomed)
-    return Response(status_code=204)
+    return doomed
 
 
 @router.get("/{template_id}/assets/{asset_id}/content", response_model=None)
 @always(Tenancy.ORG_SCOPED)
-def template_asset_content(
-    template_id: UUID, asset_id: str, principal: Optional[Principal] = Depends(current_principal)
+async def template_asset_content(
+    db: DbDep, template_id: UUID, asset_id: str, principal: Optional[Principal] = Depends(current_principal)
 ) -> Response:
     """One image's bytes, for whoever sees the template (another org's is a 404). Raster goes by a presigned
     `inline` redirect signed with its type (`routes/attachments.py::user_task_attachment_content`'s shape); SVG is
     proxied under `SVG_HEADERS`, which S3 cannot attach."""
-    with _member_session(principal) as (session, viewer):
-        row = lib.find(session, template_id)
-        if row is None or not viewer.sees(row):
-            raise HTTPException(status_code=404, detail=NOT_FOUND_DETAIL)
-        asset = _find_asset(session, row, asset_id)
-        if asset is None or not asset.s3_key:
-            raise HTTPException(status_code=404, detail="image not found")
-        key, bucket, filename, content_type = asset.s3_key, asset.s3_bucket, asset.filename, asset.content_type or ""
+    key, bucket, filename, content_type = await db.run_sync(_asset_content_ref, template_id, asset_id, principal)
+    # A read: its connection goes back before the S3 GET.
+    await release(db)
     where = attachment_storage.target(bucket)
     if where is None:
         raise HTTPException(status_code=502, detail="This control plane cannot read image storage.")
     if content_type == assets_lib.SVG:
         try:
-            data = attachment_storage.fetch(where, key)
+            data = await asyncio.to_thread(attachment_storage.fetch, where, key)
         except attachment_storage.StorageUnavailable:
             raise HTTPException(status_code=502, detail="Image storage could not be read. Try again.") from None
         return Response(
@@ -953,3 +1042,16 @@ def template_asset_content(
     return RedirectResponse(
         url=attachment_storage.browser_url(where, url), status_code=307, headers={"Cache-Control": "no-store"},
     )
+
+
+def _asset_content_ref(
+    session: Session, template_id: UUID, asset_id: str, principal: Optional[Principal]
+) -> tuple[str, Optional[str], str, str]:
+    """`template_asset_content`'s read, over the route's async session (`run_sync`): the image's key, bucket,
+    filename and type."""
+    with _member_session(session, principal) as (session, viewer):
+        row = _visible_or_404(session, viewer, template_id)
+        asset = _find_asset(session, row, asset_id)
+        if asset is None or not asset.s3_key:
+            raise HTTPException(status_code=404, detail="image not found")
+        return asset.s3_key, asset.s3_bucket, asset.filename, asset.content_type or ""

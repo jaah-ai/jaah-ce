@@ -3,26 +3,35 @@ import { Link as RouterLink } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import MenuItem from '@mui/material/MenuItem'
 import MuiLink from '@mui/material/Link'
-import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import type { Theme } from '@mui/material/styles'
 import { apiDetail } from '../../api'
 import { customerUrl } from '../../lib/customers'
+import { countOf } from '../../lib/humanize'
 import { offPlan, OFF_PLAN_ONCE, planSwitchOn } from '../../lib/planSwitches'
 import { BILLING_PAGE } from '../../lib/companySetup'
 import { isOrgAdminSeat } from '../../lib/orgAdmin'
+import { shortSha } from '../../lib/shortSha'
 import { useAuth } from '../../auth'
 import { useRowActions } from '../../hooks/useBusyIds'
-import { useConfirm } from '../ConfirmDialog'
+import { FONT_SIZE, FONT_WEIGHT, grid, RADIUS, SIZE } from '../../theme'
+import { danger, useConfirm } from '../ConfirmDialog'
 import { useWideDetailPane } from '../ListDetail'
 import Banner from '../../ui/Banner'
 import EmptyState from '../../ui/EmptyState'
+import FormTextField from '../../ui/FormTextField'
 import LoadingState from '../../ui/LoadingState'
 import SearchBox from '../../ui/SearchBox'
 import StatusChip from '../../ui/StatusChip'
-import { monoSx, PHONE, tapTargetSx } from '../../ui/listStyles'
+import {
+  MEMORY_FILTERS_CONTAINER,
+  MEMORY_FILTERS_WIDE,
+  memoryFiltersOneRow,
+  monoSx,
+  PHONE,
+  tapTargetSx,
+} from '../../ui/listStyles'
 import { OverflowMenu } from '../../ui/OverflowMenu'
 import {
   feedChips,
@@ -48,6 +57,8 @@ import {
   type MemoryUnit,
 } from './projectMemory'
 import { TaskLink } from '../../ui/DetailFields'
+import LinkButton from '../../ui/LinkButton'
+import Tip from '../../ui/Tip'
 
 /* The project edit page's MEMORY tab (D-6): what runners of this project have learned, and the two operator
  * actions on it. Feed chips first (is capture running at all, and why not), then the unit table.
@@ -90,31 +101,26 @@ const NONE_COUNTED: Record<Exclude<MemorySort, 'newest'>, string> = {
 /* The filters: one row when the tab is wide enough for all of them, else Search and the Repository filter (when there
  * is one) on rows of their own and Kind, Status and Sort a third each of the next — never one select stranded under
  * the rest. Measured on the tab, not the viewport, as the side nav and the list/detail split take a varying share.
- * On a wide tab (`WIDE_ROW`) Kind, Status and Sort stop growing at the row's end and Search and Repository take the
+ * On a wide tab (`MEMORY_FILTERS_WIDE`) Kind, Status and Sort stop growing at the row's end and Search and Repository take the
  * rest, so a select never stretches across a wide page. */
-const FILTERS_CONTAINER = 'memory-filters'
-// Search at 12rem plus 8rem per select and the gaps.
-const oneRow = (count: number) => `@container ${FILTERS_CONTAINER} (min-width: ${12 + 8.5 * (count - 1)}rem)`
-// Where a select's even share passes 10rem.
-const WIDE_ROW = `@container ${FILTERS_CONTAINER} (min-width: 60rem)`
 const filtersSx = (count: number) => ({
   display: 'grid',
   gap: 1,
   alignItems: 'flex-start',
   gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
-  [oneRow(count)]: { gridTemplateColumns: `minmax(12rem, 2fr) repeat(${count - 1}, minmax(8rem, 1fr))` },
-  [WIDE_ROW]: { gridTemplateColumns: `minmax(12rem, 1fr) repeat(3, 10rem)${count > 4 ? ' minmax(8rem, 1fr)' : ''}` },
+  [memoryFiltersOneRow(count)]: { gridTemplateColumns: `minmax(${grid(32)}, 2fr) repeat(${count - 1}, minmax(${grid(21)}, 1fr))` },
+  [MEMORY_FILTERS_WIDE]: { gridTemplateColumns: `minmax(${grid(32)}, 1fr) repeat(3, ${grid(26.5)})${count > 4 ? ` minmax(${grid(21)}, 1fr)` : ''}` },
 })
 const FILTER_SX = { minWidth: 0 }
 /** A filter that takes a whole row until the tab fits them all on one. */
-const fullRowSx = (count: number) => ({ minWidth: 0, gridColumn: '1 / -1', [oneRow(count)]: { gridColumn: 'auto' } })
+const fullRowSx = (count: number) => ({ minWidth: 0, gridColumn: '1 / -1', [memoryFiltersOneRow(count)]: { gridColumn: 'auto' } })
 
 /* THE LIST'S SURFACE, ONE VALUE: the list paints it and the title's "more" cue fades into it, so the fade matches the
    rows on any pane — the project pane's own `background.default`, or a paper drawer, where an unpainted list showed
    the paper and the fade a shade off it. */
 const LIST_SURFACE = 'var(--memory-list-surface)'
-const LIST_SX = {
-  listStyle: 'none', m: 0, p: 0, border: 1, borderColor: 'divider', borderRadius: 1,
+export const LIST_SX = {
+  listStyle: 'none', m: 0, p: 0, border: 1, borderColor: 'divider', borderRadius: RADIUS.sm,
   '--memory-list-surface': (theme: Theme) => (theme.vars ?? theme).palette.background.default,
   bgcolor: LIST_SURFACE,
 } as const
@@ -151,8 +157,6 @@ export default function ProjectMemoryTab({
   const [status, setStatus] = useState<string>(STATUS_LIVE)
   const [sort, setSort] = useState<MemorySort>('newest')
   const [repo, setRepo] = useState('')
-  const { busy, error, notice, run } = useRowActions()
-  const [confirm, confirmDialog] = useConfirm()
   useWideDetailPane()
 
   const multiRepo = repos.length > 1
@@ -177,33 +181,12 @@ export default function ProjectMemoryTab({
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['project-memory-units', projectId] })
 
-  const retire = (unit: MemoryUnit) => run(unit.id, `Could not retire ${unit.ref}`, async () => {
-    await retireUnit(projectId, unit.id)
-    await refresh()
-  }, () => `${unit.ref} retired`)
-
-  const release = (unit: MemoryUnit) => run(unit.id, `Could not release ${unit.ref}`, async () => {
-    await releaseUnit(projectId, unit.id)
-    await Promise.all([refresh(), queryClient.invalidateQueries({ queryKey: memoryFeedsKey(projectId) })])
-  }, () => `${unit.ref} released`)
-
-  async function purge(unit: MemoryUnit) {
-    const ok = await confirm({
-      title: `Purge ${unit.ref}?`,
-      identity: `${unit.ref} · ${unit.kind} — ${unit.title}`,
-      message:
-        'Deletes the unit for good and removes it from every stored runner prompt. Use it for sensitive data; ' +
-        'otherwise retire. This cannot be undone.',
-      confirmLabel: 'Purge',
-      destructive: true,
-    })
-    if (!ok) return
-    await run(unit.id, `Could not purge ${unit.ref}`, async () => {
-      const out = await purgeUnit(projectId, unit.id)
-      await refresh()
-      return out
-    }, purgedNotice)
-  }
+  const { busy, error, notice, confirmDialog, retire, release, purge } = useUnitActions<MemoryUnit>({
+    projectIdOf: () => projectId,
+    refresh: released => Promise.all([
+      refresh(), released && queryClient.invalidateQueries({ queryKey: memoryFeedsKey(projectId) }),
+    ]),
+  })
 
   const filtered = q !== '' || kind !== '' || repo !== '' || (status !== '' && status !== STATUS_LIVE)
   const listed = units.data ?? []
@@ -232,7 +215,7 @@ export default function ProjectMemoryTab({
           setStatus(STATUS_HELD)
         }} />
 
-      <Box sx={{ containerType: 'inline-size', containerName: FILTERS_CONTAINER }}>
+      <Box sx={{ containerType: 'inline-size', containerName: MEMORY_FILTERS_CONTAINER }}>
         <Box data-testid="memory-filters" sx={filtersSx(multiRepo ? 5 : 4)}>
           <SearchBox
             label="Search"
@@ -243,53 +226,39 @@ export default function ProjectMemoryTab({
             sx={fullRowSx(multiRepo ? 5 : 4)}
             testId="memory-search"
           />
-          <TextField
-            select
-            size="small"
+          <FormTextField
             label="Kind"
             value={kind}
-            onChange={e => setKind(e.target.value)}
+            onChange={setKind}
             sx={FILTER_SX}
-            slotProps={{ inputLabel: { shrink: true }, select: { displayEmpty: true, inputProps: { 'data-testid': 'memory-kind-filter' } } }}
-          >
-            <MenuItem value="">All</MenuItem>
-            {MEMORY_KINDS.map(k => <MenuItem key={k} value={k}>{k}</MenuItem>)}
-          </TextField>
-          <TextField
-            select
-            size="small"
+            testId="memory-kind-filter"
+            options={[{ value: '', label: 'All' }, ...MEMORY_KINDS.map(k => ({ value: k, label: k }))]}
+          />
+          <FormTextField
             label="Status"
             value={status}
-            onChange={e => setStatus(e.target.value)}
+            onChange={setStatus}
             sx={FILTER_SX}
-            slotProps={{ inputLabel: { shrink: true }, select: { displayEmpty: true, inputProps: { 'data-testid': 'memory-status-filter' } } }}
-          >
-            {MEMORY_STATUS_OPTIONS.map(o => <MenuItem key={o.value} value={o.value}>{o.label}</MenuItem>)}
-          </TextField>
-          <TextField
-            select
-            size="small"
+            testId="memory-status-filter"
+            options={MEMORY_STATUS_OPTIONS}
+          />
+          <FormTextField
             label="Sort"
             value={sort}
-            onChange={e => setSort(e.target.value as MemorySort)}
+            onChange={v => setSort(v as MemorySort)}
             sx={FILTER_SX}
-            slotProps={{ inputLabel: { shrink: true }, select: { inputProps: { 'data-testid': 'memory-sort' } } }}
-          >
-            {MEMORY_SORTS.map(o => <MenuItem key={o.value} value={o.value}>{o.label}</MenuItem>)}
-          </TextField>
+            testId="memory-sort"
+            options={MEMORY_SORTS}
+          />
           {multiRepo && (
-            <TextField
-              select
-              size="small"
+            <FormTextField
               label="Repository"
               value={repo}
-              onChange={e => setRepo(e.target.value)}
+              onChange={setRepo}
               sx={fullRowSx(5)}
-              slotProps={{ inputLabel: { shrink: true }, select: { displayEmpty: true, inputProps: { 'data-testid': 'memory-repo-filter' } } }}
-            >
-              <MenuItem value="">All</MenuItem>
-              {repos.map(r => <MenuItem key={r} value={r}>{r}</MenuItem>)}
-            </TextField>
+              testId="memory-repo-filter"
+              options={[{ value: '', label: 'All' }, ...repos.map(r => ({ value: r, label: r }))]}
+            />
           )}
         </Box>
       </Box>
@@ -347,13 +316,14 @@ export default function ProjectMemoryTab({
 }
 
 /** Off the plan, one line: what the tab would list and who turns it on — the operator in the org's Overrides tab, a
- *  tenant's org admin in Billing (a plan change), anyone else by asking an org admin. */
-function OffPlanNotice({ orgId }: { orgId: string | null }): JSX.Element {
+ *  tenant's org admin in Billing (a plan change), anyone else by asking an org admin. `allProjects`: no project is
+ *  picked (Audit › Memory's All projects), so the line names "your projects". */
+export function OffPlanNotice({ orgId, allProjects = false }: { orgId: string | null; allProjects?: boolean }): JSX.Element {
   const { admin } = useAuth()
   const link = (to: string, label: string) => <MuiLink component={RouterLink} to={to}>{label}</MuiLink>
   return (
     <Typography variant="body2" data-testid="project-memory-off-plan" sx={{ color: 'text.secondary' }}>
-      Memory (what runners learn on this project) isn't in your plan.{' '}
+      Memory (what runners learn on {allProjects ? 'your projects' : 'this project'}) isn't in your plan.{' '}
       {orgId ? <>Turn it on in {link(customerUrl(orgId, { tab: 'overrides' }), 'Overrides')}.</>
         : isOrgAdminSeat(admin) ? <>Turn it on in {link(BILLING_PAGE, 'Billing')}.</>
         : 'An admin can turn it on.'}
@@ -370,13 +340,10 @@ function PurgeByRef({ projectId }: { projectId: number }): JSX.Element {
 
   async function purge() {
     if (!unit) return
-    const ok = await confirm({
+    if (!await confirm(danger('Purge', {
       title: `Purge ${unit}?`,
       message: 'Deletes the unit for good and removes it from every stored runner prompt. This cannot be undone.',
-      confirmLabel: 'Purge',
-      destructive: true,
-    })
-    if (!ok) return
+    }))) return
     await run(unit, `Could not purge ${unit}`, () => purgeUnit(projectId, encodeURIComponent(unit)), out => {
       setRef('')
       return purgedNotice(out)
@@ -388,19 +355,17 @@ function PurgeByRef({ projectId }: { projectId: number }): JSX.Element {
       {confirmDialog}
       <Typography variant="body2">Erase a stored unit by its ref.</Typography>
       <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, alignItems: 'center' }}>
-        <TextField
-          size="small"
+        <FormTextField
           label="Unit"
+          help="Purge deletes it and scrubs it from stored prompts."
           placeholder="mem-N"
           value={ref}
-          onChange={e => setRef(e.target.value)}
+          onChange={setRef}
           // Inside the project page's `<form>`: Enter purges here rather than submitting the page.
           onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void purge() } }}
-          sx={{ flex: '0 1 12rem', minWidth: '8rem' }}
-          slotProps={{
-            inputLabel: { shrink: true },
-            htmlInput: { 'data-testid': 'memory-purge-ref', autoComplete: 'off', spellCheck: false },
-          }}
+          sx={{ flex: `0 1 ${grid(32)}`, minWidth: grid(21) }}
+          testId="memory-purge-ref"
+          slotProps={{ htmlInput: { autoComplete: 'off', spellCheck: false } }}
         />
         <Button type="button" color="error" variant="outlined" onClick={() => void purge()}
           disabled={!unit || busy.size > 0} sx={tapTargetSx}>
@@ -413,8 +378,9 @@ function PurgeByRef({ projectId }: { projectId: number }): JSX.Element {
   )
 }
 
-function UnitRow({
+export function UnitRow({
   unit,
+  project,
   chunks = [],
   canEdit,
   busy,
@@ -424,6 +390,8 @@ function UnitRow({
   renderChunk,
 }: {
   unit: MemoryUnit
+  /** Audit › Memory's org-wide list: the unit's project, a press that filters the list to it. */
+  project?: { name: string; onPick: () => void }
   /** The directory's other code-map chunks, folded under this one until expanded. */
   chunks?: MemoryUnit[]
   canEdit: boolean
@@ -467,7 +435,7 @@ function UnitRow({
     >
       {/* The actions share the title's line, so they never cost a row a line of their own. */}
       <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1 }}>
-        <Typography ref={titleRef} variant="body2" component="p" title={unit.title} data-testid="memory-unit-title"
+        <Tip title={unit.title}><Typography ref={titleRef} variant="body2" component="p" data-testid="memory-unit-title"
           data-expanded={expanded} role="button" tabIndex={0} aria-expanded={expanded}
           onClick={() => { if (!window.getSelection()?.toString()) setExpanded(e => !e) }}
           onKeyDown={e => {
@@ -475,18 +443,18 @@ function UnitRow({
             e.preventDefault()
             setExpanded(open => !open)
           }}
-          sx={[expanded ? TITLE_OPEN_SX : TITLE_CLAMP_SX, { fontWeight: 500, m: 0, flex: 1, alignSelf: 'center', cursor: 'pointer', position: 'relative' }]}>
+          sx={[expanded ? TITLE_OPEN_SX : TITLE_CLAMP_SX, { fontWeight: FONT_WEIGHT.medium, m: 0, flex: 1, alignSelf: 'center', cursor: 'pointer', position: 'relative' }]}>
           {unit.title}
           {/* The cue sits ON the clamp's last line, faded in over the cut text; the title itself is the control,
               so the cue is not a second button beside Body. */}
           {clipped && !expanded && (
             <Box component="span" aria-hidden data-testid="memory-title-more"
-              sx={{ position: 'absolute', right: 0, bottom: 0, pl: 3, color: 'primary.main', fontSize: '0.75rem',
-                lineHeight: 'inherit', background: `linear-gradient(to right, transparent, ${LIST_SURFACE} 1.5rem)` }}>
+              sx={{ position: 'absolute', right: 0, bottom: 0, pl: 3, color: 'primary.main', fontSize: FONT_SIZE.sm,
+                lineHeight: 'inherit', background: `linear-gradient(to right, transparent, ${LIST_SURFACE} ${grid(4)})` }}>
               more
             </Box>
           )}
-        </Typography>
+        </Typography></Tip>
         {(unit.body || canEdit) && (
           <Box component="span" data-testid="memory-unit-actions"
             sx={{ display: 'inline-flex', alignItems: 'center', flexShrink: 0, my: -0.5 }}>
@@ -495,7 +463,7 @@ function UnitRow({
             {unit.body && (
               <Button type="button" size="small" onClick={() => setExpanded(e => !e)} aria-expanded={bodyOpen}
                 aria-label="Body" aria-controls={bodyOpen ? bodyId : undefined} data-testid="memory-body-toggle"
-                sx={[tapTargetSx, { minWidth: 0, gap: 0.5, [PHONE]: { minWidth: 44 } }]}>
+                sx={[tapTargetSx, { minWidth: 0, gap: 0.5, [PHONE]: { minWidth: SIZE.tapTarget } }]}>
                 <Box component="span" sx={{ [PHONE]: { display: 'none' } }}>Body</Box>
                 <Box component="span" aria-hidden sx={{ display: 'inline-block', width: '1ch', textAlign: 'center' }}>
                   {bodyOpen ? '▴' : '▾'}
@@ -528,13 +496,19 @@ function UnitRow({
       </Box>
       <Box
         sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 1.5, rowGap: 0.5, mt: 0.5,
-          fontSize: '0.8125rem', color: 'text.secondary' }}
+          fontSize: FONT_SIZE.md, color: 'text.secondary' }}
       >
         <Box component="span" sx={[monoSx, { color: 'text.primary' }]}>
-          <Box component="span" sx={{ fontWeight: 600 }}>{unit.ref}</Box> {unit.kind}
+          <Box component="span" sx={{ fontWeight: FONT_WEIGHT.semibold }}>{unit.ref}</Box> {unit.kind}
         </Box>
+        {project && (
+          <LinkButton onClick={project.onPick} data-testid="memory-unit-project" title={`Only ${project.name}`}
+            sx={{ fontSize: 'inherit', overflowWrap: 'anywhere', textAlign: 'left' }}>
+            {project.name}
+          </LinkButton>
+        )}
         {unit.repo && (
-          <Box component="span" data-testid="memory-unit-repo" title={`Repository ${unit.repo}`}
+          <Box component="span" data-testid="memory-unit-repo"
             sx={[monoSx, { overflowWrap: 'anywhere', minWidth: 0 }]}>
             {unit.repo}
           </Box>
@@ -549,14 +523,14 @@ function UnitRow({
         />
         <Fact label="Trust" value={unit.trust.toFixed(2)} />
         <Box component="span" data-testid="memory-unit-counts"
-          sx={{ display: 'inline-flex', flexWrap: { xs: 'wrap', sm: 'nowrap' }, columnGap: 1.25,
+          sx={{ display: 'inline-flex', flexWrap: { xs: 'wrap', sm: 'nowrap' }, columnGap: 1,
             whiteSpace: { xs: 'normal', sm: 'nowrap' } }}>
           <Fact label="Injected" value={unit.injected} unit="tasks" title="In the prompt" />
           <Fact label="Seen" value={unit.seen} unit="tasks" title="Shown by the hook or at session start" />
           <Fact label="Used" value={unit.used} unit="tasks" title="Read or cited" />
           <Fact label="Wrong" value={unit.wrong} unit="tasks" title="Flagged wrong" />
         </Box>
-        <Box component="span" sx={{ display: 'inline-flex', gap: 0.75, alignItems: 'baseline' }}>
+        <Box component="span" sx={{ display: 'inline-flex', gap: 0.5, alignItems: 'baseline' }}>
           Source
           {unit.source_task_id === null ? (
             <Box component="span" sx={{ color: 'text.primary' }}>{unit.feed}</Box>
@@ -567,21 +541,20 @@ function UnitRow({
               {unit.source_session_id && (
                 <>
                   <Box component="span" aria-hidden="true">·</Box>
-                  <MuiLink
+                  <Tip title={`Session ${unit.source_session_id}`}><MuiLink
                     component={RouterLink}
                     to={`/sessions?task=${unit.source_task_id}`}
                     underline="hover"
-                    title={`Session ${unit.source_session_id}`}
                   >
                     transcript
-                  </MuiLink>
+                  </MuiLink></Tip>
                 </>
               )}
             </>
           )}
           {/* The code-map generation; on other units the sha is noise. */}
           {unit.kind === 'codemap' && unit.source_sha && (
-            <Box component="span" title={unit.source_sha} sx={monoSx}>{unit.source_sha.slice(0, 7)}</Box>
+            <Tip title={unit.source_sha}><Box component="span" sx={monoSx}>{shortSha(unit.source_sha)}</Box></Tip>
           )}
         </Box>
         {/* The reason in words, unless the chip already reads it (needs repro): muted and last, after the chip
@@ -594,13 +567,13 @@ function UnitRow({
         {chunks.length > 0 && (
           <Button type="button" size="small" onClick={() => setOpen(o => !o)} aria-expanded={open}
             aria-controls={open ? chunksId : undefined} data-testid="memory-chunks-toggle" sx={tapTargetSx}>
-            {open ? 'Hide' : 'Show'} {chunks.length} more {chunks.length === 1 ? 'chunk' : 'chunks'}
+            {open ? 'Hide' : 'Show'} {countOf(chunks.length, 'more chunk')}
           </Button>
         )}
       </Box>
       {bodyOpen && (
         <Typography id={bodyId} variant="body2" component="div" data-testid="memory-unit-body"
-          sx={{ mt: 1, pl: 1.25, borderLeft: 2, borderColor: 'divider', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+          sx={{ mt: 1, pl: 1, borderLeft: 2, borderColor: 'divider', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
           {unit.body}
         </Typography>
       )}
@@ -622,9 +595,9 @@ function Fact({ label, value, unit, title }: {
   title?: string
 }): JSX.Element {
   return (
-    <Box component="span" aria-label={unit ? `${label}: ${value} ${unit}` : `${label}: ${value}`} title={title}>
+    <Tip title={title}><Box component="span" aria-label={unit ? `${label}: ${value} ${unit}` : `${label}: ${value}`}>
       {label} <Box component="span" sx={[monoSx, { color: 'text.primary' }]}>{value}</Box>
-    </Box>
+    </Box></Tip>
   )
 }
 
@@ -654,11 +627,11 @@ function FeedStatus({
   const listed = chips.filter(c => showActive || c.reason || c.key === 'codemap')
   const foldNames = folded.map(c => c.label).join(', ')
   return (
-    <Box data-testid="memory-feed-status" sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+    <Box data-testid="memory-feed-status" sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
       {/* The chips wrap among themselves; the fix link keeps its place at the row's end, never wrapped below them.
           Twice the chips' gap: borderless, at theirs it read flush against the last chip. */}
       <Box data-testid="memory-feed-row" sx={{ display: 'flex', flexWrap: 'nowrap', gap: 1.5, alignItems: 'center' }}>
-        <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, alignItems: 'center', minWidth: 0 }}>
+        <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, alignItems: 'center', minWidth: 0 }}>
           {folded.length > 0 && (
             <Box component="span" data-testid="memory-feed-active" data-expanded={showActive}>
               <StatusChip
@@ -680,24 +653,59 @@ function FeedStatus({
         </Box>
         {/* The stopped chips' reason is their hover; the fix is one short link beside them, which a phone can tap. */}
         {noModel && (
-          <MuiLink component={RouterLink} to={MEMORY_MODEL_SETTINGS.href} variant="caption" underline="hover"
-            title={`${NO_MODEL}: ${MEMORY_MODEL_SETTINGS.label}`} data-testid="memory-feed-fix"
+          <Tip title={`${NO_MODEL}: ${MEMORY_MODEL_SETTINGS.label}`}><MuiLink component={RouterLink} to={MEMORY_MODEL_SETTINGS.href} variant="caption" underline="hover" data-testid="memory-feed-fix"
             sx={{ flexShrink: 0, whiteSpace: 'nowrap' }}>
             Set memory model
-          </MuiLink>
+          </MuiLink></Tip>
         )}
       </Box>
       {held !== null && (
-        <Typography variant="caption" sx={{ color: 'text.secondary' }} data-testid="memory-held"
-          title="Accepted, but not given to runners until the canon check clears them (canon check inactive)">
+        <Tip title="Accepted, but not given to runners until the canon check clears them (canon check inactive)"><Typography variant="caption" sx={{ color: 'text.secondary' }} data-testid="memory-held">
           Held by canon check:{' '}
-          <MuiLink component="button" type="button" variant="caption" onClick={onShowHeld}
-            aria-label={`Show ${held} held ${held === 1 ? 'unit' : 'units'}`}
+          <LinkButton variant="caption" onClick={onShowHeld}
+            aria-label={`Show ${countOf(held, 'held unit')}`}
             data-testid="memory-held-link" sx={{ verticalAlign: 'baseline' }}>
-            {held} {held === 1 ? 'unit' : 'units'}
-          </MuiLink>
-        </Typography>
+            {countOf(held, 'unit')}
+          </LinkButton>
+        </Typography></Tip>
       )}
     </Box>
   )
+}
+
+/** A unit row's Retire, Release and Purge, for every list of units. `refresh(released)` reloads the list after one. */
+export function useUnitActions<U extends MemoryUnit>({ projectIdOf, refresh, identitySuffix = () => '' }: {
+  projectIdOf: (unit: U) => number
+  refresh: (released: boolean) => Promise<unknown>
+  identitySuffix?: (unit: U) => string
+}) {
+  const { busy, error, notice, run } = useRowActions()
+  const [confirm, confirmDialog] = useConfirm()
+
+  const retire = (unit: U) => run(unit.id, `Could not retire ${unit.ref}`, async () => {
+    await retireUnit(projectIdOf(unit), unit.id)
+    await refresh(false)
+  }, () => `${unit.ref} retired`)
+
+  const release = (unit: U) => run(unit.id, `Could not release ${unit.ref}`, async () => {
+    await releaseUnit(projectIdOf(unit), unit.id)
+    await refresh(true)
+  }, () => `${unit.ref} released`)
+
+  async function purge(unit: U) {
+    if (!await confirm(danger('Purge', {
+      title: `Purge ${unit.ref}?`,
+      identity: `${unit.ref} · ${unit.kind} — ${unit.title}${identitySuffix(unit)}`,
+      message:
+        'Deletes the unit for good and removes it from every stored runner prompt. Use it for sensitive data; ' +
+        'otherwise retire. This cannot be undone.',
+    }))) return
+    await run(unit.id, `Could not purge ${unit.ref}`, async () => {
+      const out = await purgeUnit(projectIdOf(unit), unit.id)
+      await refresh(false)
+      return out
+    }, purgedNotice)
+  }
+
+  return { busy, error, notice, confirmDialog, retire, release, purge }
 }

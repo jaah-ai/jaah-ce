@@ -58,14 +58,15 @@ export function featureIconColour(colour: FeatureIconColour, mode: 'light' | 'da
 }
 
 /* The icon a task row shows: its feature's, read off the task tree. The ONLY place a row gets one, so
- * every surface agrees. Null when the task has no feature, or the tree does not (yet) carry it. */
+ * every surface agrees. Null for a project-level task, or when the tree does not (yet) carry it. */
 export function featureIconFor(
   tree: TaskTree | null | undefined,
   featureId: string | null | undefined,
 ): string | null {
   if (!tree || !featureId) return null
   for (const project of tree.projects) {
-    const feature = project.features.find((f) => f.id === featureId)
+    // A deleted feature's tasks keep its icon (`deleted_features`).
+    const feature = project.features.find((f) => f.id === featureId) ?? project.deleted_features?.find((f) => f.id === featureId)
     if (feature) return feature.icon ?? null
   }
   return null

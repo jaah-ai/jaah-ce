@@ -12,7 +12,7 @@ import string
 
 from sqlalchemy import select
 
-from app.db import SessionLocal
+from app.db import BridgedSession
 from app.models.credentials import Account
 from app.tenancy import seam
 
@@ -28,7 +28,7 @@ def new_account_slug() -> str:
     Probed on its own session outside the org seam, as `routes/commands.py::_refuse_slug_held_by_another_org`
     does: uniqueness is a fleet fact, and only whether a value is free leaves this function. Not reserved —
     the insert's unique constraint still decides a race, which at this space is never expected."""
-    with seam.detached(), seam.operator_scope(), SessionLocal() as fleet:
+    with seam.detached(), seam.operator_scope(), BridgedSession() as fleet:
         for _ in range(_ATTEMPTS):
             candidate = "".join(secrets.choice(ALPHABET) for _ in range(LENGTH))
             if fleet.scalar(select(Account.id).where(Account.slug == candidate)) is None:

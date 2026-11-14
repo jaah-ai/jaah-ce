@@ -15,7 +15,6 @@ revokes are fire-and-forget and reach only nodes whose socket this process holds
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import hmac
 import json
@@ -30,6 +29,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import UUID
 
+from app import signed_claims
+from app.clock import utcnow
 from app.dev_bypass import is_local_env
 
 log = logging.getLogger("console-direct")
@@ -74,7 +75,8 @@ _MAX_PORT = 65535
 # Domain separation for the attribution MAC.
 _MAC_DOMAIN = b"jaah.console.direct.v1"
 # Fallback key for a local stack with no SESSION_SECRET: random per process, so tokens become
-# unattributable across a restart. Never used when a secret is configured (`app/auth.py`).
+# unattributable across a restart. Never used when a real secret is configured; the published dev
+# constant counts as unset (`app/auth.py`).
 _EPHEMERAL_KEY = secrets.token_bytes(32)
 
 
@@ -154,7 +156,7 @@ def cp_frame_proof_for_node(node_ref: str) -> str:
     try:
         # Deferred, like every app-level import here: the module's import graph stays stdlib-only so
         # `apps/jaahd` can share its constants.
-        from app.db import SessionLocal
+        from app.db import BridgedSession
         from app.node_credentials import cp_frame_proof_for
         from app.node_identity import node_id_or_none
 
@@ -164,7 +166,7 @@ def cp_frame_proof_for_node(node_ref: str) -> str:
         # also imported stdlib-only, by the node daemon's tests.
         from app.tenancy import seam
 
-        with seam.identity_scope(), SessionLocal() as session:
+        with seam.identity_scope(), BridgedSession() as session:
             return cp_frame_proof_for(session, node_id_or_none(session, node_ref))
     except Exception as exc:  # noqa: BLE001 — see the docstring: degrade to `""`, never raise
         log.warning("console-direct: could not derive a CP frame proof for %r (%s)", node_ref, exc)
@@ -301,18 +303,13 @@ def session_id_for(admin_id: UUID, session_epoch: Optional[int]) -> str:
 
 
 def _signing_key() -> bytes:
+    # Deferred, like every app-level import here: the module's import graph stays stdlib-only.
+    from app.node_credentials import _PUBLISHED_DEV_SESSION_SECRET
+
     secret = os.environ.get("SESSION_SECRET", "")
-    if not secret:
-        return hmac.new(_EPHEMERAL_KEY, _MAC_DOMAIN, hashlib.sha256).digest()
-    return hmac.new(secret.encode(), _MAC_DOMAIN, hashlib.sha256).digest()
-
-
-def _b64(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
-
-
-def _unb64(value: str) -> bytes:
-    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    # The published dev constant counts as unset, as in `node_credentials._session_secret_or_ephemeral`.
+    usable = secret and secret != _PUBLISHED_DEV_SESSION_SECRET
+    return hmac.new(secret.encode() if usable else _EPHEMERAL_KEY, _MAC_DOMAIN, hashlib.sha256).digest()
 
 
 def token_fingerprint(token: str) -> str:
@@ -331,7 +328,7 @@ def mint_token(
     `jti` makes repeated grants distinct, so a token-narrowed revoke addresses one console.
     `tmux_session` rides the signed claims, so tampering fails the HMAC.
     """
-    moment = now or datetime.now(timezone.utc)
+    moment = now or utcnow()
     # Clamped here too, so a keyword argument cannot step over the 24h ceiling.
     ttl = token_ttl_seconds() if ttl_seconds is None else clamp_ttl_seconds(ttl_seconds)
     expires_at = moment + timedelta(seconds=ttl)
@@ -339,9 +336,7 @@ def mint_token(
         "s": session_id, "d": node_id, "p": project, "n": int(number), "k": kind,
         "x": int(expires_at.timestamp()), "j": secrets.token_urlsafe(12), "y": tmux_session or "",
     }
-    body = _b64(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
-    mac = _b64(hmac.new(_signing_key(), body.encode(), hashlib.sha256).digest())
-    return f"{body}.{mac}", expires_at
+    return signed_claims.mint(_signing_key(), claims), expires_at
 
 
 def rejection_reason(
@@ -359,7 +354,7 @@ def rejection_reason(
     claims = _parse(token)
     if claims is None:
         return "malformed or unsigned token"
-    moment = now or datetime.now(timezone.utc)
+    moment = now or utcnow()
     if claims.expires_at <= moment:
         return "expired"
     if claims.node_id != node_id:
@@ -376,19 +371,9 @@ def rejection_reason(
 def _parse(token: object) -> Optional[Claims]:
     """Recover a token's claims, or None for anything that is not a token this CP signed.
 
-    Fail-closed and never raises: the input is whatever a node put in a frame."""
-    if not isinstance(token, str) or "." not in token or not token.isascii():
-        # `isascii` matters: `hmac.compare_digest` raises on non-ASCII `str`, and the caller runs in the
-        # node bus read loop, where an escape unregisters the node. Signed tokens are always base64url.
-        return None
-    body, _, mac = token.rpartition(".")
-    if not hmac.compare_digest(mac, _b64(hmac.new(_signing_key(), body.encode(), hashlib.sha256).digest())):
-        return None
-    try:
-        claims = json.loads(_unb64(body))
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(claims, dict):
+    Fail-closed and never raises (`signed_claims.open_claims`): the input is whatever a node put in a frame."""
+    claims = signed_claims.open_claims(_signing_key(), token)
+    if claims is None:
         return None
     try:
         return Claims(
@@ -417,7 +402,7 @@ def resolve_origin(facts: NodeFacts, *, now: Optional[datetime] = None) -> str:
     if override:
         return _validated_override(override, facts.node_id)
 
-    moment = now or datetime.now(timezone.utc)
+    moment = now or utcnow()
     observed_at = facts.observed_at
     if observed_at is None:
         raise DirectUnavailable("this node has never reported an observation")
@@ -585,9 +570,9 @@ def compose_direct_url(origin: str, project: str, number: int, kind: str) -> str
 async def issue(
     facts: NodeFacts, *, project: str, number: int, kind: str, session_id: str, registry: Any,
     now: Optional[datetime] = None, view_allowed: bool = False, tmux_session: Optional[str] = None,
-    config_dir: Optional[str] = None, securestorage_dir: Optional[str] = None,
+    config_dir: Optional[str] = None,
     read_only: bool = False, attach_only: bool = False, provider: str,
-    api_key_account: Optional[str] = None, jaah: Optional[dict[str, Any]] = None,
+    api_key_account: Optional[str] = None,
     guard: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """C-5's discriminated union, end to end: freshness, URL validation, mint, grant, ack.
@@ -599,12 +584,11 @@ async def issue(
     `tmux_session` (pre-validated; also a signed claim); `read_only` (the tier from
     `routes/console.py::_console_read_only`; the node must confirm it, else `unavailable`);
     `attach_only` (the CP requiring "never create" — the node ORs it with the browser's hello, so a
-    viewer can still attach read-only); `config_dir` (the create's account, `_console_account()`);
-    `securestorage_dir` (where a shared account's credential lives, `app/shared_storage.py`). The last
-    two default to None, the fail-closed answer; never pass `""`, which the CLI reads as `~/.claude`.
+    viewer can still attach read-only); `config_dir` (the create's account, `_console_account()`), None by
+    default, the fail-closed answer; never pass `""`, which the CLI reads as `~/.claude`. Where that account's
+    token is, is the node's to resolve (`apps/jaahd/shared_storage.py`).
     `provider` (the picked account's, always sent) and `api_key_account` (the slug of an API-key pick,
-    `config_dir` then None) — the relay frame's same pair (`routes/console.py::_picked_account`). `jaah`: K2
-    (`account_ref` + `bedrock`) on a Jaah-account create (`routes/console.py::_console_jaah`), sent only then.
+    `config_dir` then None) — the relay frame's same pair (`routes/console.py::_picked_account`).
     `guard`: the Architectural Guard stanza (`routes/console.py::_console_guard`), sent only where it is available.
     """
     try:
@@ -627,9 +611,8 @@ async def issue(
         await _send_grant(
             registry, facts.bus_target, token=token, project=project, number=number, kind=kind,
             session_id=session_id, expires_at=expires_at, view_allowed=view_allowed,
-            tmux_session=tmux_session, config_dir=config_dir,
-            securestorage_dir=securestorage_dir, read_only=read_only,
-            attach_only=attach_only, provider=provider, api_key_account=api_key_account, jaah=jaah,
+            tmux_session=tmux_session, config_dir=config_dir, read_only=read_only,
+            attach_only=attach_only, provider=provider, api_key_account=api_key_account,
             guard=guard,
         )
     except DirectUnavailable as exc:
@@ -656,9 +639,9 @@ def _unavailable(reason: str) -> dict[str, Any]:
 async def _send_grant(
     registry: Any, node_id: str, *, token: str, project: str, number: int, kind: str,
     session_id: str, expires_at: datetime, view_allowed: bool, tmux_session: Optional[str] = None,
-    config_dir: Optional[str] = None, securestorage_dir: Optional[str] = None,
+    config_dir: Optional[str] = None,
     read_only: bool = False, attach_only: bool = False, provider: str = "claude",
-    api_key_account: Optional[str] = None, jaah: Optional[dict[str, Any]] = None,
+    api_key_account: Optional[str] = None,
     guard: Optional[dict[str, Any]] = None,
 ) -> None:
     """Send one grant and require the node's ack — `FRAME_CONSOLE_OPEN`'s pattern (`app/node_bus.py`).
@@ -692,10 +675,6 @@ async def _send_grant(
                 "api_key_account": api_key_account,
                 # The picked account's provider. Always sent.
                 "provider": provider,
-                # Where that account's token lives when not under `config_dir`. Sent even when None;
-                # additive (old nodes ignore it) and not ack-verified — ignoring it degrades to a visible
-                # "Not logged in". Never `""` (resolves to `~/.claude` on the node).
-                "securestorage_dir": securestorage_dir,
                 # The tier; this frame is its only carrier (the node's server-side `DirectGrant`), so
                 # the browser has nothing to flip. `is True`; sent even when False so the ack means
                 # "applied what you asked".
@@ -703,8 +682,6 @@ async def _send_grant(
                 # "This grant may never create" — here, not in the browser's hello. The node ORs it with
                 # the hello, so it can only narrow. Sent both ways.
                 "attach_only": attach_only is True,
-                # K2 on a Jaah-account create; absent otherwise, so an own-accounts grant is unchanged.
-                **(dict(jaah) if jaah else {}),
                 # The Architectural Guard stanza where it is available; absent otherwise, so the grant is unchanged.
                 **({"guard": dict(guard)} if guard else {}),
             },

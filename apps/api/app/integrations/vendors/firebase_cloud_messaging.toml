@@ -1,0 +1,44 @@
+slug = "firebase_cloud_messaging"
+label = "Firebase Cloud Messaging"
+category = "messaging"
+vendor_docs_url = "https://firebase.google.com/docs/cloud-messaging/auth-server"
+summary = "Send push notifications to your Android, iOS and web apps through Firebase."
+# The Test is a token grant at Google's token endpoint, so that host is the type's base.
+default_base_url = "https://oauth2.googleapis.com"
+
+[[auth]]
+kind = "service_account"
+fields = [
+  { key = "service_account_json", label = "Service account key", kind = "secret", required = true, placeholder = "{\"type\": \"service_account\", \"project_id\": \"my-app\"}", help = "Firebase console > your project > the gear icon > Project settings > Service accounts > Generate new private key > Generate key. Paste the whole downloaded JSON file" },
+  { key = "project_id", label = "Project ID", kind = "text", required = false, help = "Blank uses the project_id inside the key. Otherwise Firebase console > Project settings > General > Project ID" },
+]
+
+# FCM has no read-only call: the Test exchanges the key for a token with the FCM scope, which every send starts with.
+[test]
+tester = "app.integrations.tester_hooks:firebase_cloud_messaging"
+
+[docs]
+agent_uses = [
+  "Send a push notification to one device, by its registration token",
+  "Send to everyone subscribed to a topic, for example a release announcement",
+  "Send a data message that your app handles silently",
+]
+prerequisites = [
+  "A Firebase project with your Android, iOS or web app registered under Project settings > General > Your apps",
+  "Permission to create service account keys in the project (the Firebase Admin or Owner role); some organizations disable key creation by policy",
+  "For iOS, an APNs authentication key uploaded under Project settings > Cloud Messaging > Apple app configuration",
+]
+limitations = [
+  "Test proves the key is valid and can be issued an FCM token; the first real send also checks that the Firebase Cloud Messaging API is enabled in the project",
+  "The key file grants what its service account's roles grant. Use a dedicated service account with the Firebase Cloud Messaging API Admin role rather than the default Admin SDK one",
+  "The community edition cannot test this connection; agents can still use it",
+]
+troubleshooting = [
+  { symptom = "Test says Firebase Cloud Messaging rejected the service account key (400)", fix = "The key was deleted or the service account disabled; Google's own reason follows the message. Generate a new private key under Project settings > Service accounts and select Replace on the secret" },
+  { symptom = "Test says the key is not a service account JSON key", fix = "Paste the whole downloaded file, from the opening { to the closing }, not only the private_key value" },
+  { symptom = "Sends fail with 403 SERVICE_DISABLED or PERMISSION_DENIED", fix = "Enable the Firebase Cloud Messaging API for the project in Google Cloud console > APIs & Services, and give the service account the Firebase Cloud Messaging API Admin role" },
+]
+faq = [
+  { q = "Do I need the legacy server key?", a = "No. Google retired the legacy FCM API and its server keys; this connection uses the HTTP v1 API with a service account" },
+  { q = "Can the same key reach other Firebase services?", a = "It can reach whatever its service account's roles allow, but agents receive it as an FCM connection. Use a key with FCM-only roles" },
+]

@@ -1,7 +1,7 @@
 """Every pull request a task opened, in any of its project's repositories: the single
 home of `task_prs`' rules and of both its writers.
 
-- **Observed** (`observe`): the node daemon's `task.pr_observed`, posted by `jaah-forge pr create`/`pr view` once
+- **Observed** (`observe`): the node daemon's `pull_request.observed`, posted by `jaah-forge pr create`/`pr view` once
   the forge answered. The repository is the one the caller's checkout belongs to — the daemon judges it from the
   checkout's place in the runner's own slot, never from an argument — and the PR URL must name a pull request
   under that repository, so a row can only ever record a PR of the task's own project.
@@ -24,7 +24,7 @@ Nothing here commits: every write lands in the caller's transaction.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Iterable, Optional
 
 from sqlalchemy import func, select, update
@@ -32,6 +32,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from app import forges, merge_lane_state
+from app.clock import utcnow
 from app.models.merge_lane import MergeLaneRow
 from app.models.projects import Project, ProjectRepo
 from app.models.task_extras import TASK_PR_STATES, TaskPr
@@ -111,6 +112,12 @@ def _match(repos: Iterable[Repo], url: str) -> Optional[tuple[Repo, int]]:
     return None
 
 
+def names_primary_pr(session: Session, project: Project, url: str) -> bool:
+    """Whether `url` names a pull request under the project's PRIMARY repository (no merge is implied) — the one a
+    worktree's own `jaah-forge` acts on."""
+    return _match([r for r in project_repos(session, project) if r.primary], (url or "").strip()) is not None
+
+
 def _row_key(row: TaskPr) -> tuple[str, str]:
     return row.forge, row.repo_path.lower()
 
@@ -148,7 +155,7 @@ def observe(
             f"came from — nothing was recorded",
         )
     existing = _find(session, task.id, repo, number)
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     if existing is None:
         if not opened:
             return None
@@ -157,7 +164,7 @@ def observe(
             raise PrRefused(
                 "too_many_prs", f"task {task.id} already records {MAX_PRS_PER_TASK} PRs — nothing was recorded")
         # A concurrent first observation of the same URL lands once (the loser re-reads the winner's row).
-        session.execute(
+        opened_id = session.scalar(
             insert(TaskPr)
             .values(
                 org_id=task.org_id, task_id=task.id, project_repo_id=repo.id, repo_path=repo.ref.path,
@@ -165,7 +172,13 @@ def observe(
                 state=state, merged_at=now if state == MERGED else None,
             )
             .on_conflict_do_nothing(constraint="uq_task_prs_task_url")
+            .returning(TaskPr.id)
         )
+        if opened_id is not None:
+            # Once per PR (the loser of a concurrent first observation inserted nothing): the `pr.opened` webhook's source.
+            from app.webhooks.engine import record_pr_event
+
+            record_pr_event(session, task, "pr:opened", pr_url=pr_url.strip(), pr_number=number)
         return _find(session, task.id, repo, number)
     if existing.state != MERGED:
         _move(session, existing, state, now)
@@ -252,7 +265,7 @@ def attest(session: Session, task: Task, project: Project, pr_url: str, pr_urls:
 
 def record_attested(session: Session, task: Task, attestation: Attestation) -> None:
     """Mark every attested PR `merged` (inserting those never observed), in the settle's transaction."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     for pr in attestation.prs:
         existing = _find(session, task.id, pr.repo, pr.number)
         if existing is not None:
@@ -270,6 +283,22 @@ def record_attested(session: Session, task: Task, attestation: Attestation) -> N
             )
         )
     session.flush()
+    _outcome_merged(session, task, attestation, now)
+
+
+def _outcome_merged(session: Session, task: Task, attestation: Attestation, now: datetime) -> None:
+    """The outcome ledger's side of a self-merge. A lane project's runner attests at QUEUED, before anything
+    merged: while the lane holds a row for the task, the lane's own `merged` event moves the outcome instead."""
+    from app.outcome_ledger import writer as outcome_writer
+
+    lane_holds = session.scalar(
+        select(MergeLaneRow.id).where(
+            MergeLaneRow.task_id == task.id,
+            MergeLaneRow.state.in_((merge_lane_state.QUEUED, merge_lane_state.TESTING)),
+        ).limit(1)
+    )
+    if lane_holds is None:
+        outcome_writer.on_merged(session, task, pr_url=attestation.outcome_url, merge_sha=None, merged_at=now)
 
 
 def prs_by_task(session: Session, task_ids: Iterable[int]) -> dict[int, list[TaskPr]]:

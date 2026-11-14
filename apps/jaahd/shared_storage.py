@@ -12,8 +12,8 @@ local disk and the account is this node's alone. Nothing here asks the CP whethe
 into the store (`fleet_dispatch.ensure_shared_credential_link`). A hand-configured legacy share at
 `LEGACY_SHARED_ACCOUNTS_ROOT` stands in for the store while `.shared` is not mounted (`account_token_root`).
 A symlinked `.shared` or leaf is refused, never followed — except, on macOS, a NodeLink path that is root's link
-to the staging directory holding its mount (`_darwin_staging_target`), the one shape that OS mounts in. The `<root>/<slug>` rule is mirrored in
-`apps/api/app/shared_storage.py` (the daemon and the CP never import each other); `tests/test_shared_storage.py` is the oracle.
+to the staging directory holding its mount (`_darwin_staging_target`), the one shape that OS mounts in. The `<root>/<slug>` rule and the
+store's segment live in `shared_storage_rule.py` (one home: the CP borrows that file by path); this module re-exports them.
 
 The access point forces uid 3000:3000 on every file of a mounted store, so nothing may compare a credential
 file's owner there against the session uid — 3000 is the correct answer.
@@ -25,7 +25,7 @@ mounted (`_windows_mounted_id`). `\\\\wsl.localhost` is per-user, so this daemon
 — only the runner account, which owns the distro, does: a store under such a link is accepted lexically
 (`store_is_on_share`), and a credential there this daemon cannot read is present (`credential_file_present`).
 
-STDLIB ONLY: `agent_config_dirs.py` (a hook-loaded leaf) imports this; `environment` is a stdlib leaf too.
+STDLIB ONLY: `agent_config_dirs.py` (a hook-loaded leaf) imports this; `environment` and `shared_storage_rule` are stdlib leaves too.
 """
 from __future__ import annotations
 
@@ -39,23 +39,23 @@ import stat
 import sys
 import threading
 import time
-from collections.abc import Iterator
 from pathlib import Path, PureWindowsPath
 
 import cloud_modules
 import environment
 import file_io
 import host_platform
+import shared_storage_rule
+from rootlib import mounts
 
 log = logging.getLogger("jaahd.shared_storage")
 
-# ── The pinned contract (mirror of apps/api/app/shared_storage.py) ────────────────────────────────────
+# ── The pinned contract (`shared_storage_rule.py`, re-exported for this module's readers) ─────────────
 
-# The token store, joined to `JAAH_HOME`. A leading `.` keeps it out of the account-slug space
-# (`^[a-z0-9]…`), so it can never collide with a per-node config dir beside it.
-SHARED_ACCOUNTS_SEGMENT = "auth/.shared"
-# The pre-NodeLink mount, still mounted (same access point) while nodes move over; never dropped here.
-LEGACY_SHARED_ACCOUNTS_ROOT = "/mnt/jaah-shared/accounts"
+SHARED_ACCOUNTS_SEGMENT = shared_storage_rule.SHARED_ACCOUNTS_SEGMENT
+LEGACY_SHARED_ACCOUNTS_ROOT = shared_storage_rule.LEGACY_SHARED_ACCOUNTS_ROOT
+windows_absolute = shared_storage_rule.windows_absolute
+_has_control_character = shared_storage_rule.has_control_character
 
 # The uid (and gid) an EFS access point forces on every file of a mounted store (the CP creates every
 # NodeLink access point with it; `vnodehelper/ops.py::NODELINK_OWNER_ID` is the helper's own copy).
@@ -79,28 +79,10 @@ def _credential_files() -> tuple[str, ...]:
     return tuple(p.credential_file for p in agent_providers.PROVIDERS if p.credential_file)
 
 
-def _has_control_character(value: str) -> bool:
-    return any(ch < " " or ch == "\x7f" or "\x80" <= ch <= "\x9f" or ch in "\u2028\u2029" for ch in value)
-
-
-def windows_absolute(raw: str) -> str:
-    """RAW as a Windows absolute path without its trailing separators, or `""` — `nodelink_mount.windows_path`,
-    the one rule for a Windows node's paths."""
-    nodelink_mount = cloud_modules.load("nodelink_mount")  # deferred: Windows only, and this module is a hook-loaded leaf
-
-    return nodelink_mount.windows_path(raw) if nodelink_mount is not None else ""
-
-
 def accounts_nodelink_root() -> str:
     """`{JAAH_HOME}/auth/.shared` — the token store's path on this node, mounted or not — or `""` with no
     usable home. On Windows `{JAAH_HOME}\\auth\\.shared`, for a drive-absolute home."""
-    if host_platform.is_windows():
-        home = windows_absolute(environment.pool_root_or_empty())
-        return ntpath.join(home, *SHARED_ACCOUNTS_SEGMENT.split("/")) if home else ""
-    home = environment.pool_root_or_empty().rstrip("/")
-    if not home.startswith("/") or ".." in home.split("/") or _has_control_character(home):
-        return ""
-    return f"{home}/{SHARED_ACCOUNTS_SEGMENT}"
+    return shared_storage_rule.accounts_root_under(environment.pool_root_or_empty())
 
 
 #: How long one mount check may take before the mount counts as NOT mounted. A `hard` NFS mount whose server is
@@ -151,23 +133,6 @@ def _darwin_key(path: str) -> str:
     return nodelink_mount.darwin_canonical(path.rstrip("/") or "/") if nodelink_mount is not None else path
 
 
-def _mountinfo_rows(table: str = "") -> Iterator[tuple[str, str, str, str, str]]:
-    """Every entry of the mountinfo(5) TABLE (`_MOUNTINFO`) as `(mount id, mount point, fstype, source, super
-    options)` — the fields before the ` - ` separator, then the three after it — with the mount point's octal
-    escapes (`\\040` space, `\\011` tab, `\\134` backslash) undone once, here. The one reader of the kernel's table:
-    nothing else here parses a line. A line short of those fields is skipped; an unreadable table raises
-    `OSError`, since each caller has its own "no table" answer."""
-    with open(table or _MOUNTINFO, encoding="utf-8", errors="replace") as fh:
-        lines = fh.read().splitlines()
-    for line in lines:
-        head, sep, tail = line.partition(" - ")
-        fields, after = head.split(), tail.split()
-        if not sep or len(fields) < 5 or len(after) < 3:
-            continue
-        point = fields[4].replace("\\040", " ").replace("\\011", "\t").replace("\\134", "\\")
-        yield fields[0], point, after[0], after[1], after[2]
-
-
 def _listed_as_mount(path: str, *, no_table: bool = True) -> bool:
     """Does mountinfo list `path`, exactly as given, as a mount point? Asks the kernel's table, never the
     filesystem, so it cannot block on a dead server. `no_table` when there is no table to read (not Linux
@@ -177,7 +142,7 @@ def _listed_as_mount(path: str, *, no_table: bool = True) -> bool:
         want = _darwin_key(path)
         return no_table if table is None else any(m.on == want for m in table)
     try:
-        return any(point == path for _, point, *_ in _mountinfo_rows())
+        return any(m.point == path for m in mounts.rows())
     except OSError:
         return no_table
 
@@ -195,11 +160,11 @@ def mounts_under(path: str) -> list[str]:
         base = _darwin_key(os.path.realpath(path)).rstrip("/") or "/"
         return [m.on for m in _darwin_mounts() or () if m.on == base or m.on.startswith(base + "/")]
     try:
-        rows = list(_mountinfo_rows())
+        points = [m.point for m in mounts.rows()]
     except OSError:
         return []
     base = os.path.realpath(path).rstrip("/") or "/"
-    return [point for _, point, *_ in rows if point == base or point.startswith(base + "/")]
+    return [p for p in points if p == base or p.startswith(base + "/")]
 
 
 def _start_mount_check(path: str) -> tuple[threading.Thread, list[bool], float]:
@@ -253,7 +218,6 @@ def _is_mount(path: str) -> bool:
 _BINDFS_FSTYPE = "fuse.bindfs"
 # The filesystem types a token-store mount at `.shared` may be (EFS mounts as NFSv4).
 _ACCOUNTS_FSTYPES = frozenset({"nfs4", "nfs", "efs", _BINDFS_FSTYPE})
-_MOUNTINFO = "/proc/self/mountinfo"
 
 
 def _mount_fstype(path: str) -> str | None:
@@ -270,22 +234,22 @@ def _mount_fstype(path: str) -> str | None:
                 found = mount.fstype if mount.owner == 0 else ""
         return found
     try:
-        rows = list(_mountinfo_rows())
+        rows = list(mounts.rows())
     except OSError:
         return None
     want = os.path.realpath(path)
-    return next((fstype for _, point, fstype, *_ in reversed(rows) if point == want), "")
+    return next((m.fstype for m in reversed(rows) if m.point == want), "")
 
 
 def _mount_super_options(path: str) -> str:
     """The super options of the mount AT `path` (mountinfo's field after the source, last match wins), `""` when
     none or unreadable. For FUSE they carry the MOUNTING uid (`user_id=`), which no `fsname` can fake."""
     try:
-        rows = list(_mountinfo_rows())
+        rows = list(mounts.rows())
     except OSError:
         return ""
     want = os.path.realpath(path)
-    return next((options for _, point, _, _, options in reversed(rows) if point == want), "")
+    return next((m.options for m in reversed(rows) if m.point == want), "")
 
 
 def _bindfs_layers_up(path: str, ident: str) -> bool:
@@ -480,15 +444,15 @@ def _mount_of(mnt_id: str) -> tuple[str, str | None] | None:
     The fstype is required: a FUSE mount can carry any `fsname`, so only the kernel's NFS client's source is
     believed."""
     try:
-        rows = list(_mountinfo_rows(os.path.join(_PROC, "self", "mountinfo")))   # `_PROC`: a test fakes the tree
+        rows = list(mounts.rows(os.path.join(_PROC, "self", "mountinfo")))   # `_PROC`: a test fakes the tree
     except OSError:
         return None
-    for mnt, _, fstype, source, options in rows:
-        if mnt != mnt_id:
+    for m in rows:
+        if m.id != mnt_id:
             continue
-        if fstype not in _NFS_FSTYPES:
+        if m.fstype not in _NFS_FSTYPES:
             return None
-        return source, next((o[5:] for o in options.split(",") if o.startswith("port=")), None)
+        return m.source, next((o[5:] for o in m.options.split(",") if o.startswith("port=")), None)
     return None
 
 
@@ -792,19 +756,11 @@ def resolve_shared_auth_dir(slug: str | None) -> str:
     """`<account_token_root()>/<slug>` — where this account's token is minted and, failing a credential in
     its config dir, read — or `""`.
 
-    Node-independent by construction: no home argument, ever. Fails closed to `""` on a slug that is not
-    one path segment, and on a control character (a copy of the CP's
-    `app/shared_storage.py::has_control_character`, never imported) — the value becomes an env var."""
-    slug = (slug or "").strip().strip("/")
-    if not slug or "/" in slug or slug in (".", "..") or _has_control_character(slug):
-        return ""
-    windows = host_platform.is_windows()
-    if windows and ("\\" in slug or ":" in slug):
-        return ""
+    Node-independent by construction: no home argument, ever. Fails closed to `""` with no root to trust, and
+    on a slug that is not one path segment or carries a control character (`shared_storage_rule`'s rule —
+    the value becomes an env var)."""
     root = account_token_root()
-    if not root:
-        return ""
-    return f"{root}\\{slug}" if windows else f"{root}/{slug}"
+    return shared_storage_rule.resolve_shared_auth_dir(slug, root) if root else ""
 
 
 def account_slug(config_dir: object) -> str:

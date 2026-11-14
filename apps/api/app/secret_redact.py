@@ -13,6 +13,7 @@ Neither present is a DEPLOYMENT DEFECT, and it raises: text is never passed thro
 from __future__ import annotations
 
 from types import ModuleType
+from typing import Any
 
 from app import shared_module
 
@@ -36,7 +37,31 @@ def redact(text: str) -> tuple[str, int]:
     return redacted, sum(counts.values())
 
 
+def redacted(text: str) -> str:
+    """`redact`'s text alone, for a caller that does not count."""
+    return redact(text)[0]
+
+
+def one_line(text: str, limit: int) -> str:
+    """Text fit to show on one line: redacted first (a cut never halves a secret), whitespace collapsed, head-capped
+    at `limit` characters with an ellipsis where the cut falls."""
+    line = " ".join(redacted(str(text)).split())
+    return line if len(line) <= limit else line[:limit - 1] + "…"
+
+
 def detect(text: str) -> tuple[str, dict[str, int]]:
     """`(redacted text, {pattern name: matches})` — the shared pass's own answer, for a caller that must say WHICH
     secret shape it saw (`governance.guard.kinds.CredentialDetector`)."""
     return _load().redact_text(text)
+
+
+def redact_deep(value: Any) -> Any:
+    """`value` with every string in it (down through dicts and lists) passed through `redact`; keys and non-strings
+    kept."""
+    if isinstance(value, str):
+        return redact(value)[0]
+    if isinstance(value, dict):
+        return {k: redact_deep(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_deep(v) for v in value]
+    return value

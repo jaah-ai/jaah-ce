@@ -12,7 +12,7 @@ use under the [Sustainable Use License](LICENSE), with up to 3 AI provider accou
 ## Quick start
 
 You need [Docker](https://docs.docker.com/get-docker/) running and at least 8 GB of memory: each agent working at
-once takes 3 GB (Settings › Runners › Runner memory).
+once uses about 3 GB, and a new one waits while memory is above 90%.
 
 Linux or macOS:
 
@@ -42,10 +42,10 @@ On Windows, run the install line again with `-Upgrade`:
 
 Your data stays in Docker volumes across upgrades.
 
-### S3 bucket and KMS key settings are gone
+### S3 bucket and KMS key settings
 
 The community edition keeps attachments and sessions on its own volumes and wraps credentials under the keypair it
-generates. It no longer reads `SESSION_TRANSCRIPT_BUCKET`, `CREDENTIAL_KMS_KEY_ID` or `CREDENTIAL_KMS_PREVIOUS_KEY_IDS`:
+generates. It does not read `SESSION_TRANSCRIPT_BUCKET`, `CREDENTIAL_KMS_KEY_ID` or `CREDENTIAL_KMS_PREVIOUS_KEY_IDS`:
 an install that still sets one refuses to start, naming the setting to unset. If your install sets any of them, do
 this before you upgrade:
 
@@ -57,7 +57,7 @@ this before you upgrade:
 2. **A KMS key.** Credentials sealed under it cannot be opened after the upgrade. Unset both KMS settings, start the
    new release and enter each credential again, or stay on the previous release.
 
-### AWS settings are gone
+### AWS settings
 
 The community edition ships no AWS client. It ignores the SES settings (`SES_MAIL_DOMAIN`, `SES_CONFIGURATION_SET`), so
 it sends no system email, and `NODE_LOG_GROUP`. It refuses to start with `DB_SECRET_ARN`: put the database

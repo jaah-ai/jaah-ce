@@ -1,0 +1,40 @@
+slug = "parallel"
+label = "Parallel"
+category = "search"
+vendor_docs_url = "https://docs.parallel.ai/api-reference/monitor/list-monitors"
+summary = "Web search, extraction and deep research tasks built for agents, through Parallel's API."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "Sign in at platform.parallel.ai (docs.parallel.ai > Create an API key leads there), create an API key in the Platform and copy it at once" },
+]
+
+[test]
+method = "GET"
+path = "https://api.parallel.ai/v1/monitors?limit=1"
+auth = { field = "api_key", header = "x-api-key" }
+list_field = "monitors"
+
+[docs]
+agent_uses = [
+  "Search the web with Parallel's Search API and get ranked, excerpted results ready for reasoning",
+  "Extract the content of given URLs as clean text",
+  "Run Task API deep-research jobs that return structured, cited answers",
+  "Create and read Monitors that watch the web for new events on a topic",
+]
+prerequisites = [
+  "A Parallel account on platform.parallel.ai with billing set up or free credit available",
+]
+limitations = [
+  "Search, Extract and Task runs are billed per request by Parallel; the Test only lists your Monitors and creates nothing",
+  "Rate limits apply per minute to requests that create work (for example 600 searches per minute)",
+]
+troubleshooting = [
+  { symptom = "The Test says Parallel rejected the API key (401)", fix = "The key was revoked or mistyped. Create a new key on platform.parallel.ai and select Replace on the secret" },
+  { symptom = "Agents get 429 Too Many Requests", fix = "The per-minute limit for that API was hit. Ask the agent to run fewer requests at once, or ask Parallel support to raise the limit" },
+  { symptom = "Agents get 402 or a billing error", fix = "The account has no credit left. Add credit or a payment method on platform.parallel.ai" },
+]
+faq = [
+  { q = "Why does the Test list Monitors", a = "It is the cheapest read Parallel offers: it proves the key works without starting a billed search or task" },
+]

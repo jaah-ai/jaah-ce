@@ -1,0 +1,39 @@
+# Sanity: hosted MCP server. Facts confirmed at https://www.sanity.io/docs/compute-and-ai/mcp-server and the server's own OAuth metadata (mcp.sanity.io/.well-known/oauth-protected-resource; Dynamic Client Registration at /register).
+slug = "sanity"
+label = "Sanity"
+category = "mcp"
+vendor_docs_url = "https://www.sanity.io/docs/compute-and-ai/mcp-server"
+summary = "Query and edit Sanity content, schemas and releases through Sanity's MCP server."
+
+[[auth]]
+kind = "mcp"
+
+[mcp]
+url = "https://mcp.sanity.io"
+url_editable = false
+transport = "streamable_http"
+auth = "oauth_dcr"
+
+[docs]
+agent_uses = [
+  "Query documents with GROQ and read a project's schema",
+  "Create or patch documents, and draft content into a release for review",
+  "Translate or rewrite content in place, keeping it as a draft",
+]
+prerequisites = [
+  "A Sanity project and a user with access to its datasets",
+]
+limitations = [
+  "Agents act as the signed-in user, with that user's role in each project",
+  "Edits land as drafts or in releases you can review in Sanity Studio before publishing; publishing is a separate step",
+]
+troubleshooting = [
+  { symptom = "Test says Sanity rejected the token (401)", fix = "The sign-in expired or was revoked at sanity.io/manage. Select Reconnect" },
+  { symptom = "Agents cannot see a project", fix = "Your Sanity user is not a member of it. Ask a project admin to invite you at sanity.io/manage, then Reconnect" },
+  { symptom = "The secret shows Needs reconnect", fix = "Sanity ended the grant (a password change, a revoked connection or a long idle period). Select Reconnect on the secret and sign in to Sanity again" },
+  { symptom = "New tasks on the project have no Sanity tools", fix = "Link the secret on the project's MCP tab, then start a new task. Tasks already running keep the tools they started with, and an agent marked Not supported on that tab cannot load MCP servers" },
+]
+faq = [
+  { q = "Does Jaah need an app registered at Sanity", a = "No. Jaah registers itself with Sanity's sign-in server the first time anyone connects, and every later connection reuses that registration" },
+  { q = "What does Test do", a = "It opens an MCP session with Sanity's server and lists its tools, then closes the session. It reads and changes nothing in your Sanity account" },
+]

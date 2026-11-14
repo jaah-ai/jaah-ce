@@ -3,21 +3,33 @@ import { get } from '../../api'
 import { TASK_TREE_QUERY_KEY } from '../../hooks/useTaskTree'
 import type { FeatureSummary, TaskTree } from '../../types'
 
-/* WHERE A TASK IS FILED — the reads and words every filing surface shares: the row menu's and task page's
- * "Move to feature…" (`MoveToFeatureDialog`), the editor breadcrumb's staged feature picker
- * (`TaskBreadcrumb`), and a duplicate's carried filing (`FilingTarget`). The writes stay on
+/* WHERE A TASK IS FILED — the reads and words every filing surface shares: the task page's feature crumb, which
+ * files at once and ends in "New feature…" (`TaskBreadcrumb`, `useTaskDetailFiling`), and a duplicate's carried
+ * filing (`FilingTarget`). The writes stay on
  * the API: `PUT /api/tasks/{id}` `{feature_id}` files a task and its subtree into a feature of its own
  * project; `POST /api/tasks` takes `feature_id`. */
 
 /** Where a create files: a project and, optionally, one of its features. */
 export type FilingTarget = { projectId: number; featureId: string | null }
 
+/** The choice that files a task in its project alone, named as the project's own root ("acme/"); "Project/"
+ *  until the name is known. The path cue is the breadcrumb's; a Feature field names the plain project
+ *  (`projectRootName`). */
+export function projectRootLabel(projectName: string | undefined): string {
+  return `${projectRootName(projectName)}/`
+}
+
+/** The same choice in a Feature field, where a trailing "/" reads as a typo: "acme", "Project" until known. */
+export function projectRootName(projectName: string | undefined): string {
+  return projectName ?? 'Project'
+}
+
 /** The cache key of `useFilingFeatures`; a filing or a feature write invalidates it. */
 export const FILING_FEATURES_QUERY_KEY = ['features', 'filing'] as const
 
-/** The features a task of `projectId` may be filed into: that project's ACTIVE features, where the project
- *  grants the caller `tasks:edit` (`GET /api/features?…&editable=true`). A shipped feature and another
- *  project's are never offered (AC-7.2, AC-1.3). `undefined` projectId (or `enabled` false) fetches nothing. */
+/** The features a task of `projectId` may be filed into: that project's features, where the project grants the
+ *  caller `tasks:edit` (`GET /api/features?…&editable=true`). Another project's are never offered (AC-7.2,
+ *  AC-1.3). `undefined` projectId (or `enabled` false) fetches nothing. */
 export function useFilingFeatures(
   projectId: number | undefined,
   enabled = true,
@@ -26,7 +38,7 @@ export function useFilingFeatures(
   const query = useQuery({
     queryKey: [...FILING_FEATURES_QUERY_KEY, projectId],
     queryFn: () =>
-      get<FeatureSummary[]>(`/api/features?project_id=${projectId}&status=active&editable=true`),
+      get<FeatureSummary[]>(`/api/features?project_id=${projectId}&editable=true`),
     enabled: on,
     staleTime: 15_000,
   })
@@ -41,7 +53,7 @@ export function invalidateFilingQueries(client: QueryClient): void {
   void client.invalidateQueries({ queryKey: FILING_FEATURES_QUERY_KEY })
 }
 
-/** A feature's name, wherever the caller can see it: the tree (active and shipped) first, then `features` (any
+/** A feature's name, wherever the caller can see it: the tree first, then `features` (any
  *  `{id, name}` the caller already holds — a picker's list, a scope's feature). */
 export function featureName(
   featureId: string | null | undefined,
@@ -50,7 +62,8 @@ export function featureName(
 ): string | undefined {
   if (!featureId) return undefined
   for (const project of tree?.projects ?? []) {
-    const hit = project.features.find(f => f.id === featureId)
+    // A deleted feature still names the tasks it holds (`deleted_features`).
+    const hit = project.features.find(f => f.id === featureId) ?? project.deleted_features?.find(f => f.id === featureId)
     if (hit) return hit.name
   }
   return features.find(f => f.id === featureId)?.name

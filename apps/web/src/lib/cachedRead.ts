@@ -7,7 +7,7 @@ import { queryClient } from '../queryClient'
  * (agent choices, models, roster, attachments, dependencies). This reads through the app's singleton
  * client imperatively (`fetchQuery`), which needs no provider, so a remount inside `staleTime` answers from cache,
  * two reads in flight for one key share one GET (React StrictMode's double mount, two hooks on one page), and a key
- * a `useQuery` caller already uses (`['task-models']`, `['project-members', id]` — `pages/ProjectEditPage.tsx`) is
+ * a `useQuery` caller already uses (`['task-models']` — `hooks/useTaskModels`; `['project-members', id]` — `pages/ProjectEditPage.tsx`) is
  * one entry for both. The cached value is the RAW answer: callers shape it after, so a shared key holds one shape.
  * A failed read rejects and caches no data, so the next read asks again. Persistence is `queryClient.ts`'s
  * `UNPERSISTED_QUERIES` call, per key. */

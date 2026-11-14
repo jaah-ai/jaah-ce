@@ -25,7 +25,7 @@ tenancy axis cannot narrow (no `org_id` to filter). Verdict per route:
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Optional
 from uuid import UUID
 
@@ -33,12 +33,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.auth import require_superadmin
 from app.authz.catalog import Tenancy
 from app.authz.declarations import superadmin_only
+from app.clock import utcnow
 from app.cron_retention import activity_events_retention_days
-from app.db import get_session
+from app.db_async import DbDep
+from app.list_page import PER_MAX
 from app.models.identity import AdminUser
 from app.models.orgs import Org, TenancyExclusion
 from app.routes.audit import _require_aware
@@ -59,7 +62,6 @@ UNBOUND_ORG = "unbound"
 #: The label an item carries when `bound_org IS NULL` — the same word the filter uses.
 UNBOUND_ORG_LABEL = "unbound"
 
-_PER_MAX = 200
 _OFFSET_MAX = 100_000
 
 
@@ -192,7 +194,7 @@ def _filters(
 
 @router.get("", response_model=TenancyExclusionsPageOut)
 @superadmin_only(Tenancy.OPERATOR)
-def browse_tenancy_exclusions(
+async def browse_tenancy_exclusions(
     mapped_class: Optional[str] = Query(
         default=None,
         max_length=64,
@@ -256,11 +258,12 @@ def browse_tenancy_exclusions(
             "requirements as start."
         ),
     ),
-    limit: int = Query(default=50, ge=1, le=_PER_MAX),
+    limit: int = Query(default=50, ge=1, le=PER_MAX),
     # Bounded: Postgres reads and discards every skipped row.
     offset: int = Query(default=0, ge=0, le=_OFFSET_MAX),
     _actor: AdminUser = Depends(require_superadmin),
-    session: Session = Depends(get_session),
+    *,
+    db: DbDep,
 ) -> TenancyExclusionsPageOut:
     """One page of the durable exclusion log, with everything the page needs to be honest about it.
 
@@ -293,10 +296,7 @@ def browse_tenancy_exclusions(
             ),
         )
     if mode is not None and mode not in MODES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"unknown mode '{mode}' — expected one of {', '.join(MODES)}",
-        )
+        raise HTTPException(status_code=422, detail=f"unknown mode '{mode}' — expected one of {', '.join(MODES)}")
 
     unbound_only = bound_org == UNBOUND_ORG
     org_filter: Optional[UUID] = None
@@ -325,78 +325,83 @@ def browse_tenancy_exclusions(
         end=end,
     )
 
-    # Resolved first: the windowed count reads `covering_since`.
-    retention_days = activity_events_retention_days()
+    # Resolved first: the windowed count reads `covering_since`. In the threadpool, before the request's own
+    # session holds a connection: `log_started_at` opens its own sync session, and the retention knob is a
+    # settings read.
+    retention_days, started_at = await run_in_threadpool(
+        lambda: (activity_events_retention_days(), exclusion_log.log_started_at())
+    )
     # The later of the two terms (see the response model).
-    retention_floor = datetime.now(timezone.utc) - timedelta(days=retention_days)
-    started_at = exclusion_log.log_started_at()
+    retention_floor = utcnow() - timedelta(days=retention_days)
     # Floored to the minute, or the first bucket of the log's starting minute is excluded.
     covering_since = _floor_to_minute(
         max(retention_floor, started_at) if started_at else retention_floor
     )
 
-    total = session.scalar(
-        select(func.count()).select_from(TenancyExclusion).where(*clauses)
-    ) or 0
-    # Unfiltered answers "has anything been recorded". Computed only in the one arm that reads it (a
-    # filter narrowed the set to nothing); with no filter it is `total` exactly, and with a matching
-    # filter the page never reads it.
-    if not clauses:
-        total_unfiltered = total
-    elif total == 0:
-        # Windowed, matching the page's "the retained window holds N" and covering sweep arrears; also a
-        # range scan on the bucket index's leading `occurred_at`.
-        total_unfiltered = session.scalar(
-            select(func.count())
-            .select_from(TenancyExclusion)
-            .where(TenancyExclusion.occurred_at >= covering_since)
+    def work(session: Session) -> TenancyExclusionsPageOut:
+        total = session.scalar(
+            select(func.count()).select_from(TenancyExclusion).where(*clauses)
         ) or 0
-    else:
-        total_unfiltered = total
+        # Unfiltered answers "has anything been recorded". Computed only in the one arm that reads it (a
+        # filter narrowed the set to nothing); with no filter it is `total` exactly, and with a matching
+        # filter the page never reads it.
+        if not clauses:
+            total_unfiltered = total
+        elif total == 0:
+            # Windowed, matching the page's "the retained window holds N" and covering sweep arrears; also a
+            # range scan on the bucket index's leading `occurred_at`.
+            total_unfiltered = session.scalar(
+                select(func.count())
+                .select_from(TenancyExclusion)
+                .where(TenancyExclusion.occurred_at >= covering_since)
+            ) or 0
+        else:
+            total_unfiltered = total
 
-    rows = session.scalars(
-        select(TenancyExclusion)
-        .where(*clauses)
-        .order_by(TenancyExclusion.occurred_at.desc(), TenancyExclusion.id.desc())
-        .offset(offset)
-        .limit(limit)
-    ).all()
+        rows = session.scalars(
+            select(TenancyExclusion)
+            .where(*clauses)
+            .order_by(TenancyExclusion.occurred_at.desc(), TenancyExclusion.id.desc())
+            .offset(offset)
+            .limit(limit)
+        ).all()
 
-    # Over the unfiltered set, so it answers "is the seam still excluding anything". A backwards scan
-    # on the leading `occurred_at` index column.
-    latest_occurred_at = session.scalar(select(func.max(TenancyExclusion.occurred_at)))
+        # Over the unfiltered set, so it answers "is the seam still excluding anything". A backwards scan
+        # on the leading `occurred_at` index column.
+        latest_occurred_at = session.scalar(select(func.max(TenancyExclusion.occurred_at)))
 
-    # Option lists from the closed sets that define them (`TENANT_OWNED`, the `orgs` axis table), not
-    # `SELECT DISTINCT` over the log: no whole-index passes, stable pickers, and aged-out options stay
-    # selectable.
-    classes = sorted(cls.__name__ for cls in TENANT_OWNED)
-    all_orgs = session.execute(select(Org.id, Org.name, Org.deleted_at).order_by(Org.name)).all()
-    # A soft-deleted org is offered as no option, but still names its own past rows.
-    option_orgs = [(org_id, name) for org_id, name, deleted_at in all_orgs if deleted_at is None]
-    names: dict[UUID, str] = {org_id: name for org_id, name, _ in all_orgs}
+        # Option lists from the closed sets that define them (`TENANT_OWNED`, the `orgs` axis table), not
+        # `SELECT DISTINCT` over the log: no whole-index passes, stable pickers, and aged-out options stay
+        # selectable.
+        classes = sorted(cls.__name__ for cls in TENANT_OWNED)
+        all_orgs = session.execute(select(Org.id, Org.name, Org.deleted_at).order_by(Org.name)).all()
+        # A soft-deleted org is offered as no option, but still names its own past rows.
+        option_orgs = [(org_id, name) for org_id, name, deleted_at in all_orgs if deleted_at is None]
+        names: dict[UUID, str] = {org_id: name for org_id, name, _ in all_orgs}
 
-    orgs = [
-        TenancyExclusionOrgOut(id=org_id, name=_org_label(org_id, names))
-        for org_id, _name in option_orgs
-    ]
+        orgs = [
+            TenancyExclusionOrgOut(id=org_id, name=_org_label(org_id, names))
+            for org_id, _name in option_orgs
+        ]
 
-    health = exclusion_log.writer_health()
-    return TenancyExclusionsPageOut(
-        items=[
-            from_row(TenancyExclusionOut, row, bound_org_label=_org_label(row.bound_org, names))
-            for row in rows
-        ],
-        total=total,
-        total_unfiltered=total_unfiltered,
-        covering_since=covering_since,
-        retention_days=retention_days,
-        log_started_at=started_at,
-        latest_occurred_at=latest_occurred_at,
-        writer_ok=health.ok,
-        writer_detail=_writer_detail(health),
-        classes=classes,
-        orgs=orgs,
-        scope_kinds=list(ALL_RECORDED_SCOPE_KINDS),
-        modes=list(MODES),
-        seam_mode=seam_mode().value,
-    )
+        health = exclusion_log.writer_health()
+        return TenancyExclusionsPageOut(
+            items=[
+                from_row(TenancyExclusionOut, row, bound_org_label=_org_label(row.bound_org, names))
+                for row in rows
+            ],
+            total=total,
+            total_unfiltered=total_unfiltered,
+            covering_since=covering_since,
+            retention_days=retention_days,
+            log_started_at=started_at,
+            latest_occurred_at=latest_occurred_at,
+            writer_ok=health.ok,
+            writer_detail=_writer_detail(health),
+            classes=classes,
+            orgs=orgs,
+            scope_kinds=list(ALL_RECORDED_SCOPE_KINDS),
+            modes=list(MODES),
+            seam_mode=seam_mode().value,
+        )
+    return await db.run_sync(work)

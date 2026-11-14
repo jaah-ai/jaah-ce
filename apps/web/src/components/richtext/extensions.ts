@@ -4,9 +4,11 @@ import TaskList from '@tiptap/extension-task-list'
 import { Extension, type AnyExtension } from '@tiptap/core'
 import { Markdown } from 'tiptap-markdown'
 import StarterKit from '@tiptap/starter-kit'
-import { Plugin } from '@tiptap/pm/state'
+import type { Mark, MarkType } from '@tiptap/pm/model'
+import { Plugin, type Transaction } from '@tiptap/pm/state'
 import { Decoration, DecorationSet } from '@tiptap/pm/view'
-import { AttachmentImage } from './attachmentImage'
+import { MOD_KEY } from '../../ui/modifierKey'
+import { AttachmentImage, splitAltWidth } from './attachmentImage'
 import { type AttachmentResolver, isAttachmentSrc } from './attachmentResolver'
 
 // The ONE schema shared by RichTextEditor and RichTextRenderer (AC-9): identical node and mark sets keep the
@@ -75,22 +77,12 @@ const AutolinkStopsAtQuote = Extension.create({
   name: 'autolinkStopsAtQuote',
   addStorage: () => linkifyStorage(cutAtQuote),
   addProseMirrorPlugins() {
-    return [new Plugin({
-      appendTransaction(transactions, _oldState, state) {
-        if (!transactions.some(tr => tr.docChanged)) return null
-        const linkType = state.schema.marks.link
-        const tr = state.tr
-        state.doc.descendants((node, pos) => {
-          const link = node.isText ? linkType.isInSet(node.marks) : undefined
-          const text = node.text ?? ''
-          const cut = text.indexOf('"')
-          if (!link || cut < 0 || ![text, `http://${text}`].includes(link.attrs.href)) return
-          const href = link.attrs.href as string
-          tr.removeMark(pos + cut, pos + text.length, linkType)
-          if (cut > 0) tr.addMark(pos, pos + cut, linkType.create({ ...link.attrs, href: href.slice(0, href.length - (text.length - cut)) }))
-        })
-        return tr.docChanged ? tr : null
-      },
+    return [linkedTextFixer((tr, pos, text, link, linkType) => {
+      const cut = text.indexOf('"')
+      if (cut < 0 || ![text, `http://${text}`].includes(link.attrs.href)) return
+      const href = link.attrs.href as string
+      tr.removeMark(pos + cut, pos + text.length, linkType)
+      if (cut > 0) tr.addMark(pos, pos + cut, linkType.create({ ...link.attrs, href: href.slice(0, href.length - (text.length - cut)) }))
     })]
   },
 })
@@ -103,21 +95,28 @@ const NoAutolinkFilename = Extension.create({
   name: 'noAutolinkFilename',
   addStorage: () => linkifyStorage(found => (isBareFilename(found.raw) ? null : found)),
   addProseMirrorPlugins() {
-    return [new Plugin({
-      appendTransaction(transactions, _oldState, state) {
-        if (!transactions.some(tr => tr.docChanged)) return null
-        const linkType = state.schema.marks.link
-        const tr = state.tr
-        state.doc.descendants((node, pos) => {
-          const link = node.isText ? linkType.isInSet(node.marks) : undefined
-          const text = node.text ?? ''
-          if (link && link.attrs.href === `http://${text}` && isBareFilename(text)) tr.removeMark(pos, pos + text.length, linkType)
-        })
-        return tr.docChanged ? tr : null
-      },
+    return [linkedTextFixer((tr, pos, text, link, linkType) => {
+      if (link.attrs.href === `http://${text}` && isBareFilename(text)) tr.removeMark(pos, pos + text.length, linkType)
     })]
   },
 })
+
+/* The plugin both corrections share: after a change, `fix` sees every text node carrying a Link mark and
+   trims or removes the mark on the one transaction, applied only when it changed something. */
+function linkedTextFixer(fix: (tr: Transaction, pos: number, text: string, link: Mark, linkType: MarkType) => void): Plugin {
+  return new Plugin({
+    appendTransaction(transactions, _oldState, state) {
+      if (!transactions.some(tr => tr.docChanged)) return null
+      const linkType = state.schema.marks.link
+      const tr = state.tr
+      state.doc.descendants((node, pos) => {
+        const link = node.isText ? linkType.isInSet(node.marks) : undefined
+        if (link) fix(tr, pos, node.text ?? '', link, linkType)
+      })
+      return tr.docChanged ? tr : null
+    },
+  })
+}
 
 const CODE_FILE_EXTENSION = /\.(md|mdx|py|sh|rs|ts|tsx|js|jsx|mjs|go|rb|pl|php|java|kt|swift|c|h|cpp|cs|sql|json|yaml|yml|toml|ini|cfg|env|lock|txt|log|csv|xml|html|css|scss)$/i
 
@@ -164,7 +163,7 @@ function cutAtQuote(found: LinkifyMatch): LinkifyMatch {
   }
 }
 
-const OPEN_LINK_HINT = '⌘/Ctrl+click to open'
+const OPEN_LINK_HINT = `${MOD_KEY}+click to open`
 
 /* While editing, a plain click on a link places the caret in it (so its text stays editable); Ctrl/⌘+click opens it
    in a new tab, as in Google Docs. The href is the rendered one, already filtered by the Link mark's `isAllowedUri`.
@@ -213,7 +212,7 @@ const UntrustedContent = Extension.create({
           updateDOM(element: HTMLElement) {
             const doc = element.ownerDocument
             for (const img of Array.from(element.querySelectorAll('img'))) {
-              if (!isAttachmentSrc(img.getAttribute('src') ?? '')) img.replaceWith(doc.createTextNode(img.getAttribute('alt') ?? ''))
+              if (!isAttachmentSrc(img.getAttribute('src') ?? '')) img.replaceWith(doc.createTextNode(splitAltWidth(img.getAttribute('alt')).alt ?? ''))
             }
             for (const a of Array.from(element.querySelectorAll('a'))) {
               const href = a.getAttribute('href') ?? ''

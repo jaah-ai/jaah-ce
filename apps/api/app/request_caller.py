@@ -52,7 +52,7 @@ def client_headers(request: Request) -> dict[str, Optional[str]]:
     (`apps/api/entrypoint.sh`). So that hop is ours, and kept in its own field, while every hop left of it is
     client-declared text: the chain keeps its TAIL when bounded, so padding cannot push the ALB's hop out. A
     right-most hop that is not an IP address (no ALB in front, as on a local stack) is no `client_ip`. Every header
-    line is joined first, as uvicorn joins them for `request.client.host` (`console_relay.server.client_address`),
+    line is joined first, as `app/proxy_headers.py` joins them for `request.client.host` (`console_relay.server.client_address`),
     so a second line cannot make the two disagree."""
     user_agent = request.headers.get("user-agent")
     forwarded_for = ", ".join(request.headers.getlist("x-forwarded-for"))

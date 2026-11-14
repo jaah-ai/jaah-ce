@@ -1,0 +1,65 @@
+# TikTok through Login Kit for Web and the Display API. TikTok names the client parameter `client_key` on authorize,
+# token and refresh (`client_id_param`), separates scopes with commas, and documents PKCE for mobile and desktop
+# only. Refresh tokens rotate on every refresh. Confirmed 2026-11-03 at the vendor_docs_url
+# page, https://developers.tiktok.com/doc/oauth-user-access-token-management and
+# https://developers.tiktok.com/doc/tiktok-api-v2-get-user-info; a made-up token answers 401 access_token_invalid.
+slug = "tiktok"
+label = "TikTok"
+category = "marketing"
+vendor_docs_url = "https://developers.tiktok.com/doc/login-kit-web"
+summary = "Read the connected TikTok account's profile and videos, and their view and like counts."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://www.tiktok.com/v2/auth/authorize/"
+token_url = "https://open.tiktokapis.com/v2/oauth/token/"
+client_id_param = "client_key"
+scope_separator = ","
+pkce = false
+scopes = [
+  { name = "user.info.basic", label = "Read the account's display name and avatar, so the secret shows which account it is" },
+  { name = "user.info.stats", label = "Read follower, following, like and video counts for reporting", optional = true },
+  { name = "video.list", label = "List the account's public videos with their view, like, comment and share counts", optional = true },
+]
+jaah_app = true
+[auth.oauth.registration]
+console_url = "https://developers.tiktok.com/apps"
+steps = [
+  "Select Connect an app and choose Jaah's organization as the owner (create one under Manage organizations first if needed; never a personal owner)",
+  "On Basic information set App icon to the Jaah logo, App name to Jaah, Category to Business, Description to Jaah lets a team's AI agents read the TikTok account it connects, Terms of Service URL and Privacy Policy URL to the terms and privacy policy pages of the company that runs this Jaah",
+  "Under Platforms tick Web and enter the public homepage of the company that runs this Jaah (its https address) as the website URL. Verify that domain's URL property when TikTok asks (URL properties > Verify, by DNS TXT record)",
+  "Select Add products and add Login Kit. The redirect URIs (a later step) go under Login Kit > Web > Redirect URI",
+  "Under Scopes make sure user.info.basic, user.info.stats and video.list are added (user.info.stats and video.list come with the Display API; add that product if they are missing)",
+  "Select Submit for review. TikTok asks for an explanation of each product and scope and a demo video of the Connect flow; record one in the dev console with the Sandbox app",
+  "TikTok calls the client ID Client key: on the app page copy Client key and Client secret, and store the Client key as the oauth_app secret's client ID",
+]
+review = "Required. The app works only for its own Sandbox target users until TikTok approves it; review needs a demo video and verified URL properties, and takes several days"
+
+[test]
+method = "GET"
+path = "https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name"
+identity = [["data", "user", "display_name"]]
+
+[docs]
+revoke_at = "TikTok > Settings and privacy > Security and permissions > Apps and services permissions"
+agent_uses = [
+  "Read the connected account's display name, avatar and follower, like and video counts",
+  "List the account's public videos with their view, like, comment and share counts",
+  "Put together a performance summary of recent videos for a marketing report",
+]
+prerequisites = ["A TikTok account. A Business or Creator account is not required, but its statistics are what agents read"]
+limitations = [
+  "Read only: agents cannot post, comment or reply. Posting needs TikTok's Content Posting API, which this connection does not request",
+  "Only the connected account's own profile and videos: TikTok gives apps no access to other accounts, messages or ads",
+  "Until this Jaah's TikTok app passes TikTok's review, Connect works only for the accounts listed as its Sandbox target users",
+]
+troubleshooting = [
+  { symptom = "Test says TikTok rejected the access token (401)", fix = "The grant was revoked under TikTok Settings > Security and permissions > Apps and services permissions, or its refresh token expired unused. Select Reconnect" },
+  { symptom = "Connect ends with an error that the redirect URI does not match", fix = "The OAuth app's Login Kit > Web redirect URI differs from Jaah's by a character. Copy it again from this page into your own app's settings" },
+  { symptom = "Connect ends with scope_not_authorized", fix = "The app lacks a scope it asks for. Add user.info.stats and video.list under the app's Scopes, or untick them on the Connect screen" },
+]
+faq = [
+  { q = "Can an agent upload a TikTok video", a = "Not with this connection; it asks for read scopes only" },
+  { q = "Why does the Connect screen say client key", a = "TikTok calls the OAuth client ID a client key. Paste it as the client ID if you use your own app" },
+]

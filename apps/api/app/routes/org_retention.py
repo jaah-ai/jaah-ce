@@ -17,15 +17,13 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app import org_retention
-from app.actors import stamp_actor
-from app.auth import require_user
+from app.actors import set_request_actor, stamp_actor
 from app.authz.catalog import Tenancy
 from app.authz.declarations import org_admin
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller, current_principal
 from app.clock import utcnow
-from app.db import get_session
-from app.entity_shape import administered_org_or_404
-from app.models.identity import AdminUser
+from app.db_async import on_session
+from app.entity_shape import administered_org_or_404, from_row
 from app.models.orgs import Org
 
 router = APIRouter(tags=["orgs"])
@@ -63,18 +61,16 @@ def _out(org: Org) -> RetentionOut:
         limits = org_retention.bounds(data_class)
         stored = org_retention.stored_days(org, data_class)
         days = None if stored is None else org_retention.clamp(data_class, stored)
-        return RetentionClassOut(days=days, clamped_from=stored if stored != days else None,
-                                 default_days=limits.default_days, min_days=limits.min_days, max_days=limits.max_days)
+        return from_row(RetentionClassOut, limits, days=days, clamped_from=stored if stored != days else None)
 
     return RetentionOut(**{data_class: one(data_class) for data_class in org_retention.CLASSES})
 
 
 @router.get("/api/orgs/{org_id}/retention", response_model=RetentionOut)
 @org_admin(Tenancy.CALLER_PLANE)
+@on_session
 def get_retention(
-    org_id: str,
-    principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
+    session: Session, org_id: str, principal: Optional[Principal] = Depends(current_principal),
 ) -> RetentionOut:
     """The org's three windows and the range each may take."""
     return _out(_org(session, org_id, principal))
@@ -82,15 +78,16 @@ def get_retention(
 
 @router.put("/api/orgs/{org_id}/retention", response_model=RetentionOut)
 @org_admin(Tenancy.CALLER_PLANE)
+@on_session
 def put_retention(
+    session: Session,
     org_id: str,
     body: RetentionIn,
-    actor: AdminUser = Depends(require_user),
-    principal: Optional[Principal] = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> RetentionOut:
     """Replace the org's three windows. 422 naming the range when a value falls outside it."""
-    org = _org(session, org_id, principal)
+    set_request_actor(session, caller.actor.id)
+    org = _org(session, org_id, caller.principal)
     wanted = body.model_dump()
     for data_class, days in wanted.items():
         why = None if days is None else org_retention.refusal(data_class, days)
@@ -99,6 +96,6 @@ def put_retention(
     for data_class, days in wanted.items():
         setattr(org, org_retention.CLASSES[data_class][0], days)
     org.updated_at = utcnow()
-    stamp_actor(org, actor)
+    stamp_actor(org, caller.actor)
     session.commit()
     return _out(org)

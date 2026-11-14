@@ -1,7 +1,5 @@
-import { useMemo, useState, type JSX, type ReactNode } from 'react'
+import { useMemo, type JSX, type ReactNode } from 'react'
 import Box from '@mui/material/Box'
-import Button from '@mui/material/Button'
-import Collapse from '@mui/material/Collapse'
 import Link from '@mui/material/Link'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
@@ -12,13 +10,14 @@ import { useAuth } from '../../auth'
 import Breadcrumb from '../../components/Breadcrumb'
 import { TabPanel, Tabs, type TabDef } from '../../components/Tabs'
 import { useUrlTab } from '../../hooks/useUrlTab'
+import AdvancedSection from '../../ui/AdvancedSection'
 import Banner from '../../ui/Banner'
 import { CopyButton } from '../../ui/CopyButton'
 import LoadingState from '../../ui/LoadingState'
 import StatusChip from '../../ui/StatusChip'
 import { Mono } from '../../ui/DetailFields'
 import DetailPage, { DetailField } from '../../ui/detail/DetailPage'
-import { PHONE, monoSx } from '../../ui/listStyles'
+import { PHONE, monoSx, ELLIPSIS_SX } from '../../ui/listStyles'
 import { customerUrl } from '../../lib/customers'
 import { NO_VALUE } from '../../lib/relativeTime'
 import { formatZoned, viewerZone } from '../../lib/zonedTime'
@@ -28,6 +27,8 @@ import { statusTone } from './status'
 import { isSessionValue } from './activityFilters'
 import type { AuditRow } from './types'
 import { CodeBlock } from '../../ui/CodeBlock'
+import { grid } from '../../theme'
+import Tip from '../../ui/Tip'
 
 /* ONE ACTIVITY ROW, IN FULL (`/audit/events/:eventId`) — an editor in the list/detail pane beside Audit's
  * activity feed (`lib/listDetail.ts`), a full page below the dock width. The feed keeps what is scanned DOWN a
@@ -64,11 +65,11 @@ const FIELDS_SX = {
   pt: 1.5,
   display: 'flex',
   flexDirection: 'column',
-  gap: 1.75,
+  gap: 1.5,
   minWidth: 0,
   '& dd': { typography: 'body2', '& > span.MuiTypography-body2': { lineHeight: 'inherit', verticalAlign: 'top' } },
   [PHONE]: {
-    '& dt': { flex: '0 0 6.5rem', minWidth: 0 },
+    '& dt': { flex: `0 0 ${grid(17)}`, minWidth: 0 },
     '& dd': { flex: '1 1 0' },
   },
 } as const
@@ -82,14 +83,13 @@ function Fields({ children }: { children: ReactNode }): JSX.Element {
 function SecondaryId({ id, what }: { id: string; what: string }): JSX.Element {
   return (
     <Stack direction="row" sx={{ alignItems: 'center', gap: 0.5, minWidth: 0 }}>
-      <Typography
+      <Tip title={id}><Typography
         component="div"
         variant="caption"
-        title={id}
-        sx={[monoSx, { color: 'text.secondary', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }]}
+        sx={[monoSx, { color: 'text.secondary', ...ELLIPSIS_SX }]}
       >
         {id}
-      </Typography>
+      </Typography></Tip>
       <CopyButton variant="icon" text={() => id} label={`Copy ${what}`} />
     </Stack>
   )
@@ -100,39 +100,6 @@ const INLINE_VALUE_MAX = 120
 
 /** Payload keys with their own named disclosure, in order: the two captured bodies. */
 const BODY_KEYS = ['request', 'response'] as const
-
-/** A labelled, default-collapsed block: a plain button whose state a spec reads off `aria-expanded` (not
- *  MUI's `Accordion`). */
-function Disclosure({
-  label,
-  testId,
-  children,
-}: {
-  label: string
-  testId: string
-  children: ReactNode
-}): JSX.Element {
-  const [open, setOpen] = useState(false)
-  return (
-    <Box sx={{ mt: 1 }}>
-      <Button
-        size="small"
-        variant="text"
-        data-testid={testId}
-        aria-expanded={open}
-        onClick={() => setOpen(v => !v)}
-        sx={{ px: 0.75, textTransform: 'none' }}
-      >
-        {open ? '▾' : '▸'} {label}
-      </Button>
-      <Collapse in={open} unmountOnExit>
-        <Box data-testid={`${testId}-body`} sx={{ pt: 0.5 }}>
-          {children}
-        </Box>
-      </Collapse>
-    </Box>
-  )
-}
 
 /** One payload entry inline: scalars as themselves, structures as compact JSON up to `INLINE_VALUE_MAX`
  *  (the full object is in the payload disclosure below). */
@@ -188,16 +155,15 @@ function EventView({ row, zone }: { row: AuditRow; zone: string }): JSX.Element 
           {/* The person by name; their uuid is secondary — on hover and the copy button, never a line of its own. */}
           <DetailField label="Actor">
             <Stack direction="row" sx={{ alignItems: 'center', gap: 0.5, minWidth: 0 }}>
-              <Typography
+              <Tip title={row.user_id ?? undefined}><Typography
                 variant="body2"
                 data-testid="audit-event-actor"
-                title={row.user_id ?? undefined}
                 /* No one to name (an unknown address's refusal): muted, as the feed's actor slot is. */
                 data-unattributed={isUnattributed(row) || undefined}
                 sx={{ minWidth: 0, overflowWrap: 'anywhere', ...(isUnattributed(row) ? { color: 'text.disabled' } : null) }}
               >
                 {actorText(row)}
-              </Typography>
+              </Typography></Tip>
               {row.user_id !== null && <CopyButton variant="icon" text={() => row.user_id ?? ''} label="Copy user id" />}
             </Stack>
           </DetailField>
@@ -231,17 +197,16 @@ function EventView({ row, zone }: { row: AuditRow; zone: string }): JSX.Element 
           {row.org && (
             <DetailField label="Account">
               <Stack direction="row" sx={{ alignItems: 'center', gap: 0.5, minWidth: 0 }}>
-                <Link
+                <Tip title={row.org.id}><Link
                   component={RouterLink}
                   to={customerUrl(row.org.id)}
                   underline="hover"
                   variant="body2"
                   data-testid="audit-event-account"
-                  title={row.org.id}
                   sx={{ minWidth: 0, overflowWrap: 'anywhere' }}
                 >
                   {row.org.name}
-                </Link>
+                </Link></Tip>
                 <CopyButton variant="icon" text={() => row.org?.id ?? ''} label="Copy account id" />
               </Stack>
             </DetailField>
@@ -346,17 +311,17 @@ function EventView({ row, zone }: { row: AuditRow; zone: string }): JSX.Element 
               })}
             </Fields>
           )}
-          {/* The three JSON blocks, collapsed: `request`/`response` first, the whole payload last. */}
+          {/* The three JSON blocks, collapsed (`ui/AdvancedSection`): `request`/`response` first, the whole payload last. */}
           {BODY_KEYS.map(key =>
             key in row.data ? (
-              <Disclosure key={key} label={`${key} body`} testId={`audit-event-${key}`}>
-                <CodeBlock maxHeight={320}>{JSON.stringify(row.data[key], null, 2)}</CodeBlock>
-              </Disclosure>
+              <AdvancedSection key={key} dense label={`${key} body`} testId={`audit-event-${key}`}>
+                <CodeBlock maxHeight={grid(53)}>{JSON.stringify(row.data[key], null, 2)}</CodeBlock>
+              </AdvancedSection>
             ) : null,
           )}
-          <Disclosure label="Full payload (JSON)" testId="audit-event-payload">
-            <CodeBlock maxHeight={320}>{JSON.stringify(row.data, null, 2)}</CodeBlock>
-          </Disclosure>
+          <AdvancedSection dense label="Full payload (JSON)" testId="audit-event-payload">
+            <CodeBlock maxHeight={grid(53)}>{JSON.stringify(row.data, null, 2)}</CodeBlock>
+          </AdvancedSection>
         </TabPanel>
       )}
     </>

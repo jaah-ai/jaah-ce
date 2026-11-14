@@ -39,7 +39,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, case, func, lateral, not_, or_, select, true, tuple_, values
+from sqlalchemy import and_, case, func, lateral, not_, or_, select, true, values
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.compiler import compiles
@@ -49,10 +49,9 @@ from sqlalchemy.sql.expression import ClauseElement, Executable, column
 
 from app.identities import label_expr
 from app.activity_kinds import SUBJECT_PARAMS, nodevault_label
-from app.auth import require_user
 from app.authz.catalog import PROJECTS_VIEW_KEY, permission_key
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller
 from app.authz.visibility import (
     granted_account_slugs,
     readable_account_select,
@@ -62,7 +61,8 @@ from app.authz.visibility import (
     scoped_task_select,
 )
 from app import edition_features, keyset, login_lockout, plan_terms, request_caller
-from app.db import get_session
+from app.db_async import on_session
+from app.list_page import PER_MAX
 from app.models.access import Group
 from app.models.audit import (
     SIGN_IN_REFUSAL_KIND,
@@ -74,7 +74,7 @@ from app.models.audit import (
 from app.models.automations import Cron
 from app.models.credentials import Account, Credential
 from app.models.identity import AdminUser
-from app.models.nodes import Node
+from app.models.nodes import Node, NodeOrder
 from app.models.orgs import Org
 from app.models.projects import Project
 from app.models.task_extras import Tag
@@ -83,7 +83,8 @@ from app.audit_visibility import row_visible, tenant_worded, visible_payload
 from app.routes.tasks.activity import _transition_label
 from app.tenancy import seam
 from app.tenancy.ids import UNATTRIBUTED_SIGN_IN_ORG_ID, is_tenant_org
-from app.entity_shape import UuidRefOut, from_row
+from app.tenancy.labels import OrgRef
+from app.entity_shape import PG_INT_MAX, PG_INT_MIN, UuidRefOut, from_row, names_of, or_404
 
 log = logging.getLogger("app.routes.audit")
 
@@ -111,7 +112,6 @@ _Q_MAX_LEN = 200
 #: Activity's `q` floor: `pg_trgm` indexes three-character grams, so shorter text cannot use the trigram index
 #: and a rare match walks the whole trail.
 _Q_MIN_LEN = 3
-_PER_MAX = 200
 #: Per list in `GET /api/audit/suggest`.
 _SUGGEST_MAX = 6
 #: Values per repeatable facet (`user_id`, `org_id`): each is a bind, and the chips a person builds are few.
@@ -149,6 +149,8 @@ _SUBJECT_MODELS: dict[str, tuple[Any, Any, Any]] = {
     "group": (Group.id, Group.name, lambda principal: _org_admin_only(principal, Group)),
     "cron": (Cron.id, Cron.name, lambda principal: _org_admin_only(principal, Cron)),
     "tag": (Tag.id, Tag.name, lambda principal: _key_gated(principal, Tag, TASKS_VIEW_KEY)),
+    # Org-admin-only like its writes (`routes/node_orders.py`); its name is the node's.
+    "node_order": (NodeOrder.id, NodeOrder.name, lambda principal: _org_admin_only(principal, NodeOrder)),
 }
 
 
@@ -200,10 +202,6 @@ def _subject_ref(data: Optional[dict[str, Any]]) -> Optional[tuple[str, str]]:
     return None
 
 
-#: The INTEGER range: an out-of-range parsed id would raise at the database and 500 the whole page.
-_PG_INT_MIN, _PG_INT_MAX = -(2 ** 31), 2 ** 31 - 1
-
-
 def _parse_subject_id(id_col: Any, raw: str) -> Any:
     """One subject id as the type its own primary key column declares, or None when it does not parse.
 
@@ -221,7 +219,7 @@ def _parse_subject_id(id_col: Any, raw: str) -> Any:
             parsed = int(raw)
         except ValueError:
             return None
-        return parsed if _PG_INT_MIN <= parsed <= _PG_INT_MAX else None
+        return parsed if PG_INT_MIN <= parsed <= PG_INT_MAX else None
     try:
         return python_type(raw)
     except (TypeError, ValueError):
@@ -336,6 +334,25 @@ def _one_row_per_transfer(org_ids: frozenset[UUID] = frozenset()) -> Any:
 # ── The operator's filters ────────────────────────────────────────────────────────────────────────
 
 
+# The `start`/`end` window parameters of every route whose handler reads them through `_require_aware`
+# (`portfolio.py::command_log` shares them), spelled once: the description states the requirement it raises.
+CREATED_AT_START = Query(
+    default=None,
+    description=(
+        "Inclusive lower bound on created_at. ISO-8601 WITH AN EXPLICIT OFFSET (…+02:00 or …Z); a "
+        "zoneless value is refused with 422 rather than read in a guessed zone. CLEARED MEANS "
+        "OMITTED: drop the key, do not send it empty."
+    ),
+)
+CREATED_AT_END = Query(
+    default=None,
+    description=(
+        "Inclusive upper bound on created_at. Same explicit-offset and cleared-means-omitted "
+        "requirements as start."
+    ),
+)
+
+
 def _require_aware(value: Optional[datetime], name: str) -> Optional[datetime]:
     """One wire timestamp as an aware UTC instant — or a 422 naming the requirement.
 
@@ -383,7 +400,7 @@ def _parse_user_ids(user_ids: list[str]) -> tuple[list[UUID], bool]:
                     f"'user_id' must be a uuid or the literal '{SYSTEM_ACTOR}' "
                     "(the machine rows, which have no account behind them)"
                 ),
-            )
+            ) from None
     return uuids, system
 
 
@@ -419,7 +436,7 @@ def _parse_org_ids(org_ids: list[str]) -> frozenset[UUID]:
     try:
         return frozenset(UUID(raw) for raw in org_ids)
     except ValueError:
-        raise HTTPException(status_code=422, detail="'org_id' must be a uuid")
+        raise HTTPException(status_code=422, detail="'org_id' must be a uuid") from None
 
 
 #: A subject id spelled as a JSON number too: ASCII digits, no sign, no leading zero.
@@ -641,12 +658,6 @@ class AuditUserSuggestion(BaseModel):
     hint: Optional[str] = None
 
 
-class AuditOrgSuggestion(BaseModel):
-    id: str
-    name: str
-    slug: str
-
-
 class AuditSubjectSuggestion(BaseModel):
     """A record facet value; `type:id` is what the `subject` parameter takes."""
 
@@ -657,7 +668,7 @@ class AuditSubjectSuggestion(BaseModel):
 
 class AuditSuggestOut(BaseModel):
     users: list[AuditUserSuggestion]
-    orgs: list[AuditOrgSuggestion]
+    orgs: list[OrgRef]
     subjects: list[AuditSubjectSuggestion]
 
 
@@ -666,7 +677,9 @@ class AuditSuggestOut(BaseModel):
 
 @router.get("", response_model=AuditPageOut)
 @feature("audit", "view")
+@on_session
 def browse_audit(
+    session: Session,
     q: Optional[str] = Query(
         default=None,
         max_length=_Q_MAX_LEN,
@@ -726,21 +739,8 @@ def browse_audit(
         max_length=_Q_MAX_LEN,
         description="'<type>:<id>' (e.g. 'task:42'): only rows naming that record.",
     ),
-    start: Optional[datetime] = Query(
-        default=None,
-        description=(
-            "Inclusive lower bound on created_at. ISO-8601 WITH AN EXPLICIT OFFSET (…+02:00 or …Z); a "
-            "zoneless value is refused with 422 rather than read in a guessed zone. CLEARED MEANS "
-            "OMITTED: drop the key, do not send it empty."
-        ),
-    ),
-    end: Optional[datetime] = Query(
-        default=None,
-        description=(
-            "Inclusive upper bound on created_at. Same explicit-offset and cleared-means-omitted "
-            "requirements as start."
-        ),
-    ),
+    start: Optional[datetime] = CREATED_AT_START,
+    end: Optional[datetime] = CREATED_AT_END,
     console_session: Optional[str] = Query(
         default=None,
         pattern=request_caller.CONSOLE_SESSION.pattern,
@@ -762,10 +762,8 @@ def browse_audit(
         max_length=_Q_MAX_LEN,
         description="The previous page's next_cursor, unchanged. Omitted means the newest page.",
     ),
-    limit: int = Query(default=50, ge=1, le=_PER_MAX),
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    limit: int = Query(default=50, ge=1, le=PER_MAX),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> AuditPageOut:
     """One page of the console's activity trail, newest first, with a count that stays cheap at any size.
 
@@ -785,7 +783,10 @@ def browse_audit(
     stops at `_COUNT_CAP` (the estimate would leak other orgs' statistics). `any_visible` is one indexed
     probe, skipped when the page has rows.
     """
-    plan_terms.require_tenant_switch(session, principal, plan_terms.AUDIT)
+    # Read here, in the handler: the scope is the request's, and the org-filter census reads it per handler.
+    operator = seam.current_scope() is seam.OPERATOR
+
+    plan_terms.require_tenant_switch(session, caller.principal, plan_terms.AUDIT)
     # An empty string is a cleared control, not a filter (browsers send `user_id=`). Typed parameters
     # are not normalised — they declare no `BeforeValidator`, so pydantic refuses `""` before this body
     # runs — and a cleared typed control must drop its key (`?status=` is a pinned 422).
@@ -807,10 +808,6 @@ def browse_audit(
     if status is not None and status_class is not None:
         raise HTTPException(status_code=422, detail="send 'status' or 'status_class', not both")
     subject_ref = _parse_subject(subject) if subject else None
-    after = keyset.decode_cursor(
-        cursor, _CURSOR_SHAPE, is_stamp=lambda name: name == "created_at", int_range=(1, 2**31 - 1), status=422,
-        detail="'cursor' is not one this listing issued — send back a next_cursor unchanged, or leave it out",
-    ) if cursor else None
     start = _require_aware(start, "start")
     end = _require_aware(end, "end")
 
@@ -826,20 +823,17 @@ def browse_audit(
             api_key=api_key,
         )
 
-    page = filtered(select(ActivityEvent))
-    if after is not None:
-        page = page.where(tuple_(ActivityEvent.created_at, ActivityEvent.id) < tuple_(*after))
-    # One row past the page answers "is there another" without a count.
-    rows = list(session.scalars(
-        page.order_by(ActivityEvent.created_at.desc(), ActivityEvent.id.desc()).limit(limit + 1)
-    ).all())
-    more = len(rows) > limit
-    rows = rows[:limit]
+    rows, next_cursor = keyset.stamp_id_cursor_page(
+        session, filtered(select(ActivityEvent)), ActivityEvent.created_at, ActivityEvent.id, cursor or None, limit,
+        shape=_CURSOR_SHAPE, int_range=(1, PG_INT_MAX),
+        detail="'cursor' is not one this listing issued — send back a next_cursor unchanged, or leave it out",
+    )
+    more = next_cursor is not None
 
     total_kind: Literal["exact", "estimate", "at_least"]
-    if after is None and not more:
+    if not cursor and not more:
         total, total_kind = len(rows), "exact"
-    elif seam.current_scope() is seam.OPERATOR:
+    elif operator:
         known = len(rows) + int(more)
         total, total_kind = max(_estimated_rows(session, filtered(select(ActivityEvent.id))), known), "estimate"
     else:
@@ -849,12 +843,12 @@ def browse_audit(
     ) is not None
 
     return AuditPageOut(
-        items=_events_out(session, principal, user, rows),
-        next_cursor=keyset.encode_cursor(_CURSOR_SHAPE, [rows[-1].created_at, rows[-1].id]) if more else None,
+        items=_events_out(session, caller.principal, caller.actor, rows),
+        next_cursor=next_cursor,
         total=total,
         total_kind=total_kind,
         any_visible=any_visible,
-        filter_labels=_filter_labels(session, principal, user_ids, org_ids, subject_ref),
+        filter_labels=_filter_labels(session, caller.principal, user_ids, org_ids, subject_ref),
     )
 
 
@@ -895,8 +889,7 @@ def _filter_labels(
             ).all():
                 labels.users[str(ident)] = email
     if org_ids and seam.current_scope() is seam.OPERATOR:
-        for ident, name in session.execute(select(Org.id, Org.name).where(Org.id.in_(sorted(org_ids)))).all():
-            labels.orgs[str(ident)] = name
+        labels.orgs.update({str(ident): name for ident, name in names_of(session, Org, org_ids).items()})
     if subject is not None:
         labels.subject = _subject_labels(session, principal, [subject]).get(subject)
     return labels
@@ -904,25 +897,26 @@ def _filter_labels(
 
 @router.get("/events/{event_id}", response_model=AuditEventOut)
 @feature("audit", "view")
+@on_session
 def get_audit_event(
+    session: Session,
     event_id: int,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> AuditEventOut:
     """One row of the trail by id, in the list's item shape — so a pasted row URL opens the same record.
 
     Under the list's visibility (`audit_visibility.row_visible`, and the tenancy seam's org scope), so another
     org's row or a hidden one is a 404 like a missing id. The transfer-twin de-dup is the list's presentation rule, not
     visibility: a twin the caller may see is served."""
-    plan_terms.require_tenant_switch(session, principal, plan_terms.AUDIT)
+    plan_terms.require_tenant_switch(session, caller.principal, plan_terms.AUDIT)
     # `activity_events.id` is int4: an id past it would fail the bind, and names no row anyway.
-    row = None if not 0 < event_id < 2**31 else session.scalar(
-        select(ActivityEvent).where(ActivityEvent.id == event_id, row_visible())
+    row = or_404(
+        None if not 0 < event_id < 2**31 else session.scalar(
+            select(ActivityEvent).where(ActivityEvent.id == event_id, row_visible())
+        ),
+        detail=f"no audit event with id {event_id}",
     )
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"no audit event with id {event_id}")
-    return _events_out(session, principal, user, [row])[0]
+    return _events_out(session, caller.principal, caller.actor, [row])[0]
 
 
 def _unattributed_sign_ins(session: Session, rows: list[ActivityEvent]) -> set[int]:
@@ -958,9 +952,7 @@ def _events_out(
     # One `IN` read of org names, for the operator alone: a tenant's rows are all its own.
     org_names: dict[UUID, str] = {}
     if rows and seam.current_scope() is seam.OPERATOR:
-        org_names = dict(session.execute(
-            select(Org.id, Org.name).where(Org.id.in_({row.org_id for row in rows}))
-        ).all())
+        org_names = names_of(session, Org, (row.org_id for row in rows))
     unattributed = _unattributed_sign_ins(session, rows) if org_names else set()
     return [
         from_row(
@@ -996,11 +988,11 @@ _TASK_NUMBER = re.compile(r"#?([1-9][0-9]{0,8})")
 
 @router.get("/suggest", response_model=AuditSuggestOut)
 @feature("audit", "view")
+@on_session
 def audit_suggest(
+    session: Session,
     q: str = Query(min_length=1, max_length=_Q_MAX_LEN, description="What the person has typed so far."),
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> AuditSuggestOut:
     """The search box's facet suggestions for `q`: users, orgs and records, at most `_SUGGEST_MAX` each.
 
@@ -1011,9 +1003,11 @@ def audit_suggest(
     narrow. Records go through each type's own scoped select (`_SUBJECT_MODELS`), so a record the caller
     may not read is never offered; a task also matches by number. Every arm is a bounded indexed or
     small-table read, not a walk of the trail."""
-    plan_terms.require_tenant_switch(session, principal, plan_terms.AUDIT)
     pattern = _like_pattern(q)
+    # Read here, in the handler: the scope is the request's, and the org-filter census reads it per handler.
     operator = seam.current_scope() is seam.OPERATOR
+
+    plan_terms.require_tenant_switch(session, caller.principal, plan_terms.AUDIT)
 
     users: list[AuditUserSuggestion] = []
     if SYSTEM_ACTOR.startswith(q.lower()):
@@ -1033,19 +1027,17 @@ def audit_suggest(
     ).all()
     seat_orgs: dict[UUID, str] = {}
     if operator and members:
-        seat_orgs = dict(session.execute(
-            select(Org.id, Org.name).where(Org.id.in_({org for *_rest, org in members}))
-        ).all())
+        seat_orgs = names_of(session, Org, (org for *_rest, org in members))
     for ident, email, name, org in members:
         hint = name if name and name != email else None
         if org in seat_orgs:
             hint = f"{hint} · {seat_orgs[org]}" if hint else seat_orgs[org]
         users.append(AuditUserSuggestion(id=str(ident), label=email, hint=hint))
 
-    orgs: list[AuditOrgSuggestion] = []
+    orgs: list[OrgRef] = []
     if operator:
         orgs = [
-            AuditOrgSuggestion(id=str(ident), name=name, slug=slug)
+            OrgRef(id=ident, name=name, slug=slug)
             for ident, name, slug in session.execute(
                 select(Org.id, Org.name, Org.slug)
                 .where(or_(Org.name.ilike(pattern), Org.slug.ilike(pattern)))
@@ -1054,7 +1046,7 @@ def audit_suggest(
             ).all()
         ]
 
-    return AuditSuggestOut(users=users, orgs=orgs, subjects=_subject_suggestions(session, principal, q, pattern))
+    return AuditSuggestOut(users=users, orgs=orgs, subjects=_subject_suggestions(session, caller.principal, q, pattern))
 
 
 def _subject_suggestions(

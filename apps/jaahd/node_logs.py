@@ -12,11 +12,17 @@ configured) or 403 (not a node) backs off `BACKOFF_SECONDS` with the cursor kept
 the CP is unconfigured. The one wider re-send: a cursor journalctl rejects (or a lost cursor file) restarts
 from the 24 h backfill. A body the CP refuses (413/422) is split, so one bad entry never wedges the rest.
 
+A VIRTUAL NODE reads no journal: its daemon may not open the shared host's, which carries its neighbours' lines.
+It ships its own daemon's log instead: `tee_vnode_log` adds a rotating file under the daemon's own
+state root (`vnode_log_path`, `jaahd.log`) to its logging, and each pass tails that file exactly as the macOS and
+Windows path below tails `LOG_FILES`, as unit `jaahd.service` — so a vnode's clone and launch failures reach
+Node › Diagnostics like a physical node's. Only the daemon's own lines: its runner units' stay in the host journal.
+
 A second source, the kernel's own lines (`_TRANSPORT=kernel`), ships only its OOM lines (`KERNEL_MARKS`) as
 `unit: "kernel"` under its own cursor file (`node-logs-kernel.cursor`): the CP reads an OOM kill off them
 (`apps/api/app/node_log_findings.py`), and the rest of the kernel ring is noise. An OOM line about a virtual
 node's process (`_is_vnode_kernel_line`) stays on the node too: it may be another tenant's, and a vnode's own
-daemon ships no journal, so it would reach no one else either.
+daemon ships only its own log file, so it would reach no one else either.
 
 A runner unit runs untrusted workflow code, which can write its own lines into the unit's journal
 (`logger`, `systemd-cat`) — a forged "Job … completed" or OOM sentence. From a runner unit only the runner's
@@ -57,13 +63,13 @@ import urllib.error
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, List, Mapping, Optional
+from typing import Callable, List, Optional
 
 import cloud_modules
 import control_plane_api as control_plane_api_mod
 import env_helpers
+import environment
 import host_platform
-from jaah_env import env_get
 import node_paths
 import transcript_redact
 import windows_anchor_health
@@ -121,6 +127,10 @@ LOG_FILES = (
     ("update.log", node_paths.unit_name("update")),
 )
 FIRST_RUN_TAIL_BYTES = 64 * 1024
+# A vnode's own daemon log (`tee_vnode_log`): the one file it ships, and how much of it is kept on the node.
+VNODE_LOG_FILES = (("jaahd.log", node_paths.unit_name("daemon")),)
+VNODE_LOG_MAX_BYTES = 5 * 1024 * 1024
+VNODE_LOG_BACKUPS = 1
 # A line's own stamp and Python logging level, when it starts with them: `main.py`'s
 # `2026-01-02T03:04:05Z WARNING jaahd.x: …`, or `JaahService.cs`'s local-time `2026-01-02T03:04:05 jaah-service[…]: …`.
 _FILE_LINE_RE = re.compile(
@@ -429,6 +439,49 @@ _REJECTING_STATUSES = (400, 413, 422)
 REFUSED_PLACEHOLDER = "[node-logs: the control plane refused this entry (HTTP {code}); not shipped]"
 
 
+def vnode_log_path() -> Path:
+    """A vnode daemon's own log file: under its state root (`$HOME`, the vnode's `daemon` directory), which no
+    runner and no other vnode can write."""
+    return env_helpers.daemon_state_dir(VNODE_LOG_FILES[0][0])
+
+
+def tee_vnode_log(is_vnode: Callable[[], bool] = environment.is_vnode) -> Optional[Path]:
+    """On a vnode, also write the daemon's logging to `vnode_log_path` (rotating at `VNODE_LOG_MAX_BYTES`), in the
+    format its stdout gets, for `NodeLogForwarder` to ship. Returns the path, or None off a vnode or when the file
+    cannot be opened (logged; shipping then finds nothing, as before). Idempotent."""
+    if not is_vnode():
+        return None
+    import logging.handlers  # noqa: PLC0415 — a vnode's only
+
+    path = vnode_log_path()
+    root = logging.getLogger()
+    if any(getattr(h, "baseFilename", None) == str(path) for h in root.handlers):
+        return path
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(path, maxBytes=VNODE_LOG_MAX_BYTES,
+                                                       backupCount=VNODE_LOG_BACKUPS, encoding="utf-8")
+    except OSError as exc:
+        log.warning("node-logs: cannot open the vnode log %s (%s); this node's log is not shipped", path, exc)
+        return None
+    handler.setFormatter(_OneLineFormatter(next((h.formatter for h in root.handlers if h.formatter is not None),
+                                                None)))
+    root.addHandler(handler)
+    return path
+
+
+class _OneLineFormatter(logging.Formatter):
+    """`template`'s record text on ONE line: the file is read back line by line (`parse_file_lines`), so a logged
+    newline — a traceback, or text a runner put in a message — must not start a line with a forged stamp and level."""
+
+    def __init__(self, template: Optional[logging.Formatter]) -> None:
+        super().__init__()
+        self._template = template or logging.Formatter()
+
+    def format(self, record: logging.LogRecord) -> str:
+        return self._template.format(record).replace("\r", "\\r").replace("\n", "\\n")
+
+
 class NodeLogForwarder:
     """One `PeriodicStep`: drain the journal after the persisted cursor, POST, advance on acknowledgement."""
 
@@ -440,7 +493,7 @@ class NodeLogForwarder:
         clock: Callable[[], float] = time.monotonic,
         cursor_path: Path | None = None,
         kernel_cursor_path: Path | None = None,
-        environ: Mapping[str, str] = os.environ,
+        is_vnode: Callable[[], bool] = environment.is_vnode,
         gha_unit_glob: Callable[[], Optional[str]] = host_gha_unit_glob,
     ) -> None:
         self._read = read
@@ -450,7 +503,7 @@ class NodeLogForwarder:
         # Beside the units' cursor: a kernel cursor is a position in a different match, never interchangeable.
         self._kernel_cursor_path = kernel_cursor_path or self._cursor_path.with_name("node-logs-kernel.cursor")
         self._gha_unit_glob = gha_unit_glob
-        self._environ = environ
+        self._is_vnode = is_vnode
         self._backoff_until: Optional[float] = None
         self._warned_unreadable = False
         self._warned_files: set = set()
@@ -484,16 +537,16 @@ class NodeLogForwarder:
 
     def pass_once(self) -> int:
         """One pass over both sources, synchronously. Returns the number of batches the CP acknowledged."""
-        # A vnode daemon has no access to the shared host journal and must not read its neighbours'
-        # (deferred).
-        if env_get("JAAH_VNODE", None, self._environ) == "1":
-            return 0
         if self._backoff_until is not None:
             if self._clock() < self._backoff_until:
                 return 0
             self._backoff_until = None
+        # A vnode daemon has no access to the shared host journal and must not read its neighbours': it ships its
+        # own log file (`tee_vnode_log`).
+        if self._is_vnode():
+            return self._pass_files(str(vnode_log_path().parent), VNODE_LOG_FILES)
         if not host_platform.is_linux():
-            return self._pass_files()
+            return self._pass_files(host_platform.paths().log_dir, LOG_FILES)
         posted = self._pass_source(self._cursor_path, self._journal_args, None, _runner_line_admitted)
         # A backoff the units' POSTs earned (403/503) holds for the kernel's too: the same CP answered.
         if self._backoff_until is None:
@@ -549,13 +602,13 @@ class NodeLogForwarder:
                 return posted
         return posted
 
-    def _pass_files(self) -> int:
-        """Off Linux: tail each of `LOG_FILES` after its own byte offset, posting as `_pass_source` does."""
-        log_dir = host_platform.paths().log_dir
+    def _pass_files(self, log_dir: str, files: tuple) -> int:
+        """Tail each of `files` (`(name, unit)`) in `log_dir` after its own byte offset, posting as `_pass_source`
+        does: off Linux `LOG_FILES`, on a vnode `VNODE_LOG_FILES`."""
         posted = 0
         # Round-robin: each round splits what is left evenly among the files that used their whole share
         # last round; one that ran dry drops out, so its share goes to the busier ones.
-        active = list(LOG_FILES) if log_dir else []
+        active = list(files) if log_dir else []
         while active and self._backoff_until is None and posted < MAX_BATCHES_PER_PASS:
             share = max(1, (MAX_BATCHES_PER_PASS - posted) // len(active))
             busy = []

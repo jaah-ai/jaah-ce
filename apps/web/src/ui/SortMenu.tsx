@@ -1,14 +1,13 @@
-import { useState } from 'react'
 import Box from '@mui/material/Box'
-import IconButton from '@mui/material/IconButton'
-import Menu from '@mui/material/Menu'
-import MenuItem from '@mui/material/MenuItem'
-import Tooltip from '@mui/material/Tooltip'
+import { LINE_HEIGHT, SIZE } from '../theme'
+import { OverflowMenu, type OverflowItem } from './OverflowMenu'
 
-/* The ONLY sort affordance for a feed page, at every width: a feed row has no header row, so the
- * sortable keys live here (no `SortHeader` twin). Unconditional, or the page loses sorting above 480px.
+/* A feed page's whole sort vocabulary, at every width: a header row (`FeedList`'s `columns`) heads only the
+ * keys that ARE columns, so an order with no column (Created) lives here. Reachable wherever the list draws,
+ * or the page loses an order. `compact` fits it into a 24px header row (`FeedColumns.actions`).
  * The wordless ⇅ trigger names the current sort in its accessible name and its tooltip (hover and focus). A page whose sort can be `null`
- * (server order) passes `defaultItem`, the way back to null. */
+ * (server order) passes `defaultItem`, the way back to null. A `ui/OverflowMenu`: the active item is
+ * selected, arrowed in its label and worded in its name. */
 export type SortMenuColumn<K extends string> = { key: K; label: string }
 
 export default function SortMenu<K extends string>({
@@ -17,6 +16,7 @@ export default function SortMenu<K extends string>({
   sort,
   onSort,
   defaultItem,
+  compact = false,
 }: {
   /** The plural the trigger names: "Sort projects — …". */
   noun: string
@@ -24,51 +24,36 @@ export default function SortMenu<K extends string>({
   sort: { key: K; dir: 'asc' | 'desc' } | null
   onSort: (key: K) => void
   defaultItem?: { label: string; onSelect: () => void }
+  /** A 24px trigger, for a column header row. */
+  compact?: boolean
 }) {
-  const [anchor, setAnchor] = useState<HTMLElement | null>(null)
   const activeLabel = columns.find(c => c.key === sort?.key)?.label
   const dirWord = sort?.dir === 'asc' ? 'ascending' : 'descending'
   const summary = activeLabel ? `${activeLabel}, ${dirWord}` : 'the default order'
 
+  const items: OverflowItem[] = columns.map(c => {
+    const active = sort?.key === c.key
+    return {
+      key: c.key,
+      label: active ? `${c.label} ${sort?.dir === 'asc' ? '↑' : '↓'}` : c.label,
+      ariaLabel: active ? `${c.label}, ${dirWord}` : c.label,
+      selected: active,
+      onClick: () => onSort(c.key),
+    }
+  })
+  if (defaultItem) {
+    items.unshift({ key: '\0default', label: defaultItem.label, ariaLabel: defaultItem.label, selected: sort === null, onClick: defaultItem.onSelect })
+  }
+
   return (
-    <Box sx={{ display: 'inline-flex' }}>
-      {/* `describeChild`: the trigger keeps its own name; the tooltip is its description. */}
-      <Tooltip title={`Sorted by ${summary}`} describeChild>
-        <IconButton
-          aria-label={`Sort ${noun} — currently ${summary}`}
-          aria-haspopup="true"
-          aria-expanded={anchor ? true : undefined}
-          onClick={e => setAnchor(e.currentTarget)}
-        >
-          <Box component="span" aria-hidden="true" sx={{ fontSize: '1rem', lineHeight: 1 }}>⇅</Box>
-        </IconButton>
-      </Tooltip>
-      <Menu anchorEl={anchor} open={Boolean(anchor)} onClose={() => setAnchor(null)}>
-        {defaultItem && (
-          <MenuItem
-            selected={sort === null}
-            onClick={() => { defaultItem.onSelect(); setAnchor(null) }}
-          >
-            {defaultItem.label}
-          </MenuItem>
-        )}
-        {columns.map(c => {
-          const active = sort?.key === c.key
-          return (
-            <MenuItem
-              key={c.key}
-              selected={active}
-              aria-label={active ? `${c.label}, ${dirWord}` : c.label}
-              onClick={() => { onSort(c.key); setAnchor(null) }}
-            >
-              {c.label}
-              {active && (
-                <Box component="span" aria-hidden="true" sx={{ ml: 1 }}>{sort?.dir === 'asc' ? '↑' : '↓'}</Box>
-              )}
-            </MenuItem>
-          )
-        })}
-      </Menu>
-    </Box>
+    <OverflowMenu
+      ariaLabel={`Sort ${noun} — currently ${summary}`}
+      glyph={{
+        icon: <Box component="span" aria-hidden="true" sx={{ fontSize: compact ? SIZE.iconXs : SIZE.iconSm, lineHeight: LINE_HEIGHT.tight }}>⇅</Box>,
+        tooltip: `Sorted by ${summary}`,
+      }}
+      sx={compact ? { p: 0.5 } : undefined}
+      items={items}
+    />
   )
 }

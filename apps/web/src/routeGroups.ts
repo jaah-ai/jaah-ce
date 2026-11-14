@@ -7,8 +7,9 @@
  * `resetOn={pathname}` (mount identity narrow, error lifetime wide).
  * The shells read their paths from here, so the boundary cannot fall out of step with the tab strips. */
 
-/** Audit's six top-level tabs, in strip order (id → address). A tab with a second strip maps to that
- *  strip's DEFAULT sub-tab, so tab and front door are one address. */
+/** Audit's ten top-level tabs, in strip order (id → address). A tab with a second strip maps to that
+ *  strip's DEFAULT sub-tab, so tab and front door are one address. Automations (the org-wide list; each project
+ *  and machine also shows its own) and Slots (the worktree pool) keep their addresses. */
 export const AUDIT_TAB_PATHS = {
   users: '/audit',
   nodes: '/audit/nodes',
@@ -17,10 +18,14 @@ export const AUDIT_TAB_PATHS = {
   personas: '/audit/personas',
   exclusions: '/audit/exclusions',
   controlPlane: '/audit/control-plane',
+  clientErrors: '/audit/client-errors',
+  automations: '/automations',
+  slots: '/worktrees',
+  mergeLanes: '/audit/merge-lanes',
+  memory: '/audit/memory',
 } as const
 
-/** Audit > Nodes' sub-tabs. `commands` IS `/audit/nodes` (bookmarks and the `/command-log` redirect land
- *  on it). */
+/** Audit > Nodes' sub-tabs. `commands` IS `/audit/nodes` (bookmarks land on it). */
 export const AUDIT_NODE_TAB_PATHS = {
   commands: '/audit/nodes',
   'slot-intents': '/audit/nodes/slot-intents',
@@ -61,12 +66,21 @@ export const NETWORKS_TAB_PATHS = {
   networks: '/networks',
 } as const
 
-/** Directory > Agents' sub-tabs (`pages/agents/agentsTabs.tsx`): the runner account roster (labelled Agents; it
- *  KEEPS `/accounts` so bookmarks, the `/resources` redirect and its editors' list background
- *  (`lib/listDetail.ts`) all still resolve), the org's SDK agents (Custom agents), the connector catalog and
- *  the ACP registry. */
+/** The NodeLink list (Directory > Networks > NodeLink, `pages/nodes/NetworksPage.tsx`), spelled once for the links to it. */
+export const NODELINK_STORE_URL = `${NETWORKS_TAB_PATHS.networks}?tab=nodelink`
+
+/** One cloud connection's editor (Networks > Connections, `pages/settings/cloudConnections/ConnectionEditPage.tsx`). */
+export const connectionUrl = (id: string) => `${NETWORKS_TAB_PATHS.networks}/connections/${encodeURIComponent(id)}`
+/** A new cloud connection's page. */
+export const NEW_CONNECTION_URL = `${NETWORKS_TAB_PATHS.networks}/connections/new`
+
+/** One NodeLink's editor; `tab` lands on that tab. */
+export const nodeLinkUrl = (id: string, tab?: 'storage' | 'nodes') =>
+  `/nodes/nodelinks/${encodeURIComponent(id)}${tab ? `?tab=${tab}` : ''}`
+
+/** Customize > Agents' sub-tabs (`pages/agents/agentsTabs.tsx`): the org's SDK agents (Custom agents), the connector
+ *  catalog and the ACP registry. */
 export const AGENTS_TAB_PATHS = {
-  accounts: '/accounts',
   agents: '/agents',
   catalog: '/agents/catalog',
   registry: '/agents/registry',
@@ -74,23 +88,15 @@ export const AGENTS_TAB_PATHS = {
 
 /** Directory's tabs, in strip order (id → DEFAULT address). Each is its own page under one strip
  *  (`components/RouteTabLayout.tsx`); `lib/directoryTabs.ts` adds labels, gates and the further addresses a
- *  tab with sub-tabs answers on (People's `/groups`, Agents' `/agents`). */
+ *  tab with sub-tabs answers on (People's `/groups`). */
 export const DIRECTORY_TAB_PATHS = {
   projects: '/projects',
   nodes: MACHINES_TAB_PATHS.nodes,
-  agents: AGENTS_TAB_PATHS.accounts,
+  /* AI Accounts: the runner account roster (`pages/credentials/Accounts.tsx`). */
+  accounts: '/accounts',
   credentials: '/credentials',
   people: USERS_TAB_PATHS.users,
   networks: NETWORKS_TAB_PATHS.networks,
-} as const
-
-/** Automation's tabs (`components/RouteTabLayout.tsx`). The old Schedule (`/workflows`) and Triggers
- *  (`/triggers`) addresses redirect to `automations` (`pages/automations/LegacyRedirects.tsx`). Slots keeps
- *  `/worktrees`. */
-export const AUTOMATION_TAB_PATHS = {
-  automations: '/automations',
-  playbooks: '/playbooks',
-  worktrees: '/worktrees',
 } as const
 
 /** Task templates' addresses (`pages/templates/`): the gallery, the manage list and the editor's create page. Not
@@ -99,6 +105,15 @@ export const TEMPLATE_PATHS = {
   gallery: '/templates',
   manage: '/templates/manage',
   create: '/templates/new',
+} as const
+
+/** Customize's tabs, in strip order (id → DEFAULT address): what an org shapes its agents' work with
+ *  (`components/RouteTabLayout.tsx`); `lib/customizeTabs.ts` adds labels, gates and Agents' further addresses. */
+export const CUSTOMIZE_TAB_PATHS = {
+  playbooks: '/playbooks',
+  templates: TEMPLATE_PATHS.gallery,
+  agents: AGENTS_TAB_PATHS.agents,
+  compliancePacks: '/compliance/packs',
 } as const
 
 /* The first entry of each group is the key it answers to: the shell's DEFAULT address. */
@@ -118,9 +133,9 @@ const TAB_PATH_GROUPS: readonly (readonly string[])[] = [
     ...Object.values(USERS_TAB_PATHS),
     ...Object.values(MACHINES_TAB_PATHS),
     ...Object.values(NETWORKS_TAB_PATHS),
-    ...Object.values(AGENTS_TAB_PATHS),
   ],
-  Object.values(AUTOMATION_TAB_PATHS),
+  /* Customize's pages, Agents' sub-tabs included. */
+  [...Object.values(CUSTOMIZE_TAB_PATHS), ...Object.values(AGENTS_TAB_PATHS)],
 ]
 
 /** A pathname reduced to the ONE spelling every lookup compares against: no trailing slash (except `/`).

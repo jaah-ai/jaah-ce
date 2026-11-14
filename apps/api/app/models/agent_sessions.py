@@ -204,7 +204,8 @@ AGENT_OR_PROVIDER_SQL = "NOT (agent_id IS NOT NULL AND {provider} IS NOT NULL)"
 
 
 class FetchStamp(OrgScoped, Base):
-    """When this node last `git fetch`ed a project's base."""
+    """When this node last `git fetch`ed a project's base. Nothing reads or writes it; a later migration
+    drops the table."""
 
     __tablename__ = "fetch_stamps"
 

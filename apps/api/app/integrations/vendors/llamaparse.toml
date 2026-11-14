@@ -1,0 +1,40 @@
+slug = "llamaparse"
+label = "LlamaParse"
+category = "search"
+vendor_docs_url = "https://developers.llamaindex.ai/python/cloud/general/api_key/"
+summary = "Parse PDFs, slides and scans into clean markdown and structured data with LlamaCloud."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, placeholder = "llx-...", help = "Sign in at cloud.llamaindex.ai, select API Key in the left sidebar, then Generate New Key; name it and select Create new key, then copy it at once (it is shown only once). It starts with llx-" },
+  { key = "base_url", label = "API host", kind = "url", required = true, default = "https://api.cloud.llamaindex.ai", help = "Keep https://api.cloud.llamaindex.ai for a North America account; use https://api.cloud.eu.llamaindex.ai when you signed in at cloud.eu.llamaindex.ai" },
+]
+
+[test]
+method = "GET"
+path = "{base_url}/api/v1/projects"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+accept = ""
+
+[docs]
+agent_uses = [
+  "Parse PDFs, Word and PowerPoint files, spreadsheets and scanned images into clean markdown or JSON, tables included",
+  "Extract structured fields from documents with LlamaExtract",
+  "Query your LlamaCloud indexes to answer questions from your own documents",
+]
+prerequisites = [
+  "A LlamaCloud account (cloud.llamaindex.ai, or cloud.eu.llamaindex.ai for the EU region); the free plan includes monthly credits",
+]
+limitations = [
+  "A key works only in the region and project it was created in",
+  "Parsing spends LlamaCloud credits per page; the Test only lists your projects and spends none",
+]
+troubleshooting = [
+  { symptom = "The Test says LlamaParse rejected the API key (401)", fix = "Most often the key belongs to the other region. If you signed in at cloud.eu.llamaindex.ai, set API host to https://api.cloud.eu.llamaindex.ai; otherwise create a new key under API Key and select Replace" },
+  { symptom = "The Test passes but parsing fails with a credits error", fix = "The account's monthly credits are spent. Check Usage in LlamaCloud and upgrade or wait for the next period" },
+  { symptom = "An agent cannot find documents it parsed earlier", fix = "Keys are tied to one project. Create the key in the project that holds the documents" },
+]
+faq = [
+  { q = "Is my data sent to the EU when I use the EU host", a = "Yes: with API host set to the EU address, every call from the agent goes to LlamaCloud's EU region" },
+]

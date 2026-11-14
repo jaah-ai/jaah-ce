@@ -2,14 +2,17 @@ import type { JSX } from 'react'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Typography from '@mui/material/Typography'
+import EmptyState from '../../../ui/EmptyState'
 import { useApiRead } from '../../../hooks/useApiRead'
 import { useRowActions } from '../../../hooks/useBusyIds'
-import { useConfirm } from '../../../components/ConfirmDialog'
+import { danger, useConfirm } from '../../../components/ConfirmDialog'
 import Banner from '../../../ui/Banner'
 import StatusChip from '../../../ui/StatusChip'
 import { keyHashOf, shortHash } from '../../../lib/nodeVaultKeys'
 import { grantFor, grantView, identityChanged, keyRecipients, resetIdentity, retryGrant, type GrantView, type NodeVaultNode } from './api'
 import { monoSx } from '../../../ui/listStyles'
+import { FONT_WEIGHT, RADIUS, grid } from '../../../theme'
+import Tip from '../../../ui/Tip'
 
 /** Distribute before sending: who gets a wrapped copy now, and who gets the key later from a peer. */
 function previewView(node: NodeVaultNode): GrantView {
@@ -54,24 +57,22 @@ export default function NodeGrantList({
     run(nodeId, fallback, async () => { await write(); onChanged() })
 
   async function reset(node: NodeVaultNode) {
-    const ok = await confirm({
+    const ok = await confirm(danger('Reset', {
       title: 'Reset identity?',
       identity: node.name,
       message: 'Jaah forgets this node’s identity key and removes its key deliveries. When the node registers its new identity, a node that holds the key sends it again. Do this only if you reinstalled or wiped the node.',
-      confirmLabel: 'Reset',
-      destructive: true,
-    })
+    }))
     if (ok) await act(node.id, () => resetIdentity(node.id), 'Couldn’t reset the identity. Try again.')
   }
 
   if (nodes.length === 0) {
-    return <Typography variant="body2" sx={{ color: 'text.secondary' }}>No nodes yet.</Typography>
+    return <EmptyState inline title="No nodes yet." />
   }
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
       {error && <Banner severity="error">{error}</Banner>}
-      <Box component="ul" sx={{ listStyle: 'none', m: 0, p: 0, border: 1, borderColor: 'divider', borderRadius: 1 }} data-testid="nodevault-node-list">
+      <Box component="ul" sx={{ listStyle: 'none', m: 0, p: 0, border: 1, borderColor: 'divider', borderRadius: RADIUS.sm }} data-testid="nodevault-node-list">
         {nodes.map((node, i) => {
           const grant = grantFor(node, keyHash)
           const view = preview ? previewView(node) : grantView(node, grant)
@@ -88,18 +89,18 @@ export default function NodeGrantList({
                 px: 1.5, py: 1, borderTop: i === 0 ? 0 : 1, borderColor: 'divider',
               }}
             >
-              <Box sx={{ minWidth: 0, flex: '1 1 180px' }}>
-                <Typography variant="body2" sx={{ fontWeight: 600, overflowWrap: 'anywhere' }}>
+              <Box sx={{ minWidth: 0, flex: `1 1 ${grid(30)}` }}>
+                <Typography variant="body2" sx={{ fontWeight: FONT_WEIGHT.semibold, overflowWrap: 'anywhere' }}>
                   {node.name}
-                  <Typography component="span" variant="caption" sx={{ color: node.online ? 'success.main' : 'text.secondary', ml: 1, fontWeight: 400 }}>
+                  <Typography component="span" variant="caption" sx={{ color: node.online ? 'success.main' : 'text.secondary', ml: 1, fontWeight: FONT_WEIGHT.regular }}>
                     {node.online ? 'Online' : 'Offline'}
                   </Typography>
                 </Typography>
                 <Typography variant="caption" sx={{ color: 'text.secondary' }} component="div">
                   {node.identity_key ? (
-                    <span title={fp ? `Identity fingerprint ${fp}` : undefined}>
+                    <Tip title={fp ? `Identity fingerprint ${fp}` : undefined}><span>
                       Fingerprint <Box component="span" sx={monoSx} data-testid="nodevault-node-fp">{fp ? shortHash(fp) : '…'}</Box>
-                    </span>
+                    </span></Tip>
                   ) : 'No identity key yet'}
                 </Typography>
               </Box>

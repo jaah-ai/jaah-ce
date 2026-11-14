@@ -12,14 +12,14 @@ bindings the system copied from its parent (`app/staging_org.py::sync_admins`).
 """
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, TypeVar
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import act_as
-from app.entity_shape import SYSTEM_ACTOR_ID, SYSTEM_ACTOR_NAME
+from app.entity_shape import SYSTEM_ACTOR_ID, SYSTEM_ACTOR_NAME, names_of
 from app.identities import person_label
 from app.models.identity import AdminUser
 from app.models.orgs import Org
@@ -27,6 +27,8 @@ from app.models.tasks import Task
 from app.tenancy import seam
 from app.tenancy.copy import WITHHELD_ACTOR
 from app.tenancy.ids import is_tenant_org
+
+Out = TypeVar("Out")
 
 
 def actor_names(
@@ -77,8 +79,10 @@ def actor_names(
         )
         for actor_id, first_name, last_name, email, org_id in rows
     }
+    # The constant, never the row's name pair: a database whose system row was named otherwise (an operator's
+    # console read "Jaah") must still say what every other machine-made record says.
     if SYSTEM_ACTOR_ID in wanted:
-        resolved.setdefault(SYSTEM_ACTOR_ID, SYSTEM_ACTOR_NAME)
+        resolved[SYSTEM_ACTOR_ID] = SYSTEM_ACTOR_NAME
     scope = seam.current_scope()
     if not isinstance(scope, UUID) or not is_tenant_org(scope):
         if home_org is not None and not withhold_staff:
@@ -102,9 +106,7 @@ def _name_foreign_orgs(
         if actor_id != SYSTEM_ACTOR_ID and actor_id in resolved and org_id != home_org
     }
     tenant_orgs = {org_id for org_id in foreign.values() if org_id is not None and is_tenant_org(org_id)}
-    org_names: dict[UUID, str] = {}
-    if tenant_orgs:
-        org_names = dict(session.execute(select(Org.id, Org.name).where(Org.id.in_(tenant_orgs))).tuples().all())
+    org_names = names_of(session, Org, tenant_orgs)
     for actor_id, org_id in foreign.items():
         where = "operator" if not is_tenant_org(org_id) else org_id and org_names.get(org_id) or "another org"
         resolved[actor_id] = f"{resolved[actor_id]} ({where})"
@@ -113,8 +115,8 @@ def _name_foreign_orgs(
 def _acting_labels(session: Session, ids: set[UUID], org_id: UUID) -> dict[UUID, str]:
     """The operator-plane ids among `ids` as "<name>, acting as <org>", for an acting operator reading `org_id`.
 
-    Read on the identity lane (`act_as.own_row`'s reason: those rows live in the operator's org, which the bound
-    scope does not read). A tenant-org id is not relabelled: it stays withheld, as before."""
+    An identity read (`act_as.own_row`'s reason: those rows live in the operator's org, which the bound scope
+    does not read). A tenant-org id is not relabelled: it stays withheld, as before."""
     with seam.identity_scope():
         rows = session.execute(
             select(AdminUser.id, AdminUser.first_name, AdminUser.last_name, AdminUser.email, AdminUser.org_id).where(
@@ -138,6 +140,15 @@ def actor_names_for(session: Session, rows: Iterable[Any]) -> dict[UUID, str]:
     for row in rows:
         ids.extend((row.created_by_id, row.updated_by_id))
     return actor_names(session, ids)
+
+
+def rows_out(session: Session, rows: Iterable[Any], build: Callable[[Any, dict[UUID, str]], Out]) -> list[Out]:
+    """A page of entity rows serialised with their provenance names, in ONE actor query (never an N+1): `build`
+    is the route's own `(row, names) -> Out`, usually `Out(**entity_fields(row, names), ...)`. The one home for
+    the PLAIN `_rows_out` (names, then one Out per row); a page that batches other lookups too keeps its own."""
+    rows = list(rows)
+    names = actor_names_for(session, rows)
+    return [build(row, names) for row in rows]
 
 
 def stamp_actor(obj: Any, user: Any, *, created: bool = False) -> None:
@@ -175,6 +186,22 @@ def set_request_actor(session: Session, actor_id: Optional[UUID]) -> None:
     session.info[ACTOR_SESSION_KEY] = actor_id
 
 
+#: An async route's session (`app/db_async.py::get_db`) is not the one its auth dependency resolved the caller on
+#: (`app/auth.py::_session_user`, a sync dependency's own session), so the actor travels on the request instead:
+#: `_session_user` notes it on the request's `state` under `REQUEST_ACTOR_ATTR`, and `get_db` keeps that `state`
+#: in its session's `info` under `REQUEST_STATE_KEY`. Read only when the session recorded no actor of its own.
+REQUEST_STATE_KEY = "request_state"
+REQUEST_ACTOR_ATTR = "request_actor_id"
+
+
+def _recorded_actor(session: Session) -> Optional[UUID]:
+    """The actor this session's writes belong to: its own (`set_request_actor`), else its request's."""
+    actor_id = session.info.get(ACTOR_SESSION_KEY)
+    if actor_id is None:
+        actor_id = getattr(session.info.get(REQUEST_STATE_KEY), REQUEST_ACTOR_ATTR, None)
+    return actor_id
+
+
 #: Set while a session acts AS a person without that person acting (a cron firing as its owner): rows keep
 #: the owner's provenance (`updated_by_id`), but the Activity feed names no one (`transition_actor`).
 MACHINE_ACT_SESSION_KEY = "machine_act"
@@ -185,14 +212,14 @@ def transition_actor(session: Session) -> Optional[UUID]:
     for a machine act: the system actor, an unattributed session, or a `MACHINE_ACT_SESSION_KEY` session."""
     if session.info.get(MACHINE_ACT_SESSION_KEY):
         return None
-    actor_id = session.info.get(ACTOR_SESSION_KEY)
+    actor_id = _recorded_actor(session)
     return None if actor_id == SYSTEM_ACTOR_ID else actor_id
 
 
 def _session_actor(session: Session) -> UUID:
     """Who this session's task writes belong to, with the system-actor fallback. The one home for that
     fallback, shared by the listener and `task_actor_values`."""
-    return session.info.get(ACTOR_SESSION_KEY) or SYSTEM_ACTOR_ID
+    return _recorded_actor(session) or SYSTEM_ACTOR_ID
 
 
 def task_actor_values(session: Session) -> dict[str, Any]:
@@ -217,6 +244,10 @@ def stamp_dirty_task_actors(session: Session, _flush_context: Any, _instances: A
     for obj in session.new:
         if isinstance(obj, Task):
             obj.updated_by_id = actor_id
+            # Every task has a creator: the person its filer resolved, else the system actor — never the session's
+            # person, whom a filer that resolved nobody deliberately did not name (`task_ancestry.executor_user_id`).
+            if obj.created_by_id is None:
+                obj.created_by_id = SYSTEM_ACTOR_ID
     for obj in session.dirty:
         if isinstance(obj, Task) and session.is_modified(obj, include_collections=False):
             obj.updated_by_id = actor_id

@@ -23,18 +23,18 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, Optional, get_args
 from uuid import UUID
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from app import edition_features, node_host_metrics, node_platform
-from app.entity_shape import count_by
+from app import edition_features, node_disk_events, node_host_metrics, node_platform
+from app.clock import utcnow
 from app.models.credentials import CloudConnection
 from app.models.hosting import AllowedInstanceType
-from app.models.node_groups import NodeProject
+from app.models.projects import Project
 from app.models.nodes import Node, NodeOrder
 from app.models.worktrees import VirtualNode, VnodeEnrolment, VnodeHost
 from app.node_bootstrap import BOOTSTRAP_FETCHED_KEY
@@ -190,6 +190,32 @@ def _cp_launched(row: Node) -> bool:
     return bool(infra.get("instance_id")) or infra.get("launched_by") == "control-plane"
 
 
+def _machine_restart(
+    row: Node, reader: Reader, hosting: Optional[dict[str, Any]], carried: Optional[list[VirtualNode]] = None,
+) -> bool:
+    """Whether the reader may reboot the machine: one this control plane launched in a cloud and still signs for
+    (`cloud_lifecycle.actionable`) — the operator any, an org admin their own org's unless it is Jaah Hosted,
+    operator-allocated or carries another org's node (`routes/host_restart.py` and
+    `routes/nodes/lifecycle.py::_cloud_node`, which decide the write)."""
+    if not edition_features.enabled("cloud_nodes"):
+        return False
+    from app import cloud_lifecycle
+
+    if not cloud_lifecycle.actionable(row.infra):
+        return False
+    if reader.is_operator:
+        return True
+    foreign = any(v.node_id is not None and v.tenant_org_id != reader.org_id for v in carried or [])
+    return (reader.is_org_admin and row.org_id == reader.org_id and hosting is None and not row.operator_allocated
+            and not foreign)
+
+
+def _reboot_required(reading: Optional[node_host_metrics.LatestReading]) -> bool:
+    """The machine says it owes a reboot (`/var/run/reboot-required`) in a reading still fresh; never a guess from
+    silence, nor a stale report from a machine that stopped reporting."""
+    return reading is not None and not reading.stale and reading.reboot_required is True
+
+
 def machine_is_up(row: Node) -> bool:
     """Has this machine reported in at least once? A launched one has an instance; any one has been seen."""
     return row.last_seen is not None
@@ -211,6 +237,19 @@ def _waiting_reason(row: Node) -> str:
     return "Waiting for the machine to join."
 
 
+def _placed_project_counts(session: Session, org_ids: set[UUID], node_ids: set[UUID]) -> dict[UUID, int]:
+    """`{node id: how many projects of `org_ids` may start work on it}` (`placement_groups`), for `node_ids` only:
+    the org's projects in one read, their node sets in one batched read."""
+    from app import placement_groups  # deferred: it reads the plan and Easy Mode modules
+
+    project_ids = list(session.scalars(select(Project.id).where(Project.org_id.in_(org_ids)))) if org_ids else []
+    counts: dict[UUID, int] = {}
+    for nodes in placement_groups.allocated_node_ids_by_project(session, project_ids).values():
+        for node_id in nodes & node_ids:
+            counts[node_id] = counts.get(node_id, 0) + 1
+    return counts
+
+
 def held_in_first_boot(session: Session, node_ids: list[Optional[UUID]]) -> set[UUID]:
     """Of these nodes, those whose machine order still waits out its new host's first boot
     (`node_orders.on_vnodes_failed`): the host retries them, and their failure is not shown while the order's
@@ -227,6 +266,26 @@ def held_in_first_boot(session: Session, node_ids: list[Optional[UUID]]) -> set[
             NodeOrder.node_id.in_(ids), NodeOrder.path.in_(MACHINE_PATHS), NodeOrder.stage == "joining",
         )
     ).all())
+
+
+def retry_orders(session: Session, reader: Reader, node_ids: list[Optional[UUID]]) -> dict[UUID, str]:
+    """Each node's newest failed, undismissed Add node order — what its row's Retry re-runs (`node_orders.retry`).
+    An admin's (or the operator's) read only, as only an admin may retry; the community edition has no orders."""
+    if not (reader.is_operator or reader.is_org_admin):
+        return {}
+    if not edition_features.enabled("cloud_nodes"):
+        return {}
+    from app.node_orders import FAILED  # Local: `node_orders` imports this module.
+
+    ids = [node_id for node_id in node_ids if node_id is not None]
+    if not ids:
+        return {}
+    newest = session.execute(
+        select(NodeOrder.node_id, NodeOrder.id, NodeOrder.stage, NodeOrder.dismissed_at)
+        .where(NodeOrder.node_id.in_(ids))
+        .distinct(NodeOrder.node_id).order_by(NodeOrder.node_id, NodeOrder.created_at.desc())
+    ).all()
+    return {node_id: str(order_id) for node_id, order_id, stage, dismissed in newest if stage == FAILED and dismissed is None}
 
 
 def shown_state(vnode: VirtualNode, held: set[UUID]) -> str:
@@ -361,7 +420,28 @@ def _order_out(order: NodeOrder, *, instance_started: bool, install_fetched_at: 
         "instance_started": instance_started,
         # When its machine last fetched the install script; None = the install command has not run.
         "install_fetched_at": install_fetched_at,
+        # The progress dialog's countdown inputs, so a host's row counts down with the same code.
+        "stages": list(_stages_for(order)), "os": order.os, "instance_type": (order.params or {}).get("instance_type"),
+        # A refused launch's fix is often the connection's network: the failure links to editing it.
+        "connection_id": order_connection_id(order),
     }
+
+
+def order_connection_id(order: NodeOrder) -> Optional[str]:
+    """A cloud order's connection id (`node_orders` stamps it in `params`); None on every other path."""
+    if order.path != "cloud":
+        return None
+    picked = (order.params or {}).get("connection_id")
+    return str(picked) if picked else None
+
+
+def _stages_for(order: NodeOrder) -> tuple[str, ...]:
+    if not edition_features.enabled("cloud_nodes"):
+        return ()  # The community edition has no orders.
+    # `node_orders` imports this module, so its stage table is read at call time.
+    from app.node_orders import stages_for
+
+    return stages_for(order)
 
 
 def _failed_orders(session: Session, reader: Reader, org_id: Optional[UUID]) -> list[dict[str, Any]]:
@@ -381,7 +461,7 @@ def _failed_orders(session: Session, reader: Reader, org_id: Optional[UUID]) -> 
     query = select(NodeOrder).where(
         NodeOrder.stage == node_orders.FAILED, NodeOrder.dismissed_at.is_(None),
         NodeOrder.host_node_id.is_(None), NodeOrder.path.in_(node_orders.MACHINE_PATHS),
-        NodeOrder.updated_at > datetime.now(timezone.utc) - FAILED_ORDERS_FOR, in_live_org(NodeOrder.org_id),
+        NodeOrder.updated_at > utcnow() - FAILED_ORDERS_FOR, in_live_org(NodeOrder.org_id),
     )
     if not reader.is_operator:
         query = query.where(NodeOrder.org_id == reader.org_id)
@@ -451,7 +531,7 @@ def project(
             for row in session.scalars(select(Node).where(Node.id.in_(list(extra)))).all():
                 names[row.id] = row
     counted = set(names) | set(by_id)
-    project_counts = count_by(session, NodeProject.node_id, list(counted))
+    project_counts = _placed_project_counts(session, {row.org_id for row in names.values()}, counted)
     orders: dict[UUID, NodeOrder] = {}
     if by_id:
         for order in session.scalars(
@@ -512,6 +592,7 @@ def project(
         )
 
     held = held_in_first_boot(session, [v.node_id for vs in carried.values() for v in vs])
+    retryable = retry_orders(session, reader, [v.node_id for vs in carried.values() for v in vs])
 
     def node_out(row: Node, vnode: Optional[VirtualNode], *, host_stopped: bool = False) -> dict[str, Any]:
         stopped = host_stopped or _stopped(hosted.get(row.id))
@@ -521,6 +602,8 @@ def project(
             # The host's own report, else it lives only in the machine's journal.
             "failure_reason": _failure_text(vnode, reader) if vnode is not None and vnode.node_id not in held else None,
             "updated_at": vnode.updated_at if vnode is not None else None,
+            # Its failed Add node order, for the row's Retry; None when there is none to re-run (or the reader may not).
+            "retry_order_id": retryable.get(row.id),
         }
 
     # Each joining order's node on its host, and which of them the host has not yet taken (its envelope unread).
@@ -549,6 +632,9 @@ def project(
         )
         if host_id in joining:
             out["converge"] = _converge_out(joining[host_id], markers.get(host_id), enrolling, reader)
+        # The connection is its org's own: another org's reader of a shared host is not handed its id.
+        if not reader.is_operator and order.org_id != reader.org_id:
+            out["connection_id"] = None
         return out
 
     out: list[dict[str, Any]] = []
@@ -562,6 +648,7 @@ def project(
         can_add, add_reason = _may_add(
             row, marker, state, reader, carried.get(host_id, []),
             failed.error if failed is not None and failed.stage == "failed" else None,
+            disk_paused=_disk_paused(row, [names[v.node_id] for v in live]),
         )
         entry = {
             "id": str(row.id),
@@ -579,6 +666,8 @@ def project(
             "rental": hosted.get(host_id),
             "nodes": nodes,
             "order": order_out(host_id),
+            "machine_restart": _machine_restart(row, reader, hosted.get(host_id), carried.get(host_id)),
+            "reboot_required": _reboot_required(readings.get(host_id)),
         }
         if reader.is_operator:
             entry["machine_name"] = row.name
@@ -620,6 +709,8 @@ def project(
             "rental": hosting,
             "nodes": [node_out(row, None)],
             "order": order_out(node_id),
+            "machine_restart": _machine_restart(row, reader, hosting),
+            "reboot_required": _reboot_required(readings.get(node_id)),
         }
         if reader.is_operator:
             entry["machine_name"] = row.name
@@ -723,7 +814,7 @@ def lacks_engine(
 
     if any(v.state == "ready" for v in vnodes_on_it):
         return False
-    cutoff = (now or datetime.now(timezone.utc)) - FIRST_BOOT_WINDOW
+    cutoff = (now or utcnow()) - FIRST_BOOT_WINDOW
     return failed_order_error == NODE_FAILED_NO_ENGINE or any(
         v.state == "failed" and (v.failure_reason or "").startswith(ENGINE_FAILURE)
         and v.created_at is not None and v.created_at < cutoff
@@ -731,9 +822,19 @@ def lacks_engine(
     )
 
 
+#: A host whose disk paused new work (`node_disk_events`): a node added there would start paused.
+DISK_PAUSED_REASON = "This host's disk is full. Free space first."
+
+
+def _disk_paused(host: Node, carried: list[Node]) -> bool:
+    """The host machine, or a node it already carries, paused new work on disk: they share the one disk."""
+    return any(n.disk_gate == node_disk_events.GATE_PAUSED for n in (host, *carried))
+
+
 def _may_add(
     row: Node, marker: Optional[VnodeHost], state: str, reader: Reader,
     vnodes_on_it: Optional[list[VirtualNode]] = None, failed_order_error: Optional[str] = None,
+    *, disk_paused: bool = False,
 ) -> tuple[bool, Optional[str]]:
     if not node_platform.supports(row.os or node_platform.OS_UBUNTU, node_platform.CAP_VNODE_HOST):
         return False, LEGACY_REASON
@@ -754,6 +855,8 @@ def _may_add(
             return False, "This host is full."
     if not reader.is_operator and row.org_id != reader.org_id:
         return False, "You can't add nodes to this host."
+    if disk_paused:
+        return False, DISK_PAUSED_REASON
     return True, None
 
 

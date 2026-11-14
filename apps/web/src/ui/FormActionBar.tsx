@@ -1,12 +1,13 @@
 import { useEffect, useRef, type JSX, type ReactNode, type RefObject } from 'react'
 import Box from '@mui/material/Box'
 import Stack from '@mui/material/Stack'
-import { alpha, type Theme } from '@mui/material/styles'
-import { paperGround } from '../theme'
+import { type Theme } from '@mui/material/styles'
+import { grid, paperGround } from '../theme'
+import { PHONE } from './listStyles'
 
 /* The console's form ACTION BAR — the sticky bottom row for Discard/Save/Go, shared so the two measured
  * notes below are single-homed. Consumers: `components/tasks/TaskEditForm.tsx`, `pages/ProjectEditPage.tsx`,
- * `pages/UserEditPage.tsx`.
+ * `ui/CancelSaveBar.tsx` (every edit page's Discard/Save pair).
  */
 
 /* A testid built into a selector must be word characters and dashes; anything else is DROPPED: it becomes
@@ -26,9 +27,6 @@ export const FORM_BAR_GROUND = '--form-bar-ground'
 /** On the bar while it is STUCK: held at its scrollport's foot with content scrolled beneath it, not sitting in the
  *  flow. Only then does it draw its edge and the panel strip below it. */
 export const FORM_BAR_STUCK_ATTR = 'data-stuck'
-
-/** How far the stuck bar's ground reaches past each side of its box: past an overhanging Switch (~12px). */
-const SIDE_COVER = '1rem'
 
 /** The stuck bar's ground: the host's `--form-bar-ground`, else its paper's (`theme.ts`'s `paperGround`). */
 const groundOf = (theme: Theme): string => `var(${FORM_BAR_GROUND}, ${paperGround(theme)})`
@@ -94,11 +92,13 @@ export function useStuck(bar: RefObject<HTMLElement | null>, active: boolean, ed
   }, [bar, active, edge])
 }
 
-/** `& [data-testid="a"], & [data-testid="b"]` — empty (no rule to emit) when nothing survives the filter. */
+/** `& [data-testid="a"], & > [data-disabled-reason]:has([data-testid="a"]), …` — empty (no rule to emit) when nothing
+ *  survives the filter. The second form is the action's `ui/DisabledReason` span while it carries a reason: the bar's
+ *  flex item then, so it takes the width and the action fills it. */
 function stretchSelectorFor(testIds: readonly string[]): string {
   return testIds
     .filter(id => STRETCH_TEST_ID.test(id))
-    .map(id => `& [data-testid="${id}"]`)
+    .flatMap(id => [`& [data-testid="${id}"]`, `& > [data-disabled-reason]:has([data-testid="${id}"])`])
     .join(', ')
 }
 
@@ -130,15 +130,15 @@ export function FormActionBar({
       data-testid={testId}
       {...{ [FORM_ACTION_BAR_ATTR]: '' }}
       sx={{
-        gap: '0.5rem',
+        gap: 1,
         justifyContent: 'flex-end',
         // The note takes the first line whole; the actions wrap under it.
         ...(note ? { flexWrap: 'wrap', '& > [data-form-bar-note]': { flex: '1 0 100%' } } : {}),
         ...(plain ? {} : {
           position: 'sticky',
           bottom: 0,
-          zIndex: 3,
-          pt: '0.5rem',
+          zIndex: 3, // above its own form's positioned children (a phone KnobSection header sits at 2)
+          pt: 1,
           borderTop: '1px solid',
           borderColor: 'divider',
           /* The bar's ground, one value for its fill, its side covers and the strip below: a host on another ground
@@ -146,18 +146,18 @@ export function FormActionBar({
              flow nothing lies under the bar, and a paper fill there drew a panel on a host's own ground. */
           [`&[${FORM_BAR_STUCK_ATTR}]`]: {
             bgcolor: (theme: Theme) => groundOf(theme),
+            // The edge that parts it from a row it covers: the hairline darkens, legible on both schemes.
+            borderColor: 'text.disabled',
             /* A sticky row stops at `.app-main`'s padding edge (App.tsx's shell contract: 1rem above the phone's
                bottom nav, 1.75rem above the viewport's foot), and content scrolled through that padding showed
-               under it. The last, solid shadow paints the bar's own ground down over that strip; the first is the
-               edge that parts it from a row it covers. Both only while stuck: in the flow the edge
-               parted it from nothing and the strip was empty panel under the buttons. The two side
-               shadows widen the ground past the form column: an MUI Switch's root (its `FormControlLabel`'s negative
-               margin) overhangs it by ~12px and showed beside the bar. Shadows, not margins or padding: they take
-               no layout and add no scroll overflow. `vars` first: the static palette is light. */
+               under it. The last, solid shadow paints the bar's own ground down over that strip. Only while stuck: in
+               the flow the strip was empty panel under the buttons. The two side shadows widen the ground past the form column (by
+               `grid(2.5)`, past ~12px): an MUI Switch's root (its `FormControlLabel`'s negative margin) overhangs it
+               and showed beside the bar. Shadows, not margins or padding: they take no layout and add no scroll
+               overflow. */
             boxShadow: (theme: Theme) =>
-              `0 -6px 8px -6px ${alpha(theme.palette.common.black, 0.35)}, `
-              + `-${SIDE_COVER} 0 0 0 ${groundOf(theme)}, ${SIDE_COVER} 0 0 0 ${groundOf(theme)}, `
-              + `0 1.75rem 0 ${SIDE_COVER} ${groundOf(theme)}`,
+              `${grid(-2.5)} 0 0 0 ${groundOf(theme)}, ${grid(2.5)} 0 0 0 ${groundOf(theme)}, `
+              + `0 ${grid(4.5)} 0 ${grid(2.5)} ${groundOf(theme)}`,
           },
         }),
         // STICKY AT EVERY WIDTH (the form scrolls at ≤480px too; `bgcolor` hides prose underneath).
@@ -165,7 +165,7 @@ export function FormActionBar({
         // none (Go measured 827->871 in an 844px viewport). Only a page sees `[data-keyboard]`, so a consumer
         // that must stay reachable owes its own `fixed` rule — `TaskDetailPage`'s PAGE_SX
         // `:not([data-keyboard="up"])` block is the worked example.
-        '@media (max-width:480px)': {
+        [PHONE]: {
           /* Give the two real actions (Save/Go) the spare width so the escape hatch is not the most
              legible control; `space-between` keeps Discard its own size. */
           justifyContent: 'space-between',

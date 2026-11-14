@@ -11,6 +11,7 @@ rows on an observing node → ok; incomplete observation → not ok.
 """
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Any, Callable, Iterable, Optional
 from uuid import UUID
@@ -51,8 +52,7 @@ def pool_records(session, node_id: str) -> list[dict[str, Any]]:
     callers must pass the same `node_id` to both. Node-scoped: an unscoped read would count another
     node's occupancy as this node's.
 
-    `holder` is `Worktree.state` read directly, except the number-0 main clone reports "main" (never
-    leased; a display label, dropped downstream by `roster_from_records`). `task_id` is the DB fact
+    `holder` is `Worktree.state` read directly. `task_id` is the DB fact
     `fleet_decide.select_slot` binds a dispatch to its prior slot by. `session` is normalized to bool.
     `_project_id` is the identity the in-memory `fleet_decide` matchers compare on; `_project` is the
     display name.
@@ -89,8 +89,7 @@ def pool_records(session, node_id: str) -> list[dict[str, Any]]:
             "_project": row.project,
             "_number": row.number,
             "branch": row.branch,
-            # "main" display override for the number-0 row (see the docstring).
-            "holder": "main" if row.number == 0 else row.state,
+            "holder": row.state,
             "task_id": row.task_id,
             # The slot's tenant, so the picker sees the column `slot_state.lease` binds on; otherwise
             # it would hand over a slot the lease can never take and decline forever. NOT NULL now, but
@@ -145,8 +144,13 @@ def pool_state(
     return True, f"node {label} enumerated its slots {stale_by:.0f}s ago"
 
 
+@functools.cache
 def _node_org_in_service():
     """The conjunct that keeps a disabled org's nodes out of the dispatch roster.
+
+    Built once per process: the clause holds no value (its clock is the database's `now()`), and building it
+    with its cache key on every dispatch plan, per node and project, was one of the control plane's top CPU
+    costs. An SQL expression is immutable, so every statement may embed the one instance.
 
     Step one of the org lifecycle: disabling stops dispatch and lets in-flight work settle;
     `app/tenancy/org_lifecycle.py` is step two. The roster suffices because placement's org floor is strict
@@ -188,8 +192,8 @@ def _node_org_in_service():
 def live_nodes_for_project(
     session, project_id: int, *, max_age_secs: Optional[float] = None
 ) -> list[str]:
-    """The sorted node uuids (as strings) that host `project_id` (`slot_allocation.hosting_node_ids`: its assignments, so a
-    project with no free static slot still runs there, on a dynamic worktree), sit in an org that is in
+    """The sorted node uuids (as strings) `project_id` may start new work on (`slot_allocation.placement_node_ids`:
+    its node groups, else All — never a node merely still running one of its tasks), sit in an org that is in
     service, and have posted a complete slot enumeration inside the freshness bound — the nodes a
     dispatch plan may hand work to right now.
 
@@ -203,11 +207,11 @@ def live_nodes_for_project(
     """
     age = max_observation_age_secs() if max_age_secs is None else max_age_secs
     # Keyed on the node id, not the name, so a console rename cannot strand the shard.
-    hosting = slot_allocation.hosting_node_ids(session, int(project_id))
-    if not hosting:
+    placed = slot_allocation.placement_node_ids(session, int(project_id))
+    if not placed:
         return []
     rows = session.execute(
-        select(Node.id).where(Node.id.in_(hosting), *allocation_roster_clause(age))
+        select(Node.id).where(Node.id.in_(placed), *allocation_roster_clause(age))
     ).all()
     return sorted(str(r.id) for r in rows)
 
@@ -243,8 +247,8 @@ def live_nodes(session, *, max_age_secs: Optional[float] = None) -> list[str]:
 def live_node_clause(age: float) -> tuple:
     """`live_nodes`' where-clause: enabled, org in service, slot enumeration inside `age` seconds.
 
-    Shared with `live_node_exists` and the company-setup status (`routes/org_setup.py`), so "a node is
-    live" means what dispatch means by it rather than `nodes.last_seen`."""
+    Shared with `orgs_with_live_node` and the company-setup card's sign-in link (`routes/org_setup.py`), so "a
+    node is live" means what dispatch means by it rather than `nodes.last_seen`."""
     return (
         Node.enabled.is_(True),
         # `Node.draining` deliberately absent: a draining node still gets asked for a plan, so
@@ -261,12 +265,16 @@ def not_a_vnode_host():
     return ~select(VnodeHost.node_id).where(VnodeHost.node_id == Node.id).exists()
 
 
-def live_node_exists(session, org_id) -> bool:
-    """Does `org_id` own a node `live_nodes` would list that is not a vnode host? One `EXISTS`."""
-    clause = select(Node.id).where(
-        Node.org_id == org_id, not_a_vnode_host(), *live_node_clause(max_observation_age_secs())
-    )
-    return bool(session.scalar(select(clause.exists())))
+def orgs_with_live_node(session, org_ids: Iterable) -> set:
+    """Those of `org_ids` owning a node `live_nodes` would list that is not a vnode host, in one read."""
+    wanted = set(org_ids)
+    if not wanted:
+        return set()
+    # `None` is the org-less node (`IS NULL`), which `IN` never matches.
+    owner = or_(Node.org_id.in_(wanted - {None}), Node.org_id.is_(None)) if None in wanted else Node.org_id.in_(wanted)
+    return set(session.scalars(
+        select(Node.org_id).where(owner, not_a_vnode_host(), *live_node_clause(max_observation_age_secs())).distinct()
+    ))
 
 
 def held_on_dead_nodes(session, task_ids: Iterable[int]) -> dict[int, str]:

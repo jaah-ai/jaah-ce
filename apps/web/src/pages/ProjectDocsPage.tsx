@@ -20,6 +20,8 @@ import { OrgAside } from '../ui/OrgIndicator'
 import PageHeader from '../ui/PageHeader'
 import SectionCard from '../ui/SectionCard'
 import { docLabel, groupByDir, linkTarget, stripHtmlComments } from '../lib/docsTree'
+import Tip from '../ui/Tip'
+import { LINE_HEIGHT } from '../theme'
 
 /**
  * A project's markdown docs, read live from its repo. Not a build: a repo opts in by committing an
@@ -154,24 +156,22 @@ export default function ProjectDocsPage() {
               <List dense sx={{ maxHeight: { xs: '38vh', md: '70vh' }, overflowY: 'auto' }}>
                 {groups.map((group) => (
                   <li key={group.dir || '(root)'}>
-                    <ul style={{ padding: 0 }}>
-                      <ListSubheader sx={{ ...ELLIPSIS_SX, lineHeight: 2 }} title={group.dir}>
+                    <Box component="ul" sx={{ p: 0 }}>
+                      <Tip title={group.dir}><ListSubheader sx={{ ...ELLIPSIS_SX, lineHeight: LINE_HEIGHT.normal }}>
                         {group.dir || '/'}
-                      </ListSubheader>
+                      </ListSubheader></Tip>
                       {group.paths.map((path) => (
-                        <ListItemButton
-                          key={path}
+                        <Tip key={path} title={path}><ListItemButton
                           selected={selected.split('#')[0] === path}
                           onClick={() => setParams({ path })}
                           sx={{ ...tapTargetSx, ...ELLIPSIS_SX }}
-                          title={path}
                         >
                           <Typography variant="body2" sx={ELLIPSIS_SX}>
                             {docLabel(path)}
                           </Typography>
-                        </ListItemButton>
+                        </ListItemButton></Tip>
                       ))}
-                    </ul>
+                    </Box>
                   </li>
                 ))}
               </List>

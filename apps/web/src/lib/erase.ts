@@ -24,8 +24,7 @@ export function refusalMessage(err: unknown): string {
 }
 
 /* The CP's live-session refusal of a release, or null — the only release failure a force retry can
-resolve. Read off `reason`, never the status code: `release_slot` also 409s for the main clone, which
-no force can help. `reason` is matched exactly; an unknown value gets no retry (fail closed). */
+resolve. Read off `reason`, never the status code: another 409 is one no force can help. `reason` is matched exactly; an unknown value gets no retry (fail closed). */
 export function releaseLiveSessionRefusal(err: unknown): { session_status: string } | null {
   for (const candidate of [errField(err, 'detail'), errField(err, 'body')]) {
     if (!candidate || typeof candidate !== 'object') continue

@@ -1,0 +1,58 @@
+# Google Workspace, over the hand-written `google` type and provider (adopted, AS3: nothing of either changes).
+# Facts confirmed at the vendor's own docs: web-server OAuth (offline access, consent prompt for a refresh token)
+# https://developers.google.com/identity/protocols/oauth2/web-server ; scopes
+# https://developers.google.com/identity/protocols/oauth2/scopes
+slug = "google"
+label = "Google Workspace"
+category = "productivity"
+credential_type = "google"
+vendor_docs_url = "https://developers.google.com/identity/protocols/oauth2/web-server"
+summary = "Gmail, Calendar, Drive, Docs and Sheets through your own Google OAuth client."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+# The registered `google` provider's endpoints (the conflict guard compares them). It pins no scope catalogue, so
+# this one is used for the gallery's one-click Connect only; the row-bound Connect keeps the row's own Scopes field.
+authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+pkce = true
+authorize_extra = { access_type = "offline", prompt = "consent" }
+# Sensitive scopes only: Gmail and Drive are restricted (Google verification), so they are never asked by default; a
+# member adds them in the secret's Scopes field and uses Connect on the secret's page.
+scopes = [
+  { name = "openid", label = "Confirm who signed in" },
+  { name = "email", label = "See the account's email address, so the connection shows whose it is" },
+  { name = "https://www.googleapis.com/auth/calendar.readonly", label = "Read calendars and events, to check availability and prepare for meetings" },
+  { name = "https://www.googleapis.com/auth/documents.readonly", label = "Read Google Docs agents are pointed at", optional = true },
+  { name = "https://www.googleapis.com/auth/spreadsheets", label = "Read and edit Google Sheets", optional = true },
+]
+
+[docs]
+agent_uses = [
+  "Read your calendar to find free time or prepare for a meeting",
+  "Read a Google Doc or Sheet a task links to",
+  "Update a Google Sheet with results, if you granted Sheets access",
+  "Read Drive files or read and send Gmail, once you add those scopes to the secret (see Limitations)",
+]
+prerequisites = [
+  "A Google account (Workspace or personal)",
+  "A Google Cloud project with an OAuth client of type Web application, whose authorised redirect URI is the one shown under Use your own OAuth app, and the APIs agents need enabled (Gmail API, Google Calendar API, Google Drive API, Google Sheets API) under APIs & Services > Library",
+  "If the project's OAuth consent screen is in Testing, the account you connect added as a test user (Google Auth Platform > Audience > Test users)",
+]
+limitations = [
+  "This Jaah has no Google app of its own yet, so every connection runs on your own Google Cloud OAuth client: enter its client ID and secret on the Connect screen",
+  "Gmail and Drive are not asked for by default. To add them, open the secret, add the scope (for example https://www.googleapis.com/auth/gmail.readonly or https://www.googleapis.com/auth/drive.readonly) to its Scopes field, and select Connect on the secret's page",
+  "Gmail and Drive read scopes are restricted by Google: an External consent screen in Production needs Google's verification before accounts outside your Workspace can grant them. Use an Internal consent screen to connect only your Workspace's accounts",
+  "A consent screen left in Testing issues refresh tokens that expire after 7 days; publish it to keep the connection alive",
+]
+troubleshooting = [
+  { symptom = "Google shows Error 400 redirect_uri_mismatch", fix = "Add the redirect URI shown on this page, byte for byte, under your OAuth client's Authorised redirect URIs in Google Cloud > APIs & Services > Credentials" },
+  { symptom = "Google shows Access blocked: this app has not completed the Google verification process", fix = "Your consent screen is External and in Testing. Add the account under Audience > Test users, or switch the app to Internal for a Workspace" },
+  { symptom = "Test says the refresh token was rejected (invalid_grant)", fix = "The grant was revoked, the password changed, or a Testing consent screen let it expire after 7 days. Select Reconnect" },
+  { symptom = "Agents get 403 accessNotConfigured", fix = "The API is not enabled in your Google Cloud project. Enable it under APIs & Services > Library" },
+]
+faq = [
+  { q = "Why do I need my own Google OAuth client", a = "Google requires a verified app for Gmail and Drive access. Until Jaah's own app passes that review, your own client keeps your data under your project's control" },
+  { q = "Can I connect a shared mailbox or another user's calendar", a = "Connect as that account, or as a user it is shared with: agents see what the signed-in account sees" },
+]

@@ -2,7 +2,7 @@
 
 The opt-in parse itself (`TRUTHY`, `env_flag_enabled`, `insecure_agent_enabled`) has ONE home, the node's
 `apps/jaahd/jaah_env.py`, borrowed by path through `app/jaah_env.py` and re-exported here under the same names
-for every agent-surface auth check (`app/auth.py::_valid_node_token`, `app/node_bus.py::token_ok`,
+for every agent-surface auth check (`app/auth.py::_valid_node_token`, `app/node_bus.py::resolve_caller_async`,
 `app/routes/agent/auth.py::_check_token`, `app/node_credentials.py`).
 
 Imports nothing else from `app` (`auth.py`/`node_bus.py` are imported everywhere; a cycle otherwise). Every

@@ -1,6 +1,15 @@
 /* Task priority levels — web side of `apps/api/app/task_priority.py`; `test_task_priority.py` pins the two
  * tables together. Stored as a plain int (higher = sooner; dispatch orders `priority DESC, id`). */
 
+import type { Explain } from '../../ui/explain'
+
+/** The Priority label's explanation, on every surface that sets it (the task form, the row's Priority dialog). */
+export const PRIORITY_HELP: Explain = {
+  tip: 'Higher levels leave the queue first.',
+  more: "Queued tasks dispatch by priority, then oldest first. An epic's priority passes to its subtasks.",
+  docs: 'console-reference/tasks/new-task',
+}
+
 export type PriorityLevel = {
   /** The stored `Task.priority` int for this level. */
   value: number

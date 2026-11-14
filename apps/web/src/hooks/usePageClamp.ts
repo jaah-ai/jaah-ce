@@ -11,7 +11,7 @@ export function usePageClamp(page: number, setPage: Dispatch<SetStateAction<numb
 }
 
 /* Client-side paging over an in-memory list, `pageSize` per page: the 1-based `page` (clamped by `usePageClamp`),
- * the `pageItems` slice drawn, its `start` index in `items`, and the pager's "x–y of n" `label`. `current` is
+ * the `pageItems` slice drawn and its `start` index in `items` (`ui/ListPager` draws the footer). `current` is
  * the page actually drawn: the frame before the clamp lands (rows removed) it is the last page, not an empty one. */
 export function useClientPage<T>(items: readonly T[], pageSize: number) {
   const [page, setPage] = useState(1)
@@ -19,5 +19,5 @@ export function useClientPage<T>(items: readonly T[], pageSize: number) {
   const current = Math.min(page, totalPages)
   const start = (current - 1) * pageSize
   const pageItems = useMemo(() => items.slice(start, start + pageSize), [items, start, pageSize])
-  return { page, current, setPage, totalPages, start, pageItems, label: `${start + 1}–${Math.min(start + pageSize, items.length)} of ${items.length}` }
+  return { page, current, setPage, totalPages, start, pageItems }
 }

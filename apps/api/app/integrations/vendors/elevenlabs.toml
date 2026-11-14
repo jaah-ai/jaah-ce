@@ -1,0 +1,40 @@
+slug = "elevenlabs"
+label = "ElevenLabs"
+category = "ai_media"
+vendor_docs_url = "https://elevenlabs.io/docs/api-reference/authentication"
+summary = "Text to speech, voice cloning, sound effects and transcription with ElevenLabs."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "In ElevenLabs open your profile menu > API Keys (elevenlabs.io/app/settings/api-keys) and select Create API key. If you restrict the key's scope, keep read access to the user endpoints so the Test can run, and allow the endpoints your agents need" },
+]
+
+[test]
+method = "GET"
+path = "https://api.elevenlabs.io/v1/user"
+auth = { field = "api_key", header = "xi-api-key" }
+identity = [["first_name"]]
+
+[docs]
+agent_uses = [
+  "Turn text into natural speech in any of your voices or the voice library, and save the audio",
+  "Transcribe audio and video into text with speech to text",
+  "Generate sound effects and music from a description",
+  "List and manage your voices, including cloned ones",
+]
+prerequisites = [
+  "An ElevenLabs account; creating a personal API key needs a full seat in the workspace",
+]
+limitations = [
+  "Generation spends your ElevenLabs character or credit quota; the Test only reads your user profile",
+  "A key with an IP allowlist works only from the listed addresses, and agent sessions run on Jaah's nodes",
+]
+troubleshooting = [
+  { symptom = "The Test says ElevenLabs rejected the API key (401)", fix = "The key was deleted, expired (keys can be set to expire) or mistyped. Create a new one under API Keys and select Replace" },
+  { symptom = "The Test says ElevenLabs rejected the API key (403)", fix = "The key is restricted. Edit it under API Keys and allow read access to the user endpoints, or remove its IP allowlist" },
+  { symptom = "Agents get 402 or a quota error", fix = "The subscription's credits for this period are spent. Check Subscription in ElevenLabs and upgrade or wait for the reset" },
+]
+faq = [
+  { q = "Can agents use my cloned voices", a = "Yes, any voice in the account the key belongs to, unless you restricted the key's voice permissions" },
+]

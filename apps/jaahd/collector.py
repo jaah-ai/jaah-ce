@@ -30,6 +30,7 @@ import runner_credentials
 import session_user
 import shared_storage
 import env_helpers
+import file_io
 from env_helpers import _norm_dir
 
 log = logging.getLogger("jaahd.collector")
@@ -74,17 +75,18 @@ def _tier_label(tier_raw: str | None, seat: str | None = None) -> str | None:
     return f"Max {m.group(1)}×" if m else (seat or tier_raw or None)
 
 
+def _oauth_request(url: str, headers: dict[str, str], *, data: bytes | None = None) -> bytes:
+    """The ONE `urllib` call to the default provider's OAuth surface (the API reads, the token refresh): the
+    collector's own `User-Agent` on every request, the one timeout; an HTTP error propagates for the caller
+    to classify."""
+    req = urllib.request.Request(url, data=data, headers={**headers, "User-Agent": _OAUTH_USER_AGENT},
+                                 method="POST" if data is not None else "GET")
+    return urllib.request.urlopen(req, timeout=_OAUTH_TIMEOUT).read()
+
+
 def _oauth_get(token: str, path: str) -> dict:
     """GET an OAuth-scoped endpoint of the default provider's API with an account's access token."""
-    req = urllib.request.Request(
-        _OAUTH_API + path,
-        headers={
-            "Authorization": f"Bearer {token}",
-            _OAUTH_BETA_HEADER: _OAUTH_BETA,
-            "User-Agent": _OAUTH_USER_AGENT,
-        },
-    )
-    return json.loads(urllib.request.urlopen(req, timeout=_OAUTH_TIMEOUT).read())
+    return json.loads(_oauth_request(_OAUTH_API + path, {"Authorization": f"Bearer {token}", _OAUTH_BETA_HEADER: _OAUTH_BETA}))
 
 
 def _live_account(token: str) -> dict:
@@ -233,12 +235,9 @@ def _read_oauth_block(auth_dir: Path, securestorage_dir: str = "") -> dict:
     A snapshot's refresh token may have been rotated by a CLI before we took its lock,
     so it may already be consumed and must never be sent. `{}` is safe: callers treat no refresh token as nothing to
     do. `securestorage_dir` must match the caller's, or a rewrite reads one file and writes another."""
-    try:
-        full = json.loads(_cred_path(auth_dir, securestorage_dir).read_text())
-        block = full.get(_CREDENTIAL_BLOCK) if isinstance(full, dict) else None
-        return block if isinstance(block, dict) else {}
-    except Exception:
-        return {}
+    full = file_io.read_json_or(_cred_path(auth_dir, securestorage_dir), {}, expect=dict)
+    block = full.get(_CREDENTIAL_BLOCK)
+    return block if isinstance(block, dict) else {}
 
 
 # The default CLI's OWN refresh locks — the current one and its legacy sibling, as measured (the adapter's
@@ -429,16 +428,8 @@ def _refresh_oauth_token(auth_dir: Path, creds: dict, securestorage_dir: str = "
             "refresh_token": refresh_token,
             "client_id": _OAUTH_CLIENT_ID,
         }).encode()
-        req = urllib.request.Request(
-            _OAUTH_TOKEN_URL, data=body,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": _OAUTH_USER_AGENT,
-            },
-            method="POST",
-        )
         try:
-            raw = urllib.request.urlopen(req, timeout=_OAUTH_TIMEOUT).read()
+            raw = _oauth_request(_OAUTH_TOKEN_URL, {"Content-Type": "application/x-www-form-urlencoded"}, data=body)
         except urllib.error.HTTPError as exc:
             if exc.code == 400:
                 # invalid_grant — the refresh token is dead. Log the CODE only, never the token.
@@ -500,12 +491,7 @@ def _refresh_oauth_token(auth_dir: Path, creds: dict, securestorage_dir: str = "
 
         # Persist the rotated pair before returning, preserving other top-level keys.
         cred_path = _cred_path(auth_dir, securestorage_dir)
-        try:
-            full = json.loads(cred_path.read_text())
-            if not isinstance(full, dict):
-                full = {}
-        except Exception:
-            full = {}
+        full = file_io.read_json_or(cred_path, {}, expect=dict)
         full[_CREDENTIAL_BLOCK] = new_block
         try:
             # 0600 as the CLI itself writes it (widening is no fix), and the replace hands the file the
@@ -855,7 +841,7 @@ def _collect_resources() -> dict:
         with ThreadPoolExecutor(max_workers=min(4, len(auth_dirs))) as pool:
             results = list(pool.map(probe_account, auth_dirs, securestorage_dirs, providers))
         # zip preserves order: literal_norms[i]/auth_dirs[i] is the account behind results[i].
-        for literal_norm, source, (acct, quota) in zip(literal_norms, token_sources, results):
+        for literal_norm, source, (acct, quota) in zip(literal_norms, token_sources, results, strict=False):
             if not acct:
                 continue
             # Shared or local, never a path; rides `extra` to the Brains page (`account_fold.account_node_records`).

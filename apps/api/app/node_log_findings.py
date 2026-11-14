@@ -7,6 +7,9 @@ heartbeating, so the Health tab must say so:
   …s (a dead NFS server?)": the NodeLink store (an NFS/EFS mount) hangs.
 * `step_wedged` — `apps/jaahd/main.py`'s "<step> has been in flight for over …s and is skipping its firings":
   a periodic step or scheduled task has not returned for far longer than its interval.
+* `session_user_stalled` — `apps/jaahd/session_user.py`'s "session-user commands keep timing out: <n> timed out, …":
+  the commands the daemon runs as the session user (a file write, a probe, a git step) keep hitting their deadline,
+  rc 124 — usually memory or disk I/O pressure, on a Multi-Node Host vnode in `jaahvnodes.slice`.
 * `engine_unready` — a Windows node's "container engine not ready: …" (`apps/jaahd/windows_engine_health.py`,
   posted by the daemon itself, as a Windows node has no journal): its `jaah-engine` WSL 2 distro is not answering
   `docker info`, so nothing that needs a container can run there.
@@ -30,6 +33,10 @@ Three more kinds are not journal lines but the node's own host series (`NodeHost
 kind, so a finding outlasts the placement gate's 10-minute recovery rather than an hour past it — and
 `tmp_inodes_high`, the same rule over /tmp's inode use above `node_host_metrics.TMP_INODE_WARN_PCT`.
 
+`pane_sensor_down` is read off the node's slot observations (`worktrees.probes`): the pane sensor reads unknown
+(`tmux_ok = false`, the daemon could not reach a tmux server) while a runner is live there, so no answer or message
+can be typed into it — the node refuses every `deliver_answer` (`pane_sensor_down_from` has the rule).
+
 One more is read off the node's `sessions` rows (`relaunch_storm`): `relaunch_storm`, the same task's runner
 ending `vanished` again and again within minutes — the control plane relaunching into a node that keeps losing it.
 
@@ -39,7 +46,7 @@ recent errors).
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import math
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional, Protocol, Sequence
@@ -48,9 +55,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import node_host_metrics, node_log_history
-from app.clock import as_utc, parse_utc
+from app.clock import as_utc, parse_utc, utcnow
 from app.models.agent_sessions import AgentSession
 from app.models.nodes import Node, NodeHostMetric
+from app.models.worktrees import Worktree
 from app.runner_terminations import RUNNER_LOST_CAUSES
 
 FINDING_WINDOW = timedelta(minutes=30)
@@ -65,10 +73,13 @@ TMP_INODES_HIGH = "tmp_inodes_high"
 ENGINE_UNREADY = "engine_unready"
 FLEET_ANCHOR_UNVERIFIED = "fleet_anchor_unverified"
 CONVERGE_FAILED = "converge_failed"
+TMUX_UNJAILED = "tmux_unjailed"
+PANE_SENSOR_DOWN = "pane_sensor_down"
+SESSION_USER_STALLED = "session_user_stalled"
 
 # The journal kinds, in display order: the store first, as a hung store is the usual cause of a wedged step.
-KINDS = (CONVERGE_FAILED, NODELINK_STORE_UNRESPONSIVE, STEP_WEDGED, ENGINE_UNREADY, FLEET_ANCHOR_UNVERIFIED,
-         OOM_KILL)
+KINDS = (CONVERGE_FAILED, NODELINK_STORE_UNRESPONSIVE, STEP_WEDGED, SESSION_USER_STALLED, ENGINE_UNREADY,
+         FLEET_ANCHOR_UNVERIFIED, TMUX_UNJAILED, OOM_KILL)
 # The host-series kinds (`pressure`), served before the journal kinds: pressure is the usual cause of the rest.
 PRESSURE_KINDS = (MEMORY_CRITICAL, CPU_CRITICAL, TMP_INODES_HIGH)
 
@@ -83,6 +94,9 @@ LABELS = {
     ENGINE_UNREADY: "Container engine down",
     FLEET_ANCHOR_UNVERIFIED: "Runners unverifiable",
     CONVERGE_FAILED: "Node converge failed",
+    TMUX_UNJAILED: "tmux clients unjailed",
+    PANE_SENSOR_DOWN: "Runners unreachable (tmux)",
+    SESSION_USER_STALLED: "Node commands timing out",
 }
 # A converge runs once per package update, not every few minutes, so its refusal outlives `FINDING_WINDOW`.
 CONVERGE_WINDOW = timedelta(days=30)
@@ -104,12 +118,20 @@ _STORE_RE = re.compile(r"(\S{1,512}) did not answer a mount check")
 _STEP_RE = re.compile(
     r"(?:periodic step (\S{1,256})|scheduled task '([^']{1,256})') has been in flight for over (\d{1,12})s"
 )
+# `session_user.STALL_MARK`'s twin.
+_STALL_MARK = "session-user commands keep timing out: "
+_STALL_RE = re.compile(r"session-user commands keep timing out: (\d{1,9}) timed out")
 # `windows_engine_health.MARK`'s twin.
 _ENGINE_MARK = "container engine not ready: "
 _ENGINE_RE = re.compile(r"container engine not ready: (.{1,512})")
 # `windows_anchor_health.MARK`'s twin.
 _ANCHOR_MARK = "fleet server anchor unverified: "
 _ANCHOR_RE = re.compile(r"fleet server anchor unverified: (.{1,512})")
+# `tmux_jail_health.MARK`'s twin; the detail is cut before the line's fixed consequence clause, and a long one is
+# truncated, never dropped.
+_UNJAILED_MARK = "tmux command clients unjailed: "
+_UNJAILED_RE = re.compile(r"tmux command clients unjailed: (.{1,512})")
+_UNJAILED_TAIL = " - a runner can "
 _KERNEL_OOM_MARK = "oom-kill:"
 _SYSTEMD_OOM_MARK = ": A process of this unit has been killed by the OOM killer"
 _OOM_MEMCG_RE = re.compile(r"task_memcg=([^,\s]{1,1024})")
@@ -173,12 +195,18 @@ def classify(message: str, unit: str = "") -> tuple[str, str] | None:
     step = _STEP_RE.search(text) if _STEP_MARK in text else None
     if step:
         return STEP_WEDGED, f"{step.group(1) or step.group(2)}: in flight over {step.group(3)}s"
+    stall = _STALL_RE.search(text) if _STALL_MARK in text else None
+    if stall:
+        return SESSION_USER_STALLED, f"{stall.group(1)} commands timed out (memory or disk I/O pressure, or a hung command)"
     engine = _ENGINE_RE.search(text) if _ENGINE_MARK in text else None
     if engine:
         return ENGINE_UNREADY, engine.group(1)
     anchor = _ANCHOR_RE.search(text) if _ANCHOR_MARK in text else None
     if anchor:
         return FLEET_ANCHOR_UNVERIFIED, anchor.group(1)
+    unjailed = _UNJAILED_RE.search(text) if _UNJAILED_MARK in text else None
+    if unjailed:
+        return TMUX_UNJAILED, unjailed.group(1).split(_UNJAILED_TAIL, 1)[0]
     floor = _GIT_FLOOR_RE.search(text) if _GIT_FLOOR_MARK in text else None
     if floor:
         return CONVERGE_FAILED, (f"git {floor.group(1)} is below the {floor.group(2)} floor; "
@@ -199,7 +227,7 @@ def record(row: Node, entries: Iterable[_Entry], now: datetime | None = None) ->
 
     Also folds the batch into `app/node_log_history.py`'s lists; the result says whether either changed."""
     # A line stamped ahead of `now` (a fast node clock) is read as now: it may not keep a finding up past its window.
-    ceiling = as_utc(now) if now is not None else datetime.now(timezone.utc)
+    ceiling = as_utc(now) if now is not None else utcnow()
     current = dict(row.log_findings or {})
     changed = False
     entries = list(entries)
@@ -446,3 +474,39 @@ def relaunch_storm(
         query = query.where(AgentSession.org_id == org_id)
     storm = relaunch_storm_from(session.execute(query).all())
     return [] if storm is None else [(RELAUNCH_STORM, storm.as_finding())]
+
+
+# ── Pane sensor down: the node's slot observations, read at request time ───────────────────────
+
+
+def pane_sensor_down_from(
+    slots: Iterable[tuple[Optional[bool], Optional[str], Optional[datetime]]], now: datetime
+) -> list[tuple[str, dict]]:
+    """`[(PANE_SENSOR_DOWN, finding)]` when the node's pane sensor reads unknown while a runner is live there, else
+    `[]`. Pure. `slots` is `(session, tmux_ok, observed_at)` per slot, `tmux_ok` as the jsonb text.
+
+    `tmux_ok` is one node-wide reading copied onto every slot (`apps/jaahd/reconcile/observe.py`), and an idle node
+    has no tmux socket by design, so `false` alone is no fault: it is one only while some slot holds a live session,
+    whose answers and messages then cannot be typed. Only observations within `FINDING_WINDOW` count; an older one
+    is the liveness verdicts' to judge. Every fresh reading must be `false` — one `true` clears it."""
+    fresh = [(live, ok, as_utc(at)) for live, ok, at in slots if at is not None and as_utc(now) - as_utc(at) <= FINDING_WINDOW]
+    readings = [ok for _live, ok, _at in fresh if ok is not None]
+    live = [at for is_live, _ok, at in fresh if is_live]
+    if not readings or any(ok != "false" for ok in readings) or not live:
+        return []
+    sessions = "1 live runner" if len(live) == 1 else f"{len(live)} live runners"
+    return [(PANE_SENSOR_DOWN, {
+        "first_at": min(live).isoformat(), "last_at": max(live).isoformat(),
+        "detail": f"{sessions}, tmux not reachable", "count": len(live),
+    })]
+
+
+def pane_sensor_down(session: Session, node_uuid, now: datetime) -> list[tuple[str, dict]]:
+    """`pane_sensor_down_from` over the node's freshly observed slots (`worktrees.probes`, as the observation upsert
+    writes it; `now` is the DB's clock). Reads the one key, not the whole probes document."""
+    rows = session.execute(
+        select(Worktree.session, Worktree.probes["tmux_ok"].astext, Worktree.observed_at).where(
+            Worktree.node_id == node_uuid, Worktree.observed_at >= now - FINDING_WINDOW,
+        )
+    ).all()
+    return pane_sensor_down_from([(live, ok, at) for live, ok, at in rows], now)

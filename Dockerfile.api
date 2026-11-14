@@ -9,14 +9,37 @@
 # the control plane writes 0600 on the `jaah-node-identity` volume is readable by the container node. Each boot
 # migrates plain Postgres to head and runs the seed, which runs the CE bootstrap (`app/ce_bootstrap.py`:
 # secrets, the org, the node, its pool).
-FROM cgr.dev/chainguard/wolfi-base:latest@sha256:dbcc3a4a3b1b9e68420a4742940aa6267c97e61811736a5fef0918a06ade1827 AS deps
-RUN apk upgrade --no-cache && apk add --no-cache python-3.14 py3.14-pip tzdata bash
+#
+# FREE-THREADED CPython (`python-3.14t`, the GIL off), as the cloud image: the launcher (`apps/api/entrypoint.sh`) refuses
+# any other interpreter. New threads start with an empty context (PYTHON_THREAD_INHERIT_CONTEXT=0), so no thread carries
+# its creator's tenancy scope. psycopg's C implementation has no free-threaded wheel and is compiled in `wheels`; dbos,
+# which declares `psycopg[binary]`, is installed alone with --no-deps (its other dependencies are in the requirements).
+# The python-3.14t floor is the first snapshot carrying CPython's gh-159449 fix (a free-threaded asyncio bug that frees
+# Tasks still in use).
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:94fa13e26d449f7d78dbcd02d12ea37a0da80d24fcc3e1f17b95d515dec607a7 AS base
+ENV PYTHON_THREAD_INHERIT_CONTEXT=0
+RUN apk upgrade --no-cache && apk add --no-cache 'python-3.14t>=3.14.10_git20261111-r0' tzdata bash libpq-18 && python -m ensurepip \
+    && python -c 'import sys; sys.exit(0 if not sys._is_gil_enabled() else "python is not a free-threaded build")'
 
+FROM base AS wheels
+RUN apk add --no-cache python-3.14t-dev build-base postgresql-18-dev
+COPY apps/api/requirements.txt /tmp/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip python -m pip wheel --no-deps -w /wheels \
+    "psycopg-c==$(sed -n 's/^psycopg==//p' /tmp/requirements.txt)"
+
+FROM base AS deps
 WORKDIR /app
 COPY apps/api/requirements.txt ./requirements.txt
 # The node toolchain's pins, which requirements.txt `-r`s (`../../toolchain/requirements.txt` from /app).
 COPY toolchain/requirements.txt /toolchain/requirements.txt
-RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+# /wheels is a bind mount of the `wheels` stage, so the compiled wheel never becomes a layer of this image.
+RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheels,source=/wheels,target=/wheels \
+    grep -v '^dbos==' requirements.txt > requirements-no-dbos.txt \
+    && python -m pip install -r requirements-no-dbos.txt \
+    && python -m pip install --no-index --find-links /wheels "psycopg-c==$(sed -n 's/^psycopg==//p' requirements.txt)" \
+    && python -m pip install --no-deps "$(grep '^dbos==' requirements.txt)" \
+    && python -c 'import psycopg; assert psycopg.pq.__impl__ == "c", psycopg.pq.__impl__' \
+    && rm -f requirements-no-dbos.txt
 
 FROM deps
 COPY apps/api/ ./
@@ -24,9 +47,10 @@ COPY apps/api/ ./
 COPY doctrine/fleet/ ./doctrine/fleet/
 COPY doctrine/context-architecture.md ./doctrine/
 # The files the api loads by path from ./shared (app/shared_module.py); each is single-homed beside its other reader.
-COPY apps/jaahd/transcript_redact.py apps/jaahd/agent_providers.py apps/jaahd/jaah_env.py apps/jaahd/bedrock_call_key.py apps/jaahd/account_auth.py ./shared/
+COPY apps/jaahd/transcript_redact.py apps/jaahd/agent_providers.py apps/jaahd/jaah_env.py apps/jaahd/bedrock_call_key.py apps/jaahd/account_auth.py apps/jaahd/shared_storage_rule.py ./shared/
 COPY tools/manifest_check.py tools/github_settings.py ./shared/
 COPY packaging/linux-support.toml ./shared/
+COPY apps/docs/reference-data/events.toml ./shared/
 COPY VERSION ./VERSION
 ARG APP_VERSION
 ENV APP_VERSION=${APP_VERSION}

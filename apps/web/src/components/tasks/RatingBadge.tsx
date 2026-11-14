@@ -15,12 +15,12 @@ import Box from '@mui/material/Box'
 import type { SxProps, Theme } from '@mui/material/styles'
 import { formatAverage, ratingSummaryTitle } from '../../lib/taskRating'
 import { Icon } from '../../ui/icons'
+import { FONT_SIZE, FONT_WEIGHT, LINE_HEIGHT, grid } from '../../theme'
+import Tip from '../../ui/Tip'
 
-/* The star tone as a literal light/dark pair via `theme.applyStyles('dark', …)` (`lib/authorBadge.ts`'s
-   `AUTHOR_HUES` block says why a literal carries both schemes). Not `palette.warning.main`: on `/tasks`
-   warning means "asking for an answer". `AUTHOR_HUES`' amber values, copied not imported (that table may
-   be re-tuned). Amber-700 on white, amber-300 on `#1e293b`. */
-const STAR_TONE = { light: '#b45309', dark: '#fcd34d' } as const
+/* The star tone: the theme's amber, `warning.dark` on light paper and `warning.light` on dark paper (the
+   contrast-side shade of each scheme), not `warning.main`: on `/tasks` warning's own shade means "asking for
+   an answer". `TaskRating.tsx`'s stars and sparks read the same pair. */
 
 /* MUI's Material star PATH, inlined: `★` is a font glyph (weight and centring vary), `@mui/icons-material`
    is not a dependency, and the internal svg-icon path is private. Same shape as the `<Rating>` in
@@ -28,17 +28,17 @@ const STAR_TONE = { light: '#b45309', dark: '#fcd34d' } as const
 const STAR_PATH =
   'M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z'
 
-/* `em`-sized (tracks the badge font), tinted here so digits stay neutral. `0.9em`: the star's ink fills its
-   viewBox, so at 1em it reads heavier than the digits (0.9 is the measured match). `display: block` kills
+/* Tinted here so digits stay neutral. 12px (`grid(2)`): the star's ink fills its viewBox, so at the badge's
+   13px it reads heavier than the digits (~0.9 of the type size is the measured match). `display: block` kills
    the inline-SVG baseline gap (~3px). */
 function StarGlyph() {
   return (
     <Icon
       viewBox="0 0 24 24"
-      size="0.9em"
+      size={grid(2)}
       sx={[
-        { display: 'block' },
-        theme => ({ fill: STAR_TONE.light, ...theme.applyStyles('dark', { fill: STAR_TONE.dark }) }),
+        { display: 'block', fill: 'currentColor', color: 'warning.dark' },
+        theme => theme.applyStyles('dark', { color: 'warning.light' }),
       ]}
     >
       <path d={STAR_PATH} />
@@ -83,22 +83,21 @@ export default function RatingBadge({
   if (count <= 0 || shown === '') return null
 
   return (
-    <Box
+    <Tip title={(title === undefined ? ratingSummaryTitle(count, average) : title) ?? undefined}><Box
       component="span"
       data-testid={testId}
       /* The whole rating as one sentence (average, denominator, vote count). `?? undefined`, not `?? ''`: an
          empty `title` attribute is announced by some readers. */
-      title={(title === undefined ? ratingSummaryTitle(count, average) : title) ?? undefined}
       sx={[
         {
-          /* LAYOUT DEFAULTS — overridable. `lineHeight: 1` keeps height = font size. `gap: 0.25` (1.5px on
-             the 6px unit): "4.5" at 13px mono ~23px + star ~12px ≈ 37px, inside the ~40px both list
+          /* LAYOUT DEFAULTS — overridable. `lineHeight: 1` keeps height = font size. `gap: 0`:
+             "4.5" at 13px mono ~23px + star 12px ≈ 35px, inside the ~40px both list
              surfaces budget. A wider gap breaks a measured column. */
           display: 'inline-flex',
           alignItems: 'center',
-          gap: 0.25,
-          fontSize: '0.8125rem',
-          lineHeight: 1,
+          gap: 0,
+          fontSize: FONT_SIZE.md,
+          lineHeight: LINE_HEIGHT.tight,
           // Never wrap between number and star.
           whiteSpace: 'nowrap',
         },
@@ -107,7 +106,7 @@ export default function RatingBadge({
         theme => ({
           /* MONO: a measurement is mono (`TaskRunMetrics.tsx`), and stacked rows keep decimal points aligned. */
           fontFamily: theme.typography.mono.fontFamily,
-          fontWeight: 600,
+          fontWeight: FONT_WEIGHT.semibold,
           /* The number is neutral and only the star amber: fifty amber numbers on a board emphasise nothing. */
           color: 'text.primary',
         }),
@@ -115,6 +114,6 @@ export default function RatingBadge({
     >
       {shown}
       <StarGlyph />
-    </Box>
+    </Box></Tip>
   )
 }

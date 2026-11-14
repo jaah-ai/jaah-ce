@@ -19,23 +19,39 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-NAMESPACES = ("body", "headers", "query", "email", "slack", "user", "item")
+from app.triggers import TRACKER_SOURCE_KINDS
+
+NAMESPACES = ("body", "headers", "query", "email", "slack", "user", "incident", "suspects", "deployment", "item",
+              "tracker")
+
+_INCIDENT_NAMESPACES = frozenset({"incident", "suspects", "deployment", "item"})
 
 # Which namespaces each source kind's event carries. `item` is always offered: it is a preflight's, and a
 # template naming it on a trigger without one simply renders it empty (and names the path).
 NAMESPACES_BY_KIND: dict[str, frozenset[str]] = {
     "webhook": frozenset({"body", "headers", "query", "item"}),
     "github": frozenset({"body", "headers", "query", "item"}),
+    **{kind: frozenset({"body", "headers", "query", "item"}) for kind in (
+        "sentry", "datadog", "pagerduty", "cloudwatch", "gitlab", "azure_devops", "bitbucket")},
     "gmail": frozenset({"email", "item"}),
     "slack": frozenset({"slack", "item"}),
     # `{{user.*}}`: the keys `trigger_user_registered.USER_EVENT_KEYS` lists.
     "user_registered": frozenset({"user", "item"}),
+    # The CP-raised incident kinds: the event `app/production_qa/templates.py::event` builds.
+    "incident": _INCIDENT_NAMESPACES,
+    "deploy_failed": _INCIDENT_NAMESPACES,
+    "health_breach": _INCIDENT_NAMESPACES,
+    # `{{tracker.*}}`: the keys `app/trackers/intake.py::tracker_event` writes.
+    **{kind: frozenset({"tracker", "item"}) for kind in TRACKER_SOURCE_KINDS},
 }
 
 # Headers a template may never name: the credentials a sender proves itself with. They are also stripped
 # from the stored event (`trigger_intake.redact_headers`), so this refusal is the readable half.
 FORBIDDEN_HEADERS = ("authorization", "cookie")
-FORBIDDEN_HEADER_PREFIXES = ("x-hub-signature", "x-jaah-signature")
+FORBIDDEN_HEADER_PREFIXES = (
+    "x-hub-signature", "x-jaah-signature", "sentry-hook-signature", "x-pagerduty-signature", "x-jaah-token",
+    "x-gitlab-token",
+)
 
 MAX_VALUE_CHARS = 8 * 1024
 MAX_OUTPUT_CHARS = 64 * 1024

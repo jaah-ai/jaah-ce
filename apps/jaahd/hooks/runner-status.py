@@ -25,10 +25,8 @@ import importlib.util
 import json
 import os
 import re
-import select
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 _SELF_DIR = Path(__file__).resolve().parent
@@ -56,16 +54,14 @@ import runner_env  # noqa: E402
 # it stops an inherited never-written pipe from parking the turn. Losing the payload only degrades.
 _STDIN_WAIT_SECONDS = 0.2
 
-# Size cap on that read (a StopFailure event is a few hundred bytes), and its chunk.
+# Size cap on that read (a StopFailure event is a few hundred bytes).
 _STDIN_MAX_CHARS = 1 << 20
-_STDIN_CHUNK_CHARS = 4096
 
 # `console_exit`'s DEFAULT reason, used when its chain passes no `--reason` (a chain rendered before the flag
 # existed): Claude Code's human quitting at the prompt. The enum is `clear`,
 # `resume`, `logout`, `prompt_input_exit`, `other` — there is NO `"exit"` (verified on Claude Code 2.1.251
 # by typing `/exit`); a guessed value would make the door a silent no-op. `clear` especially must not
-# complete: it starts a fresh session in the same worktree. A literal, not imported from
-# `user-session-end.py`: a hook that fails to import kills its session.
+# complete: it starts a fresh session in the same worktree.
 _CONSOLE_EXIT_REASON = "prompt_input_exit"
 
 # Wall clock on reading this runner's own pane for a quit signature's marker. One measured CLI kills a
@@ -111,78 +107,14 @@ _TURN_END_WALL_CAUSES = ("usage_limit", "credit_exhausted", "auth_expired", "mod
 
 
 def _hook_payload() -> dict:
-    """The hook event JSON Claude Code wrote to our stdin, or `{}` — never an exception, never a hang.
-
-    Best-effort: the payload is a floor under the transcript read, so missing it costs nothing while
-    failing loudly kills the session. A tty (manual run), silence past `_STDIN_WAIT_SECONDS`, bad JSON or
-    a non-object all answer `{}`.
+    """The hook event JSON on our stdin, or `{}` (`environment.hook_payload`, under `_STDIN_WAIT_SECONDS` and
+    `_STDIN_MAX_CHARS`). Best-effort: the payload is a floor under the transcript read, so missing it costs
+    nothing while failing loudly kills the session.
 
     Only `stopfailure`, `console_exit` and `heartbeat` may call this: hook chains share one stdin. The first two
     are the only command in their chain; `heartbeat` is the Stop chain's first reader, and the lane's Stop check
-    after it only drains stdin. `test_settle_does_not_read_the_hook_payload`
-    guards `settle`.
-    Mirrors `user-session-end.py::_hook_payload` (hooks cannot import each other), plus the `select`
-    gate: StopFailure fires while the session waits on us."""
-    stream = getattr(sys, "stdin", None)
-    if stream is None:
-        return {}
-    try:
-        if stream.isatty():
-            return {}       # a manual invocation, not a hook event — nothing is coming
-    except (OSError, ValueError):
-        return {}
-    try:
-        if not select.select([stream], [], [], _STDIN_WAIT_SECONDS)[0]:
-            return {}       # nothing piped in within the budget
-    except (OSError, ValueError, TypeError):
-        # Not selectable: still usually readable, and isatty already excluded the blocking case.
-        pass
-    # Bounded in time AND size: `select` only says ONE byte is ready, so a writer that sends `{` and holds
-    # the pipe open would wedge the turn. `os.read` on the raw fd, not `stream.read(n)` — TextIOWrapper
-    # loops until n chars or EOF, making the deadline decoration. A truncated payload just fails to parse.
-    # A stream with no real fd cannot block, so it takes the plain read.
-    deadline = time.monotonic() + _STDIN_WAIT_SECONDS
-    try:
-        fd = stream.fileno()
-    except (OSError, ValueError, AttributeError):
-        fd = -1
-    if fd < 0:
-        try:
-            return _as_payload(stream.read(_STDIN_MAX_CHARS))
-        except (OSError, ValueError, UnicodeDecodeError):
-            return {}
-    chunks: list[bytes] = []
-    total = 0
-    try:
-        while total < _STDIN_MAX_CHARS:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            if not select.select([fd], [], [], remaining)[0]:
-                break
-            chunk = os.read(fd, _STDIN_CHUNK_CHARS)
-            if not chunk:
-                break   # EOF — the normal end, since Claude Code closes as it spawns us
-            chunks.append(chunk)
-            total += len(chunk)
-    except (OSError, ValueError):
-        return {}
-    try:
-        raw = b"".join(chunks).decode("utf-8", "replace")
-    except (UnicodeDecodeError, ValueError):
-        return {}
-    return _as_payload(raw)
-
-
-def _as_payload(raw) -> dict:
-    """The JSON object `raw` holds, or `{}` — the one place this file decides what counts as a payload.
-
-    Shared by both read paths so they cannot disagree; a non-object has no `error_type` to read."""
-    try:
-        payload = json.loads(raw)
-    except (json.JSONDecodeError, ValueError, TypeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    after it only drains stdin. `test_settle_does_not_read_the_hook_payload` guards `settle`."""
+    return environment.hook_payload(_STDIN_WAIT_SECONDS, _STDIN_MAX_CHARS)
 
 
 def _payload_transcript(hook_payload: dict) -> str:
@@ -209,14 +141,7 @@ def _payload_transcript(hook_payload: dict) -> str:
 def _log(*parts: str) -> None:
     """Per-task decision log (instrumentation only — never gates a decision)."""
     task_id = runner_env.task_id("none")
-    log_dir = environment.hook_log_dir()
-    try:
-        os.makedirs(log_dir, exist_ok=True)
-        stamp = __import__("time").strftime("%Y-%m-%dT%H:%M:%S%z")
-        with open(os.path.join(log_dir, f"runner-status-{task_id}.log"), "a") as f:
-            f.write(f"{stamp} [task={task_id}] {' '.join(parts)}\n")
-    except OSError:
-        pass
+    environment.hook_log(f"runner-status-{task_id}.log", f"[task={task_id}]", *parts)
 
 
 def _env_ready() -> bool:
@@ -338,7 +263,7 @@ def _post_runner_break(payload: dict, cause: str, verb: str) -> bool:
 
 def _record_break() -> tuple:
     """Classify this session's break and record it. Returns `(cause, detail, session_id)` so the caller's
-    /fail carries the SAME reason and fence identity as the incident."""
+    /fail carries the SAME reason and fence identity as the break report."""
     payload, cause, detail = _classify_and_build_break_payload(observed_by="runner-hook")
     _post_runner_break(payload, cause, "settle")
     return cause, detail, payload["session_id"]
@@ -550,7 +475,10 @@ def _pane_shows_quit(pane: str, marker: str) -> bool:
 
 def _own_pane() -> str:
     """The visible text of the tmux pane this runner lives in, or `""` when it cannot be read (no
-    `$TMUX_PANE`, no tmux, a pane already gone, the timeout). `""` fails closed: no marker, no completion."""
+    `$TMUX_PANE`, no tmux, a pane already gone, the timeout). `""` fails closed: no marker, no completion.
+
+    An isolated fleet server takes no command from a pane, so a refused `capture-pane` asks the daemon for
+    this pane's text instead (`pane.text`, answered for the caller's own identity)."""
     pane = os.environ.get("TMUX_PANE") or ""
     if not pane:
         return ""
@@ -558,8 +486,18 @@ def _own_pane() -> str:
         done = subprocess.run(["tmux", "capture-pane", "-p", "-t", pane], capture_output=True,
                               text=True, timeout=_PANE_CAPTURE_TIMEOUT_S, check=False)
     except (OSError, subprocess.SubprocessError):
+        done = None
+    if done is not None and done.returncode == 0:
+        return done.stdout
+    session_id = _runner_session_id()
+    if not session_id:
         return ""
-    return done.stdout if done.returncode == 0 else ""
+    try:
+        answer = agent_socket.call("pane.text", {"session_id": session_id})
+    except (agent_socket.AgentSocketRefused, agent_socket.AgentSocketUnavailable):
+        return ""
+    text = answer.get("text") if isinstance(answer, dict) else None
+    return text if isinstance(text, str) else ""
 
 
 def rs_console_exit(args: "list[str] | None" = None) -> int:
@@ -571,8 +509,7 @@ def rs_console_exit(args: "list[str] | None" = None) -> int:
     reason also covers other endings — a marker the CLI draws on its own pane only while quitting):
     completing frees the worktree and the runner is reaped seconds later, so every other ending is a
     logged no-op. `session_id` fences it to THIS attempt (`_runner_session_id`); no id, no call. Not
-    detached (unlike `user-session-end.py`, which releases its own slot): this only POSTs, and a detached
-    child would lose the pane ancestry the daemon identifies the caller by. A refusal is expected for
+    detached: this only POSTs, and a detached child would lose the pane ancestry the daemon identifies the caller by. A refusal is expected for
     non-interactive personas.
     """
     if not _env_ready():

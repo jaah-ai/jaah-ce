@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState, type ComponentType } from 'react'
+import { Suspense, useCallback, useEffect, useRef, useState, type ComponentType } from 'react'
 import { Navigate, useLocation, useNavigate } from 'react-router-dom'
 import Box from '@mui/material/Box'
-import { TabPanel, Tabs, type TabDef } from '../../components/Tabs'
+import { type TabDef, TabbedPanels } from '../../components/Tabs'
 import { useAuth, useCan } from '../../auth'
 import { isOrgAdminSeat } from '../../lib/orgAdmin'
 import { NotOnPlan, planSurfaceShown } from '../../lib/planSwitches'
@@ -19,13 +19,23 @@ import SessionsTab from './SessionsTab'
 import SlotIntentsTab from './SlotIntentsTab'
 import UsersTab from './UsersTab'
 import WorkflowRunsPanel from './WorkflowRunsPanel'
+import ClientErrorsTab from './ClientErrorsTab'
+import MemoryTab from './MemoryTab'
+import { memoryOffered, mergeLanesOffered } from './projectAuditTabs'
 import PersonasTab from '../personas/PersonasTab'
 import TenancyExclusionsPage from '../tenancy/TenancyExclusionsPage'
 import WorkflowTypesTab from '../workflows/WorkflowTypesTab'
 import { DenyListBackground, useListBackground } from '../../components/ListDetail'
 import { isEnabled } from '../../lib/editionFeatures'
+import { editionModule } from '../../lib/editionModule'
+import { lazyRetry as lazy } from '../../lib/lazyRetry'
+import LoadingState from '../../ui/LoadingState'
 
-/* Audit — the console's ONE "what happened" surface, in seven tabs, three with a second strip.
+/* Automations and Slots are whole pages of their own, loaded when their tab first opens. */
+const AutomationList = lazy(() => import('../automations/AutomationList'))
+const Worktrees = lazy(() => import('../Worktrees'))
+
+/* Audit — the console's ONE "what happened" surface, in twelve tabs, three with a second strip.
  *
  *      Activity     /audit                        who did what through the API (tab id `users`)
  *      Nodes        /audit/nodes                  what the fleet was told to do
@@ -41,9 +51,14 @@ import { isEnabled } from '../../lib/editionFeatures'
  *      Personas     /audit/personas               every role a fleet runner can be dispatched as
  *      Exclusions   /audit/exclusions             what the tenancy read seam held back
  *      Control plane /audit/control-plane         the control plane's own ECS service: deployments, and why tasks stopped
+ *      Client errors /audit/client-errors         console errors and stalls reported by flagged orgs and users
+ *      Automations  /automations                  every schedule and event trigger in the org (org admins)
+ *      Slots        /worktrees                    the worktree pool: which task holds each slot (the operator's)
+ *      Merge lanes  /audit/merge-lanes            every viewable project's merge lane rows; `?project=` opens one lane
+ *      Memory       /audit/memory                 what runners learned, every viewable project; `?project=` opens one
  *
  * One surface because an operator asking "what happened" does not know which ledger holds the answer
- * (Automation is the schedule; Audit is what ran, and the catalogues it ran from). The populations are
+ * (Automations are the schedule; the rest is what ran, and the catalogues it ran from). The populations are
  * NOT merged: every leaf has its own shape, and a common row would drop the columns that make each worth
  * reading. Efficiency is an aggregate over transcripts in object storage (different store, per-scan cost,
  * a "not configured" state), hence a sub-tab rather than part of the ledger.
@@ -53,23 +68,23 @@ import { isEnabled } from '../../lib/editionFeatures'
  * belong here and why the error boundary sees them as ONE page. A sub-strip's first tab IS its parent's
  * address, so a top-level click always lands on the first sub-tab (no history-dependent links).
  *
- * LEGACY `?tab=` LINKS STILL RESOLVE (`/audit?tab=nodes`, from the retired `/command-log`): one hop onto
- * the path, other params preserved; see `legacyTab`.
- *
  * PERMISSION: one key per tab (`apps/api/app/authz/`'s "THE TIER KEY BECOMES THE DOOR"), or a seat where
- * the route reads one (Workflows' leaves, Personas, Exclusions, Control plane); Activity and Sessions also ask
- * their plan switch (`audit_enabled`, `session_transcripts_enabled`; `lib/planSwitches.tsx`), and Nodes,
+ * the route reads one (Workflows' leaves, Personas, Exclusions, Control plane); Sessions also asks its plan switch
+ * (`session_transcripts_enabled`; `lib/planSwitches.tsx`), Activity says "not on your plan" in its panel when
+ * `audit_enabled` is off, and Nodes,
  * Workflows and Personas are the operator's; a holder sees
  * EVERYONE's activity within a tab (D4). `visibleTabs` decides visibility on TWO doors — the route guard
  * (App.tsx) and the panel's read key — or the strip advertises a dead end.
  */
 
-type AuditTab = 'users' | 'nodes' | 'sessions' | 'workflows' | 'personas' | 'exclusions' | 'control-plane'
+type AuditTab =
+  | 'users' | 'nodes' | 'sessions' | 'workflows' | 'personas' | 'exclusions' | 'control-plane' | 'client-errors'
+  | 'automations' | 'slots' | 'merge-lanes' | 'memory'
 type NodeTab = 'commands' | 'slot-intents'
 type SessionTab = 'list' | 'efficiency'
 type WorkflowTab = 'runs' | 'schedule' | 'catalogue'
 
-/** The eleven leaves — what the shell shows and latches. `sessions` is the ledger leaf's id (keyed by the
+/** The sixteen leaves — what the shell shows and latches. `sessions` is the ledger leaf's id (keyed by the
  *  latch and e2e specs); its sub-strip id is `list`, since strip ids name contents. */
 type AuditLeaf =
   | 'users'
@@ -83,6 +98,11 @@ type AuditLeaf =
   | 'personas'
   | 'exclusions'
   | 'control-plane'
+  | 'client-errors'
+  | 'automations'
+  | 'slots'
+  | 'merge-lanes'
+  | 'memory'
 
 /* Users is the default (the page's core question) and the bare `/audit`; an unknown pathname reads as it. */
 const DEFAULT_TAB: AuditTab = 'users'
@@ -104,9 +124,14 @@ const TABS: readonly PathTabDef<AuditTab>[] = [
   { id: 'personas', label: 'Personas', path: AUDIT_TAB_PATHS.personas },
   { id: 'exclusions', label: 'Exclusions', path: AUDIT_TAB_PATHS.exclusions },
   { id: 'control-plane', label: 'Control plane', path: AUDIT_TAB_PATHS.controlPlane },
+  { id: 'client-errors', label: 'Client errors', path: AUDIT_TAB_PATHS.clientErrors },
+  { id: 'automations', label: 'Automations', path: AUDIT_TAB_PATHS.automations },
+  { id: 'slots', label: 'Slots', path: AUDIT_TAB_PATHS.slots },
+  { id: 'merge-lanes', label: 'Merge lanes', path: AUDIT_TAB_PATHS.mergeLanes },
+  { id: 'memory', label: 'Memory', path: AUDIT_TAB_PATHS.memory },
 ]
 
-/** Nodes' strip; `commands` IS `/audit/nodes` (bookmarks and the `/command-log` redirect). Two keys:
+/** Nodes' strip; `commands` IS `/audit/nodes` (bookmarks). Two keys:
  *  `GET /api/command-log` is `@feature("system", "view")` (`routes/portfolio.py`), `GET /api/nodes/intents`
  *  is `@feature("nodes", "view")` (`routes/nodes/intents.py`) — hence the filter. */
 const NODE_TABS: readonly KeyedTabDef<NodeTab>[] = [
@@ -119,14 +144,15 @@ const NODE_TABS: readonly KeyedTabDef<NodeTab>[] = [
   },
 ]
 
-/* Efficiency (`session_efficiency`) and Control plane (`control_plane_view`), loaded where present: the community
-   edition's tree leaves both out, and `import.meta.glob` yields `{}` for an absent file. */
-const EfficiencyTab: ComponentType | undefined = Object.values(isEnabled('session_efficiency')
-  ? import.meta.glob<ComponentType>('./EfficiencyTab.tsx', { eager: true, import: 'default' })
-  : {})[0]
-const ControlPlaneTab: ComponentType | undefined = Object.values(isEnabled('control_plane_view')
-  ? import.meta.glob<ComponentType>('./ControlPlaneTab.tsx', { eager: true, import: 'default' })
-  : {})[0]
+/* Efficiency (`session_efficiency`) and Control plane (`control_plane_view`), loaded where present
+   (`lib/editionModule.ts`). */
+const EfficiencyTab = editionModule(isEnabled('session_efficiency'),
+  () => import.meta.glob<ComponentType>('./EfficiencyTab.tsx', { eager: true, import: 'default' }))
+const ControlPlaneTab = editionModule(isEnabled('control_plane_view'),
+  () => import.meta.glob<ComponentType>('./ControlPlaneTab.tsx', { eager: true, import: 'default' }))
+/* Merge lanes, with the lane (`merge_lane`). */
+const MergeLanesTab = editionModule(isEnabled('merge_lane'),
+  () => import.meta.glob<ComponentType>('./MergeLanesTab.tsx', { eager: true, import: 'default' }))
 
 /** Sessions' strip; `list` IS `/sessions` (so `/sessions?task=<id>` lands on the ledger). Both leaves ask
  *  `@feature("sessions", "view")` (`routes/sessions.py`), still spelled per leaf so one can move. */
@@ -149,6 +175,31 @@ const WORKFLOW_TABS: readonly PathTabDef<WorkflowTab>[] = [
   { id: 'catalogue', label: 'Catalogue', path: AUDIT_WORKFLOW_TAB_PATHS.catalogue },
 ]
 
+/* `hooks/useListPage`'s keys (`<panel>_page`, `<panel>_per`): each names where ONE latched panel was left, so
+ * they travel with every tab trip while the panels' own filters (`?task=`, `?node=`…) do not. */
+const PAGING_KEY = /_(?:page|per)$/
+
+/** `search` split by that rule: `paging` the page keys, `rest` everything else (a query string, no `?`). */
+function splitSearch(search: string): { paging: URLSearchParams; rest: string } {
+  const paging = new URLSearchParams()
+  const rest = new URLSearchParams()
+  for (const [key, value] of new URLSearchParams(search)) (PAGING_KEY.test(key) ? paging : rest).append(key, value)
+  return { paging, rest: rest.toString() }
+}
+
+/** `path` carrying `search`'s page keys, plus `own` (a panel's own query, as `splitSearch` gave it). */
+function addressOf(path: string, search: string, own = ''): string {
+  const { paging } = splitSearch(search)
+  for (const [key, value] of new URLSearchParams(own)) paging.set(key, value)
+  const query = paging.toString()
+  return query ? `${path}?${query}` : path
+}
+
+/** A tab id every `case` above has named: a new one is a compile error here, never an empty panel. */
+function never(id: never): never {
+  throw new Error(`unhandled audit tab ${String(id)}`)
+}
+
 export default function AuditPage() {
   /* The URL is the tab (no state copy). Normalized first: the router renders this for `/audit/nodes/` but
      keeps the trailing slash in `location.pathname` (`routeGroups.ts` owns the trim). */
@@ -170,7 +221,8 @@ export default function AuditPage() {
   /* WHICH TABS THIS READER IS OFFERED — every clause asks BOTH doors (route guard and read key); this shell
      sits under two guards (any of `audit:view`/`sessions:view`/`tasks:create` over `/audit*`, `sessions:view`
      over `/sessions*`).
-     Activity and Sessions also ask their plan switch (`planSurfaceShown`, twin of App.tsx's `RequirePlanSwitch`).
+     Sessions also asks its plan switch (`planSurfaceShown`, twin of App.tsx's `RequirePlanSwitch`); Activity is
+     offered off the plan too, its panel saying so.
      Nodes, Workflows and Personas are the operator's (App.tsx's `RequireSuperadmin`), on top of their keys and
      seats. Workflows reads seats, never a key, per leaf (`WORKFLOW_TABS`): Runs and Catalogue the operator,
      Schedule an org admin. Personas asks `tasks:create` (`routes/personas.py`). Exclusions is the
@@ -183,7 +235,9 @@ export default function AuditPage() {
      `system:view`-only reader, and its guard skips the fetch — no 403 loop. */
   const visibleTabs = TABS.filter(tab => {
     switch (tab.id) {
-      case 'users': return can('audit:view') && planSurfaceShown(admin, 'audit_enabled')
+      // Off the plan, Activity is still offered and says so in its panel, rather than vanishing: the Audit row
+      // would otherwise land, unexplained, on whichever tab comes next.
+      case 'users': return can('audit:view')
       // The community edition has one machine and one org, on loopback: no node command log, no tenancy seam to audit,
       // no ECS control plane.
       case 'nodes': return can('audit:view') && visibleNodeTabs.length > 0 && isOperator && isEnabled('cloud_nodes')
@@ -192,17 +246,17 @@ export default function AuditPage() {
       case 'personas': return can('tasks:create') && isOperator
       case 'exclusions': return can('audit:view') && isOperator && isEnabled('multi_org_tenancy')
       case 'control-plane': return can('audit:view') && can('system:view') && isOperator && ControlPlaneTab !== undefined
+      // `GET /api/client-events` is `superadmin_only`; the route guard is `RequireSuperadmin`.
+      case 'client-errors': return can('audit:view') && isOperator
+      // Every `/api/automations` route is `@org_admin`; App.tsx's `RequireSuperadmin orgAdmin`.
+      case 'automations': return isOrgAdmin
+      // `/api/worktrees` asks `worktrees:view`; the route guard is `RequireSuperadmin`.
+      case 'slots': return can('worktrees:view') && isOperator
+      // `projectAuditTabs.ts`, the rule the rail's Audit row reads too; App.tsx's `RequireFeature permission="projects:view"`.
+      case 'merge-lanes': return mergeLanesOffered(can) && MergeLanesTab !== undefined
+      case 'memory': return memoryOffered(admin, can)
     }
   })
-
-  /* The legacy `?tab=` arrival is resolved in the same expression as `activeTab`: child effects run
-     before the parent's, so reading only the pathname would fire `<UsersTab/>`'s `GET /api/audit` (and
-     latch it) before the redirect. Only on `/audit`; unknown values stay untouched; resolved against
-     VISIBLE tabs, so no redirect lands on a refused address. */
-  const legacyTab =
-    pathname === AUDIT_TAB_PATHS.users
-      ? visibleTabs.find(t => t.id === new URLSearchParams(location.search).get('tab')) ?? null
-      : null
 
   /* The active top-level tab: prefix match for containers, equality for leaves, via an explicit search
      per strip (`/audit` prefixes every address). Resolved against VISIBLE sub-tabs, so e.g. a
@@ -225,7 +279,7 @@ export default function AuditPage() {
 
   /* The default is the first OFFERED tab (Activity for `audit:view`): a `sessions:view`-only reader at
      `/sessions` has no Activity tab. */
-  const activeTab: AuditTab = legacyTab?.id ?? pathTab ?? visibleTabs[0]?.id ?? DEFAULT_TAB
+  const activeTab: AuditTab = pathTab ?? visibleTabs[0]?.id ?? DEFAULT_TAB
 
   /** The leaf: what the latches key on. */
   const activeLeaf: AuditLeaf =
@@ -237,64 +291,51 @@ export default function AuditPage() {
 
   /* Activity's last query while it was the address — what `selectTab` returns it to. */
   const activitySearch = useRef('')
-  if (activeTab === 'users' && legacyTab === null && pathname === AUDIT_TAB_PATHS.users) {
-    activitySearch.current = location.search
+  if (activeTab === 'users' && pathname === AUDIT_TAB_PATHS.users) {
+    activitySearch.current = splitSearch(location.search).rest
   }
 
   /* `replace: true`: `Tabs` selects on FOCUS, so arrow keys would flood history. The query is DROPPED on a
      click: each URL filter (`?task=`, `?node=`, `?workflow=`, `?cron=`…) belongs to ONE panel and would
-     re-apply later. Arriving deep links keep theirs; non-URL filters survive via the latches. */
+     re-apply later. Arriving deep links keep theirs; non-URL filters survive via the latches — and so does
+     each panel's page, whose keys (`hooks/useListPage`, one prefix per panel) are CARRIED across every trip. */
+  const search = location.search
   const selectTab = useCallback((next: AuditTab) => {
     const target = TABS.find(t => t.id === next)
     /* Activity is the exception: its filters ARE its query (`UsersTab.tsx`), so a trip away and back
        returns to the view it left, as the latched local-state panels do. */
-    if (target) navigate(target.path + (next === 'users' ? activitySearch.current : ''), { replace: true })
-  }, [navigate])
+    if (target) navigate(addressOf(target.path, search, next === 'users' ? activitySearch.current : ''), { replace: true })
+  }, [navigate, search])
 
   /* Sub-strips navigate on the same terms; two small callbacks, each over its own table. */
   const selectNodeTab = useCallback((next: NodeTab) => {
     const target = NODE_TABS.find(t => t.id === next)
-    if (target) navigate(target.path, { replace: true })
-  }, [navigate])
+    if (target) navigate(addressOf(target.path, search), { replace: true })
+  }, [navigate, search])
 
   const selectSessionTab = useCallback((next: SessionTab) => {
     const target = SESSION_TABS.find(t => t.id === next)
-    if (target) navigate(target.path, { replace: true })
-  }, [navigate])
+    if (target) navigate(addressOf(target.path, search), { replace: true })
+  }, [navigate, search])
 
   const selectWorkflowTab = useCallback((next: WorkflowTab) => {
     const target = WORKFLOW_TABS.find(t => t.id === next)
-    if (target) navigate(target.path, { replace: true })
-  }, [navigate])
+    if (target) navigate(addressOf(target.path, search), { replace: true })
+  }, [navigate, search])
 
-  /* The legacy `?tab=` hop — the address half of `legacyTab`. Every spelling is rewritten (even
-     `?tab=users`, or it stays a second spelling of `/audit`). One `replace` hop that changes nothing on
-     screen; only `tab` is deleted, the rest of the query survives. */
-  const legacyTabPath = legacyTab?.path ?? null
   /* Behind an open editor (components/ListDetail.tsx) the shell never re-addresses itself: a hop to another
-     of its paths would replace the editor's URL. Both hops below stand down there. */
+     of its paths would replace the editor's URL. The hop below stands down there. */
   const background = useListBackground()
-  useEffect(() => {
-    if (legacyTabPath === null || background) return
-    const params = new URLSearchParams(location.search)
-    params.delete('tab')
-    const rest = params.toString()
-    navigate(rest ? `${legacyTabPath}?${rest}` : legacyTabPath, { replace: true })
-  }, [legacyTabPath, location.search, navigate, background])
 
   /* The address follows the leaf actually SHOWN (route guards are coarser than leaves, so a refused leaf's
      address is reachable); otherwise the URL lies about the screen (`UsersPage` makes the same argument).
-     The query is carried (same surface, re-addressed). Skipped while a legacy `?tab=` hop owns the address
-     (two effects rewriting in opposite directions would loop); converges after one hop. */
+     The query is carried (same surface, re-addressed); converges after one hop. */
   const shownPath =
     activeTab === 'nodes' ? NODE_TABS.find(t => t.id === activeNodeTab)?.path
       : activeTab === 'sessions' ? SESSION_TABS.find(t => t.id === activeSessionTab)?.path
         : activeTab === 'workflows' ? WORKFLOW_TABS.find(t => t.id === activeWorkflowTab)?.path
           : TABS.find(t => t.id === activeTab)?.path
-  const correctedPath =
-    legacyTab === null && shownPath !== undefined && shownPath !== pathname
-      ? shownPath
-      : null
+  const correctedPath = shownPath !== undefined && shownPath !== pathname ? shownPath : null
   useEffect(() => {
     if (correctedPath === null || background) return
     navigate({ pathname: correctedPath, search: location.search }, { replace: true })
@@ -302,41 +343,19 @@ export default function AuditPage() {
 
   /* WHICH PANELS HAVE EVER BEEN OPENED — one latch per LEAF, since each leaf reads: without them any
      arrival fetches all eleven feeds, three of them aggregate scans (one billed by the byte). STICKY: a trip
-     away and back re-fetches nothing and keeps filters. Seeded from `activeLeaf` (which already accounts
-     for a legacy `?tab=`), so the arriving read starts on the first render and no default panel latches
-     open behind a redirect. Cost accepted: opened panels keep their streams and polls running while
+     away and back re-fetches nothing and keeps filters. Seeded from `activeLeaf`, so the arriving read starts
+     on the first render and no default panel latches open behind a redirect. Cost accepted: opened panels keep their streams and polls running while
      hidden; if that ever matters, gate that panel's SUBSCRIPTION on `activeLeaf`, never reset the latch. */
-  const [usersOpened, setUsersOpened] = useState(activeLeaf === 'users')
-  const [commandsOpened, setCommandsOpened] = useState(activeLeaf === 'commands')
-  const [slotIntentsOpened, setSlotIntentsOpened] = useState(activeLeaf === 'slot-intents')
-  const [sessionsOpened, setSessionsOpened] = useState(activeLeaf === 'sessions')
-  const [efficiencyOpened, setEfficiencyOpened] = useState(activeLeaf === 'efficiency')
-  const [runsOpened, setRunsOpened] = useState(activeLeaf === 'runs')
-  const [scheduleOpened, setScheduleOpened] = useState(activeLeaf === 'schedule')
-  const [catalogueOpened, setCatalogueOpened] = useState(activeLeaf === 'catalogue')
-  const [personasOpened, setPersonasOpened] = useState(activeLeaf === 'personas')
-  const [exclusionsOpened, setExclusionsOpened] = useState(activeLeaf === 'exclusions')
-  const [controlPlaneOpened, setControlPlaneOpened] = useState(activeLeaf === 'control-plane')
+  const [opened, setOpened] = useState<ReadonlySet<AuditLeaf>>(() => new Set([activeLeaf]))
   useEffect(() => {
-    if (activeLeaf === 'users') setUsersOpened(true)
-    if (activeLeaf === 'commands') setCommandsOpened(true)
-    if (activeLeaf === 'slot-intents') setSlotIntentsOpened(true)
-    if (activeLeaf === 'sessions') setSessionsOpened(true)
-    if (activeLeaf === 'efficiency') setEfficiencyOpened(true)
-    if (activeLeaf === 'runs') setRunsOpened(true)
-    if (activeLeaf === 'schedule') setScheduleOpened(true)
-    if (activeLeaf === 'catalogue') setCatalogueOpened(true)
-    if (activeLeaf === 'personas') setPersonasOpened(true)
-    if (activeLeaf === 'exclusions') setExclusionsOpened(true)
-    if (activeLeaf === 'control-plane') setControlPlaneOpened(true)
+    setOpened(prev => (prev.has(activeLeaf) ? prev : new Set(prev).add(activeLeaf)))
   }, [activeLeaf])
 
   /* NO TAB OFFERED — never a blank shell. The route guard admits on any of three keys, so a reader can arrive
-     with every tab withheld. A tab the reader's keys would open but the plan leaves out says "not on your plan"
-     (`RequirePlanSwitch`'s panel, Activity's switch first); anything else is a permission refusal, which takes
+     with every tab withheld. Sessions, when the reader's keys would open it but the plan leaves it out, says "not
+     on your plan" (`RequirePlanSwitch`'s panel; Activity says so in its own panel); anything else is a permission refusal, which takes
      the console's usual `/no-access` (`components/RequireFeature.tsx`'s terms, holding while `resolving`). */
   if (visibleTabs.length === 0) {
-    if (can('audit:view') && !planSurfaceShown(admin, 'audit_enabled')) return <NotOnPlan name="audit_enabled" />
     if (visibleSessionTabs.length > 0) return <NotOnPlan name="session_transcripts_enabled" />
     if (resolving) return null
     return background ? <DenyListBackground deny={background} /> : <Navigate to="/no-access" replace />
@@ -346,124 +365,80 @@ export default function AuditPage() {
     <Box>
       {/* No header: the sidebar's Audit and the selected tab name the page, and every control belongs to one
           panel. */}
-      {/* Only tabs this reader may open; a single one still gets its strip. */}
-      <Tabs
-        tabs={visibleTabs}
-        tab={activeTab}
-        onSelect={selectTab}
-        label="Audit sections"
-        idPrefix="audit"
-      />
-
-      {/* Offered panels are always mounted (`hidden` when inactive, so `aria-controls` resolve), with their
-          content rendered once latched and never unmounted. Panels NOT offered are not rendered at all
-          (nothing to unhide in devtools, no reads). The server enforces it (`components/RequireFeature.tsx`). */}
-      {offered('users') && (
-        <TabPanel id="users" current={activeTab} idPrefix="audit">
-          {usersOpened && <UsersTab />}
-        </TabPanel>
-      )}
-
-      {/* NODES — a container. Its own `idPrefix` is load-bearing: `components/Tabs.tsx` mints
-          `${idPrefix}-tab-<id>`/`-panel-<id>`, and a nested strip under the outer prefix could point a tab at
-          the panel containing it. */}
-      {offered('nodes') && (
-        <TabPanel id="nodes" current={activeTab} idPrefix="audit">
-          {/* The strip the re-key split (`NODE_TABS`): a one-key reader gets a one-tab strip. */}
-          <Tabs
-            tabs={visibleNodeTabs}
-            tab={activeNodeTab}
-            onSelect={selectNodeTab}
-            label="Node activity sections"
-            idPrefix="audit-nodes"
-          />
-          {visibleNodeTabs.some(t => t.id === 'commands') && (
-            <TabPanel id="commands" current={activeNodeTab} idPrefix="audit-nodes">
-              {commandsOpened && <NodesTab />}
-            </TabPanel>
-          )}
-          {visibleNodeTabs.some(t => t.id === 'slot-intents') && (
-            <TabPanel id="slot-intents" current={activeNodeTab} idPrefix="audit-nodes">
-              {slotIntentsOpened && <SlotIntentsTab />}
-            </TabPanel>
-          )}
-        </TabPanel>
-      )}
-
-      {/* SESSIONS — a container on the Nodes terms (`audit-sessions` prefix; `list` IS `/sessions`). The
-          per-leaf latch matters most here: `/sessions` must not trigger the byte-billed efficiency scan. */}
-      {offered('sessions') && (
-        <TabPanel id="sessions" current={activeTab} idPrefix="audit">
-          {/* No member conditional: both leaves ask `sessions:view`, so it is two tabs or none (one without Efficiency). */}
-          <Tabs
-            tabs={visibleSessionTabs}
-            tab={activeSessionTab}
-            onSelect={selectSessionTab}
-            label="Session sections"
-            idPrefix="audit-sessions"
-          />
-          <TabPanel id="list" current={activeSessionTab} idPrefix="audit-sessions">
-            {sessionsOpened && <SessionsTab />}
-          </TabPanel>
-          <TabPanel id="efficiency" current={activeSessionTab} idPrefix="audit-sessions">
-            {efficiencyOpened && EfficiencyTab && <EfficiencyTab />}
-          </TabPanel>
-        </TabPanel>
-      )}
-
-      {/* WORKFLOWS — built only when offered, and each leaf only for its seat: a hidden panel would still put
-          a refused tab in the DOM. The tab and its route guard are the operator's. */}
-      {offered('workflows') && (
-        <TabPanel id="workflows" current={activeTab} idPrefix="audit">
-          <Tabs
-            tabs={visibleWorkflowTabs}
-            tab={activeWorkflowTab}
-            onSelect={selectWorkflowTab}
-            label="Workflow activity sections"
-            idPrefix="audit-workflows"
-          />
-          {visibleWorkflowTabs.some(t => t.id === 'runs') && (
-            <TabPanel id="runs" current={activeWorkflowTab} idPrefix="audit-workflows">
-              {/* Not forked: `WorkflowRunsPanel` supplies the workflow-type catalogue (see that file). */}
-              {runsOpened && <WorkflowRunsPanel />}
-            </TabPanel>
-          )}
-          {visibleWorkflowTabs.some(t => t.id === 'schedule') && (
-            <TabPanel id="schedule" current={activeWorkflowTab} idPrefix="audit-workflows">
-              {scheduleOpened && <ScheduleTab />}
-            </TabPanel>
-          )}
-          {visibleWorkflowTabs.some(t => t.id === 'catalogue') && (
-            <TabPanel id="catalogue" current={activeWorkflowTab} idPrefix="audit-workflows">
-              {/* `pt: 1` as `WorkflowRunsPanel`, so switching sub-tabs does not shift the first row. */}
-              <Box sx={{ pt: 1 }}>
-                <WorkflowTypesTab enabled={catalogueOpened} />
-              </Box>
-            </TabPanel>
-          )}
-        </TabPanel>
-      )}
-
-      {/* PERSONAS (the operator's, with `tasks:create`) and EXCLUSIONS (operator-only) — built only when offered. */}
-      {offered('personas') && (
-        <TabPanel id="personas" current={activeTab} idPrefix="audit">
-          <PersonasTab enabled={personasOpened} />
-        </TabPanel>
-      )}
-
-      {/* The page keeps its seam badge in the panel. */}
-      {offered('exclusions') && (
-        <TabPanel id="exclusions" current={activeTab} idPrefix="audit">
-          {exclusionsOpened && <TenancyExclusionsPage />}
-        </TabPanel>
-      )}
-
-      {/* CONTROL PLANE (operator-only): the CP's own ECS service. */}
-      {offered('control-plane') && (
-        <TabPanel id="control-plane" current={activeTab} idPrefix="audit">
-          {controlPlaneOpened && ControlPlaneTab && <ControlPlaneTab />}
-        </TabPanel>
-      )}
+      {/* Only tabs this reader may open; a single one still gets its strip. Offered panels are always mounted
+          (`hidden` when inactive, so `aria-controls` resolve), with their content rendered once latched and never
+          unmounted. Panels NOT offered are not rendered at all (nothing to unhide in devtools, no reads). The
+          server enforces it (`components/RequireFeature.tsx`). */}
+      <TabbedPanels tabs={visibleTabs} tab={activeTab} onSelect={selectTab} label="Audit sections" idPrefix="audit">
+        {({ id }) => {
+          switch (id) {
+            case 'users': return opened.has('users') && (planSurfaceShown(admin, 'audit_enabled') ? <UsersTab /> : <NotOnPlan name="audit_enabled" />)
+            /* NODES — a container. Its own `idPrefix` is load-bearing: `components/Tabs.tsx` mints
+               `${idPrefix}-tab-<id>`/`-panel-<id>`, and a nested strip under the outer prefix could point a tab at
+               the panel containing it. The strip the re-key split (`NODE_TABS`): a one-key reader gets a one-tab
+               strip. */
+            case 'nodes': return (
+              <TabbedPanels tabs={visibleNodeTabs} tab={activeNodeTab} onSelect={selectNodeTab}
+                label="Node activity sections" idPrefix="audit-nodes">
+                {leaf => {
+                  switch (leaf.id) {
+                    case 'commands': return opened.has('commands') && <NodesTab />
+                    case 'slot-intents': return opened.has('slot-intents') && <SlotIntentsTab />
+                    default: return never(leaf.id)
+                  }
+                }}
+              </TabbedPanels>
+            )
+            /* SESSIONS — a container on the Nodes terms (`audit-sessions` prefix; `list` IS `/sessions`). Both
+               leaves ask `sessions:view`, so it is two tabs or none (one without Efficiency). The per-leaf latch
+               matters most here: `/sessions` must not trigger the byte-billed efficiency scan. */
+            case 'sessions': return (
+              <TabbedPanels tabs={visibleSessionTabs} tab={activeSessionTab} onSelect={selectSessionTab}
+                label="Session sections" idPrefix="audit-sessions">
+                {leaf => {
+                  switch (leaf.id) {
+                    case 'list': return opened.has('sessions') && <SessionsTab />
+                    case 'efficiency': return opened.has('efficiency') && EfficiencyTab && <EfficiencyTab />
+                    default: return never(leaf.id)
+                  }
+                }}
+              </TabbedPanels>
+            )
+            /* WORKFLOWS — built only when offered, and each leaf only for its seat: a hidden panel would still put
+               a refused tab in the DOM. The tab and its route guard are the operator's. */
+            case 'workflows': return (
+              <TabbedPanels tabs={visibleWorkflowTabs} tab={activeWorkflowTab} onSelect={selectWorkflowTab}
+                label="Workflow activity sections" idPrefix="audit-workflows">
+                {leaf => {
+                  switch (leaf.id) {
+                    /* Not forked: `WorkflowRunsPanel` supplies the workflow-type catalogue (see that file). */
+                    case 'runs': return opened.has('runs') && <WorkflowRunsPanel />
+                    case 'schedule': return opened.has('schedule') && <ScheduleTab />
+                    /* `pt: 1` as `WorkflowRunsPanel`, so switching sub-tabs does not shift the first row. */
+                    case 'catalogue': return <Box sx={{ pt: 1 }}><WorkflowTypesTab enabled={opened.has('catalogue')} /></Box>
+                    default: return never(leaf.id)
+                  }
+                }}
+              </TabbedPanels>
+            )
+            /* PERSONAS (the operator's, with `tasks:create`) and EXCLUSIONS (operator-only) — built only when offered. */
+            case 'personas': return <PersonasTab enabled={opened.has('personas')} />
+            /* The page keeps its seam badge in the panel. */
+            case 'exclusions': return opened.has('exclusions') && <TenancyExclusionsPage />
+            /* CONTROL PLANE (operator-only): the CP's own ECS service. */
+            case 'control-plane': return opened.has('control-plane') && ControlPlaneTab && <ControlPlaneTab />
+            /* CLIENT ERRORS (operator-only): what flagged consoles reported. */
+            case 'client-errors': return <ClientErrorsTab enabled={opened.has('client-errors')} />
+            /* AUTOMATIONS (org admins) and SLOTS (the operator's): whole pages, lazy, mounted once opened. */
+            case 'automations': return opened.has('automations') && <Box sx={{ pt: 1 }}><Suspense fallback={<LoadingState rows={5} />}><AutomationList /></Suspense></Box>
+            case 'slots': return opened.has('slots') && <Box sx={{ pt: 1 }}><Suspense fallback={<LoadingState rows={5} />}><Worktrees /></Suspense></Box>
+            /* MERGE LANES and MEMORY (`projects:view`): org-wide, a project filter in `?project=`. */
+            case 'merge-lanes': return opened.has('merge-lanes') && MergeLanesTab && <MergeLanesTab />
+            case 'memory': return opened.has('memory') && <MemoryTab />
+            default: return never(id)
+          }
+        }}
+      </TabbedPanels>
     </Box>
   )
 }

@@ -1,13 +1,13 @@
 /* What one inbox item says and where it goes — the non-React half shared by the bell's tray
  * (`components/MentionsBell.tsx`) and the Notifications page (`pages/NotificationsPage.tsx`). The kinds and their
  * rules are `apps/api/app/routes/inbox.py`'s docstring; this file only words and routes them. */
-import { scopeHref, scopeLabel, type InboxItem, type InboxKind, type TriggerNotice } from '../../lib/accessRequests'
+import type { InboxItem, InboxKind, ReleaseKind, TriggerNotice } from '../../lib/inbox'
 import { noticeAction } from '../../lib/billing'
 import { BILLING_PAGE } from '../../lib/companySetup'
 import { reactionGlyph } from '../../lib/reactions'
 import { STATUS_LABEL, type TicketStatus } from '../../lib/ticketStatus'
 
-/* A glyph where a comment item's author badge sits — a key for access, a speech bubble for ticket news, a check
+/* A glyph where a comment item's author badge sits — a key for an API key, a speech bubble for ticket news, a check
    for a linked task done, a card for billing. Inlined MUI paths: `@mui/icons-material` is not a dependency
    (`components/tasks/RatingBadge.tsx`). */
 export const KEY_GLYPH =
@@ -18,8 +18,8 @@ const DONE_GLYPH =
 const CARD_GLYPH =
   'M20 4H4c-1.11 0-1.99.89-1.99 2L2 18c0 1.11.89 2 2 2h16c1.11 0 2-.89 2-2V6c0-1.11-.89-2-2-2m0 14H4v-6h16zm0-10H4V6h16z'
 
-/* A trigger the system stopped (a pause sign), the daily digest (a list), an automation failing or stalling
-   (a warning sign). */
+/* A trigger the system stopped (a pause sign), the daily digest (a list), an automation failing or stalling or a
+   node failure or AI account login alert (a warning sign). */
 const STOPPED_GLYPH =
   'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2m-1 14H9V8h2zm4 0h-2V8h2z'
 const DIGEST_GLYPH = 'M3 13h2v-2H3zm0 4h2v-2H3zm0-8h2V7H3zm4 4h14v-2H7zm0 4h14v-2H7zM7 7v2h14V7z'
@@ -28,11 +28,41 @@ const TRIGGER_GLYPHS: Record<TriggerNotice['kind'], string> = {
   trigger_failed: STOPPED_GLYPH,
   trigger_digest: DIGEST_GLYPH,
   automation_alert: ALERT_GLYPH,
+  system_alert: ALERT_GLYPH,
 }
 const TRIGGER_FALLBACKS: Record<TriggerNotice['kind'], string> = {
   trigger_failed: 'Trigger stopped',
   trigger_digest: 'Trigger digest',
   automation_alert: 'Automation failing',
+  system_alert: 'System alert',
+}
+
+/* A deploy notice: a rocket. */
+const RELEASE_GLYPH =
+  'M9.19 6.35c-2.04 2.29-3.44 5.58-3.57 5.89L2 10.69l4.05-4.05c.47-.47 1.15-.68 1.81-.55zM11.17 17s3.74-1.55 5.89-3.7c5.4-5.4 4.5-9.62 4.21-10.57-.95-.3-5.17-1.19-10.57 4.21C8.55 9.09 7 12.83 7 12.83zm6.48-2.19c-2.29 2.04-5.58 3.44-5.89 3.57L13.31 22l4.05-4.05c.47-.47.68-1.15.55-1.81zM9 18c0 .83-.34 1.58-.88 2.12C6.94 21.3 2 22 2 22s.7-4.94 1.88-6.12C4.42 15.34 5.17 15 6 15c1.66 0 3 1.34 3 3m4-9c0-1.1.9-2 2-2s2 .9 2 2-.9 2-2 2-2-.9-2-2'
+const RELEASE_FALLBACKS: Record<ReleaseKind, string> = {
+  release_approval: 'Approve release',
+  release_live: 'Live',
+  release_failed: 'Release failed',
+  release_rolled_back: 'Rolled back',
+  release_approval_reminder: 'Approval waiting',
+  release_approval_timeout: 'Approval timed out',
+  release_rejected: 'Rejected',
+}
+/* Which release event it was, as the detail line (the title is the server's sentence, which may be anything). Not
+   RELEASE_FALLBACKS: those stand in for a missing sentence ("Approve release"), these name the event. */
+const RELEASE_EVENTS: Record<ReleaseKind, string> = {
+  release_approval: 'Approval needed',
+  release_live: 'Live',
+  release_failed: 'Failed',
+  release_rolled_back: 'Rolled back',
+  release_approval_reminder: 'Approval waiting',
+  release_approval_timeout: 'Approval timed out',
+  release_rejected: 'Rejected',
+}
+
+export function isReleaseKind(kind: InboxKind): kind is ReleaseKind {
+  return kind in RELEASE_FALLBACKS
 }
 
 export function isTriggerKind(kind: InboxKind): kind is TriggerNotice['kind'] {
@@ -42,15 +72,14 @@ export function isTriggerKind(kind: InboxKind): kind is TriggerNotice['kind'] {
 export const isCommentKind = (kind: InboxKind) => kind === 'mention' || kind === 'reaction'
 
 /** The kinds that keep a read stamp, so a read one stays listed under All and can be marked unread again. The
- *  rest — a pending request, both support kinds, a key reminder — are listed while unread only. */
+ *  rest — both support kinds, a key reminder — are listed while unread only. */
 export function keepsReadStamp(kind: InboxKind): boolean {
-  return isCommentKind(kind) || kind === 'access_decision' || kind === 'billing' || isTriggerKind(kind)
+  return isCommentKind(kind) || kind === 'billing' || isTriggerKind(kind) || isReleaseKind(kind)
 }
 
 export const isUnread = (item: InboxItem) => item.read_at === null
 
-/** A pending request has nothing to mark: it leaves every approver's inbox when someone decides it. */
-export const canMarkRead = (item: InboxItem) => isUnread(item) && item.kind !== 'access_request'
+export const canMarkRead = (item: InboxItem) => isUnread(item)
 
 export const canMarkUnread = (item: InboxItem) => !isUnread(item) && keepsReadStamp(item.kind)
 
@@ -81,8 +110,14 @@ export function describeItem(item: InboxItem): ItemText {
     return { glyph: TRIGGER_GLYPHS[item.kind], ...triggerLine(item), wrap: true, wrapDetail: true }
   }
   if (item.kind === 'api_key_expiring') return { glyph: KEY_GLYPH, ...apiKeyLine(item), wrap: true }
-  if (item.kind === 'billing') return { glyph: CARD_GLYPH, ...billingLine(item), wrap: true }
-  return { glyph: KEY_GLYPH, ...accessLine(item) }
+  if (isReleaseKind(item.kind)) {
+    // The server's sentence names the project or the task; it wraps rather than cutting the name.
+    return {
+      glyph: RELEASE_GLYPH, title: item.release_notice?.text || RELEASE_FALLBACKS[item.kind],
+      detail: `Release · ${RELEASE_EVENTS[item.kind]}`, wrap: true,
+    }
+  }
+  return { glyph: CARD_GLYPH, ...billingLine(item), wrap: true }
 }
 
 /** Where opening an item goes: both support kinds the ticket's page, a billing item its notice's action, a
@@ -97,31 +132,13 @@ export function itemTarget(item: InboxItem): { href: string; external?: boolean 
         : `/tasks/${item.task_id}?tab=comments#comment-${item.comment_id}`,
     }
   }
-  if (item.kind === 'access_request') return { href: '/support?tab=requests&box=pending' }
   if (item.kind === 'support_ticket' || item.kind === 'support_task_done') return { href: `/support/tickets/${item.ticket_id}` }
-  if (isTriggerKind(item.kind)) return { href: item.trigger_notice?.href ?? '/triggers' }
+  if (isTriggerKind(item.kind)) return { href: item.trigger_notice?.href ?? '/automations' }
   if (item.kind === 'api_key_expiring') return { href: item.api_key_notice?.href ?? '/settings/api-keys' }
-  if (item.kind === 'billing') {
-    // No usable action still has a home: the Billing page lists what the notice is about.
-    const action = noticeAction(item.notice?.action ?? null)
-    return action ? { href: action.href, external: action.external } : { href: BILLING_PAGE }
-  }
-  const href = item.request?.state === 'approved' && item.request ? scopeHref(item.request.scope) : null
-  return { href: href ?? '/support?tab=requests&box=mine' }
-}
-
-/** What an access item says, in two lines like a mention's: the short, identifying part bold (who asks /
- *  what was decided), the role and scope below. A long name truncates alone, never the role. */
-function accessLine(item: InboxItem): { title: string; detail: string } {
-  const r = item.request
-  if (!r) return { title: 'Access request', detail: '' }
-  if (item.kind === 'access_request') {
-    return { title: r.requester.name || 'Someone', detail: `asks for ${r.role.name} on ${scopeLabel(r.scope)}` }
-  }
-  return {
-    title: r.state === 'approved' ? 'Request approved' : 'Request denied',
-    detail: `${r.role.name} on ${scopeLabel(r.scope)}`,
-  }
+  if (isReleaseKind(item.kind)) return { href: item.release_notice?.href ?? '/tasks' }
+  // A billing item. No usable action still has a home: the Billing page lists what the notice is about.
+  const action = noticeAction(item.notice?.action ?? null)
+  return action ? { href: action.href, external: action.external } : { href: BILLING_PAGE }
 }
 
 /** A trigger item's two lines, both the server's: what happened (wraps — a trigger name is the point), then

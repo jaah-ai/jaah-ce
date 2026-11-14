@@ -76,6 +76,5 @@ class DeepSeekAdapter(ClaudeAdapter):
         `ANTHROPIC_AUTH_TOKEN` and no `ANTHROPIC_API_KEY`: the key is served by `apiKeyHelper`."""
         return adapter_env(config_dir, run={**super().env(config_dir=config_dir, worktree=worktree), **dict(RUN_ENV)})
 
-    def line_pricing_tier(self, obj: dict) -> str:
-        """The per-line tier callback `session_sweep.Analytics` takes for this provider's transcripts."""
-        return line_pricing_tier(obj)
+    #: The per-line tier callback `session_sweep.Analytics` takes for this provider's transcripts (the module's own).
+    line_pricing_tier = staticmethod(line_pricing_tier)

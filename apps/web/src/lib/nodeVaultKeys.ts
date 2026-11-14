@@ -500,7 +500,7 @@ export async function nodeVaultSealKey(publicKey: string): Promise<CredentialSea
 }
 
 /** Test and interop seam: a `NodeVaultKey` over PKCS#8 DER (a test NIK, a vector key). The page never
- *  holds a raw private key, so it never calls this. */
+ *  holds a raw private key, so it never calls this; the cross-language NodeVault interop test does. */
 export async function nodeVaultKeyFromPkcs8(pkcs8: Uint8Array<ArrayBuffer>): Promise<NodeVaultKey> {
   return keyFromPkcs8(new Uint8Array(pkcs8))
 }

@@ -1,6 +1,7 @@
 import { useMemo } from 'react'
 import { get } from '../api'
-import type { ProviderChoice } from '../types'
+import { readAsOnce } from '../lib/actAs'
+import type { OrgRef, ProviderChoice } from '../types'
 import { useApiRead } from './useApiRead'
 
 /* The provider catalogue, fetched once per mount from `GET /api/accounts/providers` (`accounts:view`);
@@ -22,9 +23,14 @@ export type ProviderCatalogue = {
 
 const NO_ROWS: ProviderChoice[] = []
 
+/** The ONE `GET /api/accounts/providers`; `org` reads as another org (`lib/actAs.ts::readAsOnce`). The task form's
+ *  `cachedRead` sites (`AgentPicker`, `TaskSpecFields`) keep their own `agent-providers` key: they mount without a
+ *  `QueryClientProvider` and answer from cache for `CATALOGUE_STALE_MS`, which `useApiRead` does not give. */
+export const listAgentProviders = (org: OrgRef | null = null) => get<ProviderChoice[]>('/api/accounts/providers', ...readAsOnce(org))
+
 export function useAgentProviders(): ProviderCatalogue {
   // Best-effort: no catalogue is the Claude-only flow, so the error is dropped. It still settles.
-  const { data, loading } = useApiRead(['accounts-providers'], () => get<ProviderChoice[]>('/api/accounts/providers'), '')
+  const { data, loading } = useApiRead(['accounts-providers'], () => listAgentProviders(), '')
   // Not an array (a stub, a proxy's page) reads as no catalogue, never a crash in a consumer.
   return useMemo(() => ({ rows: Array.isArray(data) ? data : NO_ROWS, settled: !loading }), [data, loading])
 }

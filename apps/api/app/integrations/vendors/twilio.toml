@@ -1,0 +1,44 @@
+slug = "twilio"
+label = "Twilio"
+category = "messaging"
+vendor_docs_url = "https://www.twilio.com/docs/usage/requests-to-twilio"
+summary = "Send SMS and WhatsApp messages and place calls through your Twilio account."
+
+[[auth]]
+kind = "basic"
+fields = [
+  { key = "account_sid", label = "Account SID", kind = "text", required = true, help = "Twilio Console (console.twilio.com) home page > Account Info panel > Account SID. It starts with AC" },
+  { key = "auth_token", label = "Auth token", kind = "secret", required = true, help = "Twilio Console home page > Account Info panel > Auth Token: select Show or the copy icon. A new token is issued under Account > API keys & tokens > Auth tokens" },
+]
+
+[test]
+method = "GET"
+path = "https://api.twilio.com/2010-04-01/Accounts.json"
+auth = { basic = ["account_sid", "auth_token"] }
+list_field = "accounts"
+
+[docs]
+agent_uses = [
+  "Send an SMS, for example an on-call alert or a one-time notice to a customer",
+  "Send a WhatsApp message from a Twilio-approved sender",
+  "Look up message delivery status and recent message logs",
+  "List the phone numbers on the account",
+]
+prerequisites = [
+  "A Twilio account. A trial account can send only to the phone numbers you verified under Phone Numbers > Manage > Verified Caller IDs",
+  "A Twilio phone number or messaging service to send from (Phone Numbers > Manage > Buy a number)",
+]
+limitations = [
+  "Jaah stores the account's Auth Token, which has full access to the account. Rotate it if a task description or log ever leaks it",
+  "Messages cost money per segment at Twilio's rates; Jaah does not cap what agents send",
+  "Sending to some countries needs a registered sender (for example A2P 10DLC in the US) before Twilio delivers the message",
+]
+troubleshooting = [
+  { symptom = "Test says Twilio rejected the auth token (401)", fix = "Check that the Account SID and Auth Token come from the same account, and that the token was not rotated. Copy both again from the Account Info panel and select Replace on the secret" },
+  { symptom = "Sending fails with error 21608 on a trial account", fix = "Trial accounts send only to verified numbers. Verify the recipient under Phone Numbers > Manage > Verified Caller IDs, or upgrade the account" },
+  { symptom = "Messages are accepted but never arrive in the US", fix = "Register the sending number for A2P 10DLC under Messaging > Regulatory Compliance, as Twilio requires for application-to-person SMS" },
+]
+faq = [
+  { q = "Can I use an API key instead of the Auth Token?", a = "Yes, for sending: put the API key's SID in Account SID and its secret in Auth token. A Standard key cannot read the account itself, so Test may report it rejected; a Main key passes" },
+  { q = "Does a subaccount work?", a = "Yes. Use the subaccount's own Account SID and Auth Token, so agents can reach only that subaccount" },
+]

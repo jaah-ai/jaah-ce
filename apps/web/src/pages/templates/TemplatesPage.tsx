@@ -1,11 +1,12 @@
 import { useState, type JSX } from 'react'
-import { Link as RouterLink, useSearchParams } from 'react-router-dom'
+import { Link as RouterLink } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Chip from '@mui/material/Chip'
 import Typography from '@mui/material/Typography'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { apiDetail } from '../../api'
+import { useUrlFilters } from '../../hooks/useUrlFilters'
 import CardGrid from '../../ui/gallery/CardGrid'
 import LoadFailedState from '../../ui/LoadFailedState'
 import LoadingState from '../../ui/LoadingState'
@@ -18,7 +19,8 @@ import { PURPOSES, TEMPLATES_KEY, listTemplates, type TemplateCard } from './api
 import { useTemplateEditing } from './access'
 import { gallerySections } from './sections'
 import StartTemplateDialog from './StartTemplateDialog'
-import TemplateCardView from './TemplateCardView'
+import TemplateRowView from './TemplateRowView'
+import { FONT_WEIGHT } from '../../theme'
 
 /* THE TEMPLATE GALLERY — `/templates`, the style guide's Gallery archetype. Every org member
  * browses the published templates the server shows them (`GET /api/templates`: global, plus the org's own while its
@@ -28,12 +30,10 @@ import TemplateCardView from './TemplateCardView'
  * The term and the chip live in the URL, so a task's "From template" link lands on a search. Start opens the one-shot
  * Start dialog; Customize opens the seeded create form. A template editor (`access.tsx::useTemplateEditing`: the
  * operator, or `templates:edit` while the org's switch is on) gets Manage and New template; an org editor also gets
- * Duplicate on global cards. The template's own pages are the manage view's. The sidebar names the page, so the
+ * Duplicate on global templates. The template's own pages are the manage view's. The sidebar names the page, so the
  * header carries actions only. */
-export const SEARCH_DELAY_MS = 250
-
 export default function TemplatesPage(): JSX.Element {
-  const [params, setParams] = useSearchParams()
+  const [params, setParam] = useUrlFilters()
   const q = params.get('q') ?? ''
   const purpose = PURPOSES.some(p => p.value === params.get('purpose')) ? params.get('purpose') : null
   const editing = useTemplateEditing()
@@ -49,16 +49,10 @@ export default function TemplatesPage(): JSX.Element {
   })
   const shown = searching ? found : all
 
-  const setParam = (key: string, value: string | null) => setParams(prev => {
-    const next = new URLSearchParams(prev)
-    if (value === null || value === '') next.delete(key)
-    else next.set(key, value)
-    return next
-  }, { replace: true })
-  const clearAll = () => setParams(new URLSearchParams(), { replace: true })
+  const clearAll = () => setParam({ q: '', purpose: '' })
 
-  const card = (c: TemplateCard) => (
-    <TemplateCardView key={c.id} card={c} onStart={setStarting} duplicable={editing.org} />
+  const row = (c: TemplateCard) => (
+    <TemplateRowView key={c.id} card={c} onStart={setStarting} duplicable={editing.org} />
   )
 
   let body: JSX.Element
@@ -67,7 +61,7 @@ export default function TemplatesPage(): JSX.Element {
     body = <LoadFailedState title="Templates unavailable" error={apiDetail(shown.error, '')} onRetry={() => void shown.refetch()} />
   } else if (searching) {
     body = found.data && found.data.length > 0
-      ? <CardGrid label="Search results" testId="templates-results">{found.data.map(card)}</CardGrid>
+      ? <CardGrid label="Search results" testId="templates-results" rows>{found.data.map(row)}</CardGrid>
       : <NoMatchesState title="No templates match" clearLabel="Clear" onClear={clearAll} testId="templates-clear-search" />
   } else {
     const sections = gallerySections(all.data ?? [], purpose)
@@ -77,13 +71,13 @@ export default function TemplatesPage(): JSX.Element {
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
           {sections.map(section => (
             <Box component="section" key={section.key} aria-labelledby={`templates-${section.key}`} data-testid={`templates-section-${section.key}`}>
-              <Typography id={`templates-${section.key}`} component="h2" variant="subtitle1" sx={{ fontWeight: 600, mb: 1 }}>
+              <Typography id={`templates-${section.key}`} component="h2" variant="subtitle1" sx={{ fontWeight: FONT_WEIGHT.semibold, mb: 1 }}>
                 {section.title}
-                <Box component="span" sx={{ color: 'text.secondary', fontWeight: 400, ml: 1 }} data-testid={`templates-section-${section.key}-count`}>
+                <Box component="span" sx={{ color: 'text.secondary', fontWeight: FONT_WEIGHT.regular, ml: 1 }} data-testid={`templates-section-${section.key}-count`}>
                   {section.cards.length}
                 </Box>
               </Typography>
-              <CardGrid label={section.title}>{section.cards.map(card)}</CardGrid>
+              <CardGrid label={section.title} rows>{section.cards.map(row)}</CardGrid>
             </Box>
           ))}
         </Box>
@@ -105,8 +99,8 @@ export default function TemplatesPage(): JSX.Element {
       <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
         <SearchBox
           value={q}
-          onChange={next => setParam('q', next)}
-          delayMs={SEARCH_DELAY_MS}
+          onChange={next => setParam({ q: next })}
+          delayMs={250}
           ariaLabel="Search templates"
           placeholder="Search templates"
           title="Name, summary, description and group"
@@ -123,7 +117,7 @@ export default function TemplatesPage(): JSX.Element {
               color={purpose === p.value ? 'primary' : 'default'}
               variant={purpose === p.value ? 'filled' : 'outlined'}
               aria-pressed={purpose === p.value}
-              onClick={() => setParam('purpose', purpose === p.value ? null : p.value)}
+              onClick={() => setParam({ purpose: purpose === p.value ? '' : p.value })}
               data-testid={`templates-chip-${p.value}`}
               sx={tapTargetSx}
             />

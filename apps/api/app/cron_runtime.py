@@ -17,7 +17,7 @@ import threading
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import datetime, timezone, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from typing import Any, Callable, Optional
 from uuid import UUID
@@ -27,7 +27,9 @@ import psycopg
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from app import automation_alerts, cron_activities, cron_alarms, cron_min_period
+from app import automation_alerts, cron_activities, cron_alarms, cron_min_period, write_origin
+from app.advisory_lock import SessionLock
+from app.clock import utcnow
 from app.operator_settings import reads as settings_reads
 from app.cron_schedule import CronScheduleError, next_fire_for_row
 from app.crons import (
@@ -38,11 +40,12 @@ from app.crons import (
     RUN_OUTCOME_SKIPPED,
     SKIP_ALREADY_RUNNING,
     SKIP_BELOW_MIN_PERIOD,
+    SKIP_CREDENTIAL_ROTATING,
     SKIP_DISABLED,
     SKIP_PREVIOUS_TASK_OPEN,
     should_record,
 )
-from app.db import SessionLocal, background_executor, background_lane
+from app.db import BridgedSession
 from app.entity_shape import new_uuid7
 from app import db_credentials
 from app.models.automations import Cron, CronRun
@@ -65,6 +68,14 @@ _RUN_LOCK_PREFIX = "cron_run:"
 
 # Opened before the hard bound exists, so it needs its own; a blackholed DB would park a thread per tick.
 LOCK_CONNECT_TIMEOUT_SECONDS = 5
+
+# How long Postgres may refuse the run lock's credential before a tick is an `error` again. An RDS-managed
+# rotation sets the new password before Secrets Manager serves it (observed ~80 s on dev), and a re-resolve
+# inside that gap still returns the old one; a refusal inside the window is that gap, beyond it a wrong
+# credential. Process-local, cleared by the next connection Postgres accepts.
+CREDENTIAL_ROTATION_GRACE_SECONDS = 300.0
+_credential_refused_since: Optional[float] = None
+_credential_refused_guard = threading.Lock()
 
 # The last-resort bound; generous, since a short bound reports a healthy activity as an error.
 DEFAULT_TIMEOUT_SECONDS = 300.0
@@ -186,63 +197,15 @@ def resolved_timezone_name() -> str:
 
 # ── The run lock ──────────────────────────────────────────────────────────────────────────────────────
 
-_TRY_LOCK_SQL = (
-    "SELECT pg_try_advisory_lock(%(classid)s, k) AS locked, k "
-    "FROM (SELECT hashtext(%(name)s) AS k) AS keyed"
-)
-
-
-class RunLock:
-    """A session-scoped `pg_try_advisory_lock` on its own dedicated connection.
-
-    Session-scoped so a dying process frees the lock (no lease expiry to tune). Its own connection because
-    a pooled connection carrying a session lock hands it to the next checkout.
-    """
+class RunLock(SessionLock):
+    """The cron run lock: `advisory_lock.SessionLock` on `hashtext('cron_run:<cron_id>')` under
+    `CRON_RUN_LOCK_CLASSID`, dialled under `LOCK_CONNECT_TIMEOUT_SECONDS`."""
 
     def __init__(self, cron_id: UUID | str) -> None:
-        self.name = f"{_RUN_LOCK_PREFIX}{cron_id}"
-        self._conn: Optional[psycopg.Connection] = None
-        self._key: Optional[int] = None
-        self._guard = threading.Lock()
-
-    def acquire(self) -> bool:
-        """True iff this process now holds the lock. False means another firing of the same cron is live."""
-        # Through `db_credentials`, not `psycopg` directly: a raw dialer outside the `do_connect`
-        # chokepoint, so the rotating RDS credential is injected here.
-        conn = db_credentials.psycopg_connect(
-            autocommit=True, connect_timeout=LOCK_CONNECT_TIMEOUT_SECONDS
+        name = f"{_RUN_LOCK_PREFIX}{cron_id}"
+        super().__init__(
+            CRON_RUN_LOCK_CLASSID, name, label=f"cron run lock {name}", connect_timeout=LOCK_CONNECT_TIMEOUT_SECONDS
         )
-        try:
-            with conn.cursor() as cur:
-                cur.execute(_TRY_LOCK_SQL, {"classid": CRON_RUN_LOCK_CLASSID, "name": self.name})
-                locked, key = cur.fetchone()
-        except Exception:
-            conn.close()
-            raise
-        if not locked:
-            conn.close()
-            return False
-        self._conn, self._key = conn, key
-        return True
-
-    def release(self) -> None:
-        """Unlock and close. Idempotent and never raises: it runs from a `finally` and a future's
-        done-callback, and a raise would lose the close as well as the unlock."""
-        with self._guard:
-            conn, key = self._conn, self._key
-            self._conn, self._key = None, None
-        if conn is None:
-            return
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT pg_advisory_unlock(%s, %s)", (CRON_RUN_LOCK_CLASSID, key))
-        except Exception as exc:  # noqa: BLE001 — closing the connection frees it regardless
-            log.warning("cron: advisory unlock of %s failed (%s); closing the connection", self.name, exc)
-        finally:
-            try:
-                conn.close()
-            except Exception:  # noqa: BLE001
-                pass
 
 
 def _end_lock_holders(conn: psycopg.Connection, name: str) -> bool:
@@ -279,6 +242,35 @@ def release_run_lock(cron_id: UUID | str, *, by: object = None) -> bool:
         conn.close()
 
 
+def _within_rotation_grace(exc: BaseException) -> bool:
+    """Whether a run-lock connect failure is a credential refusal inside `CREDENTIAL_ROTATION_GRACE_SECONDS`
+    of the first one. Starts the window on the first refusal; any other failure is not a rotation."""
+    global _credential_refused_since
+    if not db_credentials.is_auth_failure(exc):
+        return False
+    now = time.monotonic()
+    with _credential_refused_guard:
+        if _credential_refused_since is None:
+            _credential_refused_since = now
+        return now - _credential_refused_since < CREDENTIAL_ROTATION_GRACE_SECONDS
+
+
+def _log_bookkeeping_failure(exc: BaseException, message: str, *args: object) -> None:
+    """A heartbeat or ledger write that failed: a WARNING when Postgres refused the credential (a pooled
+    connection opened inside a rotation's gap; a lasting refusal still errors at the run lock), else ERROR."""
+    if db_credentials.is_auth_failure(exc):
+        log.warning(message + " (postgres refused the database credential)", *args)
+    else:
+        log.error(message, *args, exc_info=exc)
+
+
+def _clear_credential_refusal() -> None:
+    """Postgres accepted the credential: the next refusal opens a fresh grace window."""
+    global _credential_refused_since
+    with _credential_refused_guard:
+        _credential_refused_since = None
+
+
 # ── The hard timeout ──────────────────────────────────────────────────────────────────────────────────
 
 
@@ -294,7 +286,9 @@ def _bounded_call(
     `on_abandon` gets that future on every exit where the body is still live (expiry, unusable bound, any
     exception here); freeing the lock on those paths is the double-run the bound stops.
     """
-    executor = background_executor(1, label)
+    # A thread of its own, not a task: the body is sync, and only a thread outlives an abandoned bound. Its
+    # sessions draw on the async pool (`app/db_async.py::sync_bind`).
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=label)
     try:
         future = executor.submit(fn)
         try:
@@ -321,9 +315,13 @@ def _bounded_call(
 # ── The dropped-fire follow-up ────────────────────────────────────────────────────────────────────────
 # A fire arriving while the same cron's pass is mid-flight is recorded `already_running` and
 # dropped, so the work it woke would wait a full cadence. The dropped fire sets a flag and the lock
-# holder re-runs once on its way out. One bit per cron: N drops earn one follow-up. Process-local, so a
-# cross-replica drop gets none (accepted; the interval is the backstop). The follow-up pays the min-gap
-# floor like any firing; without a floor it is one back-to-back pass, bounded by the hard timeout.
+# holder re-runs once on its way out. One bit per cron: N drops earn one follow-up. The flag is
+# process-local, so a drop on another replica is seen two ways (`_dropped_elsewhere`): the holder reads the
+# ledger for an `already_running` row fired since it took the lock, and the dropper, once its row is
+# committed, tries the lock again — free means the holder released before that row could be read, so the
+# dropper enqueues the follow-up itself. The follow-up pays the min-gap floor like any firing (measured from
+# the previous firing's start, so a pass longer than the floor pays none); without a floor it is one
+# back-to-back pass, bounded by the hard timeout.
 _followup_wanted: set[str] = set()
 _followup_guard = threading.Lock()
 
@@ -345,8 +343,64 @@ def _take_follow_up(cron_id: UUID | str) -> bool:
     return wanted
 
 
-def _follow_up_after_release(cron_id: UUID | str) -> bool:
+# How far before the holder took the lock a drop's `fired_at` may read and still count: the two stamps come from
+# two replicas' clocks. A drop the holder already served earns at most one extra pass.
+_DROP_CLOCK_ALLOWANCE = timedelta(seconds=1)
+
+
+def _dropped_elsewhere(cron_id: UUID | str, since: datetime, session_factory) -> bool:
+    """True iff this cron is wakeable (a min-gap floor) and the ledger holds an `already_running` skip of it fired
+    at or after `since` (when this firing took the run lock, less `_DROP_CLOCK_ALLOWANCE`): a drop another replica
+    recorded, which its process-local flag cannot tell this holder about. `already_running` rows are always kept
+    (`ALWAYS_RECORDED_SKIP_REASONS`). A cron with no floor is left to its interval, as before, so one that outruns
+    its interval does not run back to back. One indexed read (`ix_cron_runs_cron_id_fired_at`); never raises — a
+    failed read costs one interval, as a missed enqueue does."""
+    try:
+        if not _wakeable(cron_id, session_factory):
+            return False
+        with seam.operator_scope(), session_factory() as session:
+            return session.scalar(
+                select(CronRun.id).where(
+                    CronRun.cron_id == cron_id,
+                    CronRun.skip_reason == SKIP_ALREADY_RUNNING,
+                    CronRun.fired_at >= since - _DROP_CLOCK_ALLOWANCE,
+                ).limit(1)
+            ) is not None
+    except Exception as exc:  # noqa: BLE001 — loss-tolerant; the interval is the correctness backstop
+        _log_bookkeeping_failure(exc, "cron %s: could not read the ledger for a dropped fire", cron_id)
+        return False
+
+
+def _wakeable(cron_id: UUID | str, session_factory) -> bool:
+    """Whether this cron has a min-gap floor (`_effective_min_gap`): only such a cron's drop earns a cross-replica
+    follow-up (`_dropped_elsewhere`). Never raises; unreadable is not wakeable."""
+    try:
+        with seam.operator_scope(), session_factory() as session:
+            cron = session.get(Cron, cron_id)
+            return cron is not None and _effective_min_gap(cron) is not None
+    except Exception as exc:  # noqa: BLE001 — the interval is the backstop
+        _log_bookkeeping_failure(exc, "cron %s: could not read whether it is wakeable", cron_id)
+        return False
+
+
+def _retry_after_drop(lock: RunLock, cron_id: UUID | str) -> None:
+    """The dropper's half of a cross-replica follow-up, run once its `already_running` row is committed: if the
+    run lock is free now, the holder released before it could read that row, so enqueue the follow-up here
+    (the flag `_want_follow_up` set is this process's, so `_follow_up_after_release` claims it). Held means the
+    holder is still running and reads the row on its way out. Never raises."""
+    try:
+        if not lock.acquire():
+            return
+    except Exception as exc:  # noqa: BLE001 — the interval is the backstop
+        log.debug("cron %s: could not re-try the run lock after a dropped fire (%s)", cron_id, exc)
+        return
+    lock.release()
+    _follow_up_after_release(cron_id)
+
+
+def _follow_up_after_release(cron_id: UUID | str, *, wanted: bool = False) -> bool:
     """Enqueue the one follow-up pass a dropped fire earned. True iff a tick was enqueued.
+    `wanted` is a drop the caller already established (`_dropped_elsewhere`); the local flag is cleared either way.
 
     Called only once the run lock is released: a trigger issued while holding it would be dropped too.
 
@@ -361,7 +415,7 @@ def _follow_up_after_release(cron_id: UUID | str) -> bool:
     context set ("cannot be called from within a workflow"). dbos 3.2.0 has no in-workflow form, and the
     follow-up is deliberately not a durable step of this tick, so it is issued as from outside one.
     """
-    if not _take_follow_up(cron_id):
+    if not (_take_follow_up(cron_id) or wanted):
         return False
     try:
         from dbos import DBOS
@@ -374,26 +428,30 @@ def _follow_up_after_release(cron_id: UUID | str) -> bool:
     return True
 
 
-def _release_then_follow_up(lock: RunLock, cron_id: UUID) -> None:
-    """Free the run lock, then enqueue any follow-up: the single spelling of that order for both exit paths."""
+def _release_then_follow_up(
+    lock: RunLock, cron_id: UUID, held_since: Optional[datetime] = None, session_factory=None,
+) -> None:
+    """Free the run lock, then enqueue any follow-up: the single spelling of that order for both exit paths.
+    With `held_since`, a drop another replica recorded while the lock was held earns it too (`_dropped_elsewhere`)."""
     lock.release()
-    _follow_up_after_release(cron_id)
+    elsewhere = (held_since is not None and session_factory is not None
+                 and _dropped_elsewhere(cron_id, held_since, session_factory))
+    _follow_up_after_release(cron_id, wanted=elsewhere)
 
 
 # ── The wrapper ───────────────────────────────────────────────────────────────────────────────────────
 
 
 def run_cron_tick(
-    cron_id: UUID, scheduled_at: datetime, *, session_factory=SessionLocal, cause: str = "schedule"
+    cron_id: UUID, scheduled_at: datetime, *, session_factory=BridgedSession, cause: str = "schedule"
 ) -> TickResult:
     """One delivered tick, end to end. Never raises: a firing that blew up is a `cron_runs` row.
 
     `scheduled_at` is the instant the schedule named, not now; the ledger records both. `cause` is `manual` for an
-    automation's Run now (`routes/automations.py`), which the fire engine records on the run. Runs in the
-    background lane (`app/db.py`), its bounded body too (`_bounded_call`).
+    automation's Run now (`routes/automations.py`), which the fire engine records on the run. Its sessions, and
+    its bounded body's (`_bounded_call`), draw on the async pool (`app/db_async.py::sync_bind`).
     """
-    with background_lane():
-        return _run_cron_tick(cron_id, scheduled_at, session_factory=session_factory, cause=cause)
+    return _run_cron_tick(cron_id, scheduled_at, session_factory=session_factory, cause=cause)
 
 
 def _run_cron_tick(cron_id: UUID, scheduled_at: datetime, *, session_factory, cause: str) -> TickResult:
@@ -403,21 +461,34 @@ def _run_cron_tick(cron_id: UUID, scheduled_at: datetime, *, session_factory, ca
     try:
         acquired = lock.acquire()
     except Exception as exc:  # noqa: BLE001 — a lock connection we could not open is an errored firing
+        if _within_rotation_grace(exc):
+            log.warning("cron %s: postgres refused the database credential (a rotation in progress) — "
+                        "skipping this tick", cron_id)
+            return _record_outside(
+                cron_id, scheduled_at, RUN_OUTCOME_SKIPPED, SKIP_CREDENTIAL_ROTATING,
+                "postgres refused the database credential while it was being rotated", session_factory,
+            )
         log.exception("cron %s: could not take the run lock", cron_id)
         return _record_outside(
             cron_id, scheduled_at, RUN_OUTCOME_ERROR, None,
             f"could not take the run lock: {exc!r}", session_factory,
         )
+    _clear_credential_refusal()
     if not acquired:
         # Set the flag before recording (its own transaction): the holder may release mid-record, and a
         # later flag would have no consumer.
         _want_follow_up(cron_id)
         log.info("cron %s: a previous firing is still running — skipping this tick", cron_id)
-        return _record_outside(
+        recorded = _record_outside(
             cron_id, scheduled_at, RUN_OUTCOME_SKIPPED, SKIP_ALREADY_RUNNING,
             "a previous firing of this cron had not returned", session_factory,
         )
+        if _wakeable(cron_id, session_factory):
+            _retry_after_drop(lock, cron_id)
+        return recorded
 
+    # When this firing took the lock: a drop another replica records from here on earns the follow-up.
+    held_since = utcnow()
     handed_off = False
     abandoned = threading.Event()
     claim = _RunClaim()
@@ -431,7 +502,7 @@ def _run_cron_tick(cron_id: UUID, scheduled_at: datetime, *, session_factory, ca
         nonlocal handed_off
         handed_off = True
         abandoned.set()
-        future.add_done_callback(lambda _f: _release_then_follow_up(lock, cron_id))
+        future.add_done_callback(lambda _f: _release_then_follow_up(lock, cron_id, held_since, session_factory))
 
     try:
         timeout = _effective_timeout(cron_id, session_factory)
@@ -467,7 +538,7 @@ def _run_cron_tick(cron_id: UUID, scheduled_at: datetime, *, session_factory, ca
     finally:
         # The ordinary exit; a handed-off firing's lock and follow-up belong to `abandon`'s callback.
         if not handed_off:
-            _release_then_follow_up(lock, cron_id)
+            _release_then_follow_up(lock, cron_id, held_since, session_factory)
 
 
 def _stamp_heartbeat(cron_id: UUID, session_factory) -> None:
@@ -484,8 +555,8 @@ def _stamp_heartbeat(cron_id: UUID, session_factory) -> None:
                 text("UPDATE crons SET last_tick_at = now() WHERE id = :id"), {"id": cron_id}
             )
             session.commit()
-    except Exception:  # noqa: BLE001 — a missed heartbeat is a false stall alarm, never a failed firing
-        log.exception("cron %s: could not stamp last_tick_at", cron_id)
+    except Exception as exc:  # noqa: BLE001 — a missed heartbeat is a false stall alarm, never a failed firing
+        _log_bookkeeping_failure(exc, "cron %s: could not stamp last_tick_at", cron_id)
 
 
 def _numeric(value: Any) -> Optional[float]:
@@ -699,7 +770,7 @@ def _inside_min_period(cron: Cron, period: int) -> bool:
     if cron.last_fired_at is None:
         return False
     slack = min(period * _MIN_PERIOD_SLACK_FRACTION, _MIN_PERIOD_SLACK_MAX_SECONDS)
-    elapsed = (datetime.now(timezone.utc) - cron.last_fired_at).total_seconds()
+    elapsed = (utcnow() - cron.last_fired_at).total_seconds()
     return elapsed < period - slack
 
 
@@ -720,7 +791,7 @@ def _hold_for_min_gap(session: Session, cron: Cron, deadline: float) -> float:
     floor = _effective_min_gap(cron)
     if not floor or cron.last_fired_at is None:
         return 0.0
-    elapsed = (datetime.now(timezone.utc) - cron.last_fired_at).total_seconds()
+    elapsed = (utcnow() - cron.last_fired_at).total_seconds()
     remaining = min(floor - elapsed, max(0.0, deadline - time.monotonic()))
     if remaining <= 0:
         return 0.0
@@ -787,7 +858,7 @@ def _run_activity(
     the `missed` rows beyond an activity failure's rollback.
     """
     run_id = new_uuid7()
-    started_at = datetime.now(timezone.utc)
+    started_at = utcnow()
     cron.last_fired_at = started_at
     session.commit()
 
@@ -801,7 +872,8 @@ def _run_activity(
         # holds `operator_scope()`, which would otherwise leak into a tenant activity (`TenancyScopeConflict`).
         # `nullcontext` keeps this the one call of `descriptor.invoke`.
         plane = seam.operator_scope() if descriptor.is_system else nullcontext()
-        with exclusion_log.caller(f"cron:{cron.activity_type}"), seam.detached(), plane:
+        with exclusion_log.caller(f"cron:{cron.activity_type}"), write_origin.scope(f"cron:{cron.activity_type}"), \
+                seam.detached(), plane:
             result = descriptor.invoke(scheduled_at, context)
     except Exception as exc:  # noqa: BLE001 — an activity that raised is an `error` row, not a crash
         log.exception("cron %s: activity %r raised", cron.id, cron.activity_type)
@@ -824,7 +896,7 @@ def _run_fire(
     from app.models.automations import Automation
 
     run_id = new_uuid7()
-    started_at = datetime.now(timezone.utc)
+    started_at = utcnow()
     with claim.guard if claim is not None else nullcontext():
         if abandoned is not None and abandoned.is_set():
             # The bound expired before the row was written: the wrapper records the timeout itself, and a row
@@ -840,7 +912,8 @@ def _run_fire(
     remaining = (deadline - time.monotonic()) if deadline is not None else None
     try:
         # Out of `_invoke`'s operator escape, into the automation's own org: every row the firing writes lands there.
-        with exclusion_log.caller("cron:automation"), seam.detached(), SessionLocal() as fire_session:
+        with exclusion_log.caller("cron:automation"), write_origin.scope("cron:automation"), seam.detached(), \
+            BridgedSession() as fire_session:
             with seam.bind_from(fire_session, Automation, automation_id):
                 automation = fire_session.scalar(select(Automation).where(Automation.id == automation_id))
                 run = fire_session.scalar(select(CronRun).where(CronRun.id == run_id))
@@ -872,7 +945,7 @@ def _settle(
     held: float,
     abandoned: Optional[threading.Event] = None,
     *,
-    session_factory=SessionLocal,
+    session_factory=BridgedSession,
     stuck: bool = False,
 ) -> TickResult:
     """Record the firing per its retention mode, move the skip counter, commit, then deliver any alarm.
@@ -901,7 +974,7 @@ def _settle(
             provisional.skip_reason = decision.skip_reason
             provisional.detail = (decision.detail or "")[:MAX_DETAIL_CHARS]
             provisional.task_id = decision.task_id
-            provisional.finished_at = datetime.now(timezone.utc)
+            provisional.finished_at = utcnow()
         else:
             # The retention mode keeps no row for this outcome; its target rows go with it (CASCADE).
             session.delete(provisional)
@@ -909,7 +982,7 @@ def _settle(
         session.add(CronRun(
             id=decision.run_id or new_uuid7(), cron_id=cron_id, fired_at=scheduled_at,
             started_at=decision.started_at,
-            finished_at=datetime.now(timezone.utc) if decision.started_at is not None else None,
+            finished_at=utcnow() if decision.started_at is not None else None,
             outcome=decision.outcome, skip_reason=decision.skip_reason,
             detail=(decision.detail or "")[:MAX_DETAIL_CHARS], task_id=decision.task_id,
         ))
@@ -1020,8 +1093,8 @@ def _record_outside(
             return _settle(
                 session, cron, decision, scheduled_at, 0.0, session_factory=session_factory, stuck=overran,
             )
-    except Exception:  # noqa: BLE001 — never let bookkeeping raise out of a firing
-        log.exception("cron %s: could not record a %s/%s firing", cron_id, outcome, skip_reason)
+    except Exception as exc:  # noqa: BLE001 — never let bookkeeping raise out of a firing
+        _log_bookkeeping_failure(exc, "cron %s: could not record a %s/%s firing", cron_id, outcome, skip_reason)
         return TickResult(outcome=outcome, skip_reason=skip_reason, detail=detail)
 
 
@@ -1049,7 +1122,7 @@ def _coalesce(cron_id: UUID | str) -> bool:
 
 
 def fire_now_sync(
-    cron_id: UUID, *, session_factory=SessionLocal, on_miss: Optional[Callable[[str], None]] = None
+    cron_id: UUID, *, session_factory=BridgedSession, on_miss: Optional[Callable[[str], None]] = None
 ) -> bool:
     """Enqueue one out-of-band firing through the same wrapper. True iff a tick was enqueued.
 
@@ -1095,7 +1168,7 @@ def fire_now_sync(
     return True
 
 
-def system_cron_next_fire(activity_type: str, *, session_factory=SessionLocal) -> Optional[datetime]:
+def system_cron_next_fire(activity_type: str, *, session_factory=BridgedSession) -> Optional[datetime]:
     """When the system cron of `activity_type` fires next; None while it is disabled, absent or unschedulable.
 
     For a tenant's read of a fleet-wide schedule (Compliance settings' "Next run"): the row lives at org zero, so
@@ -1111,12 +1184,40 @@ def system_cron_next_fire(activity_type: str, *, session_factory=SessionLocal) -
             return None
         try:
             return next_fire_for_row(cron.schedule_kind, cron.cron_expression, cron.interval_seconds,
-                                     datetime.now(timezone.utc), cron_timezone())
+                                     utcnow(), cron_timezone())
         except CronScheduleError:
             return None
 
 
-def fire_now_activity_sync(activity_type: str, *, session_factory=SessionLocal) -> bool:
+# Activity types with a trailing re-fire pending (`_refire_after_window`): at most one each.
+_refire_pending: set[str] = set()
+
+
+def _refire_after_window(activity_type: str, session_factory) -> None:
+    """Fire `activity_type` once more when the coalesce window closes, unless that re-fire is already pending: a
+    burst of wakes (several Starts pressed within seconds) costs one leading and one trailing enqueue, and none is
+    lost to the window. Never raises."""
+    with _fire_guard:
+        if activity_type in _refire_pending:
+            return
+        _refire_pending.add(activity_type)
+
+    def refire() -> None:
+        with _fire_guard:
+            _refire_pending.discard(activity_type)
+        fire_now_activity_sync(activity_type, session_factory=session_factory)
+
+    try:
+        timer = threading.Timer(FIRE_COALESCE_SECONDS, refire)
+        timer.daemon = True
+        timer.start()
+    except Exception as exc:  # noqa: BLE001 — the interval is the backstop
+        with _fire_guard:
+            _refire_pending.discard(activity_type)
+        log.debug("cron: could not schedule the trailing wake of %r (%s)", activity_type, exc)
+
+
+def fire_now_activity_sync(activity_type: str, *, session_factory=BridgedSession) -> bool:
     """`fire_now_sync` for the system cron of `activity_type`. True iff a tick was enqueued.
 
     Keyed on the activity type, never the editable `name` (a rename would silently stop the wake);
@@ -1133,8 +1234,11 @@ def fire_now_activity_sync(activity_type: str, *, session_factory=SessionLocal) 
     `tests/test_tenancy_non_request_planes.py`.
     """
     # Coalesced before the DB is touched: this runs on every committed task transition. An unknown
-    # activity taking a slot is harmless; the only callers are `app/task_wake.py`'s two constants.
+    # activity taking a slot is harmless; the only callers are `app/task_wake.py`'s two constants. A wake the
+    # window swallows earns one trailing re-fire as it closes (`_refire_after_window`): the pass the leading
+    # wake started may already have read past this one's task.
     if not _coalesce(f"activity:{activity_type}"):
+        _refire_after_window(activity_type, session_factory)
         return False
     try:
         with seam.detached(), seam.operator_scope(), session_factory() as session:
@@ -1167,7 +1271,7 @@ def fire_now_activity_sync(activity_type: str, *, session_factory=SessionLocal) 
     return True
 
 
-async def fire_now_activity(activity_type: str, *, session_factory=SessionLocal) -> bool:
+async def fire_now_activity(activity_type: str, *, session_factory=BridgedSession) -> bool:
     """`fire_now_activity_sync` off the serving loop; the form `app/task_wake.py` calls."""
     try:
         return await asyncio.to_thread(
@@ -1190,13 +1294,12 @@ def wake_after_commit(session: Session, activity_type: str) -> None:
 def _start_wake(activity_type: str) -> None:
     # Off the committing thread: the wake reads the cron row and asks DBOS, and the request must not wait on
     # either. Through `fire_now_activity`, the one seam between "committed" and "a cron fires" (the suite stubs it).
-    threading.Thread(target=_wake, args=(activity_type,), name=f"{activity_type}-wake", daemon=True).start()
+    # A task on the serving loop, in a fresh context; with no serving loop (a script), a thread of its own.
+    from app import db_async
+
+    if not db_async.spawn(fire_now_activity, activity_type, name=f"{activity_type}-wake"):
+        threading.Thread(target=_wake, args=(activity_type,), name=f"{activity_type}-wake", daemon=True).start()
 
 
 def _wake(activity_type: str) -> None:
-    async def _in_background_lane() -> None:
-        # This loop's `to_thread` worker is the wake's DB reader: put it in the background lane (`app/db.py`).
-        asyncio.get_running_loop().set_default_executor(background_executor(1, f"{activity_type}-wake"))
-        await fire_now_activity(activity_type)
-
-    asyncio.run(_in_background_lane())
+    asyncio.run(fire_now_activity(activity_type))

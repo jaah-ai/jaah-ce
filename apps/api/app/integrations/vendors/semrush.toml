@@ -1,0 +1,46 @@
+# Semrush: an API key in the `key` query parameter. The unit-balance call is free; a bad key answers HTTP 400 with
+# {"errors":[{"field":"key",...}]} (confirmed 2026-11-03 by calling it with a made-up key). The balance answer is a
+# bare number, not JSON. Balance call and key location confirmed at the vendor_docs_url page.
+slug = "semrush"
+label = "Semrush"
+category = "marketing"
+vendor_docs_url = "https://developer.semrush.com/api/v3/get-started/api-units-balance/"
+summary = "Research keywords, domains and backlinks with Semrush's SEO data."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "semrush.com > Subscription info > API units (semrush.com/accounts/subscription-info/api-units/), or My profile > API keys. API access needs a Business plan or purchased API units" },
+]
+
+[test]
+method = "GET"
+path = "https://www.semrush.com/users/countapiunits.html"
+auth = { query = "key", field = "api_key" }
+accept = ""
+rejected_statuses = [400, 401, 403]
+# Historically a bad key answered 200 text "ERROR 120 :: WRONG KEY"; read as a refusal should it come back.
+rejected_text = "ERROR 120 :: [A-Z ]+"
+
+[docs]
+agent_uses = [
+  "Look up search volume, difficulty and CPC for keywords, and find related keywords",
+  "Compare a domain's organic and paid keywords and traffic against competitors",
+  "Read a domain's backlinks and referring domains",
+  "Check how many API units are left before starting a large research task",
+]
+prerequisites = ["A Semrush Business subscription, or API units bought for your account. Pro and Guru plans have no API access"]
+limitations = [
+  "Every report an agent pulls spends API units from your Semrush balance, priced per line returned. Ask agents for a limit (display_limit) on large reports",
+  "Projects, Position Tracking and Site Audit data need the separate Projects API, which uses the same key",
+  "The Test checks the key only: it calls the free balance check, which spends no units",
+]
+troubleshooting = [
+  { symptom = "Test says Semrush rejected the API key (400)", fix = "The key was regenerated or mistyped. Copy it again from Subscription info > API units and select Replace on the secret" },
+  { symptom = "An agent gets ERROR 132 :: API UNITS BALANCE IS ZERO", fix = "The account has no API units left. Buy units under Subscription info > API units, or wait for the monthly top-up" },
+  { symptom = "An agent gets ERROR 50 :: NOTHING FOUND", fix = "Semrush has no data for that keyword or domain in the chosen database. Ask the agent to try another regional database, such as us or uk" },
+]
+faq = [
+  { q = "Does connecting cost API units", a = "No. Jaah's Test calls the free balance check" },
+  { q = "Can agents see my Semrush projects", a = "Yes, through the Projects API with the same key, if your plan includes it" },
+]

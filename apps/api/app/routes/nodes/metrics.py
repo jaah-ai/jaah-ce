@@ -11,15 +11,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import node_disk_events, node_host_metrics, node_session_usage, node_tmp_inode_alarm
-from app.auth import require_user
 from app.authz.object_access import can_access
 from app.authz.catalog import Tenancy
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, current_caller
 from app.authz.visibility import ObjectAccess
-from app.db import get_session
-from app.entity_shape import RefOut, from_row, iso_or_none
-from app.models.identity import AdminUser
+from app.db_async import on_session
+from app.entity_shape import RefOut, from_row, iso_or_none, names_of
 from app.models.nodes import Node
 from app.models.worktrees import VirtualNode
 from app.routes.nodes.node_wire import (
@@ -47,7 +45,8 @@ class NodeMetricsPointOut(BaseModel):
     last three are null for a bucket that never carried them."""
 
     at: str
-    # Null, with every figure below, for a tenant reading its node on another org's host (`_own_disk_only`).
+    # Null, with every figure below, for a tenant reading its node on another org's host: its history is withheld
+    # (`_own_disk_only`).
     cpu_pct: Optional[float]
     mem_pct: Optional[float]
     disk_pct: Optional[float] = None
@@ -136,12 +135,12 @@ def _disk_event_out(event: Any, names: dict[UUID, str], *, show_pct: bool = True
 
 @router.get("/api/nodes/{node_id}/disk-events", response_model=NodeDiskEventsOut)
 @feature("nodes", "view", tenancy=Tenancy.CALLER_PLANE)
+@on_session
 def get_node_disk_events(
+    session: Session,
     node_id: str,
     limit: int = Query(50, ge=1, le=200),
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> NodeDiskEventsOut:
     """This node's disk history, newest first: each reclaim it reported and each pause/resume of its disk
     gate (`app/node_disk_events.py`).
@@ -150,11 +149,11 @@ def get_node_disk_events(
     host's filesystem, so its host's reclaims are listed too (`source_node` names the host) — except for a
     tenant reading its node on another org's host, who is never told that host (`_on_a_foreign_host`) nor its
     usage: such a reader gets the node's own rows with every `used_pct` and `detail` blanked."""
-    _presence, row = _readable_node_or_404(session, principal, node_id)
+    _presence, row = _readable_node_or_404(session, caller.principal, node_id)
     if row is None:
         return NodeDiskEventsOut(events=[])
     _kind, hosted_on, host_org_id = _hosting_of(row, _hosting_facts(session, [row.id]).get(row.id))
-    foreign = hosted_on is not None and _on_a_foreign_host(user, "co_located", host_org_id)
+    foreign = hosted_on is not None and _on_a_foreign_host(caller.actor, "co_located", host_org_id)
     host_uuid = None
     if hosted_on is not None and not foreign:
         host_uuid = session.scalar(select(VirtualNode.host_node_id).where(VirtualNode.node_id == row.id))
@@ -168,14 +167,14 @@ def get_node_disk_events(
 
 @router.get("/api/nodes/{node_id}/metrics", response_model=NodeMetricsOut)
 @feature("nodes", "view", tenancy=Tenancy.CALLER_PLANE)
+@on_session(side_reads=True)
 def get_node_metrics(
+    session: Session,
     node_id: str,
     # 6h default; the ceiling is `RETENTION_DAYS * 24`, derived so it moves with the horizon. `ge=1`: a
     # non-positive range is malformed, and a 422 costs only a chart.
     hours: int = Query(6, ge=1, le=int(node_host_metrics.RETENTION_DAYS * 24)),
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> NodeMetricsOut:
     """This node's CPU/RAM/disk/network/runners series over the last `hours`, plus its newest judged reading.
 
@@ -191,8 +190,9 @@ def get_node_metrics(
     that never reported does.
 
     A tenant reading its node on another org's host is narrowed as the roster narrows it
-    (`_on_a_foreign_host`): `latest` keeps only the node's own disk, and every point's figures are null."""
-    _presence, row = _readable_node_or_404(session, principal, node_id)
+    (`_on_a_foreign_host`): `latest` keeps the host's CPU/RAM bars and the node's own disk, and every point's figures are null."""
+    # `side_reads`: a co-located node's own disk (`vnodes.disk_usage_of`) is read on a session of its own.
+    _presence, row = _readable_node_or_404(session, caller.principal, node_id)
     # Computed once for both `series` and the payload, so axis and rows agree.
     range_secs = float(hours) * 60.0 * 60.0
     # The axis, unconditionally, even for a presence-only host: the window belongs to the request, so an
@@ -205,7 +205,7 @@ def get_node_metrics(
     hosting, _hosted_on, host_org_id = _hosting_of(
         row, _hosting_facts(session, [row.id]).get(row.id) if row is not None else None
     )
-    own_disk_only = row is not None and _on_a_foreign_host(user, hosting, host_org_id)
+    own_disk_only = row is not None and _on_a_foreign_host(caller.actor, hosting, host_org_id)
     if own_disk_only and latest is not None:
         latest = _own_disk_only(latest, _disk_usage_of(row.id))
     bucket_secs = node_host_metrics.bucket_secs_for(range_secs)
@@ -225,7 +225,7 @@ def get_node_metrics(
             NodeMetricsPointOut(at=point.at.isoformat(), cpu_pct=None, mem_pct=None, runners=count)
             if own_disk_only
             else from_row(NodeMetricsPointOut, point, at=point.at.isoformat(), runners=count)
-            for point, count in zip(points, runners)
+            for point, count in zip(points, runners, strict=False)
         ],
         latest=latest,
     )
@@ -268,11 +268,11 @@ class SessionsUsageOut(BaseModel):
 
 @router.get("/api/nodes/{node_id}/sessions-usage", response_model=SessionsUsageOut)
 @feature("nodes", "view", tenancy=Tenancy.CALLER_PLANE)
+@on_session
 def get_node_sessions_usage(
+    session: Session,
     node_id: str,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> SessionsUsageOut:
     """The live runner sessions on this node AND every node co-located on it that the caller may read, each its
     newest fresh minute (`app/node_session_usage.py`), largest RSS first.
@@ -280,24 +280,22 @@ def get_node_sessions_usage(
     The door is `_readable_node_or_404`, as the Metrics tab's. A session is its node's own, so a tenant reading
     its node on another org's host keeps it (no `_own_disk_only` narrowing); a co-located node the caller
     cannot read is left out. A presence-only host has no uuid, so no sessions."""
-    _presence, row = _readable_node_or_404(session, principal, node_id)
+    _presence, row = _readable_node_or_404(session, caller.principal, node_id)
     if row is None:
         return SessionsUsageOut(sessions=[])
     hosted = session.scalars(
         select(VirtualNode.node_id).where(VirtualNode.host_node_id == row.id, VirtualNode.node_id.is_not(None))
     ).all()
     readable = [row.id] + [
-        uuid for uuid in hosted if can_access(session, principal, "node", uuid, mode=ObjectAccess.READ)
+        uuid for uuid in hosted if can_access(session, caller.principal, "node", uuid, mode=ObjectAccess.READ)
     ]
-    names = {row.id: row.name}
-    if len(readable) > 1:
-        names.update(session.execute(select(Node.id, Node.name).where(Node.id.in_(readable[1:]))).tuples().all())
+    names = {row.id: row.name, **names_of(session, Node, readable[1:])}
     return SessionsUsageOut(sessions=[
-        SessionUsageOut(
+        from_row(
+            SessionUsageOut, live,
             node=SessionUsageNodeOut(id=str(live.node_id), name=names.get(live.node_id, "")),
             task=None if live.task_title is None else SessionUsageTaskOut(id=live.task_id, title=live.task_title),
-            session_id=live.session_id, pid=live.pid, cpu_pct=live.cpu_pct, rss_kb=live.rss_kb, procs=live.procs,
-            sampled_at=live.bucket_at.isoformat(), age_seconds=live.age_seconds, stale=live.stale,
+            sampled_at=live.bucket_at.isoformat(),
         )
         for live in node_session_usage.live_sessions(session, readable)
     ])

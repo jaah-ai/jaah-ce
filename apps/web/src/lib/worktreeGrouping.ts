@@ -6,7 +6,6 @@
  * are OMITTED, so outline order/depth/counts are testable without a render — and find-in-page sees fewer
  * rows than the bars' TRUE counts. Pure of React and the API client.
  */
-import { MAIN_CLONE_NUMBER } from './poolSlot'
 import { orgQualifierFor } from './projectLabel'
 import type { OrgRef, Worktree } from '../types'
 
@@ -106,13 +105,9 @@ function nodeGroupLabel(nodeId: string, nodeLabelFor: NodeLabelFor): string {
   return resolved && resolved.trim() !== '' ? resolved : nodeId
 }
 
-/* SLOT ORDER: the main clone first (every sibling's `.git` points into it), then numbered ascending. Tested
-   EXPLICITLY, not left to `MAIN_CLONE_NUMBER` being the minimum. `id` breaks the final tie so the order is
-   TOTAL and does not reshuffle on a refresh. */
+/* SLOT ORDER: numbered ascending. `id` breaks the final tie so the order is TOTAL and does not reshuffle
+   on a refresh. */
 function compareSlots(a: Worktree, b: Worktree): number {
-  const aMain = a.number === MAIN_CLONE_NUMBER
-  const bMain = b.number === MAIN_CLONE_NUMBER
-  if (aMain !== bMain) return aMain ? -1 : 1
   return a.number - b.number || a.id.localeCompare(b.id)
 }
 

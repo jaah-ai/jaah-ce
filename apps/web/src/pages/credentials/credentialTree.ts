@@ -1,17 +1,5 @@
-/* THE CREDENTIAL ROSTER'S NAME-TREE VOCABULARY: what `lib/nameTree.ts`, `lib/nameTreeMove.ts` and
- * `lib/nameTreeRows.tsx` need to know about a credential (its noun, name cap, DOM handles), and the key of a folder
- * in the persisted expansion set. Tree mode itself is `./CredentialTreeView.tsx`, loaded a level at a time from the
- * server. */
-import type { NameTreeKind } from '../../lib/nameTree'
-
-/** Mirrors `routes/credentials/credential_wire.py::_NAME_MAX_LEN` (measured trimmed). */
-export const CREDENTIAL_NAME_MAX = 200
-
-export const CREDENTIAL_TREE_KIND: NameTreeKind = {
-  noun: { one: 'secret', many: 'secrets' },
-  nameMax: CREDENTIAL_NAME_MAX,
-  idPrefix: 'credential',
-}
+/* THE CREDENTIAL ROSTER'S TREE VOCABULARY: the key of a folder in the persisted expansion set. Tree mode itself
+ * is `./CredentialTreeView.tsx`, loaded a level at a time from the server. */
 
 /* ── EXPANSION PER HOME ──
  * The persisted expansion set (`view.expanded`) holds folder keys; two homes may both hold an `aws` folder, so a

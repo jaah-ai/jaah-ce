@@ -1,14 +1,15 @@
 """The email leg of a notification: the same events Slack carries, sent as system mail (`app/system_mail.py`, SES).
 
-A second delivery method beside Slack (`preferences.NOTIFICATION_METHOD_TYPES`), not a fallback for it:
-a user with both methods gets both. Each leg walks the same recipient chain
-(`notify_targets.alert_candidates`) on its own, so a candidate without an Email method is skipped exactly
-as one without Slack is. The address is the recipient's login email (`notify_targets.email_destination`).
+A channel type beside Slack and Telegram (`notification_channels`), not a fallback for either: a person with
+several channels gets each. Each leg walks the same recipient chain (`notify_targets.alert_candidates`) on its own,
+so a candidate with no Email channel wanting the event is skipped exactly as one without Slack is. Each Email
+channel is the login email or an address the person proved (`notify_targets.email_routes`).
 
 Callers: `alert_record.record_alert` (task transitions, questions, the shipped and assignment
 cards), `comment_notify.notify_mentioned`, the per-person choke point `user_notify.deliver` (whose important notices
 use `deliver_important`), a billing notice's durable email effect (`deliver_billing`, from
-`app/billing/notices.py::_email`), which writes to each of an org's Owner/Admins — no chain — and
+`app/billing/notices.py::_email`), which writes to each of an org's Owner/Admins — no chain — and fans the same
+words out over Telegram (`_over_telegram`, as `deliver_billing_message` does), and
 the trigger owner's notices (`prepare_template_email`, from `app/trigger_notices.py`), one named person each.
 Email NEVER falls through to a shared channel — an alert with no email recipient simply sends no email —
 and a send failure is logged, never raised: the Slack leg and the alert row do not depend on it. Rendering is
@@ -29,7 +30,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app import alert_relay, edition_features, email_template_store, email_templates, mail_message, notify_targets, org_names, system_mail
+from app import alert_relay, config, edition_features, email_template_store, email_templates, mail_message, notify_targets, org_names, system_mail
 from app.config import get_settings
 from app.durable import notify_outbox
 from app.models.billing import BillingNotice
@@ -52,9 +53,9 @@ def console_url(event: dict[str, Any]) -> Optional[str]:
     url = payload.get("console_url")
     task_id = payload.get("task_id")
     if not url and isinstance(task_id, int) and not isinstance(task_id, bool):
-        from app.task_external_comment import _console_task_url
+        from app.trackers.writeback import task_url
 
-        url = _console_task_url(task_id)
+        url = task_url(task_id)
     return alert_relay._console_link(str(url)) if url else None
 
 
@@ -62,10 +63,10 @@ def _notification_fields() -> dict[str, str]:
     """The active `notification` template's fields, on a short session of their own (the callers hold
     none, or one bound to another org). A read fault falls back to the built-in text rather than losing
     the email."""
-    from app.db import SessionLocal
+    from app.db import BridgedSession
 
     try:
-        with SessionLocal() as session:
+        with BridgedSession() as session:
             return email_template_store.active_fields(session, email_templates.NOTIFICATION.key)
     except Exception:
         log.exception("email notify: the notification template could not be read — using the built-in one")
@@ -89,6 +90,10 @@ def plain_parts(event: dict[str, Any]) -> tuple[str, str]:
     # `format_message` leads with the headline; the message is what follows it, so the card never shows
     # the headline twice. A text that does not lead with it (no producer today) is kept whole.
     rest = full_text[len(headline):].lstrip("\n") if full_text.startswith(headline) else full_text
+    if event.get("kind") == "support" and rest:
+        # A ticket email's `reason` is its own plain message, headline first (`durable/support_notify_queue.py::
+        # email_event`): the fact, not the kind's word, is the subject.
+        headline, _, rest = rest.partition("\n")
     return headline, rest
 
 
@@ -119,13 +124,15 @@ def _may_send(event: dict[str, Any]) -> bool:
 def _send(
     address: str, event: dict[str, Any], detail: str, fields: dict[str, str], *, user: Optional[AdminUser] = None,
     event_name: Optional[str] = None, essential: bool = False, recipient_user_id: Optional[UUID] = None,
+    channel_id: Optional[UUID] = None,
 ) -> bool:
-    """Render this event's email now and hand the send to the outbox (SES settings are re-read there). `user` and
-    `event_name`, when known, name whose preference an unsubscribe turns off; `essential` is PRD R6's flag."""
+    """Render this event's email now and hand the send to the outbox (SES settings are re-read there). `user`,
+    `event_name` and `channel_id`, when known, name which channel's setting an unsubscribe turns off; `essential` is
+    PRD R6's flag."""
     from app import email_unsubscribe
 
     target = (
-        email_unsubscribe.UnsubscribeTarget(user_id=user.id, event=event_name)
+        email_unsubscribe.UnsubscribeTarget(user_id=user.id, event=event_name, channel_id=channel_id)
         if user is not None and event_name else None
     )
     try:
@@ -142,54 +149,32 @@ def _send(
     )
 
 
-def _send_event(event: dict[str, Any], user: AdminUser, address: str, detail: str, event_name: str) -> bool:
+def _send_event(event: dict[str, Any], user: AdminUser, route: notify_targets.Route, event_name: str) -> bool:
     """`notify_targets.Send` for this leg: the template is read once a recipient is found."""
-    return _send(address, event, detail, _notification_fields(), user=user, event_name=event_name)
-
-
-def deliver_alert(
-    session: Session,
-    event: dict[str, Any],
-    *,
-    task_id: Optional[int],
-    answerable: bool,
-    question_id: Optional[int],
-    done: bool,
-    assigned: bool,
-    skipped: Optional[list[str]] = None,
-) -> bool:
-    """Email this alert to the first candidate in the chain who has Email on and wants the event.
-
-    `task_id` is the trusted payload id (`alert_record`'s `answerable_task_id`). Mirrors the Slack chain's
-    mute rule: a personal card stops at its one candidate; an operational alert walks past a mute."""
-    return _may_send(event) and notify_targets.deliver_alert(
-        session, event, notify_targets.email_destination, _send_event,
-        task_id=task_id, answerable=answerable, question_id=question_id, done=done, assigned=assigned,
-        skipped=skipped,
+    return _send(
+        route.address, event, route.level, _notification_fields(), user=user, event_name=event_name,
+        channel_id=route.channel.id if route.channel is not None else None,
     )
 
 
-def deliver_to_user(user: AdminUser, event: dict[str, Any], *, event_name: str) -> bool:
-    """Email one named person (a mention). No chain and no fall-through: nobody else may read their DM.
-    Never raises: the comment it announces is already committed."""
-    return _may_send(event) and notify_targets.deliver_to_user(
-        user, event, notify_targets.email_destination, _send_event, event_name=event_name
-    )
-
-
-def can_send(event: dict[str, Any]) -> bool:
-    """Whether this deployment may email `event` at all (the relay is on, the event is real, a mailbox is set)."""
-    return _may_send(event)
+#: This leg's entry points (`notify_targets.Leg`): the gate and the resolver are read through their modules at call
+#: time, so a test's patch of either holds. What differs from Telegram: a person may unsubscribe one channel from
+#: one event's email (`_send`'s target), unless the mail is essential.
+LEG = notify_targets.Leg(
+    lambda event: _may_send(event), lambda: notify_targets.email_routes, _send_event, notify_targets.EMAIL
+)
+deliver_alert = LEG.deliver_alert
+deliver_to_user = LEG.deliver_to_user
+can_send = LEG.can_send
+routes = LEG.routes
 
 
 def deliver_important(user: AdminUser, event: dict[str, Any], *, event_name: str) -> str:
     """Email one named person an IMPORTANT notice (`app/user_notify.py`): to the login email whatever their Email
-    method and event preference say. The address must still be proven (`AdminUser.email_verified_at`, as in
-    `notify_targets.email_destination`), a disabled membership or a pending invitation is still sent nothing, and
-    the person's brief/full choice for `event_name` still shapes the body. Returns the outcome `user_notify.Delivery`
-    records: `sent`, `skipped: <reason>` or `failed`. Never raises."""
-    from app.preferences import UserPreferences
-
+    channels say — never to a typed address. The address must still be proven (`AdminUser.email_verified_at`, as in
+    `notify_targets.email_routes`), a disabled membership or a pending invitation is still sent nothing, and the
+    account-email channel's brief choice for `event_name` (when it has one) still shapes the body. Returns the
+    outcome: `sent`, `skipped: <reason>` or `failed`. Never raises."""
     if not _may_send(event):
         return "skipped: no_email_config"
     if user.disabled_at is not None:
@@ -201,23 +186,35 @@ def deliver_important(user: AdminUser, event: dict[str, Any], *, event_name: str
         return f"skipped: {notify_targets.REASON_RECIPIENT_MISSING}"
     if user.email_verified_at is None:
         return f"skipped: {notify_targets.REASON_EMAIL_UNVERIFIED}"
-    detail = UserPreferences.from_stored(user.preferences).notifications.detail_for(event_name)
+    detail = _important_detail(user, event_name)
     # Important: sent whatever the preference says, so essential — nothing to unsubscribe from.
     return "sent" if _send(address, event, detail, _notification_fields(), essential=True, recipient_user_id=user.id) else "failed"
+
+
+def _important_detail(user: AdminUser, event_name: str) -> str:
+    """`brief` when the account-email channel resolves `event_name` brief, else `full` (an important notice is never
+    shortened by a channel being off or absent)."""
+    try:
+        resolved = notify_targets.email_routes(user, event=event_name)
+    except Exception:
+        log.exception("email notify: the brief/full choice for %s could not be read — sending full", event_name)
+        return "full"
+    account = next((route for route in resolved.routes if route.channel is not None and route.channel.account_email), None)
+    return "brief" if account is not None and account.level == "brief" else "full"
 
 
 BILLING_EVENT = "billing"
 #: A project or group budget at 80% or 100% (`app/budgets.py`): to the same people as `billing`, but optional mail
 #: under its own preference, so unsubscribing from it never silences a bill.
 BUDGET_EVENT = "budget"
-BILLING_FOOTER = "Sent to your organization's Owners and Admins because Email is on in Profile > Notifications."
+BILLING_FOOTER = "Sent to your organization's Owners and Admins because Billing is on for this address in Profile > Alerts."
 
 
 def console_path_link(path: str) -> Optional[str]:
-    """A console path (`/triggers/<id>`) as an absolute link on this deployment's own origin, or None."""
+    """A console path (`/automations/<id>`) as an absolute link on this deployment's own origin, or None."""
     if not path.startswith("/") or path.startswith("//"):
         return None
-    return alert_relay._console_link(f"{get_settings().frontend_url.rstrip('/')}{path}")
+    return alert_relay._console_link(config.console_url(path))
 
 
 def billing_link(href: Any) -> Optional[str]:
@@ -269,12 +266,23 @@ def deliver_billing(
     session: Session, notice: BillingNotice, *, recipients: Optional[list[AdminUser]] = None
 ) -> tuple[int, int]:
     """Email one billing notice to each of its org's Owner/Admins who has Email on and wants `billing`
-    (`recipients`, when the caller already read them for this org). Returns `(sent, failed)`, failed counting
-    sends the outbox could not take. Never raises: the notice is already in the bell."""
-    return _deliver_to_billing_people(
+    (`recipients`, when the caller already read them for this org), then over Telegram in the same words
+    (`_over_telegram`). Returns `(sent, failed)` for the emails, failed counting sends the outbox could not take.
+    Never raises: the notice is already in the bell."""
+    sent, failed = _deliver_to_billing_people(
         session, notice.org_id, recipients, notice.kind,
         lambda detail, fields, org, _unsubscribe_url: compose_billing(notice, detail=detail, fields=fields, org=org),
     )
+    # Telegram goes on the attempt that ends the effect: `billing/notices._email` raises when every email failed,
+    # so the outbox retries it, and a retried email must never send the Telegram message twice.
+    if sent or not failed:
+        try:
+            headline, text, _label, link = billing_parts(notice)
+        except Exception:  # noqa: BLE001 - the emails are out; a retry must not resend them
+            log.exception("email notify: billing notice %s could not be worded for Telegram — not sent", notice.kind)
+        else:
+            _over_telegram(session, notice.org_id, headline=headline, text=text, link=link)
+    return sent, failed
 
 
 def deliver_billing_message(
@@ -285,7 +293,8 @@ def deliver_billing_message(
     payment method, `routes/billing_orgs.py`; a budget warning, `app/budgets.py`, with `event` `BUDGET_EVENT`):
     `href` is a console path, the button its label. Same recipients and rules as `deliver_billing`, under `event`'s
     preference; `also` (the Stripe customer's billing email, which the operator chose to add) gets the full message
-    too unless a person already got it at that address. Never raises."""
+    too unless a person already got it at that address; then over Telegram (`_over_telegram`). Returns
+    `(sent, failed)` for the emails. Never raises."""
     def compose(
         detail: str, fields: dict[str, str], org: Optional[str], unsubscribe_url: Optional[str]
     ) -> email_templates.Rendered:
@@ -299,7 +308,24 @@ def deliver_billing_message(
         )
 
     what = "budget warning" if event == BUDGET_EVENT else "billing message"
-    return _deliver_to_billing_people(session, org_id, recipients, what, compose, also=also, event=event)
+    sent, failed = _deliver_to_billing_people(session, org_id, recipients, what, compose, also=also, event=event)
+    _over_telegram(session, org_id, headline=headline, text=text, link=console_path_link(href), event=event)
+    return sent, failed
+
+
+def _over_telegram(
+    session: Session, org_id: UUID, *, headline: str, text: str, link: Optional[str], event: str = BILLING_EVENT,
+) -> None:
+    """The Telegram leg of a billing send (`telegram_notify.to_billing_people`), the headline led by the org's name,
+    behind the ONE edition gate: the community edition has no `app/telegram_notify.py`. Never raises."""
+    if not edition_features.enabled("telegram"):
+        return
+    from app import telegram_notify  # here, not at the top: `telegram_notify` imports this module
+
+    org = " ".join((org_names.org_name(session, org_id) or "").split())
+    telegram_notify.to_billing_people(
+        session, org_id, headline=f"{org} · {headline}" if org else headline, text=text, link=link, event=event,
+    )
 
 
 def billing_mail_on() -> bool:
@@ -310,24 +336,27 @@ def billing_mail_on() -> bool:
 
 
 def billing_destinations(recipients: list[AdminUser], event: str = BILLING_EVENT) -> list[tuple[str, str]]:
-    """`(address, detail)` for each of `recipients` a billing email reaches (`notify_targets.email_destination`:
-    Email on, a verified address, `event` — `billing` unless a budget warning's — not muted or unsubscribed) — the
-    ONE rule the send, the operator's recipient preview (`routes/billing_orgs.py`) and `plan_rollover.unsent_reason`
-    read. A lookup that raises skips that person, logged."""
-    return [(address, detail) for _user, address, detail in _billing_people(recipients, event)]
+    """`(address, detail)` for every Email channel of `recipients` a billing email reaches
+    (`notify_targets.email_routes`: a proven address, `event` — `billing` unless a budget warning's — not off on
+    that channel) — the ONE rule the send, the operator's recipient preview (`routes/billing_orgs.py`) and
+    `plan_rollover.unsent_reason` read. A lookup that raises skips that person, logged."""
+    return [(address, detail) for _user, address, detail, _channel in _billing_people(recipients, event)]
 
 
-def _billing_people(recipients: list[AdminUser], event: str) -> list[tuple[Optional[AdminUser], str, str]]:
-    """`billing_destinations`' rule under `event`, keeping who each address is (an optional event's unsubscribe)."""
-    found: list[tuple[Optional[AdminUser], str, str]] = []
+def _billing_people(
+    recipients: list[AdminUser], event: str
+) -> list[tuple[Optional[AdminUser], str, str, Optional[UUID]]]:
+    """`billing_destinations`' rule under `event`, keeping who each address is and its channel (an optional event's
+    unsubscribe)."""
+    found: list[tuple[Optional[AdminUser], str, str, Optional[UUID]]] = []
     for user in recipients:
         try:
-            destination, _ = notify_targets.email_destination(user, event=event)
+            resolved = notify_targets.email_routes(user, event=event)
         except Exception:
             log.exception("email notify: recipient lookup failed for a billing notice — skipped")
             continue
-        if destination is not None:
-            found.append((user, *destination))
+        for route in resolved.routes:
+            found.append((user, route.address, route.level, route.channel.id if route.channel is not None else None))
     return found
 
 
@@ -353,12 +382,14 @@ def _deliver_to_billing_people(
     org = org_names.org_name(session, org_id)
     destinations = _billing_people(recipients, event)
     extra = mail_message.single_address(also or "")
-    if extra is not None and extra.lower() not in {address.lower() for _, address, _ in destinations}:
-        destinations.append((None, extra, "full"))
+    if extra is not None and extra.lower() not in {address.lower() for _, address, _, _ in destinations}:
+        destinations.append((None, extra, "full", None))
     # Essential (PRD R6): a bill is not a notification a person may unsubscribe from; a budget warning is.
     essential = event == BILLING_EVENT
-    for user, address, detail in destinations:
-        target = None if essential or user is None else email_unsubscribe.UnsubscribeTarget(user_id=user.id, event=event)
+    for user, address, detail, channel_id in destinations:
+        target = None if essential or user is None else email_unsubscribe.UnsubscribeTarget(
+            user_id=user.id, event=event, channel_id=channel_id
+        )
         try:
             rendered = compose(detail, fields, org, email_unsubscribe.url_for(target))
         except Exception:
@@ -386,16 +417,16 @@ def prepare_template_email(
 ) -> Optional[Callable[[], bool]]:
     """One templated email to one named person, rendered NOW (inside the caller's transaction, where `user` is
     loaded) and returned as a `send()` for the caller to run once that transaction commits
-    (`after_commit.on_commit`) — so a rolled-back write emails nobody. None when this person gets no email
-    (no Email method, an unverified address, the event muted). `send()` never raises."""
+    (`after_commit.on_commit`) — so a rolled-back write emails nobody. One email per Email channel that wants
+    `event_name`; None when there is none (no channel, an unverified address, the event off). `send()` never
+    raises."""
     try:
-        destination, _ = notify_targets.email_destination(user, event=event_name)
+        resolved = notify_targets.email_routes(user, event=event_name, session=session)
     except Exception:
         log.exception("email notify: recipient lookup failed for %s — not sent", type_key)
         return None
-    if destination is None:
+    if not resolved.routes:
         return None
-    address, _detail = destination
     try:
         fields = email_template_store.active_fields(session, type_key)
     except Exception:
@@ -404,17 +435,26 @@ def prepare_template_email(
     from app import email_unsubscribe
 
     essential = email_templates.TYPES[type_key].essential
-    target = None if essential else email_unsubscribe.UnsubscribeTarget(user_id=user.id, event=event_name)
-    rendered = email_templates.render(
-        type_key, fields, values, button_url=button_url, unsubscribe_url=email_unsubscribe.url_for(target),
-    )
+    messages = []
+    for route in resolved.routes:
+        target = None if essential else email_unsubscribe.UnsubscribeTarget(
+            user_id=user.id, event=event_name, channel_id=route.channel.id if route.channel is not None else None,
+        )
+        rendered = email_templates.render(
+            type_key, fields, values, button_url=button_url, unsubscribe_url=email_unsubscribe.url_for(target),
+        )
+        messages.append((route.address, rendered, target))
+    user_id = user.id
 
     def send() -> bool:
         if not _may_send({"kind": type_key}):
             return False
-        return notify_outbox.email(
-            address, rendered.subject, rendered.text, rendered.html, what=type_key, mail_type=type_key,
-            essential=essential, unsubscribe=target, recipient_user_id=user.id,
-        )
+        sent = False
+        for address, rendered, target in messages:
+            sent = notify_outbox.email(
+                address, rendered.subject, rendered.text, rendered.html, what=type_key, mail_type=type_key,
+                essential=essential, unsubscribe=target, recipient_user_id=user_id,
+            ) or sent
+        return sent
 
     return send

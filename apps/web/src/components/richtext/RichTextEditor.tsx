@@ -6,12 +6,14 @@ import { EditorContent, useEditor, useEditorState, type Editor } from '@tiptap/r
 import type { Slice } from '@tiptap/pm/model'
 import { useEffect, useRef, useState } from 'react'
 import { buildExtensions } from './extensions'
+import { joinMachineMarkers, splitMachineMarkers } from './machineMarkers'
 import type { AttachmentResolver } from './attachmentResolver'
+import { RTE_COMPACT_PRIMARIES, RTE_CONTAINER, RTE_FOLD_SECONDARIES } from '../../ui/listStyles'
 import { hasCopiedImages, mintImageFilename, pasteCopiedImages } from './attachmentCopy'
 import { Banner } from '../../ui/Banner'
 import { MoreHorizIcon } from '../../ui/icons'
 import { clipboardFiles } from '../../lib/clipboardFiles'
-import { paperGround } from '../../theme'
+import { FONT_SIZE, LINE_HEIGHT, RADIUS, SIZE, grid, paperGround } from '../../theme'
 
 // Reusable rich-text authoring: TipTap over markdown storage (DEC-1: `value`/`onChange` always carry
 // markdown, never HTML), capped to the REQ-1 set (DEC-7). Owns no page layout beyond its container.
@@ -25,7 +27,6 @@ export interface RichTextEditorProps {
   resolveAttachmentSrc?: AttachmentResolver
   placeholder?: string
   autoFocus?: boolean
-  className?: string
   /* Enter starts a new line, not a paragraph (`extensions.ts::EnterLineBreak`). */
   lineBreaks?: boolean
 }
@@ -45,23 +46,21 @@ function insertImageFiles(
 
 /* The editor's size container and the two widths its toolbar's one-row rule breaks at: the whole labelled set
    on one row, then the labelled primaries plus `⋯`. Measured on the rendered toolbar. */
-const RTE_CONTAINER = 'rte'
-const RTE_FULL_ROW_PX = 760
-const RTE_LABELLED_ROW_PX = 460
 
 // Chrome shared by every toolbar button. A function, not a wrapper component, so callers can extend
 // `sx` per button.
 function toolbarBtnSx(theme: Theme) {
   return {
-    minWidth: 32,
-    minHeight: 32,
-    padding: '4px 8px',
+    minWidth: SIZE.thumb,
+    minHeight: SIZE.thumb,
+    py: 0.5,
+    px: 1,
     border: '1px solid transparent',
-    borderRadius: 1.5, // 6px (theme.shape.borderRadius 4 × 1.5)
+    borderRadius: RADIUS.md,
     backgroundColor: 'transparent',
     color: 'text.secondary',
-    fontSize: '0.8125rem',
-    lineHeight: 1.2,
+    fontSize: FONT_SIZE.md,
+    lineHeight: LINE_HEIGHT.snug,
     '&:hover': { backgroundColor: 'action.hover', borderColor: 'divider' },
     // The active state is `aria-pressed`, not a class.
     '&[aria-pressed="true"]': {
@@ -70,7 +69,7 @@ function toolbarBtnSx(theme: Theme) {
       color: 'primary.main',
     },
     // 44×44 tap floor at ≤480px exactly; `down('sm')` (600px) would widen the range.
-    [theme.breakpoints.down(481)]: { minWidth: 44, minHeight: 44 },
+    [theme.breakpoints.down(481)]: { minWidth: SIZE.tapTarget, minHeight: SIZE.tapTarget },
   }
 }
 
@@ -81,7 +80,6 @@ export default function RichTextEditor({
   resolveAttachmentSrc,
   placeholder,
   autoFocus,
-  className,
   lineBreaks = false,
 }: RichTextEditorProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
@@ -100,6 +98,11 @@ export default function RichTextEditor({
   // handlePaste/handleDrop are registered before `editor` exists as a binding; the ref is set by the time
   // they fire.
   const editorRef = useRef<Editor | null>(null)
+
+  // Machine markers never reach the editor; every edit puts the latest ones back (`machineMarkers.ts`).
+  const { visible, markers } = splitMachineMarkers(value)
+  const markersRef = useRef(markers)
+  markersRef.current = markers
 
   // The current placeholder, read by the accessor handed to `buildExtensions`.
   const placeholderRef = useRef(placeholder)
@@ -122,7 +125,7 @@ export default function RichTextEditor({
       placeholder: placeholder === undefined ? undefined : () => placeholderRef.current ?? '',
       lineBreaks,
     }),
-    content: value,
+    content: visible,
     autofocus: autoFocus ?? false,
     editorProps: {
       attributes: { class: 'rte-prosemirror', 'aria-label': 'Rich text editor' },
@@ -159,7 +162,7 @@ export default function RichTextEditor({
     onUpdate: ({ editor }) => {
       // StrictMode's dev double-invoke can fire a transaction before `storage.markdown` is populated.
       if (!editor.storage.markdown) return
-      onChange(editor.storage.markdown.getMarkdown())
+      onChange(joinMachineMarkers(editor.storage.markdown.getMarkdown(), markersRef.current))
     },
   })
 
@@ -191,11 +194,11 @@ export default function RichTextEditor({
   // `setContent` resets the cursor on every keystroke.
   useEffect(() => {
     if (!editor || !editor.storage.markdown) return
-    if (editor.storage.markdown.getMarkdown() !== value) {
-      editor.commands.setContent(value, { emitUpdate: false })
+    if (editor.storage.markdown.getMarkdown() !== visible) {
+      editor.commands.setContent(visible, { emitUpdate: false })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [value, editor])
+  }, [visible, editor])
 
   /* The placeholder tracks its prop. `useEditor` runs `buildExtensions` once and tiptap copies options
   into plugin context, so only the accessor sees the current prop; this empty transaction forces a
@@ -220,16 +223,15 @@ export default function RichTextEditor({
 
   return (
     <Box
-      className={className}
       data-testid="rte"
       sx={(theme: Theme) => ({
         display: 'flex',
         flexDirection: 'column',
         height: '100%',
-        minHeight: 320,
+        minHeight: grid(53),
         border: '1px solid',
         borderColor: 'divider',
-        borderRadius: 2, // 8px
+        borderRadius: RADIUS.md,
         // The paper's own ground: plain `background.paper` reads as a darker box on elevated dark paper.
         backgroundColor: paperGround(theme),
         overflow: 'hidden',
@@ -241,9 +243,9 @@ export default function RichTextEditor({
         [theme.breakpoints.down(481)]: {
           position: 'fixed',
           inset: 0,
-          zIndex: 60,
+          zIndex: theme.zIndex.mobileStepper,
           border: 'none',
-          borderRadius: 0,
+          borderRadius: RADIUS.none,
         },
       })}
     >
@@ -255,26 +257,26 @@ export default function RichTextEditor({
         sx={(theme: Theme) => ({
           position: 'sticky',
           top: 0,
-          zIndex: 2,
+          zIndex: 1,
           display: 'flex',
           flexWrap: 'wrap',
           alignItems: 'center',
-          gap: 0.666, // 0.25rem
-          padding: 1.33, // 0.5rem
+          gap: 0.5,
+          padding: 1,
           borderBottom: '1px solid',
           borderColor: 'divider',
           backgroundColor: paperGround(theme),
           flexShrink: 0,
           // AC-3 one-row mobile toolbar: primaries swap to compact glyphs, secondaries hide until `⋯`.
           [theme.breakpoints.down(481)]: {
-            gap: 0.333, // 2px
-            padding: 0.666, // 4px
+            gap: 0,
+            padding: 0.5,
             '& [data-role="rte-more"]': { display: 'inline-flex' },
             '& [data-role~="rte-primary"] [data-testid="rte-btn-full"]': { display: 'none' },
             '& [data-role~="rte-primary"] [data-testid="rte-btn-compact"]': {
               display: 'inline',
-              fontSize: '0.9375rem',
-              lineHeight: 1,
+              fontSize: FONT_SIZE.base,
+              lineHeight: LINE_HEIGHT.tight,
             },
             '& [data-role~="rte-secondary"]': { display: 'none' },
             '&[data-expanded="true"] [data-role~="rte-secondary"]': { display: 'inline-flex' },
@@ -285,30 +287,30 @@ export default function RichTextEditor({
             '&[data-expanded="true"] [data-role~="rte-secondary-narrow"]': { display: 'inline-flex' },
           },
           /* The same one row at any viewport, by the editor's own width: the full set needs
-             ~`RTE_FULL_ROW_PX`; narrower, the secondaries fold behind `⋯` instead of wrapping onto a second row,
+             ~760px (`RTE_FOLD_SECONDARIES`); narrower, the secondaries fold behind `⋯` instead of wrapping onto a second row,
              and narrower still the primaries take their compact glyphs too. */
-          [`@container ${RTE_CONTAINER} (max-width: ${RTE_FULL_ROW_PX - 1}px)`]: {
+          [RTE_FOLD_SECONDARIES]: {
             '& [data-role="rte-more"]': { display: 'inline-flex' },
             '& [data-role~="rte-secondary"]': { display: 'none' },
             '&[data-expanded="true"] [data-role~="rte-secondary"]': { display: 'inline-flex' },
           },
-          [`@container ${RTE_CONTAINER} (max-width: ${RTE_LABELLED_ROW_PX - 1}px)`]: {
+          [RTE_COMPACT_PRIMARIES]: {
             '& [data-role~="rte-primary"] [data-testid="rte-btn-full"]': { display: 'none' },
-            '& [data-role~="rte-primary"] [data-testid="rte-btn-compact"]': { display: 'inline', lineHeight: 1 },
+            '& [data-role~="rte-primary"] [data-testid="rte-btn-compact"]': { display: 'inline', lineHeight: LINE_HEIGHT.tight },
             '& hr': { display: 'none' },
           },
         })}
       >
         <ToolbarButton editor={editor} label="Bold" compact="B" role="rte-primary" aria="Bold" run={e => e.chain().focus().toggleBold().run()} active={pressed.bold} />
         <ToolbarButton editor={editor} label="Italic" compact="I" role="rte-primary" aria="Italic" run={e => e.chain().focus().toggleItalic().run()} active={pressed.italic} />
-        <Divider orientation="vertical" flexItem sx={(theme: Theme) => ({ mx: 0.666, [theme.breakpoints.down(481)]: { display: 'none' } })} />
+        <Divider orientation="vertical" flexItem sx={(theme: Theme) => ({ mx: 0.5, [theme.breakpoints.down(481)]: { display: 'none' } })} />
         <ToolbarButton editor={editor} label="H1" role="rte-secondary" aria="Heading 1" run={e => e.chain().focus().toggleHeading({ level: 1 }).run()} active={pressed.h1} />
         <ToolbarButton editor={editor} label="H2" compact="H2" role="rte-primary" aria="Heading 2" run={e => e.chain().focus().toggleHeading({ level: 2 }).run()} active={pressed.h2} />
-        <Divider orientation="vertical" flexItem sx={(theme: Theme) => ({ mx: 0.666, [theme.breakpoints.down(481)]: { display: 'none' } })} />
+        <Divider orientation="vertical" flexItem sx={(theme: Theme) => ({ mx: 0.5, [theme.breakpoints.down(481)]: { display: 'none' } })} />
         <ToolbarButton editor={editor} label="• List" compact="•" role="rte-primary" aria="Bullet list" run={e => e.chain().focus().toggleBulletList().run()} active={pressed.bulletList} />
         <ToolbarButton editor={editor} label="1. List" role="rte-secondary" aria="Numbered list" run={e => e.chain().focus().toggleOrderedList().run()} active={pressed.orderedList} />
         <ToolbarButton editor={editor} label="☑ Checklist" compact="☑" role="rte-primary" aria="Checklist" run={e => e.chain().focus().toggleTaskList().run()} active={pressed.taskList} />
-        <Divider orientation="vertical" flexItem sx={(theme: Theme) => ({ mx: 0.666, [theme.breakpoints.down(481)]: { display: 'none' } })} />
+        <Divider orientation="vertical" flexItem sx={(theme: Theme) => ({ mx: 0.5, [theme.breakpoints.down(481)]: { display: 'none' } })} />
         <ToolbarButton editor={editor} label="❝" role="rte-secondary" aria="Quote" run={e => e.chain().focus().toggleBlockquote().run()} active={pressed.blockquote} />
         <ToolbarButton editor={editor} label="Code" role="rte-secondary" aria="Inline code" run={e => e.chain().focus().toggleCode().run()} active={pressed.code} />
         <ToolbarButton editor={editor} label="{ }" role="rte-secondary" aria="Code block" run={e => e.chain().focus().toggleCodeBlock().run()} active={pressed.codeBlock} />
@@ -361,7 +363,7 @@ export default function RichTextEditor({
             ...toolbarBtnSx(theme),
             // Shown ≤480px or in a narrow editor (the toolbar's container rule); the 44px floor is repeated because a breakpoint key can be assigned only once.
             display: 'none',
-            [theme.breakpoints.down(481)]: { minWidth: 44, minHeight: 44, display: 'inline-flex' },
+            [theme.breakpoints.down(481)]: { minWidth: SIZE.tapTarget, minHeight: SIZE.tapTarget, display: 'inline-flex' },
           })}
         >
           <MoreHorizIcon />
@@ -385,7 +387,7 @@ export default function RichTextEditor({
   )
 }
 
-export function copyFailedMessage(count: number): string {
+function copyFailedMessage(count: number): string {
   return count === 1
     ? 'Image not copied — no access, or deleted.'
     : `${count} images not copied — no access, or deleted.`

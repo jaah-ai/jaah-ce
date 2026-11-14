@@ -29,8 +29,7 @@ def timestamp_column(
     *, nullable: bool = False, server_now: bool | None = None, onupdate: bool = False, index: bool = False
 ) -> Mapped[datetime]:
     """One timezone-aware timestamp column: the single spelling of every `*_at` in the tree (`app/models/`
-    and the feature model modules that import it) but one — `AdminUser._legacy_email_verified_at` names its
-    database column explicitly, which this helper does not take.
+    and the feature model modules that import it).
 
     `server_now` stamps the row at insert with the database's `now()`; it defaults to the column's
     nullability — a NOT NULL stamp is taken at insert, a nullable one is "not yet" until a writer sets it —
@@ -120,8 +119,8 @@ def org_unique(table: str) -> UniqueConstraint:
     """`UNIQUE(id, org_id)` — what a composite foreign key `(parent_id, org_id)` must target.
 
     Required even though redundant with the PK. Declared on every `Stored` class;
-    `app/tenancy/keys.py::same_org_keys` refuses a parent without it. Built CONCURRENTLY first against a live CP
-    (`app/tenancy/contraction.py::apply_unique_constraint`)."""
+    `app/tenancy/keys.py::same_org_keys` refuses a parent without it. Built CONCURRENTLY first against a live CP,
+    then attached `USING INDEX`."""
     return UniqueConstraint("id", "org_id", name=f"uq_{table}_id_org_id")
 
 

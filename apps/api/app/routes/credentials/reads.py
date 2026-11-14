@@ -11,14 +11,18 @@ from sqlalchemy import Select, and_, case, func, literal, literal_column, or_, s
 from sqlalchemy.orm import Session
 
 from app.actors import actor_names as resolve_actor_names
+from starlette.concurrency import run_in_threadpool
+
 from app.auth import require_user
 from app.authz.declarations import feature
-from app.authz.principal import Principal, current_principal
-from app.db import get_session
-from app.credentials.registry import CREDENTIAL_TYPES
-from app import credential_consumers, credential_keys, nodevault_policy
+from app.authz.principal import AsyncCaller, Principal, current_caller
+from app.db_async import DbDep, on_session
+from app.credentials.registry import CREDENTIAL_TYPES, CredentialTypeSpec
+from app import credential_consumers, credential_keys, mcp_links, nodevault_policy
 from app.credential_keys import WRAP_ALGORITHM
 from app.credentials.testers import NODEVAULT_UNTESTABLE
+from app.entity_shape import from_row
+from app.integrations import catalog
 from app.models.credentials import (
     Credential,
     NV_KEY_CURRENT,
@@ -29,7 +33,7 @@ from app.models.orgs import Org
 from app.tenancy.labels import org_refs
 from app.tenancy.seam import bound_org
 from app.routes.credentials.guards import _VIEW_KEY, _may_edit, _org_of, _scoped_row_or_404
-from app.list_page import like_pattern
+from app.list_page import PageQuery, like_pattern, sql_page
 from app.routes.credentials import roster
 from app.routes.credentials.roster import (
     ROSTER_OWNER,
@@ -56,9 +60,11 @@ from app.routes.credentials.credential_wire import (
     _actor_names,
     _connect_out,
     _credential_out,
+    _with_owner_id,
     _home_labels,
     _host_field_key,
     _untestable_reason_out,
+    connect_fills,
 )
 
 
@@ -82,18 +88,12 @@ _ROSTER_ORDER: dict[str, tuple[Any, ...]] = {
 }
 
 
-def _ordered(page_select: Select, sort: str) -> Select:
-    """`page_select` in `sort`'s order; only `org` needs a join (it reads `orgs.name`)."""
-    if sort == "org":
-        page_select = page_select.outerjoin(Org, Org.id == Credential.org_id)
-    return page_select.order_by(*_ROSTER_ORDER[sort])
-
-
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.get("/api/credentials", response_model=CredentialListOut)
 @feature("credentials", "view", own_credential=True)
-def list_credentials(
+async def list_credentials(
+    db: DbDep,
     page: int = Query(default=1, ge=1, le=_PAGE_MAX),
     per: int = Query(default=25, ge=1, le=200),
     # `type_` avoids shadowing the builtin. `q` is bounded (an unbounded `LIKE '%…%'`); pydantic constraints are
@@ -120,12 +120,10 @@ def list_credentials(
     # the first page. Neither: the OFFSET path with its exact `total`, for `page`-based callers.
     paging: Optional[Literal["keyset"]] = Query(default=None),
     cursor: Optional[str] = Query(default=None, max_length=2048),
-    _user: AdminUser = Depends(require_user),
     # No `require_superadmin`: the gate is `credentials:view` plus the scoped select, and
     # `own_credential=True` admits a keyless session, which `roster_scope` narrows to rows it brought.
     # Scoping reads this frozen principal.
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CredentialListOut:
     """One page of the roster in `sort`'s order (newest first by default), plus its `total`.
 
@@ -135,6 +133,31 @@ def list_credentials(
     `(page - 1) * per` could overflow int8.
 
     Every filter is `roster.roster_where`'s, applied to the page and the `total` alike."""
+    return await db.run_sync(
+        _list_credentials, principal=caller.principal, page=page, per=per, type_=type_, q=q, secrets=secrets, mine=mine,
+        owner_id=owner_id, created_by_id=created_by_id, org_id=org_id, health=health, sort=sort, paging=paging,
+        cursor=cursor,
+    )
+
+
+def _list_credentials(
+    session: Session,
+    *,
+    principal: Principal | None,
+    page: int,
+    per: int,
+    type_: Optional[str],
+    q: Optional[str],
+    secrets: Optional[RosterSecrets],
+    mine: bool,
+    owner_id: list[UUID],
+    created_by_id: Optional[UUID],
+    org_id: Optional[str],
+    health: Optional[RosterHealth],
+    sort: RosterSort,
+    paging: Optional[Literal["keyset"]],
+    cursor: Optional[str],
+) -> CredentialListOut:
     if (cursor is not None or paging == "keyset") and page != 1:
         raise HTTPException(status_code=422, detail="cursor and page cannot be combined")
     filters = roster_filters_from_query(
@@ -149,10 +172,13 @@ def list_credentials(
         rows, next_cursor = keyset_page(session, where, filters, sort, per, cursor)
         total, total_capped = capped_count(session, where)
     else:
-        total = session.scalar(select(func.count()).select_from(Credential).where(*where)) or 0
-        rows = session.scalars(
-            _ordered(select(Credential).where(*where), sort).offset((page - 1) * per).limit(per)
-        ).all()
+        stmt = select(Credential).where(*where)
+        if sort == "org":  # Only `org` needs a join (it reads `orgs.name`).
+            stmt = stmt.outerjoin(Org, Org.id == Credential.org_id)
+        *lead, tie = _ROSTER_ORDER[sort]
+        rows, total = sql_page(
+            session, stmt, PageQuery(page=page, per=per, sort=None, dir="asc"), sorts={}, default=lead, tie=tie,
+        )
     # One query for all actor names on the page, never per row.
     actors = _actor_names(session, rows)
     # One query for all org labels (`app/tenancy/labels.py::org_refs`); unknown ids are simply absent.
@@ -178,13 +204,14 @@ def list_credentials(
 # PUBLIC; the private half never leaves KMS (or the local provider), so serving it is not a disclosure.
 @router.get("/api/credentials/seal-key", response_model=SealKeyOut)
 @feature("credentials", "view", own_credential=True)
-def get_credential_seal_key(user: AdminUser = Depends(require_user)) -> SealKeyOut:
+async def get_credential_seal_key(user: AdminUser = Depends(require_user)) -> SealKeyOut:
     """The deployment's secret-wrapping public key (`app/credential_keys.py`), base64 SPKI DER, plus the
     key id every envelope stamps. Cached in-process after the first `GetPublicKey`; a 503 (never a 500
     with a body) when KMS cannot be reached, so the form withholds Save rather than posting plaintext."""
     provider = credential_keys.provider()
     try:
-        spki = provider.public_key_der()
+        # KMS `GetPublicKey` on first use: off the loop.
+        spki = await run_in_threadpool(provider.public_key_der)
     except Exception as exc:  # noqa: BLE001 - the class name is the whole diagnosis wanted here
         # `KmsError`/`KmsUnreachableError` (transport class name only) or a local-key defect. Nothing of
         # a key reaches the message.
@@ -202,7 +229,7 @@ def get_credential_seal_key(user: AdminUser = Depends(require_user)) -> SealKeyO
 # Same ordering rule for `/types`.
 @router.get("/api/credentials/types", response_model=list[CredentialTypeOut])
 @feature("credentials", "view", own_credential=True)
-def list_credential_types(
+async def list_credential_types(
     user: AdminUser = Depends(require_user),
     # Relaxed from `require_superadmin`: serves the in-process catalog, needed by the roster
     # and by a keyless user bringing their own credential. Narrowed by the caller's plane, hence `user`.
@@ -213,23 +240,42 @@ def list_credential_types(
 
     Every org is served every type: no credential type is operator-only, so a row of any type can be
     created and edited wherever its org may hold credentials. An edition omits the types of a feature it lacks (`credential_wire.in_edition`)."""
-    return [
-        CredentialTypeOut(
-            slug=spec.slug,
-            label=spec.label,
-            testable=spec.testable,
-            host_field=_host_field_key(spec),
-            default_base_url=spec.default_base_url,
-            untestable_reason=_untestable_reason_out(
-                spec, connect_served=_connect_out(spec.slug) is not None
-            ),
-            oauth_connect=_connect_out(spec.slug),
-            require_one_of=[list(group) for group in spec.require_one_of],
-            fields=[FieldSpecOut.model_validate(field) for field in spec.fields],
-        )
-        for spec in CREDENTIAL_TYPES.values()
-        if in_edition(spec.slug)
-    ]
+    # Off the loop: `_connect_out` reads operator settings, whose cache miss opens its own sync session.
+    return await run_in_threadpool(_list_credential_types)
+
+
+def _list_credential_types() -> list[CredentialTypeOut]:
+    vendors = _vendor_by_type()
+    return [_type_out(spec, vendors.get(spec.slug)) for spec in CREDENTIAL_TYPES.values() if in_edition(spec.slug)]
+
+
+def _vendor_by_type() -> dict[str, catalog.IntegrationSpec]:
+    """Each credential type's catalog vendor: the first listed spec saving rows as that type (an adopting spec too)."""
+    out: dict[str, catalog.IntegrationSpec] = {}
+    for vendor in catalog.listed():
+        out.setdefault(vendor.credential_type, vendor)
+    return out
+
+
+def _type_out(spec: CredentialTypeSpec, vendor: Optional[catalog.IntegrationSpec] = None) -> CredentialTypeOut:
+    """One registry type on the wire. A field Connect fills is flagged only where the type is served a Connect."""
+    connect = _connect_out(spec.slug)
+    return from_row(
+        CredentialTypeOut, spec,
+        integration=vendor.slug if vendor is not None else None,
+        logo_url=f"/api/integrations/logos/{vendor.slug}.svg" if vendor is not None and vendor.logo_svg else None,
+        mcp=mcp_links.is_mcp_type(spec.slug),
+        host_field=_host_field_key(spec),
+        untestable_reason=_untestable_reason_out(spec, connect_served=connect is not None),
+        oauth_connect=connect,
+        require_one_of=[list(group) for group in spec.require_one_of],
+        fields=[
+            FieldSpecOut.model_validate(field).model_copy(
+                update={"connect_filled": connect_fills(field.key, connect)}
+            )
+            for field in spec.fields
+        ],
+    )
 
 
 # ── The two filter rosters ────────────────────────────────────────────────────
@@ -244,7 +290,7 @@ class CredentialOwnerOut(BaseModel):
     `id` is the filter value for `?owner_id=`; this is the only place a client can get an owner's
     actor id (list rows carry names). `credential_count` counts the caller's unfiltered roster, not the
     current page, so an option is never removed by the filter that hid it (as `routes/tasks.py::
-    task_creators`). On the search path it is capped at `roster.ROSTER_COUNT_CAP`, and `count_capped` says so
+    task_assignees`). On the search path it is capped at `roster.ROSTER_COUNT_CAP`, and `count_capped` says so
     (the full list's counts are exact, `count_capped` always false)."""
 
     id: UUID
@@ -322,20 +368,20 @@ def owner_counts_statement(principal: Principal | None, ids: list[UUID], cap: in
 
 @router.get("/api/credentials/owners", response_model=list[CredentialOwnerOut])
 @feature("credentials", "view")
+@on_session
 def list_credential_owners(
+    session: Session,
     # `q` is bounded like the roster's (an unbounded `LIKE '%…%'`); NUL is a 422 (`roster_filters_from_query`).
     q: Optional[str] = Query(default=None, max_length=_NAME_MAX_LEN),
     limit: Optional[int] = Query(default=None, ge=1, le=_OWNER_SEARCH_MAX),
     # A stored selection's owners, resolved to names; repeatable.
     ids: list[UUID] = Query(default=[]),
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> list[CredentialOwnerOut]:
     """Who owns the credentials this caller can see, with each one's count — the Owner filter's options.
 
     "Who owns a credential I can reach", not "on this page". No zero-count self entry (unlike
-    `routes/tasks.py::task_creators`): `?mine=true` covers that.
+    `routes/tasks/listing.py::task_assignees`): `?mine=true` covers that.
 
     No parameters: every owner, ordered by count DESC then name, never by recency, so the visible entries do not
     reshuffle. Any of `q`, `ids`, `limit`: the search path (`owner_search_statement`) — at most `limit` owners
@@ -347,18 +393,18 @@ def list_credential_owners(
     module's own idiom, which also keeps `config` out of the statement.
     `test_the_owner_roster_aggregate_is_reached_by_the_read_seam` holds the read seam's coverage.
     """
-    count_clause = roster_scope(principal, mine=False)
+    count_clause = roster_scope(caller.principal, mine=False)
     needle = roster_filters_from_query(q=q).q
     if len(ids) > _OWNER_SEARCH_MAX:
         raise HTTPException(status_code=422, detail=f"ids takes at most {_OWNER_SEARCH_MAX} values")
     if needle is not None or ids or limit is not None:
         if limit is None:
             limit = len(ids) if ids and needle is None else _OWNER_SEARCH_DEFAULT
-        found = list(session.scalars(owner_search_statement(principal, needle, ids, limit)).all())
+        found = list(session.scalars(owner_search_statement(caller.principal, needle, ids, limit)).all())
         if not found:
             return []
         cap = roster.ROSTER_COUNT_CAP
-        counts = dict(session.execute(owner_counts_statement(principal, found, cap)).all())
+        counts = dict(session.execute(owner_counts_statement(caller.principal, found, cap)).all())
         labels = resolve_actor_names(session, found)
         return [
             CredentialOwnerOut(
@@ -412,10 +458,8 @@ class NodeVaultEligibilityOut(BaseModel):
 # Declared before `/api/credentials/{credential_id}`: a literal segment must win over the UUID parameter.
 @router.get("/api/credentials/nodevault-state", response_model=NodeVaultStateOut)
 @feature("credentials", "view", own_credential=True)
-def get_nodevault_state(
-    _user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
-) -> NodeVaultStateOut:
+@on_session
+def get_nodevault_state(session: Session, _user: AdminUser = Depends(require_user)) -> NodeVaultStateOut:
     """The caller's org's NodeVault state, its current key hash, and which types may be NodeVault. An
     operator's read binds the fleet plane (no bound org), so their own org answers."""
     org = _org_of(session, bound_org() or _user.org_id)
@@ -443,35 +487,35 @@ def get_nodevault_state(
 
 @router.get("/api/credentials/{credential_id}/nodevault-eligibility", response_model=NodeVaultEligibilityOut)
 @feature("credentials", "view", own_credential=True)
+@on_session
 def get_nodevault_eligibility(
+    session: Session,
     credential_id: UUID,
-    _user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> NodeVaultEligibilityOut:
     """Whether this credential may be NodeVault: its type is eligible AND no control-plane consumer opens it
     (D1/D7). `consumers` names them either way, so the form can say what to unhook."""
-    row = _scoped_row_or_404(session, principal, credential_id, _VIEW_KEY)
+    row = _scoped_row_or_404(session, caller.principal, credential_id, _VIEW_KEY)
     reason, consumers = credential_consumers.eligibility(session, row)
     return NodeVaultEligibilityOut(eligible=reason is None, reason=reason, consumers=consumers)
 
 
 @router.get("/api/credentials/{credential_id}", response_model=CredentialOut)
 @feature("credentials", "view", own_credential=True)
+@on_session
 def get_credential(
+    session: Session,
     credential_id: UUID,
-    _user: AdminUser = Depends(require_user),
     # Relaxed from `require_superadmin`; `own_credential=True` narrows keyless callers to
     # rows they brought.
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CredentialOut:
     # Scoped (D13) with the route's own key, like every write (`_scoped_row_or_404`).
-    row = _scoped_row_or_404(session, principal, credential_id, _VIEW_KEY)
-    return _credential_out(
+    row = _scoped_row_or_404(session, caller.principal, credential_id, _VIEW_KEY)
+    return _with_owner_id(_credential_out(
         row,
         actor_names=_actor_names(session, [row]),
         org_labels=org_refs(session, [row.org_id]),
         home_labels=_home_labels(session, [row]),
-        editable=_may_edit(principal, row),
-    )
+        editable=_may_edit(caller.principal, row),
+    ), row)

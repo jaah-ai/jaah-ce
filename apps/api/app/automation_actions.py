@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 
 from app import edition_features
 from app.automations import ACTION_EMAIL, ACTION_NOOP, ACTION_TASK, MODE_SPECIFIC, TARGET_NODES, TARGET_PROJECTS, WHEN_EVENT
-from app.entity_shape import optional_uuid
+from app.entity_shape import optional_uuid, refused_as
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from app.authz.principal import Principal
@@ -157,9 +157,9 @@ def get(action_type: str) -> ActionDescriptor:
     """The descriptor for `action_type`, or a 422 naming the known ones; a type this edition lacks is its 404."""
     _load()
     if action_type in _REGISTRY and not _in_edition(action_type):
-        from app.ce_caps import NOT_IN_CE
+        from app import ce_caps
 
-        raise HTTPException(status_code=404, detail=NOT_IN_CE)
+        raise ce_caps.not_in_edition()
     descriptor = _REGISTRY.get(action_type)
     if descriptor is None:
         raise HTTPException(
@@ -205,10 +205,8 @@ def _activity_params_validator(activity: "ActivityDescriptor") -> Callable[..., 
     def validate(_session: Session, _draft: AutomationDraft, params: dict[str, Any]) -> dict[str, Any]:
         from app import cron_activities
 
-        try:
+        with refused_as(422, cron_activities.ParamsError, chain=True, prefix="action.params: "):
             return cron_activities.validate_params(activity, params)
-        except cron_activities.ParamsError as exc:
-            raise HTTPException(status_code=422, detail=f"action.params: {exc}") from exc
 
     return validate
 
@@ -227,6 +225,8 @@ TASK_PARAM_DEFAULTS: dict[str, Any] = {
     "body": "",
     # A template the task is filed from instead of `body` (exactly one of the two): resolved live at each fire.
     "template_id": None,
+    # The template's input placeholders' values, by label (`task_templates.fill_inputs`), filled at each fire.
+    "template_inputs": {},
     "title_template": None,
     "model": None,
     "bound_provider": None,
@@ -235,10 +235,18 @@ TASK_PARAM_DEFAULTS: dict[str, Any] = {
     "priority": None,
     "playbook_id": None,
     "transition_mode": None,
+    # An epic's throttle (`models.Task.max_running`): at most this many subtasks run at once. None: no limit.
+    "max_running": None,
     "assignee_id": None,
+    # "Run as": whose git login and coding-agent account the filed task uses. None: the project's "Run jobs as", else
+    # the org's (`git_access.project_forge_person`, resolved per target at each fire).
+    "run_as_id": None,
     "attachment_ids": [],
     "feature_id": None,
     "hidden": False,
+    # Tells the task's assignee when it ships (`models.Task.notify_when_done`). None (never set) leaves the filing
+    # default, ON only for an incident-class trigger's task (`app/task_done_notice.py::default_for`); a bool wins.
+    "notify_when_done": None,
     # False files the task as a `draft` an operator starts by hand; it is never dispatched until then.
     "start": True,
 }
@@ -249,11 +257,16 @@ _REFUSED_TASK_FIELDS: dict[str, str] = {
     "depends_on": "Dependencies are not offered on an automation's Task action",
     "external_task_system": "a Jira link is not offered on an automation's Task action",
     "external_task_id": "a Jira link is not offered on an automation's Task action",
+    "tracker_issue": "an issue link is not offered on an automation's Task action",
 }
 
 # The longest body a Task action stores (the Runner's instructions cap; triggers' template cap is the same).
 MAX_TASK_BODY_CHARS = 20_000
 MAX_TITLE_TEMPLATE_CHARS = 500
+
+
+#: A Task action with neither a body nor a template: a person's sentence, shown as is by the console.
+TASK_SOURCE_MISSING = "Add a description or pick a template."
 
 
 def _refuse(field_name: str, message: str) -> None:
@@ -270,6 +283,7 @@ def task_params(params: Optional[dict[str, Any]]) -> dict[str, Any]:
 
 def _task_validate(session: Session, draft: AutomationDraft, params: dict[str, Any]) -> dict[str, Any]:
     """Normalise and check a Task action's params; the field checks are task create's own."""
+    from app.models.tasks import MAX_RUNNING_CEILING
     from app.routes.tasks.policy import PERSONA_EPIC
     from app.routes.tasks.create import TaskCreateSpec, _provider_on_plan_or_422, validate_task_spec
 
@@ -288,16 +302,18 @@ def _task_validate(session: Session, draft: AutomationDraft, params: dict[str, A
         _refuse("body", "is required")
     template = _template_or_refuse(session, draft, out["template_id"], has_body=bool(body.strip()))
     if template is None and not body.strip():
-        _refuse("body", "is required, or a template_id")
+        _refuse("body", TASK_SOURCE_MISSING)
     if len(body) > MAX_TASK_BODY_CHARS:
         _refuse("body", f"is {len(body)} characters; the limit is {MAX_TASK_BODY_CHARS}")
     out["body"] = body
     out["template_id"] = str(template.id) if template is not None else None
+    out["template_inputs"] = _template_inputs_or_refuse(template, out["template_inputs"])
     for flag in ("autonomous", "hidden", "start"):
         if not isinstance(out[flag], bool):
             _refuse(flag, "must be true or false")
-    if out["project_memory"] is not None and not isinstance(out["project_memory"], bool):
-        _refuse("project_memory", "must be true, false or null")
+    for flag in ("project_memory", "notify_when_done"):
+        if out[flag] is not None and not isinstance(out[flag], bool):
+            _refuse(flag, "must be true, false or null")
 
     title = out["title_template"]
     if title is not None:
@@ -313,6 +329,12 @@ def _task_validate(session: Session, draft: AutomationDraft, params: dict[str, A
     persona = template.persona if template is not None else out["persona"]
     if out["transition_mode"] is not None and persona != PERSONA_EPIC:
         _refuse("transition_mode", "applies to an epic only")
+    throttle = out["max_running"]
+    if throttle is not None:
+        if isinstance(throttle, bool) or not isinstance(throttle, int) or not 1 <= throttle <= MAX_RUNNING_CEILING:
+            _refuse("max_running", f"must be a whole number from 1 to {MAX_RUNNING_CEILING}, or null")
+        if persona != PERSONA_EPIC:
+            _refuse("max_running", "applies to an epic only")
 
     # The task-create validator, so the persona set, the model and provider pins and their authorization are the
     # create route's own. Only keys actually sent are "provided", as on the create route. A template's model pin is
@@ -327,10 +349,8 @@ def _task_validate(session: Session, draft: AutomationDraft, params: dict[str, A
     for name in ("bound_provider",) if template is not None else ("model", "bound_provider"):
         if params.get(name) not in (None, ""):
             spec_fields[name] = params[name]
-    try:
+    with refused_as(422, ValueError, chain=True, prefix="action.params: "):
         spec = TaskCreateSpec(**spec_fields)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=f"action.params: {exc}") from exc
     pins = validate_task_spec(spec, draft.principal)
     out["model"], out["bound_provider"] = pins.model, pins.provider
     # A pin with no cell on the org's provider grid is refused here, as on task create; firing re-checks it.
@@ -339,13 +359,12 @@ def _task_validate(session: Session, draft: AutomationDraft, params: dict[str, A
     if spec.playbook_id is not None:
         from app import playbook_engine
 
-        try:
+        with refused_as(422, playbook_engine.PlaybookNotRunnable, chain=True, prefix="action.params.playbook_id: "):
             playbook_engine.load(session, draft.org_id, spec.playbook_id)
-        except playbook_engine.PlaybookNotRunnable as exc:
-            raise HTTPException(status_code=422, detail=f"action.params.playbook_id: {exc}") from exc
         out["playbook_id"] = str(spec.playbook_id)
 
     out["assignee_id"] = _assignee_or_refuse(session, draft, out["assignee_id"])
+    out["run_as_id"] = _run_as_or_refuse(session, draft, out["run_as_id"])
     out["attachment_ids"] = _attachments_or_refuse(session, draft, out["attachment_ids"])
     out["feature_id"] = _feature_or_refuse(session, draft, out["feature_id"])
     return out
@@ -367,6 +386,26 @@ def _template_or_refuse(session: Session, draft: AutomationDraft, value: Any, *,
     return template
 
 
+def _template_inputs_or_refuse(template: Optional[Any], value: Any) -> dict[str, str]:
+    """A value per input of the template's CURRENT body, every required one non-blank; a label the body no longer
+    has is dropped. None without a template. The template is a live reference: an input added later fails the fire
+    (`automation_fire.REASON_TEMPLATE_INPUT_MISSING`) until the action is saved with it."""
+    from app import task_templates
+
+    if not isinstance(value, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in value.items()):
+        _refuse("template_inputs", "must be an object of text values")
+    if template is None:
+        return {}
+    inputs = task_templates.inputs_of(template.body)
+    given = {" ".join(k.split()): v.strip() for k, v in value.items()}
+    for item in inputs:
+        if item.required and not given.get(item.label):
+            _refuse("template_inputs", f"{item.label!r} is required")
+        if len(given.get(item.label, "")) > task_templates.MAX_INPUT_CHARS:
+            _refuse("template_inputs", f"{item.label!r} is over {task_templates.MAX_INPUT_CHARS} characters")
+    return {item.label: given[item.label] for item in inputs if given.get(item.label)}
+
+
 def _assignee_or_refuse(session: Session, draft: AutomationDraft, value: Any) -> Optional[str]:
     """Optional (O3). At save it must be a real, non-system user of the automation's org; whether they reach each
     target is asked per target at fire time (an unreachable target files unassigned)."""
@@ -381,6 +420,26 @@ def _assignee_or_refuse(session: Session, draft: AutomationDraft, value: Any) ->
     if user is None or user.is_system:
         _refuse("assignee_id", "must name a real user of this automation's organization")
     return str(user_id)
+
+
+def _run_as_or_refuse(session: Session, draft: AutomationDraft, value: Any) -> Optional[str]:
+    """Optional. A real, enabled member of the automation's org (`git_access.usable_job_person`); anyone who may edit
+    the automation may name any member. One who later leaves falls through to the project/org default at fire, and
+    an edit that leaves the stored person unchanged is not refused for it."""
+    from app.git_access import usable_job_person
+    from app.models.automations import Automation
+
+    if value in (None, ""):
+        return None
+    user_id = optional_uuid(value)
+    if usable_job_person(session, user_id, draft.org_id):
+        return str(user_id)
+    if user_id is not None and draft.automation_id is not None:
+        stored = session.scalar(select(Automation.action_params).where(Automation.id == draft.automation_id))
+        if (stored or {}).get("run_as_id") == str(user_id):
+            return str(user_id)
+    _refuse("run_as_id", "must name a real, enabled user of this automation's organization")
+    return None
 
 
 def _attachments_or_refuse(session: Session, draft: AutomationDraft, value: Any) -> list[int]:
@@ -406,8 +465,7 @@ def _attachments_or_refuse(session: Session, draft: AutomationDraft, value: Any)
 
 def _feature_or_refuse(session: Session, draft: AutomationDraft, value: Any) -> Optional[str]:
     """A feature is offered only when the target is exactly one specific project, and must be an open feature of
-    it (the create route's rule: a shipped feature is closed for filing)."""
-    from app.features import FEATURE_SHIPPED
+    it (the create route's rule: a deleted feature is closed for filing)."""
     from app.models.projects import Feature
 
     if value in (None, ""):
@@ -419,10 +477,8 @@ def _feature_or_refuse(session: Session, draft: AutomationDraft, value: Any) -> 
     if feature_id is None:
         _refuse("feature_id", "must be a feature id")
     feature = session.scalar(select(Feature).where(Feature.id == feature_id))
-    if feature is None or feature.project_id != target.ids[0]:
+    if feature is None or feature.deleted_at is not None or feature.project_id != target.ids[0]:
         _refuse("feature_id", f"feature {feature_id} is not a feature of the target project")
-    if feature.status == FEATURE_SHIPPED:
-        _refuse("feature_id", "this feature is shipped, so it is closed for filing")
     return str(feature_id)
 
 
@@ -461,7 +517,7 @@ def _email_fire(ctx: Any, target: Any) -> Any:
     return automation_email.fire(ctx, target)
 
 
-EMAIL_ACTION = register(ActionDescriptor(
+register(ActionDescriptor(
     type=ACTION_EMAIL,
     label="Send email",
     description="Sends an email from the org's connected Gmail each time it runs.",
@@ -474,7 +530,7 @@ EMAIL_ACTION = register(ActionDescriptor(
     event_capable=True,
 ))
 
-NOOP_ACTION = register(ActionDescriptor(
+register(ActionDescriptor(
     type=ACTION_NOOP,
     label="No-op probe",
     description="Records a run and does nothing else.",

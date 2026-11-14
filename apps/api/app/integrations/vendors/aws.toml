@@ -1,0 +1,46 @@
+# AWS API, over the hand-written `aws` type (adopted, AS3: its fields and Test, STS GetCallerIdentity, are unchanged).
+# Facts confirmed at the vendor's own docs: access keys
+# https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html ; GetCallerIdentity (needs no
+# permission) https://docs.aws.amazon.com/STS/latest/APIReference/API_GetCallerIdentity.html
+slug = "aws"
+label = "AWS"
+category = "cloud"
+credential_type = "aws"
+vendor_docs_url = "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html"
+summary = "Call AWS APIs (S3, Lambda, CloudWatch and more) with an IAM access key."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "access_key_id", label = "Access key ID", kind = "text", required = true, placeholder = "AKIA...", help = "AWS console > IAM > Users > the user agents act as > Security credentials > Access keys > Create access key: choose Application running outside AWS, then copy the Access key ID" },
+  { key = "secret_access_key", label = "Secret access key", kind = "secret", required = true, help = "Shown once, on the same Retrieve access keys screen as the Access key ID: copy it before closing, or create a new key" },
+  { key = "session_token", label = "Session token", kind = "secret", required = false, help = "Only for temporary credentials (an assumed role or aws sts get-session-token, keys starting ASIA); leave blank for an IAM user's long-term key" },
+  { key = "region", label = "Region", kind = "text", required = false, placeholder = "us-east-1", help = "The region agents should start from, such as us-east-1 or eu-west-1: the code at the top right of the AWS console" },
+]
+
+[docs]
+agent_uses = [
+  "Read and write objects in the S3 buckets a task names",
+  "Read CloudWatch logs and metrics to investigate an incident",
+  "Invoke a Lambda function or inspect resources with the AWS CLI or SDK",
+  "Anything else the IAM user's policies allow, through the AWS CLI or an SDK in the agent's session",
+]
+prerequisites = [
+  "An AWS account and permission to create an IAM user and access key (IAM > Users)",
+  "An IAM user for Jaah with only the policies agents need. Do not use the root user's keys",
+]
+limitations = [
+  "AWS has no sign-in button for apps like Jaah: you connect with an access key",
+  "Agents get exactly the IAM user's permissions: scope its policies to the buckets, functions and logs tasks need",
+  "Temporary (session) credentials expire, usually within 1 to 12 hours; replace them or use a long-term key for a lasting connection",
+]
+troubleshooting = [
+  { symptom = "Test says AWS rejected the request (403, InvalidClientTokenId or SignatureDoesNotMatch)", fix = "The access key ID or secret is wrong, deactivated or deleted. Create a new access key in IAM and select Replace" },
+  { symptom = "Test says the request is time-skewed", fix = "The Jaah server's clock is wrong, not your key. Tell your Jaah operator" },
+  { symptom = "Test passes but agents get AccessDenied", fix = "The IAM user lacks a policy for that action. Attach a policy that allows it in IAM > Users > Permissions" },
+  { symptom = "A temporary credential stops working after a few hours", fix = "Its session expired. Paste a fresh key, ID and session token, or use an IAM user's long-term key" },
+]
+faq = [
+  { q = "Does the test need any IAM permission", a = "No. Jaah calls STS GetCallerIdentity, which every valid key may call, and shows the account and ARN it answered for" },
+  { q = "Is this the same secret Jaah uses to launch cloud nodes", a = "It is the same kind of secret. A separate secret per use keeps permissions tight" },
+]

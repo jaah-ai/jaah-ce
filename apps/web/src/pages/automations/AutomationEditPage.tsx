@@ -1,5 +1,6 @@
-import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { useQueryClient } from '@tanstack/react-query'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Typography from '@mui/material/Typography'
@@ -9,24 +10,29 @@ import { useChangeOrgAction } from '../../components/ChangeOrgDialog'
 import { TabPanel, Tabs, type TabDef } from '../../components/Tabs'
 import { usePersonaRegistry } from '../../components/tasks/usePersonaRegistry'
 import { useApiRead } from '../../hooks/useApiRead'
+import { useBaselineDirty } from '../../hooks/useBaselineDirty'
 import { useEditRecord } from '../../hooks/useEditRecord'
-import { useRemountDraft } from '../../hooks/useRemountDraft'
+import { useSubmit } from '../../hooks/useSubmit'
+import { useNestedCreate } from '../../hooks/useNestedCreate'
 import { useSettled } from '../../hooks/useSettled'
 import { useLeaveGuard } from '../../hooks/useLeaveGuard'
 import { useUrlTab } from '../../hooks/useUrlTab'
 import Banner from '../../ui/Banner'
 import { DetailPage, DetailSection } from '../../ui/detail/DetailPage'
-import DetailStatus from '../../ui/detail/DetailStatus'
+import { EditStatus } from '../../ui/detail/DetailStatus'
 import FormActionBar from '../../ui/FormActionBar'
+import FormBox from '../../ui/FormBox'
 import { tapTargetSx } from '../../ui/listStyles'
 import LoadingState from '../../ui/LoadingState'
 import { OPERATOR_PLANE_SLUG, useOrgsByIds } from '../../ui/OrgSelect'
 import { StatusChip } from '../../ui/StatusChip'
 import SubmitButton from '../../ui/SubmitButton'
 import SecretOnceDialog from '../../ui/SecretOnceDialog'
-import { isValidTarget, type TargetKind, type TargetPreview } from '../../ui/TargetSelector'
-import UnsavedChangesDialog from '../../ui/UnsavedChangesDialog'
+import { isValidTarget, type TargetKind, type TargetPreview, type TargetRule } from '../../ui/TargetSelector'
+import { safeReturnPath } from '../../lib/listDetail'
+import { LeaveGuardDialog } from '../../ui/UnsavedChangesDialog'
 import { listActivityTypes, type ActivityType } from '../cron/api'
+import { NEW_ADDRESS_URL, newAddressUrl, ORG_EMAIL_KEY } from '../settings/email/api'
 import { scheduleFields, SCHEDULE_KIND_CRON, type ScheduleDraft } from '../cron/schedule'
 import { DEFAULT_CREATE_RETENTION_MODE } from '../cron/vocabulary'
 import DedupEntries from '../triggers/DedupEntries'
@@ -42,6 +48,7 @@ import {
   pauseAutomation,
   previewTarget,
   releaseAutomation,
+  takeAutomationOwnership,
   resumeAutomation,
   runAutomation,
   RUNS_REREAD_MS,
@@ -53,41 +60,52 @@ import {
   type AutomationRun,
 } from './api'
 import { deleteAutomationConfirm, releaseAutomationConfirm, runNowBlocked, STUCK_PAUSED_HINT } from './AutomationList'
-import AutomationCreateWizard, { type StepBlockers, type WizardPosition } from './AutomationCreateWizard'
-import { automationReviewRows, type AutomationStepId } from './AutomationReview'
+import AutomationCreateWizard, { type AutomationStepId, type StepBlockers, type WizardPosition } from './AutomationCreateWizard'
 import AutomationRuns from './AutomationRuns'
 import { isEnabled } from '../../lib/editionFeatures'
-import { AboutSection, ActionSection, ActionTypePicker, TargetSection, WhenSection, type Draft } from './AutomationSections'
+import { planSurfaceShown } from '../../lib/planSwitches'
 import {
+  AboutSection, ActionSection, ActionTypePicker, OrgField, SettingsSection, TargetSection, WhenSection, type Draft,
+} from './AutomationSections'
+import {
+  ADDRESS_PICK,
   EVENT_TEMPLATE_HINT,
   EventSetupSection,
   EventTestPanel,
   eventDraftOf,
   eventWhenOf,
   newEventDraft,
+  NewAddressContext,
+  recordsOnly,
   readableError,
+  withAddress,
 } from './EventSourceFields'
 import {
-  STATUS_LABELS,
-  STATUS_TONE,
+  PRODUCTION_QA_SOURCE_KINDS,
+  STATUS,
+  WHEN_CHOICE_LABELS,
   WHEN_CHOICES,
   whenChoiceOf,
   type WhenChoice,
 } from './vocabulary'
+import { FONT_WEIGHT, grid } from '../../theme'
+import Tip from '../../ui/Tip'
 
-/* Automation > one automation — `/automations/new` (`mode="create"`, optional `?when=<choice>`) and
+/* One automation — `/automations/new` (`mode="create"`, optional `?when=<choice>`) and
  * `/automations/:id`, one component. ONE EDITOR FOR EVERY KIND, in the order a person thinks it:
  * WHEN (a schedule or an event source) -> TARGET (`ui/TargetSelector`, a live rule) -> ACTION (the action registry's
  * form: the Task action is the console's own task-create form, D7). The parts themselves are
  * `AutomationSections.tsx`; this page owns the draft, its validation and the one save.
  *
- * A NEW AUTOMATION IS A WIZARD (`AutomationCreateWizard.tsx`): the same four parts, one step each, then Review and
- * Create — the validation split per step, the save the same call.
+ * ESSENTIALS FIRST, EVERYTHING ELSE ON SETTINGS. A NEW AUTOMATION IS A THREE-STEP WIZARD (`AutomationCreateWizard.tsx`):
+ * When, What (action, target, its essentials), Name — the name suggested from what was picked. Every other setting
+ * keeps its default.
  *
  * A SAVED AUTOMATION IS TABBED, first-hand work first (`hooks/useUrlTab.ts`, `?tab=`): Setup (an event's
- * setup, then the four parts), Runs, and — for an event only — Advanced (Test, Dedup entries, State document).
- * Every panel stays mounted, so an unsaved edit survives a trip to Runs; Runs and Advanced mount their content
- * the first time they are shown, so Setup paints as fast as the untabbed page did. Save is the PAGE's bar.
+ * endpoint, then the essentials), Settings (everything else: `SettingsSection`), Runs, and — for an event only —
+ * Advanced (Test, Dedup entries, State document). Every panel stays mounted, so an unsaved edit survives a trip to
+ * Runs; Runs and Advanced mount their content the first time they are shown, so Setup paints as fast as the untabbed
+ * page did. Save is the PAGE's bar, one form over Setup and Settings.
  *
  * EVERY PART'S DRAFT IS KEPT across a When change (AC4.2): the schedule draft, the event draft, the target and the
  * action value each live in their own state, and `inputOf` reads only the half the current When needs — so
@@ -103,23 +121,67 @@ const PREVIEW_DEBOUNCE_MS = 300
 
 const AUTOMATION_FORM_ID = 'automation-form'
 
-type AutomationTab = 'setup' | 'runs' | 'advanced'
+type AutomationTab = 'setup' | 'settings' | 'runs' | 'advanced'
 const SETUP_TAB: TabDef<AutomationTab> = { id: 'setup', label: 'Setup' }
+const SETTINGS_TAB: TabDef<AutomationTab> = { id: 'settings', label: 'Settings' }
+/** The action params the Settings tab draws (`ActionEntry.Extras`): a refusal of one opens that tab. */
+const SETTINGS_PARAMS = new Set([
+  'start', 'assignee_id', 'attachment_ids', 'persona', 'bound_provider', 'model', 'priority',
+  'feature_id', 'hidden', 'transition_mode', 'max_running', 'cc', 'run_as_id',
+])
 const RUNS_TAB: TabDef<AutomationTab> = { id: 'runs', label: 'Runs' }
 const ADVANCED_TAB: TabDef<AutomationTab> = { id: 'advanced', label: 'Advanced' }
-/** A schedule has no Test, Dedup entries or State document, so no Advanced tab; a new automation, one part. */
+/** A schedule has no Test, Dedup entries or State document, so no Advanced tab; a new automation is the wizard. */
 function tabsFor(automation: Automation | null): TabDef<AutomationTab>[] {
   if (automation === null) return [SETUP_TAB]
-  return automation.when.kind === 'event' ? [SETUP_TAB, RUNS_TAB, ADVANCED_TAB] : [SETUP_TAB, RUNS_TAB]
+  const base = [SETUP_TAB, SETTINGS_TAB, RUNS_TAB]
+  return automation.when.kind === 'event' ? [...base, ADVANCED_TAB] : base
+}
+
+/** The Name step's suggestion: the action's first line of text (a task's body, an email's subject), else what runs
+ *  when ("Task · Schedule"). */
+export function suggestedName(draft: Draft, actionLabel: string): string {
+  const value = (draft.actionValue ?? {}) as { body?: unknown; subject?: unknown }
+  // An email's subject is its headline; its body is the letter.
+  const order = typeof value.subject === 'string' ? [value.subject, value.body] : [value.body]
+  const text = order.find((v): v is string => typeof v === 'string' && v.trim() !== '') ?? ''
+  // A placeholder is filled per run and an image names nothing; a link keeps its words.
+  const plain = (l: string) => l.replace(/\{\{[^}]*\}\}/g, '').replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/[#*_`>\\[\]]/g, '').replace(/\s+/g, ' ').trim()
+  const line = text.split('\n').map(plain).find(l => l !== '') ?? ''
+  if (line !== '') return line.length > 60 ? `${line.slice(0, 59).trimEnd()}…` : line
+  return `${actionLabel} · ${WHEN_CHOICE_LABELS[draft.when]}`
+}
+
+/** A new automation's preset Target from `?target=projects:12` / `?target=nodes:<uuid>` (a project's or node's
+ *  Automations tab): that one project or node, else none. */
+export function presetTarget(param: string | null): TargetRule | null {
+  const match = /^(projects|nodes):(.+)$/.exec(param ?? '')
+  if (match === null) return null
+  const kind = match[1] as TargetKind
+  if (kind === 'nodes') return { kind, mode: 'specific', ids: [match[2]] }
+  const id = Number(match[2])
+  return Number.isInteger(id) && id > 0 ? { kind, mode: 'specific', ids: [id] } : null
 }
 
 export default function AutomationEditPage({ mode = 'edit' }: { mode?: 'create' | 'edit' }) {
   const { id } = useParams<{ id: string }>()
   const [params] = useSearchParams()
-  const requested = params.get('when')
-  const initialWhen = (WHEN_CHOICES as readonly string[]).includes(requested ?? '') ? (requested as WhenChoice) : 'schedule'
+  const requested = params.get('when') ?? ''
+  const qaShown = planSurfaceShown(useAuth().admin, 'production_qa')
+  const offered = (WHEN_CHOICES as readonly string[]).includes(requested) && (qaShown || !PRODUCTION_QA_SOURCE_KINDS.has(requested))
+  const initialWhen = offered ? (requested as WhenChoice) : 'schedule'
+  const targetParam = mode === 'create' ? params.get('target') : null
+  const initialTarget = useMemo(() => presetTarget(targetParam), [targetParam])
   // Keyed: a create navigates `/automations/new` -> `/automations/:id` on the same element type.
-  return <AutomationEditor key={`${mode}:${id ?? ''}`} id={mode === 'create' ? null : id ?? null} initialWhen={initialWhen} />
+  return (
+    <AutomationEditor
+      key={`${mode}:${id ?? ''}`}
+      id={mode === 'create' ? null : id ?? null}
+      initialWhen={initialWhen}
+      initialTarget={initialTarget}
+    />
+  )
 }
 
 function scheduleDraftOfWhen(automation: Automation): ScheduleDraft | null {
@@ -140,6 +202,17 @@ function whenOf(draft: Draft): AutomationInput['when'] | string {
   }
   return eventWhenOf({ ...draft.event, sourceKind: draft.when })
 }
+
+/** Whether the draft's When only records incidents (`EventSourceFields.tsx::recordsOnly`): no Action, no Run now, and
+ *  its Target is the one project the incidents are recorded in. */
+export const draftRecordsOnly = (draft: Draft) =>
+  draft.when !== 'schedule' && recordsOnly({ ...draft.event, sourceKind: draft.when })
+
+/** A saved automation that only records. */
+const savedRecordsOnly = (row: Automation) => row.when.kind === 'event' && recordsOnly(eventDraftOf(row.when))
+
+/** A record-only Target: exactly one specific project. */
+const isRecordsIntoTarget = (target: TargetRule) => target.kind === 'projects' && target.mode === 'specific' && target.ids.length === 1
 
 /** Why `admin` cannot create in `orgId`, or null. An automation files as its creator, in the org they work in
  *  (`automation_fire._owner_or_reason`; an event's create is refused outright, `routes/triggers.py`), so another
@@ -169,11 +242,15 @@ export function orgNoteFor(admin: Admin | null): (org: { id: string }) => string
   return org => (org.id === working ? null : member.has(org.id) ? 'not your current org' : 'not a member')
 }
 
-/** A new automation's input and wizard step, carried across the remount a resize over the docking width causes
- *  (`hooks/useRemountDraft.ts`): `/automations/new` moves between the list's pane and the full page. */
-type CreateCarry = { draft: Draft; baselineKey: string | null; stagedFiles: File[]; position: WizardPosition | null }
+/** An automation's input, and a new one's wizard step, carried to the New address page and back
+ *  (`hooks/useNestedCreate.ts`; no step on an edit). */
+type CreateCarry = {
+  draft: Draft; baselineKey: string | null; stagedFiles: File[]; position: WizardPosition | null; nameSuggested: boolean
+}
 
-function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen: WhenChoice }) {
+function AutomationEditor({ id, initialWhen, initialTarget }: {
+  id: string | null; initialWhen: WhenChoice; initialTarget: TargetRule | null
+}) {
   const navigate = useNavigate()
   usePersonaRegistry()
   const { admin } = useAuth()
@@ -188,22 +265,44 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
   const catalogue: ActionType[] = useMemo(() => actionTypes.data?.items ?? [], [actionTypes.data])
   const activities: ActivityType[] = useMemo(() => activityCatalogue.data?.activity_types ?? [], [activityCatalogue.data])
 
-  const { restored, keep: keepCarry } = useRemountDraft<CreateCarry>()
-  const carried = id === null ? restored : null
+  /* "Receives at"'s New address… opens that page and comes back here (`hooks/useNestedCreate.ts`). The input it
+     carries is `outbox`, kept current by `carry`, since the baseline it needs is computed further down; the way out
+     is the leave guard's unasked one, which is made further down too (`leaveNow`). */
+  const outbox = useRef<CreateCarry | null>(null)
+  const leaveNowRef = useRef<(path: string) => void>(() => {})
+  const leaveNow = useCallback((path: string) => leaveNowRef.current(path), [])
+  const { openNew, restored: nestedBack, picked } = useNestedCreate(outbox, leaveNow)
+  const queryClient = useQueryClient()
+  const [back] = useState<CreateCarry | null>(() => {
+    const kept = nestedBack?.current ?? null
+    if (kept === null || picked?.pick !== ADDRESS_PICK) return kept
+    // Re-read before "Receives at" reads it, so the new address is listed (never shown as Removed).
+    void queryClient.resetQueries({ queryKey: ORG_EMAIL_KEY })
+    return { ...kept, draft: { ...kept.draft, event: withAddress(kept.draft.event, picked.id) } }
+  })
+  const carried = id === null ? back : null
+  /** A saved automation's carried input, applied over its row once it loads (`onLoad`). */
+  const resume = useRef(id === null ? null : back)
   const [automation, setAutomation] = useState<Automation | null>(null)
   const [draft, setDraft] = useState<Draft | null>(carried?.draft ?? null)
-  const [baselineKey, setBaselineKey] = useState<string | null>(carried?.baselineKey ?? null)
   const [stagedFiles, setStagedFiles] = useState<File[]>(carried?.stagedFiles ?? [])
   /** The wizard's step, reported by it after each of its renders (a step change re-renders only the wizard). */
   const wizardPosition = useRef<WizardPosition | null>(carried?.position ?? null)
+  /** The Name step is offered a name once, the first time it opens empty; a cleared name stays cleared. */
+  const nameSuggested = useRef(carried?.nameSuggested ?? false)
   const carry = (position: WizardPosition | null) => {
     wizardPosition.current = position
-    if (id === null && draft !== null) keepCarry({ draft, baselineKey, stagedFiles, position })
+    if (position?.step === 'name' && draft !== null && draft.name === '' && !nameSuggested.current) {
+      nameSuggested.current = true
+      edit({ name: suggestedName(draft, descriptorOf(draft.actionType)?.label ?? 'Task') })
+    }
+    if (draft !== null) outbox.current = { draft, baselineKey, stagedFiles, position, nameSuggested: nameSuggested.current }
   }
   useEffect(() => carry(wizardPosition.current))
-  const [saving, setSaving] = useState(false)
-  const savingRef = useRef(false)
-  const [saveError, setSaveError] = useState('')
+  /** The action form's shared UI state (`ActionContext.uiState`): forgotten on a reseed and a type change. */
+  const [actionUi, setActionUi] = useState<unknown>(null)
+  // Save's write and its refusal; the verbs on a saved automation share the banner (`setSaveError`).
+  const { busy: saving, formError: saveError, setFormError: setSaveError, run } = useSubmit()
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
   /** The wizard step a refused Create belongs on. */
   const [errorStep, setErrorStep] = useState<AutomationStepId | null>(null)
@@ -218,11 +317,14 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
      (this effect runs after the guard's cleanup in the same commit) and no secret dialog holds it, so the move is
      not taken for leaving. Replace: Back from the new automation must not reopen an emptied wizard. */
   const [createdId, setCreatedId] = useState<string | null>(null)
+  // A create opened from a project's or node's Automations tab keeps its way back there (`?from=`).
+  const returnTo = safeReturnPath(location.search, window.location.origin)
+  const createdFrom = returnTo ? `?from=${encodeURIComponent(returnTo)}` : ''
   useEffect(() => {
     if (createdId !== null && secret === null) {
-      navigate(`/automations/${createdId}`, { replace: true, state: noticeState(carriedNotice) })
+      navigate(`/automations/${createdId}${createdFrom}`, { replace: true, state: noticeState(carriedNotice) })
     }
-  }, [createdId, secret, carriedNotice, navigate])
+  }, [createdId, secret, carriedNotice, navigate, createdFrom])
   const [runsKey, setRunsKey] = useState(0)
   const [busyVerb, setBusyVerb] = useState(false)
 
@@ -255,6 +357,7 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
       orgId: d.orgId || null,
       target: descriptor && !descriptor.takes_target ? null : (row?.is_system ? null : d.target),
       whenKind: d.when === 'schedule' ? 'schedule' : 'event',
+      eventKind: d.when === 'schedule' ? undefined : d.when,
       templateHint: d.when === 'schedule' ? undefined : EVENT_TEMPLATE_HINT[d.when],
       descriptor,
       automation: row,
@@ -266,6 +369,7 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
 
   const takesTarget = useCallback((d: Draft, row: Automation | null): boolean => {
     if (row?.is_system) return false
+    if (draftRecordsOnly(d)) return true
     const descriptor = descriptorOf(d.actionType)
     return descriptor ? descriptor.takes_target : row ? row.target !== null : d.actionType === 'task'
   }, [descriptorOf])
@@ -276,16 +380,24 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
     if (typeof when === 'string') return when
     const context = contextFor(d, row)
     const entry = actionEntryFor(d.actionType, context.descriptor, row?.is_system ?? false)
-    const params = entry ? entry.toParams(d.actionValue, context) : ((d.actionValue as Record<string, unknown> | null) ?? row?.action.params ?? {})
-    return {
+    const base = {
       name: d.name.trim(),
       description: d.description.trim(),
       org_id: d.orgId,
       when,
       target: takesTarget(d, row) ? d.target : null,
-      action: { type: d.actionType, params },
     }
+    // A record-only create sends no action (it files nothing); a saved one keeps its stored action untouched.
+    if (row === null && draftRecordsOnly(d)) return base
+    const params = entry ? entry.toParams(d.actionValue, context) : ((d.actionValue as Record<string, unknown> | null) ?? row?.action.params ?? {})
+    return { ...base, action: { type: d.actionType, params } }
   }, [contextFor, takesTarget])
+
+  /* The baseline is the first fully-seeded draft's wire body: dirty is "the body a save would send moved". */
+  const currentKey = draft === null || draft.actionValue === null ? null : JSON.stringify(inputOf(draft, automation))
+  const { base: baselineKey, dirty, reset: forgetBaseline } = useBaselineDirty(currentKey, {
+    extra: stagedFiles.length > 0, initial: (carried ?? resume.current)?.baselineKey ?? null,
+  })
 
   const seed = useCallback((row: Automation) => {
     const base: Draft = {
@@ -303,15 +415,27 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
     }
     setAutomation(row)
     setDraft(base)
-    setBaselineKey(null)
+    setActionUi(null)
+    forgetBaseline()
     setStagedFiles([])
     setFieldErrors({})
     setSaveError('')
-  }, [])
+  }, [forgetBaseline])
+
+  /* Back from New address on a saved automation: the input as it was left over the loaded row, against the baseline
+     carried with it, so the editor stays dirty (nothing of it is saved yet). */
+  const onLoad = useCallback((row: Automation) => {
+    const kept = resume.current
+    if (kept === null) return seed(row)
+    resume.current = null
+    setAutomation(row)
+    setDraft(kept.draft)
+    setStagedFiles(kept.stagedFiles)
+  }, [seed])
 
   const { confirm, confirmDialog, loading, notFound, loadError, deleteError, confirmAndDelete } = useEditRecord(
-    id, getAutomation, seed,
-    { loadFallback: 'Couldn’t load this automation.', notFoundStatuses: [404, 422], listTo: '/automations', deleteFallback: 'Couldn’t delete this automation.' },
+    id, getAutomation, onLoad,
+    { loadFallback: 'Couldn’t load this automation.', notFoundStatuses: [404, 422], listTo: returnTo ?? '/automations', deleteFallback: 'Couldn’t delete this automation.' },
   )
 
   /* A NEW draft waits for the catalogues (the default schedule is the Runner's declared cadence). */
@@ -329,12 +453,13 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
         : FALLBACK_SCHEDULE,
       retentionMode: DEFAULT_CREATE_RETENTION_MODE,
       event: newEventDraft(initialWhen === 'schedule' ? 'webhook' : initialWhen),
-      targetKind: 'projects',
-      target: { kind: 'projects', mode: 'specific', ids: [] },
+      // The default action (Task) takes either kind, so a preset from a project's or node's page applies as is.
+      targetKind: initialTarget?.kind ?? 'projects',
+      target: initialTarget ?? { kind: 'projects', mode: 'specific', ids: [] },
       actionType: 'task',
       actionValue: null,
     })
-  }, [id, draft, activityCatalogue.loading, activities, initialWhen, ownOrgId])
+  }, [id, draft, activityCatalogue.loading, activities, initialWhen, initialTarget, ownOrgId])
 
   /* The action value is the entry's own shape: filled once the entry (and, for a system type, the catalogue) is
      known, from the stored params or the entry's initial value. */
@@ -353,62 +478,69 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
     setDraft(prev => (prev === null ? prev : { ...prev, actionValue: value }))
   }, [draft, automation, actionTypes.loading, activityCatalogue.loading, contextFor])
 
-  /* The baseline is the first fully-seeded draft's wire body: dirty is "the body a save would send moved". */
-  const currentKey = draft === null || draft.actionValue === null ? null : JSON.stringify(inputOf(draft, automation))
-  useEffect(() => {
-    if (baselineKey === null && currentKey !== null) setBaselineKey(currentKey)
-  }, [baselineKey, currentKey])
-  const dirty = currentKey !== null && baselineKey !== null && (currentKey !== baselineKey || stagedFiles.length > 0)
 
   const edit = useCallback((patch: Partial<Draft>) => {
     setNotice('')
+    if (patch.actionType !== undefined) setActionUi(null)
     setDraft(prev => (prev === null ? prev : { ...prev, ...patch }))
   }, [])
 
+  /* A record-only When records into a project: a Nodes target picked for another source does not carry over. */
+  const recordsIntoNodes = draft !== null && draftRecordsOnly(draft) && draft.targetKind !== 'projects'
+  useEffect(() => {
+    if (recordsIntoNodes) edit({ targetKind: 'projects' })
+  }, [recordsIntoNodes, edit])
+
   /* ── Target preview: what the rule resolves to right now (AC3.6), once the rule has settled. ── */
-  const [preview, setPreview] = useState<TargetPreview | undefined>(undefined)
   const previewRule = draft && draft.target.kind === draft.targetKind && isValidTarget(draft.target) ? draft.target : null
   const previewOrg = draft?.orgId ?? ''
   const previewKey = previewRule ? JSON.stringify(previewRule) : ''
   const settledPreviewKey = useSettled(previewKey, PREVIEW_DEBOUNCE_MS)
-  useEffect(() => {
-    setPreview(undefined)
-    if (!previewRule || previewOrg === '' || settledPreviewKey !== previewKey) return
-    let live = true
-    previewTarget(previewOrg, previewRule, automation?.id)
-      .then(wire => {
-        if (live) {
-          setPreview({
-            resolved: wire.resolved, resolvedCount: wire.resolved_count, universeCount: wire.universe_count,
-            dangling: wire.dangling,
-          })
-        }
-      })
-      .catch(() => { if (live) setPreview(undefined) })
-    return () => { live = false }
-    // previewKey stands for previewRule's content.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [previewKey, settledPreviewKey, previewOrg, automation?.id])
+  // previewKey stands for previewRule's content.
+  const previewRead = useApiRead(['automation-target-preview', previewOrg, previewKey, automation?.id ?? null],
+    () => previewTarget(previewOrg, previewRule!, automation?.id).then((wire): TargetPreview => ({
+      resolved: wire.resolved, resolvedCount: wire.resolved_count, universeCount: wire.universe_count,
+      dangling: wire.dangling,
+    })), 'The preview could not be read.', { enabled: previewRule !== null && previewOrg !== '' && settledPreviewKey === previewKey })
+  // No preview while the rule settles or re-reads, nor for a failed read: never the previous rule's answer.
+  const preview = settledPreviewKey !== previewKey || previewRead.loading || previewRead.error ? undefined : previewRead.data ?? undefined
 
   /* ── Save ── */
-  /* What stops a save, by the part it belongs to: the wizard blocks each step on its own, the edit page on the
-     first of them (About, Target, When — its order before the split). */
-  const blockers = useMemo((): StepBlockers => {
-    const none: StepBlockers = { about: null, when: null, target: null, action: null }
+  /* What stops a save, by the part it belongs to. The wizard blocks each step on its own (the org on When, since the
+     When's mailboxes and the Target's projects are that org's); the edit page on the first of them. */
+  const parts = useMemo(() => {
+    const none = { name: null, org: null, when: null, target: null, action: null, content: null }
     if (draft === null) return none
-    const about = draft.name.trim() === '' ? 'Name the automation.'
-      : draft.orgId === '' ? 'Pick the organization it files into.' : null
     let target: string | null = null
-    if (takesTarget(draft, automation)) {
+    const recordOnly = draftRecordsOnly(draft)
+    if (recordOnly) {
+      if (!isRecordsIntoTarget(draft.target)) target = 'Pick the one project incidents are recorded in.'
+    } else if (takesTarget(draft, automation)) {
       const noun = draft.targetKind === 'nodes' ? 'node' : 'project'
       if (draft.target.kind !== draft.targetKind || !isValidTarget(draft.target)) target = `Pick at least one ${noun}.`
     }
     const when = whenOf(draft)
-    // The Action step waits for its form (the value is filled once the catalogues land).
-    const action = draft.actionValue === null ? 'The action is still loading.' : null
-    return { about, when: typeof when === 'string' ? when : null, target, action }
-  }, [draft, automation, takesTarget])
-  const blocker = blockers.about ?? blockers.target ?? blockers.when
+    const entry = actionEntryFor(draft.actionType, descriptorOf(draft.actionType), automation?.is_system ?? false)
+    return {
+      name: draft.name.trim() === '' ? 'Name the automation.' : null,
+      org: draft.orgId === '' ? 'Pick the organization it files into.' : null,
+      when: typeof when === 'string' ? when : null,
+      target,
+      // The action waits for its form (the value is filled once the catalogues land).
+      action: draft.actionValue === null && !recordOnly ? 'The action is still loading.' : null,
+      // The action form's own refusal (an empty task description), held on What before Create.
+      content: recordOnly || draft.actionValue === null ? null : entry?.blocker?.(draft.actionValue) ?? null,
+    }
+  }, [draft, automation, takesTarget, descriptorOf])
+  const blockers: StepBlockers = {
+    when: parts.org ?? parts.when,
+    what: parts.target ?? parts.action ?? parts.content,
+    name: parts.name,
+  }
+  const blocker = parts.name ?? parts.org ?? parts.target ?? parts.content ?? parts.when
+  // Next refused on What for the action's own reason: said again beside the editor, not only in the footer.
+  const [blockedStep, setBlockedStep] = useState<AutomationStepId | null>(null)
+  const actionBlocked = blockedStep === 'what' && parts.target === null && parts.content !== null
 
   /* Only an operator picks the org (a new automation's About); warned there and on Target, before Create. The rule
      is the per-target filer's, so an action that takes no target is not warned. */
@@ -424,12 +556,12 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
   }, [])
 
   const save = useCallback(async (): Promise<boolean> => {
-    if (savingRef.current || draft === null) return false
+    if (saving || draft === null) return false
     setErrorStep(null)
     if (blocker) {
       setSaveError(blocker)
       // The wizard opens the step it belongs on (a Save from the unsaved-changes dialog may come from any step).
-      setErrorStep(blockers.about ? 'about' : blockers.target ? 'target' : 'when')
+      setErrorStep(parts.name ? 'name' : parts.target || parts.content ? 'what' : 'when')
       return false
     }
     const input = inputOf(draft, automation)
@@ -437,15 +569,14 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
       setSaveError(input)
       return false
     }
-    savingRef.current = true
-    setSaving(true)
-    setSaveError('')
     setFieldErrors({})
-    try {
+    let ok = false
+    await run('Couldn’t save.', async () => {
       if (automation === null) {
         const created = await createAutomation(input)
         const row = created.automation
-        if (stagedFiles.length > 0 && row.action.type === 'task') {
+        // A record-only automation files nothing: files staged on an earlier action have nowhere to go.
+        if (stagedFiles.length > 0 && row.action.type === 'task' && !draftRecordsOnly(draft)) {
           try {
             const ids = await uploadStaged(row.id, stagedFiles)
             await updateAutomation(row.id, { action: { type: 'task', params: { attachment_ids: ids } } })
@@ -457,7 +588,8 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
         setStagedFiles([])
         if (created.secret) setSecret(created.secret)
         setCreatedId(row.id)
-        return true
+        ok = true
+        return
       }
       const saved = inputOf(seededDraftOf(automation, draft), automation)
       const body: Partial<AutomationInput> = {}
@@ -470,7 +602,7 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
         if (JSON.stringify(input.action) !== JSON.stringify(saved.action)) body.action = input.action
       }
       let uploaded: number[] = []
-      if (stagedFiles.length > 0 && input.action.type === 'task') {
+      if (stagedFiles.length > 0 && input.action?.type === 'task') {
         uploaded = await uploadStaged(automation.id, stagedFiles)
         const params = { ...input.action.params }
         params.attachment_ids = [...((params.attachment_ids as number[] | undefined) ?? []), ...uploaded]
@@ -488,32 +620,26 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
       seed(next.automation)
       if (next.secret) setSecret(next.secret)
       setNotice('Saved')
-      return true
-    } catch (err) {
-      // The server's creator-org refusal is the warning About and Target already show, in its words.
-      const creatorRefused = /a trigger files as its creator/.test(apiDetailRaw(err))
-      const message = (creatorRefused && orgWarning) || readableError(err, 'Couldn’t save.')
-      setSaveError(message)
+      ok = true
+    }, { mapError: (err, fallback) => {
       const match = /^action\.params\.([a-z_]+): ([\s\S]+)$/.exec(apiDetailRaw(err))
       if (match) setFieldErrors({ [match[1]]: match[2] })
-      setErrorStep(match ? 'action' : null)
-      return false
-    } finally {
-      savingRef.current = false
-      setSaving(false)
-    }
-  }, [draft, automation, blocker, blockers, inputOf, stagedFiles, uploadStaged, seed, orgWarning])
-
-  const onSubmit = (e: FormEvent) => {
-    e.preventDefault()
-    void save()
-  }
+      setErrorStep(match ? 'what' : null)
+      // On a saved automation, the refused field's own tab.
+      if (match && automation !== null) selectTab(SETTINGS_PARAMS.has(match[1]) ? SETTINGS_TAB.id : SETUP_TAB.id)
+      // The server's creator-org refusal is the warning About and Target already show, in its words.
+      const creatorRefused = /a trigger files as its creator/.test(apiDetailRaw(err))
+      return (creatorRefused && orgWarning) || readableError(err, fallback)
+    } })
+    return ok
+  }, [draft, automation, blocker, parts, inputOf, stagedFiles, uploadStaged, seed, orgWarning, selectTab, saving, run, setSaveError])
 
   const closeSecret = () => setSecret(null)
 
   /* A create leaves for the new automation itself (`createdId`), so the gate must not go on to where the dialog was
      asked for. */
   const guard = useLeaveGuard(dirty && createdId === null, async () => (await save()) && automation !== null)
+  leaveNowRef.current = guard.leaveNow
   /* A run opens in its own pane (`AutomationRunPage.tsx`), through the same unsaved gate; `?from=` brings its
      Close back to this tab (`components/ListDetail.tsx`), and the row rides `state` so it paints at once. */
   const openRun = (run: AutomationRun) => {
@@ -553,17 +679,15 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
   useEffect(() => {
     setBarTab(prev => (pending ? tab : prev === tab ? prev : null))
   }, [pending, tab])
-  const showsBar = tab === SETUP_TAB.id || pending || barTab === tab
+  const showsBar = tab === SETUP_TAB.id || tab === SETTINGS_TAB.id || pending || barTab === tab
 
   const crumb = { label: 'Automations', to: '/automations' }
 
   if (loading || notFound || loadError) {
     return (
-      <DetailStatus
+      <EditStatus
         trail={<Breadcrumb items={[{ label: 'Automations', to: '/automations' }, { label: 'Automation' }]} />}
-        loading={loading}
-        notFound={notFound && 'Automation not found'}
-        error={loadError}
+        loading={loading} notFound={notFound} loadError={loadError} notFoundTitle="Automation not found"
       />
     )
   }
@@ -571,6 +695,7 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
 
   const busy = saving || guard.saving
   const runBlocked = automation === null ? null : runNowBlocked(automation)
+  const recordOnly = draftRecordsOnly(draft)
   const isSystem = automation?.is_system === true
   const descriptor = descriptorOf(draft.actionType)
   const showsTarget = takesTarget(draft, automation)
@@ -581,6 +706,7 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
     if (eventOnlyRefused) return false
     // A saved event's source is fixed (the trigger's own rule); Schedule stays reachable.
     if (automation?.when.kind === 'event') return choice === automation.when.source_kind
+    if (PRODUCTION_QA_SOURCE_KINDS.has(choice) && !planSurfaceShown(admin, 'production_qa')) return false
     // No new event reaches the community edition (`routes/triggers.py::NO_EVENTS_LOCALLY`).
     return isEnabled('event_triggers')
   })
@@ -589,65 +715,60 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
     disabled: busy,
     stagedFiles,
     onStagedFilesChange: setStagedFiles,
-    errors: fieldErrors,
+    errors: actionBlocked ? { ...fieldErrors, body: parts.content! } : fieldErrors,
+    uiState: actionUi,
+    onUiStateChange: setActionUi,
   }
   const entry = actionEntryFor(draft.actionType, descriptor, isSystem)
   const offeredActions = catalogue.filter(item => draft.when === 'schedule' || item.when_kinds.includes('event'))
   const title = automation?.name ?? 'New automation'
   const bodyTemplate = typeof (automation?.action.params.body) === 'string' ? (automation.action.params.body as string) : ''
 
-  /* The four parts, drawn once: the edit page's Setup tab stacks them, the New-automation wizard steps through
-     them (a step's own panel draws no top rule). */
+  /* The essentials, drawn once: the edit page's Setup tab stacks them, the New-automation wizard steps through them
+     (a step's own panel draws no top rule, and the stepper names it). */
   const wizard = automation === null
   // The community edition has one org: nothing to pick.
   const showOrg = isOperator && automation === null && isEnabled('multi_org_tenancy')
   const aboutPart = (
-    <AboutSection draft={draft} edit={edit} busy={busy} divided={automation?.when.kind === 'event'} showOrg={showOrg}
-      orgWarning={orgWarning} orgNote={orgNote} />
+    <AboutSection draft={draft} edit={edit} busy={busy} divided={automation?.when.kind === 'event'} title={wizard ? null : 'About'} />
   )
-  const typePicker = wizard && (
-    <Box sx={{ mt: 2 }}>
-      <ActionTypePicker draft={draft} edit={edit} busy={busy} offered={offeredActions} loadingTypes={actionTypes.loading}
-        descriptor={descriptor} />
-    </Box>
-  )
+  /* The New address page makes the address in the automation's org (`?org=` when it is not the viewer's own). */
+  const openNewAddress = () => openNew(draft.orgId && draft.orgId !== ownOrgId ? newAddressUrl(draft.orgId) : NEW_ADDRESS_URL, ADDRESS_PICK)
   const whenPart = (
-    <>
+    <NewAddressContext.Provider value={openNewAddress}>
       <WhenSection
         draft={draft}
         edit={edit}
         busy={busy}
         divided={!wizard}
+        title={wizard ? null : 'When'}
         choices={whenChoices}
-        scheduleOnlyLabel={eventOnlyRefused && !isSystem ? descriptor?.label ?? 'This action' : undefined}
-        sourceLocked={automation?.when.kind === 'event'}
         creatingEvent={automation === null || automation.when.kind !== 'event'}
         paused={automation?.paused === true}
         operator={isOperator}
         operatorOrg={isOperator && isOperatorPlane(admin, draft.orgId)}
         automationId={automation?.id ?? null}
-        filesTasks={showsTarget}
       />
-      {/* New: the type first, so the Target step exists only for an action that takes one. */}
-      {typePicker}
-    </>
+    </NewAddressContext.Provider>
   )
   const targetPart = showsTarget && (
-    <TargetSection draft={draft} edit={edit} busy={busy} divided={!wizard} kinds={targetKinds} preview={preview}
-      orgWarning={orgWarning} onLeaveTo={guard.leaveTo} />
+    <TargetSection draft={draft} edit={edit} busy={busy} divided kinds={recordOnly ? ['projects'] : targetKinds}
+      preview={preview} orgWarning={orgWarning} onLeaveTo={guard.leaveTo} recordsInto={recordOnly}
+      required={wizard ? parts.target : null} />
   )
-  const actionPart = (
+  // A record-only When files nothing: no Action to set.
+  const actionPart = !recordOnly && (
     <ActionSection
       draft={draft}
       edit={edit}
       busy={busy}
-      divided={!wizard}
+      divided
+      title={wizard ? null : 'Action'}
       offered={offeredActions}
       typeFixed={automation === null ? null : `${descriptor?.label ?? automation.action.type}${isSystem ? ' — read-only' : ''}`}
       typePicked={wizard}
       loadingTypes={actionTypes.loading}
       typesError={actionTypes.error || null}
-      descriptor={descriptor}
       entry={entry}
       context={context}
     />
@@ -662,12 +783,7 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
         testIdPrefix="trigger-secret"
         onClose={closeSecret}
       />
-      <UnsavedChangesDialog
-        open={guard.open}
-        saving={guard.saving}
-        onChoose={choice => void guard.onChoose(choice)}
-        message="This automation has changes that have not been saved. Save them before leaving?"
-      />
+      <LeaveGuardDialog leave={guard} message="This automation has changes that have not been saved. Save them before leaving?" />
     </>
   )
 
@@ -676,18 +792,29 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
       <AutomationCreateWizard
         breadcrumb={<Breadcrumb items={[crumb, { label: title }]} />}
         blockers={blockers}
-        nameMissing={draft.name.trim() === ''}
-        showsTarget={showsTarget}
-        about={aboutPart}
-        when={whenPart}
-        target={targetPart}
-        action={actionPart}
-        reviewRows={automationReviewRows({ draft, showOrg, showsTarget, descriptor, entry, context })}
+        when={(
+          <>
+            {showOrg && <OrgField draft={draft} edit={edit} busy={busy} orgWarning={orgWarning} orgNote={orgNote} />}
+            {whenPart}
+          </>
+        )}
+        what={(
+          <>
+            {/* The type first: whether a Target follows is the type's. */}
+            {!recordOnly && (
+              <ActionTypePicker draft={draft} edit={edit} busy={busy} offered={offeredActions} loadingTypes={actionTypes.loading} />
+            )}
+            {targetPart}
+            {actionPart}
+          </>
+        )}
+        name={aboutPart}
         onCreate={() => void save()}
-        onCancel={() => guard.leaveTo('/automations')}
+        onCancel={() => guard.leaveTo(safeReturnPath(location.search, window.location.origin) ?? '/automations')}
         creating={busy}
         saveError={saveError}
         errorStep={errorStep}
+        onBlocked={setBlockedStep}
         resume={carried?.position ?? null}
         onPosition={carry}
       >
@@ -703,7 +830,7 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
       headerTestId="automation-header"
       subtitle={automation && (
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
-          <StatusChip label={STATUS_LABELS[automation.status] ?? automation.status} tone={STATUS_TONE[automation.status] ?? 'neutral'} data-status={automation.status} />
+          <StatusChip label={STATUS[automation.status]?.label ?? automation.status} tone={STATUS[automation.status]?.tone ?? 'neutral'} data-status={automation.status} />
           {isSystem && <StatusChip label="System" tone="info" />}
           {/* A pause hides the Stuck cause, not the held run. */}
           {automation.stuck && automation.status !== 'failing' && (
@@ -714,7 +841,7 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
           {/* The cause leads (the list's words); the raw text stays under it, whole — the one place a phone, which has
               no hover, reads it. */}
           {automation.status_cause && (
-            <Typography variant="body2" sx={{ color: 'error.main', fontWeight: 600, overflowWrap: 'anywhere', minWidth: 0 }} data-testid="automation-status-cause">
+            <Typography variant="body2" sx={{ color: 'error.main', fontWeight: FONT_WEIGHT.semibold, overflowWrap: 'anywhere', minWidth: 0 }} data-testid="automation-status-cause">
               {automation.status_cause}
             </Typography>
           )}
@@ -734,7 +861,7 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
          Runs, or beside the State document's own Save, reads as theirs). Its notices show on every tab. The
          shared sticky bar has the floating Help launcher sit level with it rather than cover it. */
       actionBar={(
-        <Box sx={{ pt: 2, maxWidth: '48rem' }}>
+        <Box sx={{ pt: 2, maxWidth: grid(128) }}>
           {saveError && <Banner severity="error" testId="automation-save-error">{saveError}</Banner>}
           {notice && <Banner severity={notice === 'Saved' ? 'success' : 'info'} testId="automation-notice">{notice}</Banner>}
           {blocker && dirty && (
@@ -768,8 +895,10 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
       )}
       actions={automation && (
         <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-          {/* The reason rides a wrapper: a disabled button takes no pointer, so its own title never shows. */}
-          <Box component="span" title={runBlocked ?? undefined} data-testid="automation-run-now-reason" sx={{ display: 'inline-flex' }}>
+          {/* The reason rides a wrapper: a disabled button takes no pointer, so its own title never shows. A record-only
+              automation has nothing to run, so it has no Run now. */}
+          {!savedRecordsOnly(automation) && (
+          <Tip title={runBlocked ?? undefined}><Box component="span" data-testid="automation-run-now-reason" sx={{ display: 'inline-flex' }}>
             <Button
               variant="outlined"
               aria-describedby={runBlocked ? 'automation-run-now-why' : undefined}
@@ -780,7 +909,8 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
             >
               Run now
             </Button>
-          </Box>
+          </Box></Tip>
+          )}
           {/* A phone has no hover: the reason is printed, on a line of its own under the buttons. */}
           {runBlocked && (
             <Typography
@@ -804,18 +934,29 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
           >
             {automation.paused ? 'Resume' : 'Pause'}
           </Button>
-          {automation.stuck && (
-            <Button
+          {automation.foreign_owner && (
+            <Tip title="Its owner is in another organization. Own it yourself so its runs file again."><Button
               variant="outlined"
               color="warning"
               disabled={busyVerb}
-              title="End the run that outlived its timeout, so the next one starts. Run history stays."
+              onClick={() => void verb(() => takeAutomationOwnership(automation.id), 'Couldn’t take ownership.')}
+              sx={tapTargetSx}
+              data-testid="automation-take-ownership"
+            >
+              Take ownership
+            </Button></Tip>
+          )}
+          {automation.stuck && (
+            <Tip title="End the run that outlived its timeout, so the next one starts. Run history stays."><Button
+              variant="outlined"
+              color="warning"
+              disabled={busyVerb}
               onClick={() => void confirmAndRelease()}
               sx={tapTargetSx}
               data-testid="automation-release"
             >
               Release
-            </Button>
+            </Button></Tip>
           )}
           {/* A system automation never moves (`tenancy/transfer_objects.py::_system_rows`). */}
           {!isSystem && changeOrg.button({
@@ -850,12 +991,22 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
           <EventSetupSection automation={automation} onAutomation={setAutomation} onSecret={setSecret} confirm={confirm} />
         )}
 
-        <Box component="form" id={AUTOMATION_FORM_ID} onSubmit={onSubmit} noValidate aria-label="Automation">
+        <FormBox id={AUTOMATION_FORM_ID} onSubmit={save} aria-label="Automation">
           {aboutPart}
           {whenPart}
           {targetPart}
           {actionPart}
-        </Box>
+        </FormBox>
+      </TabPanel>
+
+      {/* The same draft and Save bar as Setup: the submit button names Setup's form, so Settings needs none. */}
+      <TabPanel id="settings" current={tab} idPrefix="automation">
+        {/* Its own form only so Enter saves here too; mounted the first time it is shown, as Runs is. */}
+        {shown('settings') && (
+          <FormBox onSubmit={save} aria-label="Automation settings">
+            <SettingsSection draft={draft} edit={edit} busy={busy} entry={entry} context={context} />
+          </FormBox>
+        )}
       </TabPanel>
 
       {automation && (
@@ -872,6 +1023,8 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
         <TabPanel id="advanced" current={tab} idPrefix="automation">
           {shown('advanced') && (
             <>
+              {/* A record-only automation renders no task and runs nothing: no Test. */}
+              {!savedRecordsOnly(automation) && (
               <DetailSection title="Test" testId="automation-section-test">
                 <EventTestPanel
                   automation={automation}
@@ -883,7 +1036,8 @@ function AutomationEditor({ id, initialWhen }: { id: string | null; initialWhen:
                   }}
                 />
               </DetailSection>
-              <DetailSection title="Dedup entries" divided testId="automation-section-dedup">
+              )}
+              <DetailSection title="Dedup entries" divided={!savedRecordsOnly(automation)} testId="automation-section-dedup">
                 <DedupEntries automationId={automation.id} />
               </DetailSection>
               <DetailSection title="State document" divided testId="automation-section-state">
@@ -912,6 +1066,7 @@ function seededDraftOf(row: Automation, current: Draft): Draft {
     orgId: row.org_id, target: row.target, whenKind: row.when.kind, descriptor: undefined, automation: row,
     disabled: false, stagedFiles: [], onStagedFilesChange: () => {},
     templateHint: row.when.kind === 'event' ? EVENT_TEMPLATE_HINT[row.when.source_kind] : undefined,
+    eventKind: row.when.kind === 'event' ? row.when.source_kind : undefined,
   }
   const entry = actionEntryFor(row.action.type, undefined, row.is_system)
   return {

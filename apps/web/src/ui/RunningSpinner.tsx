@@ -1,5 +1,6 @@
 import CircularProgress from '@mui/material/CircularProgress'
 import type { JSX } from 'react'
+import { grid } from '../theme'
 
 /* The console's in-progress mark: a running task's pill (`components/tasks/shared.tsx`), a deploying node's disc
  * and pills (`lib/nodeStatus.ts::nodeDeploy`), a cloud machine starting or stopping.
@@ -13,7 +14,7 @@ export function RunningSpinner(): JSX.Element {
     <CircularProgress
       variant="determinate"
       value={72}
-      size={11}
+      size={grid(1.5)}
       thickness={6}
       color="inherit"
       role="presentation"

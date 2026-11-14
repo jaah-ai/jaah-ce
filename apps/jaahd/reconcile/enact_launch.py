@@ -1,31 +1,25 @@
-"""The `lease_slot` executor: build or resume a slot's tree and launch its runner, closing a hand-off."""
+"""The `lease_slot` executor: build or resume a slot's tree and launch its runner."""
 from __future__ import annotations
 
 import asyncio
 import functools
 import logging
 import os
-import uuid
 
+import clone_identity
 import control_plane_api
 import git_env
 import ce_caps
-import session_user
 import shared_storage
+import slot_clone
 import slot_repos
 from worktree_mechanics import core, ports as wm_ports, lifecycle
-from reconcile import vocab, tick_wire, context, enact_reset
-from reconcile.vocab import GIT_FAST_TIMEOUT, OUTCOME_DONE, OUTCOME_FAILED, OUTCOME_REFUSED_PRECONDITION
+from reconcile import tick_wire, context, enact_reset
+from reconcile.vocab import OUTCOME_CLONE_REFUSED, OUTCOME_DONE, OUTCOME_FAILED, OUTCOME_REFUSED_PRECONDITION
 from reconcile.tick_wire import RosterSlot, SlotIntent
 from reconcile.context import ReconcileContext
 
 log = logging.getLogger(__name__)
-
-
-# A console hand-off (`lease_slot` payload `handoff`): how long `_close_for_handoff` waits for the old ACP host to
-# close its session and end before the launch's kill fallback — the host's `CLOSE_GRACE_S` (30) for the
-# cancelled turn plus its `STOP_GRACE_S` (5) for the engine, and a margin. Polled once a second.
-HANDOFF_CLOSE_WAIT_S = 45.0
 
 
 async def _launch_into_slot(
@@ -33,18 +27,19 @@ async def _launch_into_slot(
 ) -> tuple[str, str, dict]:
     """The `lease_slot` enactment body — the only dispatch verb.
 
-    `payload["resume"]` True: the tree holds this task's previous attempt and is left as-is, only the port
-    band re-applied (no tree on disk: taken as False). False: `claim_mechanics` builds or resets it detached at base (D10); the runner makes its
-    own `fleet/task-<id>`. Then the CP's `payload["prompt_bundle"]`, then `launch_runner`.
+    `payload["resume"]` True: the tree holds this task's previous attempt and is left as-is, only its node-assigned
+    ports re-applied (no tree on disk: taken as False). False: `claim_mechanics` clones the slot (or resets a
+    held-over clone) onto the task's `fleet/task-<id>` with the task's own access (`clone_identity.Acting`).
+    Then the CP's `payload["prompt_bundle"]`, then `launch_runner`.
 
     The ack extras carry the `generation`/`dispatch_id` fence plus the launch identity for `record_launch`.
-    Failures `failed`, vetoes `refused_precondition`; neither retires."""
+    Failures `failed`, vetoes `refused_precondition`; neither retires. A clone the forge refused (auth, not
+    found) is `clone_refused`, which retires the intent and ends the attempt CP-side (`_clone_failure`)."""
     import agent_providers  # noqa: PLC0415 — the provider vocabulary: what an unnamed provider is
     import agents  # noqa: PLC0415 — the runner-adapter registry: which vendors this node can launch
     import fleet_dispatch  # noqa: PLC0415 — deferred: daemon-space sibling, needed only on this verb
     import bedrock_launch  # noqa: PLC0415 — deferred, as `fleet_dispatch`: the Jaah-account plan
     import acp_runtime  # noqa: PLC0415 — deferred, as `fleet_dispatch`: the runtime dispatch fact
-    from acp import launch as acp_launch_doc  # noqa: PLC0415 — deferred, as above: a hand-off's native id shape
 
     payload = intent.payload
     task_id = payload.get("task_id")
@@ -57,18 +52,11 @@ async def _launch_into_slot(
             f"an ack (got keys {sorted(payload)})"
         ), {}
     fence = {"generation": int(generation), "dispatch_id": dispatch_id}
-    # The console toggling the slot between its chat and terminal fronts (`apps/api/app/routes/console_runtime.py`):
-    # a resume of this same task that reopens the engine's own session `native_session_ref` on the other front,
-    # after the old front (`from_session_id`) let go of it. Absent for every other dispatch.
-    handoff = payload.get("handoff")
-    if handoff is not None and not (
-            isinstance(handoff, dict) and isinstance(handoff.get("native_session_ref"), str)
-            and acp_launch_doc.NATIVE_REF.match(handoff["native_session_ref"])):
-        return OUTCOME_REFUSED_PRECONDITION, (
-            "the CP's hand-off names no valid native session to reopen — refusing rather than starting the task "
-            "over or resuming some other conversation"
-        ), {}
-
+    try:
+        # Whose access the slot's clone spends (D9): this task's, keyed by this dispatch.
+        acting = clone_identity.Acting(kind=clone_identity.ACTING_TASK, id=str(task_id), run=dispatch_id)
+    except ValueError as exc:
+        return OUTCOME_FAILED, f"payload names an unusable task_id: {exc}", {}
     # No "someone else holds this" refusal: the slot is held by this very dispatch, arbitrated by the CP's
     # atomic claim. The fences here are path agreement and the ack's `generation`/`dispatch_id`.
     config = slot.pool_config()
@@ -109,11 +97,9 @@ async def _launch_into_slot(
     # An SDK agent runs no model of ours: no provider, account, credential or prompt gate below applies to it.
     no_model = agent_launch is not None
 
-    raw_ports = payload.get("ports")
-    band = dict(tick_wire.port_band_from_wire(raw_ports)) if isinstance(raw_ports, dict) else None
     config_dir = payload.get("config_dir")
-    # The account's token store, when its token is there — resolved on this node below
-    # (`shared_storage.securestorage_dir`); the intent's `securestorage_dir` is an older CP's view, unread.
+    # The account's token store, when its token is there — the node resolves it below
+    # (`shared_storage.securestorage_dir`); the intent does not name it.
     securestorage_dir = ""
     # An API-key account's slug, or `""` for OAuth (`apps/api/app/account_auth.py`). The intent never carries
     # the key; for API-key dispatches `config_dir`/`securestorage_dir` are empty (no directory exists). Absent
@@ -190,11 +176,11 @@ async def _launch_into_slot(
 
     # `resume` means only "this slot's `task_id` is this task" (a DB fact), nothing about HEAD — a rebase can
     # leave any branch. Branch policy is the runner's; resume leaves the tree exactly as the dead runner left
-    # it and touches nothing `reset_to_base` would.
+    # it and touches nothing a lease's refresh would.
     resume = bool(payload.get("resume"))
     if resume and obs is None and not os.path.isdir(slot.path):
-        # No tree means no previous attempt's work to preserve (a first claim that died at `git worktree
-        # add`), so build it as a fresh claim would. Refusing instead re-served the same resume forever: the
+        # No tree means no previous attempt's work to preserve (a first claim that died at its clone), so build
+        # it as a fresh claim would. Refusing instead re-served the same resume forever: the
         # CP keys resume off the slot's `task_id`, which no node refusal changes. Re-checked on
         # disk, not only `obs`: a tree that appeared since the observation is resumed, never reset.
         log.info(
@@ -202,17 +188,12 @@ async def _launch_into_slot(
             slot.project, slot.number, slot.path, task_id,
         )
         resume = False
-    if handoff is not None and not resume:
-        # A hand-off reopens a conversation in the tree it ran in; with no resume there is no such tree.
-        return OUTCOME_REFUSED_PRECONDITION, (
-            f"hand-off into {slot.path}: the slot's tree is gone (or the dispatch is no resume) — nothing to hand over"
-        ), {}
     # The slot's repository set converges HERE, at the session's start and nowhere else (D7): after
     # the superseded runner is gone on a resume, before `claim_mechanics` on a fresh claim. None = a project
     # with nothing to converge (one repository, today's slot).
     manifest: dict | None = None
     slot_env = slot_repos.SlotEnv(
-        band=band, env_vars=payload.get("env_vars"), auto_ports=ctx.auto_ports, node_id=ctx.node_id,
+        env_vars=payload.get("env_vars"), auto_ports=ctx.auto_ports, node_id=ctx.node_id,
         stack_down_cmd=slot.stack_down_cmd,
     )
     if resume:
@@ -232,30 +213,8 @@ async def _launch_into_slot(
         # names a NEIGHBOUR, so `fresh_window_id_for` reads the stable `#{window_id}` at kill time and
         # `expect_cwd` re-proves the window lives in this slot. No window found means nothing to kill and
         # the launch proceeds; a window that IS there and does NOT die fails the enactment instead.
-        kill_on: dict = {}
-        if handoff is not None:
-            # A hand-off already asked the old front to let go, off the pass (`_handoff_then_ack`). What is left
-            # to kill is that front's OWN window, never whatever else stands in the slot (an operator's pane);
-            # still failing the enactment rather than run two fronts on one native session.
-            from_session = str(handoff.get("from_session_id") or "")
-
-            async def stale_window_now() -> str:
-                front = await _old_front_pane(slot.path, from_session)
-                if front is None:
-                    return ""
-                # Killed on the server that lists it, and only while it still holds that front's pane.
-                kill_on.update(socket=front[0], expect_pane_pid=front[2])
-                return front[1]
-
-            if await _old_front_window(slot.path, from_session) == "":
-                # Live, yet tmux shows no window for its pane: nothing this node can target, so no second front.
-                return OUTCOME_FAILED, (
-                    f"hand-off into {slot.path}: the old front (session {from_session}) is still running but has "
-                    "no tmux window to close — refusing to open a second front on its native session"
-                ), {}
-        else:
-            async def stale_window_now() -> str:
-                return await context.fresh_window_id_for(slot.path)
+        async def stale_window_now() -> str:
+            return await context.fresh_window_id_for(slot.path)
         stale_window = await stale_window_now()
         if stale_window:
             import kill_gates  # noqa: PLC0415 — deferred: subprocess-heavy sibling, needed only here
@@ -263,7 +222,7 @@ async def _launch_into_slot(
             killed = await asyncio.to_thread(
                 kill_gates.guarded_window_kill, stale_window,
                 f"resume {slot.project} #{slot.number}: replacing the broken runner on task {task_id}",
-                expect_cwd=slot.path, **kill_on,
+                expect_cwd=slot.path,
             )
             if killed is not True:
                 # `kill_session` answers False for both "could not kill" and "already gone": re-probe, and
@@ -282,54 +241,70 @@ async def _launch_into_slot(
                     "resume %s #%s: killed the superseded runner's window %s before relaunching task %s",
                     slot.project, slot.number, stale_window, task_id,
                 )
-        if handoff is not None:
-            # The old front is gone. A terminal front's transcript is the one the new front resumes and appends
-            # to: its row's legacy fold stops here (`session_sweep._WindowedReader`). No note: an ACP front.
-            import session_vendor  # noqa: PLC0415 — deferred: a leaf read only on this path
-
-            await asyncio.to_thread(session_vendor.close_usage_window, from_session)
-        # Re-applying is a no-op in band; kept tier-2 ports are judged against this pass's range
-        # (`ctx.auto_ports`). No `claim_mechanics` here — it would destroy the uncommitted work resume
-        # preserves. A folder slot has no `.env` and no band: it is resumed exactly as it is.
+        # Re-applying keeps every port the keep rule allows (`apply_auto_ports`), judged against this pass's
+        # range (`ctx.auto_ports`). No `claim_mechanics` here — it would destroy the uncommitted work resume
+        # preserves. A folder slot has no `.env`: it is resumed exactly as it is.
         if slot.has_repo:
             try:
                 manifest = await asyncio.to_thread(
                     slot_repos.converge, config, slot.number, mode=slot_repos.MODE_RESUME, task_id=task_id,
-                    env=slot_env,
+                    env=slot_env, acting=acting,
                 )
+            except slot_clone.CloneFailed as exc:
+                return _clone_failure(exc)
             except core.ResetRefused as exc:
                 return OUTCOME_REFUSED_PRECONDITION, f"repository converge refused: {exc}", {}
+            floor, ceiling = ctx.auto_ports or (wm_ports.AUTO_PORT_FLOOR, wm_ports.AUTO_PORT_CEILING)
             try:
                 await asyncio.to_thread(
-                    wm_ports.apply_port_band, slot.path, band,
-                    port_vars=config.port_vars, auto_ports=ctx.auto_ports,
+                    wm_ports.apply_auto_ports, slot.path,
+                    port_vars=config.port_vars, floor=floor, ceiling=ceiling, preferred=config.port_preferred,
                 )
-            except Exception as exc:  # noqa: BLE001 — a band that will not apply is a failed enactment
-                return OUTCOME_FAILED, f"could not re-apply the port band: {exc}", {}
+            except Exception as exc:  # noqa: BLE001 — ports that will not apply are a failed enactment
+                return OUTCOME_FAILED, f"could not re-apply the slot's ports: {exc}", {}
     else:
+        # A blind review child (`blind_checkout`) starts detached at base and gets the PR's diff applied.
+        blind = payload.get("blind_apply") is not None
         try:
             if slot.has_repo:
                 manifest = await asyncio.to_thread(
                     slot_repos.converge, config, slot.number, mode=slot_repos.MODE_CLAIM, task_id=task_id,
-                    env=slot_env,
+                    env=slot_env, acting=acting,
                 )
             await asyncio.to_thread(
                 lifecycle.claim_mechanics,
                 config, slot.number,
-                # No `holder=`/`branch=` (D10): `detach_base=True` leaves HEAD detached at base; the runner
-                # makes its own branch.
-                account=account_dir, detach_base=True,
-                task_id=task_id, node_id=ctx.node_id, band=band,
+                account=account_dir, acting=acting, detach=blind,
+                task_id=task_id, node_id=ctx.node_id,
                 auto_ports=ctx.auto_ports,
                 # The CP's resolved project environment (§8.1), verbatim, this leg only. Absent (older CP, no
                 # rows) is `None`, "never rebuild" — except that on a slot an earlier overlay marked it
                 # withdraws the marked variables (how deleting the last Environment row reaches a slot).
                 env_vars=payload.get("env_vars"),
             )
+        except slot_clone.CloneFailed as exc:
+            return _clone_failure(exc)
         except core.ResetRefused as exc:
-            # Refusals here are things the node cannot do (unresolvable clone, bad band), never a live-safety
-            # call: `app/slot_state.py::lease` must not have assigned an occupied slot.
+            # Refusals here are things the node cannot do (an unusable tree, a guard that would not land, a bad
+            # port var), never a live-safety call: `app/slot_state.py::lease` must not have assigned an occupied slot.
             return OUTCOME_REFUSED_PRECONDITION, f"claim mechanics refused: {exc}", {}
+        # The PR's merge-base with only its diff applied, before anything else of the launch. A resume keeps the
+        # tree it already made.
+        if blind:
+            import blind_checkout  # noqa: PLC0415 — deferred, as `fleet_dispatch`: needed only on this verb
+
+            try:
+                if not slot.has_repo:
+                    raise blind_checkout.BlindCheckoutRefused("a folder slot has no repository to check out")
+                spec = blind_checkout.BlindApply.from_payload(payload.get("blind_apply"))
+                await asyncio.to_thread(blind_checkout.prepare, slot.path, spec, config.clone_url, acting)
+            except slot_clone.CloneFailed as exc:
+                if exc.refused:
+                    # The attempt ends and its retry RESUMES: a tree without the PR's diff must not be resumed into.
+                    await asyncio.to_thread(_erase_quietly, slot.path)
+                return _clone_failure(exc)
+            except (blind_checkout.BlindCheckoutRefused, core.ResetRefused) as exc:
+                return OUTCOME_REFUSED_PRECONDITION, f"blind checkout refused: {exc}", {}
 
     # No enactment-time ask: the CP composes `payload["prompt_bundle"]` at decide time. Never partial: a
     # missing or malformed bundle fails before any network call.
@@ -376,6 +351,14 @@ async def _launch_into_slot(
                 f"{exc} — never launching a runner whose prompt names an input that is not on disk"
             ), {}
 
+    # The remote MCP servers the task's project linked; absent (an older CP) is none. Above the claim, like every
+    # other way to fail: a malformed entry refuses the launch rather than run a session with a server nobody
+    # linked, and must not spend the generation's one launch permission doing so.
+    try:
+        mcp_connections = agents.mcp_connections_from_wire(payload.get("mcp_connections"))
+    except ValueError as exc:
+        return OUTCOME_FAILED, f"the dispatch's mcp_connections are malformed: {exc} — never launching", {}
+
     # An SDK agent's three pre-claim steps (§4.4): bundle, inputs, per-run copy. Above the claim, like the
     # inputs above. Only the run dir and the required inputs raise (fail-loud, as for any runner); a bundle
     # that cannot be staged is recorded and reported by the run through `task.fail` (`agent_process`).
@@ -403,8 +386,8 @@ async def _launch_into_slot(
     # a reader to a wedged-node diagnosis instead of to the fence.
 
     # **DO NOT MOVE THIS EARLIER.** The permission is CONSUMED by the asking, and every remaining way to
-    # fail is ABOVE — the tree build (whose `reset_to_base` gate 3 is where the wedge itself refuses), the
-    # credential/path gates, the prompt-bundle gate. Asked before those, a gate-3 refusal would spend the
+    # fail is ABOVE — the tree build (`slot_clone.prepare`), the
+    # credential/path gates, the prompt-bundle gate. Asked before those, a refusal there would spend the
     # hold's one permission and refuse anyway, so the retry after a human pushed the branch would be
     # refused too, for the whole life of that generation. Claim last, when only the spawn is left.
     may_launch, refusal = await asyncio.to_thread(
@@ -456,14 +439,16 @@ async def _launch_into_slot(
         extra_dirs=slot_repos.extra_dirs(manifest),
         # The CP's resolution of the operator's runtime switch; absent (an older CP) is legacy (`acp_runtime`).
         runtime=acp_runtime.wire_runtime(payload),
-        # A console hand-off's engine session, reopened on the new front instead of the task prompt.
-        resume_ref=str(handoff["native_session_ref"]) if handoff is not None else "",
         # An SDK agent's staged run, or nothing for every other launch.
         agent=staged_agent,
         # The fence, recorded with the pane itself (`runner_registry.record`): a daemon death after the spawn
         # still leaves a runner `_launched_by` recognises.
         generation=int(generation),
         dispatch_id=dispatch_id,
+        # A benchmark shadow task (`JAAH_TASK_SHADOW=1`, its PR never merged); absent on every other dispatch.
+        shadow=payload.get("shadow") is True,
+        # Parsed above the claim (`mcp_connections_from_wire`).
+        mcp_connections=mcp_connections,
     )
     if started.get("refused") == "capacity":
         # Nothing launched: the control plane reads the marker, returns the hold and requeues the task.
@@ -479,12 +464,27 @@ async def _launch_into_slot(
     return OUTCOME_DONE, f"launched {ref_key} into {slot.path}", extras
 
 
+def _erase_quietly(path: str) -> None:
+    """Erase a slot tree whose lease was refused; a failure is logged (the refusal is the ack either way)."""
+    try:
+        slot_clone.erase(path)
+    except core.ResetRefused as exc:
+        log.warning("lease: could not erase %s after a refused clone: %s", path, exc)
+
+
+def _clone_failure(exc: "slot_clone.CloneFailed") -> tuple[str, str, dict]:
+    """The ack for a slot clone the forge failed: refused (auth, not found) ends the attempt (`clone_refused`);
+    a network or timeout failure, or the node's missing credential helper (`node_broken`), is a precondition the CP
+    re-serves with backoff. The reason is the one sentence `CloneFailed` words, naming the forge host and the cause."""
+    return (OUTCOME_CLONE_REFUSED if exc.refused else OUTCOME_REFUSED_PRECONDITION), str(exc), {}
+
+
 async def _launched_by(worktree: str, fence: dict) -> "dict | None":
     """The ack's launch identity of the live runner in `worktree` that this dispatch (`fence`) launched, or None.
 
     Read off `runner_registry` (pane pid AND start ticks, stamped with the dispatch at launch), never off the
     slot's windows: only a pane this node launched for exactly this `dispatch_id` and `generation` counts."""
-    import runner_registry  # noqa: PLC0415 — deferred, as `_old_front_pane`
+    import runner_registry  # noqa: PLC0415 — deferred: a stdlib leaf read only on this path
     import fleet_dispatch  # noqa: PLC0415 — deferred, as in `_launch_into_slot`
 
     ident = await asyncio.to_thread(runner_registry.live_in_worktree, worktree)
@@ -495,82 +495,6 @@ async def _launched_by(worktree: str, fence: dict) -> "dict | None":
         "pid": ident.pane_pid,
         "pid_start_time": await asyncio.to_thread(fleet_dispatch.proc_started_at, ident.pane_pid) or None,
     }
-
-
-async def _close_for_handoff(slot: RosterSlot, from_session_id: str, task_id: object) -> None:
-    """Ask the old front's ACP host to close for a hand-off, then wait (`HANDOFF_CLOSE_WAIT_S`) for that front's
-    own process to end (`_old_front_window`). Never raises and never decides: a legacy front (no ACP session
-    here), a refused enqueue or a front still up at the deadline all fall through to the launch's kill. Runs off
-    the pass and outside the slot lock (`_handoff_then_ack`): it touches no tree, only the hub and the registry."""
-    if not from_session_id:
-        return
-    try:
-        hub = context._acp_hub()
-        if not await asyncio.to_thread(hub.is_acp, from_session_id):
-            return  # a terminal front: its TUI holds no session/close to send, the kill ends it
-        queued = await asyncio.to_thread(hub.enqueue_control, from_session_id, {
-            "id": uuid.uuid4().hex, "type": "close", "payload": {"handoff": True}})
-    except Exception as exc:  # noqa: BLE001 — the kill fallback still guarantees one front
-        log.warning("hand-off %s #%s: the ACP runtime hub is unavailable (%s: %s); falling back to the kill",
-                    slot.project, slot.number, type(exc).__name__, exc)
-        return
-    if not queued:
-        log.warning("hand-off %s #%s: session %s refused the close; falling back to the kill",
-                    slot.project, slot.number, from_session_id)
-        return
-    # Counted polls, not a clock: the wait is bounded however the sleep is driven.
-    for _ in range(int(HANDOFF_CLOSE_WAIT_S)):
-        if await _old_front_window(slot.path, from_session_id) is None:
-            log.info("hand-off %s #%s: session %s closed for task %s", slot.project, slot.number,
-                     from_session_id, task_id)
-            return
-        await asyncio.sleep(1.0)
-    log.warning("hand-off %s #%s: session %s still holds the pane after %.0fs; falling back to the kill",
-                slot.project, slot.number, from_session_id, HANDOFF_CLOSE_WAIT_S)
-
-
-async def _old_front_window(worktree: str, from_session_id: str) -> "str | None":
-    """A hand-off's old front (`_old_front_pane`): None once it is gone (or was never this node's runner), else
-    its tmux `#{window_id}` ("" when tmux shows no window for its pane)."""
-    front = await _old_front_pane(worktree, from_session_id)
-    return None if front is None else front[1]
-
-
-async def _old_front_pane(worktree: str, from_session_id: str) -> "tuple[str, str, int] | None":
-    """A hand-off's old front, as the runner this node launched into `worktree` as `from_session_id`: None once
-    it is gone (or was never this node's runner), else `(tmux socket, #{window_id}, pane pid)` (socket and id
-    "" when tmux shows no window for its pane). Read off `runner_registry` (pane pid AND start ticks), never off
-    the slot's cwd: an operator's own pane in the worktree is no runner, so it neither holds a hand-off up nor
-    is killed by one. The socket rides along because window ids are per-server: the kill must be on it."""
-    import runner_registry  # noqa: PLC0415 — deferred: a stdlib leaf read only on this path
-
-    if not from_session_id:
-        return None
-    ident = await asyncio.to_thread(runner_registry.live_in_worktree, worktree)
-    if ident is None or ident.session_id != from_session_id:
-        return None
-    socket, window = await pane_window_for_pid(ident.tmux_pane_pid)
-    return socket, window, ident.tmux_pane_pid
-
-
-async def pane_window_for_pid(pane_pid: int) -> "tuple[str, str]":
-    """`(socket, #{window_id})` of the window holding the pane whose `#{pane_pid}` is `pane_pid`, via a live
-    `tmux list-panes -a`, or `("", "")`. Same server walk as `fresh_window_id_for`; pane pids are host-unique,
-    so the server that lists it is the one to kill on."""
-    for socket in session_user.manage_sockets():
-        if socket and not os.path.exists(socket):
-            continue
-        rc, out, _err = await vocab._sh(
-            session_user.tmux_cmd(socket, "list-panes", "-a", "-F", "#{pane_pid}\t#{window_id}"),
-            GIT_FAST_TIMEOUT,
-        )
-        if rc != 0:
-            continue
-        for line in out.splitlines():
-            pid, _, wid = line.partition("\t")
-            if wid and pid.strip() == str(pane_pid):
-                return socket, wid
-    return "", ""
 
 
 async def _enact_lease_slot(ctx: "ReconcileContext", slot: RosterSlot, intent: SlotIntent,

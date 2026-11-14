@@ -1,0 +1,64 @@
+slug = "pipedrive"
+label = "Pipedrive"
+category = "crm"
+vendor_docs_url = "https://pipedrive.readme.io/docs/marketplace-oauth-authorization"
+summary = "Work Pipedrive deals, persons, organizations, leads and activities from agent tasks."
+
+[[auth]]
+kind = "oauth"
+[auth.oauth]
+authorize_url = "https://oauth.pipedrive.com/oauth/authorize"
+token_url = "https://oauth.pipedrive.com/oauth/token"
+# Pipedrive takes the client pair as HTTP Basic, sets the scopes on the app (never on the authorize URL) and
+# documents no PKCE.
+basic_auth = true
+pkce = false
+jaah_app = true
+
+[auth.oauth.registration]
+console_url = "https://developers.pipedrive.com/"
+steps = [
+  "The owning account must be a Pipedrive developer sandbox account: create one from Start here on the developer site if there is none, and sign in to it",
+  "To create the app, open the account menu at the top right, select Developer Hub, then Create an app and choose Create private app",
+  "On Basic info enter App name Jaah; the Callback URL is the redirect URI below",
+  "On OAuth & access scopes tick Deals: Full access, Activities: Full access, Contacts: Full access, Leads: Full access, Search for all data and Users: Read only (Basic access is always on)",
+  "Select Save, then copy the Client ID and Client secret shown under OAuth & access scopes",
+]
+review = "Pipedrive must approve the public app (Marketplace review, listed or unlisted) before companies other than the developer sandbox can install it"
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "api_token", label = "API token", kind = "secret", required = true, help = "In Pipedrive, open the account menu at the top right, select Personal preferences, then the API tab, and copy Your personal API token (an admin can turn this tab off under Company settings > Permission sets)" },
+]
+
+[test]
+path = "https://api.pipedrive.com/v1/users/me"
+auth = { field = "api_token", header = "x-api-token" }
+identity = [["data", "name"], ["data", "email"]]
+
+[docs]
+agent_uses = [
+  "Create, move and update deals across pipeline stages",
+  "Add and update persons and organizations, and link them to deals",
+  "Schedule and complete activities such as calls, meetings and follow-up tasks",
+  "Search across deals, persons, organizations and leads by name, email or phone",
+]
+prerequisites = [
+  "A Pipedrive user (any plan); to approve the sign-in for the whole company you must be a Pipedrive admin",
+]
+limitations = [
+  "Agents act as the user who connected and see only the deals and contacts that user's visibility groups allow",
+  "With sign-in, what agents can do is fixed by the scopes on Jaah's Pipedrive app (deals, activities, contacts, leads, search and users read); Pipedrive shows the list on its install screen",
+  "Pipedrive rate-limits each company per token on a rolling 2-second window and, on newer plans, with daily token budgets",
+  "An agent learns the company's own API address from users/me (`data.company_domain`); requests to api.pipedrive.com also work",
+]
+troubleshooting = [
+  { symptom = "Test says Pipedrive rejected the API token (401)", fix = "The personal token was regenerated or the user was deactivated. Copy the current token from Personal preferences > API and select Replace on the secret" },
+  { symptom = "The API tab is missing from Personal preferences", fix = "Your company turned off API access for your permission set. A Pipedrive admin enables Use API under Company settings > Permission sets, or you connect with Sign in instead" },
+  { symptom = "The secret shows Needs reconnect", fix = "The app was uninstalled in Pipedrive (Tools and apps > Marketplace apps) or the refresh token expired after 60 days unused. Select Reconnect and approve again" },
+]
+faq = [
+  { q = "Sign in or API token - which should I use", a = "Sign in when you can: Jaah renews the access itself and you can uninstall it in Pipedrive at any time. Use the API token for automation accounts or when your admin has not approved the app" },
+  { q = "Can I limit which data agents reach", a = "Connect as a user whose visibility groups limit what they can see; Pipedrive applies those to every API call" },
+]

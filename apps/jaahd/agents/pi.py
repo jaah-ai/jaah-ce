@@ -6,7 +6,9 @@ runtime here (`agent_providers.PI`): the launch is `acp_launch`, under `jaah-acp
 
 Two gaps in pi-acp shape the launch, both closed node-side rather than in a fork (architecture A2):
   1. pi-acp keeps the ACP `mcpServers` of `session/new` and never hands them to pi. Pi reads its own `mcp.json`,
-     so the control server is written there, with `direct` exposure so its tools are declared to the model.
+     so the control server is written there, with `direct` exposure so its tools are declared to the model. A
+     project's linked remote MCP servers are this run's alone, so the fleet extension registers them instead
+     (`pi.registerMcpServer`), never the account's shared `mcp.json`.
   2. pi-acp starts pi with no model argument. The run's model rides `--model`, added by the command pi-acp
      spawns: `PI_ACP_PI_COMMAND` names `pi_rpc.py`, which writes Pi's files and execs `pi`.
 
@@ -36,14 +38,14 @@ from .base import (
     TASK_ARGV_POSITIONAL,
     AcpLaunch,
     AcpLaunchContext,
-    AdapterDefaults,
+    AgentAdapter,
     LifecycleChains,
     QuitSignature,
     TokenCounts,
     acp_hook_files as base_acp_hook_files,
     adapter_env,
-    control_mcp_server,
     harness_dispatch,
+    remote_mcp_servers,
     tool_path,
 )
 
@@ -117,13 +119,12 @@ dispatch_hooks = functools.partial(harness_dispatch, vendor=agent_providers.PI.v
                                    events=_HARNESS_EVENTS, matchers=_HARNESS_MATCHERS, tool_names=_TOOL_NAMES)
 
 
-def acp_hook_files(chains: LifecycleChains) -> tuple[dict, dict]:
-    """A run's two hook files (`base.acp_hook_files`): the engine's (the extension's tool and compaction events)
-    and the host's own."""
-    return base_acp_hook_files(chains, vendor=agent_providers.PI.value, dispatch=dispatch_hooks)
+# A run's two hook files (`base.acp_hook_files`): the engine's (the extension's tool and compaction events) and
+# the host's own.
+acp_hook_files = functools.partial(base_acp_hook_files, vendor=agent_providers.PI.value, dispatch=dispatch_hooks)
 
 
-class PiAdapter(AdapterDefaults):
+class PiAdapter(AgentAdapter):
     """Pi under the ACP host. Stateless — the registry holds one instance."""
 
     provider = "pi"
@@ -134,8 +135,11 @@ class PiAdapter(AdapterDefaults):
         """`pi-acp` with `pi_rpc.py` as the pi it spawns, and the `JAAH_PI_LAUNCH` document that command reads.
 
         The control server is one entry, handed to the host (which passes it in `session/new`, where pi-acp drops
-        it) and written by `pi_rpc.py` into Pi's `mcp.json`, where Pi reads it. No `prepare`: the files are written
-        by the engine itself, as the runner uid, at the paths it sees (a MicroVM's guest paths included).
+        it) and written by `pi_rpc.py` into Pi's `mcp.json`, where Pi reads it. The project's linked remote MCP
+        servers are NOT written there: that file is the account's, shared by its every run, so they ride the
+        document's `remote_mcp_servers` and the fleet extension registers them for this run alone
+        (`pi.registerMcpServer`). No `prepare`: the files are written by the engine itself, as the runner uid, at the
+        paths it sees (a MicroVM's guest paths included).
 
         The hook layer splits as Antigravity's does (`acp_hook_files`): the engine's file rides the document, read by
         the extension `pi_rpc.py` loads (`pi_extension/jaah-harness.ts`) and handed to the dispatcher on its stdin
@@ -145,10 +149,12 @@ class PiAdapter(AdapterDefaults):
 
         from . import agent_layer  # a daemon-facing sibling: local, so this module stays importable alone
 
-        control = control_mcp_server(*_split(agent_layer.jaah_mcp_command()), {})
+        control = agent_layer.control_server()
+        remote = remote_mcp_servers(ctx.mcp_connections, guest=ctx.guest)
         engine_hooks, host_hooks = acp_hook_files(guard_chains(ctx.worktree, guard=ctx.guard))
         document = {"model": ctx.model, "provider": MODEL_PROVIDER, "key_command": key_command(ctx.api_key_account),
-                    "settings": SETTINGS, "mcp_servers": [control], "hooks": engine_hooks,
+                    "settings": SETTINGS, "mcp_servers": [control], "remote_mcp_servers": list(remote),
+                    "hooks": engine_hooks,
                     "dispatcher": tool_path("hook_bridge_core.py"), "python": sys.executable,
                     "tool_inputs": _TOOL_INPUTS,
                     "ask_tool": agent_providers.PI.ask_tool, "no_answer": agent_providers.PI.ask_dismissed_result,
@@ -156,7 +162,8 @@ class PiAdapter(AdapterDefaults):
         env = {**dict(QUIET_ENV), "PI_ACP_PI_COMMAND": RPC_COMMAND, LAUNCH_ENV: json.dumps(document, sort_keys=True)}
         if ctx.config_dir:
             env[AGENT_DIR_ENV] = ctx.config_dir
-        return AcpLaunch(argv=(ACP_BINARY,), env=env, session_meta={}, mcp_servers=(control,), host_hooks=host_hooks)
+        return AcpLaunch(argv=(ACP_BINARY,), env=env, session_meta={}, mcp_servers=(control, *remote),
+                         host_hooks=host_hooks)
 
     # ── Legacy launch: none ────────────────────────────────────────────────────────────────────────
 
@@ -167,6 +174,8 @@ class PiAdapter(AdapterDefaults):
     quit_sig = _QUIT
     #: The key comes from the `auth.json` helper command, never a variable (`api_key_helper` True).
     api_key_variable = ""
+    #: `""`: `register_mcp` registers nothing — `pi_rpc.py` declares the control server in Pi's `mcp.json` at
+    #: each start.
     mcp_binary = ""
 
     def exec_line(
@@ -188,10 +197,6 @@ class PiAdapter(AdapterDefaults):
         """Nothing: the ACP launch's engine writes its own files (`pi_rpc.py`)."""
         return None
 
-    def register_mcp(self, *, config_dir: str) -> None:
-        """Nothing: `pi_rpc.py` declares the control server in Pi's `mcp.json` at each start."""
-        return None
-
     def render_hooks(
         self, *, settings_path: str, chains: LifecycleChains, config_dir: str = "",
     ) -> tuple[str | None, str]:
@@ -207,7 +212,7 @@ class PiAdapter(AdapterDefaults):
         return agent_config_dirs.CREDS_NONE
 
     # ── Session identity + ingest: the host's event stream, never a vendor transcript ───────────────
-    # `session_binding`, `discover_session_id` and `session_members` are `AdapterDefaults`' answers.
+    # `session_binding`, `discover_session_id` and `session_members` are `AgentAdapter`'s defaults.
 
     def transcript(self, *, config_dir: str, worktree: str, session_id: str) -> str | None:
         """None: the run's record is the host's normalised event stream, collected by the ACP ingest."""
@@ -233,10 +238,6 @@ def key_command(api_key_account: str) -> str:
     if not account_auth.slug_from_node_credential_name(name):
         return ""
     return f"!{fleet_launch.shq(account_auth.CREDENTIAL_HELPER)} {fleet_launch.shq(name)}"
-
-
-def _split(command: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
-    return command[0], tuple(command[1:])
 
 
 __all__ = ["PiAdapter", "key_command"]

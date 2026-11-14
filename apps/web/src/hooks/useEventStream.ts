@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
-import { apiHref, useApiRewriterVersion } from '../api'
-import { useTabOrg, withOrgParam } from '../lib/activeOrg'
+import { useEffect, useRef, useState } from 'react'
+import { useApiRewriterVersion } from '../api'
+import { useTabLeftBehind, useTabOrg, withOrgParam } from '../lib/activeOrg'
+import { openEventSource, streamUrl } from '../net/streams'
 
 // Native EventSource on GET /api/stream. Its built-in auto-reconnect covers a dropped connection only: an HTTP
 // error answer (a deploy's 502/503 from the load balancer) CLOSES it for good, and the tab sat on the 'down' poll
@@ -42,6 +43,17 @@ const DOWN_AFTER_MS = 20_000
 const REOPEN_MIN_MS = 1_000
 const REOPEN_MAX_MS = 30_000
 
+// A SILENT STREAM IS A DEAD ONE. Some networks (an ISP's DPI box, a TLS-inspecting firewall) drop the connection
+// without a FIN: the source stays OPEN, hears nothing, and the browser notices only minutes later — while every
+// read the page sends on that connection waits ~20s before the browser tries a new one. The server sends a
+// `keepalive` event every 15s (`apps/api/app/routes/stream.py::STREAM_KEEPALIVE_SECONDS`), so an OPEN source that
+// has heard nothing for SILENT_AFTER_MS is closed and reopened at once: the browser finds the dead connection in
+// the background, before the user's next click does. Armed only once a `keepalive` event has arrived, so a stream
+// whose server sends none (the live host's, an older control plane) is never torn down.
+const KEEPALIVE_EVENT = 'keepalive'
+const SILENT_AFTER_MS = 35_000
+const SILENCE_CHECK_MS = 5_000
+
 function isConsoleEvent(value: unknown): value is ConsoleEvent {
   if (!value || typeof value !== 'object') return false
   const v = value as Record<string, unknown>
@@ -76,17 +88,36 @@ if (typeof window !== 'undefined') {
 }
 
 function openSource(path: string, stream: SharedStream, reopenDelayMs: number): EventSource {
-  const source = new EventSource(path, { withCredentials: true })
+  const source = openEventSource(path, { withCredentials: true })
+  let heardAt = Date.now()
+  let armed = false
+  const silence = setInterval(() => {
+    if (sharedStreams.get(path) !== stream || stream.source !== source || source.readyState === EventSource.CLOSED) {
+      clearInterval(silence)
+      return
+    }
+    if (!armed || source.readyState !== EventSource.OPEN || Date.now() - heardAt < SILENT_AFTER_MS) return
+    clearInterval(silence)
+    source.close()
+    for (const l of stream.listeners) l.onError()
+    stream.source = openSource(path, stream, REOPEN_MIN_MS)
+  }, SILENCE_CHECK_MS)
+  source.addEventListener(KEEPALIVE_EVENT, () => {
+    armed = true
+    heardAt = Date.now()
+  })
   source.onopen = () => {
+    heardAt = Date.now()
     reopenDelayMs = REOPEN_MIN_MS
     for (const l of stream.listeners) l.onOpen()
   }
   source.onmessage = (evt: MessageEvent<string>) => {
+    heardAt = Date.now()
     try {
       const parsed: unknown = JSON.parse(evt.data)
       if (isConsoleEvent(parsed)) for (const l of stream.listeners) l.onMessage(parsed)
     } catch {
-      /* ignore malformed payloads — the keepalive comment never reaches onmessage */
+      /* ignore malformed payloads — the named `keepalive` event never reaches onmessage */
     }
   }
   source.onerror = () => {
@@ -140,13 +171,17 @@ export function useEventStream(
   /* `?org=`: the org this tab acts as, so a tab an org switch left behind is refused (`lib/activeOrg.ts`).
      Re-rendered by the pin, so a stream opened before the first live identity answer reopens carrying it. */
   useTabOrg()
-  /* The live host's stream URL (`apiHref`) is rewritten once its rewriter is installed, so that re-renders here and
+  // Left behind by an org switch: the API would only refuse it, so no stream until this tab is current again.
+  const leftBehind = useTabLeftBehind()
+  /* The live host's stream URL (`net/streams.ts::streamUrl`) is rewritten once its rewriter is installed, so that re-renders here and
      the stream opens under it. In the console both are no-ops. */
   useApiRewriterVersion()
-  const path = basePath === null ? '' : apiHref(withOrgParam(basePath))
+  const path = basePath === null || leftBehind ? '' : streamUrl(withOrgParam(basePath))
   const [state, setState] = useState<EventStreamState>(path ? 'reconnecting' : 'down')
   const [recentEvents, setRecentEvents] = useState<readonly ConsoleEvent[]>([])
   const [resumed, setResumed] = useState(0)
+  // Closed for a left-behind period: the first open after it is a resume, so readers catch up on what they missed.
+  const heldClosed = useRef(false)
   // Joined so an identical inline array does not re-subscribe every render.
   const entityKey = entities ? [...entities].sort().join(',') : ''
 
@@ -162,7 +197,14 @@ export function useEventStream(
       }
     }
 
-    // '' is a path this host must not open (`apiHref`): no stream, and polling callers fall back as for 'down'.
+    /* Left behind: 'reconnecting', not 'down' — a polling caller's fallback would only queue requests the choke point
+       holds anyway. */
+    if (leftBehind && basePath !== null) {
+      heldClosed.current = true
+      setState('reconnecting')
+      return
+    }
+    // '' is a path this host must not open (`streamUrl`): no stream, and polling callers fall back as for 'down'.
     if (!path) {
       setState('down')
       return
@@ -172,8 +214,9 @@ export function useEventStream(
         if (cancelled) return
         clearDownTimer()
         setState('connected')
-        if (errored) setResumed(n => n + 1)
+        if (errored || heldClosed.current) setResumed(n => n + 1)
         errored = false
+        heldClosed.current = false
       },
       onMessage: (evt) => {
         if (cancelled) return
@@ -198,7 +241,7 @@ export function useEventStream(
       clearDownTimer()
       release()
     }
-  }, [path, entityKey])
+  }, [path, entityKey, leftBehind, basePath])
 
   return { state, lastEvent: recentEvents[recentEvents.length - 1] ?? null, recentEvents, resumed }
 }

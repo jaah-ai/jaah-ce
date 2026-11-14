@@ -11,18 +11,17 @@ from __future__ import annotations
 
 import logging
 
-from app import task_pipeline, task_pipeline_cp
+from app import idle_runner_nudge, task_pipeline, task_pipeline_cp
 from app.alert_record import record_alert
-from app.db import SessionLocal
-# Re-exported, not re-spelled (see the liveness note below `HOLDER_LIVE_WINDOW_SECONDS`): only the
-# names already spelled through this module; `LAUNCH_SETTLE_SECONDS` because this module's tests read it.
-from app.runner_liveness import (  # noqa: F401 — re-export
+from app.db import BridgedSession
+# The liveness predicate is `app/runner_liveness.py`'s (what each value requires; why three-valued: the docstring
+# above). Imported by name, so `monkeypatch.setattr(task_pipeline_job, "runner_verdict", ...)` reaches `_runner_held`.
+from app.runner_liveness import (
     ALIVE,
     DEAD,
-    LAUNCH_SETTLE_SECONDS,
     NODE_STILL_TALKING_SECONDS,
     OBSERVATION_FRESH_SECONDS,
-    UNKNOWN,
+    UNKNOWN,  # noqa: F401 — re-exported: its tests read `task_pipeline_job.UNKNOWN`
     runner_verdict,
 )
 from app.task_lifecycle import SYSTEM_FAILED
@@ -51,13 +50,13 @@ LANE_HOLDER_LIVE_WINDOW_SECONDS = 300.0
 # `NODE_STILL_TALKING_SECONDS`) but has stopped observing this slot (`observed_at` older than
 # `runner_liveness.OBSERVATION_FRESH_SECONDS`): a starved daemon, whose runners keep
 # working. On 2026-10-17 a node at load average 328 lost its observation, and the 900s timer reclaimed 45
-# LIVE runners whose transcripts ran on for minutes. Bounded, so a node that never observes again
-# still releases its rows; the node-liveness cron alarms on the not-observing node meanwhile.
+# LIVE runners whose transcripts ran on for minutes. A node that still observes but whose session list
+# could not be read (`probes.agents_ok` false) is starved the same way: on 2026-11-13 a vnode's probe timed out
+# for over 20 minutes and the 900s timer reclaimed its long runners as `vanished`, then `launch_failed`. A blind
+# slot whose node says it holds no launched pane there (`probes.launched_pane` false) is not: that runner is gone,
+# and the normal grace runs (`runner_liveness.RunnerState.probe_blind`). Bounded,
+# so a node that never observes again still releases its rows; the node-liveness cron alarms on it meanwhile.
 TALKING_NODE_HOLDER_LIVE_WINDOW_SECONDS = 3600.0
-# ── The liveness predicate: single-homed in `app/runner_liveness.py` ──────────────────────────────
-# Re-exported so existing callers and `monkeypatch.setattr(task_pipeline_job, "runner_verdict", ...)`
-# still reach what `_runner_held` calls. The module docstring above is the home for why the verdict is
-# three-valued; that file for what each value requires.
 
 
 def _runner_held(
@@ -69,7 +68,8 @@ def _runner_held(
 
     A boolean seam because the reclaimers in `app/task_pipeline.py` take an injected
     `lease_held(number)`. ALIVE holds, DEAD does not, UNKNOWN holds only until the grace runs out:
-    `window`, or `talking_window` while the node is starved — it still heartbeats but stopped observing."""
+    `window`, or `talking_window` while the node is starved — it still heartbeats but stopped observing, or
+    observes with a session list it could not read."""
     state = runner_verdict(number)
     if state.verdict == ALIVE:
         return True
@@ -84,7 +84,7 @@ def _runner_held(
     node_spoke, observed = state.node_spoke_secs, state.observed_secs
     starved = (
         node_spoke is not None and node_spoke <= NODE_STILL_TALKING_SECONDS
-        and (observed is None or observed > OBSERVATION_FRESH_SECONDS)
+        and (observed is None or observed > OBSERVATION_FRESH_SECONDS or state.probe_blind)
     )
     if starved:
         window = max(window, talking_window)
@@ -143,7 +143,7 @@ def _alert(
     `node_id` stays a name and is not resolved here: the control plane is not a `nodes` row, and
     `alert_record.record_alert` owns turning an unknown name into NULL (fail-open)."""
     try:
-        with SessionLocal() as session:
+        with BridgedSession() as session:
             record_alert(
                 session, kind=kind, node_id=task_pipeline.control_plane_api.this_node_id(),
                 repo=repo or None, reason=reason, task_id=task_id,
@@ -160,11 +160,11 @@ def _headline_payload(session, task_id: int | None, body: str) -> dict | None:
     Without `task_id`, deliberately: that key is the answerable signal (R5.4, R5.9);
     `alert_relay.task_parts` reads the id off `record_alert`'s own parameter. `body` says which state,
     persona and visibility the row is in."""
-    # Function-local, as in `notify_targets.resolve_slack_target`: avoids a wide import closure.
+    # Function-local, as in `notify_targets.resolve_slack_targets`: avoids a wide import closure.
     from app.models.projects import Project
     from app.models.tasks import Task
     from app.org_names import org_name
-    from app.task_external_comment import _console_task_url
+    from app.trackers.writeback import task_url as _console_task_url
 
     # Fail-open: a faulting read costs the alert its task line, never the alert.
     try:
@@ -188,13 +188,6 @@ def _headline_payload(session, task_id: int | None, body: str) -> dict | None:
 def _notify_epic_fanout_blocked(epic_id: int, repo: str, reason: str) -> None:
     _alert("blocked", repo,
            f"epic task {epic_id} fanout blocked — issue-create ceiling reached: {reason}",
-           task_id=epic_id)
-
-
-def _notify_stuck_epic(epic_id: int, repo: str, reason: str, stuck_seconds: float) -> None:
-    _alert("self-heal", repo,
-           f"epic task {epic_id} stuck — active with all children done for "
-           f"{stuck_seconds / 60:.0f}m, rollup blocked: {reason}",
            task_id=epic_id)
 
 
@@ -226,7 +219,6 @@ def sweep_once() -> None:
     # when its task is terminal/deleted/reset or a user exits, the row is reused, and an un-acked dispatch
     # is re-dispatched into the same slot.
     task_pipeline.set_epic_fanout_blocked_notifier(_notify_epic_fanout_blocked)
-    task_pipeline.set_stuck_epic_notifier(_notify_stuck_epic)
     task_pipeline.set_needs_attention_notifier(_notify_needs_attention)
     try:
         task_pipeline.sweep_epic_children_fanout()
@@ -234,29 +226,38 @@ def sweep_once() -> None:
         task_pipeline.sweep_needs_attention_notify()
     finally:
         task_pipeline.set_epic_fanout_blocked_notifier(None)
-        task_pipeline.set_stuck_epic_notifier(None)
         task_pipeline.set_needs_attention_notifier(None)
 
     # The crash reclaimers, each fail-closed through the probe above; outside the notifier block because
     # they need no notifier. `_runner_held` answers liveness directly, so no second `lease_stale` probe.
-    task_pipeline.reclaim_stale_active_analysis_children(_runner_held)
+    #
+    # One open-task read for every consumer below. None relies on another's writes in this pass: the three
+    # `active` reclaimers take disjoint personas, the stall detector and finish backstop only move `active` rows
+    # off `active`, and a row the `awaiting_response` reclaimer takes is refused by the expirer's state guards.
+    open_tasks = task_pipeline_cp.list_open_tasks()
+    task_pipeline.reclaim_stale_active_analysis_children(_runner_held, open_tasks=open_tasks)
     task_pipeline.sweep_finish_phases(_runner_held)
-    task_pipeline.reclaim_stale_active_coders(_runner_held)
+    task_pipeline.reclaim_stale_active_coders(_runner_held, open_tasks=open_tasks)
     # The restart-only rows (the `outcome` and `operator` criteria). Two probes: the loose one for
     # `outcome` rows (a wrong verdict costs a re-run), the strict one for chats (it costs a live
     # conversation, and a quiet node may still be running them).
-    task_pipeline.reclaim_stale_active_restartable_tasks(_runner_held, _runner_confirmed_dead, _lane_runner_held)
+    task_pipeline.reclaim_stale_active_restartable_tasks(
+        _runner_held, _runner_confirmed_dead, _lane_runner_held, open_tasks=open_tasks,
+    )
     # The stall backstop, after the reclaimers so a row they can judge keeps their cause; its own clock, no probe.
     task_pipeline.reclaim_silent_active_tasks()
+    # The other half of silence: a runner that is alive but idle with nothing left to wake it is nudged, not
+    # reclaimed (`idle_runner_nudge`). Best effort; it never raises.
+    idle_runner_nudge.nudge_idle_runners()
     # Rows parked on an `AskUserQuestion` whose runner died are unanswerable. Uses the strict probe: a wrong
     # verdict destroys a live conversation, so it waits for an affirmative DEAD. Shares no candidate rows
     # with the reclaimers above, so its position is legibility, not a dependency.
-    task_pipeline.reclaim_stale_awaiting_response_tasks(_runner_confirmed_dead)
+    task_pipeline.reclaim_stale_awaiting_response_tasks(_runner_confirmed_dead, open_tasks=open_tasks)
     # Rows parked on a question whose runner is alive but whose human has not answered; no probe.
     #
     # Must run after the reclaimer: a confirmed-dead runner's row is reclaimed for re-dispatch, never
     # expired for a timeout its death caused. The ordering is the precedence.
-    task_pipeline.expire_timed_out_awaiting_response_tasks()
+    task_pipeline.expire_timed_out_awaiting_response_tasks(open_tasks=open_tasks)
     # The merge lane's scheduler backstop (L9c), after the reclaimers so a lane run they just ended has its
     # rows requeued and is re-filed in this same pass. Its own failure costs nothing above.
     try:

@@ -43,7 +43,7 @@ export default function StaleTabDialog() {
       testId="stale-tab-dialog"
       submitTestId="stale-tab-reload"
       describedBy="stale-tab-body"
-      backdropSx={{ backgroundColor: 'rgba(0, 0, 0, 0.25)' }}
+      backdropSx={{ backgroundColor: (t) => `color-mix(in srgb, ${(t.vars ?? t).palette.common.black} 25%, transparent)` }}
     >
       <DialogContentText id="stale-tab-body">
         This tab still shows the org you left. Reload to continue in {org?.name}.

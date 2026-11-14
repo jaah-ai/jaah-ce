@@ -65,8 +65,7 @@ export interface OrgSelectProps {
   /** A row offered but NOT PICKABLE, with the reason after its slug (the operator plane for a kind whose rule
    *  refuses it); null offers the row. Unlike a disabled org (filtered out, rule 2), the reader must see WHY. */
   optionDisabled?: (org: Org) => string | null
-  /** From `ui/FormField` for hover help; the lookup's input carries no description slot, so it is accepted
-   *  and unused rather than breaking `FormField`'s clone. */
+  /** From `ui/FormField`: its `htmlInput` (the label tip as `aria-description`) reaches the lookup's input. */
   slotProps?: { htmlInput?: Record<string, unknown> }
 }
 
@@ -112,6 +111,7 @@ export function OrgSelect({
   optionNote,
   excludeOrgId = null,
   optionDisabled,
+  slotProps,
 }: OrgSelectProps): JSX.Element {
   /* Every row a search returned, by id, so a pick hands the caller the full `Org` — and the box names a value
      this control picked without a second read. */
@@ -187,6 +187,7 @@ export function OrgSelect({
       helperText={valueMessage ?? helperText}
       disabled={disabled}
       testId={testId}
+      slotProps={slotProps}
     />
   )
 }

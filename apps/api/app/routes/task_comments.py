@@ -16,20 +16,22 @@ Mentions are resolved server-side on every write (`app/comment_mentions.py`; Sla
 The mentions bell is `GET /api/inbox` (`routes/inbox.py`). The thread itself — body rule, page, wire,
 write sequence, images — is `app/comment_service.py`, shared with a support ticket's
 (`routes/support_comments.py`). An image dropped by an edit or taken by a delete has its bytes reaped here,
-after the commit (`reap_unreferenced_object`).
+after the commit (`reap_unreferenced_objects`).
 """
 from __future__ import annotations
 
+import asyncio
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import comment_mentions, comment_notify, comment_reactions, comment_service, hipaa
-from app.auth import require_user
+from app.auth import adopt_user, require_user
 from app.authz.catalog import permission_key
 from app.authz.declarations import feature
 from app.authz.object_access import can_access, key_scope_satisfied
-from app.authz.principal import Principal, current_principal
+from app.authz.principal import AsyncCaller, Principal, current_caller, current_principal
 from app.authz.visibility import TASK_SPEC, ObjectAccess
 from app.identities import display_name
 from app.comment_service import (
@@ -40,13 +42,14 @@ from app.comment_service import (
     MentionOut,
     Subject,
 )
-from app.db import get_session
+from app.db_async import DbDep, defer_off_loop, on_session, run_deferring
 from app.entity_shape import get_or_404
+from app.task_lookup import find_task
 from app.user_activity import record_task_note
 from app.models.identity import AdminUser
 from app.models.task_extras import TaskComment
 from app.models.tasks import Task
-from app.attachment_storage import reap_unreferenced_object
+from app.attachment_storage import reap_unreferenced_objects
 
 # No `prefix=`: every decorator spells its whole `/api/...` path.
 router = APIRouter(tags=["task-comments"])
@@ -93,7 +96,9 @@ def _answered(
     """A written comment, after its commit: the DMs for its `fresh` mentions (never for a comment a later error
     rolled back), then the comment as the caller sees it."""
     session.refresh(comment)
-    comment_notify.notify_mentioned(session, task=task, comment=comment, author=user, mentioned=fresh)
+    defer_off_loop(
+        session, comment_notify.notify_mentioned_on_own_session, task.id, comment.id, user.id, [u.id for u in fresh],
+    )
     return _render(session, [comment], me=user, may_delete_any=_may_delete_any(session, principal, task.id))[0]
 
 
@@ -110,23 +115,24 @@ def _mentioned_in(session: Session, comment: TaskComment) -> list[AdminUser]:
 
 @router.get("/api/tasks/{task_id}/comments", response_model=list[CommentOut])
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
+@on_session
 def list_comments(
+    session: Session,
     task_id: int,
     request: Request,
     limit: int = 200,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> list[CommentOut]:
     """This task's comments, oldest first.
 
     The most recent `limit`, returned chronologically: the conversation is unbounded and the reader
     wants its end. A HIPAA org's read is recorded (`hipaa.record_phi_read`)."""
+    user = adopt_user(session, caller.actor)
     comments = comment_service.page(session, Subject("task", task_id), limit)
     out = _render(
-        session, comments, me=user, may_delete_any=_may_delete_any(session, principal, task_id)
+        session, comments, me=user, may_delete_any=_may_delete_any(session, caller.principal, task_id)
     )
-    task = session.scalar(select(Task).where(Task.id == task_id))
+    task = find_task(task_id, session)
     if task is not None:
         hipaa.record_phi_read(
             session, request, record_type="comments", record_id=task_id, task_id=task_id,
@@ -137,14 +143,17 @@ def list_comments(
 
 @router.post("/api/tasks/{task_id}/comments", response_model=CommentOut, status_code=201)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",))
+@on_session(deferring=True)
 def create_comment(
+    session: Session,
     task_id: int,
     payload: CommentIn,
+    # Composed in-process by its callers with an explicit pair (`routes/agent_task_board.py`), so the two dependencies stay.
     user: AdminUser = Depends(require_user),
     principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
 ) -> CommentOut:
     """Post a comment. `tasks:edit` IS THE GATE — see the module docstring."""
+    user = adopt_user(session, user)
     task = get_or_404(session, Task, task_id, detail=_NO_TASK)
     comment, fresh = comment_service.create(
         session,
@@ -160,15 +169,30 @@ def create_comment(
 
 @router.patch("/api/tasks/{task_id}/comments/{comment_id}", response_model=CommentOut)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",))
-def update_comment(
+async def update_comment(
+    db: DbDep,
     task_id: int,
     comment_id: int,
     payload: CommentIn,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CommentOut:
     """Edit your own comment. THE AUTHOR AND NOBODY ELSE — see the module docstring's asymmetry note."""
+    user, task, comment, fresh, before = await db.run_sync(_update_comment, task_id, comment_id, payload, caller.actor)
+    # A kept image's key is still named by its row, so the reap skips it.
+    await asyncio.to_thread(reap_unreferenced_objects, before)
+    return await run_deferring(db, _answered, caller.principal, user, task, comment, fresh)
+
+
+def _update_comment(
+    session: Session,
+    task_id: int,
+    comment_id: int,
+    payload: CommentIn,
+    user: AdminUser,
+) -> tuple[AdminUser, Task, TaskComment, list[AdminUser], list[tuple[Optional[str], str]]]:
+    """`update_comment`'s edit, over the route's async session (`run_sync`): committed; returns what `_answered`
+    takes and the images' keys from before the edit, for `reap_unreferenced_objects`."""
+    user = adopt_user(session, user)
     comment = comment_service.comment_or_404(session, Subject("task", task_id), comment_id)
     if comment.author_id != user.id:
         raise HTTPException(status_code=403, detail="Only the author can edit a comment")
@@ -182,25 +206,36 @@ def update_comment(
         image_ids=payload.image_ids,
     )
     session.commit()
-    # A kept image's key is still named by its row, so the reap skips it.
-    for bucket, key in before:
-        reap_unreferenced_object(session, key, bucket)
-    return _answered(session, principal, user, task, comment, fresh)
+    return user, task, comment, fresh, before
 
 
 @router.delete("/api/tasks/{task_id}/comments/{comment_id}", status_code=204)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",))
-def delete_comment(
+async def delete_comment(
+    db: DbDep,
     task_id: int,
     comment_id: int,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> Response:
     """Delete a comment — the author's own, or anyone's for a `tasks:delete` holder on this task.
 
     Mention and image rows go by CASCADE, closing unread bell entries for it; the images' bytes are
     reaped after the commit (their keys read first)."""
+    keys = await db.run_sync(_delete_comment, task_id, comment_id, caller.actor, caller.principal)
+    await asyncio.to_thread(reap_unreferenced_objects, keys)
+    return Response(status_code=204)
+
+
+def _delete_comment(
+    session: Session,
+    task_id: int,
+    comment_id: int,
+    user: AdminUser,
+    principal: Principal | None,
+) -> list[tuple[Optional[str], str]]:
+    """`delete_comment`'s body, over the route's async session (`run_sync`): committed; returns the images' keys,
+    read before the delete, for `reap_unreferenced_objects`."""
+    user = adopt_user(session, user)
     comment = comment_service.comment_or_404(session, Subject("task", task_id), comment_id)
     mine = comment.author_id == user.id
     if not mine and not _may_delete_any(session, principal, task_id):
@@ -220,9 +255,7 @@ def delete_comment(
     keys = comment_service.image_keys(session, comment.id)
     session.delete(comment)
     session.commit()
-    for bucket, key in keys:
-        reap_unreferenced_object(session, key, bucket)
-    return Response(status_code=204)
+    return keys
 
 
 def _react(
@@ -238,10 +271,7 @@ def _react(
     session.commit()
     if owed:
         # After the commit, as a mention's DM.
-        comment_reactions.notify_author(
-            session, task=get_or_404(session, Task, task_id, detail=_NO_TASK), comment=comment, reactor=user,
-            emoji=emoji,
-        )
+        defer_off_loop(session, comment_reactions.notify_author_on_own_session, task_id, comment.id, user.id, emoji)
     return _render(
         session, [comment], me=user, may_delete_any=_may_delete_any(session, principal, task_id)
     )[0]
@@ -249,43 +279,47 @@ def _react(
 
 @router.put("/api/tasks/{task_id}/comments/{comment_id}/reactions/{emoji}", response_model=CommentOut)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",))
+@on_session(deferring=True)
 def add_reaction(
+    session: Session,
     task_id: int,
     comment_id: int,
     emoji: str,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CommentOut:
     """React with `emoji` (a key of `models.REACTION_EMOJIS`). Idempotent; answers the comment."""
-    return _react(session, principal, user, task_id, comment_id, emoji, on=True)
+    user = adopt_user(session, caller.actor)
+    return _react(session, caller.principal, user, task_id, comment_id, emoji, on=True)
 
 
 @router.delete("/api/tasks/{task_id}/comments/{comment_id}/reactions/{emoji}", response_model=CommentOut)
 @feature("tasks", "edit", object_type="task", object_params=("task_id",))
+@on_session(deferring=True)
 def remove_reaction(
+    session: Session,
     task_id: int,
     comment_id: int,
     emoji: str,
-    user: AdminUser = Depends(require_user),
-    principal: Principal | None = Depends(current_principal),
-    session: Session = Depends(get_session),
+    caller: AsyncCaller = Depends(current_caller),
 ) -> CommentOut:
     """Take back your own `emoji`. Idempotent; answers the comment."""
-    return _react(session, principal, user, task_id, comment_id, emoji, on=False)
+    user = adopt_user(session, caller.actor)
+    return _react(session, caller.principal, user, task_id, comment_id, emoji, on=False)
 
 
 @router.get("/api/tasks/{task_id}/mention-candidates", response_model=list[MentionCandidateOut])
 @feature("tasks", "view", object_type="task", object_params=("task_id",))
+@on_session
 def mention_candidates(
+    session: Session,
     task_id: int,
     _user: AdminUser = Depends(require_user),
-    session: Session = Depends(get_session),
 ) -> list[MentionCandidateOut]:
     """Everyone this task's comments may name, alphabetically — what the composer's `@` picker draws.
 
     Per task, not per org (`comment_mentions.mentionable_users`): the picker and the parser read the
     same roster, so an offered name always chips and notifies."""
+    _user = adopt_user(session, _user)
     return [
         MentionCandidateOut(id=str(user.id), name=display_name(user))
         for user in comment_mentions.mentionable_users(session, task_id)

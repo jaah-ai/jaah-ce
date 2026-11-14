@@ -8,6 +8,7 @@ import { mfaPath, useAuth } from '../auth'
 import { ApiError, post, REFUSED_ADDRESS_KEY } from '../api'
 import { IP_SHAPE } from '../lib/ipAllowlist'
 import { IS_CE } from '../lib/edition'
+import { hostOf } from '../lib/hostOf'
 import { useCeSetup } from '../lib/communityEdition'
 import { isEnabled } from '../lib/editionFeatures'
 import { useSubmit } from '../hooks/useSubmit'
@@ -15,6 +16,7 @@ import Banner from '../ui/Banner'
 import FormTextField from '../ui/FormTextField'
 import { monoSx } from '../ui/listStyles'
 import { ShieldIcon } from '../ui/icons'
+import { SIZE } from '../theme'
 import { TotpField } from './MfaVerify'
 import {
   EntryCard,
@@ -301,15 +303,6 @@ function SsoEntry({ initialEmail, ssoOrigin, onBack }: {
   )
 }
 
-/** `https://app.example.com` -> `app.example.com`; the raw value when it does not parse. */
-function hostOf(origin: string): string {
-  try {
-    return new URL(origin).host
-  } catch {
-    return origin
-  }
-}
-
 /** The email `/login?email=` names (a welcome email's sign-in link), or empty. */
 function prefilledEmail(): string {
   return new URLSearchParams(window.location.search).get('email')?.trim() ?? ''
@@ -525,7 +518,7 @@ export default function Login() {
           setSso(true)
         }}
         testId="sso-signin"
-        mark={<ShieldIcon size={18} />}
+        mark={<ShieldIcon size={SIZE.iconSm} />}
       />
 
       {/* The self-service door. Only a KNOWN closed status swaps the link for the closed line; while the

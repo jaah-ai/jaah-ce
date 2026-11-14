@@ -18,6 +18,18 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
+# Every `SharedRateLimiter` bucket this process has built, with the widest window it reads: the peer sweep
+# (`cp_peers.housekeeping`) prunes each bucket's rows past its own window, so a busy minute-long bucket does not
+# sit a day in the table, and everything else past `cp_peers.RATE_LIMIT_HIT_RETENTION_SECONDS`.
+_BUCKET_WINDOWS: dict[str, float] = {}
+_BUCKET_WINDOWS_LOCK = threading.Lock()
+
+
+def bucket_windows() -> dict[str, float]:
+    """A copy of bucket -> widest window (seconds) across every `SharedRateLimiter` built in this process."""
+    with _BUCKET_WINDOWS_LOCK:
+        return dict(_BUCKET_WINDOWS)
+
 
 class RateLimiter:
     """Sliding-window counter per key, bounded in both dimensions.
@@ -113,7 +125,8 @@ class SharedRateLimiter:
     database hiccup lock every visitor out of a public route whose whole job is to answer; failing open
     would drop the budget exactly when the store is least able to absorb a flood. Degraded per task (N×
     budget) is the smallest loss: the bound still holds within this process. The fallback is logged once per
-    process, not per hit, so a long outage cannot flood the log.
+    process, not per hit, so a long outage cannot flood the log. A `fail_closed` limiter (a use-once guard, where a
+    per-process count would admit a replay on every other task) raises the failure to its caller instead.
 
     The in-memory window is also kept AHEAD of the database, not only behind it: every request this process
     admits is recorded locally too, so the local count is a lower bound on the shared count, and a key the
@@ -124,12 +137,15 @@ class SharedRateLimiter:
     """
 
     def __init__(
-        self, limit: int, window: float = 60.0, clock=time.monotonic, *, bucket: str
+        self, limit: int, window: float = 60.0, clock=time.monotonic, *, bucket: str, fail_closed: bool = False
     ):
         self.limit = limit
+        self.fail_closed = fail_closed
         self.window = window
         self.clock = clock
         self.bucket = bucket
+        with _BUCKET_WINDOWS_LOCK:
+            _BUCKET_WINDOWS[bucket] = max(float(window), _BUCKET_WINDOWS.get(bucket, 0.0))
         self._fallback = RateLimiter(limit, window, clock)
         self._warned = False
         self._warn_lock = threading.Lock()
@@ -145,6 +161,8 @@ class SharedRateLimiter:
         try:
             admitted = self._allow_shared(key, limit)
         except Exception as exc:  # noqa: BLE001 — every DB failure degrades to the in-memory bound
+            if self.fail_closed:
+                raise
             self._warn_once(exc)
             return self._fallback.allow(key, limit=limit)
         if admitted:
@@ -154,10 +172,10 @@ class SharedRateLimiter:
     def _allow_shared(self, key: str, limit: int) -> bool:
         from sqlalchemy import text
 
-        from app.db import SessionLocal  # lazy: the module stays importable without an engine
+        from app.db import BridgedSession  # lazy: the module stays importable without an engine
 
         params = {"bucket": self.bucket, "key": key, "window": float(self.window)}
-        with SessionLocal() as session, session.begin():
+        with BridgedSession() as session, session.begin():
             session.execute(text(_SQL_LOCK), {"lockkey": f"ratelimit:{self.bucket}:{key}"})
             session.execute(text(_SQL_PRUNE), params)
             count = session.execute(text(_SQL_COUNT), params).scalar_one()

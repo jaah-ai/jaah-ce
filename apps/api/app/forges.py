@@ -17,6 +17,8 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Mapping, Optional, get_args
 
+from app import github_api
+
 if TYPE_CHECKING:
     from app.models.projects import Project
 
@@ -49,6 +51,11 @@ SUPPORTED_FORGES = (
     "on the project form (API: \"forge\": \"gitlab\"), and give its GitLab base URL too when it is "
     "installed under a sub-path (for example https://example.org/gitlab)."
 )
+
+
+def quote_segment(segment: str) -> str:
+    """One URL path segment: a `/` in a forge-supplied name never becomes a path separator."""
+    return urllib.parse.quote(segment, safe="")
 
 
 class ForgeUrlError(ValueError):
@@ -91,7 +98,7 @@ class RepoRef:
 
     def api_base(self) -> str:
         if self.forge == "github":
-            return "https://api.github.com"
+            return github_api.GITHUB_API_BASE
         if self.forge == "gitlab":
             return f"https://{self.root}/api/v4"
         if self.forge == "bitbucket":

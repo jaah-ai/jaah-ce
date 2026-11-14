@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Iterable, Optional
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app import agent_session_lifecycle, agent_sessions, edition_features, fleet_verdicts, slot_state
+from app.clock import utcnow
 from app.models.projects import Project
 from app.models.tasks import Task
 from app.models.worktrees import SlotIntent, Worktree
@@ -223,7 +224,7 @@ def _mint_kill_runner_intents(
     # order).
     recent_cutoff = (
         None if fresh_decision
-        else (now or datetime.now(timezone.utc)) - _KILL_INTENT_REMINT_COOLDOWN
+        else (now or utcnow()) - _KILL_INTENT_REMINT_COOLDOWN
     )
     # Keyed per launch too: a pending kill minted for a predecessor generation is retired stale at the node
     # (`_enact_kill_runner`), so it must not swallow the kill this launch earns. `None` (a legacy row, or a hold

@@ -28,13 +28,7 @@ function StandardMark(props: BrandMarkProps) {
 
   return (
     <MarkSvg {...props}>
-      <defs>
-        <linearGradient id={grad} x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stopColor="var(--sk-mark-0, #38bdf8)" />
-          <stop offset="0.55" stopColor="var(--sk-mark-1, #3b82f6)" />
-          <stop offset="1" stopColor="var(--sk-mark-2, #a855f7)" />
-        </linearGradient>
-      </defs>
+      <defs><MarkGradient id={grad} x2={32} y2={32} /></defs>
       <rect width="32" height="32" rx="6" fill={`url(#${grad})`} />
       <g fill="#ffffff">
         <rect x="17.25" y="3" width="7" height="7" rx="1.5" opacity="0.5" />
@@ -79,6 +73,18 @@ function HalloweenMark(props: BrandMarkProps) {
       </g>
       <rect x="7.75" y="23.5" width="7" height="6.5" rx="1.5" fill={`url(#${glow})`} />
     </MarkSvg>
+  )
+}
+
+/** The brand gradient, the `--sk-mark-*` stops (inherited from any ancestor, fallbacks for a dark ground) across a
+ *  `x2`×`y2` box: the standard mark's tile and `BrandWordmark`'s cells. */
+export function MarkGradient({ id, x2, y2 }: { id: string; x2: number; y2: number }) {
+  return (
+    <linearGradient id={id} x1="0" y1="0" x2={x2} y2={y2} gradientUnits="userSpaceOnUse">
+      <stop offset="0" stopColor="var(--sk-mark-0, #38bdf8)" />
+      <stop offset="0.55" stopColor="var(--sk-mark-1, #3b82f6)" />
+      <stop offset="1" stopColor="var(--sk-mark-2, #a855f7)" />
+    </linearGradient>
   )
 }
 

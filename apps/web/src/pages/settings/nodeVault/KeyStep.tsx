@@ -3,12 +3,14 @@ import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Typography from '@mui/material/Typography'
 import BusyButton from '../../../ui/BusyButton'
+import FormBox from '../../../ui/FormBox'
 import Banner from '../../../ui/Banner'
 import FormTextField from '../../../ui/FormTextField'
 import SegmentedControl from '../../../ui/SegmentedControl'
 import { VISUALLY_HIDDEN } from '../../../ui/visuallyHidden'
 import { useSubmit } from '../../../hooks/useSubmit'
 import { generateNodeVaultKey, restoreBackup, type NodeVaultKey } from '../../../lib/nodeVaultKeys'
+import { grid } from '../../../theme'
 
 /* The Key step — Generate or Upload (AC-4.2, AC-4.4). Reused by Setup and Rotation. The private key exists
  * only inside the `NodeVaultKey` handed to `onKey`, in this page's memory: nothing here sends anything, and
@@ -75,20 +77,18 @@ export default function KeyStep({
 
   const fromBackup = mode === 'upload'
   return (
-    <Box
-      component="form"
-      onSubmit={e => { e.preventDefault(); void (fromBackup ? upload() : generate()) }}
-      sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}
-      data-testid="nodevault-key-step"
-    >
+    <FormBox onSubmit={fromBackup ? upload : generate} sx={{ display: 'flex', flexDirection: 'column', gap: 2 }} data-testid="nodevault-key-step">
       <SegmentedControl
         ariaLabel="Key"
         value={mode}
         onChange={next => { setMode(next as KeySource); setError('') }}
-        options={[{ value: 'generate', label: 'Generate' }, { value: 'upload', label: 'Upload backup' }]}
+        options={[
+          { value: 'generate', label: 'Generate', help: 'Makes a new key in this browser.' },
+          { value: 'upload', label: 'Upload backup', help: 'Opens a saved key backup with its passphrase.' },
+        ]}
       />
       {fromBackup ? (
-        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, maxWidth: 420 }}>
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, maxWidth: grid(70) }}>
           <Box>
             <Button variant="outlined" component="label">
               {file ? 'Change file' : 'Choose backup file'}
@@ -103,6 +103,7 @@ export default function KeyStep({
             {file && <Typography variant="body2" component="span" sx={{ ml: 1.5 }}>{file.name}</Typography>}
           </Box>
           <FormTextField label="Passphrase" type="password" autoComplete="off" value={passphrase}
+            help="Unlocks the chosen backup file to restore its key."
             onChange={setPassphrase} testId="nodevault-upload-passphrase" />
         </Box>
       ) : (
@@ -117,6 +118,6 @@ export default function KeyStep({
         </BusyButton>
         {actions}
       </Box>
-    </Box>
+    </FormBox>
   )
 }

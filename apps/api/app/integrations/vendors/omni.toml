@@ -1,0 +1,42 @@
+slug = "omni"
+label = "Omni"
+category = "data"
+vendor_docs_url = "https://docs.omni.co/docs/API/authentication"
+summary = "Lets agents query Omni models, read documents and dashboards, and manage content through the Omni API."
+
+[[auth]]
+kind = "key"
+fields = [
+  { key = "base_url", label = "Instance URL", kind = "url", required = true, placeholder = "https://yourcompany.omniapp.co", help = "The address you open Omni at, such as https://yourcompany.omniapp.co, with no path after it" },
+  { key = "api_key", label = "API key", kind = "secret", required = true, help = "Omni > Settings > API Access > New API key (an Organization Admin's organization key), or your profile > Personal access tokens for a key that acts as you; copy it when it is shown" },
+]
+
+[test]
+method = "GET"
+path = "{base_url}/api/v1/models"
+auth = { field = "api_key", header = "Authorization", prefix = "Bearer" }
+list_field = "records"
+
+[docs]
+agent_uses = [
+  "Run queries against an Omni model and read the results",
+  "List models, topics, documents and dashboards, and read their definitions",
+  "Create, update or move documents and folders",
+  "Manage users and groups with an organization key (SCIM)",
+]
+prerequisites = [
+  "An Omni organization and its address",
+  "An Organization Admin to create an organization API key, or the Personal access tokens setting turned on for personal keys",
+]
+limitations = [
+  "An organization API key has admin-level access to the whole organization; prefer a personal access token to keep agents to one person's access",
+  "Omni rate-limits its API per organization; a burst of agent queries can be answered with 429",
+]
+troubleshooting = [
+  { symptom = "Test says Omni rejected the API key (401)", fix = "The key is wrong, expired or was deleted. Create a new one in Omni > Settings > API Access (or your profile's personal access tokens), select Replace on the secret, and paste it" },
+  { symptom = "Test says Omni returned HTTP 404", fix = "The Instance URL is not your Omni root. Use the address you open Omni at, such as https://yourcompany.omniapp.co, with no path after it" },
+  { symptom = "Test says Omni rejected the API key (403)", fix = "A personal access token cannot reach that endpoint. Give the token's owner access to the model, or use an organization key" },
+]
+faq = [
+  { q = "Organization key or personal access token?", a = "A personal access token acts as you and sees only what you can; an organization key acts as an admin. Use the narrowest one that lets agents do the task" },
+]

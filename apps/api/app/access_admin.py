@@ -1,5 +1,4 @@
-"""What an access change owes, and the tenant create-surface org guard: the orphaned "Humans" role revoke,
-the direct-console revokes, the reserved-group name check, and `refuse_foreign_org`.
+"""What an access change owes, and the tenant create-surface org guard: the direct-console revokes, the reserved-group name check, and `refuse_foreign_org`.
 
 One home so the user, group and access routes cannot drift apart. A module rather than a route helper
 because `routes/` importing `routes/` becomes a cycle.
@@ -11,23 +10,25 @@ from typing import Sequence
 from uuid import UUID
 
 from fastapi import HTTPException
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.identity import AdminUser
-from app.models.projects import Project
 from app.tenancy.seam import current_scope
-from app.user_activity import record_write
 
 # The seeded group whose name is reserved. It confers no bypass (only `admin_users.is_superadmin`
 # does), so every write verb that could reach it refuses it by name, in `routes/groups.py` and
 # `routes/users.py`; one literal so those doors cannot drift.
 BYPASS_GROUP_NAME = "superadmin"
 
-# The two "Humans" columns on `projects`, validated against project access on write and cleared with
-# it on revoke; one list so both paths cover the same pair (`routes/projects.py` imports it).
-PROJECT_ROLE_FIELDS = ("business_analyst_id", "architect_id")
-
+# The two other role-named groups the baseline migration seeds in the operator org ("developer",
+# "product_manager"), by the ids it pins: legacy, with no members and no bindings. Next to a Role field
+# they read as roles, so the access picker (`routes/access.py::list_principals`) hides them while they
+# stay empty. Ids, not names: a tenant may name its own group "developer".
+LEGACY_ROLE_GROUP_IDS = (
+    UUID("01900000-0002-7000-8000-000000000002"),
+    UUID("01900000-0002-7000-8000-000000000003"),
+)
 
 def is_bypass_group_name(name: str | None) -> bool:
     """Does `name` name the reserved group? Case-insensitively: that is the guard, not a nicety.
@@ -47,72 +48,6 @@ def refuse_foreign_org(org_id: UUID) -> None:
     scope = current_scope()
     if isinstance(scope, UUID) and org_id != scope:
         raise HTTPException(status_code=422, detail="org_id must be your own organization")
-
-
-def revoke_orphaned_project_roles(
-    session: Session, user_ids: Sequence[UUID], *, actor_id: UUID | None = None
-) -> list[tuple[int, str]]:
-    """Clear `projects.business_analyst_id` / `architect_id` wherever the user can no longer read the
-    project; returns the `(project_id, field)` pairs cleared. Audited, on the caller's session.
-
-    Owed by every event that narrows project access: the role is who `notify_targets._referred_role` DMs
-    and who the console shows as the project's human. Called by the binding writes (`routes/access.py`), the
-    membership writes and group delete (`routes/groups.py`, `routes/users.py`) and the superadmin demote.
-
-    The predicate is `authz.can_access(..., READ)`, what `routes/projects.py::_validated_project_role`
-    admits on, so write and revoke agree on the operator plane. For a tenant actor that route drops the
-    target's `is_superadmin` first, so they diverge there; no tenant can drive this (callers are
-    `@superadmin_only(Tenancy.OPERATOR)`). A superadmin keeps every role, and a role justified by a group
-    binding survives a direct-binding revoke. Nothing is committed or flushed here."""
-    from app.authz.object_access import can_access
-    from app.authz.principal import principal_for_user
-    from app.authz.visibility import ObjectAccess
-
-    unique = sorted(set(user_ids))
-    if not unique:
-        return []
-    projects = session.scalars(
-        select(Project)
-        .where(
-            or_(Project.business_analyst_id.in_(unique), Project.architect_id.in_(unique))
-        )
-        .order_by(Project.id)
-    ).all()
-    if not projects:
-        return []
-
-    # One `Principal` per user, not per (user, project): it costs three queries, none project-dependent.
-    holders = {user.id: user for user in session.scalars(
-        select(AdminUser).where(AdminUser.id.in_(unique))
-    ).all()}
-    principals = {
-        uid: principal_for_user(session, user) for uid, user in holders.items()
-    }
-
-    actor = session.get(AdminUser, actor_id) if actor_id is not None else None
-    cleared: list[tuple[int, str]] = []
-    for project in projects:
-        for field in PROJECT_ROLE_FIELDS:
-            holder_id = getattr(project, field)
-            if holder_id not in principals:
-                continue
-            if can_access(
-                session, principals[holder_id], "project", project.id, mode=ObjectAccess.READ
-            ):
-                continue
-            setattr(project, field, None)
-            cleared.append((project.id, field))
-            # Audited as a removal, one row per role, keyed on `project_id`. The email is the point of the row.
-            record_write(
-                session, actor, "project_role_revoked",
-                f"Cleared {field} on project {project.name}: "
-                f"{holders[holder_id].email} no longer has access to it",
-                data={
-                    "project_id": project.id, "field": field,
-                    "user_id": holder_id, "email": holders[holder_id].email,
-                },
-            )
-    return cleared
 
 
 def revoke_direct_grants_current_epoch(session: Session, user_ids: Sequence[UUID]) -> None:

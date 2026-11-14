@@ -1,36 +1,38 @@
-/* AN AUTOMATION'S RUNS (`GET /api/automations/{id}/runs`), newest first (AC4.6, AC7.4). One row per firing:
- * when, why (cause), the outcome, the message an email run ran on (subject · sender), and one line of what
- * happened to its targets ("480 filed · 15 skipped: previous still open"). A run from before the fire engine has no targets and reads its stored detail instead (AC5.6): its
- * headline, then the first journal lines inline (expandable), so a pass's decisions read without opening it.
- * The cause shows only where it differs from the automation's own kind (a "Run now" on a schedule); the outcome
- * chip takes Audit > Schedule's tones. Consecutive skips with one reason fold into one row ("×12", its span on hover) —
- * a wedged schedule's `already_running` skips as one "Skipped 12 runs since …" line — and
- * so do consecutive missed runs with one detail (not ten bare "Missed" rows in a row); the strip filters server-side (Status, Search),
- * so the ticks that did something are findable.
+/* AN AUTOMATION'S RUNS (`GET /api/automations/{id}/runs`), newest first (AC4.6, AC7.4), as the console's one list
+ * (`ui/feed/FeedList`), the twin of Audit > Schedule's `pages/cron/cronRunRow.tsx`. One row per firing: the outcome
+ * is the state disc (its word on hover), the title is what happened — the message an email run ran on (subject ·
+ * sender), then one line for its targets ("480 filed · 15 skipped: previous still open") or, for a run from before
+ * the fire engine, its stored headline (AC5.6); a failed run's title is its short cause, the raw text (an exception
+ * `repr`) on hover. The journal under a headline is hover prose: its first three lines, so a pass's decisions read
+ * without opening it (AC5.6), then "+N more lines" for the rest, read in full on the run's page. Trailing: the
+ * cause where it differs from the automation's own kind (a "Run now" on a schedule; its slot gates off a phone,
+ * so the hover says it too), the filed task, the age. Consecutive skips with one reason fold into one row (a ×12 marker, its span on hover) — a wedged
+ * schedule's `already_running` skips as one "Skipped 12 runs since …" title — and so do consecutive missed runs
+ * with one detail (not ten bare "Missed" rows in a row); the strip filters server-side (Status, Search), so the
+ * ticks that did something are findable.
  * A row opens the run's own page (`AutomationRunPage.tsx`) through `onOpenRun`, the editor's: it owns the unsaved-
  * edit gate and the address, and hands the row along so the page paints at once. */
 import { useCallback, useState, type JSX } from 'react'
 import Box from '@mui/material/Box'
-import Button from '@mui/material/Button'
-import ButtonBase from '@mui/material/ButtonBase'
-import Typography from '@mui/material/Typography'
-import { usePagedList } from '../../hooks/usePagedList'
-import { clockTime, NO_VALUE } from '../../lib/relativeTime'
+import { RUNS_PAGE_SIZE, usePagedList } from '../../hooks/usePagedList'
+import { clockTime, compactAge, NO_VALUE } from '../../lib/relativeTime'
 import { formatZoned } from '../../lib/zonedTime'
 import Banner from '../../ui/Banner'
+import { TaskLink } from '../../ui/DetailFields'
 import EmptyState from '../../ui/EmptyState'
+import FeedList from '../../ui/feed/FeedList'
+import { AGE_SLOT } from '../../ui/feed/geometry'
+import type { FeedNote, FeedRowSpec, OverflowItem } from '../../ui/feed/types'
 import { FilterBar } from '../../ui/FilterBar'
 import { FilterRow, FilterSelect } from '../../ui/FilterRow'
 import { fieldTapTargetSx } from '../../ui/listStyles'
-import { LoadMoreFooter } from '../../ui/PagedList'
-import RelativeTime from '../../ui/RelativeTime'
+import NoMatchesState from '../../ui/NoMatchesState'
+import PagedList from '../../ui/PagedList'
 import SearchBox from '../../ui/SearchBox'
-import StatusChip from '../../ui/StatusChip'
-import { TaskLink } from '../../ui/DetailFields'
-import { detailLines } from '../cron/vocabulary'
-import { RUNS_PAGE_SIZE } from '../../hooks/usePagedList'
+import { detailLines, OUTCOME } from '../cron/vocabulary'
 import { listAutomationRuns, type Automation, type AutomationRun } from './api'
 import { CAUSE_LABELS, runLine, runOutcomeLabel, runOutcomeTone, targetSummary } from './vocabulary'
+import { FONT_WEIGHT, SIZE, grid } from '../../theme'
 
 /** The server's `status` tokens (`routes/automations.py::RUNS_STATUSES`). */
 const STATUS_OPTIONS = [
@@ -40,9 +42,6 @@ const STATUS_OPTIONS = [
 
 /** A received message with an empty Subject header. */
 const NO_SUBJECT = '(no subject)'
-
-/** Journal lines shown under the headline before "Show N more". */
-export const JOURNAL_PREVIEW_LINES = 3
 
 /** Consecutive runs folded into one row: skips with the same reason, missed runs with the same detail, else a run
  *  alone. `oldest` is the stretch's first LOADED run (the list is newest first, so `run` is its last); `open` when the
@@ -100,142 +99,116 @@ export function skippedSince(group: RunGroup): string | null {
   return `Skipped ${foldCount(group)} runs since ${open ? 'before ' : ''}${formatZoned(oldest.fired_at)}`
 }
 
-function RunJournal({ lines }: { lines: string[] }): JSX.Element | null {
-  const [open, setOpen] = useState(false)
-  if (lines.length === 0) return null
-  const shown = open ? lines : lines.slice(0, JOURNAL_PREVIEW_LINES)
-  const hidden = lines.length - shown.length
-  return (
-    <Box data-testid="automation-run-journal" sx={{ px: 1, pb: 1, minWidth: 0 }}>
-      <Box
-        component="ul"
-        sx={{ listStyle: 'none', m: 0, p: 0, pl: 1, borderLeft: 2, borderColor: 'divider', minWidth: 0 }}
-      >
-        {shown.map((line, index) => (
-          <Typography
-            key={index}
-            component="li"
-            variant="mono"
-            sx={{ display: 'block', fontSize: 12, lineHeight: 1.6, color: 'text.secondary', overflowWrap: 'anywhere' }}
-          >
-            {line}
-          </Typography>
-        ))}
-      </Box>
-      {(hidden > 0 || open) && lines.length > JOURNAL_PREVIEW_LINES && (
-        <Button size="small" onClick={() => setOpen(!open)} sx={{ mt: 0.5 }} aria-expanded={open}>
-          {open ? 'Show fewer' : `Show ${hidden} more line${hidden === 1 ? '' : 's'}`}
-        </Button>
-      )}
-    </Box>
-  )
-}
+/** The journal lines a row's hover shows before "+N more lines". */
+const JOURNAL_LINES = 3
 
-function RunRow({ group, ownCause, onOpen }: {
-  group: RunGroup
-  /** The automation's own kind: a run with this cause says nothing new, so its cause is not drawn. */
-  ownCause: string
-  onOpen: () => void
-}): JSX.Element {
+/** One firing (or fold) as a feed row. `ownCause` is the automation's own kind: a run with that cause says nothing
+ *  new, so its cause slot stays blank. */
+function runRow(group: RunGroup, ownCause: string, onOpen: () => void): FeedRowSpec {
   const { run, count } = group
   const hasTargets = run.targets_total > 0
   const lines = detailLines(run.detail)
   const since = skippedSince(group)
   const line = since ?? (hasTargets ? targetSummary(run) : runLine(run, lines[0].trim()))
-  /* A failed run leads with its short cause; the raw text (an exception `repr`) stays under it, as the
-     automation's header does. Only when it says something the raw line does not — a difference of case
-     alone is the same words. */
+  /* A failed run leads with its short cause; the raw text (an exception `repr`) is its hover, as the automation's
+     header does. Only when it says something the raw line does not — a difference of case alone is the same words. */
   const cause = run.failure_cause && run.failure_cause.trim().toLowerCase() !== line.trim().toLowerCase()
     ? run.failure_cause
     : null
   const journal = hasTargets || since ? [] : lines.slice(1).filter(text => text.trim() !== '')
-  return (
-    <Box component="li" sx={{ borderBottom: 1, borderColor: 'divider', minWidth: 0 }}>
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}>
-        <ButtonBase
-          data-testid="automation-run-row"
-          data-id={run.id}
-          onClick={onOpen}
-          title={count > 1 ? foldedSpan(group) : undefined}
-          sx={{
-            flex: '1 1 auto',
-            minWidth: 0,
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'stretch',
-            textAlign: 'left',
-            gap: 0.5,
-            py: 1,
-            px: 1,
-            borderRadius: 1,
-            '&:hover': { bgcolor: 'action.hover' },
-            '&.Mui-focusVisible': { outline: 2, outlineColor: 'primary.main' },
-          }}
-        >
-          <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 1, minWidth: 0 }}>
-            <RelativeTime iso={run.fired_at} variant="body2" sx={{ fontWeight: 500 }} />
-            {run.cause !== ownCause && (
-              <Typography variant="body2" component="span" data-testid="automation-run-trigger" sx={{ color: 'text.secondary' }}>
-                {CAUSE_LABELS[run.cause] ?? run.cause}
-              </Typography>
-            )}
-            <StatusChip label={runOutcomeLabel(run)} tone={runOutcomeTone(run)} data-status={run.outcome} />
-            {count > 1 && !since && (
-              <Typography
-                variant="body2"
-                component="span"
-                data-testid="automation-run-repeat"
-                sx={{ color: 'text.secondary', fontWeight: 600 }}
-              >
-                ×{count}{group.open ? '+' : ''}
-              </Typography>
-            )}
-          </Box>
-          {run.email && (
-            /* Subject and sender share the line, each ellipsised: a long subject never pushes the sender out. */
-            <Box
-              data-testid="automation-run-email"
-              title={run.email.from ? `${run.email.subject || NO_SUBJECT} — from ${run.email.from}` : undefined}
-              sx={{ display: 'flex', gap: 0.75, minWidth: 0, typography: 'body2', whiteSpace: 'nowrap' }}
-            >
-              <Box component="span" sx={{ flex: '0 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                {run.email.subject || NO_SUBJECT}
-              </Box>
-              {run.email.from && (
-                <Box component="span" sx={{ flex: '0 1 auto', minWidth: '6em', maxWidth: '50%', overflow: 'hidden', textOverflow: 'ellipsis', color: 'text.secondary' }}>
-                  · {run.email.from}
-                </Box>
-              )}
-            </Box>
-          )}
-          {cause && (
-            <Typography
-              variant="body2"
-              data-testid="automation-run-cause"
-              sx={{ color: 'error.main', fontWeight: 600, overflowWrap: 'anywhere' }}
-            >
-              {cause}
-            </Typography>
-          )}
-          {line && (
-            <Typography
-              variant="body2"
-              data-testid="automation-run-summary"
-              sx={{ color: hasTargets ? 'text.primary' : 'text.secondary', overflowWrap: 'anywhere' }}
-            >
-              {line}
-            </Typography>
-          )}
-        </ButtonBase>
-        {/* Beside the button, not in it: a link inside a button is two controls in one. */}
-        {!hasTargets && run.task_id !== null && (
-          <TaskLink taskId={run.task_id} variant="body2" sx={{ flex: '0 0 auto', pr: 1 }} />
-        )}
-      </Box>
-      {/* Below the button for the same reason: the expander is its own control. */}
-      <RunJournal lines={journal} />
-    </Box>
-  )
+  const label = runOutcomeLabel(run)
+  const firedAt = formatZoned(run.fired_at)
+  const trigger = run.cause !== ownCause ? (CAUSE_LABELS[run.cause] ?? run.cause) : null
+  const email = run.email ? `${run.email.subject || NO_SUBJECT}${run.email.from ? ` · ${run.email.from}` : ''}` : null
+  const openLabel = `Open the run of ${firedAt}`
+
+  const notes: FeedNote[] = []
+  if (cause && line) notes.push({ key: 'raw', text: line, tone: 'error' })
+  if (trigger) notes.push({ key: 'cause', text: trigger, tone: 'muted' })
+  if (journal.length > 0) notes.push({ key: 'journal', text: journal.slice(0, JOURNAL_LINES).join('\n'), tone: 'muted' })
+  const more = journal.length - JOURNAL_LINES
+  if (more > 0) {
+    notes.push({
+      key: 'more',
+      tone: 'muted',
+      text: more === 1 ? '+1 more line — open the run to read it' : `+${more} more lines — open the run to read them`,
+    })
+  }
+
+  /* Same verb in the ⋯: `onRowClick` is pointer-only, so this is the keyboard path. The task's ⋯ item is what lets its
+     slot gate off a phone (`ui/feed/types.ts`). */
+  const actions: OverflowItem[] = [{ key: 'open', icon: '▤', label: 'Open', ariaLabel: openLabel, onClick: onOpen }]
+  const taskId = !hasTargets && run.task_id !== null ? run.task_id : null
+  if (taskId !== null) actions.push({ key: 'task', icon: '↗', label: `Open task #${taskId}`, ariaLabel: `Open task #${taskId}`, to: `/tasks/${taskId}` })
+
+  /* The headline: the cause (error ink), else the line, else the outcome's word alone — never a line that only
+     repeats the disc. */
+  const headline = cause
+    ? <Box component="span" data-testid="automation-run-cause" sx={{ color: 'error.main', fontWeight: FONT_WEIGHT.semibold }}>{cause}</Box>
+    : line
+      ? <Box component="span" data-testid="automation-run-summary" sx={{ color: hasTargets ? 'text.primary' : 'text.secondary' }}>{line}</Box>
+      : email ? null : label
+
+  return {
+    key: run.id,
+    indicator: {
+      tone: runOutcomeTone(run),
+      glyph: OUTCOME[run.outcome]?.glyph ?? '?',
+      label,
+      title: label,
+      /* The token an oracle reads. */
+      data: { status: run.outcome },
+    },
+    title: (
+      <>
+        {email && <Box component="span" data-testid="automation-run-email">{email}</Box>}
+        {email && headline && ' — '}
+        {headline}
+      </>
+    ),
+    titleText: [email, cause ?? line].filter(Boolean).join(' — ') || label,
+    href: null,
+    /* Two lines at every width: a subject beside a target summary is cut mid-word on one line at phone width. */
+    titleLines: 2,
+    markers: count > 1 && !since
+      ? [{ key: 'repeat', glyph: `×${count}${group.open ? '+' : ''}`, label: `${foldCount(group)} runs folded`, title: foldedSpan(group), testId: 'automation-run-repeat' }]
+      : undefined,
+    slots: [
+      {
+        key: 'cause',
+        width: grid(13),
+        gate: 'meta',
+        align: 'left',
+        dim: true,
+        testId: trigger ? 'automation-run-trigger' : undefined,
+        node: trigger,
+      },
+      {
+        /* A real anchor (middle-click, copy link) to the task's own page; `FeedList` ignores row presses inside an `<a>`. */
+        key: 'task',
+        width: grid(9.5),
+        gate: 'id',
+        align: 'right',
+        node: taskId === null ? null : <TaskLink taskId={taskId} testId="automation-run-task-link" />,
+      },
+      {
+        /* `compactAge` (≤4 chars fits `AGE_SLOT`) with the zoned instant on hover. */
+        key: 'fired',
+        width: AGE_SLOT,
+        align: 'right',
+        mono: true,
+        dim: true,
+        testId: 'automation-run-fired',
+        title: `Fired ${firedAt}`,
+        node: compactAge(run.fired_at),
+      },
+    ],
+    notes: notes.length > 0 ? notes : undefined,
+    onRowClick: onOpen,
+    rowClickLabel: openLabel,
+    actions,
+    data: { id: run.id },
+  }
 }
 
 /** The empty ledger says what comes next for a schedule — its next run, or why there is none; an event waits. */
@@ -266,7 +239,7 @@ export default function AutomationRuns({ automation, reloadKey, onOpenRun }: {
     nextOf: page => (page.items.length >= RUNS_PAGE_SIZE ? page.offset + page.items.length : null),
     errorFallback: 'Could not load runs',
   })
-  const { rows, loaded, error } = paging
+  const { rows, error } = paging
 
   return (
     <Box data-testid="automation-runs" sx={{ display: 'flex', flexDirection: 'column', gap: 1, minWidth: 0 }}>
@@ -279,7 +252,7 @@ export default function AutomationRuns({ automation, reloadKey, onOpenRun }: {
             onChange={setStatus}
             allLabel="All runs"
             options={STATUS_OPTIONS}
-            minWidth={130}
+            minWidth={SIZE.fieldSm}
           />
           <SearchBox
             label="Search"
@@ -288,32 +261,29 @@ export default function AutomationRuns({ automation, reloadKey, onOpenRun }: {
             onChange={setQ}
             placeholder="e.g. issued"
             testId="automation-runs-search"
-            sx={[{ m: 0, minWidth: 160, flex: '1 1 200px' }, fieldTapTargetSx]}
+            sx={[{ m: 0, minWidth: SIZE.fieldMd, flex: `1 1 ${grid(33)}` }, fieldTapTargetSx]}
           />
         </FilterRow>
       </FilterBar>
-      {error && (
-        <Banner severity="error">
-          {error}{' '}
-          <Button size="small" onClick={() => void paging.reload()}>Retry</Button>
-        </Banner>
-      )}
-      {loaded && rows.length === 0 && (
-        <EmptyState title={filtered ? 'No runs match these filters' : noRunsTitle(automation)} />
-      )}
-      {rows.length > 0 && (
-        <Box component="ul" ref={paging.bodyRef} sx={{ listStyle: 'none', m: 0, p: 0, minWidth: 0 }}>
-          {groupRuns(rows, paging.hasMore).map(group => (
-            <RunRow
-              key={group.run.id}
-              group={group}
-              ownCause={automation.when.kind}
-              onOpen={() => onOpenRun(group.run)}
-            />
-          ))}
-        </Box>
-      )}
-      {loaded && <LoadMoreFooter hasMore={paging.hasMore} loading={paging.loading} onMore={() => void paging.loadMore()} />}
+      {/* Over rows from an earlier read; with none, `PagedList`'s Try again is the way out. */}
+      {error && rows.length > 0 && <Banner severity="error">{error}</Banner>}
+      <PagedList
+        paging={paging}
+        retryTestId="automation-runs-retry"
+        empty={filtered ? <NoMatchesState title="No runs match" /> : <EmptyState title={noRunsTitle(automation)} />}
+        loadMoreLabel="Load more"
+        loadMoreTestId="automation-runs-load-more"
+        caption={null}
+      >
+        <FeedList
+          ariaLabel="Runs"
+          testId="automation-runs-list"
+          sections={[{
+            key: 'runs',
+            rows: groupRuns(rows, paging.hasMore).map(group => runRow(group, automation.when.kind, () => onOpenRun(group.run))),
+          }]}
+        />
+      </PagedList>
     </Box>
   )
 }

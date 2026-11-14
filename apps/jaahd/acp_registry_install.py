@@ -55,6 +55,7 @@ from typing import IO, Callable, Optional, Union
 
 import env_helpers
 import runner_env  # python_cmd(): the node's own interpreter, never a PATH lookup
+import session_user  # run_bounded(): the daemon's one captured, text-mode subprocess call
 
 REGISTRY_DIR = "acp-registry"
 #: The most an archive may download to, and unpack to.
@@ -143,7 +144,7 @@ def fetch_https(url: str, dest: Path) -> None:
 
 def run_command(argv: list, env: dict) -> tuple[int, str]:
     """Run an installer with exactly `env` — never this process's own."""
-    proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=_RUN_TIMEOUT_S)
+    proc = session_user.run_bounded(argv, env=env, timeout=_RUN_TIMEOUT_S)
     return proc.returncode, (proc.stderr or proc.stdout or "").strip()
 
 

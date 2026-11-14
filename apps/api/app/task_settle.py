@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from app import playbook_engine, slot_allocation
 from app.models.tasks import Task
-from app.persona_registry import PERSONA_MANIFEST, PERSONA_TERMINALS
+from app.persona_registry import PERSONA_MANIFEST, PERSONA_TERMINALS, SHADOW_TERMINALS
 from app.task_artifacts import current_artifact
 from app.task_manifest import (
     DOCUMENT_KINDS,
@@ -38,6 +38,8 @@ TERMINAL_REFERENCES: dict[str, tuple[str, ...]] = {
     "no_pr": ("no_pr_reason", "no_pr_evidence"),
     "finish": (),
     "outcome": (),
+    "review": (),
+    "shadow_pr": ("pr_url",),
 }
 
 #: Every reference parameter any terminal type carries — the set a branch that does not name one FORBIDS.
@@ -108,8 +110,10 @@ def is_folder_build(session: Session, task: Task) -> bool:
 
 
 def terminals_of(session: Session, task: Task) -> tuple[str, ...]:
-    """The endings `task` may declare at settle: its declared ones, or `FOLDER_BUILD_TERMINALS` for a folder
-    build task."""
+    """The endings `task` may declare at settle: `SHADOW_TERMINALS` for a benchmark shadow, its declared ones, or
+    `FOLDER_BUILD_TERMINALS` for a folder build task. Only a shadow may declare `shadow_pr`, and a shadow nothing else."""
+    if getattr(task, "shadow", False):
+        return SHADOW_TERMINALS
     return FOLDER_BUILD_TERMINALS if is_folder_build(session, task) else _declared_terminals(task)
 
 

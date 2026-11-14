@@ -43,7 +43,7 @@ def _verify_context() -> ssl.SSLContext:
     return httpx.create_ssl_context(verify=True, trust_env=True)
 
 
-def client(timeout: float, headers: Optional[dict[str, str]] = None) -> httpx.Client:
+def client(timeout: float | httpx.Timeout, headers: Optional[dict[str, str]] = None) -> httpx.Client:
     """A client carrying the policy above; `headers` ADD to `Accept-Encoding: identity`, never replace it."""
     merged = httpx.Headers(headers or {})
     merged["Accept-Encoding"] = "identity"  # case-insensitive: replaces any spelling a caller passed
@@ -157,3 +157,44 @@ def vetted_addresses(url: str) -> tuple[Optional[str], tuple[str, ...]]:
         ):
             return f"{host} resolves to a private or reserved address, which the control plane does not dial", ()
     return None, tuple(dict.fromkeys(str(info[4][0]).split("%", 1)[0] for info in infos))
+
+
+class PinnedTransport(httpx.BaseTransport):
+    """Sends every request to `addresses` (the next one only when a connection could not be made), `host` kept as
+    the `Host` header and the TLS name; a request for any other host is refused. The name is never resolved again,
+    so a rebinding domain cannot swap in a private address after `vetted_addresses` checked it."""
+
+    def __init__(self, inner: httpx.BaseTransport, host: str, addresses: tuple[str, ...]) -> None:
+        self._inner, self._host, self._addresses = inner, host, addresses
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        if request.url.raw_host.decode("ascii") != self._host:
+            raise httpx.ConnectError("Only the connection's own host is dialled.", request=request)
+        target = request.url
+        request.extensions = {**request.extensions, "sni_hostname": self._host}
+        for address in self._addresses[:-1]:
+            request.url = target.copy_with(host=address)
+            try:
+                return self._inner.handle_request(request)
+            except httpx.ConnectError:
+                continue
+        request.url = target.copy_with(host=self._addresses[-1])
+        return self._inner.handle_request(request)
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+def pin(client: httpx.Client, host: str, addresses: tuple[str, ...]) -> httpx.Client:
+    """`client` dialing only `addresses` for `host` (`PinnedTransport`), with no environment proxy mounted (a proxy
+    would resolve the name itself). `addresses` must be non-empty: what `vetted_addresses` passed."""
+    if not addresses:
+        raise ValueError("pin needs at least one vetted address")
+    client._transport = PinnedTransport(client._transport, host, addresses)
+    client._mounts = {}
+    return client
+
+
+def pinned_client(host: str, addresses: tuple[str, ...], timeout: float | httpx.Timeout) -> httpx.Client:
+    """`client(timeout)` pinned (`pin`) to `addresses` for `host`."""
+    return pin(client(timeout), host, addresses)
